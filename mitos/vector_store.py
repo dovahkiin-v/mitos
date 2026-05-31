@@ -1,0 +1,176 @@
+"""Qdrant-backed vector store for Mitos.
+
+This module implements the vector store pipeline (D) using the Qdrant REST API
+directly, reducing dependency bloat and ensuring maximum interoperability.
+"""
+
+import requests
+import json
+from typing import List, Dict, Optional, Any
+from mitos.errors import VectorStoreError
+
+def hash_to_uuid(sha256_hex: str) -> str:
+    """Converts a 64-character SHA-256 hex string deterministically into a UUID format.
+
+    Args:
+        sha256_hex: A hex string of length 64.
+
+    Returns:
+        A 36-character standard UUID string.
+    """
+    sha = sha256_hex.lower()
+    return f"{sha[:8]}-{sha[8:12]}-{sha[12:16]}-{sha[16:20]}-{sha[20:32]}"
+
+
+class QdrantVectorStore:
+    """REST client for Qdrant vector store managing points and semantic queries."""
+
+    def __init__(self, qdrant_url: str, collection_name: str = "mitos") -> None:
+        self.base_url = qdrant_url.rstrip("/")
+        self.collection = collection_name
+        self._ensure_collection()
+
+    def _ensure_collection(self) -> None:
+        """Verifies if the collection exists, creating it with 3072-dim Cosine configuration if missing."""
+        check_url = f"{self.base_url}/collections/{self.collection}"
+        try:
+            resp = requests.get(check_url, timeout=5)
+            if resp.status_code == 200:
+                # Collection exists
+                return
+
+            if resp.status_code == 404:
+                # Create collection
+                create_url = f"{self.base_url}/collections/{self.collection}"
+                payload = {
+                    "vectors": {
+                        "size": 3072,  # Size of gemini-embedding-2
+                        "distance": "Cosine"
+                    }
+                }
+                c_resp = requests.put(
+                    create_url,
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                    timeout=5
+                )
+                if c_resp.status_code != 200:
+                    raise VectorStoreError(
+                        f"Failed to create Qdrant collection: {c_resp.text}"
+                    )
+            else:
+                raise VectorStoreError(
+                    f"Unexpected Qdrant response checking collection: {resp.text}"
+                )
+        except requests.RequestException as e:
+            raise VectorStoreError(f"Qdrant connection refused: {str(e)}")
+
+    def upsert(self, point_id: str, vector: List[float], payload: Dict[str, Any]) -> None:
+        """Upserts a single point into Qdrant using the deterministic UUID mapping.
+
+        Args:
+            point_id: The SHA-256 node ID.
+            vector: The embedding vector values.
+            payload: Node metadata {slug, scope, state, kind, embedding_text}.
+        """
+        uuid_id = hash_to_uuid(point_id)
+        upsert_url = f"{self.base_url}/collections/{self.collection}/points"
+        
+        body = {
+            "points": [
+                {
+                    "id": uuid_id,
+                    "vector": vector,
+                    "payload": payload
+                }
+            ]
+        }
+        
+        try:
+            resp = requests.put(
+                upsert_url,
+                json=body,
+                headers={"Content-Type": "application/json"},
+                timeout=5
+            )
+            if resp.status_code != 200:
+                raise VectorStoreError(f"Qdrant upsert failed: {resp.text}")
+        except requests.RequestException as e:
+            raise VectorStoreError(f"Qdrant connection error during upsert: {str(e)}")
+
+    def query(
+        self,
+        vector: List[float],
+        limit: int = 5,
+        filter_scope: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Queries Qdrant for similar vectors, supporting optional scope pre-filtering.
+
+        Args:
+            vector: The query embedding vector.
+            limit: Maximum matches to return.
+            filter_scope: Optional scope tag to filter results by.
+
+        Returns:
+            A list of dictionary results with payload and scores.
+        """
+        search_url = f"{self.base_url}/collections/{self.collection}/points/search"
+        
+        body: Dict[str, Any] = {
+            "vector": vector,
+            "limit": limit,
+            "with_payload": True
+        }
+
+        # Apply Qdrant filter if scope is defined
+        if filter_scope:
+            body["filter"] = {
+                "must": [
+                    {
+                        "key": "scope",
+                        "match": {
+                            "value": filter_scope
+                        }
+                    }
+                ]
+            }
+
+        try:
+            resp = requests.post(
+                search_url,
+                json=body,
+                headers={"Content-Type": "application/json"},
+                timeout=5
+            )
+            if resp.status_code != 200:
+                raise VectorStoreError(f"Qdrant query failed: {resp.text}")
+                
+            results = resp.json().get("result", [])
+            
+            output = []
+            for item in results:
+                # Format to a standard output tuple
+                payload = item.get("payload", {})
+                score = item.get("score", 0.0)
+                output.append({
+                    "slug": payload.get("slug"),
+                    "scope": payload.get("scope", []),
+                    "state": payload.get("state"),
+                    "kind": payload.get("kind"),
+                    "embedding_text": payload.get("embedding_text"),
+                    "score": score
+                })
+            return output
+            
+        except requests.RequestException as e:
+            raise VectorStoreError(f"Qdrant query connection error: {str(e)}")
+            
+    def delete_point(self, point_id: str) -> None:
+        """Deletes a point from Qdrant by its SHA-256 node ID."""
+        uuid_id = hash_to_uuid(point_id)
+        delete_url = f"{self.base_url}/collections/{self.collection}/points/delete"
+        body = {"points": [uuid_id]}
+        try:
+            requests.post(delete_url, json=body, timeout=5)
+        except Exception:
+            pass
