@@ -1,0 +1,52 @@
+# ===== Databases =====
+*.db
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+**/*.db
+**/*.sqlite
+**/*.sqlite-wal
+**/*.sqlite-shm
+.mitos/*.sqlite
+.mitos/*.sqlite-wal
+.mitos/*.sqlite-shm
+
+# ===== Blacksmith ADRs (Sibling/Accidental References) =====
+Blacksmith/DECISIONS.md
+../Blacksmith/DECISIONS.md
+
+# ===== Environment & secrets =====
+.env
+.env.*
+*.pem
+credentials*.json
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+venv/
+.venv/
+*.so
+
+# ===== Testing =====
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# ===== IDE & OS =====
+.idea/
+.vscode/
+.gemini/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ===== Mitos Snapshots =====
+.mitos/sync_snapshot.md
+*sync_snapshot.md
