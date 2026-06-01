@@ -442,12 +442,20 @@ def test_scenario_f2_embedding_provider_down(live_workspace) -> None:
 # ==============================================================================
 # F3 — Parser hard-fail on malformed entry
 # ==============================================================================
-def test_scenario_f3_parser_hard_fail_on_malformed(live_workspace) -> None:
+def test_scenario_f3_parser_isolates_malformed(live_workspace, capsys) -> None:
+    """F3 (skill↔parser drift): a malformed entry fails LOUDLY but is isolated.
+
+    Per the §7.2-A degradation contract the parser must hard-fail the offending
+    entry (no silent acceptance, per OD1/C5) yet NOT abort the whole sync — other
+    entries continue. Here the malformed entry is the only one, so the sync reports
+    it and exits cleanly without committing garbage and without raising. The
+    "other entries continue" half is covered by the parser unit tests.
+    """
     config, tmpdir = live_workspace
     from mitos.cli import cmd_init
     cmd_init(config)
-    
-    # Write a malformed entry using **Decision:** instead of **Decided:**
+
+    # Malformed entry using **Decision:** instead of the canonical **Decided:**
     malformed_entry = (
         "## 2026-06-01 — f3-drift — Drifted decision\n"
         "**Decision:** Use bad fields.\n"
@@ -455,23 +463,18 @@ def test_scenario_f3_parser_hard_fail_on_malformed(live_workspace) -> None:
     )
     with open(config.decisions_file, "a", encoding="utf-8") as f:
         f.write(malformed_entry + "\n")
-        
-    # Attempting to sync should raise ParseError because **Decision:** is not a valid field
+
     manager = MitosSyncManager(config)
-    
-    # Mock LLM client so we skip straight to parse/commit
-    with patch("mitos.sync.run_sync_enrichment") as mock_enrich:
-        mock_enrich.return_value = {
-            "refined_core_axiom": "", 
-            "refined_mechanisms": [],
-            "refined_scope": ["substrate"],
-            "suggested_relationships": {}
-        }
-        
-        with pytest.raises(ParseError) as exc:
-            manager.perform_sync(auto_accept=True)
-            
-        assert "Unknown field '**Decision**' declared" in str(exc.value)
+
+    # Sync must NOT raise: the malformed entry is reported and skipped.
+    manager.perform_sync(auto_accept=True)
+
+    out = capsys.readouterr().out
+    # Loud, actionable failure: the offending field is named with its line range.
+    assert "Unknown field '**Decision**' declared" in out
+    assert "lines" in out.lower()
+    # No garbage committed — the drifted entry never reached the graph.
+    assert manager.store.get_node_by_slug("f3-drift") is None
 
 
 # ==============================================================================

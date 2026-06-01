@@ -168,3 +168,56 @@ def test_parse_inline_markers() -> None:
     
     assert entry.notes == ["this is an inline note"]
     assert entry.parked_questions == ["what is the benchmark rate?"]
+
+
+def test_unknown_field_reports_true_line_range() -> None:
+    """Verifies a malformed field's ParseError points at the actual offending line (C5).
+
+    Regression: the unknown-field branch used to cite a stale scan-loop variable,
+    so in multi-entry buffers it reported the file's last line instead of the bad one.
+    """
+    entry_text = (
+        "<!-- BEGIN ENTRIES -->\n"          # line 1
+        "## 2026-05-19 — slug-a — Title\n"  # line 2  (section header)
+        "**Decided:** Something valid.\n"    # line 3
+        "**Bogus:** not a real field.\n"     # line 4  <- the offender
+        "**Rejected:** an alternative.\n"    # line 5
+    )
+    with pytest.raises(ParseError) as exc:
+        parse_decisions_file(entry_text)
+    assert exc.value.line_start == 4
+    assert exc.value.line_end == 4
+    assert "Bogus" in exc.value.message
+
+
+def test_malformed_entry_isolated_when_collector_supplied() -> None:
+    """Verifies §7.2-A: one malformed entry is recorded and skipped; the rest still parse."""
+    entry_text = (
+        "<!-- BEGIN ENTRIES -->\n"
+        "## 2026-05-19 — bad-entry — Bad\n"
+        "**Decided:** something\n"
+        "**Bogus:** nope\n"
+        "## 2026-05-19 — good-entry — Good\n"
+        "**Decided:** a valid axiom\n"
+        "**Rejected:** the rejected alternative\n"
+    )
+    errors: list = []
+    entries = parse_decisions_file(entry_text, errors=errors)
+
+    assert len(entries) == 1
+    assert entries[0].slug == "good-entry"
+    assert len(errors) == 1
+    assert isinstance(errors[0], ParseError)
+    assert "Bogus" in errors[0].message
+
+
+def test_malformed_entry_raises_in_strict_mode() -> None:
+    """Verifies the default (no collector) still hard-fails on the first malformed entry (OD1)."""
+    entry_text = (
+        "<!-- BEGIN ENTRIES -->\n"
+        "## 2026-05-19 — bad-entry — Bad\n"
+        "**Decided:** something\n"
+        "**Bogus:** nope\n"
+    )
+    with pytest.raises(ParseError):
+        parse_decisions_file(entry_text)

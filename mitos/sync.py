@@ -213,13 +213,27 @@ class MitosSyncManager:
             print("Another Mitos process holds the lock; check for stuck 'mitos sync'.")
             return
 
-        # 2. Parse from the snapshot
+        # 2. Parse from the snapshot. Per-entry isolation (§7.2-A degradation
+        #    contract): a malformed entry is reported with its line range and
+        #    skipped, so the remaining well-formed entries still sync. The skipped
+        #    entries are never committed, so content-aware rotation leaves them in
+        #    decisions.md for the user to fix and re-sync.
         with open(snapshot_path, "r", encoding="utf-8") as f:
             snapshot_text = f.read()
-        entries = parse_decisions_file(snapshot_text)
+        parse_errors: List[ParseError] = []
+        entries = parse_decisions_file(snapshot_text, errors=parse_errors)
+
+        for perr in parse_errors:
+            print(
+                f"[Parse error] {perr.message} (lines {perr.line_start}-{perr.line_end}). "
+                f"Entry skipped — fix it and re-run sync."
+            )
 
         if not entries:
-            print("Zero pending entries found in decisions.md write-buffer.")
+            if parse_errors:
+                print("No parseable entries to commit. Fix the reported entries above and re-run sync.")
+            else:
+                print("Zero pending entries found in decisions.md write-buffer.")
             return
 
         # Stale-entry detection (>14 days unprocessed)
