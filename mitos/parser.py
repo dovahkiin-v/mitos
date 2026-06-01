@@ -9,31 +9,87 @@ import re
 from typing import List, Dict, Optional, Any, Tuple
 from mitos.errors import ParseError
 
-# Canonical field normalization mapping
-FIELD_MAP: Dict[str, str] = {
-    "decided": "core_axiom",
-    "mechanisms": "mechanisms",
-    "rejected": "rejected_paths",
-    "invalidates if": "invalidates_if",
-    "invalidates-if": "invalidates_if",
-    "invalidates_if": "invalidates_if",
-    "scope": "scope",
-    "context": "context",
-    "supersedes": "supersedes",
-    "amends": "amends",
-    "narrows": "narrows",
-    "depends-on": "depends_on",
-    "depends on": "depends_on",
-    "depends_on": "depends_on",
-    "resolves": "resolves",
-    "questions": "questions_raised",
-    "corrects": "corrects",
-    "contradicts": "contradicts",
-    "derives-from": "derives_from",
-    "derives from": "derives_from",
-    "derives_from": "derives_from",
-    "cites": "cites",
-}
+def load_dynamic_field_map() -> Dict[str, str]:
+    """Dynamically builds the FIELD_MAP from format-spec.md to enforce C5 single-source truth."""
+    import os
+    import re
+    
+    special_mappings = {
+        "decided": "core_axiom",
+        "rejected": "rejected_paths",
+        "questions": "questions_raised",
+    }
+    
+    alias_variations = {
+        "depends on": "depends_on",
+        "invalidates if": "invalidates_if",
+        "derives from": "derives_from",
+    }
+    
+    field_map = {}
+    spec_path = os.path.join(os.path.dirname(__file__), "format-spec.md")
+    if os.path.exists(spec_path):
+        try:
+            with open(spec_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            
+            # Extract fields declared in the markdown list items: - `**Field:**`
+            fields_found = re.findall(r'-\s+`\*\*(?P<field>[a-zA-Z -_]+):\*\*`', content)
+            for f_name in fields_found:
+                normalized_key = f_name.strip().lower()
+                
+                if normalized_key in special_mappings:
+                    target_attr = special_mappings[normalized_key]
+                else:
+                    target_attr = normalized_key.replace("-", "_").replace(" ", "_")
+                
+                field_map[normalized_key] = target_attr
+                
+                # Register alias variations for hyphens/spaces
+                if "-" in normalized_key:
+                    field_map[normalized_key.replace("-", "_")] = target_attr
+                    field_map[normalized_key.replace("-", " ")] = target_attr
+        except Exception:
+            pass
+
+    # Safe fallback mapping to ensure baseline fields are always present
+    baseline = {
+        "decided": "core_axiom",
+        "mechanisms": "mechanisms",
+        "rejected": "rejected_paths",
+        "invalidates if": "invalidates_if",
+        "invalidates-if": "invalidates_if",
+        "invalidates_if": "invalidates_if",
+        "scope": "scope",
+        "context": "context",
+        "supersedes": "supersedes",
+        "amends": "amends",
+        "narrows": "narrows",
+        "depends-on": "depends_on",
+        "depends on": "depends_on",
+        "depends_on": "depends_on",
+        "resolves": "resolves",
+        "questions": "questions_raised",
+        "corrects": "corrects",
+        "contradicts": "contradicts",
+        "derives-from": "derives_from",
+        "derives from": "derives_from",
+        "derives_from": "derives_from",
+        "cites": "cites",
+    }
+    
+    for k, v in baseline.items():
+        if k not in field_map:
+            field_map[k] = v
+            
+    for k, v in alias_variations.items():
+        field_map[k] = v
+        
+    return field_map
+
+
+# Canonical field normalization mapping (dynamically generated to enforce C5 single-source)
+FIELD_MAP: Dict[str, str] = load_dynamic_field_map()
 
 
 def strip_html_comments(text: str) -> str:
