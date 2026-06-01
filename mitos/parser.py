@@ -260,7 +260,7 @@ class ParsedEntry:
         }
 
 
-def parse_decisions_file(text: str) -> List[ParsedEntry]:
+def parse_decisions_file(text: str, errors: Optional[List[ParseError]] = None) -> List[ParsedEntry]:
     """Parses a markdown write-buffer text deterministically into parsed entries.
 
     Handles HTML comment stripping, division into sections below the BEGIN ENTRIES
@@ -268,12 +268,19 @@ def parse_decisions_file(text: str) -> List[ParsedEntry]:
 
     Args:
         text: The raw decisions.md file content.
+        errors: Optional collector for per-entry parse failures. When supplied, a
+            malformed entry is isolated -- its ParseError is appended here and
+            parsing continues with the remaining entries, so one bad entry does
+            not block the rest of the sync (the section 7.2 degradation contract:
+            "other entries in the same sync continue"). When None (the default),
+            the first malformed entry raises immediately (strict mode).
 
     Returns:
-        A list of ParsedEntry objects.
+        A list of the successfully parsed ParsedEntry objects.
 
     Raises:
-        ParseError: If any structural syntax is malformed.
+        ParseError: If any structural syntax is malformed and no ``errors``
+            collector was supplied.
     """
     # 1. Strip HTML comments outside protected blocks on the whole file
     clean_text = strip_html_comments(text)
@@ -322,158 +329,182 @@ def parse_decisions_file(text: str) -> List[ParsedEntry]:
 
     parsed_entries: List[ParsedEntry] = []
 
-    # 4. Parse the contents of each section
+    # 4. Parse each section in isolation. A malformed entry is recorded in the
+    #    errors collector and skipped so the remaining entries still sync; in
+    #    strict mode (no collector) the first malformed entry re-raises.
     for sec in sections:
-        line_start = sec["line_start"]
-        line_end = sec["line_end"]
-
-        if sec["type"] == "decision":
-            # Extract header details
-            try:
-                slug, date, title = parse_header(sec["header_line"])
-            except Exception as e:
-                raise ParseError(f"Malformed decision header: {str(e)}", line_start, line_start)
-
-            entry = ParsedEntry("decision", slug, line_start, line_end)
-            entry.date = date
-            entry.title = title
-
-            # Parse fields
-            fields: Dict[str, List[str]] = {}
-            current_field: Optional[str] = None
-            in_transcript = False
-            transcript_lines: List[str] = []
-
-            for line in sec["lines"][1:]:  # Skip the header line
-                stripped = line.strip()
-
-                # Transcript boundary checks
-                if stripped == "[DECISION_TRANSCRIPT]":
-                    in_transcript = True
-                    continue
-                elif stripped == "[/DECISION_TRANSCRIPT]":
-                    in_transcript = False
-                    continue
-
-                if in_transcript:
-                    transcript_lines.append(line)
-                    continue
-
-                # Match standard field pattern: **Field**: or **Field:**
-                field_match = re.match(r'^\s*\*\*(?P<field>[a-zA-Z -]+)(?::\*\*|\*\*:\s*)(?P<content>.*)$', line)
-                if field_match:
-                    field_name = field_match.group("field").strip().lower()
-                    content = field_match.group("content").strip()
-                    
-                    if field_name in FIELD_MAP:
-                        current_field = FIELD_MAP[field_name]
-                        fields[current_field] = [content]
-                    else:
-                        raise ParseError(f"Unknown field '**{field_match.group('field')}**' declared", idx, idx)
-                else:
-                    if current_field and stripped:
-                        fields[current_field].append(line.strip())
-
-            # Assign parsed fields to entry
-            if transcript_lines:
-                entry.transcript = "\n".join(transcript_lines).strip()
-
-            # Scan for inline markers (NOTE, PARKED)
-            for line in sec["lines"]:
-                note_matches = re.findall(r'\[NOTE:\s*([^\]]+)\]', line)
-                for nm in note_matches:
-                    entry.notes.append(nm.strip())
-                
-                parked_matches = re.findall(r'\[PARKED:\s*([^\]]+)\]', line)
-                for pm in parked_matches:
-                    entry.parked_questions.append(pm.strip())
-
-            if "core_axiom" in fields:
-                entry.core_axiom = " ".join(fields["core_axiom"]).strip()
-            if "rejected_paths" in fields:
-                entry.rejected_paths = "\n".join(fields["rejected_paths"]).strip()
-            if "invalidates_if" in fields:
-                entry.invalidates_if = " ".join(fields["invalidates_if"]).strip()
-            if "context" in fields:
-                entry.context = "\n".join(fields["context"]).strip()
-            if "supersedes" in fields:
-                entry.supersedes = " ".join(fields["supersedes"]).strip()
-            if "amends" in fields:
-                entry.amends = " ".join(fields["amends"]).strip()
-            if "narrows" in fields:
-                entry.narrows = " ".join(fields["narrows"]).strip()
-            if "depends_on" in fields:
-                entry.depends_on = " ".join(fields["depends_on"]).strip()
-            if "resolves" in fields:
-                entry.resolves = " ".join(fields["resolves"]).strip()
-            if "corrects" in fields:
-                entry.corrects = " ".join(fields["corrects"]).strip()
-            if "contradicts" in fields:
-                entry.contradicts = " ".join(fields["contradicts"]).strip()
-            if "derives_from" in fields:
-                entry.derives_from = " ".join(fields["derives_from"]).strip()
-            if "cites" in fields:
-                entry.cites = " ".join(fields["cites"]).strip()
-
-            if "mechanisms" in fields:
-                mech_str = " ".join(fields["mechanisms"]).strip()
-                entry.mechanisms = [m.strip() for m in mech_str.split(",") if m.strip()]
-
-            if "scope" in fields:
-                scope_str = " ".join(fields["scope"]).strip()
-                entry.scope = [s.strip() for s in scope_str.split(",") if s.strip()]
-
-
-
-            parsed_entries.append(entry)
-
-        elif sec["type"] == "open_question":
-            # Extract topic & reason from inline marker: [DECISION_PARKED: topic — reason]
-            header = sec["header_line"]
-            match = re.search(r'\[DECISION_PARKED:\s*(?P<content>[^\]]+)\]', header)
-            if not match:
-                raise ParseError("Malformed [DECISION_PARKED] marker syntax", line_start, line_start)
-
-            content = match.group("content").strip()
-            parts = re.split(r'\s*[\u2014\u2013]\s*|\s+-\s+', content, maxsplit=1)
-            
-            slug = parts[0].strip()
-            park_reason = parts[1].strip() if len(parts) > 1 else None
-
-            entry = ParsedEntry("open_question", slug, line_start, line_end)
-            entry.park_reason = park_reason
-
-            # Parse fields (specifically **Questions:**)
-            questions_lines: List[str] = []
-            current_field = None
-
-            for line in sec["lines"][1:]:  # Skip the marker line
-                field_match = re.match(r'^\s*\*\*(?P<field>[a-zA-Z -]+)(?::\*\*|\*\*:\s*)(?P<content>.*)$', line)
-                if field_match:
-                    field_name = field_match.group("field").strip().lower()
-                    if FIELD_MAP.get(field_name) == "questions_raised":
-                        current_field = "questions_raised"
-                        content = field_match.group("content").strip()
-                        questions_lines.append(content)
-                    else:
-                        current_field = None
-                else:
-                    if current_field == "questions_raised" and line.strip():
-                        questions_lines.append(line.strip())
-
-            # Split questions by list markers or newlines
-            raw_questions = "\n".join(questions_lines)
-            # Find bullet points: - question, * question, 1. question
-            bullets = re.split(r'\n\s*[-\*\d\.]+\s*', "\n" + raw_questions)
-            entry.questions_raised = [b.strip() for b in bullets if b.strip()]
-
-            if not entry.questions_raised:
-                # Fallback to lines if no bullet pattern was matched
-                entry.questions_raised = [q.strip() for q in questions_lines if q.strip()]
-
-
-
-            parsed_entries.append(entry)
+        try:
+            parsed_entries.append(_parse_section(sec))
+        except ParseError as exc:
+            if errors is None:
+                raise
+            errors.append(exc)
+            continue
 
     return parsed_entries
+
+
+def _parse_section(sec: Dict[str, Any]) -> ParsedEntry:
+    """Parses a single pre-scanned section into a ParsedEntry.
+
+    Args:
+        sec: A section dict from the scanning pass, carrying ``type``,
+            ``line_start``, ``line_end``, ``header_line``, and ``lines``.
+
+    Returns:
+        The parsed entry for this section.
+
+    Raises:
+        ParseError: If the header, a field, or a marker is malformed; the
+            reported line range points at the actual offending line.
+    """
+    line_start = sec["line_start"]
+    line_end = sec["line_end"]
+
+    if sec["type"] == "decision":
+        # Extract header details
+        try:
+            slug, date, title = parse_header(sec["header_line"])
+        except Exception as e:
+            raise ParseError(f"Malformed decision header: {str(e)}", line_start, line_start)
+
+        entry = ParsedEntry("decision", slug, line_start, line_end)
+        entry.date = date
+        entry.title = title
+
+        # Parse fields
+        fields: Dict[str, List[str]] = {}
+        current_field: Optional[str] = None
+        in_transcript = False
+        transcript_lines: List[str] = []
+
+        for offset, line in enumerate(sec["lines"][1:], start=1):  # Skip the header line
+            # Absolute file line of this line, so a malformed field is reported
+            # at the real offending line rather than a stale scan-loop variable.
+            field_line = line_start + offset
+            stripped = line.strip()
+
+            # Transcript boundary checks
+            if stripped == "[DECISION_TRANSCRIPT]":
+                in_transcript = True
+                continue
+            elif stripped == "[/DECISION_TRANSCRIPT]":
+                in_transcript = False
+                continue
+
+            if in_transcript:
+                transcript_lines.append(line)
+                continue
+
+            # Match standard field pattern: **Field**: or **Field:**
+            field_match = re.match(r'^\s*\*\*(?P<field>[a-zA-Z -]+)(?::\*\*|\*\*:\s*)(?P<content>.*)$', line)
+            if field_match:
+                field_name = field_match.group("field").strip().lower()
+                content = field_match.group("content").strip()
+
+                if field_name in FIELD_MAP:
+                    current_field = FIELD_MAP[field_name]
+                    fields[current_field] = [content]
+                else:
+                    raise ParseError(f"Unknown field '**{field_match.group('field')}**' declared", field_line, field_line)
+            else:
+                if current_field and stripped:
+                    fields[current_field].append(line.strip())
+
+        # Assign parsed fields to entry
+        if transcript_lines:
+            entry.transcript = "\n".join(transcript_lines).strip()
+
+        # Scan for inline markers (NOTE, PARKED)
+        for line in sec["lines"]:
+            note_matches = re.findall(r'\[NOTE:\s*([^\]]+)\]', line)
+            for nm in note_matches:
+                entry.notes.append(nm.strip())
+
+            parked_matches = re.findall(r'\[PARKED:\s*([^\]]+)\]', line)
+            for pm in parked_matches:
+                entry.parked_questions.append(pm.strip())
+
+        if "core_axiom" in fields:
+            entry.core_axiom = " ".join(fields["core_axiom"]).strip()
+        if "rejected_paths" in fields:
+            entry.rejected_paths = "\n".join(fields["rejected_paths"]).strip()
+        if "invalidates_if" in fields:
+            entry.invalidates_if = " ".join(fields["invalidates_if"]).strip()
+        if "context" in fields:
+            entry.context = "\n".join(fields["context"]).strip()
+        if "supersedes" in fields:
+            entry.supersedes = " ".join(fields["supersedes"]).strip()
+        if "amends" in fields:
+            entry.amends = " ".join(fields["amends"]).strip()
+        if "narrows" in fields:
+            entry.narrows = " ".join(fields["narrows"]).strip()
+        if "depends_on" in fields:
+            entry.depends_on = " ".join(fields["depends_on"]).strip()
+        if "resolves" in fields:
+            entry.resolves = " ".join(fields["resolves"]).strip()
+        if "corrects" in fields:
+            entry.corrects = " ".join(fields["corrects"]).strip()
+        if "contradicts" in fields:
+            entry.contradicts = " ".join(fields["contradicts"]).strip()
+        if "derives_from" in fields:
+            entry.derives_from = " ".join(fields["derives_from"]).strip()
+        if "cites" in fields:
+            entry.cites = " ".join(fields["cites"]).strip()
+
+        if "mechanisms" in fields:
+            mech_str = " ".join(fields["mechanisms"]).strip()
+            entry.mechanisms = [m.strip() for m in mech_str.split(",") if m.strip()]
+
+        if "scope" in fields:
+            scope_str = " ".join(fields["scope"]).strip()
+            entry.scope = [s.strip() for s in scope_str.split(",") if s.strip()]
+
+        return entry
+
+    elif sec["type"] == "open_question":
+        # Extract topic & reason from inline marker: [DECISION_PARKED: topic — reason]
+        header = sec["header_line"]
+        match = re.search(r'\[DECISION_PARKED:\s*(?P<content>[^\]]+)\]', header)
+        if not match:
+            raise ParseError("Malformed [DECISION_PARKED] marker syntax", line_start, line_start)
+
+        content = match.group("content").strip()
+        parts = re.split(r'\s*[\u2014\u2013]\s*|\s+-\s+', content, maxsplit=1)
+
+        slug = parts[0].strip()
+        park_reason = parts[1].strip() if len(parts) > 1 else None
+
+        entry = ParsedEntry("open_question", slug, line_start, line_end)
+        entry.park_reason = park_reason
+
+        # Parse fields (specifically **Questions:**)
+        questions_lines: List[str] = []
+        current_field = None
+
+        for line in sec["lines"][1:]:  # Skip the marker line
+            field_match = re.match(r'^\s*\*\*(?P<field>[a-zA-Z -]+)(?::\*\*|\*\*:\s*)(?P<content>.*)$', line)
+            if field_match:
+                field_name = field_match.group("field").strip().lower()
+                if FIELD_MAP.get(field_name) == "questions_raised":
+                    current_field = "questions_raised"
+                    content = field_match.group("content").strip()
+                    questions_lines.append(content)
+                else:
+                    current_field = None
+            else:
+                if current_field == "questions_raised" and line.strip():
+                    questions_lines.append(line.strip())
+
+        # Split questions by list markers or newlines
+        raw_questions = "\n".join(questions_lines)
+        # Find bullet points: - question, * question, 1. question
+        bullets = re.split(r'\n\s*[-\*\d\.]+\s*', "\n" + raw_questions)
+        entry.questions_raised = [b.strip() for b in bullets if b.strip()]
+
+        if not entry.questions_raised:
+            # Fallback to lines if no bullet pattern was matched
+            entry.questions_raised = [q.strip() for q in questions_lines if q.strip()]
+
+        return entry
 
