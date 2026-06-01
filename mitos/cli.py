@@ -134,8 +134,8 @@ def cmd_capture(config: MitosConfig, text: str) -> None:
 
 def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter") -> None:
     """Queries the vector store semantically for similar decisions."""
-    if depth not in ("letter", "trace", "vibe"):
-        raise ValueError(f"Unsupported depth mode: '{depth}'. Must be one of 'letter', 'trace', 'vibe'.")
+    if depth != "letter":
+        raise ValueError(f"Depth mode '{depth}' is not yet implemented in v0.1 (Letter-only retrieval).")
     manager = MitosSyncManager(config)
     if not manager.embed_provider or not manager.vector_store:
         print("Semantic query unavailable (Qdrant or Gemini embedding provider down).")
