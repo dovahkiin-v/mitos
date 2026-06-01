@@ -456,22 +456,22 @@ def test_scenario_f3_parser_hard_fail_on_malformed(live_workspace) -> None:
     with open(config.decisions_file, "a", encoding="utf-8") as f:
         f.write(malformed_entry + "\n")
         
-    # Attempting to sync should raise ValidationError on commit of the malformed parsed entry
+    # Attempting to sync should raise ParseError because **Decision:** is not a valid field
     manager = MitosSyncManager(config)
     
     # Mock LLM client so we skip straight to parse/commit
     with patch("mitos.sync.run_sync_enrichment") as mock_enrich:
         mock_enrich.return_value = {
-            "refined_core_axiom": "", # Missing required axiom
+            "refined_core_axiom": "", 
             "refined_mechanisms": [],
             "refined_scope": ["substrate"],
             "suggested_relationships": {}
         }
         
-        with pytest.raises(ValidationError) as exc:
+        with pytest.raises(ParseError) as exc:
             manager.perform_sync(auto_accept=True)
             
-        assert "missing required field '**Decided:**'" in str(exc.value)
+        assert "Unknown field '**Decision**' declared" in str(exc.value)
 
 
 # ==============================================================================

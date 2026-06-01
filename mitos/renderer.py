@@ -7,7 +7,7 @@ generating global and per-scope markdown files atomically from primary source da
 import os
 import tempfile
 from typing import List, Dict, Any, Optional
-from mitos.store import GraphStore
+from mitos.protocols import GraphStoreProtocol
 
 def render_node_markdown(node: Dict[str, Any]) -> str:
     """Renders a single active decision node as markdown."""
@@ -63,7 +63,7 @@ class MitosRenderer:
         self.mitos_dir = os.path.join(self.workspace_dir, ".mitos")
         self.axioms_dir = os.path.join(self.mitos_dir, "axioms")
 
-    def render_all(self, store: GraphStore, scope: Optional[str] = None) -> List[str]:
+    def render_all(self, store: GraphStoreProtocol, scope: Optional[str] = None) -> List[str]:
         """Statelessly regenerates live_axioms.md and per-scope files.
 
         Args:

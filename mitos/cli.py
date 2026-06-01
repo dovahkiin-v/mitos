@@ -12,7 +12,7 @@ from typing import List, Optional
 from google import genai
 
 from mitos.config import MitosConfig
-from mitos.errors import MitosError
+from mitos.errors import MitosError, ParseError, ValidationError
 from mitos.store import GraphStore
 from mitos.sync import MitosSyncManager, run_ambient_capture
 from mitos.renderer import MitosRenderer
@@ -93,7 +93,14 @@ def cmd_sync(config: MitosConfig, auto_accept: bool = False, embed_only: bool = 
     if embed_only:
         manager.drain_pending_embeddings()
     else:
-        manager.perform_sync(auto_accept=auto_accept, verbose=verbose)
+        try:
+            manager.perform_sync(auto_accept=auto_accept, verbose=verbose)
+        except ParseError as e:
+            print(f"Sync Aborted: Parse error in write-buffer.\n{str(e)}", file=sys.stderr)
+            sys.exit(1)
+        except ValidationError as e:
+            print(f"Sync Aborted: Validation error.\n{str(e)}", file=sys.stderr)
+            sys.exit(1)
 
 
 def cmd_capture(config: MitosConfig, text: str) -> None:

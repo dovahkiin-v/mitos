@@ -153,6 +153,12 @@ class GraphStore:
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
+        CREATE TABLE IF NOT EXISTS node_mechanisms (
+            node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+            mechanism_name TEXT NOT NULL REFERENCES mechanisms(name) ON DELETE CASCADE,
+            PRIMARY KEY (node_id, mechanism_name)
+        );
+
         CREATE TABLE IF NOT EXISTS pending_embeddings (
             node_id TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
             embedding_text TEXT NOT NULL,
@@ -448,11 +454,16 @@ class GraphStore:
                 )
 
                 # Store mechanisms in the registry (M6)
+                cursor.execute("DELETE FROM node_mechanisms WHERE node_id = ?", (node_id,))
                 for mech in parsed.mechanisms:
                     if mech.strip():
                         cursor.execute(
                             "INSERT OR IGNORE INTO mechanisms (name) VALUES (?)",
                             (mech.strip(),)
+                        )
+                        cursor.execute(
+                            "INSERT OR IGNORE INTO node_mechanisms (node_id, mechanism_name) VALUES (?, ?)",
+                            (node_id, mech.strip())
                         )
 
                 # 3. Declarative Outgoing Edge Reconciliation (V1-D21)
@@ -480,6 +491,10 @@ class GraphStore:
                             continue
                         # Resolve slug to IDs (case-insensitive)
                         target_ids = self.resolve_slug(str(target_slug).strip())
+                        
+                        # Filter out self-reference (a node cannot correct/supersede itself)
+                        target_ids = [tid for tid in target_ids if tid != node_id]
+                        
                         if not target_ids:
                             # Log a warning or create a dangling reference as best-effort
                             # For v0.1: let's ignore or raise if we strictly want validation.

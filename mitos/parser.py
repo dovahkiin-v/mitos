@@ -313,7 +313,7 @@ def parse_decisions_file(text: str) -> List[ParsedEntry]:
                         current_field = FIELD_MAP[field_name]
                         fields[current_field] = [content]
                     else:
-                        current_field = None  # Ignore unknown fields strictly or skip
+                        raise ParseError(f"Unknown field '**{field_match.group('field')}**' declared", idx, idx)
                 else:
                     if current_field and stripped:
                         fields[current_field].append(line.strip())

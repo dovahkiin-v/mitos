@@ -16,7 +16,7 @@ from google import genai
 from google.genai import types
 
 from mitos.config import MitosConfig
-from mitos.errors import SynthesisError, ParseError
+from mitos.errors import SynthesisError, ParseError, ValidationError
 from mitos.models import get_model_id
 from mitos.parser import ParsedEntry, parse_decisions_file
 from mitos.store import GraphStore, CommitDelta, compute_hash
@@ -188,9 +188,19 @@ class MitosSyncManager:
 
     def perform_sync(self, auto_accept: bool = False, verbose: bool = False) -> None:
         """Executes the complete transactional sync flow."""
-        # 1. Snapshot-at-sync-start under brief file lock
         snapshot_path = os.path.join(self.config.mitos_dir, "sync_snapshot.md")
-        
+        try:
+            self._perform_sync_internal(snapshot_path, auto_accept, verbose)
+        finally:
+            if os.path.exists(snapshot_path):
+                try:
+                    os.remove(snapshot_path)
+                except Exception:
+                    pass
+
+    def _perform_sync_internal(self, snapshot_path: str, auto_accept: bool = False, verbose: bool = False) -> None:
+        """Executes the internal transactional sync flow."""
+        # 1. Snapshot-at-sync-start under brief file lock
         try:
             with self.lock:
                 if not os.path.exists(self.config.decisions_file):
@@ -204,13 +214,9 @@ class MitosSyncManager:
             return
 
         # 2. Parse from the snapshot
-        try:
-            with open(snapshot_path, "r", encoding="utf-8") as f:
-                snapshot_text = f.read()
-            entries = parse_decisions_file(snapshot_text)
-        except ParseError as e:
-            print(f"Sync Aborted: Parse error in write-buffer.\n{str(e)}")
-            return
+        with open(snapshot_path, "r", encoding="utf-8") as f:
+            snapshot_text = f.read()
+        entries = parse_decisions_file(snapshot_text)
 
         if not entries:
             print("Zero pending entries found in decisions.md write-buffer.")
@@ -439,9 +445,7 @@ class MitosSyncManager:
             # Degradation F4b: render failure doesn't affect graph commits
             print(f"[Warning] Failed to render active axioms: {str(e)}")
 
-        # Clean up temporary snapshot
-        if os.path.exists(snapshot_path):
-            os.remove(snapshot_path)
+        # Temporary snapshot cleanup is handled by the perform_sync finally block
 
         # 6. Best-effort outbox queue drain attempt (C2)
         try:
