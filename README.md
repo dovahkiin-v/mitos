@@ -8,18 +8,16 @@ Mitos is a strict, deterministic, local-first architectural decision graph syste
 
 ---
 
-## 🌌 Core Principles (The M-System)
+## 🌌 Core Principles (The Mitos Kernel)
 
-*   **M1: Canonical Core Hash**: Node identities are computed as an immutable SHA-256 hash of their kind, slug, core axiom, mechanisms, and questions. Changing the core content generates a new node identity linked via a typed transition edge (`corrects` or `supersedes`).
-*   **M2: Cross-Store Identity**: Identifiers are mapped deterministically. To satisfy Qdrant's schema constraints, the 256-bit SQLite node ID is truncated to a 128-bit RFC-4122 UUID (`hash_to_uuid`), preserving the idempotency of re-upserts.
-*   **M3: Dynamic State Derivation**: Node active states are computed dynamically at runtime based on the fixed-point resolution of the typed-edge graph:
-    *   **Decision States**: `active` (default), `superseded` (target of a `supersedes` or `corrects` edge), or `amended` (target of an `amends` edge).
-    *   **Open Question States**: `parked` (default) or `resolved` (target of a `resolves` edge originating from an *active* decision).
-*   **M4: Auto-Healing Write Buffer**: If the write-buffer (`decisions.md`) is modified, deleted, or missing its header or sample format blocks, the sync pipeline automatically restores them under a brief file lock using the packaged single-source specification.
-*   **M5: Rejected Alternatives Constraint**: For architectural integrity, every committed decision must document at least one alternative design and the reasons it was rejected (`**Rejected:**` block).
-*   **M6: Mechanism Registry**: Automatically registers third-party dependencies, models, and technologies (e.g. `sqlite`, `gemini-3.5-flash`) into a dedicated registry table on commit.
-*   **M7: Strict Parser & Skill**: High-fidelity transcript boundaries (`[DECISION_TRANSCRIPT]` / `[/DECISION_TRANSCRIPT]`) are parsed strictly using stripped exact-line matching, ensuring that textual references inside decision prose do not cause false positives.
-*   **M8: Stateless Asset Rendering**: Axioms are compiled statelessly from the active graph into a single consolidated `live_axioms.md` asset, along with scope-level files.
+*   **M1. Axiom Immutability**: The canonical core of a node (axiom + mechanisms for decisions; topic + questions for open questions) is strictly immutable. Changes generate a new node linked via `corrects` or `supersedes` edges. Commentary fields outside the core remain mutable in place.
+*   **M2. Content-Hash Identity (with Human-Readable Slugs)**: Node IDs are cryptographic SHA-256 hashes of their canonical core to prevent parallel work collisions. Human-readable slugs are used for citations. In Qdrant, the 256-bit hash is mapped to a 128-bit RFC-4122 UUID (`hash_to_uuid`) to preserve re-upsert idempotency.
+*   **M3. State is Computed, Not Stored**: Active states (`active`, `superseded`, `drifted` for decisions; `parked`, `resolved` for open questions) are derived dynamically from edges and signals at query time. No static `status` field exists, making status drift impossible within the graph.
+*   **M4. Three Retrieval Modes (Consumer Chooses)**: The system supports Letter, Trace, and Vibe modes. v0.1 ships with **Letter-only** retrieval, exposing only the axiom and rejected paths (~200–500 tokens) to keep LLM context thin and precise.
+*   **M5. Anti-Knowledge as First-Class**: Mandates `rejected_paths` as a required field. This acts as a critical constraint boundary, preventing LLM partners from defaulting to common but incorrect patterns that have already been discarded.
+*   **M6. Typed Mechanism Entities (and Verification Anchors)**: Mechanisms (e.g. `sqlite`, `wal-mode`) are first-class registry entities rather than plain text strings. This enables dependency auditing and serves as the substrate for future automated drift sensing.
+*   **M7. Markdown is a Transient Render**: The SQLite graph is the database of record; Markdown files like `decisions.md` are write-buffers, and output files like `live_axioms.md` are transient projects generated or parsed on demand.
+*   **M8. Always Derive From Primary Sources**: Summary projections are always regenerated fresh from primary active sets (not from summaries of summaries), preventing semantic loss and accumulation of LLM drift over time.
 
 ---
 
