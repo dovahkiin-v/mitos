@@ -135,8 +135,7 @@ def query_decisions(query: str, depth: str = "letter") -> str:
         A JSON string containing the ranked results in Letter-mode payload shape.
     """
     if depth != "letter":
-        # Log a warning to satisfy depth-control contract, but degrade to letter in v0.1
-        print(f"[Warning] Depth '{depth}' requested but only 'letter' mode is supported in v0.1.")
+        return json.dumps({"error": f"Depth mode '{depth}' is not yet implemented in v0.1 (Letter-only retrieval)."})
 
     store, embed_provider, vector_store = get_workspace_components()
     

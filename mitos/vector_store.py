@@ -8,6 +8,7 @@ import requests
 import json
 from typing import List, Dict, Optional, Any
 from mitos.errors import VectorStoreError
+from mitos.models import EMBEDDING_DIM
 
 def hash_to_uuid(sha256_hex: str) -> str:
     """Converts a 64-character SHA-256 hex string deterministically into a UUID format.
@@ -31,7 +32,7 @@ class QdrantVectorStore:
         self._ensure_collection()
 
     def _ensure_collection(self) -> None:
-        """Verifies if the collection exists, creating it with 3072-dim Cosine configuration if missing."""
+        """Verifies if the collection exists, creating it with Cosine configuration if missing."""
         check_url = f"{self.base_url}/collections/{self.collection}"
         try:
             resp = requests.get(check_url, timeout=5)
@@ -44,7 +45,7 @@ class QdrantVectorStore:
                 create_url = f"{self.base_url}/collections/{self.collection}"
                 payload = {
                     "vectors": {
-                        "size": 3072,  # Size of gemini-embedding-2
+                        "size": EMBEDDING_DIM,  # Size of gemini-embedding-2
                         "distance": "Cosine"
                     }
                 }

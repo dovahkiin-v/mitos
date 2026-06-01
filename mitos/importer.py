@@ -9,6 +9,7 @@ import os
 import json
 import re
 from typing import List, Dict, Any, Tuple
+from datetime import datetime
 import anthropic
 
 from mitos.config import MitosConfig
@@ -193,6 +194,10 @@ class MitosProseImporter:
             # Assign imported metadata fields
             # GraphStore requires parsed entries
             try:
+                # Populate OD3 confirmation metadata
+                entry.confirmed_by = get_model_id("SONNET") if use_llm_extract else "user"
+                entry.confirmed_at = datetime.now().isoformat()
+
                 # Compute stable hash
                 node_id = compute_hash(
                     entry.kind,

@@ -17,7 +17,8 @@ MODEL_IDS: Dict[str, str] = {
 }
 
 
-CAPABILITY_TIERS = ["FLASH_LITE", "FLASH", "SONNET"]
+MODEL_ALIASES = ["FLASH_LITE", "FLASH", "SONNET"]
+EMBEDDING_DIM = 3072  # Dimension size for gemini-embedding-2
 
 
 def get_model_id(alias: str) -> str:
@@ -32,7 +33,7 @@ def get_model_id(alias: str) -> str:
     upper_alias = alias.upper()
     if upper_alias not in MODEL_IDS:
         raise ValueError(
-            f"Unsupported model alias: {alias}. Must be one of {CAPABILITY_TIERS}"
+            f"Unsupported model alias: {alias}. Must be one of {MODEL_ALIASES}"
         )
 
     env_override = os.environ.get(f"MITOS_MODEL_OVERRIDE_{upper_alias}")
