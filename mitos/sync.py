@@ -16,7 +16,7 @@ from google import genai
 from google.genai import types
 
 from mitos.config import MitosConfig
-from mitos.errors import SynthesisError, ParseError, ValidationError
+from mitos.errors import SynthesisError, ParseError, ValidationError, DatabaseError
 from mitos.models import get_model_id
 from mitos.parser import ParsedEntry, parse_decisions_file
 from mitos.store import GraphStore, CommitDelta, compute_hash
@@ -112,6 +112,81 @@ Make sure the slug is a clean, lowercase hyphenated string that matches the deci
         return response.text.strip()
     except Exception as e:
         raise SynthesisError(f"Ambient capture synthesis failed: {str(e)}")
+
+
+# --- record_decision helpers (write-half of the MCP server) ---
+
+# The exact buffer marker, byte-for-byte identical to cmd_capture (cli.py). The
+# `—` is an em dash; do not retype it.
+_ENTRIES_MARKER = "<!-- BEGIN ENTRIES — new decisions go directly below this line, newest first -->"
+
+# A content line that looks like a Mitos field header (e.g. `**Decided:**`); the
+# parser would treat it as a new field and corrupt the entry (parser.py:400-409).
+_FIELD_LINE_RE = re.compile(r'^\s*\*\*[A-Za-z -]+:\*\*')
+
+# A column-0 H2/H3 heading opens a NEW entry in the parser (parser.py:308). Note
+# this is deliberately narrow: a single `#` (H1), `####`+ headings, and any
+# *indented* heading are all SAFE and must NOT be rejected.
+_SECTION_HEADER_RE = re.compile(r'^#{2,3}(?!#)')
+
+# Inline markers the parser reacts to: section/transcript/buffer boundaries and
+# the [NOTE:]/[PARKED:] scanners that siphon content into entry.notes (parser.py:419-426).
+_STRUCTURAL_MARKERS = (
+    "[DECISION_PARKED:",
+    "[DECISION_TRANSCRIPT]",
+    "[/DECISION_TRANSCRIPT]",
+    "BEGIN ENTRIES",
+    "[NOTE:",
+    "[PARKED:",
+)
+
+# The exact agent-facing error messages (spec §5). Each says what went wrong AND
+# how to recover, interpolating the offending value.
+_ERROR_MESSAGES: Dict[str, str] = {
+    "not_initialized": "No Mitos workspace found here. Run 'mitos init' before recording decisions.",
+    "empty_axiom": "'axiom' is empty. Provide the decision as a single clear sentence that is true going forward.",
+    "missing_rejected_paths": "'rejected_paths' is required: state the alternatives you considered and why you ruled them out — this is what stops you or another agent from re-proposing them later.",
+    "parse_failed": "The decision could not be serialised into a valid entry — most likely a structural token in axiom/rejected_paths/context: a line beginning with '##' or '###' (indent it or use '#'/'####' instead), a line shaped like '**Something:**', or a '[DECISION_TRANSCRIPT]' / '[DECISION_PARKED:' / 'BEGIN ENTRIES' / '[NOTE:' / '[PARKED:' marker. Remove or rephrase that line and retry.",
+    "slug_collision": "A different decision already uses the slug '{slug}'. Give this one a distinct 'slug'; and if it is meant to replace the existing decision, also set supersedes='{slug}' (the new decision must still have its own slug — two decisions cannot share one).",
+    "supersedes_not_found": "supersedes='{supersedes}' does not match any existing decision. Look it up first with query_decisions to get the exact slug, or omit 'supersedes' if this is a brand-new decision.",
+    "supersedes_ambiguous": "supersedes='{supersedes}' matches more than one decision. Use query_decisions to find the exact, full slug and pass that.",
+    "commit_failed": "The decision validated but the commit failed and nothing was written: {reason}. Retry; if it persists, the workspace store may be locked or corrupt.",
+}
+
+
+def _record_error(code: str, **fields: Any) -> Dict[str, str]:
+    """Builds a structured {error, code} dict using the canonical message for ``code``."""
+    return {"error": _ERROR_MESSAGES[code].format(**fields), "code": code}
+
+
+def _contains_structural_token(text: str) -> bool:
+    """Returns True if any line of ``text`` would corrupt the flat-file parser.
+
+    Matches the parser's own raw-line semantics (no leading-whitespace strip for
+    headers, parser.py:308): only column-0 ``##``/``###`` headings, field-shaped
+    lines, and the inline markers trigger.
+    """
+    for line in text.split("\n"):
+        if _SECTION_HEADER_RE.match(line):
+            return True
+        if _FIELD_LINE_RE.match(line):
+            return True
+        if any(marker in line for marker in _STRUCTURAL_MARKERS):
+            return True
+    return False
+
+
+def _slugify(text: str) -> str:
+    """Derives a deterministic, lowercase-hyphenated slug from free text.
+
+    Determinism is load-bearing: ``compute_hash`` lower-cases the slug, so the
+    same decision must always yield the same slug (and thus the same node id).
+    """
+    s = re.sub(r'[^a-z0-9]+', '-', text.lower())
+    s = re.sub(r'-+', '-', s).strip('-')
+    if len(s) > 64:
+        s = s[:64].rstrip('-')
+    return s
 
 
 class MitosSyncManager:
@@ -574,3 +649,256 @@ class MitosSyncManager:
                 self.store.release_pending_embeddings(drainer_id)
             except Exception:
                 pass
+
+    # --- record_decision: the write half of the MCP server (Fork A) ---
+
+    def _exact_slug_node(self, slug: str) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+        """Resolves a slug to an EXACT-match node, discarding fuzzy prefix hits.
+
+        ``resolve_slug`` falls back to a ``slug:%``/``slug-%`` prefix ``LIKE`` when
+        there is no exact hit (store.py:190-216); for write-time uniqueness we must
+        only treat a true slug match as a collision, never a prefix neighbour.
+
+        Returns:
+            A (node_id, node) tuple for the exact-slug node, or (None, None).
+        """
+        for node_id in self.store.resolve_slug(slug):
+            node = self.store.get_node(node_id)
+            if node and node.get("slug", "").lower() == slug.lower():
+                return node_id, node
+        return None, None
+
+    def _node_state(self, node_id: str) -> str:
+        """Returns the computed state of a node ('active'/'superseded'/'drifted')."""
+        conn = self.store._get_connection()
+        try:
+            return self.store.compute_all_states(conn).get(node_id, "active")
+        finally:
+            conn.close()
+
+    def _embedding_status(self, node_id: str) -> str:
+        """Reports whether a node's embedding is queued in the outbox ('pending') or done."""
+        try:
+            for row in self.store.get_pending_embeddings():
+                if row.get("node_id") == node_id:
+                    return "pending"
+        except Exception:
+            pass
+        return "indexed"
+
+    def record_decision_entry(
+        self,
+        axiom: str,
+        rejected_paths: str,
+        scope: List[str],
+        mechanisms: Optional[List[str]] = None,
+        context: Optional[str] = None,
+        supersedes: Optional[str] = None,
+        slug: Optional[str] = None,
+        actor: str = "agent",
+    ) -> Dict[str, Any]:
+        """Records a single decision into the buffer and graph, non-interactively.
+
+        The agentic write half of Mitos: persists one deliberate, pre-structured
+        decision (and the alternatives it rejected) the moment an agent makes it,
+        without LLM enrichment and without calling ``perform_sync``. Composes the
+        existing primitives only — ``commit_parsed_entry`` for the graph and
+        ``_best_effort_embed`` for the vector (preserves M7).
+
+        Validation runs entirely in memory FIRST (Phase A); the buffer append and
+        the graph commit happen together, last, under a single lock, with the
+        buffer rolled back if the commit fails (Phase B). The contract: on any
+        error code, ``decisions.md`` is byte-for-byte unchanged and nothing is
+        committed.
+
+        Args:
+            axiom: The decision as a single clear sentence true going forward (M1).
+            rejected_paths: The alternatives considered and rejected, and why (M5, required).
+            scope: Area tags (may be empty).
+            mechanisms: Concrete technologies/entities involved (M6).
+            context: Optional background on why this was decided.
+            supersedes: Optional exact slug of a prior decision this one replaces.
+            slug: Optional explicit slug; derived deterministically from axiom if None.
+            actor: Provenance, stored in ``confirmed_by``.
+
+        Returns:
+            A success dict ``{slug, id, state, embedding, status}`` (status
+            "created"|"exists"), or a structured ``{error, code}`` (see spec §5).
+        """
+        # === Phase A — validate everything in memory (no writes) ===
+
+        # 1. Preconditions. os.path.exists, NOT manager construction (which creates the db).
+        if not os.path.exists(self.config.decisions_file):
+            return _record_error("not_initialized")
+
+        # 2. Normalise CRLF, then validate. A stray \r perturbs the field regex and
+        #    compute_hash (same decision would hash differently across environments).
+        axiom = (axiom or "").replace("\r\n", "\n").replace("\r", "\n")
+        rejected_paths = (rejected_paths or "").replace("\r\n", "\n").replace("\r", "\n")
+        if context is not None:
+            context = context.replace("\r\n", "\n").replace("\r", "\n")
+
+        if not axiom.strip():
+            return _record_error("empty_axiom")
+        if not rejected_paths.strip():
+            return _record_error("missing_rejected_paths")
+
+        # 3. Reject (do NOT sanitise) content fields carrying structural tokens.
+        #    Check the NON-stripped values: a leading-whitespace `  ## heading` is
+        #    safe (the parser only splits on column-0 `##`), and stripping it first
+        #    would falsely promote it to column 0. Storage stripping happens after.
+        for field_text in (axiom, rejected_paths, context):
+            if field_text and _contains_structural_token(field_text):
+                return _record_error("parse_failed")
+
+        axiom = axiom.strip()
+        rejected_paths = rejected_paths.strip()
+        context = context.strip() if context and context.strip() else None
+        mechanisms = [m.strip() for m in mechanisms if m and m.strip()] if mechanisms else []
+        scope = [s.strip() for s in scope if s and s.strip()] if scope else []
+        if supersedes is not None:
+            supersedes = supersedes.strip() or None
+
+        # 4. Deterministic slug.
+        slug = _slugify(slug) if slug else _slugify(axiom)
+        if not slug:
+            return _record_error("empty_axiom")
+
+        # 5. Serialise to the canonical format (in memory only).
+        lines = [f"### {slug}", "", f"**Decided:** {axiom}", f"**Rejected:** {rejected_paths}"]
+        if mechanisms:
+            lines.append(f"**Mechanisms:** {', '.join(mechanisms)}")
+        if scope:
+            lines.append(f"**Scope:** {', '.join(scope)}")
+        if context:
+            lines.append(f"**Context:** {context}")
+        if supersedes:
+            lines.append(f"**Supersedes:** {supersedes}")
+        entry_text = "\n".join(lines) + "\n"
+
+        # 6. Parse our entry back through the REAL parser (marker-aware), then run
+        #    the graph-level checks as a read-only fast-fail.
+        parse_errors: List[ParseError] = []
+        parsed = parse_decisions_file(
+            _ENTRIES_MARKER + "\n\n" + entry_text, errors=parse_errors
+        )
+        if len(parsed) != 1:
+            return _record_error("parse_failed")
+        entry = parsed[0]
+
+        # Pre-validate supersedes with an EXACT match (resolve_slug is fuzzy).
+        if supersedes:
+            ids = self.store.resolve_slug(supersedes)
+            if not ids:
+                return _record_error("supersedes_not_found", supersedes=supersedes)
+            if len(ids) > 1:
+                return _record_error("supersedes_ambiguous", supersedes=supersedes)
+            target = self.store.get_node(ids[0])
+            if not target or target.get("slug", "").lower() != supersedes.lower():
+                return _record_error("supersedes_not_found", supersedes=supersedes)
+            entry.supersedes = supersedes
+
+        # Identity.
+        node_id = compute_hash(
+            entry.kind, entry.slug, entry.core_axiom, entry.mechanisms, entry.questions_raised
+        )
+
+        # Idempotency (M2) fast-fail.
+        existing = self.store.get_node(node_id)
+        if existing:
+            return {
+                "slug": existing["slug"],
+                "id": node_id,
+                "state": self._node_state(node_id),
+                "embedding": self._embedding_status(node_id),
+                "status": "exists",
+            }
+
+        # Slug-collision fast-fail (exact match only).
+        coll_id, _coll_node = self._exact_slug_node(entry.slug)
+        if coll_id and coll_id != node_id:
+            return _record_error("slug_collision", slug=entry.slug)
+
+        # === Phase B — the only writes, fully serialised under one lock ===
+        try:
+            with self.lock:
+                # Re-run the authoritative state checks INSIDE the lock, BEFORE any
+                # buffer write (closes the TOCTOU window: a racer that committed
+                # since Phase A is now seen — and a rejection here still leaves the
+                # buffer byte-for-byte unchanged, since auto-heal hasn't run yet).
+                if self.store.get_node(node_id):
+                    return {
+                        "slug": entry.slug,
+                        "id": node_id,
+                        "state": self._node_state(node_id),
+                        "embedding": self._embedding_status(node_id),
+                        "status": "exists",
+                    }
+                coll_id, _coll_node = self._exact_slug_node(entry.slug)
+                if coll_id and coll_id != node_id:
+                    return _record_error("slug_collision", slug=entry.slug)
+
+                # Guarantee header + marker, then anchor the buffer for rollback.
+                self.auto_heal_decisions_file()
+                with open(self.config.decisions_file, "r", encoding="utf-8") as f:
+                    original_content = f.read()
+
+                # Compute the new buffer (newest-first, replacing ONLY the first marker).
+                if _ENTRIES_MARKER in original_content:
+                    new_content = original_content.replace(
+                        _ENTRIES_MARKER, f"{_ENTRIES_MARKER}\n\n{entry_text}", 1
+                    )
+                else:
+                    new_content = original_content.rstrip("\n") + f"\n\n{entry_text}"
+
+                # Provenance (mirror perform_sync).
+                entry.confirmed_by = actor
+                entry.confirmed_at = datetime.now().isoformat()
+
+                # Write the buffer, then commit the graph. On ANY failure of either
+                # — including an OSError on the write itself — roll the buffer back
+                # so a failure leaves NO orphan entry, and return JSON (never raise).
+                try:
+                    with open(self.config.decisions_file, "w", encoding="utf-8") as f:
+                        f.write(new_content)
+                    delta = self.store.commit_parsed_entry(entry)
+                except (ValidationError, DatabaseError, OSError) as commit_exc:
+                    # Roll the buffer back so a failed write/commit leaves NO orphan.
+                    try:
+                        with open(self.config.decisions_file, "w", encoding="utf-8") as f:
+                            f.write(original_content)
+                    except Exception as restore_exc:
+                        return {
+                            "error": (
+                                "The commit failed AND decisions.md may still hold the "
+                                f"uncommitted entry (rollback error: {restore_exc}) — run "
+                                f"'mitos sync' to reconcile. Underlying commit error: {commit_exc}."
+                            ),
+                            "code": "commit_failed",
+                        }
+                    return _record_error("commit_failed", reason=str(commit_exc))
+        except Timeout:
+            return _record_error(
+                "commit_failed", reason="another Mitos process holds the decisions.md lock"
+            )
+
+        # 8. Embed best-effort (queues to the outbox if Gemini/Qdrant are down).
+        try:
+            self._best_effort_embed(delta, entry)
+        except Exception as e:
+            print(f"[Warning] Embedding step failed for '{entry.slug}': {str(e)}")
+
+        # 9. Re-render live_axioms.md (a render failure must not fail the commit).
+        try:
+            MitosRenderer(self.config.workspace_dir).render_all(self.store)
+        except Exception as e:
+            print(f"[Warning] Failed to render active axioms: {str(e)}")
+
+        # 10. Return. A freshly recorded decision is always active.
+        return {
+            "slug": entry.slug,
+            "id": node_id,
+            "state": "active",
+            "embedding": self._embedding_status(node_id),
+            "status": "created",
+        }

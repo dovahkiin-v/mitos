@@ -66,6 +66,7 @@ def cmd_init(config: MitosConfig) -> None:
             f"{format_spec_content}\n\n"
             "## MCP Tools\n"
             "You have access to the Mitos MCP server.\n"
+            "- Use `record_decision` the moment you commit to a foundational choice (a schema, a library, a pattern, a path you're abandoning) to persist it — along with the alternatives you rejected and why — so future sessions and other agents inherit it instead of relitigating it.\n"
             "- Use `query_decisions` to semantically search the architectural graph if you are unsure about existing precedents.\n"
             "- Use `surface_decisions` to load all active axioms for a given scope.\n"
         )
@@ -289,6 +290,37 @@ def cmd_render(config: MitosConfig, scope: Optional[str] = None, render_format: 
         print(f"  - {path}")
 
 
+def cmd_record(
+    config: MitosConfig,
+    axiom: str,
+    rejected: str,
+    scope: Optional[List[str]] = None,
+    mechanisms: Optional[List[str]] = None,
+    context: Optional[str] = None,
+    supersedes: Optional[str] = None,
+    slug: Optional[str] = None,
+) -> None:
+    """Records a decision directly to the write-buffer and graph (thin wrapper)."""
+    manager = MitosSyncManager(config)
+    result = manager.record_decision_entry(
+        axiom=axiom,
+        rejected_paths=rejected,
+        scope=scope or [],
+        mechanisms=mechanisms,
+        context=context,
+        supersedes=supersedes,
+        slug=slug,
+    )
+    if "error" in result:
+        print(f"Record failed [{result['code']}]: {result['error']}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Recorded decision '{result['slug']}' ({result['status']}) ✓")
+    print(f"  ID:        {result['id']}")
+    print(f"  State:     {result['state']}")
+    print(f"  Embedding: {result['embedding']}")
+
+
 def cmd_serve() -> None:
     """Starts the FastMCP server over standard stdio."""
     # Importing mcp instance from mcp_server inside the function prevents early execution issues
@@ -346,6 +378,16 @@ def main() -> None:
     ren_p.add_argument("--format", default="live-axioms", help="Target format.")
     ren_p.add_argument("--scope", help="Optional scope filter.")
 
+    # record
+    rec_p = subparsers.add_parser("record", help="Record a decision directly to buffer and graph.")
+    rec_p.add_argument("axiom", help="The decision as a single clear sentence true going forward.")
+    rec_p.add_argument("--rejected", required=True, help="Alternatives considered and rejected, and why (REQUIRED).")
+    rec_p.add_argument("--scope", nargs="*", default=[], help="Area tags, e.g. --scope database auth.")
+    rec_p.add_argument("--mechanisms", nargs="*", default=None, help="Concrete technologies/entities, e.g. --mechanisms sqlite wal-mode.")
+    rec_p.add_argument("--context", default=None, help="Optional background on why this was decided.")
+    rec_p.add_argument("--supersedes", default=None, help="Exact slug of a prior decision this one replaces.")
+    rec_p.add_argument("--slug", default=None, help="Optional explicit slug; derived from the axiom if omitted.")
+
     # serve
     subparsers.add_parser("serve", help="Launch Mitos FastMCP server on stdio.")
 
@@ -371,6 +413,17 @@ def main() -> None:
             cmd_import(config, args.path, use_llm_extract=args.llm_extract)
         elif args.command == "render":
             cmd_render(config, scope=args.scope, render_format=args.format)
+        elif args.command == "record":
+            cmd_record(
+                config,
+                axiom=args.axiom,
+                rejected=args.rejected,
+                scope=args.scope,
+                mechanisms=args.mechanisms,
+                context=args.context,
+                supersedes=args.supersedes,
+                slug=args.slug,
+            )
         elif args.command == "serve":
             cmd_serve()
     except MitosError as e:

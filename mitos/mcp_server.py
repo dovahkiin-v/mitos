@@ -192,3 +192,53 @@ def query_decisions(query: str, depth: str = "letter") -> str:
             return json.dumps({"error": f"Semantic claim query failed: {str(e)}"})
 
     return json.dumps({"error": f"Could not resolve slug or run semantic query for '{query}'"})
+
+
+@mcp.tool()
+def record_decision(axiom: str, rejected_paths: str, scope: List[str],
+                    mechanisms: Optional[List[str]] = None, context: Optional[str] = None,
+                    supersedes: Optional[str] = None, slug: Optional[str] = None) -> str:
+    """Record a decision you just made, with the alternatives you rejected and why,
+    so future sessions and other agents inherit it instead of relitigating it.
+
+    Call this the moment you commit to a foundational choice — a schema, a library,
+    a pattern, or a path you've decided to abandon. `rejected_paths` is required:
+    recording WHY you ruled options out is what stops you (or the next agent) from
+    re-proposing them. If this decision replaces an earlier one, look the earlier one
+    up first with query_decisions/surface_decisions and pass its exact slug as
+    `supersedes`. Returns the decision's slug; look it up afterwards with query_decisions.
+
+    Args:
+        axiom: The decision as a single clear sentence true going forward.
+        rejected_paths: The alternatives considered and rejected, and why. REQUIRED.
+        scope: Area tags, e.g. ["database", "auth"].
+        mechanisms: Concrete technologies/entities involved, e.g. ["sqlite", "wal-mode"].
+        context: Optional background on why this was decided.
+        supersedes: Optional exact slug of a prior decision this one replaces.
+        slug: Optional explicit slug; derived from the axiom if omitted.
+
+    Returns:
+        A JSON string: {slug, id, state, embedding, status} or {error, code}.
+        status="created" means newly recorded; status="exists" is a SUCCESS — the
+        identical decision was already recorded and is now confirmed present, not an
+        error and not something to retry. Only a top-level {error, code} is a failure.
+        NOTE: identity is (slug + axiom + mechanisms). Re-recording a decision that
+        already exists is a no-op — a changed `context`, `rejected_paths`, `scope`, or
+        `supersedes` on a re-record is NOT saved. To record different reasoning or a new
+        relationship, make a NEW decision (a distinct axiom), don't resubmit the old one.
+    """
+    # Build our own writable manager — do NOT reuse get_workspace_components()
+    # (it opens a read_only=True store). Workspace resolves from cwd, like the read tools.
+    from mitos.sync import MitosSyncManager
+    config = MitosConfig()
+    manager = MitosSyncManager(config)
+    result = manager.record_decision_entry(
+        axiom=axiom,
+        rejected_paths=rejected_paths,
+        scope=scope,
+        mechanisms=mechanisms,
+        context=context,
+        supersedes=supersedes,
+        slug=slug,
+    )
+    return json.dumps(result)
