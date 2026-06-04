@@ -50,3 +50,7 @@ Thumbs.db
 # ===== Mitos Snapshots =====
 .mitos/sync_snapshot.md
 *sync_snapshot.md
+
+# ===== Forge/Workshop design artifacts (internal, not for the public repo) =====
+RECORD_DECISION_SPEC.md
+*_SPEC.md
