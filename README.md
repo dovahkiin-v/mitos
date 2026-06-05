@@ -1,6 +1,6 @@
 # Mitos (v0.1)
 
-![Status: Alpha](https://img.shields.io/badge/status-alpha-orange) ![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue) ![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-green)
+![Status: Alpha](https://img.shields.io/badge/status-alpha-orange) ![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue) ![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)
 
 > ⚠️ **Alpha** — Core functionality works and passes its test suite, but has not been validated in real-world sustained use. Expect rough edges. The API surface may shift before v1.
 
@@ -82,7 +82,7 @@ PYTHONPATH=. python3 mitos/cli.py render
 
 ## 🧪 Testing
 
-Mitos enforces a strict **1:1 test-to-code byte ratio** constraint to ensure complete test coverage. Run the test suite sequentially to prevent SQLite transaction locking:
+Run the test suite sequentially — SQLite transaction locking can make parallel runs flaky:
 
 ```bash
 # Run the adversarial, pathological, and live scenario suites
