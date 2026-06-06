@@ -2,7 +2,7 @@
 
 ![Status: Alpha](https://img.shields.io/badge/status-alpha-orange) ![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue) ![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)
 
-> ⚠️ **Alpha** — Core functionality works and passes its test suite, but has not been validated in real-world sustained use. Expect rough edges. The API surface may shift before v1.
+> 🔧 **Early release** — actively developed
 
 Mitos is a strict, deterministic, local-first architectural decision graph system designed to prevent citation rot and establish a bidirectional LLM-integration boundary. It maps decisions (`decisions.md` write-buffer) into a structured graph stored in SQLite and semantically indexed in Qdrant, dynamically deriving state from typed relations.
 
