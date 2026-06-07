@@ -512,10 +512,10 @@ def test_scenario_f4_render_failure_atomicity(live_workspace) -> None:
 
 
 # ==============================================================================
-# X1 — Cross-vision coherence: end-to-end lifecycle of a single decision
+# X1 — Coherence: end-to-end lifecycle of a single decision
 # ==============================================================================
 @pytest.mark.skipif(not HAS_LIVE_KEYS, reason="Requires live GEMINI API key")
-def test_scenario_x1_cross_vision_lifecycle(live_workspace) -> None:
+def test_scenario_x1_decision_lifecycle(live_workspace) -> None:
     config, tmpdir = live_workspace
     from mitos.cli import cmd_init, cmd_sync
     cmd_init(config)
