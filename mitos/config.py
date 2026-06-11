@@ -5,7 +5,33 @@ and defines system-wide defaults.
 """
 
 import os
+import re
 from typing import Dict, Any
+
+
+def default_collection_name(workspace_dir: str) -> str:
+    """Derives a per-project Qdrant collection name from the workspace path.
+
+    Each Mitos workspace gets its OWN collection so a single shared Qdrant
+    instance never mixes decisions across projects. Without this, every project
+    would default to the same ``"mitos"`` collection and cross-contaminate
+    semantic queries — and, because a point's id is ``hash_to_uuid`` of the
+    content hash (M2), two projects recording the same axiom would collide on
+    one Qdrant point. The name is ``mitos-<sanitized-basename>`` of the
+    workspace dir; set ``qdrant_collection`` in ``.mitos/config.toml`` to
+    override explicitly.
+
+    Args:
+        workspace_dir: The workspace directory (the project root holding
+            ``.mitos/``).
+
+    Returns:
+        A Qdrant-safe, project-unique collection name.
+    """
+    base = os.path.basename(os.path.normpath(workspace_dir)).lower()
+    safe = re.sub(r"[^a-z0-9_-]+", "-", base).strip("-")
+    return f"mitos-{safe}" if safe else "mitos"
+
 
 class MitosConfig:
     """Represents the configuration state for the active Mitos workspace."""
@@ -16,8 +42,16 @@ class MitosConfig:
         
         # Default configuration values
         self.db_path = os.path.join(self.mitos_dir, "graph.sqlite")
-        self.qdrant_url = os.environ.get("QDRANT_URL", "http://localhost:6333")
-        self.qdrant_collection = "mitos"
+        # Mitos defaults to its OWN dedicated port (:7333), NOT the standard
+        # Qdrant :6333 — a user's :6333 is usually running for something else, so
+        # defaulting there would co-locate Mitos's collections in their instance
+        # and share its wipe/contamination risk. :7333 fails safe (semantic just
+        # degrades if Mitos's Qdrant isn't up). `docker compose up` starts it.
+        # QDRANT_URL overrides for anyone pointing at a different instance.
+        self.qdrant_url = os.environ.get("QDRANT_URL", "http://localhost:7333")
+        # Per-project by default so a shared Qdrant never mixes projects' decisions.
+        # An explicit qdrant_collection in .mitos/config.toml overrides this.
+        self.qdrant_collection = default_collection_name(self.workspace_dir)
         self.rotation_mode = "archive"  # "archive" | "mark" | "prune"
         self.pending_threshold = 30
         self.decisions_file = os.path.join(self.workspace_dir, "decisions.md")

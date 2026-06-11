@@ -1,0 +1,26 @@
+# Mitos's own Qdrant instance.
+#
+# Runs on :7333 (NOT the standard Qdrant :6333) so Mitos never co-locates its
+# collections in whatever Qdrant you already run for other work — keeping your
+# decision graph safe from an unrelated "wipe all collections". One instance
+# serves all your Mitos projects; each project gets its own collection.
+#
+# Start it once:   docker compose up -d
+# Stop it:         docker compose down        (data persists in the named volume)
+#
+# Mitos defaults `qdrant_url` to http://localhost:7333; override with QDRANT_URL
+# or `qdrant_url` in a project's .mitos/config.toml if you point elsewhere.
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: mitos-qdrant
+    restart: unless-stopped
+    ports:
+      - "7333:6333"   # REST  — Mitos talks to this
+      - "7334:6334"   # gRPC
+    volumes:
+      - mitos-qdrant-storage:/qdrant/storage
+
+volumes:
+  mitos-qdrant-storage:
+    name: mitos-qdrant-storage
