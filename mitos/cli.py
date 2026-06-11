@@ -11,7 +11,7 @@ import argparse
 from typing import List, Optional
 from google import genai
 
-from mitos.config import MitosConfig
+from mitos.config import MitosConfig, default_collection_name
 from mitos.errors import MitosError, ParseError, ValidationError
 from mitos.store import GraphStore
 from mitos.sync import MitosSyncManager, run_ambient_capture
@@ -24,6 +24,33 @@ def load_format_spec() -> str:
     spec_path = os.path.join(os.path.dirname(__file__), "format-spec.md")
     with open(spec_path, "r", encoding="utf-8") as f:
         return f.read()
+
+
+def _ensure_gitignore_entry(gitignore_path: str, entry: str) -> None:
+    """Ensures ``entry`` is present in ``.gitignore``, creating the file if needed.
+
+    Keeps a scaffolded ``.env`` (which will hold real API keys) out of version
+    control. Idempotent — a no-op when the entry is already a line in the file.
+
+    Args:
+        gitignore_path: Path to the workspace ``.gitignore``.
+        entry: The line to ensure is present (e.g. ``".env"``).
+    """
+    existing = ""
+    if os.path.exists(gitignore_path):
+        try:
+            with open(gitignore_path, "r", encoding="utf-8") as f:
+                existing = f.read()
+        except OSError:
+            return
+        if entry in existing.splitlines():
+            return
+    sep = "" if (not existing or existing.endswith("\n")) else "\n"
+    try:
+        with open(gitignore_path, "a", encoding="utf-8") as f:
+            f.write(f"{sep}{entry}\n")
+    except OSError:
+        pass
 
 
 def cmd_init(config: MitosConfig) -> None:
@@ -46,15 +73,44 @@ def cmd_init(config: MitosConfig) -> None:
     # 1. Create config.toml if missing
     config_path = os.path.join(config.mitos_dir, "config.toml")
     if not os.path.exists(config_path):
+        collection = default_collection_name(config.workspace_dir)
         with open(config_path, "w", encoding="utf-8") as f:
             f.write(
                 "# Mitos Workspace Configuration\n"
                 'rotation_mode = "archive" # "archive" | "mark" | "prune"\n'
                 "pending_threshold = 30\n"
-                'qdrant_url = "http://localhost:6333"\n'
-                'qdrant_collection = "mitos"\n'
+                "# Qdrant REST endpoint. Defaults to Mitos's dedicated :7333 (not the\n"
+                "# standard :6333) so Mitos never co-locates its collections in another\n"
+                "# Qdrant you run. Set QDRANT_URL before `init` or edit this line.\n"
+                f'qdrant_url = "{config.qdrant_url}"\n'
+                "# Per-project collection: keeps this project's vectors isolated\n"
+                "# from other Mitos workspaces sharing the same Qdrant instance.\n"
+                f'qdrant_collection = "{collection}"\n'
             )
-                # 2. Always write/overwrite skill.md (by inclusion of format-spec.md)
+
+    # 1b. Scaffold a gitignored .env with the credential slots, so a human or
+    #     LLM setting Mitos up knows exactly where to drop keys (empty by default).
+    env_path = os.path.join(config.workspace_dir, ".env")
+    if not os.path.exists(env_path):
+        with open(env_path, "w", encoding="utf-8") as f:
+            f.write(
+                "# ============================================================\n"
+                "# Mitos API keys — fill in the value(s), then run `mitos sync`.\n"
+                "# This file is gitignored; never commit real keys.\n"
+                "# ============================================================\n\n"
+                "# Google Gemini API key — REQUIRED. One key covers BOTH embeddings\n"
+                "# (semantic surface/query) AND decision synthesis (sync/capture).\n"
+                "# Get one: https://aistudio.google.com/app/apikey\n"
+                "GEMINI_API_KEY=\n\n"
+                "# Anthropic (Claude) API key — OPTIONAL. Only used by\n"
+                "# `mitos import --llm-extract` to convert legacy prose ADRs.\n"
+                "# Get one: https://console.anthropic.com/settings/keys\n"
+                "ANTHROPIC_API_KEY=\n"
+            )
+    # Never let the .env (real keys) get committed.
+    _ensure_gitignore_entry(os.path.join(config.workspace_dir, ".gitignore"), ".env")
+
+    # 2. Always write/overwrite skill.md (by inclusion of format-spec.md)
     skill_path = os.path.join(config.mitos_dir, "skill.md")
     with open(skill_path, "w", encoding="utf-8") as f:
         f.write(
@@ -64,8 +120,15 @@ def cmd_init(config: MitosConfig) -> None:
             "## Canonical Format Specification\n"
             "Your entries MUST adhere EXACTLY to the following markdown format (loaded from format-spec.md):\n\n"
             f"{format_spec_content}\n\n"
+            "## Setup — API Keys\n"
+            "Mitos reads keys from a `.env` file at the workspace root (`mitos init` scaffolds it with empty slots; it is gitignored). Set exactly one required key:\n"
+            "- **`GEMINI_API_KEY`** (Google Gemini) — REQUIRED for semantic `surface_decisions`/`query_decisions` and for `mitos sync`. One key covers both embeddings and synthesis.\n"
+            "- `ANTHROPIC_API_KEY` — OPTIONAL, only for `mitos import --llm-extract` (legacy prose import).\n"
+            "Without `GEMINI_API_KEY`, `record_decision` still works (it commits to the local graph; the embedding is queued and drains on the next `mitos sync` once the key is set), but semantic surface/query are unavailable. If a tool reports a missing key, tell the human to put it in `.env`.\n\n"
+            "Mitos uses its own Qdrant on **:7333** (not the standard :6333), started with `docker compose up -d`. If semantic tools report Qdrant unreachable, tell the human to start it; `record_decision` still works meanwhile (embeddings queue and drain once it's up).\n\n"
             "## MCP Tools\n"
             "You have access to the Mitos MCP server.\n"
+            "All decisions you record, surface, and query are scoped to THIS project's decision graph and its own Qdrant collection — you will not see, and cannot contaminate, other projects' decisions.\n"
             "- Use `record_decision` the moment you commit to a foundational choice (a schema, a library, a pattern, a path you're abandoning) to persist it — along with the alternatives you rejected and why — so future sessions and other agents inherit it instead of relitigating it.\n"
             "- Use `query_decisions` to semantically search the architectural graph if you are unsure about existing precedents.\n"
             "- Use `surface_decisions` to load all active axioms for a given scope.\n"
@@ -329,8 +392,41 @@ def cmd_serve() -> None:
     mcp.run()
 
 
+def load_dotenv_file(path: str = ".env") -> None:
+    """Loads ``KEY=value`` pairs from a ``.env`` file into the environment.
+
+    Mitos reads its credentials (``GEMINI_API_KEY``, ``ANTHROPIC_API_KEY``) and
+    ``QDRANT_URL`` straight from ``os.environ``. This loads them from a workspace
+    ``.env`` so a key dropped in that file takes effect without a manual
+    ``export`` — the same manual parse the live test-suite already uses, with no
+    new dependency (P19 — Dependency Skepticism). An empty value is skipped, and
+    an existing environment value is never overridden (an explicit ``export``
+    wins over the file).
+
+    Args:
+        path: Path to the ``.env`` file (default: ``.env`` in the cwd, i.e. the
+            workspace root where ``mitos`` is invoked).
+    """
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                if key and val and key not in os.environ:
+                    os.environ[key] = val
+    except OSError:
+        pass
+
+
 def main() -> None:
     """Main CLI execution router."""
+    load_dotenv_file()
     parser = argparse.ArgumentParser(
         description="Mitos: Architectural Decision Substrate for LLM-native workflows."
     )

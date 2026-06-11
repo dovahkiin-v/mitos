@@ -76,6 +76,28 @@ mitos_2/
 
 ---
 
+## 🔑 API Keys & Credentials
+
+Mitos loads keys from a **`.env` file at the workspace root**. `mitos init` scaffolds this file with empty, clearly-labelled slots (and adds it to `.gitignore`), so a human or LLM just drops the value in — no guessing variable names.
+
+| Variable | Required? | Used for | Get one |
+|---|---|---|---|
+| **`GEMINI_API_KEY`** | **Required** for semantic search + sync | Embeddings (`surface`/`query`) **and** decision synthesis (`sync`/`capture`). **One key covers both.** | <https://aistudio.google.com/app/apikey> |
+| `ANTHROPIC_API_KEY` | Optional | `mitos import --llm-extract` only (legacy prose ADR conversion). | <https://console.anthropic.com/settings/keys> |
+
+- The single key to set is **`GEMINI_API_KEY`**. Without it, `mitos record` still works (it commits to the graph and queues the embedding to drain on the next `sync`), but semantic `surface`/`query` are unavailable.
+- Keys are read from `.env` automatically on every `mitos` invocation; an explicit `export` in your shell takes precedence over the file.
+
+## 🐳 Running Qdrant (its own instance)
+
+Mitos keeps its vectors in **its own dedicated Qdrant on `:7333`** — deliberately *not* the standard `:6333`. If you already run Qdrant on `:6333` for other work, defaulting there would drop Mitos's collections into your instance and put them at risk of an unrelated "wipe all collections". `:7333` keeps Mitos isolated and **fails safe**: if its Qdrant isn't running, `record` still commits to the graph and queues embeddings — only semantic search pauses.
+
+Start it once (shared across all your Mitos projects):
+```bash
+docker compose up -d        # from the mitos repo root → mitos-qdrant on :7333
+```
+One Qdrant instance, **one collection per project** (`mitos-<project>`), so projects never mix. To point Mitos at a different instance, set **`QDRANT_URL`** before `mitos init` (it's written into `config.toml`) or edit `qdrant_url` there. *(v0.2's `sqlite-vec` substrate will remove the separate-Qdrant requirement entirely.)*
+
 ## 🛠️ CLI Operations
 
 ### 1. Workspace Initialization
