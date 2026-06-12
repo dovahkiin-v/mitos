@@ -55,3 +55,6 @@ live_axioms.md
 # ===== Internal design artifacts (not for the public repo) =====
 RECORD_DECISION_SPEC.md
 *_SPEC.md
+
+# AX feedback from the vision loop's Claude — raw dev input, not for the public repo
+AX_FEEDBACK.md
