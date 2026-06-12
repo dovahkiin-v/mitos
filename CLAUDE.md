@@ -59,6 +59,14 @@ workspace + a per-project Qdrant collection on a shared instance (`:7333`).
   non-editable `pip install` into a throwaway venv, then `mitos init` — an editable
   install hides missing package-data bugs.
 
+## AX feedback from the loop
+
+`AX_FEEDBACK.md` (gitignored) is a running log of agent-experience feedback on mitos,
+appended by the Claude running the vision loop — which uses mitos for real decision work
+every round, so it's the sharpest real-use signal we get. **Not required reading**, but
+it's a good place to look when you're hunting for rough edges to fix; turn entries into
+improvements and leave them in place (or prune once actioned).
+
 ## Principles
 
 - **P19 — Dependency Skepticism.** Prefer a small hand-rolled parse over a new
