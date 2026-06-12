@@ -6,6 +6,12 @@ setup(
     name="mitos-adr",
     version="0.1.0",
     packages=find_packages(),
+    # Ship the canonical format spec INSIDE the package — `mitos init` /
+    # load_format_spec() read `mitos/format-spec.md` from the installed package
+    # dir, so it must be bundled in the wheel (an editable install reads it from
+    # the source tree, which silently hid this gap until a real `pip install`).
+    include_package_data=True,
+    package_data={"mitos": ["format-spec.md"]},
     install_requires=[
         "filelock>=3.0.0",
         "google-genai>=1.66.0",
