@@ -261,6 +261,30 @@ def test_adjacency_surfaces_related_decision(live_workspace):
     assert "stripe-webhooks-source-of-truth" not in related_slugs
 
 
+def test_surface_brief_omits_rejected_paths_real_semantic(live_workspace, capsys):
+    """brief drops rejected_paths on the REAL semantic surface path (not the fallback)."""
+    ws, _ = live_workspace
+    config = MitosConfig(str(ws))
+    cli.cmd_record(
+        config,
+        axiom="The tutor fails fast on missing learner data",
+        rejected="Graceful-degrade rejected: a silent wrong answer is worse than a loud error",
+        scope=["personas"],
+    )
+    capsys.readouterr()
+
+    cli.cmd_surface(config, "how to handle missing data", scope="personas",
+                    as_json=True, brief=True)
+    brief = json.loads(capsys.readouterr().out)
+    assert brief["active_decisions"], "semantic recall should find the decision"
+    assert all("rejected_paths" not in d for d in brief["active_decisions"])
+    assert brief["active_decisions"][0]["axiom"]  # axiom still present
+
+    cli.cmd_surface(config, "how to handle missing data", scope="personas", as_json=True)
+    full = json.loads(capsys.readouterr().out)
+    assert any("rejected_paths" in d for d in full["active_decisions"])
+
+
 def test_cli_subprocess_relation_flag_links_decisions(tmp_path):
     """Real binary, real argv: --depends-on links two decisions, edge lands in graph."""
     mitos_bin = os.path.join(os.path.dirname(sys.executable), "mitos")

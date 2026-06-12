@@ -221,6 +221,17 @@ def _slugify(text: str) -> str:
     return s
 
 
+def _slug_is_truncated(text: str) -> bool:
+    """Reports whether deriving a slug from ``text`` would hit the length cap.
+
+    A truncated auto-slug is still valid but makes a lossy handle to carry into
+    ``supersedes``/relations — so the write path nudges for an explicit ``slug=``.
+    """
+    s = re.sub(r'[^a-z0-9]+', '-', text.lower())
+    s = re.sub(r'-+', '-', s).strip('-')
+    return len(s) > _SLUG_MAX_LEN
+
+
 class MitosSyncManager:
     """Manages the full parse-enrich-commit sync flow and side effects."""
 
@@ -893,6 +904,7 @@ class MitosSyncManager:
                 extra_relations[_name] = _val.strip()
 
         # 4. Deterministic slug.
+        explicit_slug = bool(slug and slug.strip())
         slug = _slugify(slug) if slug else _slugify(axiom)
         if not slug:
             return _record_error("empty_axiom")
@@ -957,6 +969,7 @@ class MitosSyncManager:
                 "state": self._node_state(node_id),
                 "embedding": self._embedding_status(node_id),
                 "status": "exists",
+                "path": self.config.decisions_file,
             }
 
         # Slug-collision fast-fail (exact match only).
@@ -978,6 +991,7 @@ class MitosSyncManager:
                         "state": self._node_state(node_id),
                         "embedding": self._embedding_status(node_id),
                         "status": "exists",
+                        "path": self.config.decisions_file,
                     }
                 coll_id, _coll_node = self._exact_slug_node(entry.slug)
                 if coll_id and coll_id != node_id:
@@ -1049,7 +1063,15 @@ class MitosSyncManager:
             "state": "active",
             "embedding": self._embedding_status(node_id),
             "status": "created",
+            "path": self.config.decisions_file,
         }
+        # Nudge for an explicit slug when the auto-derived one was shortened — a
+        # truncated handle is awkward to carry into supersedes/relations later.
+        if not explicit_slug and _slug_is_truncated(axiom):
+            result["slug_hint"] = (
+                f"Slug auto-derived and shortened to '{entry.slug}'. For a cleaner "
+                "handle to reference later, pass an explicit slug= next time."
+            )
         related = self._adjacent_decisions(vector, exclude_slug=entry.slug)
         if related:
             result["related"] = related
