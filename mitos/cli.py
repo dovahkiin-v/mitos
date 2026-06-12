@@ -403,6 +403,13 @@ def cmd_record(
     mechanisms: Optional[List[str]] = None,
     context: Optional[str] = None,
     supersedes: Optional[str] = None,
+    amends: Optional[str] = None,
+    narrows: Optional[str] = None,
+    depends_on: Optional[str] = None,
+    resolves: Optional[str] = None,
+    contradicts: Optional[str] = None,
+    derives_from: Optional[str] = None,
+    cites: Optional[str] = None,
     slug: Optional[str] = None,
 ) -> None:
     """Records a decision directly to the write-buffer and graph (thin wrapper)."""
@@ -414,6 +421,13 @@ def cmd_record(
         mechanisms=mechanisms,
         context=context,
         supersedes=supersedes,
+        amends=amends,
+        narrows=narrows,
+        depends_on=depends_on,
+        resolves=resolves,
+        contradicts=contradicts,
+        derives_from=derives_from,
+        cites=cites,
         slug=slug,
     )
     if "error" in result:
@@ -424,6 +438,15 @@ def cmd_record(
     print(f"  ID:        {result['id']}")
     print(f"  State:     {result['state']}")
     print(f"  Embedding: {result['embedding']}")
+    print(f"  Handle:    '{result['slug']}' — pass this to --supersedes/--amends/--depends-on/… to link future decisions.")
+    related = result.get("related")
+    if related:
+        print("  ↔ Nearest existing decisions (an intended neighbour, or a tension to reconcile?):")
+        for r in related:
+            score = r.get("score")
+            score_s = f"{score:.2f}" if isinstance(score, (int, float)) else "?"
+            axiom_snip = (r.get("axiom") or "")[:60]
+            print(f"     - {r['slug']}  ({score_s})  {axiom_snip}")
 
 
 def _read_text_arg(inline: Optional[str], file_path: Optional[str]) -> Optional[str]:
@@ -979,6 +1002,13 @@ def main() -> None:
     rec_p.add_argument("--context-file", default=None, dest="context_file",
                        help="Read --context from a file ('-' = stdin).")
     rec_p.add_argument("--supersedes", default=None, help="Exact slug of a prior decision this one replaces.")
+    rec_p.add_argument("--amends", default=None, help="Exact slug of a decision this one amends.")
+    rec_p.add_argument("--narrows", default=None, help="Exact slug of a decision this one narrows.")
+    rec_p.add_argument("--depends-on", default=None, dest="depends_on", help="Exact slug of a decision this one depends on.")
+    rec_p.add_argument("--resolves", default=None, help="Exact slug of an open question/decision this one resolves.")
+    rec_p.add_argument("--contradicts", default=None, help="Exact slug of a decision this one contradicts.")
+    rec_p.add_argument("--derives-from", default=None, dest="derives_from", help="Exact slug of a decision this one derives from.")
+    rec_p.add_argument("--cites", default=None, help="Exact slug of a decision this one cites.")
     rec_p.add_argument("--slug", default=None, help="Optional explicit slug; derived from the axiom if omitted.")
 
     # serve
@@ -1035,6 +1065,13 @@ def main() -> None:
                 mechanisms=args.mechanisms,
                 context=context,
                 supersedes=args.supersedes,
+                amends=args.amends,
+                narrows=args.narrows,
+                depends_on=args.depends_on,
+                resolves=args.resolves,
+                contradicts=args.contradicts,
+                derives_from=args.derives_from,
+                cites=args.cites,
                 slug=args.slug,
             )
         elif args.command == "serve":
