@@ -596,6 +596,60 @@ def _mcp_wired(workspace_dir: str) -> bool:
         return False
 
 
+# The decision-loop verbs (+ their MCP-name aliases). Only these get the
+# "consider wiring the MCP" nudge — setup/ops/inspection verbs are CLI-native,
+# and `serve` IS the MCP, so nudging there would be nonsense.
+_DECISION_LOOP_COMMANDS = frozenset({
+    "record", "record_decision", "surface", "surface_decisions", "query", "query_decisions",
+})
+
+
+def _mcp_hint(workspace_dir: str) -> Optional[str]:
+    """Returns a gentle 'wire the MCP for the best experience' nudge, or None.
+
+    Fires only when this project has no MCP wired, at most once per 24h per
+    workspace (so it's a nudge, not a nag), and never when ``MITOS_NO_MCP_HINT``
+    is set or the MCP is already wired. Fully fail-silent.
+
+    Args:
+        workspace_dir: The project directory the CLI command acted on.
+
+    Returns:
+        A one-line stderr-ready nudge, or None.
+    """
+    if os.environ.get("MITOS_NO_MCP_HINT") or _mcp_wired(workspace_dir):
+        return None
+    import json as _json
+    import time as _time
+
+    now = _time.time()
+    path = os.path.join(
+        os.environ.get("XDG_CACHE_HOME")
+        or os.path.join(os.path.expanduser("~"), ".cache"),
+        "mitos", "mcp_hint.json",
+    )
+    shown: Dict[str, Any] = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            shown = _json.load(f)
+    except (OSError, ValueError):
+        shown = {}
+    if now - shown.get(workspace_dir, 0) < 24 * 60 * 60:
+        return None
+    shown[workspace_dir] = now
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            _json.dump(shown, f)
+    except OSError:
+        pass
+    return (
+        "💡 You're using the mitos CLI directly. For the best experience — ambient "
+        "recall and structured recording (no shell-quoting) — wire the MCP server: "
+        "see SETUP.md §3.\n   (Silence with MITOS_NO_MCP_HINT=1.)"
+    )
+
+
 def _upsert_env_var(env_path: str, name: str, value: str) -> None:
     """Inserts or replaces ``name=value`` in a ``.env`` file, preserving the rest.
 
@@ -956,6 +1010,15 @@ def main() -> None:
                     print(_notice, file=sys.stderr)
             except Exception:
                 pass
+            # Nudge CLI-only agents toward the MCP, but only on the decision-loop
+            # verbs where it actually helps (and rate-limited inside _mcp_hint).
+            if args.command in _DECISION_LOOP_COMMANDS:
+                try:
+                    _hint = _mcp_hint(config.workspace_dir)
+                    if _hint:
+                        print(_hint, file=sys.stderr)
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":
