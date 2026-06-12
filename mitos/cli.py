@@ -130,12 +130,12 @@ def cmd_init(config: MitosConfig) -> None:
             "- `ANTHROPIC_API_KEY` — OPTIONAL, only for `mitos import --llm-extract` (legacy prose import).\n"
             "Without `GEMINI_API_KEY`, `record_decision` still works (it commits to the local graph; the embedding is queued and drains on the next `mitos sync` once the key is set), but semantic surface/query are unavailable. If a tool reports a missing key, tell the human to put it in `.env`.\n\n"
             "Mitos uses its own Qdrant on **:7333** (not the standard :6333), started with `docker compose up -d`. If semantic tools report Qdrant unreachable, tell the human to start it; `record_decision` still works meanwhile (embeddings queue and drain once it's up).\n\n"
-            "## MCP Tools\n"
-            "You have access to the Mitos MCP server.\n"
+            "## Recording & recall — MCP tools (preferred) or CLI fallback\n"
             "All decisions you record, surface, and query are scoped to THIS project's decision graph and its own Qdrant collection — you will not see, and cannot contaminate, other projects' decisions.\n"
-            "- Use `record_decision` the moment you commit to a foundational choice (a schema, a library, a pattern, a path you're abandoning) to persist it — along with the alternatives you rejected and why — so future sessions and other agents inherit it instead of relitigating it.\n"
-            "- Use `query_decisions` to semantically search the architectural graph if you are unsure about existing precedents.\n"
-            "- Use `surface_decisions` to load all active axioms for a given scope.\n"
+            "If the Mitos MCP server is wired into your agent, call these tools directly — best experience: structured args, no shell-quoting. If it is NOT wired, each maps to a CLI verb (and the CLI also accepts the long names as aliases, e.g. `mitos record_decision`):\n"
+            "- `record_decision`  (CLI: `mitos record`) — the moment you commit to a foundational choice (a schema, a library, a pattern, a path you're abandoning), persist it WITH the alternatives you rejected and why, so future sessions inherit it instead of relitigating. Recording rich prose via the CLI? Use `--rejected-file -` / `--context-file -` to read from stdin and avoid shell-quoting.\n"
+            "- `surface_decisions` (CLI: `mitos surface`) — surface active precedents for a claim/scope BEFORE you decide, so you don't relitigate a settled call. This is the recall loop — use it first.\n"
+            "- `query_decisions`   (CLI: `mitos query`) — semantic or slug lookup when unsure whether a precedent exists.\n"
         )
 
     # 3. Create decisions.md buffer if missing (utilizing the extracted sample block)
@@ -388,6 +388,110 @@ def cmd_record(
     print(f"  Embedding: {result['embedding']}")
 
 
+def _read_text_arg(inline: Optional[str], file_path: Optional[str]) -> Optional[str]:
+    """Resolves a text argument from an inline value or a file.
+
+    Lets agents pass multi-sentence prose without fighting shell quoting: a
+    ``--*-file`` path (or ``-`` for stdin) sidesteps apostrophe/quote escaping
+    that would otherwise force the prose to be degraded to satisfy bash.
+
+    Args:
+        inline: The value passed directly on the command line, if any.
+        file_path: A file path to read instead, or ``"-"`` for stdin.
+
+    Returns:
+        The resolved text, or None if neither source was provided.
+    """
+    if file_path is not None:
+        if file_path == "-":
+            return sys.stdin.read()
+        with open(file_path, "r", encoding="utf-8") as f:
+            return f.read()
+    return inline
+
+
+def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
+                as_json: bool = False) -> None:
+    """Surfaces active decisions relevant to a query — the CLI twin of the MCP
+    ``surface_decisions`` tool (the precedent-recall half of Mitos).
+
+    Mirrors ``mcp_server.surface_decisions`` so a CLI-only agent (or a human) can
+    run the recall loop without the MCP wired. Semantic match first, scope
+    pre-filter fallback, plus any parked open questions in scope.
+
+    Args:
+        config: The active workspace configuration.
+        query: The claim or topic to find precedents for.
+        scope: Optional scope tag filter.
+        as_json: Emit a machine-readable JSON report (for agents) instead of text.
+    """
+    import json as _json
+    manager = MitosSyncManager(config)
+    store = manager.store
+    results: Dict[str, Any] = {"active_decisions": [], "open_questions": []}
+
+    if manager.embed_provider and manager.vector_store:
+        try:
+            q_vector = manager.embed_provider.get_embedding(query, is_query=True)
+            for m in manager.vector_store.query(q_vector, limit=5, filter_scope=scope):
+                node = store.get_node_by_slug(m["slug"])
+                if not node:
+                    continue
+                state = store.compute_all_states(store._get_connection()).get(node["id"])
+                if state not in ("active", "drifted"):
+                    continue
+                results["active_decisions"].append({
+                    "slug": node["slug"], "axiom": node["core_axiom"],
+                    "rejected_paths": node["rejected_paths"], "scope": node["scope"],
+                    "score": m["score"],
+                })
+        except Exception:
+            pass
+
+    if not results["active_decisions"] and scope:
+        try:
+            for d in store.get_active_decisions(scope=scope)[:5]:
+                results["active_decisions"].append({
+                    "slug": d["slug"], "axiom": d["core_axiom"],
+                    "rejected_paths": d["rejected_paths"], "scope": d["scope"], "score": 1.0,
+                })
+        except Exception:
+            pass
+
+    if scope:
+        try:
+            for oq in store.get_open_questions(scope=scope):
+                if oq["computed_state"] == "parked":
+                    results["open_questions"].append({
+                        "topic": oq["slug"], "questions_raised": oq["questions_raised"],
+                        "park_reason": oq.get("park_reason"),
+                    })
+        except Exception:
+            pass
+
+    if as_json:
+        print(_json.dumps(results, indent=2))
+        return
+
+    ad, oqs = results["active_decisions"], results["open_questions"]
+    if not ad and not oqs:
+        scope_note = f" (scope: {scope})" if scope else ""
+        print(f"No active precedents found for: '{query}'{scope_note}")
+        print("→ Nothing settled here yet — safe to decide, then record it.")
+        return
+    print(f"\nPrecedents for: '{query}'" + (f"  (scope: {scope})" if scope else ""))
+    print("-" * 60)
+    for i, d in enumerate(ad, start=1):
+        print(f"{i}. {d['slug']}  (score {d['score']:.3f})")
+        print(f"   Decided:  {d['axiom']}")
+        print(f"   Rejected: {d['rejected_paths']}")
+        if d["scope"]:
+            print(f"   Scope:    {', '.join(d['scope'])}")
+        print()
+    for oq in oqs:
+        print(f"[open question in scope] {oq['topic']}")
+
+
 def cmd_serve() -> None:
     """Starts the FastMCP server over standard stdio."""
     # Importing mcp instance from mcp_server inside the function prevents early execution issues
@@ -472,6 +576,25 @@ def _gemini_key_present(workspace_dir: str) -> bool:
     return _gemini_key_source(workspace_dir) is not None
 
 
+def _mcp_wired(workspace_dir: str) -> bool:
+    """True if a project-scoped ``.mcp.json`` wires the mitos MCP server.
+
+    This is the Claude Code convention (a ``mitos`` entry under ``mcpServers``).
+    It's a *recommendation* signal for agents, never a readiness blocker — other
+    harnesses wire the MCP elsewhere, and humans don't need it at all.
+    """
+    import json as _json
+    path = os.path.join(workspace_dir, ".mcp.json")
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = _json.load(f)
+        return "mitos" in (data.get("mcpServers") or {})
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def _upsert_env_var(env_path: str, name: str, value: str) -> None:
     """Inserts or replaces ``name=value`` in a ``.env`` file, preserving the rest.
 
@@ -554,6 +677,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
     key_source = _gemini_key_source(workspace_dir)
     key_ok = key_source is not None
     q = _check_qdrant(config.qdrant_url, config.qdrant_collection)
+    mcp_wired = _mcp_wired(workspace_dir)
 
     graph_nodes = None
     if os.path.exists(config.db_path):
@@ -586,6 +710,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
                 "collection_exists": q["collection_exists"],
                 "collection_points": q["points"],
                 "graph_nodes": graph_nodes,
+                "mcp_wired": mcp_wired,
             },
         }, indent=2))
         return 0 if ready else 1
@@ -610,6 +735,10 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
         (f"Qdrant reachable ({config.qdrant_url})", q["reachable"],
          "start it: `docker compose up -d` in the mitos repo"),
         (f"collection '{config.qdrant_collection}'", coll_mark, coll_hint),
+        # Recommendation, not a requirement — never a ✗. Agents get the best AX
+        # (ambient surface/record, structured args, no shell-quoting) via the MCP.
+        ("MCP wired (recommended for agents)", True if mcp_wired else None,
+         "agents: wire `mitos serve` — see SETUP.md §3 (CLI works without it)"),
     ]
     print(f"\nMITOS STATUS for {workspace_dir} — {verdict}\n")
     for label, ok, hint in checks:
@@ -695,10 +824,17 @@ def main() -> None:
     cap_p = subparsers.add_parser("capture", help="Synthesize and append a decision.")
     cap_p.add_argument("text", help="Raw decision description.")
 
-    # query
-    q_p = subparsers.add_parser("query", help="Semantic lookup for precedents.")
+    # query (alias: query_decisions — MCP tool name)
+    q_p = subparsers.add_parser("query", aliases=["query_decisions"], help="Semantic lookup for precedents.")
     q_p.add_argument("claim", help="Assertion or subsystem query.")
     q_p.add_argument("--depth", default="letter", help="Depth (default: letter).")
+
+    # surface (alias: surface_decisions — MCP tool name) — the precedent-recall loop
+    surf_p = subparsers.add_parser("surface", aliases=["surface_decisions"],
+                                   help="Surface active decisions relevant to a query (precedent check before deciding).")
+    surf_p.add_argument("query", help="The claim or topic to find precedents for.")
+    surf_p.add_argument("--scope", default=None, help="Optional scope tag filter.")
+    surf_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON.")
 
     # show
     show_p = subparsers.add_parser("show", help="Display details of a specific node.")
@@ -724,13 +860,17 @@ def main() -> None:
     ren_p.add_argument("--format", default="live-axioms", help="Target format.")
     ren_p.add_argument("--scope", help="Optional scope filter.")
 
-    # record
-    rec_p = subparsers.add_parser("record", help="Record a decision directly to buffer and graph.")
+    # record (alias: record_decision — the MCP tool name, so an agent's first instinct works)
+    rec_p = subparsers.add_parser("record", aliases=["record_decision"], help="Record a decision directly to buffer and graph.")
     rec_p.add_argument("axiom", help="The decision as a single clear sentence true going forward.")
-    rec_p.add_argument("--rejected", required=True, help="Alternatives considered and rejected, and why (REQUIRED).")
+    rec_p.add_argument("--rejected", default=None, help="Alternatives considered and rejected, and why (REQUIRED — or use --rejected-file).")
+    rec_p.add_argument("--rejected-file", default=None, dest="rejected_file",
+                       help="Read --rejected from a file ('-' = stdin) to avoid shell-quoting long prose.")
     rec_p.add_argument("--scope", nargs="*", default=[], help="Area tags, e.g. --scope database auth.")
     rec_p.add_argument("--mechanisms", nargs="*", default=None, help="Concrete technologies/entities, e.g. --mechanisms sqlite wal-mode.")
     rec_p.add_argument("--context", default=None, help="Optional background on why this was decided.")
+    rec_p.add_argument("--context-file", default=None, dest="context_file",
+                       help="Read --context from a file ('-' = stdin).")
     rec_p.add_argument("--supersedes", default=None, help="Exact slug of a prior decision this one replaces.")
     rec_p.add_argument("--slug", default=None, help="Optional explicit slug; derived from the axiom if omitted.")
 
@@ -759,8 +899,10 @@ def main() -> None:
             cmd_sync(config, auto_accept=args.yes, embed_only=args.embed_only, verbose=args.verbose)
         elif args.command == "capture":
             cmd_capture(config, args.text)
-        elif args.command == "query":
+        elif args.command in ("query", "query_decisions"):
             cmd_query(config, args.claim, depth=args.depth)
+        elif args.command in ("surface", "surface_decisions"):
+            cmd_surface(config, args.query, scope=args.scope, as_json=args.as_json)
         elif args.command == "show":
             cmd_show(config, args.ident)
         elif args.command == "list":
@@ -771,14 +913,20 @@ def main() -> None:
             cmd_import(config, args.path, use_llm_extract=args.llm_extract)
         elif args.command == "render":
             cmd_render(config, scope=args.scope, render_format=args.format)
-        elif args.command == "record":
+        elif args.command in ("record", "record_decision"):
+            rejected = _read_text_arg(args.rejected, args.rejected_file)
+            if not (rejected and rejected.strip()):
+                print("record requires --rejected or --rejected-file "
+                      "(the rejected alternatives are mandatory).", file=sys.stderr)
+                sys.exit(2)
+            context = _read_text_arg(args.context, args.context_file)
             cmd_record(
                 config,
                 axiom=args.axiom,
-                rejected=args.rejected,
+                rejected=rejected,
                 scope=args.scope,
                 mechanisms=args.mechanisms,
-                context=args.context,
+                context=context,
                 supersedes=args.supersedes,
                 slug=args.slug,
             )

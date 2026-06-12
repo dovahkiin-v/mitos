@@ -53,9 +53,14 @@ mitos set-key <your-key>              # writes ./.env (gitignored)
 One key covers embeddings *and* synthesis. `mitos status` shows which source it
 found (`from global .env` / `from project .env` / `from environment`).
 
-### 3. Wire the MCP server into your agent
-So your agent can `surface_decisions` / `query_decisions` / `record_decision`,
-point it at `mitos serve` (a stdio MCP server) with the **project as its cwd**.
+### 3. Wire the MCP server into your agent (strongly recommended for agents)
+**This is the recommended interface for any agent working in the project.** It
+gives the best AX: ambient `surface_decisions` / `query_decisions` /
+`record_decision` tools, **structured arguments** (no shell-quoting — multi-
+sentence prose with apostrophes survives intact), and the tool names match the
+ones the docs use. The CLI works without it (see the capability map below), but
+the MCP is how an agent actually *lives* in the decision loop. Point your agent at
+`mitos serve` (a stdio MCP server) with the **project as its cwd**.
 
 **Claude Code** — add a project-scoped `.mcp.json` at the project root:
 ```json
@@ -96,3 +101,36 @@ Record decisions with `record_decision`; check precedents with `surface_decision
 
 That line is what makes Mitos-awareness travel with the project across agents and
 sessions.
+
+---
+
+## CLI vs MCP — which surface does what
+
+Mitos has two surfaces over **one** workspace. The **CLI** is the substrate
+(setup, ops, inspection) and a complete fallback; the **MCP** is the recommended
+decision interface for agents. They are not either/or — a typical agent setup
+wires the MCP for the decision loop and still uses the CLI for setup/ops.
+
+| Task | CLI | MCP |
+|------|-----|-----|
+| Setup & ops — `init`, `status`, `set-key`, `sync`, `import`, `render` | ✅ (only here) | — |
+| Inspect — `show`, `list`, `open-questions` | ✅ (only here) | — |
+| **Record a decision** | `mitos record` | `record_decision` ★ |
+| **Surface precedents (the recall loop)** | `mitos surface` | `surface_decisions` ★ |
+| **Look up by slug/claim** | `mitos query` | `query_decisions` |
+
+★ **Prefer the MCP for recording and surfacing**: structured arguments mean no
+shell-quoting (long prose with apostrophes/quotes survives), and the tool names
+are exactly these. The CLI mirrors them as a fallback (and for humans).
+
+**Name map** (the docs use the MCP names; the CLI accepts them as aliases too):
+
+| Documented / MCP name | CLI verb | CLI alias |
+|-----------------------|----------|-----------|
+| `record_decision`   | `mitos record`  | `mitos record_decision` |
+| `surface_decisions` | `mitos surface` | `mitos surface_decisions` |
+| `query_decisions`   | `mitos query`   | `mitos query_decisions` |
+
+So `mitos record_decision …` works (an agent's first instinct), and for long
+prose pass `--rejected-file -` / `--context-file -` to read from stdin instead of
+fighting the shell.
