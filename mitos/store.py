@@ -12,6 +12,31 @@ from typing import List, Dict, Optional, Any, Set, Tuple
 from mitos.errors import DatabaseError, ValidationError
 from mitos.parser import ParsedEntry
 
+# A decision is "live" (still in force) if it is active or merely drifted. Drifted
+# means live-but-possibly-stale, not retired — surface_decisions treats both as
+# surfaceable, so enumeration must use the same notion of "active".
+LIVE_STATES: Tuple[str, ...] = ("active", "drifted")
+
+
+def state_matches(computed_state: str, state_filter: Optional[str]) -> bool:
+    """Reports whether a node's computed state passes the requested state filter.
+
+    Args:
+        computed_state: The node's computed state (e.g. "active", "superseded").
+        state_filter: ``"active"`` (the common case) means the live set —
+            ``active`` or ``drifted``. ``None`` or ``"all"`` pass everything.
+            Any other value is an exact computed-state match (e.g. "superseded").
+
+    Returns:
+        True if the node should be included under the given filter.
+    """
+    if not state_filter or state_filter == "all":
+        return True
+    if state_filter == "active":
+        return computed_state in LIVE_STATES
+    return computed_state == state_filter
+
+
 def compute_hash(
     kind: str,
     slug: str,
@@ -573,6 +598,46 @@ class GraphStore:
                         continue
                 results.append(node)
                 
+            return results
+        finally:
+            conn.close()
+
+    def get_decisions(self, scope: Optional[str] = None, state: str = "active") -> List[Dict[str, Any]]:
+        """Enumerates the COMPLETE set of decision nodes matching scope and state.
+
+        The exhaustive, deterministic counterpart to the semantic recall path
+        (``surface``/``query``, which rank and cap at the top few). No top-k, no
+        ranking — every matching decision, straight from the graph — so a caller
+        can be certain it has seen every settled call in a scope.
+
+        Args:
+            scope: Optional scope tag filter; omit for the whole project.
+            state: ``"active"`` (default) returns the live set (active + drifted);
+                ``"all"`` returns every decision regardless of state; any other
+                value is an exact computed-state match (e.g. "superseded").
+
+        Returns:
+            Decision node dicts (with ``computed_state`` attached), unbounded.
+        """
+        conn = self._get_connection()
+        try:
+            states = self.compute_all_states(conn)
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM nodes WHERE kind = 'decision'")
+
+            results = []
+            for row in cursor.fetchall():
+                node = dict(row)
+                node["mechanisms"] = json.loads(node["mechanisms"] or "[]")
+                node["scope"] = json.loads(node["scope"] or "[]")
+                node["computed_state"] = states.get(node["id"], "active")
+
+                if scope and scope not in node["scope"]:
+                    continue
+                if not state_matches(node["computed_state"], state):
+                    continue
+                results.append(node)
+
             return results
         finally:
             conn.close()

@@ -137,6 +137,7 @@ def cmd_init(config: MitosConfig) -> None:
             "- `record_decision`  (CLI: `mitos record`) — the moment you commit to a foundational choice (a schema, a library, a pattern, a path you're abandoning), persist it WITH the alternatives you rejected and why, so future sessions inherit it instead of relitigating. Recording rich prose via the CLI? Use `--rejected-file -` / `--context-file -` to read from stdin and avoid shell-quoting.\n"
             "- `surface_decisions` (CLI: `mitos surface`) — surface active precedents for a claim/scope BEFORE you decide, so you don't relitigate a settled call. This is the recall loop — use it first.\n"
             "- `query_decisions`   (CLI: `mitos query`) — semantic or slug lookup when unsure whether a precedent exists.\n"
+            "- `list_decisions`    (CLI: `mitos list`) — the EXHAUSTIVE recall path. surface/query are semantic and capped at the top few matches; this returns EVERY decision in a scope, deterministically, so a completeness pass or audit doesn't miss anything below the relevance cliff. Needs no key or Qdrant.\n"
         )
 
     # 3. Create decisions.md buffer if missing (utilizing the extracted sample block)
@@ -286,37 +287,73 @@ def cmd_show(config: MitosConfig, ident: str) -> None:
     print()
 
 
-def cmd_list(config: MitosConfig, scope: Optional[str] = None, state_filter: Optional[str] = None) -> None:
-    """Lists all nodes in the database, with optional filters."""
+def cmd_list(config: MitosConfig, scope: Optional[str] = None,
+             state_filter: Optional[str] = None, as_json: bool = False) -> None:
+    """Enumerates the complete set of decisions (+ parked open questions) for a scope.
+
+    The CLI twin of the MCP ``list_decisions`` tool — the exhaustive, deterministic
+    counterpart to the ranked, capped ``surface``/``query`` recall path. Use it for a
+    completeness pass: every settled call in a scope, nothing hidden below a relevance
+    cliff. Needs no API key or Qdrant (it is a pure graph read).
+
+    Args:
+        config: The active workspace configuration.
+        scope: Optional scope tag filter; omit for the whole project.
+        state_filter: ``"active"`` (the default view) = the live set (active +
+            drifted); ``"all"`` = every decision regardless of state; any other value
+            = an exact computed-state match (e.g. "superseded").
+        as_json: Emit a machine-readable JSON report (for agents) instead of text.
+    """
+    import json as _json
     store = GraphStore(config.db_path)
-    nodes = store.get_all_nodes()
-    
-    if not nodes:
-        print("Graph database is empty. Run 'mitos sync' to ingest entries.")
+    # Default the view to the live set; an absent filter must not dump superseded
+    # decisions into what an agent reads as a completeness pass.
+    effective_state = state_filter or "active"
+    decisions = store.get_decisions(scope=scope, state=effective_state)
+    parked = [oq for oq in store.get_open_questions(scope=scope)
+              if oq["computed_state"] == "parked"]
+
+    if as_json:
+        print(_json.dumps({
+            "decisions": [
+                {"slug": d["slug"], "axiom": d["core_axiom"],
+                 "rejected_paths": d["rejected_paths"], "scope": d["scope"],
+                 "state": d["computed_state"]}
+                for d in decisions
+            ],
+            "open_questions": [
+                {"topic": oq["slug"], "questions_raised": oq["questions_raised"],
+                 "park_reason": oq.get("park_reason")}
+                for oq in parked
+            ],
+            "total": len(decisions),
+            "scope": scope,
+            "state": effective_state,
+        }, indent=2))
         return
 
-    filtered_nodes = []
-    for n in nodes:
-        if scope and scope not in n["scope"]:
-            continue
-        if state_filter and n["computed_state"] != state_filter:
-            continue
-        filtered_nodes.append(n)
-
-    if not filtered_nodes:
-        print("No nodes match the given filters.")
+    if not decisions and not parked:
+        if not store.get_all_nodes():
+            print("Graph database is empty. Run 'mitos sync' to ingest entries.")
+        else:
+            print("No decisions match the given filters.")
         return
 
-    print(f"\nNodes List ({len(filtered_nodes)} found):")
+    scope_note = f"  (scope: {scope})" if scope else ""
+    print(f"\nDecisions ({len(decisions)} found, state={effective_state}){scope_note}:")
     print("-" * 80)
-    for n in filtered_nodes:
-        scopes = f"[{', '.join(n['scope'])}]" if n["scope"] else ""
-        axiom_snip = n.get("core_axiom", "")
-        if len(axiom_snip) > 50:
-            axiom_snip = axiom_snip[:47] + "..."
-        print(f"{n['computed_state']:11} | {n['kind']:13} | {n['slug']:30} {scopes}")
+    for d in decisions:
+        scopes = f"[{', '.join(d['scope'])}]" if d["scope"] else ""
+        print(f"{d['computed_state']:11} | {d['slug']:30} {scopes}")
+        axiom_snip = d.get("core_axiom", "")
+        if len(axiom_snip) > 66:
+            axiom_snip = axiom_snip[:63] + "..."
         if axiom_snip:
             print(f"              {axiom_snip}")
+    if parked:
+        print(f"\nParked open questions ({len(parked)}):")
+        for oq in parked:
+            print(f"  ? {oq['slug']}")
     print()
 
 
@@ -470,6 +507,14 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         except Exception:
             pass
 
+    # Recall here is semantic and capped — point at the exhaustive path so a
+    # completeness pass doesn't mistake the ranked top-k for the full set.
+    if results["active_decisions"]:
+        results["note"] = (
+            "Ranked top matches only (semantic, capped). For the COMPLETE set of "
+            "decisions in a scope, use 'mitos list' (or the list_decisions tool)."
+        )
+
     if as_json:
         print(_json.dumps(results, indent=2))
         return
@@ -491,6 +536,9 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         print()
     for oq in oqs:
         print(f"[open question in scope] {oq['topic']}")
+    if ad:
+        scope_arg = f" --scope {scope}" if scope else ""
+        print(f"\n→ Ranked matches only. Full set in scope: mitos list{scope_arg}")
 
 
 def cmd_serve() -> None:
@@ -601,6 +649,7 @@ def _mcp_wired(workspace_dir: str) -> bool:
 # and `serve` IS the MCP, so nudging there would be nonsense.
 _DECISION_LOOP_COMMANDS = frozenset({
     "record", "record_decision", "surface", "surface_decisions", "query", "query_decisions",
+    "list", "list_decisions",
 })
 
 
@@ -896,10 +945,12 @@ def main() -> None:
     show_p = subparsers.add_parser("show", help="Display details of a specific node.")
     show_p.add_argument("ident", help="Slug or ID of node.")
 
-    # list
-    list_p = subparsers.add_parser("list", help="List all graph nodes.")
+    # list (alias: list_decisions — the MCP tool name, so an agent's first instinct works)
+    list_p = subparsers.add_parser("list", aliases=["list_decisions"],
+                                   help="Enumerate the complete set of decisions in a scope (exhaustive recall).")
     list_p.add_argument("--scope", help="Filter by scope tag.")
-    list_p.add_argument("--state", help="Filter by computed state.")
+    list_p.add_argument("--state", help="Computed state filter: 'active' (default, live set), 'all', or an exact state.")
+    list_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON (for agents).")
 
     # open-questions
     oq_p = subparsers.add_parser("open-questions", help="List active open questions.")
@@ -961,8 +1012,8 @@ def main() -> None:
             cmd_surface(config, args.query, scope=args.scope, as_json=args.as_json)
         elif args.command == "show":
             cmd_show(config, args.ident)
-        elif args.command == "list":
-            cmd_list(config, scope=args.scope, state_filter=args.state)
+        elif args.command in ("list", "list_decisions"):
+            cmd_list(config, scope=args.scope, state_filter=args.state, as_json=args.as_json)
         elif args.command == "open-questions":
             cmd_open_questions(config, scope=args.scope)
         elif args.command == "import":
