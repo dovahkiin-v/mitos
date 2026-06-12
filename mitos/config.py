@@ -9,6 +9,25 @@ import re
 from typing import Dict, Any
 
 
+def global_env_path() -> str:
+    """Returns the path to Mitos's global ``.env`` (shared across all projects).
+
+    A single-user machine usually wants one set of API keys for every project,
+    not a key re-entered per workspace. Mitos reads this global ``.env`` as a
+    fallback BELOW any project ``.env`` (and below an explicit environment
+    variable), so a key set here once serves every project; a project ``.env``
+    still overrides it locally. Honors ``XDG_CONFIG_HOME``.
+
+    Returns:
+        Absolute path to ``<config>/mitos/.env`` (``~/.config/mitos/.env`` by
+        default). The file need not exist.
+    """
+    config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+        os.path.expanduser("~"), ".config"
+    )
+    return os.path.join(config_home, "mitos", ".env")
+
+
 def default_collection_name(workspace_dir: str) -> str:
     """Derives a per-project Qdrant collection name from the workspace path.
 

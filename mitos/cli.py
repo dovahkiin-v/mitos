@@ -11,7 +11,7 @@ import argparse
 from typing import List, Optional, Dict, Any
 from google import genai
 
-from mitos.config import MitosConfig, default_collection_name
+from mitos.config import MitosConfig, default_collection_name, global_env_path
 from mitos.errors import MitosError, ParseError, ValidationError
 from mitos.store import GraphStore
 from mitos.sync import MitosSyncManager, run_ambient_capture
@@ -98,8 +98,12 @@ def cmd_init(config: MitosConfig) -> None:
                 "# Mitos API keys — fill in the value(s), then run `mitos sync`.\n"
                 "# This file is gitignored; never commit real keys.\n"
                 "# ============================================================\n\n"
-                "# Google Gemini API key — REQUIRED. One key covers BOTH embeddings\n"
-                "# (semantic surface/query) AND decision synthesis (sync/capture).\n"
+                "# Google Gemini API key — REQUIRED (unless already set globally).\n"
+                "# One key covers BOTH embeddings (semantic surface/query) AND\n"
+                "# decision synthesis (sync/capture).\n"
+                "# Tip: set it ONCE for every project with\n"
+                "#   mitos set-key --global <KEY>   (stored in ~/.config/mitos/.env)\n"
+                "# or drop a project-specific key on the line below to override it.\n"
                 "# Get one: https://aistudio.google.com/app/apikey\n"
                 "GEMINI_API_KEY=\n\n"
                 "# Anthropic (Claude) API key — OPTIONAL. Only used by\n"
@@ -420,21 +424,107 @@ def _check_qdrant(qdrant_url: str, collection: str) -> Dict[str, Any]:
     return out
 
 
-def _gemini_key_present(workspace_dir: str) -> bool:
-    """True if GEMINI_API_KEY is available — in the environment or the workspace .env."""
-    if os.environ.get("GEMINI_API_KEY"):
-        return True
-    env_path = os.path.join(workspace_dir, ".env")
-    if os.path.exists(env_path):
-        try:
-            with open(env_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith("GEMINI_API_KEY="):
-                        return bool(line.split("=", 1)[1].strip().strip('"').strip("'"))
-        except OSError:
-            pass
+def _env_file_has_key(env_path: str, name: str) -> bool:
+    """True if ``env_path`` assigns ``name`` a non-empty value on ANY line.
+
+    Skips empty assignments (the scaffolded ``GEMINI_API_KEY=`` slot) and keeps
+    scanning, so a key added on a later line is still found — matching
+    ``load_dotenv_file``'s "first non-empty value wins" semantics.
+    """
+    if not os.path.exists(env_path):
+        return False
+    try:
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith(f"{name}="):
+                    if line.split("=", 1)[1].strip().strip('"').strip("'"):
+                        return True
+    except OSError:
+        pass
     return False
+
+
+def _gemini_key_source(workspace_dir: str) -> Optional[str]:
+    """Reports where GEMINI_API_KEY comes from, in precedence order.
+
+    Files are checked before the live environment so the report attributes the
+    key to its durable home (``main()`` also loads both files into the
+    environment, which would otherwise mask the distinction).
+
+    Args:
+        workspace_dir: The project directory to inspect.
+
+    Returns:
+        ``"project .env"``, ``"global .env"``, ``"environment"``, or None.
+    """
+    if _env_file_has_key(os.path.join(workspace_dir, ".env"), "GEMINI_API_KEY"):
+        return "project .env"
+    if _env_file_has_key(global_env_path(), "GEMINI_API_KEY"):
+        return "global .env"
+    if os.environ.get("GEMINI_API_KEY"):
+        return "environment"
+    return None
+
+
+def _gemini_key_present(workspace_dir: str) -> bool:
+    """True if GEMINI_API_KEY is available — env, project .env, or global .env."""
+    return _gemini_key_source(workspace_dir) is not None
+
+
+def _upsert_env_var(env_path: str, name: str, value: str) -> None:
+    """Inserts or replaces ``name=value`` in a ``.env`` file, preserving the rest.
+
+    Replaces an existing (possibly empty) ``name=`` line in place; otherwise
+    appends one. Creates the file (and parent dirs) if absent, and tightens the
+    file to ``0600`` since it holds secrets.
+
+    Args:
+        env_path: Path to the ``.env`` file to write.
+        name: The variable name (e.g. ``GEMINI_API_KEY``).
+        value: The value to store.
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(env_path)), exist_ok=True)
+    lines: List[str] = []
+    found = False
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip().startswith(f"{name}="):
+                    lines.append(f"{name}={value}\n")
+                    found = True
+                else:
+                    lines.append(line)
+    if not found:
+        if lines and not lines[-1].endswith("\n"):
+            lines.append("\n")
+        lines.append(f"{name}={value}\n")
+    with open(env_path, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+    try:
+        os.chmod(env_path, 0o600)
+    except OSError:
+        pass
+
+
+def cmd_set_key(value: str, name: str = "GEMINI_API_KEY", is_global: bool = False) -> None:
+    """Stores an API key in the global or project ``.env``.
+
+    Args:
+        value: The API key value to store.
+        name: The env var name (default ``GEMINI_API_KEY``).
+        is_global: If True, write the shared ``~/.config/mitos/.env`` (serves
+            every project); otherwise write ``./.env`` for the current project.
+    """
+    if is_global:
+        env_path = global_env_path()
+    else:
+        env_path = os.path.join(os.getcwd(), ".env")
+    _upsert_env_var(env_path, name, value)
+    scope = "globally (all projects)" if is_global else "for this project"
+    print(f"Stored {name} {scope} → {env_path}")
+    if not is_global:
+        _ensure_gitignore_entry(os.path.join(os.getcwd(), ".gitignore"), ".env")
 
 
 def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
@@ -461,7 +551,8 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
     )
     decisions_ok = os.path.exists(config.decisions_file)
     spec_ok = os.path.exists(os.path.join(workspace_dir, "format-spec.md"))
-    key_ok = _gemini_key_present(workspace_dir)
+    key_source = _gemini_key_source(workspace_dir)
+    key_ok = key_source is not None
     q = _check_qdrant(config.qdrant_url, config.qdrant_collection)
 
     graph_nodes = None
@@ -503,7 +594,8 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
         ("workspace (.mitos/ + config.toml)", mitos_dir_ok, "run `mitos init`"),
         ("decisions.md buffer", decisions_ok, "created by `mitos init`"),
         ("format-spec.md", spec_ok, "created by `mitos init`"),
-        ("GEMINI_API_KEY", key_ok, "add it to this project's .env (gitignored)"),
+        ("GEMINI_API_KEY" + (f" (from {key_source})" if key_source else ""), key_ok,
+         "set it once for all projects: `mitos set-key --global <KEY>`"),
         (f"Qdrant reachable ({config.qdrant_url})", q["reachable"],
          "start it: `docker compose up -d` in the mitos repo"),
         (f"collection '{config.qdrant_collection}'",
@@ -527,7 +619,8 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
         if not initialized:
             print(f"  {n}. `mitos init` here (creates .mitos/, decisions.md, scaffolds .env)"); n += 1
         if not key_ok:
-            print(f"  {n}. Put your GEMINI_API_KEY in this project's .env"); n += 1
+            print(f"  {n}. Set your GEMINI_API_KEY once for all projects: "
+                  f"`mitos set-key --global <KEY>` (or per-project: `mitos set-key <KEY>`)"); n += 1
         if not q["reachable"]:
             print(f"  {n}. Start Mitos's Qdrant: `docker compose up -d` from the mitos repo"); n += 1
         print("  Full walkthrough → SETUP.md "
@@ -570,7 +663,11 @@ def load_dotenv_file(path: str = ".env") -> None:
 
 def main() -> None:
     """Main CLI execution router."""
+    # Project .env (cwd) wins; the global ~/.config/mitos/.env fills any gaps —
+    # load_dotenv_file never overwrites an already-set key, so loading project
+    # first then global yields the precedence env > project > global.
     load_dotenv_file()
+    load_dotenv_file(global_env_path())
     parser = argparse.ArgumentParser(
         description="Mitos: Architectural Decision Substrate for LLM-native workflows."
     )
@@ -636,6 +733,13 @@ def main() -> None:
     status_p.add_argument("path", nargs="?", default=None, help="Project directory to check (default: current directory).")
     status_p.add_argument("--json", action="store_true", dest="as_json", help="Emit a machine-readable JSON report.")
 
+    # set-key — store an API key globally (all projects) or for this project
+    sk_p = subparsers.add_parser("set-key", help="Store an API key globally (all projects) or for this project.")
+    sk_p.add_argument("value", help="The API key value.")
+    sk_p.add_argument("--name", default="GEMINI_API_KEY", help="Env var name to store (default: GEMINI_API_KEY).")
+    sk_p.add_argument("--global", action="store_true", dest="is_global",
+                      help="Write the global ~/.config/mitos/.env (shared by ALL projects) instead of this project's .env.")
+
     args = parser.parse_args()
     config = MitosConfig()
 
@@ -673,6 +777,8 @@ def main() -> None:
             cmd_serve()
         elif args.command == "status":
             sys.exit(cmd_status(args.path or os.getcwd(), as_json=args.as_json))
+        elif args.command == "set-key":
+            cmd_set_key(args.value, name=args.name, is_global=args.is_global)
     except MitosError as e:
         print(f"Error: {str(e)}", file=sys.stderr)
         sys.exit(1)
