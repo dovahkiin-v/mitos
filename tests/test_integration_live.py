@@ -142,6 +142,101 @@ def test_status_readiness_against_real_qdrant(live_workspace, capsys):
     assert data["checks"]["collection_exists"] is True  # the record created it
 
 
+def test_list_decisions_complete_set_vs_capped_surface(live_workspace, capsys):
+    """The exhaustive path's whole reason for being, proven against REAL recall:
+    list_decisions returns EVERY decision in a scope, where semantic surface ranks
+    and caps at the top few — so a completeness pass can't miss anything below the
+    relevance cliff (loop-Claude's "am I seeing everything?" gap)."""
+    ws, _ = live_workspace
+    config = MitosConfig(str(ws))
+
+    decisions = [
+        ("Payments settle through Stripe as the single PSP",
+         "Adyen rejected: heavier integration for our volume"),
+        ("Idempotency keys are required on every charge request",
+         "Dedup-by-amount rejected: collides on legitimate repeat purchases"),
+        ("Refunds are asynchronous and webhook-driven",
+         "Synchronous refunds rejected: blocks the request on PSP latency"),
+        ("Currency is stored in minor units as integers",
+         "Floats rejected: rounding drift accumulates"),
+        ("Failed charges retry with exponential backoff, capped at three",
+         "Infinite retry rejected: hammers the PSP on hard declines"),
+        ("Webhook signatures are verified before any processing",
+         "Trust-by-source-IP rejected: spoofable and brittle"),
+        ("Payment state lives in an append-only ledger",
+         "A mutable balance row rejected: loses the audit trail"),
+    ]
+    for axiom, rejected in decisions:  # each is a real embed + upsert
+        cli.cmd_record(config, axiom=axiom, rejected=rejected, scope=["payments"])
+    capsys.readouterr()
+
+    # Semantic recall is ranked and capped at the top matches.
+    cli.cmd_surface(config, "payments architecture and money handling",
+                    scope="payments", as_json=True)
+    surfaced = json.loads(capsys.readouterr().out)["active_decisions"]
+    assert len(surfaced) <= 5  # the semantic cap
+
+    # Exhaustive enumeration returns ALL of them — nothing hidden below the cliff.
+    cli.cmd_list(config, scope="payments", as_json=True)
+    listed = json.loads(capsys.readouterr().out)
+    assert listed["total"] == len(decisions) == 7
+    assert {d["slug"] for d in listed["decisions"]} >= {d["slug"] for d in surfaced}
+    assert listed["total"] > len(surfaced), "the whole point: list sees more than capped surface"
+
+
+def test_cli_subprocess_list_decisions_json(tmp_path):
+    """Real binary, real argv: the `list_decisions` MCP-name alias + `--json` emit
+    the complete structured set after real records (the exhaustive CLI path)."""
+    mitos_bin = os.path.join(os.path.dirname(sys.executable), "mitos")
+    ws = tmp_path / "proj"
+    ws.mkdir()
+    env = {
+        **os.environ,
+        "GEMINI_API_KEY": _REAL_KEY,
+        "QDRANT_URL": QDRANT_URL,
+        "MITOS_NO_UPDATE_CHECK": "1",
+        "MITOS_NO_MCP_HINT": "1",
+        "XDG_CONFIG_HOME": str(tmp_path / "cfg"),
+        "XDG_CACHE_HOME": str(tmp_path / "cache"),
+    }
+    collection = default_collection_name(str(ws))
+    try:
+        init = subprocess.run([mitos_bin, "init"], cwd=ws, env=env,
+                              capture_output=True, text=True)
+        assert init.returncode == 0, init.stderr
+
+        records = [
+            ("Services deploy as containers on Kubernetes",
+             "Bare VMs rejected: manual scaling toil"),
+            ("Config is injected via environment, never baked into images",
+             "Image-baked config rejected: a rebuild per environment"),
+            ("Secrets are fetched from the vault at runtime",
+             "Committed .env rejected: leaks on a public mirror"),
+        ]
+        for axiom, rejected in records:
+            rec = subprocess.run(
+                [mitos_bin, "record", axiom, "--rejected", rejected, "--scope", "infra"],
+                cwd=ws, env=env, capture_output=True, text=True,
+            )
+            assert rec.returncode == 0, rec.stderr
+
+        listed = subprocess.run(
+            [mitos_bin, "list_decisions", "--scope", "infra", "--json"],
+            cwd=ws, env=env, capture_output=True, text=True,
+        )
+        assert listed.returncode == 0, listed.stderr
+        data = json.loads(listed.stdout)
+        assert data["total"] == 3
+        assert data["state"] == "active"
+        assert {d["slug"] for d in data["decisions"]} == {
+            "services-deploy-as-containers-on-kubernetes",
+            "config-is-injected-via-environment-never-baked-into-images",
+            "secrets-are-fetched-from-the-vault-at-runtime",
+        }
+    finally:
+        _drop_collection(collection)
+
+
 def test_cli_subprocess_record_stdin_then_surface(tmp_path):
     """Real binary, real argv, real stdin pipe, real services — the AX fixes
     (MCP-name alias + --rejected-file stdin + surface recall) end-to-end."""
