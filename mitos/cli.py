@@ -137,7 +137,17 @@ def cmd_init(config: MitosConfig) -> None:
             "- `record_decision`  (CLI: `mitos record`) — the moment you commit to a foundational choice (a schema, a library, a pattern, a path you're abandoning), persist it WITH the alternatives you rejected and why, so future sessions inherit it instead of relitigating. Recording rich prose via the CLI? Use `--rejected-file -` / `--context-file -` to read from stdin and avoid shell-quoting.\n"
             "- `surface_decisions` (CLI: `mitos surface`) — surface active precedents for a claim/scope BEFORE you decide, so you don't relitigate a settled call. This is the recall loop — use it first.\n"
             "- `query_decisions`   (CLI: `mitos query`) — semantic or slug lookup when unsure whether a precedent exists.\n"
-            "- `list_decisions`    (CLI: `mitos list`) — the EXHAUSTIVE recall path. surface/query are semantic and capped at the top few matches; this returns EVERY decision in a scope, deterministically, so a completeness pass or audit doesn't miss anything below the relevance cliff. Needs no key or Qdrant.\n"
+            "- `list_decisions`    (CLI: `mitos list`) — the EXHAUSTIVE recall path. surface/query are semantic and capped at the top few matches; this returns EVERY decision in a scope, deterministically, so a completeness pass or audit doesn't miss anything below the relevance cliff. Needs no key or Qdrant.\n\n"
+            "## When to record — the capture trigger (YOUR judgement; Mitos stores, it does not decide what is worth storing)\n"
+            "Recall is easy to ask for; knowing WHAT is worth recording is the real call, and it falls to you. Record a decision when it:\n"
+            "- sets a pattern future work must follow, or\n"
+            "- forecloses a real alternative you weighed and rejected (capture WHY in `rejected_paths` — that is what stops the next agent re-proposing it), or\n"
+            "- is structural or costly to reverse, or\n"
+            "- reverses or supersedes a prior decision, or\n"
+            "- has cross-cutting blast radius (touches many areas).\n"
+            "Skip the local, easily-reversible, or already-settled choice. A quick self-test at any fork: *would the next agent waste time re-deriving or re-litigating this?* If yes, record it. When unsure, `surface_decisions` first — if nothing is there and it clears the bar, record it.\n\n"
+            "## Linking decisions\n"
+            "When a decision relates to an existing one, pass that one's EXACT slug to the matching relation arg so the graph stays connected instead of accumulating silent tension: `supersedes` (replaces it), `amends`, `narrows`, `depends_on`, `resolves`, `contradicts`, `derives_from`, `cites`. On `record_decision` these are args; on the CLI they are flags (`--supersedes`, `--depends-on`, …). Look the target up first to get its exact slug. After you record, the result may list nearby existing decisions (`related`) — if one is genuinely connected, link it.\n"
         )
 
     # 3. Create decisions.md buffer if missing (utilizing the extracted sample block)

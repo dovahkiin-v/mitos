@@ -117,10 +117,11 @@ wires the MCP for the decision loop and still uses the CLI for setup/ops.
 | Task | CLI | MCP |
 |------|-----|-----|
 | Setup & ops — `init`, `status`, `set-key`, `sync`, `import`, `render` | ✅ (only here) | — |
-| Inspect — `show`, `list`, `open-questions` | ✅ (only here) | — |
-| **Record a decision** | `mitos record` | `record_decision` ★ |
+| Inspect — `show`, `open-questions` | ✅ (only here) | — |
+| **Record a decision** (+ typed relations: `supersedes`/`amends`/`depends_on`/…) | `mitos record` | `record_decision` ★ |
 | **Surface precedents (the recall loop)** | `mitos surface` | `surface_decisions` ★ |
 | **Look up by slug/claim** | `mitos query` | `query_decisions` |
+| **Enumerate the full set in a scope (exhaustive recall)** | `mitos list` | `list_decisions` |
 
 ★ **Prefer the MCP for recording and surfacing**: structured arguments mean no
 shell-quoting (long prose with apostrophes/quotes survives), and the tool names
@@ -133,7 +134,34 @@ are exactly these. The CLI mirrors them as a fallback (and for humans).
 | `record_decision`   | `mitos record`  | `mitos record_decision` |
 | `surface_decisions` | `mitos surface` | `mitos surface_decisions` |
 | `query_decisions`   | `mitos query`   | `mitos query_decisions` |
+| `list_decisions`    | `mitos list`    | `mitos list_decisions` |
 
 So `mitos record_decision …` works (an agent's first instinct), and for long
 prose pass `--rejected-file -` / `--context-file -` to read from stdin instead of
 fighting the shell.
+
+---
+
+## When to record a decision (the capture trigger)
+
+Recall is easy to ask for; the judgement call is knowing **what is worth
+recording** — and that is on the agent, not the tool (Mitos is a memory, not a
+judge). Record a decision when it:
+
+- sets a pattern future work must follow,
+- forecloses a real alternative you weighed and rejected (capture **why** in
+  `rejected_paths` — that is what stops the next agent re-proposing it),
+- is structural or costly to reverse,
+- reverses or supersedes a prior decision, or
+- has cross-cutting blast radius.
+
+Skip the local, easily-reversible, or already-settled choice. A quick self-test
+at any fork: *would the next agent waste time re-deriving or re-litigating this?*
+If yes, record it — and `surface_decisions` first when unsure.
+
+**Link related decisions.** When a new decision relates to an existing one, pass
+that one's exact slug to the matching relation argument so the graph stays
+connected instead of accumulating silent tension: `supersedes` (replaces it),
+`amends`, `narrows`, `depends_on`, `resolves`, `contradicts`, `derives_from`,
+`cites`. After a record, the result may surface nearby decisions (`related`) — if
+one is genuinely connected, link it.
