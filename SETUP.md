@@ -40,11 +40,18 @@ and scaffolds a **gitignored `.env`** with empty key slots. The project gets its
 own collection, `mitos-<project>`.
 
 ### 2. Add your key
-Put your Gemini key in the project's `.env` (it's gitignored — never commit it):
+Mitos resolves `GEMINI_API_KEY` with this precedence: **shell environment → project
+`.env` → a shared global `~/.config/mitos/.env`**. On a single-user machine, set it
+**once for every project**:
+```bash
+mitos set-key --global <your-key>     # writes ~/.config/mitos/.env (mode 600)
 ```
-GEMINI_API_KEY=your-key-here
+To override it for one project, store a project-local key instead:
+```bash
+mitos set-key <your-key>              # writes ./.env (gitignored)
 ```
-`mitos` loads `.env` automatically. One key covers embeddings *and* synthesis.
+One key covers embeddings *and* synthesis. `mitos status` shows which source it
+found (`from global .env` / `from project .env` / `from environment`).
 
 ### 3. Wire the MCP server into your agent
 So your agent can `surface_decisions` / `query_decisions` / `record_decision`,
