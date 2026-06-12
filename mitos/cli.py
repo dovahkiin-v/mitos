@@ -942,6 +942,19 @@ def main() -> None:
     except Exception as e:
         print(f"Fatal Unexpected Error: {str(e)}", file=sys.stderr)
         sys.exit(1)
+    finally:
+        # Best-effort 'new version available' nudge, AFTER the command's own
+        # output (the finally runs even on the sys.exit paths above). Skipped for
+        # the long-running MCP server; fully fail-silent so it never disrupts work.
+        if args.command != "serve":
+            try:
+                from mitos import __version__ as _current_version
+                from mitos._update import update_notice
+                _notice = update_notice(_current_version)
+                if _notice:
+                    print(_notice, file=sys.stderr)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
