@@ -11,6 +11,7 @@ import argparse
 from typing import List, Optional, Dict, Any
 from google import genai
 
+from mitos import __version__
 from mitos.config import MitosConfig, default_collection_name, global_env_path
 from mitos.errors import MitosError, ParseError, ValidationError
 from mitos.store import GraphStore
@@ -809,6 +810,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Mitos: Architectural Decision Substrate for LLM-native workflows."
     )
+    parser.add_argument("--version", action="version", version=f"mitos {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # init
@@ -948,9 +950,8 @@ def main() -> None:
         # the long-running MCP server; fully fail-silent so it never disrupts work.
         if args.command != "serve":
             try:
-                from mitos import __version__ as _current_version
                 from mitos._update import update_notice
-                _notice = update_notice(_current_version)
+                _notice = update_notice(__version__)
                 if _notice:
                     print(_notice, file=sys.stderr)
             except Exception:
