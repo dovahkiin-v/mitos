@@ -563,10 +563,12 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
             graph_nodes = None
 
     initialized = mitos_dir_ok and decisions_ok
-    ready = (
-        initialized and key_ok and q["reachable"]
-        and (q["collection_exists"] is not False)
-    )
+    # A fresh, initialized project has NO Qdrant collection yet — it auto-creates
+    # on the first `record_decision`. So an absent (or empty) collection is a
+    # normal ready state, NOT a blocker: a project with .mitos/, a key, and a
+    # reachable Qdrant is ready to record its first decision. Only an unreachable
+    # Qdrant degrades semantic surface/query.
+    ready = initialized and key_ok and q["reachable"]
 
     if as_json:
         print(_json.dumps({
@@ -590,6 +592,15 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
 
     verdict = "READY ✓" if ready else ("NEEDS ATTENTION ⚠" if initialized else "NOT SET UP ✗")
     mark = lambda ok: "✓" if ok is True else ("✗" if ok is False else "—")
+    # An absent collection on a reachable Qdrant is normal (auto-creates on the
+    # first record), so show it as a neutral "—" with a note — never a ✗ that
+    # would contradict an otherwise-READY verdict.
+    if not q["reachable"]:
+        coll_mark, coll_hint = None, "needs Qdrant up (see above)"
+    elif q["collection_exists"]:
+        coll_mark, coll_hint = True, None
+    else:
+        coll_mark, coll_hint = None, "auto-created on first record — none recorded yet"
     checks = [
         ("workspace (.mitos/ + config.toml)", mitos_dir_ok, "run `mitos init`"),
         ("decisions.md buffer", decisions_ok, "created by `mitos init`"),
@@ -598,9 +609,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
          "set it once for all projects: `mitos set-key --global <KEY>`"),
         (f"Qdrant reachable ({config.qdrant_url})", q["reachable"],
          "start it: `docker compose up -d` in the mitos repo"),
-        (f"collection '{config.qdrant_collection}'",
-         q["collection_exists"] if q["reachable"] else None,
-         "auto-created on first record/sync once Qdrant is up"),
+        (f"collection '{config.qdrant_collection}'", coll_mark, coll_hint),
     ]
     print(f"\nMITOS STATUS for {workspace_dir} — {verdict}\n")
     for label, ok, hint in checks:
