@@ -150,8 +150,25 @@ _ERROR_MESSAGES: Dict[str, str] = {
     "slug_collision": "A different decision already uses the slug '{slug}'. Give this one a distinct 'slug'; and if it is meant to replace the existing decision, also set supersedes='{slug}' (the new decision must still have its own slug — two decisions cannot share one).",
     "supersedes_not_found": "supersedes='{supersedes}' does not match any existing decision. Look it up first with query_decisions to get the exact slug, or omit 'supersedes' if this is a brand-new decision.",
     "supersedes_ambiguous": "supersedes='{supersedes}' matches more than one decision. Use query_decisions to find the exact, full slug and pass that.",
+    "relation_target_not_found": "{relation}='{target}' does not match any existing decision. Look it up first with surface_decisions/query_decisions to get the exact slug, or omit '{relation}' if no such link applies.",
+    "relation_target_ambiguous": "{relation}='{target}' matches more than one decision. Use query_decisions to find the exact, full slug and pass that.",
     "commit_failed": "The decision validated but the commit failed and nothing was written: {reason}. Retry; if it persists, the workspace store may be locked or corrupt.",
 }
+
+# The user-facing typed relations beyond `supersedes` (which is special: it changes
+# computed state and has its own error codes). Each maps an agent-facing kwarg name to
+# its canonical decisions.md field label. The parser and the store's commit path
+# already understand all of these (format-spec.md §"Relationship Fields"); the agentic
+# write path just had to serialize + validate them the way it already does supersedes.
+_EXTRA_RELATIONS = (
+    ("amends", "Amends"),
+    ("narrows", "Narrows"),
+    ("depends_on", "Depends-On"),
+    ("resolves", "Resolves"),
+    ("contradicts", "Contradicts"),
+    ("derives_from", "Derives-From"),
+    ("cites", "Cites"),
+)
 
 
 def _record_error(code: str, **fields: Any) -> Dict[str, str]:
@@ -176,16 +193,31 @@ def _contains_structural_token(text: str) -> bool:
     return False
 
 
+_SLUG_MAX_LEN = 64
+_SLUG_MIN_LEN = 32  # don't trim a word boundary back past here — hard-cap instead
+
+
 def _slugify(text: str) -> str:
     """Derives a deterministic, lowercase-hyphenated slug from free text.
 
     Determinism is load-bearing: ``compute_hash`` lower-cases the slug, so the
     same decision must always yield the same slug (and thus the same node id).
+
+    When the slug exceeds the length cap it is trimmed back to the last word
+    boundary (hyphen) rather than sliced mid-word, so the handle an agent carries
+    into ``supersedes``/relations stays readable (``…brazilian-portuguese``, not
+    ``…brazilian-portug``). Still a pure function of the text, so determinism holds.
     """
     s = re.sub(r'[^a-z0-9]+', '-', text.lower())
     s = re.sub(r'-+', '-', s).strip('-')
-    if len(s) > 64:
-        s = s[:64].rstrip('-')
+    if len(s) > _SLUG_MAX_LEN:
+        cut = s[:_SLUG_MAX_LEN]
+        boundary = cut.rfind('-')
+        # Trim to the last whole word, unless that would gut the slug (one very
+        # long leading token) — then fall back to the hard cap.
+        if boundary >= _SLUG_MIN_LEN:
+            cut = cut[:boundary]
+        s = cut.rstrip('-')
     return s
 
 
@@ -547,17 +579,21 @@ class MitosSyncManager:
             hits, misses, rate = self.embed_provider.get_stats()
             print(f"\n[Observability] Cache Stats: Hits: {hits}, Misses: {misses}, Hit Rate: {rate*100:.1f}%")
 
-    def _best_effort_embed(self, delta: CommitDelta, entry: ParsedEntry) -> None:
-        """Best-effort async embedding upsert pipeline (C2)."""
+    def _best_effort_embed(self, delta: CommitDelta, entry: ParsedEntry) -> Optional[List[float]]:
+        """Best-effort async embedding upsert pipeline (C2).
+
+        Returns the document vector it computed and upserted (so a caller can reuse
+        it for a neighbour query), or None if embedding was deferred/failed.
+        """
         embedding_text = entry.core_axiom if entry.kind == "decision" else f"{entry.slug}: " + " ".join(entry.questions_raised)
-        
+
         if not self.embed_provider or not self.vector_store:
             try:
                 self.store.add_pending_embedding(delta.node_id, embedding_text)
                 print(f"[Warning] Embedding upsert deferred for '{entry.slug}': Embedding provider down.")
             except Exception as e:
                 print(f"[Warning] Failed to write outbox queue: {str(e)}")
-            return
+            return None
 
         # Prepare payload
         payload = {
@@ -572,6 +608,7 @@ class MitosSyncManager:
             # Check embedding provider and generate vector
             vector = self.embed_provider.get_embedding(payload["embedding_text"], is_query=False)
             self.vector_store.upsert(delta.node_id, vector, payload)
+            return vector
         except Exception as e:
             # Failed embeddings land in graph Outbox queue (C2)
             print(f"[Warning] Embedding upsert deferred for '{entry.slug}': {str(e)}")
@@ -579,6 +616,7 @@ class MitosSyncManager:
                 self.store.add_pending_embedding(delta.node_id, embedding_text)
             except Exception as dbe:
                 print(f"[Warning] Failed to write outbox queue: {str(dbe)}")
+            return None
 
     def drain_pending_embeddings(self) -> None:
         """Drains the pending embeddings outbox queue (C2).
@@ -668,6 +706,72 @@ class MitosSyncManager:
                 return node_id, node
         return None, None
 
+    def _validate_relation_target(self, relation: str, target: str) -> Optional[Dict[str, str]]:
+        """Validates a typed relation's target is a unique, EXACT-match decision.
+
+        Mirrors the supersedes check (``resolve_slug`` is fuzzy, so we require a true
+        slug hit), keeping every recorded edge pointed at a real, unambiguous node.
+        Runs in Phase A — a failure returns a structured error and writes nothing.
+
+        Args:
+            relation: The relation kwarg name (for the error message), e.g. "amends".
+            target: The slug the agent passed as that relation's target.
+
+        Returns:
+            None if valid, else a structured ``{error, code}`` dict.
+        """
+        ids = self.store.resolve_slug(target)
+        if not ids:
+            return _record_error("relation_target_not_found", relation=relation, target=target)
+        if len(ids) > 1:
+            return _record_error("relation_target_ambiguous", relation=relation, target=target)
+        node = self.store.get_node(ids[0])
+        if not node or node.get("slug", "").lower() != target.lower():
+            return _record_error("relation_target_not_found", relation=relation, target=target)
+        return None
+
+    def _adjacent_decisions(self, vector: Optional[List[float]], exclude_slug: str,
+                            limit: int = 3) -> List[Dict[str, Any]]:
+        """Best-effort: the nearest OTHER live decisions to a just-recorded one.
+
+        A write-time guardrail — surfaces semantic neighbours so an agent notices an
+        adjacent or contradictory prior decision instead of silently accumulating
+        tension in the graph. Needs embeddings (it is semantic), so it is empty when
+        offline. A pure read that runs AFTER the commit and is fully fail-silent: it
+        never touches the buffer-first + rollback write contract.
+
+        Args:
+            vector: The just-recorded decision's document embedding (reused), or None.
+            exclude_slug: The new decision's own slug, filtered out of the neighbours.
+            limit: Maximum neighbours to return.
+
+        Returns:
+            Up to ``limit`` dicts ``{slug, axiom, score}`` for live neighbours, most
+            similar first; empty if offline or nothing comparable exists.
+        """
+        if vector is None or not self.vector_store:
+            return []
+        out: List[Dict[str, Any]] = []
+        try:
+            conn = self.store._get_connection()
+            try:
+                states = self.store.compute_all_states(conn)
+            finally:
+                conn.close()
+            for m in self.vector_store.query(vector, limit=limit + 3):
+                slug = m.get("slug")
+                if not slug or slug == exclude_slug:
+                    continue
+                node = self.store.get_node_by_slug(slug)
+                if not node or states.get(node["id"]) not in ("active", "drifted"):
+                    continue
+                out.append({"slug": slug, "axiom": node["core_axiom"], "score": m.get("score")})
+                if len(out) >= limit:
+                    break
+        except Exception:
+            return []
+        return out
+
     def _node_state(self, node_id: str) -> str:
         """Returns the computed state of a node ('active'/'superseded'/'drifted')."""
         conn = self.store._get_connection()
@@ -694,6 +798,13 @@ class MitosSyncManager:
         mechanisms: Optional[List[str]] = None,
         context: Optional[str] = None,
         supersedes: Optional[str] = None,
+        amends: Optional[str] = None,
+        narrows: Optional[str] = None,
+        depends_on: Optional[str] = None,
+        resolves: Optional[str] = None,
+        contradicts: Optional[str] = None,
+        derives_from: Optional[str] = None,
+        cites: Optional[str] = None,
         slug: Optional[str] = None,
         actor: str = "agent",
     ) -> Dict[str, Any]:
@@ -718,12 +829,21 @@ class MitosSyncManager:
             mechanisms: Concrete technologies/entities involved (M6).
             context: Optional background on why this was decided.
             supersedes: Optional exact slug of a prior decision this one replaces.
+            amends: Optional exact slug of a decision this one amends.
+            narrows: Optional exact slug of a decision this one narrows.
+            depends_on: Optional exact slug of a decision this one depends on.
+            resolves: Optional exact slug of an open question/decision this resolves.
+            contradicts: Optional exact slug of a decision this one contradicts.
+            derives_from: Optional exact slug of a decision this one derives from.
+            cites: Optional exact slug of a decision this one cites.
             slug: Optional explicit slug; derived deterministically from axiom if None.
             actor: Provenance, stored in ``confirmed_by``.
 
         Returns:
             A success dict ``{slug, id, state, embedding, status}`` (status
-            "created"|"exists"), or a structured ``{error, code}`` (see spec §5).
+            "created"|"exists"), plus an optional ``related`` list of the nearest
+            existing live decisions (a write-time adjacency hint on the "created"
+            path), or a structured ``{error, code}`` (see spec §5).
         """
         # === Phase A — validate everything in memory (no writes) ===
 
@@ -759,6 +879,19 @@ class MitosSyncManager:
         if supersedes is not None:
             supersedes = supersedes.strip() or None
 
+        # Normalise the other typed relations into a stable-ordered map (supersedes is
+        # handled separately — it changes state and has bespoke error codes).
+        _provided = {
+            "amends": amends, "narrows": narrows, "depends_on": depends_on,
+            "resolves": resolves, "contradicts": contradicts,
+            "derives_from": derives_from, "cites": cites,
+        }
+        extra_relations: Dict[str, str] = {}
+        for _name, _label in _EXTRA_RELATIONS:
+            _val = _provided.get(_name)
+            if _val and _val.strip():
+                extra_relations[_name] = _val.strip()
+
         # 4. Deterministic slug.
         slug = _slugify(slug) if slug else _slugify(axiom)
         if not slug:
@@ -774,6 +907,9 @@ class MitosSyncManager:
             lines.append(f"**Context:** {context}")
         if supersedes:
             lines.append(f"**Supersedes:** {supersedes}")
+        for _name, _label in _EXTRA_RELATIONS:
+            if _name in extra_relations:
+                lines.append(f"**{_label}:** {extra_relations[_name]}")
         entry_text = "\n".join(lines) + "\n"
 
         # 6. Parse our entry back through the REAL parser (marker-aware), then run
@@ -797,6 +933,15 @@ class MitosSyncManager:
             if not target or target.get("slug", "").lower() != supersedes.lower():
                 return _record_error("supersedes_not_found", supersedes=supersedes)
             entry.supersedes = supersedes
+
+        # Validate every other typed relation EXACTLY like supersedes — each must
+        # point at a real, unambiguous decision. Still Phase A: a miss returns an
+        # error and writes nothing, so the buffer stays byte-for-byte unchanged.
+        for _name, _target in extra_relations.items():
+            err = self._validate_relation_target(_name, _target)
+            if err:
+                return err
+            setattr(entry, _name, _target)
 
         # Identity.
         node_id = compute_hash(
@@ -883,8 +1028,9 @@ class MitosSyncManager:
             )
 
         # 8. Embed best-effort (queues to the outbox if Gemini/Qdrant are down).
+        vector: Optional[List[float]] = None
         try:
-            self._best_effort_embed(delta, entry)
+            vector = self._best_effort_embed(delta, entry)
         except Exception as e:
             print(f"[Warning] Embedding step failed for '{entry.slug}': {str(e)}")
 
@@ -894,11 +1040,17 @@ class MitosSyncManager:
         except Exception as e:
             print(f"[Warning] Failed to render active axioms: {str(e)}")
 
-        # 10. Return. A freshly recorded decision is always active.
-        return {
+        # 10. Return. A freshly recorded decision is always active. Adjacency is a
+        #     post-commit, fail-silent guardrail — surfacing it here never affects the
+        #     write contract (the commit already succeeded above).
+        result: Dict[str, Any] = {
             "slug": entry.slug,
             "id": node_id,
             "state": "active",
             "embedding": self._embedding_status(node_id),
             "status": "created",
         }
+        related = self._adjacent_decisions(vector, exclude_slug=entry.slug)
+        if related:
+            result["related"] = related
+        return result

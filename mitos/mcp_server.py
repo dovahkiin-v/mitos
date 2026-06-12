@@ -266,16 +266,21 @@ def query_decisions(query: str, depth: str = "letter") -> str:
 @mcp.tool()
 def record_decision(axiom: str, rejected_paths: str, scope: List[str],
                     mechanisms: Optional[List[str]] = None, context: Optional[str] = None,
-                    supersedes: Optional[str] = None, slug: Optional[str] = None) -> str:
+                    supersedes: Optional[str] = None, amends: Optional[str] = None,
+                    narrows: Optional[str] = None, depends_on: Optional[str] = None,
+                    resolves: Optional[str] = None, contradicts: Optional[str] = None,
+                    derives_from: Optional[str] = None, cites: Optional[str] = None,
+                    slug: Optional[str] = None) -> str:
     """Record a decision you just made, with the alternatives you rejected and why,
     so future sessions and other agents inherit it instead of relitigating it.
 
     Call this the moment you commit to a foundational choice — a schema, a library,
     a pattern, or a path you've decided to abandon. `rejected_paths` is required:
     recording WHY you ruled options out is what stops you (or the next agent) from
-    re-proposing them. If this decision replaces an earlier one, look the earlier one
-    up first with query_decisions/surface_decisions and pass its exact slug as
-    `supersedes`. Returns the decision's slug; look it up afterwards with query_decisions.
+    re-proposing them. If this decision relates to an earlier one, look the earlier
+    one up first with query_decisions/surface_decisions and pass its EXACT slug to the
+    matching relation arg below (each is validated to point at a real decision).
+    Returns the decision's slug; look it up afterwards with query_decisions.
 
     Args:
         axiom: The decision as a single clear sentence true going forward.
@@ -283,7 +288,15 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str],
         scope: Area tags, e.g. ["database", "auth"].
         mechanisms: Concrete technologies/entities involved, e.g. ["sqlite", "wal-mode"].
         context: Optional background on why this was decided.
-        supersedes: Optional exact slug of a prior decision this one replaces.
+        supersedes: Exact slug of a prior decision this one REPLACES (the old one
+            becomes superseded). Use this for decision evolution.
+        amends: Exact slug of a decision this one amends (modifies without replacing).
+        narrows: Exact slug of a decision this one narrows the scope of.
+        depends_on: Exact slug of a decision this one depends on.
+        resolves: Exact slug of an open question / decision this one resolves.
+        contradicts: Exact slug of a decision this one is in tension with.
+        derives_from: Exact slug of a decision this one is derived from.
+        cites: Exact slug of a decision this one references.
         slug: Optional explicit slug; derived from the axiom if omitted.
 
     Returns:
@@ -291,9 +304,13 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str],
         status="created" means newly recorded; status="exists" is a SUCCESS — the
         identical decision was already recorded and is now confirmed present, not an
         error and not something to retry. Only a top-level {error, code} is a failure.
-        NOTE: identity is (slug + axiom + mechanisms). Re-recording a decision that
-        already exists is a no-op — a changed `context`, `rejected_paths`, `scope`, or
-        `supersedes` on a re-record is NOT saved. To record different reasoning or a new
+        On the "created" path the result MAY include `related`: the nearest existing
+        live decisions to the one you just recorded — a write-time adjacency hint, so
+        you notice an adjacent or contradictory prior decision. If one is genuinely
+        related, record the link (re-record with the matching relation arg, or capture
+        a follow-up). NOTE: identity is (slug + axiom + mechanisms). Re-recording an
+        existing decision is a no-op — a changed `context`/`rejected_paths`/`scope` or
+        relation on a re-record is NOT saved. To record different reasoning or a new
         relationship, make a NEW decision (a distinct axiom), don't resubmit the old one.
     """
     # Build our own writable manager — do NOT reuse get_workspace_components()
@@ -308,6 +325,13 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str],
         mechanisms=mechanisms,
         context=context,
         supersedes=supersedes,
+        amends=amends,
+        narrows=narrows,
+        depends_on=depends_on,
+        resolves=resolves,
+        contradicts=contradicts,
+        derives_from=derives_from,
+        cites=cites,
         slug=slug,
     )
     return json.dumps(result)

@@ -22,6 +22,8 @@ import requests
 
 from mitos import cli
 from mitos.config import MitosConfig, default_collection_name
+from mitos.store import GraphStore
+from mitos.sync import MitosSyncManager
 
 
 def _read_key_from_env_file(path: str, name: str = "GEMINI_API_KEY"):
@@ -233,6 +235,69 @@ def test_cli_subprocess_list_decisions_json(tmp_path):
             "config-is-injected-via-environment-never-baked-into-images",
             "secrets-are-fetched-from-the-vault-at-runtime",
         }
+    finally:
+        _drop_collection(collection)
+
+
+def test_adjacency_surfaces_related_decision(live_workspace):
+    """Recording a decision surfaces its nearest existing live neighbour — the
+    write-time adjacency guardrail, proven against REAL embeddings (③)."""
+    ws, _ = live_workspace
+    m = MitosSyncManager(MitosConfig(str(ws)))
+    m.record_decision_entry(
+        axiom="Payments settle through Stripe as the single payment processor",
+        rejected_paths="Adyen rejected: heavier integration for our volume",
+        scope=["payments"], slug="stripe-single-psp",
+    )
+    res = m.record_decision_entry(
+        axiom="Stripe webhooks are the source of truth for charge status",
+        rejected_paths="Polling the Stripe API rejected: rate limits and latency",
+        scope=["payments"], slug="stripe-webhooks-source-of-truth",
+    )
+    assert res["status"] == "created"
+    related_slugs = [r["slug"] for r in res.get("related", [])]
+    assert "stripe-single-psp" in related_slugs, related_slugs
+    # The new decision never lists itself as its own neighbour.
+    assert "stripe-webhooks-source-of-truth" not in related_slugs
+
+
+def test_cli_subprocess_relation_flag_links_decisions(tmp_path):
+    """Real binary, real argv: --depends-on links two decisions, edge lands in graph."""
+    mitos_bin = os.path.join(os.path.dirname(sys.executable), "mitos")
+    ws = tmp_path / "proj"
+    ws.mkdir()
+    env = {
+        **os.environ,
+        "GEMINI_API_KEY": _REAL_KEY,
+        "QDRANT_URL": QDRANT_URL,
+        "MITOS_NO_UPDATE_CHECK": "1",
+        "MITOS_NO_MCP_HINT": "1",
+        "XDG_CONFIG_HOME": str(tmp_path / "cfg"),
+        "XDG_CACHE_HOME": str(tmp_path / "cache"),
+    }
+    collection = default_collection_name(str(ws))
+    try:
+        assert subprocess.run([mitos_bin, "init"], cwd=ws, env=env,
+                              capture_output=True, text=True).returncode == 0
+        a = subprocess.run(
+            [mitos_bin, "record", "Adopt hexagonal architecture",
+             "--rejected", "Layered rejected: leaks IO into the core", "--scope", "arch",
+             "--slug", "hexagonal-arch"],
+            cwd=ws, env=env, capture_output=True, text=True)
+        assert a.returncode == 0, a.stderr
+        b = subprocess.run(
+            [mitos_bin, "record", "Adapters live at the edges",
+             "--rejected", "Core importing IO rejected: violates the dependency rule",
+             "--scope", "arch", "--slug", "adapters-at-edges", "--depends-on", "hexagonal-arch"],
+            cwd=ws, env=env, capture_output=True, text=True)
+        assert b.returncode == 0, b.stderr
+        assert "Recorded decision" in b.stdout
+
+        store = GraphStore(MitosConfig(str(ws)).db_path)
+        fid = store.get_node_by_slug("adapters-at-edges")["id"]
+        tid = store.get_node_by_slug("hexagonal-arch")["id"]
+        assert any(e["from_id"] == fid and e["to_id"] == tid and e["type"] == "depends_on"
+                   for e in store.get_edges())
     finally:
         _drop_collection(collection)
 
