@@ -20,6 +20,15 @@ Claude: That breaks the local-first requirement in P10. Let's use SQLite.
 
 <!-- BEGIN ENTRIES — new decisions go directly below this line, newest first -->
 
+### mitos-status-and-per-project-setup
+
+**Decided:** Mitos ships a 'mitos status [path]' command (exit 0 ready / 1 not, plus --json) and a per-project SETUP.md walkthrough, so any human or LLM can check whether Mitos is set up for a project and follow a clear path to set it up; the setup skill also adds a SETUP.md pointer to the project's agent files (AGENTS.md/CLAUDE.md/GEMINI.md) noting it is per-project.
+**Rejected:** Make the check an MCP tool only — the MCP server only runs once Mitos is already wired, but the whole point is checking projects where it is NOT, so a CLI command works regardless. Leave setup discovery to prose docs alone — humans and LLMs must find the right doc and guess the steps.
+**Mechanisms:** cli, mcp
+**Scope:** setup, cli, llm-integration
+**Context:** Mitos is per-project; onboarding a new project needs init + key + Qdrant + MCP wiring. 'mitos status' makes that state machine-checkable; SETUP.md + a setup skill make the walkthrough findable; the AGENTS.md pointer propagates Mitos-awareness to every agent that later opens the project.
+
+
 ### init-scaffolds-gitignored-env
 
 **Decided:** mitos init scaffolds a gitignored .env at the workspace root with explicit empty credential slots (GEMINI_API_KEY required; ANTHROPIC_API_KEY optional), and the CLI auto-loads .env, so credential setup is unambiguous for any human or LLM.

@@ -105,6 +105,13 @@ Sets up `.mitos/`, initializes the SQLite schema, copies the single-source `form
 ```bash
 python3 mitos/cli.py init
 ```
+> **New project?** See **[SETUP.md](SETUP.md)** for the full per-project walkthrough (init → key → Qdrant → MCP wiring), and run `mitos status` to verify.
+
+### 1b. Setup Check
+Reports whether Mitos is set up for a project — `.mitos/` workspace, `decisions.md`, `GEMINI_API_KEY`, Qdrant reachability, the project's collection, and graph size — with a clear `READY ✓` / `NOT SET UP ✗` verdict, next-step hints, and an exit code (`0` ready / `1` not). Built for both humans and LLMs (`--json` for scripts).
+```bash
+mitos status [project-path]   # defaults to the current directory
+```
 
 ### 2. Transactional Synchronization
 Parses `decisions.md` under file lock, runs LLM enrichment on new entries, resolves outgoing edges case-insensitively (using prefix-fallback for legacy ADR formats), commits changes atomically, updates Qdrant, and rotates successfully synced entries to quarterly archives once the volume threshold is met.
