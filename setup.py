@@ -1,10 +1,24 @@
 """Setup script for Mitos package installation."""
 
+import os
+import re
+
 from setuptools import setup, find_packages
+
+
+def _read_version() -> str:
+    """Reads ``__version__`` from mitos/__init__.py (single source of truth)."""
+    here = os.path.abspath(os.path.dirname(__file__))
+    with open(os.path.join(here, "mitos", "__init__.py"), encoding="utf-8") as f:
+        match = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', f.read())
+    if not match:
+        raise RuntimeError("Unable to find __version__ in mitos/__init__.py")
+    return match.group(1)
+
 
 setup(
     name="mitos-adr",
-    version="0.1.0",
+    version=_read_version(),
     packages=find_packages(),
     # Ship the canonical format spec INSIDE the package — `mitos init` /
     # load_format_spec() read `mitos/format-spec.md` from the installed package
