@@ -8,7 +8,7 @@ MCP serving.
 import sys
 import os
 import argparse
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from google import genai
 
 from mitos.config import MitosConfig, default_collection_name
@@ -392,6 +392,150 @@ def cmd_serve() -> None:
     mcp.run()
 
 
+def _check_qdrant(qdrant_url: str, collection: str) -> Dict[str, Any]:
+    """Probes Qdrant reachability and the project's collection (best-effort).
+
+    Args:
+        qdrant_url: The configured Qdrant REST endpoint.
+        collection: The project's collection name.
+
+    Returns:
+        ``{reachable, collection_exists, points}`` — ``collection_exists`` and
+        ``points`` are ``None`` when Qdrant is unreachable.
+    """
+    import requests
+    out: Dict[str, Any] = {"reachable": False, "collection_exists": None, "points": None}
+    try:
+        r = requests.get(
+            f"{qdrant_url.rstrip('/')}/collections/{collection}", timeout=3
+        )
+        out["reachable"] = True
+        if r.status_code == 200:
+            out["collection_exists"] = True
+            out["points"] = r.json().get("result", {}).get("points_count")
+        elif r.status_code == 404:
+            out["collection_exists"] = False
+    except Exception:
+        pass
+    return out
+
+
+def _gemini_key_present(workspace_dir: str) -> bool:
+    """True if GEMINI_API_KEY is available — in the environment or the workspace .env."""
+    if os.environ.get("GEMINI_API_KEY"):
+        return True
+    env_path = os.path.join(workspace_dir, ".env")
+    if os.path.exists(env_path):
+        try:
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("GEMINI_API_KEY="):
+                        return bool(line.split("=", 1)[1].strip().strip('"').strip("'"))
+        except OSError:
+            pass
+    return False
+
+
+def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
+    """Reports whether Mitos is set up for a project, and what (if anything) is missing.
+
+    Designed to be run by a human OR an LLM in a new project: it answers "is Mitos
+    ready here?" with a clear ✓/⚠/✗ report, a one-line verdict, and an exit code
+    (0 = fully ready, 1 = needs attention / not set up). When not ready it prints
+    concise next steps and points at the full SETUP walkthrough.
+
+    Args:
+        workspace_dir: The project directory to inspect.
+        as_json: Emit a machine-readable JSON report instead of the text report.
+
+    Returns:
+        ``0`` if fully ready, ``1`` otherwise.
+    """
+    import json as _json
+    workspace_dir = os.path.abspath(workspace_dir)
+    config = MitosConfig(workspace_dir)
+
+    mitos_dir_ok = os.path.isdir(config.mitos_dir) and os.path.exists(
+        os.path.join(config.mitos_dir, "config.toml")
+    )
+    decisions_ok = os.path.exists(config.decisions_file)
+    spec_ok = os.path.exists(os.path.join(workspace_dir, "format-spec.md"))
+    key_ok = _gemini_key_present(workspace_dir)
+    q = _check_qdrant(config.qdrant_url, config.qdrant_collection)
+
+    graph_nodes = None
+    if os.path.exists(config.db_path):
+        try:
+            graph_nodes = len(GraphStore(config.db_path, read_only=True).get_all_nodes())
+        except Exception:
+            graph_nodes = None
+
+    initialized = mitos_dir_ok and decisions_ok
+    ready = (
+        initialized and key_ok and q["reachable"]
+        and (q["collection_exists"] is not False)
+    )
+
+    if as_json:
+        print(_json.dumps({
+            "workspace": workspace_dir,
+            "ready": ready,
+            "initialized": initialized,
+            "qdrant_url": config.qdrant_url,
+            "collection": config.qdrant_collection,
+            "checks": {
+                "mitos_workspace": mitos_dir_ok,
+                "decisions_buffer": decisions_ok,
+                "format_spec": spec_ok,
+                "gemini_api_key": key_ok,
+                "qdrant_reachable": q["reachable"],
+                "collection_exists": q["collection_exists"],
+                "collection_points": q["points"],
+                "graph_nodes": graph_nodes,
+            },
+        }, indent=2))
+        return 0 if ready else 1
+
+    verdict = "READY ✓" if ready else ("NEEDS ATTENTION ⚠" if initialized else "NOT SET UP ✗")
+    mark = lambda ok: "✓" if ok is True else ("✗" if ok is False else "—")
+    checks = [
+        ("workspace (.mitos/ + config.toml)", mitos_dir_ok, "run `mitos init`"),
+        ("decisions.md buffer", decisions_ok, "created by `mitos init`"),
+        ("format-spec.md", spec_ok, "created by `mitos init`"),
+        ("GEMINI_API_KEY", key_ok, "add it to this project's .env (gitignored)"),
+        (f"Qdrant reachable ({config.qdrant_url})", q["reachable"],
+         "start it: `docker compose up -d` in the mitos repo"),
+        (f"collection '{config.qdrant_collection}'",
+         q["collection_exists"] if q["reachable"] else None,
+         "auto-created on first record/sync once Qdrant is up"),
+    ]
+    print(f"\nMITOS STATUS for {workspace_dir} — {verdict}\n")
+    for label, ok, hint in checks:
+        line = f"  {mark(ok)} {label}"
+        if ok is not True and hint:
+            line += f"   → {hint}"
+        print(line)
+    if q["reachable"] and q["collection_exists"] and q["points"] is not None:
+        print(f"      ({q['points']} vector(s) indexed)")
+    if graph_nodes is not None:
+        print(f"  • graph holds {graph_nodes} node(s)")
+    print()
+    if not ready:
+        print("Next steps:")
+        n = 1
+        if not initialized:
+            print(f"  {n}. `mitos init` here (creates .mitos/, decisions.md, scaffolds .env)"); n += 1
+        if not key_ok:
+            print(f"  {n}. Put your GEMINI_API_KEY in this project's .env"); n += 1
+        if not q["reachable"]:
+            print(f"  {n}. Start Mitos's Qdrant: `docker compose up -d` from the mitos repo"); n += 1
+        print("  Full walkthrough → SETUP.md "
+              "(https://github.com/dovahkiin-v/mitos/blob/main/SETUP.md)")
+        print()
+    return 0 if ready else 1
+
+
 def load_dotenv_file(path: str = ".env") -> None:
     """Loads ``KEY=value`` pairs from a ``.env`` file into the environment.
 
@@ -487,6 +631,11 @@ def main() -> None:
     # serve
     subparsers.add_parser("serve", help="Launch Mitos FastMCP server on stdio.")
 
+    # status — is Mitos set up for this project? (human- and LLM-friendly check)
+    status_p = subparsers.add_parser("status", help="Check whether Mitos is set up for a project.")
+    status_p.add_argument("path", nargs="?", default=None, help="Project directory to check (default: current directory).")
+    status_p.add_argument("--json", action="store_true", dest="as_json", help="Emit a machine-readable JSON report.")
+
     args = parser.parse_args()
     config = MitosConfig()
 
@@ -522,6 +671,8 @@ def main() -> None:
             )
         elif args.command == "serve":
             cmd_serve()
+        elif args.command == "status":
+            sys.exit(cmd_status(args.path or os.getcwd(), as_json=args.as_json))
     except MitosError as e:
         print(f"Error: {str(e)}", file=sys.stderr)
         sys.exit(1)
