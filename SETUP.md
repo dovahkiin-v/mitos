@@ -13,7 +13,7 @@ what's done and what's left (it exits `0` when ready, `1` otherwise).
 
 ## Prerequisites (once per machine)
 
-- **Mitos installed** — `pip install -e .` from the [mitos repo](https://github.com/dovahkiin-v/mitos), or `pip install mitos-adr`.
+- **Mitos installed** — the recommended global install is **pipx**: `pipx install git+https://github.com/dovahkiin-v/mitos` (isolated, on PATH, upgrade with `pipx upgrade mitos-adr`). Or `pip install git+https://github.com/dovahkiin-v/mitos` into a venv; or `pip install -e .` from a clone if you're hacking on Mitos. *(A PyPI release — `pip install mitos-adr` — is planned but not yet published.)*
 - **Docker** — for Mitos's Qdrant.
 - **A Google Gemini API key** — <https://aistudio.google.com/app/apikey>. (An Anthropic key is only needed for `mitos import --llm-extract`.)
 
