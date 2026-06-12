@@ -43,8 +43,20 @@ from mitos.store import GraphStore, ParsedEntry
 
 
 @pytest.fixture
-def isolated_workspace() -> Tuple[MitosConfig, str]:
-    """Fixture that provisions a fully isolated temporary workspace for CLI pathology tests."""
+def isolated_workspace(monkeypatch) -> Tuple[MitosConfig, str]:
+    """Fixture that provisions a fully isolated temporary workspace for CLI pathology tests.
+
+    Forced offline so these no-services pathology tests are hermetic: an unreachable
+    Qdrant and no API keys, regardless of what an earlier *live* test in the same run
+    leaked into ``os.environ``. Without this, ``test_cli_pathology_query_parameters``
+    would flake — if a real key leaked in and Qdrant ``:7333`` happened to be up, its
+    query would hit a real (empty) collection and print "No matching decisions" instead
+    of the expected unavailable/degraded message. Mirrors the ``offline`` fixture in
+    ``test_payload_economy.py``. Tests that need a key set it themselves (``patch.dict``).
+    """
+    monkeypatch.setenv("QDRANT_URL", "http://localhost:9")
+    for _k in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "ANTHROPIC_API_KEY"):
+        monkeypatch.delenv(_k, raising=False)
     tmpdir = tempfile.mkdtemp()
     config = MitosConfig(tmpdir)
     config.db_path = os.path.join(tmpdir, ".mitos", "graph.sqlite")
