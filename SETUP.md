@@ -105,6 +105,7 @@ it up, add a short pointer to whichever agent-instruction files the project uses
 This project uses **mitos** for architectural decision memory. It is a
 **per-project** setup. Run `mitos status` to check it; if not ready, follow the
 mitos setup guide: https://github.com/dovahkiin-v/mitos/blob/main/SETUP.md
+(If `mitos` itself is `command not found`, it was uninstalled after setup — reinstall it (pipx) or flag it; don't silently drop decision-recording.)
 Record decisions with `record_decision`; check precedents with `surface_decisions` / `query_decisions`.
 ```
 

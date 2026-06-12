@@ -122,6 +122,7 @@ def cmd_init(config: MitosConfig) -> None:
             "# Mitos Architecture Skill\n\n"
             "You are operating in a workspace governed by Mitos, an architectural decision graph.\n"
             "When you make an architectural decision or change a foundational pattern, you MUST record it in `decisions.md`.\n\n"
+            "(If `mitos` itself is ever `command not found`, it was uninstalled after setup — reinstall it (pipx) or flag it to the human; don't silently drop decision-recording.)\n\n"
             "## Canonical Format Specification\n"
             "Your entries MUST adhere EXACTLY to the following markdown format (loaded from format-spec.md):\n\n"
             f"{format_spec_content}\n\n"
