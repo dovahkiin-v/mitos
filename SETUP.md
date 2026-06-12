@@ -61,7 +61,9 @@ gives the best AX: ambient `surface_decisions` / `query_decisions` /
 sentence prose with apostrophes survives intact), and the tool names match the
 ones the docs use. The CLI works without it (see the capability map below), but
 the MCP is how an agent actually *lives* in the decision loop. Point your agent at
-`mitos serve` (a stdio MCP server) with the **project as its cwd**.
+`mitos serve` (a stdio MCP server) with the **project as its cwd**. *(Until it's
+wired, the CLI prints a gentle once-a-day reminder on the record/surface/query
+verbs; silence it with `MITOS_NO_MCP_HINT=1`.)*
 
 **Claude Code** — add a project-scoped `.mcp.json` at the project root:
 ```json
