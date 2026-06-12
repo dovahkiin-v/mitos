@@ -17,6 +17,47 @@ from mitos.vector_store import QdrantVectorStore
 # Create FastMCP server instance
 mcp = FastMCP("Mitos")
 
+# Slugs already returned to the agent this session. `mitos serve` is one persistent
+# process per agent session, so this set lives exactly as long as the session — it
+# powers surface's dedup: a decision seen earlier comes back lightweight (no repeated
+# rejected_paths wall) and flagged `seen`, so the recall loop doesn't re-pay context
+# for the same precedent. Reset between tests via the conftest fixture.
+_SEEN_SLUGS: set = set()
+
+
+def _decision_payload(node: Dict[str, Any], score: float, *, brief: bool, dedup: bool) -> Dict[str, Any]:
+    """Shapes a Letter-mode decision payload, applying brevity + session dedup.
+
+    ``rejected_paths`` — the heavy, high-value field — is included on first sight so
+    the precedent's reasoning lands. It is dropped when ``brief`` (the caller wants a
+    quick scan) or, under ``dedup``, when this slug was already surfaced this session
+    (a re-hit is flagged ``seen: True`` instead of re-paying the wall).
+
+    Args:
+        node: A store node dict (``slug``, ``core_axiom``, ``rejected_paths``, ``scope``).
+        score: The relevance score to attach.
+        brief: Drop ``rejected_paths`` for an axiom-only scan.
+        dedup: Track/skip already-seen slugs for this session.
+
+    Returns:
+        A Letter-mode decision dict.
+    """
+    slug = node["slug"]
+    seen = dedup and slug in _SEEN_SLUGS
+    payload: Dict[str, Any] = {
+        "slug": slug,
+        "axiom": node["core_axiom"],
+        "scope": node["scope"],
+        "score": score,
+    }
+    if not (brief or seen):
+        payload["rejected_paths"] = node["rejected_paths"]
+    if seen:
+        payload["seen"] = True
+    if dedup:
+        _SEEN_SLUGS.add(slug)
+    return payload
+
 def get_workspace_components() -> Tuple[GraphStore, Optional[GeminiEmbeddingProvider], Optional[QdrantVectorStore]]:
     """Loads and returns the graph store (read-only), embedding provider, and vector store."""
     config = MitosConfig()
@@ -35,27 +76,34 @@ def get_workspace_components() -> Tuple[GraphStore, Optional[GeminiEmbeddingProv
 
 
 @mcp.tool()
-def surface_decisions(query: str, scope: Optional[str] = None) -> str:
-    """Surfaces active decisions relevant to the query, supporting scope filtering.
+def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = False) -> str:
+    """Surface active precedents for a CLAIM before you decide — the recall loop, use first.
 
-    This implements the C4 Letter-mode-only retrieval contract. If a scope filter
-    is provided, it pre-filters semantic matches and appends open questions in
-    that scope.
+    The broad "is there a settled decision near this?" scan: a ranked, capped (top
+    few) semantic match. Reach for this when deciding something; reach for
+    query_decisions to look up a SPECIFIC slug or claim, and list_decisions for the
+    EXHAUSTIVE set in a scope. Each returned precedent carries its `rejected_paths`
+    (why alternatives were ruled out) — the field that actually stops relitigation.
+
+    Within a session, a precedent you've already been shown comes back lightweight
+    (flagged `seen`, without its `rejected_paths` again), so a repeated scan doesn't
+    re-pay the same context.
 
     Args:
         query: The semantic claim or topic string (e.g. 'cache strategy').
         scope: Optional scope tag filter (e.g. 'auth', 'database').
+        brief: If True, omit `rejected_paths` from every result (axiom-only — a quick
+            "is there anything nearby?" scan). Default False keeps the full reasoning.
 
     Returns:
-        A JSON string containing a ranked list of relevant active decisions
-        formatted strictly in Letter mode, and any relevant open questions.
+        A JSON string with `active_decisions` (ranked, Letter-mode), plus
+        `open_questions` ONLY when a scope was given (absent = not scanned, [] = none
+        parked in that scope). Each decision: slug, axiom, scope, score, and
+        rejected_paths unless brief / already seen this session.
     """
     store, embed_provider, vector_store = get_workspace_components()
-    
-    results: Dict[str, Any] = {
-        "active_decisions": [],
-        "open_questions": []
-    }
+
+    results: Dict[str, Any] = {"active_decisions": []}
 
     # 1. Semantic search if embeddings and vector store are active
     if embed_provider and vector_store:
@@ -63,27 +111,22 @@ def surface_decisions(query: str, scope: Optional[str] = None) -> str:
             # Generate query vector
             q_vector = embed_provider.get_embedding(query, is_query=True)
             matches = vector_store.query(q_vector, limit=5, filter_scope=scope)
-            
+
             for m in matches:
                 slug = m["slug"]
                 node = store.get_node_by_slug(slug)
                 if not node:
                     continue
-                    
-                # Verifycomputed active status in SQLite (M3 computed state is source-of-truth)
+
+                # Verify computed active status in SQLite (M3 computed state is source-of-truth)
                 node_state = store.compute_all_states(store._get_connection()).get(node["id"])
                 if node_state not in ("active", "drifted"):
                     # Stale vector reference, skip
                     continue
 
-                # Strictly Letter-mode payload per C4 contract
-                results["active_decisions"].append({
-                    "slug": node["slug"],
-                    "axiom": node["core_axiom"],
-                    "rejected_paths": node["rejected_paths"],
-                    "scope": node["scope"],
-                    "score": m["score"]
-                })
+                results["active_decisions"].append(
+                    _decision_payload(node, m["score"], brief=brief, dedup=True)
+                )
         except Exception as e:
             # Degrade to exact/scope filtering only
             pass
@@ -93,29 +136,27 @@ def surface_decisions(query: str, scope: Optional[str] = None) -> str:
         try:
             active_decs = store.get_active_decisions(scope=scope)
             for d in active_decs[:5]:
-                results["active_decisions"].append({
-                    "slug": d["slug"],
-                    "axiom": d["core_axiom"],
-                    "rejected_paths": d["rejected_paths"],
-                    "scope": d["scope"],
-                    "score": 1.0
-                })
+                results["active_decisions"].append(
+                    _decision_payload(d, 1.0, brief=brief, dedup=True)
+                )
         except Exception:
             pass
 
-    # 3. Append Open Questions if scope matches (C4 resolves clause)
+    # 3. Append Open Questions ONLY when a scope was given (C4 resolves clause).
+    #    Omitting the key when no scope disambiguates "not scanned" from "none here".
     if scope:
+        open_questions = []
         try:
-            oqs = store.get_open_questions(scope=scope)
-            for q in oqs:
+            for q in store.get_open_questions(scope=scope):
                 if q["computed_state"] == "parked":
-                    results["open_questions"].append({
+                    open_questions.append({
                         "topic": q["slug"],
                         "questions_raised": q["questions_raised"],
                         "park_reason": q.get("park_reason")
                     })
         except Exception:
             pass
+        results["open_questions"] = open_questions
 
     # Recall here is SEMANTIC and capped at the top few matches — great for "is
     # there precedent for this claim?", but it cannot prove you have seen
@@ -133,7 +174,7 @@ def surface_decisions(query: str, scope: Optional[str] = None) -> str:
 
 
 @mcp.tool()
-def list_decisions(scope: Optional[str] = None, state: str = "active") -> str:
+def list_decisions(scope: Optional[str] = None, state: str = "active", brief: bool = False) -> str:
     """Enumerate the COMPLETE set of decisions (optionally scope-filtered) — no ranking, no top-k.
 
     surface_decisions / query_decisions are SEMANTIC and capped at the top few
@@ -149,6 +190,8 @@ def list_decisions(scope: Optional[str] = None, state: str = "active") -> str:
         state: 'active' (default) returns the live set (active + drifted); 'all'
             returns every decision regardless of state (including superseded); any
             other value is an exact computed-state match (e.g. 'superseded').
+        brief: If True, omit `rejected_paths` from every decision (axiom-only). Useful
+            here — an exhaustive scope can otherwise return many full reasoning walls.
 
     Returns:
         A JSON string: {decisions, open_questions, total, scope, state}. Each
@@ -157,16 +200,17 @@ def list_decisions(scope: Optional[str] = None, state: str = "active") -> str:
     """
     store, _embed, _vec = get_workspace_components()
 
-    decisions = [
-        {
+    decisions = []
+    for n in store.get_decisions(scope=scope, state=state):
+        d = {
             "slug": n["slug"],
             "axiom": n["core_axiom"],
-            "rejected_paths": n["rejected_paths"],
             "scope": n["scope"],
             "state": n["computed_state"],
         }
-        for n in store.get_decisions(scope=scope, state=state)
-    ]
+        if not brief:
+            d["rejected_paths"] = n["rejected_paths"]
+        decisions.append(d)
 
     open_questions = []
     try:
@@ -190,15 +234,20 @@ def list_decisions(scope: Optional[str] = None, state: str = "active") -> str:
 
 
 @mcp.tool()
-def query_decisions(query: str, depth: str = "letter") -> str:
-    """Performs an on-demand claim or slug lookup with depth control.
+def query_decisions(query: str, depth: str = "letter", brief: bool = False) -> str:
+    """Look up a SPECIFIC decision by slug or claim — the targeted lookup.
 
-    If query matches a unique slug exactly, returns that decision. Otherwise,
-    executes a ranked semantic search for matches matching the claim.
+    Use this when you know roughly what you're after (a slug you're carrying, or a
+    pointed claim). For the broad "is there precedent near this?" scan before
+    deciding, use surface_decisions; for the EXHAUSTIVE set in a scope, list_decisions.
+    If query matches a unique slug exactly, returns that one decision (full); otherwise
+    a ranked semantic search for the claim.
 
     Args:
         query: Unique decision slug identifier OR a semantic claim search query.
         depth: The retrieval depth (e.g. 'letter', 'trace', 'vibe'). v0.1 enforces Letter mode.
+        brief: If True, omit `rejected_paths` from ranked semantic matches (axiom-only).
+            An exact-slug hit is always returned in full (you asked for that one).
 
     Returns:
         A JSON string containing the ranked results in Letter-mode payload shape.
@@ -246,15 +295,17 @@ def query_decisions(query: str, depth: str = "letter") -> str:
                 if node_state not in ("active", "drifted"):
                     continue
 
-                output_list.append({
+                match = {
                     "slug": node["slug"],
                     "axiom": node["core_axiom"],
-                    "rejected_paths": node["rejected_paths"],
                     "scope": node["scope"],
                     "state": node_state,
                     "score": m["score"],
                     "depth_mode": "letter"
-                })
+                }
+                if not brief:
+                    match["rejected_paths"] = node["rejected_paths"]
+                output_list.append(match)
                 
             return json.dumps({"query": query, "depth_mode": "letter", "matches": output_list}, indent=2)
         except Exception as e:

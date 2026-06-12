@@ -135,7 +135,7 @@ def cmd_init(config: MitosConfig) -> None:
             "All decisions you record, surface, and query are scoped to THIS project's decision graph and its own Qdrant collection — you will not see, and cannot contaminate, other projects' decisions.\n"
             "If the Mitos MCP server is wired into your agent, call these tools directly — best experience: structured args, no shell-quoting. If it is NOT wired, each maps to a CLI verb (and the CLI also accepts the long names as aliases, e.g. `mitos record_decision`):\n"
             "- `record_decision`  (CLI: `mitos record`) — the moment you commit to a foundational choice (a schema, a library, a pattern, a path you're abandoning), persist it WITH the alternatives you rejected and why, so future sessions inherit it instead of relitigating. Recording rich prose via the CLI? Use `--rejected-file -` / `--context-file -` to read from stdin and avoid shell-quoting.\n"
-            "- `surface_decisions` (CLI: `mitos surface`) — surface active precedents for a claim/scope BEFORE you decide, so you don't relitigate a settled call. This is the recall loop — use it first.\n"
+            "- `surface_decisions` (CLI: `mitos surface`) — surface active precedents for a claim/scope BEFORE you decide, so you don't relitigate a settled call. This is the recall loop — use it first. Re-checking is cheap: a precedent already surfaced this session comes back lightweight (flagged `seen`), and `brief=True` (CLI `--brief`) gives an axiom-only scan.\n"
             "- `query_decisions`   (CLI: `mitos query`) — semantic or slug lookup when unsure whether a precedent exists.\n"
             "- `list_decisions`    (CLI: `mitos list`) — the EXHAUSTIVE recall path. surface/query are semantic and capped at the top few matches; this returns EVERY decision in a scope, deterministically, so a completeness pass or audit doesn't miss anything below the relevance cliff. Needs no key or Qdrant.\n\n"
             "## When to record — the capture trigger (YOUR judgement; Mitos stores, it does not decide what is worth storing)\n"
@@ -298,7 +298,8 @@ def cmd_show(config: MitosConfig, ident: str) -> None:
 
 
 def cmd_list(config: MitosConfig, scope: Optional[str] = None,
-             state_filter: Optional[str] = None, as_json: bool = False) -> None:
+             state_filter: Optional[str] = None, as_json: bool = False,
+             brief: bool = False) -> None:
     """Enumerates the complete set of decisions (+ parked open questions) for a scope.
 
     The CLI twin of the MCP ``list_decisions`` tool — the exhaustive, deterministic
@@ -323,14 +324,16 @@ def cmd_list(config: MitosConfig, scope: Optional[str] = None,
     parked = [oq for oq in store.get_open_questions(scope=scope)
               if oq["computed_state"] == "parked"]
 
+    def _list_item(d):
+        item = {"slug": d["slug"], "axiom": d["core_axiom"],
+                "scope": d["scope"], "state": d["computed_state"]}
+        if not brief:
+            item["rejected_paths"] = d["rejected_paths"]
+        return item
+
     if as_json:
         print(_json.dumps({
-            "decisions": [
-                {"slug": d["slug"], "axiom": d["core_axiom"],
-                 "rejected_paths": d["rejected_paths"], "scope": d["scope"],
-                 "state": d["computed_state"]}
-                for d in decisions
-            ],
+            "decisions": [_list_item(d) for d in decisions],
             "open_questions": [
                 {"topic": oq["slug"], "questions_raised": oq["questions_raised"],
                  "park_reason": oq.get("park_reason")}
@@ -448,7 +451,11 @@ def cmd_record(
     print(f"  ID:        {result['id']}")
     print(f"  State:     {result['state']}")
     print(f"  Embedding: {result['embedding']}")
+    if result.get("path"):
+        print(f"  Written:   {result['path']}  (the human-readable entry — eyeball it)")
     print(f"  Handle:    '{result['slug']}' — pass this to --supersedes/--amends/--depends-on/… to link future decisions.")
+    if result.get("slug_hint"):
+        print(f"  Note:      {result['slug_hint']}")
     related = result.get("related")
     if related:
         print("  ↔ Nearest existing decisions (an intended neighbour, or a tension to reconcile?):")
@@ -482,24 +489,35 @@ def _read_text_arg(inline: Optional[str], file_path: Optional[str]) -> Optional[
 
 
 def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
-                as_json: bool = False) -> None:
+                as_json: bool = False, brief: bool = False) -> None:
     """Surfaces active decisions relevant to a query — the CLI twin of the MCP
     ``surface_decisions`` tool (the precedent-recall half of Mitos).
 
     Mirrors ``mcp_server.surface_decisions`` so a CLI-only agent (or a human) can
     run the recall loop without the MCP wired. Semantic match first, scope
-    pre-filter fallback, plus any parked open questions in scope.
+    pre-filter fallback, plus any parked open questions in scope. (The MCP tool also
+    dedupes already-seen precedents within a session; the CLI is a fresh process per
+    call, so it cannot — use ``--brief`` for a lighter scan.)
 
     Args:
         config: The active workspace configuration.
         query: The claim or topic to find precedents for.
         scope: Optional scope tag filter.
         as_json: Emit a machine-readable JSON report (for agents) instead of text.
+        brief: Omit ``rejected_paths`` (axiom-only — a quick "anything nearby?" scan).
     """
     import json as _json
     manager = MitosSyncManager(config)
     store = manager.store
-    results: Dict[str, Any] = {"active_decisions": [], "open_questions": []}
+
+    def _shape(node, score):
+        d = {"slug": node["slug"], "axiom": node["core_axiom"],
+             "scope": node["scope"], "score": score}
+        if not brief:
+            d["rejected_paths"] = node["rejected_paths"]
+        return d
+
+    results: Dict[str, Any] = {"active_decisions": []}
 
     if manager.embed_provider and manager.vector_store:
         try:
@@ -511,34 +529,30 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
                 state = store.compute_all_states(store._get_connection()).get(node["id"])
                 if state not in ("active", "drifted"):
                     continue
-                results["active_decisions"].append({
-                    "slug": node["slug"], "axiom": node["core_axiom"],
-                    "rejected_paths": node["rejected_paths"], "scope": node["scope"],
-                    "score": m["score"],
-                })
+                results["active_decisions"].append(_shape(node, m["score"]))
         except Exception:
             pass
 
     if not results["active_decisions"] and scope:
         try:
             for d in store.get_active_decisions(scope=scope)[:5]:
-                results["active_decisions"].append({
-                    "slug": d["slug"], "axiom": d["core_axiom"],
-                    "rejected_paths": d["rejected_paths"], "scope": d["scope"], "score": 1.0,
-                })
+                results["active_decisions"].append(_shape(d, 1.0))
         except Exception:
             pass
 
+    # Open questions only when a scope was given (absent = not scanned, [] = none here).
     if scope:
+        open_questions = []
         try:
             for oq in store.get_open_questions(scope=scope):
                 if oq["computed_state"] == "parked":
-                    results["open_questions"].append({
+                    open_questions.append({
                         "topic": oq["slug"], "questions_raised": oq["questions_raised"],
                         "park_reason": oq.get("park_reason"),
                     })
         except Exception:
             pass
+        results["open_questions"] = open_questions
 
     # Recall here is semantic and capped — point at the exhaustive path so a
     # completeness pass doesn't mistake the ranked top-k for the full set.
@@ -552,7 +566,7 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         print(_json.dumps(results, indent=2))
         return
 
-    ad, oqs = results["active_decisions"], results["open_questions"]
+    ad, oqs = results["active_decisions"], results.get("open_questions", [])
     if not ad and not oqs:
         scope_note = f" (scope: {scope})" if scope else ""
         print(f"No active precedents found for: '{query}'{scope_note}")
@@ -563,7 +577,8 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     for i, d in enumerate(ad, start=1):
         print(f"{i}. {d['slug']}  (score {d['score']:.3f})")
         print(f"   Decided:  {d['axiom']}")
-        print(f"   Rejected: {d['rejected_paths']}")
+        if "rejected_paths" in d:
+            print(f"   Rejected: {d['rejected_paths']}")
         if d["scope"]:
             print(f"   Scope:    {', '.join(d['scope'])}")
         print()
@@ -973,6 +988,7 @@ def main() -> None:
     surf_p.add_argument("query", help="The claim or topic to find precedents for.")
     surf_p.add_argument("--scope", default=None, help="Optional scope tag filter.")
     surf_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON.")
+    surf_p.add_argument("--brief", action="store_true", help="Axiom-only (omit rejected_paths) — a quick scan.")
 
     # show
     show_p = subparsers.add_parser("show", help="Display details of a specific node.")
@@ -984,6 +1000,7 @@ def main() -> None:
     list_p.add_argument("--scope", help="Filter by scope tag.")
     list_p.add_argument("--state", help="Computed state filter: 'active' (default, live set), 'all', or an exact state.")
     list_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON (for agents).")
+    list_p.add_argument("--brief", action="store_true", help="Axiom-only (omit rejected_paths) — lighter over a big scope.")
 
     # open-questions
     oq_p = subparsers.add_parser("open-questions", help="List active open questions.")
@@ -1049,11 +1066,11 @@ def main() -> None:
         elif args.command in ("query", "query_decisions"):
             cmd_query(config, args.claim, depth=args.depth)
         elif args.command in ("surface", "surface_decisions"):
-            cmd_surface(config, args.query, scope=args.scope, as_json=args.as_json)
+            cmd_surface(config, args.query, scope=args.scope, as_json=args.as_json, brief=args.brief)
         elif args.command == "show":
             cmd_show(config, args.ident)
         elif args.command in ("list", "list_decisions"):
-            cmd_list(config, scope=args.scope, state_filter=args.state, as_json=args.as_json)
+            cmd_list(config, scope=args.scope, state_filter=args.state, as_json=args.as_json, brief=args.brief)
         elif args.command == "open-questions":
             cmd_open_questions(config, scope=args.scope)
         elif args.command == "import":
