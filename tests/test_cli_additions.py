@@ -119,7 +119,7 @@ def test_mcp_hint_opt_out(tmp_path, monkeypatch):
 
 def test_decision_loop_commands_cover_aliases():
     for verb in ("record", "record_decision", "surface", "surface_decisions",
-                 "query", "query_decisions"):
+                 "query", "query_decisions", "list", "list_decisions"):
         assert verb in cli._DECISION_LOOP_COMMANDS
     for non_verb in ("init", "status", "sync", "serve", "set-key"):
         assert non_verb not in cli._DECISION_LOOP_COMMANDS

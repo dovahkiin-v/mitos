@@ -117,7 +117,76 @@ def surface_decisions(query: str, scope: Optional[str] = None) -> str:
         except Exception:
             pass
 
+    # Recall here is SEMANTIC and capped at the top few matches — great for "is
+    # there precedent for this claim?", but it cannot prove you have seen
+    # everything. Point the agent at the exhaustive path so a completeness pass
+    # doesn't mistake the ranked top-k for the full set (closes the "am I seeing
+    # everything?" trust gap).
+    if results["active_decisions"]:
+        results["note"] = (
+            "Ranked top matches only (semantic, capped). For the COMPLETE set of "
+            "decisions in a scope — a completeness pass, not just the most relevant "
+            "few — call list_decisions(scope=...)."
+        )
+
     return json.dumps(results, indent=2)
+
+
+@mcp.tool()
+def list_decisions(scope: Optional[str] = None, state: str = "active") -> str:
+    """Enumerate the COMPLETE set of decisions (optionally scope-filtered) — no ranking, no top-k.
+
+    surface_decisions / query_decisions are SEMANTIC and capped at the top few
+    matches: ideal for "is there precedent for this claim?", but they cannot tell
+    you whether you have seen *everything*. When you need certainty — a completeness
+    pass over a scope, an audit, "show me every settled call in `auth`" — use this.
+    It returns every matching decision deterministically, straight from the graph,
+    so nothing hides below a relevance cliff. Needs no API key or Qdrant (pure graph
+    read), so it works even when semantic recall is degraded.
+
+    Args:
+        scope: Optional scope tag filter (e.g. 'auth'). Omit for the whole project.
+        state: 'active' (default) returns the live set (active + drifted); 'all'
+            returns every decision regardless of state (including superseded); any
+            other value is an exact computed-state match (e.g. 'superseded').
+
+    Returns:
+        A JSON string: {decisions, open_questions, total, scope, state}. Each
+        decision carries the same Letter-mode shape as surface_decisions (slug,
+        axiom, rejected_paths, scope) plus its computed `state` — but UNBOUNDED.
+    """
+    store, _embed, _vec = get_workspace_components()
+
+    decisions = [
+        {
+            "slug": n["slug"],
+            "axiom": n["core_axiom"],
+            "rejected_paths": n["rejected_paths"],
+            "scope": n["scope"],
+            "state": n["computed_state"],
+        }
+        for n in store.get_decisions(scope=scope, state=state)
+    ]
+
+    open_questions = []
+    try:
+        for oq in store.get_open_questions(scope=scope):
+            if oq["computed_state"] == "parked":
+                open_questions.append({
+                    "topic": oq["slug"],
+                    "questions_raised": oq["questions_raised"],
+                    "park_reason": oq.get("park_reason"),
+                })
+    except Exception:
+        pass
+
+    return json.dumps({
+        "decisions": decisions,
+        "open_questions": open_questions,
+        "total": len(decisions),
+        "scope": scope,
+        "state": state,
+    }, indent=2)
 
 
 @mcp.tool()
