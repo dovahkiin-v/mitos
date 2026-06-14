@@ -158,7 +158,7 @@ def cmd_init(config: MitosConfig) -> None:
             "All decisions you record, surface, and query are scoped to THIS project's decision graph and its own Qdrant collection — you will not see, and cannot contaminate, other projects' decisions.\n"
             "If the Mitos MCP server is wired into your agent, call these tools directly — best experience: structured args, no shell-quoting. If it is NOT wired, each maps to a CLI verb (and the CLI also accepts the long names as aliases, e.g. `mitos record_decision`):\n"
             "- `record_decision`  (CLI: `mitos record`) — the moment you commit to a foundational choice (a schema, a library, a pattern, a path you're abandoning), persist it WITH the alternatives you rejected and why, so future sessions inherit it instead of relitigating. Recording rich prose via the CLI? Use `--rejected-file -` / `--context-file -` to read from stdin and avoid shell-quoting.\n"
-            "- `surface_decisions` (CLI: `mitos surface`) — surface active precedents for a claim/scope BEFORE you decide, so you don't relitigate a settled call. This is the recall loop — use it first. Re-checking is cheap: a precedent already surfaced this session comes back lightweight (flagged `seen`), and `brief=True` (CLI `--brief`) gives an axiom-only scan.\n"
+            "- `surface_decisions` (CLI: `mitos surface`) — surface active precedents for a claim/scope BEFORE you decide, so you don't relitigate a settled call. This is the recall loop — use it first. Every hit carries its full `rejected_paths`; pass `brief=True` (CLI `--brief`) for an axiom-only scan.\n"
             "- `query_decisions`   (CLI: `mitos query`) — semantic or slug lookup when unsure whether a precedent exists.\n"
             "- `list_decisions`    (CLI: `mitos list`) — the EXHAUSTIVE recall path. surface/query are semantic and capped at the top few matches; this returns EVERY decision in a scope, deterministically, so a completeness pass or audit doesn't miss anything below the relevance cliff. Needs no key or Qdrant.\n\n"
             "## When to record — the capture trigger (YOUR judgement; Mitos stores, it does not decide what is worth storing)\n"
@@ -532,9 +532,8 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
 
     Mirrors ``mcp_server.surface_decisions`` so a CLI-only agent (or a human) can
     run the recall loop without the MCP wired. Semantic match first, scope
-    pre-filter fallback, plus any parked open questions in scope. (The MCP tool also
-    dedupes already-seen precedents within a session; the CLI is a fresh process per
-    call, so it cannot — use ``--brief`` for a lighter scan.)
+    pre-filter fallback, plus any parked open questions in scope. (Both surfaces
+    return full ``rejected_paths``; pass ``--brief`` for a lighter axiom-only scan.)
 
     Args:
         config: The active workspace configuration.

@@ -17,12 +17,17 @@ from mitos.vector_store import QdrantVectorStore
 # Create FastMCP server instance
 mcp = FastMCP("Mitos")
 
-# Slugs already returned to the agent this session. `mitos serve` is one persistent
-# process per agent session, so this set lives exactly as long as the session — it
-# powers surface's dedup: a decision seen earlier comes back lightweight (no repeated
-# rejected_paths wall) and flagged `seen`, so the recall loop doesn't re-pay context
-# for the same precedent. Reset between tests via the conftest fixture.
-_SEEN_SLUGS: set = set()
+# No cross-call "seen" dedup state — deliberately. An earlier design cached
+# already-surfaced slugs in a process-global set and trimmed `rejected_paths` (the
+# relitigation-stopping field) from re-hits, flagging them `seen`. But `mitos serve`
+# outlives a single agent session — the orchestrator `/clear`s and respawns the agent
+# against the SAME long-running server — so the set leaked across session resets: a
+# brand-new fresh-eyes session was handed `seen: true` with `rejected_paths` withheld,
+# exactly the field it needed, with no way to tell it was being short-changed. No
+# connection/session key is fully correct either (a bare `/clear` keeps the connection
+# while resetting the agent's context), so the only correct shape is to hold no
+# cross-call state at all. A caller who wants a lightweight scan passes `brief=True` —
+# explicit, per-call, stateless. (V5 owns the rebuilt MCP server; carry this forward.)
 
 
 def _attach_modifiers(payload: Dict[str, Any], node: Dict[str, Any], store: GraphStore) -> Dict[str, Any]:
@@ -32,8 +37,8 @@ def _attach_modifiers(payload: Dict[str, Any], node: Dict[str, Any], store: Grap
     (only the non-empty ones) so a reader knows a later decision has moved on from
     this axiom and which one to chase — the fix for amended/narrowed nodes that stay
     ``active`` with their original (now-stale) mechanism text. Always applied,
-    independent of ``brief``/``seen``: the staleness flag matters MOST on the
-    lightweight re-hit, where ``rejected_paths`` was trimmed but the trap remains.
+    independent of ``brief``: the staleness flag matters even on an axiom-only scan,
+    where ``rejected_paths`` is trimmed but the trap remains.
     Fail-silent — a modifier lookup error never breaks the recall response.
 
     Args:
@@ -52,40 +57,33 @@ def _attach_modifiers(payload: Dict[str, Any], node: Dict[str, Any], store: Grap
     return payload
 
 
-def _decision_payload(node: Dict[str, Any], score: float, *, brief: bool, dedup: bool,
+def _decision_payload(node: Dict[str, Any], score: float, *, brief: bool,
                       store: Optional[GraphStore] = None) -> Dict[str, Any]:
-    """Shapes a Letter-mode decision payload, applying brevity + session dedup.
+    """Shapes a Letter-mode decision payload.
 
-    ``rejected_paths`` — the heavy, high-value field — is included on first sight so
-    the precedent's reasoning lands. It is dropped when ``brief`` (the caller wants a
-    quick scan) or, under ``dedup``, when this slug was already surfaced this session
-    (a re-hit is flagged ``seen: True`` instead of re-paying the wall).
+    ``rejected_paths`` — the heavy, high-value field whose reasoning stops
+    relitigation — is always included unless ``brief`` (the caller explicitly asked
+    for an axiom-only scan). There is deliberately no cross-call "seen" trimming; see
+    the module-level note on why that state was removed.
 
     Args:
         node: A store node dict (``slug``, ``core_axiom``, ``rejected_paths``, ``scope``).
         score: The relevance score to attach.
         brief: Drop ``rejected_paths`` for an axiom-only scan.
-        dedup: Track/skip already-seen slugs for this session.
         store: When given, reverse-relation modifier keys are stamped on (always,
-            even for brief/seen payloads).
+            even for brief payloads).
 
     Returns:
         A Letter-mode decision dict.
     """
-    slug = node["slug"]
-    seen = dedup and slug in _SEEN_SLUGS
     payload: Dict[str, Any] = {
-        "slug": slug,
+        "slug": node["slug"],
         "axiom": node["core_axiom"],
         "scope": node["scope"],
         "score": score,
     }
-    if not (brief or seen):
+    if not brief:
         payload["rejected_paths"] = node["rejected_paths"]
-    if seen:
-        payload["seen"] = True
-    if dedup:
-        _SEEN_SLUGS.add(slug)
     if store is not None:
         _attach_modifiers(payload, node, store)
     return payload
@@ -116,10 +114,7 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
     query_decisions to look up a SPECIFIC slug or claim, and list_decisions for the
     EXHAUSTIVE set in a scope. Each returned precedent carries its `rejected_paths`
     (why alternatives were ruled out) — the field that actually stops relitigation.
-
-    Within a session, a precedent you've already been shown comes back lightweight
-    (flagged `seen`, without its `rejected_paths` again), so a repeated scan doesn't
-    re-pay the same context.
+    Every hit carries its full `rejected_paths` unless you pass `brief=True`.
 
     Args:
         query: The semantic claim or topic string (e.g. 'cache strategy').
@@ -131,11 +126,11 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         A JSON string with `active_decisions` (ranked, Letter-mode), plus
         `open_questions` ONLY when a scope was given (absent = not scanned, [] = none
         parked in that scope). Each decision: slug, axiom, scope, score, and
-        rejected_paths unless brief / already seen this session. A precedent a later
-        decision has moved on from also carries the modifying slugs under
+        rejected_paths unless brief. A precedent a later decision has moved on from
+        also carries the modifying slugs under
         `superseded_by`/`amended_by`/`narrowed_by`/`corrected_by` (always present when
-        they apply, even on a brief/seen re-hit) — chase those before treating its
-        axiom as the current mechanism.
+        they apply, even on a brief scan) — chase those before treating its axiom as
+        the current mechanism.
     """
     store, embed_provider, vector_store = get_workspace_components()
 
@@ -161,7 +156,7 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
                     continue
 
                 results["active_decisions"].append(
-                    _decision_payload(node, m["score"], brief=brief, dedup=True, store=store)
+                    _decision_payload(node, m["score"], brief=brief, store=store)
                 )
         except Exception as e:
             # Degrade to exact/scope filtering only
@@ -173,7 +168,7 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
             active_decs = store.get_active_decisions(scope=scope)
             for d in active_decs[:5]:
                 results["active_decisions"].append(
-                    _decision_payload(d, 1.0, brief=brief, dedup=True, store=store)
+                    _decision_payload(d, 1.0, brief=brief, store=store)
                 )
         except Exception:
             pass

@@ -19,13 +19,6 @@ def hermetic_mitos_env(monkeypatch, tmp_path):
     monkeypatch.setenv("MITOS_NO_MCP_HINT", "1")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg_config"))
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg_cache"))
-    # The MCP server's session-dedup set lives for the process lifetime; reset it
-    # per test so surface's "seen" tracking never leaks between tests.
-    try:
-        import mitos.mcp_server as _mcp
-        _mcp._SEEN_SLUGS.clear()
-    except Exception:
-        pass
 
 
 @pytest.fixture(scope="session", autouse=True)
