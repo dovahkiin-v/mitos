@@ -13,6 +13,7 @@ from mitos.config import MitosConfig
 from mitos.store import GraphStore
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.vector_store import QdrantVectorStore
+from mitos.recall import assess_surface_recall
 
 # Create FastMCP server instance
 mcp = FastMCP("Mitos")
@@ -130,11 +131,17 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         also carries the modifying slugs under
         `superseded_by`/`amended_by`/`narrowed_by`/`corrected_by` (always present when
         they apply, even on a brief scan) — chase those before treating its axiom as
-        the current mechanism.
+        the current mechanism. Also includes `confidence` (`strong`/`weak`/`none` when
+        semantic ranking ran) and a `note`: `weak` or `none` means no settled precedent
+        on this claim — treat it as no-precedent and decide, or call
+        list_decisions(scope=...) for a certain check (don't read weak neighbours as a
+        settled decision).
     """
     store, embed_provider, vector_store = get_workspace_components()
 
     results: Dict[str, Any] = {"active_decisions": []}
+    semantic_ran = False
+    top_score: Optional[float] = None
 
     # 1. Semantic search if embeddings and vector store are active
     if embed_provider and vector_store:
@@ -142,6 +149,7 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
             # Generate query vector
             q_vector = embed_provider.get_embedding(query, is_query=True)
             matches = vector_store.query(q_vector, limit=5, filter_scope=scope)
+            semantic_ran = True
 
             for m in matches:
                 slug = m["slug"]
@@ -158,12 +166,16 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
                 results["active_decisions"].append(
                     _decision_payload(node, m["score"], brief=brief, store=store)
                 )
+                if top_score is None or m["score"] > top_score:
+                    top_score = m["score"]
         except Exception as e:
             # Degrade to exact/scope filtering only
-            pass
+            semantic_ran = False
 
-    # 2. Scope pre-filtering fallback if semantic search is down
-    if not results["active_decisions"] and scope:
+    # 2. Scope pre-filtering fallback — ONLY when semantic recall is down (degraded).
+    #    When semantic ran and simply found nothing, do NOT dump an unranked scope
+    #    listing dressed as matches — that's the false-precedent ambiguity P5 closes.
+    if not semantic_ran and not results["active_decisions"] and scope:
         try:
             active_decs = store.get_active_decisions(scope=scope)
             for d in active_decs[:5]:
@@ -189,17 +201,27 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
             pass
         results["open_questions"] = open_questions
 
-    # Recall here is SEMANTIC and capped at the top few matches — great for "is
-    # there precedent for this claim?", but it cannot prove you have seen
-    # everything. Point the agent at the exhaustive path so a completeness pass
-    # doesn't mistake the ranked top-k for the full set (closes the "am I seeing
-    # everything?" trust gap).
-    if results["active_decisions"]:
-        results["note"] = (
-            "Ranked top matches only (semantic, capped). For the COMPLETE set of "
-            "decisions in a scope — a completeness pass, not just the most relevant "
-            "few — call list_decisions(scope=...)."
-        )
+    # Confidence signal — let the agent tell a settled precedent from loose neighbours
+    # or genuine absence, instead of a boilerplate note that read the same every time
+    # (AX P5). Compute the scope's active-decision count only when it disambiguates an
+    # empty result ("tag unused" vs "populated but nothing matched").
+    scope_decision_count: Optional[int] = None
+    if scope and not results["active_decisions"]:
+        try:
+            scope_decision_count = len(store.get_active_decisions(scope=scope))
+        except Exception:
+            scope_decision_count = None
+
+    confidence, note = assess_surface_recall(
+        semantic_ran=semantic_ran,
+        top_score=top_score,
+        result_count=len(results["active_decisions"]),
+        scope=scope,
+        scope_decision_count=scope_decision_count,
+    )
+    if confidence is not None:
+        results["confidence"] = confidence
+    results["note"] = note
 
     return json.dumps(results, indent=2)
 
