@@ -174,6 +174,18 @@ class GraphStoreProtocol(Protocol):
         """
         ...
 
+    def get_modifiers_map(self, node_ids: List[str]) -> Dict[str, Dict[str, List[str]]]:
+        """Maps each node to the slugs of later decisions that modify it.
+
+        Args:
+            node_ids: The node IDs to look up modifiers for.
+
+        Returns:
+            A mapping of node_id -> {reverse_relation_key: [modifier_slug, ...]},
+            containing only nodes that actually have modifiers.
+        """
+        ...
+
     def add_pending_embedding(self, node_id: str, embedding_text: str) -> None:
         """Adds a node to the pending outbox queue.
 
