@@ -462,6 +462,7 @@ def cmd_record(
     derives_from: Optional[str] = None,
     cites: Optional[str] = None,
     slug: Optional[str] = None,
+    acknowledge_neighbors: bool = False,
 ) -> None:
     """Records a decision directly to the write-buffer and graph (thin wrapper)."""
     manager = MitosSyncManager(config)
@@ -480,10 +481,25 @@ def cmd_record(
         derives_from=derives_from,
         cites=cites,
         slug=slug,
+        acknowledge_neighbors=acknowledge_neighbors,
     )
     if "error" in result:
         print(f"Record failed [{result['code']}]: {result['error']}", file=sys.stderr)
         sys.exit(1)
+
+    if result.get("status") == "needs_review":
+        # P4 pause — nothing was written. Show the neighbours and how to proceed.
+        print(f"⚠ Paused — '{result['slug']}' looks like an existing decision. Nothing written.",
+              file=sys.stderr)
+        for n in result.get("neighbors", []):
+            score = n.get("score")
+            score_s = f"{score:.2f}" if isinstance(score, (int, float)) else "?"
+            tension = "  [possible tension]" if n.get("possible_tension") else ""
+            print(f"  ↔ {n['slug']}  ({score_s}){tension}  {(n.get('axiom') or '')[:60]}",
+                  file=sys.stderr)
+        print("  → Re-record with --supersedes/--amends/--contradicts/--cites <slug> to link "
+              "it, or --acknowledge-neighbors to record as independent.", file=sys.stderr)
+        sys.exit(2)
 
     print(f"Recorded decision '{result['slug']}' ({result['status']}) ✓")
     print(f"  ID:        {result['id']}")
@@ -1098,6 +1114,8 @@ def main() -> None:
     rec_p.add_argument("--derives-from", default=None, dest="derives_from", help="Exact slug of a decision this one derives from.")
     rec_p.add_argument("--cites", default=None, help="Exact slug of a decision this one cites.")
     rec_p.add_argument("--slug", default=None, help="Optional explicit slug; derived from the axiom if omitted.")
+    rec_p.add_argument("--acknowledge-neighbors", action="store_true", dest="acknowledge_neighbors",
+                       help="Record past the near-duplicate review (the decision is genuinely independent).")
 
     # serve
     subparsers.add_parser("serve", help="Launch Mitos FastMCP server on stdio.")
@@ -1161,6 +1179,7 @@ def main() -> None:
                 derives_from=args.derives_from,
                 cites=args.cites,
                 slug=args.slug,
+                acknowledge_neighbors=args.acknowledge_neighbors,
             )
         elif args.command == "serve":
             cmd_serve()

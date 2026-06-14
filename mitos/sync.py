@@ -196,6 +196,31 @@ def _contains_structural_token(text: str) -> bool:
 _SLUG_MAX_LEN = 64
 _SLUG_MIN_LEN = 32  # don't trim a word boundary back past here — hard-cap instead
 
+# A new decision at/above this document-document similarity to an existing one the
+# author did NOT reference is paused for review (AX P4): the neighbour was invisible
+# until the post-commit `related` echo, one step too late to point an
+# amends/supersedes/contradicts at it (you can't relink after commit — re-record is a
+# no-op). Same score scale as the `related` echo. Tune here.
+_NEIGHBOR_REVIEW_THRESHOLD = 0.85
+
+# Cheap polarity cues for the `possible_tension` hint — a high-similarity pair where
+# one axiom negates and the other doesn't ("never a per-persona field" vs "is a
+# per-persona field") is a likely contradiction, not a duplicate. Heuristic only: it
+# flags a neighbour for the author's eye, never changes the pause decision.
+_NEGATION_CUES = (" not ", " never ", " no ", "n't", " without ", " cannot ",
+                  " neither ", " nor ", " none ", " non-")
+
+
+def _has_negation(text: str) -> bool:
+    """Reports whether ``text`` carries a surface negation cue (whitespace-padded scan)."""
+    padded = f" {text.lower()} "
+    return any(cue in padded for cue in _NEGATION_CUES)
+
+
+def _polarity_mismatch(a: str, b: str) -> bool:
+    """True when exactly one of two axioms negates — a possible-tension signal."""
+    return _has_negation(a) != _has_negation(b)
+
 
 def _slugify(text: str) -> str:
     """Derives a deterministic, lowercase-hyphenated slug from free text.
@@ -783,6 +808,51 @@ class MitosSyncManager:
             return []
         return out
 
+    def _review_neighbors(self, entry: ParsedEntry,
+                          declared_targets: set) -> List[Dict[str, Any]]:
+        """Pre-commit: existing live decisions too similar to ``entry`` to ignore (P4).
+
+        Embeds the about-to-be-recorded axiom (same document vector and score scale as
+        the post-commit ``related`` echo), finds its nearest live neighbours, and keeps
+        those at/above ``_NEIGHBOR_REVIEW_THRESHOLD`` that the author did NOT already
+        reference via a relation. Surfacing these BEFORE the write is the whole point:
+        after the commit the author can no longer point an amends/supersedes at them (a
+        re-record is a no-op). Fully fail-silent and offline-safe — no embeddings/vector
+        store, or any error, means an empty list (never block a write we can't check).
+
+        Args:
+            entry: The parsed entry about to be committed.
+            declared_targets: Lower-cased slugs the entry already links to (its declared
+                supersedes/amends/… targets), excluded so a linked neighbour is not re-flagged.
+
+        Returns:
+            A list of ``{slug, axiom, score, possible_tension}`` for unreferenced
+            high-similarity neighbours, most similar first; empty when there is nothing
+            to flag or the check could not run.
+        """
+        if not self.embed_provider or not self.vector_store:
+            return []
+        try:
+            text = (entry.core_axiom if entry.kind == "decision"
+                    else f"{entry.slug}: " + " ".join(entry.questions_raised))
+            vector = self.embed_provider.get_embedding(text, is_query=False)
+        except Exception:
+            return []
+        flagged: List[Dict[str, Any]] = []
+        for n in self._adjacent_decisions(vector, exclude_slug=entry.slug, limit=5):
+            score = n.get("score")
+            if score is None or score < _NEIGHBOR_REVIEW_THRESHOLD:
+                continue
+            if n["slug"].lower() in declared_targets:
+                continue
+            flagged.append({
+                "slug": n["slug"],
+                "axiom": n["axiom"],
+                "score": score,
+                "possible_tension": _polarity_mismatch(entry.core_axiom, n["axiom"]),
+            })
+        return flagged
+
     def _node_state(self, node_id: str) -> str:
         """Returns the computed state of a node ('active'/'superseded'/'drifted')."""
         conn = self.store._get_connection()
@@ -818,6 +888,7 @@ class MitosSyncManager:
         cites: Optional[str] = None,
         slug: Optional[str] = None,
         actor: str = "agent",
+        acknowledge_neighbors: bool = False,
     ) -> Dict[str, Any]:
         """Records a single decision into the buffer and graph, non-interactively.
 
@@ -849,12 +920,18 @@ class MitosSyncManager:
             cites: Optional exact slug of a decision this one cites.
             slug: Optional explicit slug; derived deterministically from axiom if None.
             actor: Provenance, stored in ``confirmed_by``.
+            acknowledge_neighbors: Skip the pre-commit near-duplicate review and record
+                even when a highly-similar unreferenced decision exists (P4). Pass True
+                to commit a genuinely independent decision past the pause.
 
         Returns:
             A success dict ``{slug, id, state, embedding, status}`` (status
             "created"|"exists"), plus an optional ``related`` list of the nearest
             existing live decisions (a write-time adjacency hint on the "created"
-            path), or a structured ``{error, code}`` (see spec §5).
+            path); OR, when a highly-similar unreferenced decision exists and
+            ``acknowledge_neighbors`` is False, a ``{status: "needs_review", code:
+            "similar_decision_exists", neighbors, message}`` pause that wrote NOTHING;
+            OR a structured ``{error, code}`` failure (see spec §5).
         """
         # === Phase A — validate everything in memory (no writes) ===
 
@@ -976,6 +1053,33 @@ class MitosSyncManager:
         coll_id, _coll_node = self._exact_slug_node(entry.slug)
         if coll_id and coll_id != node_id:
             return _record_error("slug_collision", slug=entry.slug)
+
+        # Near-duplicate / possible-tension review (P4) — still Phase A, so a pause
+        # writes NOTHING (buffer byte-for-byte unchanged). Surfacing the neighbour now,
+        # not in the post-commit `related` echo, is the point: after commit the author
+        # can no longer point a relation at it (a re-record is a no-op). Offline-safe
+        # (no embeddings → no pause) and bypassable with acknowledge_neighbors=True.
+        if not acknowledge_neighbors:
+            declared_targets = {
+                t.lower() for t in
+                (([supersedes] if supersedes else []) + list(extra_relations.values()))
+            }
+            neighbors = self._review_neighbors(entry, declared_targets)
+            if neighbors:
+                return {
+                    "status": "needs_review",
+                    "code": "similar_decision_exists",
+                    "slug": entry.slug,
+                    "neighbors": neighbors,
+                    "message": (
+                        f"Paused: '{entry.slug}' is ≥{_NEIGHBOR_REVIEW_THRESHOLD:.2f} "
+                        f"similar to {len(neighbors)} existing decision(s) you did not "
+                        "reference. If it amends/supersedes/contradicts/cites one, "
+                        "re-record with that relation pointing at the neighbour's slug; "
+                        "if it is genuinely independent, re-record with "
+                        "acknowledge_neighbors=True. Nothing was written."
+                    ),
+                }
 
         # === Phase B — the only writes, fully serialised under one lock ===
         try:
