@@ -14,10 +14,32 @@ from google import genai
 from mitos import __version__
 from mitos.config import MitosConfig, default_collection_name, global_env_path
 from mitos.errors import MitosError, ParseError, ValidationError
-from mitos.store import GraphStore
+from mitos.store import GraphStore, MODIFIER_EDGE_KEYS
 from mitos.sync import MitosSyncManager, run_ambient_capture
 from mitos.renderer import MitosRenderer
 from mitos.importer import MitosProseImporter
+
+
+def _modifier_marker(payload: Dict[str, Any]) -> str:
+    """Builds a one-line staleness marker from a payload's modifier keys.
+
+    Reads the reverse-relation keys (``superseded_by``/``amended_by``/… set by
+    :meth:`GraphStore.get_modifiers`) off an already-shaped payload and renders a
+    compact ``⚠ amended by: <slug>`` marker so a human scanning text output sees
+    that a still-live axiom has been moved on from. Empty when the node is unmodified.
+
+    Args:
+        payload: A decision payload that may carry reverse-relation modifier keys.
+
+    Returns:
+        A ``⚠ …`` marker string, or ``""`` when there are no modifiers.
+    """
+    parts = []
+    for key in MODIFIER_EDGE_KEYS.values():
+        slugs = payload.get(key)
+        if slugs:
+            parts.append(f"{key.replace('_', ' ')}: {', '.join(slugs)}")
+    return ("⚠ " + "; ".join(parts)) if parts else ""
 
 
 def load_format_spec() -> str:
@@ -245,6 +267,10 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter") -> No
             print(f"   Decided: {m['embedding_text']}")
             print(f"   Scope:   {', '.join(m['scope'])}")
             print(f"   State:   {m['state']}")
+            node = manager.store.get_node_by_slug(m["slug"])
+            marker = _modifier_marker(manager.store.get_modifiers(node["id"])) if node else ""
+            if marker:
+                print(f"   {marker}")
             print()
     except Exception as e:
         print(f"Query failed: {str(e)}")
@@ -269,9 +295,14 @@ def cmd_show(config: MitosConfig, ident: str) -> None:
     state = states.get(node["id"], "active")
     conn.close()
 
+    modifiers = store.get_modifiers(node["id"])
+
     print(f"\n[{node['kind'].upper()}] {node['slug']}")
     print(f"ID:           {node['id']}")
     print(f"State:        {state}")
+    for key in MODIFIER_EDGE_KEYS.values():
+        if modifiers.get(key):
+            print(f"{(key.replace('_', ' ').capitalize() + ':'):14}{', '.join(modifiers[key])}")
     if node.get("date"):
         print(f"Date:         {node['date']}")
     if node.get("title"):
@@ -322,6 +353,7 @@ def cmd_list(config: MitosConfig, scope: Optional[str] = None,
     # decisions into what an agent reads as a completeness pass.
     effective_state = state_filter or "active"
     decisions = store.get_decisions(scope=scope, state=effective_state)
+    modifiers = store.get_modifiers_map([d["id"] for d in decisions])
     parked = [oq for oq in store.get_open_questions(scope=scope)
               if oq["computed_state"] == "parked"]
 
@@ -330,6 +362,7 @@ def cmd_list(config: MitosConfig, scope: Optional[str] = None,
                 "scope": d["scope"], "state": d["computed_state"]}
         if not brief:
             item["rejected_paths"] = d["rejected_paths"]
+        item.update(modifiers.get(d["id"], {}))
         return item
 
     if as_json:
@@ -364,6 +397,9 @@ def cmd_list(config: MitosConfig, scope: Optional[str] = None,
             axiom_snip = axiom_snip[:63] + "..."
         if axiom_snip:
             print(f"              {axiom_snip}")
+        marker = _modifier_marker(modifiers.get(d["id"], {}))
+        if marker:
+            print(f"              {marker}")
     if parked:
         print(f"\nParked open questions ({len(parked)}):")
         for oq in parked:
@@ -516,6 +552,7 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
              "scope": node["scope"], "score": score}
         if not brief:
             d["rejected_paths"] = node["rejected_paths"]
+        d.update(store.get_modifiers(node["id"]))
         return d
 
     results: Dict[str, Any] = {"active_decisions": []}
@@ -578,6 +615,9 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     for i, d in enumerate(ad, start=1):
         print(f"{i}. {d['slug']}  (score {d['score']:.3f})")
         print(f"   Decided:  {d['axiom']}")
+        marker = _modifier_marker(d)
+        if marker:
+            print(f"   {marker}")
         if "rejected_paths" in d:
             print(f"   Rejected: {d['rejected_paths']}")
         if d["scope"]:

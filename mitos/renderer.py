@@ -9,8 +9,20 @@ import tempfile
 from typing import List, Dict, Any, Optional
 from mitos.protocols import GraphStoreProtocol
 
-def render_node_markdown(node: Dict[str, Any]) -> str:
-    """Renders a single active decision node as markdown."""
+def render_node_markdown(node: Dict[str, Any],
+                         modifiers: Optional[Dict[str, List[str]]] = None) -> str:
+    """Renders a single active decision node as markdown.
+
+    Args:
+        node: The decision node dict.
+        modifiers: Optional reverse-relation modifiers (from
+            ``GraphStore.get_modifiers``). A live-but-amended/narrowed decision is
+            rendered with a ``⚠ Amended by`` line so this generated context file
+            can't present a moved-on axiom as the final word.
+
+    Returns:
+        The node's markdown block.
+    """
     slug = node.get("slug", "")
     axiom = node.get("core_axiom", "")
     scopes = ", ".join(node.get("scope", []))
@@ -21,6 +33,12 @@ def render_node_markdown(node: Dict[str, Any]) -> str:
         f"## {slug}",
         f"- **Decided:** {axiom}"
     ]
+    for key, label in (("amended_by", "Amended by"), ("narrowed_by", "Narrowed by"),
+                       ("corrected_by", "Corrected by"), ("superseded_by", "Superseded by")):
+        targets = (modifiers or {}).get(key)
+        if targets:
+            lines.append(f"- **⚠ {label}:** {', '.join(targets)} "
+                         f"(chase before treating this axiom as current)")
     if scopes:
         lines.append(f"- **Scope:** {scopes}")
     if mechs:
@@ -29,7 +47,7 @@ def render_node_markdown(node: Dict[str, Any]) -> str:
         # Format rejected paths nicely (possibly multiline)
         rejected_indented = "\n  ".join(rejected.splitlines())
         lines.append(f"- **Rejected:**\n  {rejected_indented}")
-    
+
     return "\n".join(lines) + "\n"
 
 
@@ -75,7 +93,10 @@ class MitosRenderer:
         """
         # Fetch active decisions directly from database
         active_decisions = store.get_active_decisions()
-        
+        # Reverse-relation modifiers, so a live-but-amended axiom carries its
+        # "chase the later decision" marker instead of reading as the final word.
+        modifiers = store.get_modifiers_map([d["id"] for d in active_decisions])
+
         rendered_paths = []
 
         # 1. Generate global live_axioms.md
@@ -88,7 +109,9 @@ class MitosRenderer:
         
         global_content = global_header
         if active_decisions:
-            global_content += "\n".join(render_node_markdown(d) for d in active_decisions)
+            global_content += "\n".join(
+                render_node_markdown(d, modifiers.get(d["id"])) for d in active_decisions
+            )
         else:
             global_content += "*No active decisions committed in this workspace.*\n"
             
@@ -125,7 +148,9 @@ class MitosRenderer:
             scope_decisions = scope_groups.get(s, [])
             scope_content = scope_header
             if scope_decisions:
-                scope_content += "\n".join(render_node_markdown(d) for d in scope_decisions)
+                scope_content += "\n".join(
+                    render_node_markdown(d, modifiers.get(d["id"])) for d in scope_decisions
+                )
             else:
                 scope_content += "*No active decisions committed in this scope.*\n"
                 

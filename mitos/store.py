@@ -17,6 +17,21 @@ from mitos.parser import ParsedEntry
 # surfaceable, so enumeration must use the same notion of "active".
 LIVE_STATES: Tuple[str, ...] = ("active", "drifted")
 
+# Edge types that mean a LATER decision has modified an earlier one. Edges are
+# stored from the newer node TO the one it changes, so the INCOMING set of these
+# on a node is exactly "who moved on from me". Mapping is edge type -> the
+# reverse-relation key surfaced on a retrieved payload. Surfacing these closes the
+# "amended axioms read as live" trap: an `amends`/`narrows` leaves the parent
+# `active` with its original axiom text, so without this a reader cites a
+# superseded mechanism — worst case an architecture relocation — with full
+# confidence. `corrects` is included for completeness (it retires like supersedes).
+MODIFIER_EDGE_KEYS: Dict[str, str] = {
+    "supersedes": "superseded_by",
+    "amends": "amended_by",
+    "narrows": "narrowed_by",
+    "corrects": "corrected_by",
+}
+
 
 def state_matches(computed_state: str, state_filter: Optional[str]) -> bool:
     """Reports whether a node's computed state passes the requested state filter.
@@ -696,6 +711,64 @@ class GraphStore:
             return [dict(row) for row in cursor.fetchall()]
         finally:
             conn.close()
+
+    def get_modifiers_map(self, node_ids: List[str]) -> Dict[str, Dict[str, List[str]]]:
+        """Maps each node to the slugs of later decisions that modify it.
+
+        For every node in ``node_ids`` that is the target of one or more
+        ``supersedes``/``amends``/``narrows``/``corrects`` edges, returns the
+        modifying decisions grouped by reverse-relation key (``superseded_by``,
+        ``amended_by``, ``narrowed_by``, ``corrected_by``). A reader stamps these
+        onto a retrieved payload so a still-``active`` axiom can't masquerade as the
+        live mechanism when a later decision has moved on from it.
+
+        Args:
+            node_ids: The node IDs to look up modifiers for.
+
+        Returns:
+            A mapping of node_id -> {reverse_key: [modifier_slug, ...]}. Only nodes
+            that actually have modifiers appear, and each carries only the
+            reverse-relation keys that are non-empty (an unmodified node is absent).
+        """
+        if not node_ids:
+            return {}
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            id_placeholders = ",".join("?" for _ in node_ids)
+            type_placeholders = ",".join("?" for _ in MODIFIER_EDGE_KEYS)
+            cursor.execute(
+                f"""
+                SELECT e.to_id AS to_id, e.type AS type, n.slug AS slug
+                FROM edges e
+                JOIN nodes n ON n.id = e.from_id
+                WHERE e.to_id IN ({id_placeholders})
+                  AND e.type IN ({type_placeholders})
+                ORDER BY n.slug
+                """,
+                (*node_ids, *MODIFIER_EDGE_KEYS.keys()),
+            )
+            result: Dict[str, Dict[str, List[str]]] = {}
+            for row in cursor.fetchall():
+                key = MODIFIER_EDGE_KEYS[row["type"]]
+                result.setdefault(row["to_id"], {}).setdefault(key, []).append(row["slug"])
+            return result
+        finally:
+            conn.close()
+
+    def get_modifiers(self, node_id: str) -> Dict[str, List[str]]:
+        """Returns the reverse-relation modifiers for a single node.
+
+        Single-node convenience over :meth:`get_modifiers_map`.
+
+        Args:
+            node_id: The node ID to look up modifiers for.
+
+        Returns:
+            A mapping of reverse-relation key to modifier slugs, or ``{}`` when the
+            node is unmodified.
+        """
+        return self.get_modifiers_map([node_id]).get(node_id, {})
 
     def add_pending_embedding(self, node_id: str, embedding_text: str) -> None:
         """Adds or updates a node to the pending embeddings queue (C2/F2)."""

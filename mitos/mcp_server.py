@@ -25,7 +25,35 @@ mcp = FastMCP("Mitos")
 _SEEN_SLUGS: set = set()
 
 
-def _decision_payload(node: Dict[str, Any], score: float, *, brief: bool, dedup: bool) -> Dict[str, Any]:
+def _attach_modifiers(payload: Dict[str, Any], node: Dict[str, Any], store: GraphStore) -> Dict[str, Any]:
+    """Stamps reverse-relation modifier keys onto a decision payload, in place.
+
+    Adds ``superseded_by`` / ``amended_by`` / ``narrowed_by`` / ``corrected_by``
+    (only the non-empty ones) so a reader knows a later decision has moved on from
+    this axiom and which one to chase — the fix for amended/narrowed nodes that stay
+    ``active`` with their original (now-stale) mechanism text. Always applied,
+    independent of ``brief``/``seen``: the staleness flag matters MOST on the
+    lightweight re-hit, where ``rejected_paths`` was trimmed but the trap remains.
+    Fail-silent — a modifier lookup error never breaks the recall response.
+
+    Args:
+        payload: The decision payload to augment.
+        node: The store node dict (must carry ``id``).
+        store: The graph store to read reverse edges from.
+
+    Returns:
+        The same payload dict, with any modifier keys added.
+    """
+    try:
+        for key, slugs in store.get_modifiers(node["id"]).items():
+            payload[key] = slugs
+    except Exception:
+        pass
+    return payload
+
+
+def _decision_payload(node: Dict[str, Any], score: float, *, brief: bool, dedup: bool,
+                      store: Optional[GraphStore] = None) -> Dict[str, Any]:
     """Shapes a Letter-mode decision payload, applying brevity + session dedup.
 
     ``rejected_paths`` — the heavy, high-value field — is included on first sight so
@@ -38,6 +66,8 @@ def _decision_payload(node: Dict[str, Any], score: float, *, brief: bool, dedup:
         score: The relevance score to attach.
         brief: Drop ``rejected_paths`` for an axiom-only scan.
         dedup: Track/skip already-seen slugs for this session.
+        store: When given, reverse-relation modifier keys are stamped on (always,
+            even for brief/seen payloads).
 
     Returns:
         A Letter-mode decision dict.
@@ -56,6 +86,8 @@ def _decision_payload(node: Dict[str, Any], score: float, *, brief: bool, dedup:
         payload["seen"] = True
     if dedup:
         _SEEN_SLUGS.add(slug)
+    if store is not None:
+        _attach_modifiers(payload, node, store)
     return payload
 
 def get_workspace_components() -> Tuple[GraphStore, Optional[GeminiEmbeddingProvider], Optional[QdrantVectorStore]]:
@@ -99,7 +131,11 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         A JSON string with `active_decisions` (ranked, Letter-mode), plus
         `open_questions` ONLY when a scope was given (absent = not scanned, [] = none
         parked in that scope). Each decision: slug, axiom, scope, score, and
-        rejected_paths unless brief / already seen this session.
+        rejected_paths unless brief / already seen this session. A precedent a later
+        decision has moved on from also carries the modifying slugs under
+        `superseded_by`/`amended_by`/`narrowed_by`/`corrected_by` (always present when
+        they apply, even on a brief/seen re-hit) — chase those before treating its
+        axiom as the current mechanism.
     """
     store, embed_provider, vector_store = get_workspace_components()
 
@@ -125,7 +161,7 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
                     continue
 
                 results["active_decisions"].append(
-                    _decision_payload(node, m["score"], brief=brief, dedup=True)
+                    _decision_payload(node, m["score"], brief=brief, dedup=True, store=store)
                 )
         except Exception as e:
             # Degrade to exact/scope filtering only
@@ -137,7 +173,7 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
             active_decs = store.get_active_decisions(scope=scope)
             for d in active_decs[:5]:
                 results["active_decisions"].append(
-                    _decision_payload(d, 1.0, brief=brief, dedup=True)
+                    _decision_payload(d, 1.0, brief=brief, dedup=True, store=store)
                 )
         except Exception:
             pass
@@ -196,12 +232,16 @@ def list_decisions(scope: Optional[str] = None, state: str = "active", brief: bo
     Returns:
         A JSON string: {decisions, open_questions, total, scope, state}. Each
         decision carries the same Letter-mode shape as surface_decisions (slug,
-        axiom, rejected_paths, scope) plus its computed `state` — but UNBOUNDED.
+        axiom, rejected_paths, scope) plus its computed `state`, and — when a later
+        decision modifies it — `superseded_by`/`amended_by`/`narrowed_by`/
+        `corrected_by` modifier slugs. UNBOUNDED.
     """
     store, _embed, _vec = get_workspace_components()
 
+    nodes = store.get_decisions(scope=scope, state=state)
+    modifiers = store.get_modifiers_map([n["id"] for n in nodes])
     decisions = []
-    for n in store.get_decisions(scope=scope, state=state):
+    for n in nodes:
         d = {
             "slug": n["slug"],
             "axiom": n["core_axiom"],
@@ -210,6 +250,7 @@ def list_decisions(scope: Optional[str] = None, state: str = "active", brief: bo
         }
         if not brief:
             d["rejected_paths"] = n["rejected_paths"]
+        d.update(modifiers.get(n["id"], {}))
         decisions.append(d)
 
     open_questions = []
@@ -251,6 +292,10 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False) -> s
 
     Returns:
         A JSON string containing the ranked results in Letter-mode payload shape.
+        A decision a later one has moved on from also carries `superseded_by`/
+        `amended_by`/`narrowed_by`/`corrected_by` (the modifying slugs) — an exact-slug
+        hit on an amended decision still reads `state: "active"`, so chase these before
+        trusting its axiom's mechanism.
     """
     if depth != "letter":
         return json.dumps({"error": f"Depth mode '{depth}' is not yet implemented in v0.1 (Letter-only retrieval)."})
@@ -273,6 +318,7 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False) -> s
                 "state": state,
                 "depth_mode": "letter"
             }
+            output.update(store.get_modifiers(node["id"]))
             return json.dumps(output, indent=2)
     except Exception:
         # Not a slug collision or lookup failed; proceed to semantic claim lookup
@@ -305,6 +351,7 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False) -> s
                 }
                 if not brief:
                     match["rejected_paths"] = node["rejected_paths"]
+                match.update(store.get_modifiers(node["id"]))
                 output_list.append(match)
                 
             return json.dumps({"query": query, "depth_mode": "letter", "matches": output_list}, indent=2)
