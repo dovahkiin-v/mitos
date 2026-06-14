@@ -15,6 +15,7 @@ from mitos import __version__
 from mitos.config import MitosConfig, default_collection_name, global_env_path
 from mitos.errors import MitosError, ParseError, ValidationError
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS
+from mitos.recall import assess_surface_recall
 from mitos.sync import MitosSyncManager, run_ambient_capture
 from mitos.renderer import MitosRenderer
 from mitos.importer import MitosProseImporter
@@ -555,11 +556,15 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         return d
 
     results: Dict[str, Any] = {"active_decisions": []}
+    semantic_ran = False
+    top_score: Optional[float] = None
 
     if manager.embed_provider and manager.vector_store:
         try:
             q_vector = manager.embed_provider.get_embedding(query, is_query=True)
-            for m in manager.vector_store.query(q_vector, limit=5, filter_scope=scope):
+            matches = manager.vector_store.query(q_vector, limit=5, filter_scope=scope)
+            semantic_ran = True
+            for m in matches:
                 node = store.get_node_by_slug(m["slug"])
                 if not node:
                     continue
@@ -567,10 +572,14 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
                 if state not in ("active", "drifted"):
                     continue
                 results["active_decisions"].append(_shape(node, m["score"]))
+                if top_score is None or m["score"] > top_score:
+                    top_score = m["score"]
         except Exception:
-            pass
+            semantic_ran = False
 
-    if not results["active_decisions"] and scope:
+    # Scope listing fallback ONLY in degraded mode (mirrors the MCP tool, P5): a
+    # semantic run that found nothing must not masquerade as an unranked scope dump.
+    if not semantic_ran and not results["active_decisions"] and scope:
         try:
             for d in store.get_active_decisions(scope=scope)[:5]:
                 results["active_decisions"].append(_shape(d, 1.0))
@@ -591,25 +600,39 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
             pass
         results["open_questions"] = open_questions
 
-    # Recall here is semantic and capped — point at the exhaustive path so a
-    # completeness pass doesn't mistake the ranked top-k for the full set.
-    if results["active_decisions"]:
-        results["note"] = (
-            "Ranked top matches only (semantic, capped). For the COMPLETE set of "
-            "decisions in a scope, use 'mitos list' (or the list_decisions tool)."
-        )
+    # Confidence signal — distinguish a settled precedent from loose neighbours / no
+    # match (AX P5). Shared policy with the MCP tool via mitos.recall.
+    scope_decision_count: Optional[int] = None
+    if scope and not results["active_decisions"]:
+        try:
+            scope_decision_count = len(store.get_active_decisions(scope=scope))
+        except Exception:
+            scope_decision_count = None
+    confidence, note = assess_surface_recall(
+        semantic_ran=semantic_ran,
+        top_score=top_score,
+        result_count=len(results["active_decisions"]),
+        scope=scope,
+        scope_decision_count=scope_decision_count,
+    )
+    if confidence is not None:
+        results["confidence"] = confidence
+    results["note"] = note
 
     if as_json:
         print(_json.dumps(results, indent=2))
         return
 
     ad, oqs = results["active_decisions"], results.get("open_questions", [])
+    conf = results.get("confidence")
     if not ad and not oqs:
         scope_note = f" (scope: {scope})" if scope else ""
         print(f"No active precedents found for: '{query}'{scope_note}")
-        print("→ Nothing settled here yet — safe to decide, then record it.")
+        print(f"→ {note}")
         return
     print(f"\nPrecedents for: '{query}'" + (f"  (scope: {scope})" if scope else ""))
+    if conf in ("weak", "none"):
+        print(f"⚠ confidence: {conf} — these may be loose neighbours, not settled precedent")
     print("-" * 60)
     for i, d in enumerate(ad, start=1):
         print(f"{i}. {d['slug']}  (score {d['score']:.3f})")
@@ -624,9 +647,7 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         print()
     for oq in oqs:
         print(f"[open question in scope] {oq['topic']}")
-    if ad:
-        scope_arg = f" --scope {scope}" if scope else ""
-        print(f"\n→ Ranked matches only. Full set in scope: mitos list{scope_arg}")
+    print(f"\n→ {note}")
 
 
 def cmd_serve() -> None:
