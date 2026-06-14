@@ -2,8 +2,9 @@
 
 From loop-Claude's second round of feedback:
 - #1a brevity knob — surface/list can omit the heavy `rejected_paths` for a quick scan.
-- #1b session dedup — the MCP server marks already-surfaced decisions `seen` and stops
-  re-paying their `rejected_paths` within a session (one persistent serve process).
+- #1b no cross-call dedup — a re-surfaced precedent keeps its full `rejected_paths`; the
+  old process-global `seen` trim leaked across the loop's session resets and was removed
+  (P3 fix). `brief=True` is the explicit, stateless way to ask for a lighter scan.
 - #5b record returns the path to the markdown it wrote (so the agent can eyeball it).
 - #2 residual — a truncated auto-slug nudges for an explicit `slug=`.
 - #5a — `open_questions` is omitted when no scope was given (absent = not scanned).
@@ -99,11 +100,14 @@ def test_cli_list_brief_json(ws, capsys):
 
 
 # --------------------------------------------------------------------------- #
-# #1b Session dedup (MCP-only)
+# #1b No cross-call dedup — a re-surfaced precedent is never short-changed (P3 fix)
 # --------------------------------------------------------------------------- #
 
-def test_mcp_surface_dedup_marks_seen_within_session(ws):
-    """A precedent surfaced twice in a session comes back `seen`, without re-paying."""
+def test_mcp_surface_repeat_keeps_full_rejected_paths(ws):
+    """A precedent surfaced twice returns its full `rejected_paths` BOTH times, with no
+    `seen` flag. The old process-global dedup leaked across the loop's session resets
+    and silently withheld the decisive field from cold sessions; it was removed (see the
+    mcp_server module note). `brief=True` is the explicit lightweight path."""
     config, m = ws
     m.record_decision_entry("Single PSP is Stripe.", "Adyen heavier.", ["pay"], slug="stripe-psp")
     store = _ro_store(config)
@@ -112,13 +116,14 @@ def test_mcp_surface_dedup_marks_seen_within_session(ws):
         second = json.loads(mcp_server.surface_decisions("payments", scope="pay"))
     d1 = first["active_decisions"][0]
     d2 = second["active_decisions"][0]
-    assert "rejected_paths" in d1 and "seen" not in d1      # first sight: full
-    assert d2.get("seen") is True and "rejected_paths" not in d2  # re-hit: lightweight
+    assert "rejected_paths" in d1 and "seen" not in d1
+    assert "rejected_paths" in d2 and "seen" not in d2          # re-hit is NOT short-changed
+    assert d1["rejected_paths"] == d2["rejected_paths"]
 
 
-def test_seen_set_reset_between_tests():
-    """Guards the conftest reset — the dedup set starts empty each test."""
-    assert mcp_server._SEEN_SLUGS == set()
+def test_mcp_server_holds_no_seen_state():
+    """Regression guard — the leak-prone process-global dedup set stays gone."""
+    assert not hasattr(mcp_server, "_SEEN_SLUGS")
 
 
 # --------------------------------------------------------------------------- #

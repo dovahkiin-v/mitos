@@ -274,10 +274,10 @@ def test_mcp_query_exact_slug_superseded_carries_superseded_by(ws) -> None:
     assert resp["superseded_by"] == ["v2"]
 
 
-def test_modifiers_survive_brief_and_seen_trim(ws) -> None:
-    """The staleness flag is ALWAYS attached — even on a brief/seen payload where
-    rejected_paths is trimmed. That re-hit is exactly where a fresh session, having
-    lost the heavy field, most needs to know the axiom has moved on."""
+def test_modifiers_survive_brief_trim(ws) -> None:
+    """The staleness flag is ALWAYS attached — even on a brief payload where
+    rejected_paths is trimmed. A lightweight scan that lost the heavy field still needs
+    to know the axiom has been moved on from."""
     from mitos import mcp_server
     config, m = ws
     _rec(m, "hot")
@@ -285,13 +285,11 @@ def test_modifiers_survive_brief_and_seen_trim(ws) -> None:
     store = GraphStore(config.db_path, read_only=True)
     node = store.get_node_by_slug("hot")
 
-    brief = mcp_server._decision_payload(node, 1.0, brief=True, dedup=False, store=store)
+    brief = mcp_server._decision_payload(node, 1.0, brief=True, store=store)
     assert "rejected_paths" not in brief and brief["amended_by"] == ["hot-v2"]
 
-    mcp_server._SEEN_SLUGS.add("hot")
-    seen = mcp_server._decision_payload(node, 1.0, brief=False, dedup=True, store=store)
-    assert seen.get("seen") is True and "rejected_paths" not in seen
-    assert seen["amended_by"] == ["hot-v2"]
+    full = mcp_server._decision_payload(node, 1.0, brief=False, store=store)
+    assert full["rejected_paths"] and full["amended_by"] == ["hot-v2"]
 
 
 # --------------------------------------------------------------------------- #
