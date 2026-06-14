@@ -253,6 +253,10 @@ def test_adjacency_surfaces_related_decision(live_workspace):
         axiom="Stripe webhooks are the source of truth for charge status",
         rejected_paths="Polling the Stripe API rejected: rate limits and latency",
         scope=["payments"], slug="stripe-webhooks-source-of-truth",
+        # This test deliberately records a decision with a known live neighbour to
+        # prove the post-commit `related` echo — acknowledge the P4 review so a high
+        # real-embedding similarity doesn't pause the write (the echo still fires).
+        acknowledge_neighbors=True,
     )
     assert res["status"] == "created"
     related_slugs = [r["slug"] for r in res.get("related", [])]

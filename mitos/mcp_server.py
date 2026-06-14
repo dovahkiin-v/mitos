@@ -385,7 +385,7 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str],
                     narrows: Optional[str] = None, depends_on: Optional[str] = None,
                     resolves: Optional[str] = None, contradicts: Optional[str] = None,
                     derives_from: Optional[str] = None, cites: Optional[str] = None,
-                    slug: Optional[str] = None) -> str:
+                    slug: Optional[str] = None, acknowledge_neighbors: bool = False) -> str:
     """Record a decision you just made, with the alternatives you rejected and why,
     so future sessions and other agents inherit it instead of relitigating it.
 
@@ -413,12 +413,22 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str],
         derives_from: Exact slug of a decision this one is derived from.
         cites: Exact slug of a decision this one references.
         slug: Optional explicit slug; derived from the axiom if omitted.
+        acknowledge_neighbors: Set True to record past the near-duplicate review (below)
+            — i.e. you have looked at the flagged neighbour(s) and this decision is
+            genuinely independent. Leave False (default) on the first attempt.
 
     Returns:
         A JSON string: {slug, id, state, embedding, status} or {error, code}.
         status="created" means newly recorded; status="exists" is a SUCCESS — the
         identical decision was already recorded and is now confirmed present, not an
         error and not something to retry. Only a top-level {error, code} is a failure.
+        status="needs_review" (code "similar_decision_exists") is a PAUSE, not a failure
+        and not a write: your decision is ≥0.85 similar to existing `neighbors` you did
+        not reference. Inspect them — if this amends/supersedes/contradicts/cites one,
+        re-record with that relation arg pointing at the neighbour's slug (`possible_tension`
+        on a neighbour flags a likely contradiction, not a duplicate); if it is genuinely
+        independent, re-record with acknowledge_neighbors=True. Nothing was written, so a
+        re-record is the right move here (unlike an "exists" no-op).
         On the "created" path the result MAY include `related`: the nearest existing
         live decisions to the one you just recorded — a write-time adjacency hint, so
         you notice an adjacent or contradictory prior decision. If one is genuinely
@@ -448,5 +458,6 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str],
         derives_from=derives_from,
         cites=cites,
         slug=slug,
+        acknowledge_neighbors=acknowledge_neighbors,
     )
     return json.dumps(result)

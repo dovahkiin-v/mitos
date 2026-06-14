@@ -336,7 +336,11 @@ def test_concurrent_distinct_slugs_all_land(ws) -> None:
     config, m = ws
 
     def rec(i: int):
-        return m.record_decision_entry(f"Decision number {i}.", f"Rejection {i}.", ["c"], slug=f"con-{i}")
+        # These template axioms are near-identical, so with live embeddings the P4
+        # review would (correctly) flag them as look-alikes; this test is about
+        # concurrent buffer integrity, not dedup, so acknowledge past the review.
+        return m.record_decision_entry(f"Decision number {i}.", f"Rejection {i}.", ["c"],
+                                       slug=f"con-{i}", acknowledge_neighbors=True)
 
     threads, results = [], {}
     for i in range(5):
