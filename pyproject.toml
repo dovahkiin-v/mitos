@@ -1,0 +1,52 @@
+# Packaging for Mitos — declarative, setuptools-backed, zero new runtime dependency.
+#
+# This file is the single packaging home (it replaces setup.py). Later visions
+# extend the dependency list and the argparse subparser tree behind the `mitos`
+# console script; they do not rebuild this surface.
+#
+# Two fragile invariants are kept alive here:
+#   1. `__version__` stays the single source of truth in mitos/__init__.py and is
+#      read DYNAMICALLY by the build backend (see [tool.setuptools.dynamic]). A
+#      static `[project] version` field would silently kill the once-a-day update
+#      nudge (mitos/_update.py fetches that literal from GitHub `main`).
+#   2. mitos/format-spec.md ships as package data — `mitos init` and
+#      `import mitos.parser` (FIELD_MAP at import time) read it from the installed
+#      package dir, so it MUST be in the wheel.
+
+[build-system]
+# setuptools >=64 is the minimum that supports all three things we rely on:
+# PEP 621 `[project]` metadata + `[tool.setuptools.dynamic]` attr-version (61.0)
+# AND PEP 660 editable installs (64.0, the dev loop's `pip install -e .`).
+# Build-time only — never a runtime dependency. Latest release at migration
+# time was 82.0.1; the floor is the minimum, not a pin.
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mitos-adr"            # distribution name (import package is `mitos`); kept on purpose
+dynamic = ["version"]          # read from mitos/__init__.py — NOT a static literal
+requires-python = ">=3.13"     # UCD 15.1.0 goldens (§11) + SQLite 3.37+ for STRICT tables ship with 3.13
+dependencies = [
+    "filelock>=3.0.0",
+    "google-genai>=1.66.0",
+    "anthropic>=0.84.0",
+    "mcp>=1.26.0",
+    "requests>=2.0.0",
+]
+
+[project.scripts]
+mitos = "mitos.cli:main"
+
+[tool.setuptools]
+packages = ["mitos"]
+
+[tool.setuptools.dynamic]
+version = { attr = "mitos.__version__" }
+
+[tool.setuptools.package-data]
+mitos = ["format-spec.md"]
+
+[tool.pytest.ini_options]
+markers = [
+    "packaging: slow real-install packaging test (fresh venv + non-editable pip install). CI runs it explicitly with `-m packaging`; the fast suite skips it with `-m 'not packaging'`. Not selected by testmon (no imported source) — the marker is its CI-selection contract.",
+]
