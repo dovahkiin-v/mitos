@@ -1,0 +1,50 @@
+name: ci
+
+# Single-lane gate (Phase 1b — the first CI this project has ever had). On every
+# push to main and every pull request, install the package on the 3.13 floor and
+# run the substrate suite + the packaging install test, green with no secrets and
+# no service containers.
+#
+# One lane on Python 3.13 — NOT a matrix. The §11 hashing goldens are pinned to
+# UCD 15.1.0, which ships with 3.13 (1a set requires-python >= 3.13 for this); on a
+# different Python/UCD the golden digests can legitimately differ, so a matrix would
+# paint red lanes that aren't bugs (R10). Adding a matrix axis later is additive, not
+# destructive (P20) — so the deferral is correct, not debt.
+#
+# Tests are selected by MARKER, never a hand-listed file allowlist: Phase 3a's
+# golden-trace tests and the substrate tests are gated the moment they land, with no
+# edit to this file.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege: this job only reads the repo and runs tests — no writes, no token
+# scope creep (P8).
+permissions:
+  contents: read
+
+# Cancel superseded in-flight runs on the same ref (saves runner minutes).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      # Third-party actions are SHA-pinned for supply-chain durability; the tag in the
+      # comment is the human-readable handle (re-verify on the releases page when bumping).
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: "3.13"   # single lane — see the matrix-deferred note above
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install package and test deps
+        run: python -m pip install -e '.[test]'
+      - name: Run substrate suite (no secrets, no services)
+        run: python -m pytest -m "not packaging"
+      - name: Run packaging install gate (real wheel build + non-editable install)
+        run: python -m pytest -m "packaging"

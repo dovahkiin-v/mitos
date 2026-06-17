@@ -204,10 +204,16 @@ def test_sync_outbox_queue_and_drain(mock_client: MagicMock, sync_env: Tuple[Mit
     store = GraphStore(config.db_path)
     os.environ["GEMINI_API_KEY"] = "mock_key"
 
-    # Mock the embedding provider API call entirely to prevent network requests
+    # Inject mock embedding deps so the test is hermetic: the manager is built by the
+    # fixture before any mocking, so without a reachable Qdrant/GEMINI key (e.g. in CI)
+    # it lands in degraded graph-only mode with embed_provider/vector_store == None
+    # (sync.py __init__). Assign mocks directly to prevent network requests and exercise
+    # the outbox path deterministically regardless of the host environment.
+    manager.embed_provider = MagicMock()
     manager.embed_provider.get_embedding = MagicMock(return_value=[0.1, 0.2, 0.3])
 
     # 1. Force a connection failure on vector store upsert
+    manager.vector_store = MagicMock()
     manager.vector_store.upsert = MagicMock(side_effect=Exception("Qdrant connection refused"))
 
     # 2. Append new decision entry

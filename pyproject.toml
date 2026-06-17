@@ -37,6 +37,18 @@ dependencies = [
 [project.scripts]
 mitos = "mitos.cli:main"
 
+[project.optional-dependencies]
+# Test tooling — the single declarative home for it (local dev AND CI install the
+# same set via `pip install -e .[test]`). Do NOT duplicate the runtime [project]
+# dependencies here; the base install pulls those. Floors, not pins: grounded in
+# the current releases (pytest 9.x, pytest-asyncio 1.4.0) but left open so a future
+# bump happens once, here. pytest-asyncio is load-bearing for the fast suite — the
+# offline async tests (test_mcp.py, test_record_decision.py) run in `-m "not packaging"`.
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=1.0",
+]
+
 [tool.setuptools]
 packages = ["mitos"]
 
@@ -47,6 +59,11 @@ version = { attr = "mitos.__version__" }
 mitos = ["format-spec.md"]
 
 [tool.pytest.ini_options]
+# Explicit strict mode: every coroutine test must carry @pytest.mark.asyncio (they
+# already do). Makes the contract explicit and silences pytest-asyncio's unset-mode
+# config warning. Do NOT switch to "auto" — it would change collection semantics
+# for the whole suite.
+asyncio_mode = "strict"
 markers = [
     "packaging: slow real-install packaging test (fresh venv + non-editable pip install). CI runs it explicitly with `-m packaging`; the fast suite skips it with `-m 'not packaging'`. Not selected by testmon (no imported source) — the marker is its CI-selection contract.",
 ]
