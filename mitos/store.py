@@ -10,7 +10,19 @@ import os
 import hashlib
 from typing import List, Dict, Optional, Any, Set, Tuple
 from mitos.errors import DatabaseError, ValidationError
+from mitos.migrations import run_migrations
 from mitos.parser import ParsedEntry
+
+# The SQLite floor V1a's STRICT tables and the migration ladder require. The
+# >=3.13 Python floor (Phase 1a) guarantees a bundled SQLite at or above this, but
+# a custom build or a rebuilt `sqlite3` module could link an older library — so we
+# verify the *linked* version at connect time rather than trusting the interpreter.
+SQLITE_MIN_VERSION: Tuple[int, int, int] = (3, 37, 0)
+
+# The §5.2.8 writer-lock-contention budget: SQLITE_BUSY retries are handled inside
+# the SQLite C driver via this timeout, never an application-layer Python retry
+# loop (Lesson 2 — keep the retry structural, in C).
+BUSY_TIMEOUT_MS: int = 5000
 
 # A decision is "live" (still in force) if it is active or merely drifted. Drifted
 # means live-but-possibly-stale, not retired — surface_decisions treats both as
@@ -116,6 +128,82 @@ class CommitDelta:
         }
 
 
+def _assert_sqlite_version() -> None:
+    """Fails fast if the linked SQLite is too old for V1a's schema substrate.
+
+    Read live from ``sqlite3.sqlite_version_info`` (the linked library version,
+    not the interpreter's) on every connect — matching the vision's "at every
+    connect()" wording and keeping the guard monkeypatchable in tests. The check
+    is a cheap tuple compare; it fires *before* any STRICT DDL could run.
+
+    Raises:
+        DatabaseError: If ``sqlite3.sqlite_version_info`` is below
+            ``SQLITE_MIN_VERSION``, naming the required version, the detected
+            version, and an upgrade path.
+    """
+    if sqlite3.sqlite_version_info < SQLITE_MIN_VERSION:
+        required = ".".join(str(p) for p in SQLITE_MIN_VERSION)
+        found = ".".join(str(p) for p in sqlite3.sqlite_version_info)
+        raise DatabaseError(
+            f"Mitos requires SQLite >= {required} (for STRICT tables and the "
+            f"migration ladder), but the linked library is {found}. Upgrade your "
+            f"Python's bundled SQLite — a newer python.org build or a distro "
+            f"update — or rebuild the `sqlite3` module against a newer libsqlite3."
+        )
+
+
+def open_connection(db_path: str, read_only: bool = False) -> sqlite3.Connection:
+    """Opens a SQLite connection with Mitos's full PRAGMA suite (MI-8 chokepoint).
+
+    This is the single connection-open path for the whole codebase — write path,
+    read path, test fixtures, the migration runner all flow through it — so "every
+    connection is correctly configured" is a structural fact, not a discipline
+    anyone can forget. SQLite defaults ``foreign_keys`` OFF *per connection*; a
+    forgotten PRAGMA would silently disable the kind-matrix FK enforcement the
+    whole edge model rests on (MI-8).
+
+    PRAGMA order follows §5.2.8: version guard (before connect) → connect →
+    ``journal_mode=WAL`` → ``synchronous=NORMAL`` (write connections only — a
+    ``mode=ro`` connection cannot change them) → ``foreign_keys=ON`` →
+    ``busy_timeout`` (every connection; the lock-retry budget handled in the C
+    driver, never a Python retry loop).
+
+    Args:
+        db_path: Filesystem path to the SQLite database file.
+        read_only: If True, open immutably via ``file:...?mode=ro`` and skip the
+            write-only PRAGMAs (WAL / synchronous). ``foreign_keys`` and
+            ``busy_timeout`` still apply.
+
+    Returns:
+        A configured ``sqlite3.Connection`` with ``row_factory = sqlite3.Row``.
+
+    Raises:
+        DatabaseError: If the linked SQLite is below the required version, or the
+            connection cannot be opened.
+    """
+    _assert_sqlite_version()
+    try:
+        if read_only:
+            abs_path = os.path.abspath(db_path)
+            conn = sqlite3.connect(f"file:{abs_path}?mode=ro", uri=True)
+        else:
+            conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        if not read_only:
+            # WAL + NORMAL synchronous: the V1-D12 single-writer/multi-reader
+            # posture. Both are write-connection only — a mode=ro connection
+            # cannot change the journal mode or the synchronous level.
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA foreign_keys=ON;")
+        # busy_timeout last, per §5.2.8: the writer-lock retry budget, handled in
+        # the SQLite C driver — never an application-layer Python retry loop.
+        conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS};")
+        return conn
+    except sqlite3.Error as e:
+        raise DatabaseError(f"Failed to connect to SQLite: {str(e)}")
+
+
 class GraphStore:
     """SQLite-backed store managing nodes, edges, signals, and computed state."""
 
@@ -123,23 +211,34 @@ class GraphStore:
         self.db_path = db_path
         self.read_only = read_only
         self._init_db()
+        if not self.read_only:
+            # Boot the migration ladder through the live path (Option A). The
+            # registry is empty in V1a 2a, so this is a clean no-op that leaves
+            # user_version at 0 — but wiring it now proves the boot-through-ladder
+            # path and makes 2b a pure addition (register step 1, retire _init_db).
+            # Read-only stores never migrate (§7 gotcha): a mode=ro connection
+            # cannot run the ladder's write transaction.
+            conn = self._get_connection()
+            try:
+                run_migrations(conn)
+            finally:
+                conn.close()
 
     def _get_connection(self) -> sqlite3.Connection:
-        """Opens a connection to the SQLite database and configures it."""
-        try:
-            if self.read_only:
-                abs_path = os.path.abspath(self.db_path)
-                conn = sqlite3.connect(f"file:{abs_path}?mode=ro", uri=True)
-            else:
-                conn = sqlite3.connect(self.db_path)
-            conn.row_factory = sqlite3.Row
-            if not self.read_only:
-                # Enable WAL mode for concurrent multi-reader, single-writer
-                conn.execute("PRAGMA journal_mode=WAL;")
-            conn.execute("PRAGMA foreign_keys=ON;")
-            return conn
-        except sqlite3.Error as e:
-            raise DatabaseError(f"Failed to connect to SQLite: {str(e)}")
+        """Opens a configured connection to this store's database.
+
+        A thin instance-method wrapper over the module-level ``open_connection``
+        so the PRAGMA suite (MI-8) lives in exactly one place while preserving the
+        heavily-bound ``store._get_connection()`` call contract used across the
+        codebase and tests.
+
+        Returns:
+            A configured ``sqlite3.Connection``.
+
+        Raises:
+            DatabaseError: If the linked SQLite is too old or the connection fails.
+        """
+        return open_connection(self.db_path, self.read_only)
 
     def _init_db(self) -> None:
         """Initializes the database schema if it does not exist."""
