@@ -5,10 +5,12 @@ declarative edge reconciliation (V1-D21), signals insert-or-ignore (MI-4), and
 the CommitDelta cascade contract (V1-D22/D18).
 """
 
+import sqlite3
 import tempfile
 import os
 import pytest
 from mitos.store import GraphStore, ValidationError
+from mitos.errors import DatabaseError
 from mitos.parser import ParsedEntry
 
 @pytest.fixture
@@ -190,3 +192,75 @@ def test_wal_concurrency_multi_reader(temp_store: GraphStore) -> None:
     row_after = cursor_reader.fetchone()
     assert row_after["core_axiom"] == "Axiom Modified"
     conn_reader.close()
+
+
+# --- Phase 2a: connection hardening (PRAGMA suite, version guard, ladder boot) ---
+
+
+def test_write_connection_issues_full_pragma_suite(temp_store: GraphStore) -> None:
+    """A write/file connection reports the full §5.2.8 PRAGMA suite (MI-8)."""
+    conn = temp_store._get_connection()
+    try:
+        assert conn.execute("PRAGMA foreign_keys;").fetchone()[0] == 1
+        assert conn.execute("PRAGMA busy_timeout;").fetchone()[0] == 5000
+        assert conn.execute("PRAGMA journal_mode;").fetchone()[0].lower() == "wal"
+        # synchronous: 0=OFF, 1=NORMAL, 2=FULL — NORMAL is the V1-D12 posture.
+        assert conn.execute("PRAGMA synchronous;").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_read_only_connection_keeps_fk_and_busy_timeout(temp_store: GraphStore) -> None:
+    """A read-only connection still issues FK + busy_timeout, skips WAL/synchronous cleanly."""
+    ro_store = GraphStore(temp_store.db_path, read_only=True)
+    conn = ro_store._get_connection()
+    try:
+        assert conn.execute("PRAGMA foreign_keys;").fetchone()[0] == 1
+        assert conn.execute("PRAGMA busy_timeout;").fetchone()[0] == 5000
+    finally:
+        conn.close()
+
+
+def test_foreign_keys_enforced_at_connection_level(temp_store: GraphStore) -> None:
+    """The FK PRAGMA actually takes effect: an orphan child insert is rejected.
+
+    Generic proof that ``foreign_keys=ON`` is live (the V1a kind-matrix schema
+    arrives in 2b). With FK off, the orphan insert would silently succeed.
+    """
+    conn = temp_store._get_connection()
+    try:
+        conn.execute("CREATE TABLE _fk_parent (id INTEGER PRIMARY KEY);")
+        conn.execute(
+            "CREATE TABLE _fk_child ("
+            "id INTEGER PRIMARY KEY, "
+            "parent_id INTEGER REFERENCES _fk_parent(id));"
+        )
+        conn.commit()
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("INSERT INTO _fk_child (id, parent_id) VALUES (1, 999);")
+            conn.commit()
+    finally:
+        conn.close()
+
+
+def test_sqlite_version_guard_rejects_old_runtime(
+    temp_store: GraphStore, monkeypatch
+) -> None:
+    """A sub-3.37 linked SQLite makes the connection helper fail fast with guidance."""
+    monkeypatch.setattr(sqlite3, "sqlite_version_info", (3, 36, 0))
+    with pytest.raises(DatabaseError) as exc_info:
+        temp_store._get_connection()
+    message = str(exc_info.value)
+    assert "3.37" in message  # names the required floor
+    assert "3.36" in message  # names the detected version
+
+
+def test_boot_through_empty_ladder_leaves_user_version_zero(
+    temp_store: GraphStore,
+) -> None:
+    """Option-A wiring boots the empty ladder as a no-op (user_version stays 0)."""
+    conn = temp_store._get_connection()
+    try:
+        assert conn.execute("PRAGMA user_version;").fetchone()[0] == 0
+    finally:
+        conn.close()
