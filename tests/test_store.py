@@ -264,3 +264,31 @@ def test_boot_through_empty_ladder_leaves_user_version_zero(
         assert conn.execute("PRAGMA user_version;").fetchone()[0] == 0
     finally:
         conn.close()
+
+
+def test_v1_schema_authored_but_not_live_until_phase_5a(
+    temp_store: GraphStore,
+) -> None:
+    """DEFERRED-FLIP TRIPWIRE — Phase 2b authors _v1_schema but does NOT make it live.
+
+    Phase 2b builds and fully proves the V1a STRICT schema (``_v1_schema``) but
+    deliberately does NOT register it (Key Decision 1): the live boot stays on the
+    prototype ``_init_db`` so the suite stays green through 2b–4b. **Phase 5a** is
+    the flipping phase — it appends ``(1, _v1_schema)`` to ``MIGRATION_STEPS`` and
+    retires ``_init_db`` in lockstep with the ``commit_parsed_entry`` rebuild that
+    writes the V1a schema. When 5a does that, this test MUST be consciously
+    updated; it is the forcing function that makes the deferred wiring visible.
+
+    Two assertions pin the deferred state from both sides — the boot still lands on
+    the prototype (``user_version == 0``) AND the schema step is absent from the
+    live registry.
+    """
+    from mitos.migrations import MIGRATION_STEPS, _v1_schema
+
+    conn = temp_store._get_connection()
+    try:
+        assert conn.execute("PRAGMA user_version;").fetchone()[0] == 0
+    finally:
+        conn.close()
+    assert (1, _v1_schema) not in MIGRATION_STEPS
+    assert MIGRATION_STEPS == []
