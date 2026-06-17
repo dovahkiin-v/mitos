@@ -51,6 +51,12 @@ Thumbs.db
 .mitos/
 live_axioms.md
 *sync_snapshot.md
+# Root-anchored: the repo root is a dogfood `mitos init` workspace, so `init`
+# regenerates a workspace `format-spec.md` at root. The package copy is the only
+# tracked C5 source (V1-D7). Leading slash is load-bearing — a bare `format-spec.md`
+# would also ignore `mitos/format-spec.md` (the package data) and re-open the
+# Phase-1a missing-from-wheel bug.
+/format-spec.md
 
 # ===== Internal design artifacts (not for the public repo) =====
 RECORD_DECISION_SPEC.md
