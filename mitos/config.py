@@ -9,6 +9,67 @@ import re
 from typing import Dict, Any
 
 
+def _hint_cache_path(cache_name: str) -> str:
+    """Returns the path to a debounce cache file under the user cache dir.
+
+    Honors ``XDG_CACHE_HOME`` (so tests redirect it into a tmp dir) and falls back
+    to ``~/.cache``. The file need not exist.
+
+    Args:
+        cache_name: The cache file's basename (e.g. ``"mcp_hint.json"``).
+
+    Returns:
+        Absolute path to ``<cache>/mitos/<cache_name>``.
+    """
+    cache_home = os.environ.get("XDG_CACHE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".cache"
+    )
+    return os.path.join(cache_home, "mitos", cache_name)
+
+
+def hint_due(cache_name: str, key: str, window_seconds: float) -> bool:
+    """Fail-silent once-per-window gate for a debounced nudge.
+
+    Backs the recurring-nudge surfaces (the MCP-server hint, the render-overflow
+    summary) so they fire at most once per ``window_seconds`` per ``key`` instead of
+    on every call. Reads a small JSON cache keyed by ``key``; if that key has not
+    fired within the window it stamps the current time and returns True, otherwise
+    returns False. Never raises — a missing/corrupt cache or an unwritable cache dir
+    degrades to "due" (the nudge shows) rather than crashing the caller.
+
+    Args:
+        cache_name: The cache file's basename, namespacing one nudge from another.
+        key: The per-subject key to debounce on (typically a workspace path).
+        window_seconds: Minimum seconds between two firings for the same key.
+
+    Returns:
+        True if the nudge is due now (and the firing was just stamped), else False.
+    """
+    import json
+    import time
+
+    now = time.time()
+    path = _hint_cache_path(cache_name)
+    shown: Dict[str, Any] = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            shown = json.load(f)
+    except (OSError, ValueError):
+        shown = {}
+    if not isinstance(shown, dict):
+        shown = {}
+    if now - shown.get(key, 0) < window_seconds:
+        return False
+    shown[key] = now
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(shown, f)
+    except OSError:
+        pass
+    return True
+
+
 def global_env_path() -> str:
     """Returns the path to Mitos's global ``.env`` (shared across all projects).
 

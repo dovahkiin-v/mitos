@@ -8,9 +8,13 @@ import tempfile
 import os
 import pytest
 from typing import Tuple
+import mitos.renderer as R
 from mitos.store import GraphStore
 from mitos.parser import ParsedEntry
-from mitos.renderer import MitosRenderer, atomic_write
+from mitos.renderer import (
+    MitosRenderer, atomic_write, assemble_render, overflow_report,
+    summarize_overflows, estimate_tokens,
+)
 
 @pytest.fixture
 def temp_workspace() -> Tuple[GraphStore, str]:
@@ -94,3 +98,94 @@ def test_renderer_stateless_outputs(temp_workspace: Tuple[GraphStore, str]) -> N
         fe_content = f.read()
     assert "fe-new" in fe_content
     assert "be-choice" not in fe_content
+
+
+# --------------------------------------------------------------------------- #
+# Size-ceiling overflow: recorded as data, never printed (so it can't bury a receipt)
+# --------------------------------------------------------------------------- #
+
+def test_estimate_tokens_heuristic() -> None:
+    """estimate_tokens uses the ~4-chars/token floor heuristic."""
+    assert estimate_tokens(0) == 0
+    assert estimate_tokens(4) == 1
+    assert estimate_tokens(401) == 100  # floor division
+
+
+def test_summarize_overflows_none_singular_plural() -> None:
+    """summarize_overflows is None when clean, and pluralises + points at `mitos status`."""
+    assert summarize_overflows([]) is None
+    one = summarize_overflows([{"name": "substrate.md"}])
+    assert one is not None and "1 rendered axiom file " in one and "mitos status" in one
+    two = summarize_overflows([{"name": "a.md"}, {"name": "b.md"}])
+    assert "2 rendered axiom files " in two
+
+
+def test_assemble_render_matches_disk(temp_workspace: Tuple[GraphStore, str]) -> None:
+    """assemble_render's content is byte-identical to what render_all writes (no drift)."""
+    store, workspace = temp_workspace
+    e = ParsedEntry("decision", "use-sqlite", 1, 5)
+    e.core_axiom = "We use SQLite in WAL mode."
+    e.rejected_paths = "Postgres (too heavy)."
+    e.scope = ["substrate"]
+    store.commit_parsed_entry(e)
+
+    assembled = assemble_render(store)
+    MitosRenderer(workspace).render_all(store)
+
+    with open(os.path.join(workspace, "live_axioms.md"), encoding="utf-8") as f:
+        assert f.read() == assembled["global"]["content"]
+    with open(os.path.join(workspace, ".mitos", "axioms", "substrate.md"), encoding="utf-8") as f:
+        assert f.read() == assembled["scopes"]["substrate"]["content"]
+
+
+def test_render_all_is_silent_and_records_overflow(
+    temp_workspace: Tuple[GraphStore, str], capsys, monkeypatch
+) -> None:
+    """render_all writes the files, prints nothing, and records the overflow on .overflows."""
+    monkeypatch.setattr(R, "SCOPE_OVERFLOW_WARN_CHARS", 150)
+    store, workspace = temp_workspace
+    e = ParsedEntry("decision", "over-one", 1, 5)
+    e.core_axiom = "Rationale that is comfortably long. " * 12
+    e.rejected_paths = "n/a"
+    e.scope = ["substrate"]
+    store.commit_parsed_entry(e)
+
+    renderer = MitosRenderer(workspace)
+    renderer.render_all(store)
+
+    captured = capsys.readouterr()
+    assert captured.out == "" and "exceeds" not in captured.err
+    names = [o["name"] for o in renderer.overflows]
+    assert "substrate.md" in names
+
+
+def test_overflow_report_ranks_largest_decision_first(
+    temp_workspace: Tuple[GraphStore, str], monkeypatch
+) -> None:
+    """overflow_report flags an over-ceiling scope and ranks its biggest decision first."""
+    monkeypatch.setattr(R, "SCOPE_OVERFLOW_WARN_CHARS", 200)
+    monkeypatch.setattr(R, "GLOBAL_OVERFLOW_WARN_CHARS", 10_000_000)  # keep the global file out
+    store, workspace = temp_workspace
+
+    small = ParsedEntry("decision", "small-one", 1, 5)
+    small.core_axiom = "Tiny axiom."
+    small.rejected_paths = "n/a"
+    small.scope = ["substrate"]
+    store.commit_parsed_entry(small)
+
+    big = ParsedEntry("decision", "big-one", 1, 5)
+    big.core_axiom = "A much larger rationale block. " * 40
+    big.rejected_paths = "n/a"
+    big.scope = ["substrate"]
+    store.commit_parsed_entry(big)
+
+    report = overflow_report(store)
+    sub = [o for o in report if o["name"] == "substrate.md"]
+    assert len(sub) == 1
+    o = sub[0]
+    assert o["scope"] == "substrate"
+    assert o["chars"] > 200 and o["threshold_chars"] == 200
+    assert o["est_tokens"] == o["chars"] // 4
+    # Largest decision is ranked first, so an author knows what to re-scope.
+    assert o["top_decisions"][0]["slug"] == "big-one"
+    assert o["top_decisions"][0]["chars"] >= o["top_decisions"][-1]["chars"]

@@ -6,8 +6,36 @@ generating global and per-scope markdown files atomically from primary source da
 
 import os
 import tempfile
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from mitos.protocols import GraphStoreProtocol
+
+# Size ceilings for the generated context files, named in CHARACTERS — the unit the
+# check actually measures. (A `len(content)` is characters, so the threshold is named
+# in characters, not tokens, to keep the name honest about what it guards.) A rough
+# chars→tokens estimate is reported alongside so an author sees the LLM-context cost
+# the ceiling is really about. live_axioms.md aggregates every active axiom while a
+# per-scope file holds a single scope's slice, so the global ceiling is the looser one.
+GLOBAL_OVERFLOW_WARN_CHARS = 50_000
+SCOPE_OVERFLOW_WARN_CHARS = 20_000
+_CHARS_PER_TOKEN = 4
+
+
+def estimate_tokens(char_count: int) -> int:
+    """Estimates an LLM token count from a character count.
+
+    Uses the standard ~4-characters-per-token heuristic. Deliberately rough — it
+    exists so a size report can show "~13k tokens" next to a raw char count, giving
+    an author the context-cost framing the ceiling is really guarding (not an exact
+    tokeniser count).
+
+    Args:
+        char_count: Number of characters.
+
+    Returns:
+        The estimated token count.
+    """
+    return char_count // _CHARS_PER_TOKEN
+
 
 def render_node_markdown(node: Dict[str, Any],
                          modifiers: Optional[Dict[str, List[str]]] = None) -> str:
@@ -73,6 +101,162 @@ def atomic_write(filepath: str, content: str) -> None:
         raise IOError(f"Atomic write failed for {filepath}: {str(e)}")
 
 
+def assemble_render(store: GraphStoreProtocol) -> Dict[str, Any]:
+    """Builds the global and per-scope axiom markdown in memory, without writing.
+
+    The single source of truth for both ``MitosRenderer.render_all`` (which writes the
+    files) and the read-only size report a health surface shows — so the two can never
+    drift on what a file's content (and therefore its measured size) is.
+
+    Args:
+        store: The initialized GraphStore to read active decisions from.
+
+    Returns:
+        A dict ``{"global": <file>, "scopes": {scope: <file>}}`` where each ``<file>``
+        is ``{"name", "scope", "content", "decisions"}`` and ``decisions`` is a list of
+        ``(slug, char_count)`` per rendered decision block — enough for a caller to find
+        the largest contributors to a file's size. Only scopes with at least one active
+        decision appear in ``scopes``.
+    """
+    active_decisions = store.get_active_decisions()
+    # Reverse-relation modifiers, so a live-but-amended axiom carries its
+    # "chase the later decision" marker instead of reading as the final word.
+    modifiers = store.get_modifiers_map([d["id"] for d in active_decisions])
+
+    def blocks_for(decisions: List[Dict[str, Any]]) -> List[Tuple[str, str]]:
+        return [(d.get("slug", ""), render_node_markdown(d, modifiers.get(d["id"])))
+                for d in decisions]
+
+    global_header = (
+        "# Live Axioms\n"
+        "*Generated automatically by Mitos. Derived statelessly from primary sources (M8).*\n\n"
+    )
+    global_blocks = blocks_for(active_decisions)
+    if global_blocks:
+        global_content = global_header + "\n".join(b for _, b in global_blocks)
+    else:
+        global_content = global_header + "*No active decisions committed in this workspace.*\n"
+
+    scope_groups: Dict[str, List[Dict[str, Any]]] = {}
+    for dec in active_decisions:
+        for s in dec.get("scope", []):
+            scope_groups.setdefault(s, []).append(dec)
+
+    scopes: Dict[str, Dict[str, Any]] = {}
+    for s, decs in scope_groups.items():
+        header = (
+            f"# Active Axioms for Scope: {s}\n"
+            f"*Generated automatically by Mitos. Derived statelessly from primary sources (M8).*\n\n"
+        )
+        s_blocks = blocks_for(decs)  # always non-empty: scope_groups only holds non-empty scopes
+        scopes[s] = {
+            "name": f"{s}.md",
+            "scope": s,
+            "content": header + "\n".join(b for _, b in s_blocks),
+            "decisions": [(slug, len(b)) for slug, b in s_blocks],
+        }
+
+    return {
+        "global": {
+            "name": "live_axioms.md",
+            "scope": None,
+            "content": global_content,
+            "decisions": [(slug, len(b)) for slug, b in global_blocks],
+        },
+        "scopes": scopes,
+    }
+
+
+def _empty_scope_file(s: str) -> Dict[str, Any]:
+    """Builds the empty-state file record for an explicitly-requested scope with no decisions."""
+    return {
+        "name": f"{s}.md",
+        "scope": s,
+        "content": (
+            f"# Active Axioms for Scope: {s}\n"
+            f"*Generated automatically by Mitos. Derived statelessly from primary sources (M8).*\n\n"
+            f"*No active decisions committed in this scope.*\n"
+        ),
+        "decisions": [],
+    }
+
+
+def _ceiling_for(file_info: Dict[str, Any]) -> int:
+    """Returns the char ceiling for an assembled file (the looser global one vs per-scope)."""
+    return GLOBAL_OVERFLOW_WARN_CHARS if file_info["scope"] is None else SCOPE_OVERFLOW_WARN_CHARS
+
+
+def _overflow_entry(file_info: Dict[str, Any], top_n: int = 5) -> Dict[str, Any]:
+    """Builds the overflow record for one over-ceiling file.
+
+    Args:
+        file_info: An assembled file record (from ``assemble_render``).
+        top_n: How many of the largest decisions in the file to list.
+
+    Returns:
+        A JSON-serializable record with the file's char/estimated-token size, the
+        ceiling it breached, and its ``top_decisions`` (largest first) — so a reader
+        knows which decisions to consider re-scoping.
+    """
+    chars = len(file_info["content"])
+    top = sorted(file_info["decisions"], key=lambda t: t[1], reverse=True)[:top_n]
+    return {
+        "name": file_info["name"],
+        "scope": file_info["scope"],
+        "chars": chars,
+        "est_tokens": estimate_tokens(chars),
+        "threshold_chars": _ceiling_for(file_info),
+        "top_decisions": [
+            {"slug": slug, "chars": c, "est_tokens": estimate_tokens(c)} for slug, c in top
+        ],
+    }
+
+
+def overflow_report(store: GraphStoreProtocol, top_n: int = 5) -> List[Dict[str, Any]]:
+    """Read-only report of which rendered files exceed their size ceiling.
+
+    Assembles the same content ``render_all`` would write (without writing it) and
+    returns one entry per over-ceiling file — each with its char/estimated-token size
+    and the top-N largest decisions in it — so a health surface (``mitos status``) can
+    tell an author *what* to re-scope. Returns an empty list when nothing is over.
+
+    Args:
+        store: The initialized GraphStore to read from.
+        top_n: How many of the largest decisions to list per over-ceiling file.
+
+    Returns:
+        A list of overflow records (see ``_overflow_entry``), largest file first.
+    """
+    assembled = assemble_render(store)
+    files = [assembled["global"]] + list(assembled["scopes"].values())
+    over = [_overflow_entry(f, top_n) for f in files if len(f["content"]) > _ceiling_for(f)]
+    over.sort(key=lambda e: e["chars"], reverse=True)
+    return over
+
+
+def summarize_overflows(overflows: List[Dict[str, Any]]) -> Optional[str]:
+    """One-line write-path summary of files over their size ceiling, or None.
+
+    Returns ``None`` when nothing is over threshold, so the caller can print a clean
+    success receipt and only append a warning when there is genuinely one to show. The
+    detail (which files, which decisions) lives on ``mitos status`` — this is the
+    debounced nudge that points there, replacing the per-file wall of lines that used
+    to print on every write.
+
+    Args:
+        overflows: The overflow records (e.g. from ``MitosRenderer.overflows``).
+
+    Returns:
+        A one-line summary, or None.
+    """
+    if not overflows:
+        return None
+    n = len(overflows)
+    noun = "file" if n == 1 else "files"
+    return (f"⚠ {n} rendered axiom {noun} over the size ceiling "
+            f"— run `mitos status` for the breakdown.")
+
+
 class MitosRenderer:
     """Renderer creating active-axiom markdown assets for LLM context ingestion."""
 
@@ -80,9 +264,18 @@ class MitosRenderer:
         self.workspace_dir = os.path.abspath(workspace_dir)
         self.mitos_dir = os.path.join(self.workspace_dir, ".mitos")
         self.axioms_dir = os.path.join(self.mitos_dir, "axioms")
+        # Populated by render_all: one record per written file that breached its size
+        # ceiling. Read (not printed) so the write path can present a single debounced
+        # summary AFTER its success receipt instead of a wall of per-file warnings.
+        self.overflows: List[Dict[str, Any]] = []
 
     def render_all(self, store: GraphStoreProtocol, scope: Optional[str] = None) -> List[str]:
         """Statelessly regenerates live_axioms.md and per-scope files.
+
+        Size-ceiling overflows are recorded on ``self.overflows`` (not printed), so the
+        write path can present a single debounced summary AFTER its success receipt and
+        route the full breakdown to ``mitos status`` — see ``summarize_overflows`` and
+        ``overflow_report``.
 
         Args:
             store: The initialized GraphStore database.
@@ -91,73 +284,34 @@ class MitosRenderer:
         Returns:
             A list of paths rendered.
         """
-        # Fetch active decisions directly from database
-        active_decisions = store.get_active_decisions()
-        # Reverse-relation modifiers, so a live-but-amended axiom carries its
-        # "chase the later decision" marker instead of reading as the final word.
-        modifiers = store.get_modifiers_map([d["id"] for d in active_decisions])
+        assembled = assemble_render(store)
+        rendered_paths: List[str] = []
+        written_files: List[Dict[str, Any]] = []
 
-        rendered_paths = []
-
-        # 1. Generate global live_axioms.md
+        # 1. Global live_axioms.md (always rendered).
+        global_info = assembled["global"]
         global_filepath = os.path.join(self.workspace_dir, "live_axioms.md")
-        
-        global_header = (
-            "# Live Axioms\n"
-            "*Generated automatically by Mitos. Derived statelessly from primary sources (M8).*\n\n"
-        )
-        
-        global_content = global_header
-        if active_decisions:
-            global_content += "\n".join(
-                render_node_markdown(d, modifiers.get(d["id"])) for d in active_decisions
-            )
-        else:
-            global_content += "*No active decisions committed in this workspace.*\n"
-            
-        atomic_write(global_filepath, global_content)
+        atomic_write(global_filepath, global_info["content"])
         rendered_paths.append(global_filepath)
+        written_files.append(global_info)
 
-        if len(global_content) > 50000:
-            print(f"[Warning] 'live_axioms.md' exceeds 50,000 characters ({len(global_content)} chars). Large context files can increase LLM costs and latency. Consider dividing decisions into specialized scopes.")
-
-        # 2. Generate per-scope files
-        # Group active decisions by scope tag
-        scope_groups: Dict[str, List[Dict[str, Any]]] = {}
-        for dec in active_decisions:
-            scopes = dec.get("scope", [])
-            for s in scopes:
-                scope_groups.setdefault(s, []).append(dec)
-
-        # Ensure axioms directory exists
+        # 2. Per-scope files (filtered to one scope when requested).
         os.makedirs(self.axioms_dir, exist_ok=True)
-
-        # If a specific scope is requested, only write that one
-        scopes_to_render = [scope] if scope else scope_groups.keys()
-
+        scopes_to_render = [scope] if scope else list(assembled["scopes"].keys())
         for s in scopes_to_render:
             if not s:
                 continue
-            
+            # An explicitly-requested scope with no active decisions still gets an
+            # empty-state file (preserves the pre-refactor `render --scope` behaviour).
+            info = assembled["scopes"].get(s) or _empty_scope_file(s)
             scope_filepath = os.path.join(self.axioms_dir, f"{s}.md")
-            scope_header = (
-                f"# Active Axioms for Scope: {s}\n"
-                f"*Generated automatically by Mitos. Derived statelessly from primary sources (M8).*\n\n"
-            )
-            
-            scope_decisions = scope_groups.get(s, [])
-            scope_content = scope_header
-            if scope_decisions:
-                scope_content += "\n".join(
-                    render_node_markdown(d, modifiers.get(d["id"])) for d in scope_decisions
-                )
-            else:
-                scope_content += "*No active decisions committed in this scope.*\n"
-                
-            atomic_write(scope_filepath, scope_content)
+            atomic_write(scope_filepath, info["content"])
             rendered_paths.append(scope_filepath)
+            written_files.append(info)
 
-            if len(scope_content) > 20000:
-                print(f"[Warning] Scope axiom file '{s}.md' exceeds 20,000 characters ({len(scope_content)} chars). Consider dividing into smaller sub-scopes.")
+        # Record (don't print) which written files breached their size ceiling.
+        self.overflows = [
+            _overflow_entry(f) for f in written_files if len(f["content"]) > _ceiling_for(f)
+        ]
 
         return rendered_paths

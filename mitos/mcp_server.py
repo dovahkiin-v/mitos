@@ -437,6 +437,9 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str],
         existing decision is a no-op — a changed `context`/`rejected_paths`/`scope` or
         relation on a re-record is NOT saved. To record different reasoning or a new
         relationship, make a NEW decision (a distinct axiom), don't resubmit the old one.
+        The result MAY also carry `scope_overflow`: a one-line, debounced (≤once/24h)
+        health nudge that the generated context files have grown past their size ceiling
+        — not an error and not about this decision; run `mitos status` for the breakdown.
     """
     # Build our own writable manager — do NOT reuse get_workspace_components()
     # (it opens a read_only=True store). Workspace resolves from cwd, like the read tools.

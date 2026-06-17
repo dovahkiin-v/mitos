@@ -64,3 +64,44 @@ def test_json_report_ready_and_has_mcp_field(tmp_path, monkeypatch, capsys):
     assert data["ready"] is True
     assert "mcp_wired" in data["checks"]
     assert data["checks"]["mcp_wired"] is False  # no .mcp.json in a fresh init
+    # A clean (within-budget) project reports an empty size-ceiling list.
+    assert data["scope_overflow"] == []
+
+
+def test_status_reports_scope_overflow_detail(tmp_path, monkeypatch, capsys):
+    """status is the detail surface for size-ceiling overflows: per-file sizes + largest
+    decisions in the text report, and a structured list in the JSON report. This is where
+    the write path's one-line nudge sends the author for the actionable breakdown."""
+    import mitos.renderer as R
+    from mitos.store import GraphStore
+    from mitos.parser import ParsedEntry
+
+    _init(tmp_path)
+    capsys.readouterr()  # discard cmd_init's message
+    monkeypatch.setenv("GEMINI_API_KEY", "testkey")
+    monkeypatch.setattr(cli, "_check_qdrant", _qdrant(True, True, points=1))
+    monkeypatch.setattr(R, "SCOPE_OVERFLOW_WARN_CHARS", 200)  # cross a small ceiling cheaply
+
+    config = MitosConfig(str(tmp_path))
+    store = GraphStore(config.db_path)
+    big = ParsedEntry("decision", "big-axiom", 1, 5)
+    big.core_axiom = "A long rationale block. " * 40
+    big.rejected_paths = "n/a"
+    big.scope = ["substrate"]
+    store.commit_parsed_entry(big)
+
+    # Text report names the over-ceiling file, the largest decision, and a token estimate.
+    assert cli.cmd_status(str(tmp_path)) == 0
+    out = capsys.readouterr().out
+    assert "over the size ceiling" in out
+    assert "substrate.md" in out
+    assert "big-axiom" in out
+    assert "tokens" in out
+
+    # JSON report carries the structured scope_overflow list with ranked top decisions.
+    assert cli.cmd_status(str(tmp_path), as_json=True) == 0
+    data = json.loads(capsys.readouterr().out)
+    over = [o for o in data["scope_overflow"] if o["name"] == "substrate.md"]
+    assert len(over) == 1
+    assert over[0]["threshold_chars"] == 200
+    assert over[0]["top_decisions"][0]["slug"] == "big-axiom"

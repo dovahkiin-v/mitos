@@ -340,23 +340,34 @@ def test_pathology_rotation_mode_mark(isolated_workspace) -> None:
 # P7 — Renderer Warning on Budget Overflow
 # ==============================================================================
 def test_pathology_renderer_budget_overflow_warning(isolated_workspace, capsys) -> None:
-    """Verifies that the renderer emits a warning when the global axioms file size exceeds the budget."""
+    """Verifies the renderer RECORDS a size-ceiling overflow on ``.overflows`` (never prints it).
+
+    The warnings used to print mid-render, burying the record receipt under a wall of
+    repeated lines. They are now structured data the write path debounces and the
+    ``status`` surface details — so the render itself must stay silent.
+    """
     config, tmpdir = isolated_workspace
     store = GraphStore(config.db_path)
-    
-    # Commit a massive node to trigger the size warning (> 50,000 characters)
+
+    # Commit a massive node to push live_axioms.md over the 50,000-char ceiling.
     entry = ParsedEntry("decision", "massive-axiom", 1, 5)
     entry.core_axiom = "We strictly use large text buffers to overflow budget." * 1500
     entry.rejected_paths = "None."
     store.commit_parsed_entry(entry)
-    
+
     renderer = MitosRenderer(config.workspace_dir)
     renderer.render_all(store)
-    
-    # Verify global live_axioms.md exists
+
+    # Verify global live_axioms.md exists.
     live_axioms_path = os.path.join(config.workspace_dir, "live_axioms.md")
     assert os.path.exists(live_axioms_path)
-    
-    # Capture stdout and assert warning was emitted
+
+    # The overflow is recorded structurally and NOT printed (so it can't bury a receipt).
     captured = capsys.readouterr()
-    assert "exceeds 50,000 characters" in captured.out
+    assert "exceeds" not in captured.out
+    assert "[Warning]" not in captured.out
+    over = [o for o in renderer.overflows if o["name"] == "live_axioms.md"]
+    assert len(over) == 1
+    assert over[0]["chars"] > 50000
+    assert over[0]["threshold_chars"] == 50000
+    assert over[0]["est_tokens"] > 0
