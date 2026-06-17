@@ -12,12 +12,12 @@ from typing import List, Optional, Dict, Any
 from google import genai
 
 from mitos import __version__
-from mitos.config import MitosConfig, default_collection_name, global_env_path
+from mitos.config import MitosConfig, default_collection_name, global_env_path, hint_due
 from mitos.errors import MitosError, ParseError, ValidationError
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS
 from mitos.recall import assess_surface_recall
 from mitos.sync import MitosSyncManager, run_ambient_capture
-from mitos.renderer import MitosRenderer
+from mitos.renderer import MitosRenderer, overflow_report
 from mitos.importer import MitosProseImporter
 
 
@@ -518,6 +518,14 @@ def cmd_record(
             score_s = f"{score:.2f}" if isinstance(score, (int, float)) else "?"
             axiom_snip = (r.get("axiom") or "")[:60]
             print(f"     - {r['slug']}  ({score_s})  {axiom_snip}")
+    # Debounced size-ceiling nudge — AFTER the receipt, on stderr (an ancillary health
+    # hint, never the receipt itself), so a healthy growing corpus can't bury "Recorded ✓".
+    # Flush stdout first so the receipt lands before the nudge even when stdout is piped
+    # (block-buffered) while stderr is unbuffered — otherwise the streams can interleave.
+    overflow = result.get("scope_overflow")
+    if overflow:
+        sys.stdout.flush()
+        print(f"\n{overflow}", file=sys.stderr)
 
 
 def _read_text_arg(inline: Optional[str], file_path: Optional[str]) -> Optional[str]:
@@ -793,30 +801,8 @@ def _mcp_hint(workspace_dir: str) -> Optional[str]:
     """
     if os.environ.get("MITOS_NO_MCP_HINT") or _mcp_wired(workspace_dir):
         return None
-    import json as _json
-    import time as _time
-
-    now = _time.time()
-    path = os.path.join(
-        os.environ.get("XDG_CACHE_HOME")
-        or os.path.join(os.path.expanduser("~"), ".cache"),
-        "mitos", "mcp_hint.json",
-    )
-    shown: Dict[str, Any] = {}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            shown = _json.load(f)
-    except (OSError, ValueError):
-        shown = {}
-    if now - shown.get(workspace_dir, 0) < 24 * 60 * 60:
+    if not hint_due("mcp_hint.json", workspace_dir, 24 * 60 * 60):
         return None
-    shown[workspace_dir] = now
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            _json.dump(shown, f)
-    except OSError:
-        pass
     return (
         "💡 You're using the mitos CLI directly. For the best experience — ambient "
         "recall and structured recording (no shell-quoting) — wire the MCP server: "
@@ -879,6 +865,37 @@ def cmd_set_key(value: str, name: str = "GEMINI_API_KEY", is_global: bool = Fals
         _ensure_gitignore_entry(os.path.join(os.getcwd(), ".gitignore"), ".env")
 
 
+def _fmt_k(n: int) -> str:
+    """Formats a token count with a 'k' suffix for readability (e.g. 14237 → '~14k')."""
+    return f"~{round(n / 1000)}k" if n >= 1000 else f"~{n}"
+
+
+def _print_overflow_detail(overflows: List[Dict[str, Any]]) -> None:
+    """Prints the size-ceiling breakdown for over-budget context files (status surface).
+
+    The detailed counterpart to the one-line nudge the write path shows: per file, its
+    char/estimated-token size and the largest decisions in it, so an author knows what
+    to re-scope. Informational only — never a readiness blocker.
+
+    Args:
+        overflows: Overflow records from ``overflow_report`` (largest file first).
+    """
+    n = len(overflows)
+    noun = "file" if n == 1 else "files"
+    print(f"\n  ⚠ {n} rendered axiom {noun} over the size ceiling "
+          f"(informational — not a readiness blocker):")
+    for o in overflows:
+        print(f"      - {o['name']}: {o['chars']:,} chars "
+              f"({_fmt_k(o['est_tokens'])} tokens, ceiling {o['threshold_chars']:,})")
+        top = o.get("top_decisions", [])
+        if top:
+            print("          largest decisions:")
+            for d in top:
+                print(f"            • {d['slug']}  ({d['chars']:,} chars)")
+    print("    These context files grow with the corpus — re-scope the largest decisions "
+          "above, or split a broad scope.")
+
+
 def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
     """Reports whether Mitos is set up for a project, and what (if anything) is missing.
 
@@ -909,11 +926,17 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
     mcp_wired = _mcp_wired(workspace_dir)
 
     graph_nodes = None
+    # Read-only size-ceiling report for the generated context files. This is the
+    # health surface the write-path overflow nudge points at — the detailed breakdown
+    # (which files, which decisions to re-scope) lives here, not on every `record`.
+    overflows: List[Dict[str, Any]] = []
     if os.path.exists(config.db_path):
         try:
-            graph_nodes = len(GraphStore(config.db_path, read_only=True).get_all_nodes())
+            ro_store = GraphStore(config.db_path, read_only=True)
+            graph_nodes = len(ro_store.get_all_nodes())
+            overflows = overflow_report(ro_store)
         except Exception:
-            graph_nodes = None
+            pass  # both reads are best-effort; a failure leaves the safe defaults
 
     initialized = mitos_dir_ok and decisions_ok
     # A fresh, initialized project has NO Qdrant collection yet — it auto-creates
@@ -941,6 +964,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
                 "graph_nodes": graph_nodes,
                 "mcp_wired": mcp_wired,
             },
+            "scope_overflow": overflows,
         }, indent=2))
         return 0 if ready else 1
 
@@ -979,6 +1003,8 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
         print(f"      ({q['points']} vector(s) indexed)")
     if graph_nodes is not None:
         print(f"  • graph holds {graph_nodes} node(s)")
+    if overflows:
+        _print_overflow_detail(overflows)
     print()
     if not ready:
         print("Next steps:")

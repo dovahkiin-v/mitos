@@ -276,6 +276,52 @@ def test_slug_prefix_is_not_a_collision(ws) -> None:
 
 @patch("mitos.sync.QdrantVectorStore")
 @patch("mitos.sync.GeminiEmbeddingProvider")
+def test_scope_overflow_summary_after_receipt_then_debounced(mock_provider, mock_vector, ws) -> None:
+    """An over-ceiling render attaches ONE debounced `scope_overflow` summary to the result.
+
+    Reproduces the AX complaint and pins the fix end-to-end on the shared write path
+    (so both the CLI and MCP surfaces inherit it): the receipt fields are always intact,
+    the size nudge is a single line pointing at `mitos status` (not the per-write wall),
+    and a second record in the same workspace within the window is silent.
+    """
+    config, _ = ws
+    # Degrade the backends → no network and no P4 near-duplicate pause (which needs
+    # embeddings), isolating the overflow-presentation behaviour under test.
+    mock_provider.side_effect = Exception("provider down")
+    mock_vector.side_effect = Exception("qdrant down")
+    m = MitosSyncManager(config)
+
+    big_axiom = "We persist an enormous rationale here. " * 1600  # > 50,000 chars
+    first = m.record_decision_entry(big_axiom, "Smaller buffers.", ["substrate"], slug="huge-one")
+    assert "error" not in first and first["status"] == "created"
+    # Receipt fields are present and intact — never buried or dropped.
+    assert first["slug"] == "huge-one" and first["state"] == "active"
+    # Exactly one debounced summary line, pointing at the health surface for detail.
+    assert "scope_overflow" in first
+    assert "mitos status" in first["scope_overflow"]
+
+    # A second record in the same workspace within the 24h window is silent (debounced),
+    # even though the corpus is still over the ceiling.
+    second = m.record_decision_entry("A small follow-up axiom.", "Nothing.", ["substrate"], slug="small-two")
+    assert "error" not in second
+    assert "scope_overflow" not in second
+
+
+@patch("mitos.sync.QdrantVectorStore")
+@patch("mitos.sync.GeminiEmbeddingProvider")
+def test_no_scope_overflow_field_when_within_budget(mock_provider, mock_vector, ws) -> None:
+    """A normal-sized decision records cleanly with NO scope_overflow field."""
+    config, _ = ws
+    mock_provider.side_effect = Exception("provider down")
+    mock_vector.side_effect = Exception("qdrant down")
+    m = MitosSyncManager(config)
+    res = m.record_decision_entry("Use a small, bounded axiom.", "Sprawl.", ["substrate"], slug="tidy")
+    assert "error" not in res and res["status"] == "created"
+    assert "scope_overflow" not in res
+
+
+@patch("mitos.sync.QdrantVectorStore")
+@patch("mitos.sync.GeminiEmbeddingProvider")
 def test_graceful_degradation(mock_provider, mock_vector, ws) -> None:
     """Embedding backend down → node commits, embedding 'pending', outbox row present."""
     config, _ = ws
@@ -287,6 +333,27 @@ def test_graceful_degradation(mock_provider, mock_vector, ws) -> None:
     assert res["embedding"] == "pending"
     pending = GraphStore(config.db_path).get_pending_embeddings()
     assert any(p["node_id"] == res["id"] for p in pending)
+
+
+@patch("mitos.sync.QdrantVectorStore")
+@patch("mitos.sync.GeminiEmbeddingProvider")
+def test_write_path_warnings_go_to_stderr_not_stdout(mock_provider, mock_vector, ws, capsys) -> None:
+    """With the backend down, the embedding-deferral warning lands on stderr, never stdout.
+
+    The MCP write tool (record_decision) shares this code path and uses stdout for its
+    JSON-RPC channel, so any stray stdout line there corrupts the protocol — every
+    write-path warning must go to stderr.
+    """
+    config, _ = ws
+    mock_provider.side_effect = Exception("provider down")
+    mock_vector.side_effect = Exception("qdrant down")
+    m = MitosSyncManager(config)
+    res = m.record_decision_entry("Defer the embedding cleanly.", "Crash.", ["reliability"], slug="defer-clean")
+    assert "error" not in res and res["embedding"] == "pending"
+    captured = capsys.readouterr()
+    assert "[Warning]" not in captured.out  # stdout stays clean for the MCP JSON-RPC channel
+    assert "Embedding upsert deferred" in captured.err
+    assert "defer-clean" in captured.err
 
 
 # --------------------------------------------------------------------------- #

@@ -6,6 +6,7 @@ archive rotation.
 """
 
 import os
+import sys
 import shutil
 import re
 import json
@@ -15,14 +16,14 @@ from filelock import FileLock, Timeout
 from google import genai
 from google.genai import types
 
-from mitos.config import MitosConfig
+from mitos.config import MitosConfig, hint_due
 from mitos.errors import SynthesisError, ParseError, ValidationError, DatabaseError
 from mitos.models import get_model_id
 from mitos.parser import ParsedEntry, parse_decisions_file
 from mitos.store import GraphStore, CommitDelta, compute_hash
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.vector_store import QdrantVectorStore
-from mitos.renderer import MitosRenderer
+from mitos.renderer import MitosRenderer, summarize_overflows
 
 def run_sync_enrichment(
     client: genai.Client,
@@ -626,9 +627,12 @@ class MitosSyncManager:
         if not self.embed_provider or not self.vector_store:
             try:
                 self.store.add_pending_embedding(delta.node_id, embedding_text)
-                print(f"[Warning] Embedding upsert deferred for '{entry.slug}': Embedding provider down.")
+                # stderr: this path is shared with the MCP write tool, whose stdout is the
+                # JSON-RPC channel — a stray stdout line there corrupts the protocol.
+                print(f"[Warning] Embedding upsert deferred for '{entry.slug}': Embedding provider down.",
+                      file=sys.stderr)
             except Exception as e:
-                print(f"[Warning] Failed to write outbox queue: {str(e)}")
+                print(f"[Warning] Failed to write outbox queue: {str(e)}", file=sys.stderr)
             return None
 
         # Prepare payload
@@ -646,12 +650,13 @@ class MitosSyncManager:
             self.vector_store.upsert(delta.node_id, vector, payload)
             return vector
         except Exception as e:
-            # Failed embeddings land in graph Outbox queue (C2)
-            print(f"[Warning] Embedding upsert deferred for '{entry.slug}': {str(e)}")
+            # Failed embeddings land in graph Outbox queue (C2). stderr — shared with the
+            # MCP write tool, whose stdout is the JSON-RPC channel (see the deferred-path note).
+            print(f"[Warning] Embedding upsert deferred for '{entry.slug}': {str(e)}", file=sys.stderr)
             try:
                 self.store.add_pending_embedding(delta.node_id, embedding_text)
             except Exception as dbe:
-                print(f"[Warning] Failed to write outbox queue: {str(dbe)}")
+                print(f"[Warning] Failed to write outbox queue: {str(dbe)}", file=sys.stderr)
             return None
 
     def drain_pending_embeddings(self) -> None:
@@ -1150,13 +1155,24 @@ class MitosSyncManager:
         try:
             vector = self._best_effort_embed(delta, entry)
         except Exception as e:
-            print(f"[Warning] Embedding step failed for '{entry.slug}': {str(e)}")
+            # stderr: the MCP write tool shares this path and uses stdout for JSON-RPC.
+            print(f"[Warning] Embedding step failed for '{entry.slug}': {str(e)}", file=sys.stderr)
 
         # 9. Re-render live_axioms.md (a render failure must not fail the commit).
+        #    The renderer records size-ceiling overflows on `.overflows` instead of
+        #    printing them, so we can attach ONE debounced summary to the result below
+        #    — after the success receipt — rather than burying it under a per-file wall.
+        overflow_summary: Optional[str] = None
         try:
-            MitosRenderer(self.config.workspace_dir).render_all(self.store)
+            renderer = MitosRenderer(self.config.workspace_dir)
+            renderer.render_all(self.store)
+            if renderer.overflows and hint_due(
+                "scope_overflow_hint.json", self.config.workspace_dir, 24 * 60 * 60
+            ):
+                overflow_summary = summarize_overflows(renderer.overflows)
         except Exception as e:
-            print(f"[Warning] Failed to render active axioms: {str(e)}")
+            # stderr: the MCP write tool shares this path and uses stdout for JSON-RPC.
+            print(f"[Warning] Failed to render active axioms: {str(e)}", file=sys.stderr)
 
         # 10. Return. A freshly recorded decision is always active. Adjacency is a
         #     post-commit, fail-silent guardrail — surfacing it here never affects the
@@ -1179,4 +1195,9 @@ class MitosSyncManager:
         related = self._adjacent_decisions(vector, exclude_slug=entry.slug)
         if related:
             result["related"] = related
+        # Debounced, presentation-only: a one-line "N files over the size ceiling — run
+        # `mitos status`" nudge, never on the burying-the-receipt critical path. Shared
+        # by both surfaces (CLI prints it after the receipt; MCP returns it structured).
+        if overflow_summary:
+            result["scope_overflow"] = overflow_summary
         return result

@@ -7,7 +7,7 @@ and TOML-style config loading logic.
 import os
 import tempfile
 import pytest
-from mitos.config import MitosConfig, default_collection_name
+from mitos.config import MitosConfig, default_collection_name, hint_due
 
 def test_config_defaults() -> None:
     """Verifies that MitosConfig initializes with standard default values."""
@@ -74,3 +74,23 @@ def test_config_file_loading() -> None:
         assert loaded_config.rotation_mode == "mark"
         assert loaded_config.pending_threshold == 42
         assert loaded_config.qdrant_collection == "custom_collection"
+
+
+def test_hint_due_debounces_within_window(tmp_path) -> None:
+    """hint_due fires once per window per key, and never raises (fail-silent debounce).
+
+    Backs both the MCP-server hint and the render-overflow summary, so a recurring
+    nudge fires at most once per window instead of on every call. (The autouse
+    hermetic fixture redirects XDG_CACHE_HOME into a tmp dir, so this never touches
+    the real ~/.cache.)
+    """
+    key = str(tmp_path / "proj")
+    # First call in the window is due (and stamps); the next is debounced.
+    assert hint_due("overflow_test.json", key, 10_000) is True
+    assert hint_due("overflow_test.json", key, 10_000) is False
+    # A different key is tracked independently.
+    assert hint_due("overflow_test.json", key + "-other", 10_000) is True
+    # A different cache file is a separate namespace, so it fires again for the same key.
+    assert hint_due("other_test.json", key, 10_000) is True
+    # A zero-second window always re-fires (the elapsed time is never < 0).
+    assert hint_due("overflow_test.json", key, 0) is True
