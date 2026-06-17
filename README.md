@@ -68,7 +68,6 @@ mitos_2/
 │   ├── format-spec.md          # Packaged single-source format specifier
 │   └── ...
 ├── decisions.md                # Write-buffer decisions file (Auto-healed)
-├── format-spec.md              # Global single-source format specification file
 ├── live_axioms.md              # Compiled stateless active axioms list
 ├── tests/                      # 1:1 test-to-code byte ratio adversarial test package
 └── .gitignore                  # Local repository exclusion list
