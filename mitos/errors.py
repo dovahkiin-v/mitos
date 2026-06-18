@@ -68,6 +68,29 @@ class SynthesisError(MitosError):
     pass
 
 
+class CommitError(MitosError):
+    """Raised when the store rejects an entry on referential/graph grounds (§5.2.2).
+
+    The store-stage analogue of :class:`ParseError`: a referential violation found
+    while committing (a missing/dangling kill-edge target, a cross-kind edge, a
+    cycle, or a slug collision) raises this carrying the structured ``EntryFailure``
+    envelope (``source="store"`` items), so the caller gets the same
+    machine-readable payload the parser produces.
+
+    It is deliberately a :class:`MitosError` and **not** a ``sqlite3.Error``
+    subclass: raised inside ``commit_parsed_entry``'s ``with conn:`` block it rolls
+    the whole entry back (V1-D10), then propagates *past* the SQLite exception
+    handlers with its envelope intact.
+
+    Attributes:
+        failure: The structured §5.2.2 envelope for the rejected entry.
+    """
+
+    def __init__(self, message: str, failure: "EntryFailure") -> None:
+        self.failure = failure
+        super().__init__(message)
+
+
 # ---------------------------------------------------------------------------
 # §5.2.2 Structured Failure Envelope (Phase 4b)
 #
@@ -104,6 +127,29 @@ PARSER_FAILURE_CODES = frozenset(
         PARSER_MALFORMED_ENTRY,
         PARSER_MISSING_REQUIRED_FIELD,
         PARSER_MALFORMED_MARKER,
+    }
+)
+
+# Store-stage code names (emitted with ``source="store"``, Phase 5b) — the five
+# referential codes reserved in the comment above. They are NOT parser codes and
+# must never appear in a parser-produced envelope (the stage-purity invariant).
+STORE_SLUG_COLLISION = "slug_collision"
+STORE_MISSING_TARGET = "missing_target"
+STORE_DANGLING_EDGE = "dangling_edge"
+STORE_KIND_CONSTRAINT_VIOLATION = "kind_constraint_violation"
+STORE_CYCLE_VIOLATION = "cycle_violation"
+
+# The store-stage whitelist (mirrors ``PARSER_FAILURE_CODES``). The NAMES are the
+# cross-vision §5.2.2 contract — V3a's interactive review UX and V5's MCP error
+# surface switch on these exact strings, so a typo is a silent cross-vision break
+# (pinned by ``test_store_failure_codes_pin``).
+STORE_FAILURE_CODES = frozenset(
+    {
+        STORE_SLUG_COLLISION,
+        STORE_MISSING_TARGET,
+        STORE_DANGLING_EDGE,
+        STORE_KIND_CONSTRAINT_VIOLATION,
+        STORE_CYCLE_VIOLATION,
     }
 )
 
