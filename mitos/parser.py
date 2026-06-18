@@ -69,7 +69,12 @@ def load_dynamic_field_map() -> Dict[str, str]:
         ) from exc
 
     # Extract fields declared in the markdown list items: - `**Field:**`
-    fields_found = re.findall(r'-\s+`\*\*(?P<field>[a-zA-Z -_]+):\*\*`', content)
+    # Char class is literal letters + space + underscore + hyphen. The hyphen MUST
+    # stay last (or be escaped) so it is a literal `-`, NOT a range endpoint — the
+    # pre-r2 `[a-zA-Z -_]` silently parsed ` -_` as the 0x20–0x5F range (35 stray
+    # chars: digits, @, punctuation). This regex is the SOLE field-recognition gate
+    # post-4b (no baseline mask), so a malformed spec name must not be harvested.
+    fields_found = re.findall(r'-\s+`\*\*(?P<field>[A-Za-z _-]+):\*\*`', content)
     for f_name in fields_found:
         normalized_key = f_name.strip().lower()
 
