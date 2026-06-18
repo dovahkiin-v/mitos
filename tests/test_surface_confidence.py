@@ -24,7 +24,7 @@ from mitos.config import MitosConfig
 from mitos.cli import cmd_init
 from mitos.store import GraphStore
 from mitos.sync import MitosSyncManager
-from mitos.recall import assess_surface_recall, SURFACE_CONFIDENCE_THRESHOLD
+from mitos.recall import assess_surface_recall, SURFACE_STRONG_THRESHOLD, SURFACE_WEAK_THRESHOLD
 
 
 @pytest.fixture
@@ -75,7 +75,7 @@ def test_policy_strong_when_top_score_clears_threshold():
 
 def test_policy_strong_at_exact_threshold():
     """The threshold is inclusive — a score exactly at the bar is strong."""
-    conf, _ = assess_surface_recall(semantic_ran=True, top_score=SURFACE_CONFIDENCE_THRESHOLD,
+    conf, _ = assess_surface_recall(semantic_ran=True, top_score=SURFACE_STRONG_THRESHOLD,
                                     result_count=1, scope=None, scope_decision_count=None)
     assert conf == "strong"
 
@@ -84,8 +84,14 @@ def test_policy_weak_below_threshold_names_the_score():
     conf, note = assess_surface_recall(semantic_ran=True, top_score=0.61, result_count=3,
                                        scope=None, scope_decision_count=None)
     assert conf == "weak"
-    assert "0.61" in note and "0.80" in note
-    assert "loose neighbours" in note and "no-precedent" in note
+    assert "0.61" in note
+
+
+def test_policy_off_axis_below_weak_threshold():
+    conf, note = assess_surface_recall(semantic_ran=True, top_score=0.55, result_count=3,
+                                       scope=None, scope_decision_count=None)
+    assert conf == "none"
+    assert "0.55" in note and "off-axis" in note.lower()
 
 
 def test_policy_none_no_match_points_to_list():
@@ -139,7 +145,7 @@ def test_mcp_surface_weak_hit_flagged(ws):
     _rec(m, "loose-neighbour", scope=["db"])
     resp = _surface_with([{"slug": "loose-neighbour", "score": 0.62}], ws, scope="db")
     assert resp["confidence"] == "weak"
-    assert "no-precedent" in resp["note"]
+    assert "Twilight zone" in resp["note"]
     assert resp["active_decisions"]  # still returned, just flagged weak
 
 

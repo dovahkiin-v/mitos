@@ -147,6 +147,7 @@ _STRUCTURAL_MARKERS = (
 _ERROR_MESSAGES: Dict[str, str] = {
     "not_initialized": "No Mitos workspace found here. Run 'mitos init' before recording decisions.",
     "empty_axiom": "'axiom' is empty. Provide the decision as a single clear sentence that is true going forward.",
+    "empty_slug": "'slug' is empty. Provide a short, explicit, hyphenated handle (e.g. 'sqlite-wal-mode').",
     "missing_rejected_paths": "'rejected_paths' is required: state the alternatives you considered and why you ruled them out — this is what stops you or another agent from re-proposing them later.",
     "parse_failed": "The decision could not be serialised into a valid entry — most likely a structural token in axiom/rejected_paths/context: a line beginning with '##' or '###' (indent it or use '#'/'####' instead), a line shaped like '**Something:**', or a '[DECISION_TRANSCRIPT]' / '[DECISION_PARKED:' / 'BEGIN ENTRIES' / '[NOTE:' / '[PARKED:' marker. Remove or rephrase that line and retry.",
     "slug_collision": "A different decision already uses the slug '{slug}'. Give this one a distinct 'slug'; and if it is meant to replace the existing decision, also set supersedes='{slug}' (the new decision must still have its own slug — two decisions cannot share one).",
@@ -272,6 +273,8 @@ def _slugify(text: str) -> str:
     into ``supersedes``/relations stays readable (``…brazilian-portuguese``, not
     ``…brazilian-portug``). Still a pure function of the text, so determinism holds.
     """
+    if not text:
+        return ""
     s = re.sub(r'[^a-z0-9]+', '-', text.lower())
     s = re.sub(r'-+', '-', s).strip('-')
     if len(s) > _SLUG_MAX_LEN:
@@ -1044,10 +1047,9 @@ class MitosSyncManager:
                 extra_relations[_name] = _val.strip()
 
         # 4. Deterministic slug.
-        explicit_slug = bool(slug and slug.strip())
-        slug = _slugify(slug) if slug else _slugify(axiom)
+        slug = _slugify(slug)
         if not slug:
-            return _record_error("empty_axiom")
+            return _record_error("empty_slug")
 
         # 5. Serialise to the canonical format (in memory only).
         lines = [f"### {slug}", "", f"**Decided:** {axiom}", f"**Rejected:** {rejected_paths}"]
@@ -1271,13 +1273,6 @@ class MitosSyncManager:
             "status": "created",
             "path": self.config.decisions_file,
         }
-        # Nudge for an explicit slug when the auto-derived one was shortened — a
-        # truncated handle is awkward to carry into supersedes/relations later.
-        if not explicit_slug and _slug_is_truncated(axiom):
-            result["slug_hint"] = (
-                f"Slug auto-derived and shortened to '{entry.slug}'. For a cleaner "
-                "handle to reference later, pass an explicit slug= next time."
-            )
         related = self._adjacent_decisions(vector, exclude_slug=entry.slug)
         if related:
             result["related"] = related

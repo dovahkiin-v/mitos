@@ -617,7 +617,8 @@ def cmd_record(
     contradicts: Optional[str] = None,
     derives_from: Optional[str] = None,
     cites: Optional[str] = None,
-    slug: Optional[str] = None,
+    *,
+    slug: str,
     acknowledge_neighbors: bool = False,
 ) -> None:
     """Records a decision directly to the write-buffer and graph (thin wrapper)."""
@@ -665,8 +666,6 @@ def cmd_record(
     if result.get("path"):
         print(f"  Written:   {result['path']}  (the human-readable entry — eyeball it)")
     print(f"  Handle:    '{result['slug']}' — pass this to --supersedes/--amends/--depends-on/… to link future decisions.")
-    if result.get("slug_hint"):
-        print(f"  Note:      {result['slug_hint']}")
     related = result.get("related")
     if related:
         print("  ↔ Nearest existing decisions (an intended neighbour, or a tension to reconcile?):")
@@ -812,8 +811,10 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         print(f"→ {note}")
         return
     print(f"\nPrecedents for: '{query}'" + (f"  (scope: {scope})" if scope else ""))
-    if conf in ("weak", "none"):
-        print(f"⚠ confidence: {conf} — these may be loose neighbours, not settled precedent")
+    if conf == "weak":
+        print("⚠ confidence: weak — twilight zone: matches are close but may not settle this.")
+    elif conf == "none":
+        print("⚠ confidence: likely off-axis — the scope is populated, but nothing matches your query.")
     print("-" * 60)
     for i, d in enumerate(ad, start=1):
         print(f"{i}. {d['slug']}  (score {d['score']:.3f})")
@@ -1498,7 +1499,7 @@ def main() -> None:
     rec_p.add_argument("--contradicts", default=None, help="Exact slug of a decision this one contradicts.")
     rec_p.add_argument("--derives-from", default=None, dest="derives_from", help="Exact slug of a decision this one derives from.")
     rec_p.add_argument("--cites", default=None, help="Exact slug of a decision this one cites.")
-    rec_p.add_argument("--slug", default=None, help="Optional explicit slug; derived from the axiom if omitted.")
+    rec_p.add_argument("--slug", required=True, help="Explicit slug (handle) for the decision (required).")
     rec_p.add_argument("--acknowledge-neighbors", action="store_true", dest="acknowledge_neighbors",
                        help="Record past the near-duplicate review (the decision is genuinely independent).")
 
