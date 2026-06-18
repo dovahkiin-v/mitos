@@ -20,7 +20,7 @@ from unittest.mock import MagicMock, patch
 
 from mitos.config import MitosConfig
 from mitos.cli import cmd_init
-from mitos.store import GraphStore, compute_hash
+from mitos.store import GraphStore
 from mitos.errors import DatabaseError
 from mitos.sync import MitosSyncManager
 from mitos.parser import parse_decisions_file
@@ -217,14 +217,15 @@ def test_supersedes_e2e(ws) -> None:
     rb = m.record_decision_entry("Axiom B.", "Reject B.", [], supersedes="dec-a", slug="dec-b")
     assert "error" not in rb and rb["status"] == "created"
     store = GraphStore(config.db_path)
+    # V1a single-node state derivation (8a): the prototype compute_all_states DAG retired.
+    assert store.get_node_state(ra["id"]) == "superseded"
+    assert store.get_node_state(rb["id"]) == "active"
     conn = store._get_connection()
     try:
-        states = store.compute_all_states(conn)
-        assert states[ra["id"]] == "superseded"
-        assert states[rb["id"]] == "active"
-        edges = conn.execute("SELECT * FROM edges WHERE type='supersedes'").fetchall()
+        # V1a edge columns: edge_type / source_id / target_id (was type / from_id / to_id).
+        edges = conn.execute("SELECT * FROM edges WHERE edge_type='supersedes'").fetchall()
         assert len(edges) == 1
-        assert edges[0]["from_id"] == rb["id"] and edges[0]["to_id"] == ra["id"]
+        assert edges[0]["source_id"] == rb["id"] and edges[0]["target_id"] == ra["id"]
     finally:
         conn.close()
 
@@ -484,6 +485,6 @@ def _mk_entry(axiom: str, slug: str):
     """Builds a minimal committable decision ParsedEntry for racing/ambiguity setup."""
     from mitos.parser import ParsedEntry
     e = ParsedEntry("decision", slug, 0, 0)
-    e.core_axiom = axiom
+    e.axiom = axiom
     e.rejected_paths = "setup rejection"
     return e

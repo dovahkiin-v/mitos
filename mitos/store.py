@@ -189,7 +189,16 @@ def compute_hash(
     mechanisms: List[str] = [],
     questions_raised: List[str] = []
 ) -> str:
-    """Computes a stable, deterministic SHA-256 hash for content-hash identity (M2).
+    """Computes the PROTOTYPE slug-inclusive SHA-256 id — retained ONLY as a test fixture.
+
+    ⚠ **Retired from production (Phase 8a, entry-002 tail).** The live identity is
+    ``identity.compute_node_id`` (slug-free canonical-core hash, V1-D2). No
+    production consumer imports or calls this anymore — ``sync.py`` / ``importer.py``
+    mint via ``compute_node_id``. This prototype formula (slug-inclusive,
+    newline-delimited) survives **only** because the cutover-reference tests
+    (``test_cutover``) plant prototype-shaped graphs via the retained ``_init_db``
+    fixture and must recompute the matching prototype ids. Do NOT reintroduce a
+    production call; mint identity through ``identity.compute_node_id``.
 
     Args:
         kind: One of "decision" or "open_question".
@@ -775,100 +784,70 @@ class GraphStore:
         finally:
             conn.close()
 
-    def compute_all_states(self, conn: sqlite3.Connection) -> Dict[str, str]:
-        """Computes states for all nodes currently in the transaction connection.
+    def get_node_state(self, node_id: str) -> str:
+        """Computes one node's state from its incoming kill-edge (the V1a active view).
 
-        Implements the M3 principle (computed state derived at runtime).
-        - Decision state: 'active | superseded | drifted'
-        - Open Question state: 'parked | resolved'
+        The single-node companion to ``get_decisions``' bulk ``computed_state``
+        derivation: it binds the SAME ``_KILLER_TYPE_SQL`` / ``_computed_decision_state``
+        logic (M3 — state is computed, never stored), so the store has exactly one
+        definition of "active". Replaces the prototype
+        ``compute_all_states(conn).get(node_id)`` consumer call sites (Phase 8a).
+
+        Returns ``"active"`` for a node with no incoming kill-edge, ``"superseded"``
+        for an incoming ``supersedes``, ``"corrected"`` for an incoming ``corrects``,
+        and ``"drifted"`` for an otherwise-active node carrying a drifted signal
+        (always-False in v0.1 — the channel is reserved, V1-D11). An absent node
+        defaults to ``"active"`` (mirrors the prototype ``.get(id, "active")``; every
+        live caller resolves the node first, so the absent branch is a defensive
+        vector, P3).
+
+        The state is **decision-centric** (``active`` / ``superseded`` /
+        ``corrected`` / ``drifted``). Open-question resolution state
+        (``parked`` / ``resolved``) rides the ``resolves`` edge — a warn-deferred
+        V1b type — so an open_question resolves to its kill-edge state here, never
+        ``parked`` / ``resolved`` (G7; V1b owns OQ resolution).
+
+        Args:
+            node_id: The content-hash id of the node to derive state for.
 
         Returns:
-            A mapping of node_id -> state_string.
+            The computed state string.
         """
-        cursor = conn.cursor()
-        
-        # Load all nodes
-        cursor.execute("SELECT id, kind, scope FROM nodes")
-        nodes = {row["id"]: {"kind": row["kind"], "scope": json.loads(row["scope"] or "[]")} for row in cursor.fetchall()}
-        
-        # Load all edges of type 'supersedes', 'corrects', 'resolves'
-        cursor.execute("SELECT from_id, to_id, type FROM edges WHERE type IN ('supersedes', 'corrects', 'resolves')")
-        edges = cursor.fetchall()
-        
-        # Load drifted signals
-        cursor.execute("SELECT node_id FROM signals WHERE type = 'drifted'")
-        drifted_nodes = {row["node_id"] for row in cursor.fetchall()}
-
-        # Build incoming edge index: to_id -> list of (from_id, type)
-        incoming: Dict[str, List[Tuple[str, str]]] = {}
-        for edge in edges:
-            to_id = edge["to_id"]
-            from_id = edge["from_id"]
-            etype = edge["type"]
-            incoming.setdefault(to_id, []).append((from_id, etype))
-
-        computed_states: Dict[str, str] = {}
-
-        # First, evaluate Decision nodes. Since it's a DAG of overrides (new corrects/supersedes old),
-        # we can evaluate active nodes by checking if they are corrected or superseded
-        # by an active node. Since it can be recursive, we do a topological walk.
-        # But simpler: in v0.1, a node is superseded if there is ANY active node in its override lineage.
-        # Let's perform a simple fixed-point evaluation of active decisions.
-        active_decisions: Set[str] = {nid for nid, n in nodes.items() if n["kind"] == "decision"}
-        
-        changed = True
-        while changed:
-            changed = False
-            to_remove = set()
-            for nid in active_decisions:
-                # Check if any incoming corrects/supersedes is from another active decision
-                for parent_id, etype in incoming.get(nid, []):
-                    if etype in ("supersedes", "corrects") and parent_id in active_decisions:
-                        to_remove.add(nid)
-                        changed = True
-                        break
-            if to_remove:
-                active_decisions -= to_remove
-
-        # Assign states to Decisions
-        for nid, node in nodes.items():
-            if node["kind"] == "decision":
-                if nid in active_decisions:
-                    if nid in drifted_nodes:
-                        computed_states[nid] = "drifted"
-                    else:
-                        computed_states[nid] = "active"
-                else:
-                    computed_states[nid] = "superseded"
-
-        # Assign states to Open Questions
-        # Open Question state is 'resolved' if there is an active decision resolving it.
-        for nid, node in nodes.items():
-            if node["kind"] == "open_question":
-                is_resolved = False
-                for parent_id, etype in incoming.get(nid, []):
-                    if etype == "resolves" and computed_states.get(parent_id) in ("active", "drifted"):
-                        is_resolved = True
-                        break
-                
-                computed_states[nid] = "resolved" if is_resolved else "parked"
-
-        return computed_states
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                f"SELECT {_IS_DRIFTED_SQL}, {_KILLER_TYPE_SQL} "
+                "FROM nodes WHERE nodes.id = ?",
+                (node_id,),
+            ).fetchone()
+            if row is None:
+                return "active"
+            if row["killer_type"] is None and row["is_drifted"]:
+                return "drifted"
+            return _computed_decision_state(row["killer_type"])
+        finally:
+            conn.close()
 
     def write_signal(self, node_id: str, stype: str, actor: Optional[str] = None) -> None:
-        """Writes a signal row (drifted, source_reencounter) using INSERT OR IGNORE.
+        """Writes a signal row (drifted, source_reencounter, retired) via INSERT OR IGNORE.
 
-        Ensures unique constraints do not crash transactions (signals-insert-or-ignore).
+        Aligned to the V1a ``signals`` shape (Phase 8a): ``type``→``signal_type``,
+        ``actor``→``source`` (NOT NULL DEFAULT '' — a ``None`` actor maps to ''), and
+        the now-required application-supplied ``created_at`` UTC µs stamp (MI-10; the
+        V1a schema carries no ``DEFAULT CURRENT_TIMESTAMP``). All three signal_type
+        values are reserved-but-unwritten in V1a — no live caller writes a signal —
+        so this is a correctness alignment of a latent landmine (K6), not a behavior
+        change. ``INSERT OR IGNORE`` keeps the composite-PK uniqueness from crashing.
         """
         conn = self._get_connection()
         try:
             with conn:
                 conn.execute(
                     """
-                    INSERT OR IGNORE INTO signals (node_id, type, actor)
-                    VALUES (?, ?, ?)
+                    INSERT OR IGNORE INTO signals (node_id, signal_type, source, created_at)
+                    VALUES (?, ?, ?, ?)
                     """,
-                    (node_id, stype, actor)
+                    (node_id, stype, actor or "", _utc_now_iso())
                 )
         except sqlite3.Error as e:
             raise DatabaseError(f"Failed to write signal: {str(e)}")
@@ -1915,18 +1894,30 @@ class GraphStore:
         finally:
             conn.close()
 
-    def add_pending_embedding(self, node_id: str, embedding_text: str) -> None:
-        """Adds or updates a node to the pending embeddings queue (C2/F2)."""
+    def add_pending_embedding(self, node_id: str) -> None:
+        """Enqueues a node onto the pending-embeddings Outbox (V1a 3-column shape).
+
+        Aligned to the V1a ``pending_embeddings`` schema (Phase 8a): no
+        ``embedding_text`` column — the drainer re-derives ``embedding_text(node)``
+        at drain time (a pure function of the immutable core, C2/M8), so nothing is
+        stored. A re-enqueue UPSERT resets drain state (re-stamps ``queued_at``,
+        clears ``retry_count``) — the same conservative flagless contract
+        ``_enqueue_outbox`` (5c) writes inside the commit transaction. This public
+        method is the standalone-connection twin of that in-transaction enqueue,
+        retained as part of the drain surface ``sync`` binds (R12).
+        """
         conn = self._get_connection()
         try:
             with conn:
                 conn.execute(
                     """
-                    INSERT INTO pending_embeddings (node_id, embedding_text)
-                    VALUES (?, ?)
-                    ON CONFLICT(node_id) DO UPDATE SET attempts = attempts + 1
+                    INSERT INTO pending_embeddings (node_id, queued_at, retry_count)
+                    VALUES (?, ?, 0)
+                    ON CONFLICT(node_id) DO UPDATE SET
+                        queued_at = excluded.queued_at,
+                        retry_count = 0
                     """,
-                    (node_id, embedding_text)
+                    (node_id, _utc_now_iso())
                 )
         except sqlite3.Error as e:
             raise DatabaseError(f"Failed to add pending embedding: {str(e)}")
@@ -1955,14 +1946,19 @@ class GraphStore:
             conn.close()
 
     def increment_pending_attempts(self, node_id: str) -> None:
-        """Increments the retry attempt count for a pending embedding and releases the claim."""
+        """Increments the retry count for a pending embedding (V1a 3-column shape).
+
+        Aligned to V1a (Phase 8a): ``attempts``→``retry_count``, and the
+        ``claimed_by = NULL`` release is dropped — V1a is single-writer
+        (``busy_timeout``), so the claim machinery defers to V3b (§5.2.8).
+        """
         conn = self._get_connection()
         try:
             with conn:
                 conn.execute(
                     """
                     UPDATE pending_embeddings
-                    SET attempts = attempts + 1, claimed_by = NULL
+                    SET retry_count = retry_count + 1
                     WHERE node_id = ?
                     """,
                     (node_id,)
@@ -1973,40 +1969,39 @@ class GraphStore:
             conn.close()
 
     def claim_pending_embeddings(self, drainer_id: str, limit: int = 10) -> List[Dict[str, Any]]:
-        """Claims a batch of pending embeddings atomically using UPDATE ... RETURNING (V1-D26)."""
+        """Reads a batch of pending embeddings to drain (V1a single-writer semantics).
+
+        Aligned to V1a (Phase 8a): the prototype's ``claimed_by`` claim machinery
+        (UPDATE ... RETURNING) defers to V3b (§5.2.8) — V1a is single-writer
+        (``busy_timeout``), so a plain ordered SELECT is the whole contract. The
+        returned rows carry NO ``embedding_text`` (the column is gone, C2/M8); the
+        drainer re-derives it per node. ``drainer_id`` is retained for surface
+        stability (R12) and is unused under single-writer semantics.
+        """
         conn = self._get_connection()
         try:
-            with conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    """
-                    UPDATE pending_embeddings
-                    SET claimed_by = ?
-                    WHERE node_id IN (
-                        SELECT node_id FROM pending_embeddings
-                        WHERE claimed_by IS NULL
-                        LIMIT ?
-                    )
-                    RETURNING node_id, embedding_text
-                    """,
-                    (drainer_id, limit)
-                )
-                return [dict(row) for row in cursor.fetchall()]
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT node_id, queued_at, retry_count
+                FROM pending_embeddings
+                ORDER BY queued_at
+                LIMIT ?
+                """,
+                (limit,)
+            )
+            return [dict(row) for row in cursor.fetchall()]
         except sqlite3.Error as e:
             raise DatabaseError(f"Failed to claim pending embeddings: {str(e)}")
         finally:
             conn.close()
 
     def release_pending_embeddings(self, drainer_id: str) -> None:
-        """Releases claims held by a drainer, resetting them back to NULL."""
-        conn = self._get_connection()
-        try:
-            with conn:
-                conn.execute(
-                    "UPDATE pending_embeddings SET claimed_by = NULL WHERE claimed_by = ?",
-                    (drainer_id,)
-                )
-        except sqlite3.Error as e:
-            raise DatabaseError(f"Failed to release pending embeddings: {str(e)}")
-        finally:
-            conn.close()
+        """No-op under V1a single-writer semantics (Phase 8a; retained for surface stability).
+
+        The prototype released ``claimed_by`` holds; V1a has no ``claimed_by`` column
+        (the claim machinery defers to V3b, §5.2.8), so there is nothing to release.
+        The method name/signature are preserved because ``sync._drain_embeddings``
+        binds it (R12).
+        """
+        return None

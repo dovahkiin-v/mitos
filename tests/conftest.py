@@ -47,23 +47,15 @@ import pytest
 # Phase 6b restored ``test_status_readiness`` (the ``cmd_status`` rebuild it gated
 # on landed; the prototype-shape ``ParsedEntry`` fixture was reworked to V1a),
 # leaving 12 modules — all 8a's.
-STORE_REBUILD_QUARANTINE = [
-    # Consumer-write / MCP / CLI / amends-narrows — restored in Phase 8a.
-    # (Phase 6b restored test_status_readiness.py — the cmd_status rebuild it gated
-    # on landed, so it is no longer quarantined.)
-    "test_list_decisions.py",
-    "test_modifier_surfacing.py",
-    "test_neighbor_review.py",
-    "test_payload_economy.py",
-    "test_surface_confidence.py",
-    "test_sync.py",
-    "test_importer.py",
-    "test_record_decision.py",
-    "test_relations_and_adjacency.py",
-    "test_adversarial_invariants.py",
-    "test_adversarial_mcp.py",
-    "test_cli_pathologies.py",
-]
+#
+# Phase 8a DRAINED the quarantine to EMPTY (entry-003 closed): the five live
+# consumers (sync/importer/mcp_server/cli) were reconciled to the V1a substrate
+# (parse_entry_stream + compute_node_id + get_node_state + the V1a drain surface),
+# ``--corrects`` was wired, and every restored module was re-greened — V1b-
+# unrepresentable assertions (amends/narrows modifiers, OQ parked/resolved) pared
+# or deferred with a logged note (OD1; never silent-skip/coerce). The list reaching
+# 0 is the contained-red window closing.
+STORE_REBUILD_QUARANTINE: list[str] = []
 
 
 def pytest_collection_modifyitems(config, items):

@@ -30,6 +30,27 @@ from mitos.sync import MitosSyncManager
 from mitos.renderer import render_node_markdown, MitosRenderer
 
 
+# The "amended axioms read as live" trap these surface tests pin is V1b: it needs a
+# NON-retiring modifier (amends/narrows) that leaves its target ACTIVE-but-stale, so a
+# read surface returns the live node carrying a modifier key. V1a commits only the two
+# KILL-edges (supersedes/corrects) — both RETIRE the target, so the modified node is
+# inactive and excluded from every active consumer surface (list/surface/query). amends
+# and narrows are warn-deferred in V1a (no edge committed), so amended_by/narrowed_by
+# never populate. The modifier-stamping SEAM itself ships in 5d and is proven at the
+# store level in tests/test_store.py (T12); the V1a kill-edge modifiers (superseded_by/
+# corrected_by) are proven on the store reads below. The consumer-surface amends/narrows
+# cases are deferred to the V1b modifier vision — deferred with a logged reason, not
+# silently coerced (K5/G4/G6).
+_V1B_MODIFIER_REASON = (
+    "V1b: amends/narrows are warn-deferred in V1a (no edge committed), and the 'amended "
+    "axioms read as live' surfacing needs a NON-retiring modifier on an ACTIVE node — "
+    "V1a's supersedes/corrects kill-edges retire their targets (excluded from active "
+    "consumer surfaces). The modifier-stamping seam is proven at the store level "
+    "(tests/test_store.py T12) + the V1a kill-edge modifier tests below. Deferred to V1b "
+    "(K5/G4)."
+)
+
+
 @pytest.fixture
 def offline(monkeypatch):
     """Forces degraded graph-only mode: unreachable Qdrant, no embedding keys."""
@@ -66,11 +87,15 @@ def _rec(m: MitosSyncManager, slug: str, scope=None, **relations) -> dict:
 
 @pytest.mark.parametrize("relation,reverse_key", [
     ("supersedes", "superseded_by"),
-    ("amends", "amended_by"),
-    ("narrows", "narrowed_by"),
+    ("corrects", "corrected_by"),
 ])
 def test_get_modifiers_one_per_relation(ws, relation, reverse_key) -> None:
-    """Each writable modifying edge surfaces under its reverse key on the TARGET."""
+    """Each V1a KILL-edge surfaces under its reverse key on the (now-retired) TARGET.
+
+    8a pared the prototype's amends/narrows cases (V1b warn-deferred) and added the
+    corrects case (now authorable through the write path, K4): both V1a kill-edges
+    retire the target, and the target's payload carries who moved on from it.
+    """
     config, m = ws
     target = _rec(m, "target")
     _rec(m, "modifier", **{relation: "target"})
@@ -78,19 +103,23 @@ def test_get_modifiers_one_per_relation(ws, relation, reverse_key) -> None:
     assert store.get_modifiers(target["id"]) == {reverse_key: ["modifier"]}
 
 
-def test_get_modifiers_corrects_edge(ws) -> None:
-    """`corrects` (a valid graph edge, e.g. from import — not exposed to the agentic
-    write path) maps to `corrected_by`, covering the full MODIFIER_EDGE_KEYS table."""
-    import sqlite3
+def test_get_modifiers_corrects_edge_via_write_path(ws) -> None:
+    """`corrects` maps to `corrected_by` and the corrected (inactive) node carries it.
+
+    8a rewired this off the prototype's raw `INSERT INTO edges (from_id, to_id, type)`
+    (dropped columns) onto the authorable `--corrects` write path (K4). The corrected
+    target leaves the active view; reading it by id still stamps corrected_by (the
+    store modifier seam stamps inactive nodes too — get_node, not the active surfaces).
+    """
     config, m = ws
     target = _rec(m, "target")
-    corrector = _rec(m, "corrector")
-    conn = sqlite3.connect(config.db_path)
-    conn.execute("INSERT INTO edges (from_id, to_id, type) VALUES (?, ?, 'corrects')",
-                 (corrector["id"], target["id"]))
-    conn.commit()
-    conn.close()
-    assert GraphStore(config.db_path).get_modifiers(target["id"]) == {"corrected_by": ["corrector"]}
+    _rec(m, "corrector", corrects="target")
+    store = GraphStore(config.db_path)
+    assert store.get_modifiers(target["id"]) == {"corrected_by": ["corrector"]}
+    # The store read surface (get_node by id) stamps corrected_by on the inactive node.
+    node = store.get_node(target["id"])
+    assert node["corrected_by"] == ["corrector"]
+    assert store.get_node_state(target["id"]) == "corrected"
 
 
 def test_get_modifiers_only_on_target_not_modifier(ws) -> None:
@@ -109,6 +138,7 @@ def test_get_modifiers_unmodified_is_empty(ws) -> None:
     assert GraphStore(config.db_path).get_modifiers(solo["id"]) == {}
 
 
+@pytest.mark.skip(reason=_V1B_MODIFIER_REASON)
 def test_get_modifiers_accumulates_multiple_edges(ws) -> None:
     """A hub node accumulates edges: amended by one decision AND narrowed by another.
 
@@ -123,6 +153,7 @@ def test_get_modifiers_accumulates_multiple_edges(ws) -> None:
     assert mods == {"amended_by": ["amender"], "narrowed_by": ["narrower"]}
 
 
+@pytest.mark.skip(reason=_V1B_MODIFIER_REASON)
 def test_get_modifiers_two_of_same_relation_sorted(ws) -> None:
     """Two decisions amending one node both appear, deterministically ordered."""
     config, m = ws
@@ -134,16 +165,21 @@ def test_get_modifiers_two_of_same_relation_sorted(ws) -> None:
 
 
 def test_get_modifiers_map_batches(ws) -> None:
-    """The batch map keys each modified node and omits unmodified ones."""
+    """The batch map keys each modified node and omits unmodified ones (V1a kill-edges).
+
+    8a pared the prototype's amends case to the V1a corrects kill-edge: a is corrected,
+    b is superseded, solo is untouched — the map keys only the two modified (now-retired)
+    nodes.
+    """
     config, m = ws
     a = _rec(m, "a")
     b = _rec(m, "b")
     solo = _rec(m, "solo")
-    _rec(m, "a-mod", amends="a")
+    _rec(m, "a-mod", corrects="a")
     _rec(m, "b-mod", supersedes="b")
     store = GraphStore(config.db_path)
     mp = store.get_modifiers_map([a["id"], b["id"], solo["id"]])
-    assert mp == {a["id"]: {"amended_by": ["a-mod"]},
+    assert mp == {a["id"]: {"corrected_by": ["a-mod"]},
                   b["id"]: {"superseded_by": ["b-mod"]}}
     assert solo["id"] not in mp
 
@@ -158,6 +194,7 @@ def test_get_modifiers_map_empty_input(ws) -> None:
 # MCP read surfaces
 # --------------------------------------------------------------------------- #
 
+@pytest.mark.skip(reason=_V1B_MODIFIER_REASON)
 def test_mcp_query_exact_slug_surfaces_amended_by(ws) -> None:
     """THE headline case: an exact-slug read of an amended decision reads `active`
     but now also carries `amended_by` so the stale axiom can't masquerade as live."""
@@ -183,6 +220,7 @@ def test_mcp_query_exact_slug_unmodified_has_no_modifier_keys(ws) -> None:
     assert not any(k in resp for k in MODIFIER_EDGE_KEYS.values())
 
 
+@pytest.mark.skip(reason=_V1B_MODIFIER_REASON)
 def test_mcp_list_decisions_surfaces_modifiers(ws) -> None:
     """list_decisions stamps modifier slugs onto the affected decision only."""
     from mitos import mcp_server
@@ -198,6 +236,7 @@ def test_mcp_list_decisions_surfaces_modifiers(ws) -> None:
     assert not any(k in by_slug["untouched"] for k in MODIFIER_EDGE_KEYS.values())
 
 
+@pytest.mark.skip(reason=_V1B_MODIFIER_REASON)
 def test_mcp_surface_scope_fallback_surfaces_modifiers(ws) -> None:
     """The offline scope-fallback path on surface_decisions also stamps modifiers."""
     from mitos import mcp_server
@@ -228,6 +267,7 @@ class _FakeVector:
         return self._matches
 
 
+@pytest.mark.skip(reason=_V1B_MODIFIER_REASON)
 def test_mcp_surface_semantic_path_surfaces_modifiers(ws) -> None:
     """The SEMANTIC ranking loop (the AX loop's primary path) stamps modifiers too —
     not just the offline exact/scope-fallback paths. Driven by a fake vector store so
@@ -245,6 +285,7 @@ def test_mcp_surface_semantic_path_surfaces_modifiers(ws) -> None:
     assert target["amended_by"] == ["sem-amender"]
 
 
+@pytest.mark.skip(reason=_V1B_MODIFIER_REASON)
 def test_mcp_query_semantic_path_surfaces_modifiers(ws) -> None:
     """query_decisions' semantic branch (claim, not slug) stamps modifiers on matches."""
     from mitos import mcp_server
@@ -261,6 +302,12 @@ def test_mcp_query_semantic_path_surfaces_modifiers(ws) -> None:
     assert match["amended_by"] == ["q-amender"]
 
 
+@pytest.mark.skip(reason="V1a: query_decisions' exact-slug lookup is active-scoped "
+                         "(get_node_by_slug returns <=1 ACTIVE node, MI-13), so a superseded "
+                         "node is not reachable through this consumer surface. The kill-edge "
+                         "modifier (superseded_by) on an inactive node surfaces via the store's "
+                         "get_node(by id) — proven in tests/test_store.py (T12) and "
+                         "test_get_modifiers_corrects_edge_via_write_path above. Deferred (K5/G4).")
 def test_mcp_query_exact_slug_superseded_carries_superseded_by(ws) -> None:
     """A superseded node read by exact slug reports BOTH state and which decision replaced it."""
     from mitos import mcp_server
@@ -274,6 +321,7 @@ def test_mcp_query_exact_slug_superseded_carries_superseded_by(ws) -> None:
     assert resp["superseded_by"] == ["v2"]
 
 
+@pytest.mark.skip(reason=_V1B_MODIFIER_REASON)
 def test_modifiers_survive_brief_trim(ws) -> None:
     """The staleness flag is ALWAYS attached — even on a brief payload where
     rejected_paths is trimmed. A lightweight scan that lost the heavy field still needs
@@ -296,6 +344,7 @@ def test_modifiers_survive_brief_trim(ws) -> None:
 # CLI read surfaces
 # --------------------------------------------------------------------------- #
 
+@pytest.mark.skip(reason=_V1B_MODIFIER_REASON)
 def test_cli_show_prints_modifier(ws, capsys) -> None:
     """`mitos show` on an amended decision prints the 'Amended by' annotation."""
     config, m = ws
@@ -307,6 +356,7 @@ def test_cli_show_prints_modifier(ws, capsys) -> None:
     assert "Amended by" in out and "shown-v2" in out
 
 
+@pytest.mark.skip(reason=_V1B_MODIFIER_REASON)
 def test_cli_list_text_marks_modified(ws, capsys) -> None:
     """`mitos list` text output flags a modified-but-live decision with ⚠."""
     config, m = ws
@@ -318,6 +368,7 @@ def test_cli_list_text_marks_modified(ws, capsys) -> None:
     assert "⚠" in out and "narrowed by" in out and "listed-v2" in out
 
 
+@pytest.mark.skip(reason=_V1B_MODIFIER_REASON)
 def test_cli_list_json_carries_modifiers(ws, capsys) -> None:
     """`mitos list --json` carries the modifier key for agent consumption."""
     config, m = ws
@@ -330,6 +381,7 @@ def test_cli_list_json_carries_modifiers(ws, capsys) -> None:
     assert target["amended_by"] == ["j-amender"]
 
 
+@pytest.mark.skip(reason=_V1B_MODIFIER_REASON)
 def test_cli_surface_json_carries_modifiers(ws, capsys) -> None:
     """`mitos surface --json` (scope fallback) carries the modifier key."""
     config, m = ws
@@ -355,6 +407,7 @@ def test_render_node_markdown_emits_marker() -> None:
     assert "⚠ Amended by:** x-v2" in marked and "chase" in marked
 
 
+@pytest.mark.skip(reason=_V1B_MODIFIER_REASON)
 def test_render_all_writes_modifier_marker(ws) -> None:
     """render_all annotates an amended-but-active decision in live_axioms.md."""
     config, m = ws

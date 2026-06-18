@@ -322,10 +322,17 @@ def test_cli_subprocess_relation_flag_links_decisions(tmp_path):
         assert "Recorded decision" in b.stdout
 
         store = GraphStore(MitosConfig(str(ws)).db_path)
-        fid = store.get_node_by_slug("adapters-at-edges")["id"]
-        tid = store.get_node_by_slug("hexagonal-arch")["id"]
-        assert any(e["from_id"] == fid and e["to_id"] == tid and e["type"] == "depends_on"
-                   for e in store.get_edges())
+        # Both decisions committed via the real binary; both resolve as active.
+        assert store.get_node_by_slug("adapters-at-edges") is not None
+        assert store.get_node_by_slug("hexagonal-arch") is not None
+        # `--depends-on` is warn-deferred in V1a (not a kill-edge): the flag threads
+        # through the real binary into the buffer, but no edge is committed (V1b). 8a
+        # pared the prototype's "depends_on edge committed" assertion to the V1a truth
+        # (K5/G6) — the authored field is present for the V1b reconciler.
+        with open(os.path.join(str(ws), "decisions.md"), encoding="utf-8") as f:
+            buf = f.read()
+        assert "**Depends-On:** hexagonal-arch" in buf
+        assert store.get_edges() == []
     finally:
         _drop_collection(collection)
 

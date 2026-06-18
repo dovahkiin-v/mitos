@@ -265,7 +265,7 @@ def test_cli_pathology_render_failures(isolated_workspace, capsys) -> None:
     
     # Commit a valid decision
     d = ParsedEntry("decision", "rule-one", 1, 5)
-    d.core_axiom = "WAL mode SQLite."
+    d.axiom = "WAL mode SQLite."
     d.rejected_paths = "None."
     d.scope = ["substrate"]
     store.commit_parsed_entry(d)
