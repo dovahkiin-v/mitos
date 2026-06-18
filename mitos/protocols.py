@@ -83,7 +83,10 @@ class GraphStoreProtocol(Protocol):
     """Protocol for the relational, SQLite-backed decision graph."""
 
     def resolve_slug(self, slug: str) -> List[str]:
-        """Resolves a slug to matching node IDs (case-insensitive).
+        """Resolves a slug to matching node IDs via casefold-exact match (V1-D23).
+
+        Single-tier ``str.casefold()`` match against ``slug_casefold`` — no fuzzy
+        alias-fallback tier (MI-9; the ``slug_aliases`` subsystem is V1b/MI-2).
 
         Args:
             slug: The slug string to find.

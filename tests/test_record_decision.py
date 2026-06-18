@@ -458,15 +458,100 @@ def test_toctou_same_slug_different_axiom(ws) -> None:
 
 
 def test_supersedes_ambiguous(ws) -> None:
-    """A supersedes target that resolves to multiple nodes → supersedes_ambiguous, no half-commit."""
+    """A supersedes target matching >1 same-casefold-slug lineage node → supersedes_ambiguous.
+
+    The V1a ambiguity trigger is a same-slug supersession lineage (MI-13), not the
+    retired fuzzy-prefix tier: node-2 supersedes node-1 while both keep slug 'amb', so
+    the all-nodes resolve_slug('amb') returns 2 ids (only node-2 is active).
+    """
     config, m = ws
-    # Two nodes whose slugs both match the fuzzy prefix 'amb'.
-    m.store.commit_parsed_entry(_mk_entry("axiom one", "amb-one"))
-    m.store.commit_parsed_entry(_mk_entry("axiom two", "amb-two"))
+    m.store.commit_parsed_entry(_mk_entry("axiom one", "amb"))      # node-1, slug 'amb'
+    e2 = _mk_entry("axiom two", "amb")
+    e2.supersedes = "amb"                                           # resolves to node-1 (active non-self)
+    m.store.commit_parsed_entry(e2)                                # node-2 supersedes node-1; both slug 'amb'
     before = _read(config)
     res = m.record_decision_entry("New decision.", "Rejection.", [], supersedes="amb")
     assert res["code"] == "supersedes_ambiguous"
     assert _read(config) == before
+
+
+def test_supersedes_accepts_cased_non_ascii_lithuanian(ws) -> None:
+    """A cased non-ASCII supersedes target (Lithuanian 'KABUTĖ' → 'kabutė') commits.
+
+    Guards the resolve_slug layer: pre-fix SQLite COLLATE NOCASE cannot fold Ė/ė, so a
+    legal kill-edge was spuriously rejected (supersedes_not_found). Post-fix casefold
+    resolves it and the supersession commits. (Targets reach resolve_slug un-slugified —
+    only the new entry's own slug is slugified — so the cased literal is what's matched.)
+    """
+    config, m = ws
+    m.store.commit_parsed_entry(_mk_entry("axiom one", "kabutė"))  # node-1, cased non-ASCII slug
+    node1_id = GraphStore(config.db_path).get_node_by_slug("kabutė")["id"]
+    res = m.record_decision_entry("New axiom.", "Reject.", [], supersedes="KABUTĖ", slug="kabute-v2")
+    assert "error" not in res and res["status"] == "created"
+    store = GraphStore(config.db_path)
+    assert store.get_node_state(node1_id) == "superseded"
+    conn = store._get_connection()
+    try:
+        edges = conn.execute("SELECT * FROM edges WHERE edge_type='supersedes'").fetchall()
+        assert len(edges) == 1
+        assert edges[0]["source_id"] == res["id"] and edges[0]["target_id"] == node1_id
+    finally:
+        conn.close()
+
+
+def test_supersedes_casefold_distinguishes_from_lower_german_ss(ws) -> None:
+    """German ß: 'straße'.casefold()=='strasse', so supersede via 'STRASSE' must be accepted.
+
+    This is the ONLY test that catches a regression of the sync.py re-filter back to
+    ``.lower()``: ``"straße".lower()=="straße" != "STRASSE".lower()=="strasse"`` would
+    reject, whereas both ``.casefold()`` to ``"strasse"``. (Lithuanian alone does not
+    catch it — ``.lower()`` folds ``Ė`` fine; only ß/Greek diverge under ``.lower()``.)
+    """
+    config, m = ws
+    m.store.commit_parsed_entry(_mk_entry("axiom one", "straße"))  # slug_casefold == "strasse"
+    node1_id = GraphStore(config.db_path).get_node_by_slug("straße")["id"]
+    res = m.record_decision_entry("New axiom.", "Reject.", [], supersedes="STRASSE", slug="strasse-v2")
+    assert "error" not in res and res["status"] == "created"
+    store = GraphStore(config.db_path)
+    assert store.get_node_state(node1_id) == "superseded"
+    conn = store._get_connection()
+    try:
+        edges = conn.execute("SELECT * FROM edges WHERE edge_type='supersedes'").fetchall()
+        assert len(edges) == 1
+        assert edges[0]["source_id"] == res["id"] and edges[0]["target_id"] == node1_id
+    finally:
+        conn.close()
+
+
+def test_corrects_accepts_cased_non_ascii(ws) -> None:
+    """A cased non-ASCII corrects target ('KABUTĖ' → 'kabutė') commits (kill-edge twin)."""
+    config, m = ws
+    m.store.commit_parsed_entry(_mk_entry("axiom one", "kabutė"))
+    node1_id = GraphStore(config.db_path).get_node_by_slug("kabutė")["id"]
+    res = m.record_decision_entry("New axiom.", "Reject.", [], corrects="KABUTĖ", slug="kabute-fix")
+    assert "error" not in res and res["status"] == "created"
+    store = GraphStore(config.db_path)
+    assert store.get_node_state(node1_id) == "corrected"
+    conn = store._get_connection()
+    try:
+        edges = conn.execute("SELECT * FROM edges WHERE edge_type='corrects'").fetchall()
+        assert len(edges) == 1
+        assert edges[0]["source_id"] == res["id"] and edges[0]["target_id"] == node1_id
+    finally:
+        conn.close()
+
+
+def test_relation_target_accepts_cased_non_ascii(ws) -> None:
+    """A cased non-ASCII relation target ('amends'='KABUTĖ' → 'kabutė') passes pre-validation.
+
+    Covers ``_validate_relation_target`` (sync.py:828): pre-fix ``.lower()`` rejected it
+    as ``relation_target_not_found``; post-fix ``.casefold()`` resolves it and the record
+    commits (V1a warn-defers the non-kill amends edge itself, so only ``status`` is asserted).
+    """
+    config, m = ws
+    m.store.commit_parsed_entry(_mk_entry("axiom one", "kabutė"))
+    res = m.record_decision_entry("New axiom.", "Reject.", [], amends="KABUTĖ", slug="kabute-amend")
+    assert "error" not in res and res["status"] == "created"
 
 
 def test_pathological_inputs(ws) -> None:

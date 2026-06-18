@@ -516,29 +516,29 @@ class GraphStore:
             conn.close()
 
     def resolve_slug(self, slug: str) -> List[str]:
-        """Resolves a slug to node IDs (case-insensitive with collision check).
+        """Resolves a slug to node IDs via single-tier casefold-exact match (V1-D23).
+
+        Binds Python ``str.casefold()`` against the indexed ``slug_casefold`` column —
+        the same Unicode-correct discipline the authoritative commit path
+        (``_reconcile_edges``) and ``get_node_by_slug`` already use (MI-9: never SQLite
+        ASCII-only ``COLLATE NOCASE`` / ``LOWER``). There is **no** fuzzy alias-fallback
+        tier: V1a mandates single-tier exact match, and the ``slug_aliases`` citation
+        subsystem is a separate V1b feature (MI-2), not this resolver. Returns every node
+        sharing the casefolded slug — a same-slug supersession lineage yields >1 (MI-13);
+        callers own active-view scoping and ambiguity handling.
 
         Args:
-            slug: The slug string to find.
+            slug: The slug to find (case-insensitive via ``str.casefold()``).
 
         Returns:
-            A list of matching node IDs.
+            A list of matching node IDs (empty if none).
         """
         conn = self._get_connection()
         try:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT id FROM nodes WHERE slug = ? COLLATE NOCASE",
-                (slug,)
-            )
-            rows = cursor.fetchall()
-            if not rows:
-                # Fuzzy fallback for legacy import naming styles
-                cursor.execute(
-                    "SELECT id FROM nodes WHERE (slug LIKE ? OR slug LIKE ?) COLLATE NOCASE",
-                    (f"{slug}:%", f"{slug}-%")
-                )
-                rows = cursor.fetchall()
+            rows = conn.execute(
+                "SELECT id FROM nodes WHERE slug_casefold = ?",
+                (slug.casefold(),),
+            ).fetchall()
             return [row["id"] for row in rows]
         finally:
             conn.close()
@@ -747,10 +747,12 @@ class GraphStore:
         at most one active node per ``casefold(slug)``, so the ambiguity ``raise``
         below is a defensive vector (P3) that is structurally unreachable.
 
-        Deliberately does NOT route through ``resolve_slug`` — that prototype method
-        uses SQLite ``COLLATE NOCASE`` (the forbidden Unicode folding) plus a fuzzy
-        ``LIKE`` alias-fallback tier the negative-space fence rejects; both are 8a's to
-        reconcile. Here we bind Python ``str.casefold()`` against ``slug_casefold``.
+        Deliberately does NOT route through ``resolve_slug`` because the two methods
+        serve different scopes — this is an active-view single read (≤1), while
+        ``resolve_slug`` is an all-nodes list (for collision / edge pre-validation).
+        Both now share one casing discipline: Python ``str.casefold()`` bound against
+        the indexed ``slug_casefold`` column (no SQLite ``NOCASE``, no fuzzy ``LIKE``
+        tier; reconciled in r1).
 
         Args:
             slug: The slug identifier (case-insensitive via ``str.casefold()``).
