@@ -172,3 +172,59 @@ connected instead of accumulating silent tension: `supersedes` (replaces it),
 `amends`, `narrows`, `depends_on`, `resolves`, `contradicts`, `derives_from`,
 `cites`. After a record, the result may surface nearby decisions (`related`) — if
 one is genuinely connected, link it.
+
+---
+
+## Cutover (migrating a prototype graph to V1a)
+
+A graph created by an **older (pre-V1a) Mitos** uses a different node identity, so
+it cannot be migrated in place — `mitos init`/`status` will refuse it and route
+you here. Because the graph is a *derivative* projection of your markdown corpus,
+the fix is to **rebuild it from `decisions.md` (+ `questions.md` + archives) and
+atomically swap it in**. This is a **one-time, destructive** operation — distinct
+from the safe, repeatable `mitos init` — so it has its own verb: **`mitos
+cutover`**.
+
+You only need this if `mitos status` reports a *prototype graph*. A fresh or
+already-V1a workspace never does (running `cutover` there is a harmless no-op).
+
+The swap itself is crash-safe by construction: the old graph is backed up first
+and the new graph lands in a single atomic rename, so a crash at any instant
+leaves a workspace that simply re-runs clean — no manual restore. Run these steps
+**in order**:
+
+1. **Quiesce the workspace.** Stop `mitos serve`, and finish or abort any
+   in-flight `mitos sync`, *before* you start. Mitos is single-writer; the cutover
+   reads the old graph assuming no concurrent writer.
+2. **Run the cutover from a build that has the verb.** Use the
+   current/editable install (`./venv/bin/mitos cutover`, or a freshly-built
+   checkout). **Do not** `pipx install --force` the global install yet — a
+   reinstalled Mitos refuses a prototype graph, so the global upgrade is the
+   *last* step (#9), unblocked only once the cutover has landed.
+3. **Review the verdict.** The command re-parses the corpus, replays it into a
+   build-aside graph, and prints a completeness verdict. A **corpus defect**
+   (malformed markdown) aborts with a one-line error — fix the markdown and
+   re-run; it is never overridable. A **completeness shortfall** (an active
+   decision present in the old graph but absent from the rebuild) refuses the
+   swap and surfaces the offenders. Inspect them: re-run with **`--allow-drops`**
+   only if the removal was intentional (your `decisions.md` is authoritative — a
+   drop may be a deliberate purge). Use **`--yes`** to skip the interactive
+   confirmation in automation, and **`--json`** for a machine-readable report.
+4. **Wipe the stale Qdrant collection.** Its vectors are keyed on the old
+   prototype ids, so they no longer match. Delete it — it auto-recreates on the
+   next sync:
+   ```bash
+   curl -X DELETE <qdrant_url>/collections/<collection>
+   ```
+   (`mitos cutover` prints the exact command with your URL + collection filled in.)
+5. **Re-embed the V1a active set.** Run `mitos sync` (or `mitos sync
+   --embed-only`) to drain the embedding queue. Until it finishes there is a
+   **bounded semantic-surface outage**: `surface`/`query` are degraded, but
+   graph-only `mitos list` works throughout.
+6. **Restart `mitos serve`** if it was running.
+7. **Verify.** `mitos status` → expect `READY ✓`.
+8. **Remove the backup.** Once you're satisfied, delete the
+   `graph.sqlite.bak_<timestamp>` the cutover left in `.mitos/`.
+9. **Upgrade the global install.** *Now* run `pipx install --force
+   git+https://github.com/dovahkiin-v/mitos` — the operational carry is resolved,
+   and the global Mitos will accept the V1a graph.

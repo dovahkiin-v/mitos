@@ -48,6 +48,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
@@ -279,6 +280,126 @@ def rebuild_and_gate(config: MitosConfig, *, aside_db_path: str) -> RebuildResul
         reconstructed_active_count=len(reconstructed_ids),
         missing_cores=missing_cores,
     )
+
+
+# --- atomic swap (Phase 7b) ----------------------------------------------------
+
+
+def _clear_sidecars(base_path: str) -> None:
+    """Removes a SQLite database's ``-wal`` / ``-shm`` sidecars, if present.
+
+    Mirrors :func:`_discard_stale_aside`'s absent-is-a-no-op idiom but clears only
+    the WAL sidecars, never the main file — :func:`perform_swap` calls this on both
+    the aside (after its checkpoint folds every frame into the main file) and the
+    destination (before the atomic rename, so no stale orphan ``-wal`` survives to
+    be mis-applied to the freshly-swapped graph → ``SQLITE_CORRUPT``, R11).
+
+    Args:
+        base_path: The database path whose ``-wal`` / ``-shm`` sidecars to clear.
+    """
+    for suffix in ("-wal", "-shm"):
+        try:
+            os.remove(base_path + suffix)
+        except FileNotFoundError:
+            pass
+
+
+def perform_swap(
+    config: MitosConfig, aside_db_path: str, *, timestamp: str
+) -> Optional[str]:
+    """Atomically swaps the rebuilt build-aside graph into place; backs up the old.
+
+    The destructive twin of :func:`rebuild_and_gate`: it takes the proven
+    build-aside file 7a left on disk and makes it the live graph in a single
+    crash-safe instant. The whole crash-safety story is *structural*, not
+    disciplinary (Lesson 2 / P5 Ironclad): the only destructive primitive is one
+    POSIX-atomic :func:`os.rename` within a single filesystem (guaranteed by 7a's
+    sibling :func:`default_aside_db_path`), and every destructive-adjacent step
+    precedes it. Because the old graph is **copied** (not moved) to the ``.bak``,
+    ``config.db_path`` is never absent — at every instant it opens as either the
+    intact old graph or the new V1a graph, so a crash at any point leaves a
+    re-runnable workspace needing no manual restore (P5 Unplugged).
+
+    Two WAL hazards are handled, both fatal if mishandled (R11, §2.1):
+
+    * *New side:* the rebuilt graph is in WAL mode, so committed frames may still
+      sit in ``<aside>-wal``. ``PRAGMA wal_checkpoint(TRUNCATE)`` folds them into
+      the main file and empties the WAL **before** the rename — only then is the
+      rebuilt main file self-contained. Skipping this silently loses data.
+    * *Old/destination side:* the old graph's ``-wal`` / ``-shm`` must be gone from
+      the destination **before** the new main lands there, else SQLite applies a
+      stale orphan WAL to the new file on next open → ``SQLITE_CORRUPT``.
+
+    After the swap ``config.db_path`` carries **no sidecars at all**; SQLite
+    recreates fresh ``-wal`` / ``-shm`` on the next open.
+
+    The old graph is *copied* (not checkpointed-then-copied): the 5a boot guard
+    refuses a prototype graph read-write, the workspace is quiesced (an operator
+    precondition), and the markdown corpus is the authoritative recovery source
+    regardless (M7/P6) — so the ``.bak`` is a best-effort courtesy, and
+    ``perform_swap`` never mutates the graph it is discarding (a clean bulkhead).
+
+    Governing ADRs: ``cutover-build-aside-atomic-swap``,
+    ``v1a-cutover-wipe-and-rebuild``,
+    ``cutover-gate-defaults-abort-with-p6-operator-override``.
+
+    Args:
+        config: The active workspace config (supplies ``config.db_path``, the swap
+            destination).
+        aside_db_path: The rebuilt build-aside graph to swap in (a sibling of
+            ``config.db_path`` for atomicity — see :func:`default_aside_db_path`).
+        timestamp: A caller-supplied label for the ``.bak`` filename. Passed in
+            (never wall-clocked here) so the helper stays deterministic for
+            fixtures (PLANNING_NOTES: pin nothing to wall-clock).
+
+    Returns:
+        The ``<db_path>.bak_<timestamp>`` backup path, or ``None`` when there was
+        no old graph to back up.
+
+    Raises:
+        CutoverError: If ``aside_db_path`` is absent — a defensive guard; the
+            caller (:func:`~mitos.cli.cmd_cutover`) only invokes this after a
+            successful :func:`rebuild_and_gate`.
+    """
+    # 1. Guard (defensive — cmd_cutover only calls this after a clean rebuild).
+    if not os.path.exists(aside_db_path):
+        raise CutoverError(
+            "build-aside graph missing — the rebuild did not complete; "
+            "re-run the cutover."
+        )
+
+    # 2. Checkpoint the aside DB (TRUNCATE): fold every WAL frame into the main
+    #    file so the rebuilt graph is self-contained before it is renamed alone.
+    #    A fresh write connection is the only open handle (GraphStore is
+    #    connection-stateless; rebuild_and_gate left none open), so the TRUNCATE
+    #    cannot be blocked by a concurrent reader.
+    conn = open_connection(aside_db_path)
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.close()
+
+    # 3. Clear the aside's now-empty sidecars: the rebuilt main file is fully
+    #    self-contained from here on.
+    _clear_sidecars(aside_db_path)
+
+    # 4. Back up the old graph by COPY (not move), so config.db_path is never
+    #    absent (the entire crash-safety guarantee — do not reorder 4–6).
+    bak_path: Optional[str] = None
+    if os.path.exists(config.db_path):
+        bak_path = config.db_path + ".bak_" + timestamp
+        shutil.copy2(config.db_path, bak_path)
+
+    # 5. Clear the destination's old sidecars BEFORE the rename — the R11
+    #    orphan-WAL guard. A leftover prototype `-wal` beside the freshly-renamed
+    #    main is applied on next open → SQLITE_CORRUPT.
+    _clear_sidecars(config.db_path)
+
+    # 6. The one atomic, destructive primitive: same-filesystem POSIX rename.
+    os.rename(aside_db_path, config.db_path)
+
+    # 7. config.db_path now holds the rebuilt V1a graph with no sidecars.
+    return bak_path
 
 
 # --- stream loading & ordering -------------------------------------------------
