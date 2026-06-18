@@ -49,20 +49,20 @@ def test_renderer_stateless_outputs(temp_workspace: Tuple[GraphStore, str]) -> N
 
     # Commit active node in scope 'backend'
     entry1 = ParsedEntry("decision", "be-choice", 1, 5)
-    entry1.core_axiom = "We use Python 3.12."
+    entry1.axiom = "We use Python 3.12."
     entry1.rejected_paths = "Older versions."
     entry1.scope = ["backend"]
     store.commit_parsed_entry(entry1)
 
     # Commit superseded node in scope 'frontend' (should be excluded)
     entry2 = ParsedEntry("decision", "fe-old", 1, 5)
-    entry2.core_axiom = "Vanilla JS."
+    entry2.axiom = "Vanilla JS."
     entry2.rejected_paths = "React."
     entry2.scope = ["frontend"]
     d2 = store.commit_parsed_entry(entry2)
 
     entry3 = ParsedEntry("decision", "fe-new", 1, 5)
-    entry3.core_axiom = "Vite + TS."
+    entry3.axiom = "Vite + TS."
     entry3.rejected_paths = "Vanilla JS."
     entry3.supersedes = "fe-old"
     entry3.scope = ["frontend"]
@@ -124,7 +124,7 @@ def test_assemble_render_matches_disk(temp_workspace: Tuple[GraphStore, str]) ->
     """assemble_render's content is byte-identical to what render_all writes (no drift)."""
     store, workspace = temp_workspace
     e = ParsedEntry("decision", "use-sqlite", 1, 5)
-    e.core_axiom = "We use SQLite in WAL mode."
+    e.axiom = "We use SQLite in WAL mode."
     e.rejected_paths = "Postgres (too heavy)."
     e.scope = ["substrate"]
     store.commit_parsed_entry(e)
@@ -145,7 +145,7 @@ def test_render_all_is_silent_and_records_overflow(
     monkeypatch.setattr(R, "SCOPE_OVERFLOW_WARN_CHARS", 150)
     store, workspace = temp_workspace
     e = ParsedEntry("decision", "over-one", 1, 5)
-    e.core_axiom = "Rationale that is comfortably long. " * 12
+    e.axiom = "Rationale that is comfortably long. " * 12
     e.rejected_paths = "n/a"
     e.scope = ["substrate"]
     store.commit_parsed_entry(e)
@@ -168,13 +168,13 @@ def test_overflow_report_ranks_largest_decision_first(
     store, workspace = temp_workspace
 
     small = ParsedEntry("decision", "small-one", 1, 5)
-    small.core_axiom = "Tiny axiom."
+    small.axiom = "Tiny axiom."
     small.rejected_paths = "n/a"
     small.scope = ["substrate"]
     store.commit_parsed_entry(small)
 
     big = ParsedEntry("decision", "big-one", 1, 5)
-    big.core_axiom = "A much larger rationale block. " * 40
+    big.axiom = "A much larger rationale block. " * 40
     big.rejected_paths = "n/a"
     big.scope = ["substrate"]
     store.commit_parsed_entry(big)

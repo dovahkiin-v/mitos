@@ -824,25 +824,28 @@ def test_store_rebuild_quarantine_is_tracked() -> None:
     """FORCING FUNCTION — the Phase 5a contained-red quarantine is a conscious, shrinking set.
 
     The quarantine list (``tests/conftest.py``, Decision 5) must stay an explicit,
-    tracked set that provably empties by Phase 8a: Phase 5d removes the read-view
-    consumers it restores, Phase 8a removes the rest. Pinning it here makes any
-    change a conscious edit (and any restoring phase must update this set), never a
-    silent drift. The set was derived empirically from the flip (not the pre-existing
+    tracked set that provably empties by Phase 8a. Pinning it here makes any change a
+    conscious edit (and any restoring phase must update this set), never a silent
+    drift. The set was derived empirically from the flip (not the pre-existing
     ``*_live.py`` 429 flakes, which are not quarantined).
+
+    Phase 5d removed the 2 genuinely store-only modules it restored
+    (``test_renderer`` + ``test_adversarial_rendering``) and re-bucketed the other
+    6 of 5a's "restored in 5d" labels (WIRING_LEDGER entry-003, §16):
+    ``test_status_readiness`` → 6b (gated on the ``cmd_status`` rebuild) and the 5
+    consumer-entangled modules → 8a. Final set = 13 (1 in 6b, 12 in 8a).
     """
     from conftest import STORE_REBUILD_QUARANTINE
 
     assert set(STORE_REBUILD_QUARANTINE) == {
-        # restored in Phase 5d (read views + modifier stamping)
+        # restored in Phase 6b (the cmd_status rebuild it gates on)
+        "test_status_readiness.py",
+        # restored in Phase 8a (consumer preservation)
         "test_list_decisions.py",
         "test_modifier_surfacing.py",
         "test_neighbor_review.py",
         "test_payload_economy.py",
         "test_surface_confidence.py",
-        "test_status_readiness.py",
-        "test_renderer.py",
-        "test_adversarial_rendering.py",
-        # restored in Phase 8a (consumer preservation)
         "test_sync.py",
         "test_importer.py",
         "test_record_decision.py",
@@ -1207,3 +1210,372 @@ def test_store_failure_codes_pin() -> None:
             "cycle_violation",
         }
     )
+
+
+# ===========================================================================
+# Phase 5d — read views, retrieval surfaces & modifier stamping
+#
+# The read side completes the substrate: every read method is rebuilt over the
+# V1a STRICT schema to (a) compute activeness via the kill-edge anti-join (the
+# SAME definition ``_is_active`` encodes — M3, never the prototype
+# ``compute_all_states``), (b) return the prototype reader-key dict so the
+# unchanged consumers keep working, and (c) stamp reverse-relation modifiers
+# through ONE bulk join. Plus the two new primitives: ``get_transcript`` and the
+# C4 ``query_letter``. Fixtures commit via ``commit_parsed_entry`` (the store
+# path), never ``record_decision_entry`` (the 8a consumer path).
+# ===========================================================================
+
+
+def _insert_drifted_signal(store: GraphStore, node_id: str) -> None:
+    """Raw-SQL inserts a ``drifted`` signal (no V1a writer exists — reserved channel)."""
+    conn = store._get_connection()
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO signals (node_id, signal_type, created_at) "
+                "VALUES (?, 'drifted', ?)",
+                (node_id, "2026-06-18T00:00:00.000000+00:00"),
+            )
+    finally:
+        conn.close()
+
+
+# --- Active-view anti-join & reader-key aliasing (the core) --------------------
+
+
+def test_5d_active_decisions_excludes_superseded(temp_store: GraphStore) -> None:
+    """get_active_decisions returns only nodes with no incoming kill-edge."""
+    old = temp_store.commit_parsed_entry(_decision(slug="old", axiom="Old."))
+    _commit_kill(temp_store, "new", "New.", "supersedes", "old")
+
+    slugs = [n["slug"] for n in temp_store.get_active_decisions()]
+    assert slugs == ["new"]
+    # The read's anti-join matches the inline ``_is_active`` helper definition (Lesson 14).
+    assert _is_active(temp_store, old.node_id) is False
+
+
+def test_5d_active_reads_never_call_compute_all_states(
+    temp_store: GraphStore, monkeypatch
+) -> None:
+    """The active read methods compute activeness via the anti-join, NOT the prototype DAG.
+
+    Monkeypatching ``compute_all_states`` to raise proves no active read depends on
+    it (it reads dropped edge columns and is retired from the active views; 8a owns
+    its deletion). A regression re-introducing the prototype filter fails loudly here.
+    """
+    old = temp_store.commit_parsed_entry(_decision(slug="old", axiom="Old.", scope=["z"]))
+    _commit_kill(temp_store, "new", "New.", "supersedes", "old", scope=["z"])
+    temp_store.commit_parsed_entry(_open_question(slug="oq", topic="T", scope=["z"]))
+
+    def _boom(_conn):
+        raise AssertionError("compute_all_states must not be called by the active reads")
+
+    monkeypatch.setattr(temp_store, "compute_all_states", _boom)
+
+    assert [n["slug"] for n in temp_store.get_active_decisions()] == ["new"]
+    assert [n["slug"] for n in temp_store.get_active_decisions(scope="z")] == ["new"]
+    assert [n["slug"] for n in temp_store.get_open_questions()] == ["oq"]
+    assert temp_store.get_node_by_slug("new")["slug"] == "new"
+    assert [p["slug"] for p in temp_store.query_letter(scope="z")] == ["new"]
+    assert {n["slug"] for n in temp_store.get_decisions(state="all")} == {"old", "new"}
+
+
+def test_5d_reader_keys_aliased_no_v1a_leak(temp_store: GraphStore) -> None:
+    """A decision read returns the prototype reader keys; V1a column names don't leak."""
+    temp_store.commit_parsed_entry(
+        _decision(slug="d", axiom="The axiom.", mechanisms=["beta", "alpha"], scope=["s"])
+    )
+    (node,) = temp_store.get_active_decisions()
+    assert node["core_axiom"] == "The axiom."
+    assert node["mechanisms"] == ["beta", "alpha"]  # list, decode order preserved
+    assert node["scope"] == ["s"]
+    assert node["rejected_paths"] == "An alternative."  # raw string
+    assert node["is_drifted"] is False
+    # The V1a column names must NOT appear as keys (the alias is total).
+    for leaked in ("axiom", "mechanism_refs_json", "rejected_paths_json", "questions_raised_json"):
+        assert leaked not in node
+    # A decision carries no OQ keys.
+    assert "topic" not in node and "questions_raised" not in node
+
+
+def test_5d_rejected_paths_is_raw_string_not_json(temp_store: GraphStore) -> None:
+    """rejected_paths round-trips the RAW string (5a §14) — never JSON-decoded."""
+    temp_store.commit_parsed_entry(
+        _decision(slug="d", axiom="A.", rejected='["not", "a", "list"]')
+    )
+    (node,) = temp_store.get_active_decisions()
+    # If the read JSON-decoded it, this would be a list; it must stay the raw string.
+    assert node["rejected_paths"] == '["not", "a", "list"]'
+    assert isinstance(node["rejected_paths"], str)
+
+
+def test_5d_drifted_node_included_and_annotated(temp_store: GraphStore) -> None:
+    """A drifted decision stays in the active view with is_drifted True (annotate, not retire)."""
+    d = temp_store.commit_parsed_entry(_decision(slug="d", axiom="A."))
+    _insert_drifted_signal(temp_store, d.node_id)
+
+    (node,) = temp_store.get_active_decisions()
+    assert node["slug"] == "d"
+    assert node["is_drifted"] is True  # forward-correct EXISTS derivation lights up
+
+
+def test_5d_active_decisions_scope_filter(temp_store: GraphStore) -> None:
+    """The scope filter narrows correctly; a multi-scope node appears under each scope."""
+    temp_store.commit_parsed_entry(_decision(slug="a", axiom="A.", scope=["be"]))
+    temp_store.commit_parsed_entry(_decision(slug="b", axiom="B.", scope=["fe", "be"]))
+
+    assert {n["slug"] for n in temp_store.get_active_decisions(scope="be")} == {"a", "b"}
+    assert {n["slug"] for n in temp_store.get_active_decisions(scope="fe")} == {"b"}
+    assert temp_store.get_active_decisions(scope="nope") == []
+
+
+def test_5d_get_node_aliases_any_state(temp_store: GraphStore) -> None:
+    """get_node returns the reader shape for active AND inactive ids (not active-scoped)."""
+    old = temp_store.commit_parsed_entry(_decision(slug="old", axiom="Old."))
+    _commit_kill(temp_store, "new", "New.", "supersedes", "old")
+
+    n = temp_store.get_node(old.node_id)
+    assert n is not None and n["slug"] == "old" and n["core_axiom"] == "Old."
+    assert temp_store.get_node("nonexistent-id") is None
+
+
+def test_5d_get_node_by_slug_active_only(temp_store: GraphStore) -> None:
+    """get_node_by_slug returns the single ACTIVE node; casefold matches; unknown → None."""
+    temp_store.commit_parsed_entry(_decision(slug="be-choice", axiom="A."))
+    assert temp_store.get_node_by_slug("be-choice")["slug"] == "be-choice"
+    assert temp_store.get_node_by_slug("BE-CHOICE")["slug"] == "be-choice"  # str.casefold
+    assert temp_store.get_node_by_slug("unknown") is None
+
+
+def test_5d_get_node_by_slug_resolves_one_after_reslug(temp_store: GraphStore) -> None:
+    """After a supersede + slug reuse, get_node_by_slug still resolves ≤1 active (MI-13)."""
+    # Commit 'c'; supersede it with 'b'; reuse slug 'c' on a NEW independent decision.
+    temp_store.commit_parsed_entry(_decision(slug="c", axiom="C-old."))
+    _commit_kill(temp_store, "b", "B.", "supersedes", "c")
+    temp_store.commit_parsed_entry(_decision(slug="c", axiom="C-new-independent."))
+
+    node = temp_store.get_node_by_slug("c")
+    assert node is not None
+    assert node["core_axiom"] == "C-new-independent."  # the lone active 'c'
+
+
+def test_5d_open_questions_reader_keys_and_anti_join(temp_store: GraphStore) -> None:
+    """get_open_questions returns the OQ reader shape and applies the Stage-1 anti-join."""
+    oq1 = temp_store.commit_parsed_entry(
+        _open_question(slug="oq1", topic="Topic one", questions=["a?", "b?"], scope=["x"])
+    )
+    (node,) = temp_store.get_open_questions()
+    assert node["topic"] == "Topic one"
+    assert node["questions_raised"] == ["a?", "b?"]
+    assert node["scope"] == ["x"]
+    # OQ carries no decision keys.
+    for leaked in ("core_axiom", "mechanisms", "rejected_paths"):
+        assert leaked not in node
+
+    # A corrects kill-edge on the OQ removes it from the active OQ view (V1-D18 Stage-1).
+    e = _open_question(slug="oq2", topic="Topic two")
+    e.corrects = "oq1"
+    temp_store.commit_parsed_entry(e)
+    assert [n["slug"] for n in temp_store.get_open_questions()] == ["oq2"]
+
+
+def test_5d_get_decisions_computed_state(temp_store: GraphStore) -> None:
+    """get_decisions attaches computed_state (active/superseded/corrected) and filters on it."""
+    temp_store.commit_parsed_entry(_decision(slug="sup-old", axiom="O."))
+    _commit_kill(temp_store, "sup-new", "N.", "supersedes", "sup-old")
+    temp_store.commit_parsed_entry(_decision(slug="cor-old", axiom="CO."))
+    _commit_kill(temp_store, "cor-new", "CN.", "corrects", "cor-old")
+
+    states = {n["slug"]: n["computed_state"] for n in temp_store.get_decisions(state="all")}
+    assert states == {
+        "sup-old": "superseded",
+        "sup-new": "active",
+        "cor-old": "corrected",
+        "cor-new": "active",
+    }
+    assert {n["slug"] for n in temp_store.get_decisions()} == {"sup-new", "cor-new"}  # live set
+    assert [n["slug"] for n in temp_store.get_decisions(state="superseded")] == ["sup-old"]
+    assert [n["slug"] for n in temp_store.get_decisions(state="corrected")] == ["cor-old"]
+
+
+def test_5d_get_all_nodes_mixed_kinds_with_state(temp_store: GraphStore) -> None:
+    """get_all_nodes returns both kinds (any state) with computed_state attached."""
+    temp_store.commit_parsed_entry(_decision(slug="d", axiom="A."))
+    temp_store.commit_parsed_entry(_open_question(slug="oq", topic="T"))
+    got = {(n["slug"], n["kind"], n["computed_state"]) for n in temp_store.get_all_nodes()}
+    assert got == {("d", "decision", "active"), ("oq", "open_question", "active")}
+
+
+# --- Modifier engine (T12 — store-level) --------------------------------------
+
+
+def test_5d_modifiers_map_superseded_by(temp_store: GraphStore) -> None:
+    """get_modifiers_map populates superseded_by for an inactive (superseded) target."""
+    old = temp_store.commit_parsed_entry(_decision(slug="old", axiom="O."))
+    _commit_kill(temp_store, "new", "N.", "supersedes", "old")
+    assert temp_store.get_modifiers_map([old.node_id]) == {
+        old.node_id: {"superseded_by": ["new"]}
+    }
+    assert temp_store.get_modifiers(old.node_id) == {"superseded_by": ["new"]}
+
+
+def test_5d_modifiers_map_corrected_by(temp_store: GraphStore) -> None:
+    """get_modifiers_map populates corrected_by for an inactive (corrected) target."""
+    buggy = temp_store.commit_parsed_entry(_decision(slug="buggy", axiom="B."))
+    _commit_kill(temp_store, "fixed", "F.", "corrects", "buggy")
+    assert temp_store.get_modifiers_map([buggy.node_id]) == {
+        buggy.node_id: {"corrected_by": ["fixed"]}
+    }
+
+
+def test_5d_modifiers_map_unmodified_absent_and_empty_input(temp_store: GraphStore) -> None:
+    """An unmodified node is absent from the map; empty input → {}."""
+    d = temp_store.commit_parsed_entry(_decision(slug="d", axiom="A."))
+    assert temp_store.get_modifiers_map([d.node_id]) == {}  # active, no incoming kill-edge
+    assert temp_store.get_modifiers(d.node_id) == {}
+    assert temp_store.get_modifiers_map([]) == {}
+
+
+def test_5d_reserved_modifier_keys_never_populate_in_v1a(temp_store: GraphStore) -> None:
+    """amended_by / narrowed_by are reserved-empty in V1a but stay in MODIFIER_EDGE_KEYS (the seam).
+
+    Only supersedes/corrects edges can exist (the edges CHECK + parser warn-defer),
+    so only superseded_by/corrected_by ever populate. The reserved keys remaining in
+    MODIFIER_EDGE_KEYS is what makes V1b lighting up amends/narrows a one-line change
+    with zero read-surface edits (the C4 FORWARD HAZARD seam).
+    """
+    from mitos.store import MODIFIER_EDGE_KEYS
+
+    assert MODIFIER_EDGE_KEYS == {
+        "supersedes": "superseded_by",
+        "amends": "amended_by",
+        "narrows": "narrowed_by",
+        "corrects": "corrected_by",
+    }
+    old = temp_store.commit_parsed_entry(_decision(slug="old", axiom="O."))
+    _commit_kill(temp_store, "new", "N.", "supersedes", "old")
+    mods = temp_store.get_modifiers_map([old.node_id])[old.node_id]
+    assert "amended_by" not in mods and "narrowed_by" not in mods
+
+
+def test_5d_active_surfaces_modifier_empty_seam_ships(temp_store: GraphStore) -> None:
+    """The active view is provably modifier-empty, but every surface still runs the stamp pass.
+
+    An active node has no incoming kill-edge (that IS the anti-join), so active reads
+    carry no modifier keys; an inactive node read via get_decisions(state='superseded')
+    DOES carry its stamped superseded_by — proving the stamping machinery is wired on
+    the surfaces that can return an inactive node (the seam ships; C4 FORWARD HAZARD).
+    """
+    old = temp_store.commit_parsed_entry(_decision(slug="old", axiom="O."))
+    _commit_kill(temp_store, "new", "N.", "supersedes", "old")
+
+    for node in temp_store.get_active_decisions():
+        assert "superseded_by" not in node and "corrected_by" not in node
+    (inactive,) = temp_store.get_decisions(state="superseded")
+    assert inactive["superseded_by"] == ["new"]
+    assert temp_store.get_node(old.node_id)["superseded_by"] == ["new"]
+
+
+def test_5d_modifier_stamp_is_one_bulk_call_never_n_plus_1(
+    temp_store: GraphStore, monkeypatch
+) -> None:
+    """A read over N nodes issues exactly ONE modifier query (never N+1, P11)."""
+    for i in range(5):
+        temp_store.commit_parsed_entry(_decision(slug=f"d{i}", axiom=f"A{i}.", scope=["s"]))
+
+    calls = {"n": 0}
+    original = temp_store._modifiers_map
+
+    def _counting(conn, node_ids):
+        calls["n"] += 1
+        return original(conn, node_ids)
+
+    monkeypatch.setattr(temp_store, "_modifiers_map", _counting)
+    assert len(temp_store.get_active_decisions()) == 5
+    assert calls["n"] == 1  # one bulk join for all five nodes
+
+
+# --- C4 Letter query (T5 substrate) -------------------------------------------
+
+
+def test_5d_query_letter_by_slug_shape(temp_store: GraphStore) -> None:
+    """query_letter(slug=…) returns the Letter projection (axiom, NOT core_axiom)."""
+    temp_store.commit_parsed_entry(
+        _decision(slug="d", axiom="The axiom.", rejected="Why not.", scope=["s"])
+    )
+    (payload,) = temp_store.query_letter(slug="d")
+    assert payload == {
+        "slug": "d",
+        "axiom": "The axiom.",  # the C4 projection name (not core_axiom)
+        "scope": ["s"],
+        "rejected_paths": "Why not.",
+    }
+
+
+def test_5d_query_letter_by_node_id_and_scope(temp_store: GraphStore) -> None:
+    """query_letter filters by node_id (PK) and by scope+kind on the active view."""
+    d = temp_store.commit_parsed_entry(_decision(slug="d", axiom="A.", scope=["x"]))
+    temp_store.commit_parsed_entry(_decision(slug="e", axiom="E.", scope=["y"]))
+
+    assert [p["slug"] for p in temp_store.query_letter(node_id=d.node_id)] == ["d"]
+    assert [p["slug"] for p in temp_store.query_letter(scope="x", kind="decision")] == ["d"]
+    assert temp_store.query_letter(scope="none-such") == []
+
+
+def test_5d_query_letter_brief_drops_rejected_keeps_axiom_and_modifiers(
+    temp_store: GraphStore,
+) -> None:
+    """brief=True drops rejected_paths but keeps axiom and any modifier keys."""
+    temp_store.commit_parsed_entry(_decision(slug="d", axiom="A.", rejected="Heavy."))
+    (full,) = temp_store.query_letter(slug="d")
+    (brief,) = temp_store.query_letter(slug="d", brief=True)
+    assert "rejected_paths" in full and full["rejected_paths"] == "Heavy."
+    assert "rejected_paths" not in brief
+    assert brief["axiom"] == "A." and brief["scope"] == []
+
+
+def test_5d_query_letter_active_view_only(temp_store: GraphStore) -> None:
+    """query_letter never returns an inactive (superseded) node."""
+    temp_store.commit_parsed_entry(_decision(slug="old", axiom="O."))
+    _commit_kill(temp_store, "new", "N.", "supersedes", "old")
+    assert [p["slug"] for p in temp_store.query_letter()] == ["new"]
+    assert temp_store.query_letter(slug="old") == []
+
+
+def test_5d_query_letter_has_no_semantic_path() -> None:
+    """V1a has no vector/embedding query — the word 'semantic' must not appear in query_letter."""
+    import inspect
+
+    src = inspect.getsource(GraphStore.query_letter)
+    assert "semantic" not in src.lower()
+
+
+# --- get_transcript (new primitive) -------------------------------------------
+
+
+def test_5d_get_transcript_returns_self_or_none(temp_store: GraphStore) -> None:
+    """get_transcript returns the node's own committed transcript text, or None."""
+    with_tx = temp_store.commit_parsed_entry(
+        _decision(slug="d", axiom="A.", transcript="User: why?\nLLM: because.")
+    )
+    without_tx = temp_store.commit_parsed_entry(_decision(slug="e", axiom="E."))
+    assert temp_store.get_transcript(with_tx.node_id) == "User: why?\nLLM: because."
+    assert temp_store.get_transcript(without_tx.node_id) is None
+    assert temp_store.get_transcript("nonexistent-id") is None
+
+
+def test_5d_get_transcript_supersession_does_not_borrow(temp_store: GraphStore) -> None:
+    """A superseding node's transcript is its OWN — the predecessor's is not borrowed.
+
+    The corrects-only transitive walk is V1b/V5 (pinned in the docstring); for the
+    V1a direct read the rule holds trivially: get_transcript(new) returns only new's
+    own transcript (None here), never the superseded predecessor's.
+    """
+    old = temp_store.commit_parsed_entry(
+        _decision(slug="old", axiom="O.", transcript="OLD transcript.")
+    )
+    new = _decision(slug="new", axiom="N.")
+    new.supersedes = "old"
+    new_delta = temp_store.commit_parsed_entry(new)
+    assert temp_store.get_transcript(new_delta.node_id) is None  # not borrowed from old
+    assert temp_store.get_transcript(old.node_id) == "OLD transcript."

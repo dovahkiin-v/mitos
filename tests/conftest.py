@@ -30,20 +30,28 @@ import pytest
 # NOT scattered per-file ``pytestmark`` skips and NOT a red CI. The list was
 # derived **empirically** (flip → run the full suite → quarantine exactly the
 # modules that failed *because of the flip*, not the pre-existing ``*_live.py``
-# 429 flakes). Each later phase REMOVES the modules it restores (5d: the read-view
-# consumers; 8a: the rest); ``test_store_rebuild_quarantine_is_tracked`` (in
-# tests/test_store.py) pins the current set so the shrink to empty is auditable.
+# 429 flakes). Each later phase REMOVES the modules it restores;
+# ``test_store_rebuild_quarantine_is_tracked`` (in tests/test_store.py) pins the
+# current set so the shrink to empty is auditable.
+#
+# Phase 5d re-bucketed 5a's empirical labels (WIRING_LEDGER entry-003, §16): of the
+# 8 modules 5a labelled "restored in 5d", only **2** were genuinely store-only
+# (``test_renderer`` + ``test_adversarial_rendering`` — removed below as 5d
+# restored them). The other 6 were mis-bucketed: ``test_status_readiness`` is 8×
+# ``cli.cmd_status`` (gated on the **6b** cmd_status rebuild), and the remaining 5
+# drive the sync consumer write path (``record_decision_entry``), the MCP/CLI
+# surfaces, and/or ``amends``/``narrows`` edges (unrepresentable until V1b) — all
+# **8a**'s charter. The store-level modifier (T12) + C4 (T5) proofs those would
+# have given are delivered in ``tests/test_store.py`` instead.
 STORE_REBUILD_QUARANTINE = [
-    # Read-method consumers — restored in Phase 5d (read views + modifier stamping)
+    # Status surface — restored in Phase 6b (the cmd_status rebuild it gates on)
+    "test_status_readiness.py",
+    # Consumer-write / MCP / CLI / amends-narrows — restored in Phase 8a
     "test_list_decisions.py",
     "test_modifier_surfacing.py",
     "test_neighbor_review.py",
     "test_payload_economy.py",
     "test_surface_confidence.py",
-    "test_status_readiness.py",
-    "test_renderer.py",
-    "test_adversarial_rendering.py",
-    # Commit-via-consumer + edge/state consumers — restored in Phase 8a
     "test_sync.py",
     "test_importer.py",
     "test_record_decision.py",
@@ -63,9 +71,9 @@ def pytest_collection_modifyitems(config, items):
     provably empties by Phase 8a.
     """
     reason = (
-        "Phase 5a contained-red window: consumer/read methods break at runtime "
-        "against the flipped V1a schema; restored in Phase 5d (read views) / "
-        "Phase 8a (consumers)."
+        "Phase 5a contained-red window: consumer methods break at runtime against "
+        "the flipped V1a schema (the read views were restored in Phase 5d); "
+        "restored in Phase 6b (cmd_status) / Phase 8a (consumers)."
     )
     skip_marker = pytest.mark.skip(reason=reason)
     for item in items:

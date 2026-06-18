@@ -95,6 +95,51 @@ _DEFERRED_EDGE_FIELDS: Tuple[str, ...] = (
 # definition Phase 5d builds its public read methods on.
 _KILL_EDGE_TYPES_SQL: str = "('supersedes', 'corrects')"
 
+# --- Phase 5d read-layer SQL fragments -----------------------------------------
+# These are the ONE shared active-view / derivation definitions every public read
+# method binds, so phrasing can never drift between surfaces (Lesson 14:
+# find-first / validate-second). Each is a code-internal literal (no user value
+# interpolated — P8); a read method appends the ``?``-bound value separately.
+
+# Activeness is COMPUTED, never stored (M3): a node is inactive iff it is the
+# target of an incoming kill-edge. This correlated ``NOT EXISTS`` is the same
+# active-view definition 5b/5c compute inline and the ``_is_active`` test helper
+# encodes. Bind it in any SELECT whose FROM clause is the unaliased ``nodes``.
+_ACTIVE_VIEW_PREDICATE: str = (
+    "NOT EXISTS (SELECT 1 FROM edges "
+    "WHERE edges.target_id = nodes.id "
+    f"AND edges.edge_type IN {_KILL_EDGE_TYPES_SQL})"
+)
+
+# ``is_drifted`` is DERIVED from a correlated EXISTS over the drifted-signal
+# channel (V1-D11), evaluated INSIDE the main SELECT (one query, never a per-node
+# lookup — P11). Structurally always-False in v0.1 (no V1a path writes a drifted
+# signal), but forward-correct: it lights up the day a writer ships, for one cheap
+# indexed check. Drift ANNOTATES — a drifted node is never excluded from a view
+# (drift is loud, not hidden; it does not retire).
+_IS_DRIFTED_SQL: str = (
+    "EXISTS (SELECT 1 FROM signals "
+    "WHERE signals.node_id = nodes.id "
+    "AND signals.signal_type = 'drifted') AS is_drifted"
+)
+
+# The incoming kill-edge type (if any) for a node, derived inside the main SELECT
+# to compute ``computed_state`` (``superseded`` / ``corrected`` / ``active``).
+# NULL ⇒ no incoming kill-edge ⇒ active.
+_KILLER_TYPE_SQL: str = (
+    "(SELECT edges.edge_type FROM edges "
+    "WHERE edges.target_id = nodes.id "
+    f"AND edges.edge_type IN {_KILL_EDGE_TYPES_SQL} LIMIT 1) AS killer_type"
+)
+
+# Indexed scope-membership filter (P11: ``idx_node_scopes_scope`` serves
+# ``scope = ?``, then the PK joins back to ``node_id``). Appended to a read SELECT
+# and bound with a single ``?`` scope value — never an O(N) Python post-filter.
+_SCOPE_FILTER_SQL: str = (
+    " AND EXISTS (SELECT 1 FROM node_scopes "
+    "WHERE node_scopes.node_id = nodes.id AND node_scopes.scope = ?)"
+)
+
 
 def state_matches(computed_state: str, state_filter: Optional[str]) -> bool:
     """Reports whether a node's computed state passes the requested state filter.
@@ -113,6 +158,28 @@ def state_matches(computed_state: str, state_filter: Optional[str]) -> bool:
     if state_filter == "active":
         return computed_state in LIVE_STATES
     return computed_state == state_filter
+
+
+def _computed_decision_state(killer_type: Optional[str]) -> str:
+    """Derives a node's computed state from its incoming kill-edge type (M3).
+
+    State is computed, never stored: a node with no incoming kill-edge is
+    ``"active"``; an incoming ``supersedes`` makes it ``"superseded"`` and an
+    incoming ``corrects`` makes it ``"corrected"``. ``is_drifted`` is a separate
+    annotation (drift does not retire — it never replaces this state).
+
+    Args:
+        killer_type: The incoming kill-edge ``edge_type`` (from the ``killer_type``
+            derived column), or None when the node has no incoming kill-edge.
+
+    Returns:
+        The computed state string (``"active"`` / ``"superseded"`` / ``"corrected"``).
+    """
+    if killer_type == "supersedes":
+        return "superseded"
+    if killer_type == "corrects":
+        return "corrected"
+    return "active"
 
 
 def compute_hash(
@@ -467,51 +534,246 @@ class GraphStore:
         finally:
             conn.close()
 
+    # --- Phase 5d read-layer helpers (one alias map, one anti-join, one bulk -----
+    # scope fetch, one bulk modifier stamp; shared by every public read method so
+    # the reader-facing shape and the active-view definition can never drift).
+
+    def _hydrate_node(self, row: sqlite3.Row, scopes: List[str]) -> Dict[str, Any]:
+        """Re-keys a raw V1a ``nodes`` row into the prototype reader-facing dict.
+
+        The single alias map (§3) at the heart of the read layer: the V1a column
+        names (``axiom`` / ``mechanism_refs_json`` / ``questions_raised_json`` /
+        ``rejected_paths_json``) are re-keyed to the prototype reader keys the
+        unchanged consumers (``renderer.py`` / ``mcp_server.py``) bind, so the read
+        paths keep working with no consumer edit (deferred to Phase 8a). Kind-aware:
+        a decision carries ``core_axiom`` / ``mechanisms`` / ``rejected_paths``; an
+        open_question carries ``topic`` / ``questions_raised``. Off-kind columns are
+        NULL in V1a (5a §14) and are dropped, never surfaced as an empty reader key.
+
+        Args:
+            row: A ``nodes`` row joined with the derived ``is_drifted`` column (and,
+                for state-bearing reads, ``killer_type``); both helper columns are
+                stripped from the returned dict.
+            scopes: The node's scope tags, bulk-fetched from ``node_scopes`` (never a
+                per-node query — P11).
+
+        Returns:
+            The reader-facing node dict (lists are lists, never tuples; the raw
+            ``rejected_paths`` string passes through verbatim).
+        """
+        node = dict(row)
+        # Strip the derived helper columns — never part of the reader contract.
+        node["is_drifted"] = bool(node.pop("is_drifted", 0))
+        node.pop("killer_type", None)
+        node["scope"] = list(scopes)
+
+        # Pop all the kind-differentiated canonical-core columns so an off-kind
+        # NULL never leaks under a reader key; re-add only the committing kind's.
+        axiom = node.pop("axiom", None)
+        mechanism_refs_json = node.pop("mechanism_refs_json", None)
+        rejected_paths_json = node.pop("rejected_paths_json", None)
+        questions_raised_json = node.pop("questions_raised_json", None)
+        topic = node.pop("topic", None)
+        if node["kind"] == "decision":
+            node["core_axiom"] = axiom or ""
+            # The degenerate ``["!!!"]→[""]`` mechanism stores ``'[""]'`` (5a §14),
+            # which decodes to ``[""]`` — a harmless display artifact; the canonical
+            # core is fenced and never re-compared, so do NOT "fix" it here.
+            node["mechanisms"] = json.loads(mechanism_refs_json or "[]")
+            # ``rejected_paths_json`` holds a RAW string, NOT JSON (5a §14) — passed
+            # through verbatim; ``json.loads`` would corrupt or raise.
+            node["rejected_paths"] = (
+                rejected_paths_json if rejected_paths_json is not None else ""
+            )
+        else:
+            node["topic"] = topic
+            node["questions_raised"] = json.loads(questions_raised_json or "[]")
+        return node
+
+    def _scopes_for(
+        self, conn: sqlite3.Connection, node_ids: List[str]
+    ) -> Dict[str, List[str]]:
+        """Bulk-fetches scope tags for many nodes in ONE indexed query (never N+1).
+
+        Args:
+            conn: An open connection (the caller owns its lifecycle).
+            node_ids: The node IDs to fetch scopes for.
+
+        Returns:
+            A mapping of node_id -> sorted scope-tag list; an id with no scopes is
+            simply absent from the map.
+        """
+        if not node_ids:
+            return {}
+        placeholders = ",".join("?" for _ in node_ids)
+        out: Dict[str, List[str]] = {}
+        for row in conn.execute(
+            f"SELECT node_id, scope FROM node_scopes "
+            f"WHERE node_id IN ({placeholders}) ORDER BY node_id, scope",
+            node_ids,
+        ):
+            out.setdefault(row["node_id"], []).append(row["scope"])
+        return out
+
+    def _modifiers_map(
+        self, conn: sqlite3.Connection, node_ids: List[str]
+    ) -> Dict[str, Dict[str, List[str]]]:
+        """The V1a modifier-map engine over an open connection (one bulk join).
+
+        Shared by the public :meth:`get_modifiers_map` and the per-surface
+        :meth:`_stamp_modifiers` pass so a single query — never N+1 — answers "who
+        moved on from these nodes?".
+
+        Args:
+            conn: An open connection (the caller owns its lifecycle).
+            node_ids: The target node IDs to look up incoming modifier edges for.
+
+        Returns:
+            A mapping of node_id -> {reverse_key: [modifier_slug, ...]}; only
+            modified nodes appear, each with only non-empty, slug-sorted keys.
+        """
+        if not node_ids:
+            return {}
+        id_placeholders = ",".join("?" for _ in node_ids)
+        type_placeholders = ",".join("?" for _ in MODIFIER_EDGE_KEYS)
+        cursor = conn.execute(
+            f"""
+            SELECT e.target_id AS target_id, e.edge_type AS edge_type, n.slug AS slug
+            FROM edges e
+            JOIN nodes n ON n.id = e.source_id
+            WHERE e.target_id IN ({id_placeholders})
+              AND e.edge_type IN ({type_placeholders})
+            ORDER BY n.slug
+            """,
+            (*node_ids, *MODIFIER_EDGE_KEYS.keys()),
+        )
+        result: Dict[str, Dict[str, List[str]]] = {}
+        for row in cursor.fetchall():
+            key = MODIFIER_EDGE_KEYS[row["edge_type"]]
+            result.setdefault(row["target_id"], {}).setdefault(key, []).append(
+                row["slug"]
+            )
+        return result
+
+    def _stamp_modifiers(
+        self, conn: sqlite3.Connection, nodes: List[Dict[str, Any]]
+    ) -> None:
+        """Stamps reverse-relation modifier keys via ONE bulk modifier join, in place.
+
+        Every store read surface routes through this single bulk pass — never N+1,
+        never a static-empty stamp. The C4 FORWARD HAZARD seam ships on every read
+        even though V1a's active view is provably modifier-empty (an active node has
+        no incoming kill-edge by definition): the graph always knew via the edges, so
+        the payload must not lie, and V1b lighting up ``amends`` / ``narrows`` is then
+        a one-line ``MODIFIER_EDGE_KEYS`` change with zero read-surface edits.
+
+        Args:
+            conn: An open connection (the caller owns its lifecycle).
+            nodes: Already-hydrated node dicts (each carrying ``id``) to stamp.
+        """
+        if not nodes:
+            return
+        mod_map = self._modifiers_map(conn, [n["id"] for n in nodes])
+        for node in nodes:
+            for key, slugs in mod_map.get(node["id"], {}).items():
+                node[key] = slugs
+
+    def _hydrate_rows(
+        self, conn: sqlite3.Connection, rows: List[sqlite3.Row]
+    ) -> List[Dict[str, Any]]:
+        """Hydrates many rows with ONE bulk scope fetch + ONE bulk modifier stamp.
+
+        Args:
+            conn: An open connection (the caller owns its lifecycle).
+            rows: Raw ``nodes`` rows (each joined with ``is_drifted``).
+
+        Returns:
+            The reader-facing node dicts, scope-joined and modifier-stamped.
+        """
+        if not rows:
+            return []
+        ids = [row["id"] for row in rows]
+        scopes_map = self._scopes_for(conn, ids)
+        nodes = [self._hydrate_node(row, scopes_map.get(row["id"], [])) for row in rows]
+        self._stamp_modifiers(conn, nodes)
+        return nodes
+
     def get_node(self, node_id: str) -> Optional[Dict[str, Any]]:
-        """Retrieves a single node by its ID.
+        """Retrieves a single node by its content-hash ID, in the reader-facing shape.
+
+        Returns the node whether it is active or inactive (a direct id read is not
+        active-scoped); an inactive node carries its stamped ``superseded_by`` /
+        ``corrected_by`` modifier keys so a reader of a moved-on node still sees who
+        moved on.
 
         Args:
             node_id: The primary key ID of the node.
 
         Returns:
-            A dictionary containing the node data, or None if not found.
+            The reader-facing node dict (aliased columns, ``scope`` list,
+            ``is_drifted`` bool, stamped modifiers when non-empty), or None.
         """
         conn = self._get_connection()
         try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM nodes WHERE id = ?", (node_id,))
-            row = cursor.fetchone()
+            row = conn.execute(
+                f"SELECT nodes.*, {_IS_DRIFTED_SQL} FROM nodes WHERE nodes.id = ?",
+                (node_id,),
+            ).fetchone()
             if not row:
                 return None
-            
-            node = dict(row)
-            # Deserialize JSON fields
-            for field in ("questions_raised", "mechanisms", "scope"):
-                if node.get(field):
-                    node[field] = json.loads(node[field])
-                else:
-                    node[field] = []
+            scopes_map = self._scopes_for(conn, [node_id])
+            node = self._hydrate_node(row, scopes_map.get(node_id, []))
+            self._stamp_modifiers(conn, [node])
             return node
         finally:
             conn.close()
 
     def get_node_by_slug(self, slug: str) -> Optional[Dict[str, Any]]:
-        """Retrieves a single node by slug, throwing on ambiguity.
+        """Retrieves the single ACTIVE node for a slug (active-scoped → ≤1, MI-13).
+
+        Resolves the slug directly within the active view — ``casefold(slug)`` match
+        AND the kill-edge anti-join — so ``casefold(slug) → active node`` is a
+        function, not a relation (a superseded predecessor and its superseder never
+        coexist in the active set). MI-13 (enforced upstream at commit, 5b) guarantees
+        at most one active node per ``casefold(slug)``, so the ambiguity ``raise``
+        below is a defensive vector (P3) that is structurally unreachable.
+
+        Deliberately does NOT route through ``resolve_slug`` — that prototype method
+        uses SQLite ``COLLATE NOCASE`` (the forbidden Unicode folding) plus a fuzzy
+        ``LIKE`` alias-fallback tier the negative-space fence rejects; both are 8a's to
+        reconcile. Here we bind Python ``str.casefold()`` against ``slug_casefold``.
 
         Args:
-            slug: The slug identifier.
+            slug: The slug identifier (case-insensitive via ``str.casefold()``).
 
         Returns:
-            The node dictionary or None.
+            The single active node dict (reader-facing shape), or None.
+
+        Raises:
+            ValidationError: If more than one active node shares the casefolded slug
+                — an MI-13 breach (defensive; structurally unreachable).
         """
-        node_ids = self.resolve_slug(slug)
-        if not node_ids:
-            return None
-        if len(node_ids) > 1:
-            raise ValidationError(
-                f"Slug '{slug}' is ambiguous and maps to multiple nodes: {node_ids}"
-            )
-        return self.get_node(node_ids[0])
+        conn = self._get_connection()
+        try:
+            rows = conn.execute(
+                f"SELECT nodes.*, {_IS_DRIFTED_SQL} FROM nodes "
+                f"WHERE nodes.slug_casefold = ? AND {_ACTIVE_VIEW_PREDICATE}",
+                (slug.casefold(),),
+            ).fetchall()
+            if not rows:
+                return None
+            if len(rows) > 1:
+                raise ValidationError(
+                    f"Slug '{slug}' resolves to {len(rows)} active nodes "
+                    f"(MI-13 breach): {[row['id'] for row in rows]}"
+                )
+            node_id = rows[0]["id"]
+            scopes_map = self._scopes_for(conn, [node_id])
+            node = self._hydrate_node(rows[0], scopes_map.get(node_id, []))
+            self._stamp_modifiers(conn, [node])
+            return node
+        finally:
+            conn.close()
 
     def compute_all_states(self, conn: sqlite3.Connection) -> Dict[str, str]:
         """Computes states for all nodes currently in the transaction connection.
@@ -1354,35 +1616,34 @@ class GraphStore:
         )
 
     def get_active_decisions(self, scope: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Exposes view of all active decisions (C3 / M3)."""
+        """Exposes the active-view set of decisions (C3 / M3).
+
+        Activeness is the kill-edge anti-join (no incoming ``supersedes`` /
+        ``corrects``), computed at query time — never the prototype
+        ``compute_all_states`` DAG (which reads dropped edge columns). A drifted
+        node is INCLUDED with ``is_drifted == True`` (drift annotates, does not
+        retire). Each result is hydrated to the reader-facing shape and
+        modifier-stamped (provably empty on the active view, but the seam ships).
+
+        Args:
+            scope: Optional scope tag; filtered in SQL via the indexed
+                ``node_scopes`` membership join (P11), not an O(N) post-filter.
+
+        Returns:
+            Active decision node dicts (reader-facing shape).
+        """
         conn = self._get_connection()
         try:
-            states = self.compute_all_states(conn)
-            active_ids = [nid for nid, state in states.items() if state in ("active", "drifted")]
-            
-            if not active_ids:
-                return []
-
-            placeholders = ",".join("?" for _ in active_ids)
-            cursor = conn.cursor()
-            cursor.execute(
-                f"SELECT * FROM nodes WHERE id IN ({placeholders}) AND kind = 'decision'",
-                active_ids
+            sql = (
+                f"SELECT nodes.*, {_IS_DRIFTED_SQL} FROM nodes "
+                f"WHERE nodes.kind = 'decision' AND {_ACTIVE_VIEW_PREDICATE}"
             )
-            
-            results = []
-            for row in cursor.fetchall():
-                node = dict(row)
-                node["mechanisms"] = json.loads(node["mechanisms"] or "[]")
-                node["scope"] = json.loads(node["scope"] or "[]")
-                
-                # Apply scope filter if present
-                if scope:
-                    if scope not in node["scope"]:
-                        continue
-                results.append(node)
-                
-            return results
+            params: List[str] = []
+            if scope is not None:
+                sql += _SCOPE_FILTER_SQL
+                params.append(scope)
+            rows = conn.execute(sql, params).fetchall()
+            return self._hydrate_rows(conn, rows)
         finally:
             conn.close()
 
@@ -1405,69 +1666,85 @@ class GraphStore:
         """
         conn = self._get_connection()
         try:
-            states = self.compute_all_states(conn)
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM nodes WHERE kind = 'decision'")
+            sql = (
+                f"SELECT nodes.*, {_IS_DRIFTED_SQL}, {_KILLER_TYPE_SQL} "
+                f"FROM nodes WHERE nodes.kind = 'decision'"
+            )
+            params: List[str] = []
+            if scope is not None:
+                sql += _SCOPE_FILTER_SQL
+                params.append(scope)
+            rows = conn.execute(sql, params).fetchall()
 
-            results = []
-            for row in cursor.fetchall():
-                node = dict(row)
-                node["mechanisms"] = json.loads(node["mechanisms"] or "[]")
-                node["scope"] = json.loads(node["scope"] or "[]")
-                node["computed_state"] = states.get(node["id"], "active")
+            # Derive computed_state from the incoming kill-edge (active vs
+            # superseded/corrected) and filter BEFORE hydrating, so the bulk scope
+            # fetch + modifier stamp only runs over the kept rows. The exact
+            # vocabulary is validated against ``list_decisions`` at 8a (§14) — kept
+            # deliberately simple here.
+            kept: List[Tuple[sqlite3.Row, str]] = []
+            for row in rows:
+                computed_state = _computed_decision_state(row["killer_type"])
+                if state_matches(computed_state, state):
+                    kept.append((row, computed_state))
 
-                if scope and scope not in node["scope"]:
-                    continue
-                if not state_matches(node["computed_state"], state):
-                    continue
-                results.append(node)
-
-            return results
+            nodes = self._hydrate_rows(conn, [row for row, _ in kept])
+            for node, (_, computed_state) in zip(nodes, kept):
+                node["computed_state"] = computed_state
+            return nodes
         finally:
             conn.close()
 
     def get_open_questions(self, scope: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Exposes open questions (resolved or parked)."""
+        """Exposes the active-view set of open questions (V1-D18 Stage-1).
+
+        Applies the SAME kill-edge anti-join as the decision views (an OQ with an
+        incoming ``supersedes`` / ``corrects`` is excluded); there is no ``state``
+        column. Hydrated to the reader-facing OQ shape (``topic`` /
+        ``questions_raised``) and modifier-stamped.
+
+        Args:
+            scope: Optional scope tag; filtered in SQL via the indexed
+                ``node_scopes`` membership join (P11).
+
+        Returns:
+            Active open-question node dicts (reader-facing shape).
+        """
         conn = self._get_connection()
         try:
-            states = self.compute_all_states(conn)
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM nodes WHERE kind = 'open_question'")
-            
-            results = []
-            for row in cursor.fetchall():
-                node = dict(row)
-                node["questions_raised"] = json.loads(node["questions_raised"] or "[]")
-                node["scope"] = json.loads(node["scope"] or "[]")
-                node["computed_state"] = states.get(node["id"], "parked")
-
-                if scope:
-                    if scope not in node["scope"]:
-                        continue
-                results.append(node)
-                
-            return results
+            sql = (
+                f"SELECT nodes.*, {_IS_DRIFTED_SQL} FROM nodes "
+                f"WHERE nodes.kind = 'open_question' AND {_ACTIVE_VIEW_PREDICATE}"
+            )
+            params: List[str] = []
+            if scope is not None:
+                sql += _SCOPE_FILTER_SQL
+                params.append(scope)
+            rows = conn.execute(sql, params).fetchall()
+            return self._hydrate_rows(conn, rows)
         finally:
             conn.close()
 
     def get_all_nodes(self) -> List[Dict[str, Any]]:
-        """Retrieves all nodes in the database with their computed states."""
+        """Retrieves every node (any kind, any state) with its computed state.
+
+        Unfiltered — both kinds, active and inactive — each hydrated to the
+        reader-facing shape, modifier-stamped, and carrying ``computed_state``
+        derived from the kill-edge anti-join (``active`` / ``superseded`` /
+        ``corrected``).
+
+        Returns:
+            All node dicts (reader-facing shape).
+        """
         conn = self._get_connection()
         try:
-            states = self.compute_all_states(conn)
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM nodes")
-            
-            results = []
-            for row in cursor.fetchall():
-                node = dict(row)
-                node["mechanisms"] = json.loads(node["mechanisms"] or "[]")
-                node["scope"] = json.loads(node["scope"] or "[]")
-                node["questions_raised"] = json.loads(node["questions_raised"] or "[]")
-                node["computed_state"] = states.get(node["id"], "active")
-                results.append(node)
-                
-            return results
+            rows = conn.execute(
+                f"SELECT nodes.*, {_IS_DRIFTED_SQL}, {_KILLER_TYPE_SQL} FROM nodes"
+            ).fetchall()
+            states = [_computed_decision_state(row["killer_type"]) for row in rows]
+            nodes = self._hydrate_rows(conn, rows)
+            for node, computed_state in zip(nodes, states):
+                node["computed_state"] = computed_state
+            return nodes
         finally:
             conn.close()
             
@@ -1503,25 +1780,7 @@ class GraphStore:
             return {}
         conn = self._get_connection()
         try:
-            cursor = conn.cursor()
-            id_placeholders = ",".join("?" for _ in node_ids)
-            type_placeholders = ",".join("?" for _ in MODIFIER_EDGE_KEYS)
-            cursor.execute(
-                f"""
-                SELECT e.to_id AS to_id, e.type AS type, n.slug AS slug
-                FROM edges e
-                JOIN nodes n ON n.id = e.from_id
-                WHERE e.to_id IN ({id_placeholders})
-                  AND e.type IN ({type_placeholders})
-                ORDER BY n.slug
-                """,
-                (*node_ids, *MODIFIER_EDGE_KEYS.keys()),
-            )
-            result: Dict[str, Dict[str, List[str]]] = {}
-            for row in cursor.fetchall():
-                key = MODIFIER_EDGE_KEYS[row["type"]]
-                result.setdefault(row["to_id"], {}).setdefault(key, []).append(row["slug"])
-            return result
+            return self._modifiers_map(conn, node_ids)
         finally:
             conn.close()
 
@@ -1538,6 +1797,123 @@ class GraphStore:
             node is unmodified.
         """
         return self.get_modifiers_map([node_id]).get(node_id, {})
+
+    def get_transcript(self, node_id: str) -> Optional[str]:
+        """Returns a node's own committed transcript text, or None.
+
+        The V1a primitive is the DIRECT self-read: ``transcripts.transcript_text``
+        for this node only. It is the single store-owned transcript accessor —
+        never reimplemented per consumer.
+
+        **Cross-vision contract (pinned; the transitive walk is NOT in V1a).** The
+        ancestry edge set is ``corrects`` ONLY, and the walk STOPS at any
+        ``supersedes`` (the decision boundary): a ``corrects`` is a bug-fix on the
+        *same* decision, so an ancestor's synthesis still describes it and may be
+        borrowed; a ``supersedes`` moves the decision forward, so the predecessor's
+        reasoning must NOT be borrowed. The transitive ``corrects``-chain traversal
+        lands with V1b's cascade walker / V5 as first consumer (§5.2.3; ADR
+        ``transcript-ancestry-corrects-only``) — for the V1a direct read the rule
+        holds trivially (a single node's own transcript borrows nothing).
+
+        Args:
+            node_id: The node whose transcript to read.
+
+        Returns:
+            The raw transcript text, or None when the node has no transcript.
+        """
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT transcript_text FROM transcripts WHERE node_id = ?",
+                (node_id,),
+            ).fetchone()
+            return row["transcript_text"] if row else None
+        finally:
+            conn.close()
+
+    def query_letter(
+        self,
+        *,
+        scope: Optional[str] = None,
+        kind: str = "decision",
+        slug: Optional[str] = None,
+        node_id: Optional[str] = None,
+        brief: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Structured-filter Letter query over the active view (C4) — deterministic only.
+
+        The deterministic C4 retrieval surface: filters the ACTIVE view by any of
+        ``scope`` (indexed ``node_scopes`` join), ``kind``, exact ``slug``
+        (``slug_casefold``), or ``node_id`` (the content-hash PK) and returns the
+        Letter projection ``{slug, axiom, rejected_paths, scope}`` plus stamped
+        reverse-relation modifier keys. There is deliberately NO vector / embedding
+        path in V1a — this is the structured-filter retrieval, not the ranked recall.
+
+        Note the Letter payload uses ``axiom`` (the C4 projection name), whereas the
+        full-node read methods use ``core_axiom`` — two deliberate projections of the
+        same column; do not unify them.
+
+        ``brief`` is an explicit per-call argument — NEVER inferred from session or
+        connection state (a bare ``/clear`` keeps a connection alive while resetting
+        the agent's context, so no connection key can correctly decide "give me
+        less"). It drops ``rejected_paths`` only; ``axiom`` and the modifier keys are
+        always carried.
+
+        Args:
+            scope: Optional scope tag (indexed membership filter).
+            kind: ``"decision"`` (default) or ``"open_question"``.
+            slug: Optional exact slug (matched case-insensitively via casefold).
+            node_id: Optional exact content-hash id.
+            brief: When True, omit ``rejected_paths`` (axiom-only scan); modifiers
+                and ``axiom`` are still carried.
+
+        Returns:
+            Letter payload dicts (active-view only), each modifier-stamped.
+        """
+        conn = self._get_connection()
+        try:
+            sql = (
+                f"SELECT nodes.* FROM nodes "
+                f"WHERE nodes.kind = ? AND {_ACTIVE_VIEW_PREDICATE}"
+            )
+            params: List[str] = [kind]
+            if node_id is not None:
+                sql += " AND nodes.id = ?"
+                params.append(node_id)
+            if slug is not None:
+                sql += " AND nodes.slug_casefold = ?"
+                params.append(slug.casefold())
+            if scope is not None:
+                sql += _SCOPE_FILTER_SQL
+                params.append(scope)
+            rows = conn.execute(sql, params).fetchall()
+            if not rows:
+                return []
+
+            ids = [row["id"] for row in rows]
+            scopes_map = self._scopes_for(conn, ids)
+            mod_map = self._modifiers_map(conn, ids)
+            payloads: List[Dict[str, Any]] = []
+            for row in rows:
+                rid = row["id"]
+                payload: Dict[str, Any] = {
+                    "slug": row["slug"],
+                    "axiom": row["axiom"] or "",
+                    "scope": scopes_map.get(rid, []),
+                }
+                if not brief:
+                    # rejected_paths_json is a RAW string (5a §14) — verbatim.
+                    payload["rejected_paths"] = (
+                        row["rejected_paths_json"]
+                        if row["rejected_paths_json"] is not None
+                        else ""
+                    )
+                for key, slugs in mod_map.get(rid, {}).items():
+                    payload[key] = slugs
+                payloads.append(payload)
+            return payloads
+        finally:
+            conn.close()
 
     def add_pending_embedding(self, node_id: str, embedding_text: str) -> None:
         """Adds or updates a node to the pending embeddings queue (C2/F2)."""

@@ -186,6 +186,65 @@ class GraphStoreProtocol(Protocol):
         """
         ...
 
+    def get_modifiers(self, node_id: str) -> Dict[str, List[str]]:
+        """Returns the reverse-relation modifiers for a single node.
+
+        Args:
+            node_id: The node ID to look up modifiers for.
+
+        Returns:
+            A mapping of reverse-relation key to modifier slugs, or ``{}``.
+        """
+        ...
+
+    def get_decisions(
+        self, scope: Optional[str] = None, state: str = "active"
+    ) -> List[Dict[str, Any]]:
+        """Enumerates decision nodes matching scope and computed state.
+
+        Args:
+            scope: Optional scope filter.
+            state: ``"active"`` (live set), ``"all"``, or an exact computed state.
+
+        Returns:
+            List of decision node dicts with ``computed_state`` attached.
+        """
+        ...
+
+    def get_transcript(self, node_id: str) -> Optional[str]:
+        """Returns a node's own committed transcript text, or None.
+
+        Args:
+            node_id: The node whose transcript to read.
+
+        Returns:
+            The raw transcript text, or None.
+        """
+        ...
+
+    def query_letter(
+        self,
+        *,
+        scope: Optional[str] = None,
+        kind: str = "decision",
+        slug: Optional[str] = None,
+        node_id: Optional[str] = None,
+        brief: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Structured-filter Letter query over the active view (C4) — no semantic path.
+
+        Args:
+            scope: Optional scope tag.
+            kind: ``"decision"`` or ``"open_question"``.
+            slug: Optional exact slug (casefolded).
+            node_id: Optional exact content-hash id.
+            brief: When True, omit ``rejected_paths``.
+
+        Returns:
+            Letter payload dicts (active-view only), each modifier-stamped.
+        """
+        ...
+
     def add_pending_embedding(self, node_id: str, embedding_text: str) -> None:
         """Adds a node to the pending outbox queue.
 
