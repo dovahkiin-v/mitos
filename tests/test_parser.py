@@ -12,13 +12,25 @@ from mitos.parser import (
     parse_header,
     parse_decisions_file,
     parse_entry_stream,
+    load_dynamic_field_map,
+    FIELD_MAP,
     ParsedEntry,
     _normalize_mechanism_list,
     _normalize_scope_list,
     _normalize_questions_list,
 )
 from mitos import identity
-from mitos.errors import ParseError, ValidationError
+from mitos.errors import (
+    ParseError,
+    ValidationError,
+    MitosError,
+    EntryFailure,
+    FailureItem,
+    PARSER_MALFORMED_ENTRY,
+    PARSER_MISSING_REQUIRED_FIELD,
+    PARSER_MALFORMED_MARKER,
+    PARSER_FAILURE_CODES,
+)
 from mitos.store import GraphStore
 
 def test_strip_html_comments_outside_protected() -> None:
@@ -352,17 +364,28 @@ def test_parse_entry_stream_sample_below_deleted_sentinel_surfaces() -> None:
 
 
 def test_parse_entry_stream_kind_is_caller_declared() -> None:
-    """The same slug block parses as either kind per the caller's param (Success #7).
+    """Kind comes from the caller's param, not content-sniffing (Success #7).
 
-    No [DECISION_PARKED] marker; kind is the caller's declaration, not sniffed.
+    4b enforces required fields per kind, so a fixture valid for one kind is no
+    longer auto-valid for the other (a decision needs Decided+Rejected; an OQ
+    needs Topic+Questions, and Rejected is forbidden on it). The old single
+    shared-slug block tripped required-field validation for both kinds — so this
+    uses a minimal *valid* block per kind, still proving the caller declares kind.
     """
-    block = (
+    decision_block = (
         "<!-- BEGIN ENTRIES -->\n"
-        "### shared-slug\n"
-        "**Topic:** a topic that also reads as prose\n"
+        "### a-decision\n"
+        "**Decided:** an axiom\n"
+        "**Rejected:** a rejected path\n"
     )
-    assert parse_entry_stream(block, "decision")[0].kind == "decision"
-    assert parse_entry_stream(block, "open_question")[0].kind == "open_question"
+    oq_block = (
+        "<!-- BEGIN ENTRIES -->\n"
+        "### an-open-question\n"
+        "**Topic:** a topic\n"
+        "**Questions:** a real question?\n"
+    )
+    assert parse_entry_stream(decision_block, "decision")[0].kind == "decision"
+    assert parse_entry_stream(oq_block, "open_question")[0].kind == "open_question"
 
 
 def test_parse_entry_stream_unknown_kind_raises() -> None:
@@ -590,3 +613,468 @@ def test_parse_entry_stream_scope_norm_is_parser_pinned() -> None:
         "substrate",
         "auth",
     ]
+
+
+# ===========================================================================
+# Phase 4b — validation, marker recognition & the §5.2.2 failure envelope
+#
+# The parser becomes the authority on format-level well-formedness (the C1
+# boundary). A malformed entry yields a structured EntryFailure anchored to the
+# slug (or None), with FailureItems carrying stable cross-vision code names and a
+# source="parser" discriminator. Per-stage accumulation, per-entry isolation.
+# ===========================================================================
+
+# A minimal well-formed decision / OQ stream (line 2 = the slug header).
+_MIN_DECISION = (
+    "<!-- BEGIN ENTRIES -->\n"
+    "### a-decision\n"
+    "**Decided:** an axiom\n"
+    "**Rejected:** a rejected path\n"
+)
+_MIN_OQ = (
+    "<!-- BEGIN ENTRIES -->\n"
+    "### an-open-question\n"
+    "**Topic:** a topic\n"
+    "**Questions:** a real question?\n"
+)
+
+
+def test_parse_entry_stream_well_formed_empty_collector() -> None:
+    """Success #1: a well-formed stream returns entries with an empty collector."""
+    failures: list = []
+    entries = parse_entry_stream(_MIN_DECISION, "decision", failures=failures)
+    assert len(entries) == 1
+    assert failures == []
+    # Strict mode (no collector) does not raise on a well-formed stream.
+    assert len(parse_entry_stream(_MIN_DECISION, "decision")) == 1
+
+
+def test_parse_entry_stream_missing_decided() -> None:
+    """A decision missing **Decided:** yields one missing_required_field item."""
+    text = (
+        "<!-- BEGIN ENTRIES -->\n"
+        "### no-axiom\n"
+        "**Rejected:** a rejected path\n"
+    )
+    failures: list = []
+    entries = parse_entry_stream(text, "decision", failures=failures)
+    assert entries == []
+    assert len(failures) == 1
+    env = failures[0]
+    assert env.slug == "no-axiom"
+    assert len(env.items) == 1
+    item = env.items[0]
+    assert item.code == "missing_required_field"
+    assert item.source == "parser"
+    assert item.field == "**Decided:**"
+    assert item.line_start == 2  # localized to the entry header line
+
+
+def test_parse_entry_stream_missing_rejected() -> None:
+    """A decision missing **Rejected:** yields one missing_required_field item."""
+    text = (
+        "<!-- BEGIN ENTRIES -->\n"
+        "### no-rejected\n"
+        "**Decided:** an axiom\n"
+    )
+    failures: list = []
+    entries = parse_entry_stream(text, "decision", failures=failures)
+    assert entries == []
+    assert len(failures) == 1
+    assert [i.field for i in failures[0].items] == ["**Rejected:**"]
+    assert failures[0].items[0].code == "missing_required_field"
+
+
+def test_parse_entry_stream_missing_both_required_accumulates() -> None:
+    """Missing BOTH required fields -> ONE envelope with TWO items (§5.2.2 accumulate)."""
+    text = (
+        "<!-- BEGIN ENTRIES -->\n"
+        "### empty-decision\n"
+        "**Context:** only commentary, no required fields\n"
+    )
+    failures: list = []
+    entries = parse_entry_stream(text, "decision", failures=failures)
+    assert entries == []
+    assert len(failures) == 1  # ONE envelope, not two
+    items = failures[0].items
+    assert len(items) == 2  # both required fields accumulate within the stage
+    assert {i.code for i in items} == {"missing_required_field"}
+    assert {i.field for i in items} == {"**Decided:**", "**Rejected:**"}
+
+
+def test_parse_entry_stream_oq_missing_topic() -> None:
+    """An OQ missing **Topic:** yields a missing_required_field item."""
+    text = (
+        "<!-- BEGIN ENTRIES -->\n"
+        "### no-topic\n"
+        "**Questions:** a real question?\n"
+    )
+    failures: list = []
+    entries = parse_entry_stream(text, "open_question", failures=failures)
+    assert entries == []
+    assert [i.field for i in failures[0].items] == ["**Topic:**"]
+
+
+def test_parse_entry_stream_oq_missing_questions() -> None:
+    """An OQ missing **Questions:** yields a missing_required_field item."""
+    text = (
+        "<!-- BEGIN ENTRIES -->\n"
+        "### no-questions\n"
+        "**Topic:** a topic with no questions\n"
+    )
+    failures: list = []
+    entries = parse_entry_stream(text, "open_question", failures=failures)
+    assert entries == []
+    assert [i.field for i in failures[0].items] == ["**Questions:**"]
+
+
+def test_parse_entry_stream_mechanisms_optional() -> None:
+    """A decision with NO **Mechanisms:** is valid (optional -> [], not required)."""
+    failures: list = []
+    entries = parse_entry_stream(_MIN_DECISION, "decision", failures=failures)
+    assert len(entries) == 1
+    assert entries[0].mechanisms == []
+    assert failures == []
+
+
+def test_parse_entry_stream_empty_required_field_is_missing() -> None:
+    """A present-but-empty **Decided:** counts as missing (must be non-empty, §1)."""
+    text = (
+        "<!-- BEGIN ENTRIES -->\n"
+        "### empty-axiom\n"
+        "**Decided:** \n"
+        "**Rejected:** a rejected path\n"
+    )
+    failures: list = []
+    entries = parse_entry_stream(text, "decision", failures=failures)
+    assert entries == []
+    assert [i.field for i in failures[0].items] == ["**Decided:**"]
+
+
+def test_parse_entry_stream_slugless_header_envelope() -> None:
+    """A slug-less header -> malformed_entry, slug=None, raw_header captured."""
+    text = (
+        "<!-- BEGIN ENTRIES -->\n"  # line 1
+        "###\n"                       # line 2  <- slug-less header
+        "**Decided:** x\n"            # line 3
+    )
+    failures: list = []
+    entries = parse_entry_stream(text, "decision", failures=failures)
+    assert entries == []
+    assert len(failures) == 1
+    env = failures[0]
+    assert env.slug is None
+    assert env.raw_header == "###"
+    assert len(env.items) == 1
+    item = env.items[0]
+    assert item.code == "malformed_entry"
+    assert item.source == "parser"
+    assert item.line_start == 2 and item.line_end == 2  # the header line
+
+
+def test_parse_entry_stream_unrecognized_field() -> None:
+    """An unrecognized field -> malformed_entry, field/line localized."""
+    text = (
+        "<!-- BEGIN ENTRIES -->\n"   # line 1
+        "### with-bogus\n"            # line 2
+        "**Decided:** x\n"           # line 3
+        "**Bogus:** not a real field\n"  # line 4  <- the offender
+        "**Rejected:** y\n"          # line 5
+    )
+    failures: list = []
+    entries = parse_entry_stream(text, "decision", failures=failures)
+    assert entries == []
+    assert len(failures) == 1
+    items = failures[0].items
+    assert len(items) == 1
+    assert items[0].code == "malformed_entry"
+    assert items[0].field == "**Bogus:**"
+    assert items[0].line_start == 4  # the offending field's line
+
+
+def test_parse_entry_stream_rejected_on_oq_forbidden() -> None:
+    """**Rejected:** on an open_question -> malformed_entry (M5, Decision 5)."""
+    text = (
+        "<!-- BEGIN ENTRIES -->\n"  # line 1
+        "### oq-with-rejected\n"     # line 2
+        "**Topic:** a topic\n"       # line 3
+        "**Questions:** q?\n"        # line 4
+        "**Rejected:** forbidden\n"  # line 5  <- M5 violation
+    )
+    failures: list = []
+    entries = parse_entry_stream(text, "open_question", failures=failures)
+    assert entries == []
+    assert len(failures) == 1
+    items = failures[0].items
+    assert len(items) == 1
+    assert items[0].code == "malformed_entry"
+    assert items[0].field == "**Rejected:**"
+    assert items[0].line_start == 5
+    assert "M5" in items[0].message
+
+
+def test_parse_entry_stream_rejected_on_oq_flagged_even_when_empty() -> None:
+    """An empty **Rejected:** on an OQ is still an M5 violation (flagged on presence)."""
+    text = (
+        "<!-- BEGIN ENTRIES -->\n"
+        "### oq-empty-rejected\n"
+        "**Topic:** a topic\n"
+        "**Questions:** q?\n"
+        "**Rejected:** \n"
+    )
+    failures: list = []
+    parse_entry_stream(text, "open_question", failures=failures)
+    assert len(failures) == 1
+    assert [i.field for i in failures[0].items] == ["**Rejected:**"]
+
+
+def test_parse_entry_stream_topic_on_decision_is_tolerated() -> None:
+    """Scope discipline: a stray **Topic:** on a decision is NOT forbidden (spec silent)."""
+    text = (
+        "<!-- BEGIN ENTRIES -->\n"
+        "### decision-with-topic\n"
+        "**Decided:** an axiom\n"
+        "**Rejected:** a rejected path\n"
+        "**Topic:** the spec forbids only Rejected-on-OQ, not Topic-on-decision\n"
+    )
+    failures: list = []
+    entries = parse_entry_stream(text, "decision", failures=failures)
+    assert len(entries) == 1  # tolerated — only the one M5 rule is enforced
+    assert failures == []
+
+
+def test_parse_entry_stream_unclosed_transcript_marker() -> None:
+    """An unclosed [DECISION_TRANSCRIPT] -> malformed_marker (Decision 4).
+
+    The unclosed span absorbs the following sibling entry to EOF (the 4a
+    silent-data-loss edge). 4b reports it loudly rather than swallowing in
+    silence; recovery (un-absorbing the sibling) is a deliberate non-goal.
+    """
+    text = (
+        "<!-- BEGIN ENTRIES -->\n"
+        "### entry-a\n"
+        "**Decided:** axiom a\n"
+        "**Rejected:** rejected a\n"
+        "[DECISION_TRANSCRIPT]\n"
+        "User: a transcript with no close marker\n"
+        "### entry-b\n"
+        "**Decided:** axiom b\n"
+        "**Rejected:** rejected b\n"
+    )
+    failures: list = []
+    entries = parse_entry_stream(text, "decision", failures=failures)
+    assert entries == []  # entry-b was absorbed into the open span (not recovered)
+    assert len(failures) == 1
+    items = failures[0].items
+    assert any(i.code == "malformed_marker" for i in items)
+    marker = [i for i in items if i.code == "malformed_marker"][0]
+    assert marker.field == "[DECISION_TRANSCRIPT]"
+    assert marker.line_start == 5  # localized to the unclosed open-marker line
+
+
+def test_parse_entry_stream_stray_close_marker() -> None:
+    """A stray [/DECISION_TRANSCRIPT] (no open) -> malformed_marker (latitude)."""
+    text = (
+        "<!-- BEGIN ENTRIES -->\n"
+        "### entry-a\n"
+        "**Decided:** axiom a\n"
+        "**Rejected:** rejected a\n"
+        "[/DECISION_TRANSCRIPT]\n"
+    )
+    failures: list = []
+    entries = parse_entry_stream(text, "decision", failures=failures)
+    assert entries == []
+    assert len(failures) == 1
+    items = failures[0].items
+    assert len(items) == 1
+    assert items[0].code == "malformed_marker"
+    assert items[0].field == "[/DECISION_TRANSCRIPT]"
+
+
+def test_parse_entry_stream_well_formed_transcript_still_parses() -> None:
+    """A balanced [DECISION_TRANSCRIPT] block is valid — no malformed_marker."""
+    failures: list = []
+    entries = parse_entry_stream(_DECISION_SAMPLE_STREAM, "decision", failures=failures)
+    assert len(entries) == 1
+    assert failures == []
+    assert entries[0].transcript is not None
+
+
+def test_parse_entry_stream_collector_isolates_per_entry() -> None:
+    """§5.2.2 per-entry isolation: one malformed + one good -> good returned, bad enveloped."""
+    text = (
+        "<!-- BEGIN ENTRIES -->\n"
+        "### bad-entry\n"
+        "**Decided:** something\n"
+        "**Bogus:** nope\n"
+        "### good-entry\n"
+        "**Decided:** a valid axiom\n"
+        "**Rejected:** the rejected alternative\n"
+    )
+    failures: list = []
+    entries = parse_entry_stream(text, "decision", failures=failures)
+    assert len(entries) == 1
+    assert entries[0].slug == "good-entry"
+    assert len(failures) == 1
+    assert failures[0].slug == "bad-entry"
+
+
+def test_parse_entry_stream_strict_mode_raises_with_envelope() -> None:
+    """Strict mode (no collector): first malformed entry raises ParseError carrying envelope."""
+    text = (
+        "<!-- BEGIN ENTRIES -->\n"
+        "### no-axiom\n"
+        "**Rejected:** y\n"
+    )
+    with pytest.raises(ParseError) as exc:
+        parse_entry_stream(text, "decision")
+    assert exc.value.failure is not None
+    assert isinstance(exc.value.failure, EntryFailure)
+    assert exc.value.failure.items[0].code == "missing_required_field"
+
+
+def test_parse_entry_stream_strict_mode_stops_at_first_malformed() -> None:
+    """Strict mode raises on the FIRST malformed entry (does not reach the second)."""
+    text = (
+        "<!-- BEGIN ENTRIES -->\n"
+        "### first-bad\n"
+        "**Rejected:** y\n"          # missing Decided
+        "### second-bad\n"
+        "**Decided:** x\n"           # missing Rejected
+    )
+    with pytest.raises(ParseError) as exc:
+        parse_entry_stream(text, "decision")
+    assert exc.value.failure.slug == "first-bad"
+
+
+def test_parse_entry_stream_code_names_pinned() -> None:
+    """Cross-vision contract: the literal code/source strings are pinned (§5.2.2).
+
+    A typo here is a silent cross-vision break (V3a UX / V5 relay switch on these).
+    """
+    # The constants ARE the literal contract strings.
+    assert PARSER_MALFORMED_ENTRY == "malformed_entry"
+    assert PARSER_MISSING_REQUIRED_FIELD == "missing_required_field"
+    assert PARSER_MALFORMED_MARKER == "malformed_marker"
+    assert PARSER_FAILURE_CODES == {
+        "malformed_entry",
+        "missing_required_field",
+        "malformed_marker",
+    }
+    # And the parser emits exactly these, with source="parser".
+    emitted = {
+        "missing_required_field": (
+            "<!-- BEGIN ENTRIES -->\n### x\n**Rejected:** y\n", "decision"),
+        "malformed_entry": (
+            "<!-- BEGIN ENTRIES -->\n### x\n**Decided:** a\n**Bogus:** b\n"
+            "**Rejected:** y\n", "decision"),
+        "malformed_marker": (
+            "<!-- BEGIN ENTRIES -->\n### x\n**Decided:** a\n**Rejected:** y\n"
+            "[DECISION_TRANSCRIPT]\nopen\n", "decision"),
+    }
+    for expected_code, (text, kind) in emitted.items():
+        failures: list = []
+        parse_entry_stream(text, kind, failures=failures)
+        codes = {i.code for env in failures for i in env.items}
+        sources = {i.source for env in failures for i in env.items}
+        assert expected_code in codes, (expected_code, codes)
+        assert sources == {"parser"}
+        # Stage-purity: a parser envelope carries ONLY parser-stage codes.
+        assert codes <= PARSER_FAILURE_CODES
+
+
+def test_entry_failure_to_dict_json_roundtrip_safe() -> None:
+    """Both envelope structs serialize JSON-roundtrip-safe (cross-vision boundary)."""
+    import json
+
+    text = (
+        "<!-- BEGIN ENTRIES -->\n"
+        "### bad\n"
+        "**Bogus:** z\n"
+    )
+    failures: list = []
+    parse_entry_stream(text, "decision", failures=failures)
+    assert len(failures) == 1
+    d = failures[0].to_dict()
+    # Survives a JSON roundtrip; items is a list of plain dicts (never tuples).
+    assert json.loads(json.dumps(d)) == d
+    assert isinstance(d["items"], list)
+    assert all(isinstance(i, dict) for i in d["items"])
+    # The item dict carries the contract keys.
+    item0 = d["items"][0]
+    assert set(item0) == {"code", "source", "message", "field", "line_start", "line_end"}
+
+
+def test_entry_failure_source_path_threaded() -> None:
+    """source_path is threaded from parse_entry_stream onto each envelope."""
+    text = "<!-- BEGIN ENTRIES -->\n### bad\n**Bogus:** z\n"
+    failures: list = []
+    parse_entry_stream(text, "decision", source_path="archive/2025-Q1.md", failures=failures)
+    assert failures[0].source_path == "archive/2025-Q1.md"
+
+
+# --- Baseline removal / §9 spec-pure FIELD_MAP gate (Decision 3) ------------
+# The hardcoded baseline mask is gone; FIELD_MAP derives purely from the spec.
+# These pin: (a) all expected fields are recognized, (b) spec-derived ⊇ the old
+# baseline (no recognition lost), (c) a missing spec fails loudly.
+
+# The exact key set the removed baseline carried (frozen here as the historical
+# reference — if a future spec edit drops one of these, (b) fails loudly -> it is
+# a 1c spec gap to escalate, NOT a cue to re-add the baseline).
+_REMOVED_BASELINE_KEYS = {
+    "decided", "mechanisms", "rejected", "invalidates if", "invalidates-if",
+    "invalidates_if", "scope", "context", "supersedes", "amends", "narrows",
+    "depends-on", "depends on", "depends_on", "resolves", "questions", "corrects",
+    "contradicts", "derives-from", "derives from", "derives_from", "cites",
+}
+
+
+def test_field_map_spec_pure_recognizes_all_fields() -> None:
+    """The §9 gate: the spec-pure FIELD_MAP recognizes every field + all 9 edges."""
+    fm = load_dynamic_field_map()
+    # Core / commentary / provenance fields.
+    for key in [
+        "decided", "mechanisms", "rejected", "invalidates-if", "scope",
+        "context", "source", "topic", "questions",
+    ]:
+        assert key in fm, key
+    # All nine relationship names (corrects rides purely on the spec post-removal).
+    for rel in [
+        "supersedes", "corrects", "amends", "narrows", "depends_on",
+        "resolves", "contradicts", "derives_from", "cites",
+    ]:
+        assert rel in fm, rel
+    # special_mappings translate spec names -> attribute names.
+    assert fm["decided"] == "core_axiom"
+    assert fm["rejected"] == "rejected_paths"
+    assert fm["questions"] == "questions_raised"
+
+
+def test_field_map_spec_derived_superset_of_baseline() -> None:
+    """Decision 3 proof: spec-derived ⊇ the old baseline (no recognition lost)."""
+    fm = load_dynamic_field_map()
+    missing = _REMOVED_BASELINE_KEYS - set(fm)
+    assert missing == set(), (
+        f"spec-derived FIELD_MAP lost baseline keys {missing} — a 1c spec gap; "
+        "escalate, do NOT re-add the baseline (V1-D7)."
+    )
+
+
+def test_load_dynamic_field_map_missing_spec_raises() -> None:
+    """A missing/unreadable spec fails loudly (MitosError), not a silent empty map."""
+    import builtins
+
+    real_open = builtins.open
+
+    def fake_open(path, *args, **kwargs):
+        if "format-spec.md" in str(path):
+            raise FileNotFoundError(path)
+        return real_open(path, *args, **kwargs)
+
+    original = builtins.open
+    builtins.open = fake_open
+    try:
+        with pytest.raises(MitosError):
+            load_dynamic_field_map()
+    finally:
+        builtins.open = original

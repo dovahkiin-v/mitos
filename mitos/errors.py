@@ -2,7 +2,15 @@
 
 This module contains the hierarchical exception architecture used across
 the Mitos codebase to ensure precise error vectors and graceful degradation.
+
+It also holds the §5.2.2 structured failure envelope (``FailureItem`` /
+``EntryFailure``) — the C1-neutral surface both the parser (4b) and the store
+(5b) emit. The structs live here, in the import-free leaf, so neither stage has
+to import the other (that would reverse the C1 direction).
 """
+
+from typing import Any, Dict, List, Optional
+
 
 class MitosError(Exception):
     """Base exception class for all Mitos errors."""
@@ -16,12 +24,22 @@ class ParseError(MitosError):
         line_start: The line number where the offending entry starts.
         line_end: The line number where the offending entry ends.
         message: Detailed explanation of the parsing failure.
+        failure: The structured §5.2.2 envelope for the offending entry, when
+            the error was raised in strict mode by ``parse_entry_stream``. A
+            ``None`` value preserves the prototype path's plain ``ParseError``.
     """
 
-    def __init__(self, message: str, line_start: int = 1, line_end: int = 1) -> None:
+    def __init__(
+        self,
+        message: str,
+        line_start: int = 1,
+        line_end: int = 1,
+        failure: Optional["EntryFailure"] = None,
+    ) -> None:
         self.line_start = line_start
         self.line_end = line_end
         self.message = message
+        self.failure = failure
         super().__init__(f"Lines {line_start}-{line_end}: {message}")
 
 
@@ -48,3 +66,147 @@ class EmbeddingError(MitosError):
 class SynthesisError(MitosError):
     """Raised when the LLM synthesis or enrichment call fails."""
     pass
+
+
+# ---------------------------------------------------------------------------
+# §5.2.2 Structured Failure Envelope (Phase 4b)
+#
+# When parsing or committing an entry fails, V1a reports a structured payload
+# anchored to the parsed slug (or ``None`` for a pre-header failure): a line
+# range, the raw header bytes, the source path, and a list of structured
+# ``FailureItem``s. Each item carries a stable ``code`` from a per-stage
+# whitelist, a ``source`` discriminator ("parser" | "store" — the C1 boundary
+# marker; mixing the lists is a C1 breach), a calm message, and optional
+# field/line localization.
+#
+# These structs are the C1-NEUTRAL shared surface: ``parser.py`` (4b) emits
+# ``source="parser"`` items; ``store.py`` (5b) REUSES the same structs for
+# ``source="store"`` items. They live in this import-free leaf so neither stage
+# imports the other.
+#
+# The failure-code NAMES are the cross-vision §5.2.2 contract: V3a's interactive
+# review UX and V5's MCP error surface switch on these exact strings, so a typo
+# is a silent cross-vision break (pinned by test).
+# ---------------------------------------------------------------------------
+
+# Parser-stage code names (emitted with ``source="parser"``).
+PARSER_MALFORMED_ENTRY = "malformed_entry"
+PARSER_MISSING_REQUIRED_FIELD = "missing_required_field"
+PARSER_MALFORMED_MARKER = "malformed_marker"
+
+# The parser-stage whitelist. The store-stage codes (``slug_collision`` /
+# ``missing_target`` / ``dangling_edge`` / ``kind_constraint_violation`` /
+# ``cycle_violation``) are ADDED BY 5b as their own ``STORE_FAILURE_CODES`` set,
+# emitted with ``source="store"`` — they are NOT parser codes and must never
+# appear in a parser-produced envelope (the stage-purity invariant).
+PARSER_FAILURE_CODES = frozenset(
+    {
+        PARSER_MALFORMED_ENTRY,
+        PARSER_MISSING_REQUIRED_FIELD,
+        PARSER_MALFORMED_MARKER,
+    }
+)
+
+
+class FailureItem:
+    """A single format- or referential-level violation within one entry.
+
+    One ``FailureItem`` is one thing that is wrong. Items accumulate within a
+    stage — a decision missing both required fields yields two items — and the
+    ``source`` discriminator records which stage produced the item (the C1
+    boundary marker, §5.2.2). A parser-produced envelope contains only
+    ``source="parser"`` items; the store appends ``source="store"`` items to its
+    own envelopes. Mixing them in one envelope is a C1 breach.
+
+    Attributes:
+        code: A stable failure code from a per-stage whitelist
+            (``PARSER_FAILURE_CODES`` for the parser stage).
+        source: The producing stage — ``"parser"`` or ``"store"``.
+        message: A calm, terse, screen-reader-clean explanation (P9).
+        field: The offending field token (e.g. ``"**Decided:**"``), if any.
+        line_start: 1-based start line of the violation, if localizable.
+        line_end: 1-based end line of the violation, if localizable.
+    """
+
+    def __init__(
+        self,
+        code: str,
+        source: str,
+        message: str,
+        field: Optional[str] = None,
+        line_start: Optional[int] = None,
+        line_end: Optional[int] = None,
+    ) -> None:
+        self.code = code
+        self.source = source
+        self.message = message
+        self.field = field
+        self.line_start = line_start
+        self.line_end = line_end
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serializes the item into a JSON-compatible dictionary.
+
+        Returns:
+            A dict with plain string/int/None values (JSON-roundtrip-safe).
+        """
+        return {
+            "code": self.code,
+            "source": self.source,
+            "message": self.message,
+            "field": self.field,
+            "line_start": self.line_start,
+            "line_end": self.line_end,
+        }
+
+
+class EntryFailure:
+    """The per-entry failure envelope (the §5.2.2 payload).
+
+    Anchors a list of :class:`FailureItem` to one entry. ``slug`` is the parsed
+    slug, or ``None`` when tokenization failed before a slug could be read (a
+    pre-header failure) — in which case ``raw_header`` carries the raw header
+    bytes so the offending entry stays identifiable. A malformed entry is
+    isolated: it is reported and skipped, never aborting the whole batch
+    (§5.2.2 per-entry isolation).
+
+    Attributes:
+        slug: The parsed slug, or ``None`` for a pre-header failure.
+        line_start: 1-based start line of the entry's section span.
+        line_end: 1-based end line of the entry's section span.
+        source_path: The originating file path, if known.
+        raw_header: The raw header line, for a pre-header (slug-less) failure.
+        items: The accumulated failures for this entry (always at least one).
+    """
+
+    def __init__(
+        self,
+        slug: Optional[str],
+        line_start: int,
+        line_end: int,
+        items: Optional[List["FailureItem"]] = None,
+        source_path: Optional[str] = None,
+        raw_header: Optional[str] = None,
+    ) -> None:
+        self.slug = slug
+        self.line_start = line_start
+        self.line_end = line_end
+        self.items: List["FailureItem"] = items if items is not None else []
+        self.source_path = source_path
+        self.raw_header = raw_header
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serializes the envelope into a JSON-compatible dictionary.
+
+        Returns:
+            A dict with plain values and an ``items`` list of item dicts
+            (JSON-roundtrip-safe; lists, never tuples).
+        """
+        return {
+            "slug": self.slug,
+            "line_start": self.line_start,
+            "line_end": self.line_end,
+            "source_path": self.source_path,
+            "raw_header": self.raw_header,
+            "items": [item.to_dict() for item in self.items],
+        }
