@@ -105,48 +105,15 @@ def test_parse_decisions_valid_entry() -> None:
     assert "User: Can we couple it?" in entry.transcript
 
 
-def test_parse_decisions_missing_axiom_throws() -> None:
-    """Verifies that missing required **Decided:** field throws a ValidationError on store commit."""
-    entry_text = (
-        "<!-- BEGIN ENTRIES -->\n"
-        "### missing-axiom\n"
-        "**Rejected:** Alternative paths.\n"
-    )
-    entries = parse_decisions_file(entry_text)
-    assert len(entries) == 1
-    
-    fd, path = tempfile.mkstemp(suffix=".sqlite")
-    os.close(fd)
-    try:
-        store = GraphStore(path)
-        with pytest.raises(ValidationError) as exc:
-            store.commit_parsed_entry(entries[0])
-        assert "missing required field '**Decided:**'" in str(exc.value)
-    finally:
-        if os.path.exists(path):
-            os.remove(path)
-
-
-def test_parse_decisions_missing_rejected_throws() -> None:
-    """Verifies that missing required **Rejected:** field throws a ValidationError on store commit."""
-    entry_text = (
-        "<!-- BEGIN ENTRIES -->\n"
-        "### missing-rejected\n"
-        "**Decided:** We will build a pure core.\n"
-    )
-    entries = parse_decisions_file(entry_text)
-    assert len(entries) == 1
-    
-    fd, path = tempfile.mkstemp(suffix=".sqlite")
-    os.close(fd)
-    try:
-        store = GraphStore(path)
-        with pytest.raises(ValidationError) as exc:
-            store.commit_parsed_entry(entries[0])
-        assert "missing required field '**Rejected:**'" in str(exc.value)
-    finally:
-        if os.path.exists(path):
-            os.remove(path)
+# NOTE (Phase 5a): the two prototype store-validation tests that lived here
+# (``test_parse_decisions_missing_axiom_throws`` / ``..._missing_rejected_throws``)
+# were removed. They drove a ``parse_decisions_file`` entry into
+# ``commit_parsed_entry`` and asserted the prototype's *store-side* required-field
+# ``ValidationError``. Phase 5a (Decision 2) moves format validation to the parser
+# (C1) and removes that store gate, so those tests asserted behaviour that no
+# longer exists. The parser-stage required-field coverage lives in the Phase 4b
+# section below; the store's structural canonical-core guard is covered by
+# ``tests/test_store.py::test_structural_guard_rejects_empty_canonical_core``.
 
 
 def test_parse_open_question() -> None:

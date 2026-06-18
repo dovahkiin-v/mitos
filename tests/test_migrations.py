@@ -55,15 +55,27 @@ def _create_step(table: str):
     return step
 
 
-def test_default_registry_is_empty() -> None:
-    """The real registry ships empty in V1a 2a (the empty-case-first-class lever)."""
-    assert MIGRATION_STEPS == []
+def test_registry_has_v1a_schema_step() -> None:
+    """Phase 5a registered ``_v1_schema`` as live ladder step 1 (entry-001 flip).
+
+    Inverts the 2a-era ``test_default_registry_is_empty``: the registry shipped
+    empty through 2a–4b so the suite stayed on the prototype boot; 5a appends
+    ``(1, _v1_schema)`` via ``.append`` (never a rebind) so the live boot ladders
+    to the V1a schema.
+    """
+    assert (1, _v1_schema) in MIGRATION_STEPS
+    assert len(MIGRATION_STEPS) == 1  # V1a has exactly one rung
 
 
 def test_empty_ladder_is_noop() -> None:
-    """The empty ladder on a fresh DB leaves user_version=0, creates nothing."""
+    """An explicitly-empty ladder on a fresh DB leaves user_version=0, creates nothing.
+
+    Pass ``steps=[]`` explicitly: the module default ``MIGRATION_STEPS`` is no
+    longer empty (5a registered step 1), so the empty-ladder-noop guarantee is
+    proven with an injected empty registry, not the live default.
+    """
     conn = _fresh_conn()
-    head = run_migrations(conn)
+    head = run_migrations(conn, steps=[])
     assert head == 0
     assert _user_version(conn) == 0
     # No tables of any kind were created.
@@ -74,10 +86,14 @@ def test_empty_ladder_is_noop() -> None:
 
 
 def test_empty_ladder_replay_is_noop() -> None:
-    """Replaying the empty ladder still changes nothing and raises nothing (MI-3)."""
+    """Replaying the empty ladder still changes nothing and raises nothing (MI-3).
+
+    Uses an injected empty registry (``steps=[]``): the live default now carries
+    step 1 (5a), so the empty-ladder replay guarantee is proven explicitly.
+    """
     conn = _fresh_conn()
-    assert run_migrations(conn) == 0
-    assert run_migrations(conn) == 0
+    assert run_migrations(conn, steps=[]) == 0
+    assert run_migrations(conn, steps=[]) == 0
     assert _user_version(conn) == 0
 
 
@@ -672,8 +688,19 @@ def _proto_nodes(conn: sqlite3.Connection, strict: bool = False, with_casefold: 
 
 
 def test_is_pre_v1a_true_for_real_prototype_schema(tmp_path) -> None:
-    """The live prototype graph (real _init_db schema) is detected as pre-V1a → must route to cutover."""
-    store = GraphStore(str(tmp_path / "proto.sqlite"))
+    """The real prototype graph (real _init_db schema) is detected as pre-V1a → route to cutover.
+
+    Post-5a a normal ``GraphStore(...)`` boots the V1a schema (user_version 1), so
+    building the *real* prototype DDL requires bypassing ``__init__`` and calling
+    the retained ``_init_db`` method directly — the canonical prototype-schema
+    definition Phase 7's cutover relies on (§16). This preserves the "real
+    prototype DDL is detected → route-to-cutover" coverage; the sibling
+    ``test_is_pre_v1a_true_for_minimal_non_strict_nodes`` covers the minimal shape.
+    """
+    store = GraphStore.__new__(GraphStore)  # bypass the V1a-booting __init__
+    store.db_path = str(tmp_path / "proto.sqlite")
+    store.read_only = False
+    store._init_db()  # build the real prototype (pre-V1a) schema in place
     conn = store._get_connection()
     try:
         assert is_pre_v1a_schema(conn) is True

@@ -1,201 +1,469 @@
-"""Adversarial test suite for the Mitos SQLite GraphStore.
+"""Tests for the Mitos SQLite GraphStore — V1a per-entry commit core (Phase 5a).
 
-Verifies database schema initialization, content-hash identity, computed states (M3),
-declarative edge reconciliation (V1-D21), signals insert-or-ignore (MI-4), and
-the CommitDelta cascade contract (V1-D22/D18).
+Covers the Phase 5a rebuild of ``commit_parsed_entry`` against the live V1a STRICT
+schema (the dual deferred-flip — entry-001 schema + entry-002 identity — landed
+here): slug-free content-hash identity (``compute_node_id``), the in-place
+commentary UPDATE with the MI-4 canonical-core + ``source`` fence, ``node_scopes``
+reconciliation (MI-9), write-once-preserve ``transcripts`` (V1-D16), the
+idempotent no-op (MI-3 / V1-D17), the ``source`` enum coverage matrix (V1-D20),
+atomic rollback (V1-D10), and the 5b/5c deferred seams' forcing-function tests.
+
+Read methods are unavailable until Phase 5d, so node/scope/transcript assertions
+go through **raw SQL** on the store's own connection. The connection-suite /
+PRAGMA / version-guard tests (Phase 2a) are schema-agnostic and stay green.
 """
 
 import sqlite3
 import tempfile
 import os
+import json
 import pytest
 from mitos.store import GraphStore, ValidationError, compute_hash
 from mitos.identity import compute_node_id
 from mitos.errors import DatabaseError
-from mitos.parser import ParsedEntry
+from mitos.parser import ParsedEntry, parse_entry_stream
+
 
 @pytest.fixture
 def temp_store() -> GraphStore:
-    """Fixture that initializes a temporary in-memory-like file GraphStore."""
+    """Initializes a temporary file GraphStore (boots the V1a schema post-5a)."""
     fd, path = tempfile.mkstemp(suffix=".sqlite")
     os.close(fd)
     store = GraphStore(path)
     yield store
-    # Cleanup
     if os.path.exists(path):
         os.remove(path)
 
 
-def test_store_commit_and_retrieve(temp_store: GraphStore) -> None:
-    """Verifies basic commit and retrieval of nodes."""
-    entry = ParsedEntry("decision", "core-isolation", 1, 10)
-    entry.core_axiom = "We will isolate the pure logic core."
-    entry.rejected_paths = "pgvector, or direct coupling."
-    entry.scope = ["substrate"]
+# --- Test builders + raw-SQL read helpers (reads unavailable until 5d) ---------
 
-    delta = temp_store.commit_parsed_entry(entry)
-    assert delta.node_id is not None
+
+def _decision(
+    slug: str = "d-slug",
+    axiom: str = "An axiom.",
+    rejected: str = "An alternative.",
+    mechanisms=None,
+    scope=None,
+    source=None,
+    transcript=None,
+    invalidates_if=None,
+    context=None,
+) -> ParsedEntry:
+    """Builds a hand-made decision ``ParsedEntry`` on the V1a (``axiom``) surface."""
+    e = ParsedEntry("decision", slug, 1, 5)
+    e.axiom = axiom
+    e.rejected_paths = rejected
+    e.mechanisms = list(mechanisms) if mechanisms else []
+    e.scope = list(scope) if scope else []
+    e.source = source
+    e.transcript = transcript
+    e.invalidates_if = invalidates_if
+    e.context = context
+    return e
+
+
+def _open_question(
+    slug: str = "oq-slug", topic: str = "A topic.", questions=None, scope=None
+) -> ParsedEntry:
+    """Builds a hand-made open_question ``ParsedEntry`` on the V1a surface."""
+    e = ParsedEntry("open_question", slug, 1, 5)
+    e.topic = topic
+    e.questions_raised = list(questions) if questions else ["A question?"]
+    e.scope = list(scope) if scope else []
+    return e
+
+
+def _node_row(store: GraphStore, node_id: str):
+    """Reads a single ``nodes`` row as a dict via raw SQL, or None."""
+    conn = store._get_connection()
+    try:
+        row = conn.execute("SELECT * FROM nodes WHERE id = ?", (node_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def _scopes(store: GraphStore, node_id: str):
+    """Reads a node's ``node_scopes`` tags as a sorted list via raw SQL."""
+    conn = store._get_connection()
+    try:
+        return sorted(
+            r["scope"]
+            for r in conn.execute(
+                "SELECT scope FROM node_scopes WHERE node_id = ?", (node_id,)
+            )
+        )
+    finally:
+        conn.close()
+
+
+def _transcript(store: GraphStore, node_id: str):
+    """Reads a node's stored transcript text via raw SQL, or None."""
+    conn = store._get_connection()
+    try:
+        row = conn.execute(
+            "SELECT transcript_text FROM transcripts WHERE node_id = ?", (node_id,)
+        ).fetchone()
+        return row["transcript_text"] if row else None
+    finally:
+        conn.close()
+
+
+def _count(store: GraphStore, table: str) -> int:
+    """Counts rows in a table via raw SQL (table name is a code-internal literal)."""
+    conn = store._get_connection()
+    try:
+        return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+    finally:
+        conn.close()
+
+
+# ===========================================================================
+# Phase 5a — per-entry commit core (node identity, commentary, scope, transcript)
+# ===========================================================================
+
+
+def test_new_decision_inserts_one_node(temp_store: GraphStore) -> None:
+    """A decision commits one nodes row at the slug-free compute_node_id id."""
+    e = _decision(
+        slug="core-isolation",
+        axiom="We will isolate the pure logic core.",
+        rejected="pgvector, or direct coupling.",
+        mechanisms=["sqlite", "wal"],
+        scope=["substrate"],
+    )
+    delta = temp_store.commit_parsed_entry(e)
+
+    assert delta.node_id == compute_node_id(
+        kind="decision", axiom=e.axiom, mechanism_refs=e.mechanisms
+    )
+    assert delta.node_id != compute_hash(
+        "decision", "core-isolation", e.axiom, e.mechanisms
+    )
     assert delta.node_scope == ["substrate"]
-    assert not delta.commentary_fields_changed
+    assert delta.commentary_fields_changed is False  # a fresh INSERT is not a "change"
+    assert _count(temp_store, "nodes") == 1
 
-    node = temp_store.get_node(delta.node_id)
-    assert node is not None
-    assert node["slug"] == "core-isolation"
-    assert node["core_axiom"] == "We will isolate the pure logic core."
-    assert node["scope"] == ["substrate"]
+    row = _node_row(temp_store, delta.node_id)
+    assert row["kind"] == "decision"
+    assert row["slug"] == "core-isolation"
+    assert row["slug_casefold"] == "core-isolation"
+    assert row["axiom"] == e.axiom
+    assert json.loads(row["mechanism_refs_json"]) == ["sqlite", "wal"]
+    assert row["rejected_paths_json"] == "pgvector, or direct coupling."
+    assert row["source"] == "user"  # absent **Source:** -> "user" (V1-D20)
+    assert row["created_at"] == row["updated_at"]  # one stamp on INSERT (MI-10)
+    # off-kind columns are NULL (not json.dumps("") of an absent core field)
+    assert row["topic"] is None
+    assert row["questions_raised_json"] is None
+    assert _scopes(temp_store, delta.node_id) == ["substrate"]
 
 
-def test_computed_state_traversal(temp_store: GraphStore) -> None:
-    """Tests the M3 computed state derivation for supersession chains."""
-    # 1. Commit first node (active)
-    entry1 = ParsedEntry("decision", "db-choice", 1, 10)
-    entry1.core_axiom = "Use pgvector."
-    entry1.rejected_paths = "None."
-    entry1.scope = ["database"]
-    d1 = temp_store.commit_parsed_entry(entry1)
+def test_new_open_question_inserts_one_node(temp_store: GraphStore) -> None:
+    """An open_question commits topic + questions; decision columns are NULL."""
+    e = _open_question(
+        slug="auth-roadblock",
+        topic="Session handling",
+        questions=["How do we handle sessions?", "Stateless or stateful?"],
+        scope=["auth"],
+    )
+    delta = temp_store.commit_parsed_entry(e)
 
-    # 2. Verify it is active
+    assert delta.node_id == compute_node_id(
+        kind="open_question", topic=e.topic, questions_raised=e.questions_raised
+    )
+    row = _node_row(temp_store, delta.node_id)
+    assert row["kind"] == "open_question"
+    assert row["topic"] == "Session handling"
+    assert json.loads(row["questions_raised_json"]) == e.questions_raised
+    assert row["axiom"] is None
+    assert row["mechanism_refs_json"] is None
+    assert row["rejected_paths_json"] is None
+    assert row["created_at"] == row["updated_at"]
+    assert _scopes(temp_store, delta.node_id) == ["auth"]
+
+
+def test_commentary_update_slug_rename_same_id(temp_store: GraphStore) -> None:
+    """Same core + new slug → one node, slug renamed in place, updated_at ticks (V1-D16)."""
+    e1 = _decision(slug="use-sqlite", axiom="Use SQLite.", mechanisms=["sqlite"])
+    d1 = temp_store.commit_parsed_entry(e1)
+    row1 = _node_row(temp_store, d1.node_id)
+
+    e2 = _decision(slug="use-sqlite-renamed", axiom="Use SQLite.", mechanisms=["sqlite"])
+    d2 = temp_store.commit_parsed_entry(e2)
+
+    assert d2.node_id == d1.node_id  # slug excluded from identity (Q5)
+    assert d2.commentary_fields_changed is True
+    assert _count(temp_store, "nodes") == 1  # a rename, not a second node
+
+    row2 = _node_row(temp_store, d1.node_id)
+    assert row2["slug"] == "use-sqlite-renamed"
+    assert row2["slug_casefold"] == "use-sqlite-renamed"
+    assert row2["axiom"] == "Use SQLite."  # canonical core unchanged (fenced)
+    assert row2["created_at"] == row1["created_at"]  # created_at stable
+    assert row2["updated_at"] > row1["updated_at"]  # updated_at ticked (V1-D17)
+
+
+def test_mi4_source_fence_and_core_change(temp_store: GraphStore) -> None:
+    """source is fenced on a same-id re-commit; a changed axiom mints a new node."""
+    e1 = _decision(slug="d", axiom="Axiom A.", source=None)  # -> "user"
+    d1 = temp_store.commit_parsed_entry(e1)
+    assert _node_row(temp_store, d1.node_id)["source"] == "user"
+
+    # same canonical core, different **Source:** -> stored source unchanged (MI-4)
+    e2 = _decision(slug="d", axiom="Axiom A.", source="capture_llm")
+    d2 = temp_store.commit_parsed_entry(e2)
+    assert d2.node_id == d1.node_id
+    assert _node_row(temp_store, d1.node_id)["source"] == "user"
+
+    # changed axiom -> a NEW id (new node), not an in-place update
+    e3 = _decision(slug="d", axiom="Axiom B.")
+    d3 = temp_store.commit_parsed_entry(e3)
+    assert d3.node_id != d1.node_id
+    assert _count(temp_store, "nodes") == 2
+
+
+def test_idempotent_recommit_is_noop(temp_store: GraphStore) -> None:
+    """A byte-identical re-commit is a true no-op — updated_at does not tick (MI-3)."""
+    e = _decision(slug="d", axiom="A.", mechanisms=["m"], scope=["s"], transcript="T")
+    d1 = temp_store.commit_parsed_entry(e)
+    before = _node_row(temp_store, d1.node_id)["updated_at"]
+
+    e2 = _decision(slug="d", axiom="A.", mechanisms=["m"], scope=["s"], transcript="T")
+    d2 = temp_store.commit_parsed_entry(e2)
+
+    assert d2.node_id == d1.node_id
+    assert d2.commentary_fields_changed is False
+    assert _count(temp_store, "nodes") == 1
+    assert _node_row(temp_store, d1.node_id)["updated_at"] == before  # no tick
+
+
+def test_scope_reconciliation_converges_and_casefolds(temp_store: GraphStore) -> None:
+    """Scopes casefold-collapse on commit and converge idempotently on re-commit (MI-9)."""
+    e = _decision(slug="d", axiom="A.", scope=["Substrate", "substrate", "Auth"])
+    d = temp_store.commit_parsed_entry(e)
+    assert _scopes(temp_store, d.node_id) == ["auth", "substrate"]  # casefold collapse
+
+    # re-commit with one tag removed and one added -> rows converge
+    e2 = _decision(slug="d", axiom="A.", scope=["substrate", "render"])
+    d2 = temp_store.commit_parsed_entry(e2)
+    assert d2.node_id == d.node_id
+    assert _scopes(temp_store, d.node_id) == ["render", "substrate"]
+    assert d2.commentary_fields_changed is True  # a scope change is a footprint change
+
+
+def test_transcript_write_once_preserve(temp_store: GraphStore) -> None:
+    """Transcripts are write-once-preserve: a strip-and-re-sync never deletes (V1-D16)."""
+    e = _decision(slug="d", axiom="A.", transcript="ORIGINAL")
+    d = temp_store.commit_parsed_entry(e)
+    assert _transcript(temp_store, d.node_id) == "ORIGINAL"
+    assert _count(temp_store, "transcripts") == 1
+
+    # strip the [DECISION_TRANSCRIPT] block and re-sync -> row PRESERVED
+    e2 = _decision(slug="d", axiom="A.", transcript=None)
+    d2 = temp_store.commit_parsed_entry(e2)
+    assert _transcript(temp_store, d.node_id) == "ORIGINAL"
+    assert d2.commentary_fields_changed is False  # absent transcript is not a change
+
+    # a changed transcript -> updated
+    e3 = _decision(slug="d", axiom="A.", transcript="REVISED")
+    d3 = temp_store.commit_parsed_entry(e3)
+    assert _transcript(temp_store, d.node_id) == "REVISED"
+    assert d3.commentary_fields_changed is True
+
+
+@pytest.mark.parametrize(
+    "source_line, expected",
+    [
+        ("**Source:** user\n", "user"),
+        ("**Source:** capture_llm\n", "capture_llm"),
+        ("**Source:** import_llm\n", "import_llm"),
+        ("", "user"),  # absent -> "user"
+    ],
+)
+def test_source_enum_coverage_through_parse(
+    temp_store: GraphStore, source_line: str, expected: str
+) -> None:
+    """All three source enum values (plus absent→user) flow through parse→commit (Lesson 13)."""
+    text = (
+        "### src-test\n"
+        "**Decided:** an axiom for source coverage\n"
+        "**Rejected:** an alternative\n"
+        + source_line
+    )
+    entries = parse_entry_stream(text, "decision")
+    assert len(entries) == 1
+    delta = temp_store.commit_parsed_entry(entries[0])
+    assert _node_row(temp_store, delta.node_id)["source"] == expected
+
+
+def test_source_out_of_enum_rejected_by_ddl_check(temp_store: GraphStore) -> None:
+    """An out-of-enum **Source:** is rejected by the DDL CHECK and the entry rolls back."""
+    text = (
+        "### bad-src\n"
+        "**Decided:** an axiom\n"
+        "**Rejected:** an alternative\n"
+        "**Source:** banana\n"
+    )
+    entries = parse_entry_stream(text, "decision")
+    with pytest.raises(DatabaseError) as exc:
+        temp_store.commit_parsed_entry(entries[0])
+    assert "banana" in str(exc.value) or "source" in str(exc.value)
+    assert _count(temp_store, "nodes") == 0  # nothing committed
+
+
+def test_structural_guard_rejects_empty_canonical_core(temp_store: GraphStore) -> None:
+    """A hand-built entry that bypassed the parser (empty axiom) fails with a clear vector."""
+    e = ParsedEntry("decision", "no-axiom", 1, 5)  # .axiom defaults to ""
+    e.rejected_paths = "alt"
+    with pytest.raises(ValidationError):
+        temp_store.commit_parsed_entry(e)
+    assert _count(temp_store, "nodes") == 0
+
+
+# --- Deferred-seam forcing functions (Decision 4) ------------------------------
+
+
+def test_5a_commits_no_edges_yet(temp_store: GraphStore) -> None:
+    """FORCING FUNCTION — 5a writes ZERO edges even with a declared Supersedes:.
+
+    The ``_reconcile_edges`` seam is a no-op in 5a. This flips RED when Phase 5b
+    wires edge reconciliation — making that wiring a conscious inversion, not a
+    silent fill-in. (In the 5a–5b window a declared kill-edge is silently dropped;
+    safe because the half-built store is never in production during the rebuild.)
+    """
+    temp_store.commit_parsed_entry(_decision(slug="old-choice", axiom="Old."))
+    e = _decision(slug="new-choice", axiom="New.")
+    e.supersedes = "old-choice"
+    temp_store.commit_parsed_entry(e)
+    assert _count(temp_store, "edges") == 0
+
+
+def test_5a_enqueues_no_outbox_yet(temp_store: GraphStore) -> None:
+    """FORCING FUNCTION — 5a enqueues NOTHING into pending_embeddings.
+
+    The ``_enqueue_outbox`` seam is a no-op in 5a. This flips RED when Phase 5c
+    wires the Outbox enqueue.
+    """
+    temp_store.commit_parsed_entry(_decision(slug="d", axiom="A."))
+    assert _count(temp_store, "pending_embeddings") == 0
+
+
+def test_atomic_commit_rolls_back_on_midcommit_failure(
+    temp_store: GraphStore, monkeypatch
+) -> None:
+    """An induced failure mid-commit leaves ZERO partial rows across all tables (V1-D10)."""
+    e = _decision(slug="atomic", axiom="ATOM.", scope=["x"], transcript="t")
+
+    def boom(cursor, node_id, parsed):
+        raise sqlite3.IntegrityError("forced mid-commit failure")
+
+    monkeypatch.setattr(temp_store, "_reconcile_edges", boom)
+
+    with pytest.raises(DatabaseError):
+        temp_store.commit_parsed_entry(e)
+
+    assert _count(temp_store, "nodes") == 0
+    assert _count(temp_store, "node_scopes") == 0
+    assert _count(temp_store, "transcripts") == 0
+
+
+# --- Deferred-flip tripwires (consciously INVERTED in Phase 5a) ----------------
+
+
+def test_v1_schema_is_live_migration_step_after_phase_5a(temp_store: GraphStore) -> None:
+    """DEFERRED-FLIP TRIPWIRE INVERTED — Phase 5a registered _v1_schema as live step 1.
+
+    Through 2b–4b this asserted the schema was authored-but-not-live (the boot stayed
+    on the prototype ``_init_db`` at ``user_version == 0``, the step absent from the
+    registry). Phase 5a flipped it (entry-001): the step is registered and a fresh
+    boot lands ``user_version == 1`` over the V1a STRICT schema.
+    """
+    from mitos.migrations import MIGRATION_STEPS, _v1_schema
+
+    assert (1, _v1_schema) in MIGRATION_STEPS
     conn = temp_store._get_connection()
-    states = temp_store.compute_all_states(conn)
-    assert states[d1.node_id] == "active"
-    conn.close()
-
-    # 3. Commit second node superseding the first
-    entry2 = ParsedEntry("decision", "db-choice-new", 1, 10)
-    entry2.core_axiom = "Use SQLite."
-    entry2.rejected_paths = "pgvector."
-    entry2.supersedes = "db-choice"
-    entry2.scope = ["database"]
-    d2 = temp_store.commit_parsed_entry(entry2)
-
-    # 4. Verify computed states: d1 is superseded, d2 is active
-    conn = temp_store._get_connection()
-    states = temp_store.compute_all_states(conn)
-    assert states[d1.node_id] == "superseded"
-    assert states[d2.node_id] == "active"
-    conn.close()
+    try:
+        assert conn.execute("PRAGMA user_version;").fetchone()[0] == 1
+        assert bool(
+            conn.execute(
+                "SELECT strict FROM pragma_table_list WHERE name='nodes';"
+            ).fetchone()[0]
+        )
+    finally:
+        conn.close()
 
 
-def test_declarative_edge_reconciliation(temp_store: GraphStore) -> None:
-    """Verifies V1-D21 outgoing edges mirror the buffer and delete retired links."""
-    # Create target nodes first
-    target1 = ParsedEntry("decision", "t1", 1, 2)
-    target1.core_axiom = "Target 1."
-    target1.rejected_paths = "None."
-    temp_store.commit_parsed_entry(target1)
+def test_identity_hash_is_slug_free_after_phase_5a(temp_store: GraphStore) -> None:
+    """DEFERRED-FLIP TRIPWIRE INVERTED — Phase 5a points the commit at compute_node_id.
 
-    target2 = ParsedEntry("decision", "t2", 1, 2)
-    target2.core_axiom = "Target 2."
-    target2.rejected_paths = "None."
-    temp_store.commit_parsed_entry(target2)
+    Through 3a–4b this asserted the commit path still minted via the slug-INCLUSIVE
+    prototype ``compute_hash``. Phase 5a flipped it (entry-002): the live mint is the
+    slug-free ``compute_node_id``, so two same-core/different-slug entries converge to
+    ONE node and a rename is a V1-D16 in-place commentary UPDATE. (Phase 8a retires
+    ``compute_hash`` itself + reconciles its remaining importers — its 8a tail.)
+    """
+    AXIOM = "Use SQLite for the graph store"
+    MECHS = ["sqlite", "wal"]
 
-    # Commit source node pointing to t1
-    source = ParsedEntry("decision", "src", 1, 5)
-    source.core_axiom = "Source."
-    source.rejected_paths = "None."
-    source.supersedes = "t1"
-    
-    d_src = temp_store.commit_parsed_entry(source)
-    edges = temp_store.get_edges()
-    assert len(edges) == 1
-    assert edges[0]["from_id"] == d_src.node_id
-    assert edges[0]["type"] == "supersedes"
+    e1 = _decision(slug="use-sqlite", axiom=AXIOM, rejected="Postgres.", mechanisms=list(MECHS))
+    d1 = temp_store.commit_parsed_entry(e1)
 
-    # Re-commit source node pointing to t2 instead
-    source.supersedes = "t2"
-    d_src_updated = temp_store.commit_parsed_entry(source)
-    
-    # Assert outgoing edge reconciled: old deleted, new inserted
-    edges_updated = temp_store.get_edges()
-    assert len(edges_updated) == 1
-    assert edges_updated[0]["from_id"] == d_src_updated.node_id
-    assert edges_updated[0]["to_id"] != edges[0]["to_id"]
+    slug_free_id = compute_node_id(kind="decision", axiom=AXIOM, mechanism_refs=MECHS)
+    assert d1.node_id == slug_free_id  # minted via the slug-free hash
+    assert d1.node_id != compute_hash("decision", "use-sqlite", AXIOM, MECHS)
+
+    # Same canonical core, different slug -> the SAME node id (converged)
+    e2 = _decision(
+        slug="use-sqlite-renamed", axiom=AXIOM, rejected="Postgres.", mechanisms=list(MECHS)
+    )
+    d2 = temp_store.commit_parsed_entry(e2)
+    assert d2.node_id == d1.node_id
+    assert _count(temp_store, "nodes") == 1
+    assert _node_row(temp_store, d1.node_id)["slug"] == "use-sqlite-renamed"
 
 
-def test_signals_insert_or_ignore(temp_store: GraphStore) -> None:
-    """Tests the MI-4 partial unique index insert-or-ignore rule."""
-    entry = ParsedEntry("decision", "sig-test", 1, 5)
-    entry.core_axiom = "Axiom."
-    entry.rejected_paths = "None."
-    d = temp_store.commit_parsed_entry(entry)
-
-    # Write drifted signal
-    temp_store.write_signal(d.node_id, "drifted")
-    # Duplicate write should be a silent no-op (insert-or-ignore enforced)
-    temp_store.write_signal(d.node_id, "drifted")
-
-    # Assert drifted state is derived
-    conn = temp_store._get_connection()
-    states = temp_store.compute_all_states(conn)
-    assert states[d.node_id] == "drifted"
-    conn.close()
-
-
-def test_commit_delta_cascade_scopes(temp_store: GraphStore) -> None:
-    """Tests that CommitDelta returns accurate cascade scopes on status flips."""
-    # 1. Commit target question in scope "auth"
-    oq = ParsedEntry("open_question", "auth-roadblock", 1, 5)
-    oq.questions_raised = ["How do we handle sessions?"]
-    oq.scope = ["auth"]
-    d_oq = temp_store.commit_parsed_entry(oq)
-
-    # Verify open question is parked initially
-    conn = temp_store._get_connection()
-    assert temp_store.compute_all_states(conn)[d_oq.node_id] == "parked"
-    conn.close()
-
-    # 2. Commit resolving decision in scope "core"
-    res = ParsedEntry("decision", "resolve-auth", 1, 5)
-    res.core_axiom = "Use stateless JWTs."
-    res.rejected_paths = "Sessions."
-    res.resolves = "auth-roadblock"
-    res.scope = ["core"]
-    
-    delta = temp_store.commit_parsed_entry(res)
-    
-    # Assert resolving decision caused state flip of the OQ, returning its scope in cascade
-    assert "auth" in delta.cascade_affected_scopes
+# ===========================================================================
+# Phase 2a — connection hardening (PRAGMA suite, version guard, ladder boot)
+#
+# Schema-agnostic; these stay green across the 5a flip. The empty-ladder-boot
+# test is updated to assert the V1a head (user_version == 1) now that step 1 is
+# live. The WAL concurrency test's raw INSERT/UPDATE moved to V1a `nodes` columns.
+# ===========================================================================
 
 
 def test_wal_concurrency_multi_reader(temp_store: GraphStore) -> None:
     """Verifies SQLite WAL concurrency permits multiple parallel readers and a writer."""
-    # 1. Open main connection and write initial node
+    now = "2026-06-18T00:00:00.000000+00:00"
+    # 1. Open main connection and write an initial V1a node row
     conn_writer = temp_store._get_connection()
     cursor = conn_writer.cursor()
     cursor.execute(
-        "INSERT INTO nodes (id, slug, kind, core_axiom, rejected_paths) VALUES (?, ?, ?, ?, ?)",
-        ("test-id", "test-slug", "decision", "My core axiom", "None")
+        "INSERT INTO nodes "
+        "(id, kind, slug, slug_casefold, source, axiom, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("test-id", "decision", "test-slug", "test-slug", "user", "My core axiom", now, now),
     )
     conn_writer.commit()
 
-    # 2. Start a transaction on the writer connection but do not commit it yet
+    # 2. Start a transaction on the writer but do not commit it yet
     conn_writer.execute("BEGIN IMMEDIATE TRANSACTION;")
-    conn_writer.execute(
-        "UPDATE nodes SET core_axiom = 'Axiom Modified' WHERE id = 'test-id'"
-    )
+    conn_writer.execute("UPDATE nodes SET axiom = 'Axiom Modified' WHERE id = 'test-id'")
 
-    # 3. Open a separate reader connection
+    # 3. A separate reader sees the pre-write snapshot (WAL snapshot isolation)
     conn_reader = temp_store._get_connection()
     cursor_reader = conn_reader.cursor()
-    
-    # In WAL mode, the reader is not blocked by the writer's immediate transaction!
-    # The reader sees the state before the uncommitted write (snapshot isolation).
-    cursor_reader.execute("SELECT core_axiom FROM nodes WHERE id = 'test-id'")
-    row = cursor_reader.fetchone()
-    assert row["core_axiom"] == "My core axiom"
-    
+    cursor_reader.execute("SELECT axiom FROM nodes WHERE id = 'test-id'")
+    assert cursor_reader.fetchone()["axiom"] == "My core axiom"
+
     # 4. Commit the write
     conn_writer.commit()
     conn_writer.close()
 
-    # 5. Reader now sees modified state after a new query
-    cursor_reader.execute("SELECT core_axiom FROM nodes WHERE id = 'test-id'")
-    row_after = cursor_reader.fetchone()
-    assert row_after["core_axiom"] == "Axiom Modified"
+    # 5. The reader now sees the modified state on a fresh query
+    cursor_reader.execute("SELECT axiom FROM nodes WHERE id = 'test-id'")
+    assert cursor_reader.fetchone()["axiom"] == "Axiom Modified"
     conn_reader.close()
-
-
-# --- Phase 2a: connection hardening (PRAGMA suite, version guard, ladder boot) ---
 
 
 def test_write_connection_issues_full_pragma_suite(temp_store: GraphStore) -> None:
@@ -223,11 +491,7 @@ def test_read_only_connection_keeps_fk_and_busy_timeout(temp_store: GraphStore) 
 
 
 def test_foreign_keys_enforced_at_connection_level(temp_store: GraphStore) -> None:
-    """The FK PRAGMA actually takes effect: an orphan child insert is rejected.
-
-    Generic proof that ``foreign_keys=ON`` is live (the V1a kind-matrix schema
-    arrives in 2b). With FK off, the orphan insert would silently succeed.
-    """
+    """The FK PRAGMA actually takes effect: an orphan child insert is rejected."""
     conn = temp_store._get_connection()
     try:
         conn.execute("CREATE TABLE _fk_parent (id INTEGER PRIMARY KEY);")
@@ -256,100 +520,85 @@ def test_sqlite_version_guard_rejects_old_runtime(
     assert "3.36" in message  # names the detected version
 
 
-def test_boot_through_empty_ladder_leaves_user_version_zero(
-    temp_store: GraphStore,
-) -> None:
-    """Option-A wiring boots the empty ladder as a no-op (user_version stays 0)."""
+def test_boot_lands_v1a_schema_at_user_version_one(temp_store: GraphStore) -> None:
+    """5a's boot ladders a fresh store to the V1a schema head (user_version == 1).
+
+    Inverts the 2a-era ``test_boot_through_empty_ladder_leaves_user_version_zero``:
+    with step 1 live, a fresh boot lands ``user_version == 1`` over the V1a STRICT
+    schema rather than the empty-ladder ``0``.
+    """
     conn = temp_store._get_connection()
     try:
-        assert conn.execute("PRAGMA user_version;").fetchone()[0] == 0
+        assert conn.execute("PRAGMA user_version;").fetchone()[0] == 1
     finally:
         conn.close()
 
 
-def test_v1_schema_authored_but_not_live_until_phase_5a(
-    temp_store: GraphStore,
-) -> None:
-    """DEFERRED-FLIP TRIPWIRE — Phase 2b authors _v1_schema but does NOT make it live.
+def test_init_boot_guard_refuses_prototype_graph() -> None:
+    """The RW ``__init__`` boot guard REFUSES a prototype graph, routing to cutover (§10.1).
 
-    Phase 2b builds and fully proves the V1a STRICT schema (``_v1_schema``) but
-    deliberately does NOT register it (Key Decision 1): the live boot stays on the
-    prototype ``_init_db`` so the suite stays green through 2b–4b. **Phase 5a** is
-    the flipping phase — it appends ``(1, _v1_schema)`` to ``MIGRATION_STEPS`` and
-    retires ``_init_db`` in lockstep with the ``commit_parsed_entry`` rebuild that
-    writes the V1a schema. When 5a does that, this test MUST be consciously
-    updated; it is the forcing function that makes the deferred wiring visible.
-
-    Two assertions pin the deferred state from both sides — the boot still lands on
-    the prototype (``user_version == 0``) AND the schema step is absent from the
-    live registry.
+    Phase 5a (entry-001) wires ``is_pre_v1a_schema`` into ``GraphStore.__init__``:
+    opening a real pre-V1a (prototype ``_init_db``) graph must **raise** + name the
+    one-time cutover, never silently ladder-advance it into an undiagnosable hybrid
+    (R3/R11). The predicate itself is unit-tested in ``test_migrations.py``; this
+    proves the boot actually *invokes* the guard and surfaces the remedy — a
+    regression that dropped the guard would pass every predicate test but fail here.
     """
-    from mitos.migrations import MIGRATION_STEPS, _v1_schema
-
-    conn = temp_store._get_connection()
+    fd, path = tempfile.mkstemp(suffix=".sqlite")
+    os.close(fd)
     try:
-        assert conn.execute("PRAGMA user_version;").fetchone()[0] == 0
+        # Build the real prototype (pre-V1a) schema in place, bypassing the
+        # V1a-booting __init__ (the §16 retained-``_init_db`` fixture pattern).
+        proto = GraphStore.__new__(GraphStore)
+        proto.db_path = path
+        proto.read_only = False
+        proto._init_db()
+
+        # A normal RW construction over that prototype graph must refuse + route.
+        with pytest.raises(DatabaseError) as exc:
+            GraphStore(path)
+        assert "cutover" in str(exc.value).lower()  # names the route-to-cutover remedy
+
+        # The refused boot did NOT ladder-advance the prototype (no R3/R11 hybrid):
+        # ``user_version`` stays 0, the prototype schema is untouched on disk.
+        conn = proto._get_connection()
+        try:
+            assert conn.execute("PRAGMA user_version;").fetchone()[0] == 0
+        finally:
+            conn.close()
     finally:
-        conn.close()
-    assert (1, _v1_schema) not in MIGRATION_STEPS
-    assert MIGRATION_STEPS == []
+        if os.path.exists(path):
+            os.remove(path)
 
 
-def test_identity_hash_still_slug_inclusive_until_phase_5a(
-    temp_store: GraphStore,
-) -> None:
-    """DEFERRED-FLIP TRIPWIRE — Phase 3a authors the slug-free hash but does NOT wire it.
+def test_store_rebuild_quarantine_is_tracked() -> None:
+    """FORCING FUNCTION — the Phase 5a contained-red quarantine is a conscious, shrinking set.
 
-    Phase 3a builds and golden-proves the slug-free canonical-core hash
-    (``mitos.identity.compute_node_id`` + the five §12 norm rules + the §11 trace
-    table in ``tests/test_identity.py``) but deliberately leaves the live commit
-    path on the prototype slug-INCLUSIVE ``store.compute_hash`` so the suite stays
-    green through 3a–4b (construction-vs-migration containment, plan Key Decision
-    1 / ADR ``identity-rebuilt-in-3a-compute-hash-flip-deferred-to-5a-8a``;
-    WIRING_LEDGER entry-002).
-
-    **Phase 5a** is the flipping phase — it points ``commit_parsed_entry`` at
-    ``compute_node_id`` (keyword-only, slug-less), so two same-core/different-slug
-    entries converge to ONE node id (a slug rename becomes a V1-D16 in-place
-    commentary UPDATE). **Phase 8a** then retires ``store.compute_hash`` itself
-    and reconciles its remaining importers (``sync.py``/``importer.py`` + the two
-    ``test_adversarial_invariants.py`` call sites). When 5a flips the commit path,
-    this test MUST be consciously updated — it is the forcing function that makes
-    the deferred wiring visible.
-
-    Three assertions pin the current slug-inclusive reality from both the pure
-    function and the live commit path; each flips when 5a wires ``compute_node_id``.
+    The quarantine list (``tests/conftest.py``, Decision 5) must stay an explicit,
+    tracked set that provably empties by Phase 8a: Phase 5d removes the read-view
+    consumers it restores, Phase 8a removes the rest. Pinning it here makes any
+    change a conscious edit (and any restoring phase must update this set), never a
+    silent drift. The set was derived empirically from the flip (not the pre-existing
+    ``*_live.py`` 429 flakes, which are not quarantined).
     """
-    AXIOM = "Use SQLite for the graph store"
-    MECHS = ["sqlite", "wal"]
+    from conftest import STORE_REBUILD_QUARANTINE
 
-    # (1) The prototype pure function is still slug-INCLUSIVE: two inputs that
-    #     differ ONLY in slug produce DIFFERENT ids. Under the slug-free
-    #     compute_node_id (no slug parameter) this divergence vanishes.
-    assert compute_hash("decision", "use-sqlite", AXIOM, MECHS) != \
-        compute_hash("decision", "use-sqlite-renamed", AXIOM, MECHS)
-
-    # (2) The live commit path still MINTS via the slug-inclusive hash: the
-    #     node id equals a locally-recomputed slug-inclusive compute_hash, and
-    #     NOT the slug-free compute_node_id. (5a flips both halves.)
-    e1 = ParsedEntry("decision", "use-sqlite", 1, 5)
-    e1.core_axiom = AXIOM
-    e1.rejected_paths = "Postgres."
-    e1.mechanisms = list(MECHS)
-    delta1 = temp_store.commit_parsed_entry(e1)
-
-    assert delta1.node_id == compute_hash(
-        e1.kind, e1.slug, e1.core_axiom, e1.mechanisms, e1.questions_raised
-    )
-    slug_free_id = compute_node_id(kind="decision", axiom=AXIOM, mechanism_refs=MECHS)
-    assert delta1.node_id != slug_free_id  # commit path is NOT yet on compute_node_id
-
-    # (3) Same canonical core, different slug → a SECOND, distinct node today
-    #     (slug is still in the id). 5a makes these converge to one node.
-    e2 = ParsedEntry("decision", "use-sqlite-renamed", 1, 5)
-    e2.core_axiom = AXIOM
-    e2.rejected_paths = "Postgres."
-    e2.mechanisms = list(MECHS)
-    delta2 = temp_store.commit_parsed_entry(e2)
-
-    assert delta2.node_id != delta1.node_id
+    assert set(STORE_REBUILD_QUARANTINE) == {
+        # restored in Phase 5d (read views + modifier stamping)
+        "test_list_decisions.py",
+        "test_modifier_surfacing.py",
+        "test_neighbor_review.py",
+        "test_payload_economy.py",
+        "test_surface_confidence.py",
+        "test_status_readiness.py",
+        "test_renderer.py",
+        "test_adversarial_rendering.py",
+        # restored in Phase 8a (consumer preservation)
+        "test_sync.py",
+        "test_importer.py",
+        "test_record_decision.py",
+        "test_relations_and_adjacency.py",
+        "test_adversarial_invariants.py",
+        "test_adversarial_mcp.py",
+        "test_cli_pathologies.py",
+    }

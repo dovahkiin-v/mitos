@@ -371,3 +371,15 @@ def is_pre_v1a_schema(conn: sqlite3.Connection) -> bool:
         is not None
     )
     return (not is_strict) or (not has_casefold)
+
+
+# --- V1a live registration (Phase 5a) ------------------------------------------
+#
+# The entry-001 schema boot-flip: 2b authored ``_v1_schema`` but left it
+# unregistered so the suite stayed green on the prototype boot through 2b–4b.
+# Phase 5a registers it as live ladder step 1 in lockstep with the
+# ``commit_parsed_entry`` rebuild that writes this schema. Use ``.append`` — NEVER
+# rebind ``MIGRATION_STEPS = [...]``: ``run_migrations``'s default arg binds the
+# list *object* at def-time, so an in-place append is seen by the live boot while
+# a rebind would be invisible to it (2a IMPL_NOTES; §7 gotcha).
+MIGRATION_STEPS.append((1, _v1_schema))
