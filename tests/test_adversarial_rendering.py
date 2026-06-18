@@ -19,6 +19,7 @@ from typing import Tuple, Dict, Any, List
 
 from mitos.config import MitosConfig
 from mitos.store import GraphStore, ParsedEntry
+from mitos.errors import CommitError
 from mitos.renderer import MitosRenderer, render_node_markdown
 
 
@@ -41,56 +42,56 @@ def isolated_workspace() -> Tuple[MitosConfig, str]:
 # ==============================================================================
 # 1. Rendering Dangling Edges and Broken References
 # ==============================================================================
-def test_render_dangling_edges(isolated_workspace) -> None:
-    """Verifies that the renderer handles nodes with dangling relationship references gracefully.
+def test_dangling_edge_refused_so_renders_stay_clean(isolated_workspace) -> None:
+    """V1a makes a dangling kill-edge structurally impossible, so the renderer never sees one.
 
-    If a decision has a 'supersedes' or 'depends_on' edge that points to a nonexistent slug
-    (or a node that was deleted), the renderer must generate a clean markdown representation
-    and note the citation without raising database or formatting exceptions.
+    The prototype simulated a dangling ``supersedes`` by force-inserting an edge to a
+    nonexistent target (FK off). Under V1a that simulation is meaningless: 5b's
+    referential integrity rejects a ``supersedes``/``corrects`` citing a non-existent
+    target at COMMIT time (``missing_target`` CommitError), so a dangling edge can
+    never enter the graph and the renderer is never exposed to one. A *valid*
+    superseding decision still renders cleanly, with the superseded target excluded
+    from the active view (M3/M8).
     """
     config, tmpdir = isolated_workspace
     store = GraphStore(config.db_path)
-    
-    # 1. Commit a decision referencing a nonexistent slug 'dangling-target'
-    entry = ParsedEntry("decision", "my-decision", 1, 5)
-    entry.core_axiom = "We use WAL mode SQLite for local storage."
-    entry.rejected_paths = "pgvector (too heavy)."
-    entry.scope = ["substrate"]
-    entry.supersedes = "dangling-target"
-    
-    # Force commit bypassing resolve check to simulate a dangling reference in the graph
-    # (e.g. database corruption or dynamic deletion of the target node)
-    conn = store._get_connection()
-    conn.execute("PRAGMA foreign_keys=OFF;")
-    with conn:
-        conn.execute(
-            """
-            INSERT INTO nodes (id, slug, kind, core_axiom, rejected_paths, scope)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            ("my-id", "my-decision", "decision", entry.core_axiom, entry.rejected_paths, '["substrate"]')
-        )
-        conn.execute(
-            """
-            INSERT INTO edges (from_id, to_id, type)
-            VALUES (?, ?, ?)
-            """,
-            ("my-id", "nonexistent-id", "supersedes")
-        )
-    conn.close()
-    
-    # 2. Trigger rendering
+
+    # 1. A decision whose `supersedes` cites a nonexistent slug is REFUSED — no
+    #    dangling edge ever lands in the graph (the prototype's force-insert is gone).
+    dangling = ParsedEntry("decision", "my-decision", 1, 5)
+    dangling.axiom = "We use WAL mode SQLite for local storage."
+    dangling.rejected_paths = "pgvector (too heavy)."
+    dangling.scope = ["substrate"]
+    dangling.supersedes = "nonexistent-target"
+    with pytest.raises(CommitError):
+        store.commit_parsed_entry(dangling)
+
+    # 2. A VALID superseding decision (target committed first) renders cleanly.
+    target = ParsedEntry("decision", "old-target", 1, 5)
+    target.axiom = "Older storage choice."
+    target.rejected_paths = "n/a"
+    target.scope = ["substrate"]
+    store.commit_parsed_entry(target)
+
+    superseder = ParsedEntry("decision", "my-decision", 1, 5)
+    superseder.axiom = "We use WAL mode SQLite for local storage."
+    superseder.rejected_paths = "pgvector (too heavy)."
+    superseder.scope = ["substrate"]
+    superseder.supersedes = "old-target"
+    store.commit_parsed_entry(superseder)
+
+    # 3. Trigger rendering and assert the active superseder renders, target excluded.
     renderer = MitosRenderer(config.workspace_dir)
     renderer.render_all(store)
-    
-    # 3. Assert global live_axioms.md exists and contains the decision
+
     live_axioms_path = os.path.join(config.workspace_dir, "live_axioms.md")
     assert os.path.exists(live_axioms_path)
     with open(live_axioms_path, "r", encoding="utf-8") as f:
         rendered_content = f.read()
-        
+
     assert "my-decision" in rendered_content
     assert "WAL mode SQLite" in rendered_content
+    assert "old-target" not in rendered_content  # superseded → excluded (M3/M8)
 
 
 # ==============================================================================
@@ -140,7 +141,7 @@ def test_render_massive_scale_profiling(isolated_workspace) -> None:
     scopes = ["substrate", "networking", "frontend"]
     for i in range(120):
         entry = ParsedEntry("decision", f"dec-{i}", 1, 5)
-        entry.core_axiom = f"This is rule number {i} for Mitos scalability."
+        entry.axiom = f"This is rule number {i} for Mitos scalability."
         entry.rejected_paths = "None."
         entry.scope = [scopes[i % 3]]
         entry.mechanisms = ["scalability-test"]
@@ -182,14 +183,14 @@ def test_render_scope_isolation_and_atomicity(isolated_workspace) -> None:
     
     # 1. Decision C1: substrate scope
     c1 = ParsedEntry("decision", "c1-substrate", 1, 5)
-    c1.core_axiom = "Substrate uses WAL SQLite."
+    c1.axiom = "Substrate uses WAL SQLite."
     c1.rejected_paths = "None."
     c1.scope = ["substrate"]
     store.commit_parsed_entry(c1)
     
     # 2. Decision C2: networking scope
     c2 = ParsedEntry("decision", "c2-networking", 6, 10)
-    c2.core_axiom = "Networking uses pure sockets."
+    c2.axiom = "Networking uses pure sockets."
     c2.rejected_paths = "None."
     c2.scope = ["networking"]
     store.commit_parsed_entry(c2)
