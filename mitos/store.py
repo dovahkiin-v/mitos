@@ -1163,13 +1163,13 @@ class GraphStore:
                         active_slugs = [
                             r["slug"]
                             for r in cursor.execute(
-                                """
+                                f"""
                                 SELECT n.slug AS slug FROM nodes n
                                 WHERE n.slug_casefold = ?
                                   AND NOT EXISTS (
                                       SELECT 1 FROM edges e
                                       WHERE e.target_id = n.id
-                                        AND e.edge_type IN ('supersedes', 'corrects')
+                                        AND e.edge_type IN {_KILL_EDGE_TYPES_SQL}
                                   )
                                 """,
                                 (check_casefold,),
@@ -1242,11 +1242,11 @@ class GraphStore:
                     affected.update(
                         r["scope"]
                         for r in cursor.execute(
-                            """
+                            f"""
                             SELECT ns.scope AS scope FROM edges e
                             JOIN node_scopes ns ON ns.node_id = e.target_id
                             WHERE e.source_id = ?
-                              AND e.edge_type IN ('supersedes', 'corrects')
+                              AND e.edge_type IN {_KILL_EDGE_TYPES_SQL}
                             """,
                             (node_id,),
                         )
