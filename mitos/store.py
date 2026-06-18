@@ -843,11 +843,14 @@ class GraphStore:
                 # ``_reconcile_edges`` returns whether the outgoing edge set changed
                 # (feeds the ``updated_at`` tick, V1-D17) plus any ``source="store"``
                 # referential failures; it shares the single ``now`` stamp (MI-10)
-                # for edge ``created_at``. ``_enqueue_outbox`` is still a no-op (5c).
+                # for edge ``created_at``. ``_enqueue_outbox`` UPSERTs the committing
+                # node's ``pending_embeddings`` Outbox row (unconditional, flagless,
+                # drain-state-resetting; C2) sharing that same ``now`` — a
+                # speculative write that the rollback below unwinds on any failure.
                 edges_changed, store_failures, resurrected_slugs = (
                     self._reconcile_edges(cursor, node_id, parsed, now)
                 )
-                self._enqueue_outbox(cursor, node_id, parsed)
+                self._enqueue_outbox(cursor, node_id, parsed, now)
                 store_failures = list(store_failures)
 
                 # --- Same-id commentary write + the single ``updated_at`` tick --
@@ -955,15 +958,38 @@ class GraphStore:
                     )
 
                 # --- Build the delta --------------------------------------------
-                # ``cascade_affected_scopes`` is committing-node first-order in 5a
-                # (5c finalizes the kill-edge-target population once 5b's edges
-                # exist): a footprint change touches the rendered view of every
-                # scope the node entered or left. Only ``delta.node_id`` is read by
-                # live consumers, so narrowing the population is consumer-safe.
+                # ``cascade_affected_scopes`` is FIRST-ORDER as of 5c (V1b adds the
+                # transitive walker, §5.2.4): the union of (i) the committing node's
+                # entered/left scopes when its own footprint changed (the 5a
+                # behavior) and (ii) the scopes of the nodes this commit currently
+                # kill-edges, when the outgoing edge set changed — a superseded /
+                # corrected target leaves the active view, so every scope it was in
+                # needs a re-render (C3). The targets are read from the
+                # POST-reconciliation ``edges`` (the cursor sees 5b's just-written
+                # rows; the read runs well after the seam at line 847). The
+                # resurrection-target gap is deliberate (a DELETEd kill-edge's target
+                # is no longer outgoing → not captured here; V1b's transitive walker
+                # owns it — forward-safe: no live V1a consumer reads this field, only
+                # ``delta.node_id``). The ``CommitDelta`` field shape is unchanged —
+                # V1b extends the population, never rebuilds the struct. A
+                # byte-identical re-commit trips neither gate -> ``[]``.
+                affected = set()
                 if is_new or direct_footprint_changed:
-                    cascade_affected_scopes = sorted(incoming_scopes | prior_scopes)
-                else:
-                    cascade_affected_scopes = []
+                    affected |= incoming_scopes | prior_scopes
+                if edges_changed:
+                    affected.update(
+                        r["scope"]
+                        for r in cursor.execute(
+                            """
+                            SELECT ns.scope AS scope FROM edges e
+                            JOIN node_scopes ns ON ns.node_id = e.target_id
+                            WHERE e.source_id = ?
+                              AND e.edge_type IN ('supersedes', 'corrects')
+                            """,
+                            (node_id,),
+                        )
+                    )
+                cascade_affected_scopes = sorted(affected)
 
                 return CommitDelta(
                     node_id=node_id,
@@ -993,7 +1019,7 @@ class GraphStore:
         node_id: str,
         parsed: ParsedEntry,
         now: str,
-    ) -> Tuple[bool, List[FailureItem]]:
+    ) -> Tuple[bool, List[FailureItem], Set[str]]:
         """Reconciles the committing node's outgoing kill-edges (V1-D21/D6/D23).
 
         Declarative mirror inside ``commit_parsed_entry``'s transaction: the node's
@@ -1270,22 +1296,62 @@ class GraphStore:
         return edges_changed, failures, resurrected_slugs
 
     def _enqueue_outbox(
-        self, cursor: sqlite3.Cursor, node_id: str, parsed: ParsedEntry
+        self, cursor: sqlite3.Cursor, node_id: str, parsed: ParsedEntry, now: str
     ) -> None:
-        """Phase 5c seam: ``pending_embeddings`` Outbox enqueue. No-op in 5a.
+        """Conservative flagless "node-changed" Outbox enqueue (C2 / §5.1).
 
-        5c fills this body: UPSERT a committing-node row into ``pending_embeddings``
-        (a conservative flagless "node-changed" signal; a re-enqueue resets
-        ``queued_at`` / ``retry_count``) inside this transaction. It takes the open
-        ``cursor`` so 5c enlists in the commit's transaction without re-plumbing it.
-        In 5a the Outbox stays empty.
+        UPSERTs exactly ONE ``pending_embeddings`` row for the committing node,
+        **unconditionally** — commentary-only and byte-identical re-commits
+        included — inside ``commit_parsed_entry``'s transaction (the row commits
+        with the node or not at all; a rolled-back commit enqueues nothing —
+        MI-12 / V1-D10). The row carries no ``task_type`` / flag and no embedding
+        text: the V3b drainer re-derives ``embedding_text(node)`` at drain (a pure
+        function of the immutable core, M8) and the embedding cache returns it at
+        zero token cost, so a bare "node-changed" signal is the whole contract.
+
+        The enqueue is **never** skipped (recall-over-precision, OPERA §11): a
+        missed enqueue is permanent vector staleness (the costly miss), a false one
+        is a free drain-time cache-hit (the cheap false positive). Commentary is
+        not forever vector-irrelevant — V2's anti-knowledge vector keys on
+        ``rejected_paths`` (commentary) and churns on commentary edits by design,
+        so a commentary-blind enqueue would silently starve it the moment V2 ships.
+
+        A re-enqueue RESETS drain state (re-stamps ``queued_at``, clears
+        ``retry_count`` to 0) rather than a bare idempotent no-op: a node V3b
+        dead-lettered on a *transient* provider outage must be revived by a
+        deliberate re-commit — and the byte-identical re-commit IS that retry — or
+        it would be stranded at max-retry forever (P5 self-healing). This is the
+        deliberate exception to MI-3's "true no-op": MI-3 governs the **node** row
+        (no tick, no new node), MI-12's reset clause governs the **Outbox** row;
+        the two coexist on purpose.
+
+        Kind-agnostic (every committed node may need embedding — no kind branch).
+        Writes raw SQL against the three-column V1a shape; it does NOT route through
+        the prototype drain methods, which bind the dropped
+        ``embedding_text``/``attempts``/``claimed_by`` columns (8a reconciles them).
 
         Args:
-            cursor: The open cursor inside ``commit_parsed_entry``'s transaction.
-            node_id: The committing node's content-hash id.
-            parsed: The committing ``ParsedEntry``.
+            cursor: The open cursor inside ``commit_parsed_entry``'s transaction —
+                the enqueue enlists in the commit transaction with no re-plumbing.
+            node_id: The committing node's content-hash id — the
+                ``pending_embeddings`` PK and its FK to ``nodes(id)`` (the node row
+                already exists by this point, so the FK is always satisfied).
+            parsed: The committing ``ParsedEntry`` (retained for seam-shape
+                stability; the flagless body does not read it).
+            now: The commit's single UTC ISO-8601 µs stamp (MI-10) — shared with
+                the node and edge ``created_at`` writes; never re-read inside the
+                seam (one stamp per commit).
         """
-        return None
+        cursor.execute(
+            """
+            INSERT INTO pending_embeddings (node_id, queued_at, retry_count)
+            VALUES (?, ?, 0)
+            ON CONFLICT(node_id) DO UPDATE SET
+                queued_at = excluded.queued_at,
+                retry_count = 0
+            """,
+            (node_id, now),
+        )
 
     def get_active_decisions(self, scope: Optional[str] = None) -> List[Dict[str, Any]]:
         """Exposes view of all active decisions (C3 / M3)."""
