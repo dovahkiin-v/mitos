@@ -9,84 +9,85 @@ import re
 import string
 import unicodedata
 from typing import List, Dict, Optional, Any, Tuple
-from mitos.errors import ParseError
+from mitos.errors import (
+    ParseError,
+    MitosError,
+    EntryFailure,
+    FailureItem,
+    PARSER_MALFORMED_ENTRY,
+    PARSER_MISSING_REQUIRED_FIELD,
+    PARSER_MALFORMED_MARKER,
+)
 
 def load_dynamic_field_map() -> Dict[str, str]:
-    """Dynamically builds the FIELD_MAP from format-spec.md to enforce C5 single-source truth."""
+    """Builds the FIELD_MAP purely from format-spec.md (C5 single source, V1-D7).
+
+    The map is derived *only* from the field declarations in ``format-spec.md`` —
+    there is no hardcoded baseline mask. Post-1c the spec carries every field
+    name (``source``/``topic``/``corrects`` + all nine relationship names; the §9
+    gate proves spec-derived ⊇ the old baseline), so a baseline would only *hide*
+    a future spec omission rather than expose it. ``special_mappings`` translate
+    spec names to attribute names (``decided``→``core_axiom``); ``alias_variations``
+    register the space-form aliases of multi-word fields.
+
+    Returns:
+        A mapping of recognized (lowercased) field names to ParsedEntry attribute
+        names.
+
+    Raises:
+        MitosError: If ``format-spec.md`` is missing or unreadable. Without it
+            the map would be empty and every field would read as unrecognized —
+            a debugging nightmare — so this is a loud hard failure (C5
+            single-source consequence). The spec ships as package data, so a real
+            install always has it.
+    """
     import os
-    import re
-    
+
     special_mappings = {
         "decided": "core_axiom",
         "rejected": "rejected_paths",
         "questions": "questions_raised",
     }
-    
+
     alias_variations = {
         "depends on": "depends_on",
         "invalidates if": "invalidates_if",
         "derives from": "derives_from",
     }
-    
-    field_map = {}
-    spec_path = os.path.join(os.path.dirname(__file__), "format-spec.md")
-    if os.path.exists(spec_path):
-        try:
-            with open(spec_path, "r", encoding="utf-8") as f:
-                content = f.read()
-            
-            # Extract fields declared in the markdown list items: - `**Field:**`
-            fields_found = re.findall(r'-\s+`\*\*(?P<field>[a-zA-Z -_]+):\*\*`', content)
-            for f_name in fields_found:
-                normalized_key = f_name.strip().lower()
-                
-                if normalized_key in special_mappings:
-                    target_attr = special_mappings[normalized_key]
-                else:
-                    target_attr = normalized_key.replace("-", "_").replace(" ", "_")
-                
-                field_map[normalized_key] = target_attr
-                
-                # Register alias variations for hyphens/spaces
-                if "-" in normalized_key:
-                    field_map[normalized_key.replace("-", "_")] = target_attr
-                    field_map[normalized_key.replace("-", " ")] = target_attr
-        except Exception:
-            pass
 
-    # Safe fallback mapping to ensure baseline fields are always present
-    baseline = {
-        "decided": "core_axiom",
-        "mechanisms": "mechanisms",
-        "rejected": "rejected_paths",
-        "invalidates if": "invalidates_if",
-        "invalidates-if": "invalidates_if",
-        "invalidates_if": "invalidates_if",
-        "scope": "scope",
-        "context": "context",
-        "supersedes": "supersedes",
-        "amends": "amends",
-        "narrows": "narrows",
-        "depends-on": "depends_on",
-        "depends on": "depends_on",
-        "depends_on": "depends_on",
-        "resolves": "resolves",
-        "questions": "questions_raised",
-        "corrects": "corrects",
-        "contradicts": "contradicts",
-        "derives-from": "derives_from",
-        "derives from": "derives_from",
-        "derives_from": "derives_from",
-        "cites": "cites",
-    }
-    
-    for k, v in baseline.items():
-        if k not in field_map:
-            field_map[k] = v
-            
+    field_map: Dict[str, str] = {}
+    spec_path = os.path.join(os.path.dirname(__file__), "format-spec.md")
+    try:
+        with open(spec_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except OSError as exc:
+        raise MitosError(
+            f"format-spec.md is missing or unreadable at {spec_path}: {exc}. "
+            "It is the single source of field-name truth (C5); without it every "
+            "field is unrecognized. Reinstall mitos so the spec ships as package "
+            "data."
+        ) from exc
+
+    # Extract fields declared in the markdown list items: - `**Field:**`
+    fields_found = re.findall(r'-\s+`\*\*(?P<field>[a-zA-Z -_]+):\*\*`', content)
+    for f_name in fields_found:
+        normalized_key = f_name.strip().lower()
+
+        if normalized_key in special_mappings:
+            target_attr = special_mappings[normalized_key]
+        else:
+            target_attr = normalized_key.replace("-", "_").replace(" ", "_")
+
+        field_map[normalized_key] = target_attr
+
+        # Register alias variations for hyphens/spaces
+        if "-" in normalized_key:
+            field_map[normalized_key.replace("-", "_")] = target_attr
+            field_map[normalized_key.replace("-", " ")] = target_attr
+
     for k, v in alias_variations.items():
         field_map[k] = v
-        
+
     return field_map
 
 
@@ -716,25 +717,40 @@ def _split_entry_sections(
     return sections
 
 
-def _tokenize_entry(sec: Dict[str, Any], kind: str) -> ParsedEntry:
+def _tokenize_entry(
+    sec: Dict[str, Any],
+    kind: str,
+    items: Optional[List[FailureItem]] = None,
+) -> ParsedEntry:
     """Tokenizes one pre-split section into a ``ParsedEntry`` of the given kind.
 
-    Permissive by design (4b validates): extracts every field ``FIELD_MAP``
-    recognizes, assigns ``**Decided:**`` to the new ``axiom`` attribute (not
-    ``core_axiom``), and normalizes the list fields at the C1 boundary. An
-    unrecognized ``**Field:**`` line is discarded (it stops field accumulation so
-    it can't corrupt a neighbour) rather than rejected — 4a's only hard failure
-    is a structurally untokenizable header (no slug).
+    Extracts every field ``FIELD_MAP`` recognizes, assigns ``**Decided:**`` to
+    the new ``axiom`` attribute (not ``core_axiom``), and normalizes the list
+    fields at the C1 boundary.
+
+    When an ``items`` collector is supplied (4b validation), structural format
+    violations that have an offending line are surfaced into it as
+    :class:`~mitos.errors.FailureItem`: an unrecognized ``**Field:**`` line, a
+    ``**Rejected:**`` field on an ``open_question`` (forbidden by M5), an
+    unclosed ``[DECISION_TRANSCRIPT]`` marker, and a stray
+    ``[/DECISION_TRANSCRIPT]`` close. *Absence* failures (a required field that is
+    simply not present) have no line and are checked separately by
+    :func:`_check_required_fields`. When ``items`` is ``None`` the tokenizer is
+    purely permissive (4a behavior): unrecognized fields are silently discarded
+    and marker balance is not reported.
 
     Args:
         sec: A section dict from :func:`_split_entry_sections`.
         kind: The caller-declared kind (``"decision"`` / ``"open_question"``).
+        items: Optional collector for structural ``FailureItem``s (4b).
 
     Returns:
         The tokenized entry.
 
     Raises:
         ParseError: If the header carries no slug (structural fail-fast, V1-D1).
+            The caller (:func:`_validate_section`) folds this into a pre-header
+            ``malformed_entry`` envelope.
     """
     line_start = sec["line_start"]
     line_end = sec["line_end"]
@@ -749,15 +765,20 @@ def _tokenize_entry(sec: Dict[str, Any], kind: str) -> ParsedEntry:
     fields: Dict[str, List[str]] = {}
     current_field: Optional[str] = None
     in_transcript = False
+    transcript_open_line: Optional[int] = None
     transcript_lines: List[str] = []
 
-    for line in sec["lines"][1:]:  # skip the header line
+    # Per-line offset tracking (mirrors the prototype ``_parse_section``) so a
+    # structural item can be localized to the offending file line.
+    for offset, line in enumerate(sec["lines"][1:], start=1):  # skip the header
+        file_line = line_start + offset  # 1-based, absolute file line
         stripped = line.strip()
 
         # Transcript span: markers toggle, body is captured verbatim. A field- or
         # header-shaped line inside the span is literal transcript text.
         if not in_transcript and stripped == "[DECISION_TRANSCRIPT]":
             in_transcript = True
+            transcript_open_line = file_line
             continue
         if in_transcript and stripped == "[/DECISION_TRANSCRIPT]":
             in_transcript = False
@@ -765,22 +786,95 @@ def _tokenize_entry(sec: Dict[str, Any], kind: str) -> ParsedEntry:
         if in_transcript:
             transcript_lines.append(line)
             continue
+        if stripped == "[/DECISION_TRANSCRIPT]":
+            # A close marker with no matching open (latitude, Decision 4): a
+            # marker line is never field content, so it is consumed here. Loud
+            # report when validating; otherwise silently dropped.
+            if items is not None:
+                items.append(
+                    FailureItem(
+                        code=PARSER_MALFORMED_MARKER,
+                        source="parser",
+                        message=(
+                            "Stray [/DECISION_TRANSCRIPT] close marker with no "
+                            "matching [DECISION_TRANSCRIPT]."
+                        ),
+                        field="[/DECISION_TRANSCRIPT]",
+                        line_start=file_line,
+                        line_end=file_line,
+                    )
+                )
+            continue
 
         field_match = _FIELD_LINE_RE.match(line)
         if field_match:
-            name = field_match.group("field").strip().lower()
+            raw_name = field_match.group("field").strip()
+            name = raw_name.lower()
             content = field_match.group("content").strip()
             if name in FIELD_MAP:
                 current_field = FIELD_MAP[name]
                 fields[current_field] = [content]
+                # M5 (Decision 5): ``**Rejected:**`` is decision-only — its
+                # presence on an open question is a format violation. Flagged on
+                # the field line (presence, not content), so an empty
+                # ``**Rejected:**`` on an OQ is caught too.
+                if (
+                    kind == "open_question"
+                    and current_field == "rejected_paths"
+                    and items is not None
+                ):
+                    items.append(
+                        FailureItem(
+                            code=PARSER_MALFORMED_ENTRY,
+                            source="parser",
+                            message=(
+                                "Field **Rejected:** is not permitted on an open "
+                                "question (decision-only, M5)."
+                            ),
+                            field="**Rejected:**",
+                            line_start=file_line,
+                            line_end=file_line,
+                        )
+                    )
             else:
-                # Permissive: an unrecognized field is not captured and stops
-                # accumulation so its content can't bleed into the prior field.
-                # Spec-pure field-name recognition + reporting is 4b.
+                # An unrecognized field stops accumulation so its content can't
+                # bleed into the prior field. Permissive (discard) without a
+                # collector; reported as malformed_entry with a collector (4b).
                 current_field = None
+                if items is not None:
+                    items.append(
+                        FailureItem(
+                            code=PARSER_MALFORMED_ENTRY,
+                            source="parser",
+                            message=f"Unrecognized field '**{raw_name}:**'.",
+                            field=f"**{raw_name}:**",
+                            line_start=file_line,
+                            line_end=file_line,
+                        )
+                    )
         elif current_field is not None and stripped:
             # Continuation line for the current field.
             fields[current_field].append(stripped)
+
+    # Marker balance: an unclosed [DECISION_TRANSCRIPT] swallows every following
+    # entry into the open span to EOF (the 4a silent-data-loss edge). 4b detects
+    # and reports it; recovery (un-absorbing siblings) is a deliberate non-goal
+    # (Decision 4) — the loud failure is the remedy.
+    if in_transcript and items is not None:
+        open_line = transcript_open_line if transcript_open_line is not None else line_start
+        items.append(
+            FailureItem(
+                code=PARSER_MALFORMED_MARKER,
+                source="parser",
+                message=(
+                    "Unclosed [DECISION_TRANSCRIPT] marker "
+                    "(missing [/DECISION_TRANSCRIPT])."
+                ),
+                field="[DECISION_TRANSCRIPT]",
+                line_start=open_line,
+                line_end=line_end,
+            )
+        )
 
     if transcript_lines:
         entry.transcript = "\n".join(transcript_lines).strip()
@@ -823,10 +917,140 @@ def _tokenize_entry(sec: Dict[str, Any], kind: str) -> ParsedEntry:
     return entry
 
 
+# Required fields per kind (V1-D8 / format-spec.md §1, §2): the spec field token
+# paired with the ParsedEntry attribute that must be present and non-empty.
+# ``mechanism_refs`` is intentionally NOT here — it is optional (absent -> []).
+_REQUIRED_FIELDS: Dict[str, List[Tuple[str, str]]] = {
+    "decision": [("**Decided:**", "axiom"), ("**Rejected:**", "rejected_paths")],
+    "open_question": [("**Topic:**", "topic"), ("**Questions:**", "questions_raised")],
+}
+
+
+def _attr_is_present(entry: ParsedEntry, attr: str) -> bool:
+    """Reports whether a required ParsedEntry attribute is present and non-empty.
+
+    A required field whose value is empty (or whitespace-only for the string
+    fields) counts as absent — format-spec.md requires the field be "present and
+    non-empty", so an empty ``**Decided:**`` is a missing axiom, and a
+    ``**Questions:**`` that normalizes to no items is missing questions.
+
+    Args:
+        entry: The tokenized entry.
+        attr: The attribute name (``axiom`` / ``rejected_paths`` / ``topic`` /
+            ``questions_raised``).
+
+    Returns:
+        ``True`` if the field carries content, ``False`` otherwise.
+    """
+    value = getattr(entry, attr)
+    if isinstance(value, str):
+        return bool(value.strip())
+    return bool(value)  # list field (questions_raised): non-empty
+
+
+def _check_required_fields(
+    entry: ParsedEntry, kind: str, sec: Dict[str, Any], items: List[FailureItem]
+) -> None:
+    """Appends a ``missing_required_field`` item for each absent required field.
+
+    An absent field has no offending line (there is nothing there), so each item
+    is localized to the entry's header line — the place a reader looks to fix it
+    (P3 vector error). Failures accumulate: a decision missing both required
+    fields yields two items in one envelope (§5.2.2 "accumulate within stage").
+
+    Args:
+        entry: The tokenized entry.
+        kind: The caller-declared kind.
+        sec: The section dict (its ``line_start`` anchors the items).
+        items: The collector to append to.
+    """
+    header_line = sec["line_start"]
+    for field_token, attr in _REQUIRED_FIELDS.get(kind, []):
+        if not _attr_is_present(entry, attr):
+            items.append(
+                FailureItem(
+                    code=PARSER_MISSING_REQUIRED_FIELD,
+                    source="parser",
+                    message=f"Missing required field {field_token}.",
+                    field=field_token,
+                    line_start=header_line,
+                    line_end=header_line,
+                )
+            )
+
+
+def _validate_section(
+    sec: Dict[str, Any], kind: str, source_path: Optional[str]
+) -> Tuple[Optional[ParsedEntry], Optional[EntryFailure]]:
+    """Tokenizes and format-validates one section against ``format-spec.md``.
+
+    Exactly one of the returned pair is non-``None``:
+
+    - ``(ParsedEntry, None)`` — the section is well-formed.
+    - ``(None, EntryFailure)`` — the section has one or more format violations,
+      accumulated into the envelope's ``items`` (the §5.2.2 payload).
+
+    A pre-header failure (a structurally untokenizable header — no slug) cannot
+    anchor field checks, so it short-circuits to a single ``malformed_entry``
+    item with ``slug=None`` and the raw header captured. A tokenizable entry runs
+    all checks and accumulates them.
+
+    Args:
+        sec: A section dict from :func:`_split_entry_sections`.
+        kind: The caller-declared kind.
+        source_path: The originating path, threaded onto the envelope.
+
+    Returns:
+        The ``(entry, failure)`` pair described above.
+    """
+    items: List[FailureItem] = []
+    try:
+        entry = _tokenize_entry(sec, kind, items)
+    except ParseError as exc:
+        # Pre-header failure: no slug to anchor field checks. Emit one
+        # malformed_entry item carrying the raw header (slug stays None).
+        envelope = EntryFailure(
+            slug=None,
+            line_start=exc.line_start,
+            line_end=exc.line_end,
+            source_path=source_path,
+            raw_header=sec["header_line"],
+            items=[
+                FailureItem(
+                    code=PARSER_MALFORMED_ENTRY,
+                    source="parser",
+                    message=exc.message,
+                    field=None,
+                    line_start=exc.line_start,
+                    line_end=exc.line_end,
+                )
+            ],
+        )
+        return None, envelope
+
+    # Header tokenized: required-field presence (the absence checks). Structural
+    # violations with a line (unrecognized field, M5, marker balance) were
+    # already appended to ``items`` during tokenization.
+    _check_required_fields(entry, kind, sec, items)
+
+    if not items:
+        return entry, None
+
+    envelope = EntryFailure(
+        slug=entry.slug,
+        line_start=sec["line_start"],
+        line_end=sec["line_end"],
+        source_path=source_path,
+        items=items,
+    )
+    return None, envelope
+
+
 def parse_entry_stream(
     text: str,
     kind: str,
     source_path: Optional[str] = None,
+    failures: Optional[List[EntryFailure]] = None,
 ) -> List[ParsedEntry]:
     """Tokenizes one entry-stream file of a single declared kind (V1a, C1).
 
@@ -842,24 +1066,36 @@ def parse_entry_stream(
     lets the cutover replay archive/snapshot files under the correct kind. A file
     with **no** sentinel is treated as wholly an entry stream.
 
-    This is a pure tokenizer: it does **not** hash (store/5a), **not** validate
-    required-field presence or build a structured failure envelope (4b), and
-    **not** strip HTML comments from stream content (V1-D7). ``source_path`` is
-    accepted and threaded for 4b's failure envelope but is inert here — 4a never
-    stats the file or derives kind from it.
+    The parser is the authority on **format-level well-formedness** (the C1
+    boundary, V1-D8): required-field presence per kind, marker balance, and
+    spec-pure field recognition. A malformed entry produces a structured
+    :class:`~mitos.errors.EntryFailure` (§5.2.2). It does **not** hash (store/5a),
+    does **not** do referential/graph validation — slug collisions, edge targets,
+    acyclicity are the store's ``source="store"`` codes (5b) — and does **not**
+    strip HTML comments from stream content (V1-D7).
+
+    **Per-entry isolation (§5.2.2):** a malformed entry never aborts the batch.
+
+    - **COLLECTOR mode** (``failures`` supplied): a malformed entry's envelope is
+      appended to ``failures`` and the entry is omitted from the return; the
+      well-formed entries are returned.
+    - **STRICT mode** (default, no collector): the first malformed entry raises
+      ``ParseError`` carrying its envelope on ``.failure``.
 
     Args:
         text: The raw entry-stream file content.
         kind: ``"decision"`` or ``"open_question"`` (caller-declared).
-        source_path: The originating path, threaded for 4b's failure envelope;
-            inert in 4a.
+        source_path: The originating path, threaded onto each envelope.
+        failures: Optional collector. When supplied, malformed entries are
+            isolated into it (collector mode) instead of raising (strict mode).
 
     Returns:
-        The tokenized entries in file order.
+        The well-formed tokenized entries in file order.
 
     Raises:
         ValueError: If ``kind`` is neither ``"decision"`` nor ``"open_question"``.
-        ParseError: If an entry header is structurally untokenizable (no slug).
+        ParseError: In strict mode (no ``failures`` collector), on the first
+            malformed entry — with the §5.2.2 envelope on ``.failure``.
     """
     if kind not in ("decision", "open_question"):
         raise ValueError(
@@ -879,5 +1115,24 @@ def parse_entry_stream(
             break
 
     sections = _split_entry_sections(lines, begin_idx)
-    return [_tokenize_entry(sec, kind) for sec in sections]
+
+    result: List[ParsedEntry] = []
+    for sec in sections:
+        entry, failure = _validate_section(sec, kind, source_path)
+        if failure is None:
+            result.append(entry)
+        elif failures is not None:
+            # Collector mode: isolate this entry, keep parsing the rest.
+            failures.append(failure)
+        else:
+            # Strict mode: raise on the first malformed entry, carrying the
+            # envelope. The ParseError's line range is taken from the first item
+            # (so the slug-less header still reports its header line), falling
+            # back to the entry span when an item has no line.
+            first = failure.items[0]
+            ls = first.line_start if first.line_start is not None else failure.line_start
+            le = first.line_end if first.line_end is not None else failure.line_end
+            raise ParseError(first.message, ls, le, failure=failure)
+
+    return result
 
