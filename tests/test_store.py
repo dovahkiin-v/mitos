@@ -9,7 +9,8 @@ import sqlite3
 import tempfile
 import os
 import pytest
-from mitos.store import GraphStore, ValidationError
+from mitos.store import GraphStore, ValidationError, compute_hash
+from mitos.identity import compute_node_id
 from mitos.errors import DatabaseError
 from mitos.parser import ParsedEntry
 
@@ -292,3 +293,63 @@ def test_v1_schema_authored_but_not_live_until_phase_5a(
         conn.close()
     assert (1, _v1_schema) not in MIGRATION_STEPS
     assert MIGRATION_STEPS == []
+
+
+def test_identity_hash_still_slug_inclusive_until_phase_5a(
+    temp_store: GraphStore,
+) -> None:
+    """DEFERRED-FLIP TRIPWIRE — Phase 3a authors the slug-free hash but does NOT wire it.
+
+    Phase 3a builds and golden-proves the slug-free canonical-core hash
+    (``mitos.identity.compute_node_id`` + the five §12 norm rules + the §11 trace
+    table in ``tests/test_identity.py``) but deliberately leaves the live commit
+    path on the prototype slug-INCLUSIVE ``store.compute_hash`` so the suite stays
+    green through 3a–4b (construction-vs-migration containment, plan Key Decision
+    1 / ADR ``identity-rebuilt-in-3a-compute-hash-flip-deferred-to-5a-8a``;
+    WIRING_LEDGER entry-002).
+
+    **Phase 5a** is the flipping phase — it points ``commit_parsed_entry`` at
+    ``compute_node_id`` (keyword-only, slug-less), so two same-core/different-slug
+    entries converge to ONE node id (a slug rename becomes a V1-D16 in-place
+    commentary UPDATE). **Phase 8a** then retires ``store.compute_hash`` itself
+    and reconciles its remaining importers (``sync.py``/``importer.py`` + the two
+    ``test_adversarial_invariants.py`` call sites). When 5a flips the commit path,
+    this test MUST be consciously updated — it is the forcing function that makes
+    the deferred wiring visible.
+
+    Three assertions pin the current slug-inclusive reality from both the pure
+    function and the live commit path; each flips when 5a wires ``compute_node_id``.
+    """
+    AXIOM = "Use SQLite for the graph store"
+    MECHS = ["sqlite", "wal"]
+
+    # (1) The prototype pure function is still slug-INCLUSIVE: two inputs that
+    #     differ ONLY in slug produce DIFFERENT ids. Under the slug-free
+    #     compute_node_id (no slug parameter) this divergence vanishes.
+    assert compute_hash("decision", "use-sqlite", AXIOM, MECHS) != \
+        compute_hash("decision", "use-sqlite-renamed", AXIOM, MECHS)
+
+    # (2) The live commit path still MINTS via the slug-inclusive hash: the
+    #     node id equals a locally-recomputed slug-inclusive compute_hash, and
+    #     NOT the slug-free compute_node_id. (5a flips both halves.)
+    e1 = ParsedEntry("decision", "use-sqlite", 1, 5)
+    e1.core_axiom = AXIOM
+    e1.rejected_paths = "Postgres."
+    e1.mechanisms = list(MECHS)
+    delta1 = temp_store.commit_parsed_entry(e1)
+
+    assert delta1.node_id == compute_hash(
+        e1.kind, e1.slug, e1.core_axiom, e1.mechanisms, e1.questions_raised
+    )
+    slug_free_id = compute_node_id(kind="decision", axiom=AXIOM, mechanism_refs=MECHS)
+    assert delta1.node_id != slug_free_id  # commit path is NOT yet on compute_node_id
+
+    # (3) Same canonical core, different slug → a SECOND, distinct node today
+    #     (slug is still in the id). 5a makes these converge to one node.
+    e2 = ParsedEntry("decision", "use-sqlite-renamed", 1, 5)
+    e2.core_axiom = AXIOM
+    e2.rejected_paths = "Postgres."
+    e2.mechanisms = list(MECHS)
+    delta2 = temp_store.commit_parsed_entry(e2)
+
+    assert delta2.node_id != delta1.node_id
