@@ -8,6 +8,7 @@ MCP serving.
 import sys
 import os
 import re
+import time
 import hashlib
 import argparse
 from typing import List, Optional, Dict, Any
@@ -24,21 +25,23 @@ from mitos.config import (
 from mitos.errors import MitosError, ParseError, ValidationError, DatabaseError, ConfigError
 from mitos.migrations import is_pre_v1a_schema
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS, open_connection
+from mitos.cutover import default_aside_db_path, perform_swap, rebuild_and_gate
 from mitos.recall import assess_surface_recall
 from mitos.sync import MitosSyncManager, run_ambient_capture
 from mitos.renderer import MitosRenderer, overflow_report
 from mitos.importer import MitosProseImporter
 
 
-# Shared route-to-cutover guidance. `mitos init` raises it (DatabaseError) and
-# `mitos status` reports it when a pre-V1a (prototype) graph is detected, so both
-# operator surfaces point the same direction. Mirrors the substance of the
+# Shared route-to-cutover guidance. `mitos init` raises it (DatabaseError),
+# `mitos status` reports it (both the pre-V1a check-line and the next-steps line)
+# when a prototype graph is detected, so every operator surface points the same
+# direction and names the same verb. Mirrors the substance of the
 # GraphStore.__init__ boot-guard message (store.py) + vision §2.1; the one-time
-# cutover tooling itself ships at Phase 7.
+# `mitos cutover` verb itself is implemented below (cmd_cutover).
 _CUTOVER_GUIDANCE = (
     "This graph predates the V1a schema (a prototype layout was detected). "
-    "Mitos will not migrate it in place — run the one-time cutover to rebuild "
-    "it into the V1a store."
+    "Mitos will not migrate it in place — run the one-time cutover (`mitos "
+    "cutover`) to rebuild it into the V1a store (see SETUP.md → Cutover)."
 )
 
 
@@ -1191,10 +1194,11 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
     # right after the workspace line, with the same route-to-cutover guidance `init`
     # raises. Never `READY ✓` for a graph `init` would refuse (§5.2.7).
     if pre_v1a:
-        checks.insert(1, (
-            "graph schema (V1a)", False,
-            "prototype graph detected — run the one-time cutover to rebuild it into the V1a store",
-        ))
+        # Route through the shared constant (single source) so this check-line hint
+        # and the next-steps line below can never re-diverge — both name `mitos
+        # cutover`. (The store.py boot-guard message stays its own deeper-internal
+        # phrasing; it is not an operator-primary surface.)
+        checks.insert(1, ("graph schema (V1a)", False, _CUTOVER_GUIDANCE))
     print(f"\nMITOS STATUS for {workspace_dir} — {verdict}\n")
     for label, ok, hint in checks:
         line = f"  {mark(ok)} {label}"
@@ -1224,6 +1228,157 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
               "(https://github.com/dovahkiin-v/mitos/blob/main/SETUP.md)")
         print()
     return 0 if ready else 1
+
+
+def cmd_cutover(
+    config: MitosConfig, *, allow_drops: bool, assume_yes: bool, as_json: bool
+) -> int:
+    """Runs the one-time prototype→V1a cutover (the destructive migration).
+
+    Orchestrates 7a's verdict surface into an operator-runnable verb: probe →
+    rebuild + gate → present the verdict → confirm (or override a shortfall with
+    ``--allow-drops``) → atomic swap → print the post-swap runbook. The load-bearing
+    correctness lives in :func:`~mitos.cutover.perform_swap`; this is the thin
+    interactive orchestrator (K1).
+
+    Only a genuine **prototype** graph proceeds — an already-V1a, empty, or absent
+    graph is a cheap no-op (G7), which also makes a post-success or post-crash
+    re-run idempotent. A **corpus defect** raises ``CutoverError`` (propagated to
+    ``main()``'s boundary, rendered one-line, exit 1) and is never overridable; a
+    completeness **shortfall** is overridable with ``--allow-drops`` (P6 — the
+    markdown is authoritative, a drop may be a deliberate purge).
+
+    Args:
+        config: The active workspace config.
+        allow_drops: Proceed past a completeness shortfall (active cores absent from
+            the rebuild). Never overrides a corpus defect.
+        assume_yes: Skip the interactive swap confirmation (automation / non-TTY).
+        as_json: Emit a machine-readable JSON report instead of the human runbook.
+
+    Returns:
+        ``0`` on a successful swap (or a no-op non-prototype graph), ``1``
+        otherwise (absent graph, refused shortfall, declined/missing confirmation).
+
+    Raises:
+        CutoverError: On a corpus defect during the rebuild (caught at the
+            ``main()`` boundary).
+    """
+    import json as _json
+
+    # 1. Up-front prototype probe (G7) — mirrors the cmd_init / cmd_status RO-probe
+    #    shape. An absent / already-V1a / empty graph is a cheap no-op: no rebuild,
+    #    no swap, no Qdrant churn (and a post-success re-run is idempotent).
+    if not os.path.exists(config.db_path):
+        if as_json:
+            print(_json.dumps({"workspace": config.workspace_dir,
+                               "swapped": False, "reason": "no_graph"}, indent=2))
+        else:
+            print("No graph found at this workspace — run `mitos init` for a fresh "
+                  "V1a workspace (nothing to cut over).")
+        return 1
+    probe_conn = open_connection(config.db_path, read_only=True)
+    try:
+        is_prototype = is_pre_v1a_schema(probe_conn)
+    finally:
+        probe_conn.close()
+    if not is_prototype:
+        if as_json:
+            print(_json.dumps({"workspace": config.workspace_dir,
+                               "swapped": False, "reason": "not_a_prototype"}, indent=2))
+        else:
+            print("Graph is already on the V1a schema (or empty) — nothing to "
+                  "cut over.")
+        return 0
+
+    # 2. Rebuild + gate (7a). A corpus defect raises CutoverError, which propagates
+    #    to main()'s `except MitosError` boundary (one-line error, exit 1) — never
+    #    overridable here, it is malformed markdown the operator must fix.
+    aside_db_path = default_aside_db_path(config)
+    result = rebuild_and_gate(config, aside_db_path=aside_db_path)
+
+    qdrant_wipe_cmd = (
+        f"curl -X DELETE {config.qdrant_url}/collections/{config.qdrant_collection}"
+    )
+
+    # 3. Present the verdict.
+    if not as_json:
+        print("\nCutover rebuild verdict:")
+        print(f"  decisions committed:       {result.decisions_committed}")
+        print(f"  open questions committed:  {result.open_questions_committed}")
+        print(f"  active cores (old graph):  {result.reference_active_count}")
+        print(f"  active cores (rebuild):    {result.reconstructed_active_count}")
+
+    if not result.gate_passed:
+        n = len(result.missing_cores)
+        if not as_json:
+            print(f"\n⚠ {n} active core(s) from the prototype are ABSENT from the "
+                  f"rebuild:")
+            for mc in result.missing_cores:
+                print(f"    - '{mc.slug}' [{mc.kind}]: {mc.axiom_excerpt}")
+        if not allow_drops:
+            if as_json:
+                print(_json.dumps({**result.to_dict(), "swapped": False,
+                                   "reason": "shortfall_refused",
+                                   "qdrant_wipe_cmd": qdrant_wipe_cmd}, indent=2))
+            else:
+                print(f"\nRefusing to swap: {n} active core(s) would be dropped. "
+                      f"Review the offenders above. If this purge is intentional "
+                      f"(they were deliberately removed from the corpus), re-run "
+                      f"with --allow-drops. Otherwise restore them in "
+                      f"{os.path.basename(config.decisions_file)} and re-run.")
+            return 1
+        if not as_json:
+            print(f"\n--allow-drops set: proceeding despite the {n} dropped "
+                  f"core(s), treating the corpus as authoritative (P6).")
+
+    # 4. Confirm the destructive swap (K5/G5 — never call input() on a no-TTY).
+    if not assume_yes:
+        if as_json:
+            # JSON mode is for automation: never prompt; require an explicit --yes.
+            print(_json.dumps({**result.to_dict(), "swapped": False,
+                               "reason": "confirmation_required",
+                               "qdrant_wipe_cmd": qdrant_wipe_cmd}, indent=2))
+            return 1
+        if sys.stdin.isatty():
+            answer = input("\nProceed with the cutover swap? This replaces the "
+                           "live graph. [y/N] ")
+            if answer.strip().lower() not in ("y", "yes"):
+                print("Aborted — no changes made.")
+                return 1
+        else:
+            print("\nRefusing to prompt: this is a destructive operation and stdin "
+                  "is not a TTY. Re-run with --yes to proceed non-interactively.")
+            return 1
+
+    # 5. Swap — the single atomic instant. The timestamp is pinned by the caller
+    #    (G8) so perform_swap stays wall-clock-free and fixture-deterministic.
+    bak_path = perform_swap(
+        config, result.aside_db_path, timestamp=time.strftime("%Y%m%d-%H%M%S")
+    )
+
+    # 6. Print the post-swap runbook (the operator must not have to remember it).
+    if as_json:
+        print(_json.dumps({**result.to_dict(), "swapped": True,
+                           "bak_path": bak_path,
+                           "qdrant_wipe_cmd": qdrant_wipe_cmd}, indent=2))
+        return 0
+
+    print(f"\n✓ Cutover complete — the V1a graph is live at {config.db_path}.")
+    if bak_path:
+        print(f"  Old prototype graph backed up to: {bak_path}")
+    print("\nFinish the cutover (it is not fully done until these run):")
+    print("  1. Wipe the stale Qdrant collection (its vectors are keyed on the old")
+    print("     prototype ids — it auto-recreates on the next sync):")
+    print(f"       {qdrant_wipe_cmd}")
+    print("  2. Re-embed the V1a active set:  mitos sync   (or: mitos sync --embed-only)")
+    print("     Semantic surface/query stay degraded until the queue drains;")
+    print("     graph-only `mitos list` works throughout.")
+    print("  3. If `mitos serve` was running, restart it.")
+    print("  4. Verify:  mitos status   → expect READY ✓")
+    if bak_path:
+        print(f"  5. Once satisfied, remove the backup:  rm {bak_path}")
+    print("  Full runbook → SETUP.md → Cutover.")
+    return 0
 
 
 def load_dotenv_file(path: str = ".env") -> None:
@@ -1362,6 +1517,18 @@ def main() -> None:
     sk_p.add_argument("--global", action="store_true", dest="is_global",
                       help="Write the global ~/.config/mitos/.env (shared by ALL projects) instead of this project's .env.")
 
+    # cutover — the one-time prototype→V1a migration (destructive; operator-run).
+    cut_p = subparsers.add_parser(
+        "cutover",
+        help="One-time migration of a prototype graph to the V1a store (destructive).")
+    cut_p.add_argument("--allow-drops", action="store_true", dest="allow_drops",
+                       help="Proceed even if active decisions would be dropped from the "
+                            "rebuild (P6: a drop may be a deliberate purge).")
+    cut_p.add_argument("--yes", action="store_true",
+                       help="Skip the interactive confirmation (automation / non-TTY).")
+    cut_p.add_argument("--json", action="store_true", dest="as_json",
+                       help="Emit a machine-readable JSON report.")
+
     args = parser.parse_args()
 
     try:
@@ -1423,6 +1590,9 @@ def main() -> None:
             sys.exit(cmd_status(args.path or os.getcwd(), as_json=args.as_json))
         elif args.command == "set-key":
             cmd_set_key(args.value, name=args.name, is_global=args.is_global)
+        elif args.command == "cutover":
+            sys.exit(cmd_cutover(config, allow_drops=args.allow_drops,
+                                 assume_yes=args.yes, as_json=args.as_json))
     except MitosError as e:
         print(f"Error: {str(e)}", file=sys.stderr)
         sys.exit(1)

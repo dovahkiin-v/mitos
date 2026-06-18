@@ -13,21 +13,26 @@ serialization roundtrip (§10).
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
+import sys
 
 import pytest
 
+from mitos.cli import cmd_cutover, main as cli_main
 from mitos.config import MitosConfig
 from mitos.cutover import (
     MissingCore,
     RebuildResult,
     check_reconstruction_completeness,
     default_aside_db_path,
+    perform_swap,
     rebuild_and_gate,
 )
 from mitos.errors import CutoverError, EntryFailure
 from mitos.identity import compute_node_id
-from mitos.store import GraphStore, compute_hash
+from mitos.migrations import is_pre_v1a_schema
+from mitos.store import GraphStore, compute_hash, open_connection
 
 SENTINEL = "<!-- BEGIN ENTRIES — newest first -->"
 
@@ -632,3 +637,356 @@ def test_rebuild_result_gate_passed_is_computed():
         "p", 1, 0, 2, 1, [MissingCore("id", "decision", "s", "x")]
     )
     assert shortfall.gate_passed is False
+
+
+# ==============================================================================
+# Phase 7b — atomic swap, WAL-sidecar safety & the `mitos cutover` verb
+# ==============================================================================
+#
+# [integration/fixture] — real temp-dir SQLite, no mocks of the store/file layer.
+# Crash injection is deterministic via monkeypatch (no real process kills);
+# `timestamp` is always a fixed fixture string so `.bak` paths assert exactly.
+
+
+def _is_prototype(db_path):
+    """Returns True iff ``db_path`` holds a pre-V1a (prototype) graph (RO probe)."""
+    conn = open_connection(db_path, read_only=True)
+    try:
+        return is_pre_v1a_schema(conn)
+    finally:
+        conn.close()
+
+
+# A valid standalone V1a node (no FK to satisfy) used to strand a committed frame
+# in the aside's -wal — its survival after the swap proves the checkpoint ran.
+_SENTINEL_NODE_SQL = (
+    "INSERT INTO nodes (id, kind, slug, slug_casefold, source, axiom, "
+    "created_at, updated_at) VALUES "
+    "('wal-sentinel-id', 'decision', 'wal-sentinel', 'wal-sentinel', 'user', "
+    "'WAL sentinel axiom.', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"
+)
+
+
+def _strand_write_in_wal(db_path, sql, params=()):
+    """Leaves a committed write in ``db_path``'s -wal but OUT of the main file.
+
+    Reproduces a pre-checkpoint 'crash' deterministically: with auto-checkpoint
+    disabled, commit ``sql`` (the frame lands in -wal, not the main file), snapshot
+    the main+wal pair WHILE the writer is open, let the close-time checkpoint fold
+    the frame, then restore the pre-checkpoint pair — so the frame again lives only
+    in the -wal. A stale -shm is dropped (SQLite rebuilds it from the -wal on open).
+    """
+    conn = open_connection(db_path)
+    try:
+        conn.execute("PRAGMA wal_autocheckpoint=0")
+        conn.execute(sql, params)
+        conn.commit()
+        shutil.copy2(db_path, db_path + ".mainsnap")
+        shutil.copy2(db_path + "-wal", db_path + "-wal.snap")
+    finally:
+        conn.close()  # close-checkpoint folds the frame into the main file
+    os.replace(db_path + ".mainsnap", db_path)
+    os.replace(db_path + "-wal.snap", db_path + "-wal")
+    try:
+        os.remove(db_path + "-shm")
+    except FileNotFoundError:
+        pass
+
+
+# --- perform_swap: SC1–SC5 + the missing-aside guard ---------------------------
+
+
+def test_perform_swap_happy_path(tmp_path):
+    """SC1: a passing rebuild swaps into place; the old graph is backed up."""
+    config = _config(tmp_path)
+    _plant_prototype(
+        config.db_path,
+        [{"slug": "alpha", "kind": "decision", "core_axiom": "Alpha axiom."}],
+    )
+    _write(
+        config.decisions_file,
+        _stream(_decision("alpha", "Alpha axiom."), _decision("beta", "Beta axiom.")),
+    )
+    aside = _aside(config)
+    rebuild_and_gate(config, aside_db_path=aside)
+
+    bak = perform_swap(config, aside, timestamp="20260618-120000")
+
+    # Immediately after the swap (before any open re-creates them): the aside is
+    # gone and the new graph carries NO sidecars. Assert this FIRST — opening a
+    # write GraphStore for the readback below legitimately re-creates a -wal.
+    assert not os.path.exists(aside)
+    assert not os.path.exists(config.db_path + "-wal")
+    assert not os.path.exists(config.db_path + "-shm")
+    # The .bak is the old prototype graph, recognizably a prototype.
+    assert bak == config.db_path + ".bak_20260618-120000"
+    assert os.path.exists(bak)
+    assert _is_prototype(bak)
+    # The live graph is now the rebuilt V1a graph with the full active set.
+    assert not _is_prototype(config.db_path)
+    decs, oqs = _active_slugs(config.db_path)
+    assert decs == {"alpha", "beta"}
+
+
+def test_perform_swap_clears_destination_wal_orphan(tmp_path):
+    """SC2: a stale destination -wal/-shm is cleared before the rename (R11/K3)."""
+    config = _config(tmp_path)
+    _plant_prototype(
+        config.db_path,
+        [{"slug": "alpha", "kind": "decision", "core_axiom": "Alpha axiom."}],
+    )
+    _write(config.decisions_file, _stream(_decision("alpha", "Alpha axiom.")))
+    aside = _aside(config)
+    rebuild_and_gate(config, aside_db_path=aside)
+
+    # The R11 hazard: a stale orphan -wal beside the destination would be applied
+    # to the swapped-in graph on next open → SQLITE_CORRUPT.
+    _write(config.db_path + "-wal", "stale orphan wal frames")
+    _write(config.db_path + "-shm", "stale shm")
+
+    perform_swap(config, aside, timestamp="20260618-000000")
+
+    assert not os.path.exists(config.db_path + "-wal")
+    assert not os.path.exists(config.db_path + "-shm")
+    decs, oqs = _active_slugs(config.db_path)
+    assert decs == {"alpha"}
+
+
+def test_perform_swap_folds_aside_wal_checkpoint(tmp_path):
+    """SC3: the aside's un-checkpointed -wal frames are folded in before the rename."""
+    config = _config(tmp_path)
+    _write(
+        config.decisions_file,
+        _stream(_decision("alpha", "Alpha axiom."), _decision("beta", "Beta axiom.")),
+    )
+    aside = _aside(config)
+    rebuild_and_gate(config, aside_db_path=aside)
+
+    # Strand a committed node only in the aside's -wal (a pre-checkpoint crash):
+    # if perform_swap clears the -wal without checkpointing first, it is lost.
+    _strand_write_in_wal(aside, _SENTINEL_NODE_SQL)
+    assert os.path.exists(aside + "-wal")
+
+    perform_swap(config, aside, timestamp="20260618-000000")
+
+    # No -wal beside the swapped-in graph, yet the stranded node survived → the
+    # TRUNCATE checkpoint folded it into the main file BEFORE the rename (K3/G2).
+    assert not os.path.exists(config.db_path + "-wal")
+    all_slugs = _all_slugs(config.db_path)
+    assert "wal-sentinel" in all_slugs
+    assert {"alpha", "beta"} <= all_slugs
+
+
+def test_perform_swap_crash_mid_rename_leaves_prototype_valid(tmp_path, monkeypatch):
+    """SC4: a crash at the atomic rename leaves the prototype intact; re-run recovers."""
+    config = _config(tmp_path)
+    _plant_prototype(
+        config.db_path,
+        [{"slug": "alpha", "kind": "decision", "core_axiom": "Alpha axiom."}],
+    )
+    _write(config.decisions_file, _stream(_decision("alpha", "Alpha axiom.")))
+    before = _fingerprint(config.db_path)
+    result = rebuild_and_gate(config, aside_db_path=_aside(config))
+
+    def _raise_oserror(*a, **k):
+        raise OSError("simulated crash at the atomic rename")
+
+    monkeypatch.setattr(os, "rename", _raise_oserror)
+    with pytest.raises(OSError):
+        perform_swap(config, result.aside_db_path, timestamp="20260618-000000")
+    monkeypatch.undo()
+
+    # Copy-not-move (K2): config.db_path is never absent — it is still the intact
+    # prototype, byte-for-byte (the rename is the only destructive step).
+    assert _fingerprint(config.db_path) == before
+    assert _is_prototype(config.db_path)
+
+    # A clean re-run recovers with no manual file surgery (P5 Unplugged).
+    result2 = rebuild_and_gate(config, aside_db_path=_aside(config))
+    perform_swap(config, result2.aside_db_path, timestamp="20260618-000001")
+    assert not _is_prototype(config.db_path)
+    decs, oqs = _active_slugs(config.db_path)
+    assert decs == {"alpha"}
+
+
+def test_perform_swap_crash_discards_orphan_aside_and_sidecars(tmp_path):
+    """SC5: an orphan aside (+ stale sidecars) from a crashed run is discarded, then swap."""
+    config = _config(tmp_path)
+    _plant_prototype(
+        config.db_path,
+        [
+            {"slug": "alpha", "kind": "decision", "core_axiom": "Alpha axiom."},
+            {"slug": "beta", "kind": "decision", "core_axiom": "Beta axiom."},
+        ],
+    )
+    _write(
+        config.decisions_file,
+        _stream(_decision("alpha", "Alpha axiom."), _decision("beta", "Beta axiom.")),
+    )
+    aside = _aside(config)
+    # A prior 'crashed' run left an orphan aside main + stale -wal/-shm sidecars.
+    _write(aside, "not a sqlite database")
+    _write(aside + "-wal", "junk")
+    _write(aside + "-shm", "junk")
+
+    # rebuild_and_gate discards the orphan (+ its sidecars) and rebuilds cleanly...
+    result = rebuild_and_gate(config, aside_db_path=aside)
+    # ...then a clean swap follows with no manual step.
+    bak = perform_swap(config, result.aside_db_path, timestamp="20260618-000000")
+
+    assert not os.path.exists(aside)
+    assert not os.path.exists(config.db_path + "-wal")
+    assert not os.path.exists(config.db_path + "-shm")
+    assert _is_prototype(bak)
+    decs, oqs = _active_slugs(config.db_path)
+    assert decs == {"alpha", "beta"}
+
+
+def test_perform_swap_missing_aside_raises(tmp_path):
+    """The defensive guard: a missing build-aside file raises CutoverError."""
+    config = _config(tmp_path)
+    with pytest.raises(CutoverError):
+        perform_swap(config, _aside(config), timestamp="20260618-000000")
+
+
+# --- cmd_cutover: SC6–SC10 + the --json payload --------------------------------
+
+
+def test_cmd_cutover_gate_pass_swaps(tmp_path, capsys):
+    """SC6: a gate-passing cutover swaps and prints the post-swap runbook (exit 0)."""
+    config = _config(tmp_path)
+    _plant_prototype(
+        config.db_path,
+        [{"slug": "alpha", "kind": "decision", "core_axiom": "Alpha axiom."}],
+    )
+    _write(config.decisions_file, _stream(_decision("alpha", "Alpha axiom.")))
+
+    rc = cmd_cutover(config, allow_drops=False, assume_yes=True, as_json=False)
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert ".bak_" in out                 # names the backup
+    assert "curl -X DELETE" in out        # the Qdrant-wipe guidance
+    assert "mitos sync" in out            # the re-sync guidance
+    assert not _is_prototype(config.db_path)
+    decs, oqs = _active_slugs(config.db_path)
+    assert decs == {"alpha"}
+
+
+def test_cmd_cutover_shortfall_refuses_then_allow_drops_overrides(tmp_path, capsys):
+    """SC7: a shortfall refuses without --allow-drops; --allow-drops (P6) overrides."""
+    config = _config(tmp_path)
+    _plant_prototype(
+        config.db_path,
+        [
+            {"slug": "alpha", "kind": "decision", "core_axiom": "Alpha axiom."},
+            {"slug": "gamma", "kind": "decision", "core_axiom": "Gamma axiom."},
+        ],
+    )
+    # The corpus rebuilds only alpha → gamma would be dropped (a shortfall).
+    _write(config.decisions_file, _stream(_decision("alpha", "Alpha axiom.")))
+
+    rc = cmd_cutover(config, allow_drops=False, assume_yes=True, as_json=False)
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "gamma" in out                 # the offender is surfaced
+    assert _is_prototype(config.db_path)  # no swap — still the prototype
+
+    # With --allow-drops (+ --yes): the P6 override swaps.
+    rc2 = cmd_cutover(config, allow_drops=True, assume_yes=True, as_json=False)
+    assert rc2 == 0
+    assert not _is_prototype(config.db_path)
+    decs, oqs = _active_slugs(config.db_path)
+    assert decs == {"alpha"}
+
+
+def test_cmd_cutover_corpus_defect_one_line_error_via_main(tmp_path, monkeypatch, capsys):
+    """SC8: a corpus defect → one-line `Error:` via main()'s boundary, no swap."""
+    config = _config(tmp_path)
+    _plant_prototype(
+        config.db_path,
+        [{"slug": "alpha", "kind": "decision", "core_axiom": "Alpha axiom."}],
+    )
+    before = _fingerprint(config.db_path)
+    # Malformed corpus: a kill-edge to a non-existent target (missing_target).
+    _write(
+        config.decisions_file,
+        _stream(_decision("orphan", "Orphan axiom.", supersedes="ghost")),
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MITOS_NO_UPDATE_CHECK", "1")
+    monkeypatch.setattr(sys, "argv", ["mitos", "cutover", "--yes"])
+
+    with pytest.raises(SystemExit) as exc:
+        cli_main()
+
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "Traceback" not in err
+    assert "Error:" in err
+    # No swap — the live graph is the untouched prototype.
+    assert _fingerprint(config.db_path) == before
+
+
+def test_cmd_cutover_noop_on_non_prototype(tmp_path, capsys):
+    """SC9: an already-V1a graph is a no-op (no rebuild, no swap, exit 0)."""
+    config = _config(tmp_path)
+    GraphStore(config.db_path)  # a fresh V1a (non-prototype) graph
+    _write(config.decisions_file, _stream(_decision("alpha", "Alpha axiom.")))
+    before = _fingerprint(config.db_path)
+
+    rc = cmd_cutover(config, allow_drops=False, assume_yes=True, as_json=False)
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "nothing to cut over" in out.lower()
+    # No rebuild, no swap — the graph is byte-for-byte untouched, no aside built.
+    assert _fingerprint(config.db_path) == before
+    assert not os.path.exists(_aside(config))
+
+
+def test_cmd_cutover_no_tty_without_yes_refuses(tmp_path, monkeypatch, capsys):
+    """SC10: a no-TTY stdin without --yes refuses calmly, never calling input()."""
+    config = _config(tmp_path)
+    _plant_prototype(
+        config.db_path,
+        [{"slug": "alpha", "kind": "decision", "core_axiom": "Alpha axiom."}],
+    )
+    _write(config.decisions_file, _stream(_decision("alpha", "Alpha axiom.")))
+
+    class _FakeStdin:
+        def isatty(self):
+            return False
+
+    monkeypatch.setattr(sys, "stdin", _FakeStdin())
+
+    def _no_input(*a, **k):
+        raise AssertionError("input() must never be called on a no-TTY path")
+
+    monkeypatch.setattr("builtins.input", _no_input)
+
+    rc = cmd_cutover(config, allow_drops=False, assume_yes=False, as_json=False)
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "--yes" in out
+    assert _is_prototype(config.db_path)  # no swap
+
+
+def test_cmd_cutover_json_success_payload(tmp_path, capsys):
+    """The --json success payload is a single parseable object (no human text)."""
+    config = _config(tmp_path)
+    _plant_prototype(
+        config.db_path,
+        [{"slug": "alpha", "kind": "decision", "core_axiom": "Alpha axiom."}],
+    )
+    _write(config.decisions_file, _stream(_decision("alpha", "Alpha axiom.")))
+
+    rc = cmd_cutover(config, allow_drops=False, assume_yes=True, as_json=True)
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["swapped"] is True
+    assert payload["gate_passed"] is True
+    assert payload["bak_path"] and ".bak_" in payload["bak_path"]
+    assert payload["qdrant_wipe_cmd"].startswith("curl -X DELETE")
