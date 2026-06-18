@@ -125,3 +125,34 @@ def test_cli_unexpected_error_exits_1() -> None:
             with pytest.raises(SystemExit) as exc:
                 main()
             assert exc.value.code == 1
+
+
+def test_cli_malformed_config_exits_clean_no_traceback(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """A malformed `.mitos/config.toml` exits 1 with a one-line error, no traceback.
+
+    The strict config loader (6a) raises a `ConfigError` at `MitosConfig()`
+    construction. Because `main()` now builds the config INSIDE its `try:`, the
+    `except MitosError` boundary renders it as a clean `Error: …` line rather than
+    dumping a raw Python traceback for every command (PLANNING_NOTES Lesson 45 —
+    the Letterbox `ConfigError`→traceback trap). `main()` builds `MitosConfig()`
+    from cwd, so we chdir into a workspace whose config is malformed.
+    """
+    mitos_dir = tmp_path / ".mitos"
+    mitos_dir.mkdir()
+    # Unterminated string mid-file → tomllib raises → strict loader raises ConfigError.
+    (mitos_dir / "config.toml").write_text(
+        'rotation_mode = "archive\nqdrant_url = "x"\n', encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+
+    with patch.object(sys, "argv", ["mitos", "list"]):
+        with pytest.raises(SystemExit) as exc:
+            main()
+    assert exc.value.code == 1
+
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    assert "Error:" in captured.err
+    assert "config" in captured.err.lower()

@@ -6,7 +6,78 @@ and defines system-wide defaults.
 
 import os
 import re
+import sys
+import tomllib
 from typing import Dict, Any
+
+from mitos.errors import ConfigError
+
+# ---------------------------------------------------------------------------
+# v0.1 config schema (§5.2.6) — the SINGLE source of the static defaults.
+#
+# `CONFIG_DEFAULTS` holds the seven STATIC-default schema keys: `mitos init` (6b)
+# seeds `config.toml` from this exact map, and the loader's missing-key fallback
+# reads it — so a seeded file and a deleted-key fallback can never diverge (P11).
+# The two QDRANT keys are recognized + type-validated (in `CONFIG_SCHEMA`) but NOT
+# here: their defaults are DYNAMIC (env- / workspace-derived) and computed in
+# `__init__` from their existing single-source helpers, then file-overridable.
+# ---------------------------------------------------------------------------
+CONFIG_DEFAULTS: Dict[str, Any] = {
+    "rotation_mode": "archive",
+    "rotation_archive_path_template": "decisions/archive/{year}-Q{quarter}.md",
+    "rotation_volume_threshold_entries": 50,
+    "stale_entry_window_days": 30,
+    "embedding_cache_max_entries": 10_000,
+    # Pinned to renderer.py's GLOBAL/SCOPE_OVERFLOW_WARN_CHARS via a cross-check
+    # test (config.py is a lower-tier leaf; importing renderer would invert tiers).
+    # V4 wires the renderer to read these keys, making config the runtime source.
+    "render_global_overflow_warn_chars": 50_000,
+    "render_scope_overflow_warn_chars": 20_000,
+}
+
+# The recognized file keys → expected (TOML scalar) type, for strict validation.
+# The seven static keys above PLUS the two dynamic-default qdrant keys = the §5.2.6
+# nine-key schema. A file key NOT in this map is warn-tolerated (unknown key); this
+# is the bucket the dropped prototype keys (`db_path`, `decisions_file`,
+# `archive_dir`, `pending_threshold`) fall into — their ATTRIBUTES survive (R12),
+# only the file-override capability is gone.
+CONFIG_SCHEMA: Dict[str, type] = {
+    "rotation_mode": str,
+    "rotation_archive_path_template": str,
+    "rotation_volume_threshold_entries": int,
+    "stale_entry_window_days": int,
+    "embedding_cache_max_entries": int,
+    "render_global_overflow_warn_chars": int,
+    "render_scope_overflow_warn_chars": int,
+    "qdrant_url": str,
+    "qdrant_collection": str,
+}
+
+# The `rotation_mode` enum: correct type (str) but a value outside this set is a
+# hard ConfigError — a typo'd `rotation_mode` silently defaulting to "archive" and
+# then archiving when the author meant "mark" is exactly the silent-coerce OD1
+# forbids (a deliberate behavior change from the prototype's silent-ignore).
+ROTATION_MODES = frozenset({"archive", "mark", "prune"})
+
+
+def _value_matches_type(value: Any, expected: type) -> bool:
+    """Returns True if a parsed TOML value matches a schema key's expected type.
+
+    Treats ``bool`` as distinct from ``int`` even though ``bool`` subclasses
+    ``int``: a TOML ``true`` must NOT satisfy an int-typed key (the silent-coerce
+    the strict loader exists to kill). No v0.1 key expects a bool, so a bool is
+    always a type mismatch.
+
+    Args:
+        value: The value ``tomllib`` parsed for the key.
+        expected: The type the key's ``CONFIG_SCHEMA`` entry requires.
+
+    Returns:
+        True if ``value`` is acceptably typed for ``expected``, else False.
+    """
+    if expected is int:
+        return isinstance(value, int) and not isinstance(value, bool)
+    return isinstance(value, expected)
 
 
 def _hint_cache_path(cache_name: str) -> str:
@@ -119,9 +190,25 @@ class MitosConfig:
     def __init__(self, workspace_dir: str = ".") -> None:
         self.workspace_dir = os.path.abspath(workspace_dir)
         self.mitos_dir = os.path.join(self.workspace_dir, ".mitos")
-        
-        # Default configuration values
+
+        # Convention-path attributes — derived from the workspace, NOT file-schema
+        # keys in v0.1 (a file occurrence is warn-tolerated). Consumers
+        # (store/sync/importer/cli/mcp_server) bind these by name (R12), so they
+        # stay real instance attributes even though the file can no longer set them.
         self.db_path = os.path.join(self.mitos_dir, "graph.sqlite")
+        self.decisions_file = os.path.join(self.workspace_dir, "decisions.md")
+        self.archive_dir = os.path.join(self.workspace_dir, "decisions", "archive")
+
+        # `pending_threshold` LEFT the v0.1 file schema (its migration to
+        # `rotation_volume_threshold_entries` is V3a's, not V1a's) but stays a
+        # default-valued attribute — `sync.py`'s rotation-prompt gate reads it. A
+        # `pending_threshold` file key is now warn-tolerated, not applied.
+        self.pending_threshold = 30
+
+        # Dynamic-default schema keys: recognized + type-validated by CONFIG_SCHEMA,
+        # file-overridable, but defaulted from their single-source helpers (not from
+        # CONFIG_DEFAULTS, which holds only the STATIC defaults).
+        #
         # Mitos defaults to its OWN dedicated port (:7333), NOT the standard
         # Qdrant :6333 — a user's :6333 is usually running for something else, so
         # defaulting there would co-locate Mitos's collections in their instance
@@ -132,79 +219,108 @@ class MitosConfig:
         # Per-project by default so a shared Qdrant never mixes projects' decisions.
         # An explicit qdrant_collection in .mitos/config.toml overrides this.
         self.qdrant_collection = default_collection_name(self.workspace_dir)
-        self.rotation_mode = "archive"  # "archive" | "mark" | "prune"
-        self.pending_threshold = 30
-        self.decisions_file = os.path.join(self.workspace_dir, "decisions.md")
-        self.archive_dir = os.path.join(self.workspace_dir, "decisions", "archive")
+
+        # Static-default schema keys — seeded from the single CONFIG_DEFAULTS map
+        # (P11), the same map `mitos init` (6b) serializes. The keys are exactly the
+        # attribute names, so a plain setattr keeps the surface in lockstep.
+        for key, default in CONFIG_DEFAULTS.items():
+            setattr(self, key, default)
 
         self._load_config_file()
 
     def _load_config_file(self) -> None:
-        """Loads configuration overrides from .mitos/config.toml if present."""
+        """Overlays `.mitos/config.toml` onto the defaults under the strict policy.
+
+        Replaces the prototype's hand-rolled ``key=val`` parser (which swallowed
+        every error back to defaults) with a ``tomllib`` loader enforcing the
+        §5.2.6 failure-mode policy, symmetric with OD1: a broken config is loud and
+        located, never silently defaulted.
+
+        Policy:
+            - Malformed TOML → ``ConfigError`` carrying the path + the decoder's
+              line/column message. No fallback.
+            - A known key with the wrong type → ``ConfigError`` naming the key,
+              expected type, and got type.
+            - ``rotation_mode`` with a valid-string-but-out-of-enum value →
+              ``ConfigError`` (the silent-coerce OD1 forbids).
+            - A missing known key → keeps the already-seeded default.
+            - An unknown key → one calm stderr line, tolerated, skipped.
+
+        Raises:
+            ConfigError: On malformed TOML, a type mismatch, or an out-of-enum
+                ``rotation_mode``.
+        """
         config_path = os.path.join(self.mitos_dir, "config.toml")
         if not os.path.exists(config_path):
             return
 
         try:
-            # Since tomlkit or similar might not be installed or standard,
-            # we do a simple manual key-value parse to prevent dependencies,
-            # adhering to P19 (Dependency Skepticism).
-            with open(config_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    if "=" in line:
-                        key, val = line.split("=", 1)
-                        key = key.strip()
-                        val = val.strip().strip('"').strip("'")
-                        
-                        if val.isdigit():
-                            parsed_val: Any = int(val)
-                        elif val.lower() in ("true", "yes", "1"):
-                            parsed_val = True
-                        elif val.lower() in ("false", "no", "0"):
-                            parsed_val = False
-                        else:
-                            parsed_val = val
-                            
-                        self.set_attribute(key, parsed_val)
-        except Exception:
-            # Fail silently and fallback to defaults
-            pass
+            # tomllib requires BINARY mode — a text-mode handle raises TypeError.
+            with open(config_path, "rb") as f:
+                data = tomllib.load(f)
+        except tomllib.TOMLDecodeError as e:
+            raise ConfigError(
+                f"Malformed config at {config_path}: {e}. "
+                f"Fix the offending line or remove it."
+            ) from e
+        except OSError as e:
+            # The file existed at the os.path.exists check but can't be read now
+            # (permissions, a TOCTOU vanish, a directory). Keep the error vector
+            # uniform: every failure to LOAD the config is a located ConfigError,
+            # never a raw "Fatal Unexpected Error" — and never a silent default.
+            raise ConfigError(f"Cannot read config at {config_path}: {e}.") from e
 
-    def set_attribute(self, key: str, val: Any) -> None:
-        """Sets a configuration attribute if it matches a known setting."""
-        if key == "db_path":
-            self.db_path = os.path.abspath(val) if os.path.isabs(val) else os.path.join(self.mitos_dir, val)
-        elif key == "qdrant_url":
-            self.qdrant_url = val
-        elif key == "qdrant_collection":
-            self.qdrant_collection = val
-        elif key == "rotation_mode":
-            if val in ("archive", "mark", "prune"):
-                self.rotation_mode = val
-        elif key == "pending_threshold":
-            self.pending_threshold = int(val)
-        elif key == "decisions_file":
-            self.decisions_file = os.path.abspath(val) if os.path.isabs(val) else os.path.join(self.workspace_dir, val)
-        elif key == "archive_dir":
-            self.archive_dir = os.path.abspath(val) if os.path.isabs(val) else os.path.join(self.workspace_dir, val)
+        for key, val in data.items():
+            if key not in CONFIG_SCHEMA:
+                # Unknown (or dropped-from-schema) key — warn-but-tolerate. One
+                # calm, terse, screen-reader-clean line to stderr (P9), no emoji.
+                print(
+                    f"Warning: ignoring unrecognized config key "
+                    f"'{key}' in {config_path}",
+                    file=sys.stderr,
+                )
+                continue
+
+            expected = CONFIG_SCHEMA[key]
+            if not _value_matches_type(val, expected):
+                raise ConfigError(
+                    f"Config key '{key}' in {config_path} expects "
+                    f"{expected.__name__}, got {type(val).__name__} ({val!r}). "
+                    f"Fix the value's type."
+                )
+
+            if key == "rotation_mode" and val not in ROTATION_MODES:
+                allowed = ", ".join(sorted(ROTATION_MODES))
+                raise ConfigError(
+                    f"Config key 'rotation_mode' in {config_path} must be one of "
+                    f"{{{allowed}}}, got {val!r}."
+                )
+
+            # Schema keys are exactly the attribute names (R12 surface).
+            setattr(self, key, val)
 
     def to_dict(self) -> Dict[str, Any]:
         """Converts configuration to dictionary form.
 
+        Includes the convention-path attributes, the two dynamic-default qdrant
+        keys, the kept-but-de-schema'd ``pending_threshold``, and the seven static
+        schema keys (sourced from ``CONFIG_DEFAULTS`` so the set can't drift). No
+        consumer binds this today; it exists for a future ``--json``/debug surface.
+
         Returns:
-            A dictionary containing configuration fields.
+            A dictionary containing every configuration field.
         """
-        return {
+        result: Dict[str, Any] = {
             "workspace_dir": self.workspace_dir,
             "mitos_dir": self.mitos_dir,
             "db_path": self.db_path,
             "qdrant_url": self.qdrant_url,
             "qdrant_collection": self.qdrant_collection,
-            "rotation_mode": self.rotation_mode,
             "pending_threshold": self.pending_threshold,
             "decisions_file": self.decisions_file,
             "archive_dir": self.archive_dir,
         }
+        # The seven static schema keys (incl. rotation_mode) from their one source.
+        for key in CONFIG_DEFAULTS:
+            result[key] = getattr(self, key)
+        return result

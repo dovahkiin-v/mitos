@@ -1159,9 +1159,15 @@ def main() -> None:
                       help="Write the global ~/.config/mitos/.env (shared by ALL projects) instead of this project's .env.")
 
     args = parser.parse_args()
-    config = MitosConfig()
 
     try:
+        # Constructed INSIDE the try so a strict-loader ConfigError on a malformed
+        # `.mitos/config.toml` is caught by `except MitosError` below and rendered
+        # as a one-line `Error: …` — not a raw traceback (the 6a raising-loader owns
+        # this boundary). The `finally`'s only config read (config.workspace_dir for
+        # the MCP hint) is already wrapped in its own `except Exception: pass`, so an
+        # unbound `config` after a construction failure stays silent.
+        config = MitosConfig()
         if args.command == "init":
             cmd_init(config)
         elif args.command == "sync":

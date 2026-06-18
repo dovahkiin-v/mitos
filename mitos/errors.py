@@ -53,6 +53,21 @@ class DatabaseError(MitosError):
     pass
 
 
+class ConfigError(MitosError):
+    """Raised when `.mitos/config.toml` is malformed or carries an invalid value.
+
+    The strict config loader (``MitosConfig._load_config_file``) refuses to swallow
+    a broken config: malformed TOML, a known key with the wrong type, or an
+    out-of-enum ``rotation_mode`` all raise this rather than silently falling back
+    to defaults (the OD1-symmetric failure-mode policy, §5.2.6). A ``MitosError``
+    subclass so the CLI's ``except MitosError`` boundary renders it as a one-line
+    ``Error: …`` message instead of a raw traceback. The message names the file
+    path and the located cause (the ``tomllib`` line/column, or the offending key +
+    expected type).
+    """
+    pass
+
+
 class VectorStoreError(MitosError):
     """Raised when Qdrant vector store operations fail."""
     pass
