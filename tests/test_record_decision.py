@@ -73,6 +73,17 @@ def test_keystone_round_trip(ws) -> None:
     assert node["rejected_paths"] == rejected
 
 
+def test_empty_slug_error(ws) -> None:
+    """An empty slug returns an empty_slug error, bypassing the fallback."""
+    config, m = ws
+    res = m.record_decision_entry(
+        axiom="Some valid decision.",
+        rejected_paths="None.",
+        scope=["test"],
+        slug="",  # Explicitly empty
+    )
+    assert res.get("code") == "empty_slug"
+    assert "hyphenated handle" in res.get("error")
 def test_multiline_rejected_paths_round_trips(ws) -> None:
     """A bulleted rejected_paths list survives serialise→parse intact."""
     config, m = ws

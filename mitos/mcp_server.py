@@ -377,14 +377,14 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False) -> s
 
 
 @mcp.tool()
-def record_decision(axiom: str, rejected_paths: str, scope: List[str],
+def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str,
                     mechanisms: Optional[List[str]] = None, context: Optional[str] = None,
                     supersedes: Optional[str] = None, corrects: Optional[str] = None,
                     amends: Optional[str] = None,
                     narrows: Optional[str] = None, depends_on: Optional[str] = None,
                     resolves: Optional[str] = None, contradicts: Optional[str] = None,
                     derives_from: Optional[str] = None, cites: Optional[str] = None,
-                    slug: Optional[str] = None, acknowledge_neighbors: bool = False) -> str:
+                    acknowledge_neighbors: bool = False) -> str:
     """Record a decision you just made, with the alternatives you rejected and why,
     so future sessions and other agents inherit it instead of relitigating it.
 
@@ -413,10 +413,9 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str],
         resolves: Exact slug of an open question / decision this one resolves.
         contradicts: Exact slug of a decision this one is in tension with.
         derives_from: Exact slug of a decision this one is derived from.
-        cites: Exact slug of a decision this one references.
-        slug: Optional explicit slug; derived from the axiom if omitted.
-        acknowledge_neighbors: Set True to record past the near-duplicate review (below)
-            — i.e. you have looked at the flagged neighbour(s) and this decision is
+        cites: Exact slug of a decision this one cites.
+        slug: The short, descriptive handle for the decision (e.g. 'sqlite-wal-mode').
+        acknowledge_neighbors: Record past the near-duplicate review (the decision is genuinely independent). you have looked at the flagged neighbour(s) and this decision is
             genuinely independent. Leave False (default) on the first attempt.
 
     Returns:

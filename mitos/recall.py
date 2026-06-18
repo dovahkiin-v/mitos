@@ -16,7 +16,8 @@ from typing import Optional, Tuple
 # land >0.82, adjacent-but-unrelated neighbours <0.72, so 0.80 is the strong/weak
 # boundary. It gates a *hint* to the agent, never correctness — the agent always has the
 # raw scores and ``list_decisions`` for certainty. Tune here only.
-SURFACE_CONFIDENCE_THRESHOLD: float = 0.80
+SURFACE_STRONG_THRESHOLD: float = 0.75
+SURFACE_WEAK_THRESHOLD: float = 0.60
 
 
 def assess_surface_recall(
@@ -67,21 +68,26 @@ def assess_surface_recall(
         )
 
     # Semantic ran with a real, confident hit.
-    if result_count and (top_score is None or top_score >= SURFACE_CONFIDENCE_THRESHOLD):
+    if result_count and (top_score is None or top_score >= SURFACE_STRONG_THRESHOLD):
         return "strong", (
-            "Ranked top matches only (semantic, capped). For the COMPLETE set of "
-            f"decisions in a scope — a completeness pass, not just the most relevant "
-            f"few — call {list_hint}."
+            f"Ranked top matches. For the COMPLETE set of decisions in a scope — a "
+            f"completeness pass — call {list_hint}."
         )
 
-    # Semantic ran but every match is below the confidence bar.
-    if result_count:
+    # Semantic ran but it's in the Twilight Zone (loose neighbour / phrased differently)
+    if result_count and top_score >= SURFACE_WEAK_THRESHOLD:
         shown = f"{top_score:.2f}" if top_score is not None else "?"
         return "weak", (
-            f"No strong precedent: top semantic score {shown} is below "
-            f"{SURFACE_CONFIDENCE_THRESHOLD:.2f}, so the matches below are loose "
-            f"neighbours, not a settled decision on {scope_phrase}. Treat as "
-            f"no-precedent and decide (then record), or call {list_hint} to be certain."
+            f"Twilight zone: top score {shown} is close. They might be family neighbours or "
+            f"exact precedent phrased differently. Check carefully before deciding."
+        )
+
+    # Semantic ran but every match is garbage (off-axis)
+    if result_count:
+        shown = f"{top_score:.2f}" if top_score is not None else "?"
+        return "none", (
+            f"Very likely off-axis: top score {shown} is too low to be related. The scope is populated, "
+            f"but nothing matches your query. Treat as no-precedent and decide fresh."
         )
 
     # Semantic ran and returned nothing surfaceable.

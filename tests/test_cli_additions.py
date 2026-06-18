@@ -15,7 +15,7 @@ from mitos.cli import main
 
 @patch("mitos.cli.cmd_record")
 def test_record_decision_alias_routes(mock_record, monkeypatch):
-    monkeypatch.setattr(sys, "argv", ["mitos", "record_decision", "ax", "--rejected", "r"])
+    monkeypatch.setattr(sys, "argv", ["mitos", "record_decision", "ax", "--rejected", "r", "--slug", "s"])
     main()
     assert mock_record.called
 
@@ -65,14 +65,14 @@ def test_read_text_arg_from_stdin(monkeypatch):
 def test_record_reads_rejected_from_file(mock_record, tmp_path, monkeypatch):
     rf = tmp_path / "rej.txt"
     rf.write_text("rejected prose, apostrophe-safe: Camila's", encoding="utf-8")
-    monkeypatch.setattr(sys, "argv", ["mitos", "record", "ax", "--rejected-file", str(rf)])
+    monkeypatch.setattr(sys, "argv", ["mitos", "record", "ax", "--rejected-file", str(rf), "--slug", "s"])
     main()
     _, kwargs = mock_record.call_args
     assert kwargs["rejected"] == "rejected prose, apostrophe-safe: Camila's"
 
 
 def test_record_requires_rejected(monkeypatch):
-    monkeypatch.setattr(sys, "argv", ["mitos", "record", "ax"])  # neither --rejected nor --rejected-file
+    monkeypatch.setattr(sys, "argv", ["mitos", "record", "ax", "--slug", "s"])  # neither --rejected nor --rejected-file
     with pytest.raises(SystemExit) as exc:
         main()
     assert exc.value.code == 2

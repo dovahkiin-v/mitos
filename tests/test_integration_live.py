@@ -17,6 +17,7 @@ import os
 import subprocess
 import sys
 
+import shutil
 import pytest
 import requests
 
@@ -109,6 +110,7 @@ def test_record_then_surface_recall(live_workspace, capsys):
         rejected="Graceful-degrade rejected: a silent wrong answer is worse than a loud error",
         scope=["personas"],
         mechanisms=["prompts.py"],
+        slug="tutor-pt-fails-fast",
     )
     capsys.readouterr()  # flush the record output
 
@@ -135,6 +137,7 @@ def test_status_readiness_against_real_qdrant(live_workspace, capsys):
         axiom="SQLite WAL mode is the graph store",
         rejected="pgvector rejected: too heavy for a local-first tool",
         scope=["substrate"],
+        slug="sqlite-wal-mode"
     )
     capsys.readouterr()
 
@@ -168,8 +171,8 @@ def test_list_decisions_complete_set_vs_capped_surface(live_workspace, capsys):
         ("Payment state lives in an append-only ledger",
          "A mutable balance row rejected: loses the audit trail"),
     ]
-    for axiom, rejected in decisions:  # each is a real embed + upsert
-        cli.cmd_record(config, axiom=axiom, rejected=rejected, scope=["payments"])
+    for i, (axiom, rejected) in enumerate(decisions):  # each is a real embed + upsert
+        cli.cmd_record(config, axiom=axiom, rejected=rejected, scope=["payments"], slug=f"payment-slug-{i}")
     capsys.readouterr()
 
     # Semantic recall is ranked and capped at the top matches.
@@ -189,7 +192,7 @@ def test_list_decisions_complete_set_vs_capped_surface(live_workspace, capsys):
 def test_cli_subprocess_list_decisions_json(tmp_path):
     """Real binary, real argv: the `list_decisions` MCP-name alias + `--json` emit
     the complete structured set after real records (the exhaustive CLI path)."""
-    mitos_bin = os.path.join(os.path.dirname(sys.executable), "mitos")
+    mitos_bin = shutil.which("mitos") or "mitos"
     ws = tmp_path / "proj"
     ws.mkdir()
     env = {
@@ -215,9 +218,9 @@ def test_cli_subprocess_list_decisions_json(tmp_path):
             ("Secrets are fetched from the vault at runtime",
              "Committed .env rejected: leaks on a public mirror"),
         ]
-        for axiom, rejected in records:
+        for i, (axiom, rejected) in enumerate(records):
             rec = subprocess.run(
-                [mitos_bin, "record", axiom, "--rejected", rejected, "--scope", "infra"],
+                [mitos_bin, "record", axiom, "--rejected", rejected, "--scope", "infra", "--slug", f"slug-{i}"],
                 cwd=ws, env=env, capture_output=True, text=True,
             )
             assert rec.returncode == 0, rec.stderr
@@ -231,9 +234,9 @@ def test_cli_subprocess_list_decisions_json(tmp_path):
         assert data["total"] == 3
         assert data["state"] == "active"
         assert {d["slug"] for d in data["decisions"]} == {
-            "services-deploy-as-containers-on-kubernetes",
-            "config-is-injected-via-environment-never-baked-into-images",
-            "secrets-are-fetched-from-the-vault-at-runtime",
+            "slug-0",
+            "slug-1",
+            "slug-2"
         }
     finally:
         _drop_collection(collection)
@@ -274,6 +277,7 @@ def test_surface_brief_omits_rejected_paths_real_semantic(live_workspace, capsys
         axiom="The tutor fails fast on missing learner data",
         rejected="Graceful-degrade rejected: a silent wrong answer is worse than a loud error",
         scope=["personas"],
+        slug="tutor-fails-fast",
     )
     capsys.readouterr()
 
@@ -291,7 +295,7 @@ def test_surface_brief_omits_rejected_paths_real_semantic(live_workspace, capsys
 
 def test_cli_subprocess_relation_flag_links_decisions(tmp_path):
     """Real binary, real argv: --depends-on links two decisions, edge lands in graph."""
-    mitos_bin = os.path.join(os.path.dirname(sys.executable), "mitos")
+    mitos_bin = shutil.which("mitos") or "mitos"
     ws = tmp_path / "proj"
     ws.mkdir()
     env = {
@@ -340,7 +344,7 @@ def test_cli_subprocess_relation_flag_links_decisions(tmp_path):
 def test_cli_subprocess_record_stdin_then_surface(tmp_path):
     """Real binary, real argv, real stdin pipe, real services — the AX fixes
     (MCP-name alias + --rejected-file stdin + surface recall) end-to-end."""
-    mitos_bin = os.path.join(os.path.dirname(sys.executable), "mitos")
+    mitos_bin = shutil.which("mitos") or "mitos"
     ws = tmp_path / "proj"
     ws.mkdir()
     env = {
@@ -362,7 +366,7 @@ def test_cli_subprocess_record_stdin_then_surface(tmp_path):
         rec = subprocess.run(
             [mitos_bin, "record_decision",
              "Camila's tutor fails fast on missing data", "--rejected-file", "-",
-             "--scope", "personas"],
+             "--slug", "camilas-tutor", "--scope", "personas"],
             cwd=ws, env=env, text=True, capture_output=True,
             input="Rejected graceful-degrade: Camila's tutor must never show a silent wrong answer",
         )
