@@ -43,10 +43,14 @@ import pytest
 # surfaces, and/or ``amends``/``narrows`` edges (unrepresentable until V1b) — all
 # **8a**'s charter. The store-level modifier (T12) + C4 (T5) proofs those would
 # have given are delivered in ``tests/test_store.py`` instead.
+#
+# Phase 6b restored ``test_status_readiness`` (the ``cmd_status`` rebuild it gated
+# on landed; the prototype-shape ``ParsedEntry`` fixture was reworked to V1a),
+# leaving 12 modules — all 8a's.
 STORE_REBUILD_QUARANTINE = [
-    # Status surface — restored in Phase 6b (the cmd_status rebuild it gates on)
-    "test_status_readiness.py",
-    # Consumer-write / MCP / CLI / amends-narrows — restored in Phase 8a
+    # Consumer-write / MCP / CLI / amends-narrows — restored in Phase 8a.
+    # (Phase 6b restored test_status_readiness.py — the cmd_status rebuild it gated
+    # on landed, so it is no longer quarantined.)
     "test_list_decisions.py",
     "test_modifier_surfacing.py",
     "test_neighbor_review.py",

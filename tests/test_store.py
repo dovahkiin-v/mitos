@@ -833,13 +833,12 @@ def test_store_rebuild_quarantine_is_tracked() -> None:
     (``test_renderer`` + ``test_adversarial_rendering``) and re-bucketed the other
     6 of 5a's "restored in 5d" labels (WIRING_LEDGER entry-003, §16):
     ``test_status_readiness`` → 6b (gated on the ``cmd_status`` rebuild) and the 5
-    consumer-entangled modules → 8a. Final set = 13 (1 in 6b, 12 in 8a).
+    consumer-entangled modules → 8a. Phase 6b then restored ``test_status_readiness``
+    (the ``cmd_status`` rebuild landed), leaving 12 — all 8a's.
     """
     from conftest import STORE_REBUILD_QUARANTINE
 
     assert set(STORE_REBUILD_QUARANTINE) == {
-        # restored in Phase 6b (the cmd_status rebuild it gates on)
-        "test_status_readiness.py",
         # restored in Phase 8a (consumer preservation)
         "test_list_decisions.py",
         "test_modifier_surfacing.py",
