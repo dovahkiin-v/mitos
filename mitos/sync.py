@@ -789,27 +789,28 @@ class MitosSyncManager:
     # --- record_decision: the write half of the MCP server (Fork A) ---
 
     def _exact_slug_node(self, slug: str) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
-        """Resolves a slug to an EXACT-match node, discarding fuzzy prefix hits.
+        """Resolves a slug to an EXACT-match node.
 
-        ``resolve_slug`` falls back to a ``slug:%``/``slug-%`` prefix ``LIKE`` when
-        there is no exact hit (store.py:190-216); for write-time uniqueness we must
-        only treat a true slug match as a collision, never a prefix neighbour.
+        ``resolve_slug`` is now single-tier casefold-exact (no fuzzy prefix tier), so
+        every id it returns already shares the casefolded slug; the per-node re-filter
+        below is a defensive guard on that contract (and folds with ``str.casefold()``,
+        never ``str.lower()`` — the two diverge on ``ß``/Greek, MI-9).
 
         Returns:
             A (node_id, node) tuple for the exact-slug node, or (None, None).
         """
         for node_id in self.store.resolve_slug(slug):
             node = self.store.get_node(node_id)
-            if node and node.get("slug", "").lower() == slug.lower():
+            if node and node.get("slug", "").casefold() == slug.casefold():
                 return node_id, node
         return None, None
 
     def _validate_relation_target(self, relation: str, target: str) -> Optional[Dict[str, str]]:
         """Validates a typed relation's target is a unique, EXACT-match decision.
 
-        Mirrors the supersedes check (``resolve_slug`` is fuzzy, so we require a true
-        slug hit), keeping every recorded edge pointed at a real, unambiguous node.
-        Runs in Phase A — a failure returns a structured error and writes nothing.
+        Mirrors the supersedes check (``resolve_slug`` is casefold-exact; the re-filter
+        defends its contract), keeping every recorded edge pointed at a real, unambiguous
+        node. Runs in Phase A — a failure returns a structured error and writes nothing.
 
         Args:
             relation: The relation kwarg name (for the error message), e.g. "amends".
@@ -824,7 +825,7 @@ class MitosSyncManager:
         if len(ids) > 1:
             return _record_error("relation_target_ambiguous", relation=relation, target=target)
         node = self.store.get_node(ids[0])
-        if not node or node.get("slug", "").lower() != target.lower():
+        if not node or node.get("slug", "").casefold() != target.casefold():
             return _record_error("relation_target_not_found", relation=relation, target=target)
         return None
 
@@ -879,7 +880,7 @@ class MitosSyncManager:
 
         Args:
             entry: The parsed entry about to be committed.
-            declared_targets: Lower-cased slugs the entry already links to (its declared
+            declared_targets: Casefolded slugs the entry already links to (its declared
                 supersedes/amends/… targets), excluded so a linked neighbour is not re-flagged.
 
         Returns:
@@ -902,7 +903,7 @@ class MitosSyncManager:
             score = n.get("score")
             if score is None or score < _NEIGHBOR_REVIEW_THRESHOLD:
                 continue
-            if n["slug"].lower() in declared_targets:
+            if n["slug"].casefold() in declared_targets:
                 continue
             flagged.append({
                 "slug": n["slug"],
@@ -1077,7 +1078,7 @@ class MitosSyncManager:
             return _record_error("parse_failed")
         entry = parsed[0]
 
-        # Pre-validate supersedes with an EXACT match (resolve_slug is fuzzy).
+        # Pre-validate supersedes with an EXACT match.
         if supersedes:
             ids = self.store.resolve_slug(supersedes)
             if not ids:
@@ -1085,7 +1086,7 @@ class MitosSyncManager:
             if len(ids) > 1:
                 return _record_error("supersedes_ambiguous", supersedes=supersedes)
             target = self.store.get_node(ids[0])
-            if not target or target.get("slug", "").lower() != supersedes.lower():
+            if not target or target.get("slug", "").casefold() != supersedes.casefold():
                 return _record_error("supersedes_not_found", supersedes=supersedes)
             entry.supersedes = supersedes
 
@@ -1099,7 +1100,7 @@ class MitosSyncManager:
             if len(ids) > 1:
                 return _record_error("corrects_ambiguous", corrects=corrects)
             target = self.store.get_node(ids[0])
-            if not target or target.get("slug", "").lower() != corrects.lower():
+            if not target or target.get("slug", "").casefold() != corrects.casefold():
                 return _record_error("corrects_not_found", corrects=corrects)
             entry.corrects = corrects
 
@@ -1148,7 +1149,7 @@ class MitosSyncManager:
         # (no embeddings → no pause) and bypassable with acknowledge_neighbors=True.
         if not acknowledge_neighbors:
             declared_targets = {
-                t.lower() for t in (
+                t.casefold() for t in (
                     ([supersedes] if supersedes else [])
                     + ([corrects] if corrects else [])
                     + list(extra_relations.values())

@@ -63,6 +63,15 @@ def _edge(store: GraphStore, from_slug: str, to_slug: str, etype: str) -> bool:
               for e in store.get_edges())
 
 
+def _mk_entry(axiom: str, slug: str):
+    """Builds a minimal committable decision ParsedEntry for same-slug-lineage setup."""
+    from mitos.parser import ParsedEntry
+    e = ParsedEntry("decision", slug, 0, 0)
+    e.axiom = axiom
+    e.rejected_paths = "setup rejection"
+    return e
+
+
 # --------------------------------------------------------------------------- #
 # ② Slug ergonomics — word-boundary truncation
 # --------------------------------------------------------------------------- #
@@ -206,10 +215,19 @@ def test_relation_target_fuzzy_prefix_rejected(ws):
 
 
 def test_relation_target_ambiguous_buffer_unchanged(ws):
-    """A relation target matching multiple nodes → ambiguous error, no half-commit."""
+    """A relation target matching >1 same-casefold-slug lineage node → ambiguous, no half-commit.
+
+    The V1a ambiguity trigger is a same-slug supersession lineage (MI-13), not the
+    retired fuzzy-prefix tier: node-2 supersedes node-1 while both keep slug 'amb', so
+    the all-nodes resolve_slug('amb') returns 2 ids and _validate_relation_target reports
+    relation_target_ambiguous. (Mirrors test_record_decision.py::test_supersedes_ambiguous
+    — the relation-target twin of the same fuzzy-tier removal.)
+    """
     config, m = ws
-    m.record_decision_entry("Axiom one.", "rej", [], slug="amb-one")
-    m.record_decision_entry("Axiom two.", "rej", [], slug="amb-two")
+    m.store.commit_parsed_entry(_mk_entry("axiom one", "amb"))     # node-1, slug 'amb'
+    e2 = _mk_entry("axiom two", "amb")
+    e2.supersedes = "amb"                                          # resolves to node-1 (active non-self)
+    m.store.commit_parsed_entry(e2)                               # node-2 supersedes node-1; both slug 'amb'
     before = _read(config)
     res = m.record_decision_entry("Linker.", "rej", [], depends_on="amb")
     assert res["code"] == "relation_target_ambiguous"
