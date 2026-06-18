@@ -147,6 +147,24 @@ def _is_active(store: GraphStore, node_id: str) -> bool:
         conn.close()
 
 
+def _pending(store: GraphStore):
+    """Reads all ``pending_embeddings`` (Outbox) rows as dicts via raw SQL.
+
+    Read methods stay quarantined until 5d, so the 5c Outbox assertions go through
+    raw SQL on the store's own connection (the ``_edges``/``_scopes`` pattern).
+    """
+    conn = store._get_connection()
+    try:
+        return [
+            dict(r)
+            for r in conn.execute(
+                "SELECT * FROM pending_embeddings ORDER BY node_id"
+            )
+        ]
+    finally:
+        conn.close()
+
+
 # ===========================================================================
 # Phase 5a — per-entry commit core (node identity, commentary, scope, transcript)
 # ===========================================================================
@@ -384,14 +402,200 @@ def test_5b_supersedes_commits_one_kill_edge(temp_store: GraphStore) -> None:
     assert _is_active(temp_store, new.node_id) is True
 
 
-def test_5a_enqueues_no_outbox_yet(temp_store: GraphStore) -> None:
-    """FORCING FUNCTION — 5a enqueues NOTHING into pending_embeddings.
+def test_5c_commit_enqueues_one_outbox_row(temp_store: GraphStore) -> None:
+    """FORCING-FUNCTION INVERSION — Phase 5c wires the Outbox enqueue.
 
-    The ``_enqueue_outbox`` seam is a no-op in 5a. This flips RED when Phase 5c
-    wires the Outbox enqueue.
+    Through 5a the ``_enqueue_outbox`` seam was a no-op and a commit enqueued ZERO
+    ``pending_embeddings`` rows (``test_5a_enqueues_no_outbox_yet``). 5c fills the
+    seam: every commit now UPSERTs exactly one row keyed on the committing node's
+    id (``queued_at`` stamped, ``retry_count`` 0). This is the conscious inversion
+    of the 5a forcing function.
     """
-    temp_store.commit_parsed_entry(_decision(slug="d", axiom="A."))
-    assert _count(temp_store, "pending_embeddings") == 0
+    delta = temp_store.commit_parsed_entry(_decision(slug="d", axiom="A."))
+    rows = _pending(temp_store)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["node_id"] == delta.node_id
+    assert row["queued_at"]  # application-supplied ISO stamp (MI-10), not NULL
+    assert row["retry_count"] == 0
+    # The Outbox stamp shares the commit's single ``now`` (MI-10): on a new commit
+    # ``queued_at`` equals the node's ``created_at``.
+    assert row["queued_at"] == _node_row(temp_store, delta.node_id)["created_at"]
+
+
+def test_5c_open_question_enqueues_identically(temp_store: GraphStore) -> None:
+    """An open_question commit enqueues one Outbox row too — the enqueue is kind-agnostic."""
+    delta = temp_store.commit_parsed_entry(_open_question(slug="oq", topic="T"))
+    rows = _pending(temp_store)
+    assert len(rows) == 1
+    assert rows[0]["node_id"] == delta.node_id
+    assert rows[0]["retry_count"] == 0
+
+
+def test_5c_enqueue_unconditional_on_commentary_only_recommit(
+    temp_store: GraphStore,
+) -> None:
+    """A commentary-only re-commit (slug rename → same canonical core → same id) re-enqueues
+    and RESETS the row's drain state — slug is not identity (M2)."""
+    d1 = temp_store.commit_parsed_entry(_decision(slug="d-one", axiom="A."))
+    # Advance the drain state via raw SQL so the re-stamp's reset is observable.
+    conn = temp_store._get_connection()
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE pending_embeddings SET queued_at = ?, retry_count = ? "
+                "WHERE node_id = ?",
+                ("2000-01-01T00:00:00+00:00", 5, d1.node_id),
+            )
+    finally:
+        conn.close()
+
+    d2 = temp_store.commit_parsed_entry(_decision(slug="d-two", axiom="A."))
+    assert d2.node_id == d1.node_id  # slug is not part of identity (M2)
+    assert d2.commentary_fields_changed is True  # a rename is a commentary change
+    rows = _pending(temp_store)
+    assert len(rows) == 1  # still exactly one row (UPSERT on the PK, not a dup)
+    assert rows[0]["retry_count"] == 0  # drain state reset
+    assert rows[0]["queued_at"] != "2000-01-01T00:00:00+00:00"  # re-stamped
+
+
+def test_5c_byte_identical_recommit_resets_drain_state_node_noop(
+    temp_store: GraphStore,
+) -> None:
+    """The load-bearing P5 self-healing case: a byte-identical re-commit re-stamps the
+    Outbox row (resets a dead-lettered ``retry_count``) EVEN THOUGH the node row is a
+    true no-op (MI-3).
+
+    MI-3's "true no-op" governs the NODE (no tick, no new node); MI-12's reset clause
+    governs the OUTBOX (a deliberate retry must revive a node V3b dead-lettered on a
+    transient outage). The two invariants coexist on purpose — this is the proof.
+    """
+    e = _decision(slug="d", axiom="A.", mechanisms=["m"], scope=["s"], transcript="T")
+    d1 = temp_store.commit_parsed_entry(e)
+    node_before = _node_row(temp_store, d1.node_id)
+    # Simulate a V3b dead-letter: a transient provider outage drove retry_count up.
+    conn = temp_store._get_connection()
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE pending_embeddings SET retry_count = 3 WHERE node_id = ?",
+                (d1.node_id,),
+            )
+    finally:
+        conn.close()
+
+    # Re-commit BYTE-IDENTICALLY.
+    e2 = _decision(slug="d", axiom="A.", mechanisms=["m"], scope=["s"], transcript="T")
+    d2 = temp_store.commit_parsed_entry(e2)
+
+    # The NODE is a true no-op (MI-3): same id, no commentary change, one row, no tick.
+    assert d2.node_id == d1.node_id
+    assert d2.commentary_fields_changed is False
+    assert _count(temp_store, "nodes") == 1
+    assert _node_row(temp_store, d1.node_id)["updated_at"] == node_before["updated_at"]
+
+    # The OUTBOX row IS revived (MI-12): retry_count reset to 0 (a bare no-op would
+    # have left it at 3) — the dead-letter gets a fresh drain attempt.
+    rows = _pending(temp_store)
+    assert len(rows) == 1
+    assert rows[0]["retry_count"] == 0
+
+
+def test_5c_idempotent_upsert_keeps_single_row(temp_store: GraphStore) -> None:
+    """Two commits of the same node keep EXACTLY one Outbox row (UPSERT on the PK).
+
+    The F2 idempotent-enqueue substrate assertion the index routes to 5c.
+    """
+    d1 = temp_store.commit_parsed_entry(_decision(slug="d", axiom="A."))
+    d2 = temp_store.commit_parsed_entry(_decision(slug="d", axiom="A."))
+    assert d2.node_id == d1.node_id
+    rows = _pending(temp_store)
+    assert len(rows) == 1
+    assert rows[0]["node_id"] == d1.node_id
+
+
+def test_5c_rollback_enqueues_nothing(temp_store: GraphStore) -> None:
+    """A store-stage failure (missing_target) rolls back the speculative Outbox row too.
+
+    The enqueue at the seam writes the row BEFORE the slug-collision gate; a
+    ``CommitError`` raised later rolls the whole transaction back, including the
+    speculative ``pending_embeddings`` row (V1-D10 / MI-12 — commits with the node
+    or not at all).
+    """
+    e = _decision(slug="new", axiom="New.")
+    e.supersedes = "nonexistent"  # missing_target — fails store-stage, rolls back
+    with pytest.raises(CommitError):
+        temp_store.commit_parsed_entry(e)
+    assert _count(temp_store, "pending_embeddings") == 0  # speculative row rolled back
+    assert _count(temp_store, "nodes") == 0
+
+
+# --- First-order CommitDelta cascade (5c finalizes cascade_affected_scopes) -----
+
+
+def test_5c_cascade_committing_node_only(temp_store: GraphStore) -> None:
+    """A decision in scopes {x, y} with no edges → cascade is its own scopes (5a behavior preserved)."""
+    delta = temp_store.commit_parsed_entry(
+        _decision(slug="d", axiom="A.", scope=["x", "y"])
+    )
+    assert delta.cascade_affected_scopes == ["x", "y"]
+
+
+def test_5c_cascade_includes_kill_edge_target_scope(temp_store: GraphStore) -> None:
+    """B supersedes A: B's delta names BOTH its own scope and A's now-deactivated scope (C3).
+
+    When B supersedes A, A leaves the active view, so every scope A was in needs a
+    re-render — the first-order render-targeting signal V3b/V4 consume.
+    """
+    temp_store.commit_parsed_entry(_decision(slug="a", axiom="Old.", scope=["x"]))
+    e = _decision(slug="b", axiom="New.", scope=["y"])
+    e.supersedes = "a"
+    delta = temp_store.commit_parsed_entry(e)
+    assert delta.cascade_affected_scopes == ["x", "y"]
+
+
+def test_5c_cascade_on_edge_only_change(temp_store: GraphStore) -> None:
+    """Re-committing a node to ADD a Supersedes: line (no commentary/scope change) surfaces
+    the target's scope via the ``edges_changed`` gate, even though the node's own footprint
+    is unchanged (so the node's own scope is NOT re-added — only A's view membership flipped)."""
+    temp_store.commit_parsed_entry(_decision(slug="a", axiom="Old.", scope=["x"]))
+    b1 = temp_store.commit_parsed_entry(_decision(slug="b", axiom="New.", scope=["y"]))
+    # Re-commit B identically EXCEPT for the added Supersedes: line.
+    e = _decision(slug="b", axiom="New.", scope=["y"])
+    e.supersedes = "a"
+    delta = temp_store.commit_parsed_entry(e)
+    assert delta.node_id == b1.node_id
+    assert delta.commentary_fields_changed is False  # footprint unchanged; only edges
+    assert delta.cascade_affected_scopes == ["x"]  # the target's scope, not B's own
+
+
+def test_5c_cascade_empty_on_byte_identical_recommit(temp_store: GraphStore) -> None:
+    """A byte-identical re-commit produces an empty cascade — even though the Outbox is re-stamped."""
+    temp_store.commit_parsed_entry(_decision(slug="d", axiom="A.", scope=["x"]))
+    delta = temp_store.commit_parsed_entry(_decision(slug="d", axiom="A.", scope=["x"]))
+    assert delta.cascade_affected_scopes == []
+    assert _count(temp_store, "pending_embeddings") == 1  # but the Outbox IS re-enqueued
+
+
+def test_5c_commit_delta_struct_shape_preserved(temp_store: GraphStore) -> None:
+    """The CommitDelta still carries all five fields with the correct types (V1b extends, never rebuilds)."""
+    delta = temp_store.commit_parsed_entry(
+        _decision(slug="d", axiom="A.", scope=["x"])
+    )
+    assert isinstance(delta.node_id, str)
+    assert isinstance(delta.node_scope, list)
+    assert isinstance(delta.self_old_scope, list)
+    assert isinstance(delta.commentary_fields_changed, bool)
+    assert isinstance(delta.cascade_affected_scopes, list)
+    # to_dict() carries exactly the five fields, JSON-safe (no tuples).
+    d = delta.to_dict()
+    assert set(d.keys()) == {
+        "node_id",
+        "node_scope",
+        "self_old_scope",
+        "commentary_fields_changed",
+        "cascade_affected_scopes",
+    }
 
 
 def test_atomic_commit_rolls_back_on_midcommit_failure(
