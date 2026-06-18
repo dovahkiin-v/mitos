@@ -7,6 +7,15 @@ The slug is **not** an input — two captures of the same canonical core converg
 to one id regardless of slug, and a rename is an in-place commentary edit that
 leaves the id unchanged (Q5 / ``slug-removed-from-canonical-core-hash``).
 
+This module also exports :func:`embedding_text` — the **second** projection of
+the same immutable canonical core. Where :func:`compute_node_id` renders the
+core to the SHA-256 that *names* the node, :func:`embedding_text` renders it to
+the per-kind string V2's embedding pipeline embeds against — the *meaning* a
+semantic search reads. Both are pure functions of the canonical core through the
+same normalization rules, so the node's name and its meaning can never drift
+apart (M8): re-deriving the embedding string for an unchanged node yields the
+identical bytes, and V2's content-hash cache returns the cached vector for free.
+
 This module is a **pure stdlib Tier-1 leaf**: it imports only ``hashlib``,
 ``json``, ``re``, ``string`` and ``unicodedata``, and nothing from ``mitos/``.
 The eventual edges are inbound only — Phase 5a points ``commit_parsed_entry``
@@ -50,7 +59,7 @@ import json
 import re
 import string
 import unicodedata
-from typing import Dict, List, Optional
+from typing import Dict, List, Mapping, Optional
 
 # Maximal run of ASCII whitespace OR ASCII punctuation -> a single hyphen. The
 # ``re.ASCII`` flag restricts ``\s`` to ASCII whitespace ([ \t\n\r\f\v]) so the
@@ -238,3 +247,68 @@ def compute_node_id(
 
     serialized = canonical_core_json_form(obj)
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def embedding_text(node: Mapping[str, object]) -> str:
+    """Builds the single embedding-input string for a node (§5.1 C2, M8).
+
+    The companion to :func:`compute_node_id`: the *second* projection of the
+    immutable canonical core. The hash names the node; this string is what V2's
+    embedding pipeline embeds and caches against. Both run the same core through
+    the same 3a normalization rules (:func:`canonical_core_string_norm`,
+    :func:`questions_raised_list_norm`), so the embedding string can never drift
+    from the hashed identity — re-deriving it for an unchanged node yields the
+    identical bytes and V2's content-hash cache returns the cached vector for
+    free (P15).
+
+    Per-kind shape — the pinned cross-vision cache-key byte form:
+
+    * **decision** → the normalized ``axiom`` and **nothing else**.
+      ``mechanism_refs`` is deliberately excluded, and the reason is
+      **recall-cleanliness, NOT cache-stability**: mechanism refs *are*
+      immutable canonical core (so they would not churn the cache), but they are
+      short casefolded identifier tokens whose folded form dilutes a
+      natural-language recall vector. Do **not** "fix" this by appending them
+      [ADR ``embedding-text-excludes-mechanism-refs``].
+    * **open_question** → ``topic`` + a blank line + the ``questions_raised``
+      joined by single newlines, **in authored order** (order-preserving dedup,
+      **never sorted**). Authored order is identity-significant (§11/§12), and
+      the list joined here is byte-identical to the one :func:`compute_node_id`
+      hashes — both call :func:`questions_raised_list_norm`
+      [ADR ``questions-raised-order-significant-prose-not-sorted-set``].
+
+    ``node`` is a native-typed mapping (in practice a ``dict`` from a store read
+    method) carrying the canonical-core fields under reader-facing keys in native
+    Python types: ``axiom``/``topic`` as ``str``, ``questions_raised`` as an
+    already-JSON-decoded ``list[str]``. JSON decoding of the stored
+    ``questions_raised_json`` column is the store read layer's job, not this pure
+    leaf's — this function never sees a ``ParsedEntry`` or a ``*_json`` string.
+
+    A degenerate open_question with no surviving questions renders as
+    ``topic + "\\n\\n"`` (a trailing blank line) — deterministic and total, with
+    no special-case branch (4b validation makes it unreachable in practice).
+
+    Args:
+        node: The canonical-core mapping. ``kind`` is ``"decision"`` or
+            ``"open_question"``; a decision carries ``axiom`` (``mechanism_refs``
+            may be present but is ignored); an open_question carries ``topic`` and
+            ``questions_raised``.
+
+    Returns:
+        The embedding-input string for the node.
+
+    Raises:
+        ValueError: If ``node["kind"]`` is neither ``"decision"`` nor
+            ``"open_question"`` (mirrors :func:`compute_node_id`'s guard).
+    """
+    kind = node.get("kind")
+    if kind == "decision":
+        return canonical_core_string_norm(node.get("axiom") or "")
+    if kind == "open_question":
+        topic = canonical_core_string_norm(node.get("topic") or "")
+        questions = questions_raised_list_norm(node.get("questions_raised") or [])
+        return topic + "\n\n" + "\n".join(questions)
+    raise ValueError(
+        f"embedding_text: unknown kind {kind!r}; "
+        "expected 'decision' or 'open_question'"
+    )

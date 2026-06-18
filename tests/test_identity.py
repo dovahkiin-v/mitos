@@ -36,6 +36,7 @@ from mitos.identity import (
     canonical_core_string_norm,
     compute_node_id,
     dedup_preserve_order,
+    embedding_text,
     mechanism_canonical_norm,
     mechanism_refs_list_norm,
     questions_raised_list_norm,
@@ -427,3 +428,146 @@ def test_ucd_pin_guard() -> None:
         "deliberate one-time regeneration recorded as an amendment (vision "
         "UCD-bump policy), never a silent edit of the frozen constants."
     )
+
+
+# ===========================================================================
+# embedding_text — the SECOND projection of the canonical core (§5.1 C2, M8).
+#
+# Unlike the §11 hash goldens (frozen SHA digests, generated once), these
+# goldens are human-authored literal strings: the output is plain text, the
+# V2 embedding-cache key, directly assertable. decision = normalized axiom
+# only; open_question = topic + "\n\n" + "\n".join(authored-order questions).
+# ===========================================================================
+
+OQ_TOPIC = "SQLite vs Postgres for the store"
+OQ_Q1 = "Which scales for our write pattern?"
+OQ_Q2 = "What is the ops cost?"
+
+EMBEDDING_TEXT_GOLDENS = [
+    # decision: axiom only, NFC + end-strip, case preserved, mechanisms absent.
+    ("E_dec_basic",
+     {"kind": "decision", "axiom": "  Use SQLite for the graph store  ",
+      "mechanism_refs": ["sqlite", "wal"]},
+     "Use SQLite for the graph store"),
+    # decision: case is preserved (no casefold) — distinct from the upper form.
+    ("E_dec_lowercase",
+     {"kind": "decision", "axiom": "use sqlite for the graph store"},
+     "use sqlite for the graph store"),
+    # open_question: topic + blank line + authored-order questions, single "\n" between.
+    ("E_oq_basic",
+     {"kind": "open_question", "topic": OQ_TOPIC,
+      "questions_raised": [OQ_Q1, OQ_Q2]},
+     "SQLite vs Postgres for the store\n\n"
+     "Which scales for our write pattern?\nWhat is the ops cost?"),
+    # open_question: swapped questions → DIFFERENT bytes (no-sort, order axis).
+    ("E_oq_swapped",
+     {"kind": "open_question", "topic": OQ_TOPIC,
+      "questions_raised": [OQ_Q2, OQ_Q1]},
+     "SQLite vs Postgres for the store\n\n"
+     "What is the ops cost?\nWhich scales for our write pattern?"),
+    # open_question: order-preserving dedup — the repeat drops, first position kept.
+    ("E_oq_dedup",
+     {"kind": "open_question", "topic": OQ_TOPIC,
+      "questions_raised": [OQ_Q2, OQ_Q1, OQ_Q2]},
+     "SQLite vs Postgres for the store\n\n"
+     "What is the ops cost?\nWhich scales for our write pattern?"),
+    # open_question: empty / whitespace-only questions filtered before joining.
+    ("E_oq_empty_filter",
+     {"kind": "open_question", "topic": OQ_TOPIC,
+      "questions_raised": [OQ_Q1, "", "   "]},
+     "SQLite vs Postgres for the store\n\nWhich scales for our write pattern?"),
+    # degenerate open_question: no surviving questions → topic + "\n\n" (trailing
+    # blank line). Total + deterministic, no special-case branch.
+    ("E_oq_no_questions",
+     {"kind": "open_question", "topic": "When should we shard?",
+      "questions_raised": []},
+     "When should we shard?\n\n"),
+]
+
+
+@pytest.mark.parametrize("name, node, expected", EMBEDDING_TEXT_GOLDENS,
+                         ids=[r[0] for r in EMBEDDING_TEXT_GOLDENS])
+def test_embedding_text_golden(name: str, node: dict, expected: str) -> None:
+    """Each node renders to its pinned per-kind embedding string (V2 cache-key bytes)."""
+    assert embedding_text(node) == expected
+
+
+# --- canaries: the structural locks (survive any literal-string churn) ---
+
+def test_embedding_text_decision_excludes_mechanism_refs() -> None:
+    """A decision embeds the axiom ONLY — a distinctive mechanism token never leaks.
+
+    Exclusion reason is recall-cleanliness, not cache-stability (mechanism_refs IS
+    immutable canonical core — see the embedding_text docstring / the ADR).
+    """
+    out = embedding_text(
+        {"kind": "decision", "axiom": "Use SQLite for the graph store",
+         "mechanism_refs": ["zzdistinctivemechtoken", "wal"]}
+    )
+    assert out == "Use SQLite for the graph store"
+    assert "zzdistinctivemechtoken" not in out
+
+
+def test_embedding_text_oq_order_significant() -> None:
+    """Reordering an OQ's questions changes the bytes (no-sort; order axis, M8)."""
+    base = {"kind": "open_question", "topic": "T", "questions_raised": ["A?", "B?"]}
+    swapped = {"kind": "open_question", "topic": "T", "questions_raised": ["B?", "A?"]}
+    assert embedding_text(base) != embedding_text(swapped)
+
+
+def test_embedding_text_oq_order_preserving_dedup() -> None:
+    """A duplicated question is kept once, at its first occurrence, never sorted."""
+    node = {"kind": "open_question", "topic": "T",
+            "questions_raised": ["B?", "A?", "B?"]}
+    assert embedding_text(node) == "T\n\nB?\nA?"
+
+
+def test_embedding_text_nfc_convergence() -> None:
+    """Composed vs decomposed Lithuanian "ė" in BOTH topic and a question → identical
+    output. Inherits NFC via canonical_core_string_norm; asserted as a ``==`` relation
+    (UCD-bump-durable), never against a frozen literal."""
+    assert OQ_TOPIC_NFC != OQ_TOPIC_NFD  # genuinely different code points
+    composed = {"kind": "open_question", "topic": OQ_TOPIC_NFC,
+                "questions_raised": [OQ_Q_NFC]}
+    decomposed = {"kind": "open_question", "topic": OQ_TOPIC_NFD,
+                  "questions_raised": [OQ_Q_NFD]}
+    assert embedding_text(composed) == embedding_text(decomposed)
+
+
+# --- M8 cross-check (load-bearing): the embedding string is built from the SAME
+#     normalized canonical core compute_node_id hashes — they can never diverge.
+
+def test_embedding_text_m8_crosscheck_decision() -> None:
+    """Decision embedding string == the normalized axiom the hash consumes (M8)."""
+    node = {"kind": "decision", "axiom": "  Use SQLite for the graph store  ",
+            "mechanism_refs": ["sqlite", "wal"]}
+    assert embedding_text(node) == canonical_core_string_norm(node["axiom"])
+
+
+def test_embedding_text_m8_crosscheck_open_question() -> None:
+    """OQ embedding text is topic + "\\n\\n" + the EXACT question list the hash sees.
+
+    Both embedding_text and compute_node_id pass questions_raised through
+    questions_raised_list_norm, so the embedded question block and the hashed one
+    are byte-identical — the M8 thread V2's cache depends on.
+    """
+    node = {"kind": "open_question", "topic": OQ_TOPIC,
+            "questions_raised": [OQ_Q1, OQ_Q2, OQ_Q1]}  # trailing dup → dropped
+    expected_questions = questions_raised_list_norm(node["questions_raised"])
+    out = embedding_text(node)
+    assert out.endswith("\n".join(expected_questions))
+    assert out == (
+        canonical_core_string_norm(node["topic"])
+        + "\n\n"
+        + "\n".join(expected_questions)
+    )
+
+
+def test_embedding_text_rejects_unknown_kind() -> None:
+    """A third kind — or a missing kind — is a ValueError (mirrors compute_node_id)."""
+    with pytest.raises(ValueError, match="unknown kind"):
+        embedding_text({"kind": "mechanism", "axiom": "x"})
+    with pytest.raises(ValueError):
+        embedding_text({"kind": "", "topic": "x"})
+    with pytest.raises(ValueError):
+        embedding_text({"axiom": "x"})  # no kind key at all
