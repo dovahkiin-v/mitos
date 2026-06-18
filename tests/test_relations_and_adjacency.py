@@ -53,9 +53,13 @@ def _read(config: MitosConfig) -> str:
 
 
 def _edge(store: GraphStore, from_slug: str, to_slug: str, etype: str) -> bool:
-    fid = store.get_node_by_slug(from_slug)["id"]
-    tid = store.get_node_by_slug(to_slug)["id"]
-    return any(e["from_id"] == fid and e["to_id"] == tid and e["type"] == etype
+    # V1a edge columns: source_id / target_id / edge_type (was from_id / to_id / type).
+    # A killed (corrected/superseded) target leaves the active view, so resolve ids
+    # via get_all_nodes rather than the active-only get_node_by_slug.
+    by_slug = {n["slug"]: n["id"] for n in store.get_all_nodes()}
+    fid = by_slug.get(from_slug)
+    tid = by_slug.get(to_slug)
+    return any(e["source_id"] == fid and e["target_id"] == tid and e["edge_type"] == etype
               for e in store.get_edges())
 
 
@@ -107,28 +111,59 @@ def test_record_long_axiom_yields_readable_handle(ws):
 
 # --------------------------------------------------------------------------- #
 # ③a Typed relations through the write path
+#
+# V1a commits only the two kill-edges (supersedes / corrects). The other seven
+# relationship fields are parsed + serialized + Phase-A target-validated, but
+# WARN-DEFERRED to V1b (store._DEFERRED_EDGE_FIELDS) — no edge is committed. So
+# the V1a contract these pin is: the field round-trips into the buffer (authored
+# for V1b to light up) and the record succeeds, while get_edges() carries no such
+# edge yet. (8a pared these from the prototype "creates an edge" assertions —
+# K5/G6; the genuine V1b edge-commit is deferred, not silently coerced.)
 # --------------------------------------------------------------------------- #
 
-@pytest.mark.parametrize("kwarg,etype", [
-    ("amends", "amends"),
-    ("narrows", "narrows"),
-    ("depends_on", "depends_on"),
-    ("resolves", "resolves"),
-    ("contradicts", "contradicts"),
-    ("derives_from", "derives_from"),
-    ("cites", "cites"),
-])
-def test_each_extra_relation_creates_edge(ws, kwarg, etype):
-    """Every newly-exposed relation serializes + commits a correctly-typed edge."""
+_EXTRA_RELATION_LABELS = {
+    "amends": "Amends", "narrows": "Narrows", "depends_on": "Depends-On",
+    "resolves": "Resolves", "contradicts": "Contradicts",
+    "derives_from": "Derives-From", "cites": "Cites",
+}
+
+
+def test_corrects_creates_kill_edge(ws):
+    """The second V1a kill-edge: record --corrects retires the target (8a wiring, K4)."""
+    config, m = ws
+    rt = m.record_decision_entry("Target axiom.", "rej", [], slug="target")
+    res = m.record_decision_entry("Corrector axiom.", "rej", [], slug="corrector",
+                                  corrects="target")
+    assert res["status"] == "created", res
+    store = GraphStore(config.db_path)
+    assert _edge(store, "corrector", "target", "corrects")
+    # The corrected target leaves the active view (kill-edge) — computed 'corrected'.
+    assert store.get_node_state(rt["id"]) == "corrected"
+    assert store.get_node_by_slug("target") is None  # gone from the active view
+
+
+@pytest.mark.parametrize("kwarg,label", sorted(_EXTRA_RELATION_LABELS.items()))
+def test_each_extra_relation_serializes_but_warn_defers_edge(ws, kwarg, label):
+    """Each non-kill relation round-trips into the buffer but commits NO edge (V1b).
+
+    V1a parses + serializes + Phase-A-validates these seven, then warn-defers the
+    edge to V1b. The prototype asserted the edge committed; 8a pares that to the
+    V1a truth — the field is authored (present for the V1b reconciler) and the
+    record succeeds, while get_edges() stays empty of it.
+    """
     config, m = ws
     m.record_decision_entry("Target axiom.", "rej", [], slug="target")
-    res = m.record_decision_entry("Linker axiom.", "rej", [], slug="linker", **{kwarg: "target"})
+    res = m.record_decision_entry("Linker axiom.", "rej", [], slug="linker",
+                                  **{kwarg: "target"})
     assert res["status"] == "created", res
-    assert _edge(GraphStore(config.db_path), "linker", "target", etype)
+    # The relation is serialized into decisions.md (authored for V1b).
+    assert f"**{label}:** target" in _read(config)
+    # ...but no edge is committed in V1a (warn-deferred).
+    assert not _edge(GraphStore(config.db_path), "linker", "target", kwarg)
 
 
 def test_multiple_relations_in_one_entry(ws):
-    """A single decision can declare several typed edges at once."""
+    """Several non-kill relations co-author into one buffer entry (edges defer to V1b)."""
     config, m = ws
     for slug in ("dep", "cited", "amended"):
         m.record_decision_entry(f"Axiom {slug}.", "rej", [], slug=slug)
@@ -137,10 +172,15 @@ def test_multiple_relations_in_one_entry(ws):
         depends_on="dep", cites="cited", amends="amended",
     )
     assert res["status"] == "created"
+    buf = _read(config)
+    assert "**Depends-On:** dep" in buf
+    assert "**Cites:** cited" in buf
+    assert "**Amends:** amended" in buf
+    # All three are warn-deferred — no edges committed in V1a.
     store = GraphStore(config.db_path)
-    assert _edge(store, "hub", "dep", "depends_on")
-    assert _edge(store, "hub", "cited", "cites")
-    assert _edge(store, "hub", "amended", "amends")
+    assert not _edge(store, "hub", "dep", "depends_on")
+    assert not _edge(store, "hub", "cited", "cites")
+    assert not _edge(store, "hub", "amended", "amends")
 
 
 def test_relation_target_not_found_buffer_unchanged(ws):
@@ -178,17 +218,13 @@ def test_relation_target_ambiguous_buffer_unchanged(ws):
 
 
 def test_relation_does_not_change_target_state(ws):
-    """A non-supersedes relation leaves its target active (only supersedes retires)."""
+    """A non-kill relation leaves its target active (only supersedes/corrects retire)."""
     config, m = ws
     rt = m.record_decision_entry("Target stays active.", "rej", [], slug="t")
     m.record_decision_entry("Depends on it.", "rej", [], slug="d", depends_on="t")
-    store = GraphStore(config.db_path)
-    conn = store._get_connection()
-    try:
-        states = store.compute_all_states(conn)
-        assert states[rt["id"]] == "active"
-    finally:
-        conn.close()
+    # V1a single-node state derivation (8a). depends_on is warn-deferred AND non-kill,
+    # so the target is unambiguously active.
+    assert GraphStore(config.db_path).get_node_state(rt["id"]) == "active"
 
 
 # --------------------------------------------------------------------------- #
@@ -196,24 +232,37 @@ def test_relation_does_not_change_target_state(ws):
 # --------------------------------------------------------------------------- #
 
 def test_cli_cmd_record_depends_on(ws):
-    """cmd_record threads a relation flag through to a committed edge."""
+    """cmd_record threads a relation flag through to the buffer (edge defers to V1b)."""
     config, _ = ws
     cmd_record(config, axiom="Target.", rejected="rej", slug="cli-target")
     cmd_record(config, axiom="Linker.", rejected="rej", slug="cli-linker", depends_on="cli-target")
-    assert _edge(GraphStore(config.db_path), "cli-linker", "cli-target", "depends_on")
+    # The flag reaches the buffer; the edge is warn-deferred in V1a (K5/G6).
+    assert "**Depends-On:** cli-target" in _read(config)
+    assert not _edge(GraphStore(config.db_path), "cli-linker", "cli-target", "depends_on")
+
+
+def test_cli_cmd_record_corrects_kill_edge(ws):
+    """cmd_record --corrects commits the V1a corrects kill-edge end-to-end (8a, G5)."""
+    config, _ = ws
+    cmd_record(config, axiom="Target.", rejected="rej", slug="cli-ktarget")
+    cmd_record(config, axiom="Corrector.", rejected="rej", slug="cli-kcorrector",
+               corrects="cli-ktarget")
+    assert _edge(GraphStore(config.db_path), "cli-kcorrector", "cli-ktarget", "corrects")
 
 
 @patch("mitos.cli.cmd_record")
 def test_cli_relation_flags_route(mock_record, monkeypatch):
-    """The new --depends-on/--amends/--cites/etc. flags reach cmd_record."""
+    """The --corrects/--depends-on/--amends/--cites/etc. flags reach cmd_record."""
     monkeypatch.setattr(sys, "argv", [
         "mitos", "record", "ax", "--rejected", "r",
+        "--corrects", "korrekt",
         "--depends-on", "foo", "--amends", "bar", "--cites", "baz",
         "--derives-from", "qux", "--contradicts", "quux", "--narrows", "corge",
         "--resolves", "grault",
     ])
     main()
     _, kwargs = mock_record.call_args
+    assert kwargs["corrects"] == "korrekt"
     assert kwargs["depends_on"] == "foo"
     assert kwargs["amends"] == "bar"
     assert kwargs["cites"] == "baz"
@@ -224,7 +273,7 @@ def test_cli_relation_flags_route(mock_record, monkeypatch):
 
 
 def test_mcp_record_decision_with_relation(ws):
-    """The MCP record_decision tool accepts a relation arg and commits the edge."""
+    """The MCP record_decision tool accepts a relation arg + serializes it (edge defers to V1b)."""
     config, _ = ws
     with patch("mitos.mcp_server.MitosConfig", return_value=config):
         from mitos.mcp_server import record_decision
@@ -232,7 +281,20 @@ def test_mcp_record_decision_with_relation(ws):
         res = json.loads(record_decision("Linker.", "rej", ["s"], slug="mcp-linker",
                                          depends_on="mcp-target"))
     assert res["status"] == "created"
-    assert _edge(GraphStore(config.db_path), "mcp-linker", "mcp-target", "depends_on")
+    assert "**Depends-On:** mcp-target" in _read(config)
+    assert not _edge(GraphStore(config.db_path), "mcp-linker", "mcp-target", "depends_on")
+
+
+def test_mcp_record_decision_corrects_kill_edge(ws):
+    """The MCP record_decision tool commits the V1a corrects kill-edge (8a, G5 parity)."""
+    config, _ = ws
+    with patch("mitos.mcp_server.MitosConfig", return_value=config):
+        from mitos.mcp_server import record_decision
+        json.loads(record_decision("Target.", "rej", ["s"], slug="mcp-ktarget"))
+        res = json.loads(record_decision("Corrector.", "rej", ["s"], slug="mcp-kcorrector",
+                                         corrects="mcp-ktarget"))
+    assert res["status"] == "created"
+    assert _edge(GraphStore(config.db_path), "mcp-kcorrector", "mcp-ktarget", "corrects")
 
 
 # --------------------------------------------------------------------------- #

@@ -16,7 +16,8 @@ from mitos.config import MitosConfig
 from mitos.errors import SynthesisError, ValidationError
 from mitos.models import get_model_id
 from mitos.parser import ParsedEntry, parse_header
-from mitos.store import GraphStore, CommitDelta, compute_hash
+from mitos.store import GraphStore, CommitDelta
+from mitos.identity import compute_node_id, embedding_text
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.vector_store import QdrantVectorStore
 from mitos.renderer import MitosRenderer
@@ -173,7 +174,7 @@ class MitosProseImporter:
                     print(f"[Warning] Failed to compress entry '{slug}': {str(e)}. Skipping.")
                     continue
 
-                entry.core_axiom = compressed.get("core_axiom", "")
+                entry.axiom = compressed.get("core_axiom", "")
                 entry.rejected_paths = compressed.get("rejected_paths", "")
                 entry.mechanisms = compressed.get("mechanisms", [])
                 entry.scope = compressed.get("scope", [])
@@ -182,31 +183,37 @@ class MitosProseImporter:
                 entry.resolves = compressed.get("resolves")
             else:
                 # If not using LLM, populate core fields with raw content as best effort
-                entry.core_axiom = title or slug
+                entry.axiom = title or slug
                 entry.rejected_paths = "No rejected paths specified in raw import."
                 entry.context = raw_content
 
             # Standardize invariants check
-            if not entry.core_axiom or not entry.rejected_paths:
+            if not entry.axiom or not entry.rejected_paths:
                 print(f"[Warning] Skipping '{slug}': missing core_axiom or rejected_paths.")
                 continue
 
             # Assign imported metadata fields
             # GraphStore requires parsed entries
             try:
-                # Populate OD3 confirmation metadata
+                # Populate OD3 confirmation metadata + V1a import provenance. The
+                # import provenance rides ``nodes.source`` (V1-D20 enum: import_llm),
+                # set on the entry BEFORE commit so it passes the DDL CHECK and is
+                # fenced as canonical core (MI-4). The prototype's post-commit
+                # ``UPDATE … SET source='imported', source_ref=?`` is retired (8a):
+                # 'imported' is outside the V1a enum and ``source_ref`` is a dropped
+                # column (§6.5) — the file:line provenance has no V1a home and is
+                # deferred (a V1b importer concern), not silently crash-on-write.
+                entry.source = "import_llm"
                 entry.confirmed_by = get_model_id("SONNET") if use_llm_extract else "user"
                 entry.confirmed_at = datetime.now().isoformat()
 
-                # Compute stable hash
-                node_id = compute_hash(
-                    entry.kind,
-                    entry.slug,
-                    entry.core_axiom,
-                    entry.mechanisms,
-                    []
+                # Compute the stable slug-free V1a id (V1-D2) — matches commit_parsed_entry.
+                node_id = compute_node_id(
+                    kind=entry.kind,
+                    axiom=entry.axiom,
+                    mechanism_refs=entry.mechanisms,
                 )
-                
+
                 # Check duplication
                 if self.store.get_node(node_id):
                     # Stable identity: re-running import on same content is a no-op (S2/S5)
@@ -215,15 +222,7 @@ class MitosProseImporter:
                 # Add to DB via GraphStore commit helper
                 delta = self.store.commit_parsed_entry(entry)
                 imported_count += 1
-                
-                # Tag imported source metadata
-                conn = self.store._get_connection()
-                with conn:
-                    conn.execute(
-                        "UPDATE nodes SET source = 'imported', source_ref = ? WHERE id = ?",
-                        (f"{os.path.basename(filepath)}:{line_start}-{line_end}", delta.node_id)
-                    )
-                
+
                 # Best-effort embedding upsert
                 self._best_effort_embed(delta, entry)
             except Exception as e:
@@ -247,7 +246,9 @@ class MitosProseImporter:
             "scope": entry.scope,
             "state": "active",
             "kind": entry.kind,
-            "embedding_text": entry.core_axiom
+            # V1a embedding text re-derived from the immutable core (M8) so it is
+            # byte-consistent with the drain-time re-derivation (sync).
+            "embedding_text": embedding_text({"kind": entry.kind, "axiom": entry.axiom})
         }
 
         try:

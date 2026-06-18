@@ -34,8 +34,8 @@ def test_query_decisions_tool(mock_get_components: MagicMock) -> None:
         "scope": ["auth"],
         "transcript": "Secret conversation text."  # C4: must be excluded!
     }
-    mock_store.compute_all_states.return_value = {"hash-abc": "active"}
-    
+    mock_store.get_node_state.return_value = "active"
+
     mock_get_components.return_value = (mock_store, None, None)
 
     # Call query_decisions
@@ -82,7 +82,7 @@ def test_surface_decisions_fallback_filtering(mock_get_components: MagicMock) ->
             "computed_state": "parked"
         }
     ]
-    mock_store.compute_all_states.return_value = {"hash-oq": "parked", "hash-1": "active"}
+    mock_store.get_node_state.return_value = "active"
 
     mock_get_components.return_value = (mock_store, None, None)
 

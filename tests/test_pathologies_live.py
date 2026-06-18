@@ -82,12 +82,12 @@ def test_pathology_unicode_slug_integrity(isolated_workspace) -> None:
     slug_sa = "svapnas-तव-तमसे-नक्ते"
     
     e1 = ParsedEntry("decision", slug_lt, 1, 10)
-    e1.core_axiom = "Ąžuolas yra stiprus ir gilus."
+    e1.axiom = "Ąžuolas yra stiprus ir gilus."
     e1.rejected_paths = "Eglė, pušis."
     e1.scope = ["lietuva"]
     
     e2 = ParsedEntry("decision", slug_sa, 1, 10)
-    e2.core_axiom = "Asmi svapnas tava tamase nakte."
+    e2.axiom = "Asmi svapnas tava tamase nakte."
     e2.rejected_paths = "None."
     e2.scope = ["sanskrit"]
     
@@ -111,6 +111,12 @@ def test_pathology_unicode_slug_integrity(isolated_workspace) -> None:
 # ==============================================================================
 # P2 — Circular Dependency Prevention & Loop Resolution
 # ==============================================================================
+@pytest.mark.skip(reason="V1a: state is a single incoming-kill-edge lookup (get_node_state), "
+                         "not a recursive DAG, so there is no RecursionError to guard against. "
+                         "A circular supersedes can't even form — the first commit references a "
+                         "not-yet-existing target (missing_target) and the source-active "
+                         "acyclicity guard (5b) rejects self/cycle kill-edges. The V1a cycle "
+                         "prevention is structural and pinned in the test_store 5b suite. Deferred (K5).")
 def test_pathology_circular_dependency_resolution(isolated_workspace) -> None:
     """Tests how the GraphStore handle circular dependency edge declarations."""
     config, tmpdir = isolated_workspace
@@ -119,12 +125,12 @@ def test_pathology_circular_dependency_resolution(isolated_workspace) -> None:
     # We establish two nodes that supersede each other circularly:
     # A supersedes B, B supersedes A
     eA = ParsedEntry("decision", "node-a", 1, 5)
-    eA.core_axiom = "Axiom A"
+    eA.axiom = "Axiom A"
     eA.rejected_paths = "None."
     eA.supersedes = "node-b"
     
     eB = ParsedEntry("decision", "node-b", 1, 5)
-    eB.core_axiom = "Axiom B"
+    eB.axiom = "Axiom B"
     eB.rejected_paths = "None."
     eB.supersedes = "node-a"
     
@@ -147,6 +153,11 @@ def test_pathology_circular_dependency_resolution(isolated_workspace) -> None:
 # ==============================================================================
 # P3 — Extreme Cascading Status Flips & Deletion Propagation
 # ==============================================================================
+@pytest.mark.skip(reason="V1b: this exercises the narrows/resolves cascade and OQ "
+                         "parked→resolved state (V1-D18 Stage-2). narrows/resolves are "
+                         "warn-deferred in V1a (no edge committed), CommitDelta is first-order "
+                         "(5c, no transitive cascade-affected set), and get_node_state never "
+                         "returns resolved. Deferred to V1b (K5/G6/G7).")
 def test_pathology_extreme_cascading_status_flips(isolated_workspace) -> None:
     """Verifies that resolving an open question triggers a cascade across the graph."""
     config, tmpdir = isolated_workspace
@@ -160,14 +171,14 @@ def test_pathology_extreme_cascading_status_flips(isolated_workspace) -> None:
     
     # 2. Add an active decision narrowing another active decision
     e1 = ParsedEntry("decision", "jwt-base", 1, 5)
-    e1.core_axiom = "JWT is base auth."
+    e1.axiom = "JWT is base auth."
     e1.rejected_paths = "None."
     e1.scope = ["auth"]
     d_e1 = store.commit_parsed_entry(e1)
     
     # 3. Add jwt-spec narrowing jwt-base and resolving roadblock
     e2 = ParsedEntry("decision", "jwt-spec", 1, 5)
-    e2.core_axiom = "Use stateless JWTs with HMAC SHA-256."
+    e2.axiom = "Use stateless JWTs with HMAC SHA-256."
     e2.rejected_paths = "RSA (too heavy)."
     e2.narrows = "jwt-base"
     e2.resolves = "auth-roadblock"
@@ -187,6 +198,12 @@ def test_pathology_extreme_cascading_status_flips(isolated_workspace) -> None:
 # ==============================================================================
 # P4 — Outbox Queue High Contention & Worker Saturation
 # ==============================================================================
+@pytest.mark.skip(reason="V3b: the claimed_by claim-reservation machinery is deferred "
+                         "(§5.2.8, K3). V1a is single-writer (busy_timeout), so "
+                         "claim_pending_embeddings is an ordered SELECT with no reservation — "
+                         "there is no multi-drainer double-claim to gate. The V1a single-writer "
+                         "drain surface is pinned by "
+                         "test_sync.test_sync_outbox_drain_single_writer_semantics. Deferred to V3b (K5).")
 def test_pathology_outbox_queue_worker_saturation(isolated_workspace) -> None:
     """Simulates 10 concurrent drainers attempting to drain a saturated outbox queue."""
     config, tmpdir = isolated_workspace
@@ -196,13 +213,13 @@ def test_pathology_outbox_queue_worker_saturation(isolated_workspace) -> None:
     node_ids = []
     for i in range(50):
         e = ParsedEntry("decision", f"contend-{i}", 1, 5)
-        e.core_axiom = f"Axiom {i}"
+        e.axiom = f"Axiom {i}"
         e.rejected_paths = "None."
         d = store.commit_parsed_entry(e)
         node_ids.append(d.node_id)
         
-        # Add to outbox queue
-        store.add_pending_embedding(d.node_id, f"Axiom {i}")
+        # Add to outbox queue (V1a 3-column shape: node_id only, no embedding_text)
+        store.add_pending_embedding(d.node_id)
         
     # Verify outbox size is 50
     assert len(store.get_pending_embeddings()) == 50
@@ -351,7 +368,7 @@ def test_pathology_renderer_budget_overflow_warning(isolated_workspace, capsys) 
 
     # Commit a massive node to push live_axioms.md over the 50,000-char ceiling.
     entry = ParsedEntry("decision", "massive-axiom", 1, 5)
-    entry.core_axiom = "We strictly use large text buffers to overflow budget." * 1500
+    entry.axiom = "We strictly use large text buffers to overflow budget." * 1500
     entry.rejected_paths = "None."
     store.commit_parsed_entry(entry)
 

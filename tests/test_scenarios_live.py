@@ -177,7 +177,7 @@ def test_scenario_s3_pre_write_surfacing(live_workspace) -> None:
     
     # Seed prior decision
     entry = ParsedEntry("decision", "cache-concurrency", 1, 10)
-    entry.core_axiom = "In-process asyncio.Lock for dedup."
+    entry.axiom = "In-process asyncio.Lock for dedup."
     entry.rejected_paths = "advisory locks — would saturate pool"
     entry.scope = ["cache"]
     store.commit_parsed_entry(entry)
@@ -200,30 +200,27 @@ def test_scenario_s4_edit_in_place_correction(live_workspace) -> None:
     
     # Sync first version
     e1 = ParsedEntry("decision", "cache-concurrency", 1, 10)
-    e1.core_axiom = "Initial Axiom"
+    e1.axiom = "Initial Axiom"
     e1.rejected_paths = "None."
     d1 = store.commit_parsed_entry(e1)
     
     # Re-commit edited version (typo corrected)
     e2 = ParsedEntry("decision", "cache-concurrency", 1, 10)
-    e2.core_axiom = "Corrected Axiom"
+    e2.axiom = "Corrected Axiom"
     e2.rejected_paths = "None."
     e2.corrects = "cache-concurrency" # Simulates user picking '[c]orrection' in prompt
     d2 = store.commit_parsed_entry(e2)
     
-    # Check correctness of edges & state view
+    # Check correctness of edges & state view (V1a edge columns: edge_type/source_id/target_id)
     edges = store.get_edges()
     assert len(edges) == 1
-    assert edges[0]["type"] == "corrects"
-    assert edges[0]["from_id"] == d2.node_id
-    assert edges[0]["to_id"] == d1.node_id
-    
-    conn = store._get_connection()
-    states = store.compute_all_states(conn)
-    conn.close()
-    
-    assert states[d2.node_id] == "active"
-    assert states[d1.node_id] == "superseded"  # corrected nodes become superseded/inactive
+    assert edges[0]["edge_type"] == "corrects"
+    assert edges[0]["source_id"] == d2.node_id
+    assert edges[0]["target_id"] == d1.node_id
+
+    # V1a distinguishes 'corrected' from 'superseded' (the prototype collapsed both) — 8a/G12.
+    assert store.get_node_state(d2.node_id) == "active"
+    assert store.get_node_state(d1.node_id) == "corrected"  # corrects retires the target
 
 
 # ==============================================================================
@@ -260,6 +257,10 @@ def test_scenario_s5_idempotent_re_sync(live_workspace) -> None:
 # ==============================================================================
 # S6 — Open-question lifecycle across sessions
 # ==============================================================================
+@pytest.mark.skip(reason="V1b: OQ parked/resolved lifecycle rides the `resolves` edge "
+                         "(OQ Stage-2), a warn-deferred V1b type. V1a OQ state is the kill-edge "
+                         "anti-join only (active vs retired) — get_node_state never returns "
+                         "parked/resolved, and `resolves` commits no edge. Deferred to V1b (K5/G7).")
 def test_scenario_s6_open_question_lifecycle(live_workspace) -> None:
     config, tmpdir = live_workspace
     store = GraphStore(config.db_path)
@@ -276,7 +277,7 @@ def test_scenario_s6_open_question_lifecycle(live_workspace) -> None:
     
     # Session B: decision resolves it
     res = ParsedEntry("decision", "resolve-auth", 1, 5)
-    res.core_axiom = "Use stateless JWTs."
+    res.axiom = "Use stateless JWTs."
     res.rejected_paths = "Sessions."
     res.resolves = "auth-roadblock"
     res.scope = ["auth"]
@@ -306,7 +307,7 @@ def test_scenario_s7_long_sustained_use(live_workspace) -> None:
     # Seed base nodes
     for i in range(1, 150):
         e = ParsedEntry("decision", f"dec-{i}", 1, 5)
-        e.core_axiom = f"This is axiom number {i}."
+        e.axiom = f"This is axiom number {i}."
         e.rejected_paths = "None."
         e.scope = ["loadtest"]
         store.commit_parsed_entry(e)
@@ -314,7 +315,7 @@ def test_scenario_s7_long_sustained_use(live_workspace) -> None:
     # Supersession chains (20 chains)
     for i in range(1, 21):
         e = ParsedEntry("decision", f"dec-super-{i}", 1, 5)
-        e.core_axiom = f"New supersession {i}."
+        e.axiom = f"New supersession {i}."
         e.rejected_paths = "None."
         e.supersedes = f"dec-{i}"
         store.commit_parsed_entry(e)
@@ -322,7 +323,7 @@ def test_scenario_s7_long_sustained_use(live_workspace) -> None:
     # Corrections (15 corrections)
     for i in range(1, 16):
         e = ParsedEntry("decision", f"dec-correct-{i}", 1, 5)
-        e.core_axiom = f"Corrected decision {i}."
+        e.axiom = f"Corrected decision {i}."
         e.rejected_paths = "None."
         e.corrects = f"dec-{i+20}"
         store.commit_parsed_entry(e)
@@ -330,18 +331,19 @@ def test_scenario_s7_long_sustained_use(live_workspace) -> None:
     # Parked & Resolved questions (10 resolves)
     for i in range(1, 11):
         oq = ParsedEntry("open_question", f"question-{i}", 1, 5)
+        oq.topic = f"Open question topic {i}"  # V1a OQ canonical core requires a topic
         oq.questions_raised = [f"What is question {i}?"]
         store.commit_parsed_entry(oq)
-        
+
         res = ParsedEntry("decision", f"dec-resolve-{i}", 1, 5)
-        res.core_axiom = f"Resolve answer {i}."
+        res.axiom = f"Resolve answer {i}."
         res.rejected_paths = "None."
         res.resolves = f"question-{i}"
         store.commit_parsed_entry(res)
         
     # Lithuanian/Sanskrit UTF-8 verification
     utf8_entry = ParsedEntry("decision", "utf8-test", 1, 5)
-    utf8_entry.core_axiom = "Kas tu esi? Esmi sapnas tavo tamsioje naktyje."
+    utf8_entry.axiom = "Kas tu esi? Esmi sapnas tavo tamsioje naktyje."
     utf8_entry.rejected_paths = "None."
     d_utf8 = store.commit_parsed_entry(utf8_entry)
     
@@ -422,7 +424,7 @@ def test_scenario_f2_embedding_provider_down(live_workspace) -> None:
         manager.embed_provider.get_embedding.return_value = [0.1, 0.2, 0.3]
         
         entry = ParsedEntry("decision", "f2-outbox", 1, 5)
-        entry.core_axiom = "Must fail embedding but commit graph."
+        entry.axiom = "Must fail embedding but commit graph."
         entry.rejected_paths = "None."
         
         # Sync enrichment / commit
@@ -471,7 +473,9 @@ def test_scenario_f3_parser_isolates_malformed(live_workspace, capsys) -> None:
 
     out = capsys.readouterr().out
     # Loud, actionable failure: the offending field is named with its line range.
-    assert "Unknown field '**Decision**' declared" in out
+    # V1a's parse_entry_stream reports the unrecognized field + the missing required
+    # one (the canonical **Decided:** is absent), each with the entry's line range.
+    assert "Unrecognized field '**Decision:**'" in out
     assert "lines" in out.lower()
     # No garbage committed — the drifted entry never reached the graph.
     assert manager.store.get_node_by_slug("f3-drift") is None
@@ -486,7 +490,7 @@ def test_scenario_f4_render_failure_atomicity(live_workspace) -> None:
     
     # 1. Populate graph with initial active entry
     entry = ParsedEntry("decision", "active-one", 1, 5)
-    entry.core_axiom = "Verified active."
+    entry.axiom = "Verified active."
     entry.rejected_paths = "None."
     store.commit_parsed_entry(entry)
     

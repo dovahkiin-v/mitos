@@ -108,6 +108,11 @@ def test_sync_happy_path(mock_client: MagicMock, sync_env: Tuple[MitosConfig, Mi
     assert "## 2026-05-19 — isolation" in archive_content
 
 
+@pytest.mark.skip(reason="V1a defers date-based stale detection (8a): parse_entry_stream "
+                         "uses slug-only headers (V1-D7) and does not extract entry.date, so "
+                         "the >14-day stale warning has no input. The capability rides dated "
+                         "headers, a prototype format V1a's spec dropped — deferred, not silently "
+                         "coerced (K5/OD1).")
 @patch("google.genai.Client")
 def test_sync_stale_entry_detection(mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str], capsys: pytest.CaptureFixture) -> None:
     """Verifies that entries drafted >14 days ago trigger a stdout warning."""
@@ -149,7 +154,7 @@ def test_sync_slug_collision_correction(mock_input: MagicMock, mock_client: Magi
 
     # 1. Seed an existing active decision in the graph
     entry1 = ParsedEntry("decision", "database", 1, 10)
-    entry1.core_axiom = "We use PostgreSQL."
+    entry1.axiom = "We use PostgreSQL."
     entry1.rejected_paths = "No SQL."
     entry1.scope = ["database"]
     store.commit_parsed_entry(entry1)
@@ -176,25 +181,23 @@ def test_sync_slug_collision_correction(mock_input: MagicMock, mock_client: Magi
     # 3. Run sync (interactive input mock selects "c" for correction and "a" for accept)
     manager.perform_sync(auto_accept=False)
 
-    # 4. Assert corrects relationship was created in database
+    # 4. Assert corrects relationship was created in database (V1a edge column edge_type)
     edges = store.get_edges()
     assert len(edges) == 1
     edge = edges[0]
-    assert edge["type"] == "corrects"
+    assert edge["edge_type"] == "corrects"
 
-    # Assert computed states have replaced original active decision with corrected one
+    # Assert computed states: the corrector is active; the original is CORRECTED.
+    # V1a distinguishes 'corrected' from 'superseded' (the prototype collapsed both) —
+    # this is the G12 vocabulary drift the store comment anchors to 8a.
     nodes = store.get_all_nodes()
     assert len(nodes) == 2
-    
-    conn = store._get_connection()
-    states = store.compute_all_states(conn)
-    conn.close()
-    
+
     corrected_id = [n["id"] for n in nodes if "SQLite" in n["core_axiom"]][0]
     original_id = [n["id"] for n in nodes if "PostgreSQL" in n["core_axiom"]][0]
-    
-    assert states[corrected_id] == "active"
-    assert states[original_id] == "superseded"
+
+    assert store.get_node_state(corrected_id) == "active"
+    assert store.get_node_state(original_id) == "corrected"
 
 
 @patch("google.genai.Client")
@@ -245,7 +248,8 @@ def test_sync_outbox_queue_and_drain(mock_client: MagicMock, sync_env: Tuple[Mit
     pending = store.get_pending_embeddings()
     assert len(pending) == 1
     assert pending[0]["node_id"] == nodes[0]["id"]
-    assert pending[0]["embedding_text"] == "Outbox queue works."
+    # V1a stores NO embedding_text on the row — it is re-derived at drain (C2/M8, 8a).
+    assert "embedding_text" not in pending[0]
 
     # 5. Restore vector store (mock recovery)
     manager.vector_store.upsert = MagicMock() # success
@@ -259,53 +263,44 @@ def test_sync_outbox_queue_and_drain(mock_client: MagicMock, sync_env: Tuple[Mit
     manager.vector_store.upsert.assert_called_once()
 
 
-def test_sync_outbox_queue_concurrent_drain(sync_env: Tuple[MitosConfig, MitosSyncManager, str]) -> None:
-    """Verifies that concurrent drainers atomically claim distinct rows and prevent double-processing."""
+def test_sync_outbox_drain_single_writer_semantics(sync_env: Tuple[MitosConfig, MitosSyncManager, str]) -> None:
+    """V1a single-writer drain surface: claim is an ordered read, release is a no-op (8a).
+
+    The prototype tested concurrent ``claimed_by`` reservation (two drainers claim
+    disjoint rows). V1a defers that claim machinery to V3b (§5.2.8, K3) — it
+    serializes writers via ``busy_timeout``, so there is no in-DB claim to contend
+    over. The 3-column ``pending_embeddings`` shape carries no ``claimed_by``, so
+    ``claim`` is an ordered bounded SELECT (no reservation) and ``release`` is inert.
+    This pins the V1a contract; the concurrent-reservation case is V3b's.
+    """
     config, manager, tmpdir = sync_env
     store = GraphStore(config.db_path)
-    
-    # 1. Commit three valid nodes first to satisfy FK constraints
-    e1 = ParsedEntry("decision", "db-1", 1, 5)
-    e1.core_axiom = "Axiom 1"
-    e1.rejected_paths = "None."
-    d1 = store.commit_parsed_entry(e1)
-    
-    e2 = ParsedEntry("decision", "db-2", 1, 5)
-    e2.core_axiom = "Axiom 2"
-    e2.rejected_paths = "None."
-    d2 = store.commit_parsed_entry(e2)
-    
-    e3 = ParsedEntry("decision", "db-3", 1, 5)
-    e3.core_axiom = "Axiom 3"
-    e3.rejected_paths = "None."
-    d3 = store.commit_parsed_entry(e3)
 
-    # Pre-populate some pending embeddings in the queue
-    store.add_pending_embedding(d1.node_id, "Axiom 1")
-    store.add_pending_embedding(d2.node_id, "Axiom 2")
-    store.add_pending_embedding(d3.node_id, "Axiom 3")
-    
-    # Drainer 1 claims a batch of 2
-    drainer1_items = store.claim_pending_embeddings("drainer-1", limit=2)
-    assert len(drainer1_items) == 2
-    
-    # Drainer 2 tries to claim a batch of 2 -> should only get the remaining 1 item!
-    drainer2_items = store.claim_pending_embeddings("drainer-2", limit=2)
-    assert len(drainer2_items) == 1
-    assert drainer2_items[0]["node_id"] == d3.node_id
-    
-    # Verify Drainer 1 items are d1 and d2
-    drainer1_node_ids = {item["node_id"] for item in drainer1_items}
-    assert drainer1_node_ids == {d1.node_id, d2.node_id}
-    
-    # Drainer 1 releases its claims
+    # Commit three valid nodes (the commit also enqueues them — 5c _enqueue_outbox).
+    deltas = []
+    for slug, ax in (("db-1", "Axiom 1"), ("db-2", "Axiom 2"), ("db-3", "Axiom 3")):
+        e = ParsedEntry("decision", slug, 1, 5)
+        e.axiom = ax
+        e.rejected_paths = "None."
+        d = store.commit_parsed_entry(e)
+        # add_pending_embedding is the idempotent standalone twin of the commit-time
+        # enqueue (V1a 3-column shape, no embedding_text arg) — re-stamps the row.
+        store.add_pending_embedding(d.node_id)
+        deltas.append(d)
+    all_ids = {d.node_id for d in deltas}
+
+    # claim is an ordered read bounded by limit — NO reservation (V1a single-writer).
+    batch = store.claim_pending_embeddings("drainer-1", limit=2)
+    assert len(batch) == 2
+
+    # release is inert (no claimed_by column to clear) and nothing was consumed.
     store.release_pending_embeddings("drainer-1")
-    
-    # Drainer 3 claims now -> should get d1 and d2
-    drainer3_items = store.claim_pending_embeddings("drainer-3", limit=2)
-    assert len(drainer3_items) == 2
-    drainer3_node_ids = {item["node_id"] for item in drainer3_items}
-    assert drainer3_node_ids == {d1.node_id, d2.node_id}
+    assert len(store.get_pending_embeddings()) == 3
+
+    # The full pending set is reachable; a row carries no embedding_text (re-derived).
+    everyone = store.claim_pending_embeddings("drainer-2", limit=10)
+    assert {item["node_id"] for item in everyone} == all_ids
+    assert "embedding_text" not in everyone[0]
 
 
 def test_sync_auto_heal_sample_block(sync_env: Tuple[MitosConfig, MitosSyncManager, str]) -> None:

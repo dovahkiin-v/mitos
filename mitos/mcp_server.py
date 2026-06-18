@@ -158,7 +158,7 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
                     continue
 
                 # Verify computed active status in SQLite (M3 computed state is source-of-truth)
-                node_state = store.compute_all_states(store._get_connection()).get(node["id"])
+                node_state = store.get_node_state(node["id"])
                 if node_state not in ("active", "drifted"):
                     # Stale vector reference, skip
                     continue
@@ -323,10 +323,8 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False) -> s
     try:
         node = store.get_node_by_slug(query)
         if node:
-            conn = store._get_connection()
-            state = store.compute_all_states(conn).get(node["id"], "active")
-            conn.close()
-            
+            state = store.get_node_state(node["id"])
+
             output = {
                 "slug": node["slug"],
                 "axiom": node["core_axiom"],
@@ -354,7 +352,7 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False) -> s
                 if not node:
                     continue
                     
-                node_state = store.compute_all_states(store._get_connection()).get(node["id"])
+                node_state = store.get_node_state(node["id"])
                 if node_state not in ("active", "drifted"):
                     continue
 
@@ -381,7 +379,8 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False) -> s
 @mcp.tool()
 def record_decision(axiom: str, rejected_paths: str, scope: List[str],
                     mechanisms: Optional[List[str]] = None, context: Optional[str] = None,
-                    supersedes: Optional[str] = None, amends: Optional[str] = None,
+                    supersedes: Optional[str] = None, corrects: Optional[str] = None,
+                    amends: Optional[str] = None,
                     narrows: Optional[str] = None, depends_on: Optional[str] = None,
                     resolves: Optional[str] = None, contradicts: Optional[str] = None,
                     derives_from: Optional[str] = None, cites: Optional[str] = None,
@@ -405,6 +404,9 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str],
         context: Optional background on why this was decided.
         supersedes: Exact slug of a prior decision this one REPLACES (the old one
             becomes superseded). Use this for decision evolution.
+        corrects: Exact slug of a prior decision this one CORRECTS (an in-buffer
+            correction — the old one leaves the active view, like supersedes; use
+            this when the earlier decision was wrong rather than outgrown).
         amends: Exact slug of a decision this one amends (modifies without replacing).
         narrows: Exact slug of a decision this one narrows the scope of.
         depends_on: Exact slug of a decision this one depends on.
@@ -453,6 +455,7 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str],
         mechanisms=mechanisms,
         context=context,
         supersedes=supersedes,
+        corrects=corrects,
         amends=amends,
         narrows=narrows,
         depends_on=depends_on,

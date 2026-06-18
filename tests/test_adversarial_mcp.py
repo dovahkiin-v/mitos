@@ -54,13 +54,13 @@ def test_mcp_unconfigured_vector_store_fallback(isolated_workspace) -> None:
     
     # Commit two active decisions
     d1 = ParsedEntry("decision", "rule-one", 1, 5)
-    d1.core_axiom = "We use WAL mode SQLite for local storage."
+    d1.axiom = "We use WAL mode SQLite for local storage."
     d1.rejected_paths = "None."
     d1.scope = ["substrate"]
     store.commit_parsed_entry(d1)
     
     d2 = ParsedEntry("decision", "rule-two", 6, 10)
-    d2.core_axiom = "We use pure python."
+    d2.axiom = "We use pure python."
     d2.rejected_paths = "None."
     d2.scope = ["core"]
     store.commit_parsed_entry(d2)
@@ -134,7 +134,7 @@ def test_mcp_surface_invalid_scopes(isolated_workspace) -> None:
     
     # Commit a decision in 'substrate' scope
     d = ParsedEntry("decision", "dec-one", 1, 5)
-    d.core_axiom = "WAL mode SQLite."
+    d.axiom = "WAL mode SQLite."
     d.rejected_paths = "None."
     d.scope = ["substrate"]
     store.commit_parsed_entry(d)

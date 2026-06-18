@@ -90,5 +90,9 @@ def test_import_with_llm_extract(mock_anthropic: MagicMock, import_env: Tuple[Mi
     assert node["slug"] == "legacy-sqlite"
     assert node["core_axiom"] == "We use SQLite in WAL mode."
     assert node["rejected_paths"] == "pgvector."
-    assert node["source"] == "imported"
-    assert "legacy.md" in node["source_ref"]
+    # V1a import provenance rides nodes.source as the enum value 'import_llm' (V1-D20),
+    # set on the entry pre-commit (the prototype's post-commit source='imported' +
+    # source_ref UPDATE is retired in 8a — 'imported' is outside the enum and source_ref
+    # is a dropped column, §6.5). The file:line provenance has no V1a home (deferred).
+    assert node["source"] == "import_llm"
+    assert "source_ref" not in node

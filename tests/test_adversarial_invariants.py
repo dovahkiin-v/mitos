@@ -24,7 +24,8 @@ from typing import Tuple, List, Dict, Any, Optional
 from unittest.mock import MagicMock, patch
 
 from mitos.config import MitosConfig
-from mitos.store import GraphStore, ValidationError, DatabaseError, compute_hash
+from mitos.store import GraphStore, ValidationError, DatabaseError, CommitError
+from mitos.identity import compute_node_id
 from mitos.parser import ParsedEntry, parse_decisions_file
 from mitos.sync import MitosSyncManager
 from mitos.renderer import MitosRenderer
@@ -69,6 +70,12 @@ def isolated_workspace() -> Tuple[MitosConfig, str]:
 # ==============================================================================
 # 1. M1/M2/M3 — Deep DAG Immutability & Computed State Cascade Verification
 # ==============================================================================
+@pytest.mark.skip(reason="V1b: this exercises OQ parked/resolved state and the V1-D18 "
+                         "Stage-2 resolves-cascade (an OQ flips parked→resolved→parked as its "
+                         "resolver is superseded). V1a OQ state is the kill-edge anti-join only "
+                         "(no parked/resolved; resolves is a warn-deferred V1b edge). The V1a "
+                         "supersedes-cascade is covered by test_5d_active_decisions_excludes_superseded "
+                         "+ test_supersedes_e2e. Deferred, not silently coerced (K5/G7).")
 def test_invariant_m1_m2_m3_deep_dag_and_cascades(isolated_workspace) -> None:
     """Tests Axiom Immutability (M1), Multi-byte Stability (M2), and Computed State (M3) under deep cascades.
 
@@ -96,7 +103,7 @@ def test_invariant_m1_m2_m3_deep_dag_and_cascades(isolated_workspace) -> None:
 
     # 1. Commit Decision A (active)
     a = ParsedEntry("decision", "decision-a", 1, 5)
-    a.core_axiom = "We use WAL mode SQLite for local storage."
+    a.axiom = "We use WAL mode SQLite for local storage."
     a.rejected_paths = "Postgres (too heavy), MongoDB."
     a.scope = ["substrate", "database"]
     a.mechanisms = ["sqlite", "wal-mode"]
@@ -120,7 +127,7 @@ def test_invariant_m1_m2_m3_deep_dag_and_cascades(isolated_workspace) -> None:
     
     # Now link A to resolve Q1
     a_resolves = ParsedEntry("decision", "decision-a", 1, 6)
-    a_resolves.core_axiom = "We use WAL mode SQLite for local storage."
+    a_resolves.axiom = "We use WAL mode SQLite for local storage."
     a_resolves.rejected_paths = "Postgres (too heavy), MongoDB."
     a_resolves.scope = ["substrate", "database"]
     a_resolves.mechanisms = ["sqlite", "wal-mode"]
@@ -135,7 +142,7 @@ def test_invariant_m1_m2_m3_deep_dag_and_cascades(isolated_workspace) -> None:
     
     # 3. Commit Decision C (supersedes A)
     c = ParsedEntry("decision", "decision-c", 11, 15)
-    c.core_axiom = "We use SQLite in WAL mode with advisory file locking."
+    c.axiom = "We use SQLite in WAL mode with advisory file locking."
     c.rejected_paths = "No locking (leads to write race)."
     c.scope = ["substrate", "locking"]
     c.supersedes = "decision-a"
@@ -156,46 +163,39 @@ def test_invariant_m1_m2_m3_deep_dag_and_cascades(isolated_workspace) -> None:
 # ==============================================================================
 # 2. Case-Insensitive Slug Resolution & Ambiguity Safety
 # ==============================================================================
-def test_invariant_slug_resolution_case_insensitivity_and_ambiguity(isolated_workspace) -> None:
-    """Verifies that edge resolution is case-insensitive, but raises a ValidationError on ambiguous variants.
+def test_invariant_slug_casefold_collision_is_rejected(isolated_workspace) -> None:
+    """V1a structurally PREVENTS the case-variant ambiguity (V1-D4 / MI-13, 8a/G8).
 
-    If two nodes exist that differ only in case (e.g. 'Use-SQLite' and 'use-sqlite'),
-    resolving a relationship to 'use-sqlite' must raise a structured ambiguity error
-    listing both candidate IDs so the user can resolve the collision.
+    The prototype let 'Use-SQLite' and 'use-sqlite' coexist and then resolved the
+    fuzzy NOCASE ambiguity at read/edge time. V1a closes the door upstream: the
+    post-mutation slug-collision assertion (5b) enforces at most ONE active node per
+    casefold(slug), so committing a second active node that casefolds to an existing
+    active slug — with no kill-edge between them — rolls back with ``slug_collision``.
+    The "ambiguous resolution" the prototype tested is now structurally unreachable;
+    this pins the V1a enforcement that makes it so (8a pared the prototype assertion).
     """
     config, tmpdir = isolated_workspace
     store = GraphStore(config.db_path)
-    
+
     # Insert node 1: 'Use-SQLite'
     e1 = ParsedEntry("decision", "Use-SQLite", 1, 5)
-    e1.core_axiom = "Axiom one."
+    e1.axiom = "Axiom one."
     e1.rejected_paths = "None."
     store.commit_parsed_entry(e1)
-    
-    # Insert node 2: 'use-sqlite' (differs only in case)
+
+    # Insert node 2: 'use-sqlite' (differs only in case) — a casefold collision with no
+    # kill-edge between them: V1a rolls it back rather than letting both go active.
     e2 = ParsedEntry("decision", "use-sqlite", 6, 10)
-    e2.core_axiom = "Axiom two."
+    e2.axiom = "Axiom two."
     e2.rejected_paths = "None."
-    store.commit_parsed_entry(e2)
-    
-    # Verify they both coexist in database, but querying by slug raises ValidationError due to ambiguity!
-    with pytest.raises(ValidationError) as exc_ambig:
-        store.get_node_by_slug("use-sqlite")
-    assert "ambiguous" in str(exc_ambig.value)
-    
-    # Now attempt to commit a decision that references 'use-sqlite' case-insensitively.
-    # Because there are multiple active matches, it must raise a structured ValidationError
-    # listing both candidates.
-    ref = ParsedEntry("decision", "ref-decision", 11, 15)
-    ref.core_axiom = "This depends on sqlite."
-    ref.rejected_paths = "None."
-    ref.depends_on = "use-sqlite"
-    
-    with pytest.raises(ValidationError) as exc:
-        store.commit_parsed_entry(ref)
-        
-    assert "Ambiguous relationship target slug" in str(exc.value)
-    assert "Use-SQLite" in str(exc.value) or "use-sqlite" in str(exc.value)
+    with pytest.raises(CommitError) as exc:
+        store.commit_parsed_entry(e2)
+    assert exc.value.failure is not None
+    assert any(item.code == "slug_collision" for item in exc.value.failure.items)
+
+    # The first node remains the single, unambiguous active holder of the casefold slug.
+    resolved = store.get_node_by_slug("use-sqlite")
+    assert resolved is not None and resolved["slug"] == "Use-SQLite"
 
 
 # ==============================================================================
@@ -267,18 +267,24 @@ def test_invariant_m5_database_corruption_and_rebuild(isolated_workspace) -> Non
     assert d1_restored is not None
     assert d2_restored is not None
     
-    # Verify relationships restored
+    # The two decisions rebuild from decisions.md (M5). The `Depends-On: d1` edge is
+    # warn-deferred to V1b (not a V1a kill-edge), so NO edge is committed — 8a pared
+    # the prototype's "1 depends_on edge restored" assertion to the V1a truth (K5/G6).
     conn = sqlite3.connect(config.db_path)
     conn.row_factory = sqlite3.Row
     edges = conn.execute("SELECT * FROM edges").fetchall()
-    assert len(edges) == 1
-    assert edges[0]["type"] == "depends_on"
+    assert len(edges) == 0
     conn.close()
 
 
 # ==============================================================================
 # 4. M6 — Deduplicating Mechanisms Registry Verification
 # ==============================================================================
+@pytest.mark.skip(reason="V1b: the typed mechanism registry (M6) — the `mechanisms` / "
+                         "`node_mechanisms` SQL tables — is explicitly out of V1a's scope "
+                         "(negative-space fence: 'no mechanisms table (V1b)'). V1a stores "
+                         "mechanism_refs as a JSON tag list on the node, not a deduplicated "
+                         "registry table. Deferred to the V1b mechanisms vision (K5).")
 def test_invariant_m6_mechanism_registry_deduplication(isolated_workspace) -> None:
     """Tests the Mechanism Registry (M6).
 
@@ -290,14 +296,14 @@ def test_invariant_m6_mechanism_registry_deduplication(isolated_workspace) -> No
     
     # Commit Decision A with mechanisms sqlite, wal-mode
     a = ParsedEntry("decision", "a", 1, 5)
-    a.core_axiom = "WAL SQLite."
+    a.axiom = "WAL SQLite."
     a.rejected_paths = "None."
     a.mechanisms = ["sqlite", "wal-mode"]
     store.commit_parsed_entry(a)
     
     # Commit Decision B with mechanisms sqlite, python
     b = ParsedEntry("decision", "b", 6, 10)
-    b.core_axiom = "Python SQLite."
+    b.axiom = "Python SQLite."
     b.rejected_paths = "None."
     b.mechanisms = ["sqlite ", " python"] # with whitespace
     store.commit_parsed_entry(b)
@@ -333,21 +339,21 @@ def test_invariant_unicode_slug_and_axiom_stability(isolated_workspace) -> None:
     
     # 1. Parse and commit Unicode entry
     e = ParsedEntry("decision", lithuanian_slug, 1, 5)
-    e.core_axiom = f"{devanagari_axiom} — {lithuanian_axiom}"
+    e.axiom = f"{devanagari_axiom} — {lithuanian_axiom}"
     e.rejected_paths = "Nothing."
     e.mechanisms = ["unicode-utf8"]
     
     delta = store.commit_parsed_entry(e)
-    
-    # 2. Re-calculate hash identity locally using UTF-8 encoding
-    expected_hash = compute_hash(
-        "decision",
-        lithuanian_slug,
-        f"{devanagari_axiom} — {lithuanian_axiom}",
-        ["unicode-utf8"],
-        []
+
+    # 2. Re-calculate the V1a slug-free canonical-core id locally (UTF-8 stable). The
+    # slug is NOT part of identity (V1-D2) — 8a migrated this off the prototype
+    # slug-inclusive compute_hash onto compute_node_id.
+    expected_hash = compute_node_id(
+        kind="decision",
+        axiom=f"{devanagari_axiom} — {lithuanian_axiom}",
+        mechanism_refs=["unicode-utf8"],
     )
-    
+
     assert delta.node_id == expected_hash
     
     # 3. Retrieve node and assert text matches perfectly without corruption
@@ -360,6 +366,12 @@ def test_invariant_unicode_slug_and_axiom_stability(isolated_workspace) -> None:
 # ==============================================================================
 # 6. Outbox Queue Concurrency and Claim-Row Race Condition Safety
 # ==============================================================================
+@pytest.mark.skip(reason="V3b: the claimed_by claim-reservation machinery is deferred "
+                         "(§5.2.8, K3). V1a is single-writer (busy_timeout serializes writers), "
+                         "so claim_pending_embeddings is an ordered SELECT with NO reservation — "
+                         "there is no multi-drainer race to gate. The V1a single-writer drain "
+                         "surface is pinned by test_sync.test_sync_outbox_drain_single_writer_semantics. "
+                         "Deferred to V3b, not silently coerced (K5).")
 def test_invariant_outbox_queue_drain_concurrency(isolated_workspace) -> None:
     """Verifies that outbox queue drains strictly protect against double-processing.
 
@@ -373,11 +385,11 @@ def test_invariant_outbox_queue_drain_concurrency(isolated_workspace) -> None:
     # Insert 50 mock nodes and add them all to pending embeddings outbox queue
     for i in range(50):
         d = ParsedEntry("decision", f"dec-{i}", 1, 5)
-        d.core_axiom = f"Rule {i}"
+        d.axiom = f"Rule {i}"
         d.rejected_paths = "None."
         store.commit_parsed_entry(d)
-        node_id = compute_hash("decision", f"dec-{i}", f"Rule {i}", [], [])
-        store.add_pending_embedding(node_id, f"Rule {i}")
+        node_id = compute_node_id(kind="decision", axiom=f"Rule {i}")
+        store.add_pending_embedding(node_id)
         
     # Check outbox size is 50
     assert len(store.get_pending_embeddings()) == 50
@@ -423,27 +435,27 @@ def test_invariant_circular_dependency_gate(isolated_workspace) -> None:
     
     # 1. Commit Decision A
     a = ParsedEntry("decision", "a", 1, 5)
-    a.core_axiom = "Decision A."
+    a.axiom = "Decision A."
     a.rejected_paths = "None."
     store.commit_parsed_entry(a)
     
     # 2. Commit Decision B depends on A
     b = ParsedEntry("decision", "b", 6, 10)
-    b.core_axiom = "Decision B."
+    b.axiom = "Decision B."
     b.rejected_paths = "None."
     b.depends_on = "a"
     store.commit_parsed_entry(b)
     
     # 3. Commit Decision C depends on B
     c = ParsedEntry("decision", "c", 11, 15)
-    c.core_axiom = "Decision C."
+    c.axiom = "Decision C."
     c.rejected_paths = "None."
     c.depends_on = "b"
     store.commit_parsed_entry(c)
     
     # 4. Update A to depend on C (Creates Cycle: A -> C -> B -> A!)
     a_cycle = ParsedEntry("decision", "a", 1, 5)
-    a_cycle.core_axiom = "Decision A."
+    a_cycle.axiom = "Decision A."
     a_cycle.rejected_paths = "None."
     a_cycle.depends_on = "c"
     store.commit_parsed_entry(a_cycle)

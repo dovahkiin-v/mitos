@@ -245,12 +245,15 @@ class GraphStoreProtocol(Protocol):
         """
         ...
 
-    def add_pending_embedding(self, node_id: str, embedding_text: str) -> None:
-        """Adds a node to the pending outbox queue.
+    def add_pending_embedding(self, node_id: str) -> None:
+        """Enqueues a node onto the pending-embeddings outbox (V1a 3-column shape).
+
+        Aligned to the V1a ``pending_embeddings`` schema (Phase 8a): no
+        ``embedding_text`` argument — the drainer re-derives ``embedding_text(node)``
+        at drain time from the node's immutable core (C2/M8), so nothing is stored.
 
         Args:
-            node_id: The node ID.
-            embedding_text: The canonical text to embed.
+            node_id: The node ID to enqueue.
         """
         ...
 

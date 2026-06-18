@@ -838,21 +838,10 @@ def test_store_rebuild_quarantine_is_tracked() -> None:
     """
     from conftest import STORE_REBUILD_QUARANTINE
 
-    assert set(STORE_REBUILD_QUARANTINE) == {
-        # restored in Phase 8a (consumer preservation)
-        "test_list_decisions.py",
-        "test_modifier_surfacing.py",
-        "test_neighbor_review.py",
-        "test_payload_economy.py",
-        "test_surface_confidence.py",
-        "test_sync.py",
-        "test_importer.py",
-        "test_record_decision.py",
-        "test_relations_and_adjacency.py",
-        "test_adversarial_invariants.py",
-        "test_adversarial_mcp.py",
-        "test_cli_pathologies.py",
-    }
+    # Phase 8a drained the contained-red window to EMPTY: all 12 consumer modules
+    # were restored against the reconciled V1a consumers (entry-003 closed). The set
+    # provably reaching 0 is the closing of the 5a→8a window.
+    assert set(STORE_REBUILD_QUARANTINE) == set()
 
 
 # ===========================================================================
@@ -1253,23 +1242,25 @@ def test_5d_active_decisions_excludes_superseded(temp_store: GraphStore) -> None
     assert _is_active(temp_store, old.node_id) is False
 
 
-def test_5d_active_reads_never_call_compute_all_states(
+def test_5d_active_reads_never_call_get_node_state(
     temp_store: GraphStore, monkeypatch
 ) -> None:
-    """The active read methods compute activeness via the anti-join, NOT the prototype DAG.
+    """The active read methods compute activeness via the anti-join, NOT per-node state.
 
-    Monkeypatching ``compute_all_states`` to raise proves no active read depends on
-    it (it reads dropped edge columns and is retired from the active views; 8a owns
-    its deletion). A regression re-introducing the prototype filter fails loudly here.
+    The prototype ``compute_all_states`` DAG was retired in Phase 8a; its single-node
+    successor is ``get_node_state``. Monkeypatching it to raise proves the active read
+    views still derive activeness from the inline SQL kill-edge anti-join (one
+    definition of "active", Lesson 14) and never fall back to an N+1 per-node state
+    call. A regression re-introducing a per-node filter fails loudly here.
     """
     old = temp_store.commit_parsed_entry(_decision(slug="old", axiom="Old.", scope=["z"]))
     _commit_kill(temp_store, "new", "New.", "supersedes", "old", scope=["z"])
     temp_store.commit_parsed_entry(_open_question(slug="oq", topic="T", scope=["z"]))
 
-    def _boom(_conn):
-        raise AssertionError("compute_all_states must not be called by the active reads")
+    def _boom(_node_id):
+        raise AssertionError("get_node_state must not be called by the active reads")
 
-    monkeypatch.setattr(temp_store, "compute_all_states", _boom)
+    monkeypatch.setattr(temp_store, "get_node_state", _boom)
 
     assert [n["slug"] for n in temp_store.get_active_decisions()] == ["new"]
     assert [n["slug"] for n in temp_store.get_active_decisions(scope="z")] == ["new"]

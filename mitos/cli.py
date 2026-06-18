@@ -448,11 +448,8 @@ def cmd_show(config: MitosConfig, ident: str) -> None:
         print(f"Node with ID or Slug '{ident}' not found.")
         return
 
-    # Compute current active/superseded state
-    conn = store._get_connection()
-    states = store.compute_all_states(conn)
-    state = states.get(node["id"], "active")
-    conn.close()
+    # Compute current active/superseded state (single-node V1a derivation, 8a)
+    state = store.get_node_state(node["id"])
 
     modifiers = store.get_modifiers(node["id"])
 
@@ -612,6 +609,7 @@ def cmd_record(
     mechanisms: Optional[List[str]] = None,
     context: Optional[str] = None,
     supersedes: Optional[str] = None,
+    corrects: Optional[str] = None,
     amends: Optional[str] = None,
     narrows: Optional[str] = None,
     depends_on: Optional[str] = None,
@@ -631,6 +629,7 @@ def cmd_record(
         mechanisms=mechanisms,
         context=context,
         supersedes=supersedes,
+        corrects=corrects,
         amends=amends,
         narrows=narrows,
         depends_on=depends_on,
@@ -750,7 +749,7 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
                 node = store.get_node_by_slug(m["slug"])
                 if not node:
                     continue
-                state = store.compute_all_states(store._get_connection()).get(node["id"])
+                state = store.get_node_state(node["id"])
                 if state not in ("active", "drifted"):
                     continue
                 results["active_decisions"].append(_shape(node, m["score"]))
@@ -1491,6 +1490,7 @@ def main() -> None:
     rec_p.add_argument("--context-file", default=None, dest="context_file",
                        help="Read --context from a file ('-' = stdin).")
     rec_p.add_argument("--supersedes", default=None, help="Exact slug of a prior decision this one replaces.")
+    rec_p.add_argument("--corrects", default=None, help="Exact slug of a prior decision this one corrects (kill-edge twin of --supersedes).")
     rec_p.add_argument("--amends", default=None, help="Exact slug of a decision this one amends.")
     rec_p.add_argument("--narrows", default=None, help="Exact slug of a decision this one narrows.")
     rec_p.add_argument("--depends-on", default=None, dest="depends_on", help="Exact slug of a decision this one depends on.")
@@ -1574,6 +1574,7 @@ def main() -> None:
                 mechanisms=args.mechanisms,
                 context=context,
                 supersedes=args.supersedes,
+                corrects=args.corrects,
                 amends=args.amends,
                 narrows=args.narrows,
                 depends_on=args.depends_on,

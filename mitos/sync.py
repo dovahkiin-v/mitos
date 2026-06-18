@@ -17,10 +17,11 @@ from google import genai
 from google.genai import types
 
 from mitos.config import MitosConfig, hint_due
-from mitos.errors import SynthesisError, ParseError, ValidationError, DatabaseError
+from mitos.errors import SynthesisError, ParseError, ValidationError, DatabaseError, EntryFailure
 from mitos.models import get_model_id
-from mitos.parser import ParsedEntry, parse_decisions_file
-from mitos.store import GraphStore, CommitDelta, compute_hash
+from mitos.parser import ParsedEntry, parse_entry_stream
+from mitos.store import GraphStore, CommitDelta
+from mitos.identity import compute_node_id, embedding_text
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.vector_store import QdrantVectorStore
 from mitos.renderer import MitosRenderer, summarize_overflows
@@ -43,7 +44,7 @@ Here are some currently ACTIVE decisions in the workspace:
 
 Here is the proposed decision entry:
 Slug: {entry.slug}
-Decided: {entry.core_axiom}
+Decided: {entry.axiom}
 Rejected: {entry.rejected_paths}
 Mechanisms: {','.join(entry.mechanisms)}
 Scope: {','.join(entry.scope)}
@@ -151,6 +152,8 @@ _ERROR_MESSAGES: Dict[str, str] = {
     "slug_collision": "A different decision already uses the slug '{slug}'. Give this one a distinct 'slug'; and if it is meant to replace the existing decision, also set supersedes='{slug}' (the new decision must still have its own slug — two decisions cannot share one).",
     "supersedes_not_found": "supersedes='{supersedes}' does not match any existing decision. Look it up first with query_decisions to get the exact slug, or omit 'supersedes' if this is a brand-new decision.",
     "supersedes_ambiguous": "supersedes='{supersedes}' matches more than one decision. Use query_decisions to find the exact, full slug and pass that.",
+    "corrects_not_found": "corrects='{corrects}' does not match any existing decision. Look it up first with query_decisions to get the exact slug, or omit 'corrects' if this is a brand-new decision.",
+    "corrects_ambiguous": "corrects='{corrects}' matches more than one decision. Use query_decisions to find the exact, full slug and pass that.",
     "relation_target_not_found": "{relation}='{target}' does not match any existing decision. Look it up first with surface_decisions/query_decisions to get the exact slug, or omit '{relation}' if no such link applies.",
     "relation_target_ambiguous": "{relation}='{target}' matches more than one decision. Use query_decisions to find the exact, full slug and pass that.",
     "commit_failed": "The decision validated but the commit failed and nothing was written: {reason}. Retry; if it persists, the workspace store may be locked or corrupt.",
@@ -175,6 +178,39 @@ _EXTRA_RELATIONS = (
 def _record_error(code: str, **fields: Any) -> Dict[str, str]:
     """Builds a structured {error, code} dict using the canonical message for ``code``."""
     return {"error": _ERROR_MESSAGES[code].format(**fields), "code": code}
+
+
+def _embedding_input_text(
+    kind: str,
+    axiom: Optional[str] = None,
+    topic: Optional[str] = None,
+    questions_raised: Optional[List[str]] = None,
+) -> str:
+    """Derives the V1a embedding-input string for an entry or node (C2/M8 single source).
+
+    Routes through :func:`identity.embedding_text` so the record-time and drain-time
+    embedding text are byte-identical — a node embedded inline at record time and the
+    same node re-derived from the Outbox at drain time yield the same vector (the
+    ``embedding_text`` column is gone in V1a, so drain re-derives from the immutable
+    core, M8). Bridges the one reader-key gap: a decision's axiom is exposed as
+    ``axiom`` on a :class:`ParsedEntry` but ``core_axiom`` on a store node dict —
+    callers pass whichever they hold under ``axiom``.
+
+    Args:
+        kind: ``"decision"`` or ``"open_question"``.
+        axiom: The decision axiom (for a decision entry/node).
+        topic: The open_question topic.
+        questions_raised: The open_question's questions, in authored order.
+
+    Returns:
+        The embedding-input string (normalized, M8-consistent with the hashed core).
+    """
+    return embedding_text({
+        "kind": kind,
+        "axiom": axiom,
+        "topic": topic,
+        "questions_raised": questions_raised or [],
+    })
 
 
 def _contains_structural_token(text: str) -> bool:
@@ -226,8 +262,10 @@ def _polarity_mismatch(a: str, b: str) -> bool:
 def _slugify(text: str) -> str:
     """Derives a deterministic, lowercase-hyphenated slug from free text.
 
-    Determinism is load-bearing: ``compute_hash`` lower-cases the slug, so the
-    same decision must always yield the same slug (and thus the same node id).
+    Determinism keeps the human-readable handle stable: the slug is NOT part of the
+    node id (V1a identity is the slug-free canonical core — ``compute_node_id``), but
+    a stable auto-derived slug means the same decision presents the same handle and
+    the casefold slug-collision check (V1-D4) behaves predictably.
 
     When the slug exceeds the length cap it is trimmed back to the last word
     boundary (hyphen) rather than sliced mid-word, so the handle an agent carries
@@ -364,17 +402,21 @@ class MitosSyncManager:
         #    decisions.md for the user to fix and re-sync.
         with open(snapshot_path, "r", encoding="utf-8") as f:
             snapshot_text = f.read()
-        parse_errors: List[ParseError] = []
-        entries = parse_decisions_file(snapshot_text, errors=parse_errors)
+        # decisions.md is a decisions-only stream in V1a (OQ authoring lives in a
+        # separate questions.md — 1c). Collector mode isolates a malformed entry
+        # (reported + skipped) so the rest still sync (§5.2.2 per-entry isolation).
+        parse_failures: List[EntryFailure] = []
+        entries = parse_entry_stream(snapshot_text, "decision", failures=parse_failures)
 
-        for perr in parse_errors:
+        for fail in parse_failures:
+            msgs = "; ".join(item.message for item in fail.items) or "malformed entry"
             print(
-                f"[Parse error] {perr.message} (lines {perr.line_start}-{perr.line_end}). "
+                f"[Parse error] {msgs} (lines {fail.line_start}-{fail.line_end}). "
                 f"Entry skipped — fix it and re-run sync."
             )
 
         if not entries:
-            if parse_errors:
+            if parse_failures:
                 print("No parseable entries to commit. Fix the reported entries above and re-run sync.")
             else:
                 print("Zero pending entries found in decisions.md write-buffer.")
@@ -408,15 +450,15 @@ class MitosSyncManager:
                 snap_lines = f.readlines()
             entry_raw_text = "".join(snap_lines[entry.line_start - 1 : entry.line_end])
 
-            # Check if this node is already in the database
-            node_id = compute_hash(
-                entry.kind,
-                entry.slug,
-                entry.core_axiom,
-                entry.mechanisms,
-                entry.questions_raised
+            # Check if this node is already in the database (slug-free V1a id — V1-D2).
+            node_id = compute_node_id(
+                kind=entry.kind,
+                axiom=entry.axiom,
+                mechanism_refs=entry.mechanisms,
+                topic=entry.topic,
+                questions_raised=entry.questions_raised,
             )
-            
+
             existing = self.store.get_node(node_id)
             if existing:
                 # Idempotency short-circuit (S5)
@@ -429,7 +471,7 @@ class MitosSyncManager:
             if collision:
                 print(f"\n[Collision] Slug '{entry.slug}' already exists in graph.")
                 print(f"  Existing Axiom: {collision.get('core_axiom')}")
-                print(f"  New Axiom:      {entry.core_axiom}")
+                print(f"  New Axiom:      {entry.axiom}")
                 
                 if auto_accept:
                     # Default to correction in auto-mode
@@ -469,7 +511,7 @@ class MitosSyncManager:
                         return
 
                 # Apply refinements
-                refined_axiom = enrichment.get("refined_core_axiom", entry.core_axiom)
+                refined_axiom = enrichment.get("refined_core_axiom", entry.axiom)
                 refined_mechs = enrichment.get("refined_mechanisms", entry.mechanisms)
                 refined_scopes = enrichment.get("refined_scope", entry.scope)
                 sugg_rels = enrichment.get("suggested_relationships", {})
@@ -495,8 +537,8 @@ class MitosSyncManager:
                         # Simple inline editing loop
                         refined_axiom = input(f"Enter core axiom [{refined_axiom}]: ").strip() or refined_axiom
 
-                # Commit to local variables for database insert
-                entry.core_axiom = refined_axiom
+                # Commit refined values back onto the entry (commit reads .axiom — V1a).
+                entry.axiom = refined_axiom
                 entry.mechanisms = refined_mechs
                 entry.scope = refined_scopes
                 
@@ -619,20 +661,27 @@ class MitosSyncManager:
     def _best_effort_embed(self, delta: CommitDelta, entry: ParsedEntry) -> Optional[List[float]]:
         """Best-effort async embedding upsert pipeline (C2).
 
-        Returns the document vector it computed and upserted (so a caller can reuse
-        it for a neighbour query), or None if embedding was deferred/failed.
+        The committing node is already enqueued on the ``pending_embeddings`` Outbox
+        by ``commit_parsed_entry`` (``_enqueue_outbox``, 5c), so this is the inline
+        fast path: with the provider up we embed + upsert immediately and DROP the
+        now-redundant Outbox row (the node is indexed); with it down or the call
+        failing we leave the row for the next ``sync`` drain — never a second enqueue
+        (the commit already wrote one; the prototype's deferred ``add_pending_embedding``
+        is retired here, 8a). Returns the document vector it computed and upserted (so
+        a caller can reuse it for a neighbour query), or None if embedding was
+        deferred/failed.
         """
-        embedding_text = entry.core_axiom if entry.kind == "decision" else f"{entry.slug}: " + " ".join(entry.questions_raised)
+        embed_text = _embedding_input_text(
+            kind=entry.kind, axiom=entry.axiom,
+            topic=entry.topic, questions_raised=entry.questions_raised,
+        )
 
         if not self.embed_provider or not self.vector_store:
-            try:
-                self.store.add_pending_embedding(delta.node_id, embedding_text)
-                # stderr: this path is shared with the MCP write tool, whose stdout is the
-                # JSON-RPC channel — a stray stdout line there corrupts the protocol.
-                print(f"[Warning] Embedding upsert deferred for '{entry.slug}': Embedding provider down.",
-                      file=sys.stderr)
-            except Exception as e:
-                print(f"[Warning] Failed to write outbox queue: {str(e)}", file=sys.stderr)
+            # Already enqueued by the commit; just note the deferral. stderr — this
+            # path is shared with the MCP write tool, whose stdout is the JSON-RPC
+            # channel (a stray stdout line there corrupts the protocol).
+            print(f"[Warning] Embedding upsert deferred for '{entry.slug}': Embedding provider down.",
+                  file=sys.stderr)
             return None
 
         # Prepare payload
@@ -641,22 +690,23 @@ class MitosSyncManager:
             "scope": entry.scope,
             "state": "active",
             "kind": entry.kind,
-            "embedding_text": embedding_text
+            "embedding_text": embed_text
         }
 
         try:
             # Check embedding provider and generate vector
             vector = self.embed_provider.get_embedding(payload["embedding_text"], is_query=False)
             self.vector_store.upsert(delta.node_id, vector, payload)
+            # Indexed now — drop the Outbox row the commit enqueued.
+            try:
+                self.store.remove_pending_embedding(delta.node_id)
+            except Exception as dbe:
+                print(f"[Warning] Failed to clear outbox row: {str(dbe)}", file=sys.stderr)
             return vector
         except Exception as e:
-            # Failed embeddings land in graph Outbox queue (C2). stderr — shared with the
-            # MCP write tool, whose stdout is the JSON-RPC channel (see the deferred-path note).
+            # The commit already enqueued this node (C2); leave the row for the next
+            # drain. stderr — shared with the MCP write tool's JSON-RPC stdout channel.
             print(f"[Warning] Embedding upsert deferred for '{entry.slug}': {str(e)}", file=sys.stderr)
-            try:
-                self.store.add_pending_embedding(delta.node_id, embedding_text)
-            except Exception as dbe:
-                print(f"[Warning] Failed to write outbox queue: {str(dbe)}", file=sys.stderr)
             return None
 
     def drain_pending_embeddings(self) -> None:
@@ -687,8 +737,7 @@ class MitosSyncManager:
         try:
             for item in pending:
                 node_id = item["node_id"]
-                embedding_text = item["embedding_text"]
-                
+
                 # Fetch node details from graph for Qdrant payload
                 node = self.store.get_node(node_id)
                 if not node:
@@ -699,17 +748,25 @@ class MitosSyncManager:
                         pass
                     continue
 
+                # Re-derive the embedding text from the node's immutable core (the
+                # Outbox row no longer carries it — C2/M8); byte-identical to what the
+                # inline record-time embed used for the same node.
+                embed_text = _embedding_input_text(
+                    kind=node["kind"], axiom=node.get("core_axiom"),
+                    topic=node.get("topic"), questions_raised=node.get("questions_raised"),
+                )
+
                 payload = {
                     "slug": node["slug"],
                     "scope": node["scope"],
                     "state": "active",
                     "kind": node["kind"],
-                    "embedding_text": embedding_text
+                    "embedding_text": embed_text
                 }
 
                 try:
                     # 1. Fetch embedding vector
-                    vector = self.embed_provider.get_embedding(embedding_text, is_query=False)
+                    vector = self.embed_provider.get_embedding(embed_text, is_query=False)
                     # 2. Upsert to Qdrant
                     self.vector_store.upsert(node_id, vector, payload)
                     # 3. Clean up queue row on success
@@ -794,17 +851,12 @@ class MitosSyncManager:
             return []
         out: List[Dict[str, Any]] = []
         try:
-            conn = self.store._get_connection()
-            try:
-                states = self.store.compute_all_states(conn)
-            finally:
-                conn.close()
             for m in self.vector_store.query(vector, limit=limit + 3):
                 slug = m.get("slug")
                 if not slug or slug == exclude_slug:
                     continue
                 node = self.store.get_node_by_slug(slug)
-                if not node or states.get(node["id"]) not in ("active", "drifted"):
+                if not node or self.store.get_node_state(node["id"]) not in ("active", "drifted"):
                     continue
                 out.append({"slug": slug, "axiom": node["core_axiom"], "score": m.get("score")})
                 if len(out) >= limit:
@@ -838,8 +890,10 @@ class MitosSyncManager:
         if not self.embed_provider or not self.vector_store:
             return []
         try:
-            text = (entry.core_axiom if entry.kind == "decision"
-                    else f"{entry.slug}: " + " ".join(entry.questions_raised))
+            text = _embedding_input_text(
+                kind=entry.kind, axiom=entry.axiom,
+                topic=entry.topic, questions_raised=entry.questions_raised,
+            )
             vector = self.embed_provider.get_embedding(text, is_query=False)
         except Exception:
             return []
@@ -854,17 +908,13 @@ class MitosSyncManager:
                 "slug": n["slug"],
                 "axiom": n["axiom"],
                 "score": score,
-                "possible_tension": _polarity_mismatch(entry.core_axiom, n["axiom"]),
+                "possible_tension": _polarity_mismatch(entry.axiom, n["axiom"]),
             })
         return flagged
 
     def _node_state(self, node_id: str) -> str:
-        """Returns the computed state of a node ('active'/'superseded'/'drifted')."""
-        conn = self.store._get_connection()
-        try:
-            return self.store.compute_all_states(conn).get(node_id, "active")
-        finally:
-            conn.close()
+        """Returns the computed state of a node ('active'/'superseded'/'corrected'/'drifted')."""
+        return self.store.get_node_state(node_id)
 
     def _embedding_status(self, node_id: str) -> str:
         """Reports whether a node's embedding is queued in the outbox ('pending') or done."""
@@ -884,6 +934,7 @@ class MitosSyncManager:
         mechanisms: Optional[List[str]] = None,
         context: Optional[str] = None,
         supersedes: Optional[str] = None,
+        corrects: Optional[str] = None,
         amends: Optional[str] = None,
         narrows: Optional[str] = None,
         depends_on: Optional[str] = None,
@@ -916,6 +967,8 @@ class MitosSyncManager:
             mechanisms: Concrete technologies/entities involved (M6).
             context: Optional background on why this was decided.
             supersedes: Optional exact slug of a prior decision this one replaces.
+            corrects: Optional exact slug of a prior decision this one corrects (a
+                kill-edge twin of supersedes — the target leaves the active view).
             amends: Optional exact slug of a decision this one amends.
             narrows: Optional exact slug of a decision this one narrows.
             depends_on: Optional exact slug of a decision this one depends on.
@@ -945,7 +998,8 @@ class MitosSyncManager:
             return _record_error("not_initialized")
 
         # 2. Normalise CRLF, then validate. A stray \r perturbs the field regex and
-        #    compute_hash (same decision would hash differently across environments).
+        #    the canonical-core hash (same decision would hash differently across
+        #    environments — compute_node_id normalizes, but normalize at the boundary).
         axiom = (axiom or "").replace("\r\n", "\n").replace("\r", "\n")
         rejected_paths = (rejected_paths or "").replace("\r\n", "\n").replace("\r", "\n")
         if context is not None:
@@ -971,9 +1025,12 @@ class MitosSyncManager:
         scope = [s.strip() for s in scope if s and s.strip()] if scope else []
         if supersedes is not None:
             supersedes = supersedes.strip() or None
+        if corrects is not None:
+            corrects = corrects.strip() or None
 
-        # Normalise the other typed relations into a stable-ordered map (supersedes is
-        # handled separately — it changes state and has bespoke error codes).
+        # Normalise the other typed relations into a stable-ordered map (supersedes and
+        # corrects are handled separately — both are kill-edges that change computed
+        # state and carry bespoke error codes).
         _provided = {
             "amends": amends, "narrows": narrows, "depends_on": depends_on,
             "resolves": resolves, "contradicts": contradicts,
@@ -1001,17 +1058,21 @@ class MitosSyncManager:
             lines.append(f"**Context:** {context}")
         if supersedes:
             lines.append(f"**Supersedes:** {supersedes}")
+        if corrects:
+            lines.append(f"**Corrects:** {corrects}")
         for _name, _label in _EXTRA_RELATIONS:
             if _name in extra_relations:
                 lines.append(f"**{_label}:** {extra_relations[_name]}")
         entry_text = "\n".join(lines) + "\n"
 
-        # 6. Parse our entry back through the REAL parser (marker-aware), then run
-        #    the graph-level checks as a read-only fast-fail.
-        parse_errors: List[ParseError] = []
-        parsed = parse_decisions_file(
-            _ENTRIES_MARKER + "\n\n" + entry_text, errors=parse_errors
-        )
+        # 6. Parse our entry back through the V1a tokenizer (sets .axiom/.topic +
+        #    the relationship attrs), then run the graph-level checks as a read-only
+        #    fast-fail. STRICT mode (no collector): a malformed self-serialized entry
+        #    raises ParseError, which we map to the structured parse_failed code (G2).
+        try:
+            parsed = parse_entry_stream(entry_text, "decision")
+        except ParseError:
+            return _record_error("parse_failed")
         if len(parsed) != 1:
             return _record_error("parse_failed")
         entry = parsed[0]
@@ -1028,6 +1089,20 @@ class MitosSyncManager:
                 return _record_error("supersedes_not_found", supersedes=supersedes)
             entry.supersedes = supersedes
 
+        # Pre-validate corrects with an EXACT match — the kill-edge twin of supersedes
+        # (V1a's second kill-edge; the target leaves the active view). Same Phase-A
+        # read-only fast-fail shape, so a miss writes nothing.
+        if corrects:
+            ids = self.store.resolve_slug(corrects)
+            if not ids:
+                return _record_error("corrects_not_found", corrects=corrects)
+            if len(ids) > 1:
+                return _record_error("corrects_ambiguous", corrects=corrects)
+            target = self.store.get_node(ids[0])
+            if not target or target.get("slug", "").lower() != corrects.lower():
+                return _record_error("corrects_not_found", corrects=corrects)
+            entry.corrects = corrects
+
         # Validate every other typed relation EXACTLY like supersedes — each must
         # point at a real, unambiguous decision. Still Phase A: a miss returns an
         # error and writes nothing, so the buffer stays byte-for-byte unchanged.
@@ -1037,9 +1112,16 @@ class MitosSyncManager:
                 return err
             setattr(entry, _name, _target)
 
-        # Identity.
-        node_id = compute_hash(
-            entry.kind, entry.slug, entry.core_axiom, entry.mechanisms, entry.questions_raised
+        # Identity (slug-free canonical-core hash — V1-D2). Computed over the SAME
+        # fields commit_parsed_entry hashes, so this pre-commit idempotency id equals
+        # the commit id: a same-core re-record with a new --slug is an in-place UPDATE
+        # (slug rename), never a spurious slug_collision (G3, V1-D16).
+        node_id = compute_node_id(
+            kind=entry.kind,
+            axiom=entry.axiom,
+            mechanism_refs=entry.mechanisms,
+            topic=entry.topic,
+            questions_raised=entry.questions_raised,
         )
 
         # Idempotency (M2) fast-fail.
@@ -1066,8 +1148,11 @@ class MitosSyncManager:
         # (no embeddings → no pause) and bypassable with acknowledge_neighbors=True.
         if not acknowledge_neighbors:
             declared_targets = {
-                t.lower() for t in
-                (([supersedes] if supersedes else []) + list(extra_relations.values()))
+                t.lower() for t in (
+                    ([supersedes] if supersedes else [])
+                    + ([corrects] if corrects else [])
+                    + list(extra_relations.values())
+                )
             }
             neighbors = self._review_neighbors(entry, declared_targets)
             if neighbors:
