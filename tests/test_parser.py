@@ -1045,3 +1045,50 @@ def test_load_dynamic_field_map_missing_spec_raises() -> None:
             load_dynamic_field_map()
     finally:
         builtins.open = original
+
+
+def test_field_map_regex_rejects_malformed_field_names(monkeypatch) -> None:
+    """r2 guard: the recognition regex harvests only well-formed [A-Za-z _-] names.
+
+    The pre-r2 class ``[a-zA-Z -_]`` parsed ` -_` as the 0x20-0x5F range, silently
+    accepting 35 unintended chars (digits, ``@``, ``/``, ``;`` …). Post-4b this regex
+    is the SOLE field-recognition gate (no baseline mask), so a malformed spec bullet
+    must NOT be harvested. Well-formed names — including hyphenated ones (hyphen stays
+    literal) — must still resolve. Pre-fix this test fails: ``fo0o``/``fo@o``/``a/b``/
+    ``a;b`` are harvested by the over-broad range.
+    """
+    import builtins
+    import io
+    import re
+
+    synthetic_spec = (
+        "# Synthetic format-spec for the r2 regex guard\n"
+        "- `**Decided:**` well-formed plain name\n"
+        "- `**Invalidates-If:**` well-formed hyphenated name (hyphen literal)\n"
+        "- `**Fo0o:**` malformed — digit in name\n"
+        "- `**Fo@o:**` malformed — @ in name\n"
+        "- `**A/B:**` malformed — slash in name\n"
+        "- `**A;B:**` malformed — semicolon in name\n"
+    )
+
+    real_open = builtins.open
+
+    def fake_open(path, *args, **kwargs):
+        if "format-spec.md" in str(path):
+            return io.StringIO(synthetic_spec)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+
+    fm = load_dynamic_field_map()
+
+    # Well-formed names are harvested — hyphen-as-literal is preserved.
+    assert "decided" in fm
+    assert "invalidates-if" in fm
+    # Malformed names are rejected outright by the tightened class.
+    for malformed in ("fo0o", "fo@o", "a/b", "a;b"):
+        assert malformed not in fm, f"malformed field name {malformed!r} was harvested"
+    # Strong form: NO harvested key carries a char outside [a-z], space, _ or -.
+    # (special_mappings + alias_variations only ever add space/underscore/hyphen keys.)
+    for key in fm:
+        assert re.fullmatch(r"[a-z _-]+", key), f"unexpected chars in harvested key {key!r}"
