@@ -251,6 +251,30 @@ def test_commentary_update_slug_rename_same_id(temp_store: GraphStore) -> None:
     assert row2["updated_at"] > row1["updated_at"]  # updated_at ticked (V1-D17)
 
 
+def test_mi5_commentary_update_emits_no_edge(temp_store: GraphStore) -> None:
+    """MI-5: a commentary-only update touches ``edges`` zero times (§5.3 / §12 anchor).
+
+    An in-place commentary UPDATE — slug/scope/context changes on the same
+    canonical core, no declared relationship field — is a node + ``node_scopes``
+    mutation only. Edges are reserved for declared relations, so a commentary edit
+    must never write (or churn) an ``edges`` row. This is the dedicated MI-5
+    verification anchor the closeout §5.3 audit names (distinct from the
+    failed-commit rollback cases, which leave 0 edges for a different reason).
+    """
+    e1 = _decision(slug="d", axiom="A.", scope=["one"], context="First.")
+    d1 = temp_store.commit_parsed_entry(e1)
+    assert _count(temp_store, "edges") == 0
+
+    # Same core, changed commentary (slug rename + scope + context) → an in-place
+    # UPDATE (one node), and STILL zero edges — the commentary edit emits no edge.
+    e2 = _decision(slug="d-renamed", axiom="A.", scope=["two"], context="Revised.")
+    d2 = temp_store.commit_parsed_entry(e2)
+    assert d2.node_id == d1.node_id
+    assert d2.commentary_fields_changed is True
+    assert _count(temp_store, "nodes") == 1
+    assert _count(temp_store, "edges") == 0
+
+
 def test_mi4_source_fence_and_core_change(temp_store: GraphStore) -> None:
     """source is fenced on a same-id re-commit; a changed axiom mints a new node."""
     e1 = _decision(slug="d", axiom="Axiom A.", source=None)  # -> "user"
