@@ -197,6 +197,12 @@ class MitosConfig:
         # stay real instance attributes even though the file can no longer set them.
         self.db_path = os.path.join(self.mitos_dir, "graph.sqlite")
         self.decisions_file = os.path.join(self.workspace_dir, "decisions.md")
+        # The open-question authoring buffer, a fixed v0.1 convention path
+        # paralleling ``decisions_file`` (ADR
+        # ``open-questions-authored-in-separate-questions-md-file``). ``mitos init``
+        # (6b) seeds it; the V3a sync / V6 importer consumers read it later
+        # (forward-provided — no in-vision reader yet, like 5d's protocol seams).
+        self.questions_file = os.path.join(self.workspace_dir, "questions.md")
         self.archive_dir = os.path.join(self.workspace_dir, "decisions", "archive")
 
         # `pending_threshold` LEFT the v0.1 file schema (its migration to
@@ -318,6 +324,7 @@ class MitosConfig:
             "qdrant_collection": self.qdrant_collection,
             "pending_threshold": self.pending_threshold,
             "decisions_file": self.decisions_file,
+            "questions_file": self.questions_file,
             "archive_dir": self.archive_dir,
         }
         # The seven static schema keys (incl. rotation_mode) from their one source.

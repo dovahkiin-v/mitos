@@ -85,7 +85,10 @@ def test_status_reports_scope_overflow_detail(tmp_path, monkeypatch, capsys):
     config = MitosConfig(str(tmp_path))
     store = GraphStore(config.db_path)
     big = ParsedEntry("decision", "big-axiom", 1, 5)
-    big.core_axiom = "A long rationale block. " * 40
+    # V1a: commit_parsed_entry reads `parsed.axiom` (not the prototype `core_axiom`);
+    # the renderer hydrates it back to the reader key `core_axiom` (5d _hydrate_node),
+    # so the overflow surface still works end-to-end.
+    big.axiom = "A long rationale block. " * 40
     big.rejected_paths = "n/a"
     big.scope = ["substrate"]
     store.commit_parsed_entry(big)

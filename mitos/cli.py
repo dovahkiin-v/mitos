@@ -7,18 +7,39 @@ MCP serving.
 
 import sys
 import os
+import re
+import hashlib
 import argparse
 from typing import List, Optional, Dict, Any
 from google import genai
 
 from mitos import __version__
-from mitos.config import MitosConfig, default_collection_name, global_env_path, hint_due
-from mitos.errors import MitosError, ParseError, ValidationError
-from mitos.store import GraphStore, MODIFIER_EDGE_KEYS
+from mitos.config import (
+    MitosConfig,
+    CONFIG_DEFAULTS,
+    default_collection_name,
+    global_env_path,
+    hint_due,
+)
+from mitos.errors import MitosError, ParseError, ValidationError, DatabaseError, ConfigError
+from mitos.migrations import is_pre_v1a_schema
+from mitos.store import GraphStore, MODIFIER_EDGE_KEYS, open_connection
 from mitos.recall import assess_surface_recall
 from mitos.sync import MitosSyncManager, run_ambient_capture
 from mitos.renderer import MitosRenderer, overflow_report
 from mitos.importer import MitosProseImporter
+
+
+# Shared route-to-cutover guidance. `mitos init` raises it (DatabaseError) and
+# `mitos status` reports it when a pre-V1a (prototype) graph is detected, so both
+# operator surfaces point the same direction. Mirrors the substance of the
+# GraphStore.__init__ boot-guard message (store.py) + vision §2.1; the one-time
+# cutover tooling itself ships at Phase 7.
+_CUTOVER_GUIDANCE = (
+    "This graph predates the V1a schema (a prototype layout was detected). "
+    "Mitos will not migrate it in place — run the one-time cutover to rebuild "
+    "it into the V1a store."
+)
 
 
 def _modifier_marker(payload: Dict[str, Any]) -> str:
@@ -77,40 +98,155 @@ def _ensure_gitignore_entry(gitignore_path: str, entry: str) -> None:
         pass
 
 
+def _extract_sample_block(spec: str, header: str) -> str:
+    """Extracts the fenced markdown sample under a ``## N`` header from format-spec.md.
+
+    The spec carries one worked sample per kind inside a ```` ```markdown ```` fence:
+    ``## 3. Sample Entry`` (decisions) and ``## 4. Open Question Sample`` (questions).
+    ``mitos init`` lifts each into the matching buffer's preamble so a fresh
+    ``decisions.md`` / ``questions.md`` shows the author the canonical shape. Only
+    these two sections carry a fenced sample; the ``## 1`` / ``## 2`` field-definition
+    sections do not, so this helper serves exactly those two callers.
+
+    Args:
+        spec: The full ``format-spec.md`` content.
+        header: The section header to match (e.g. ``"## 3. Sample Entry"``).
+
+    Returns:
+        The sample block's inner text (stripped), or ``""`` if no fenced sample
+        follows the header.
+    """
+    match = re.search(
+        rf"{re.escape(header)}.*?\n```markdown\n(.*?)\n```",
+        spec,
+        re.DOTALL | re.IGNORECASE,
+    )
+    return match.group(1).strip() if match else ""
+
+
+def _toml_scalar(value: Any) -> str:
+    """Serializes a v0.1 config scalar to its TOML right-hand-side literal.
+
+    A deliberately tiny serializer for exactly the value set the v0.1 schema uses —
+    plain strings (no embedded ``"`` or newline) and integers — NOT a general TOML
+    writer. The stdlib ``tomllib`` is read-only and P19 forbids pulling ``tomli-w``
+    for nine flat scalars, so ``mitos init`` seeds ``config.toml`` through this
+    (mirrors the project's hand-rolled ``.env``/config readers). A ``bool`` is
+    rejected: it subclasses ``int`` (so it would slip through as ``0``/``1``), and
+    no v0.1 key is bool-typed.
+
+    Args:
+        value: The config value to serialize (``str`` or ``int``).
+
+    Returns:
+        The TOML literal — e.g. ``'"archive"'`` for a string, ``'50'`` for an int.
+
+    Raises:
+        TypeError: If the value is not a plain ``str``/``int``, or is a ``str``
+            containing a ``"`` or newline (beyond this serializer's v0.1 scope).
+    """
+    if isinstance(value, bool):
+        raise TypeError(f"_toml_scalar does not serialize bool (got {value!r})")
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str):
+        if '"' in value or "\n" in value:
+            raise TypeError(
+                f"_toml_scalar only handles simple strings without quotes or "
+                f"newlines (got {value!r})"
+            )
+        return f'"{value}"'
+    raise TypeError(
+        f"_toml_scalar cannot serialize {type(value).__name__}: {value!r}"
+    )
+
+
 def cmd_init(config: MitosConfig) -> None:
-    """Initializes the Mitos workspace."""
+    """Initializes (or idempotently re-initializes) the Mitos workspace.
+
+    Scaffolds the V1a ``.mitos/`` layout: the graph boots at the migration-ladder
+    head, ``config.toml`` is seeded from the single-source ``CONFIG_DEFAULTS``,
+    ``format-spec.md`` is installed from the package (refresh-on-mismatch), and the
+    ``decisions.md`` / ``questions.md`` buffers are seeded only when absent. A
+    re-run is idempotent: present config/buffers are left untouched, a deleted
+    buffer is re-seeded, the ladder re-runs as a no-op (§5.2.7). A pre-V1a
+    (prototype) graph is refused **before any file mutation** with route-to-cutover
+    guidance, never ladder-advanced into a hybrid.
+
+    Args:
+        config: The workspace configuration to initialize.
+
+    Raises:
+        DatabaseError: If a pre-V1a (prototype) graph is detected — the workspace
+            is left in its pre-init state; route the operator to the cutover.
+    """
+    # 0. Refuse a pre-V1a (prototype) graph BEFORE any file mutation. The RW
+    #    GraphStore boot guard would also refuse it, but only at the very end —
+    #    after config/.env/skill/buffers were written. §5.2.7 requires
+    #    abort-before-partial-mutation, so probe explicitly up front (read-only;
+    #    open_connection's mode=ro needs the file to exist, hence the guard) and
+    #    raise with route-to-cutover guidance, leaving the directory untouched.
+    if os.path.exists(config.db_path):
+        probe_conn = open_connection(config.db_path, read_only=True)
+        try:
+            if is_pre_v1a_schema(probe_conn):
+                raise DatabaseError(_CUTOVER_GUIDANCE)
+        finally:
+            probe_conn.close()
+
     os.makedirs(config.mitos_dir, exist_ok=True)
-    
-    # 0. Ensure format-spec.md exists and is the single source of truth
+
+    # 1. Install format-spec.md from the package — the C5 single source of truth.
+    #    Refresh-on-mismatch (V1-D7 / §5.2.7): absent -> install; present but drifted
+    #    from the shipped copy -> overwrite with a calm one-line warning naming both
+    #    short hashes (never a silent overwrite, never a silent stale-skip). skill.md
+    #    embeds the spec, so it is regenerated every init (below) and stays in lockstep.
     format_spec_path = os.path.join(config.workspace_dir, "format-spec.md")
     format_spec_content = load_format_spec()
-    
     if not os.path.exists(format_spec_path):
         with open(format_spec_path, "w", encoding="utf-8") as f:
             f.write(format_spec_content)
+    else:
+        with open(format_spec_path, "r", encoding="utf-8") as f:
+            on_disk_spec = f.read()
+        if on_disk_spec != format_spec_content:
+            old_hash = hashlib.sha256(on_disk_spec.encode("utf-8")).hexdigest()[:12]
+            new_hash = hashlib.sha256(format_spec_content.encode("utf-8")).hexdigest()[:12]
+            with open(format_spec_path, "w", encoding="utf-8") as f:
+                f.write(format_spec_content)
+            print(
+                f"Refreshed format-spec.md to match the installed Mitos package "
+                f"({old_hash} → {new_hash})."
+            )
 
-    # Extract sample block from format-spec.md
-    import re
-    match = re.search(r'## 3\.\s+Sample Entry.*?\n```markdown\n(.*?)\n```', format_spec_content, re.DOTALL | re.IGNORECASE)
-    sample_block = match.group(1).strip() if match else ""
-    
-    # 1. Create config.toml if missing
+    # Extract the canonical sample for each buffer from the spec (one helper, both
+    # kinds): the ## 3 decision sample and the ## 4 open-question sample.
+    decision_sample = _extract_sample_block(format_spec_content, "## 3. Sample Entry")
+    question_sample = _extract_sample_block(format_spec_content, "## 4. Open Question Sample")
+
+    # 1a. Seed config.toml when absent — from the single-source CONFIG_DEFAULTS map
+    #     (P11 / WIRING_LEDGER entry-004), NOT hand-copied literals, so a seeded file
+    #     and the loader's deleted-key fallback can never diverge. The seven static
+    #     keys serialize in CONFIG_DEFAULTS order; the two dynamic qdrant_* lines
+    #     follow (env-/workspace-derived defaults, computed in MitosConfig.__init__).
+    #     NO pending_threshold line — it left the v0.1 file schema (the loader would
+    #     warn-tolerate it on every command).
     config_path = os.path.join(config.mitos_dir, "config.toml")
     if not os.path.exists(config_path):
-        collection = default_collection_name(config.workspace_dir)
+        lines = ["# Mitos Workspace Configuration"]
+        for key, default in CONFIG_DEFAULTS.items():
+            lines.append(f"{key} = {_toml_scalar(default)}")
+        lines += [
+            "# Qdrant REST endpoint. Defaults to Mitos's dedicated :7333 (not the",
+            "# standard :6333) so Mitos never co-locates its collections in another",
+            "# Qdrant you run. Set QDRANT_URL before `init` or edit this line.",
+            f"qdrant_url = {_toml_scalar(config.qdrant_url)}",
+            "# Per-project collection: keeps this project's vectors isolated",
+            "# from other Mitos workspaces sharing the same Qdrant instance.",
+            f"qdrant_collection = {_toml_scalar(config.qdrant_collection)}",
+        ]
         with open(config_path, "w", encoding="utf-8") as f:
-            f.write(
-                "# Mitos Workspace Configuration\n"
-                'rotation_mode = "archive" # "archive" | "mark" | "prune"\n'
-                "pending_threshold = 30\n"
-                "# Qdrant REST endpoint. Defaults to Mitos's dedicated :7333 (not the\n"
-                "# standard :6333) so Mitos never co-locates its collections in another\n"
-                "# Qdrant you run. Set QDRANT_URL before `init` or edit this line.\n"
-                f'qdrant_url = "{config.qdrant_url}"\n'
-                "# Per-project collection: keeps this project's vectors isolated\n"
-                "# from other Mitos workspaces sharing the same Qdrant instance.\n"
-                f'qdrant_collection = "{collection}"\n'
-            )
+            f.write("\n".join(lines) + "\n")
 
     # 1b. Scaffold a gitignored .env with the credential slots, so a human or
     #     LLM setting Mitos up knows exactly where to drop keys (empty by default).
@@ -174,7 +310,7 @@ def cmd_init(config: MitosConfig) -> None:
             "When a decision relates to an existing one, pass that one's EXACT slug to the matching relation arg so the graph stays connected instead of accumulating silent tension: `supersedes` (replaces it), `amends`, `narrows`, `depends_on`, `resolves`, `contradicts`, `derives_from`, `cites`. On `record_decision` these are args; on the CLI they are flags (`--supersedes`, `--depends-on`, …). Look the target up first to get its exact slug. After you record, the result may list nearby existing decisions (`related`) — if one is genuinely connected, link it.\n"
         )
 
-    # 3. Create decisions.md buffer if missing (utilizing the extracted sample block)
+    # 3. Seed the decisions.md buffer when absent (with the extracted ## 3 sample).
     if not os.path.exists(config.decisions_file):
         with open(config.decisions_file, "w", encoding="utf-8") as f:
             f.write(
@@ -182,11 +318,30 @@ def cmd_init(config: MitosConfig) -> None:
                 "<!-- This file is managed by mitos. LLM integration: see .mitos/skill.md once V5 ships. -->\n"
                 "<!-- DO NOT MODIFY ABOVE THIS LINE -->\n\n"
                 "## SAMPLE FORMAT — auto-restored by mitos sync, do not modify or delete\n\n"
-                f"{sample_block}\n\n"
+                f"{decision_sample}\n\n"
                 "<!-- BEGIN ENTRIES — new decisions go directly below this line, newest first -->\n"
             )
-            
-    # Touch database to initialize
+
+    # 4. Seed the questions.md buffer when absent — the open-question authoring
+    #    file (ADR open-questions-authored-in-separate-questions-md-file), parallel
+    #    to decisions.md. The load-bearing parts are the BEGIN ENTRIES sentinel (the
+    #    parser splits the preamble on that substring) and the ## 4 sample sitting in
+    #    the preamble (it yields zero graph state on the first sync).
+    if not os.path.exists(config.questions_file):
+        with open(config.questions_file, "w", encoding="utf-8") as f:
+            f.write(
+                "# Open Questions for Mitos\n\n"
+                "<!-- This file is managed by mitos. LLM integration: see .mitos/skill.md once V5 ships. -->\n"
+                "<!-- DO NOT MODIFY ABOVE THIS LINE -->\n\n"
+                "## SAMPLE FORMAT — auto-restored by mitos sync, do not modify or delete\n\n"
+                f"{question_sample}\n\n"
+                "<!-- BEGIN ENTRIES — new questions go directly below this line, newest first -->\n"
+            )
+
+    # Touch database to initialize — boots the V1a STRICT schema via the migration
+    # ladder (fresh -> user_version=1; an existing V1a graph re-runs as a no-op). A
+    # pre-V1a graph was already refused by the early probe above, so this never
+    # ladder-advances a prototype into a hybrid.
     GraphStore(config.db_path)
     print(f"Initialized Mitos workspace at {config.workspace_dir} ✓")
 
@@ -913,7 +1068,44 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
     """
     import json as _json
     workspace_dir = os.path.abspath(workspace_dir)
-    config = MitosConfig(workspace_dir)
+
+    # `status` is the "is this set up?" probe, so a malformed config.toml is exactly
+    # what it should surface — calmly, as not-ready, never a traceback. The main()
+    # boundary would render only a generic `Error: …`; status owes its caller the
+    # contextual "config malformed → not ready" report (Lesson 45 / entry-004).
+    try:
+        config = MitosConfig(workspace_dir)
+    except ConfigError as e:
+        if as_json:
+            print(_json.dumps({
+                "workspace": workspace_dir,
+                "ready": False,
+                "initialized": False,
+                "config_error": str(e),
+            }, indent=2))
+        else:
+            print(f"\nMITOS STATUS for {workspace_dir} — NOT SET UP ✗\n")
+            print(f"  ✗ config.toml malformed: {e}")
+            print("      → fix it or re-run `mitos init`")
+            print()
+        return 1
+
+    # Pre-V1a (prototype) graph detection — mirrors `init`'s early probe so the two
+    # surfaces stay coherent (§5.2.7). A read-only GraphStore SKIPS the boot guard
+    # (RO can't migrate), so a prototype graph would open fine and only fail deep in
+    # get_all_nodes() (swallowed below) → status must run its OWN probe and force
+    # not-ready. is_pre_v1a_schema is False for an absent/empty or V1a-or-later DB,
+    # so a freshly-init'ed empty graph stays healthy (empty-is-healthy, P5).
+    pre_v1a = False
+    if os.path.exists(config.db_path):
+        try:
+            probe_conn = open_connection(config.db_path, read_only=True)
+            try:
+                pre_v1a = is_pre_v1a_schema(probe_conn)
+            finally:
+                probe_conn.close()
+        except Exception:
+            pass  # best-effort, like the RO read below: a probe failure leaves it False
 
     mitos_dir_ok = os.path.isdir(config.mitos_dir) and os.path.exists(
         os.path.join(config.mitos_dir, "config.toml")
@@ -930,7 +1122,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
     # health surface the write-path overflow nudge points at — the detailed breakdown
     # (which files, which decisions to re-scope) lives here, not on every `record`.
     overflows: List[Dict[str, Any]] = []
-    if os.path.exists(config.db_path):
+    if os.path.exists(config.db_path) and not pre_v1a:
         try:
             ro_store = GraphStore(config.db_path, read_only=True)
             graph_nodes = len(ro_store.get_all_nodes())
@@ -943,14 +1135,16 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
     # on the first `record_decision`. So an absent (or empty) collection is a
     # normal ready state, NOT a blocker: a project with .mitos/, a key, and a
     # reachable Qdrant is ready to record its first decision. Only an unreachable
-    # Qdrant degrades semantic surface/query.
-    ready = initialized and key_ok and q["reachable"]
+    # Qdrant degrades semantic surface/query. A pre-V1a (prototype) graph is never
+    # ready — it must be routed through the one-time cutover first (§5.2.7).
+    ready = initialized and key_ok and q["reachable"] and not pre_v1a
 
     if as_json:
         print(_json.dumps({
             "workspace": workspace_dir,
             "ready": ready,
             "initialized": initialized,
+            "pre_v1a": pre_v1a,
             "qdrant_url": config.qdrant_url,
             "collection": config.qdrant_collection,
             "checks": {
@@ -993,6 +1187,14 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
         ("MCP wired (recommended for agents)", True if mcp_wired else None,
          "agents: wire `mitos serve` — see SETUP.md §3 (CLI works without it)"),
     ]
+    # A pre-V1a (prototype) graph is the dominant blocker — surface it prominently,
+    # right after the workspace line, with the same route-to-cutover guidance `init`
+    # raises. Never `READY ✓` for a graph `init` would refuse (§5.2.7).
+    if pre_v1a:
+        checks.insert(1, (
+            "graph schema (V1a)", False,
+            "prototype graph detected — run the one-time cutover to rebuild it into the V1a store",
+        ))
     print(f"\nMITOS STATUS for {workspace_dir} — {verdict}\n")
     for label, ok, hint in checks:
         line = f"  {mark(ok)} {label}"
@@ -1009,6 +1211,8 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
     if not ready:
         print("Next steps:")
         n = 1
+        if pre_v1a:
+            print(f"  {n}. {_CUTOVER_GUIDANCE}"); n += 1
         if not initialized:
             print(f"  {n}. `mitos init` here (creates .mitos/, decisions.md, scaffolds .env)"); n += 1
         if not key_ok:
