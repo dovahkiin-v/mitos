@@ -8,9 +8,11 @@ import sqlite3
 import json
 import os
 import hashlib
+from datetime import datetime, timezone
 from typing import List, Dict, Optional, Any, Set, Tuple
 from mitos.errors import DatabaseError, ValidationError
-from mitos.migrations import run_migrations
+from mitos.identity import compute_node_id
+from mitos.migrations import run_migrations, is_pre_v1a_schema
 from mitos.parser import ParsedEntry
 
 # The SQLite floor V1a's STRICT tables and the migration ladder require. The
@@ -94,6 +96,20 @@ def compute_hash(
         
     hasher.update(raw_text.encode("utf-8"))
     return hasher.hexdigest()
+
+
+def _utc_now_iso() -> str:
+    """Returns the current UTC instant as an ISO-8601 microsecond string (MI-10).
+
+    The V1a schema carries no ``DEFAULT CURRENT_TIMESTAMP`` — every timestamp is
+    application-supplied UTC ISO-8601 with a ``+00:00`` offset and microsecond
+    precision (MI-10). One stamp is taken per commit; ``created_at`` and
+    ``updated_at`` share it on an INSERT.
+
+    Returns:
+        The current time, e.g. ``"2026-06-18T05:54:31.532538+00:00"``.
+    """
+    return datetime.now(timezone.utc).isoformat()
 
 
 class CommitDelta:
@@ -210,16 +226,33 @@ class GraphStore:
     def __init__(self, db_path: str, read_only: bool = False) -> None:
         self.db_path = db_path
         self.read_only = read_only
-        self._init_db()
+        # Ensure the parent directory exists before any connection touches the
+        # file. This was the prototype ``_init_db``'s first step; with the
+        # ``_init_db()`` boot call removed (Phase 5a, entry-001) it lives here so
+        # a fresh store still scaffolds its directory before the ladder boots.
+        db_dir = os.path.dirname(self.db_path)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
+
         if not self.read_only:
-            # Boot the migration ladder through the live path (Option A). The
-            # registry is empty in V1a 2a, so this is a clean no-op that leaves
-            # user_version at 0 — but wiring it now proves the boot-through-ladder
-            # path and makes 2b a pure addition (register step 1, retire _init_db).
-            # Read-only stores never migrate (§7 gotcha): a mode=ro connection
-            # cannot run the ladder's write transaction.
+            # V1a boot (entry-001 flip): the V1a STRICT schema now boots via the
+            # migration ladder (``run_migrations`` -> ``_v1_schema``), not the
+            # prototype ``_init_db``. Read-only stores never migrate (§7 gotcha):
+            # a mode=ro connection cannot run the ladder's write transaction.
             conn = self._get_connection()
             try:
+                # Refuse a prototype graph rather than ladder-advance it into an
+                # undiagnosable hybrid (R3/R11). ``is_pre_v1a_schema`` is False for
+                # a fresh/empty DB and for any V1a-or-later DB, True only for a
+                # prototype graph — route it to the §2.1 one-time cutover (whose
+                # tooling ships at Phase 7). The RO "not-ready" status surface is
+                # Phase 6b, not 5a.
+                if is_pre_v1a_schema(conn):
+                    raise DatabaseError(
+                        "This graph predates the V1a schema (a prototype layout "
+                        "was detected). Mitos will not migrate it in place. Run "
+                        "the one-time cutover to rebuild it into the V1a store."
+                    )
                 run_migrations(conn)
             finally:
                 conn.close()
@@ -241,7 +274,15 @@ class GraphStore:
         return open_connection(self.db_path, self.read_only)
 
     def _init_db(self) -> None:
-        """Initializes the database schema if it does not exist."""
+        """Builds the prototype (pre-V1a) schema — retained as a test/cutover fixture.
+
+        As of Phase 5a this is **no longer the live boot path**: ``__init__`` boots
+        the V1a STRICT schema via the migration ladder. The method is kept (the
+        boot *call* was removed, not the definition) because it is the canonical
+        prototype-schema definition that ``is_pre_v1a_schema`` detection tests and
+        the Phase 7 cutover rely on. Full retirement defers to 8a/Phase 7 (§16).
+        Not to be confused with ``embeddings.py``'s unrelated ``_init_db``.
+        """
         db_dir = os.path.dirname(self.db_path)
         if db_dir:
             os.makedirs(db_dir, exist_ok=True)
@@ -501,187 +542,315 @@ class GraphStore:
             conn.close()
 
     def commit_parsed_entry(self, parsed: ParsedEntry) -> CommitDelta:
-        """Commits a single ParsedEntry atomic transaction (C1/V1-D22).
+        """Commits one ParsedEntry as a single atomic V1a transaction (V1-D10).
 
-        Computes ID, performs validation, inserts/updates node, reconciles
-        outgoing edges (declarative-mirror-edge-reconciliation), evaluates
-        cascade consequences (commit-delta-cascade-transitive), and returns
-        the structured CommitDelta.
+        Mints the slug-free content-hash id via ``identity.compute_node_id`` and
+        writes the committing entry across ``nodes`` + ``node_scopes`` +
+        ``transcripts`` in one transaction — partial commit is structurally
+        impossible (a crash, lock timeout, or error rolls back the whole entry).
+
+        Identity is the content, not the slug (entry-002 / V1-D2): a new id is an
+        INSERT; a re-commit of the same canonical core is an **in-place commentary
+        UPDATE** whose ``SET`` covers only commentary — ``slug`` is mutable (a
+        rename), but the canonical core *and* ``source`` are fenced (MI-4). A
+        byte-identical re-commit is a true no-op: ``updated_at`` does not tick
+        (MI-3 / V1-D17). ``node_scopes`` reconcile idempotently (casefolded,
+        insert-missing / delete-absent; MI-9) and ``transcripts`` are
+        write-once-preserve (insert / update / no-op-on-absent, **never** DELETE;
+        V1-D16).
+
+        Edge reconciliation (5b), Outbox enqueue (5c), and the read views (5d) are
+        deferred seams: ``_reconcile_edges`` / ``_enqueue_outbox`` are no-op stubs
+        here. Format validation is the parser's job (C1 / Decision 2) — the store
+        owns referential truth, not format truth — so it does not re-validate
+        format.
 
         Args:
-            parsed: The ParsedEntry representation.
+            parsed: A well-formed ``ParsedEntry`` (the parser's C1 guarantee).
 
         Returns:
-            A structured CommitDelta payload.
-        """
-        # 0. Invariant Validation (C1 Seam / M5 invariant)
-        if parsed.kind == "decision":
-            if not parsed.core_axiom:
-                raise ValidationError(f"Decision '{parsed.slug}' is missing required field '**Decided:**'")
-            if not parsed.rejected_paths:
-                raise ValidationError(f"Decision '{parsed.slug}' is missing required field '**Rejected:**' (P14 / M5 invariant)")
-        elif parsed.kind == "open_question":
-            if not parsed.questions_raised:
-                raise ValidationError(f"Open question '{parsed.slug}' is missing required field '**Questions:**'")
+            A ``CommitDelta`` carrying the committed ``node_id`` plus the scope /
+            commentary-change metadata.
 
-        # 1. Compute node ID
-        node_id = compute_hash(
-            parsed.kind,
-            parsed.slug,
-            parsed.core_axiom,
-            parsed.mechanisms,
-            parsed.questions_raised
-        )
+        Raises:
+            ValidationError: If the canonical-core field that feeds the hash is
+                empty or the kind is unknown (a caller that bypassed the parser).
+            DatabaseError: On a SQLite failure (e.g. a ``source`` outside the DDL
+                CHECK enum), with the whole entry rolled back.
+        """
+        # Structural guard, NOT a format re-implementation (Decision 2): the parser
+        # owns format validation (C1). This only fences the single value that feeds
+        # the hash — an empty canonical core would mint a degenerate node id — so a
+        # caller that bypassed the parser fails with a clear vector (P3) instead of
+        # silently corrupting identity. A raise (not a bare ``assert``) survives the
+        # ``-O`` flag (the 2a IMPL_NOTES precedent: a vector error is durable).
+        if parsed.kind == "decision":
+            if not parsed.axiom:
+                raise ValidationError(
+                    f"Decision '{parsed.slug}' reached the store with an empty "
+                    "axiom — the parser's format guarantee was bypassed."
+                )
+            node_id = compute_node_id(
+                kind="decision",
+                axiom=parsed.axiom,
+                mechanism_refs=parsed.mechanisms,
+            )
+        elif parsed.kind == "open_question":
+            if not parsed.topic:
+                raise ValidationError(
+                    f"Open question '{parsed.slug}' reached the store with an "
+                    "empty topic — the parser's format guarantee was bypassed."
+                )
+            node_id = compute_node_id(
+                kind="open_question",
+                topic=parsed.topic,
+                questions_raised=parsed.questions_raised,
+            )
+        else:
+            # Mirror identity's guard so an unknown kind fails here, not deep in a
+            # NULL-column INSERT.
+            raise ValidationError(
+                f"Cannot commit entry '{parsed.slug}': unknown kind "
+                f"{parsed.kind!r} (expected 'decision' or 'open_question')."
+            )
+
+        # Kind-aware column values. Off-kind canonical/commentary columns are NULL
+        # (never ``json.dumps("")`` of an absent core field): a decision's
+        # topic/questions are NULL; an OQ's axiom/mechanism_refs/rejected_paths/
+        # invalidates_if/context are NULL. Only id/kind/slug/slug_casefold/source/
+        # created_at/updated_at are NOT NULL (§8.2).
+        slug = parsed.slug
+        slug_casefold = slug.casefold()  # MI-7: Python casefold, never SQLite LOWER
+        source = parsed.source or "user"  # V1-D20: absent ``**Source:**`` -> "user"
+        if parsed.kind == "decision":
+            axiom = parsed.axiom
+            mechanism_refs_json = json.dumps(parsed.mechanisms)
+            topic = None
+            questions_raised_json = None
+            rejected_paths_json = parsed.rejected_paths  # raw string (§14 latitude)
+            invalidates_if = parsed.invalidates_if
+            context = parsed.context
+        else:
+            axiom = None
+            mechanism_refs_json = None
+            topic = parsed.topic
+            questions_raised_json = json.dumps(parsed.questions_raised)
+            rejected_paths_json = None
+            invalidates_if = None
+            context = None
+        confirmed_by = parsed.confirmed_by  # reserved — NULL in V1a in practice
+        confirmed_at = parsed.confirmed_at
+
+        # Incoming scopes: strip + casefold + drop-empties (the parser already
+        # normalizes; re-applying ``str.casefold()`` is idempotent and keeps a
+        # hand-built entry honest — MI-9, never SQLite NOCASE/LOWER). A scope row
+        # is never empty/NULL.
+        incoming_scopes = {tag for s in parsed.scope if (tag := s.strip().casefold())}
+        incoming_transcript = parsed.transcript or None  # falsy -> absent
 
         conn = self._get_connection()
         try:
             with conn:
-                # Check for prior node with same slug/ID to capture delta metadata
                 cursor = conn.cursor()
-                cursor.execute("SELECT scope, id FROM nodes WHERE slug = ? COLLATE NOCASE", (parsed.slug,))
-                prior_rows = cursor.fetchall()
-                
-                prior_id: Optional[str] = None
-                self_old_scope: List[str] = []
-                
-                for row in prior_rows:
-                    # If matches exact ID, it's a commentary update
-                    if row["id"] == node_id:
-                        prior_id = node_id
-                        self_old_scope = json.loads(row["scope"] or "[]")
-                        break
-                
-                # If no exact ID match but slug exists, we are replacing the node (e.g. correction/supersession)
-                if not prior_id and prior_rows:
-                    # Use scope of the most recent slug holder
-                    self_old_scope = json.loads(prior_rows[-1]["scope"] or "[]")
 
-                # Track global computed states BEFORE write
-                states_before = self.compute_all_states(conn)
-
-                # 2. Write Node Row
-                serialized_questions = json.dumps(parsed.questions_raised)
-                serialized_mechanisms = json.dumps(parsed.mechanisms)
-                serialized_scope = json.dumps(parsed.scope)
-
-                # Store or update the node
-                cursor.execute(
-                    """
-                    INSERT INTO nodes (
-                        id, slug, kind, date, title, core_axiom, rejected_paths,
-                        invalidates_if, context, transcript, park_reason,
-                        questions_raised, mechanisms, scope, confirmed_by, confirmed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET
-                        date=excluded.date,
-                        title=excluded.title,
-                        invalidates_if=excluded.invalidates_if,
-                        context=excluded.context,
-                        transcript=excluded.transcript,
-                        park_reason=excluded.park_reason,
-                        scope=excluded.scope,
-                        confirmed_by=excluded.confirmed_by,
-                        confirmed_at=excluded.confirmed_at
-                    """,
-                    (
-                        node_id, parsed.slug, parsed.kind, parsed.date, parsed.title,
-                        parsed.core_axiom, parsed.rejected_paths, parsed.invalidates_if,
-                        parsed.context, parsed.transcript, parsed.park_reason,
-                        serialized_questions, serialized_mechanisms, serialized_scope,
-                        parsed.confirmed_by, parsed.confirmed_at
+                # --- Read prior state (same content-hash id => same node) -------
+                prior = cursor.execute(
+                    "SELECT * FROM nodes WHERE id = ?", (node_id,)
+                ).fetchone()
+                prior_scopes = {
+                    r["scope"]
+                    for r in cursor.execute(
+                        "SELECT scope FROM node_scopes WHERE node_id = ?", (node_id,)
                     )
+                }
+                prior_tx_row = cursor.execute(
+                    "SELECT transcript_text FROM transcripts WHERE node_id = ?",
+                    (node_id,),
+                ).fetchone()
+                prior_transcript = (
+                    prior_tx_row["transcript_text"] if prior_tx_row else None
                 )
 
-                # Store mechanisms in the registry (M6)
-                cursor.execute("DELETE FROM node_mechanisms WHERE node_id = ?", (node_id,))
-                for mech in parsed.mechanisms:
-                    if mech.strip():
+                is_new = prior is None
+
+                # --- Diff the direct footprint (same-id path only) --------------
+                # The commentary SET is enumerated explicitly (no SELECT *-style
+                # overwrite): slug is mutable commentary, the canonical core and
+                # ``source`` are fenced (MI-4) and never appear here.
+                commentary = {
+                    "slug": slug,
+                    "slug_casefold": slug_casefold,
+                    "rejected_paths_json": rejected_paths_json,
+                    "invalidates_if": invalidates_if,
+                    "context": context,
+                    "confirmed_by": confirmed_by,
+                    "confirmed_at": confirmed_at,
+                }
+                commentary_changed = (not is_new) and any(
+                    prior[col] != val for col, val in commentary.items()
+                )
+                scopes_changed = incoming_scopes != prior_scopes
+                # Transcript write-once-preserve (V1-D16): an absent incoming
+                # transcript leaves the stored row untouched (never a change).
+                transcript_changed = (
+                    incoming_transcript is not None
+                    and incoming_transcript != prior_transcript
+                )
+                direct_footprint_changed = (
+                    commentary_changed or scopes_changed or transcript_changed
+                )
+
+                # --- Timestamp (MI-10): one application-supplied stamp per commit.
+                # New node: created_at == updated_at == now. Same-id with a real
+                # mutation: tick updated_at. True no-op: no tick (MI-3 / V1-D17).
+                now = (
+                    _utc_now_iso()
+                    if is_new or direct_footprint_changed
+                    else None
+                )
+
+                # --- Write the nodes row ----------------------------------------
+                if is_new:
+                    cursor.execute(
+                        """
+                        INSERT INTO nodes (
+                            id, kind, slug, slug_casefold, source,
+                            axiom, mechanism_refs_json, topic, questions_raised_json,
+                            rejected_paths_json, invalidates_if, context,
+                            confirmed_by, confirmed_at, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            node_id, parsed.kind, slug, slug_casefold, source,
+                            axiom, mechanism_refs_json, topic, questions_raised_json,
+                            rejected_paths_json, invalidates_if, context,
+                            confirmed_by, confirmed_at, now, now,
+                        ),
+                    )
+                elif direct_footprint_changed:
+                    # In-place commentary UPDATE: only the commentary columns +
+                    # updated_at. The canonical core and ``source`` are NOT touched.
+                    cursor.execute(
+                        """
+                        UPDATE nodes SET
+                            slug = ?, slug_casefold = ?, rejected_paths_json = ?,
+                            invalidates_if = ?, context = ?, confirmed_by = ?,
+                            confirmed_at = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            slug, slug_casefold, rejected_paths_json,
+                            invalidates_if, context, confirmed_by,
+                            confirmed_at, now, node_id,
+                        ),
+                    )
+                # else: a byte-identical re-commit leaves the nodes row untouched.
+
+                # --- Reconcile node_scopes (insert-missing / delete-absent) -----
+                for tag in incoming_scopes - prior_scopes:
+                    cursor.execute(
+                        "INSERT INTO node_scopes (node_id, scope) VALUES (?, ?)",
+                        (node_id, tag),
+                    )
+                for tag in prior_scopes - incoming_scopes:
+                    cursor.execute(
+                        "DELETE FROM node_scopes WHERE node_id = ? AND scope = ?",
+                        (node_id, tag),
+                    )
+
+                # --- Transcripts: write-once-preserve (never DELETE) ------------
+                if transcript_changed:
+                    if prior_transcript is None:
                         cursor.execute(
-                            "INSERT OR IGNORE INTO mechanisms (name) VALUES (?)",
-                            (mech.strip(),)
+                            "INSERT INTO transcripts (node_id, transcript_text) "
+                            "VALUES (?, ?)",
+                            (node_id, incoming_transcript),
                         )
+                    else:
                         cursor.execute(
-                            "INSERT OR IGNORE INTO node_mechanisms (node_id, mechanism_name) VALUES (?, ?)",
-                            (node_id, mech.strip())
+                            "UPDATE transcripts SET transcript_text = ? "
+                            "WHERE node_id = ?",
+                            (incoming_transcript, node_id),
                         )
 
-                # 3. Declarative Outgoing Edge Reconciliation (V1-D21)
-                # First delete existing outgoing edges originating from this node ID
-                cursor.execute("DELETE FROM edges WHERE from_id = ?", (node_id,))
+                # --- Deferred seams (5b fills edges, 5c fills the Outbox) -------
+                # Passed the cursor so they enlist in THIS transaction without
+                # re-plumbing it. Forcing-function tests assert they are no-ops in
+                # 5a (test_5a_commits_no_edges_yet / test_5a_enqueues_no_outbox_yet).
+                self._reconcile_edges(cursor, node_id, parsed)
+                self._enqueue_outbox(cursor, node_id, parsed)
 
-                # Insert declared relationship edges
-                declared_relationships = [
-                    ("supersedes", parsed.supersedes),
-                    ("corrects", parsed.corrects),
-                    ("amends", parsed.amends),
-                    ("narrows", parsed.narrows),
-                    ("depends_on", parsed.depends_on),
-                    ("resolves", parsed.resolves),
-                    ("contradicts", parsed.contradicts),
-                    ("derives_from", parsed.derives_from),
-                    ("cites", parsed.cites),
-                ]
-
-                for etype, target_slug in declared_relationships:
-                    if target_slug:
-                        if isinstance(target_slug, list):
-                            target_slug = target_slug[0] if target_slug else None
-                        if not target_slug:
-                            continue
-                        # Resolve slug to IDs (case-insensitive)
-                        target_ids = self.resolve_slug(str(target_slug).strip())
-                        
-                        # Filter out self-reference (a node cannot correct/supersede itself)
-                        target_ids = [tid for tid in target_ids if tid != node_id]
-                        
-                        if not target_ids:
-                            # Log a warning or create a dangling reference as best-effort
-                            # For v0.1: let's ignore or raise if we strictly want validation.
-                            # We'll raise to keep graph honest, except for imported where S2 says warning
-                            continue
-                        
-                        if len(target_ids) > 1:
-                            raise ValidationError(
-                                f"Ambiguous relationship target slug '{target_slug}': resolves to {target_ids}"
-                            )
-                        
-                        # Insert edge
-                        cursor.execute(
-                            "INSERT OR IGNORE INTO edges (from_id, to_id, type) VALUES (?, ?, ?)",
-                            (node_id, target_ids[0], etype)
-                        )
-
-                # 4. Evaluate Cascade Consequences (V1-D22)
-                states_after = self.compute_all_states(conn)
-                
-                # Compare states to find flipped view memberships
-                cascade_affected_scopes: Set[str] = set()
-                
-                # Fetch scopes for all nodes to map flipped states to scopes
-                cursor.execute("SELECT id, scope FROM nodes")
-                all_node_scopes = {row["id"]: json.loads(row["scope"] or "[]") for row in cursor.fetchall()}
-
-                for nid, after_state in states_after.items():
-                    before_state = states_before.get(nid)
-                    if before_state != after_state:
-                        # State membership flipped!
-                        scopes = all_node_scopes.get(nid, [])
-                        for s in scopes:
-                            cascade_affected_scopes.add(s)
-
-                commentary_changed = (prior_id == node_id)
+                # --- Build the delta --------------------------------------------
+                # ``cascade_affected_scopes`` is committing-node first-order in 5a
+                # (5c finalizes the kill-edge-target population once 5b's edges
+                # exist): a footprint change touches the rendered view of every
+                # scope the node entered or left. Only ``delta.node_id`` is read by
+                # live consumers, so narrowing the population is consumer-safe.
+                if is_new or direct_footprint_changed:
+                    cascade_affected_scopes = sorted(incoming_scopes | prior_scopes)
+                else:
+                    cascade_affected_scopes = []
 
                 return CommitDelta(
                     node_id=node_id,
-                    node_scope=parsed.scope,
-                    self_old_scope=self_old_scope,
-                    commentary_fields_changed=commentary_changed,
-                    cascade_affected_scopes=list(cascade_affected_scopes)
+                    node_scope=sorted(incoming_scopes),
+                    self_old_scope=sorted(prior_scopes),
+                    commentary_fields_changed=(
+                        False if is_new else direct_footprint_changed
+                    ),
+                    cascade_affected_scopes=cascade_affected_scopes,
                 )
+        except sqlite3.IntegrityError as e:
+            # The DDL CHECKs/FKs are the structural type gate (Lesson 2). The most
+            # likely surface is a ``source`` outside the enum — name the field and
+            # the bad value (P3 vector) and roll the whole entry back (V1-D10).
+            raise DatabaseError(
+                f"Commit of '{parsed.slug}' violated a database constraint "
+                f"(source={source!r}?): {e}"
+            )
         except sqlite3.Error as e:
             raise DatabaseError(f"SQLite transaction commit failed: {str(e)}")
         finally:
             conn.close()
+
+    def _reconcile_edges(
+        self, cursor: sqlite3.Cursor, node_id: str, parsed: ParsedEntry
+    ) -> None:
+        """Phase 5b seam: declarative outgoing-edge reconciliation. No-op in 5a.
+
+        5b fills this body: resolve the declared ``Supersedes:`` / ``Corrects:``
+        target slugs against the active node carrying each slug (indexed
+        ``slug_casefold`` exact-match), upsert the two kill-edges, DELETE retired
+        ones, warn-defer the seven non-V1a edge types, and run the slug-collision +
+        source-active acyclicity assertions — all inside this same transaction. It
+        takes the open ``cursor`` so 5b enlists in the commit's transaction without
+        re-plumbing it. In 5a a commentary-only commit must touch ``edges`` zero
+        times (MI-5), so the stub writes nothing.
+
+        Args:
+            cursor: The open cursor inside ``commit_parsed_entry``'s transaction.
+            node_id: The committing node's content-hash id.
+            parsed: The committing ``ParsedEntry`` (carries the declared edges).
+        """
+        return None
+
+    def _enqueue_outbox(
+        self, cursor: sqlite3.Cursor, node_id: str, parsed: ParsedEntry
+    ) -> None:
+        """Phase 5c seam: ``pending_embeddings`` Outbox enqueue. No-op in 5a.
+
+        5c fills this body: UPSERT a committing-node row into ``pending_embeddings``
+        (a conservative flagless "node-changed" signal; a re-enqueue resets
+        ``queued_at`` / ``retry_count``) inside this transaction. It takes the open
+        ``cursor`` so 5c enlists in the commit's transaction without re-plumbing it.
+        In 5a the Outbox stays empty.
+
+        Args:
+            cursor: The open cursor inside ``commit_parsed_entry``'s transaction.
+            node_id: The committing node's content-hash id.
+            parsed: The committing ``ParsedEntry``.
+        """
+        return None
 
     def get_active_decisions(self, scope: Optional[str] = None) -> List[Dict[str, Any]]:
         """Exposes view of all active decisions (C3 / M3)."""

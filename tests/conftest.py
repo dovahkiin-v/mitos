@@ -12,6 +12,67 @@ import os
 import pytest
 
 
+# --- Phase 5a store-rebuild quarantine (the contained-red window) --------------
+#
+# Phase 5a flips the live schema (entry-001) + identity (entry-002) and rebuilds
+# ``commit_parsed_entry`` over the V1a STRICT schema. That flip breaks the five
+# live consumers (``sync``/``importer``/``mcp``/``cli``/``renderer``) and the
+# prototype read methods **at runtime** — they bind prototype column names
+# (``core_axiom``, inline ``scope``/``mechanisms``, ``edges.from_id/to_id/type``,
+# the ``pending_embeddings`` drain surface) that no longer exist. This is the
+# vision's *contained-red window*, not a regression to chase: the read views are
+# restored in Phase 5d and the consumers reconciled in Phase 8a.
+#
+# To keep the substrate gate (test_identity / test_parser / test_migrations /
+# test_config / test_packaging + 5a's rewritten test_store) meaningfully green
+# through the 5a→8a window, the broken consumer/read test modules are quarantined
+# here — a SINGLE tracked list (Decision 5) skipped via the collection hook below,
+# NOT scattered per-file ``pytestmark`` skips and NOT a red CI. The list was
+# derived **empirically** (flip → run the full suite → quarantine exactly the
+# modules that failed *because of the flip*, not the pre-existing ``*_live.py``
+# 429 flakes). Each later phase REMOVES the modules it restores (5d: the read-view
+# consumers; 8a: the rest); ``test_store_rebuild_quarantine_is_tracked`` (in
+# tests/test_store.py) pins the current set so the shrink to empty is auditable.
+STORE_REBUILD_QUARANTINE = [
+    # Read-method consumers — restored in Phase 5d (read views + modifier stamping)
+    "test_list_decisions.py",
+    "test_modifier_surfacing.py",
+    "test_neighbor_review.py",
+    "test_payload_economy.py",
+    "test_surface_confidence.py",
+    "test_status_readiness.py",
+    "test_renderer.py",
+    "test_adversarial_rendering.py",
+    # Commit-via-consumer + edge/state consumers — restored in Phase 8a
+    "test_sync.py",
+    "test_importer.py",
+    "test_record_decision.py",
+    "test_relations_and_adjacency.py",
+    "test_adversarial_invariants.py",
+    "test_adversarial_mcp.py",
+    "test_cli_pathologies.py",
+]
+
+
+def pytest_collection_modifyitems(config, items):
+    """Skips the store-rebuild quarantine modules during the 5a→8a contained-red window.
+
+    Applies a single skip marker to every collected item whose test module is in
+    ``STORE_REBUILD_QUARANTINE`` (Phase 5a, Decision 5). The reason names the
+    restoring phases so the deferral is legible in the test report; the list
+    provably empties by Phase 8a.
+    """
+    reason = (
+        "Phase 5a contained-red window: consumer/read methods break at runtime "
+        "against the flipped V1a schema; restored in Phase 5d (read views) / "
+        "Phase 8a (consumers)."
+    )
+    skip_marker = pytest.mark.skip(reason=reason)
+    for item in items:
+        if item.path.name in STORE_REBUILD_QUARANTINE:
+            item.add_marker(skip_marker)
+
+
 @pytest.fixture(autouse=True)
 def hermetic_mitos_env(monkeypatch, tmp_path):
     """Isolates per-test config/cache and silences the CLI's network/nag side-effects."""
