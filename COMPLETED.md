@@ -1,0 +1,5 @@
+# Completed
+
+## 2026-06-18
+
+- **`v-mitos-parser-and-store-v1a-20260519` — Substrate floor of v0.1.** Hardening rebuild of the prototype substrate: the strict deterministic runtime parser (`decisions.md` + `questions.md`, kind-by-file), the SQLite graph store with slug-free content-hash identity (slug is a mutable handle; same-core entries converge), the two kill-edges (`supersedes` + `corrects`) wiring the computed active-decisions view, the `PRAGMA user_version` migration ladder, the `pending_embeddings` outbox, modifier stamping, the `tomllib` config loader, `mitos init`/`status` on the v0.1 schema, and the build-aside + completeness-gate + atomic-swap cutover tooling (`mitos cutover`, fixture-proven). Stands up single-lane CI with the MI-1 golden-trace byte-equality gate. Shipped at `mitos 0.2.0`. Remediation cycle 1 (r1 write-side slug casefold discipline, r2 parser field-regex hardening) closed clean — 602 passed / 23 documented skips / 0 failed, CI green. Backs v0.1 must-include #1 (parser) and the identity + kill-edge substrate of #2; the remaining edge catalog, mechanism registry, and cascade wiring carry to the sibling V1b vision.
