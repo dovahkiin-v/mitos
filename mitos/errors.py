@@ -9,7 +9,7 @@ It also holds the §5.2.2 structured failure envelope (``FailureItem`` /
 to import the other (that would reverse the C1 direction).
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 
 class MitosError(Exception):
@@ -102,6 +102,45 @@ class CommitError(MitosError):
     """
 
     def __init__(self, message: str, failure: "EntryFailure") -> None:
+        self.failure = failure
+        super().__init__(message)
+
+
+class CutoverError(MitosError):
+    """Raised when the V1a cutover rebuild hits a genuine corpus defect (§2.1, R11).
+
+    The cutover (Phase 7a) re-parses the corpus and replays it oldest-first into a
+    fresh *build-aside* graph, leaving the live graph untouched. A **corpus
+    defect** — a parse-stage format failure, a missing kill-edge target, a
+    Q5-convergence self-edge (``cycle_violation``), an empty canonical core
+    reaching the store — aborts the rebuild and raises this, carrying the
+    offending failure(s) so the Phase 7b CLI boundary can render one located line
+    and the operator can fix the markdown and re-run.
+
+    It is deliberately distinct from a **completeness shortfall** (an active
+    reference core absent from the reconstruction). A shortfall is NOT raised: it
+    is a verdict on :class:`~mitos.cutover.RebuildResult` the operator may override
+    (P6) — the markdown is authoritative, so a drop may be intentional. Abort is a
+    loud exception; shortfall is a returned verdict. Keeping the two on separate
+    channels is the §2.1 contract.
+
+    A :class:`MitosError` subclass so the CLI's ``except MitosError`` boundary
+    renders it as a one-line ``Error: …`` message instead of a raw traceback.
+
+    Attributes:
+        failure: The offending :class:`EntryFailure` (a single replay/commit
+            reject) or a ``list`` of them (the parse-stage aggregate, where every
+            format defect is collected before aborting so the operator fixes them
+            all at once), or ``None`` when the defect carried no structured
+            envelope (a bypassed-parser ``ValidationError``/``DatabaseError``
+            surfacing mid-replay).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        failure: Optional[Union["EntryFailure", List["EntryFailure"]]] = None,
+    ) -> None:
         self.failure = failure
         super().__init__(message)
 
