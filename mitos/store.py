@@ -8,12 +8,30 @@ import sqlite3
 import json
 import os
 import hashlib
+import logging
 from datetime import datetime, timezone
 from typing import List, Dict, Optional, Any, Set, Tuple
-from mitos.errors import DatabaseError, ValidationError
+from mitos.errors import (
+    DatabaseError,
+    ValidationError,
+    CommitError,
+    EntryFailure,
+    FailureItem,
+    STORE_SLUG_COLLISION,
+    STORE_MISSING_TARGET,
+    STORE_DANGLING_EDGE,
+    STORE_KIND_CONSTRAINT_VIOLATION,
+    STORE_CYCLE_VIOLATION,
+)
 from mitos.identity import compute_node_id
 from mitos.migrations import run_migrations, is_pre_v1a_schema
 from mitos.parser import ParsedEntry
+
+# Module logger for non-failing notices (the warn-defer channel). The store is a
+# pure primitive — it logs (loud, testable via ``caplog``, no raw stdout I/O) and
+# never prints to the user; user-facing notices belong to the sync/cli consumer
+# layer.
+logger = logging.getLogger(__name__)
 
 # The SQLite floor V1a's STRICT tables and the migration ladder require. The
 # >=3.13 Python floor (Phase 1a) guarantees a bundled SQLite at or above this, but
@@ -45,6 +63,37 @@ MODIFIER_EDGE_KEYS: Dict[str, str] = {
     "narrows": "narrowed_by",
     "corrects": "corrected_by",
 }
+
+# The two V1a kill-edge relationship fields (new→old): a declared citation mints a
+# typed edge that removes the target from the active view. Both match the
+# ``edges.edge_type`` DDL CHECK whitelist (``'supersedes'`` / ``'corrects'``).
+_KILL_EDGE_FIELDS: Tuple[str, ...] = ("supersedes", "corrects")
+
+# Display tokens for the kill-edge fields, used for ``FailureItem.field``
+# localization (the store has no finer per-line anchor than the entry span).
+_KILL_EDGE_TOKENS: Dict[str, str] = {
+    "supersedes": "**Supersedes:**",
+    "corrects": "**Corrects:**",
+}
+
+# The seven relationship types parsed onto ``ParsedEntry`` but NOT committed in
+# V1a — warn-deferred to V1b's reconciler. A deferred declaration is a logged
+# notice, never a §5.2.2 failure, and the node + its kill-edges still commit
+# (keeps 8b's self-parse closeout achievable).
+_DEFERRED_EDGE_FIELDS: Tuple[str, ...] = (
+    "amends",
+    "narrows",
+    "depends_on",
+    "resolves",
+    "contradicts",
+    "derives_from",
+    "cites",
+)
+
+# The kill-edge anti-join: a node is INACTIVE iff it is the target of one of these.
+# Inlined as a code-internal whitelist (P8 carve-out) — the same active-view
+# definition Phase 5d builds its public read methods on.
+_KILL_EDGE_TYPES_SQL: str = "('supersedes', 'corrects')"
 
 
 def state_matches(computed_state: str, state_filter: Optional[str]) -> bool:
@@ -110,6 +159,29 @@ def _utc_now_iso() -> str:
         The current time, e.g. ``"2026-06-18T05:54:31.532538+00:00"``.
     """
     return datetime.now(timezone.utc).isoformat()
+
+
+def _strip_citation(raw: str) -> str:
+    """Strips a single surrounding ``[ ... ]`` and whitespace from an edge citation.
+
+    ``format-spec.md`` authors kill-edges as ``**Supersedes:** [slug]`` and the
+    deterministic parser stores the value raw (brackets included); the agentic
+    write path (``sync.py``) supplies a bare slug. Both shapes must resolve, so a
+    single layer of square brackets plus surrounding whitespace is stripped before
+    casefolding (MI-7). Nested or unbalanced brackets are left intact — they would
+    fail resolution loudly rather than be silently "repaired".
+
+    Args:
+        raw: The relationship value as stored on ``ParsedEntry`` — possibly
+            ``[bracketed]`` (corpus/cutover shape), possibly bare (agentic shape).
+
+    Returns:
+        The bare citation slug, stripped of one bracket layer and whitespace.
+    """
+    s = raw.strip()
+    if len(s) >= 2 and s.startswith("[") and s.endswith("]"):
+        s = s[1:-1].strip()
+    return s
 
 
 class CommitDelta:
@@ -559,11 +631,13 @@ class GraphStore:
         write-once-preserve (insert / update / no-op-on-absent, **never** DELETE;
         V1-D16).
 
-        Edge reconciliation (5b), Outbox enqueue (5c), and the read views (5d) are
-        deferred seams: ``_reconcile_edges`` / ``_enqueue_outbox`` are no-op stubs
-        here. Format validation is the parser's job (C1 / Decision 2) — the store
-        owns referential truth, not format truth — so it does not re-validate
-        format.
+        Edge reconciliation is live as of 5b: ``_reconcile_edges`` commits the two
+        kill-edges (``supersedes`` / ``corrects``) via declarative mirror, and a
+        post-mutation slug-collision assertion (V1-D4) enforces one active node per
+        ``casefold(slug)``. A referential violation rolls the whole entry back with
+        a structured ``source="store"`` envelope. Outbox enqueue (5c) and the read
+        views (5d) remain deferred seams. Format validation is the parser's job
+        (C1 / Decision 2) — the store owns referential truth, not format truth.
 
         Args:
             parsed: A well-formed ``ParsedEntry`` (the parser's C1 guarantee).
@@ -575,6 +649,10 @@ class GraphStore:
         Raises:
             ValidationError: If the canonical-core field that feeds the hash is
                 empty or the kind is unknown (a caller that bypassed the parser).
+            CommitError: On a store-stage referential violation (``missing_target``,
+                ``dangling_edge``, ``cycle_violation``, ``kind_constraint_violation``,
+                or ``slug_collision``), carrying the §5.2.2 ``EntryFailure`` envelope;
+                the whole entry is rolled back (V1-D10).
             DatabaseError: On a SQLite failure (e.g. a ``source`` outside the DDL
                 CHECK enum), with the whole entry rolled back.
         """
@@ -700,16 +778,21 @@ class GraphStore:
                     commentary_changed or scopes_changed or transcript_changed
                 )
 
-                # --- Timestamp (MI-10): one application-supplied stamp per commit.
-                # New node: created_at == updated_at == now. Same-id with a real
-                # mutation: tick updated_at. True no-op: no tick (MI-3 / V1-D17).
-                now = (
-                    _utc_now_iso()
-                    if is_new or direct_footprint_changed
-                    else None
-                )
+                # --- Timestamp (MI-10): one application-supplied stamp per commit,
+                # shared by the node write and any edge ``created_at``. Computed
+                # unconditionally (it is cheap) so it is available to
+                # ``_reconcile_edges`` (edge rows need it), but only *written* when
+                # something actually changed — a byte-identical re-commit writes it
+                # nowhere, so ``updated_at`` does not tick (MI-3 / V1-D17).
+                now = _utc_now_iso()
 
-                # --- Write the nodes row ----------------------------------------
+                # --- Write the NEW nodes row (FK: must precede edge writes) ------
+                # A new node is inserted here so the edge FK
+                # (``edges.source_id -> nodes(id, kind)``) is satisfied when
+                # ``_reconcile_edges`` runs below. The same-id commentary UPDATE is
+                # DEFERRED to after the seam so its single ``updated_at`` tick can
+                # also fire on an edge-set change (V1-D17); see the deferred write
+                # below. A byte-identical re-commit writes the nodes row nowhere.
                 if is_new:
                     cursor.execute(
                         """
@@ -727,24 +810,6 @@ class GraphStore:
                             confirmed_by, confirmed_at, now, now,
                         ),
                     )
-                elif direct_footprint_changed:
-                    # In-place commentary UPDATE: only the commentary columns +
-                    # updated_at. The canonical core and ``source`` are NOT touched.
-                    cursor.execute(
-                        """
-                        UPDATE nodes SET
-                            slug = ?, slug_casefold = ?, rejected_paths_json = ?,
-                            invalidates_if = ?, context = ?, confirmed_by = ?,
-                            confirmed_at = ?, updated_at = ?
-                        WHERE id = ?
-                        """,
-                        (
-                            slug, slug_casefold, rejected_paths_json,
-                            invalidates_if, context, confirmed_by,
-                            confirmed_at, now, node_id,
-                        ),
-                    )
-                # else: a byte-identical re-commit leaves the nodes row untouched.
 
                 # --- Reconcile node_scopes (insert-missing / delete-absent) -----
                 for tag in incoming_scopes - prior_scopes:
@@ -773,12 +838,121 @@ class GraphStore:
                             (incoming_transcript, node_id),
                         )
 
-                # --- Deferred seams (5b fills edges, 5c fills the Outbox) -------
-                # Passed the cursor so they enlist in THIS transaction without
-                # re-plumbing it. Forcing-function tests assert they are no-ops in
-                # 5a (test_5a_commits_no_edges_yet / test_5a_enqueues_no_outbox_yet).
-                self._reconcile_edges(cursor, node_id, parsed)
+                # --- Edge reconciliation (5b) + Outbox enqueue (5c) ------------
+                # Both take the open cursor so they enlist in THIS transaction.
+                # ``_reconcile_edges`` returns whether the outgoing edge set changed
+                # (feeds the ``updated_at`` tick, V1-D17) plus any ``source="store"``
+                # referential failures; it shares the single ``now`` stamp (MI-10)
+                # for edge ``created_at``. ``_enqueue_outbox`` is still a no-op (5c).
+                edges_changed, store_failures, resurrected_slugs = (
+                    self._reconcile_edges(cursor, node_id, parsed, now)
+                )
                 self._enqueue_outbox(cursor, node_id, parsed)
+                store_failures = list(store_failures)
+
+                # --- Same-id commentary write + the single ``updated_at`` tick --
+                # Deferred to here (after the seam) so ``edges_changed`` can join
+                # the tick condition: a same-id commit ticks ``updated_at`` on ANY
+                # footprint change — commentary, scope, transcript, OR outgoing
+                # edges (V1-D17). The commentary columns are re-asserted in the same
+                # statement (they equal the stored values when only edges changed —
+                # a harmless content no-op) so the timestamp is written from exactly
+                # one place. The canonical core and ``source`` are NEVER touched
+                # (MI-4). A new node already wrote its row above; a byte-identical
+                # re-commit changes nothing here (MI-3).
+                if (not is_new) and (direct_footprint_changed or edges_changed):
+                    cursor.execute(
+                        """
+                        UPDATE nodes SET
+                            slug = ?, slug_casefold = ?, rejected_paths_json = ?,
+                            invalidates_if = ?, context = ?, confirmed_by = ?,
+                            confirmed_at = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            slug, slug_casefold, rejected_paths_json,
+                            invalidates_if, context, confirmed_by,
+                            confirmed_at, now, node_id,
+                        ),
+                    )
+
+                # --- Slug-collision assertion (V1-D4 / MI-13) -------------------
+                # Application-layer BY NECESSITY: M3 forbids a DDL uniqueness
+                # predicate over the kill-edge-filtered *active* view (a reflexive
+                # ``UNIQUE(slug_casefold)`` would wrongly reject a legitimate
+                # same-slug supersession). Run AFTER the node + edge writes land
+                # (so a rename's new slug and the edge anti-join are both current).
+                # Checked slugs: the committing slug PLUS every slug a
+                # declarative-mirror DELETE may have resurrected — dropping a
+                # ``Supersedes:`` line can reactivate a predecessor whose slug a
+                # *different* active node has since taken (the cross-slug
+                # resurrection collision; a committing-slug-only check misses it).
+                # Each must resolve to exactly one ACTIVE node. Skipped when
+                # edge-stage failures already exist — that failure is the actionable
+                # one, and a count over a doomed edge set could mislead (Decision 4).
+                if not store_failures:
+                    slugs_to_check = [slug_casefold] + sorted(
+                        resurrected_slugs - {slug_casefold}
+                    )
+                    for check_casefold in slugs_to_check:
+                        active_slugs = [
+                            r["slug"]
+                            for r in cursor.execute(
+                                """
+                                SELECT n.slug AS slug FROM nodes n
+                                WHERE n.slug_casefold = ?
+                                  AND NOT EXISTS (
+                                      SELECT 1 FROM edges e
+                                      WHERE e.target_id = n.id
+                                        AND e.edge_type IN ('supersedes', 'corrects')
+                                  )
+                                """,
+                                (check_casefold,),
+                            ).fetchall()
+                        ]
+                        if len(active_slugs) > 1:
+                            # Name the committing slug verbatim when it collides;
+                            # otherwise name a representative active holder of the
+                            # resurrected slug. One item is enough to roll the entry
+                            # back and keeps the envelope single-item (as the
+                            # FM2/independent/rename/case-variant tests assert).
+                            display = (
+                                slug
+                                if check_casefold == slug_casefold
+                                else active_slugs[0]
+                            )
+                            store_failures.append(
+                                FailureItem(
+                                    code=STORE_SLUG_COLLISION,
+                                    source="store",
+                                    message=(
+                                        f"Slug '{display}' would resolve to "
+                                        f"{len(active_slugs)} active entries; exactly "
+                                        "one active entry may carry a slug. Supersede "
+                                        "or rename the colliding entry."
+                                    ),
+                                    line_start=parsed.line_start,
+                                    line_end=parsed.line_end,
+                                )
+                            )
+                            break
+
+                # --- Raise the single store-stage envelope on any failure -------
+                # Raised INSIDE ``with conn:`` so the whole entry rolls back
+                # (V1-D10). ``CommitError`` is a ``MitosError`` (NOT a
+                # ``sqlite3.Error``), so it propagates past the SQLite handlers
+                # below, carrying its structured ``EntryFailure`` to the caller.
+                if store_failures:
+                    raise CommitError(
+                        f"Commit of '{parsed.slug}' failed store-stage referential "
+                        "validation.",
+                        failure=EntryFailure(
+                            slug=parsed.slug,
+                            line_start=parsed.line_start,
+                            line_end=parsed.line_end,
+                            items=store_failures,
+                        ),
+                    )
 
                 # --- Build the delta --------------------------------------------
                 # ``cascade_affected_scopes`` is committing-node first-order in 5a
@@ -814,25 +988,286 @@ class GraphStore:
             conn.close()
 
     def _reconcile_edges(
-        self, cursor: sqlite3.Cursor, node_id: str, parsed: ParsedEntry
-    ) -> None:
-        """Phase 5b seam: declarative outgoing-edge reconciliation. No-op in 5a.
+        self,
+        cursor: sqlite3.Cursor,
+        node_id: str,
+        parsed: ParsedEntry,
+        now: str,
+    ) -> Tuple[bool, List[FailureItem]]:
+        """Reconciles the committing node's outgoing kill-edges (V1-D21/D6/D23).
 
-        5b fills this body: resolve the declared ``Supersedes:`` / ``Corrects:``
-        target slugs against the active node carrying each slug (indexed
-        ``slug_casefold`` exact-match), upsert the two kill-edges, DELETE retired
-        ones, warn-defer the seven non-V1a edge types, and run the slug-collision +
-        source-active acyclicity assertions — all inside this same transaction. It
-        takes the open ``cursor`` so 5b enlists in the commit's transaction without
-        re-plumbing it. In 5a a commentary-only commit must touch ``edges`` zero
-        times (MI-5), so the stub writes nothing.
+        Declarative mirror inside ``commit_parsed_entry``'s transaction: the node's
+        stored outgoing edge set is brought into agreement with the buffer's
+        declared ``Supersedes:`` / ``Corrects:`` citations. A declared edge already
+        present (matched STRUCTURALLY by its stored target's *current* slug, never
+        re-resolved) is RETAINED untouched — re-resolving a retained kill-edge
+        against the active view would fail, because the target is inactive *because
+        of that very edge* (the self-strangling trap). Only a NET-NEW declared edge
+        is resolved against the active view and guarded; a stored edge no longer
+        declared is DELETEd (the declarative mirror — removing a ``Supersedes:``
+        line resurrects the target, §4.5.1).
+
+        The four guards fire only on net-new edges and report structured
+        ``source="store"`` failures (the entry rolls back on any):
+
+        - ``missing_target`` — no node carries the cited slug (a forward reference
+          is always a causal violation; edges point new→old);
+        - ``dangling_edge`` — a node carries it but is inactive (the immediate
+          1-hop killer is named; no transitive walker — that is V1b);
+        - ``cycle_violation`` — a self-edge (a node cannot supersede/correct
+          itself), or a net-new kill-edge from an already-superseded source;
+        - ``kind_constraint_violation`` — a cross-kind edge, caught from the DDL
+          CHECK on the edge INSERT and mapped (Lesson 2 — never pre-asserted).
+
+        The seven non-V1a relationship types are warn-deferred (logged WARNING,
+        node + kill-edges still commit, NOT a failure).
 
         Args:
-            cursor: The open cursor inside ``commit_parsed_entry``'s transaction.
-            node_id: The committing node's content-hash id.
+            cursor: The open cursor inside ``commit_parsed_entry``'s transaction —
+                edge writes enlist in the commit transaction with no re-plumbing.
+            node_id: The committing (source) node's content-hash id.
             parsed: The committing ``ParsedEntry`` (carries the declared edges).
+            now: The commit's single ``_utc_now_iso()`` stamp (MI-10), reused for
+                any edge ``created_at`` (the schema has no ``DEFAULT``).
+
+        Returns:
+            A ``(edges_changed, failures, resurrected_slugs)`` tuple.
+            ``edges_changed`` is True iff an edge row was inserted or deleted (feeds
+            the ``updated_at`` tick, V1-D17); ``failures`` is the accumulated list of
+            ``source="store"`` ``FailureItem``s (empty on success);
+            ``resurrected_slugs`` is the set of ``slug_casefold`` values whose target
+            had an outgoing edge DELETEd this commit (declarative-mirror resurrection
+            candidates). ``commit_parsed_entry`` runs the slug-collision assertion
+            over these too: a resurrected predecessor may reactivate a slug a
+            *different* active node has since taken (the cross-slug resurrection
+            collision — distinct from the committing-slug FM2 case, and missed by a
+            committing-slug-only check).
         """
-        return None
+        failures: List[FailureItem] = []
+        edges_changed = False
+        # slug_casefolds whose target had an edge DELETEd this commit (resurrection
+        # candidates); the caller's slug-collision assertion must also cover these so
+        # a removed kill-edge cannot reactivate a node onto an occupied active slug
+        # (V1-D4 / MI-13).
+        resurrected_slugs: Set[str] = set()
+
+        # --- Declared kill-edges (strip brackets, casefold for lookup) ----------
+        # ``declared`` drives net-new resolution; ``declared_keys`` (the casefolded
+        # target slug + edge_type) drives the declarative-mirror DELETE (V1-D21).
+        declared: List[Tuple[str, str, str]] = []  # (edge_type, casefold, display)
+        declared_keys: Set[Tuple[str, str]] = set()
+        for edge_type in _KILL_EDGE_FIELDS:
+            raw = getattr(parsed, edge_type, None)
+            if not raw:
+                continue
+            citation = _strip_citation(raw)
+            if not citation:  # an empty / bracket-only value is not a declaration
+                continue
+            citation_casefold = citation.casefold()  # MI-7: never SQLite LOWER
+            declared.append((edge_type, citation_casefold, citation))
+            declared_keys.add((citation_casefold, edge_type))
+
+        # --- Stored outgoing edges, keyed by the target's CURRENT slug (V1-D23) --
+        # Matching retained edges by the target's current slug means a renamed-then-
+        # cited target resolves correctly, and a stale citation of the OLD name
+        # falls through to net-new -> missing_target (the correct strict rejection).
+        stored_by_key: Dict[Tuple[str, str], str] = {}
+        for row in cursor.execute(
+            "SELECT e.target_id AS target_id, e.edge_type AS edge_type, "
+            "n.slug_casefold AS slug_casefold "
+            "FROM edges e JOIN nodes n ON n.id = e.target_id "
+            "WHERE e.source_id = ?",
+            (node_id,),
+        ).fetchall():
+            stored_by_key[(row["slug_casefold"], row["edge_type"])] = row["target_id"]
+
+        # --- The committing (source) node's own activeness ----------------------
+        # Shared by every net-new edge this commit: outgoing INSERTs never change
+        # the source's *incoming* set, so this is stable across the loop (compute
+        # once). A kill-edge mints only from an active source (V1-D6).
+        source_active = (
+            cursor.execute(
+                "SELECT 1 FROM edges WHERE target_id = ? "
+                f"AND edge_type IN {_KILL_EDGE_TYPES_SQL} LIMIT 1",
+                (node_id,),
+            ).fetchone()
+            is None
+        )
+
+        # --- Resolve + guard each declared kill-edge ----------------------------
+        for edge_type, citation_casefold, citation in declared:
+            if (citation_casefold, edge_type) in stored_by_key:
+                # RETAINED — matched structurally, never re-resolved (the
+                # self-strangle fix). An unchanged re-declaration is a pure no-op:
+                # no re-resolution, no guard, no write (this is what satisfies MI-5
+                # for a commentary-only re-commit).
+                continue
+
+            token = _KILL_EDGE_TOKENS[edge_type]
+
+            # NET-NEW — resolve the citation against the *active* view. Multiple
+            # nodes may share a casefolded slug (a same-slug supersession lineage);
+            # the active one (no incoming kill-edge) is the resolution target.
+            candidates = cursor.execute(
+                "SELECT id, kind FROM nodes WHERE slug_casefold = ?",
+                (citation_casefold,),
+            ).fetchall()
+            active_candidates = [
+                c
+                for c in candidates
+                if cursor.execute(
+                    "SELECT 1 FROM edges WHERE target_id = ? "
+                    f"AND edge_type IN {_KILL_EDGE_TYPES_SQL} LIMIT 1",
+                    (c["id"],),
+                ).fetchone()
+                is None
+            ]
+            # Prefer an active target that is NOT the committing node: in a
+            # same-slug supersession the new node shares the slug with the one it
+            # supersedes (Q5), so "x" must resolve to the OTHER node, not self.
+            active_non_self = [c for c in active_candidates if c["id"] != node_id]
+
+            if active_non_self:
+                target = active_non_self[0]
+                if not source_active:
+                    failures.append(
+                        FailureItem(
+                            code=STORE_CYCLE_VIOLATION,
+                            source="store",
+                            message=(
+                                "This entry is itself superseded, so it cannot "
+                                f"{edge_type} '{citation}' — a kill-edge mints only "
+                                "from an active source."
+                            ),
+                            field=token,
+                            line_start=parsed.line_start,
+                            line_end=parsed.line_end,
+                        )
+                    )
+                    continue
+                try:
+                    cursor.execute(
+                        "INSERT INTO edges (source_id, source_kind, target_id, "
+                        "target_kind, edge_type, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            node_id,
+                            parsed.kind,
+                            target["id"],
+                            target["kind"],
+                            edge_type,
+                            now,
+                        ),
+                    )
+                    edges_changed = True
+                except sqlite3.IntegrityError:
+                    # The ONLY IntegrityError reachable here is the kind-matrix DDL
+                    # CHECK: net-new => no PK dup; a real resolved target with its
+                    # true kind => the composite FK is satisfied. Catch tightly +
+                    # map (Lesson 2) so it never reaches the outer source-enum
+                    # handler in ``commit_parsed_entry``.
+                    failures.append(
+                        FailureItem(
+                            code=STORE_KIND_CONSTRAINT_VIOLATION,
+                            source="store",
+                            message=(
+                                f"'{citation}' is a different kind of entry; "
+                                f"{edge_type} edges must connect two decisions or "
+                                "two open questions."
+                            ),
+                            field=token,
+                            line_start=parsed.line_start,
+                            line_end=parsed.line_end,
+                        )
+                    )
+            elif active_candidates:
+                # The only active carrier of the slug is the committing node itself:
+                # a node cannot supersede/correct itself. Distinct from the FM1
+                # collision case, where the citation resolves to the OTHER same-slug
+                # node and commits.
+                failures.append(
+                    FailureItem(
+                        code=STORE_CYCLE_VIOLATION,
+                        source="store",
+                        message=(
+                            f"An entry cannot {edge_type} itself ('{citation}' "
+                            "resolves to this same entry)."
+                        ),
+                        field=token,
+                        line_start=parsed.line_start,
+                        line_end=parsed.line_end,
+                    )
+                )
+            elif candidates:
+                # A node carries the slug but every carrier is inactive: report the
+                # immediate 1-hop killer of one inactive carrier (a single anti-join
+                # hop — NO transitive chain-head walker, that is V1b).
+                killer = cursor.execute(
+                    "SELECT n.slug AS slug FROM edges e "
+                    "JOIN nodes n ON n.id = e.source_id "
+                    "WHERE e.target_id = ? "
+                    f"AND e.edge_type IN {_KILL_EDGE_TYPES_SQL} LIMIT 1",
+                    (candidates[0]["id"],),
+                ).fetchone()
+                killer_slug = killer["slug"] if killer else "another entry"
+                failures.append(
+                    FailureItem(
+                        code=STORE_DANGLING_EDGE,
+                        source="store",
+                        message=(
+                            f"'{citation}' is inactive (superseded by "
+                            f"'{killer_slug}'); a {edge_type} edge must target an "
+                            "active entry."
+                        ),
+                        field=token,
+                        line_start=parsed.line_start,
+                        line_end=parsed.line_end,
+                    )
+                )
+            else:
+                # No node carries the slug at all. Edges point new→old, so a
+                # forward reference is always a causal violation (strict rejection,
+                # never a "resolve later" deferral — §1.1).
+                failures.append(
+                    FailureItem(
+                        code=STORE_MISSING_TARGET,
+                        source="store",
+                        message=(
+                            f"'{citation}' does not match any entry in the graph. "
+                            "Edges point newer→older, so the cited entry must "
+                            "already exist."
+                        ),
+                        field=token,
+                        line_start=parsed.line_start,
+                        line_end=parsed.line_end,
+                    )
+                )
+
+        # --- Declarative-mirror DELETE: stored edges no longer declared (V1-D21) -
+        for (slug_casefold, edge_type), target_id in stored_by_key.items():
+            if (slug_casefold, edge_type) not in declared_keys:
+                cursor.execute(
+                    "DELETE FROM edges WHERE source_id = ? AND target_id = ? "
+                    "AND edge_type = ?",
+                    (node_id, target_id, edge_type),
+                )
+                edges_changed = True
+                # Deleting this edge may reactivate its target (resurrection,
+                # §4.5.1); the target's current slug must be re-checked for a
+                # collision by the caller (V1-D4).
+                resurrected_slugs.add(slug_casefold)
+
+        # --- Warn-defer the seven non-V1a relationship types --------------------
+        # Loud (WARNING, non-deduping — matters at cutover replay), NOT a failure.
+        for field in _DEFERRED_EDGE_FIELDS:
+            if getattr(parsed, field, None):
+                logger.warning(
+                    "Entry '%s': '%s' edge deferred to V1b (not committed).",
+                    parsed.slug,
+                    field,
+                )
+
+        return edges_changed, failures, resurrected_slugs
 
     def _enqueue_outbox(
         self, cursor: sqlite3.Cursor, node_id: str, parsed: ParsedEntry

@@ -17,10 +17,11 @@ import sqlite3
 import tempfile
 import os
 import json
+import logging
 import pytest
 from mitos.store import GraphStore, ValidationError, compute_hash
 from mitos.identity import compute_node_id
-from mitos.errors import DatabaseError
+from mitos.errors import DatabaseError, CommitError
 from mitos.parser import ParsedEntry, parse_entry_stream
 
 
@@ -114,6 +115,34 @@ def _count(store: GraphStore, table: str) -> int:
     conn = store._get_connection()
     try:
         return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _edges(store: GraphStore):
+    """Reads all ``edges`` rows as dicts via raw SQL (read methods quarantined until 5d)."""
+    conn = store._get_connection()
+    try:
+        return [
+            dict(r)
+            for r in conn.execute(
+                "SELECT * FROM edges ORDER BY source_id, target_id, edge_type"
+            )
+        ]
+    finally:
+        conn.close()
+
+
+def _is_active(store: GraphStore, node_id: str) -> bool:
+    """True iff the node has no incoming kill-edge (the inline active-view anti-join)."""
+    conn = store._get_connection()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM edges WHERE target_id = ? "
+            "AND edge_type IN ('supersedes', 'corrects') LIMIT 1",
+            (node_id,),
+        ).fetchone()
+        return row is None
     finally:
         conn.close()
 
@@ -216,8 +245,11 @@ def test_mi4_source_fence_and_core_change(temp_store: GraphStore) -> None:
     assert d2.node_id == d1.node_id
     assert _node_row(temp_store, d1.node_id)["source"] == "user"
 
-    # changed axiom -> a NEW id (new node), not an in-place update
-    e3 = _decision(slug="d", axiom="Axiom B.")
+    # changed axiom -> a NEW id (new node), not an in-place update. A DISTINCT
+    # slug is used: under 5b two active nodes may not share a casefold(slug), so a
+    # same-slug different-axiom pair is an independent slug_collision (V1-D4 case 3,
+    # covered by test_independent_collision_rolls_back) — not what this test probes.
+    e3 = _decision(slug="d-b", axiom="Axiom B.")
     d3 = temp_store.commit_parsed_entry(e3)
     assert d3.node_id != d1.node_id
     assert _count(temp_store, "nodes") == 2
@@ -324,19 +356,32 @@ def test_structural_guard_rejects_empty_canonical_core(temp_store: GraphStore) -
 # --- Deferred-seam forcing functions (Decision 4) ------------------------------
 
 
-def test_5a_commits_no_edges_yet(temp_store: GraphStore) -> None:
-    """FORCING FUNCTION — 5a writes ZERO edges even with a declared Supersedes:.
+def test_5b_supersedes_commits_one_kill_edge(temp_store: GraphStore) -> None:
+    """FORCING-FUNCTION INVERSION — Phase 5b wires the kill-edge.
 
-    The ``_reconcile_edges`` seam is a no-op in 5a. This flips RED when Phase 5b
-    wires edge reconciliation — making that wiring a conscious inversion, not a
-    silent fill-in. (In the 5a–5b window a declared kill-edge is silently dropped;
-    safe because the half-built store is never in production during the rebuild.)
+    Through 5a the ``_reconcile_edges`` seam was a no-op and a declared
+    ``Supersedes:`` committed ZERO edges (``test_5a_commits_no_edges_yet``). 5b
+    fills the seam: a declared kill-edge now commits exactly one ``edges`` row
+    new→old and removes the target from the active view. This is the conscious
+    inversion of the 5a tripwire.
     """
-    temp_store.commit_parsed_entry(_decision(slug="old-choice", axiom="Old."))
+    old = temp_store.commit_parsed_entry(_decision(slug="old-choice", axiom="Old."))
     e = _decision(slug="new-choice", axiom="New.")
     e.supersedes = "old-choice"
-    temp_store.commit_parsed_entry(e)
-    assert _count(temp_store, "edges") == 0
+    new = temp_store.commit_parsed_entry(e)
+
+    rows = _edges(temp_store)
+    assert len(rows) == 1
+    edge = rows[0]
+    assert edge["source_id"] == new.node_id
+    assert edge["target_id"] == old.node_id
+    assert edge["source_kind"] == "decision"
+    assert edge["target_kind"] == "decision"
+    assert edge["edge_type"] == "supersedes"
+    assert edge["created_at"]  # application-supplied ISO stamp (MI-10), not NULL
+    # The superseded node leaves the active view; the superseding node stays active.
+    assert _is_active(temp_store, old.node_id) is False
+    assert _is_active(temp_store, new.node_id) is True
 
 
 def test_5a_enqueues_no_outbox_yet(temp_store: GraphStore) -> None:
@@ -355,7 +400,7 @@ def test_atomic_commit_rolls_back_on_midcommit_failure(
     """An induced failure mid-commit leaves ZERO partial rows across all tables (V1-D10)."""
     e = _decision(slug="atomic", axiom="ATOM.", scope=["x"], transcript="t")
 
-    def boom(cursor, node_id, parsed):
+    def boom(cursor, node_id, parsed, now):
         raise sqlite3.IntegrityError("forced mid-commit failure")
 
     monkeypatch.setattr(temp_store, "_reconcile_edges", boom)
@@ -602,3 +647,359 @@ def test_store_rebuild_quarantine_is_tracked() -> None:
         "test_adversarial_mcp.py",
         "test_cli_pathologies.py",
     }
+
+
+# ===========================================================================
+# Phase 5b — edge reconciliation, referential integrity & slug-collision
+#
+# The store becomes the authority on the graph's referential truth: the two
+# kill-edges commit by declarative mirror, the slug-collision assertion enforces
+# one active node per casefold(slug), and the five source="store" codes fire.
+# All assertions are raw-SQL on edges/nodes (read methods quarantined until 5d).
+# ===========================================================================
+
+
+def _commit_kill(store, slug, axiom, edge_type, target, **kw):
+    """Builds a decision declaring one kill-edge (bare-slug, agentic shape) + commits it."""
+    e = _decision(slug=slug, axiom=axiom, **kw)
+    setattr(e, edge_type, target)
+    return store.commit_parsed_entry(e)
+
+
+# --- Kill-edge commit (both types, both kinds) ---------------------------------
+
+
+def test_corrects_commits_one_kill_edge(temp_store: GraphStore) -> None:
+    """A declared ``Corrects:`` commits one edge of edge_type 'corrects'."""
+    buggy = temp_store.commit_parsed_entry(_decision(slug="buggy", axiom="Buggy."))
+    fix = _commit_kill(temp_store, "fixed", "Fixed.", "corrects", "buggy")
+
+    rows = _edges(temp_store)
+    assert len(rows) == 1
+    assert rows[0]["edge_type"] == "corrects"
+    assert rows[0]["source_id"] == fix.node_id
+    assert rows[0]["target_id"] == buggy.node_id
+    assert _is_active(temp_store, buggy.node_id) is False
+
+
+def test_open_question_supersedes_open_question_same_kind(temp_store: GraphStore) -> None:
+    """An OQ→OQ kill-edge commits (the CHECK permits same-kind, forbids cross-kind)."""
+    oq1 = temp_store.commit_parsed_entry(_open_question(slug="oq1", topic="T1"))
+    e = _open_question(slug="oq2", topic="T2")
+    e.supersedes = "oq1"
+    oq2 = temp_store.commit_parsed_entry(e)
+
+    rows = _edges(temp_store)
+    assert len(rows) == 1
+    assert rows[0]["source_kind"] == "open_question"
+    assert rows[0]["target_kind"] == "open_question"
+    assert rows[0]["source_id"] == oq2.node_id
+    assert rows[0]["target_id"] == oq1.node_id
+    assert _is_active(temp_store, oq1.node_id) is False
+
+
+def test_bracket_and_bare_citation_both_resolve(temp_store: GraphStore) -> None:
+    """A bracketed citation (corpus shape) and a bare slug (agentic shape) both resolve."""
+    old = temp_store.commit_parsed_entry(_decision(slug="old-choice", axiom="Old."))
+    # Corpus/cutover shape: the parser stores the value raw, brackets included.
+    text = (
+        "### new-choice\n"
+        "**Decided:** A new axiom.\n"
+        "**Rejected:** An alternative.\n"
+        "**Supersedes:** [old-choice]\n"
+    )
+    entries = parse_entry_stream(text, "decision")
+    assert entries[0].supersedes == "[old-choice]"  # brackets retained by the parser
+    new = temp_store.commit_parsed_entry(entries[0])
+
+    rows = _edges(temp_store)
+    assert len(rows) == 1
+    assert rows[0]["source_id"] == new.node_id
+    assert rows[0]["target_id"] == old.node_id
+
+
+# --- Declarative mirror (V1-D21 / §4.5.1) --------------------------------------
+
+
+def test_declarative_mirror_drop_resurrects_then_readd(temp_store: GraphStore) -> None:
+    """Dropping a Supersedes line DELETEs the edge (target resurrects); re-adding re-inserts."""
+    old = temp_store.commit_parsed_entry(_decision(slug="old", axiom="Old."))
+    new = _commit_kill(temp_store, "new", "New.", "supersedes", "old")
+    assert _count(temp_store, "edges") == 1
+    assert _is_active(temp_store, old.node_id) is False
+
+    # Re-commit 'new' WITHOUT the Supersedes line -> edge DELETEd, 'old' resurrected.
+    temp_store.commit_parsed_entry(_decision(slug="new", axiom="New."))
+    assert _count(temp_store, "edges") == 0
+    assert _is_active(temp_store, old.node_id) is True
+
+    # Re-add the Supersedes line -> edge re-inserted.
+    _commit_kill(temp_store, "new", "New.", "supersedes", "old")
+    assert _count(temp_store, "edges") == 1
+    assert _is_active(temp_store, old.node_id) is False
+
+
+def test_idempotent_redeclaration_no_churn(temp_store: GraphStore) -> None:
+    """Re-declaring an unchanged kill-edge is a no-op — no duplicate, no updated_at tick (MI-5)."""
+    temp_store.commit_parsed_entry(_decision(slug="old", axiom="Old."))
+    new = _commit_kill(temp_store, "new", "New.", "supersedes", "old")
+    before = _node_row(temp_store, new.node_id)["updated_at"]
+
+    # Byte-identical re-commit (same commentary, same declared edge).
+    again = _commit_kill(temp_store, "new", "New.", "supersedes", "old")
+    assert again.node_id == new.node_id
+    assert _count(temp_store, "edges") == 1  # no duplicate
+    assert _node_row(temp_store, new.node_id)["updated_at"] == before  # no tick (MI-3)
+
+
+# --- Net-new-only / the self-strangling trap (Decision 1) ----------------------
+
+
+def test_recommit_superseding_node_with_changed_commentary_keeps_edge(
+    temp_store: GraphStore,
+) -> None:
+    """The self-strangle fix: re-committing a superseding node retains its kill-edge.
+
+    Re-resolving a RETAINED ``Supersedes:`` against the active view would fail (the
+    target is inactive *because of that edge*) and roll back the commentary edit.
+    Net-new-only re-resolution keeps the edge intact and the target inactive.
+    """
+    old = temp_store.commit_parsed_entry(_decision(slug="old", axiom="Old."))
+    new = _commit_kill(temp_store, "new", "New.", "supersedes", "old", context="v1")
+    assert _is_active(temp_store, old.node_id) is False
+
+    # Re-commit 'new' with CHANGED commentary, STILL declaring Supersedes: old.
+    again = _commit_kill(
+        temp_store, "new", "New.", "supersedes", "old", context="v2"
+    )
+    assert again.node_id == new.node_id
+    assert _count(temp_store, "edges") == 1  # edge intact, never re-resolved
+    assert _is_active(temp_store, old.node_id) is False  # target still inactive
+    assert _node_row(temp_store, new.node_id)["context"] == "v2"  # commentary edited
+
+
+# --- The four V1-D4 collision cases (Decision 4) -------------------------------
+
+
+def test_fm1_same_slug_supersession_commits(temp_store: GraphStore) -> None:
+    """FM1 — a same-slug supersession commits: the predecessor goes inactive."""
+    a = temp_store.commit_parsed_entry(_decision(slug="x", axiom="Axiom A."))
+    b = _commit_kill(temp_store, "x", "Axiom B.", "supersedes", "x")
+
+    assert b.node_id != a.node_id
+    assert _count(temp_store, "nodes") == 2
+    assert _count(temp_store, "edges") == 1
+    assert _is_active(temp_store, a.node_id) is False  # predecessor inactive
+    assert _is_active(temp_store, b.node_id) is True  # one live answer for 'x'
+
+
+def test_fm2_removing_supersedes_rolls_back_on_collision(temp_store: GraphStore) -> None:
+    """FM2 — removing the Supersedes line resurrects the predecessor → slug_collision rollback."""
+    a = temp_store.commit_parsed_entry(_decision(slug="x", axiom="Axiom A."))
+    b = _commit_kill(temp_store, "x", "Axiom B.", "supersedes", "x")
+
+    # Re-commit B without the Supersedes line: resurrecting A recreates the collision.
+    with pytest.raises(CommitError) as exc:
+        temp_store.commit_parsed_entry(_decision(slug="x", axiom="Axiom B."))
+    codes = [item.code for item in exc.value.failure.items]
+    assert codes == ["slug_collision"]
+    # Rolled back: the edge survives, A stays inactive (no resurrection on disk).
+    assert _count(temp_store, "edges") == 1
+    assert _is_active(temp_store, a.node_id) is False
+
+
+def test_cross_slug_resurrection_collision_rolls_back(temp_store: GraphStore) -> None:
+    """Dropping a Supersedes line must not resurrect a predecessor onto a slug a
+    *different* active entry has since taken (the cross-slug resurrection collision).
+
+    Distinct from FM2 (same-slug): here the superseding node 'b' has its OWN slug, a
+    third entry independently reused the predecessor's freed slug 'c' while it was
+    inactive, and dropping b's Supersedes line would reactivate 'c' — leaving TWO
+    active entries under 'c'. A committing-slug-only assertion (it would only check
+    'b') misses it; the resurrected-slug check catches it and rolls back so MI-13
+    stays a hard global invariant (5d's get_node_by_slug depends on ≤1 active/slug).
+    """
+    c = temp_store.commit_parsed_entry(_decision(slug="c", axiom="Axiom C."))
+    _commit_kill(temp_store, "b", "Axiom B.", "supersedes", "c")  # c -> inactive
+    d = temp_store.commit_parsed_entry(_decision(slug="c", axiom="Axiom D."))  # reuse 'c'
+    assert _is_active(temp_store, c.node_id) is False
+    assert _is_active(temp_store, d.node_id) is True
+
+    # Re-commit 'b' WITHOUT the Supersedes line: resurrecting 'c' collides with 'd'.
+    with pytest.raises(CommitError) as exc:
+        temp_store.commit_parsed_entry(_decision(slug="b", axiom="Axiom B."))
+    assert [i.code for i in exc.value.failure.items] == ["slug_collision"]
+
+    # Rolled back: the b→c edge survives, 'c' stays inactive, exactly one active 'c'.
+    assert _count(temp_store, "edges") == 1
+    assert _is_active(temp_store, c.node_id) is False
+    assert _is_active(temp_store, d.node_id) is True
+    assert [n for n in (c.node_id, d.node_id) if _is_active(temp_store, n)] == [
+        d.node_id
+    ]
+
+
+def test_independent_collision_rolls_back(temp_store: GraphStore) -> None:
+    """An independent same-slug entry (no supersession) rolls back slug_collision."""
+    temp_store.commit_parsed_entry(_decision(slug="dup", axiom="Axiom A."))
+    with pytest.raises(CommitError) as exc:
+        temp_store.commit_parsed_entry(_decision(slug="dup", axiom="Axiom B."))
+    assert [i.code for i in exc.value.failure.items] == ["slug_collision"]
+    assert _count(temp_store, "nodes") == 1  # the second entry never committed
+
+
+def test_rename_onto_active_slug_rolls_back(temp_store: GraphStore) -> None:
+    """Renaming an entry onto an existing active slug rolls back slug_collision."""
+    temp_store.commit_parsed_entry(_decision(slug="a", axiom="Axiom A."))
+    b = temp_store.commit_parsed_entry(_decision(slug="b", axiom="Axiom B."))
+
+    # Re-commit B (same core => same id) renamed to 'a' -> collides with the active A.
+    with pytest.raises(CommitError) as exc:
+        temp_store.commit_parsed_entry(_decision(slug="a", axiom="Axiom B."))
+    assert [i.code for i in exc.value.failure.items] == ["slug_collision"]
+    assert _node_row(temp_store, b.node_id)["slug"] == "b"  # rename rolled back
+
+
+def test_case_variant_zombie_rolls_back_under_casefold(temp_store: GraphStore) -> None:
+    """A case-variant slug (use-x vs Use-X) collides under casefold and rolls back."""
+    temp_store.commit_parsed_entry(_decision(slug="use-x", axiom="Axiom A."))
+    with pytest.raises(CommitError) as exc:
+        temp_store.commit_parsed_entry(_decision(slug="Use-X", axiom="Axiom B."))
+    assert [i.code for i in exc.value.failure.items] == ["slug_collision"]
+    assert _count(temp_store, "nodes") == 1
+
+
+# --- The five store-stage codes (each: right code + source + full rollback) ----
+
+
+def test_missing_target_rolls_back(temp_store: GraphStore) -> None:
+    """Citing a slug not in the graph fires missing_target and rolls the entry back."""
+    e = _decision(slug="new", axiom="New.")
+    e.supersedes = "nonexistent"
+    with pytest.raises(CommitError) as exc:
+        temp_store.commit_parsed_entry(e)
+    item = exc.value.failure.items[0]
+    assert item.code == "missing_target"
+    assert item.source == "store"
+    assert exc.value.failure.slug == "new"
+    assert _count(temp_store, "nodes") == 0  # whole entry rolled back
+    assert _count(temp_store, "edges") == 0
+
+
+def test_dangling_edge_reports_one_hop_killer(temp_store: GraphStore) -> None:
+    """Citing an inactive target fires dangling_edge and names its immediate 1-hop killer."""
+    temp_store.commit_parsed_entry(_decision(slug="a", axiom="Axiom A."))
+    _commit_kill(temp_store, "b", "Axiom B.", "supersedes", "a")  # a is now inactive
+
+    # C cites the now-inactive 'a' (it should have cited the active 'b').
+    e = _decision(slug="c", axiom="Axiom C.")
+    e.supersedes = "a"
+    with pytest.raises(CommitError) as exc:
+        temp_store.commit_parsed_entry(e)
+    item = exc.value.failure.items[0]
+    assert item.code == "dangling_edge"
+    assert "b" in item.message  # the 1-hop killer's slug is named
+    assert _count(temp_store, "nodes") == 2  # C rolled back
+
+
+def test_cycle_violation_self_edge(temp_store: GraphStore) -> None:
+    """A node citing its own slug (resolving to self) fires cycle_violation."""
+    e = _decision(slug="x", axiom="Self.")
+    e.supersedes = "x"
+    with pytest.raises(CommitError) as exc:
+        temp_store.commit_parsed_entry(e)
+    assert exc.value.failure.items[0].code == "cycle_violation"
+    assert _count(temp_store, "nodes") == 0
+    assert _count(temp_store, "edges") == 0
+
+
+def test_cycle_violation_inactive_source(temp_store: GraphStore) -> None:
+    """A net-new kill-edge from an already-superseded source fires cycle_violation."""
+    a = temp_store.commit_parsed_entry(_decision(slug="a", axiom="Axiom A."))
+    temp_store.commit_parsed_entry(_decision(slug="c", axiom="Axiom C."))
+    _commit_kill(temp_store, "b", "Axiom B.", "supersedes", "a")  # a is now inactive
+
+    # Re-commit A (same core => same id, now inactive) declaring a NEW kill-edge.
+    e = _decision(slug="a", axiom="Axiom A.")
+    e.supersedes = "c"
+    with pytest.raises(CommitError) as exc:
+        temp_store.commit_parsed_entry(e)
+    assert exc.value.failure.items[0].code == "cycle_violation"
+    # No A→C edge minted; only the original B→A edge remains.
+    rows = _edges(temp_store)
+    assert len(rows) == 1
+    assert rows[0]["source_id"] != a.node_id  # the surviving edge is B→A, not A→C
+
+
+def test_kind_constraint_violation_via_ddl_check(temp_store: GraphStore) -> None:
+    """A cross-kind kill-edge fires kind_constraint_violation from the DDL CHECK (Lesson 2)."""
+    temp_store.commit_parsed_entry(_open_question(slug="oq1", topic="A topic."))
+    e = _decision(slug="d", axiom="A decision.")
+    e.supersedes = "oq1"  # decision -> open_question is cross-kind
+    with pytest.raises(CommitError) as exc:
+        temp_store.commit_parsed_entry(e)
+    assert exc.value.failure.items[0].code == "kind_constraint_violation"
+    assert _count(temp_store, "edges") == 0
+    assert _count(temp_store, "nodes") == 1  # only the OQ; the decision rolled back
+
+
+# --- Warn-defer the seven non-V1a edge types -----------------------------------
+
+
+def test_deferred_edge_types_warn_not_fail(
+    temp_store: GraphStore, caplog
+) -> None:
+    """A V1b relationship field (e.g. Amends:) is logged, NOT committed, NOT a failure."""
+    target = temp_store.commit_parsed_entry(_decision(slug="t", axiom="Target."))
+    e = _decision(slug="d", axiom="A decision.")
+    e.amends = "t"  # a V1b type — warn-deferred
+    e.cites = "t"  # another V1b type
+    e.supersedes = "t"  # a V1a kill-edge — this DOES commit
+
+    with caplog.at_level(logging.WARNING, logger="mitos.store"):
+        delta = temp_store.commit_parsed_entry(e)
+
+    # The node + the kill-edge committed; the two deferred types wrote NO edges.
+    assert _node_row(temp_store, delta.node_id) is not None
+    rows = _edges(temp_store)
+    assert len(rows) == 1
+    assert rows[0]["edge_type"] == "supersedes"
+    assert _is_active(temp_store, target.node_id) is False
+    # Both deferred types are logged loudly (WARNING), naming the entry + field.
+    assert "deferred to V1b" in caplog.text
+    assert "amends" in caplog.text
+    assert "cites" in caplog.text
+
+
+# --- updated_at ticks on an edge-set change (V1-D17) ---------------------------
+
+
+def test_updated_at_ticks_on_edge_only_change(temp_store: GraphStore) -> None:
+    """An edge-only re-commit ticks updated_at; a byte-identical re-commit does not."""
+    temp_store.commit_parsed_entry(_decision(slug="old", axiom="Old."))
+    b = temp_store.commit_parsed_entry(_decision(slug="b", axiom="B axiom."))
+    before = _node_row(temp_store, b.node_id)["updated_at"]
+
+    # Re-commit B with the SAME commentary but a NEW outgoing kill-edge.
+    again = _commit_kill(temp_store, "b", "B axiom.", "supersedes", "old")
+    assert again.node_id == b.node_id
+    after = _node_row(temp_store, b.node_id)["updated_at"]
+    assert after > before  # edges_changed feeds the tick even with no commentary change
+
+
+# --- Code-name pin (the cross-vision §5.2.2 contract) --------------------------
+
+
+def test_store_failure_codes_pin() -> None:
+    """STORE_FAILURE_CODES is EXACTLY the five reserved names (a typo is a silent break)."""
+    from mitos.errors import STORE_FAILURE_CODES
+
+    assert STORE_FAILURE_CODES == frozenset(
+        {
+            "slug_collision",
+            "missing_target",
+            "dangling_edge",
+            "kind_constraint_violation",
+            "cycle_violation",
+        }
+    )
