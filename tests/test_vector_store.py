@@ -55,7 +55,8 @@ def test_vector_store_collection_creation(mock_put: MagicMock, mock_get: MagicMo
 @patch("requests.get")
 @patch("requests.post")
 def test_vector_store_query_handling(mock_post: MagicMock, mock_get: MagicMock) -> None:
-    """Verifies semantic query requests and scope tag filters match format specifications."""
+    """Verifies a semantic query request is scope-blind: no scope filter in the
+    Qdrant payload, verbatim limit, and raw (unboosted) scores returned."""
     # Mock initialization checks to be successful
     mock_get_resp = MagicMock()
     mock_get_resp.status_code = 200

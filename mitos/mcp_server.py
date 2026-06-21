@@ -119,7 +119,12 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
 
     Args:
         query: The semantic claim or topic string (e.g. 'cache strategy').
-        scope: Optional scope tag filter (e.g. 'auth', 'database').
+        scope: Optional scope hint — does NOT filter the semantic search. Recall is
+            scope-blind by design, so a mis-guessed tag can't hide cross-scope
+            precedent; scope only narrows the `open_questions` scan and shapes the
+            recall `note` (incl. the "unused tag → valid scopes" redirect). For
+            scope-RESTRICTED retrieval use list_decisions(scope=...) — the only
+            surface that hard-filters by scope.
         brief: If True, omit `rejected_paths` from every result (axiom-only — a quick
             "is there anything nearby?" scan). Default False keeps the full reasoning.
 
@@ -240,10 +245,14 @@ def list_decisions(scope: Optional[str] = None, state: str = "active", brief: bo
     pass over a scope, an audit, "show me every settled call in `auth`" — use this.
     It returns every matching decision deterministically, straight from the graph,
     so nothing hides below a relevance cliff. Needs no API key or Qdrant (pure graph
-    read), so it works even when semantic recall is degraded.
+    read), so it works even when semantic recall is degraded. This is also the ONLY
+    retrieval surface that hard-filters by scope — surface/query are scope-blind, so
+    when you want results restricted to a scope, this is the verb.
 
     Args:
-        scope: Optional scope tag filter (e.g. 'auth'). Omit for the whole project.
+        scope: Optional scope tag filter (e.g. 'auth') — a true hard filter (this is
+            the only retrieval surface that restricts by scope). Omit for the whole
+            project.
         state: 'active' (default) returns the live set (active + drifted); 'all'
             returns every decision regardless of state (including superseded); any
             other value is an exact computed-state match (e.g. 'superseded').
