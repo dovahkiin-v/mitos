@@ -102,8 +102,16 @@ def test_policy_none_no_match_points_to_list():
 
 def test_policy_none_scope_unused_says_zero_decisions():
     conf, note = assess_surface_recall(semantic_ran=True, top_score=None, result_count=0,
-                                       scope="ghost", scope_decision_count=0)
-    assert conf == "none" and "0 decisions" in note and "tag unused" in note
+                                       scope="ghost", scope_decision_count=0, all_scopes=["db"])
+    assert conf == "none" and "unused scope tag" in note and "Valid scopes are: db" in note
+
+def test_policy_weak_scope_unused_but_has_matches():
+    conf, note = assess_surface_recall(semantic_ran=True, top_score=0.65, result_count=1,
+                                       scope="ghost", scope_decision_count=0, all_scopes=["auth"])
+    assert conf == "weak"
+    assert "unused scope tag" in note
+    assert "Valid scopes are: auth" in note
+    assert "Twilight zone" in note
 
 
 def test_policy_degraded_with_results_is_not_a_ranking():
@@ -116,7 +124,7 @@ def test_policy_degraded_with_results_is_not_a_ranking():
 def test_policy_degraded_empty_scope_unused():
     conf, note = assess_surface_recall(semantic_ran=False, top_score=None, result_count=0,
                                        scope="ghost", scope_decision_count=0)
-    assert conf is None and "unavailable" in note and "0 decisions" in note
+    assert conf is None and "unavailable" in note and "unused scope tag" in note
 
 
 # --------------------------------------------------------------------------- #
@@ -155,7 +163,7 @@ def test_mcp_surface_no_match_scope_unused(ws):
     resp = _surface_with([], ws, scope="ghost")  # semantic ran, found nothing, ghost scope empty
     assert resp["confidence"] == "none"
     assert resp["active_decisions"] == []
-    assert "0 decisions" in resp["note"]
+    assert "unused scope tag" in resp["note"] and "Valid scopes are: other" in resp["note"]
 
 
 def test_mcp_surface_semantic_empty_does_not_dump_scope_listing(ws):

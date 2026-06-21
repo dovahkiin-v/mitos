@@ -20,6 +20,45 @@ Claude: That breaks the local-first requirement in P10. Let's use SQLite.
 
 <!-- BEGIN ENTRIES — new decisions go directly below this line, newest first -->
 
+### rollback-no-post-v1a-rebuild-gates-are-sole-defense
+
+**Decided:** There is no re-runnable post-V1a full-corpus rebuild, so V1b R13 and R14 faithfulness gates are the sole defense for archived-row survival rather than a backstop behind an easy rollback: the P6/M7 wipe-and-rebuild from buffer plus archives is wired only into the one-time prototype cutover (rebuild_and_gate), which no-ops on an already-V1a, absent, or empty graph, while steady-state sync re-reads the buffer alone, so a shipped populated-schema-migration faithfulness bug cannot be recovered by delete-and-resync.
+**Rejected:** Relying on P6/M7 the-graph-is-disposable-delete-and-resync as the rollback for V1b populated-schema migrations: rejected because delete-and-resync re-reads the buffer only, archived entries rotated out of decisions.md are not re-derivable from the buffer, and the full-corpus replay that would restore them (cutover rebuild_and_gate) is gated to is_pre_v1a_schema and no-ops post-V1a (verified in cli.py cmd_cutover). Also rejected: building a re-runnable full-corpus rebuild verb in V1b, which is substrate/ROADMAP scope; the V1b correct response is to state the honest recovery contract and make R13 and R14 hard closeout gates.
+**Mechanisms:** rebuild_and_gate, is_pre_v1a_schema
+**Scope:** store, substrate, sync, schema
+**Cites:** node-handles-migration-backfills-archived-slugs
+
+
+### oq-read-surfaces-stamp-modifiers-like-decision-reads
+
+**Decided:** The new OQ read surfaces (oq_state_view and the minimal CLI open-question read) stamp amended_by and narrowed_by exactly as every decision-read surface does, because amends and narrows are legal OQ-to-OQ in the kind matrix and cluster 3 commits OQ-authored ones, so an amended-but-active open question must not read as the final word: the every-read-surface modifier invariant applies to OQ reads, not only decision reads.
+**Rejected:** Scoping modifier stamping to decision-read surfaces only (the prior DoD 7 every-decision-read-surface phrasing): rejected because it leaves the new OQ read surfaces ungated while the kind matrix makes OQ-to-OQ amends and narrows legal and cluster 3 commits them, recreating the amended-axioms-read-as-live trap for open questions. Also rejected: scoping OQ amends and narrows out of v0.1 to avoid stamping, since the kind matrix lists them legal and ingestion commits them, so the edges exist and omitting them from the read payload is a silent under-report, not a clean scope cut.
+**Mechanisms:** oq_state_view, amended_by, narrowed_by
+**Scope:** retrieval, store, substrate
+**Depends-On:** v1a-ships-modifier-stamping-seam-not-reserved-slot
+
+
+### node-handles-backfill-forecloses-insert-or-ignore
+
+**Decided:** The one-time node_handles migration backfill forecloses INSERT OR IGNORE, extending the steady-state handle-write OD1 foreclosure to the backfill path: because V1a slug-uniqueness is active-only, the pre-existing corpus may legitimately hold an active and an inactive node sharing a casefold slug that V1b all-node tightening renders a genuine collision, so the backfill replay-safety must surface a pre-existing cross-node collision as the loud slug_collision P3 vector error rather than silently swallow it.
+**Rejected:** INSERT OR IGNORE or ON CONFLICT DO NOTHING for the backfill replay-safety: rejected because, unlike a benign signals re-insert, a backfill INSERT OR IGNORE keeps one node slug-handle and orphans the duplicate node handle, the OD1 citation-capture break the subsystem exists to prevent; the section 6.2 INSERT-OR-IGNORE-vs-table-empty-probe phrasing offered the foreclosed pattern for the backfill specifically, whereas the steady-state recompute path was already foreclosed by node-handles-insert-is-same-node-idempotent-not-blind-conflict. Also rejected: assuming the V1a corpus has no casefold-duplicate slugs, since idx_nodes_slug_casefold is non-unique by design (active-view-scoped uniqueness) so an active-plus-inactive duplicate is legal pre-existing state the all-node tightening newly rejects.
+**Mechanisms:** node_handles, idx_nodes_slug_casefold, slug_collision
+**Scope:** identity, store, substrate, sync, schema
+**Amends:** node-handles-insert-is-same-node-idempotent-not-blind-conflict
+
+
+### idempotency-skip-includes-handle-inputs-not-hash-only
+
+**Decided:** The Mitos per-entry idempotency skip — the slug-free-canonical-core early-return that gates whether commit_parsed_entry runs (perform_sync continue-on-existing and record_decision_entry return-exists) — must include the handle inputs, the entry current slug and Aliases, not key on the canonical-core hash alone, so a same-hash slug rename or Aliases edit re-commits and the node_handles recompute actually runs, while a genuinely unchanged entry still skips.
+**Rejected:** Hash-only skip (the V1a status quo): rejected because the slug is out of the canonical-core hash (Q5 / slug-removed-from-canonical-core-hash) and the Aliases field is new in V1b, so a same-hash entry that only renames its slug or edits its Aliases line early-returns before commit_parsed_entry — the node_handles recompute never runs and the authored rename/alias is silently dropped. It lands only on a full wipe-and-rebuild (where every entry re-commits) and on brand-new entries, so DoD #5 rebuild-faithfulness still passes and the gap hides behind a green gate. That silently defeats the corpus-authored alias model (aliases-corpus-authored-via-aliases-field) on exactly the rename-then-alias flow it exists for — a P6/M7 corpus-faithfulness break wearing the costume of an economics optimization. It also undercuts node-handles-recomputed-per-parsed-entry-removed-handles-dropped, whose drop-removed-handles guarantee only holds when the recompute fires.
+
+Always-run recompute (drop-and-reinsert the handle rows unconditionally, off the skip's gated path): rejected because it churns node_handles (and the WAL) on every re-sync of an unchanged corpus, breaking P5's re-syncing-an-unchanged-decisions.md-is-a-no-op at the write tier and wasting I/O (P17). The recompute must be gated by the widened skip, not unconditional. The exact site of the handle-aware comparison — widen the early-return condition, or move the handle recompute onto the always-run side of the skip — is the plan's call.
+**Mechanisms:** commit_parsed_entry, perform_sync, record_decision_entry, node_handles
+**Scope:** identity, store, substrate, sync
+**Context:** Surfaced in the V1b economics-lens vision review on 2026-06-21 by grounding the section 8.2 nodes.slug-and-node_handles-cannot-diverge invariant against the real sync code: both steady-state write paths early-return on the slug-free hash before commit_parsed_entry (sync.py line 484 and sync.py line 1164). Claude found it, Gemini endorsed. Amends vision sections 8.2 and 6.2.
+**Cites:** node-handles-recomputed-per-parsed-entry-removed-handles-dropped
+
+
 ### nodes-slug-guard-kept-as-core-table-defense-in-depth-not-dropped
 
 **Decided:** V1b keeps an independent slug_casefold guard on the core nodes table rather than dropping it: node_handles UNIQUE(handle_casefold) is the union-uniqueness anchor across all node slugs and aliases, but the core nodes table retains an independent slug guard as P7 defense-in-depth, because an integrity constraint on the core table natural key is not duplicated derived state and constraints do not drift; since V1b tightens slug-uniqueness to all-node scope, promoting the existing plain non-unique slug_casefold index to a UNIQUE constraint becomes legitimate, but keep-plain versus promote-to-UNIQUE is a plan-level call.

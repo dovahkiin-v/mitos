@@ -206,11 +206,14 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
     # (AX P5). Compute the scope's active-decision count only when it disambiguates an
     # empty result ("tag unused" vs "populated but nothing matched").
     scope_decision_count: Optional[int] = None
-    if scope and not results["active_decisions"]:
+    all_scopes: Optional[List[str]] = None
+    if scope:
         try:
             scope_decision_count = len(store.get_active_decisions(scope=scope))
+            if scope_decision_count == 0:
+                all_scopes = store.get_all_scopes()
         except Exception:
-            scope_decision_count = None
+            pass
 
     confidence, note = assess_surface_recall(
         semantic_ran=semantic_ran,
@@ -218,6 +221,7 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         result_count=len(results["active_decisions"]),
         scope=scope,
         scope_decision_count=scope_decision_count,
+        all_scopes=all_scopes,
     )
     if confidence is not None:
         results["confidence"] = confidence

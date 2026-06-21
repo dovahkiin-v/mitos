@@ -95,5 +95,4 @@ def test_vector_store_query_handling(mock_post: MagicMock, mock_get: MagicMock) 
     args, kwargs = mock_post.call_args
     body = kwargs["json"]
     assert body["limit"] == 1
-    assert body["filter"]["must"][0]["key"] == "scope"
-    assert body["filter"]["must"][0]["match"]["value"] == "core"
+    assert "filter" not in body
