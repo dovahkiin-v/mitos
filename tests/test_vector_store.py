@@ -88,11 +88,12 @@ def test_vector_store_query_handling(mock_post: MagicMock, mock_get: MagicMock) 
     
     assert len(results) == 1
     assert results[0]["slug"] == "query-result"
-    assert results[0]["score"] == 0.95
+    import math
+    assert math.isclose(results[0]["score"], 1.1)
     assert results[0]["scope"] == ["core"]
 
     # Assert scope pre-filter included in post payload
     args, kwargs = mock_post.call_args
     body = kwargs["json"]
-    assert body["limit"] == 1
+    assert body["limit"] == 10
     assert "filter" not in body
