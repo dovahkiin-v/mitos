@@ -6,7 +6,7 @@ directly, reducing dependency bloat and ensuring maximum interoperability.
 
 import requests
 import json
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Any
 from mitos.errors import VectorStoreError
 from mitos.models import EMBEDDING_DIM
 
@@ -103,30 +103,29 @@ class QdrantVectorStore:
         self,
         vector: List[float],
         limit: int = 5,
-        filter_scope: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        """Queries Qdrant for similar vectors, supporting optional scope pre-filtering.
+        """Queries Qdrant for the semantically nearest vectors.
+
+        Semantic recall is deliberately scope-blind: a decision is the precedent on
+        its subject regardless of which scope drawer it was filed under, and gating
+        the search by a caller-guessed tag silently hides real precedent (the
+        ``gemini-live`` vs ``live-voice`` drift). Scope is handled downstream as a
+        discoverability hint in :mod:`mitos.recall`, never as a recall filter.
 
         Args:
             vector: The query embedding vector.
             limit: Maximum matches to return.
-            filter_scope: Optional scope tag to filter results by.
 
         Returns:
             A list of dictionary results with payload and scores.
         """
         search_url = f"{self.base_url}/collections/{self.collection}/points/search"
-        
-        # We fetch more results if we intend to soft-boost so matches can bubble up
-        fetch_limit = max(10, limit * 2) if filter_scope else limit
+
         body: Dict[str, Any] = {
             "vector": vector,
-            "limit": fetch_limit,
+            "limit": limit,
             "with_payload": True
         }
-
-        # Apply Qdrant filter if scope is defined
-        # (Removed: Semantic search shouldn't be gated by scope. Replaced with Layer #1 warning in recall.py)
 
         try:
             resp = requests.post(
@@ -137,9 +136,9 @@ class QdrantVectorStore:
             )
             if resp.status_code != 200:
                 raise VectorStoreError(f"Qdrant query failed: {resp.text}")
-                
+
             results = resp.json().get("result", [])
-            
+
             output = []
             for item in results:
                 # Format to a standard output tuple
@@ -153,16 +152,9 @@ class QdrantVectorStore:
                     "embedding_text": payload.get("embedding_text"),
                     "score": score
                 })
-            
-            # Layer #2 Soft Boost: bump score if it matches the requested scope
-            if filter_scope:
-                for item in output:
-                    if filter_scope in item["scope"]:
-                        item["score"] += 0.15
-                output.sort(key=lambda x: x["score"], reverse=True)
-                
-            return output[:limit]
-            
+
+            return output
+
         except requests.RequestException as e:
             raise VectorStoreError(f"Qdrant query connection error: {str(e)}")
             

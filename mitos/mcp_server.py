@@ -148,7 +148,7 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         try:
             # Generate query vector
             q_vector = embed_provider.get_embedding(query, is_query=True)
-            matches = vector_store.query(q_vector, limit=5, filter_scope=scope)
+            matches = vector_store.query(q_vector, limit=5)
             semantic_ran = True
 
             for m in matches:

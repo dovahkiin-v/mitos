@@ -743,7 +743,7 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     if manager.embed_provider and manager.vector_store:
         try:
             q_vector = manager.embed_provider.get_embedding(query, is_query=True)
-            matches = manager.vector_store.query(q_vector, limit=5, filter_scope=scope)
+            matches = manager.vector_store.query(q_vector, limit=5)
             semantic_ran = True
             for m in matches:
                 node = store.get_node_by_slug(m["slug"])
