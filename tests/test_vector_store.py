@@ -83,17 +83,17 @@ def test_vector_store_query_handling(mock_post: MagicMock, mock_get: MagicMock) 
 
     store = QdrantVectorStore("http://localhost:6333", collection_name="test_collection")
     
-    # Perform query with scope tag filter
-    results = store.query([0.1]*3072, limit=1, filter_scope="core")
-    
+    # Recall is scope-blind: query takes no scope filter.
+    results = store.query([0.1]*3072, limit=1)
+
     assert len(results) == 1
     assert results[0]["slug"] == "query-result"
-    import math
-    assert math.isclose(results[0]["score"], 1.1)
+    # Raw semantic score is returned untouched — no scope boost inflating it.
+    assert results[0]["score"] == 0.95
     assert results[0]["scope"] == ["core"]
 
-    # Assert scope pre-filter included in post payload
+    # Scope must NOT reach the Qdrant payload — no filter, and limit is verbatim.
     args, kwargs = mock_post.call_args
     body = kwargs["json"]
-    assert body["limit"] == 10
+    assert body["limit"] == 1
     assert "filter" not in body

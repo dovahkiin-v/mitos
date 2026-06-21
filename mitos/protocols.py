@@ -64,14 +64,15 @@ class VectorStore(Protocol):
         self,
         vector: List[float],
         limit: int = 5,
-        filter_scope: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        """Queries for similar vectors, supporting optional scope pre-filtering.
+        """Queries for the semantically nearest vectors.
+
+        Recall is scope-blind by contract — scope is a downstream discoverability
+        hint, never a recall filter (see :meth:`QdrantVectorStore.query`).
 
         Args:
             vector: The query embedding vector.
             limit: Maximum matches to return.
-            filter_scope: Optional scope tag to filter results by.
 
         Returns:
             A list of dictionary results with payload and scores.

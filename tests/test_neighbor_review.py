@@ -51,7 +51,7 @@ class _FakeVector:
     def __init__(self, matches):
         self._matches = matches
 
-    def query(self, vector, limit=5, filter_scope=None):
+    def query(self, vector, limit=5):
         return self._matches
 
     def upsert(self, *a, **k):

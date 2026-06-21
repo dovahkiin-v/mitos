@@ -377,7 +377,7 @@ def test_adjacent_decisions_excludes_self_missing_and_superseded(ws):
     m.record_decision_entry("The just-recorded self.", "rej", [], slug="self-node")
 
     class FakeVectorStore:
-        def query(self, vector, limit=5, filter_scope=None):
+        def query(self, vector, limit=5):
             return [
                 {"slug": "self-node", "score": 1.0},  # itself — must be excluded
                 {"slug": "keep", "score": 0.82},      # live — kept
