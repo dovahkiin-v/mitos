@@ -172,11 +172,13 @@ def test_marker_replace_count_one(ws) -> None:
 
 
 def test_slug_determinism_and_sorted_mechanism_idempotency(ws) -> None:
-    """Same axiom → same slug; mechanism order does not change identity (hash sorts mechanisms)."""
+    """Same axiom+slug → same identity; mechanism order does not change identity (hash sorts mechanisms)."""
     config, m = ws
-    r1 = m.record_decision_entry("We MUST use SQLite!!!", "pgvector", [], mechanisms=["sqlite", "wal"])
+    r1 = m.record_decision_entry("We MUST use SQLite!!!", "pgvector", [], slug="we-must-use-sqlite",
+                                 mechanisms=["sqlite", "wal"])
     assert r1["slug"] == "we-must-use-sqlite"
-    r2 = m.record_decision_entry("We MUST use SQLite!!!", "pgvector", [], mechanisms=["wal", "sqlite"])
+    r2 = m.record_decision_entry("We MUST use SQLite!!!", "pgvector", [], slug="we-must-use-sqlite",
+                                 mechanisms=["wal", "sqlite"])
     assert r2["status"] == "exists" and r2["id"] == r1["id"]
 
 
@@ -245,7 +247,7 @@ def test_supersedes_not_found_buffer_unchanged(ws) -> None:
     """Unknown supersedes slug → supersedes_not_found, nothing written, buffer untouched."""
     config, m = ws
     before = _read(config)
-    res = m.record_decision_entry("New.", "Old.", [], supersedes="ghost-slug")
+    res = m.record_decision_entry("New.", "Old.", [], slug="new-decision", supersedes="ghost-slug")
     assert res["code"] == "supersedes_not_found"
     assert _read(config) == before
     assert len(GraphStore(config.db_path).get_all_nodes()) == 0
@@ -255,7 +257,8 @@ def test_supersedes_fuzzy_guard(ws) -> None:
     """A prefix (not exact) supersedes target → supersedes_not_found, not a wrong-node edge."""
     config, m = ws
     m.record_decision_entry("Decision foo bar.", "no", [], slug="foo-bar")
-    res = m.record_decision_entry("Tries to supersede a prefix.", "no", [], supersedes="foo")
+    res = m.record_decision_entry("Tries to supersede a prefix.", "no", [], slug="prefix-superseder",
+                                  supersedes="foo")
     assert res["code"] == "supersedes_not_found"
 
 
@@ -388,7 +391,7 @@ def test_mcp_tool_returns_well_formed_json(ws) -> None:
         from mitos.mcp_server import record_decision
         ok = json.loads(record_decision("A decision.", "A rejection.", ["s"], slug="mcp-ok"))
         assert ok["status"] == "created" and ok["slug"] == "mcp-ok"
-        err = json.loads(record_decision("Another.", "", ["s"]))  # missing rejected_paths
+        err = json.loads(record_decision("Another.", "", ["s"], slug="mcp-err"))  # missing rejected_paths
         assert err["code"] == "missing_rejected_paths"
     # The write actually landed through the MCP entry point (writable store).
     assert GraphStore(config.db_path).get_node_by_slug("mcp-ok") is not None
@@ -481,7 +484,7 @@ def test_supersedes_ambiguous(ws) -> None:
     e2.supersedes = "amb"                                           # resolves to node-1 (active non-self)
     m.store.commit_parsed_entry(e2)                                # node-2 supersedes node-1; both slug 'amb'
     before = _read(config)
-    res = m.record_decision_entry("New decision.", "Rejection.", [], supersedes="amb")
+    res = m.record_decision_entry("New decision.", "Rejection.", [], slug="new-decision", supersedes="amb")
     assert res["code"] == "supersedes_ambiguous"
     assert _read(config) == before
 

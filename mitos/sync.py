@@ -148,6 +148,7 @@ _ERROR_MESSAGES: Dict[str, str] = {
     "not_initialized": "No Mitos workspace found here. Run 'mitos init' before recording decisions.",
     "empty_axiom": "'axiom' is empty. Provide the decision as a single clear sentence that is true going forward.",
     "empty_slug": "'slug' is empty. Provide a short, explicit, hyphenated handle (e.g. 'sqlite-wal-mode').",
+    "slug_too_long": "slug '{slug}' is {length} characters — {over} over the {max}-character limit. The slug is the permanent citation handle (it is folded into the decision's identity), so it is NOT silently truncated. Pass a shorter 'slug' of at most {max} characters.",
     "missing_rejected_paths": "'rejected_paths' is required: state the alternatives you considered and why you ruled them out — this is what stops you or another agent from re-proposing them later.",
     "parse_failed": "The decision could not be serialised into a valid entry — most likely a structural token in axiom/rejected_paths/context: a line beginning with '##' or '###' (indent it or use '#'/'####' instead), a line shaped like '**Something:**', or a '[DECISION_TRANSCRIPT]' / '[DECISION_PARKED:' / 'BEGIN ENTRIES' / '[NOTE:' / '[PARKED:' marker. Remove or rephrase that line and retry.",
     "slug_collision": "A different decision already uses the slug '{slug}'. Give this one a distinct 'slug'; and if it is meant to replace the existing decision, also set supersedes='{slug}' (the new decision must still have its own slug — two decisions cannot share one).",
@@ -231,8 +232,17 @@ def _contains_structural_token(text: str) -> bool:
     return False
 
 
-_SLUG_MAX_LEN = 64
-_SLUG_MIN_LEN = 32  # don't trim a word boundary back past here — hard-cap instead
+# The citation-handle length cap. The slug is folded into the canonical-core identity
+# (V1-D2), so it is permanent once committed — generous enough for a descriptive
+# multi-word handle (real corpus handles top out ~68 chars), firm enough to keep one
+# from running away. An *explicit* slug over this is REJECTED with an exact char count
+# (never silently truncated — a silent trim diverges the stored handle from the one the
+# author already cited: self-inflicted citation rot). Auto-derived slugs still trim to it.
+# NOTE: this cap is advertised up-front to callers — the CLI `--slug` help imports this
+# constant; the MCP `record_decision` slug docstring carries the number as a literal. If
+# you change it, update that docstring (mcp_server.py) too.
+_SLUG_MAX_LEN = 100
+_SLUG_MIN_LEN = 32  # auto-derive only: don't trim a word boundary back past here — hard-cap instead
 
 # A new decision at/above this document-document similarity to an existing one the
 # author did NOT reference is paused for review (AX P4): the neighbour was invisible
@@ -260,23 +270,43 @@ def _polarity_mismatch(a: str, b: str) -> bool:
     return _has_negation(a) != _has_negation(b)
 
 
+def _normalize_slug(text: str) -> str:
+    """Lowercases and hyphenates free text into slug characters — with no length cap.
+
+    The character-normalisation half of :func:`_slugify`, factored out so the write
+    path can validate an explicit slug's *length* without silently truncating it: an
+    over-length explicit slug is the author's permanent citation handle, so the right
+    move is to reject (and ask for a shorter one), not to mangle it down to fit.
+
+    Args:
+        text: Free text — an explicit slug, or an axiom for auto-derivation.
+
+    Returns:
+        The lowercase-hyphenated form, stripped of leading/trailing hyphens (``""``
+        for empty/whitespace-only input). Uncapped.
+    """
+    if not text:
+        return ""
+    s = re.sub(r'[^a-z0-9]+', '-', text.lower())
+    return re.sub(r'-+', '-', s).strip('-')
+
+
 def _slugify(text: str) -> str:
-    """Derives a deterministic, lowercase-hyphenated slug from free text.
+    """Derives a deterministic, lowercase-hyphenated slug from free text, capped in length.
 
     Determinism keeps the human-readable handle stable: the slug is NOT part of the
     node id (V1a identity is the slug-free canonical core — ``compute_node_id``), but
     a stable auto-derived slug means the same decision presents the same handle and
     the casefold slug-collision check (V1-D4) behaves predictably.
 
-    When the slug exceeds the length cap it is trimmed back to the last word
-    boundary (hyphen) rather than sliced mid-word, so the handle an agent carries
-    into ``supersedes``/relations stays readable (``…brazilian-portuguese``, not
-    ``…brazilian-portug``). Still a pure function of the text, so determinism holds.
+    This is the auto-derive path: when the slug exceeds the length cap it is trimmed
+    back to the last word boundary (hyphen) rather than sliced mid-word, so the handle
+    stays readable (``…brazilian-portuguese``, not ``…brazilian-portug``). Still a pure
+    function of the text, so determinism holds. The agentic write path does NOT trim an
+    *explicit* slug — it validates length via :func:`_normalize_slug` and rejects an
+    over-length one (see ``slug_too_long``).
     """
-    if not text:
-        return ""
-    s = re.sub(r'[^a-z0-9]+', '-', text.lower())
-    s = re.sub(r'-+', '-', s).strip('-')
+    s = _normalize_slug(text)
     if len(s) > _SLUG_MAX_LEN:
         cut = s[:_SLUG_MAX_LEN]
         boundary = cut.rfind('-')
@@ -286,17 +316,6 @@ def _slugify(text: str) -> str:
             cut = cut[:boundary]
         s = cut.rstrip('-')
     return s
-
-
-def _slug_is_truncated(text: str) -> bool:
-    """Reports whether deriving a slug from ``text`` would hit the length cap.
-
-    A truncated auto-slug is still valid but makes a lossy handle to carry into
-    ``supersedes``/relations — so the write path nudges for an explicit ``slug=``.
-    """
-    s = re.sub(r'[^a-z0-9]+', '-', text.lower())
-    s = re.sub(r'-+', '-', s).strip('-')
-    return len(s) > _SLUG_MAX_LEN
 
 
 class MitosSyncManager:
@@ -1046,10 +1065,24 @@ class MitosSyncManager:
             if _val and _val.strip():
                 extra_relations[_name] = _val.strip()
 
-        # 4. Deterministic slug.
-        slug = _slugify(slug)
+        # 4. Slug — validate, don't mangle. The slug is now mandatory and explicit, and
+        #    it is folded into the canonical-core identity (V1-D2), so it is permanent
+        #    once committed. Normalise case/separators, but REJECT an over-length slug
+        #    with an exact char count rather than silently truncating it — a silent trim
+        #    would diverge the stored handle from the one the author already cited
+        #    (self-inflicted citation rot, the exact failure the handle subsystem exists
+        #    to prevent).
+        slug = _normalize_slug(slug)
         if not slug:
             return _record_error("empty_slug")
+        if len(slug) > _SLUG_MAX_LEN:
+            return _record_error(
+                "slug_too_long",
+                slug=slug,
+                length=len(slug),
+                over=len(slug) - _SLUG_MAX_LEN,
+                max=_SLUG_MAX_LEN,
+            )
 
         # 5. Serialise to the canonical format (in memory only).
         lines = [f"### {slug}", "", f"**Decided:** {axiom}", f"**Rejected:** {rejected_paths}"]

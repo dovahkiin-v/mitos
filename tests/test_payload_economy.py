@@ -6,7 +6,8 @@ From loop-Claude's second round of feedback:
   old process-global `seen` trim leaked across the loop's session resets and was removed
   (P3 fix). `brief=True` is the explicit, stateless way to ask for a lighter scan.
 - #5b record returns the path to the markdown it wrote (so the agent can eyeball it).
-- #2 residual — a truncated auto-slug nudges for an explicit `slug=`.
+- #2 residual — slugs are now mandatory + explicit + length-validated; the auto-derive
+  path and its post-write `slug_hint` nudge are retired.
 - #5a — `open_questions` is omitted when no scope was given (absent = not scanned).
 
 Offline (unreachable Qdrant + no keys) so behaviour is deterministic; the live brief
@@ -156,32 +157,22 @@ def test_cli_record_prints_path(ws, capsys):
 
 
 # --------------------------------------------------------------------------- #
-# #2 residual — explicit-slug nudge on truncation
+# #2 residual — slugs are explicit + validated (no auto-derive, no post-write nudge)
+#
+# The auto-derive-from-axiom path and its post-write `slug_hint` nudge are gone: the
+# slug is now mandatory and explicit, validated up front (over-length → `slug_too_long`,
+# covered in test_relations_and_adjacency.py). So a clean record carries no `slug_hint`.
 # --------------------------------------------------------------------------- #
 
 _LONG_AXIOM = ("The art catalog listing endpoint resolves persona scoped collections "
                "through the catalog data module rather than inlining them per persona")
 
 
-def test_record_long_auto_slug_emits_hint(ws):
-    """A truncated auto-derived slug nudges for an explicit slug."""
-    config, m = ws
-    res = m.record_decision_entry(_LONG_AXIOM, "rej", ["catalog"])
-    assert res["status"] == "created"
-    assert "slug_hint" in res and "slug=" in res["slug_hint"]
-
-
-def test_record_long_explicit_slug_no_hint(ws):
-    """An explicit slug on a long axiom suppresses the nudge."""
+def test_record_explicit_slug_no_hint(ws):
+    """A recorded decision carries no `slug_hint` — the auto-derive nudge is retired."""
     config, m = ws
     res = m.record_decision_entry(_LONG_AXIOM, "rej", ["catalog"], slug="catalog-endpoint-resolves")
-    assert "slug_hint" not in res
-
-
-def test_record_short_axiom_no_hint(ws):
-    """A short axiom (no truncation) gets no nudge."""
-    config, m = ws
-    res = m.record_decision_entry("Short and sweet.", "rej", ["s"])
+    assert res["status"] == "created"
     assert "slug_hint" not in res
 
 
