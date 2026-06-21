@@ -111,7 +111,7 @@ def test_policy_weak_scope_unused_but_has_matches():
     assert conf == "weak"
     assert "unused scope tag" in note
     assert "Valid scopes are: auth" in note
-    assert "Twilight zone" in note
+    assert "matched semantically (twilight zone" in note
 
 
 def test_policy_degraded_with_results_is_not_a_ranking():

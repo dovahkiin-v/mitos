@@ -117,9 +117,11 @@ class QdrantVectorStore:
         """
         search_url = f"{self.base_url}/collections/{self.collection}/points/search"
         
+        # We fetch more results if we intend to soft-boost so matches can bubble up
+        fetch_limit = max(10, limit * 2) if filter_scope else limit
         body: Dict[str, Any] = {
             "vector": vector,
-            "limit": limit,
+            "limit": fetch_limit,
             "with_payload": True
         }
 
@@ -151,7 +153,15 @@ class QdrantVectorStore:
                     "embedding_text": payload.get("embedding_text"),
                     "score": score
                 })
-            return output
+            
+            # Layer #2 Soft Boost: bump score if it matches the requested scope
+            if filter_scope:
+                for item in output:
+                    if filter_scope in item["scope"]:
+                        item["score"] += 0.15
+                output.sort(key=lambda x: x["score"], reverse=True)
+                
+            return output[:limit]
             
         except requests.RequestException as e:
             raise VectorStoreError(f"Qdrant query connection error: {str(e)}")

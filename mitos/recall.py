@@ -75,16 +75,18 @@ def assess_surface_recall(
 
     # Semantic ran with a real, confident hit.
     if result_count and (top_score is None or top_score >= SURFACE_STRONG_THRESHOLD):
+        matches_phrase = "Here are results that matched semantically." if prefix else "Ranked top matches."
         return "strong", (
-            f"{prefix}Ranked top matches. For the COMPLETE set of decisions in a scope — a "
+            f"{prefix}{matches_phrase} For the COMPLETE set of decisions in a scope — a "
             f"completeness pass — call {list_hint}."
         )
 
     # Semantic ran but it's in the Twilight Zone (loose neighbour / phrased differently)
     if result_count and top_score >= SURFACE_WEAK_THRESHOLD:
         shown = f"{top_score:.2f}" if top_score is not None else "?"
+        matches_phrase = "Here are results that matched semantically (twilight zone" if prefix else "Twilight zone"
         return "weak", (
-            f"{prefix}Twilight zone: top score {shown} is close. They might be family neighbours or "
+            f"{prefix}{matches_phrase}: top score {shown} is close. They might be family neighbours or "
             f"exact precedent phrased differently. Check carefully before deciding."
         )
 
