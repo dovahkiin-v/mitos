@@ -124,17 +124,7 @@ class QdrantVectorStore:
         }
 
         # Apply Qdrant filter if scope is defined
-        if filter_scope:
-            body["filter"] = {
-                "must": [
-                    {
-                        "key": "scope",
-                        "match": {
-                            "value": filter_scope
-                        }
-                    }
-                ]
-            }
+        # (Removed: Semantic search shouldn't be gated by scope. Replaced with Layer #1 warning in recall.py)
 
         try:
             resp = requests.post(

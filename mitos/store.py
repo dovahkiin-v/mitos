@@ -1628,6 +1628,15 @@ class GraphStore:
         finally:
             conn.close()
 
+    def get_all_scopes(self) -> List[str]:
+        """Returns a sorted list of all unique scope tags currently in use."""
+        conn = self._get_connection()
+        try:
+            rows = conn.execute("SELECT DISTINCT scope FROM node_scopes ORDER BY scope").fetchall()
+            return [row["scope"] for row in rows]
+        finally:
+            conn.close()
+
     def get_decisions(self, scope: Optional[str] = None, state: str = "active") -> List[Dict[str, Any]]:
         """Enumerates the COMPLETE set of decision nodes matching scope and state.
 

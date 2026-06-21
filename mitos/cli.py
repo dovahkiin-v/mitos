@@ -784,17 +784,21 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     # Confidence signal — distinguish a settled precedent from loose neighbours / no
     # match (AX P5). Shared policy with the MCP tool via mitos.recall.
     scope_decision_count: Optional[int] = None
-    if scope and not results["active_decisions"]:
+    all_scopes: Optional[List[str]] = None
+    if scope:
         try:
             scope_decision_count = len(store.get_active_decisions(scope=scope))
+            if scope_decision_count == 0:
+                all_scopes = store.get_all_scopes()
         except Exception:
-            scope_decision_count = None
+            pass
     confidence, note = assess_surface_recall(
         semantic_ran=semantic_ran,
         top_score=top_score,
         result_count=len(results["active_decisions"]),
         scope=scope,
         scope_decision_count=scope_decision_count,
+        all_scopes=all_scopes,
     )
     if confidence is not None:
         results["confidence"] = confidence
