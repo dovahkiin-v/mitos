@@ -713,14 +713,18 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     ``surface_decisions`` tool (the precedent-recall half of Mitos).
 
     Mirrors ``mcp_server.surface_decisions`` so a CLI-only agent (or a human) can
-    run the recall loop without the MCP wired. Semantic match first, scope
-    pre-filter fallback, plus any parked open questions in scope. (Both surfaces
-    return full ``rejected_paths``; pass ``--brief`` for a lighter axiom-only scan.)
+    run the recall loop without the MCP wired. The semantic match is scope-blind;
+    ``scope`` only narrows the parked open questions and the recall note (plus the
+    degraded fallback when semantic recall is down). For scope-RESTRICTED retrieval
+    use ``mitos list --scope`` — the only surface that hard-filters by scope. (Both
+    surfaces return full ``rejected_paths``; pass ``--brief`` for a lighter scan.)
 
     Args:
         config: The active workspace configuration.
         query: The claim or topic to find precedents for.
-        scope: Optional scope tag filter.
+        scope: Optional scope hint — does NOT filter the semantic search; scopes the
+            open-questions scan and recall note only. Use ``mitos list --scope`` to
+            hard-filter by scope.
         as_json: Emit a machine-readable JSON report (for agents) instead of text.
         brief: Omit ``rejected_paths`` (axiom-only — a quick "anything nearby?" scan).
     """
@@ -1508,7 +1512,7 @@ def main() -> None:
     surf_p = subparsers.add_parser("surface", aliases=["surface_decisions"],
                                    help="Surface active decisions relevant to a query (precedent check before deciding).")
     surf_p.add_argument("query", help="The claim or topic to find precedents for.")
-    surf_p.add_argument("--scope", default=None, help="Optional scope tag filter.")
+    surf_p.add_argument("--scope", default=None, help="Optional scope hint (does NOT filter semantic recall — scopes open-questions + note only). Use `list --scope` to hard-filter by scope.")
     surf_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON.")
     surf_p.add_argument("--brief", action="store_true", help="Axiom-only (omit rejected_paths) — a quick scan.")
 
