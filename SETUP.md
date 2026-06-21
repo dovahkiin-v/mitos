@@ -96,21 +96,27 @@ mitos import --from prose --llm-extract path/to/DECISIONS.md   # needs ANTHROPIC
 ```
 
 ### 6. Tell the next agent — point your project's agent files at this guide
-So **any** agent that later opens this project knows Mitos is here and how to set
-it up, add a short pointer to whichever agent-instruction files the project uses
-(`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `.cursorrules`, …):
+So **any** agent that later opens this project knows Mitos is here and how to use
+it, paste the canonical pointer block into whichever agent-instruction files the
+project uses (`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `.cursorrules`, …). Generate it
+with:
 
-```markdown
-## Architectural Decisions — Mitos (per-project setup)
-This project uses **mitos** for architectural decision memory. It is a
-**per-project** setup. Run `mitos status` to check it; if not ready, follow the
-mitos setup guide: https://github.com/dovahkiin-v/mitos/blob/main/SETUP.md
-(If `mitos` itself is `command not found`, it was uninstalled after setup — reinstall it (pipx) or flag it; don't silently drop decision-recording.)
-Record decisions with `record_decision`; check precedents with `surface_decisions` / `query_decisions`.
+```bash
+mitos agent-block          # prints the current block to paste
+mitos agent-block --check  # later: flags any pasted copy that's gone stale
 ```
 
-That line is what makes Mitos-awareness travel with the project across agents and
-sessions.
+The block is deliberately **thin** — durable pointers only (run `mitos status`, read
+this guide, and *the tools are self-describing* — their schemas carry the required
+fields and the slug rule). Keeping the volatile detail in the always-fresh surfaces
+(the MCP tool schemas + this guide) instead of the pasted copy is what stops the copy
+from going stale.
+
+It carries a hidden version marker (`<!-- mitos-agent-guide: vN -->`). On the rare
+release that changes the block, `mitos status` (and `mitos agent-block --check`) will
+notice an older pasted copy and nudge you to re-run `mitos agent-block` to refresh it.
+That is what makes Mitos-awareness travel with the project across agents and sessions
+*without* silently rotting.
 
 ---
 

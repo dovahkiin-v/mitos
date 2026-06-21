@@ -415,6 +415,8 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
         derives_from: Exact slug of a decision this one is derived from.
         cites: Exact slug of a decision this one cites.
         slug: The short, descriptive handle for the decision (e.g. 'sqlite-wal-mode').
+            Keep it to at most 100 characters — the slug is the permanent citation
+            handle, so an over-length one is rejected (not silently truncated).
         acknowledge_neighbors: Record past the near-duplicate review (the decision is genuinely independent). you have looked at the flagged neighbour(s) and this decision is
             genuinely independent. Leave False (default) on the first attempt.
 

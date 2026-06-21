@@ -27,7 +27,8 @@ from mitos.migrations import is_pre_v1a_schema
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS, open_connection
 from mitos.cutover import default_aside_db_path, perform_swap, rebuild_and_gate
 from mitos.recall import assess_surface_recall
-from mitos.sync import MitosSyncManager, run_ambient_capture
+from mitos.sync import MitosSyncManager, run_ambient_capture, _SLUG_MAX_LEN
+from mitos._agent_block import agent_block, agent_block_drift, AGENT_GUIDE_VERSION
 from mitos.renderer import MitosRenderer, overflow_report
 from mitos.importer import MitosProseImporter
 
@@ -1119,6 +1120,9 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
     key_ok = key_source is not None
     q = _check_qdrant(config.qdrant_url, config.qdrant_collection)
     mcp_wired = _mcp_wired(workspace_dir)
+    # Best-effort: is the pasted agent-file mitos note out of date? A recommendation,
+    # never a readiness blocker — like the MCP-wired check.
+    agent_drift = agent_block_drift(workspace_dir)
 
     graph_nodes = None
     # Read-only size-ceiling report for the generated context files. This is the
@@ -1162,6 +1166,8 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
                 "mcp_wired": mcp_wired,
             },
             "scope_overflow": overflows,
+            "agent_guide_version": AGENT_GUIDE_VERSION,
+            "agent_files": agent_drift["files"],
         }, indent=2))
         return 0 if ready else 1
 
@@ -1211,6 +1217,13 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
         print(f"  • graph holds {graph_nodes} node(s)")
     if overflows:
         _print_overflow_detail(overflows)
+    if agent_drift["stale"]:
+        stale_files = ", ".join(
+            f["file"] for f in agent_drift["files"]
+            if f["status"] in ("outdated", "unversioned")
+        )
+        print(f"  ⚠ agent-file mitos note out of date ({stale_files}) "
+              f"— refresh with `mitos agent-block`")
     print()
     if not ready:
         print("Next steps:")
@@ -1228,6 +1241,49 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
               "(https://github.com/dovahkiin-v/mitos/blob/main/SETUP.md)")
         print()
     return 0 if ready else 1
+
+
+def cmd_agent_block(workspace_dir: str, check: bool = False) -> int:
+    """Prints the canonical agent-file block, or checks pasted copies for drift.
+
+    The block is the thin, versioned pointer a project pastes into its agent files
+    (``AGENTS.md`` / ``CLAUDE.md`` / ``GEMINI.md`` / ``.cursorrules``) so the next
+    agent knows mitos is set up here. Without ``--check`` it prints the current block
+    to stdout, paste-ready; with ``--check`` it scans the project's agent files and
+    reports which carry an out-of-date or unversioned mitos note.
+
+    Args:
+        workspace_dir: The project root (only used by ``--check``).
+        check: Report drift in the project's agent files instead of printing the block.
+
+    Returns:
+        ``0`` on a plain print, or when ``--check`` finds no stale copy; ``1`` when
+        ``--check`` finds an outdated/unversioned mitos note to refresh.
+    """
+    if not check:
+        print(agent_block())
+        return 0
+
+    workspace_dir = os.path.abspath(workspace_dir)
+    report = agent_block_drift(workspace_dir)
+    files = report["files"]
+    print(f"\nAgent-file mitos note (current guide: v{AGENT_GUIDE_VERSION}) for {workspace_dir}\n")
+    if not files:
+        print("  — no agent file references mitos yet.")
+        print("    Paste `mitos agent-block` into your AGENTS.md / CLAUDE.md / GEMINI.md so")
+        print("    the next agent knows mitos is set up here.\n")
+        return 0
+    for f in files:
+        if f["status"] == "current":
+            print(f"  ✓ {f['file']}  (guide v{f['marker_version']})")
+        elif f["status"] == "outdated":
+            print(f"  ⚠ {f['file']}  (guide v{f['marker_version']} → v{AGENT_GUIDE_VERSION}) "
+                  f"— refresh with `mitos agent-block`")
+        else:  # unversioned
+            print(f"  ⚠ {f['file']}  (mitos note with no version marker) "
+                  f"— refresh with `mitos agent-block`")
+    print()
+    return 1 if report["stale"] else 0
 
 
 def cmd_cutover(
@@ -1499,7 +1555,9 @@ def main() -> None:
     rec_p.add_argument("--contradicts", default=None, help="Exact slug of a decision this one contradicts.")
     rec_p.add_argument("--derives-from", default=None, dest="derives_from", help="Exact slug of a decision this one derives from.")
     rec_p.add_argument("--cites", default=None, help="Exact slug of a decision this one cites.")
-    rec_p.add_argument("--slug", required=True, help="Explicit slug (handle) for the decision (required).")
+    rec_p.add_argument("--slug", required=True,
+                       help=f"Explicit slug (handle) for the decision, required "
+                            f"(≤{_SLUG_MAX_LEN} chars; an over-length slug is rejected, not truncated).")
     rec_p.add_argument("--acknowledge-neighbors", action="store_true", dest="acknowledge_neighbors",
                        help="Record past the near-duplicate review (the decision is genuinely independent).")
 
@@ -1529,6 +1587,15 @@ def main() -> None:
                        help="Skip the interactive confirmation (automation / non-TTY).")
     cut_p.add_argument("--json", action="store_true", dest="as_json",
                        help="Emit a machine-readable JSON report.")
+
+    # agent-block — print the canonical agent-file block to paste, or --check pasted copies.
+    ab_p = subparsers.add_parser(
+        "agent-block",
+        help="Print the agent-file block to paste into AGENTS.md/CLAUDE.md/…, or --check for drift.")
+    ab_p.add_argument("path", nargs="?", default=None,
+                      help="Project directory (default: current directory) — used by --check.")
+    ab_p.add_argument("--check", action="store_true",
+                      help="Scan the project's agent files and report stale/unversioned mitos notes.")
 
     args = parser.parse_args()
 
@@ -1590,6 +1657,8 @@ def main() -> None:
             cmd_serve()
         elif args.command == "status":
             sys.exit(cmd_status(args.path or os.getcwd(), as_json=args.as_json))
+        elif args.command == "agent-block":
+            sys.exit(cmd_agent_block(args.path or os.getcwd(), check=args.check))
         elif args.command == "set-key":
             cmd_set_key(args.value, name=args.name, is_global=args.is_global)
         elif args.command == "cutover":

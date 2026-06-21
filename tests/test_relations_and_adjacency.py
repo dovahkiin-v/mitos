@@ -26,7 +26,7 @@ from unittest.mock import patch
 from mitos.config import MitosConfig
 from mitos.cli import cmd_init, cmd_record, main
 from mitos.store import GraphStore
-from mitos.sync import MitosSyncManager, _slugify, _SLUG_MAX_LEN
+from mitos.sync import MitosSyncManager, _slugify, _normalize_slug, _SLUG_MAX_LEN
 
 
 @pytest.fixture
@@ -73,7 +73,14 @@ def _mk_entry(axiom: str, slug: str):
 
 
 # --------------------------------------------------------------------------- #
-# ② Slug ergonomics — word-boundary truncation
+# ② Slug ergonomics — explicit slugs are validated, not truncated
+#
+# The slug is now mandatory + explicit on record, and it is folded into the
+# canonical-core identity (permanent once committed). So the write path NORMALISES an
+# explicit slug (case/separators) but REJECTS an over-length one with an exact char
+# count — never silently truncating it (a silent trim diverges the stored handle from
+# the one the author already cited: self-inflicted citation rot). `_slugify` keeps its
+# word-boundary truncation, but that is the AUTO-DERIVE path only — not the write path.
 # --------------------------------------------------------------------------- #
 
 def test_slugify_short_text_unchanged():
@@ -82,11 +89,13 @@ def test_slugify_short_text_unchanged():
 
 
 def test_slugify_trims_to_word_boundary_not_midword():
-    """A long axiom trims to whole words — no `…brazilian-portug` fragment."""
-    axiom = ("Camila the Portuguese tutor uses the European variant rather than "
-             "the Brazilian Portuguese pronunciation")
+    """The auto-derive path trims a long slug to whole words — no `…brazilian-portug`."""
+    # Long enough to exceed the cap so the boundary-trim branch actually fires.
+    axiom = ("Camila the Portuguese tutor always uses the formal European variant of "
+             "the language rather than the informal Brazilian Portuguese pronunciation")
     slug = _slugify(axiom)
     assert len(slug) <= _SLUG_MAX_LEN
+    assert len(_normalize_slug(axiom)) > _SLUG_MAX_LEN  # the trim branch really ran
     assert not slug.endswith("-")
     # Every piece of the slug is a whole source word — nothing sliced mid-word.
     source_words = set(re.sub(r"[^a-z0-9 ]", " ", axiom.lower()).split())
@@ -101,21 +110,46 @@ def test_slugify_deterministic_for_long_axiom():
 
 def test_slugify_single_long_token_hard_caps():
     """One huge token with no boundary in range falls back to the hard cap."""
-    slug = _slugify("x" * 100)
+    slug = _slugify("x" * 150)
     assert slug == "x" * _SLUG_MAX_LEN
 
 
-def test_record_long_axiom_yields_readable_handle(ws):
-    """End-to-end: a recorded long-axiom decision gets a clean, carry-able slug."""
+def test_record_long_explicit_slug_under_cap_records_verbatim(ws):
+    """A long-but-under-cap explicit slug records with its handle byte-intact (no silent trim).
+
+    This 68-char descriptive handle is exactly the AX failure case: under the old
+    64-char cap it committed as `…-over-quarantine` (the trailing `-floor` silently
+    dropped), diverging from the form the author cited. The raised cap + no-truncate
+    contract now stores it verbatim.
+    """
     config, m = ws
-    res = m.record_decision_entry(
-        axiom=("The catalog data module owns all persona neutral gallery markers "
-               "for the Brazilian Portuguese variant going forward"),
-        rejected_paths="Inlining markers per persona was rejected: duplication drift.",
-        scope=["catalog"],
-    )
-    assert res["status"] == "created"
-    assert not res["slug"].endswith("-") and len(res["slug"]) <= _SLUG_MAX_LEN
+    slug = "steady-state-batch-oldest-first-flow-heuristic-over-quarantine-floor"  # 68 chars
+    assert len(slug) <= _SLUG_MAX_LEN
+    res = m.record_decision_entry("A real decision.", "rej", ["s"], slug=slug)
+    assert res["status"] == "created", res
+    assert res["slug"] == slug  # stored handle == cited handle, no truncation
+
+
+def test_record_over_length_slug_rejected_with_exact_count(ws):
+    """An explicit slug over the cap is REJECTED (not truncated), stating the exact overrun.
+
+    Nothing is written — the buffer-first + rollback contract holds — and the message
+    names the actual length, the overrun, and the limit so the author knows exactly
+    how many characters to drop.
+    """
+    config, m = ws
+    before = _read(config)
+    over = "a-very-" * 20  # normalises well past the 100-char cap
+    normalized = _normalize_slug(over)
+    assert len(normalized) > _SLUG_MAX_LEN
+    res = m.record_decision_entry("Some decision.", "rej", ["s"], slug=over)
+    assert res["code"] == "slug_too_long", res
+    assert str(len(normalized)) in res["error"]                       # exact length
+    assert str(len(normalized) - _SLUG_MAX_LEN) in res["error"]       # exact overrun
+    assert str(_SLUG_MAX_LEN) in res["error"]                         # the limit
+    # Nothing written — the contract holds.
+    assert _read(config) == before
+    assert len(GraphStore(config.db_path).get_all_nodes()) == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -199,7 +233,7 @@ def test_relation_target_not_found_buffer_unchanged(ws):
     """
     config, m = ws
     before = _read(config)
-    res = m.record_decision_entry("New.", "Old.", [], depends_on="ghost-slug")
+    res = m.record_decision_entry("New.", "Old.", [], slug="linker", depends_on="ghost-slug")
     assert res["code"] == "relation_target_not_found"
     assert "depends_on" in res["error"] and "ghost-slug" in res["error"]
     assert _read(config) == before
@@ -210,7 +244,7 @@ def test_relation_target_fuzzy_prefix_rejected(ws):
     """A prefix (not exact) relation target is rejected, not silently wrong-linked."""
     config, m = ws
     m.record_decision_entry("Decision foo bar.", "rej", [], slug="foo-bar")
-    res = m.record_decision_entry("Tries a prefix link.", "rej", [], amends="foo")
+    res = m.record_decision_entry("Tries a prefix link.", "rej", [], slug="linker", amends="foo")
     assert res["code"] == "relation_target_not_found"
 
 
@@ -229,7 +263,7 @@ def test_relation_target_ambiguous_buffer_unchanged(ws):
     e2.supersedes = "amb"                                          # resolves to node-1 (active non-self)
     m.store.commit_parsed_entry(e2)                               # node-2 supersedes node-1; both slug 'amb'
     before = _read(config)
-    res = m.record_decision_entry("Linker.", "rej", [], depends_on="amb")
+    res = m.record_decision_entry("Linker.", "rej", [], slug="linker", depends_on="amb")
     assert res["code"] == "relation_target_ambiguous"
     assert _read(config) == before
     assert GraphStore(config.db_path).get_node_by_slug("linker") is None
@@ -272,7 +306,7 @@ def test_cli_cmd_record_corrects_kill_edge(ws):
 def test_cli_relation_flags_route(mock_record, monkeypatch):
     """The --corrects/--depends-on/--amends/--cites/etc. flags reach cmd_record."""
     monkeypatch.setattr(sys, "argv", [
-        "mitos", "record", "ax", "--rejected", "r",
+        "mitos", "record", "ax", "--rejected", "r", "--slug", "the-slug",
         "--corrects", "korrekt",
         "--depends-on", "foo", "--amends", "bar", "--cites", "baz",
         "--derives-from", "qux", "--contradicts", "quux", "--narrows", "corge",
@@ -280,6 +314,7 @@ def test_cli_relation_flags_route(mock_record, monkeypatch):
     ])
     main()
     _, kwargs = mock_record.call_args
+    assert kwargs["slug"] == "the-slug"
     assert kwargs["corrects"] == "korrekt"
     assert kwargs["depends_on"] == "foo"
     assert kwargs["amends"] == "bar"
