@@ -199,12 +199,15 @@ def test_missing_known_key_falls_back_to_default() -> None:
         assert config.stale_entry_window_days == CONFIG_DEFAULTS["stale_entry_window_days"]
 
 
-def test_unknown_key_warns_but_tolerates(capsys: pytest.CaptureFixture) -> None:
-    """Unknown / dropped-schema keys are warned to stderr, skipped, and never applied.
+def test_retired_keys_silent_unknown_keys_warn(capsys: pytest.CaptureFixture) -> None:
+    """Retired keys are tolerated SILENTLY; only genuinely-unknown keys warn.
 
-    The dropped prototype keys (`pending_threshold`, `db_path`, `decisions_file`,
-    `archive_dir`) fall into this bucket: their file occurrence is tolerated and
-    ignored, but the ATTRIBUTE survives at its default (R12).
+    A recognized-but-retired key (`RETIRED_CONFIG_KEYS`: `pending_threshold`,
+    `db_path`, `decisions_file`, `archive_dir`) was deliberately dropped from the
+    file schema but is still recognized — its ATTRIBUTE survives at its default
+    (R12) and its file occurrence is skipped with NO warning (it is not a typo, so
+    warning on it every call is noise). A genuinely unknown key (a typo) still earns
+    one calm stderr line — that warning is the signal the setting won't take effect.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         _write_config(
@@ -217,13 +220,14 @@ def test_unknown_key_warns_but_tolerates(capsys: pytest.CaptureFixture) -> None:
         config = MitosConfig(tmpdir)
         # Recognized key still applies.
         assert config.rotation_mode == "mark"
-        # Dropped file keys are ignored — the attributes keep their defaults.
+        # Retired file keys are ignored — the attributes keep their defaults.
         assert config.pending_threshold == 30
         assert "graph.sqlite" in config.db_path
-        # One calm stderr line per ignored key (P9: terse, no emoji).
         err = capsys.readouterr().err
-        assert "pending_threshold" in err
-        assert "db_path" in err
+        # Retired keys are tolerated silently — no per-invocation noise.
+        assert "pending_threshold" not in err
+        assert "db_path" not in err
+        # A genuine typo still earns one calm stderr line (P9: terse, no emoji).
         assert "frobnicate" in err
         assert "Traceback" not in err
 
@@ -288,8 +292,8 @@ def test_prototype_shaped_config_loads_clean(capsys: pytest.CaptureFixture) -> N
 
     Mirrors the live `.mitos/config.toml`: `rotation_mode` carries a trailing inline
     comment (which the hand-rolled parser mangled and silently defaulted; tomllib
-    parses it cleanly), `pending_threshold` is now warn-tolerated, and the
-    `qdrant_*` keys apply.
+    parses it cleanly), `pending_threshold` is now silently tolerated (a recognized
+    retired key), and the `qdrant_*` keys apply.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         _write_config(
@@ -305,10 +309,13 @@ def test_prototype_shaped_config_loads_clean(capsys: pytest.CaptureFixture) -> N
         assert config.rotation_mode == "archive"
         assert config.qdrant_url == "http://localhost:7333"
         assert config.qdrant_collection == "mitos-mitos-pub"
-        # pending_threshold file key warn-tolerated; attribute keeps its default.
+        # pending_threshold file key silently tolerated; attribute keeps its default.
         assert config.pending_threshold == 30
+        # The real seeded file now loads with a CLEAN stderr — no per-invocation
+        # noise on the recognized-but-retired `pending_threshold` key.
         err = capsys.readouterr().err
-        assert "pending_threshold" in err  # the lone warn-tolerated key
+        assert "pending_threshold" not in err
+        assert err.strip() == ""
 
 
 # ---------------------------------------------------------------------------
