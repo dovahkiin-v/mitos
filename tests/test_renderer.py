@@ -64,7 +64,7 @@ def test_renderer_stateless_outputs(temp_workspace: Tuple[GraphStore, str]) -> N
     entry3 = ParsedEntry("decision", "fe-new", 1, 5)
     entry3.axiom = "Vite + TS."
     entry3.rejected_paths = "Vanilla JS."
-    entry3.supersedes = "fe-old"
+    entry3.supersedes = ["fe-old"]
     entry3.scope = ["frontend"]
     store.commit_parsed_entry(entry3)
 

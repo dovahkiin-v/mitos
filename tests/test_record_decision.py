@@ -481,7 +481,7 @@ def test_supersedes_ambiguous(ws) -> None:
     config, m = ws
     m.store.commit_parsed_entry(_mk_entry("axiom one", "amb"))      # node-1, slug 'amb'
     e2 = _mk_entry("axiom two", "amb")
-    e2.supersedes = "amb"                                           # resolves to node-1 (active non-self)
+    e2.supersedes = ["amb"]                                           # resolves to node-1 (active non-self)
     m.store.commit_parsed_entry(e2)                                # node-2 supersedes node-1; both slug 'amb'
     before = _read(config)
     res = m.record_decision_entry("New decision.", "Rejection.", [], slug="new-decision", supersedes="amb")
@@ -560,7 +560,7 @@ def test_relation_target_accepts_cased_non_ascii(ws) -> None:
 
     Covers ``_validate_relation_target`` (sync.py:828): pre-fix ``.lower()`` rejected it
     as ``relation_target_not_found``; post-fix ``.casefold()`` resolves it and the record
-    commits (V1a warn-defers the non-kill amends edge itself, so only ``status`` is asserted).
+    commits (the non-kill amends edge now commits in V1b; only ``status`` is asserted here).
     """
     config, m = ws
     m.store.commit_parsed_entry(_mk_entry("axiom one", "kabutė"))

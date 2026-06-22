@@ -476,7 +476,10 @@ def test_parse_entry_stream_source_field_extracted_raw() -> None:
 
 
 def test_parse_entry_stream_relationship_fields_raw() -> None:
-    """Relationship fields are extracted as raw single-slug strings (resolution is 5b)."""
+    """Relationship fields tokenize to comma-separated List[str] (resolution is the store).
+
+    A lone slug is a 1-element list; ``Cites: a, b`` is two (V1b multi-valued).
+    """
     text = (
         "<!-- BEGIN ENTRIES -->\n"
         "### with-edges\n"
@@ -485,11 +488,14 @@ def test_parse_entry_stream_relationship_fields_raw() -> None:
         "**Supersedes:** old-decision\n"
         "**Corrects:** typo-decision\n"
         "**Depends-On:** base-decision\n"
+        "**Cites:** ref-a, ref-b\n"
     )
     entry = parse_entry_stream(text, "decision")[0]
-    assert entry.supersedes == "old-decision"
-    assert entry.corrects == "typo-decision"
-    assert entry.depends_on == "base-decision"
+    assert entry.supersedes == ["old-decision"]
+    assert entry.corrects == ["typo-decision"]
+    assert entry.depends_on == ["base-decision"]
+    assert entry.cites == ["ref-a", "ref-b"]  # multi-valued split
+    assert entry.amends == []  # absent → empty list, never None
 
 
 def test_parse_entry_stream_slugless_header_fails_fast() -> None:

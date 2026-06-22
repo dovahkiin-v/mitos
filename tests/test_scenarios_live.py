@@ -208,7 +208,7 @@ def test_scenario_s4_edit_in_place_correction(live_workspace) -> None:
     e2 = ParsedEntry("decision", "cache-concurrency", 1, 10)
     e2.axiom = "Corrected Axiom"
     e2.rejected_paths = "None."
-    e2.corrects = "cache-concurrency" # Simulates user picking '[c]orrection' in prompt
+    e2.corrects = ["cache-concurrency"] # Simulates user picking '[c]orrection' in prompt
     d2 = store.commit_parsed_entry(e2)
     
     # Check correctness of edges & state view (V1a edge columns: edge_type/source_id/target_id)
@@ -317,7 +317,7 @@ def test_scenario_s7_long_sustained_use(live_workspace) -> None:
         e = ParsedEntry("decision", f"dec-super-{i}", 1, 5)
         e.axiom = f"New supersession {i}."
         e.rejected_paths = "None."
-        e.supersedes = f"dec-{i}"
+        e.supersedes = [f"dec-{i}"]
         store.commit_parsed_entry(e)
         
     # Corrections (15 corrections)
@@ -325,7 +325,7 @@ def test_scenario_s7_long_sustained_use(live_workspace) -> None:
         e = ParsedEntry("decision", f"dec-correct-{i}", 1, 5)
         e.axiom = f"Corrected decision {i}."
         e.rejected_paths = "None."
-        e.corrects = f"dec-{i+20}"
+        e.corrects = [f"dec-{i+20}"]
         store.commit_parsed_entry(e)
         
     # Parked & Resolved questions (10 resolves)
@@ -338,7 +338,7 @@ def test_scenario_s7_long_sustained_use(live_workspace) -> None:
         res = ParsedEntry("decision", f"dec-resolve-{i}", 1, 5)
         res.axiom = f"Resolve answer {i}."
         res.rejected_paths = "None."
-        res.resolves = f"question-{i}"
+        res.resolves = [f"question-{i}"]
         store.commit_parsed_entry(res)
         
     # Lithuanian/Sanskrit UTF-8 verification

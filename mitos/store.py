@@ -34,10 +34,9 @@ from mitos.migrations import (
 )
 from mitos.parser import ParsedEntry
 
-# Module logger for non-failing notices (the warn-defer channel). The store is a
-# pure primitive — it logs (loud, testable via ``caplog``, no raw stdout I/O) and
-# never prints to the user; user-facing notices belong to the sync/cli consumer
-# layer.
+# Module logger for non-failing notices. The store is a pure primitive — it logs
+# (loud, testable via ``caplog``, no raw stdout I/O) and never prints to the user;
+# user-facing notices belong to the sync/cli consumer layer.
 logger = logging.getLogger(__name__)
 
 # The SQLite floor V1a's STRICT tables and the migration ladder require. The
@@ -76,17 +75,48 @@ MODIFIER_EDGE_KEYS: Dict[str, str] = {
 # ``edges.edge_type`` DDL CHECK whitelist (``'supersedes'`` / ``'corrects'``).
 _KILL_EDGE_FIELDS: Tuple[str, ...] = ("supersedes", "corrects")
 
-# Display tokens for the kill-edge fields, used for ``FailureItem.field``
-# localization (the store has no finer per-line anchor than the entry span).
-_KILL_EDGE_TOKENS: Dict[str, str] = {
+# Display tokens for every relationship field, used for ``FailureItem.field``
+# localization (the store has no finer per-line anchor than the entry span). These
+# are the canonical ``decisions.md`` field labels — the two kill-edge labels plus
+# the seven from ``sync._EXTRA_RELATIONS``. The store owns its own copy (it is a
+# lower tier than ``sync`` and must not import from it); the labels are pinned by
+# the test suite so the two can never drift.
+_RELATION_TOKENS: Dict[str, str] = {
     "supersedes": "**Supersedes:**",
     "corrects": "**Corrects:**",
+    "amends": "**Amends:**",
+    "narrows": "**Narrows:**",
+    "depends_on": "**Depends-On:**",
+    "resolves": "**Resolves:**",
+    "contradicts": "**Contradicts:**",
+    "derives_from": "**Derives-From:**",
+    "cites": "**Cites:**",
 }
 
-# The seven relationship types parsed onto ``ParsedEntry`` but NOT committed in
-# V1a — warn-deferred to V1b's reconciler. A deferred declaration is a logged
-# notice, never a §5.2.2 failure, and the node + its kill-edges still commit
-# (keeps 8b's self-parse closeout achievable).
+# Human-readable kind requirement per edge type, for the ``kind_constraint_violation``
+# vector error (P3). The six same-kind types share one clause; the two cross-kind
+# types name their direction. (``cites`` is any→any and never trips the kind CHECK,
+# so its clause is informational only.) The widened ``edges`` CHECK (1b) is the
+# structural gate; this just phrases its rejection for the author.
+_EDGE_KIND_REQUIREMENT: Dict[str, str] = {
+    "supersedes": "connect two entries of the same kind",
+    "corrects": "connect two entries of the same kind",
+    "amends": "connect two entries of the same kind",
+    "narrows": "connect two entries of the same kind",
+    "depends_on": "connect two entries of the same kind",
+    "contradicts": "connect two entries of the same kind",
+    "resolves": "go from a decision to an open question",
+    "derives_from": "go from an open question to a decision",
+    "cites": "connect any two entries",
+}
+
+# The seven NON-KILL relationship types. As of V1b (Phase 2a) these COMMIT their
+# edges — both endpoints stay active (unlike the two kill-edges, which retire their
+# target). They are kept as a named set because the two reconciliation gates that
+# are kill-edge-specific — the "itself superseded" source-active reject (V1-D6) and
+# the resurrection re-check — key on membership: a non-kill edge mints from any
+# source and resurrects nothing. ``_KILL_EDGE_FIELDS + _DEFERRED_EDGE_FIELDS`` is
+# exactly the nine-type catalog the widened ``edges`` CHECK enforces (1b).
 _DEFERRED_EDGE_FIELDS: Tuple[str, ...] = (
     "amends",
     "narrows",
@@ -850,9 +880,10 @@ class GraphStore:
 
         The state is **decision-centric** (``active`` / ``superseded`` /
         ``corrected`` / ``drifted``). Open-question resolution state
-        (``parked`` / ``resolved``) rides the ``resolves`` edge — a warn-deferred
-        V1b type — so an open_question resolves to its kill-edge state here, never
-        ``parked`` / ``resolved`` (G7; V1b owns OQ resolution).
+        (``parked`` / ``resolved``) rides the ``resolves`` edge — that edge commits
+        as of V1b 2a, but deriving the OQ ``parked`` / ``resolved`` state from it is
+        a later V1b phase — so an open_question resolves to its kill-edge state here,
+        never ``parked`` / ``resolved`` (G7; V1b owns OQ resolution).
 
         Args:
             node_id: The content-hash id of the node to derive state for.
@@ -1308,33 +1339,43 @@ class GraphStore:
         parsed: ParsedEntry,
         now: str,
     ) -> Tuple[bool, List[FailureItem], Set[str]]:
-        """Reconciles the committing node's outgoing kill-edges (V1-D21/D6/D23).
+        """Reconciles the committing node's outgoing edges (V1-D21/D6/D23/D13).
 
         Declarative mirror inside ``commit_parsed_entry``'s transaction: the node's
         stored outgoing edge set is brought into agreement with the buffer's
-        declared ``Supersedes:`` / ``Corrects:`` citations. A declared edge already
-        present (matched STRUCTURALLY by its stored target's *current* slug, never
-        re-resolved) is RETAINED untouched — re-resolving a retained kill-edge
-        against the active view would fail, because the target is inactive *because
-        of that very edge* (the self-strangling trap). Only a NET-NEW declared edge
-        is resolved against the active view and guarded; a stored edge no longer
+        declared relationship citations across **all nine** edge types — the two
+        kill-edges (``Supersedes:`` / ``Corrects:``) and the seven non-kill types
+        (``Amends:`` / ``Narrows:`` / ``Depends-On:`` / ``Resolves:`` /
+        ``Contradicts:`` / ``Derives-From:`` / ``Cites:``). Each relationship field
+        is comma-separated multi-valued (V1b): ``Cites: a, b`` reconciles two
+        ``cites`` edges; a within-field repeat collapses to one. A declared edge
+        already present (matched STRUCTURALLY by its stored target's *current* slug,
+        never re-resolved) is RETAINED untouched — re-resolving a retained edge
+        against the active view would fail when the target is inactive *because of
+        that very edge* (the self-strangling trap). Only a NET-NEW declared edge is
+        resolved against the active view and guarded; a stored edge no longer
         declared is DELETEd (the declarative mirror — removing a ``Supersedes:``
         line resurrects the target, §4.5.1).
 
-        The four guards fire only on net-new edges and report structured
+        The guards fire only on net-new edges and report structured
         ``source="store"`` failures (the entry rolls back on any):
 
         - ``missing_target`` — no node carries the cited slug (a forward reference
           is always a causal violation; edges point new→old);
         - ``dangling_edge`` — a node carries it but is inactive (the immediate
-          1-hop killer is named; no transitive walker — that is V1b);
-        - ``cycle_violation`` — a self-edge (a node cannot supersede/correct
-          itself), or a net-new kill-edge from an already-superseded source;
-        - ``kind_constraint_violation`` — a cross-kind edge, caught from the DDL
+          1-hop killer is named; no transitive walker — that is V5);
+        - ``cycle_violation`` — a self-edge (a node cannot relate to itself), or a
+          net-new **kill-edge** from an already-superseded source (the source-active
+          reject is a kill-edge invariant per V1-D6; a non-kill edge mints from any
+          source — a superseded node may still add a ``Cites:``);
+        - ``kind_constraint_violation`` — a kind-violating edge (e.g. a ``resolves``
+          D→D, or a decision-source ``derives_from``), caught from the widened DDL
           CHECK on the edge INSERT and mapped (Lesson 2 — never pre-asserted).
 
-        The seven non-V1a relationship types are warn-deferred (logged WARNING,
-        node + kill-edges still commit, NOT a failure).
+        All nine types resolve to the *active* view (V1-D23); a ``cites`` to a
+        superseded target therefore fails ``dangling_edge`` (cite the live version).
+        Removing a non-kill edge resurrects nothing (it retired no target), so only a
+        removed kill-edge feeds the caller's resurrection slug-collision re-check.
 
         Args:
             cursor: The open cursor inside ``commit_parsed_entry``'s transaction —
@@ -1365,21 +1406,28 @@ class GraphStore:
         # (V1-D4 / MI-13).
         resurrected_slugs: Set[str] = set()
 
-        # --- Declared kill-edges (strip brackets, casefold for lookup) ----------
-        # ``declared`` drives net-new resolution; ``declared_keys`` (the casefolded
-        # target slug + edge_type) drives the declarative-mirror DELETE (V1-D21).
+        # --- Declared edges, all nine types (strip brackets, casefold) ----------
+        # Each relationship field is a ``List[str]`` of cited slugs (V1b
+        # multi-valued); iterate the full nine-type catalog and expand each field
+        # into per-citation declarations. ``declared`` drives net-new resolution;
+        # ``declared_keys`` (the casefolded target slug + edge_type) drives the
+        # declarative-mirror DELETE (V1-D21). A within-field repeat (``Cites: a, a``)
+        # collapses to a single declaration — the edge PK is
+        # ``(source_id, target_id, edge_type)``, so a second INSERT of the same
+        # triple would trip the PK (and mis-map to a kind violation in the catch).
         declared: List[Tuple[str, str, str]] = []  # (edge_type, casefold, display)
         declared_keys: Set[Tuple[str, str]] = set()
-        for edge_type in _KILL_EDGE_FIELDS:
-            raw = getattr(parsed, edge_type, None)
-            if not raw:
-                continue
-            citation = _strip_citation(raw)
-            if not citation:  # an empty / bracket-only value is not a declaration
-                continue
-            citation_casefold = citation.casefold()  # MI-7: never SQLite LOWER
-            declared.append((edge_type, citation_casefold, citation))
-            declared_keys.add((citation_casefold, edge_type))
+        for edge_type in _KILL_EDGE_FIELDS + _DEFERRED_EDGE_FIELDS:
+            for raw in (getattr(parsed, edge_type, None) or []):
+                citation = _strip_citation(raw)
+                if not citation:  # an empty / bracket-only value is not a declaration
+                    continue
+                citation_casefold = citation.casefold()  # MI-7: never SQLite LOWER
+                key = (citation_casefold, edge_type)
+                if key in declared_keys:  # within-field / repeated citation → one edge
+                    continue
+                declared.append((edge_type, citation_casefold, citation))
+                declared_keys.add(key)
 
         # --- Stored outgoing edges, keyed by the target's CURRENT slug (V1-D23) --
         # Matching retained edges by the target's current slug means a renamed-then-
@@ -1408,7 +1456,7 @@ class GraphStore:
             is None
         )
 
-        # --- Resolve + guard each declared kill-edge ----------------------------
+        # --- Resolve + guard each declared edge (all nine types) ----------------
         for edge_type, citation_casefold, citation in declared:
             if (citation_casefold, edge_type) in stored_by_key:
                 # RETAINED — matched structurally, never re-resolved (the
@@ -1417,7 +1465,7 @@ class GraphStore:
                 # for a commentary-only re-commit).
                 continue
 
-            token = _KILL_EDGE_TOKENS[edge_type]
+            token = _RELATION_TOKENS[edge_type]
 
             # NET-NEW — resolve the citation against the *active* view. Multiple
             # nodes may share a casefolded slug (a same-slug supersession lineage);
@@ -1443,7 +1491,12 @@ class GraphStore:
 
             if active_non_self:
                 target = active_non_self[0]
-                if not source_active:
+                # The "itself superseded" reject is a KILL-EDGE invariant (V1-D6): a
+                # kill-edge mints only from an active source. A non-kill edge (the
+                # seven) mints from any source — a superseded node may still add a
+                # ``Cites:`` (the mutation-cycle concern for amends/narrows is 3a's
+                # write-time reachability probe, not a blanket source-active reject).
+                if edge_type in _KILL_EDGE_FIELDS and not source_active:
                     failures.append(
                         FailureItem(
                             code=STORE_CYCLE_VIOLATION,
@@ -1485,9 +1538,9 @@ class GraphStore:
                             code=STORE_KIND_CONSTRAINT_VIOLATION,
                             source="store",
                             message=(
-                                f"'{citation}' is a different kind of entry; "
-                                f"{edge_type} edges must connect two decisions or "
-                                "two open questions."
+                                f"'{citation}' has an incompatible kind for a "
+                                f"{edge_type} edge; {edge_type} edges must "
+                                f"{_EDGE_KIND_REQUIREMENT[edge_type]}."
                             ),
                             field=token,
                             line_start=parsed.line_start,
@@ -1566,20 +1619,13 @@ class GraphStore:
                     (node_id, target_id, edge_type),
                 )
                 edges_changed = True
-                # Deleting this edge may reactivate its target (resurrection,
-                # §4.5.1); the target's current slug must be re-checked for a
-                # collision by the caller (V1-D4).
-                resurrected_slugs.add(slug_casefold)
-
-        # --- Warn-defer the seven non-V1a relationship types --------------------
-        # Loud (WARNING, non-deduping — matters at cutover replay), NOT a failure.
-        for field in _DEFERRED_EDGE_FIELDS:
-            if getattr(parsed, field, None):
-                logger.warning(
-                    "Entry '%s': '%s' edge deferred to V1b (not committed).",
-                    parsed.slug,
-                    field,
-                )
+                # Only a removed KILL-edge can reactivate a target (it was inactive
+                # *because of* that edge), so only it feeds the caller's resurrection
+                # slug-collision re-check (§4.5.1 / V1-D4). A removed non-kill edge
+                # (cites/amends/…) changes no node's activeness; adding it here would
+                # trigger a spurious collision re-check (Decision 5).
+                if edge_type in _KILL_EDGE_FIELDS:
+                    resurrected_slugs.add(slug_casefold)
 
         return edges_changed, failures, resurrected_slugs
 

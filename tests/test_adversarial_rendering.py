@@ -62,7 +62,7 @@ def test_dangling_edge_refused_so_renders_stay_clean(isolated_workspace) -> None
     dangling.axiom = "We use WAL mode SQLite for local storage."
     dangling.rejected_paths = "pgvector (too heavy)."
     dangling.scope = ["substrate"]
-    dangling.supersedes = "nonexistent-target"
+    dangling.supersedes = ["nonexistent-target"]
     with pytest.raises(CommitError):
         store.commit_parsed_entry(dangling)
 
@@ -77,7 +77,7 @@ def test_dangling_edge_refused_so_renders_stay_clean(isolated_workspace) -> None
     superseder.axiom = "We use WAL mode SQLite for local storage."
     superseder.rejected_paths = "pgvector (too heavy)."
     superseder.scope = ["substrate"]
-    superseder.supersedes = "old-target"
+    superseder.supersedes = ["old-target"]
     store.commit_parsed_entry(superseder)
 
     # 3. Trigger rendering and assert the active superseder renders, target excluded.

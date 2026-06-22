@@ -423,7 +423,7 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
         amends: Exact slug of a decision this one amends (modifies without replacing).
         narrows: Exact slug of a decision this one narrows the scope of.
         depends_on: Exact slug of a decision this one depends on.
-        resolves: Exact slug of an open question / decision this one resolves.
+        resolves: Exact slug of an open question this one resolves (the resolves edge is decision→open_question only).
         contradicts: Exact slug of a decision this one is in tension with.
         derives_from: Exact slug of a decision this one is derived from.
         cites: Exact slug of a decision this one cites.

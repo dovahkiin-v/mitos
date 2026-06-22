@@ -409,7 +409,7 @@ def test_5b_supersedes_commits_one_kill_edge(temp_store: GraphStore) -> None:
     """
     old = temp_store.commit_parsed_entry(_decision(slug="old-choice", axiom="Old."))
     e = _decision(slug="new-choice", axiom="New.")
-    e.supersedes = "old-choice"
+    e.supersedes = ["old-choice"]
     new = temp_store.commit_parsed_entry(e)
 
     rows = _edges(temp_store)
@@ -547,7 +547,7 @@ def test_5c_rollback_enqueues_nothing(temp_store: GraphStore) -> None:
     or not at all).
     """
     e = _decision(slug="new", axiom="New.")
-    e.supersedes = "nonexistent"  # missing_target — fails store-stage, rolls back
+    e.supersedes = ["nonexistent"]  # missing_target — fails store-stage, rolls back
     with pytest.raises(CommitError):
         temp_store.commit_parsed_entry(e)
     assert _count(temp_store, "pending_embeddings") == 0  # speculative row rolled back
@@ -573,7 +573,7 @@ def test_5c_cascade_includes_kill_edge_target_scope(temp_store: GraphStore) -> N
     """
     temp_store.commit_parsed_entry(_decision(slug="a", axiom="Old.", scope=["x"]))
     e = _decision(slug="b", axiom="New.", scope=["y"])
-    e.supersedes = "a"
+    e.supersedes = ["a"]
     delta = temp_store.commit_parsed_entry(e)
     assert delta.cascade_affected_scopes == ["x", "y"]
 
@@ -586,7 +586,7 @@ def test_5c_cascade_on_edge_only_change(temp_store: GraphStore) -> None:
     b1 = temp_store.commit_parsed_entry(_decision(slug="b", axiom="New.", scope=["y"]))
     # Re-commit B identically EXCEPT for the added Supersedes: line.
     e = _decision(slug="b", axiom="New.", scope=["y"])
-    e.supersedes = "a"
+    e.supersedes = ["a"]
     delta = temp_store.commit_parsed_entry(e)
     assert delta.node_id == b1.node_id
     assert delta.commentary_fields_changed is False  # footprint unchanged; only edges
@@ -893,7 +893,7 @@ def test_store_rebuild_quarantine_is_tracked() -> None:
 def _commit_kill(store, slug, axiom, edge_type, target, **kw):
     """Builds a decision declaring one kill-edge (bare-slug, agentic shape) + commits it."""
     e = _decision(slug=slug, axiom=axiom, **kw)
-    setattr(e, edge_type, target)
+    setattr(e, edge_type, [target])  # List[str] shape (V1b multi-valued)
     return store.commit_parsed_entry(e)
 
 
@@ -917,7 +917,7 @@ def test_open_question_supersedes_open_question_same_kind(temp_store: GraphStore
     """An OQ→OQ kill-edge commits (the CHECK permits same-kind, forbids cross-kind)."""
     oq1 = temp_store.commit_parsed_entry(_open_question(slug="oq1", topic="T1"))
     e = _open_question(slug="oq2", topic="T2")
-    e.supersedes = "oq1"
+    e.supersedes = ["oq1"]
     oq2 = temp_store.commit_parsed_entry(e)
 
     rows = _edges(temp_store)
@@ -940,7 +940,7 @@ def test_bracket_and_bare_citation_both_resolve(temp_store: GraphStore) -> None:
         "**Supersedes:** [old-choice]\n"
     )
     entries = parse_entry_stream(text, "decision")
-    assert entries[0].supersedes == "[old-choice]"  # brackets retained by the parser
+    assert entries[0].supersedes == ["[old-choice]"]  # brackets retained by the parser
     new = temp_store.commit_parsed_entry(entries[0])
 
     rows = _edges(temp_store)
@@ -1106,7 +1106,7 @@ def test_case_variant_zombie_rolls_back_under_casefold(temp_store: GraphStore) -
 def test_missing_target_rolls_back(temp_store: GraphStore) -> None:
     """Citing a slug not in the graph fires missing_target and rolls the entry back."""
     e = _decision(slug="new", axiom="New.")
-    e.supersedes = "nonexistent"
+    e.supersedes = ["nonexistent"]
     with pytest.raises(CommitError) as exc:
         temp_store.commit_parsed_entry(e)
     item = exc.value.failure.items[0]
@@ -1124,7 +1124,7 @@ def test_dangling_edge_reports_one_hop_killer(temp_store: GraphStore) -> None:
 
     # C cites the now-inactive 'a' (it should have cited the active 'b').
     e = _decision(slug="c", axiom="Axiom C.")
-    e.supersedes = "a"
+    e.supersedes = ["a"]
     with pytest.raises(CommitError) as exc:
         temp_store.commit_parsed_entry(e)
     item = exc.value.failure.items[0]
@@ -1136,7 +1136,7 @@ def test_dangling_edge_reports_one_hop_killer(temp_store: GraphStore) -> None:
 def test_cycle_violation_self_edge(temp_store: GraphStore) -> None:
     """A node citing its own slug (resolving to self) fires cycle_violation."""
     e = _decision(slug="x", axiom="Self.")
-    e.supersedes = "x"
+    e.supersedes = ["x"]
     with pytest.raises(CommitError) as exc:
         temp_store.commit_parsed_entry(e)
     assert exc.value.failure.items[0].code == "cycle_violation"
@@ -1152,7 +1152,7 @@ def test_cycle_violation_inactive_source(temp_store: GraphStore) -> None:
 
     # Re-commit A (same core => same id, now inactive) declaring a NEW kill-edge.
     e = _decision(slug="a", axiom="Axiom A.")
-    e.supersedes = "c"
+    e.supersedes = ["c"]
     with pytest.raises(CommitError) as exc:
         temp_store.commit_parsed_entry(e)
     assert exc.value.failure.items[0].code == "cycle_violation"
@@ -1166,7 +1166,7 @@ def test_kind_constraint_violation_via_ddl_check(temp_store: GraphStore) -> None
     """A cross-kind kill-edge fires kind_constraint_violation from the DDL CHECK (Lesson 2)."""
     temp_store.commit_parsed_entry(_open_question(slug="oq1", topic="A topic."))
     e = _decision(slug="d", axiom="A decision.")
-    e.supersedes = "oq1"  # decision -> open_question is cross-kind
+    e.supersedes = ["oq1"]  # decision -> open_question is cross-kind
     with pytest.raises(CommitError) as exc:
         temp_store.commit_parsed_entry(e)
     assert exc.value.failure.items[0].code == "kind_constraint_violation"
@@ -1174,32 +1174,39 @@ def test_kind_constraint_violation_via_ddl_check(temp_store: GraphStore) -> None
     assert _count(temp_store, "nodes") == 1  # only the OQ; the decision rolled back
 
 
-# --- Warn-defer the seven non-V1a edge types -----------------------------------
+# --- The seven formerly-deferred edge types now COMMIT (V1b 2a flip) -----------
 
 
-def test_deferred_edge_types_warn_not_fail(
+def test_formerly_deferred_edge_types_now_commit(
     temp_store: GraphStore, caplog
 ) -> None:
-    """A V1b relationship field (e.g. Amends:) is logged, NOT committed, NOT a failure."""
-    target = temp_store.commit_parsed_entry(_decision(slug="t", axiom="Target."))
+    """The non-kill types commit their edges (no warn, no defer) as of V1b 2a.
+
+    Pre-flip these seven warn-deferred — logged a WARNING, committed no edge. The
+    flip removes that tail: ``amends`` / ``cites`` now author a real edge, both
+    endpoints stay active (non-kill), and no "deferred to V1b" notice is logged.
+    """
+    t1 = temp_store.commit_parsed_entry(_decision(slug="t1", axiom="Target one."))
+    t2 = temp_store.commit_parsed_entry(_decision(slug="t2", axiom="Target two."))
     e = _decision(slug="d", axiom="A decision.")
-    e.amends = "t"  # a V1b type — warn-deferred
-    e.cites = "t"  # another V1b type
-    e.supersedes = "t"  # a V1a kill-edge — this DOES commit
+    e.amends = ["t1"]  # formerly warn-deferred — now commits
+    e.cites = ["t2"]  # formerly warn-deferred — now commits
 
     with caplog.at_level(logging.WARNING, logger="mitos.store"):
         delta = temp_store.commit_parsed_entry(e)
 
-    # The node + the kill-edge committed; the two deferred types wrote NO edges.
+    # The node + both non-kill edges committed.
     assert _node_row(temp_store, delta.node_id) is not None
     rows = _edges(temp_store)
-    assert len(rows) == 1
-    assert rows[0]["edge_type"] == "supersedes"
-    assert _is_active(temp_store, target.node_id) is False
-    # Both deferred types are logged loudly (WARNING), naming the entry + field.
-    assert "deferred to V1b" in caplog.text
-    assert "amends" in caplog.text
-    assert "cites" in caplog.text
+    assert {(r["edge_type"], r["target_id"]) for r in rows} == {
+        ("amends", t1.node_id),
+        ("cites", t2.node_id),
+    }
+    # Non-kill edges retire nothing — both targets stay active.
+    assert _is_active(temp_store, t1.node_id) is True
+    assert _is_active(temp_store, t2.node_id) is True
+    # The warn-defer tail is gone — no "deferred to V1b" notice is logged.
+    assert "deferred to V1b" not in caplog.text
 
 
 # --- updated_at ticks on an edge-set change (V1-D17) ---------------------------
@@ -1400,7 +1407,7 @@ def test_5d_open_questions_reader_keys_and_anti_join(temp_store: GraphStore) -> 
 
     # A corrects kill-edge on the OQ removes it from the active OQ view (V1-D18 Stage-1).
     e = _open_question(slug="oq2", topic="Topic two")
-    e.corrects = "oq1"
+    e.corrects = ["oq1"]
     temp_store.commit_parsed_entry(e)
     assert [n["slug"] for n in temp_store.get_open_questions()] == ["oq2"]
 
@@ -1601,7 +1608,7 @@ def test_5d_get_transcript_supersession_does_not_borrow(temp_store: GraphStore) 
         _decision(slug="old", axiom="O.", transcript="OLD transcript.")
     )
     new = _decision(slug="new", axiom="N.")
-    new.supersedes = "old"
+    new.supersedes = ["old"]
     new_delta = temp_store.commit_parsed_entry(new)
     assert temp_store.get_transcript(new_delta.node_id) is None  # not borrowed from old
     assert temp_store.get_transcript(old.node_id) == "OLD transcript."

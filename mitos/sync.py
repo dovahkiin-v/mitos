@@ -17,7 +17,7 @@ from google import genai
 from google.genai import types
 
 from mitos.config import MitosConfig, hint_due
-from mitos.errors import SynthesisError, ParseError, ValidationError, DatabaseError, EntryFailure
+from mitos.errors import SynthesisError, ParseError, ValidationError, DatabaseError, EntryFailure, CommitError
 from mitos.models import get_model_id
 from mitos.parser import ParsedEntry, parse_entry_stream
 from mitos.store import GraphStore, CommitDelta
@@ -566,18 +566,23 @@ class MitosSyncManager:
                 
                 # Apply slug-collision override if present
                 if edge_relationship == "corrects":
-                    entry.corrects = entry.slug
-                    entry.supersedes = None
+                    entry.corrects = [entry.slug]
+                    entry.supersedes = []
                 elif edge_relationship == "supersedes":
-                    entry.supersedes = entry.slug
-                    entry.corrects = None
+                    entry.supersedes = [entry.slug]
+                    entry.corrects = []
                 else:
-                    def norm_rel(v: Any) -> Optional[str]:
+                    def norm_rel(v: Any) -> List[str]:
+                        # Coerce a single suggested relation to the List[str] shape the
+                        # relationship attrs now carry (V1b). ``sugg_rels`` feeds at most
+                        # one slug per relation, so a list input takes its first element;
+                        # absent → ``[]`` so ``entry.X or norm_rel(...)`` stays a list
+                        # either way (never a bare scalar — the `[] or scalar` foot-gun).
                         if not v:
-                            return None
+                            return []
                         if isinstance(v, list):
-                            return str(v[0]).strip() if v else None
-                        return str(v).strip()
+                            return [str(v[0]).strip()] if v else []
+                        return [str(v).strip()]
 
                     entry.supersedes = entry.supersedes or norm_rel(sugg_rels.get("supersedes"))
                     entry.amends = entry.amends or norm_rel(sugg_rels.get("amends"))
@@ -995,7 +1000,8 @@ class MitosSyncManager:
             amends: Optional exact slug of a decision this one amends.
             narrows: Optional exact slug of a decision this one narrows.
             depends_on: Optional exact slug of a decision this one depends on.
-            resolves: Optional exact slug of an open question/decision this resolves.
+            resolves: Optional exact slug of an open question this resolves (the
+                ``resolves`` edge is decision→open_question only).
             contradicts: Optional exact slug of a decision this one contradicts.
             derives_from: Optional exact slug of a decision this one derives from.
             cites: Optional exact slug of a decision this one cites.
@@ -1123,7 +1129,7 @@ class MitosSyncManager:
             target = self.store.get_node(ids[0])
             if not target or target.get("slug", "").casefold() != supersedes.casefold():
                 return _record_error("supersedes_not_found", supersedes=supersedes)
-            entry.supersedes = supersedes
+            entry.supersedes = [supersedes]  # List[str] shape (V1b multi-valued)
 
         # Pre-validate corrects with an EXACT match — the kill-edge twin of supersedes
         # (V1a's second kill-edge; the target leaves the active view). Same Phase-A
@@ -1137,7 +1143,7 @@ class MitosSyncManager:
             target = self.store.get_node(ids[0])
             if not target or target.get("slug", "").casefold() != corrects.casefold():
                 return _record_error("corrects_not_found", corrects=corrects)
-            entry.corrects = corrects
+            entry.corrects = [corrects]  # List[str] shape (V1b multi-valued)
 
         # Validate every other typed relation EXACTLY like supersedes — each must
         # point at a real, unambiguous decision. Still Phase A: a miss returns an
@@ -1146,7 +1152,7 @@ class MitosSyncManager:
             err = self._validate_relation_target(_name, _target)
             if err:
                 return err
-            setattr(entry, _name, _target)
+            setattr(entry, _name, [_target])  # List[str] shape (V1b multi-valued)
 
         # Identity (slug-free canonical-core hash — V1-D2). Computed over the SAME
         # fields commit_parsed_entry hashes, so this pre-commit idempotency id equals
@@ -1251,8 +1257,15 @@ class MitosSyncManager:
                     with open(self.config.decisions_file, "w", encoding="utf-8") as f:
                         f.write(new_content)
                     delta = self.store.commit_parsed_entry(entry)
-                except (ValidationError, DatabaseError, OSError) as commit_exc:
-                    # Roll the buffer back so a failed write/commit leaves NO orphan.
+                except (ValidationError, DatabaseError, OSError, CommitError) as commit_exc:
+                    # Roll the buffer back so a failed write/commit leaves NO orphan
+                    # (the sacred buffer-first + rollback contract). ``CommitError``
+                    # carries the store-stage failure envelope — as of V1b a declared
+                    # relation can fail at commit (e.g. a decision-source ``resolves``/
+                    # ``derives_from`` violates the edge kind matrix → a loud
+                    # ``kind_constraint_violation``, where V1a silently warn-deferred
+                    # it). Surface the per-item messages so the agent sees the actionable
+                    # field (P3 vector error), not a generic wall.
                     try:
                         with open(self.config.decisions_file, "w", encoding="utf-8") as f:
                             f.write(original_content)
@@ -1265,7 +1278,12 @@ class MitosSyncManager:
                             ),
                             "code": "commit_failed",
                         }
-                    return _record_error("commit_failed", reason=str(commit_exc))
+                    reason = str(commit_exc)
+                    if isinstance(commit_exc, CommitError) and commit_exc.failure:
+                        reason = "; ".join(
+                            i.message for i in commit_exc.failure.items
+                        ) or reason
+                    return _record_error("commit_failed", reason=reason)
         except Timeout:
             return _record_error(
                 "commit_failed", reason="another Mitos process holds the decisions.md lock"

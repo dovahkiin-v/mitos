@@ -42,8 +42,18 @@ These create typed edges in the graph. Values must be valid slugs.
 - `**Derives-From:**` [slug]
 - `**Cites:**` [slug]
 
-In V1a the graph actively commits the two kill-edges, `Supersedes` and `Corrects`. The
-remaining edges are recognized and reserved (warn-deferred until V1b).
+The graph commits all nine edge types. Two are **kill-edges** (`Supersedes`,
+`Corrects`) — they retire their target from the active view. The other seven
+(`Amends`, `Narrows`, `Depends-On`, `Resolves`, `Contradicts`, `Derives-From`,
+`Cites`) are **non-kill** — both endpoints stay active. Three are cross-kind:
+`Cites` connects any→any, `Derives-From` is open-question→decision, and `Resolves`
+is decision→open-question; every other type connects two entries of the same kind.
+
+Each relationship field is **comma-separated multi-valued**: `Cites: a, b` commits
+two `cites` edges. Slugs may be bare or individually bracketed (`Cites: [a], [b]`);
+a single bracket pair wrapping several slugs (`Cites: [a, b]`) leaves the brackets
+unbalanced per-slug and fails loudly rather than being silently repaired. A lone
+slug is a 1-element list, so single-valued authoring is unchanged.
 
 ### Transcripts
 A verbatim transcript of the LLM conversation that led to the decision. `[DECISION_TRANSCRIPT]`
