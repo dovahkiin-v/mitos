@@ -43,7 +43,7 @@ import pytest
 from mitos.cli import cmd_init
 from mitos.config import MitosConfig
 from mitos.identity import compute_node_id
-from mitos.migrations import is_pre_v1a_schema
+from mitos.migrations import MIGRATION_STEPS, _pending_head, is_pre_v1a_schema
 from mitos.parser import parse_entry_stream
 from mitos.store import GraphStore, open_connection
 from mitos.sync import MitosSyncManager
@@ -158,9 +158,11 @@ def test_t1_s1_cold_start_round_trip(ws) -> None:
     """
     config, m = ws
 
-    # Cold-start scaffolding landed (W5 ladder boot at V1a head, W6 config seed,
-    # W7 format-spec install, W8 .mitos/ + buffers) — a healthy, ready workspace.
-    assert _user_version(config.db_path) == 1
+    # Cold-start scaffolding landed (W5 ladder boot at the live head, W6 config seed,
+    # W7 format-spec install, W8 .mitos/ + buffers) — a healthy, ready workspace. The
+    # head is read programmatically (it advances as later visions append rungs, e.g.
+    # V1b's step 2); ``_is_v1a_not_prototype`` proves the V1a schema is present.
+    assert _user_version(config.db_path) == _pending_head(MIGRATION_STEPS)
     assert _is_v1a_not_prototype(config.db_path)
     assert os.path.exists(config.decisions_file)
     assert os.path.exists(config.questions_file)
