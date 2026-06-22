@@ -370,3 +370,149 @@ def test_removing_cites_line_deletes_edge_no_resurrection(temp_store: GraphStore
     re_src = temp_store.commit_parsed_entry(_decision("src", "Source axiom."))
     assert re_src.node_id == src.node_id
     assert _edge_count(temp_store, "cites") == 0
+
+
+# --- 8. Symmetric `contradicts` bidirectional accessor (Phase 2c, DoD #9) -------
+#
+# `contradicts` is the catalog's one semantically-symmetric edge: stored ONCE as
+# authored (A as source_id, B as target_id, never mirrored), yet "A contradicts B"
+# means the same as "B contradicts A". `get_contradictions(node_id)` is the single
+# safe bidirectional read so no future consumer hand-rolls
+# `WHERE source_id = X OR target_id = X` and silently under-reports by forgetting
+# the `OR` (the OD1 hazard). These gates prove the read from BOTH ends (#9), the
+# cross-direction dedup, and the v0.1 no-active-view-action pin — the three
+# negatives that make the seam trustworthy (a happy-path "it returns something"
+# proves nothing).
+
+
+def test_contradicts_bidirectional_read_dod9(temp_store: GraphStore) -> None:
+    """DoD #9: a `contradicts` authored A→B is returned from EITHER endpoint."""
+    b = temp_store.commit_parsed_entry(_decision("b", "B axiom."))
+    a = temp_store.commit_parsed_entry(_decision("a", "A axiom.", contradicts=["b"]))
+    # Returned when queried from A (the authoring source)...
+    assert [c["node_id"] for c in temp_store.get_contradictions(a.node_id)] == [b.node_id]
+    # ...AND from B (the target). Neither call hand-rolls a directional query.
+    assert [c["node_id"] for c in temp_store.get_contradictions(b.node_id)] == [a.node_id]
+
+
+def test_contradicts_oq_to_oq_bidirectional(temp_store: GraphStore) -> None:
+    """OQ→OQ `contradicts` is a real authored shape (same-kind); reads from both ends."""
+    oq2 = temp_store.commit_parsed_entry(_oq("oq2", "Topic two."))
+    oq1 = temp_store.commit_parsed_entry(_oq("oq1", "Topic one.", contradicts=["oq2"]))
+    from_oq1 = temp_store.get_contradictions(oq1.node_id)
+    assert [c["node_id"] for c in from_oq1] == [oq2.node_id]
+    assert [c["node_id"] for c in temp_store.get_contradictions(oq2.node_id)] == [oq1.node_id]
+    # Counterpart kind is the queried kind (same-kind only) — informational, not a discriminator.
+    assert from_oq1[0]["kind"] == "open_question"
+
+
+def test_contradicts_multiple_counterparts_each_once(temp_store: GraphStore) -> None:
+    """A node contradicting B and C returns both, each exactly once."""
+    b = temp_store.commit_parsed_entry(_decision("b", "B axiom."))
+    c = temp_store.commit_parsed_entry(_decision("c", "C axiom."))
+    a = temp_store.commit_parsed_entry(_decision("a", "A axiom.", contradicts=["b", "c"]))
+    result = temp_store.get_contradictions(a.node_id)
+    assert {r["node_id"] for r in result} == {b.node_id, c.node_id}
+    assert len(result) == 2  # no duplicates
+
+
+def test_contradicts_dedup_across_directions(temp_store: GraphStore) -> None:
+    """Both `A→B` and `B→A` authored → the counterpart appears ONCE (UNION, not UNION ALL).
+
+    The cross-direction dedup tripwire: querying A finds B via the source_id=A
+    direction AND via the target_id=A direction — B must collapse to one entry.
+    """
+    a = temp_store.commit_parsed_entry(_decision("a", "A axiom."))
+    # b→a ...
+    b = temp_store.commit_parsed_entry(_decision("b", "B axiom.", contradicts=["a"]))
+    # ...and a→b (re-commit 'a' on the SAME core → same node, now also contradicting b).
+    re_a = temp_store.commit_parsed_entry(_decision("a", "A axiom.", contradicts=["b"]))
+    assert re_a.node_id == a.node_id
+    # Both directional edges exist...
+    assert _edge_count(temp_store, "contradicts") == 2
+    # ...but each endpoint reports its counterpart exactly once.
+    assert [r["node_id"] for r in temp_store.get_contradictions(a.node_id)] == [b.node_id]
+    assert [r["node_id"] for r in temp_store.get_contradictions(b.node_id)] == [a.node_id]
+
+
+def test_contradicts_returned_regardless_of_endpoint_liveness(temp_store: GraphStore) -> None:
+    """No-liveness pin (Decision 3): superseding an endpoint does NOT drop the contradiction.
+
+    v0.1 takes no active-view action on `contradicts` — the liveness treatment is
+    v0.2 Conflict's. This gate would regress loudly if someone later bolts a
+    liveness filter onto the accessor.
+    """
+    b = temp_store.commit_parsed_entry(_decision("b", "B axiom."))
+    a = temp_store.commit_parsed_entry(_decision("a", "A axiom.", contradicts=["b"]))
+    # Supersede A via a kill-edge.
+    temp_store.commit_parsed_entry(_decision("killer", "Killer axiom.", supersedes=["a"]))
+    assert temp_store.get_node_state(a.node_id) == "superseded"
+    # The contradiction is still returned from the live endpoint B...
+    assert [r["node_id"] for r in temp_store.get_contradictions(b.node_id)] == [a.node_id]
+    # ...and from the superseded endpoint A (the edge itself is untouched).
+    assert [r["node_id"] for r in temp_store.get_contradictions(a.node_id)] == [b.node_id]
+
+
+def test_contradicts_empty_and_absent_return_empty_list(temp_store: GraphStore) -> None:
+    """A node with no `contradicts` edges, and a non-existent id, both return `[]`."""
+    lonely = temp_store.commit_parsed_entry(_decision("lonely", "Lonely axiom."))
+    assert temp_store.get_contradictions(lonely.node_id) == []
+    assert temp_store.get_contradictions("0" * 64) == []  # absent id is not an error
+
+
+def test_contradicts_return_shape_is_identity_only(temp_store: GraphStore) -> None:
+    """Each entry carries exactly {node_id, slug, kind} — no axiom/payload, nothing stamped."""
+    b = temp_store.commit_parsed_entry(_decision("b", "B axiom."))
+    a = temp_store.commit_parsed_entry(_decision("a", "A axiom.", contradicts=["b"]))
+    result = temp_store.get_contradictions(a.node_id)
+    assert result == [{"node_id": b.node_id, "slug": "b", "kind": "decision"}]
+
+
+def test_contradicts_isolation_other_edge_types_do_not_leak(temp_store: GraphStore) -> None:
+    """Only `contradicts` edges are returned — `cites`/`amends`/`depends_on` don't leak."""
+    b = temp_store.commit_parsed_entry(_decision("b", "B axiom."))
+    c = temp_store.commit_parsed_entry(_decision("c", "C axiom."))
+    d = temp_store.commit_parsed_entry(_decision("d", "D axiom."))
+    # 'hub' contradicts b, but also cites c and amends d (distinct targets, no kill edge).
+    hub = temp_store.commit_parsed_entry(_decision(
+        "hub", "Hub axiom.", contradicts=["b"], cites=["c"], amends=["d"],
+    ))
+    assert [r["node_id"] for r in temp_store.get_contradictions(hub.node_id)] == [b.node_id]
+    # The cited/amended nodes report no contradiction with the hub.
+    assert temp_store.get_contradictions(c.node_id) == []
+    assert temp_store.get_contradictions(d.node_id) == []
+
+
+def test_contradicts_self_edge_defense_never_returns_self(temp_store: GraphStore) -> None:
+    """A corrupt out-of-band self-edge (`A contradicts A`) never makes A return itself.
+
+    The supported write path rejects `A contradicts A` as `cycle_violation`, so a
+    self-edge can never be authored. But the graph is a rebuildable derivative
+    (M7/P6) that out-of-band corruption could leave holding one, so the accessor
+    carries `!= ?` guards. This pins them load-bearing: inject a raw self-edge,
+    bypassing the reconciler, and assert it never surfaces as A's own contradiction
+    while a legitimate counterpart still does.
+    """
+    b = temp_store.commit_parsed_entry(_decision("b", "B axiom."))
+    a = temp_store.commit_parsed_entry(_decision("a", "A axiom.", contradicts=["b"]))
+    # Inject a raw self-edge directly, bypassing the reconciler that would reject it.
+    conn = temp_store._get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO edges "
+            "(source_id, source_kind, target_id, target_kind, edge_type, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?);",
+            (a.node_id, "decision", a.node_id, "decision", "contradicts",
+             "2026-06-23T00:00:00.000000+00:00"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    # The corrupt self-edge IS present in the raw edge set (the injection took)...
+    assert any(
+        e["source_id"] == a.node_id and e["target_id"] == a.node_id
+        and e["edge_type"] == "contradicts"
+        for e in temp_store.get_edges()
+    )
+    # ...but the accessor never returns A as its own contradiction — only B.
+    assert [r["node_id"] for r in temp_store.get_contradictions(a.node_id)] == [b.node_id]
