@@ -30,27 +30,6 @@ from mitos.sync import MitosSyncManager
 from mitos.renderer import render_node_markdown, MitosRenderer
 
 
-# The "amended axioms read as live" trap these surface tests pin is V1b: it needs a
-# NON-retiring modifier (amends/narrows) that leaves its target ACTIVE-but-stale, so a
-# read surface returns the live node carrying a modifier key. V1a commits only the two
-# KILL-edges (supersedes/corrects) — both RETIRE the target, so the modified node is
-# inactive and excluded from every active consumer surface (list/surface/query). amends
-# and narrows are warn-deferred in V1a (no edge committed), so amended_by/narrowed_by
-# never populate. The modifier-stamping SEAM itself ships in 5d and is proven at the
-# store level in tests/test_store.py (T12); the V1a kill-edge modifiers (superseded_by/
-# corrected_by) are proven on the store reads below. The consumer-surface amends/narrows
-# cases are deferred to the V1b modifier vision — deferred with a logged reason, not
-# silently coerced (K5/G4/G6).
-_V1B_MODIFIER_REASON = (
-    "V1b: amends/narrows are warn-deferred in V1a (no edge committed), and the 'amended "
-    "axioms read as live' surfacing needs a NON-retiring modifier on an ACTIVE node — "
-    "V1a's supersedes/corrects kill-edges retire their targets (excluded from active "
-    "consumer surfaces). The modifier-stamping seam is proven at the store level "
-    "(tests/test_store.py T12) + the V1a kill-edge modifier tests below. Deferred to V1b "
-    "(K5/G4)."
-)
-
-
 @pytest.fixture
 def offline(monkeypatch):
     """Forces degraded graph-only mode: unreachable Qdrant, no embedding keys."""
@@ -138,7 +117,6 @@ def test_get_modifiers_unmodified_is_empty(ws) -> None:
     assert GraphStore(config.db_path).get_modifiers(solo["id"]) == {}
 
 
-@pytest.mark.skip(reason=_V1B_MODIFIER_REASON)
 def test_get_modifiers_accumulates_multiple_edges(ws) -> None:
     """A hub node accumulates edges: amended by one decision AND narrowed by another.
 
@@ -153,7 +131,6 @@ def test_get_modifiers_accumulates_multiple_edges(ws) -> None:
     assert mods == {"amended_by": ["amender"], "narrowed_by": ["narrower"]}
 
 
-@pytest.mark.skip(reason=_V1B_MODIFIER_REASON)
 def test_get_modifiers_two_of_same_relation_sorted(ws) -> None:
     """Two decisions amending one node both appear, deterministically ordered."""
     config, m = ws
@@ -194,7 +171,6 @@ def test_get_modifiers_map_empty_input(ws) -> None:
 # MCP read surfaces
 # --------------------------------------------------------------------------- #
 
-@pytest.mark.skip(reason=_V1B_MODIFIER_REASON)
 def test_mcp_query_exact_slug_surfaces_amended_by(ws) -> None:
     """THE headline case: an exact-slug read of an amended decision reads `active`
     but now also carries `amended_by` so the stale axiom can't masquerade as live."""
@@ -220,7 +196,6 @@ def test_mcp_query_exact_slug_unmodified_has_no_modifier_keys(ws) -> None:
     assert not any(k in resp for k in MODIFIER_EDGE_KEYS.values())
 
 
-@pytest.mark.skip(reason=_V1B_MODIFIER_REASON)
 def test_mcp_list_decisions_surfaces_modifiers(ws) -> None:
     """list_decisions stamps modifier slugs onto the affected decision only."""
     from mitos import mcp_server
@@ -236,7 +211,6 @@ def test_mcp_list_decisions_surfaces_modifiers(ws) -> None:
     assert not any(k in by_slug["untouched"] for k in MODIFIER_EDGE_KEYS.values())
 
 
-@pytest.mark.skip(reason=_V1B_MODIFIER_REASON)
 def test_mcp_surface_scope_fallback_surfaces_modifiers(ws) -> None:
     """The offline scope-fallback path on surface_decisions also stamps modifiers."""
     from mitos import mcp_server
@@ -267,7 +241,6 @@ class _FakeVector:
         return self._matches
 
 
-@pytest.mark.skip(reason=_V1B_MODIFIER_REASON)
 def test_mcp_surface_semantic_path_surfaces_modifiers(ws) -> None:
     """The SEMANTIC ranking loop (the AX loop's primary path) stamps modifiers too —
     not just the offline exact/scope-fallback paths. Driven by a fake vector store so
@@ -285,7 +258,6 @@ def test_mcp_surface_semantic_path_surfaces_modifiers(ws) -> None:
     assert target["amended_by"] == ["sem-amender"]
 
 
-@pytest.mark.skip(reason=_V1B_MODIFIER_REASON)
 def test_mcp_query_semantic_path_surfaces_modifiers(ws) -> None:
     """query_decisions' semantic branch (claim, not slug) stamps modifiers on matches."""
     from mitos import mcp_server
@@ -321,7 +293,6 @@ def test_mcp_query_exact_slug_superseded_carries_superseded_by(ws) -> None:
     assert resp["superseded_by"] == ["v2"]
 
 
-@pytest.mark.skip(reason=_V1B_MODIFIER_REASON)
 def test_modifiers_survive_brief_trim(ws) -> None:
     """The staleness flag is ALWAYS attached — even on a brief payload where
     rejected_paths is trimmed. A lightweight scan that lost the heavy field still needs
@@ -344,7 +315,6 @@ def test_modifiers_survive_brief_trim(ws) -> None:
 # CLI read surfaces
 # --------------------------------------------------------------------------- #
 
-@pytest.mark.skip(reason=_V1B_MODIFIER_REASON)
 def test_cli_show_prints_modifier(ws, capsys) -> None:
     """`mitos show` on an amended decision prints the 'Amended by' annotation."""
     config, m = ws
@@ -356,7 +326,6 @@ def test_cli_show_prints_modifier(ws, capsys) -> None:
     assert "Amended by" in out and "shown-v2" in out
 
 
-@pytest.mark.skip(reason=_V1B_MODIFIER_REASON)
 def test_cli_list_text_marks_modified(ws, capsys) -> None:
     """`mitos list` text output flags a modified-but-live decision with ⚠."""
     config, m = ws
@@ -368,7 +337,6 @@ def test_cli_list_text_marks_modified(ws, capsys) -> None:
     assert "⚠" in out and "narrowed by" in out and "listed-v2" in out
 
 
-@pytest.mark.skip(reason=_V1B_MODIFIER_REASON)
 def test_cli_list_json_carries_modifiers(ws, capsys) -> None:
     """`mitos list --json` carries the modifier key for agent consumption."""
     config, m = ws
@@ -381,7 +349,6 @@ def test_cli_list_json_carries_modifiers(ws, capsys) -> None:
     assert target["amended_by"] == ["j-amender"]
 
 
-@pytest.mark.skip(reason=_V1B_MODIFIER_REASON)
 def test_cli_surface_json_carries_modifiers(ws, capsys) -> None:
     """`mitos surface --json` (scope fallback) carries the modifier key."""
     config, m = ws
@@ -407,7 +374,6 @@ def test_render_node_markdown_emits_marker() -> None:
     assert "⚠ Amended by:** x-v2" in marked and "chase" in marked
 
 
-@pytest.mark.skip(reason=_V1B_MODIFIER_REASON)
 def test_render_all_writes_modifier_marker(ws) -> None:
     """render_all annotates an amended-but-active decision in live_axioms.md."""
     config, m = ws
@@ -418,3 +384,140 @@ def test_render_all_writes_modifier_marker(ws) -> None:
     with open(f"{config.workspace_dir}/live_axioms.md", encoding="utf-8") as f:
         content = f.read()
     assert "⚠ Amended by:** rendered-v2" in content
+
+
+# --------------------------------------------------------------------------- #
+# Dead-amender de-projection — the genuinely-new 2b gate (DoD #6, T6 decision side)
+#
+# The §4.3 FORWARD HAZARD: V1a's modifier join joins the source node only for its
+# slug; it never checks the SOURCE's own liveness. Once amends/narrows commit (2a),
+# an amender that is itself later superseded/corrected would otherwise ghost-stamp a
+# still-live target — a dead axiom projecting onto a live node. 2b's source-liveness
+# filter de-projects: the present-tense projections (amended_by/narrowed_by) drop
+# when their source is killed; the historical kill-pointers (superseded_by/
+# corrected_by) stay (they only ever point at already-dead targets and must stay
+# consistent with get_node_state, which computes the kill state UNFILTERED).
+#
+# Fail-safe, not data loss: a superseded amender is superseded, NOT deleted — its
+# axiom stays in the graph (recoverable via get_lineage, 3a); the target merely stops
+# being projected onto. Re-amending from the successor is the author's call (smoothed
+# at V3a's reconciliation surface, not 2b — 2b never auto-propagates).
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("kill_relation,dead_state", [
+    ("supersedes", "superseded"),
+    ("corrects", "corrected"),
+])
+def test_dead_amender_deprojects_amended_by(ws, kill_relation, dead_state) -> None:
+    """A superseded/corrected amender stops stamping its still-LIVE target.
+
+    A amended by B (A active, reads amended_by:[B]); then B is killed by C in a
+    SEPARATE entry (no re-declared amends). A must read un-amended again — the dead
+    amender's "go read B for the current nuance" is stale. B's axiom is NOT lost: it
+    stays in the graph as a (now-inactive) node, recoverable via lineage.
+    """
+    config, m = ws
+    a = _rec(m, "a")
+    b = _rec(m, "b", amends="a")
+    store = GraphStore(config.db_path)
+    # Before B dies: A is amended by B.
+    assert store.get_modifiers(a["id"]) == {"amended_by": ["b"]}
+
+    # Kill B from a SEPARATE entry (stacking a kill-edge + a non-kill edge on one
+    # entry trips dangling_edge — 2a gotcha).
+    _rec(m, "c", **{kill_relation: "b"})
+    store = GraphStore(config.db_path)
+
+    # A de-projects: it reads active with NO amended_by key, on the store map AND on
+    # an active read surface.
+    assert store.get_modifiers(a["id"]) == {}
+    assert store.get_node_state(a["id"]) == "active"
+    a_node = store.get_node_by_slug("a")
+    assert "amended_by" not in a_node and "narrowed_by" not in a_node
+
+    # Fail-safe: B is still in the graph (its axiom recoverable), just retired.
+    assert store.get_node(b["id"]) is not None
+    assert store.get_node_state(b["id"]) == dead_state
+
+
+def test_dead_narrower_deprojects_narrowed_by(ws) -> None:
+    """The narrows mirror of de-projection — a superseded narrower stops stamping.
+
+    Confirms the filter gates narrowed_by exactly as it gates amended_by (both are
+    present-tense projections onto a live target).
+    """
+    config, m = ws
+    a = _rec(m, "a")
+    _rec(m, "b", narrows="a")
+    store = GraphStore(config.db_path)
+    assert store.get_modifiers(a["id"]) == {"narrowed_by": ["b"]}
+
+    _rec(m, "c", supersedes="b")
+    store = GraphStore(config.db_path)
+    assert store.get_modifiers(a["id"]) == {}
+    assert store.get_node_state(a["id"]) == "active"
+
+
+def test_deletion_decision_deprojects_amender(ws) -> None:
+    """§4.5 successor-less death — a bare deletion decision de-projects identically.
+
+    A deletion decision supersedes the amender WITHOUT introducing a successor that
+    re-amends A. De-projection needs no successor: the same kill-edge set
+    (_KILL_EDGE_TYPES_SQL) drives it, with no separate clause for the deletion case.
+    This pins that a successor-less death (the §4.5 model) correctly de-projects — we
+    do NOT accidentally require a replacement to exist before dropping the stale
+    projection.
+    """
+    config, m = ws
+    a = _rec(m, "a")
+    _rec(m, "amender", amends="a")
+    store = GraphStore(config.db_path)
+    assert store.get_modifiers(a["id"]) == {"amended_by": ["amender"]}
+
+    # A deletion decision: its sole role is to supersede the amender (no re-declared
+    # amends to A, no replacement content).
+    _rec(m, "deletion-decision", supersedes="amender")
+    store = GraphStore(config.db_path)
+    assert store.get_modifiers(a["id"]) == {}
+    assert store.get_node_state(a["id"]) == "active"
+
+
+def test_kill_pointer_survives_source_death(ws) -> None:
+    """⚠ Decision 3 guard — historical kill-pointers stay UNFILTERED (regression trap).
+
+    A superseded by B; then B superseded by C. A's superseded_by:[B] MUST survive even
+    though B is itself now dead — it is a permanent "who retired me" record, and
+    get_node_state computes `superseded` UNFILTERED. A future "simplify" pass that made
+    the source-liveness filter uniform would empty superseded_by while get_node_state
+    still returned `superseded`, desyncing the payload from the state. This test fails
+    that regression.
+    """
+    config, m = ws
+    a = _rec(m, "a")
+    _rec(m, "b", supersedes="a")
+    _rec(m, "c", supersedes="b")  # B itself dies
+    store = GraphStore(config.db_path)
+
+    # The historical pointer survives B's death, and stays consistent with the state.
+    assert store.get_node(a["id"])["superseded_by"] == ["b"]
+    assert store.get_node_state(a["id"]) == "superseded"
+
+
+def test_partial_hub_deprojects_only_dead_amender(ws) -> None:
+    """Per-source de-projection, not all-or-nothing: a live amender survives a dead one.
+
+    Hub amended by X (stays active) and Y; then Y is superseded. The hub surfaces ONLY
+    the live amender X (Y dropped, slug-sorted) — the filter is correlated per modifier
+    row on each edge's own source, never a blanket on/off for the whole node.
+    """
+    config, m = ws
+    hub = _rec(m, "hub")
+    _rec(m, "x-amender", amends="hub")
+    _rec(m, "y-amender", amends="hub")
+    store = GraphStore(config.db_path)
+    assert store.get_modifiers(hub["id"]) == {"amended_by": ["x-amender", "y-amender"]}
+
+    _rec(m, "y-killer", supersedes="y-amender")
+    store = GraphStore(config.db_path)
+    assert store.get_modifiers(hub["id"]) == {"amended_by": ["x-amender"]}
+    assert store.get_node_state(hub["id"]) == "active"

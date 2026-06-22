@@ -720,6 +720,40 @@ class GraphStore:
             return {}
         id_placeholders = ",".join("?" for _ in node_ids)
         type_placeholders = ",".join("?" for _ in MODIFIER_EDGE_KEYS)
+        # Source-liveness gate (V1b 2b, the §4.3 FORWARD HAZARD). The join above
+        # joins the source node only for its slug; without this gate a dead
+        # *modifier* (the edge's source) would ghost-stamp a still-live target — a
+        # dead axiom projecting onto a live node. Gate the SOURCE (``e.source_id``),
+        # never the target: ``get_node`` deliberately reads inactive nodes and must
+        # keep stamping their kill-pointers, so a target-liveness filter would break
+        # that read path.
+        #
+        # ⚠ THE SEMANTIC FORK (do NOT make this filter uniform — it is a regression
+        # trap): the kill-edge keys (``superseded_by`` / ``corrected_by``) stay
+        # UNFILTERED, only the present-tense projections (``amended_by`` /
+        # ``narrowed_by``) are source-gated.
+        #   - ``amends`` / ``narrows`` project present-tense policy ("go read X for
+        #     the current nuance") onto a still-live target — once X is itself
+        #     superseded/corrected that guidance is stale, so de-project (the target
+        #     reads un-amended again). De-projection is fail-safe, not data loss: a
+        #     superseded amender is superseded, not deleted — its axiom stays in the
+        #     graph (recoverable via ``get_lineage``); the target merely stops being
+        #     projected onto. Re-amending from the successor is the author's call.
+        #   - ``supersedes`` / ``corrects`` are historical "who retired me" pointers
+        #     on an already-dead target; a kill-edge can NEVER point at a *live*
+        #     target, so leaving it unfiltered cannot reintroduce the hazard. Crucially
+        #     ``_KILLER_TYPE_SQL`` / ``get_node_state`` compute ``superseded`` /
+        #     ``corrected`` UNFILTERED — gating these keys would empty
+        #     ``superseded_by`` while ``get_node_state`` still returns ``superseded``,
+        #     desyncing the payload from the state. The kill-pointer-survives guard
+        #     test pins this.
+        #
+        # Single-sourced through ``_KILL_EDGE_TYPES_SQL`` (the one liveness atom every
+        # anti-join keys off) — never a re-hand-rolled ``('supersedes','corrects')``
+        # literal, never ``_ACTIVE_VIEW_PREDICATE`` verbatim (it binds an UNALIASED
+        # ``nodes``; this FROM aliases the source ``n``). Interpolated, not bound
+        # (P8 carve-out, exactly as the other kill-edge anti-joins do it), so the
+        # binding tuple is unchanged.
         cursor = conn.execute(
             f"""
             SELECT e.target_id AS target_id, e.edge_type AS edge_type, n.slug AS slug
@@ -727,6 +761,14 @@ class GraphStore:
             JOIN nodes n ON n.id = e.source_id
             WHERE e.target_id IN ({id_placeholders})
               AND e.edge_type IN ({type_placeholders})
+              AND (
+                    e.edge_type IN {_KILL_EDGE_TYPES_SQL}
+                 OR NOT EXISTS (
+                        SELECT 1 FROM edges k
+                        WHERE k.target_id = e.source_id
+                          AND k.edge_type IN {_KILL_EDGE_TYPES_SQL}
+                    )
+                  )
             ORDER BY n.slug
             """,
             (*node_ids, *MODIFIER_EDGE_KEYS.keys()),
@@ -748,8 +790,11 @@ class GraphStore:
         never a static-empty stamp. The C4 FORWARD HAZARD seam ships on every read
         even though V1a's active view is provably modifier-empty (an active node has
         no incoming kill-edge by definition): the graph always knew via the edges, so
-        the payload must not lie, and V1b lighting up ``amends`` / ``narrows`` is then
-        a one-line ``MODIFIER_EDGE_KEYS`` change with zero read-surface edits.
+        the payload must not lie. ``amends`` / ``narrows`` light up that seam as of
+        V1b — the warn-defer→commit flip (2a, the moment those edges first exist) plus
+        the source-liveness gate inside :meth:`_modifiers_map` (2b) that de-projects a
+        dead amender. ``MODIFIER_EDGE_KEYS`` already maps all four keys (the V1a seam);
+        the light-up is the new edges committing + the new gate, not a key-map edit.
 
         Args:
             conn: An open connection (the caller owns its lifecycle).
