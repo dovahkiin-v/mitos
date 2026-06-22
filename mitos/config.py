@@ -37,10 +37,10 @@ CONFIG_DEFAULTS: Dict[str, Any] = {
 
 # The recognized file keys → expected (TOML scalar) type, for strict validation.
 # The seven static keys above PLUS the two dynamic-default qdrant keys = the §5.2.6
-# nine-key schema. A file key NOT in this map is warn-tolerated (unknown key); this
-# is the bucket the dropped prototype keys (`db_path`, `decisions_file`,
-# `archive_dir`, `pending_threshold`) fall into — their ATTRIBUTES survive (R12),
-# only the file-override capability is gone.
+# nine-key schema. A file key NOT in this map is tolerated and skipped — split into
+# two buckets by `_load_config_file`: a RECOGNIZED-but-retired key (`RETIRED_CONFIG_KEYS`
+# below) is tolerated SILENTLY, while a genuinely unknown key (a typo) earns one
+# calm stderr line.
 CONFIG_SCHEMA: Dict[str, type] = {
     "rotation_mode": str,
     "rotation_archive_path_template": str,
@@ -52,6 +52,17 @@ CONFIG_SCHEMA: Dict[str, type] = {
     "qdrant_url": str,
     "qdrant_collection": str,
 }
+
+# Keys the code DELIBERATELY dropped from the file schema but still recognizes —
+# their ATTRIBUTES survive at a default (R12); only the file-override capability is
+# gone. These are NOT typos, so the per-invocation "unrecognized config key" warning
+# is a false alarm: the `mitos init`-seeded `pending_threshold` line tripped it on
+# every single call. They are tolerated SILENTLY. The warning is reserved for keys
+# the code does not know at all — where it is the useful signal that a setting will
+# silently not take effect.
+RETIRED_CONFIG_KEYS: frozenset = frozenset(
+    {"pending_threshold", "db_path", "decisions_file", "archive_dir"}
+)
 
 # The `rotation_mode` enum: correct type (str) but a value outside this set is a
 # hard ConfigError — a typo'd `rotation_mode` silently defaulting to "archive" and
@@ -208,7 +219,8 @@ class MitosConfig:
         # `pending_threshold` LEFT the v0.1 file schema (its migration to
         # `rotation_volume_threshold_entries` is V3a's, not V1a's) but stays a
         # default-valued attribute — `sync.py`'s rotation-prompt gate reads it. A
-        # `pending_threshold` file key is now warn-tolerated, not applied.
+        # `pending_threshold` file key is now silently tolerated (a recognized
+        # retired key — see RETIRED_CONFIG_KEYS), not applied.
         self.pending_threshold = 30
 
         # Dynamic-default schema keys: recognized + type-validated by CONFIG_SCHEMA,
@@ -250,7 +262,10 @@ class MitosConfig:
             - ``rotation_mode`` with a valid-string-but-out-of-enum value →
               ``ConfigError`` (the silent-coerce OD1 forbids).
             - A missing known key → keeps the already-seeded default.
-            - An unknown key → one calm stderr line, tolerated, skipped.
+            - A recognized-but-retired key (``RETIRED_CONFIG_KEYS``) → tolerated and
+              skipped SILENTLY (not a typo; a per-call warning on it is just noise).
+            - A genuinely unknown key (a typo) → one calm stderr line, tolerated,
+              skipped.
 
         Raises:
             ConfigError: On malformed TOML, a type mismatch, or an out-of-enum
@@ -278,13 +293,18 @@ class MitosConfig:
 
         for key, val in data.items():
             if key not in CONFIG_SCHEMA:
-                # Unknown (or dropped-from-schema) key — warn-but-tolerate. One
-                # calm, terse, screen-reader-clean line to stderr (P9), no emoji.
-                print(
-                    f"Warning: ignoring unrecognized config key "
-                    f"'{key}' in {config_path}",
-                    file=sys.stderr,
-                )
+                # A recognized-but-retired key (deliberately dropped from the file
+                # schema; its attribute still lives at a default, R12) is tolerated
+                # SILENTLY — it is not a typo, so warning on it every call is pure
+                # noise. A genuinely unknown key (a typo whose setting silently won't
+                # take effect) still earns one calm, terse, screen-reader-clean line
+                # to stderr (P9, no emoji) — that warning is the useful signal.
+                if key not in RETIRED_CONFIG_KEYS:
+                    print(
+                        f"Warning: ignoring unrecognized config key "
+                        f"'{key}' in {config_path}",
+                        file=sys.stderr,
+                    )
                 continue
 
             expected = CONFIG_SCHEMA[key]
