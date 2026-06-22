@@ -940,6 +940,78 @@ class MitosSyncManager:
             })
         return flagged
 
+    def _lineage_suppression_slugs(
+        self, mutation_target_slugs: List[Optional[str]]
+    ) -> set[str]:
+        """Casefolded slugs of the transitive mutation ancestors of declared targets (3b).
+
+        Transitive-lineage near-duplicate suppression. When an author declares an
+        ``amends``/``narrows``/``supersedes`` edge to the HEAD of a multi-link mutation
+        chain, the near-dup gate (:meth:`_review_neighbors`) must not pause on a near-dup
+        OLDER member reachable *through* that chain — by naming one node in a lineage the
+        author has acknowledged the whole lineage, not just the node they happened to
+        declare. This helper resolves each declared mutation target to its node id and
+        walks :meth:`GraphStore.get_lineage` (the transitive ``supersedes`` ∪ ``amends``
+        ∪ ``narrows`` ancestor walk, Phase 3a) from it, returning every ancestor's
+        casefolded slug to merge into ``declared_targets`` — the suppression set
+        :meth:`_review_neighbors` already filters on (``n["slug"].casefold() in
+        declared_targets``). Both sides casefold, matching that filter exactly. Merging
+        into the set only ever *grows* suppression, so V1a's DIRECT suppression of all
+        nine relation types is preserved by construction (must-not-regress, DoD #13b).
+
+        Seed ONLY the mutation three — ``supersedes`` ∪ ``amends`` ∪ ``narrows``, which
+        equals ``store._MUTATION_EDGE_FIELDS`` (the exact edge set ``get_lineage``
+        walks). ``corrects`` and the other five declared relations still get DIRECT
+        suppression via ``declared_targets`` but NO transitive extension: walking
+        ``get_lineage`` from, say, a ``cites`` target would traverse a mutation graph
+        that edge has nothing to do with — semantically wrong and over-suppressing.
+
+        Sibling-cluster shape — design-AWARE, deliberately NOT auto-suppressed
+        (Decision 4, vision §6.2). When N decisions each amend one shared root R, a new
+        sibling that also amends R is near-dup to its CO-CHILDREN (R's other amenders),
+        not only to R. Those co-children are R's *descendants*, NOT in ``get_lineage(R)``
+        (R is *their* ancestor), so this walk does not — and must not — suppress them.
+        Auto-suppressing them would mean "declaring ``amends R`` silences the gate for
+        R's entire descendant cluster", hiding a GENUINE duplicate of one sibling behind
+        an unrelated declaration. The vision defers the cluster's ergonomics to a later
+        granular-acknowledge layer. The seam that layer would add — a SYMMETRIC
+        per-neighbour check, ``any(t_id in {a["node_id"] for a in
+        get_lineage(neighbour_id)} for t_id in declared_mutation_target_ids)`` gated
+        behind explicit per-neighbour acknowledgement — is named here so it is
+        discoverable, built later, never rediscovered as a "bug".
+
+        Consumes ``get_lineage``'s loud-but-non-fatal partial-on-cycle tolerance as-is
+        (Decision 5): over a corrupt graph the suppression degrades gracefully (it
+        suppresses what was walked before the cycle bound fired, and ``get_lineage``
+        emits the loud ``logger.warning``) and never hangs the hot ``record`` path. This
+        helper adds no cycle handling of its own — that is the read-side "tolerate" half
+        of 3a's one-walk-two-call-sites split.
+
+        Args:
+            mutation_target_slugs: The declared ``supersedes``/``amends``/``narrows``
+                target slugs; any element may be ``None`` or empty (skipped).
+
+        Returns:
+            The casefolded slugs of every transitive mutation ancestor of every
+            resolvable declared target; an empty set when no mutation edge was declared
+            (or no target resolves to exactly one node).
+        """
+        suppressed: set[str] = set()
+        for slug in mutation_target_slugs:
+            if not slug or not slug.strip():
+                continue
+            ids = self.store.resolve_slug(slug)
+            # Each declared target was pre-validated unique-and-existing before the gate
+            # runs (supersedes at the supersedes fast-fail, amends/narrows via
+            # _validate_relation_target), so resolve_slug returns exactly one id on the
+            # supported path. Defensive skip on 0/>1 keeps the helper robust if reused:
+            # a non-unique seed cannot meaningfully seed a single lineage walk.
+            if len(ids) != 1:
+                continue
+            for ancestor in self.store.get_lineage(ids[0]):
+                suppressed.add(ancestor["slug"].casefold())
+        return suppressed
+
     def _node_state(self, node_id: str) -> str:
         """Returns the computed state of a node ('active'/'superseded'/'corrected'/'drifted')."""
         return self.store.get_node_state(node_id)
@@ -1196,6 +1268,21 @@ class MitosSyncManager:
                     + list(extra_relations.values())
                 )
             }
+            # Transitive-lineage suppression (3b): also suppress the pause for the
+            # OLDER members of an amends/narrows/supersedes chain reachable through a
+            # declared mutation edge — by naming the chain head the author has
+            # acknowledged the whole lineage (consuming get_lineage from 3a). Seed only
+            # the mutation three (corrects + the other five stay direct-only). Skip the
+            # walk when the gate is a no-op (offline → _review_neighbors returns []);
+            # the augmentation only ever GROWS the set, so direct suppression of all
+            # nine types is preserved (DoD #13b). The walk is suppression-only: it does
+            # NOT re-declare amends/narrows (that serves modifier stamping, a different
+            # consumer — §6.2), so a bridged predecessor still reads un-amended.
+            if self.embed_provider and self.vector_store:
+                declared_targets |= self._lineage_suppression_slugs(
+                    [supersedes, extra_relations.get("amends"),
+                     extra_relations.get("narrows")]
+                )
             neighbors = self._review_neighbors(entry, declared_targets)
             if neighbors:
                 return {
