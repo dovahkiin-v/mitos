@@ -1924,6 +1924,66 @@ class GraphStore:
         """
         return self.get_modifiers_map([node_id]).get(node_id, {})
 
+    def get_contradictions(self, node_id: str) -> List[Dict[str, str]]:
+        """Returns the nodes that contradict ``node_id``, from EITHER direction.
+
+        ``contradicts`` is the catalog's one semantically-symmetric edge — "A
+        contradicts B" is the same fact as "B contradicts A" — yet it is stored
+        exactly once, as authored (``A`` as ``source_id``, ``B`` as ``target_id``,
+        never mirrored: the store-once economy). This is the single safe
+        bidirectional read, so no consumer hand-rolls
+        ``WHERE source_id = X OR target_id = X`` and silently under-reports
+        contradictions by forgetting the ``OR`` (the OD1 hazard, P7).
+
+        Returns counterparts **regardless of either endpoint's active-view state**.
+        In v0.1 ``contradicts`` is a flag for v0.2's Conflict pipeline and takes no
+        active-view action (§1.1), so a later-superseded endpoint's contradiction is
+        still returned — the liveness treatment is v0.2 Conflict's to own. Identity
+        only (``{node_id, slug, kind}`` per counterpart), not a hydrated decision
+        payload: this is an adjacency read like :meth:`get_edges`, so it stamps no
+        modifiers; a consumer wanting a counterpart's full axiom calls
+        :meth:`get_node`.
+
+        Args:
+            node_id: The node whose contradictions to read.
+
+        Returns:
+            One ``{"node_id", "slug", "kind"}`` dict per distinct counterpart node,
+            deduplicated across the two edge directions and sorted by slug. Empty
+            when the node has no ``contradicts`` edges (or does not exist) — empty is
+            healthy, never an error.
+        """
+        conn = self._get_connection()
+        try:
+            # UNION (not UNION ALL) dedups the both-directions-authored case
+            # (A->B and B->A both present): the counterpart must appear once. The
+            # ``!= ?`` guards are cheap insurance against an out-of-band corrupt
+            # self-edge (the write path rejects A contradicts A as cycle_violation,
+            # but the graph is a rebuildable derivative — M7/P6) so the node never
+            # returns itself.
+            rows = conn.execute(
+                """
+                SELECT nodes.id AS node_id, nodes.slug AS slug, nodes.kind AS kind
+                FROM edges
+                JOIN nodes ON nodes.id = edges.target_id
+                WHERE edges.edge_type = 'contradicts'
+                  AND edges.source_id = ?
+                  AND edges.target_id != ?
+                UNION
+                SELECT nodes.id AS node_id, nodes.slug AS slug, nodes.kind AS kind
+                FROM edges
+                JOIN nodes ON nodes.id = edges.source_id
+                WHERE edges.edge_type = 'contradicts'
+                  AND edges.target_id = ?
+                  AND edges.source_id != ?
+                ORDER BY slug
+                """,
+                (node_id, node_id, node_id, node_id),
+            ).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            conn.close()
+
     def get_transcript(self, node_id: str) -> Optional[str]:
         """Returns a node's own committed transcript text, or None.
 

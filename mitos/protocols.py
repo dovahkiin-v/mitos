@@ -201,6 +201,24 @@ class GraphStoreProtocol(Protocol):
         """
         ...
 
+    def get_contradictions(self, node_id: str) -> List[Dict[str, str]]:
+        """Returns the nodes that contradict ``node_id``, from EITHER direction.
+
+        ``contradicts`` is symmetric and stored once (A->B); this is the single
+        safe bidirectional read — no consumer hand-rolls
+        ``WHERE source=X OR target=X``. Returns counterparts regardless of either
+        endpoint's active-view state (v0.1 takes no active-view action on
+        ``contradicts``). Identity only, not a hydrated decision payload.
+
+        Args:
+            node_id: The node whose contradictions to read.
+
+        Returns:
+            One ``{node_id, slug, kind}`` dict per distinct counterpart node,
+            deduplicated across the two edge directions; ``[]`` when none.
+        """
+        ...
+
     def get_decisions(
         self, scope: Optional[str] = None, state: str = "active"
     ) -> List[Dict[str, Any]]:
