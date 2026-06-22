@@ -647,7 +647,11 @@ def _cutover_error_for_commit(entry: ParsedEntry, exc: CommitError) -> CutoverEr
     """
     codes = {item.code for item in exc.failure.items} if exc.failure else set()
     if STORE_CYCLE_VIOLATION in codes:
-        target = (entry.supersedes or entry.corrects or "<unknown>").strip()
+        # supersedes/corrects are now List[str] (V1b multi-valued); take the first
+        # declared kill-edge target for the diagnostic (a degenerate self-reference
+        # carries a single citation in practice).
+        _kill = entry.supersedes or entry.corrects
+        target = (_kill[0] if _kill else "<unknown>").strip()
         if len(target) >= 2 and target.startswith("[") and target.endswith("]"):
             target = target[1:-1].strip()
         msg = (

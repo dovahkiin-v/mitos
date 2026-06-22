@@ -267,13 +267,14 @@ def test_invariant_m5_database_corruption_and_rebuild(isolated_workspace) -> Non
     assert d1_restored is not None
     assert d2_restored is not None
     
-    # The two decisions rebuild from decisions.md (M5). The `Depends-On: d1` edge is
-    # warn-deferred to V1b (not a V1a kill-edge), so NO edge is committed — 8a pared
-    # the prototype's "1 depends_on edge restored" assertion to the V1a truth (K5/G6).
+    # The two decisions rebuild from decisions.md (M5), and the `Depends-On: d1`
+    # edge rebuilds with them — as of V1b 2a the non-kill edge commits (it was
+    # warn-deferred in V1a), so the rebuild carries it forward faithfully.
     conn = sqlite3.connect(config.db_path)
     conn.row_factory = sqlite3.Row
     edges = conn.execute("SELECT * FROM edges").fetchall()
-    assert len(edges) == 0
+    assert len(edges) == 1
+    assert edges[0]["edge_type"] == "depends_on"
     conn.close()
 
 
@@ -443,21 +444,21 @@ def test_invariant_circular_dependency_gate(isolated_workspace) -> None:
     b = ParsedEntry("decision", "b", 6, 10)
     b.axiom = "Decision B."
     b.rejected_paths = "None."
-    b.depends_on = "a"
+    b.depends_on = ["a"]
     store.commit_parsed_entry(b)
     
     # 3. Commit Decision C depends on B
     c = ParsedEntry("decision", "c", 11, 15)
     c.axiom = "Decision C."
     c.rejected_paths = "None."
-    c.depends_on = "b"
+    c.depends_on = ["b"]
     store.commit_parsed_entry(c)
     
     # 4. Update A to depend on C (Creates Cycle: A -> C -> B -> A!)
     a_cycle = ParsedEntry("decision", "a", 1, 5)
     a_cycle.axiom = "Decision A."
     a_cycle.rejected_paths = "None."
-    a_cycle.depends_on = "c"
+    a_cycle.depends_on = ["c"]
     store.commit_parsed_entry(a_cycle)
     
     # Verify that we can resolve all states successfully without recursion or crash!

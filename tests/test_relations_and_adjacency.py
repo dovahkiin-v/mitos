@@ -155,19 +155,21 @@ def test_record_over_length_slug_rejected_with_exact_count(ws):
 # --------------------------------------------------------------------------- #
 # ③a Typed relations through the write path
 #
-# V1a commits only the two kill-edges (supersedes / corrects). The other seven
-# relationship fields are parsed + serialized + Phase-A target-validated, but
-# WARN-DEFERRED to V1b (store._DEFERRED_EDGE_FIELDS) — no edge is committed. So
-# the V1a contract these pin is: the field round-trips into the buffer (authored
-# for V1b to light up) and the record succeeds, while get_edges() carries no such
-# edge yet. (8a pared these from the prototype "creates an edge" assertions —
-# K5/G6; the genuine V1b edge-commit is deferred, not silently coerced.)
+# As of V1b (Phase 2a) the write path commits all nine relationship types — the
+# two kill-edges (supersedes/corrects, which retire their target) and the seven
+# non-kill types (which leave both endpoints active). The field round-trips into
+# the buffer AND the edge commits. ``record_decision_entry`` records a DECISION,
+# so the five non-kill relations below author a D→D (or any→any ``cites``) edge;
+# ``resolves`` is D→OQ (tested with an OQ target) and a decision-source
+# ``derives_from`` / a ``resolves`` pointed at a decision is a loud kind violation.
 # --------------------------------------------------------------------------- #
 
-_EXTRA_RELATION_LABELS = {
+# The five non-kill relations valid from a DECISION source: four same-kind (D→D)
+# plus ``cites`` (any→any). ``resolves`` (D→OQ) and ``derives_from`` (OQ→D) are
+# cross-kind and covered separately.
+_DECISION_VALID_RELATION_LABELS = {
     "amends": "Amends", "narrows": "Narrows", "depends_on": "Depends-On",
-    "resolves": "Resolves", "contradicts": "Contradicts",
-    "derives_from": "Derives-From", "cites": "Cites",
+    "contradicts": "Contradicts", "cites": "Cites",
 }
 
 
@@ -185,28 +187,64 @@ def test_corrects_creates_kill_edge(ws):
     assert store.get_node_by_slug("target") is None  # gone from the active view
 
 
-@pytest.mark.parametrize("kwarg,label", sorted(_EXTRA_RELATION_LABELS.items()))
-def test_each_extra_relation_serializes_but_warn_defers_edge(ws, kwarg, label):
-    """Each non-kill relation round-trips into the buffer but commits NO edge (V1b).
+@pytest.mark.parametrize("kwarg,label", sorted(_DECISION_VALID_RELATION_LABELS.items()))
+def test_each_decision_valid_relation_commits_edge(ws, kwarg, label):
+    """Each non-kill relation valid from a decision source commits its edge (V1b 2a).
 
-    V1a parses + serializes + Phase-A-validates these seven, then warn-defers the
-    edge to V1b. The prototype asserted the edge committed; 8a pares that to the
-    V1a truth — the field is authored (present for the V1b reconciler) and the
-    record succeeds, while get_edges() stays empty of it.
+    Pre-flip these warn-deferred (serialized into the buffer, no edge). Now the edge
+    commits AND the field still round-trips into decisions.md — this is the V1b
+    edge-commit the V1a tests deferred, finally lit up.
     """
     config, m = ws
     m.record_decision_entry("Target axiom.", "rej", [], slug="target")
     res = m.record_decision_entry("Linker axiom.", "rej", [], slug="linker",
                                   **{kwarg: "target"})
     assert res["status"] == "created", res
-    # The relation is serialized into decisions.md (authored for V1b).
+    # The relation is serialized into decisions.md.
     assert f"**{label}:** target" in _read(config)
-    # ...but no edge is committed in V1a (warn-deferred).
-    assert not _edge(GraphStore(config.db_path), "linker", "target", kwarg)
+    # ...and the edge now commits (both endpoints stay active — non-kill).
+    assert _edge(GraphStore(config.db_path), "linker", "target", kwarg)
+
+
+def test_record_resolves_open_question_commits_cross_kind(ws):
+    """`record --resolves <oq>` commits the cross-kind D→OQ ``resolves`` edge (V1b 2a).
+
+    ``record_decision_entry`` records decisions, so the OQ target is authored
+    directly via ``parse_entry_stream(..., "open_question")`` → ``commit_parsed_entry``.
+    """
+    from mitos.parser import parse_entry_stream
+    config, m = ws
+    oq_text = "### auth-q\n**Topic:** Which auth?\n**Questions:**\n- Which auth?\n"
+    m.store.commit_parsed_entry(parse_entry_stream(oq_text, "open_question")[0])
+    res = m.record_decision_entry("We pick OAuth.", "rej", [], slug="oauth-decision",
+                                  resolves="auth-q")
+    assert res["status"] == "created", res
+    assert _edge(GraphStore(config.db_path), "oauth-decision", "auth-q", "resolves")
+
+
+@pytest.mark.parametrize("kwarg", ["resolves", "derives_from"])
+def test_record_kind_violating_relation_rejects_gracefully(ws, kwarg):
+    """A decision-source ``resolves``-to-a-decision / ``derives_from`` is a loud kind violation.
+
+    V1a silently warn-deferred these (a no-op); V1b 2a attempts the commit and the
+    widened CHECK rejects the kind-violating shape as ``kind_constraint_violation``.
+    The write path must reject GRACEFULLY — a structured error, the buffer
+    byte-for-byte unchanged, NO orphan node (the buffer-first + rollback contract
+    holds for the new failure mode; not a crash, not a half-write).
+    """
+    config, m = ws
+    m.record_decision_entry("Target axiom.", "rej", [], slug="target")
+    before = _read(config)
+    res = m.record_decision_entry("Linker axiom.", "rej", [], slug="linker",
+                                  **{kwarg: "target"})
+    assert "error" in res and res["code"] == "commit_failed", res
+    assert "kind" in res["error"].lower()
+    assert _read(config) == before  # buffer rolled back — no orphan entry
+    assert GraphStore(config.db_path).get_node_by_slug("linker") is None
 
 
 def test_multiple_relations_in_one_entry(ws):
-    """Several non-kill relations co-author into one buffer entry (edges defer to V1b)."""
+    """Several non-kill relations co-author into one buffer entry and all commit (V1b 2a)."""
     config, m = ws
     for slug in ("dep", "cited", "amended"):
         m.record_decision_entry(f"Axiom {slug}.", "rej", [], slug=slug)
@@ -219,11 +257,11 @@ def test_multiple_relations_in_one_entry(ws):
     assert "**Depends-On:** dep" in buf
     assert "**Cites:** cited" in buf
     assert "**Amends:** amended" in buf
-    # All three are warn-deferred — no edges committed in V1a.
+    # All three edges commit (V1b 2a flip).
     store = GraphStore(config.db_path)
-    assert not _edge(store, "hub", "dep", "depends_on")
-    assert not _edge(store, "hub", "cited", "cites")
-    assert not _edge(store, "hub", "amended", "amends")
+    assert _edge(store, "hub", "dep", "depends_on")
+    assert _edge(store, "hub", "cited", "cites")
+    assert _edge(store, "hub", "amended", "amends")
 
 
 def test_relation_target_not_found_buffer_unchanged(ws):
@@ -260,7 +298,7 @@ def test_relation_target_ambiguous_buffer_unchanged(ws):
     config, m = ws
     m.store.commit_parsed_entry(_mk_entry("axiom one", "amb"))     # node-1, slug 'amb'
     e2 = _mk_entry("axiom two", "amb")
-    e2.supersedes = "amb"                                          # resolves to node-1 (active non-self)
+    e2.supersedes = ["amb"]                                          # resolves to node-1 (active non-self)
     m.store.commit_parsed_entry(e2)                               # node-2 supersedes node-1; both slug 'amb'
     before = _read(config)
     res = m.record_decision_entry("Linker.", "rej", [], slug="linker", depends_on="amb")
@@ -274,8 +312,8 @@ def test_relation_does_not_change_target_state(ws):
     config, m = ws
     rt = m.record_decision_entry("Target stays active.", "rej", [], slug="t")
     m.record_decision_entry("Depends on it.", "rej", [], slug="d", depends_on="t")
-    # V1a single-node state derivation (8a). depends_on is warn-deferred AND non-kill,
-    # so the target is unambiguously active.
+    # depends_on now commits an edge (V1b 2a) but is NON-kill — only supersedes/
+    # corrects retire a target — so the target stays unambiguously active.
     assert GraphStore(config.db_path).get_node_state(rt["id"]) == "active"
 
 
@@ -284,13 +322,13 @@ def test_relation_does_not_change_target_state(ws):
 # --------------------------------------------------------------------------- #
 
 def test_cli_cmd_record_depends_on(ws):
-    """cmd_record threads a relation flag through to the buffer (edge defers to V1b)."""
+    """cmd_record threads a relation flag to the buffer AND commits the edge (V1b 2a)."""
     config, _ = ws
     cmd_record(config, axiom="Target.", rejected="rej", slug="cli-target")
     cmd_record(config, axiom="Linker.", rejected="rej", slug="cli-linker", depends_on="cli-target")
-    # The flag reaches the buffer; the edge is warn-deferred in V1a (K5/G6).
+    # The flag reaches the buffer and the depends_on edge now commits.
     assert "**Depends-On:** cli-target" in _read(config)
-    assert not _edge(GraphStore(config.db_path), "cli-linker", "cli-target", "depends_on")
+    assert _edge(GraphStore(config.db_path), "cli-linker", "cli-target", "depends_on")
 
 
 def test_cli_cmd_record_corrects_kill_edge(ws):
@@ -326,7 +364,7 @@ def test_cli_relation_flags_route(mock_record, monkeypatch):
 
 
 def test_mcp_record_decision_with_relation(ws):
-    """The MCP record_decision tool accepts a relation arg + serializes it (edge defers to V1b)."""
+    """The MCP record_decision tool accepts a relation arg, serializes it AND commits the edge."""
     config, _ = ws
     with patch("mitos.mcp_server.MitosConfig", return_value=config):
         from mitos.mcp_server import record_decision
@@ -335,7 +373,7 @@ def test_mcp_record_decision_with_relation(ws):
                                          depends_on="mcp-target"))
     assert res["status"] == "created"
     assert "**Depends-On:** mcp-target" in _read(config)
-    assert not _edge(GraphStore(config.db_path), "mcp-linker", "mcp-target", "depends_on")
+    assert _edge(GraphStore(config.db_path), "mcp-linker", "mcp-target", "depends_on")
 
 
 def test_mcp_record_decision_corrects_kill_edge(ws):

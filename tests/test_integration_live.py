@@ -327,16 +327,24 @@ def test_cli_subprocess_relation_flag_links_decisions(tmp_path):
 
         store = GraphStore(MitosConfig(str(ws)).db_path)
         # Both decisions committed via the real binary; both resolve as active.
-        assert store.get_node_by_slug("adapters-at-edges") is not None
-        assert store.get_node_by_slug("hexagonal-arch") is not None
-        # `--depends-on` is warn-deferred in V1a (not a kill-edge): the flag threads
-        # through the real binary into the buffer, but no edge is committed (V1b). 8a
-        # pared the prototype's "depends_on edge committed" assertion to the V1a truth
-        # (K5/G6) — the authored field is present for the V1b reconciler.
+        src = store.get_node_by_slug("adapters-at-edges")
+        tgt = store.get_node_by_slug("hexagonal-arch")
+        assert src is not None
+        assert tgt is not None
+        # `--depends-on` commits a non-kill depends_on edge as of V1b 2a (D→D,
+        # same-kind): the flag threads through the real binary into the buffer AND
+        # the reconciler commits the edge. Both endpoints stay active — a non-kill
+        # edge retires nothing (unlike supersedes/corrects).
         with open(os.path.join(str(ws), "decisions.md"), encoding="utf-8") as f:
             buf = f.read()
         assert "**Depends-On:** hexagonal-arch" in buf
-        assert store.get_edges() == []
+        edges = store.get_edges()
+        assert len(edges) == 1
+        assert edges[0]["edge_type"] == "depends_on"
+        assert edges[0]["source_id"] == src["id"]
+        assert edges[0]["target_id"] == tgt["id"]
+        assert store.get_node_state(src["id"]) == "active"
+        assert store.get_node_state(tgt["id"]) == "active"
     finally:
         _drop_collection(collection)
 

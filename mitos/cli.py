@@ -1559,7 +1559,7 @@ def main() -> None:
     rec_p.add_argument("--amends", default=None, help="Exact slug of a decision this one amends.")
     rec_p.add_argument("--narrows", default=None, help="Exact slug of a decision this one narrows.")
     rec_p.add_argument("--depends-on", default=None, dest="depends_on", help="Exact slug of a decision this one depends on.")
-    rec_p.add_argument("--resolves", default=None, help="Exact slug of an open question/decision this one resolves.")
+    rec_p.add_argument("--resolves", default=None, help="Exact slug of an open question this one resolves (resolves is decision→open-question only).")
     rec_p.add_argument("--contradicts", default=None, help="Exact slug of a decision this one contradicts.")
     rec_p.add_argument("--derives-from", default=None, dest="derives_from", help="Exact slug of a decision this one derives from.")
     rec_p.add_argument("--cites", default=None, help="Exact slug of a decision this one cites.")

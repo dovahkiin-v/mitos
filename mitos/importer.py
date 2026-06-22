@@ -178,9 +178,11 @@ class MitosProseImporter:
                 entry.rejected_paths = compressed.get("rejected_paths", "")
                 entry.mechanisms = compressed.get("mechanisms", [])
                 entry.scope = compressed.get("scope", [])
-                entry.supersedes = compressed.get("supersedes")
-                entry.amends = compressed.get("amends")
-                entry.resolves = compressed.get("resolves")
+                # Relationship fields are List[str] (V1b multi-valued); wrap the
+                # single compressed slug into a 1-element list, [] when absent.
+                entry.supersedes = [v] if (v := compressed.get("supersedes")) else []
+                entry.amends = [v] if (v := compressed.get("amends")) else []
+                entry.resolves = [v] if (v := compressed.get("resolves")) else []
             else:
                 # If not using LLM, populate core fields with raw content as best effort
                 entry.axiom = title or slug

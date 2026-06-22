@@ -224,15 +224,21 @@ class ParsedEntry:
         self.invalidates_if: Optional[str] = None
         self.scope: List[str] = []
         self.context: Optional[str] = None
-        self.supersedes: Optional[str] = None
-        self.corrects: Optional[str] = None
-        self.amends: Optional[str] = None
-        self.narrows: Optional[str] = None
-        self.depends_on: Optional[str] = None
-        self.resolves: Optional[str] = None
-        self.contradicts: Optional[str] = None
-        self.derives_from: Optional[str] = None
-        self.cites: Optional[str] = None
+        # Relationship fields are comma-separated multi-valued (V1b, ADR
+        # ``relationship-fields-comma-separated-multivalued``): each parses to a
+        # ``List[str]`` of cited slugs, mirroring ``mechanisms`` / ``scope`` above
+        # (``[]`` when absent; a lone slug is a 1-element list, so V1a single-valued
+        # authoring is unchanged — additive, no migration). The per-instance ``[]``
+        # is minted fresh each ``__init__`` (no shared-mutable-default foot-gun).
+        self.supersedes: List[str] = []
+        self.corrects: List[str] = []
+        self.amends: List[str] = []
+        self.narrows: List[str] = []
+        self.depends_on: List[str] = []
+        self.resolves: List[str] = []
+        self.contradicts: List[str] = []
+        self.derives_from: List[str] = []
+        self.cites: List[str] = []
         self.transcript: Optional[str] = None
         self.confirmed_by: Optional[str] = None
         self.confirmed_at: Optional[str] = None
@@ -453,24 +459,13 @@ def _parse_section(sec: Dict[str, Any]) -> ParsedEntry:
             entry.invalidates_if = " ".join(fields["invalidates_if"]).strip()
         if "context" in fields:
             entry.context = "\n".join(fields["context"]).strip()
-        if "supersedes" in fields:
-            entry.supersedes = " ".join(fields["supersedes"]).strip()
-        if "amends" in fields:
-            entry.amends = " ".join(fields["amends"]).strip()
-        if "narrows" in fields:
-            entry.narrows = " ".join(fields["narrows"]).strip()
-        if "depends_on" in fields:
-            entry.depends_on = " ".join(fields["depends_on"]).strip()
-        if "resolves" in fields:
-            entry.resolves = " ".join(fields["resolves"]).strip()
-        if "corrects" in fields:
-            entry.corrects = " ".join(fields["corrects"]).strip()
-        if "contradicts" in fields:
-            entry.contradicts = " ".join(fields["contradicts"]).strip()
-        if "derives_from" in fields:
-            entry.derives_from = " ".join(fields["derives_from"]).strip()
-        if "cites" in fields:
-            entry.cites = " ".join(fields["cites"]).strip()
+        # Relationship fields are comma-separated multi-valued (V1b) — same split as
+        # the live ``parse_entry_stream`` path, kept consistent so this prototype
+        # never assigns a bare ``str`` to a now-``List[str]`` attribute.
+        for rel in _RELATIONSHIP_FIELDS:
+            if rel in fields:
+                rel_raw = " ".join(fields[rel]).strip()
+                setattr(entry, rel, [c.strip() for c in rel_raw.split(",") if c.strip()])
 
         if "mechanisms" in fields:
             mech_str = " ".join(fields["mechanisms"]).strip()
@@ -902,9 +897,14 @@ def _tokenize_entry(
         entry.rejected_paths = "\n".join(fields["rejected_paths"]).strip()
     if "context" in fields:
         entry.context = "\n".join(fields["context"]).strip()
+    # Relationship fields are comma-separated multi-valued (V1b): ``Cites: a, b``
+    # tokenizes to ``["a", "b"]``; a lone slug is a 1-element list (mirror the
+    # ``mechanisms`` / ``scope`` split below). Edge resolution per citation is the
+    # store's job (``_reconcile_edges``); the parser only tokenizes.
     for rel in _RELATIONSHIP_FIELDS:
         if rel in fields:
-            setattr(entry, rel, " ".join(fields[rel]).strip())
+            rel_raw = " ".join(fields[rel]).strip()
+            setattr(entry, rel, [c.strip() for c in rel_raw.split(",") if c.strip()])
 
     # Boundary-normalized list fields (the C1 fold/dedup, byte-equal to identity
     # for mechanisms/questions; scope is parser-only).
