@@ -374,6 +374,198 @@ def is_pre_v1a_schema(conn: sqlite3.Connection) -> bool:
     return (not is_strict) or (not has_casefold)
 
 
+# --- V1b schema (Phase 1b): migration ladder step 2 ----------------------------
+#
+# The first populated-schema migration: it (a) creates the ``mechanisms`` entity
+# registry (W1, written by Phase 5a) and (b) rebuilds ``edges`` to widen its
+# kind-CHECK from the V1a two-type, same-kind-only whitelist to the full nine-type
+# V1b catalog (W3, committed by Phase 2a). Three of the nine are CROSS-kind
+# (``cites`` any→any, ``derives_from`` OQ→D, ``resolves`` D→OQ) that
+# ``source_kind = target_kind`` structurally forbids, so an ``IN(...)`` extension
+# cannot express them and a table REBUILD is required (Decision 2; SQLite cannot
+# ``ALTER`` a CHECK).
+#
+# Appending ``(2, _v1b_schema)`` to ``MIGRATION_STEPS`` activates Phase 1a's dormant
+# pre-ladder snapshot (the head becomes 2, so a populated v1 boot now satisfies the
+# ``current < head`` precondition) with ZERO change to the 1a harness — so a real
+# ``v1→v2`` boot snapshots first and restores on failure, the binary reversal for the
+# silent-semantic corruption the in-step faithfulness count-check (Decision 4) cannot
+# see. The rebuild runs FK-on and is safe ONLY because nothing references ``edges``
+# (``grep "REFERENCES edges"`` → empty, Decision 3); ``PRAGMA foreign_keys`` cannot be
+# toggled inside the runner's transaction anyway. There is NO ``edge_type_matrix``
+# reference table — the CHECK-with-OR is the whole catalog (P19; ADR
+# ``edge-catalog-stays-check-constraint-not-reference-table``).
+
+# ``mechanisms`` — the V1-D5 / V1-D15 entity registry (W1). Pure add:
+# ``canonical_name`` PK (slugified by 5a's WRITER via ``mechanism_canonical_norm``,
+# NOT this DDL), ``authored_name`` first-seen presentation casing, ``source``
+# first-seen-wins provenance, ``created_at`` application-supplied UTC ISO-8601 µs (no
+# ``CURRENT_TIMESTAMP`` default — MI-10, mirrors ``_v1_schema``). STRICT enforces the
+# TEXT typing. NO ``kind`` column, NO alias storage, NO ``node_mechanisms`` junction
+# (the dead ``store._init_db`` prototype's shape — v0.2 adds the ``kind`` flag/aliases
+# non-destructively, so P12/P20 forbid pre-creating them here). The ``canonical_name``
+# PK is the only index needed (P11); nodes link via the existing
+# ``mechanism_refs_json`` column, not a foreign key.
+_V1B_MECHANISMS_STATEMENT: str = """
+    CREATE TABLE IF NOT EXISTS mechanisms (
+        canonical_name TEXT NOT NULL,
+        authored_name  TEXT NOT NULL,
+        source         TEXT NOT NULL,
+        created_at     TEXT NOT NULL,
+        PRIMARY KEY (canonical_name),
+        CHECK (source IN ('user', 'capture_llm', 'import_llm'))
+    ) STRICT;
+"""
+
+# ``edges_new`` — the rebuild target carrying the widened nine-type kind-CHECK. Every
+# other column/PK/FK is byte-identical to the V1a ``edges`` (step 1's DDL); ONLY the
+# CHECK widens. The catalog (vision §4.3): six SAME-kind types (the two kill-edges +
+# the four new same-kind non-kill ``amends``/``narrows``/``depends_on``/``contradicts``)
+# plus three CROSS-kind clauses (``cites`` any→any, ``derives_from`` OQ→D, ``resolves``
+# D→OQ). Node kinds are exactly {'decision', 'open_question'} (the ``nodes`` CHECK), so
+# the cross-kind clauses enumerate the full direction matrix. These nine ==
+# ``store._KILL_EDGE_FIELDS ∪ _DEFERRED_EDGE_FIELDS`` (the set Phase 2a commits) — a
+# typo here is a silent cross-phase mismatch 2a inherits, so the literals are copied
+# from the live constants, not retyped from memory.
+_V1B_EDGES_NEW_STATEMENT: str = """
+    CREATE TABLE edges_new (
+        source_id TEXT NOT NULL,
+        source_kind TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        target_kind TEXT NOT NULL,
+        edge_type TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (source_id, target_id, edge_type),
+        CHECK (
+            (source_kind = target_kind AND edge_type IN
+                ('supersedes', 'corrects', 'amends', 'narrows', 'depends_on', 'contradicts'))
+         OR (edge_type = 'cites')
+         OR (source_kind = 'open_question' AND target_kind = 'decision'      AND edge_type = 'derives_from')
+         OR (source_kind = 'decision'      AND target_kind = 'open_question' AND edge_type = 'resolves')
+        ),
+        FOREIGN KEY (source_id, source_kind) REFERENCES nodes(id, kind),
+        FOREIGN KEY (target_id, target_kind) REFERENCES nodes(id, kind)
+    ) STRICT;
+"""
+
+# A stable marker of the widened CHECK in ``edges``'s stored DDL: the quoted token
+# ``'cites'`` appears in the nine-type catalog and never in the V1a two-type CHECK, so
+# its presence means the rebuild has already run — the MI-3 replay skip-guard
+# (``_rebuild_edges_widened``). ``ALTER TABLE ... RENAME`` rewrites the stored ``sql``
+# to name the table ``edges`` while preserving the CHECK body, so the marker survives
+# the rename.
+_V1B_EDGES_WIDENED_MARKER: str = "'cites'"
+
+
+def _rebuild_edges_widened(conn: sqlite3.Connection) -> None:
+    """Rebuilds ``edges`` in place to widen its kind-CHECK to the 9-type catalog.
+
+    SQLite cannot ``ALTER`` a CHECK, and an ``IN(...)`` list can express neither a
+    cross-kind row nor the dropping of ``source_kind = target_kind``, so the widening
+    is a table rebuild: create ``edges_new`` with the widened CHECK, copy every row,
+    drop ``edges``, rename ``edges_new`` → ``edges``, recreate ``idx_edges_target``
+    (``DROP TABLE`` takes the index with it). Runs inside ``run_migrations``'
+    transaction — one statement per ``conn.execute``, touching neither
+    ``BEGIN``/``COMMIT`` nor ``user_version``.
+
+    Two safety properties make this faithful and reversible:
+
+    * **Faithfulness (R13, Decision 4):** the source row count is captured before the
+      copy and compared to ``edges_new`` after it — *before* ``edges`` is dropped — so
+      a short ``INSERT ... SELECT`` raises (rolling the whole step back, the 1a
+      snapshot restoring) with the original ``edges`` still intact. This turns a silent
+      edge loss into a loud, reversible failure. ``PRAGMA foreign_key_check`` then
+      asserts the copy left no dangling reference (a read-only probe, legal inside the
+      txn; the SQLite FK-disable dance is unneeded because ``edges`` is not an FK
+      target — Decision 3).
+    * **Replay-safety (MI-3, Decision 5):** if ``edges`` already carries the widened
+      CHECK (the ``'cites'`` marker), the rebuild is skipped entirely — a true no-op on
+      full-ladder replay or a re-invocation against an already-v2 DB.
+
+    Args:
+        conn: An open, writable SQLite connection inside the runner's transaction, with
+            ``foreign_keys=ON`` live (opened via ``store.open_connection``, MI-8). The
+            ``edges`` table from step 1 must already exist.
+
+    Raises:
+        DatabaseError: If the copied edge count differs from the source (a faithfulness
+            breach, R13) or ``PRAGMA foreign_key_check`` reports a dangling reference.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='edges';"
+    ).fetchone()
+    if row is not None and row[0] is not None and _V1B_EDGES_WIDENED_MARKER in row[0]:
+        # Already widened — the MI-3 replay no-op (Decision 5).
+        return
+
+    # Drop any leftover ``edges_new`` from a crashed prior attempt before the rebuild.
+    # Transactional rollback makes a real orphan impossible, but the guard is cheap
+    # insurance and keeps a bare re-invocation clean.
+    conn.execute("DROP TABLE IF EXISTS edges_new;")
+    conn.execute(_V1B_EDGES_NEW_STATEMENT)
+
+    # Faithfulness gate (R13): count BEFORE the copy, compare AFTER — and BEFORE the
+    # ``DROP``, so a mismatch rolls back with the original ``edges`` intact.
+    before = conn.execute("SELECT COUNT(*) FROM edges;").fetchone()[0]
+    conn.execute(
+        "INSERT INTO edges_new "
+        "(source_id, source_kind, target_id, target_kind, edge_type, created_at) "
+        "SELECT source_id, source_kind, target_id, target_kind, edge_type, created_at "
+        "FROM edges;"
+    )
+    after = conn.execute("SELECT COUNT(*) FROM edges_new;").fetchone()[0]
+    if before != after:
+        raise DatabaseError(
+            f"edges rebuild faithfulness check failed: {before} source rows but "
+            f"{after} carried into edges_new — aborting to avoid silent edge loss "
+            f"(R13). The step rolls back and the pre-ladder snapshot restores the graph."
+        )
+    # Structural assertion: the copy introduced no dangling FK. The table name is a
+    # code-internal literal — the P8 carve-out, same class as ``PRAGMA user_version``.
+    fk_violations = conn.execute("PRAGMA foreign_key_check(edges_new);").fetchall()
+    if fk_violations:
+        raise DatabaseError(
+            f"edges rebuild left {len(fk_violations)} dangling foreign-key "
+            f"reference(s) in edges_new — aborting (R13). The step rolls back and the "
+            f"pre-ladder snapshot restores the graph."
+        )
+
+    conn.execute("DROP TABLE edges;")
+    conn.execute("ALTER TABLE edges_new RENAME TO edges;")
+    # ``DROP TABLE edges`` took ``idx_edges_target`` with it; recreate the
+    # incoming-kill-edge anti-join index on the rebuilt table (mirrors the V1a DDL).
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_edges_target ON edges (target_id, edge_type);"
+    )
+
+
+def _v1b_schema(conn: sqlite3.Connection) -> None:
+    """Migration step 2 (V1b): create ``mechanisms`` and widen the ``edges`` CHECK.
+
+    Lands both V1b schema additions as one forward-only ladder rung (``user_version``
+    1→2): (a) the STRICT ``mechanisms`` entity registry (W1, written by Phase 5a) and
+    (b) the ``edges`` kind-CHECK widened to the nine-type catalog via an in-place table
+    rebuild (W3, committed by Phase 2a). Runs inside ``run_migrations``' transaction;
+    does NOT touch ``user_version`` or ``BEGIN``/``COMMIT`` (the runner owns both), and
+    issues one statement per ``conn.execute`` — never ``executescript`` (it
+    force-commits and would split the DDL out of the atomic version-bump, the contract
+    ``_v1_schema`` documents).
+
+    Order is mechanisms-first (a trivial ``CREATE ... IF NOT EXISTS``), edges-rebuild
+    second (the risky part — Decision 1). Both are idempotent for MI-3 replay: the
+    ``mechanisms`` create via ``IF NOT EXISTS``, the edges rebuild via its widened-CHECK
+    skip-guard (``_rebuild_edges_widened``).
+
+    Args:
+        conn: An open, writable SQLite connection inside the runner's transaction, with
+            ``foreign_keys=ON`` live (opened via ``store.open_connection``, MI-8). The
+            ``edges`` / ``nodes`` tables from step 1 must already exist — the ladder
+            applies step 1 before step 2 on a fresh boot.
+    """
+    conn.execute(_V1B_MECHANISMS_STATEMENT)
+    _rebuild_edges_widened(conn)
+
+
 # --- Pre-ladder DB snapshot harness (Phase 1a): binary migration reversal ------
 #
 # The first populated-schema migration (Phase 1b) rewrites a graph that already
@@ -560,3 +752,16 @@ def restore_from_snapshot(db_path: str, snapshot_path: str) -> None:
 # list *object* at def-time, so an in-place append is seen by the live boot while
 # a rebind would be invisible to it (2a IMPL_NOTES; §7 gotcha).
 MIGRATION_STEPS.append((1, _v1_schema))
+
+
+# --- V1b live registration (Phase 1b) ------------------------------------------
+#
+# Append step 2 — the ``mechanisms`` DDL + the widened ``edges`` CHECK. This single
+# ``.append`` is the switch that wakes Phase 1a's dormant pre-ladder snapshot: the
+# ladder head becomes 2, so a populated v1 graph now has a pending step and the
+# snapshot fires on its real ``v1→v2`` boot (with ZERO change to the 1a harness, which
+# keys off ``_pending_head(steps)``). Use ``.append`` — NEVER rebind
+# ``MIGRATION_STEPS = [...]``: ``run_migrations``'s default arg binds the list *object*
+# at def-time, so an in-place append is seen by the live boot while a rebind would be
+# invisible to it (PATTERNS; §7 gotcha).
+MIGRATION_STEPS.append((2, _v1b_schema))

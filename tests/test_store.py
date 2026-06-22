@@ -649,15 +649,19 @@ def test_v1_schema_is_live_migration_step_after_phase_5a(temp_store: GraphStore)
 
     Through 2b–4b this asserted the schema was authored-but-not-live (the boot stayed
     on the prototype ``_init_db`` at ``user_version == 0``, the step absent from the
-    registry). Phase 5a flipped it (entry-001): the step is registered and a fresh
-    boot lands ``user_version == 1`` over the V1a STRICT schema.
+    registry). Phase 5a flipped it (entry-001): step 1 is registered and a fresh boot
+    ladders the V1a STRICT schema in. The boot now lands at the live ladder head (read
+    programmatically — V1b's step 2 ladders past 1; the STRICT ``nodes`` table proves
+    the V1a schema is present regardless of how far the head has advanced).
     """
-    from mitos.migrations import MIGRATION_STEPS, _v1_schema
+    from mitos.migrations import MIGRATION_STEPS, _pending_head, _v1_schema
 
     assert (1, _v1_schema) in MIGRATION_STEPS
     conn = temp_store._get_connection()
     try:
-        assert conn.execute("PRAGMA user_version;").fetchone()[0] == 1
+        assert conn.execute("PRAGMA user_version;").fetchone()[0] == _pending_head(
+            MIGRATION_STEPS
+        )
         assert bool(
             conn.execute(
                 "SELECT strict FROM pragma_table_list WHERE name='nodes';"
@@ -700,8 +704,10 @@ def test_identity_hash_is_slug_free_after_phase_5a(temp_store: GraphStore) -> No
 # Phase 2a — connection hardening (PRAGMA suite, version guard, ladder boot)
 #
 # Schema-agnostic; these stay green across the 5a flip. The empty-ladder-boot
-# test is updated to assert the V1a head (user_version == 1) now that step 1 is
-# live. The WAL concurrency test's raw INSERT/UPDATE moved to V1a `nodes` columns.
+# test is updated to assert the live ladder head (read via `_pending_head`, not a
+# literal — it advances as later visions append rungs, e.g. V1b's step 2) now that
+# the registry is populated. The WAL concurrency test's raw INSERT/UPDATE moved to
+# V1a `nodes` columns.
 # ===========================================================================
 
 
@@ -793,16 +799,22 @@ def test_sqlite_version_guard_rejects_old_runtime(
     assert "3.36" in message  # names the detected version
 
 
-def test_boot_lands_v1a_schema_at_user_version_one(temp_store: GraphStore) -> None:
-    """5a's boot ladders a fresh store to the V1a schema head (user_version == 1).
+def test_boot_ladders_fresh_store_to_head(temp_store: GraphStore) -> None:
+    """5a's boot ladders a fresh store up to the live ladder head (not the empty ``0``).
 
     Inverts the 2a-era ``test_boot_through_empty_ladder_leaves_user_version_zero``:
-    with step 1 live, a fresh boot lands ``user_version == 1`` over the V1a STRICT
-    schema rather than the empty-ladder ``0``.
+    with the registry populated, a fresh boot lands at the live head over the STRICT
+    schema rather than the empty-ladder ``0``. The head is read programmatically
+    (``_pending_head``) — it advances as later visions append rungs (V1b's step 2),
+    so this never re-pins to a stale literal.
     """
+    from mitos.migrations import MIGRATION_STEPS, _pending_head
+
     conn = temp_store._get_connection()
     try:
-        assert conn.execute("PRAGMA user_version;").fetchone()[0] == 1
+        assert conn.execute("PRAGMA user_version;").fetchone()[0] == _pending_head(
+            MIGRATION_STEPS
+        )
     finally:
         conn.close()
 

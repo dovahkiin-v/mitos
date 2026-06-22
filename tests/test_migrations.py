@@ -16,7 +16,9 @@ import pytest
 from mitos.errors import DatabaseError
 from mitos.migrations import (
     MIGRATION_STEPS,
+    _pending_head,
     _v1_schema,
+    _v1b_schema,
     is_pre_v1a_schema,
     run_migrations,
 )
@@ -55,16 +57,18 @@ def _create_step(table: str):
     return step
 
 
-def test_registry_has_v1a_schema_step() -> None:
-    """Phase 5a registered ``_v1_schema`` as live ladder step 1 (entry-001 flip).
+def test_registry_has_v1a_and_v1b_schema_steps() -> None:
+    """The live registry carries both ladder rungs: V1a step 1 and V1b step 2.
 
-    Inverts the 2a-era ``test_default_registry_is_empty``: the registry shipped
-    empty through 2a–4b so the suite stayed on the prototype boot; 5a appends
-    ``(1, _v1_schema)`` via ``.append`` (never a rebind) so the live boot ladders
-    to the V1a schema.
+    Phase 5a appended ``(1, _v1_schema)`` (entry-001 flip); Phase 1b appends
+    ``(2, _v1b_schema)`` (the ``mechanisms`` DDL + widened ``edges`` CHECK) via
+    ``.append`` — never a rebind, so ``run_migrations``'s def-time-bound default arg
+    sees both on the live boot. This retires the ``len == 1`` dormancy tripwire 1a
+    left for 1b.
     """
     assert (1, _v1_schema) in MIGRATION_STEPS
-    assert len(MIGRATION_STEPS) == 1  # V1a has exactly one rung
+    assert (2, _v1b_schema) in MIGRATION_STEPS
+    assert len(MIGRATION_STEPS) == 2  # the V1a rung + the V1b rung
 
 
 def test_empty_ladder_is_noop() -> None:
@@ -750,3 +754,307 @@ def test_is_pre_v1a_false_at_advanced_version_regardless_of_shape() -> None:
     _proto_nodes(conn, strict=False, with_casefold=False)
     conn.execute("PRAGMA user_version = 1;")
     assert is_pre_v1a_schema(conn) is False
+
+
+# --- Phase 1b: mechanisms DDL + edges kind-CHECK widening (ladder step 2) -------
+#
+# Step 2 is authored + proven here the same way step 1 was: injected through
+# ``run_migrations(conn, steps=[(1, _v1_schema), (2, _v1b_schema)])`` against real
+# on-disk temp DBs (the rebuild's INSERT...SELECT + ALTER RENAME need a file the FK
+# pragma is live on — ``_v1_conn`` already opens through ``open_connection``). The
+# real-registry snapshot-reversal half (the fault-injection T15 variant) lives in
+# ``tests/test_migration_snapshot.py``; these are the DDL-level shape/widening/
+# faithfulness/replay fixtures. Achieved state is always read back through the DB /
+# introspection, never asserted against a literal we also wrote; no ``user_version``
+# literal (PLANNING_NOTES — bind to instance state).
+
+# The full injected ladder to head 2 (mirrors the live ``MIGRATION_STEPS``).
+_V1B_STEPS = [(1, _v1_schema), (2, _v1b_schema)]
+
+
+def _v1b_conn(tmp_path, name: str = "v1b.sqlite") -> sqlite3.Connection:
+    """Opens an FK-on file DB laddered through the injected registry to head 2 (V1b)."""
+    conn = open_connection(str(tmp_path / name))
+    run_migrations(conn, steps=_V1B_STEPS)
+    return conn
+
+
+def test_full_ladder_boots_fresh_db_to_head_2_via_live_registry(tmp_path) -> None:
+    """A fresh DB run through the LIVE registry ladders to head 2 with both schemas.
+
+    PLANNING_NOTES:57 — the from-scratch boot (not just step-2-on-a-seeded-v1) is what
+    catches a "step 2 assumes ``edges`` exists but nothing created it" bug: the live
+    ``MIGRATION_STEPS`` applies step 1 then step 2 from ``user_version`` 0. The head is
+    read dynamically (``_pending_head``), never a literal.
+    """
+    conn = open_connection(str(tmp_path / "fresh.sqlite"))
+    try:
+        head = run_migrations(conn, MIGRATION_STEPS)
+        assert head == _pending_head(MIGRATION_STEPS)
+        assert _user_version(conn) == _pending_head(MIGRATION_STEPS)
+        # All six V1a tables + the new mechanisms registry are present.
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table';"
+            )
+        }
+        assert tables == set(_V1A_TABLES) | {"mechanisms"}
+        # mechanisms laddered in STRICT with its canonical_name PK (full shape +
+        # prototype-negative assertions live in the dedicated mechanisms tests below).
+        assert _is_strict(conn, "mechanisms")
+        assert _columns(conn, "mechanisms")["canonical_name"]["pk"] == 1
+        # idx_edges_target survived the rebuild (DROP TABLE took it; the step recreates it).
+        assert "idx_edges_target" in _index_unique_flags(conn, "edges")
+        # The widened CHECK is in effect: a cross-kind cites edge inserts (v1 forbade it).
+        _insert_node(conn, "d1", kind="decision")
+        _insert_node(conn, "q1", kind="open_question")
+        _insert_edge(conn, "d1", "decision", "q1", "open_question", edge_type="cites")
+        assert conn.execute("SELECT COUNT(*) FROM edges;").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+# --- mechanisms DDL constraints (§9 #5) ---
+
+def test_v1b_mechanisms_table_shape_and_no_prototype_artifacts(tmp_path) -> None:
+    """mechanisms has the §8.2 columns/PK/STRICT and NONE of the dead prototype's shape."""
+    conn = _v1b_conn(tmp_path)
+    try:
+        assert _is_strict(conn, "mechanisms")
+        cols = _columns(conn, "mechanisms")
+        assert set(cols) == {"canonical_name", "authored_name", "source", "created_at"}
+        assert cols["canonical_name"]["pk"] == 1
+        for col in ("canonical_name", "authored_name", "source", "created_at"):
+            assert cols[col]["notnull"] == 1, f"{col} should be NOT NULL"
+        # Negative assertions against the dead ``_init_db`` prototype trap (vision §2/§7):
+        # no ``kind`` column, no ``name``-PK column, no ``node_mechanisms`` junction.
+        assert "kind" not in cols
+        assert "name" not in cols
+        assert not _table_exists(conn, "node_mechanisms")
+        # No CURRENT_TIMESTAMP default — created_at is application-supplied (MI-10).
+        sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='mechanisms';"
+        ).fetchone()[0]
+        assert "CURRENT_TIMESTAMP" not in sql.upper()
+    finally:
+        conn.close()
+
+
+def test_v1b_mechanisms_check_rejects_bad_source(tmp_path) -> None:
+    """A mechanisms row whose source is outside the enum is rejected by the DDL CHECK.
+
+    Proves the CHECK shipped; the writer-tied all-three-values parameterized coverage
+    is Phase 5a's (§6.2 Lesson 13).
+    """
+    conn = _v1b_conn(tmp_path)
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO mechanisms (canonical_name, authored_name, source, created_at) "
+                "VALUES (?, ?, ?, ?);",
+                ("lint:wal", "LINT:wal", "robot", _TS),
+            )
+    finally:
+        conn.close()
+
+
+def test_v1b_mechanisms_accepts_valid_row_and_pk_dedupes(tmp_path) -> None:
+    """A valid mechanisms row commits; a duplicate canonical_name conflicts on the PK."""
+    conn = _v1b_conn(tmp_path)
+    try:
+        conn.execute(
+            "INSERT INTO mechanisms (canonical_name, authored_name, source, created_at) "
+            "VALUES (?, ?, ?, ?);",
+            ("lint:wal", "LINT:wal", "user", _TS),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO mechanisms (canonical_name, authored_name, source, created_at) "
+                "VALUES (?, ?, ?, ?);",
+                ("lint:wal", "lint-wal", "capture_llm", _TS),
+            )
+        assert conn.execute("SELECT COUNT(*) FROM mechanisms;").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+# --- Widening is effective: the rebuild's accept/reject at the raw DDL level (§9 #3) ---
+# 1b verifies the DDL CHECK; Phase 2a owns the store-layer kind_constraint_violation
+# mapping over it (DoD #8b).
+
+def test_v1b_edges_accept_the_four_new_same_kind_types(tmp_path) -> None:
+    """The four new same-kind edge types now insert (decision→decision and OQ→OQ)."""
+    conn = _v1b_conn(tmp_path)
+    try:
+        _insert_node(conn, "d1", kind="decision")
+        _insert_node(conn, "d2", kind="decision")
+        for edge_type in ("amends", "narrows", "depends_on", "contradicts"):
+            _insert_edge(conn, "d1", "decision", "d2", "decision", edge_type=edge_type)
+        # OQ→OQ same-kind also holds for the non-cross types.
+        _insert_node(conn, "q1", kind="open_question")
+        _insert_node(conn, "q2", kind="open_question")
+        _insert_edge(conn, "q1", "open_question", "q2", "open_question", edge_type="narrows")
+        assert conn.execute("SELECT COUNT(*) FROM edges;").fetchone()[0] == 5
+    finally:
+        conn.close()
+
+
+def test_v1b_edges_accept_the_three_cross_kind_shapes(tmp_path) -> None:
+    """The three cross-kind clauses insert: cites any→any, derives_from OQ→D, resolves D→OQ."""
+    conn = _v1b_conn(tmp_path)
+    try:
+        _insert_node(conn, "d1", kind="decision")
+        _insert_node(conn, "q1", kind="open_question")
+        # cites is any→any: exercise a cross-kind direction the v1 CHECK forbade.
+        _insert_edge(conn, "d1", "decision", "q1", "open_question", edge_type="cites")
+        # derives_from is OQ→D only.
+        _insert_edge(conn, "q1", "open_question", "d1", "decision", edge_type="derives_from")
+        # resolves is D→OQ only.
+        _insert_edge(conn, "d1", "decision", "q1", "open_question", edge_type="resolves")
+        assert conn.execute("SELECT COUNT(*) FROM edges;").fetchone()[0] == 3
+    finally:
+        conn.close()
+
+
+def test_v1b_edges_reject_bogus_type_and_kind_violations(tmp_path) -> None:
+    """An unknown edge_type and kind-violating cross-kind shapes are still rejected."""
+    conn = _v1b_conn(tmp_path)
+    try:
+        _insert_node(conn, "d1", kind="decision")
+        _insert_node(conn, "d2", kind="decision")
+        _insert_node(conn, "q1", kind="open_question")
+        # Unknown edge_type — no clause admits it.
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_edge(conn, "d1", "decision", "d2", "decision", edge_type="bogus")
+        # resolves is D→OQ only: a D→D resolves is kind-violating (the canonical #8b case).
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_edge(conn, "d1", "decision", "d2", "decision", edge_type="resolves")
+        # derives_from is OQ→D only: the reverse D→OQ is rejected.
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_edge(conn, "d1", "decision", "q1", "open_question", edge_type="derives_from")
+        # A same-kind-only type across kinds (amends D→OQ) is rejected.
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_edge(conn, "d1", "decision", "q1", "open_question", edge_type="amends")
+        assert conn.execute("SELECT COUNT(*) FROM edges;").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+# --- Faithfulness — DoD #8a (R13): every edge row survives the rebuild (§9 #2) ---
+
+def test_v1b_edges_rebuild_preserves_every_row_incl_archived_entry(tmp_path) -> None:
+    """The widening carries forward every edge row — incl. one on an 'archived' entry (R13).
+
+    Seed a v1 graph with a spread of kill-edges (the only v1-legal types), including an
+    edge whose target is an otherwise-untouched node standing in for an already-archived
+    entry NOT re-derivable from the buffer (DoD #8a). Apply step 2 and assert the full
+    edge set survives byte-for-byte, the count is unchanged, and ``foreign_key_check`` is
+    clean.
+    """
+    conn = _v1_conn(tmp_path)  # at head 1 — seed under the narrow v1 schema
+    try:
+        for node_id, kind in (
+            ("d_archived", "decision"),
+            ("d_live", "decision"),
+            ("d_two", "decision"),
+            ("q_root", "open_question"),
+            ("q_child", "open_question"),
+        ):
+            _insert_node(conn, node_id, kind=kind)
+        # A spread of v1 kill-edges, incl. one TARGETING the archived entry.
+        _insert_edge(conn, "d_live", "decision", "d_archived", "decision", edge_type="supersedes")
+        _insert_edge(conn, "d_two", "decision", "d_live", "decision", edge_type="corrects")
+        _insert_edge(conn, "q_child", "open_question", "q_root", "open_question", edge_type="supersedes")
+
+        select_all = (
+            "SELECT source_id, source_kind, target_id, target_kind, edge_type, created_at "
+            "FROM edges ORDER BY source_id, target_id, edge_type;"
+        )
+        # Materialize as plain tuples (open_connection sets row_factory=Row, which a
+        # literal-tuple membership check below would not match).
+        before_rows = [tuple(r) for r in conn.execute(select_all).fetchall()]
+
+        # Apply step 2 (step 1 is gated — already at version 1).
+        assert run_migrations(conn, steps=_V1B_STEPS) == 2
+
+        after_rows = [tuple(r) for r in conn.execute(select_all).fetchall()]
+        assert len(after_rows) == len(before_rows)  # no silent loss
+        assert after_rows == before_rows  # every column value identical
+        # The archived-entry edge specifically survived.
+        assert (
+            "d_live",
+            "decision",
+            "d_archived",
+            "decision",
+            "supersedes",
+            _TS,
+        ) in after_rows
+        assert conn.execute("PRAGMA foreign_key_check;").fetchall() == []
+    finally:
+        conn.close()
+
+
+# --- MI-3 replay-safety (§9 #4) ---
+
+def test_v1b_full_ladder_replay_is_noop(tmp_path) -> None:
+    """Re-running the full ladder over an at-head v2 DB changes nothing, raises nothing (MI-3)."""
+    conn = _v1_conn(tmp_path)
+    try:
+        _insert_node(conn, "d1", kind="decision")
+        _insert_node(conn, "d2", kind="decision")
+        _insert_edge(conn, "d1", "decision", "d2", "decision", edge_type="supersedes")
+        assert run_migrations(conn, steps=_V1B_STEPS) == 2
+
+        edges_before = conn.execute("SELECT * FROM edges;").fetchall()
+        mech_sql_before = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name='mechanisms';"
+        ).fetchone()[0]
+        edges_sql_before = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name='edges';"
+        ).fetchone()[0]
+
+        assert run_migrations(conn, steps=_V1B_STEPS) == 2  # raises nothing; gate holds
+        assert _user_version(conn) == 2
+        assert conn.execute("SELECT * FROM edges;").fetchall() == edges_before
+        assert (
+            conn.execute("SELECT sql FROM sqlite_master WHERE name='mechanisms';").fetchone()[0]
+            == mech_sql_before
+        )
+        assert (
+            conn.execute("SELECT sql FROM sqlite_master WHERE name='edges';").fetchone()[0]
+            == edges_sql_before
+        )
+    finally:
+        conn.close()
+
+
+def test_v1b_schema_reinvoked_directly_is_noop_via_skip_guard(tmp_path) -> None:
+    """Re-invoking ``_v1b_schema`` against an already-v2 DB is a true no-op (skip-guard, MI-3).
+
+    The version gate skips step 2 on full-ladder replay, so a DIRECT re-invocation is
+    what actually exercises the widened-CHECK skip-guard: the rebuild must NOT run again
+    (no churn, no row loss, no error, no orphan ``edges_new``) when ``edges`` already
+    carries the ``'cites'`` marker.
+    """
+    conn = _v1b_conn(tmp_path)
+    try:
+        _insert_node(conn, "d1", kind="decision")
+        _insert_node(conn, "d2", kind="decision")
+        _insert_edge(conn, "d1", "decision", "d2", "decision", edge_type="amends")
+        edges_before = conn.execute("SELECT * FROM edges;").fetchall()
+        edges_sql_before = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name='edges';"
+        ).fetchone()[0]
+
+        # Direct re-invocation outside the runner — the skip-guard must short-circuit.
+        _v1b_schema(conn)
+
+        assert conn.execute("SELECT * FROM edges;").fetchall() == edges_before
+        assert (
+            conn.execute("SELECT sql FROM sqlite_master WHERE name='edges';").fetchone()[0]
+            == edges_sql_before
+        )
+        assert not _table_exists(conn, "edges_new")  # no stray rebuild table
+    finally:
+        conn.close()

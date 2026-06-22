@@ -20,6 +20,7 @@ from mitos.config import (
     CONFIG_SCHEMA,
     default_collection_name,
 )
+from mitos.migrations import MIGRATION_STEPS, _pending_head
 from mitos.store import GraphStore
 from mitos.errors import DatabaseError
 
@@ -75,11 +76,14 @@ def test_fresh_init_creates_v1a_workspace(tmp_path):
     ):
         assert (tmp_path / rel).exists(), f"missing {rel}"
 
-    # The graph booted via the migration ladder to the V1a head (read the version
-    # programmatically — never hardcode a migration revision).
+    # The graph booted via the migration ladder to the live head (read the version
+    # programmatically — never hardcode a migration revision; the head moves as later
+    # visions append rungs, e.g. V1b's step 2).
     conn = sqlite3.connect(str(tmp_path / ".mitos" / "graph.sqlite"))
     try:
-        assert conn.execute("PRAGMA user_version;").fetchone()[0] == 1
+        assert conn.execute("PRAGMA user_version;").fetchone()[0] == _pending_head(
+            MIGRATION_STEPS
+        )
     finally:
         conn.close()
 
@@ -144,7 +148,10 @@ def test_reinit_idempotent_on_present_files(tmp_path):
 
     conn = sqlite3.connect(str(tmp_path / ".mitos" / "graph.sqlite"))
     try:
-        assert conn.execute("PRAGMA user_version;").fetchone()[0] == 1  # ladder no-op
+        # Ladder no-op on re-init: still at the live head (read programmatically).
+        assert conn.execute("PRAGMA user_version;").fetchone()[0] == _pending_head(
+            MIGRATION_STEPS
+        )
     finally:
         conn.close()
 

@@ -27,6 +27,7 @@ from mitos.migrations import (
     _pending_head,
     _snapshot_path,
     _v1_schema,
+    _v1b_schema,
     restore_from_snapshot,
     run_migrations,
     take_pre_ladder_snapshot,
@@ -281,29 +282,114 @@ def test_snapshot_taken_when_populated_db_has_pending_step(tmp_path) -> None:
         conn.close()
 
 
-def test_real_boot_is_dormant_no_snapshot(tmp_path) -> None:
-    """With the LIVE registry, a populated V1a graph takes no snapshot (dormant).
+def test_real_registry_boot_snapshots_migrates_to_v2_and_retains(tmp_path) -> None:
+    """With the LIVE registry, a populated v1 graph snapshots, migrates to v2, retains it.
 
-    Behavioural proof of the dormant-until-1b contract, keyed off the actual
-    ``MIGRATION_STEPS`` head — no literal: a populated graph seeded at the live head
-    has no pending step, so the precondition ``current < head`` cannot hold and the
-    harness never fires on a real boot. 1b's ``.append((2, _v1b_schema))`` makes
-    ``current < head`` true and flips it live (at which point this dormancy test is
-    1b's to retire — the deliberate tripwire).
+    The flip of 1a's dormancy tripwire: 1b's ``.append((2, _v1b_schema))`` makes the
+    live head 2, so a populated v1 graph now has a pending step. ``_boot_migrations``
+    with the live ``MIGRATION_STEPS`` takes a pre-ladder snapshot, ladders to v2
+    (``mechanisms`` created, ``edges`` widened), every seeded edge survives, a cross-kind
+    shape the v1 CHECK forbade now inserts — and the snapshot is RETAINED on disk (never
+    auto-dropped, the silent-corruption fallback, P5 Ironclad). The head is read
+    dynamically (``_pending_head``), never a literal.
     """
     db_path = str(tmp_path / ".mitos" / "graph.sqlite")
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
-    _seed_v1_db(db_path)  # seeded at user_version 1 == the live ladder head
+    _seed_v1_db(db_path)  # seeded at user_version 1
+
+    conn = open_connection(db_path)
+    pre_version = _user_version(conn)
+    conn.close()
+    snapshot_path = _snapshot_path(db_path, pre_version)
+
+    _boot_migrations(db_path, MIGRATION_STEPS)  # live head 2 — snapshot fires, ladders up
 
     conn = open_connection(db_path)
     try:
-        # The seeded version equals the live head, so there is no pending step.
-        assert _user_version(conn) == _pending_head(MIGRATION_STEPS)
-        result = take_pre_ladder_snapshot(conn, db_path, MIGRATION_STEPS)
-        assert result is None  # dormant: nothing pending at the live head
+        assert _user_version(conn) == _pending_head(MIGRATION_STEPS)  # == 2, dynamic
+        assert _table_exists(conn, "mechanisms")
+        # Every seeded edge survived the rebuild (incl. the archived-entry edge).
+        assert _edge_count(conn) == 1
+        edge = conn.execute(
+            "SELECT source_id, target_id, edge_type FROM edges;"
+        ).fetchone()
+        assert tuple(edge) == ("d_live", "d_archived", "supersedes")
+        # The widened CHECK is live: a cross-kind edge the v1 schema forbade inserts.
+        _insert_node(conn, "q_new", kind="open_question")
+        conn.execute(
+            "INSERT INTO edges "
+            "(source_id, source_kind, target_id, target_kind, edge_type, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?);",
+            ("q_new", "open_question", "d_live", "decision", "derives_from", _TS),
+        )
+        assert _edge_count(conn) == 2
     finally:
         conn.close()
-    assert _snapshot_files(db_path) == []
+
+    # The snapshot is RETAINED and faithful to the pre-migration (v1) graph.
+    assert os.path.exists(snapshot_path)
+    snap = open_connection(snapshot_path, read_only=True)
+    try:
+        assert _user_version(snap) == pre_version  # v1, VACUUM INTO preserved it
+        assert not _table_exists(snap, "mechanisms")  # pre-migration content
+        assert snap.execute("SELECT COUNT(*) FROM edges;").fetchone()[0] == 1
+    finally:
+        snap.close()
+
+
+def test_real_registry_fault_restores_pre_migration_graph(tmp_path) -> None:
+    """A post-rebuild gate failure restores the pre-migration graph (real-registry T15).
+
+    1a proved restore-on-failure with a synthetic sentinel step; this is the
+    real-registry variant exercising the actual ``_v1b_schema``. Boot via
+    ``[(2, _v1b_schema), (3, raising_gate)]``: ``_v1b_schema`` commits the REAL
+    divergence (``mechanisms`` + widened ``edges``, advancing to 2), then the injected
+    gate raises (a simulated post-commit faithfulness-gate failure). Assert the boot
+    re-raises and the live DB is restored to v1 — no ``mechanisms`` table, the narrow
+    CHECK back, every seeded edge present, no half-migrated DB, no orphan sidecars, the
+    snapshot consumed by the restore. (A no-op restore cannot pass: step 2 makes the
+    in-place DB diverge from the snapshot before the gate fails.)
+    """
+    db_path = str(tmp_path / ".mitos" / "graph.sqlite")
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    _seed_v1_db(db_path)
+
+    conn = open_connection(db_path)
+    pre_version = _user_version(conn)
+    conn.close()
+    snapshot_path = _snapshot_path(db_path, pre_version)
+
+    # Step 2 = the real _v1b_schema; step 3 = the post-commit gate that raises. Versions
+    # keyed off the pre-migration version — no literal.
+    steps = [(pre_version + 1, _v1b_schema), (pre_version + 2, _raising_step)]
+    with pytest.raises(RuntimeError, match="boom"):
+        _boot_migrations(db_path, steps)
+
+    # No half-migrated DB / no orphan sidecars — assert BEFORE reopening (a read
+    # connection re-creates a -wal).
+    assert not os.path.exists(db_path + "-wal")
+    assert not os.path.exists(db_path + "-shm")
+    assert not os.path.exists(snapshot_path)  # snapshot consumed by the restore
+
+    conn = open_connection(db_path)
+    try:
+        assert _user_version(conn) == pre_version  # rolled all the way back to v1
+        assert not _table_exists(conn, "mechanisms")  # _v1b_schema's commit undone
+        assert not _table_exists(conn, "half_migrated")  # the gate step never committed
+        assert not _table_exists(conn, "edges_new")  # no orphan rebuild table
+        # The narrow v1 edges CHECK is back (the widened 'cites' marker is gone).
+        edges_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='edges';"
+        ).fetchone()[0]
+        assert "'cites'" not in edges_sql
+        # Every seeded edge survived, including the archived-entry edge (R13).
+        assert _edge_count(conn) == 1
+        edge = conn.execute(
+            "SELECT source_id, target_id, edge_type FROM edges;"
+        ).fetchone()
+        assert tuple(edge) == ("d_live", "d_archived", "supersedes")
+    finally:
+        conn.close()
 
 
 # --- WAL-consistency: VACUUM INTO captures uncheckpointed frames ----------------
