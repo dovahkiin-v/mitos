@@ -24,7 +24,14 @@ from mitos.errors import (
     STORE_CYCLE_VIOLATION,
 )
 from mitos.identity import compute_node_id
-from mitos.migrations import run_migrations, is_pre_v1a_schema
+from mitos.migrations import (
+    MIGRATION_STEPS,
+    MigrationStep,
+    run_migrations,
+    is_pre_v1a_schema,
+    take_pre_ladder_snapshot,
+    restore_from_snapshot,
+)
 from mitos.parser import ParsedEntry
 
 # Module logger for non-failing notices (the warn-defer channel). The store is a
@@ -368,6 +375,56 @@ def open_connection(db_path: str, read_only: bool = False) -> sqlite3.Connection
         raise DatabaseError(f"Failed to connect to SQLite: {str(e)}")
 
 
+def _boot_migrations(
+    db_path: str, steps: List[MigrationStep] = MIGRATION_STEPS
+) -> None:
+    """Boots the migration ladder for a writable store, snapshot-protected.
+
+    The single migration-boot path; ``GraphStore.__init__`` delegates its migration
+    block here. Opens a dedicated write connection, refuses a prototype graph
+    (routing it to the one-time cutover rather than ladder-advancing it into an
+    undiagnosable hybrid, R3/R11), takes a pre-ladder snapshot when a populated
+    graph has a pending step, then runs the ladder. On any failure the connection is
+    closed and the live graph is atomically restored from the snapshot — leaving no
+    half-migrated DB — before the exception propagates; when no snapshot was taken
+    (fresh/empty DB, or no pending step) the failure path simply re-raises. On
+    success the snapshot is left on disk, retained — never auto-dropped (the
+    silent-corruption fallback, P5 Ironclad).
+
+    Args:
+        db_path: Filesystem path to the graph DB to migrate. Read-only stores never
+            reach here (a ``mode=ro`` connection cannot run the ladder's write
+            transaction) — ``__init__`` gates the call on ``not self.read_only``.
+        steps: The step registry to apply and to size the snapshot precondition
+            against. Defaults to the live ``MIGRATION_STEPS``; tests inject synthetic
+            steps to exercise the snapshot/restore path before 1b's real step exists.
+    """
+    conn = open_connection(db_path)
+    snapshot_path: Optional[str] = None
+    try:
+        # Refuse a prototype graph rather than ladder-advance it into an
+        # undiagnosable hybrid (R3/R11) — route it to the §2.1 one-time cutover.
+        # Message unchanged from the pre-1a in-__init__ guard (relocated here).
+        if is_pre_v1a_schema(conn):
+            raise DatabaseError(
+                "This graph predates the V1a schema (a prototype layout "
+                "was detected). Mitos will not migrate it in place. Run "
+                "the one-time cutover to rebuild it into the V1a store."
+            )
+        snapshot_path = take_pre_ladder_snapshot(conn, db_path, steps)
+        run_migrations(conn, steps)
+    except Exception:
+        # Close before restoring: file replacement needs every handle released (and
+        # the orphan-WAL cleared). ``close()`` is idempotent, so the second close in
+        # ``finally`` is a safe no-op.
+        conn.close()
+        if snapshot_path is not None:
+            restore_from_snapshot(db_path, snapshot_path)
+        raise
+    finally:
+        conn.close()
+
+
 class GraphStore:
     """SQLite-backed store managing nodes, edges, signals, and computed state."""
 
@@ -383,27 +440,15 @@ class GraphStore:
             os.makedirs(db_dir, exist_ok=True)
 
         if not self.read_only:
-            # V1a boot (entry-001 flip): the V1a STRICT schema now boots via the
-            # migration ladder (``run_migrations`` -> ``_v1_schema``), not the
-            # prototype ``_init_db``. Read-only stores never migrate (§7 gotcha):
-            # a mode=ro connection cannot run the ladder's write transaction.
-            conn = self._get_connection()
-            try:
-                # Refuse a prototype graph rather than ladder-advance it into an
-                # undiagnosable hybrid (R3/R11). ``is_pre_v1a_schema`` is False for
-                # a fresh/empty DB and for any V1a-or-later DB, True only for a
-                # prototype graph — route it to the §2.1 one-time cutover (whose
-                # tooling ships at Phase 7). The RO "not-ready" status surface is
-                # Phase 6b, not 5a.
-                if is_pre_v1a_schema(conn):
-                    raise DatabaseError(
-                        "This graph predates the V1a schema (a prototype layout "
-                        "was detected). Mitos will not migrate it in place. Run "
-                        "the one-time cutover to rebuild it into the V1a store."
-                    )
-                run_migrations(conn)
-            finally:
-                conn.close()
+            # V1a boot (entry-001 flip): the V1a STRICT schema boots via the
+            # migration ladder, now snapshot-protected for the first populated-schema
+            # migration (Phase 1a — restore-on-failure, retain-on-success). The whole
+            # boot (prototype guard + snapshot + ladder + restore) lives in the
+            # module-level ``_boot_migrations`` so a fault-injection test can drive
+            # snapshot→fail→restore with injected synthetic steps. Read-only stores
+            # never migrate (§7 gotcha): a mode=ro connection cannot run the ladder's
+            # write transaction.
+            _boot_migrations(self.db_path)
 
     def _get_connection(self) -> sqlite3.Connection:
         """Opens a configured connection to this store's database.
