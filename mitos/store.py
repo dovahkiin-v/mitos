@@ -132,6 +132,25 @@ _DEFERRED_EDGE_FIELDS: Tuple[str, ...] = (
 # definition Phase 5d builds its public read methods on.
 _KILL_EDGE_TYPES_SQL: str = "('supersedes', 'corrects')"
 
+# The MUTATION-UNION relationship fields (new→old) the lineage walk traverses and
+# the write-time cycle guard protects: ``supersedes`` (a kill-edge) PLUS the two
+# non-kill mutation edges ``amends`` / ``narrows``. This is a THIRD, distinct set —
+# it cherry-picks ACROSS ``_KILL_EDGE_FIELDS`` and ``_DEFERRED_EDGE_FIELDS`` and is
+# derivable from NEITHER, so do NOT reuse ``_KILL_EDGE_TYPES_SQL``. ``corrects`` (a
+# kill-edge) is deliberately EXCLUDED: it is kept acyclic by the source-active
+# kill-edge guard, and a typo-fix is not semantic evolution — it belongs to the
+# deferred ``get_transcript`` ancestry, not the mutation lineage (M1;
+# ``corrects-excluded-from-mutation-cycle-probe``). The other five non-kill types
+# (``depends_on`` / ``resolves`` / ``contradicts`` / ``derives_from`` / ``cites``)
+# are not lineage edges and never participate in a mutation cycle.
+_MUTATION_EDGE_FIELDS: Tuple[str, ...] = ("supersedes", "amends", "narrows")
+
+# The paired SQL ``IN (...)`` literal single-sourcing the mutation-union
+# ``edge_type`` filter the lineage walk binds — mirrors ``_KILL_EDGE_TYPES_SQL``'s
+# form (a code-internal constant interpolated into the IN clause; no user value is
+# interpolated, so it is P8-safe). Kept in lockstep with ``_MUTATION_EDGE_FIELDS``.
+_MUTATION_EDGE_TYPES_SQL: str = "('supersedes', 'amends', 'narrows')"
+
 # --- Phase 5d read-layer SQL fragments -----------------------------------------
 # These are the ONE shared active-view / derivation definitions every public read
 # method binds, so phrasing can never drift between surfaces (Lesson 14:
@@ -1322,8 +1341,8 @@ class GraphStore:
                     )
 
                 # --- Build the delta --------------------------------------------
-                # ``cascade_affected_scopes`` is FIRST-ORDER as of 5c (V1b adds the
-                # transitive walker, §5.2.4): the union of (i) the committing node's
+                # ``cascade_affected_scopes`` is FIRST-ORDER as of 5c (no V1b
+                # cascade; V4 full-regenerates, §5.2.4): the union of (i) the committing node's
                 # entered/left scopes when its own footprint changed (the 5a
                 # behavior) and (ii) the scopes of the nodes this commit currently
                 # kill-edges, when the outgoing edge set changed — a superseded /
@@ -1332,8 +1351,8 @@ class GraphStore:
                 # POST-reconciliation ``edges`` (the cursor sees 5b's just-written
                 # rows; the read runs well after the seam at line 847). The
                 # resurrection-target gap is deliberate (a DELETEd kill-edge's target
-                # is no longer outgoing → not captured here; V1b's transitive walker
-                # owns it — forward-safe: no live V1a consumer reads this field, only
+                # is no longer outgoing → not captured here; V5 owns the transitive
+                # treatment — forward-safe: no live V1a consumer reads this field, only
                 # ``delta.node_id``). The ``CommitDelta`` field shape is unchanged —
                 # V1b extends the population, never rebuilds the struct. A
                 # byte-identical re-commit trips neither gate -> ``[]``.
@@ -1539,8 +1558,9 @@ class GraphStore:
                 # The "itself superseded" reject is a KILL-EDGE invariant (V1-D6): a
                 # kill-edge mints only from an active source. A non-kill edge (the
                 # seven) mints from any source — a superseded node may still add a
-                # ``Cites:`` (the mutation-cycle concern for amends/narrows is 3a's
-                # write-time reachability probe, not a blanket source-active reject).
+                # ``Cites:`` (the mutation-cycle concern for amends/narrows is the
+                # write-time reachability probe below, not a blanket source-active
+                # reject).
                 if edge_type in _KILL_EDGE_FIELDS and not source_active:
                     failures.append(
                         FailureItem(
@@ -1557,6 +1577,46 @@ class GraphStore:
                         )
                     )
                     continue
+                # --- Write-time mutation-cycle rejection (W8, §4.3) --------------
+                # A net-new mutation edge ``node_id → target`` points new→old, so it
+                # makes ``node_id`` a DESCENDANT of ``target``. It CLOSES a cycle iff
+                # ``target`` already reaches ``node_id`` through the mutation union —
+                # i.e. ``node_id`` is already a mutation ancestor of ``target``. This
+                # is the exact case the source-active kill-edge reject above CANNOT
+                # catch once non-kill edges commit: a live-source ``supersedes`` /
+                # ``amends`` / ``narrows`` looping back through an existing non-kill
+                # ``amends`` / ``narrows`` (which retire nothing, so the active-source
+                # guard never fires). The probe is the SAME walk ``get_lineage``
+                # exposes, with the EXACT-reject reaction (zero false positives: a
+                # convergent DAG only shares reachability, it never makes the target
+                # reach the source). Runs only for the mutation union (Decision 2,
+                # ``corrects`` excluded), only on net-new edges (a retained edge
+                # already passed). The reachability bound inside the walk keeps even a
+                # corrupt existing graph from hanging the hot ``record`` path; the
+                # failure funnels through the same ``CommitError`` raise the other
+                # rejects use (no new code, no new raise site — §5.2.2).
+                if edge_type in _MUTATION_EDGE_FIELDS:
+                    ancestor_ids, _ = self._walk_mutation_lineage(
+                        cursor, target["id"]
+                    )
+                    if node_id in ancestor_ids:
+                        failures.append(
+                            FailureItem(
+                                code=STORE_CYCLE_VIOLATION,
+                                source="store",
+                                message=(
+                                    f"A {edge_type} edge to '{citation}' would close "
+                                    "a mutation cycle: that entry already descends "
+                                    "from this one through the lineage chain "
+                                    "(supersedes/amends/narrows), so the edge would "
+                                    "make the entry its own ancestor."
+                                ),
+                                field=token,
+                                line_start=parsed.line_start,
+                                line_end=parsed.line_end,
+                            )
+                        )
+                        continue
                 try:
                     cursor.execute(
                         "INSERT INTO edges (source_id, source_kind, target_id, "
@@ -1984,6 +2044,164 @@ class GraphStore:
         finally:
             conn.close()
 
+    def _walk_mutation_lineage(
+        self, cursor: sqlite3.Cursor, start_id: str
+    ) -> Tuple[List[str], Optional[str]]:
+        """Walks the transitive mutation-union ancestry outward from ``start_id``.
+
+        The ONE shared walk behind both :meth:`get_lineage` (read) and the
+        write-time cycle-rejection guard in :meth:`_reconcile_edges` (the vision's
+        "one walk, two call-sites", §4.3). Follows ``start_id``'s OUTGOING mutation
+        edges (``supersedes`` ∪ ``amends`` ∪ ``narrows`` — ``_MUTATION_EDGE_FIELDS``;
+        ``corrects`` excluded, Decision 2) transitively: mutation edges point
+        new→old, so an ancestor is an older node a chain of mutations descends from.
+
+        Depth-first with three-colour cycle detection bounds the traversal so it
+        TERMINATES even over a corrupt/out-of-band cyclic graph the supported write
+        path never authors (the graph is a rebuildable SQLite derivative — M7/P6). A
+        back-edge to a node still on the active DFS path (``_GRAY``) is a true cycle;
+        re-reaching a fully-explored node (``_BLACK``) by a second acyclic path — a
+        convergent DAG / diamond — is NOT, so a legitimate diamond raises no false
+        cycle. On a healthy (acyclic) graph — the invariant the write-guard enforces
+        — the walk visits each ancestor exactly once and returns ``cycle_node =
+        None``, so the guard's membership test (``source in ancestor_ids``) is exact
+        with zero false positives.
+
+        Takes a CURSOR rather than opening a connection so the write-guard reads the
+        live transaction's snapshot with no second connection on the hot ``record``
+        path. Each node's outgoing edges are materialised (``fetchall``) before
+        descending, because the single cursor is reused for every hop.
+
+        Args:
+            cursor: An open cursor (the read path's own connection, or the
+                committing transaction's cursor).
+            start_id: The node whose mutation ancestors to walk. Excluded from the
+                result (a node is not its own ancestor).
+
+        Returns:
+            A ``(ancestor_ids, cycle_node)`` tuple. ``ancestor_ids`` is the list of
+            distinct ancestor node ids in first-seen depth-first order (never
+            including ``start_id``). ``cycle_node`` is the id of the node where a
+            cycle closed (the back-edge target), or ``None`` when the reachable
+            mutation subgraph is acyclic; when a cycle is present ``ancestor_ids`` is
+            the partial set walked around the bound (never a hang, never a raise).
+        """
+        _WHITE, _GRAY, _BLACK = 0, 1, 2
+        children_sql = (
+            "SELECT target_id FROM edges WHERE source_id = ? "
+            f"AND edge_type IN {_MUTATION_EDGE_TYPES_SQL}"
+        )
+
+        def _children(node_id: str) -> List[str]:
+            # Materialise before descending — the single cursor is reused per hop.
+            return [
+                row["target_id"]
+                for row in cursor.execute(children_sql, (node_id,)).fetchall()
+            ]
+
+        ancestors: List[str] = []
+        color: Dict[str, int] = {start_id: _GRAY}
+        cycle_node: Optional[str] = None
+        # Iterative DFS — each stack frame is (node, iterator over its children).
+        stack: List[Tuple[str, Any]] = [(start_id, iter(_children(start_id)))]
+        while stack:
+            node, children = stack[-1]
+            descended = False
+            for child in children:
+                state = color.get(child, _WHITE)
+                if state == _GRAY:
+                    # Back-edge to a node still on the active path — a true cycle.
+                    # Record the first one; keep scanning so the rest of the
+                    # reachable set is still collected (the write-guard wants the
+                    # complete ancestor set even over a corrupt graph).
+                    if cycle_node is None:
+                        cycle_node = child
+                    continue
+                if state == _BLACK:
+                    # Already fully explored by another acyclic path — a convergent
+                    # DAG, not a cycle. Skip without re-walking.
+                    continue
+                # _WHITE: a fresh ancestor. ``child`` is never ``start_id`` (it is
+                # _GRAY from the top, so it would have matched the back-edge branch).
+                color[child] = _GRAY
+                ancestors.append(child)
+                stack.append((child, iter(_children(child))))
+                descended = True
+                break
+            if not descended:
+                color[node] = _BLACK
+                stack.pop()
+        return ancestors, cycle_node
+
+    def get_lineage(self, node_id: str) -> List[Dict[str, str]]:
+        """Returns ``node_id``'s transitive mutation ancestors (``supersedes`` ∪ ``amends`` ∪ ``narrows``).
+
+        Walks OUTWARD from ``node_id`` following its outgoing mutation edges
+        (new→old), transitively, via the shared :meth:`_walk_mutation_lineage`.
+        ``corrects`` is deliberately excluded (kept acyclic by V1a's active-source
+        guard, and walked only by the deferred ``get_transcript`` ancestry — M1,
+        Decision 2). The mutation graph is kept acyclic at write time by the guard in
+        :meth:`_reconcile_edges` (the same walk), so on the supported path this
+        returns the full chain.
+
+        Identity only — ``{node_id, slug, kind}`` per ancestor, the SAME thin shape
+        :meth:`get_contradictions` ships — NOT a hydrated/modifier-stamped decision
+        payload (this is an adjacency/lineage lookup, not a decision-read surface;
+        Decision 3). A consumer wanting an ancestor's axiom calls :meth:`get_node`,
+        which stamps.
+
+        Homeostasis bound (P5/P7): on a corrupt/out-of-band cycle the graph never
+        meant to hold (M7/P6 — it is a rebuildable derivative), the walk TRUNCATES at
+        the cycle, emits a loud ``logger.warning`` naming the node, and returns the
+        PARTIAL lineage — it never infinite-loops, never silently truncates, and
+        never aborts the caller (a ``record`` over a corrupt graph still completes).
+
+        Args:
+            node_id: The node whose mutation ancestry to read.
+
+        Returns:
+            One ``{"node_id", "slug", "kind"}`` dict per distinct mutation ancestor,
+            sorted by slug; ``node_id`` itself is never included. Empty when the node
+            has no outgoing mutation edges (or does not exist) — empty is healthy,
+            never an error.
+        """
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            ancestor_ids, cycle_node = self._walk_mutation_lineage(cursor, node_id)
+            if cycle_node is not None:
+                # Loud, non-fatal: the supported write path never authors a mutation
+                # cycle (the write-time reachability guard rejects every cycle-closer),
+                # so this is an out-of-band / corrupt edge. Name the node and surface
+                # the repair path; do NOT raise (the hot ``record`` path stays
+                # crash-safe over a corrupt graph).
+                logger.warning(
+                    "get_lineage: mutation cycle detected while walking lineage of "
+                    "node %s — the cycle closes at node %s. Returning the partial "
+                    "lineage (%d ancestor(s)) walked before the bound fired. The "
+                    "supported write path never authors a mutation cycle; this is an "
+                    "out-of-band or corrupt edge — resync from decisions.md (the "
+                    "authoritative source) to rebuild the derivative graph.",
+                    node_id,
+                    cycle_node,
+                    len(ancestor_ids),
+                )
+            if not ancestor_ids:
+                return []
+            # Hydrate the ancestor ids → identity dicts. ``id`` is the globally-unique
+            # ``nodes`` PK, so each id resolves to exactly one row. The placeholder
+            # string is built from ``?`` only (no value interpolated) and the ids bind
+            # positionally — P8-safe.
+            placeholders = ",".join("?" for _ in ancestor_ids)
+            rows = cursor.execute(
+                "SELECT id AS node_id, slug, kind FROM nodes "
+                f"WHERE id IN ({placeholders}) ORDER BY slug",
+                ancestor_ids,
+            ).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            conn.close()
+
     def get_transcript(self, node_id: str) -> Optional[str]:
         """Returns a node's own committed transcript text, or None.
 
@@ -1997,9 +2215,12 @@ class GraphStore:
         *same* decision, so an ancestor's synthesis still describes it and may be
         borrowed; a ``supersedes`` moves the decision forward, so the predecessor's
         reasoning must NOT be borrowed. The transitive ``corrects``-chain traversal
-        lands with V1b's cascade walker / V5 as first consumer (§5.2.3; ADR
-        ``transcript-ancestry-corrects-only``) — for the V1a direct read the rule
-        holds trivially (a single node's own transcript borrows nothing).
+        lands with V5 as first consumer (V1b ships no transitive ``corrects`` walk —
+        ``get_lineage`` is the mutation-union walk, ``supersedes`` ∪ ``amends`` ∪
+        ``narrows``, a distinct edge set; §5.2.3, ADR
+        ``transcript-ancestry-corrects-only`` / ``get-transcript-deferred-to-v5``) —
+        for the V1a direct read the rule holds trivially (a single node's own
+        transcript borrows nothing).
 
         Args:
             node_id: The node whose transcript to read.
