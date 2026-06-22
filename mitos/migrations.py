@@ -22,8 +22,9 @@ So the registry stays empty and the empty ladder boots clean as a no-op that
 leaves ``user_version`` at 0.
 """
 
+import os
 import sqlite3
-from typing import Callable, List, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from mitos.errors import DatabaseError
 
@@ -371,6 +372,182 @@ def is_pre_v1a_schema(conn: sqlite3.Connection) -> bool:
         is not None
     )
     return (not is_strict) or (not has_casefold)
+
+
+# --- Pre-ladder DB snapshot harness (Phase 1a): binary migration reversal ------
+#
+# The first populated-schema migration (Phase 1b) rewrites a graph that already
+# holds real, irreplaceable rows — including edges on archived entries that are
+# NOT re-derivable from the buffer. The 1b faithfulness gates catch a migration
+# that loses rows *loudly*; they cannot reverse a successful-but-buggy rebuild that
+# drops rows *silently*. So before the ladder runs against a populated graph, take
+# a WAL-consistent snapshot of the DB file: restored on any ladder failure (leaving
+# no half-migrated DB), and RETAINED on success — never auto-dropped-on-pass, the
+# load-bearing anti-requirement (a gate-passing migration can still commit a silent
+# semantic corruption, so destroying the only pre-migration image the instant the
+# gates go green is a wrongful-advance, P5 Ironclad). ADRs:
+# ``v1b-migration-takes-pre-ladder-db-snapshot-as-binary-reversal`` and its amend
+# ``v1b-migration-snapshot-retained-on-success-not-dropped``.
+#
+# The harness ships DORMANT in 1a: the live registry head is 1, so the
+# ``current >= 1 AND current < head`` precondition is unsatisfiable on a real boot
+# until 1b appends ``(2, _v1b_schema)``. It is proven now via injected synthetic
+# steps and first fires on a real boot in 1b — with ZERO further change here,
+# because the precondition keys off ``_pending_head(steps)``, never a hardcoded
+# version. The WAL-sidecar discipline mirrors ``cutover.py``'s idioms but does NOT
+# import them — that would form a ``migrations -> cutover -> store -> migrations``
+# cycle (Decision 5); the ~4-line ``_clear_sidecars`` is re-implemented here.
+
+
+def _pending_head(steps: List[MigrationStep]) -> int:
+    """Returns the highest version in ``steps`` (the ladder head), 0 if empty.
+
+    Keyed off the passed ``steps`` rather than a hardcoded version so the snapshot
+    precondition activates automatically when a later phase appends a rung: 1b's
+    single ``MIGRATION_STEPS.append((2, _v1b_schema))`` flips the harness live with
+    no change here.
+
+    Args:
+        steps: The step registry whose head version to read.
+
+    Returns:
+        The maximum step version, or 0 when ``steps`` is empty.
+    """
+    return max((version for version, _step_fn in steps), default=0)
+
+
+def _snapshot_path(db_path: str, current: int) -> str:
+    """Returns the deterministic pre-ladder snapshot sibling path for ``current``.
+
+    Derived once here so the producer (:func:`take_pre_ladder_snapshot`) and the
+    consumer (:func:`restore_from_snapshot`) cannot drift. The path is a sibling of
+    ``db_path`` (same filesystem → atomic ``os.replace``) keyed by the version
+    migrated *from*, making it deterministic and wall-clock-free (one image per
+    version jump). It is distinct from the cutover's ``.rebuild`` / ``.bak_<ts>``
+    siblings.
+
+    Args:
+        db_path: The live graph DB path.
+        current: The pre-migration ``user_version`` the snapshot captures.
+
+    Returns:
+        The snapshot path, e.g. ``.mitos/graph.sqlite.snapshot_v1``.
+    """
+    return f"{db_path}.snapshot_v{current}"
+
+
+def _clear_sidecars(base_path: str) -> None:
+    """Removes a SQLite database's ``-wal`` / ``-shm`` sidecars, if present.
+
+    Re-implements ``cutover._clear_sidecars``'s idiom (deliberately NOT imported —
+    that would cycle ``migrations -> cutover -> store -> migrations``, Decision 5).
+    Clearing the destination's orphan WAL sidecars *before* a restore is the
+    cutover's hard-won R11 lesson: a stale ``-wal`` mis-applied to the restored file
+    yields ``SQLITE_CORRUPT``. Absent files are a no-op.
+
+    Args:
+        base_path: The database path whose ``-wal`` / ``-shm`` sidecars to clear.
+    """
+    for suffix in ("-wal", "-shm"):
+        try:
+            os.remove(base_path + suffix)
+        except FileNotFoundError:
+            pass
+
+
+def _discard_stale_snapshot(snapshot_path: str) -> None:
+    """Removes a leftover snapshot (+ any orphan sidecars) before a fresh take.
+
+    ``VACUUM INTO`` errors if its target already exists, so a snapshot left by a
+    crashed prior attempt must be cleared first — the boot then self-heals on retry
+    (P5 idempotency). A ``VACUUM INTO`` output carries no sidecars, but a crashed
+    attempt's leftovers might, so all three suffixes are cleared (mirrors
+    ``cutover._discard_stale_aside``). Absent files are a no-op.
+
+    Args:
+        snapshot_path: The snapshot path to discard.
+    """
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            os.remove(snapshot_path + suffix)
+        except FileNotFoundError:
+            pass
+
+
+def take_pre_ladder_snapshot(
+    conn: sqlite3.Connection,
+    db_path: str,
+    steps: List[MigrationStep] = MIGRATION_STEPS,
+) -> Optional[str]:
+    """Takes a WAL-consistent snapshot of ``db_path`` before a pending migration.
+
+    Snapshots **only** when a populated graph (``user_version >= 1``) has a pending
+    ladder step (``current < head(steps)``) — exactly the first populated-schema
+    migration the reversal defends. A fresh/empty DB (version 0) has no rows to
+    lose, and an at-head DB has no pending step; both return ``None`` and write no
+    file, so the common no-op boot copies nothing.
+
+    The snapshot is taken via ``VACUUM INTO``: it reads the connection's committed
+    view — **WAL frames included** — and writes a fresh, self-contained DB with no
+    ``-wal``/``-shm`` sidecars, so there is exactly one consistent file to restore
+    from. A bare ``cp`` of the main DB while a ``-wal`` exists would capture a torn,
+    stale image and silently destroy the guarantee (§9, Decision 1). ``VACUUM INTO``
+    also preserves ``user_version``, so the restored DB is faithful to the
+    pre-migration version.
+
+    Args:
+        conn: The open boot connection (the same one the ladder will run on). At the
+            call site only read-only schema probes have run, so no write transaction
+            is open; a defensive ``commit`` is issued anyway because ``VACUUM``
+            cannot run inside a transaction.
+        db_path: The live graph DB path the snapshot is a sibling of.
+        steps: The step registry whose head decides whether a migration is pending.
+            Defaults to the live ``MIGRATION_STEPS`` (head 1 → dormant until 1b
+            appends step 2); tests inject synthetic steps.
+
+    Returns:
+        The snapshot path if one was taken, else ``None`` (no pending populated
+        migration).
+    """
+    current = _get_user_version(conn)
+    if current < 1 or current >= _pending_head(steps):
+        return None
+    snapshot_path = _snapshot_path(db_path, current)
+    # Self-heal an interrupted prior attempt: VACUUM INTO errors on an existing
+    # target, so discard any stale snapshot first (P5 idempotency).
+    _discard_stale_snapshot(snapshot_path)
+    # VACUUM cannot run inside a transaction. No write txn is open here (only
+    # ``is_pre_v1a_schema``'s reads have run, under Python's deferred isolation), so
+    # this commit is a defensive no-op — cheap insurance before the VACUUM.
+    conn.commit()
+    # The path is code-derived from ``config.db_path`` — never user/LLM input — so
+    # binding it as a parameter satisfies P8 with no carve-out needed.
+    conn.execute("VACUUM INTO ?;", (snapshot_path,))
+    return snapshot_path
+
+
+def restore_from_snapshot(db_path: str, snapshot_path: str) -> None:
+    """Atomically replaces ``db_path`` with the snapshot, clearing orphan WAL first.
+
+    The failure-path reversal: on any ladder error the live graph is rolled back to
+    the pre-migration snapshot, leaving no half-migrated DB. The snapshot is
+    **consumed** — it *becomes* the live DB (``os.replace`` is the cross-platform
+    atomic overwrite, truly atomic because the snapshot is a same-filesystem
+    sibling). Retention is therefore a *success*-path property, not a failure one.
+
+    The destination's ``-wal``/``-shm`` are cleared **before** the replace (the
+    cutover's R11 orphan-WAL guard — a stale ``-wal`` applied to the restored file
+    yields ``SQLITE_CORRUPT``). The snapshot itself (from ``VACUUM INTO``) has none.
+
+    Precondition: every connection to ``db_path`` is closed (the caller closes its
+    boot conn before invoking this).
+
+    Args:
+        db_path: The live graph DB path to restore in place.
+        snapshot_path: The snapshot produced by :func:`take_pre_ladder_snapshot`.
+    """
+    _clear_sidecars(db_path)
+    os.replace(snapshot_path, db_path)
 
 
 # --- V1a live registration (Phase 5a) ------------------------------------------
