@@ -1470,12 +1470,14 @@ def test_5d_modifiers_map_unmodified_absent_and_empty_input(temp_store: GraphSto
 
 
 def test_5d_reserved_modifier_keys_never_populate_in_v1a(temp_store: GraphStore) -> None:
-    """amended_by / narrowed_by are reserved-empty in V1a but stay in MODIFIER_EDGE_KEYS (the seam).
+    """A kill-edge-only modified node carries its kill-pointer key alone — not amends/narrows.
 
-    Only supersedes/corrects edges can exist (the edges CHECK + parser warn-defer),
-    so only superseded_by/corrected_by ever populate. The reserved keys remaining in
-    MODIFIER_EDGE_KEYS is what makes V1b lighting up amends/narrows a one-line change
-    with zero read-surface edits (the C4 FORWARD HAZARD seam).
+    Post-light-up (V1b 2a commit-flip + 2b source-liveness filter) amended_by/narrowed_by
+    DO populate when a live amends/narrows edge points at a node — but here the only edge
+    is a `supersedes` kill-edge, so only superseded_by stamps; the present-tense projection
+    keys stay absent because no amends/narrows edge targets this node. MODIFIER_EDGE_KEYS
+    already carried all four keys in V1a (the seam) — V1b never edited that map; the light-
+    up was the warn-defer→commit flip plus the source-liveness filter, never a key-map edit.
     """
     from mitos.store import MODIFIER_EDGE_KEYS
 
@@ -1492,12 +1494,14 @@ def test_5d_reserved_modifier_keys_never_populate_in_v1a(temp_store: GraphStore)
 
 
 def test_5d_active_surfaces_modifier_empty_seam_ships(temp_store: GraphStore) -> None:
-    """The active view is provably modifier-empty, but every surface still runs the stamp pass.
+    """Every surface runs the stamp pass; a kill-edge-only target stamps on the inactive read.
 
-    An active node has no incoming kill-edge (that IS the anti-join), so active reads
-    carry no modifier keys; an inactive node read via get_decisions(state='superseded')
-    DOES carry its stamped superseded_by — proving the stamping machinery is wired on
-    the surfaces that can return an inactive node (the seam ships; C4 FORWARD HAZARD).
+    Post-light-up the active view is NO LONGER universally modifier-empty — an active node
+    amended by a LIVE amender now carries amended_by (see test_modifier_surfacing). Here the
+    only edge is a `supersedes` kill-edge, which retires its target: the active reads carry
+    no modifier key, while the inactive target read via get_decisions(state='superseded') /
+    get_node(by id) DOES carry its stamped superseded_by — proving the stamp machinery is
+    wired on the surfaces that can return an inactive node (C4 FORWARD HAZARD).
     """
     old = temp_store.commit_parsed_entry(_decision(slug="old", axiom="O."))
     _commit_kill(temp_store, "new", "N.", "supersedes", "old")
