@@ -219,6 +219,24 @@ class GraphStoreProtocol(Protocol):
         """
         ...
 
+    def get_lineage(self, node_id: str) -> List[Dict[str, str]]:
+        """Returns ``node_id``'s transitive mutation ancestors.
+
+        Walks ``node_id``'s outgoing mutation edges (``supersedes`` ∪ ``amends`` ∪
+        ``narrows``; ``corrects`` excluded) transitively, new→old. Identity only,
+        not a hydrated decision payload. On a corrupt/out-of-band cycle: truncate,
+        log a loud diagnostic naming the node, return the partial lineage (never
+        loops, never raises).
+
+        Args:
+            node_id: The node whose mutation ancestry to read.
+
+        Returns:
+            One ``{node_id, slug, kind}`` dict per distinct ancestor, sorted by
+            slug, excluding ``node_id`` itself; ``[]`` when none.
+        """
+        ...
+
     def get_decisions(
         self, scope: Optional[str] = None, state: str = "active"
     ) -> List[Dict[str, Any]]:
