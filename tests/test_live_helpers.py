@@ -14,15 +14,18 @@ import subprocess
 import pytest
 from _pytest.outcomes import Skipped
 
-from mitos.errors import EmbeddingError
+from mitos.errors import EmbeddingError, SynthesisError
 
 import live_helpers
 from live_helpers import (
     EMBED_QUOTA_SKIP_REASON,
+    ENRICHMENT_QUOTA_SKIP_REASON,
     _is_embed_quota_exhausted,
+    _is_enrichment_quota_exhausted,
     _is_stale,
     _parse_semver,
     skip_if_embed_quota_exhausted,
+    skip_if_enrichment_quota_exhausted,
     skip_if_global_mitos_stale,
     skip_on_embed_quota,
 )
@@ -254,3 +257,153 @@ def test_embed_quota_skip_reason_is_loud_and_actionable():
     assert "RESOURCE_EXHAUSTED" in EMBED_QUOTA_SKIP_REASON
     assert "resets daily" in EMBED_QUOTA_SKIP_REASON
     assert "NOT a code defect" in EMBED_QUOTA_SKIP_REASON
+
+
+# ===========================================================================
+# Generative-enrichment-quota probe (Phase r3 / C4) — keyless fakes
+# ===========================================================================
+# The probe must be CI-verifiable (P10 "every fix carries a fixture"; P16) —
+# otherwise it is only ever exercised on Vinga's box under the un-reproducible
+# spent-quota condition. Drive it with a tiny fake client (no ``unittest.mock``,
+# mirroring ``_FakeProvider``); no keys / Qdrant / network. ``run_sync_enrichment``
+# constructs a ``types.GenerateContentConfig`` and (on the healthy path) does
+# ``json.loads(resp.text)`` — both are pure, no network, on the fake path.
+
+
+class _FakeResp:
+    """A stand-in for the genai response object (only ``.text`` is read)."""
+
+    def __init__(self, text):
+        self.text = text
+
+
+class _FakeModels:
+    """``client.models`` stand-in — either raises or returns a fixed response.
+
+    Records whether ``generate_content`` was called so a no-skip path can be
+    distinguished from a short-circuit. The signature accepts the three keyword
+    args ``run_sync_enrichment`` passes (``model``/``contents``/``config``).
+    """
+
+    def __init__(self, raises=None, text=None):
+        self._raises, self._text, self.called = raises, text, False
+
+    def generate_content(self, model, contents, config):
+        self.called = True
+        if self._raises is not None:
+            raise self._raises
+        return _FakeResp(self._text)
+
+
+class _FakeClient:
+    """A ``genai.Client`` stand-in exposing only ``.models.generate_content``."""
+
+    def __init__(self, raises=None, text=None):
+        self.models = _FakeModels(raises=raises, text=text)
+
+
+# A valid JSON body for the healthy path (run_sync_enrichment does json.loads(resp.text)).
+_HEALTHY_JSON = ('{"refined_core_axiom": "x", "refined_mechanisms": [], '
+                 '"refined_scope": [], "suggested_relationships": {}}')
+
+
+# ---------------------------------------------------------------------------
+# _is_enrichment_quota_exhausted — the narrow signature matcher (wider than embed)
+# ---------------------------------------------------------------------------
+
+def test_is_enrichment_quota_exhausted_matches_full_429_payload():
+    msg = (
+        "LLM enrichment call failed: 429 RESOURCE_EXHAUSTED. Quota exceeded for "
+        "metric generate_content_free_tier_requests, limit ..."
+    )
+    assert _is_enrichment_quota_exhausted(SynthesisError(msg)) is True
+
+
+def test_is_enrichment_quota_exhausted_matches_resource_exhausted_only():
+    assert _is_enrichment_quota_exhausted(SynthesisError("RESOURCE_EXHAUSTED")) is True
+
+
+def test_is_enrichment_quota_exhausted_matches_bare_429():
+    assert _is_enrichment_quota_exhausted(SynthesisError("HTTP 429 rate limited")) is True
+
+
+def test_is_enrichment_quota_exhausted_matches_503():
+    # Wider than the embed matcher: the generative model 503s under high demand.
+    assert _is_enrichment_quota_exhausted(SynthesisError("HTTP 503 model overloaded")) is True
+
+
+def test_is_enrichment_quota_exhausted_matches_unavailable():
+    assert _is_enrichment_quota_exhausted(
+        SynthesisError("503 UNAVAILABLE — model experiencing high demand")
+    ) is True
+
+
+def test_is_enrichment_quota_exhausted_rejects_non_quota_error():
+    # Narrowness proof: an auth error and a malformed-JSON error must NOT match.
+    assert _is_enrichment_quota_exhausted(
+        SynthesisError("LLM enrichment call failed: 401 unauthorized")
+    ) is False
+    assert _is_enrichment_quota_exhausted(
+        SynthesisError("LLM enrichment call failed: Expecting value: line 1 column 1")
+    ) is False
+
+
+# ---------------------------------------------------------------------------
+# skip_if_enrichment_quota_exhausted — the active probe (driven with a fake client)
+# ---------------------------------------------------------------------------
+
+def test_enrichment_probe_skips_on_429():
+    client = _FakeClient(raises=Exception(
+        "429 RESOURCE_EXHAUSTED. Quota exceeded for metric "
+        "generate_content_free_tier_requests"
+    ))
+    with pytest.raises(Skipped) as exc_info:
+        skip_if_enrichment_quota_exhausted(client)
+    # Loud, named reason — not a bare/silent skip.
+    assert "RESOURCE_EXHAUSTED" in str(exc_info.value.msg)
+    assert client.models.called is True
+
+
+def test_enrichment_probe_skips_on_503():
+    client = _FakeClient(raises=Exception("503 UNAVAILABLE model overloaded"))
+    with pytest.raises(Skipped):
+        skip_if_enrichment_quota_exhausted(client)
+    assert client.models.called is True
+
+
+def test_enrichment_probe_returns_when_healthy():
+    # A healthy probe (valid JSON, no 429/503) returns → a real shortfall still
+    # reaches the caller's assert (the probe never masks a genuine lost node).
+    client = _FakeClient(text=_HEALTHY_JSON)
+    skip_if_enrichment_quota_exhausted(client)  # no skip raised
+    assert client.models.called is True
+
+
+def test_enrichment_probe_propagates_non_quota_error():
+    # A non-quota SynthesisError (auth) is re-raised, not swallowed into a skip —
+    # a real enrichment bug fails red.
+    client = _FakeClient(raises=Exception("401 unauthorized"))
+    with pytest.raises(SynthesisError):
+        skip_if_enrichment_quota_exhausted(client)
+
+
+def test_enrichment_probe_no_key_returns_without_skip(monkeypatch):
+    # No client + no GEMINI_API_KEY → can't probe → return without skipping (don't
+    # mask the caller's assert). The delenv is load-bearing: a sibling live module's
+    # ``load_live_env()`` may have injected the key into ``os.environ`` at import.
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    skip_if_enrichment_quota_exhausted()  # no arg, no key → returns, no raise
+
+
+# ---------------------------------------------------------------------------
+# ENRICHMENT_QUOTA_SKIP_REASON — the loudness contract
+# ---------------------------------------------------------------------------
+
+def test_enrichment_quota_skip_reason_is_loud_and_actionable():
+    assert "429" in ENRICHMENT_QUOTA_SKIP_REASON
+    assert "503" in ENRICHMENT_QUOTA_SKIP_REASON
+    assert "RESOURCE_EXHAUSTED" in ENRICHMENT_QUOTA_SKIP_REASON
+    assert "resets daily" in ENRICHMENT_QUOTA_SKIP_REASON
+    assert "NOT a code defect" in ENRICHMENT_QUOTA_SKIP_REASON
+    # Names the SEPARATE generative bucket (distinct from the embed quota).
+    assert "generate_content_free_tier_requests" in ENRICHMENT_QUOTA_SKIP_REASON

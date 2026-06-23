@@ -1,13 +1,18 @@
 """Shared robustness helpers for the ``*_live.py`` suites (Phase r2).
 
 The live integration suites make real Gemini/Anthropic calls and exercise the
-real ``mitos`` binary as a subprocess. Two *environmental* (non-code) conditions
+real ``mitos`` binary as a subprocess. Three *environmental* (non-code) conditions
 otherwise paint the suite red and train the team to ignore live-red — which masks
 a real future regression (P10/P16: live-red must stay trustworthy):
 
 1. The Gemini free-tier daily embed quota is spent → ``429 RESOURCE_EXHAUSTED``.
 2. The globally-installed (pipx) ``mitos`` binary lags the source under test, so a
    subprocess test asserting V1b-new behaviour fails cryptically (``0 == 1``).
+3. The Gemini free-tier daily GENERATIVE enrichment quota is spent (a SEPARATE
+   bucket from embed) or the model 503s under high demand → ``cmd_sync`` swallows the
+   wrapped ``SynthesisError`` and skips the entry, so a corruption-rebuild test
+   (m5) reds as a cryptic ``AssertionError`` (fewer than the expected committed
+   decisions), with no ``EmbeddingError`` ever propagating.
 
 These helpers degrade each condition to a **LOUD** ``pytest.skip`` — a named,
 actionable cause, never a silent skip (the invisible-failure class PATTERNS.md
@@ -23,13 +28,17 @@ STORE_REBUILD_QUARANTINE`` at ``tests/test_store.py``.
 """
 
 import contextlib
+import os
 import subprocess
 from typing import Optional, Tuple
 
 import pytest
+from google import genai
 
 from mitos import __version__ as SOURCE_VERSION
-from mitos.errors import EmbeddingError
+from mitos.errors import EmbeddingError, SynthesisError
+from mitos.parser import ParsedEntry
+from mitos.sync import run_sync_enrichment
 
 # Loud, actionable skip reason naming the quota + retry + that it is environmental.
 EMBED_QUOTA_SKIP_REASON = (
@@ -118,6 +127,113 @@ def skip_if_embed_quota_exhausted(embed_provider) -> None:
         embed_provider.get_embedding(
             "mitos r2 live-suite embed-quota probe", is_query=True
         )
+
+
+# ---------------------------------------------------------------------------
+# Generative-enrichment-quota (429/503) robustness
+# ---------------------------------------------------------------------------
+
+# Loud, actionable skip reason — names the GENERATIVE quota, that it is a SEPARATE
+# bucket from embed, environmental, resets daily, and NOT a code defect.
+ENRICHMENT_QUOTA_SKIP_REASON = (
+    "Gemini free-tier GENERATIVE enrichment quota spent / model unavailable "
+    "(429 RESOURCE_EXHAUSTED on generate_content_free_tier_requests, or 503 "
+    "UNAVAILABLE 'model experiencing high demand' on gemini-3.1-flash-lite). A "
+    "SEPARATE bucket from the embed quota (confirmed independent). Environmental, "
+    "resets daily; NOT a code defect (PATTERNS.md). The m5 corruption-rebuild test "
+    "is not exercisable until the generative quota/availability recovers."
+)
+
+
+def _is_enrichment_quota_exhausted(exc: BaseException) -> bool:
+    """Return whether an exception carries the generative-quota / unavailable signature.
+
+    Narrow by design: matches only 429 / 503 / RESOURCE_EXHAUSTED / UNAVAILABLE —
+    the signatures the generative enrichment model raises under a spent quota or a
+    transient outage. Every other ``SynthesisError`` (auth, malformed JSON, network)
+    falls through unchanged and still fails red. ``run_sync_enrichment`` wraps the
+    genai error as ``f"LLM enrichment call failed: {str(e)}"`` and the genai
+    429/503 string carries the signature, so matching ``str(exc)`` is reliable.
+
+    Wider than ``_is_embed_quota_exhausted``'s 429/RESOURCE_EXHAUSTED set because
+    the generative model also 503s under high demand (the Phase-1-boundary flake
+    was a 503 UNAVAILABLE, not a 429); keep the two matchers separate.
+
+    Args:
+        exc: The exception to inspect.
+
+    Returns:
+        True if the exception message names the 429/503/quota/unavailable signature.
+    """
+    msg = str(exc)
+    return (
+        "RESOURCE_EXHAUSTED" in msg
+        or "UNAVAILABLE" in msg
+        or "429" in msg
+        or "503" in msg
+    )
+
+
+def _enrichment_probe_entry() -> ParsedEntry:
+    """Build a minimal decision ParsedEntry to drive the enrichment probe call.
+
+    ``run_sync_enrichment`` reads only ``slug``/``axiom``/``rejected_paths``/
+    ``mechanisms``/``scope``/``context``; the rest default safely on a fresh
+    ``ParsedEntry`` (``mechanisms``/``scope`` MUST stay ``list[str]`` — they are
+    ``','.join``-ed in the prompt).
+
+    Returns:
+        A populated ``ParsedEntry`` suitable for a single enrichment probe call.
+    """
+    pe = ParsedEntry(kind="decision", slug="mitos-r3-enrichment-probe", line_start=1, line_end=1)
+    pe.axiom = "Probe the generative enrichment model for live-quota availability."
+    pe.core_axiom = pe.axiom
+    pe.rejected_paths = "None."
+    pe.mechanisms = ["probe"]
+    pe.scope = ["test"]
+    pe.context = "r3 live-suite enrichment-quota active probe."
+    return pe
+
+
+def skip_if_enrichment_quota_exhausted(genai_client=None) -> None:
+    """Probe the generative enrichment model; skip loudly if its quota is exhausted.
+
+    The swallowed-boundary twin of :func:`skip_if_embed_quota_exhausted`, but against
+    the GENERATIVE enrichment model. m5 calls ``cmd_sync``, which on a 429/503 swallows
+    the wrapped ``SynthesisError`` in its F1 branch (``sync.py:609-626``) and skips the
+    entry — so the failure never reaches the test as an exception; it surfaces only as
+    fewer-than-2 committed decisions (an ``AssertionError`` downstream). Fire this ONLY
+    on that degraded path (``len(active_decisions) < 2``): it exercises the exact
+    production call (``run_sync_enrichment``) and, if the live generative quota is spent,
+    raises a quota-signature ``SynthesisError`` -> loud skip. If the call SUCCEEDS (quota
+    healthy) the shortfall is a real bug -> return -> the caller's assertion fires loudly.
+    Zero extra API cost on the healthy path (gated behind the ``< 2`` check).
+
+    Args:
+        genai_client: A genai client (or a test fake exposing
+            ``models.generate_content``). ``None`` -> construct one from
+            ``GEMINI_API_KEY``; if no key is set, return without skipping (can't probe
+            -> let the caller's assert fire rather than silently mask it).
+
+    Returns:
+        None.
+
+    Raises:
+        Skipped: When the probe raises a quota-signature ``SynthesisError``.
+        SynthesisError: When the probe raises a non-quota ``SynthesisError`` (a real
+            enrichment bug, never silently skipped).
+    """
+    if genai_client is None:
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            return  # no key -> can't probe -> let the caller's assert fire (don't mask)
+        genai_client = genai.Client(api_key=api_key)
+    try:
+        run_sync_enrichment(genai_client, _enrichment_probe_entry(), [])
+    except SynthesisError as exc:
+        if _is_enrichment_quota_exhausted(exc):
+            pytest.skip(ENRICHMENT_QUOTA_SKIP_REASON)
+        raise
 
 
 # ---------------------------------------------------------------------------
