@@ -87,7 +87,7 @@ class GraphStoreProtocol(Protocol):
         """Resolves a slug to matching node IDs via casefold-exact match (V1-D23).
 
         Single-tier ``str.casefold()`` match against ``slug_casefold`` — no fuzzy
-        alias-fallback tier (MI-9; the ``slug_aliases`` subsystem is V1b/MI-2).
+        alias-fallback tier (MI-9); a renamed-away slug is not silently repaired.
 
         Args:
             slug: The slug string to find.

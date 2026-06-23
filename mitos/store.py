@@ -659,10 +659,10 @@ class GraphStore:
         the same Unicode-correct discipline the authoritative commit path
         (``_reconcile_edges``) and ``get_node_by_slug`` already use (MI-9: never SQLite
         ASCII-only ``COLLATE NOCASE`` / ``LOWER``). There is **no** fuzzy alias-fallback
-        tier: V1a mandates single-tier exact match, and the ``slug_aliases`` citation
-        subsystem is a separate V1b feature (MI-2), not this resolver. Returns every node
-        sharing the casefolded slug — a same-slug supersession lineage yields >1 (MI-13);
-        callers own active-view scoping and ambiguity handling.
+        tier: V1a mandates single-tier exact match. A renamed-away slug is not silently
+        repaired — a stale citation breaks loud as ``missing_target`` on the next sync.
+        Returns every node sharing the casefolded slug — a same-slug supersession lineage
+        yields >1 (MI-13); callers own active-view scoping and ambiguity handling.
 
         Args:
             slug: The slug to find (case-insensitive via ``str.casefold()``).
