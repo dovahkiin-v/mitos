@@ -20,6 +20,185 @@ Claude: That breaks the local-first requirement in P10. Let's use SQLite.
 
 <!-- BEGIN ENTRIES — new decisions go directly below this line, newest first -->
 
+### mitos-rebuild-recommits-the-corpus-through-the-current-catalog
+
+**Decided:** Mitos ships a `mitos rebuild` verb as the supported upgrade path: it re-commits the full corpus (decisions.md + the quarterly archives) oldest-first through the CURRENT edge catalog and mechanism registry into a build-aside graph, then atomically swaps it in (the old graph backed up to graph.sqlite.bak_<ts>), so a corpus whose graph was migrated in place — the schema ladder widens the DDL but never re-commits, leaving the new edge types and mechanism registry empty — gains the full catalog without re-authoring. No decisions are ever at risk: the markdown is the source of truth (M7/P6) and the rebuild writes only the aside until the completeness gate passes.
+**Rejected:** Relying on steady-state `mitos sync` to backfill the catalog: REJECTED — it structurally cannot. Sync reads the buffer ALONE (the archives are never re-parsed), and its per-entry idempotency skip short-circuits an unchanged canonical core before `commit_parsed_entry`, so the warn-deferred edges + mechanisms of already-committed nodes never re-reconcile. Empirically a newest-first buffer re-sync committed 7/129 (forward-ref-at-scale); the oldest-first archive+buffer replay commits the whole corpus. Leaving no rebuild path at all (the prior status quo): REJECTED — it strands every in-place-upgraded corpus with an empty catalog and no supported way to populate it.
+**Mechanisms:** mitos-rebuild, cutover, build-aside-swap, oldest-first-replay
+**Scope:** cli, cutover, substrate
+**Context:** Built 2026-06-23 (0.5.0) after the V1b vision-complete review, when dogfooding the refreshed global install revealed the live corpus held the V1b schema on pre-V1b data (0 mechanisms / 0 non-kill edges despite 113 Mechanisms + 41 amends + 56 cites authored in the buffer). A risk-free throwaway replay proved the oldest-first rebuild populates the full catalog (cites 59, amends 41, mechanisms 197). `mitos status` nudges when a rebuild is due. Closes the upgrade-UX gap rollback-no-post-v1a-rebuild-gates-are-sole-defense named.
+**Cites:** rollback-no-post-v1a-rebuild-gates-are-sole-defense
+
+### rebuild-shares-the-cutover-engine-with-per-caller-strict-resilient-policy
+
+**Decided:** `mitos rebuild` and the one-time `cutover` share ONE oldest-first replay engine — a per-entry quarantine + intra-sync fixpoint extracted as the module-level `mitos.replay.commit_quarantine_fixpoint` primitive (steady-state sync's fixpoint becomes a thin wrapper over it) — differing only by a per-caller policy: cutover is STRICT (the first casualty aborts with a CutoverError, because a one-time prototype migration must halt on a genuine corpus defect), rebuild is RESILIENT (casualties ride back on RebuildResult and surface as a guided punch-list, never raised).
+**Rejected:** A separate replay path for rebuild (duplicating the quarantine+fixpoint): REJECTED — single source of truth; the order-independent convergence logic is load-bearing and must not fork. Unifying both verbs as resilient (dropping cutover's abort): REJECTED — it changes cutover's shipped one-time-migration contract (a prototype migration with a real defect must halt, not proceed-and-drop). Abort-on-first for rebuild (cutover's old behaviour): REJECTED — an upgraded corpus with ANY stale citation could then never rebuild (fix-one-abort-again whack-a-mole); the resilient path surfaces ALL casualties in one pass.
+**Mechanisms:** mitos-rebuild, cutover, quarantine-fixpoint, oldest-first-replay
+**Scope:** cutover, sync, substrate
+**Context:** Built 2026-06-23 (0.5.0). The V1b Phase-4b fixpoint was already self-contained (store + an embed callback only), so the lift to `mitos.replay` was faithful and sync's behaviour is preserved (a thin wrapper); cutover's abort-on-first replay was replaced by the shared replay with strict=True. Vinga chose "shared helper, per-caller policy" over a separate path or a full unification.
+**Cites:** v1a-cutover-wipe-and-rebuild
+
+### rebuild-completeness-gate-baselines-the-current-graph-and-refuses-silent-drops
+
+**Decided:** The rebuild completeness gate baselines against the CURRENT (V1a/V1b) graph's active set — not only the prototype, where it previously vacuous-passed — so a `mitos rebuild` that would drop or deactivate a node the live graph holds surfaces it as a shortfall; combined with the per-entry casualty list the swap is REFUSED by default (the live graph untouched) unless --allow-drops, and a refusal prints a per-failure-class remediation guide naming the live successor to re-point a stale citation to. No silent active-set shrinkage (P5/P6).
+**Rejected:** Keeping the gate's vacuous-pass on a non-prototype graph (relying on the quarantine residual + the .bak backup alone): REJECTED — the residual catches entries that fail to COMMIT, but a node that commits yet computes inactive in the rebuild for another reason would slip through; baselining the current graph is the principled no-silent-loss check. Silently dropping casualties and proceeding (recovery via .bak rather than prevention): REJECTED — prevention before the destructive swap is the contract; the markdown stays authoritative and the dropped entries re-enter on the next fixed rebuild.
+**Mechanisms:** mitos-rebuild, completeness-gate, active-view, build-aside-swap
+**Scope:** cutover, cli, substrate
+**Context:** Built 2026-06-23 (0.5.0–0.5.1). Vinga chose to generalize the gate over relying on residual+backup. The 0.5.1 follow-up turned a bare "refused" into a reassuring per-class guide (dangling_edge → re-point to the named active successor; missing_target → fix/remove the citation; --allow-drops the safe escape) so a stranger upgrading is never left stuck. A real run on the dogfood corpus surfaced exactly one casualty (a cites to a since-superseded decision), now fixed.
+**Cites:** v1a-cutover-wipe-and-rebuild
+
+### relationship-fields-comma-separated-multivalued
+
+**Decided:** Mitos relationship fields are comma-separated multi-valued in the format-spec (like Mechanisms: and Scope:): the parser splits on comma and the reconciler commits N edges per field, a lone slug with no comma parses as a 1-element list so existing single-valued usage is unchanged (additive, no migration), and the agentic record API may stay single-slug in v0.1 and widen to lists later with no format change.
+**Rejected:** Pinning the relationship fields single-slug for v0.1: REJECTED. This is a clean P20 (Retrofit Test) fire, both conditions holding:
+- Known future need — the AX dogfood log (the vision-loop's own use of mitos) establishes it: consolidating one architecture flip that invalidated a 4-decision cluster cost 5 records; single-valued `supersedes` repeatedly forces "N records for fewer conceptual changes" (a cleanup record per retired neighbour); multi-`cites` is a recurring ask.
+- Destructive retrofit — widening single→multi later is a C5 format-contract arity change (the field's value contract is re-typed in the format-spec, the parser, and the `ParsedEntry` attribute) on data already in the wild, requiring a P1 deprecation epoch — re-opening the exact two surfaces (format-spec + `_reconcile_edges`) v1b's warn-defer→commit flip is editing now.
+
+Adopting comma-separated now is nearly free and MORE consistent, not less: the parser already comma-splits `Mechanisms:`/`Scope:` (the identical pattern, three lines from the relationship-field handling), committed edges are already N rows per field in the store, and it collapses two conventions (multi-valued tags vs single-valued relations) into one. A lone slug with no comma parses as a 1-element list, so all existing V1a single-valued `Supersedes:`/`Corrects:` usage is unchanged — additive, no migration. YAGNI does not override P20 when both its conditions hold.
+
+Doing the agentic API (record args) as multi NOW: deliberately deferred (NOT rejected). The format/parser/store going multi-valued is the wall that must open now; the `record`/`record_decision` args can keep single-slug in v0.1 and widen to `List[str]` later with no further format change (no wall — YAGNI applies to the API surface).
+**Scope:** format, parser, substrate
+**Context:** Ruled by Vinga in the terminal, 2026-06-22. Surfaced by mitos-pub's AX_FEEDBACK dogfood log — the vision-loop Claude's own real use of mitos for decision work — where the single-valued relationship fields produced a recurring, escalating write-path pain (N cleanup records to retire a cluster; multi-cites asks). A dogfood loop closes here: the feedback that exposed the gap becomes a recorded decision in the very graph it is about.
+
+V1b is pre-implementation, so this is zero-churn: it lands as part of v1b's §2 warn-defer→commit flip, which already commits v1b to rewriting the format-spec relationship-fields section (the stale "in V1a the graph commits the two kill-edges" note). Make the arity a conscious, recorded decision rather than an accidental pin.
+
+Scope split (the P20 wall vs the YAGNI defer): the FORMAT-SPEC + parser + ParsedEntry attrs + store go multi-valued now (the wall — widening later would be a breaking C5 contract change); the agentic record API stays single-slug in v0.1 and widens to lists later for free (no wall).
+
+Two adjacent items noted but NOT part of this decision: (1) the transitive near-dup (get_lineage) suppression should be design-tested against the "retire/refine a whole lineage-cluster" workflow — the sibling-pause, where N decisions amending one root each trip their siblings' similarity, not just the declared target; (2) once these relationship fields commit as real edges, a future prose-vs-graph drift sensor (v0.2 conflict-sensor territory) can diff authored prose ("this amends X") against the committed edges — v1b enables it by committing the edges, does not build it.
+
+
+### forward-ref-convergence-via-intra-sync-fixpoint-retry-loop
+
+**Decided:** Mitos sync converges same-sync cross-file forward references via an intra-sync fixpoint retry loop (retry the per-entry-quarantined set until no further progress, then surface what remains): any acyclic cross-file dependency chain commits in ONE sync, order-independent, while per-entry quarantine stays the floor so malformed entries and genuine cycles still surface loudly after the fixpoint.
+**Rejected:** Quarantine + manual re-sync as the sole convergence (the prior recorded stance): REJECTED. A deep acyclic cross-file chain (OQ→D→OQ→D, where `derives_from` is OQ→D and `resolves` is D→OQ — opposite directions, so no file order satisfies both) takes O(chain-depth) manual re-runs of perfectly valid markdown — a real P3/P5 flow harm on a common authoring pattern (a cluster of open questions plus the decisions that spawn/resolve them, authored together).
+
+Entry-level topological sort: REJECTED — its age-proxy is file position (newest-on-top), nondeterministic on reused mutable slugs (tried and reverted in cutover).
+
+Two-phase all-DELETEs-then-all-INSERTs: REJECTED — breaks V1a's per-entry commit atomicity and the MI-12 crash-safety resting on it.
+
+A file-processing order (decisions before questions, or a node-pass-then-edge-pass split): REJECTED — `derives_from` (OQ→D) and `resolves` (D→OQ) point opposite ways, so no single file order satisfies both; a genuine circular ordering dependency.
+
+The fixpoint loop is the one remedy that is BOTH order-independent AND preserves per-entry atomicity/MI-12 (~4-10 lines), and it distinguishes by construction a transient orderable failure (clears within the sync) from a genuine error (a real 2-node cycle or malformed entry survives the fixpoint and surfaces loudly).
+**Scope:** sync, substrate, store
+**Context:** Ruled by Vinga in the terminal, 2026-06-22 (VINGA_QUESTIONS flag #1). Joint Claude+Gemini recommendation, sharpened this review cycle with the O(chain-depth) proof (the status quo was mis-framed as "rare 2-sync" — it is O(depth) for a deep cross-file chain). V1b is pre-implementation, so the fixpoint loop is built in from the start: zero churn, no reversal of shipped code.
+
+What stays: per-entry quarantine remains the FLOOR (re-stated here, not dropped) — it isolates malformed entries and genuine 2-node cycles, which surface loudly after the fixpoint converges. The oldest-first batch heuristic (steady-state-batch-oldest-first-flow-heuristic-over-quarantine) is KEPT but is now cosmetic (casing/near-dup ordering); it is no longer load-bearing for cross-file correctness, which the fixpoint handles order-independently. Only the prior "no intra-sync retry; re-running sync IS the retry" stance is reversed.
+
+Note: the §4.1 same-sync handle-handoff case this flag previously cited as also collapsing to 1-sync is moot — the slug-alias/handle subsystem is being stripped (see strip-slug-alias-subsystem-renames-break-loud-via-missing-target).
+
+Enactment (batched with the other 2026-06-22 rulings): vision §6.1 cluster 3 (reframe the anti-retry MUST-NOT to the fixpoint loop), DoD #12 (one-sync in-batch convergence for any acyclic chain).
+**Supersedes:** cross-file-forward-ref-per-entry-quarantine-self-heal
+
+
+### strip-slug-alias-subsystem-renames-break-loud-via-missing-target
+
+**Decided:** Mitos ships no slug-alias citation-rot subsystem (no node_handles table, no Aliases field, no fallback resolution, no union-uniqueness, no backfill): slugs stay mandatory, explicit, capped at 100, and mutable, but a citation to a renamed-away slug breaks loudly as missing_target so the author fixes the markdown, and kernel M2 is amended to drop its slug_aliases old-citations-still-resolve clause.
+**Rejected:** Keeping the slug-alias subsystem (kernel M2 as written): REJECTED. It heals the disposable SQLite graph while leaving stale `Cites: old-name` references in the Gold-Standard markdown — a P6/M7 inversion, where the authoritative source goes internally inconsistent while only the derivative resolves. Its value is narrow: already-committed edges resolve by node-ID and are rename-immune, so only a *newly authored* citation using an *old* name benefits — a case a human fixes with search-replace and an agent self-heals by re-querying for the live slug. And it cost ~17 ADRs of safety machinery (union-uniqueness across all current+historical handles, archived-slug backfill, collision disambiguation, fold/validation parity, handle-aware idempotency skip) — the recurring-amendment "stop patching, ask the redesign question" smell VISION_GUIDANCE names.
+
+Author-time prefix expansion / unique-prefix parse-time resolution: separately REJECTED — a stored prefix that resolves uniquely today turns ambiguous the moment a later unrelated node is minted, manufacturing the very citation-rot the subsystem claimed to prevent.
+
+The enforcer instead is the existing `missing_target` quarantine, which keeps the markdown truthful by construction: a stale citation breaks loudly and the author updates the source. Deprecating a name while preserving history is a `supersedes` deletion decision (M1), not an alias.
+**Scope:** identity, substrate, store
+**Context:** Ruled by Vinga in the terminal, 2026-06-22. Origin: Gemini's high-altitude saboteur strike during the V1b vision review; Claude concurred on the merits. V1b is pre-implementation (V1a completed; node_handles was never built), so the strip is zero-churn — it removes un-built scope, not shipped code. Q5 (slug-removed-from-canonical-core-hash) stands unchanged: slugs remain mutable handles out of the identity hash.
+
+This decision RETIRES the entire slug-alias / node_handles ADR cluster (all now moot): slug-alias-union-strict-casefold-uniqueness, slug-uniqueness-spans-all-node-slugs-not-just-active, aliases-corpus-authored-via-aliases-field, node-handles-single-table-structural-union-uniqueness, node-handles-fold-matches-slug-casefold-exactly, node-handles-validation-matches-slug-write-side, node-handles-legality-parity-v1b-established-not-inherited, node-handles-migration-backfills-archived-slugs, node-handles-backfill-collision-warned-disambiguation-not-dead-end, node-handles-backfill-forecloses-insert-or-ignore, node-handles-insert-is-same-node-idempotent-not-blind-conflict, node-handles-same-node-idempotency-is-the-recompute-delete, node-handles-recomputed-per-parsed-entry-removed-handles-dropped, idempotency-skip-includes-handle-inputs-not-hash-only, archived-slug-reclamation-is-explicit-valve-not-uniqueness, prefix-matching-is-author-time-expansion-not-parse-time.
+
+Two related ADRs are only PARTIALLY affected and are NOT retired: per-entry-quarantine-isolates-whole-commit-error-class still governs the non-alias rejection codes (missing_target, mutation-cycle, kind_constraint_violation, dangling_edge); nodes-slug-guard-kept-as-core-table-defense-in-depth-not-dropped reverts to V1a's active-only slug uniqueness (the all-node tightening was an alias-subsystem consequence).
+
+Follow-up enactment: amend FRAMEWORK.md kernel M2 (drop the slug_aliases clause); strip the subsystem from the V1b vision (§1, §1.2, §2, §4.1, §6.1 cluster 6, §6.2, §8.2, §9 R14, §10); check ROADMAP for alias references.
+**Supersedes:** node-handles-single-table-structural-union-uniqueness
+
+
+### mechanism-alias-storage-shape-not-prescribed-column-or-table
+
+**Decided:** V1b's deferral of mechanism-alias storage to v0.2 does NOT prescribe its storage shape — v0.2 may add a nullable column OR a relational table (e.g. symmetric to node_handles) once its alias-merge semantics are designed, both additive so P20 still does not fire — because pinning a JSON aliases_json column would prejudge v0.2 toward a model divergent from the relational node_handles namespace before mechanism aliasing's merge semantics (a many-to-one merge whose cross-row-uniqueness needs differ from the handle namespace) are settled.
+**Rejected:** Prescribing the `aliases_json` JSON column — the parent ADR's "v0.2 adds them via a non-destructive ALTER TABLE ADD COLUMN" framing applied to alias storage: rejected because casually naming a JSON column locks v0.2 into a model that breaks the relational uniqueness/JOIN model just established for node_handles (an anti-pattern, P19/Cathedral). Crucially, the P20-does-not-fire deferral argument the parent ADR rests on holds regardless of shape — a CREATE TABLE is equally additive/non-destructive with no lost-data backfill — so the column shape was never load-bearing for the deferral and should not have been pinned.
+
+Prescribing a `mechanism_handles` relational table symmetric to node_handles (the proposed fix this round): rejected as over-specifying in the opposite direction. node_handles is relational SPECIFICALLY because it needs a declarative cross-row UNIQUE to make silent citation capture structurally impossible (OD1, a unique-handle namespace). Mechanism aliasing is a many-to-one MERGE ("LINT:wal -> lint-wal"), and the fold (mechanism_canonical_norm) already unifies the fuzzy cases at registration — so whether v0.2's alias merge even needs cross-row uniqueness is undesigned. Mandating the table guesses v0.2's semantics as much as aliases_json did. The vision should prescribe NEITHER shape; v0.2 picks it when its merge semantics exist.
+**Scope:** mechanisms, store, substrate
+**Context:** Surfaced in V1b vision-review (paired round, 2026-06-21, with Gemini). The vision wove a specific aliases_json JSON column through §1.1/§4.6/§7/§8.2/§10; neutralized to shape-agnostic. Parent ADR deferral reasoning (P20 does not fire) is unchanged and holds for either shape.
+**Amends:** mechanism-registry-defers-aliases-json-and-kind-columns
+
+
+### idempotency-skip-includes-source-as-third-no-op-input
+
+**Decided:** The Mitos per-entry idempotency skip's widened no-op condition must include source as a third out-of-core input alongside the handle set (slug and Aliases) — skipping only when canonical core, handle set, AND source are all unchanged — because the sync-level if-existing short-circuit gates the source_reencounter signal-evaluation pass and the node_handles recompute alike, so a (core-and-handle)-only widening silently skips a same-core/same-handle re-encounter from a different source before source_reencounter can fire, failing DoD #1.
+**Rejected:** A (core ∪ handle)-only widening — the parent ADR's literal scope (handle inputs = slug ∪ Aliases): rejected because `source` is out of BOTH the canonical-core hash (M2/MI-4) and the handle set, so a same-core/same-handle entry re-encountered from a different `source` matches the widened "unchanged" condition and is skipped by the blanket `if existing:` gate before `commit_parsed_entry` runs — so `source_reencounter` never fires and DoD #1 ("re-sync identical entry from a different source → exactly one signal row") silently fails. signals-insert-or-ignore cannot rescue it: the skip prevents the signal INSERT from being attempted at all, upstream of any ON CONFLICT.
+
+Treating the `source_reencounter` short-circuit-bypass and the handle-aware idempotency skip as two independent mechanisms — the prior vision framing carried them as two separate §6.2 bullets with two different mental models (one a per-table-write bypass, one a widened blanket skip): rejected because they gate the SAME sync-level `if existing:` short-circuit (verified in code: perform_sync `continue`-on-existing and record_decision_entry `return "exists"`, both ABOVE commit_parsed_entry). Implemented separately, a planner widens the skip to (core ∪ handle), passes DoD #5's incremental handle-edit gate, and silently regresses DoD #1 — the gap hides behind one green gate while the other breaks.
+**Scope:** identity, store, substrate, sync, signals
+**Context:** Surfaced in V1b vision-review (paired round, 2026-06-21). Verified in sync.py that both write paths blanket-skip above commit_parsed_entry (perform_sync continue-on-existing sync.py:485; record_decision_entry return-exists sync.py:1164). The §6.2 source_reencounter bullet and handle-aware-skip bullet prescribed one short-circuit two ways; this unifies them and adds source as the third no-op input.
+**Amends:** idempotency-skip-includes-handle-inputs-not-hash-only
+
+
+### v1b-migration-snapshot-retained-on-success-not-dropped
+
+**Decided:** The V1b pre-ladder migration snapshot is RETAINED on a successful migration, never auto-dropped-on-pass — restore-on-failure and keep-on-success — so the one-step binary reversal outlives the gate-pass boundary; its cleanup is an explicit user action or a later lifecycle sweep, not an automatic drop.
+**Rejected:** Drop-on-pass (the parent ADR's sub-clause: discard the snapshot once the post-migration faithfulness gates pass): rejected because the gates catch only a DETECTABLY lossy rebuild, while a successful-but-buggy migration can pass every gate and still commit a SILENT semantic corruption no gate covered (e.g. a backfill logic flaw that drops aliases without raising) — exactly the parent ADR's own rejected-path (c) failure mode. Destroying the only pre-migration image the instant the gates go green re-opens that exposure at the worst moment: it is a wrongful-advance (P5 Ironclad — automated recovery never destroys user data on the assumption of its own correctness), and the graph DB is single-digit MB so retention costs effectively nothing. Also rejected: a fixed auto-expiry (drop after N syncs) — the same wrongful-advance in slow motion, since a silent corruption can surface after any interval; cleanup stays explicit, human- or lifecycle-gated.
+**Mechanisms:** sqlite
+**Scope:** schema, store, substrate, sync, migrations
+**Context:** V1b vision review 2026-06-21, Gemini's Saboteur-lens finding (drop-on-pass destroys the only binary escape hatch the instant a silent semantic migration bug would later surface); Claude concurred on P5-Ironclad grounds. mitos surface confirmed no prior decision weighed keep-vs-drop-on-success — the parent recorded drop-on-pass as an unweighed sub-clause. Applied to vision DoD #16 and section 9. Recorded directly in decisions.md because the dogfood graph predates V1a and awaits cutover, so the buffer is the only writable surface this round; the amend edge reconciles on rebuild.
+**Amends:** v1b-migration-takes-pre-ladder-db-snapshot-as-binary-reversal
+
+
+### oq-rotation-deferral-passes-retrofit-test-additive
+
+**Decided:** The V1b deferral of open-question rotation passes the P20 Retrofit Test — condition 2 (destructive retrofit) fails because the only accrued cost is recoverable bloat in an always-read buffer whose later cleanup by rotation is purely additive — so P20 does not fire and the P19 plus P11 deferral governs.
+**Rejected:** P20 forces building OQ rotation into V1b now (the economics-lens review claim that deferral creates a destructive "migrate a massive questions.md" retrofit): rejected — the retrofit is additive, not destructive. questions.md holds parked plus resolved OQs and every reader reads it (nothing lost or hidden); a later rotation moves resolved OQs (computed state, M3) to an archive the same future vision teaches the rebuild to glob, with edges resolving by node identity not file location — so no schema change, no backfill, no consumer rewrite, no data loss. A deferral whose only accrued cost is recoverable bloat with a purely additive cleanup structurally cannot meet P20 condition 2 (destructive retrofit) — the exact inverse of mechanisms.source's genuine lost-if-not-captured hit, which V1b DOES wire now. Also rejected: leaving the deferral justified on P19 plus correctness plus scope alone without an explicit Retrofit Test — the framework forbids a deferral that never runs the test, so the determination is now recorded.
+**Mechanisms:** questions.md
+**Scope:** substrate, sync, store
+**Context:** Raised in the V1b parser-and-store economics-lens vision-review round (2026-06-21) by Gemini, who argued P11/P20 mandate building OQ rotation now. Resolved by explicitly running the Retrofit Test: condition 1 (known future need) holds, condition 2 (destructive retrofit) fails. Hardens the rejected-path of the parent deferral so a future P20-grounded re-litigation bounces off precedent. Vision text updated at section 10 P20 (counter-case) and section 6.1 cluster 3.
+**Amends:** questions-md-persistent-buffer-oq-rotation-deferred
+
+
+### v1b-migration-takes-pre-ladder-db-snapshot-as-binary-reversal
+
+**Decided:** The first populated-schema migration in V1b snapshots the SQLite graph DB file before the in-place ladder runs (restore-on-failure, drop-on-pass), giving the migration a one-step binary reversal independent of the absent post-V1a corpus rebuild.
+**Rejected:** (a) Gates-only with no defined reversal (the recorded rollback-no-post-v1a-rebuild-gates-are-sole-defense stance): rejected because the faithfulness gates PREVENT a lossy migration but are not themselves a REVERSAL, and the framework holds a change is not done until its reversal is defined. (b) Building a re-runnable full-corpus rebuild verb in V1b: already rejected by the parent ADR as substrate/ROADMAP scope; the snapshot is the cheaper third option the parent never weighed, needing no rebuild verb. (c) Relying on the in-place migration transaction alone: it rolls back a crash mid-step but COMMITS a successful-but-buggy rebuild that drops archived edges or handles, so it is no reversal for the failure mode that matters.
+**Mechanisms:** sqlite
+**Scope:** schema, store, substrate, sync, migrations
+**Context:** V1b vision review 2026-06-21 (Claude and Gemini converged). migrations.py runs the ladder in-place (transaction-per-step bumping user_version); only the one-time cutover build-asides. Reuses the cutover build-aside idiom in its lightest form (a file copy). Exact mechanism (file copy vs VACUUM INTO vs SQLite backup API) and retention are the plan call. Pinned as vision DoD #16, verified by fault injection (P10 Provoke the Failure).
+**Amends:** rollback-no-post-v1a-rebuild-gates-are-sole-defense
+
+
+### questions-md-persistent-buffer-oq-rotation-deferred
+
+**Decided:** Mitos V1b ingests questions.md into steady-state sync as a persistent write-buffer (exactly as decisions.md is one today, not per-sync-evacuated) plus the minimal oq_state_view visibility read, and defers per-sync open-question rotation and any open-question archive convention to V3a/V3b/Vision 7, because no OQ archive convention exists today and the post-V1a rebuild reads the OQ buffer alone, so rotating synced OQs out would break P6/M7 rebuild-faithfulness
+**Rejected:** Rotating questions.md on successful sync "exactly as decisions.md does" (the superseded questions-md-rotates-as-write-buffer-with-minimal-oq-visibility): rejected — cutover._load_oq_stream reads only the questions buffer (its own docstring: "no open-question archive convention yet"), the post-V1a rebuild reads the buffer alone (rollback-no-post-v1a-rebuild-gates-are-sole-defense), and decisions.md itself is NOT per-sync-evacuated (rotation is threshold-gated + interactive, V3b, sync.py), so rotating a synced OQ out to a non-existent archive the rebuild cannot read loses it on any wipe-and-rebuild — breaking the exact P6/M7 rebuild-faithfulness the corpus-authored alias subsystem (aliases-corpus-authored-via-aliases-field) is anchored on.
+Forcing per-sync rotation to close the prune-divergence trap: rejected — that divergence is the same accepted no-graph-GC property as decisions.md, swept by Vision 7's Lifecycle Gardener (oq-hygiene-drop-is-lifecycle-gardener-not-forced-decision); the minimal oq_state_view read, not rotation, is what keeps questions.md from being a hand-managed worklist.
+Building an OQ archive + a re-runnable full-corpus rebuild in V1b so rotation is safe: rejected — substrate/ROADMAP scope, not V1b; keeping the OQ in its buffer (which every reader already reads and the user can port) preserves faithfulness with zero new machinery (P19).
+**Scope:** store, substrate, sync
+**Context:** SUPERSEDES questions-md-rotates-as-write-buffer-with-minimal-oq-visibility (the Supersedes edge cannot be authored yet — that prior ADR is still an unsynced buffer entry; add the kill-edge once it is synced). Raised by Gemini in the V1b paired vision round 2026-06-21, verified against cutover.py (_load_oq_stream reads the OQ buffer alone — docstring: 'no open-question archive convention yet'), converged with Claude. Cites aliases-corpus-authored-via-aliases-field, rollback-no-post-v1a-rebuild-gates-are-sole-defense, oq-hygiene-drop-is-lifecycle-gardener-not-forced-decision.
+
+
+### corrects-excluded-from-mutation-cycle-probe
+
+**Decided:** Mitos V1b deliberately excludes corrects from the write-time mutation-cycle probe and from get_lineage's walk, and the exclusion is safe because the mutation family (supersedes/amends/narrows) and the corrects-only transcript family are walked by two disjoint primitives no consumer traverses together, so a corrects-mixed cycle is never walked as a cycle.
+**Rejected:** Extend the write-time mutation-cycle probe (and get_lineage's walk) to include `corrects`, so the whole temporal edge family `supersedes ∪ corrects ∪ amends ∪ narrows` is DAG-checked together (Gemini's V1b finding, flagged CRITICAL, 2026-06-21): rejected. The exclusion is safe because Mitos walks the mutation family and the corrects family with TWO DISJOINT primitives that no consumer ever traverses together: `get_lineage` walks `supersedes ∪ amends ∪ narrows` (the near-dup transitive-suppression and cycle-probe set), while `get_transcript` walks corrects-only (its transitive form deferred to V5). `corrects` is a kill-edge (`_KILL_EDGE_TYPES_SQL`), so V1a's active-source guard — a kill-edge mints only from a non-killed source (store.py source_active check) — already keeps the corrects-only graph acyclic; and the active-view, modifier-stamping, and OQ-Stage-2 reads are single-hop, not recursive walks. Worked example (D1 `corrects` D2, then D2 `amends` D1): the abstract full-family union has a 2-cycle, but `get_lineage(D2) = [D1]` and `get_lineage(D1) = []` because the `corrects` edge is never followed, so no walker loops and computed state stays coherent (D2 inactive, its dead amends-edge does not stamp the still-live D1 via the source-liveness filter). No walker ever traverses a combined `supersedes ∪ corrects ∪ amends ∪ narrows` cycle — the temporal paradox lives only in an abstract union nothing walks.
+
+Merge `corrects` into `get_lineage` so one walk covers the entire temporal family: rejected — it violates the M1 mutation-vs-transcript split [get-lineage-separate-store-primitive-not-get-transcript-overload]: `corrects` are in-buffer typo fixes, not semantic evolution, so folding them into the lineage walk would corrupt the immutable-history reading and change near-dup transitive-suppression semantics, for zero safety gain (the exclusion is already proven safe above).
+**Mechanisms:** get_lineage, get_transcript
+**Scope:** edges, retrieval, store, substrate
+**Context:** V1b vision-review round, 2026-06-21: Gemini's fresh pass re-raised (as CRITICAL) whether corrects belongs in the mutation-cycle-prevention union; this pins why the exclusion is safe so the probe's scope is not re-opened by a future fresh-eyes reviewer.
+**Cites:** get-lineage-carries-loud-homeostasis-cycle-bound
+
+
+### node-handles-backfill-collision-warned-disambiguation-not-dead-end
+
+**Decided:** On the one-time node_handles migration backfill, a pre-existing cross-node casefold-slug collision (legal under V1a active-only slug uniqueness) is disposed by explicit, warned auto-disambiguation of the inactive or archived duplicate handle with a -N suffix (the active node, if any, keeps the bare handle so no live citation re-resolves) rather than a bare loud slug_collision raise that strands the operator, because the colliding nodes are archived with no buffer-edit lever and a transactional migration rollback on the raise would otherwise deadlock V1b adoption; the steady-state same-sync handle-handoff keeps its loud-raise-converge disposition because there both entries are in the buffer and re-sync is a genuine recovery path
+**Rejected:** Bare loud-fail (raise slug_collision and stop, "operator resolves") as the backfill disposition — rejected because the colliding nodes are pre-existing and archived: steady-state sync re-parses the buffer alone and there is no post-V1a full-corpus rebuild (rollback-no-post-v1a-rebuild-gates-are-sole-defense), so the operator has no buffer lever to rename either side, and a transactional migration that rolls back on the raise leaves them unable to reach V1b at all — the framework-forbidden P5/P3 "stranded with no path forward", a migration deadlock. This is the gap the parent ADR's "surface as the loud slug_collision rather than silently swallow" framing missed: it weighed loud-raise only against silent-swallow, never against the warn-and-self-resolve third path.
+
+Silent INSERT OR IGNORE / ON CONFLICT DO NOTHING — already foreclosed by the parent node-handles-backfill-forecloses-insert-or-ignore (it orphans the duplicate handle, the OD1 citation-capture break); explicit auto-disambiguation differs precisely by being loud AND warned, so the OD1 foreclosure stands intact (this ADR amends, not reverses, the parent).
+
+Graph surgery (operator hand-edits nodes.slug in the SQLite graph) as the sanctioned primary escape — rejected as the contract because it is not self-completing and makes the operator edit a derivative store the system tells them is disposable; it remains available as a manual last resort, but is not the disposition.
+
+Extending the steady-state same-sync handle-handoff loud-raise-converge disposition (same-sync-handle-handoff-surfaces-collision-not-batch-ordering) to the backfill — rejected because the two cases differ in exactly the property that matters: in the steady-state handoff both entries are in the buffer and A's relinquish lands this sync so B converges on re-sync (a real recovery path, so P19 fewest-moving-parts rightly prefers loud-raise there), whereas the one-time backfill collides two pre-existing archived nodes with no buffer lever and no convergence path. Auto-disambiguation is therefore scoped to the one-time backfill only and does not touch the steady-state handoff.
+**Scope:** identity, schema, store, substrate, sync
+**Context:** Surfaced in the V1b vision review (2026-06-21, paired round with Gemini, simplification lens). The node_handles all-node backfill (DoD #5, R14, vision §6.2) hits UNIQUE(handle_casefold) on a pre-existing active+inactive (or multi-inactive) casefold-slug duplicate that V1a active-only slug uniqueness legally permits (idx_nodes_slug_casefold is non-unique by design; the mint-time collision check is active-scoped — both verified in shipped code). Vision §4.1's slug_collision remedy ("rename or re-home the citation") assumes a buffer-editable entry, which an archived node is not. Gemini and Claude converged on explicit-warned -N auto-disambiguation of the inactive duplicate as the OD1-safe, deadlock-breaking disposition. Applied to vision §4.1 / §6.2 / R14 / DoD #5.
+**Amends:** node-handles-backfill-forecloses-insert-or-ignore
+**Cites:** same-sync-handle-handoff-surfaces-collision-not-batch-ordering
+
+
 ### rollback-no-post-v1a-rebuild-gates-are-sole-defense
 
 **Decided:** There is no re-runnable post-V1a full-corpus rebuild, so V1b R13 and R14 faithfulness gates are the sole defense for archived-row survival rather than a backstop behind an easy rollback: the P6/M7 wipe-and-rebuild from buffer plus archives is wired only into the one-time prototype cutover (rebuild_and_gate), which no-ops on an already-V1a, absent, or empty graph, while steady-state sync re-reads the buffer alone, so a shipped populated-schema-migration faithfulness bug cannot be recovered by delete-and-resync.
@@ -266,7 +445,7 @@ The structural form is therefore conditionally idempotent: a no-op only when the
 **Scope:** store, substrate, identity, sync, render
 **Context:** V1b parser-and-store vision-loop review escalated Q-Retire-Mechanism to Vinga (it reverses her Q6 manual-round decision and reaches ROADMAP Vision 7 / the ROADMAP text). Vinga ruled for the supersedes-only deletion-decision form in the terminal, 2026-06-20, after walking through the three options and confirming the key point: nothing is deleted — both removed and replaced decisions are retained append-only and droppable from the active view only; option 1 makes removal behave like replacement (a supersession), strictly MORE visible than the marker (which left no successor trace), the only thing given up being the typed removed-vs-replaced distinction, which no consumer needs. Supersedes successor-less-death-via-retired-marker-and-signal. Restores consistency with graph-store-append-only-edge-driven-retirement (retirement is edge-driven only). Applied to vision sections 1, 1.2 (DoD #6 and #7), 3, 4 (honours-list), 4.3 (modifier source-liveness filter), 4.5 (rewritten), 4.5.1, 4.7, 6.2, 7, 8.2, and 10 (M5, P4); and to ROADMAP Vision 7. Recorded directly in decisions.md because the dogfood graph predates V1a and awaits cutover, so the buffer is the only writable surface.
 **Supersedes:** successor-less-death-via-retired-marker-and-signal
-**Cites:** graph-store-append-only-edge-driven-retirement
+**Cites:** graph-store-append-only-nodes-declarative-mirror-edges
 
 
 ### this-should-fail-because-no-slug-is-provided
@@ -1073,7 +1252,7 @@ Wire only the column now and add the format-spec field later at V3a-time: reject
 **Mechanisms:** sqlite, qdrant
 **Scope:** substrate, store, sync, identity
 **Context:** Vinga confirmed 2026-06-15: wiping the derivative graph is fine as long as the actual ADRs are reconstructible from the corpus. Re-hash is safe because edges are slug-declared in the buffer and re-resolve against new ids. The graph-store-append-only-edge-driven-retirement reachability invariant (every active node present in buffer, archives, or a buffer-present kill-edge) IS the pre-wipe completeness check. Stripped DECISION_TRANSCRIPT provenance is an accepted soft loss. Invalidates if the live graph holds active decisions not reconstructible from decisions.md plus archives, which would force a preserving dump-and-restore instead of a clean wipe. Converged with Gemini in vision round 4.
-**Cites:** graph-store-append-only-edge-driven-retirement
+**Cites:** graph-store-append-only-nodes-declarative-mirror-edges
 
 
 ### edge-catalog-reference-table
