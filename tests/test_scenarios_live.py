@@ -258,39 +258,43 @@ def test_scenario_s5_idempotent_re_sync(live_workspace) -> None:
 # ==============================================================================
 # S6 — Open-question lifecycle across sessions
 # ==============================================================================
-@pytest.mark.skip(reason="V1b: OQ parked/resolved lifecycle rides the `resolves` edge "
-                         "(OQ Stage-2), a warn-deferred V1b type. V1a OQ state is the kill-edge "
-                         "anti-join only (active vs retired) — get_node_state never returns "
-                         "parked/resolved, and `resolves` commits no edge. Deferred to V1b (K5/G7).")
 def test_scenario_s6_open_question_lifecycle(live_workspace) -> None:
+    """S6 — an open question's parked → resolved lifecycle across sessions.
+
+    Rewritten for V1b OQ Stage-2: state is read off ``oq_state_view``
+    (``get_open_questions``' ``state``), not the phantom ``compute_all_states``.
+    The OQ's Stage-2 state is computed at query time (M3); the resolving decision
+    reads ``active`` off the kill-edge axis.
+    """
     config, tmpdir = live_workspace
     store = GraphStore(config.db_path)
-    
+
+    def oq_state(slug: str) -> str:
+        for oq in store.get_open_questions():
+            if oq["slug"] == slug:
+                return oq["state"]
+        raise ValueError(f"OQ {slug} not in the active OQ view")
+
     # Session A: park an open question
     oq = ParsedEntry("open_question", "auth-roadblock", 1, 5)
+    oq.topic = "Auth session strategy"
     oq.questions_raised = ["How do we handle sessions?"]
     oq.scope = ["auth"]
-    d_oq = store.commit_parsed_entry(oq)
-    
-    conn = store._get_connection()
-    assert store.compute_all_states(conn)[d_oq.node_id] == "parked"
-    conn.close()
-    
-    # Session B: decision resolves it
+    store.commit_parsed_entry(oq)
+
+    assert oq_state("auth-roadblock") == "parked"
+
+    # Session B: a decision resolves it
     res = ParsedEntry("decision", "resolve-auth", 1, 5)
     res.axiom = "Use stateless JWTs."
     res.rejected_paths = "Sessions."
-    res.resolves = "auth-roadblock"
+    res.resolves = ["auth-roadblock"]
     res.scope = ["auth"]
-    d_res = store.commit_parsed_entry(res)
-    
-    # Verify state changes
-    conn = store._get_connection()
-    states = store.compute_all_states(conn)
-    conn.close()
-    
-    assert states[d_oq.node_id] == "resolved"
-    assert states[d_res.node_id] == "active"
+    store.commit_parsed_entry(res)
+
+    # The OQ now reads resolved; the resolving decision is active (kill-edge axis).
+    assert oq_state("auth-roadblock") == "resolved"
+    assert store.get_node_state(store.get_node_by_slug("resolve-auth")["id"]) == "active"
 
 
 # ==============================================================================

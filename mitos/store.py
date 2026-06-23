@@ -188,6 +188,30 @@ _KILLER_TYPE_SQL: str = (
     f"AND edges.edge_type IN {_KILL_EDGE_TYPES_SQL} LIMIT 1) AS killer_type"
 )
 
+# OQ Stage-2 resolution (V1-D18). An open question is ``resolved`` iff it is the
+# target of ≥1 incoming ``resolves`` edge whose SOURCE decision is STILL ACTIVE.
+# Computed inside the main SELECT (one query, never a per-node lookup — P11), like
+# ``_KILLER_TYPE_SQL`` above. This is the THIRD reader of the one liveness atom
+# ``_KILL_EDGE_TYPES_SQL`` (after ``_ACTIVE_VIEW_PREDICATE`` and
+# ``_modifiers_map``'s source-liveness gate — §6.2, Lesson 4): the inner
+# ``NOT EXISTS`` gates the RESOLVER's liveness (``k.target_id = r.source_id``),
+# never the OQ's own (the OQ's Stage-1 liveness is the outer
+# ``_ACTIVE_VIEW_PREDICATE``). Single-sourced through ``_KILL_EDGE_TYPES_SQL`` +
+# the literal ``'resolves'`` (the only ``resolves`` direction the widened CHECK
+# accepts, D→OQ) — never a re-hand-rolled anti-join, never ``_ACTIVE_VIEW_PREDICATE``
+# verbatim (it binds the UNALIASED ``nodes``; this subquery correlates on the
+# aliased ``r.source_id``, so an f-string of it would bind to nothing — the §4.3
+# alias trap). Interpolated, not bound (P8 carve-out, exactly as the kill-edge
+# anti-joins) — the binding tuple is unchanged. Self-healing falls out for free
+# (M3): kill the resolver and this EXISTS recomputes ``parked`` at the next read.
+_OQ_RESOLVED_SQL: str = (
+    "EXISTS (SELECT 1 FROM edges r "
+    "WHERE r.target_id = nodes.id AND r.edge_type = 'resolves' "
+    "AND NOT EXISTS (SELECT 1 FROM edges k "
+    "WHERE k.target_id = r.source_id "
+    f"AND k.edge_type IN {_KILL_EDGE_TYPES_SQL})) AS is_resolved"
+)
+
 # Indexed scope-membership filter (P11: ``idx_node_scopes_scope`` serves
 # ``scope = ?``, then the PK joins back to ``node_id``). Appended to a read SELECT
 # and bound with a single ``?`` scope value — never an O(N) Python post-filter.
@@ -236,6 +260,25 @@ def _computed_decision_state(killer_type: Optional[str]) -> str:
     if killer_type == "corrects":
         return "corrected"
     return "active"
+
+
+def _computed_oq_state(is_resolved: int) -> str:
+    """Derives an open question's Stage-2 state from its resolver liveness (M3).
+
+    The OQ counterpart to :func:`_computed_decision_state`. Stage-2 state is
+    computed, never stored: an open question with ≥1 incoming ``resolves`` edge
+    from a still-active decision is ``"resolved"``; otherwise it is ``"parked"``.
+    (Stage-1 active-view membership — the kill-edge anti-join — is a separate axis
+    applied as the outer filter; a kill-edged OQ never reaches this helper.)
+
+    Args:
+        is_resolved: The truthy ``is_resolved`` derived column (from
+            ``_OQ_RESOLVED_SQL``) — 1 when an active resolver exists, else 0.
+
+    Returns:
+        The computed Stage-2 state string (``"resolved"`` / ``"parked"``).
+    """
+    return "resolved" if is_resolved else "parked"
 
 
 def compute_hash(
@@ -668,6 +711,9 @@ class GraphStore:
         # Strip the derived helper columns — never part of the reader contract.
         node["is_drifted"] = bool(node.pop("is_drifted", 0))
         node.pop("killer_type", None)
+        # OQ Stage-2 derived column (get_open_questions); a raw 0/1 must never leak
+        # under a reader key. Popped above the kind branch so both kinds stay clean.
+        node.pop("is_resolved", None)
         node["scope"] = list(scopes)
 
         # Pop all the kind-differentiated canonical-core columns so an off-kind
@@ -1881,24 +1927,44 @@ class GraphStore:
             conn.close()
 
     def get_open_questions(self, scope: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Exposes the active-view set of open questions (V1-D18 Stage-1).
+        """Exposes the open-question view with computed Stage-1 + Stage-2 state.
 
-        Applies the SAME kill-edge anti-join as the decision views (an OQ with an
-        incoming ``supersedes`` / ``corrects`` is excluded); there is no ``state``
-        column. Hydrated to the reader-facing OQ shape (``topic`` /
-        ``questions_raised``) and modifier-stamped.
+        This method *is* ``oq_state_view`` — the single OQ read surface every
+        consumer (CLI/MCP visibility verbs, future V4/V5) calls. It applies two
+        independent, query-time axes (M3 — state is computed, never stored):
+
+          - **Stage 1 (active-view membership, V1a):** the SAME kill-edge anti-join
+            as the decision views (``_ACTIVE_VIEW_PREDICATE``) — an OQ with an
+            incoming ``supersedes`` / ``corrects`` (a typo-fix / retirement) is
+            EXCLUDED entirely, exactly as a superseded decision leaves the live set.
+          - **Stage 2 (resolution, V1b):** each surviving OQ is labeled
+            ``state ∈ {parked, resolved}`` (``_OQ_RESOLVED_SQL``): ``resolved`` iff
+            it has ≥1 incoming ``resolves`` edge from a STILL-ACTIVE decision, else
+            ``parked``. Resolution does NOT flow transitively through ``supersedes``
+            (only direct incoming ``resolves`` + their source's liveness are
+            checked), so superseding the resolver without re-declaring ``Resolves:``
+            flips the OQ back to ``parked`` automatically — self-healing for free
+            (§4.5.1). ``resolved`` OQs are RETURNED (``resolves`` is not a kill
+            edge); callers foreground ``parked``.
+
+        Hydrated to the reader-facing OQ shape (``topic`` / ``questions_raised``)
+        and modifier-stamped — so an amended-but-active OQ carries ``amended_by`` /
+        ``narrowed_by`` and never reads as the final word (the 2b chokepoint reaches
+        the OQ surface for free via ``_hydrate_rows``).
 
         Args:
             scope: Optional scope tag; filtered in SQL via the indexed
                 ``node_scopes`` membership join (P11).
 
         Returns:
-            Active open-question node dicts (reader-facing shape).
+            Open-question node dicts (reader-facing shape), each carrying a computed
+            ``state`` (``"parked"`` / ``"resolved"``) plus stamped modifier keys
+            when a later ``amends`` / ``narrows`` has moved on from it.
         """
         conn = self._get_connection()
         try:
             sql = (
-                f"SELECT nodes.*, {_IS_DRIFTED_SQL} FROM nodes "
+                f"SELECT nodes.*, {_IS_DRIFTED_SQL}, {_OQ_RESOLVED_SQL} FROM nodes "
                 f"WHERE nodes.kind = 'open_question' AND {_ACTIVE_VIEW_PREDICATE}"
             )
             params: List[str] = []
@@ -1906,7 +1972,14 @@ class GraphStore:
                 sql += _SCOPE_FILTER_SQL
                 params.append(scope)
             rows = conn.execute(sql, params).fetchall()
-            return self._hydrate_rows(conn, rows)
+            nodes = self._hydrate_rows(conn, rows)
+            # Zip the computed Stage-2 state onto each hydrated node — mirrors
+            # get_decisions' computed_state zip, minus the state_matches filter
+            # (oq_state_view returns ALL Stage-1 survivors labeled; the caller
+            # foregrounds parked). _hydrate_rows preserves row order.
+            for node, row in zip(nodes, rows):
+                node["state"] = _computed_oq_state(row["is_resolved"])
+            return nodes
         finally:
             conn.close()
 

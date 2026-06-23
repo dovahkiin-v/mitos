@@ -71,7 +71,9 @@ def test_surface_decisions_fallback_filtering(mock_get_components: MagicMock) ->
         }
     ]
     
-    # Mock open questions in same scope
+    # Mock open questions in same scope. As of Phase 4c oq_state_view carries the
+    # computed Stage-2 `state` (parked/resolved) the consumer foregrounds — NOT the
+    # never-set `computed_state` the pre-4c skeleton read.
     mock_store.get_open_questions.return_value = [
         {
             "id": "hash-oq",
@@ -79,7 +81,7 @@ def test_surface_decisions_fallback_filtering(mock_get_components: MagicMock) ->
             "questions_raised": ["How does it shard?"],
             "scope": ["db"],
             "park_reason": "needs benchmarking",
-            "computed_state": "parked"
+            "state": "parked"
         }
     ]
     mock_store.get_node_state.return_value = "active"

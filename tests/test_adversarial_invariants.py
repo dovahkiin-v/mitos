@@ -70,34 +70,41 @@ def isolated_workspace() -> Tuple[MitosConfig, str]:
 # ==============================================================================
 # 1. M1/M2/M3 — Deep DAG Immutability & Computed State Cascade Verification
 # ==============================================================================
-@pytest.mark.skip(reason="V1b: this exercises OQ parked/resolved state and the V1-D18 "
-                         "Stage-2 resolves-cascade (an OQ flips parked→resolved→parked as its "
-                         "resolver is superseded). V1a OQ state is the kill-edge anti-join only "
-                         "(no parked/resolved; resolves is a warn-deferred V1b edge). The V1a "
-                         "supersedes-cascade is covered by test_5d_active_decisions_excludes_superseded "
-                         "+ test_supersedes_e2e. Deferred, not silently coerced (K5/G7).")
 def test_invariant_m1_m2_m3_deep_dag_and_cascades(isolated_workspace) -> None:
-    """Tests Axiom Immutability (M1), Multi-byte Stability (M2), and Computed State (M3) under deep cascades.
+    """Tests Axiom Immutability (M1), in-place edge addition (M1 commentary), and
+    Computed State (M3) across the OQ Stage-2 resolution self-healing cascade.
 
-    Constructs a complex, multi-level hierarchy of decisions and open questions:
+    Constructs the decision/open-question hierarchy and drives it through the full
+    Stage-2 lifecycle:
       - Decision A: active.
-      - Decision B: active.
-      - Open Question Q1: parked, resolved by A.
-      - Decision C: active, supersedes A.
-      - Decision D: active, amends C.
-      - Open Question Q2: parked, resolved by B.
-      - Decision E: active, contradicts D (causes drift).
-      
-    Verifies that state transitions (active, superseded, resolved, parked, drifted)
-    propagate correctly and that CommitDelta correctly tracks all cascade changes.
+      - Open Question Q1: parked → resolved by A (an in-place edge addition on A's
+        existing node — same canonical core, so the same id; M1 commentary/edges
+        are mutable in place).
+      - Decision C: active, supersedes A → A inactive → Q1 self-heals back to
+        parked (its resolver is no longer active; V1-D18 Stage-2, §4.5.1).
+
+    Verifies that decision state (active/superseded) and OQ Stage-2 state
+    (parked/resolved) are each computed at query time off the right surface — the
+    helper MUST split: a decision's state lives on ``get_all_nodes``'
+    ``computed_state`` (the kill-edge axis), while an OQ's parked/resolved state
+    lives ONLY on ``get_open_questions``' ``state`` (a resolved OQ still appears in
+    ``get_all_nodes`` reading ``computed_state="active"`` — never parked/resolved).
     """
     config, tmpdir = isolated_workspace
     store = GraphStore(config.db_path)
-    
+
     def get_node_state(slug: str) -> str:
-        nodes = store.get_all_nodes()
-        for n in nodes:
+        # Decisions: kill-edge state (active/superseded/corrected) via get_all_nodes.
+        # OQs: Stage-2 state (parked/resolved) via get_open_questions — get_all_nodes'
+        # computed_state is the kill-edge axis and reads "active" for a resolved OQ,
+        # so the OQ branch must read the dedicated Stage-2 surface instead.
+        for n in store.get_all_nodes():
             if n["slug"] == slug:
+                if n["kind"] == "open_question":
+                    for oq in store.get_open_questions():
+                        if oq["slug"] == slug:
+                            return oq["state"]
+                    raise ValueError(f"OQ {slug} not in the active OQ view")
                 return n["computed_state"]
         raise ValueError(f"Node with slug {slug} not found")
 
@@ -108,55 +115,63 @@ def test_invariant_m1_m2_m3_deep_dag_and_cascades(isolated_workspace) -> None:
     a.scope = ["substrate", "database"]
     a.mechanisms = ["sqlite", "wal-mode"]
     delta_a = store.commit_parsed_entry(a)
-    
+
     assert delta_a.node_id is not None
-    assert delta_a.node_scope == ["substrate", "database"]
+    # node_scope comes back scope-sorted (the store's deterministic contract), not
+    # in authoring order.
+    assert delta_a.node_scope == ["database", "substrate"]
     assert delta_a.self_old_scope == []
-    
+
     # Verify node A is active
     assert get_node_state("decision-a") == "active"
-    
-    # 2. Commit Open Question Q1 (parked, resolved by A)
+
+    # 2. Commit Open Question Q1 (parked)
     q1 = ParsedEntry("open_question", "question-q1", 6, 10)
+    q1.topic = "File lock strategy"
     q1.park_reason = "need to determine file lock strategy"
     q1.questions_raised = ["How do we serialize sync calls?"]
     store.commit_parsed_entry(q1)
-    
+
     # Verify Q1 is parked
     assert get_node_state("question-q1") == "parked"
-    
-    # Now link A to resolve Q1
+
+    # Now re-commit A with a Resolves: edge to Q1. Same canonical core (axiom +
+    # mechanisms unchanged) ⇒ SAME node id (M2 content-hash identity) ⇒ the resolves
+    # edge lands IN PLACE on the existing node (M1: the axiom is immutable, but
+    # commentary/edges are mutable on a matching core), not a new node.
     a_resolves = ParsedEntry("decision", "decision-a", 1, 6)
     a_resolves.axiom = "We use WAL mode SQLite for local storage."
     a_resolves.rejected_paths = "Postgres (too heavy), MongoDB."
     a_resolves.scope = ["substrate", "database"]
     a_resolves.mechanisms = ["sqlite", "wal-mode"]
-    a_resolves.resolves = "question-q1"
-    
+    a_resolves.resolves = ["question-q1"]
+
     delta_a_resolves = store.commit_parsed_entry(a_resolves)
-    # Check cascade affects Q1
-    assert "question-q1" in delta_a_resolves.cascade_affected_scopes or len(delta_a_resolves.cascade_affected_scopes) >= 0
-    
+    # M2: the re-commit is the SAME node (slug-free content-hash identity), edge
+    # added in place — not a fork.
+    assert delta_a_resolves.node_id == delta_a.node_id
+
     # Verify Q1 is resolved and no longer parked
     assert get_node_state("question-q1") == "resolved"
-    
-    # 3. Commit Decision C (supersedes A)
+
+    # 3. Commit Decision C (supersedes A) from a distinct entry
     c = ParsedEntry("decision", "decision-c", 11, 15)
     c.axiom = "We use SQLite in WAL mode with advisory file locking."
     c.rejected_paths = "No locking (leads to write race)."
     c.scope = ["substrate", "locking"]
-    c.supersedes = "decision-a"
-    
-    delta_c = store.commit_parsed_entry(c)
-    
+    c.supersedes = ["decision-a"]
+
+    store.commit_parsed_entry(c)
+
     # Verify A is now superseded (inactive)
     assert get_node_state("decision-a") == "superseded"
-    
+
     # Verify C is active
     assert get_node_state("decision-c") == "active"
-    
-    # Verify Q1 flips back to parked because A (which resolved it) is no longer active!
-    # This is V1-D18 stage-2 dependency resolution cascade!
+
+    # Verify Q1 flips back to parked because A (which resolved it) is no longer
+    # active — V1-D18 Stage-2 self-healing, computed at read time (M3), no cascade
+    # write. Resolution does not flow transitively through supersedes.
     assert get_node_state("question-q1") == "parked"
 
 
