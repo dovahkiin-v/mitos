@@ -329,15 +329,20 @@ def rebuild_and_gate(
     # 4. Bound the embedding seed to the active set. Every commit self-enqueued one
     #    pending_embeddings row (5c), so the queue holds the whole corpus incl. dead
     #    nodes; prune it to the store's own active set (G5 — never a re-encoded
-    #    predicate). Reused as the gate's reconstructed set (step 5).
-    reconstructed_ids = _reconstructed_active_ids(store)
-    _prune_embedding_queue_to_active(aside_db_path, reconstructed_ids)
+    #    predicate).
+    reconstructed_active_ids = _reconstructed_active_ids(store)
+    _prune_embedding_queue_to_active(aside_db_path, reconstructed_active_ids)
 
-    # 5. Completeness gate against the still-live OLD graph (read-only). A shortfall
-    #    is a verdict, never an abort (P6 operator override is 7b's flag; 7a simply
-    #    does not raise).
+    # 5. Completeness gate against the still-live OLD graph (read-only). The gate
+    #    baselines on PRESENCE (every node id in the rebuild, active OR superseded) —
+    #    NOT the active set — so a node the rebuild correctly RETIRES (a supersession
+    #    the stale live graph never saw, the common upgrade case) is not mis-flagged
+    #    as a loss: it is retained-but-inactive, surfaceable (M5), never dropped. Only
+    #    a node ABSENT from the rebuild entirely (a casualty, or removed from the
+    #    corpus) is a genuine shortfall. A shortfall is a verdict, never an abort.
+    reconstructed_all_ids = _reconstructed_all_ids(store)
     missing_cores, reference_active_count = check_reconstruction_completeness(
-        config, reconstructed_ids
+        config, reconstructed_all_ids
     )
 
     # 6. Close the aside store cleanly before returning. Every helper opens and
@@ -350,7 +355,7 @@ def rebuild_and_gate(
         decisions_committed=decisions_committed,
         open_questions_committed=oq_committed,
         reference_active_count=reference_active_count,
-        reconstructed_active_count=len(reconstructed_ids),
+        reconstructed_active_count=len(reconstructed_active_ids),
         missing_cores=missing_cores,
         residual_casualties=residual_casualties,
     )
@@ -743,6 +748,23 @@ def _reconstructed_active_ids(store: GraphStore) -> Set[str]:
     return active
 
 
+def _reconstructed_all_ids(store: GraphStore) -> Set[str]:
+    """Returns EVERY node id in the rebuilt graph (any kind, active or superseded).
+
+    The completeness gate's PRESENCE baseline: a node the rebuild committed but then
+    correctly retired (an incoming kill-edge) is still present here, so it is not a
+    loss — only a node absent from this set was genuinely dropped (a casualty, or
+    removed from the corpus). Reads the store's own ``get_all_nodes`` (G5).
+
+    Args:
+        store: The build-aside store.
+
+    Returns:
+        All node ids in the rebuild (both kinds, every state).
+    """
+    return {node["id"] for node in store.get_all_nodes()}
+
+
 def _prune_embedding_queue_to_active(
     aside_db_path: str, active_ids: Set[str]
 ) -> None:
@@ -792,13 +814,16 @@ def check_reconstruction_completeness(
 ) -> Tuple[List[MissingCore], int]:
     """Proves every active core in the old graph survived into the reconstruction.
 
-    Opens the still-live old graph **read-only** and reads its active-core set
-    under the *same* kill-edge active lens the reconstructed set uses (a
-    derivative-to-derivative regression baseline). Each active old core is
-    recomputed to its slug-free :func:`~mitos.identity.compute_node_id` id and
-    compared against ``reconstructed_ids``; any reference core absent from the
-    rebuild is surfaced as a :class:`MissingCore`. **Never raises** — a shortfall
-    is a verdict the operator may override (P6).
+    Opens the still-live old graph **read-only** and reads its active-core set. Each
+    active old core is recomputed to its slug-free
+    :func:`~mitos.identity.compute_node_id` id and checked for **presence** in
+    ``reconstructed_ids`` (every node the rebuild committed, active OR superseded —
+    NOT only the active set). A reference core **absent** from the rebuild is a
+    genuine loss → :class:`MissingCore`; a core the rebuild committed but then
+    correctly RETIRED (a supersession the stale live graph had not yet seen — the
+    common upgrade case) is present here and is *not* flagged (it is retained-but-
+    inactive, surfaceable per M5, never dropped). **Never raises** — a shortfall is a
+    verdict the operator may override (P6).
 
     The reference baseline depends on the live graph's shape. An **absent** old graph
     means nothing could be lost → vacuous pass. A **prototype** graph is read through
@@ -815,7 +840,8 @@ def check_reconstruction_completeness(
 
     Args:
         config: The active workspace config (``config.db_path`` is the old graph).
-        reconstructed_ids: The rebuilt graph's active node ids (both kinds).
+        reconstructed_ids: EVERY node id present in the rebuilt graph (both kinds,
+            active or superseded) — the presence baseline, not the active set.
 
     Returns:
         ``(missing_cores, reference_active_count)`` — the shortfall offenders (empty

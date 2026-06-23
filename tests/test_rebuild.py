@@ -253,6 +253,36 @@ def test_gate_baselines_against_current_v1b_graph(tmp_path):
     assert [mc.slug for mc in result.missing_cores] == ["beta"]
 
 
+def test_gate_does_not_flag_a_correctly_superseded_node(tmp_path):
+    """A node the rebuild RETIRES (a supersession the stale live graph lacked) is
+    present-but-inactive in the rebuild — retained, surfaceable (M5), not a loss.
+
+    The gate baselines on PRESENCE (rebuild's all-nodes), not the active set, so the
+    common upgrade case — the buffer authors a supersession the stale live graph never
+    synced — is not mis-flagged as a dropped decision.
+    """
+    config = _config(tmp_path)
+    # Stale live graph: only 'old' committed + active (the supersession never synced).
+    live = GraphStore(config.db_path)
+    _commit(live, _decision("old", "Old axiom."))
+    # Buffer: 'old' + a 'newer' that supersedes it.
+    _write(
+        config.decisions_file,
+        _stream(
+            _decision("newer", "Newer axiom.", supersedes="old"),
+            _decision("old", "Old axiom."),
+        ),
+    )
+
+    result = rebuild_and_gate(config, aside_db_path=_aside(config), strict=False)
+
+    # 'old' is active in the stale live graph but SUPERSEDED (present) in the rebuild —
+    # correctly retired, not dropped → no casualty, no shortfall.
+    assert result.residual_casualties == []
+    assert result.gate_passed is True
+    assert result.missing_cores == []
+
+
 # --- the cmd_rebuild verb ------------------------------------------------------
 
 
