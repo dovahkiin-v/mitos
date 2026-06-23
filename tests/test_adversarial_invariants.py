@@ -31,6 +31,8 @@ from mitos.sync import MitosSyncManager
 from mitos.renderer import MitosRenderer
 from mitos.errors import ParseError
 
+from live_helpers import skip_if_enrichment_quota_exhausted
+
 
 # Load live environment keys from .env if present
 def load_live_env() -> None:
@@ -258,7 +260,14 @@ def test_invariant_m5_database_corruption_and_rebuild(isolated_workspace) -> Non
     
     # Verify database has nodes and edges
     store = GraphStore(config.db_path)
-    assert len(store.get_active_decisions()) == 2
+    active = store.get_active_decisions()
+    # Degraded-path active probe (r3/C4): fewer than 2 decisions means the generative
+    # enrichment model may have 429/503'd under auto_accept (sync.py:609-626 silently
+    # skips the entry). Probe it; skip LOUDLY if the quota is spent, else let the assert
+    # fire — a real lost-node regression still reds (the probe succeeds when quota healthy).
+    if len(active) < 2:
+        skip_if_enrichment_quota_exhausted()
+    assert len(active) == 2
     node_d2 = store.get_node_by_slug("d2")
     assert node_d2 is not None
     
@@ -281,6 +290,9 @@ def test_invariant_m5_database_corruption_and_rebuild(isolated_workspace) -> Non
     # 6. Verify that graph has been perfectly and fully restored from decisions.md!
     store_restored = GraphStore(config.db_path)
     active_decisions = store_restored.get_active_decisions()
+    # Degraded-path active probe (r3/C4), post-rebuild twin of the site above.
+    if len(active_decisions) < 2:
+        skip_if_enrichment_quota_exhausted()
     assert len(active_decisions) == 2
     
     d1_restored = store_restored.get_node_by_slug("d1")

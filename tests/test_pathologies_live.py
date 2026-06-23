@@ -8,23 +8,16 @@ rotation modes, pushing test coverage past 1:1 byte-wise ratio.
 import os
 import tempfile
 import shutil
-import sqlite3
 import pytest
 import uuid
-import json
-import time
 import multiprocessing
-from typing import Tuple, List, Dict, Any, Optional
-from unittest.mock import MagicMock, patch
+from typing import Tuple
 
 from mitos.config import MitosConfig
-from mitos.store import GraphStore, ValidationError, DatabaseError
-from mitos.parser import ParsedEntry, parse_decisions_file
+from mitos.store import GraphStore
+from mitos.parser import ParsedEntry
 from mitos.sync import MitosSyncManager
-from mitos.embeddings import GeminiEmbeddingProvider, EmbeddingCache
-from mitos.vector_store import QdrantVectorStore
 from mitos.renderer import MitosRenderer
-from mitos.errors import ParseError
 
 # Force load live environment keys
 def load_live_env() -> None:
