@@ -5,6 +5,7 @@ OD1 runtime parsing constraint: strictly structured, deterministic, and loud
 on any format violation.
 """
 
+import os
 import re
 import string
 import unicodedata
@@ -1140,4 +1141,60 @@ def parse_entry_stream(
             raise ParseError(first.message, ls, le, failure=failure)
 
     return result
+
+
+def read_text_or_none(path: str) -> Optional[str]:
+    """Reads a UTF-8 file, returning ``None`` if it does not exist.
+
+    A missing buffer or archive is a no-op stream, never a crash — an absent
+    ``questions.md`` is the live-corpus reality today, both at the one-time cutover
+    and in steady-state ``mitos sync`` open-question ingestion (V1b Phase 4a).
+
+    Args:
+        path: The file to read.
+
+    Returns:
+        The file text, or ``None`` if the file is absent.
+    """
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as fh:
+        return fh.read()
+
+
+def parse_file_reversed(
+    path: str, kind: str, failures: List[EntryFailure]
+) -> List[ParsedEntry]:
+    """Parses one corpus file in collector mode and reverses it to oldest-first.
+
+    Each corpus file is authored **newest-first** (the ``BEGIN ENTRIES … newest
+    first`` convention), so reversing the parsed list yields oldest-first *within*
+    the file, landing an older in-buffer entry before a newer one that references
+    it. Collector mode (``failures`` supplied) isolates malformed entries into
+    ``failures`` instead of raising, so all defects across all files aggregate
+    before the caller decides to abort.
+
+    This is the **single source** of the newest-first→oldest-first convention,
+    shared by the one-time cutover replay (``cutover.py``) and steady-state
+    ``mitos sync`` ingestion (``sync.py``, Phase 4a) — never replicated inline (two
+    ``reverse`` definitions drift). The oldest-first order is a *flow heuristic*,
+    not a correctness mechanism: its age-proxy is file position, so a
+    convention-violating batch simply falls through to the caller's quarantine /
+    fixpoint, never a wrong commit.
+
+    Args:
+        path: The corpus file to parse (absent → empty stream).
+        kind: ``"decision"`` or ``"open_question"`` (caller-declared, V1-D8).
+        failures: The shared collector for malformed-entry envelopes.
+
+    Returns:
+        The well-formed entries, oldest-first within this file (empty when the
+        file is absent).
+    """
+    text = read_text_or_none(path)
+    if text is None:
+        return []
+    entries = parse_entry_stream(text, kind, source_path=path, failures=failures)
+    entries.reverse()
+    return entries
 

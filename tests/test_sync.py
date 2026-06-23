@@ -330,3 +330,436 @@ def test_sync_auto_heal_sample_block(sync_env: Tuple[MitosConfig, MitosSyncManag
     assert "Real core decision." in content
 
 
+# --------------------------------------------------------------------------- #
+# Phase 4a — questions.md steady-state ingestion + per-entry commit-stage
+# quarantine floor. The quarantine lives in perform_sync ABOVE the commit, so it
+# is driven through perform_sync (mock-key + mocked client just satisfy the
+# decision-enrichment key gate; the OQ branch never calls the client). Node ids
+# are read back from the store, never hardcoded.
+# --------------------------------------------------------------------------- #
+
+_QUESTIONS_HEADER = (
+    "# Open Questions\n"
+    "<!-- BEGIN ENTRIES — new open questions go directly below this line, newest first -->\n\n"
+)
+
+
+def _set_enrichment_passthrough(mock_client: MagicMock) -> None:
+    """Wires the mocked Gemini client to return a UNIQUE refined axiom per call.
+
+    Each decision in the batch is enriched once; a per-call distinct axiom keeps
+    distinct decisions distinct (a fixed axiom would collapse several decisions to
+    one canonical core). ``suggested_relationships`` is empty so the only edges are
+    the authored ones. Open questions skip enrichment entirely, so this is never
+    called for them.
+    """
+    counter = {"n": 0}
+
+    def _gen(*args: object, **kwargs: object) -> MagicMock:
+        counter["n"] += 1
+        resp = MagicMock()
+        resp.text = json.dumps(
+            {
+                "refined_core_axiom": f"Refined axiom number {counter['n']}.",
+                "refined_mechanisms": [],
+                "refined_scope": ["core"],
+                "suggested_relationships": {},
+            }
+        )
+        return resp
+
+    mock_client.return_value.models.generate_content.side_effect = _gen
+
+
+def _append_decision(config: MitosConfig, text: str) -> None:
+    with open(config.decisions_file, "a", encoding="utf-8") as f:
+        f.write(text + "\n")
+
+
+def _write_questions(tmpdir: str, body: str) -> str:
+    path = os.path.join(tmpdir, "questions.md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(_QUESTIONS_HEADER + body)
+    return path
+
+
+_HOST_DECISION = (
+    "## 2026-05-19 — host-decision — Host Decision\n"
+    "**Decided:** Use the host approach.\n"
+    "**Rejected:** The alternatives.\n"
+    "**Scope:** core\n"
+)
+
+
+@patch("google.genai.Client")
+def test_sync_ingests_questions_md_and_commits_derives_from(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """OQ ingestion happy path: both OQ nodes land and an OQ→D derives_from commits.
+
+    Decisions-first ordering (D1) lands the typical Derives-From: forward-ref on the
+    first pass — the host decision commits before the open question that derives
+    from it.
+    """
+    config, manager, tmpdir = sync_env
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+    _set_enrichment_passthrough(mock_client)
+
+    _append_decision(config, _HOST_DECISION)
+    _write_questions(
+        tmpdir,
+        "### oq-one\n\n"
+        "**Topic:** Embedding model selection for v0.2.\n"
+        "**Questions:** Do we pin one model or allow per-project choice?\n\n"
+        "### oq-two\n\n"
+        "**Topic:** Whether the host approach needs revisiting at scale.\n"
+        "**Questions:** Does the host approach hold past 1k nodes?\n"
+        "**Derives-From:** host-decision\n",
+    )
+
+    manager.perform_sync(auto_accept=True)
+
+    store = GraphStore(config.db_path)
+    oqs = store.get_open_questions()
+    assert {q["slug"] for q in oqs} == {"oq-one", "oq-two"}
+
+    host = store.get_node_by_slug("host-decision")
+    assert host is not None
+    oq_two_id = next(q["id"] for q in oqs if q["slug"] == "oq-two")
+
+    derives = [e for e in store.get_edges() if e["edge_type"] == "derives_from"]
+    assert len(derives) == 1
+    assert derives[0]["source_id"] == oq_two_id
+    assert derives[0]["target_id"] == host["id"]
+
+
+@patch("google.genai.Client")
+def test_sync_missing_questions_md_is_healthy(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """An absent questions.md is healthy-empty: no FileNotFoundError, decisions commit."""
+    config, manager, tmpdir = sync_env
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+    _set_enrichment_passthrough(mock_client)
+
+    assert not os.path.exists(os.path.join(tmpdir, "questions.md"))
+    _append_decision(config, _HOST_DECISION)
+
+    # Must not raise.
+    manager.perform_sync(auto_accept=True)
+
+    store = GraphStore(config.db_path)
+    assert store.get_node_by_slug("host-decision") is not None
+    assert store.get_open_questions() == []
+
+
+@patch("google.genai.Client")
+def test_sync_questions_md_file_level_error_bulkheads_from_decisions(
+    mock_client: MagicMock,
+    sync_env: Tuple[MitosConfig, MitosSyncManager, str],
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """File-level bulkhead (D4/P7): a broken questions.md warns + yields zero OQs,
+    while decisions.md still commits.
+
+    questions.md is made a *directory*, so the snapshot copy raises IsADirectoryError
+    (an OSError) — a deterministic file-level failure that is isolated to OQ ingestion.
+    """
+    config, manager, tmpdir = sync_env
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+    _set_enrichment_passthrough(mock_client)
+
+    # A directory at the questions.md path: exists() is True, but shutil.copy raises.
+    os.makedirs(os.path.join(tmpdir, "questions.md"))
+    _append_decision(config, _HOST_DECISION)
+
+    manager.perform_sync(auto_accept=True)
+
+    captured = capsys.readouterr()
+    assert "Could not snapshot questions.md" in captured.out
+
+    store = GraphStore(config.db_path)
+    assert store.get_node_by_slug("host-decision") is not None  # decisions unaffected
+    assert store.get_open_questions() == []  # zero OQ entries, not a crash
+
+
+@patch("google.genai.Client")
+def test_sync_questions_md_undecodable_bytes_bulkheads_from_decisions(
+    mock_client: MagicMock,
+    sync_env: Tuple[MitosConfig, MitosSyncManager, str],
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """File-level bulkhead, parse axis (D4/P7): a questions.md with invalid UTF-8
+    bytes warns + yields zero OQs while decisions.md still commits.
+
+    The snapshot copy is a BINARY copy, so undecodable bytes pass straight through it
+    and only blow up when parse_file_reversed re-reads the snapshot as UTF-8. Without
+    wrapping the OQ read+parse this UnicodeDecodeError would propagate and abort the
+    WHOLE sync (decisions included) — the exact cross-buffer contamination D4 forbids.
+    """
+    config, manager, tmpdir = sync_env
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+    _set_enrichment_passthrough(mock_client)
+
+    # Invalid UTF-8 bytes in questions.md (copies fine as binary, fails utf-8 parse).
+    with open(os.path.join(tmpdir, "questions.md"), "wb") as f:
+        f.write(b"# Open Questions\n<!-- BEGIN ENTRIES -->\n\xff\xfe### oq\n"
+                b"**Topic:** x\n**Questions:** y\n")
+    _append_decision(config, _HOST_DECISION)
+
+    # Must not raise — the OQ buffer fault is isolated.
+    manager.perform_sync(auto_accept=True)
+
+    captured = capsys.readouterr()
+    assert "Could not parse questions.md" in captured.out
+
+    store = GraphStore(config.db_path)
+    assert store.get_node_by_slug("host-decision") is not None  # decisions unaffected
+    assert store.get_open_questions() == []  # zero OQ entries, not a crash
+
+
+@patch("google.genai.Client")
+def test_sync_malformed_decision_entry_does_not_strand_oq(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """Symmetric bulkhead: a malformed DECISION entry is per-entry isolated, and OQ
+    ingestion still proceeds (a defect in one buffer never strands the other)."""
+    config, manager, tmpdir = sync_env
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+    _set_enrichment_passthrough(mock_client)
+
+    # A decision missing the required **Rejected:** field (M5) → collector-isolated.
+    _append_decision(
+        config,
+        "## 2026-05-19 — broken-decision — Broken\n"
+        "**Decided:** This decision omits the required rejected paths.\n",
+    )
+    _write_questions(
+        tmpdir,
+        "### healthy-oq\n\n"
+        "**Topic:** A question that should still ingest.\n"
+        "**Questions:** Does the OQ buffer survive a decision-side parse defect?\n",
+    )
+
+    manager.perform_sync(auto_accept=True)
+
+    store = GraphStore(config.db_path)
+    assert store.get_node_by_slug("broken-decision") is None  # isolated, not committed
+    assert {q["slug"] for q in store.get_open_questions()} == {"healthy-oq"}
+
+
+@patch("google.genai.Client")
+def test_sync_quarantines_forward_ref_missing_target_as_guiding_vector(
+    mock_client: MagicMock,
+    sync_env: Tuple[MitosConfig, MitosSyncManager, str],
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """Whole-class quarantine, axis (a): a forward-ref missing_target isolates as a
+    GUIDING vector, the rest of the batch commits, and the quarantined entry stays in
+    its buffer (not rotated).
+
+    A decision that Resolves: an open question authored in questions.md hits the
+    opposite file order: decisions-first commits the decision before its OQ target,
+    so the resolves edge is a forward-ref → missing_target → quarantine. The OQ itself
+    still commits; the decision converges on a later sync (4b's fixpoint in one).
+    """
+    config, manager, tmpdir = sync_env
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+    _set_enrichment_passthrough(mock_client)
+
+    _append_decision(
+        config,
+        "## 2026-05-19 — resolver-decision — Resolver\n"
+        "**Decided:** This decision answers the open thread.\n"
+        "**Rejected:** Leaving it open.\n"
+        "**Resolves:** oq-target\n",
+    )
+    _write_questions(
+        tmpdir,
+        "### oq-target\n\n"
+        "**Topic:** The open thread the decision resolves.\n"
+        "**Questions:** Which approach do we commit to?\n",
+    )
+
+    manager.perform_sync(auto_accept=True)
+
+    captured = capsys.readouterr()
+    assert "target not committed yet" in captured.out
+    assert "resolver-decision" in captured.out
+
+    store = GraphStore(config.db_path)
+    # The decision is quarantined (not committed); its OQ target DID commit.
+    assert store.get_node_by_slug("resolver-decision") is None
+    assert {q["slug"] for q in store.get_open_questions()} == {"oq-target"}
+
+    # Quarantined entry stays in its buffer (never rotated) for a later sync.
+    with open(config.decisions_file, "r", encoding="utf-8") as f:
+        assert "resolver-decision" in f.read()
+
+
+@patch("google.genai.Client")
+def test_sync_quarantine_isolates_whole_commit_error_class(
+    mock_client: MagicMock,
+    sync_env: Tuple[MitosConfig, MitosSyncManager, str],
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """Whole-class quarantine, axis (b): a kind_constraint_violation ALSO isolates and
+    does NOT abort the sync — proof the catch is the CommitError CLASS, not a
+    missing_target-only filter (P10: a missing_target-only catch would let this abort
+    the whole batch, so the healthy OQ below would not commit).
+    """
+    config, manager, tmpdir = sync_env
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+    _set_enrichment_passthrough(mock_client)
+
+    # Seed an existing DECISION target so the offending edge is a kind violation
+    # (resolves is D→OQ; a resolves D→D is kind_constraint_violation), not a
+    # missing_target.
+    seed = GraphStore(config.db_path)
+    target = ParsedEntry("decision", "target-decision", 1, 5)
+    target.axiom = "A pre-existing decision target."
+    target.rejected_paths = "None."
+    seed.commit_parsed_entry(target)
+
+    _append_decision(
+        config,
+        "## 2026-05-19 — kind-violator — Kind Violator\n"
+        "**Decided:** This decision wrongly resolves another decision.\n"
+        "**Rejected:** Authoring it correctly.\n"
+        "**Resolves:** target-decision\n",
+    )
+    _write_questions(
+        tmpdir,
+        "### survivor-oq\n\n"
+        "**Topic:** An open question that must still commit.\n"
+        "**Questions:** Does one entry's kind violation abort the batch?\n",
+    )
+
+    manager.perform_sync(auto_accept=True)
+
+    captured = capsys.readouterr()
+    assert "kind_constraint_violation" in captured.out
+    assert "kind-violator" in captured.out
+
+    store = GraphStore(config.db_path)
+    assert store.get_node_by_slug("kind-violator") is None  # quarantined
+    # The batch did NOT abort — the healthy OQ committed after the rejected entry.
+    assert {q["slug"] for q in store.get_open_questions()} == {"survivor-oq"}
+
+
+@patch("google.genai.Client")
+def test_sync_open_questions_never_rotate(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """OQ does not rotate (D5): questions.md is byte-unchanged after sync, no archive
+    carries the OQ, while the decision rotates normally."""
+    config, manager, tmpdir = sync_env
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+    _set_enrichment_passthrough(mock_client)
+
+    _append_decision(config, _HOST_DECISION)
+    questions_path = _write_questions(
+        tmpdir,
+        "### persistent-oq\n\n"
+        "**Topic:** A persistent open thread.\n"
+        "**Questions:** Should this OQ ever be rotated out of its buffer?\n",
+    )
+    with open(questions_path, "r", encoding="utf-8") as f:
+        questions_before = f.read()
+
+    manager.perform_sync(auto_accept=True)
+
+    # questions.md is a persistent buffer — byte-for-byte unchanged.
+    with open(questions_path, "r", encoding="utf-8") as f:
+        assert f.read() == questions_before
+
+    store = GraphStore(config.db_path)
+    assert {q["slug"] for q in store.get_open_questions()} == {"persistent-oq"}
+
+    # The decision rotated to archive; the OQ did not appear there.
+    if os.path.isdir(config.archive_dir):
+        for name in os.listdir(config.archive_dir):
+            with open(os.path.join(config.archive_dir, name), "r", encoding="utf-8") as f:
+                archive_text = f.read()
+            assert "persistent-oq" not in archive_text
+            assert "persistent open thread" not in archive_text
+
+
+@patch("google.genai.Client")
+def test_sync_decisions_oldest_first_amend_commits_in_one_sync(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """Decisions oldest-first (D2): a newer entry (authored on top) that Amends: an
+    older in-buffer entry commits in ONE sync — the reversal lands the older entry
+    first, so the amend resolves its target on the first pass."""
+    config, manager, tmpdir = sync_env
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+    _set_enrichment_passthrough(mock_client)
+
+    # Authored newest-first (the buffer convention): newer on top, older below.
+    _append_decision(
+        config,
+        "## 2026-05-20 — newer-decision — Newer\n"
+        "**Decided:** The newer refinement.\n"
+        "**Rejected:** Status quo.\n"
+        "**Amends:** older-decision\n\n"
+        "## 2026-05-19 — older-decision — Older\n"
+        "**Decided:** The original approach.\n"
+        "**Rejected:** Nothing considered.\n",
+    )
+
+    manager.perform_sync(auto_accept=True)
+
+    store = GraphStore(config.db_path)
+    older = store.get_node_by_slug("older-decision")
+    newer = store.get_node_by_slug("newer-decision")
+    assert older is not None and newer is not None
+
+    amends = [e for e in store.get_edges() if e["edge_type"] == "amends"]
+    assert len(amends) == 1
+    assert amends[0]["source_id"] == newer["id"]
+    assert amends[0]["target_id"] == older["id"]
+
+
+@patch("google.genai.Client")
+def test_sync_enrichment_failure_under_auto_accept_skips_not_blocks(
+    mock_client: MagicMock,
+    sync_env: Tuple[MitosConfig, MitosSyncManager, str],
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """F1 degradation under non-interactive sync (4a fold-in): a per-entry enrichment
+    failure auto-skips the entry with a loud log instead of blocking on input() — so
+    one degraded entry can't EOF-hang or hard-fail the whole batch.
+
+    Without the fix, the F1 branch would call input() ignoring auto_accept and EOF on
+    the captured (non-TTY) stdin, aborting the sync. Here it degrades deterministically:
+    the entry is skipped, not committed, and left in its buffer for a later sync.
+    """
+    config, manager, tmpdir = sync_env
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+
+    # Enrichment fails on every call (e.g. a transient 429). The OQ branch never
+    # enriches, so this only affects the decision.
+    mock_client.return_value.models.generate_content.side_effect = Exception(
+        "Resource Exhausted (429)"
+    )
+    _append_decision(
+        config,
+        "## 2026-05-19 — degraded-decision — Degraded\n"
+        "**Decided:** This entry's enrichment will fail.\n"
+        "**Rejected:** Blocking the whole batch.\n",
+    )
+
+    # Must not raise / must not block on input().
+    manager.perform_sync(auto_accept=True)
+
+    captured = capsys.readouterr()
+    assert "[Skipped] 'degraded-decision'" in captured.out
+
+    store = GraphStore(config.db_path)
+    assert store.get_node_by_slug("degraded-decision") is None  # skipped, not committed
+    # Left in its buffer for a later sync (never rotated).
+    with open(config.decisions_file, "r", encoding="utf-8") as f:
+        assert "degraded-decision" in f.read()
+
+
