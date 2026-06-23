@@ -10,7 +10,7 @@ from typing import Optional, List, Dict, Any, Tuple
 from mcp.server.fastmcp import FastMCP
 
 from mitos.config import MitosConfig
-from mitos.store import GraphStore
+from mitos.store import GraphStore, MODIFIER_EDGE_KEYS
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.vector_store import QdrantVectorStore
 from mitos.recall import assess_surface_recall
@@ -106,6 +106,32 @@ def get_workspace_components() -> Tuple[GraphStore, Optional[GeminiEmbeddingProv
     return store, embed_provider, vector_store
 
 
+def _oq_payload(oq: Dict[str, Any]) -> Dict[str, Any]:
+    """Builds the open-question output sub-dict for the MCP visibility tools.
+
+    Mirrors the CLI twins (``cmd_surface`` / ``cmd_list``): the
+    ``{topic, questions_raised, park_reason}`` shape PLUS any reverse-relation
+    modifier keys (``amended_by`` / ``narrowed_by``) already stamped on the OQ by
+    ``get_open_questions``' 2b modifier chokepoint, read straight off the payload —
+    so an amended-but-active OQ never reads as the final word, and the MCP surface
+    stays behaviourally in sync with its CLI mirror (CLI⇄MCP parity).
+
+    Args:
+        oq: A hydrated, modifier-stamped open-question dict from
+            ``get_open_questions``.
+
+    Returns:
+        The OQ output sub-dict, carrying present modifier keys when non-empty.
+    """
+    payload: Dict[str, Any] = {
+        "topic": oq["slug"],
+        "questions_raised": oq["questions_raised"],
+        "park_reason": oq.get("park_reason"),
+    }
+    payload.update({key: oq[key] for key in MODIFIER_EDGE_KEYS.values() if oq.get(key)})
+    return payload
+
+
 @mcp.tool()
 def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = False) -> str:
     """Surface active precedents for a CLAIM before you decide — the recall loop, use first.
@@ -196,12 +222,8 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         open_questions = []
         try:
             for q in store.get_open_questions(scope=scope):
-                if q["computed_state"] == "parked":
-                    open_questions.append({
-                        "topic": q["slug"],
-                        "questions_raised": q["questions_raised"],
-                        "park_reason": q.get("park_reason")
-                    })
+                if q["state"] == "parked":
+                    open_questions.append(_oq_payload(q))
         except Exception:
             pass
         results["open_questions"] = open_questions
@@ -286,12 +308,8 @@ def list_decisions(scope: Optional[str] = None, state: str = "active", brief: bo
     open_questions = []
     try:
         for oq in store.get_open_questions(scope=scope):
-            if oq["computed_state"] == "parked":
-                open_questions.append({
-                    "topic": oq["slug"],
-                    "questions_raised": oq["questions_raised"],
-                    "park_reason": oq.get("park_reason"),
-                })
+            if oq["state"] == "parked":
+                open_questions.append(_oq_payload(oq))
     except Exception:
         pass
 

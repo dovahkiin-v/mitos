@@ -153,46 +153,74 @@ def test_pathology_circular_dependency_resolution(isolated_workspace) -> None:
 # ==============================================================================
 # P3 — Extreme Cascading Status Flips & Deletion Propagation
 # ==============================================================================
-@pytest.mark.skip(reason="V1b: this exercises the narrows/resolves cascade and OQ "
-                         "parked→resolved state (V1-D18 Stage-2). narrows/resolves are "
-                         "warn-deferred in V1a (no edge committed), CommitDelta is first-order "
-                         "(5c, no transitive cascade-affected set), and get_node_state never "
-                         "returns resolved. Deferred to V1b (K5/G6/G7).")
 def test_pathology_extreme_cascading_status_flips(isolated_workspace) -> None:
-    """Verifies that resolving an open question triggers a cascade across the graph."""
+    """Resolving an open question flips its COMPUTED state but triggers NO cascade.
+
+    Rewritten for V1b reality: there is no transitive cascade (``CommitDelta`` is
+    first-order, DoD #3) and OQ Stage-2 state is computed at read time (M3), so the
+    resolving commit writes nothing to the OQ node — no ``updated_at`` tick, no
+    Outbox re-enqueue. Only the committing decision gets those. (Was authored
+    against the phantom ``compute_all_states`` + a transitive ``cascade_affected_scopes``
+    assertion that V1b does not ship — T3 OQ side.)
+    """
     config, tmpdir = isolated_workspace
     store = GraphStore(config.db_path)
-    
+
+    def oq_meta(node_id: str):
+        conn = store._get_connection()
+        try:
+            updated_at = conn.execute(
+                "SELECT updated_at FROM nodes WHERE id = ?", (node_id,)
+            ).fetchone()[0]
+            row = conn.execute(
+                "SELECT queued_at FROM pending_embeddings WHERE node_id = ?", (node_id,)
+            ).fetchone()
+            return updated_at, (row[0] if row else None)
+        finally:
+            conn.close()
+
+    def oq_state(slug: str) -> str:
+        for oq in store.get_open_questions():
+            if oq["slug"] == slug:
+                return oq["state"]
+        raise ValueError(f"OQ {slug} not in the active OQ view")
+
     # 1. Park an open question in 'auth' scope
     oq = ParsedEntry("open_question", "auth-roadblock", 1, 5)
+    oq.topic = "Auth session strategy"
     oq.questions_raised = ["How do we handle sessions?"]
     oq.scope = ["auth"]
     d_oq = store.commit_parsed_entry(oq)
-    
-    # 2. Add an active decision narrowing another active decision
+    assert oq_state("auth-roadblock") == "parked"
+
+    # 2. Add an active decision (the future narrow target)
     e1 = ParsedEntry("decision", "jwt-base", 1, 5)
     e1.axiom = "JWT is base auth."
     e1.rejected_paths = "None."
     e1.scope = ["auth"]
-    d_e1 = store.commit_parsed_entry(e1)
-    
-    # 3. Add jwt-spec narrowing jwt-base and resolving roadblock
+    store.commit_parsed_entry(e1)
+
+    # Fingerprint the OQ's write state BEFORE the resolving commit.
+    before = oq_meta(d_oq.node_id)
+
+    # 3. jwt-spec narrows jwt-base AND resolves auth-roadblock (two distinct targets,
+    #    so no dangling_edge from stacking edges on one entry to the same target).
     e2 = ParsedEntry("decision", "jwt-spec", 1, 5)
     e2.axiom = "Use stateless JWTs with HMAC SHA-256."
     e2.rejected_paths = "RSA (too heavy)."
-    e2.narrows = "jwt-base"
-    e2.resolves = "auth-roadblock"
+    e2.narrows = ["jwt-base"]
+    e2.resolves = ["auth-roadblock"]
     e2.scope = ["auth"]
-    
-    delta = store.commit_parsed_entry(e2)
-    
-    # Verify JWT roadblock resolved and JWT base status propagated correctly
-    assert "auth" in delta.cascade_affected_scopes
-    conn = store._get_connection()
-    states = store.compute_all_states(conn)
-    conn.close()
-    
-    assert states[d_oq.node_id] == "resolved"
+    d_e2 = store.commit_parsed_entry(e2)
+
+    # The OQ's computed state flips to resolved (read at query time)...
+    assert oq_state("auth-roadblock") == "resolved"
+    # ...but the resolving commit wrote NO cascade to the OQ node: its updated_at
+    # and Outbox queued_at are byte-identical to before jwt-spec committed.
+    assert oq_meta(d_oq.node_id) == before
+    # The committing decision is the one node jwt-spec enqueued for (re-)embedding.
+    pending = {row["node_id"] for row in store.get_pending_embeddings()}
+    assert d_e2.node_id in pending
 
 
 # ==============================================================================

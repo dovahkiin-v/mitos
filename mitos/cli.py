@@ -68,6 +68,28 @@ def _modifier_marker(payload: Dict[str, Any]) -> str:
     return ("⚠ " + "; ".join(parts)) if parts else ""
 
 
+def _oq_modifiers(oq: Dict[str, Any]) -> Dict[str, List[str]]:
+    """Lifts the reverse-relation modifier keys already stamped on an OQ dict.
+
+    ``GraphStore.get_open_questions`` routes through the 2b modifier chokepoint, so
+    a still-active OQ that a later ``amends`` / ``narrows`` has moved on from already
+    carries ``amended_by`` / ``narrowed_by``. This returns the present (non-empty)
+    modifier keys so the user-facing OQ output carries them too — the OQ analogue of
+    the decision-side ``item.update(modifiers.get(d["id"], {}))``, read straight off
+    the stamped payload (no separate ``get_modifiers_map`` call), so an amended OQ
+    never reads as the final word.
+
+    Args:
+        oq: A hydrated, modifier-stamped open-question dict from
+            ``get_open_questions``.
+
+    Returns:
+        A dict of the present reverse-relation keys to their slug lists (empty when
+        the OQ is unmodified).
+    """
+    return {key: oq[key] for key in MODIFIER_EDGE_KEYS.values() if oq.get(key)}
+
+
 def load_format_spec() -> str:
     """Loads the canonical format specification from the package's single source of truth."""
     spec_path = os.path.join(os.path.dirname(__file__), "format-spec.md")
@@ -512,7 +534,7 @@ def cmd_list(config: MitosConfig, scope: Optional[str] = None,
     decisions = store.get_decisions(scope=scope, state=effective_state)
     modifiers = store.get_modifiers_map([d["id"] for d in decisions])
     parked = [oq for oq in store.get_open_questions(scope=scope)
-              if oq["computed_state"] == "parked"]
+              if oq["state"] == "parked"]
 
     def _list_item(d):
         item = {"slug": d["slug"], "axiom": d["core_axiom"],
@@ -527,7 +549,7 @@ def cmd_list(config: MitosConfig, scope: Optional[str] = None,
             "decisions": [_list_item(d) for d in decisions],
             "open_questions": [
                 {"topic": oq["slug"], "questions_raised": oq["questions_raised"],
-                 "park_reason": oq.get("park_reason")}
+                 "park_reason": oq.get("park_reason"), **_oq_modifiers(oq)}
                 for oq in parked
             ],
             "total": len(decisions),
@@ -561,6 +583,9 @@ def cmd_list(config: MitosConfig, scope: Optional[str] = None,
         print(f"\nParked open questions ({len(parked)}):")
         for oq in parked:
             print(f"  ? {oq['slug']}")
+            marker = _modifier_marker(oq)
+            if marker:
+                print(f"        {marker}")
     print()
 
 
@@ -568,8 +593,8 @@ def cmd_open_questions(config: MitosConfig, scope: Optional[str] = None) -> None
     """Lists all parked open questions."""
     store = GraphStore(config.db_path)
     oqs = store.get_open_questions(scope=scope)
-    
-    parked = [q for q in oqs if q["computed_state"] == "parked"]
+
+    parked = [q for q in oqs if q["state"] == "parked"]
     if not parked:
         print("Zero parked open questions found.")
         return
@@ -581,6 +606,9 @@ def cmd_open_questions(config: MitosConfig, scope: Optional[str] = None) -> None
         print(f"Topic: {q['slug']} {reason}")
         for question in q["questions_raised"]:
             print(f"  - {question}")
+        marker = _modifier_marker(q)
+        if marker:
+            print(f"  {marker}")
     print()
 
 
@@ -776,10 +804,10 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         open_questions = []
         try:
             for oq in store.get_open_questions(scope=scope):
-                if oq["computed_state"] == "parked":
+                if oq["state"] == "parked":
                     open_questions.append({
                         "topic": oq["slug"], "questions_raised": oq["questions_raised"],
-                        "park_reason": oq.get("park_reason"),
+                        "park_reason": oq.get("park_reason"), **_oq_modifiers(oq),
                     })
         except Exception:
             pass
@@ -838,6 +866,9 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         print()
     for oq in oqs:
         print(f"[open question in scope] {oq['topic']}")
+        marker = _modifier_marker(oq)
+        if marker:
+            print(f"   {marker}")
     print(f"\n→ {note}")
 
 
