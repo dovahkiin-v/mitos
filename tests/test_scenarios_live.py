@@ -5,6 +5,7 @@ real API and workspace conditions, proving seam integrity across all clusters.
 """
 
 import os
+import sys
 import tempfile
 import shutil
 import sqlite3
@@ -393,13 +394,22 @@ def test_scenario_f1_synthesis_llm_down(live_workspace) -> None:
             raise resp
         return resp
         
-    with patch("google.genai.Client") as mock_client:
+    # The F1 retry-on-input path is INTERACTIVE by definition. As of V1b 4a, a
+    # non-interactive sync (auto_accept, or a non-TTY stdin) no longer blocks on
+    # input() — it auto-skips the degraded entry (see the deterministic skip gate
+    # in test_sync.py). So this retry scenario runs in interactive mode: stdin is a
+    # TTY (mocked) and auto_accept is False, so the user is prompted and chooses
+    # [r]etry.
+    mock_stdin = MagicMock()
+    mock_stdin.isatty.return_value = True
+    with patch("google.genai.Client") as mock_client, \
+         patch("builtins.input", return_value="r"), \
+         patch.object(sys, "stdin", mock_stdin):
         mock_client.return_value.models.generate_content.side_effect = stateful_side_effect
-        
+
         # Verify sync pauses and recovers cleanly on 'r' (retry) input
-        with patch("builtins.input", return_value="r"):
-            manager.perform_sync(auto_accept=True)
-            
+        manager.perform_sync(auto_accept=False)
+
     # Verify the decision is successfully committed after the successful retry
     store = GraphStore(config.db_path)
     nodes = store.get_all_nodes()

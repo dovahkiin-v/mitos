@@ -17,9 +17,17 @@ from google import genai
 from google.genai import types
 
 from mitos.config import MitosConfig, hint_due
-from mitos.errors import SynthesisError, ParseError, ValidationError, DatabaseError, EntryFailure, CommitError
+from mitos.errors import (
+    SynthesisError,
+    ParseError,
+    ValidationError,
+    DatabaseError,
+    EntryFailure,
+    CommitError,
+    STORE_MISSING_TARGET,
+)
 from mitos.models import get_model_id
-from mitos.parser import ParsedEntry, parse_entry_stream
+from mitos.parser import ParsedEntry, parse_entry_stream, parse_file_reversed
 from mitos.store import GraphStore, CommitDelta
 from mitos.identity import compute_node_id, embedding_text
 from mitos.embeddings import GeminiEmbeddingProvider
@@ -393,18 +401,26 @@ class MitosSyncManager:
     def perform_sync(self, auto_accept: bool = False, verbose: bool = False) -> None:
         """Executes the complete transactional sync flow."""
         snapshot_path = os.path.join(self.config.mitos_dir, "sync_snapshot.md")
+        # Second snapshot for steady-state questions.md ingestion (Phase 4a): taken
+        # under the same lock as the decisions snapshot for read-consistency, and
+        # cleaned in the same finally. Absent when questions.md is absent (healthy).
+        questions_snapshot_path = os.path.join(self.config.mitos_dir, "questions_snapshot.md")
         try:
-            self._perform_sync_internal(snapshot_path, auto_accept, verbose)
+            self._perform_sync_internal(
+                snapshot_path, questions_snapshot_path, auto_accept, verbose
+            )
         finally:
-            if os.path.exists(snapshot_path):
-                try:
-                    os.remove(snapshot_path)
-                except Exception:
-                    pass
+            for path in (snapshot_path, questions_snapshot_path):
+                if os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except Exception:
+                        pass
 
-    def _perform_sync_internal(self, snapshot_path: str, auto_accept: bool = False, verbose: bool = False) -> None:
+    def _perform_sync_internal(self, snapshot_path: str, questions_snapshot_path: str, auto_accept: bool = False, verbose: bool = False) -> None:
         """Executes the internal transactional sync flow."""
         # 1. Snapshot-at-sync-start under brief file lock
+        questions_snapshotted = False
         try:
             with self.lock:
                 if not os.path.exists(self.config.decisions_file):
@@ -413,39 +429,85 @@ class MitosSyncManager:
                 # Auto-heal the decisions file header/sample block under lock
                 self.auto_heal_decisions_file()
                 shutil.copy(self.config.decisions_file, snapshot_path)
+                # Snapshot questions.md under the SAME lock (4a steady-state OQ
+                # ingestion). An absent questions.md is healthy-empty (no current
+                # corpus ships one). File-level bulkhead (D4/P7): a copy error in
+                # the OQ buffer warns and yields zero OQ entries — it must never
+                # abort decisions ingestion.
+                if os.path.exists(self.config.questions_file):
+                    try:
+                        shutil.copy(self.config.questions_file, questions_snapshot_path)
+                        questions_snapshotted = True
+                    except OSError as exc:
+                        print(
+                            f"[Warning] Could not snapshot questions.md ({exc}); "
+                            f"skipping open-question ingestion this sync."
+                        )
         except Timeout:
             print("Another Mitos process holds the lock; check for stuck 'mitos sync'.")
             return
 
-        # 2. Parse from the snapshot. Per-entry isolation (§7.2-A degradation
-        #    contract): a malformed entry is reported with its line range and
-        #    skipped, so the remaining well-formed entries still sync. The skipped
-        #    entries are never committed, so content-aware rotation leaves them in
-        #    decisions.md for the user to fix and re-sync.
-        with open(snapshot_path, "r", encoding="utf-8") as f:
-            snapshot_text = f.read()
-        # decisions.md is a decisions-only stream in V1a (OQ authoring lives in a
-        # separate questions.md — 1c). Collector mode isolates a malformed entry
-        # (reported + skipped) so the rest still sync (§5.2.2 per-entry isolation).
-        parse_failures: List[EntryFailure] = []
-        entries = parse_entry_stream(snapshot_text, "decision", failures=parse_failures)
+        # 2. Parse from the snapshots, oldest-first within each file. Steady-state
+        #    sync now ingests BOTH the decisions buffer and the questions.md
+        #    open-question buffer (4a) — each parsed kind-by-file (V1-D8) into its
+        #    OWN failure collector so a malformed entry in one buffer never aborts
+        #    the other (D4 bulkhead). Oldest-first (parse_file_reversed) lands an
+        #    older in-buffer entry before a newer one that references it — a flow
+        #    heuristic, NOT correctness; the per-entry quarantine below (and 4b's
+        #    fixpoint) are correctness. Collector mode isolates a malformed entry
+        #    (reported + skipped) so the rest still sync (§5.2.2 per-entry isolation).
+        dec_failures: List[EntryFailure] = []
+        decision_entries = parse_file_reversed(snapshot_path, "decision", dec_failures)
 
-        for fail in parse_failures:
+        oq_failures: List[EntryFailure] = []
+        oq_entries: List[ParsedEntry] = []
+        if questions_snapshotted:
+            # File-level bulkhead (D4/P7): the OQ snapshot read+parse is wrapped in
+            # its OWN try/except so a file-level fault in questions.md — e.g. invalid
+            # UTF-8 bytes the binary snapshot copy passed straight through, which
+            # read_text_or_none then hits decoding as UTF-8 — warns and yields ZERO
+            # OQ entries while decisions ingestion proceeds. The secondary buffer must
+            # never abort the primary. (Per-ENTRY malformed OQs are already collector-
+            # isolated into oq_failures, not raised; this catches the file-level fault
+            # the collector cannot reach.)
+            try:
+                oq_entries = parse_file_reversed(
+                    questions_snapshot_path, "open_question", oq_failures
+                )
+            except Exception as exc:
+                oq_entries = []
+                print(
+                    f"[Warning] Could not parse questions.md ({exc}); "
+                    f"skipping open-question ingestion this sync."
+                )
+
+        all_failures = dec_failures + oq_failures
+        for fail in all_failures:
             msgs = "; ".join(item.message for item in fail.items) or "malformed entry"
             print(
                 f"[Parse error] {msgs} (lines {fail.line_start}-{fail.line_end}). "
                 f"Entry skipped — fix it and re-run sync."
             )
 
+        # Decisions first, then open questions (D1): the host decision of an OQ's
+        # typical Derives-From: forward-ref commits before the OQ, landing that
+        # common case on the first pass. The opposite direction (a decision that
+        # Resolves: an OQ authored above it) still quarantines on the first pass in
+        # 4a and converges on the next sync (4b's fixpoint converges it in one).
+        entries = decision_entries + oq_entries
+
         if not entries:
-            if parse_failures:
+            if all_failures:
                 print("No parseable entries to commit. Fix the reported entries above and re-run sync.")
             else:
-                print("Zero pending entries found in decisions.md write-buffer.")
+                print("Zero pending entries found in the decisions.md / questions.md write-buffers.")
             return
 
-        # Stale-entry detection (>14 days unprocessed)
-        for entry in entries:
+        # Stale-entry detection (>14 days unprocessed) — DECISIONS ONLY (D5): the
+        # vision defers OQ stale-detection; questions.md is a persistent buffer that
+        # never rotates, so a >14-day open question must NOT emit a spurious
+        # "remains unsynced" warning.
+        for entry in decision_entries:
             if entry.date:
                 try:
                     entry_dt = datetime.strptime(entry.date, "%Y-%m-%d")
@@ -467,10 +529,16 @@ class MitosSyncManager:
 
         # 3. Process each parsed entry
         for entry in entries:
-            # Read exact raw text block of this entry from snapshot for content-aware rotation
-            with open(snapshot_path, "r", encoding="utf-8") as f:
-                snap_lines = f.readlines()
-            entry_raw_text = "".join(snap_lines[entry.line_start - 1 : entry.line_end])
+            # Read exact raw text block of this entry from snapshot for content-aware
+            # rotation — DECISIONS ONLY (D5): the line range here indexes the
+            # DECISIONS snapshot, so an open-question entry's range would index the
+            # wrong file. OQ entries never rotate (questions.md is a persistent
+            # buffer), so they need no raw-text block.
+            entry_raw_text = ""
+            if entry.kind == "decision":
+                with open(snapshot_path, "r", encoding="utf-8") as f:
+                    snap_lines = f.readlines()
+                entry_raw_text = "".join(snap_lines[entry.line_start - 1 : entry.line_end])
 
             # Check if this node is already in the database (slug-free V1a id — V1-D2).
             node_id = compute_node_id(
@@ -520,8 +588,21 @@ class MitosSyncManager:
                 try:
                     enrichment = run_sync_enrichment(genai_client, entry, active_decs)
                 except Exception as e:
-                    # Degradation F1: Pause and let user decide
+                    # Degradation F1: enrichment failed.
                     print(f"\n[Error] LLM enrichment failed for '{entry.slug}': {str(e)}")
+                    if auto_accept or not sys.stdin.isatty():
+                        # Non-interactive degradation (4a fold-in, deferred here from
+                        # Phase 1): under auto-accept or a non-TTY stdin, never block
+                        # on input() — a transient enrichment failure would otherwise
+                        # EOF on the missing prompt and hard-fail the whole sync.
+                        # Skip this entry with a loud log (it stays in its buffer for a
+                        # later sync), so one degraded entry can't halt the batch — the
+                        # same per-entry robustness 4a's commit-stage quarantine builds.
+                        print(
+                            f"[Skipped] '{entry.slug}' — enrichment unavailable under "
+                            f"non-interactive sync; entry left in its buffer for a later sync."
+                        )
+                        continue
                     choice = input("Would you like to [r]etry, [s]kip this entry, or [a]bort sync? ").strip().lower()
                     if choice == 'r':
                         # Retry once
@@ -606,15 +687,43 @@ class MitosSyncManager:
             entry.confirmed_by = get_model_id("FLASH_LITE") if entry.kind == "decision" else "user"
             entry.confirmed_at = datetime.now().isoformat()
 
-            # Commit to graph database atomically per entry (C1 atomicity)
-            delta = self.store.commit_parsed_entry(entry)
+            # Commit to graph database atomically per entry (C1 atomicity), now with
+            # the per-entry commit-stage quarantine (4a floor — P5 dead-letter / P7
+            # bulkhead): a store-stage rejection isolates to THIS entry while the rest
+            # of the batch (decisions AND open questions) still commits — never the
+            # whole-sync abort it was before. The catch keys on the CommitError CLASS,
+            # not a code allowlist, so every §5.2.2 structural rejection (missing_target
+            # ∪ slug_collision ∪ cycle_violation ∪ kind_constraint_violation ∪
+            # dangling_edge) funnels through it uniformly (D3).
+            try:
+                delta = self.store.commit_parsed_entry(entry)
+            except CommitError as exc:
+                self._report_commit_quarantine(entry, exc)
+                continue
+            except (ValidationError, DatabaseError) as exc:
+                # Defensive secondary bulkhead (Gotcha): a bypassed-parser empty core
+                # or a raw SQLite failure carries NO §5.2.2 envelope, so the CommitError
+                # quarantine above would miss it and it would abort the batch. Isolate
+                # it per-entry too — report + skip (a genuine defect, never retry-
+                # eligible). CommitError-only is the firm contract; this is the
+                # defensive half.
+                print(
+                    f"\n[Quarantined] '{entry.slug}' (lines {entry.line_start}-"
+                    f"{entry.line_end}): unexpected store error — {exc}. Entry left in "
+                    f"its buffer; fix and re-sync."
+                )
+                continue
             print(f"Committed node: {entry.slug} ✓")
 
-            # best-effort embedding upsert (C2)
+            # best-effort embedding upsert (C2) — applies to OQ nodes too.
             self._best_effort_embed(delta, entry)
 
-            # Record successfully committed block for rotation
-            synced_blocks.append((entry, entry_raw_text))
+            # Record successfully committed block for rotation — DECISIONS ONLY (D5):
+            # questions.md never rotates (persistent buffer), and an OQ block would
+            # carry decisions-snapshot raw text, so OQ entries must not enter the
+            # rotation set or the pending_threshold rotation prompt's count.
+            if entry.kind == "decision":
+                synced_blocks.append((entry, entry_raw_text))
 
         # 4. Content-aware archive rotation under brief lock (V3b)
         if synced_blocks:
@@ -684,6 +793,46 @@ class MitosSyncManager:
         if verbose and self.embed_provider:
             hits, misses, rate = self.embed_provider.get_stats()
             print(f"\n[Observability] Cache Stats: Hits: {hits}, Misses: {misses}, Hit Rate: {rate*100:.1f}%")
+
+    def _report_commit_quarantine(self, entry: ParsedEntry, exc: CommitError) -> None:
+        """Reports a quarantined per-entry commit failure as a guiding vector (4a).
+
+        The per-entry commit-stage bulkhead (P5 dead-letter / P7 Bulkhead): a single
+        entry's store-stage rejection — any member of the §5.2.2 ``CommitError``
+        class — is isolated to *that* entry. The entry is left in its buffer (never
+        recorded for rotation), so a later sync can commit it once its target lands
+        or its defect is fixed; the rest of this batch proceeds untouched.
+
+        A still-unresolved ``missing_target`` is surfaced as a *guiding* vector
+        ("target not committed yet"), not the bare "does not match any entry" wall
+        that reads as a typo (D6) — a forward-ref to a target authored later in the
+        corpus commits on a subsequent sync once that target lands. Every other code
+        gets a calm, located generic surface. This mirrors the code-aware message
+        builder in ``cutover._cutover_error_for_commit`` (the sync-side analogue —
+        that one is cutover-specific and returns a ``CutoverError``, so it is not
+        reused here).
+
+        Args:
+            entry: The entry the store rejected.
+            exc: The ``CommitError`` carrying the §5.2.2 failure envelope.
+        """
+        items = exc.failure.items if exc.failure else []
+        codes = {item.code for item in items}
+        detail = "; ".join(item.message for item in items) or str(exc)
+        if STORE_MISSING_TARGET in codes:
+            print(
+                f"\n[Quarantined] '{entry.slug}' (lines {entry.line_start}-{entry.line_end}): "
+                f"references a target not committed yet — it may be authored later in this "
+                f"corpus and will commit on a subsequent sync once its target lands. Entry "
+                f"left in its buffer. ({detail})"
+            )
+        else:
+            code_str = ", ".join(sorted(codes)) if codes else "referential violation"
+            print(
+                f"\n[Quarantined] '{entry.slug}' (lines {entry.line_start}-{entry.line_end}): "
+                f"the store rejected it ({code_str}). Entry left in its buffer for a later "
+                f"sync once fixed. ({detail})"
+            )
 
     def _best_effort_embed(self, delta: CommitDelta, entry: ParsedEntry) -> Optional[List[float]]:
         """Best-effort async embedding upsert pipeline (C2).

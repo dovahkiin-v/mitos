@@ -64,7 +64,7 @@ from mitos.errors import (
 )
 from mitos.identity import compute_node_id
 from mitos.migrations import is_pre_v1a_schema
-from mitos.parser import ParsedEntry, parse_entry_stream
+from mitos.parser import ParsedEntry, parse_file_reversed
 from mitos.store import GraphStore, open_connection
 
 logger = logging.getLogger(__name__)
@@ -421,24 +421,6 @@ def _discard_stale_aside(aside_db_path: str) -> None:
             pass
 
 
-def _read_text_or_none(path: str) -> Optional[str]:
-    """Reads a UTF-8 file, returning ``None`` if it does not exist.
-
-    A missing buffer or archive is a no-op stream, never a crash — an absent
-    ``questions.md`` is the live-corpus reality today (§6).
-
-    Args:
-        path: The file to read.
-
-    Returns:
-        The file text, or ``None`` if the file is absent.
-    """
-    if not os.path.exists(path):
-        return None
-    with open(path, "r", encoding="utf-8") as fh:
-        return fh.read()
-
-
 def _archive_files_oldest_first(archive_dir: str) -> List[str]:
     """Returns the ``{year}-Q{quarter}.md`` archive files, oldest quarter first.
 
@@ -463,33 +445,6 @@ def _archive_files_oldest_first(archive_dir: str) -> List[str]:
     return [path for _, _, path in matches]
 
 
-def _parse_file_reversed(
-    path: str, kind: str, failures: List[EntryFailure]
-) -> List[ParsedEntry]:
-    """Parses one corpus file in collector mode and reverses it to oldest-first.
-
-    Each corpus file is authored **newest-first** (the ``BEGIN ENTRIES … newest
-    first`` convention), so reversing the parsed list yields oldest-first *within*
-    the file. Collector mode (``failures`` supplied) isolates malformed entries
-    into ``failures`` instead of raising, so all defects across all files
-    aggregate before the caller decides to abort.
-
-    Args:
-        path: The corpus file to parse (absent → empty stream).
-        kind: ``"decision"`` or ``"open_question"`` (caller-declared, V1-D8).
-        failures: The shared collector for malformed-entry envelopes.
-
-    Returns:
-        The well-formed entries, oldest-first within this file.
-    """
-    text = _read_text_or_none(path)
-    if text is None:
-        return []
-    entries = parse_entry_stream(text, kind, source_path=path, failures=failures)
-    entries.reverse()
-    return entries
-
-
 def _load_decision_stream(
     config: MitosConfig, failures: List[EntryFailure]
 ) -> List[ParsedEntry]:
@@ -510,8 +465,8 @@ def _load_decision_stream(
     """
     stream: List[ParsedEntry] = []
     for archive_path in _archive_files_oldest_first(config.archive_dir):
-        stream.extend(_parse_file_reversed(archive_path, "decision", failures))
-    stream.extend(_parse_file_reversed(config.decisions_file, "decision", failures))
+        stream.extend(parse_file_reversed(archive_path, "decision", failures))
+    stream.extend(parse_file_reversed(config.decisions_file, "decision", failures))
     return stream
 
 
@@ -533,7 +488,7 @@ def _load_oq_stream(
         The open-question entries, oldest-first (empty when ``questions.md`` is
         absent).
     """
-    return _parse_file_reversed(config.questions_file, "open_question", failures)
+    return parse_file_reversed(config.questions_file, "open_question", failures)
 
 
 def _format_parse_aggregate_message(failures: List[EntryFailure]) -> str:

@@ -215,19 +215,24 @@ def test_invariant_m5_database_corruption_and_rebuild(isolated_workspace) -> Non
     from mitos.cli import cmd_init, cmd_sync
     cmd_init(config)
     
-    # 2. Write multiple decisions to decisions.md write-buffer
+    # 2. Write multiple decisions to decisions.md write-buffer.
+    # Authored newest-first (the buffer convention): the newer d2 — which
+    # Depends-On the older d1 — sits ON TOP of d1. Steady-state sync now parses the
+    # buffer oldest-first (V1b 4a reverses it), so d1 commits before d2 and the
+    # forward-ref lands in a single sync. (A buffer that placed d2 below d1 would
+    # quarantine d2's edge on the first pass and converge on the next.)
     entry_text = (
-        "## 2026-06-01 — d1 — First decision\n"
-        "**Decided:** First rule of Mitos.\n"
-        "**Rejected:** None.\n"
-        "**Mechanisms:** python\n"
-        "**Scope:** core\n\n"
         "## 2026-06-01 — d2 — Second decision\n"
         "**Decided:** Second rule of Mitos.\n"
         "**Rejected:** None.\n"
         "**Mechanisms:** sqlite\n"
         "**Scope:** substrate\n"
-        "**Depends-On:** d1\n"
+        "**Depends-On:** d1\n\n"
+        "## 2026-06-01 — d1 — First decision\n"
+        "**Decided:** First rule of Mitos.\n"
+        "**Rejected:** None.\n"
+        "**Mechanisms:** python\n"
+        "**Scope:** core\n"
     )
     with open(config.decisions_file, "a", encoding="utf-8") as f:
         f.write(entry_text + "\n")
