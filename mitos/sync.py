@@ -562,7 +562,17 @@ class MitosSyncManager:
 
             existing = self.store.get_node(node_id)
             if existing:
-                # Idempotency short-circuit (S5)
+                # Idempotency short-circuit (S5). The node commit is deliberately
+                # skipped — but a re-encounter from a NEW source must still emit one
+                # source_reencounter audit signal (MI-4 / V1-D14). source is
+                # out-of-core, so the canonical core is identical here; the
+                # signal-eval is the one pass the skip must NOT swallow (§6.2
+                # Lesson 13). This gate sits above the per-entry commit quarantine,
+                # but note_source_reencounter is best-effort, so a signal failure
+                # can never abort a sync of real decisions.
+                self.store.note_source_reencounter(
+                    node_id, existing["source"], entry.source or "user"
+                )
                 continue
 
             # Slug collision check
@@ -1522,6 +1532,13 @@ class MitosSyncManager:
         # Idempotency (M2) fast-fail.
         existing = self.store.get_node(node_id)
         if existing:
+            # Cross-source re-encounter audit (MI-4 / V1-D14) before the exists
+            # short-circuit returns. record authors no **Source:** line, so on this
+            # path entry.source is None → "user". Best-effort (note_source_reencounter
+            # never raises), so the agentic exists-path can never crash on the audit.
+            self.store.note_source_reencounter(
+                node_id, existing["source"], entry.source or "user"
+            )
             return {
                 "slug": existing["slug"],
                 "id": node_id,
@@ -1588,7 +1605,16 @@ class MitosSyncManager:
                 # buffer write (closes the TOCTOU window: a racer that committed
                 # since Phase A is now seen — and a rejection here still leaves the
                 # buffer byte-for-byte unchanged, since auto-heal hasn't run yet).
-                if self.store.get_node(node_id):
+                existing = self.store.get_node(node_id)
+                if existing:
+                    # TOCTOU re-check: a racer committed this node between Phase A
+                    # and here. Same cross-source audit as gate 3 (rare; INSERT OR
+                    # IGNORE makes any Phase-A/Phase-B overlap a harmless no-op).
+                    # Best-effort, and the threading lock here is not a DB txn, so
+                    # write_signal's own connection is fine.
+                    self.store.note_source_reencounter(
+                        node_id, existing["source"], entry.source or "user"
+                    )
                     return {
                         "slug": entry.slug,
                         "id": node_id,

@@ -119,13 +119,33 @@ class GraphStoreProtocol(Protocol):
         """
         ...
 
-    def write_signal(self, node_id: str, stype: str, actor: Optional[str] = None) -> None:
+    def write_signal(self, node_id: str, stype: str, source: Optional[str] = None) -> None:
         """Writes a signal row (drifted, source_reencounter).
 
         Args:
             node_id: The node to signal.
             stype: One of 'drifted', 'source_reencounter'.
-            actor: Optional string actor name.
+            source: Optional source enum value the signal carries (uniform with
+                ``nodes.source`` — V1-D14).
+        """
+        ...
+
+    def note_source_reencounter(
+        self, node_id: str, stored_source: str, new_source: str
+    ) -> bool:
+        """Emits one source_reencounter signal iff the re-encountering source differs.
+
+        The V1-D14 policy wrapper over ``write_signal``, called at the four
+        node-exists short-circuit gates (MI-4 cross-source provenance audit).
+
+        Args:
+            node_id: The re-encountered node's content-hash id.
+            stored_source: The node's first-seen (MI-4-fenced) source.
+            new_source: The re-encountering source enum value.
+
+        Returns:
+            True iff a signal write was committed (or idempotently ignored); False if
+            the source was unchanged or the best-effort write was dropped.
         """
         ...
 

@@ -1016,16 +1016,18 @@ class GraphStore:
         finally:
             conn.close()
 
-    def write_signal(self, node_id: str, stype: str, actor: Optional[str] = None) -> None:
+    def write_signal(self, node_id: str, stype: str, source: Optional[str] = None) -> None:
         """Writes a signal row (drifted, source_reencounter, retired) via INSERT OR IGNORE.
 
         Aligned to the V1a ``signals`` shape (Phase 8a): ``type``→``signal_type``,
-        ``actor``→``source`` (NOT NULL DEFAULT '' — a ``None`` actor maps to ''), and
-        the now-required application-supplied ``created_at`` UTC µs stamp (MI-10; the
-        V1a schema carries no ``DEFAULT CURRENT_TIMESTAMP``). All three signal_type
-        values are reserved-but-unwritten in V1a — no live caller writes a signal —
-        so this is a correctness alignment of a latent landmine (K6), not a behavior
-        change. ``INSERT OR IGNORE`` keeps the composite-PK uniqueness from crashing.
+        and the column the signal carries is ``source`` (NOT NULL DEFAULT '' — a
+        ``None`` ``source`` maps to '') — uniform with ``nodes.source`` /
+        ``mechanisms.source`` / ``ParsedEntry.source`` (V1-D14: the prior ``actor``
+        param was conceptual shadowing of the same enum under two names; renamed
+        ``actor``→``source`` here in V1b, this being the first live caller). The
+        application-supplied ``created_at`` UTC µs stamp is required (MI-10; the V1a
+        schema carries no ``DEFAULT CURRENT_TIMESTAMP``). ``INSERT OR IGNORE`` keeps
+        the composite-PK uniqueness from crashing on a repeat write.
         """
         conn = self._get_connection()
         try:
@@ -1035,12 +1037,66 @@ class GraphStore:
                     INSERT OR IGNORE INTO signals (node_id, signal_type, source, created_at)
                     VALUES (?, ?, ?, ?)
                     """,
-                    (node_id, stype, actor or "", _utc_now_iso())
+                    (node_id, stype, source or "", _utc_now_iso())
                 )
         except sqlite3.Error as e:
             raise DatabaseError(f"Failed to write signal: {str(e)}")
         finally:
             conn.close()
+
+    def note_source_reencounter(
+        self, node_id: str, stored_source: str, new_source: str
+    ) -> bool:
+        """Emits one ``source_reencounter`` signal iff the re-encountering source differs.
+
+        The substrate's first real signal writer (MI-4 provenance audit, V1-D14).
+        Called at the four short-circuit gates that skip ``commit_parsed_entry`` for
+        an already-stored node (sync, import, and both ``record`` exists-paths). When
+        the same canonical decision is met again from a *different* ``source`` (e.g. a
+        node first authored ``user``, later swept in by ``mitos import`` as
+        ``import_llm``), it records that cross-source re-encounter exactly once per
+        ``(node, source)``.
+
+        The signal carries the **new** source; the stored node ``source`` is never
+        mutated (first-seen-wins, MI-4-fenced). V1a's composite PK
+        ``(node_id, signal_type, source)`` makes a repeat from the same new source a
+        clean ``INSERT OR IGNORE`` no-op, so the per-``(node, source)`` audit row is
+        written at most once (DoD #1 / §8.2); a third, distinct source mints a second
+        row. ``commit_parsed_entry`` gets ZERO change — it is never reached on an
+        existing node, so the re-encounter is detected here, at the gate.
+
+        The audit is best-effort: a hard SQLite failure logs and is dropped so a
+        non-critical provenance row can never abort a real sync / import / record —
+        the decision graph is authoritative, the audit trail is not (P7 bulkhead).
+        The next re-encounter re-writes it idempotently (MI-3). A PK collision is not
+        a failure (``INSERT OR IGNORE`` swallows it, no raise).
+
+        Args:
+            node_id: The re-encountered node's content-hash id.
+            stored_source: The node's first-seen (MI-4-fenced) ``source``.
+            new_source: The re-encountering ``source`` ∈ {user, capture_llm, import_llm}.
+
+        Returns:
+            True iff a signal write was committed (or idempotently ignored); False if
+            the new source matched the stored source (no write needed) or the
+            best-effort write was dropped on a hard SQLite failure.
+        """
+        if new_source == stored_source:
+            return False
+        try:
+            self.write_signal(node_id, "source_reencounter", new_source)
+            return True
+        except DatabaseError as e:
+            # Audit is best-effort; the decision graph is not. A failed signal write
+            # must never abort a real sync / import / record (the emit sits at gates
+            # that lie outside the per-entry commit quarantine) — log loud and drop;
+            # the next re-encounter re-writes it idempotently (MI-3 / INSERT OR IGNORE).
+            logger.warning(
+                "source_reencounter audit signal dropped for node '%s' "
+                "(new source '%s'): %s",
+                node_id, new_source, e,
+            )
+            return False
 
     def commit_parsed_entry(self, parsed: ParsedEntry) -> CommitDelta:
         """Commits one ParsedEntry as a single atomic V1a transaction (V1-D10).

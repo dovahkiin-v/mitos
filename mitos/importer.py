@@ -217,8 +217,18 @@ class MitosProseImporter:
                 )
 
                 # Check duplication
-                if self.store.get_node(node_id):
-                    # Stable identity: re-running import on same content is a no-op (S2/S5)
+                existing = self.store.get_node(node_id)
+                if existing:
+                    # Stable identity: re-running import on same content is a no-op
+                    # (S2/S5). But a corpus re-imported over a hand-authored graph is
+                    # the textbook cross-source case (existing 'user' vs new
+                    # 'import_llm') — emit one source_reencounter audit signal before
+                    # the skip (MI-4 / V1-D14). entry.source is "import_llm" (set
+                    # above); the `or "user"` mirrors the other gates for uniformity.
+                    # Best-effort, and additionally inside this per-entry try/except.
+                    self.store.note_source_reencounter(
+                        node_id, existing["source"], entry.source or "user"
+                    )
                     continue
 
                 # Add to DB via GraphStore commit helper
