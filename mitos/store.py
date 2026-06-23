@@ -23,7 +23,7 @@ from mitos.errors import (
     STORE_KIND_CONSTRAINT_VIOLATION,
     STORE_CYCLE_VIOLATION,
 )
-from mitos.identity import compute_node_id
+from mitos.identity import compute_node_id, mechanism_canonical_norm
 from mitos.migrations import (
     MIGRATION_STEPS,
     MigrationStep,
@@ -1240,6 +1240,18 @@ class GraphStore:
                         ),
                     )
 
+                # --- Auto-register cited mechanisms (5a; V1-D5 / V1-D15) --------
+                # Takes the open cursor so the registry write enlists in THIS
+                # transaction (MI-5 atomicity — a later store-stage failure below
+                # rolls the mechanism rows back too). Gated ``is_new and decision``:
+                # ``mechanism_refs`` is part of the canonical core, so a genuinely
+                # new mechanism can ONLY arrive on a node whose id is novel
+                # (``is_new``) — a same-id commentary re-commit never carries a new
+                # mechanism, so the gate is provably complete, not just an
+                # optimization (Decision 2; MI-5 / DoD #2 pass by construction).
+                if is_new and parsed.kind == "decision":
+                    self._register_mechanisms(cursor, parsed, now)
+
                 # --- Reconcile node_scopes (insert-missing / delete-absent) -----
                 for tag in incoming_scopes - prior_scopes:
                     cursor.execute(
@@ -1441,6 +1453,68 @@ class GraphStore:
             raise DatabaseError(f"SQLite transaction commit failed: {str(e)}")
         finally:
             conn.close()
+
+    def _register_mechanisms(
+        self, cursor: sqlite3.Cursor, parsed: ParsedEntry, now: str
+    ) -> None:
+        """Auto-registers a committing decision's cited mechanisms (first-seen-wins, in-txn).
+
+        Mints a ``mechanisms`` registry row the first time each cited mechanism's
+        ``canonical_name`` is seen, recording who coined it and how they spelled it
+        (V1-D5 / V1-D15) — the first-seen provenance v0.2's Drift sensor reads to
+        weight hallucination-risk. ``INSERT OR IGNORE`` on the ``canonical_name`` PK
+        gives first-seen-wins by construction: a later citation of the same canonical
+        no-ops, preserving the earliest ``authored_name`` / ``source`` / ``created_at``
+        (and MI-3 replay-safety — a re-run no-ops, never raises).
+
+        Iterates ``parsed.mechanisms`` — the AUTHORITATIVE folded set the node itself
+        stores and hashes (``mechanism_refs_json``) — so the registry mirrors the
+        node's refs exactly. ``authored_name`` (first-seen presentation casing) is
+        resolved by canonical-MATCH against ``parsed.mechanisms_authored`` (the raw
+        pre-fold tokens), NOT a direct read: LLM enrichment (``sync.py``) overwrites
+        ``mechanisms`` but NOT ``mechanisms_authored``, so a direct read would register
+        stale pre-enrichment tokens. Falls back to the ref itself when no raw token
+        folds to its canonical (the enrichment-changed-the-set or ``importer.py``
+        raw-build path — the accepted R4-class degradation to folded casing).
+
+        An empty-fold token (``mechanism_canonical_norm("!!!") == ""``, the
+        self-cleaning degenerate-mechanism case) is skipped — it must never mint a
+        junk ``canonical_name=''`` PK row.
+
+        Enlists in the open ``cursor`` (atomic with the node/edge writes): a later
+        store-stage failure in the same entry rolls the registration back too (MI-5).
+
+        Args:
+            cursor: The open transaction cursor from ``commit_parsed_entry``.
+            parsed: The committing decision entry (gated to ``kind == "decision"`` by
+                the call site).
+            now: The commit's single ``_utc_now_iso()`` stamp (MI-10), reused as the
+                registry row's ``created_at``.
+
+        Returns:
+            None.
+        """
+        source = parsed.source or "user"  # V1-D20: absent **Source:** -> "user"
+        for ref in parsed.mechanisms:
+            canonical = mechanism_canonical_norm(ref)
+            if not canonical:
+                continue  # empty-fold degenerate token — no junk PK row
+            authored = next(
+                (
+                    raw
+                    for raw in parsed.mechanisms_authored
+                    if mechanism_canonical_norm(raw) == canonical
+                ),
+                ref,  # fallback: the ref (enrichment-changed set / importer raw path)
+            )
+            # Parameterized (P8); INSERT OR IGNORE is the first-seen-wins conflict
+            # policy on the ``canonical_name`` PK.
+            cursor.execute(
+                "INSERT OR IGNORE INTO mechanisms "
+                "(canonical_name, authored_name, source, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (canonical, authored, source, now),
+            )
 
     def _reconcile_edges(
         self,
@@ -2272,6 +2346,65 @@ class GraphStore:
                 ancestor_ids,
             ).fetchall()
             return [dict(row) for row in rows]
+        finally:
+            conn.close()
+
+    def get_unregistered_mechanisms(self, parsed: ParsedEntry) -> List[str]:
+        """Returns the subset of ``parsed``'s mechanism refs NOT yet in the registry.
+
+        A read-only pre-commit feedback query (registers NOTHING — the whole point is
+        to let the author catch a typo or alias *before* the auto-registration ratchet
+        fires; V1-D5 / V1-D15). Ships gated with no in-vision consumer — V3a's
+        interactive-review surface calls it later. Closure criterion is ship +
+        gate-tested, the same P20-forward-wiring convention as
+        :meth:`get_contradictions` (W6/W14).
+
+        Iterates ``parsed.mechanisms`` (the authoritative folded set), keys each by
+        ``mechanism_canonical_norm`` against the ``mechanisms`` PK, and returns the
+        not-yet-present ones in authored presentation form when available
+        (canonical-match against ``mechanisms_authored``, else the ref) — order-stable
+        (first appearance in ``parsed.mechanisms``) and deduped by ``canonical_name``.
+        Empty-fold tokens are skipped (they never register, so they are never
+        "unregistered"). Opens its OWN connection (read-only, like :meth:`get_lineage`),
+        decoupled from any write transaction.
+
+        Args:
+            parsed: The entry whose mechanism refs to check against the registry.
+
+        Returns:
+            The authored (or ref-fallback) form of each cited mechanism not yet
+            registered, first-seen order, deduped by ``canonical_name``; ``[]`` when
+            all are registered, the entry cites none, or it is an open question
+            (an OQ carries no mechanisms — empty is healthy, never an error).
+        """
+        if parsed.kind != "decision":
+            return []
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            unregistered: List[str] = []
+            seen: Set[str] = set()
+            for ref in parsed.mechanisms:
+                canonical = mechanism_canonical_norm(ref)
+                if not canonical or canonical in seen:
+                    continue
+                seen.add(canonical)
+                row = cursor.execute(
+                    "SELECT 1 FROM mechanisms WHERE canonical_name = ?",
+                    (canonical,),
+                ).fetchone()
+                if row is not None:
+                    continue  # already registered
+                authored = next(
+                    (
+                        raw
+                        for raw in parsed.mechanisms_authored
+                        if mechanism_canonical_norm(raw) == canonical
+                    ),
+                    ref,
+                )
+                unregistered.append(authored)
+            return unregistered
         finally:
             conn.close()
 

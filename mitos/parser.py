@@ -221,6 +221,14 @@ class ParsedEntry:
         self.title: Optional[str] = None
         self.core_axiom: str = ""
         self.mechanisms: List[str] = []
+        # Raw first-seen presentation tokens for the cited mechanisms (pre-fold,
+        # comma-split, stripped, empties dropped, authored order preserved). V1b 5a
+        # uses these to recover first-seen casing for the ``mechanisms`` registry's
+        # ``authored_name`` — ``mechanisms`` above is folded (NFC+casefold+punct) for
+        # identity, so the authored spelling would be lost without this hash-neutral
+        # sidecar (V1-D15 / Decision 1, Option A). Populated only by
+        # ``parse_entry_stream`` at the single fold site; never feeds the node hash.
+        self.mechanisms_authored: List[str] = []
         self.rejected_paths: str = ""
         self.invalidates_if: Optional[str] = None
         self.scope: List[str] = []
@@ -261,6 +269,7 @@ class ParsedEntry:
             "title": self.title,
             "core_axiom": self.core_axiom,
             "mechanisms": self.mechanisms,
+            "mechanisms_authored": self.mechanisms_authored,
             "rejected_paths": self.rejected_paths,
             "invalidates_if": self.invalidates_if,
             "scope": self.scope,
@@ -912,6 +921,15 @@ def _tokenize_entry(
     if "mechanisms" in fields:
         mech_raw = " ".join(fields["mechanisms"]).strip()
         entry.mechanisms = _normalize_mechanism_list(mech_raw.split(","))
+        # Hash-neutral sidecar: the raw pre-fold tokens, authored order preserved
+        # (V1-D15 / Decision 1). ``entry.mechanisms`` above is folded for identity;
+        # 5a's registry writer canonical-matches these back to recover first-seen
+        # casing for ``authored_name``. Filtered on the raw token (same rule as
+        # ``_normalize_mechanism_list``); never deduped here (the writer's
+        # canonical-match "first token wins" gives first-seen-within-entry).
+        entry.mechanisms_authored = [
+            t.strip() for t in mech_raw.split(",") if t.strip()
+        ]
     if "scope" in fields:
         scope_raw = " ".join(fields["scope"]).strip()
         entry.scope = _normalize_scope_list(scope_raw.split(","))

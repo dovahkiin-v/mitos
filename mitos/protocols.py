@@ -237,6 +237,27 @@ class GraphStoreProtocol(Protocol):
         """
         ...
 
+    def get_unregistered_mechanisms(self, parsed: ParsedEntry) -> List[str]:
+        """Returns the subset of ``parsed``'s mechanism refs NOT yet registered.
+
+        Read-only pre-commit feedback query (registers nothing): given a parsed
+        entry, returns which cited mechanisms are not yet in the ``mechanisms``
+        registry, so an interactive-review surface can flag a typo/alias before
+        auto-registration fires. Keys each ref by ``mechanism_canonical_norm``,
+        returns the not-yet-present ones (authored form when available), order-stable
+        and deduped by ``canonical_name``. Decision-gated — an open question carries
+        no mechanisms → ``[]``.
+
+        Args:
+            parsed: The entry whose mechanism refs to check against the registry.
+
+        Returns:
+            The authored (or ref-fallback) form of each unregistered cited
+            mechanism, first-seen order; ``[]`` when all registered / none cited /
+            open question.
+        """
+        ...
+
     def get_decisions(
         self, scope: Optional[str] = None, state: str = "active"
     ) -> List[Dict[str, Any]]:
