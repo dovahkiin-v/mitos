@@ -132,6 +132,13 @@ Manually compiles active axioms into `live_axioms.md`.
 PYTHONPATH=. python3 mitos/cli.py render
 ```
 
+### 5. Rebuild (upgrade path)
+Re-commits the full corpus (`decisions.md` + the quarterly archives) through the **current** edge catalog and mechanism registry, into a build-aside graph that is swapped in atomically (the old graph is backed up to `graph.sqlite.bak_<timestamp>`). Use it after upgrading across a schema change — e.g. **0.3.x → 0.4.0**, where the in-place migration widens the schema but does *not* re-commit, so the newer edge types (`amends`/`narrows`/`depends_on`/`cites`/…) and the mechanism registry stay empty until you rebuild. **No decisions are ever at risk** — the markdown is the source of truth; an entry the current catalog rejects (e.g. a citation to a since-superseded decision) is surfaced as a punch-list, never silently dropped. `mitos status` nudges when a rebuild is due.
+```bash
+mitos rebuild                # refuses to swap if it would drop content; shows why
+mitos rebuild --allow-drops  # proceed, accepting the drops (they stay in the markdown)
+```
+
 ---
 
 ## 🧪 Testing

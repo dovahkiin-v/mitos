@@ -532,10 +532,16 @@ def test_dod13_seven_non_kill_types_commit_without_retiring_endpoints(store) -> 
 
 
 def test_version_is_v1b_minor_bump() -> None:
-    """``mitos.__version__`` reads the V1b minor bump (0.3.3 → 0.4.0).
+    """``mitos.__version__`` is at least the V1b minor bump (0.4.0 floor).
 
-    The one user-facing act of the whole vision: a whole-substrate catalog
-    completion is a minor bump (PATTERNS / CLAUDE.md release ritual). Read from the
-    single source of truth (``mitos/__init__.py``), pinned once here.
+    V1b's one user-facing act was the 0.3.3 → 0.4.0 minor bump (a whole-substrate
+    catalog completion; PATTERNS / CLAUDE.md release ritual). This pins the **floor**
+    rather than a frozen literal: ``__version__`` is a single living value the release
+    ritual keeps bumping (e.g. 0.5.0 for the `mitos rebuild` verb), so freezing it at
+    ``== "0.4.0"`` would break the suite on every later release. Asserting ``>= 0.4.0``
+    still catches a regression below the V1b minor while surviving forward bumps.
     """
-    assert __version__ == "0.4.0"
+    parts = tuple(int(p) for p in __version__.split("."))
+    assert parts >= (0, 4, 0), (
+        f"version {__version__} regressed below the V1b 0.4.0 minor-bump floor"
+    )
