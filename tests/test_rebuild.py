@@ -401,3 +401,41 @@ def test_status_no_nudge_when_registry_populated(tmp_path, monkeypatch, capsys):
     assert cli.cmd_status(str(tmp_path)) == 0
     out = capsys.readouterr().out
     assert "behind your buffer" not in out
+
+
+# --- the refused-rebuild remediation guidance (upgrade-path UX) ----------------
+
+
+def test_cmd_rebuild_refusal_prints_actionable_remediation(tmp_path, capsys):
+    """A refused rebuild guides the user: safe + per-class fix + --allow-drops escape.
+
+    A stranger upgrading must not hit a bare ``refused`` wall — they need to learn
+    their decisions are safe, exactly what to do for a dangling_edge casualty, and
+    that --allow-drops is a safe escape.
+    """
+    config = _config(tmp_path)
+    live = GraphStore(config.db_path)
+    _commit(
+        live,
+        _decision("old", "Old axiom."),
+        _decision("newer", "Newer axiom.", supersedes="old"),
+        _decision("citer", "Cites old."),
+    )
+    _write(
+        config.decisions_file,
+        _stream(
+            _decision("citer", "Cites old.", cites="old"),
+            _decision("newer", "Newer axiom.", supersedes="old"),
+            _decision("old", "Old axiom."),
+        ),
+    )
+
+    rc = cmd_rebuild(config, allow_drops=False, assume_yes=True, as_json=False)
+    out = capsys.readouterr().out
+
+    assert rc == 1
+    assert "nothing is lost" in out          # reassurance
+    assert "source of truth" in out
+    assert "dangling_edge" in out            # per-class fix
+    assert "active successor" in out
+    assert "--allow-drops" in out            # the safe escape
