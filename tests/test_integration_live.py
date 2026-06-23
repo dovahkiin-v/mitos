@@ -26,6 +26,8 @@ from mitos.config import MitosConfig, default_collection_name
 from mitos.store import GraphStore
 from mitos.sync import MitosSyncManager
 
+from live_helpers import skip_if_embed_quota_exhausted, skip_if_global_mitos_stale
+
 
 def _read_key_from_env_file(path: str, name: str = "GEMINI_API_KEY"):
     if not os.path.exists(path):
@@ -263,6 +265,12 @@ def test_adjacency_surfaces_related_decision(live_workspace):
     )
     assert res["status"] == "created"
     related_slugs = [r["slug"] for r in res.get("related", [])]
+    if not related_slugs:
+        # The adjacency echo is fail-silent (production swallows embed errors,
+        # sync.py:1688); an empty echo under a spent embed quota is environmental,
+        # not a code defect. Probe to distinguish: skip loudly on a 429, else let
+        # the assert fire on a real regression.
+        skip_if_embed_quota_exhausted(m.embed_provider)
     assert "stripe-single-psp" in related_slugs, related_slugs
     # The new decision never lists itself as its own neighbour.
     assert "stripe-webhooks-source-of-truth" not in related_slugs
@@ -296,6 +304,7 @@ def test_surface_brief_omits_rejected_paths_real_semantic(live_workspace, capsys
 def test_cli_subprocess_relation_flag_links_decisions(tmp_path):
     """Real binary, real argv: --depends-on links two decisions, edge lands in graph."""
     mitos_bin = shutil.which("mitos") or "mitos"
+    skip_if_global_mitos_stale(mitos_bin)
     ws = tmp_path / "proj"
     ws.mkdir()
     env = {

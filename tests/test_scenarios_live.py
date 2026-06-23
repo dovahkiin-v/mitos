@@ -25,6 +25,8 @@ from mitos.importer import MitosProseImporter
 from mitos.mcp_server import query_decisions, surface_decisions
 from mitos.errors import ParseError
 
+from live_helpers import skip_on_embed_quota
+
 # 1. Load live environment keys from .env if present
 def load_live_env() -> None:
     env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
@@ -116,7 +118,8 @@ def test_scenario_s1_cold_start_happy_path(live_workspace) -> None:
     qdrant = QdrantVectorStore(config.qdrant_url, config.qdrant_collection)
     
     # Verify we can retrieve it by semantic similarity
-    q_vector = provider.get_embedding("init read format-spec", is_query=True)
+    with skip_on_embed_quota():
+        q_vector = provider.get_embedding("init read format-spec", is_query=True)
     matches = qdrant.query(q_vector, limit=1)
     assert len(matches) == 1
     assert matches[0]["slug"] == "s1-happy"
@@ -568,7 +571,8 @@ def test_scenario_x1_decision_lifecycle(live_workspace) -> None:
     provider = GeminiEmbeddingProvider(cache_path)
     qdrant = QdrantVectorStore(config.qdrant_url, config.qdrant_collection)
     
-    q_vector = provider.get_embedding(committed_axiom, is_query=True)
+    with skip_on_embed_quota():
+        q_vector = provider.get_embedding(committed_axiom, is_query=True)
     matches = qdrant.query(q_vector, limit=1)
     assert len(matches) == 1
     assert matches[0]["slug"] == "x1-coherence"
