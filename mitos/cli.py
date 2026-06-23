@@ -1521,6 +1521,58 @@ def cmd_cutover(
     return 0
 
 
+def _print_rebuild_remediation(casualties, missing_cores, decisions_basename: str) -> None:
+    """Prints reassuring, per-class remediation when a rebuild is refused.
+
+    The upgrade-path UX (no stranger's experience is broken): a user who hits a stale
+    citation must learn three things at once — their decisions are SAFE, exactly WHAT
+    to do per failure class, and that ``--allow-drops`` is a safe escape — never a
+    bare ``refused`` wall.
+
+    Args:
+        casualties: The :class:`~mitos.cutover.Casualty` punch-list (each carries
+            ``codes`` + a ``detail`` that already names any superseding successor).
+        missing_cores: Active decisions absent from the rebuild (a corpus removal,
+            not a citation defect) — guided separately.
+        decisions_basename: The buffer filename to point edits at (e.g.
+            ``decisions.md``).
+    """
+    print(
+        f"\nRefusing to swap — the live graph is untouched and nothing is lost: "
+        f"{decisions_basename} (plus the archives) is the source of truth, and every "
+        f"entry below stays there. Here is how to clear each one:"
+    )
+    codes = {code for c in casualties for code in c.codes}
+    if "dangling_edge" in codes:
+        print(
+            "  • dangling_edge — the entry cites a decision that has since been "
+            "superseded. Re-point that citation to the active successor named in the "
+            "detail above (or delete the citation line), then re-run `mitos rebuild`."
+        )
+    if "missing_target" in codes:
+        print(
+            "  • missing_target — the entry cites a slug that no longer exists "
+            "(renamed away, or a typo). Fix or remove the citation, then re-run."
+        )
+    other = sorted(codes - {"dangling_edge", "missing_target"})
+    if other:
+        print(
+            f"  • {', '.join(other)} — see the detail above; fix the entry in "
+            f"{decisions_basename} and re-run."
+        )
+    if missing_cores:
+        print(
+            "  • Some active decisions are absent from the corpus entirely (a removal, "
+            "not a citation defect). If that is intentional, --allow-drops accepts it; "
+            "otherwise restore them in the buffer."
+        )
+    print(
+        "\nOr re-run `mitos rebuild --allow-drops` to proceed now — the listed entries "
+        "remain in your markdown and re-enter the graph the moment you fix the "
+        "citation and rebuild again."
+    )
+
+
 def cmd_rebuild(
     config: MitosConfig, *, allow_drops: bool, assume_yes: bool, as_json: bool
 ) -> int:
@@ -1617,11 +1669,9 @@ def cmd_rebuild(
             print(_json.dumps({**result.to_dict(), "swapped": False,
                                "reason": "casualties_or_shortfall_refused"}, indent=2))
         else:
-            print(f"\nRefusing to swap: the rebuild would drop content the live graph "
-                  f"holds. Fix the citations above in "
-                  f"{os.path.basename(config.decisions_file)} and re-run, or — if these "
-                  f"drops are intentional — re-run with --allow-drops. The live graph "
-                  f"is untouched.")
+            _print_rebuild_remediation(
+                casualties, result.missing_cores, os.path.basename(config.decisions_file)
+            )
         return 1
     if blocked and not as_json:
         print("\n--allow-drops set: proceeding despite the dropped content, treating "
