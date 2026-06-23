@@ -220,7 +220,8 @@ def test_invariant_m5_database_corruption_and_rebuild(isolated_workspace) -> Non
     # Depends-On the older d1 — sits ON TOP of d1. Steady-state sync now parses the
     # buffer oldest-first (V1b 4a reverses it), so d1 commits before d2 and the
     # forward-ref lands in a single sync. (A buffer that placed d2 below d1 would
-    # quarantine d2's edge on the first pass and converge on the next.)
+    # quarantine d2's edge on the first pass, then converge in the SAME sync via 4b's
+    # intra-sync fixpoint retry — no second sync needed.)
     entry_text = (
         "## 2026-06-01 — d2 — Second decision\n"
         "**Decided:** Second rule of Mitos.\n"
