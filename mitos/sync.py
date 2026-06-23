@@ -527,6 +527,17 @@ class MitosSyncManager:
 
         synced_blocks: List[Tuple[ParsedEntry, str]] = []
 
+        # 4b intra-sync fixpoint: the main pass below collects every entry the store
+        # rejects with a CommitError (a forward-ref whose in-corpus target has not
+        # committed yet, a slug collision, a kind/cycle violation) into this set
+        # instead of reporting it immediately. After the main pass, the fixpoint
+        # re-attempts the set until a pass makes no further progress, so any acyclic
+        # cross-file forward-ref chain converges in THIS single sync. Each tuple
+        # carries the fully-prepared entry, its decisions-snapshot raw text (for
+        # rotation if a decision commits in the fixpoint; "" for OQs), and its latest
+        # failure (for the post-fixpoint residual report).
+        quarantined: List[Tuple[ParsedEntry, str, CommitError]] = []
+
         # 3. Process each parsed entry
         for entry in entries:
             # Read exact raw text block of this entry from snapshot for content-aware
@@ -694,11 +705,19 @@ class MitosSyncManager:
             # whole-sync abort it was before. The catch keys on the CommitError CLASS,
             # not a code allowlist, so every §5.2.2 structural rejection (missing_target
             # ∪ slug_collision ∪ cycle_violation ∪ kind_constraint_violation ∪
-            # dangling_edge) funnels through it uniformly (D3).
+            # dangling_edge) funnels through it uniformly (D3). 4b lifts the floor to a
+            # ceiling: a quarantined entry is COLLECTED (not reported here) and re-tried
+            # by the intra-sync fixpoint after this loop, so an acyclic forward-ref
+            # converges in this sync rather than the next.
             try:
                 delta = self.store.commit_parsed_entry(entry)
             except CommitError as exc:
-                self._report_commit_quarantine(entry, exc)
+                # 4b: collect (don't report yet) for the intra-sync fixpoint retry
+                # after this loop. The entry is fully prepared (enriched, collision-
+                # resolved, confirmed-stamped) — only the store-stage commit failed,
+                # and its in-corpus target may yet commit in this same sync. Carry
+                # entry_raw_text so a decision committed in the fixpoint still rotates.
+                quarantined.append((entry, entry_raw_text, exc))
                 continue
             except (ValidationError, DatabaseError) as exc:
                 # Defensive secondary bulkhead (Gotcha): a bypassed-parser empty core
@@ -724,6 +743,21 @@ class MitosSyncManager:
             # rotation set or the pending_threshold rotation prompt's count.
             if entry.kind == "decision":
                 synced_blocks.append((entry, entry_raw_text))
+
+        # 3b. Intra-sync fixpoint retry (4b). The main pass committed every entry
+        # whose targets were already present; re-attempt the quarantined set until a
+        # pass makes no further progress, so any acyclic cross-file forward-ref chain
+        # (D resolves Q, Q derives_from D', … however deep, in any authoring order)
+        # converges in THIS single sync — order-independently, while every retry stays
+        # an isolated per-entry commit_parsed_entry transaction (no batching, no
+        # ordering — D5/MI-12). A genuinely-unresolvable reference (a never-authored
+        # target, or a true A↔B mutual-reference cycle) makes zero progress, terminates
+        # after one no-progress pass, and surfaces below as a loud per-entry vector —
+        # never a hang, never a whole-sync abort. The fixpoint sits BEFORE rotation so
+        # a decision it commits is appended to synced_blocks and rotates with the rest.
+        residual = self._commit_quarantine_fixpoint(quarantined, synced_blocks)
+        for entry, _raw, exc in residual:
+            self._report_commit_quarantine(entry, exc)
 
         # 4. Content-aware archive rotation under brief lock (V3b)
         if synced_blocks:
@@ -794,23 +828,119 @@ class MitosSyncManager:
             hits, misses, rate = self.embed_provider.get_stats()
             print(f"\n[Observability] Cache Stats: Hits: {hits}, Misses: {misses}, Hit Rate: {rate*100:.1f}%")
 
+    def _commit_quarantine_fixpoint(
+        self,
+        quarantined: List[Tuple[ParsedEntry, str, CommitError]],
+        synced_blocks: List[Tuple[ParsedEntry, str]],
+    ) -> List[Tuple[ParsedEntry, str, CommitError]]:
+        """Drains the per-entry quarantine set to a fixpoint (4b).
+
+        Sits on 4a's per-entry quarantine *floor*: the main pass collected every
+        entry the store rejected with a :class:`CommitError` (a forward-ref whose
+        in-corpus target had not committed yet, plus the structural rejections that
+        never self-heal). This re-attempts that set in repeated passes until a pass
+        commits nothing new — so any acyclic cross-file forward-ref chain (``D``
+        resolves ``Q``, ``Q`` derives_from ``D'``, … however deep, in any authoring
+        order) converges in a **single** sync, order-independently.
+
+        Each retry is the **same** isolated ``commit_parsed_entry(entry)`` call on the
+        **same** already-prepared entry — no enrichment, no collision prompt, no
+        re-stamp (those all ran in the main loop before the entry reached commit), no
+        batching, no ordering (D1/D5/MI-12). A failed retry rolls back wholly
+        (``CommitError`` is raised inside ``commit_parsed_entry``'s ``with conn:``), so
+        a clean DB plus any targets committed earlier in the same pass is what the next
+        retry sees — the load-bearing safety property that makes re-attempt safe.
+
+        **Termination (D2/D3).** The whole ``CommitError`` class is retried uniformly —
+        never a "retry only ``missing_target``" allowlist (the exact non-uniform
+        bulkhead the vision forbids). The progress metric is *a commit succeeded this
+        pass*, not *the set is non-empty*: a committed entry leaves the set and is never
+        revisited (none enter after the main pass), so the set is monotonically
+        non-increasing and the loop stops on the first zero-progress pass. A true
+        mutual-reference cycle (or a never-authored target) makes zero progress → one
+        no-progress pass → exit → the caller reports the residual loudly. Worst case is
+        O(k) passes for a depth-k chain; fine at sync batch sizes (P19 boring core).
+
+        Args:
+            quarantined: The fully-prepared entries the main pass quarantined, each
+                with its decisions-snapshot raw text ("" for an OQ) and its latest
+                ``CommitError``.
+            synced_blocks: The rotation record; a decision committed here is appended
+                ``(entry, raw)`` so it rotates with the main-pass commits (mutated in
+                place — the fixpoint runs before rotation reads it).
+
+        Returns:
+            The residual entries that never committed, each still carrying its latest
+            ``CommitError`` — ``[]`` when everything converged.
+        """
+        if not quarantined:
+            return []
+
+        pending: List[Tuple[ParsedEntry, str, CommitError]] = list(quarantined)
+        committed = 0
+        passes = 0
+        while pending:
+            passes += 1
+            progressed = False
+            still_pending: List[Tuple[ParsedEntry, str, CommitError]] = []
+            for entry, raw, _exc in pending:
+                try:
+                    delta = self.store.commit_parsed_entry(entry)
+                except CommitError as new_exc:
+                    # Still blocked — keep it (carrying its LATEST failure) for the
+                    # next pass. The whole entry rolled back inside commit_parsed_entry's
+                    # `with conn:`, so the DB stays consistent for the other retries.
+                    still_pending.append((entry, raw, new_exc))
+                    continue
+                # Committed: its target landed in the main pass or an earlier retry.
+                progressed = True
+                committed += 1
+                print(f"Committed node: {entry.slug} ✓")
+                # Embed every fixpoint-committed node, exactly like the main pass —
+                # OQ nodes embed too. Idempotent on this path (the commit already
+                # enqueued the Outbox row; this drops it once indexed).
+                self._best_effort_embed(delta, entry)
+                # Decisions rotate; OQs never do (raw is "" for an OQ, D5).
+                if entry.kind == "decision":
+                    synced_blocks.append((entry, raw))
+            pending = still_pending
+            if not progressed:
+                # A full pass committed nothing — no remaining entry can ever make
+                # progress (the set only shrinks), so stop and leave them as residual.
+                break
+
+        # Convergence observability: make the fixpoint's work visible (the vision
+        # values loud diagnostics) without any timing assertion — a structural signal
+        # a test can read. Only printed when the quarantine set was non-empty.
+        entry_word = "entry" if committed == 1 else "entries"
+        pass_word = "pass" if passes == 1 else "passes"
+        print(
+            f"\n[Fixpoint] converged {committed} quarantined {entry_word} over "
+            f"{passes} retry {pass_word}; {len(pending)} unresolved."
+        )
+        return pending
+
     def _report_commit_quarantine(self, entry: ParsedEntry, exc: CommitError) -> None:
-        """Reports a quarantined per-entry commit failure as a guiding vector (4a).
+        """Reports a residual per-entry commit failure as a guiding vector.
 
         The per-entry commit-stage bulkhead (P5 dead-letter / P7 Bulkhead): a single
         entry's store-stage rejection — any member of the §5.2.2 ``CommitError``
         class — is isolated to *that* entry. The entry is left in its buffer (never
-        recorded for rotation), so a later sync can commit it once its target lands
-        or its defect is fixed; the rest of this batch proceeds untouched.
+        recorded for rotation), so a later sync can commit it once the operator fixes
+        the reference or authors the missing target; the rest of this batch proceeds
+        untouched.
 
-        A still-unresolved ``missing_target`` is surfaced as a *guiding* vector
-        ("target not committed yet"), not the bare "does not match any entry" wall
-        that reads as a typo (D6) — a forward-ref to a target authored later in the
-        corpus commits on a subsequent sync once that target lands. Every other code
-        gets a calm, located generic surface. This mirrors the code-aware message
-        builder in ``cutover._cutover_error_for_commit`` (the sync-side analogue —
-        that one is cutover-specific and returns a ``CutoverError``, so it is not
-        reused here).
+        Called **post-fixpoint** (4b): by the time this fires, the intra-sync fixpoint
+        has already exhausted every in-corpus retry, so a residual ``missing_target``
+        no longer means "authored later in this corpus, settles next sync" (4a's
+        optimistic framing) — it means the referenced target is **not present anywhere
+        in this corpus**: a forward-ref to a never-authored / renamed-away target, or a
+        true mutual-reference cycle where neither member can commit first. The vector
+        says so honestly (D4), still a *guiding* vector rather than the bare "does not
+        match any entry" wall that reads as a typo (D6). Every other code gets a calm,
+        located generic surface. This mirrors the code-aware message builder in
+        ``cutover._cutover_error_for_commit`` (the sync-side analogue — that one is
+        cutover-specific and returns a ``CutoverError``, so it is not reused here).
 
         Args:
             entry: The entry the store rejected.
@@ -822,9 +952,11 @@ class MitosSyncManager:
         if STORE_MISSING_TARGET in codes:
             print(
                 f"\n[Quarantined] '{entry.slug}' (lines {entry.line_start}-{entry.line_end}): "
-                f"references a target not committed yet — it may be authored later in this "
-                f"corpus and will commit on a subsequent sync once its target lands. Entry "
-                f"left in its buffer. ({detail})"
+                f"references a target that is not present anywhere in this corpus. The "
+                f"intra-sync fixpoint already retried every in-corpus dependency, so this is "
+                f"not a settles-on-the-next-sync forward-ref — author the missing target, fix "
+                f"the reference, or break the mutual-reference cycle (in an A↔B cycle neither "
+                f"member can commit first). Entry left in its buffer. ({detail})"
             )
         else:
             code_str = ", ".join(sorted(codes)) if codes else "referential violation"

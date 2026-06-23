@@ -549,19 +549,22 @@ def test_sync_malformed_decision_entry_does_not_strand_oq(
 
 
 @patch("google.genai.Client")
-def test_sync_quarantines_forward_ref_missing_target_as_guiding_vector(
+def test_sync_single_forward_ref_converges_in_one_sync(
     mock_client: MagicMock,
     sync_env: Tuple[MitosConfig, MitosSyncManager, str],
     capsys: pytest.CaptureFixture,
 ) -> None:
-    """Whole-class quarantine, axis (a): a forward-ref missing_target isolates as a
-    GUIDING vector, the rest of the batch commits, and the quarantined entry stays in
-    its buffer (not rotated).
+    """4b fixpoint, the headline (DoD #11 axis 1): a single cross-file forward-ref
+    converges in ONE sync.
 
     A decision that Resolves: an open question authored in questions.md hits the
-    opposite file order: decisions-first commits the decision before its OQ target,
-    so the resolves edge is a forward-ref → missing_target → quarantine. The OQ itself
-    still commits; the decision converges on a later sync (4b's fixpoint in one).
+    opposite file order — decisions-first attempts the decision before its OQ target,
+    so on the main pass the resolves edge is a forward-ref → missing_target →
+    quarantine. Under 4a this stranded the decision for a SECOND sync; under 4b's
+    fixpoint the OQ commits on the main pass and the re-attempt then lands the
+    decision + its resolves edge in THIS sync. (Was
+    test_sync_quarantines_forward_ref_missing_target_as_guiding_vector under 4a; the
+    guiding-vector coverage moved to test_sync_unauthored_target_residual_guiding_vector.)
     """
     config, manager, tmpdir = sync_env
     os.environ["GEMINI_API_KEY"] = "mock_key"
@@ -584,17 +587,233 @@ def test_sync_quarantines_forward_ref_missing_target_as_guiding_vector(
     manager.perform_sync(auto_accept=True)
 
     captured = capsys.readouterr()
-    assert "target not committed yet" in captured.out
-    assert "resolver-decision" in captured.out
+    # Converged: nothing left in the residual, so no [Quarantined] vector fired.
+    assert "[Quarantined]" not in captured.out
+    assert "0 unresolved" in captured.out
 
     store = GraphStore(config.db_path)
-    # The decision is quarantined (not committed); its OQ target DID commit.
-    assert store.get_node_by_slug("resolver-decision") is None
-    assert {q["slug"] for q in store.get_open_questions()} == {"oq-target"}
+    # BOTH nodes committed in the one sync.
+    resolver = store.get_node_by_slug("resolver-decision")
+    assert resolver is not None
+    oqs = store.get_open_questions()
+    assert {q["slug"] for q in oqs} == {"oq-target"}
+    oq_target_id = next(q["id"] for q in oqs if q["slug"] == "oq-target")
 
-    # Quarantined entry stays in its buffer (never rotated) for a later sync.
+    # The resolves edge landed in the fixpoint (decision → OQ), endpoints read back.
+    resolves = [e for e in store.get_edges() if e["edge_type"] == "resolves"]
+    assert len(resolves) == 1
+    assert resolves[0]["source_id"] == resolver["id"]
+    assert resolves[0]["target_id"] == oq_target_id
+
+
+@patch("google.genai.Client")
+def test_sync_deep_acyclic_chain_converges_in_one_sync(
+    mock_client: MagicMock,
+    sync_env: Tuple[MitosConfig, MitosSyncManager, str],
+) -> None:
+    """4b fixpoint, the deep case (DoD #11 axis 1): a cross-file forward-ref chain
+    whose dependency direction alternates across files converges in ONE sync.
+
+    Chain: d1 Resolves: q1; q1 Derives-From: d2; d2 Resolves: q2; q2 terminal. The
+    `resolves` (D→OQ) and `derives_from` (OQ→D) edges point opposite ways, so neither
+    decisions-first nor oldest-first lands the whole chain on the main pass — only the
+    terminal q2 commits there; the fixpoint walks the rest (d2 → q1 → d1) over its
+    retry passes. All four nodes and all three edges land in a single sync.
+    """
+    config, manager, tmpdir = sync_env
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+    _set_enrichment_passthrough(mock_client)
+
+    # Decisions, authored newest-first (the buffer convention): d1 (newer) on top.
+    _append_decision(
+        config,
+        "## 2026-05-21 — d1 — D1\n"
+        "**Decided:** The leaf decision, resolving q1.\n"
+        "**Rejected:** Leaving q1 open.\n"
+        "**Resolves:** q1\n\n"
+        "## 2026-05-19 — d2 — D2\n"
+        "**Decided:** The mid decision, resolving q2.\n"
+        "**Rejected:** Leaving q2 open.\n"
+        "**Resolves:** q2\n",
+    )
+    # Open questions, newest-first: q1 (which derives from d2) on top, terminal q2 below.
+    _write_questions(
+        tmpdir,
+        "### q1\n\n"
+        "**Topic:** The question d1 resolves and that derives from d2.\n"
+        "**Questions:** Does q1 hold given d2?\n"
+        "**Derives-From:** d2\n\n"
+        "### q2\n\n"
+        "**Topic:** The terminal question d2 resolves.\n"
+        "**Questions:** Which approach for q2?\n",
+    )
+
+    manager.perform_sync(auto_accept=True)
+
+    store = GraphStore(config.db_path)
+    d1 = store.get_node_by_slug("d1")
+    d2 = store.get_node_by_slug("d2")
+    assert d1 is not None and d2 is not None
+
+    oqs = store.get_open_questions()
+    oq_ids = {q["slug"]: q["id"] for q in oqs}
+    assert set(oq_ids) == {"q1", "q2"}
+
+    edges = store.get_edges()
+    resolves = {(e["source_id"], e["target_id"]) for e in edges if e["edge_type"] == "resolves"}
+    derives = {(e["source_id"], e["target_id"]) for e in edges if e["edge_type"] == "derives_from"}
+    # d1→q1 and d2→q2 (two resolves); q1→d2 (one derives_from).
+    assert resolves == {(d1["id"], oq_ids["q1"]), (d2["id"], oq_ids["q2"])}
+    assert derives == {(oq_ids["q1"], d2["id"])}
+
+
+@patch("google.genai.Client")
+def test_sync_fixpoint_is_load_bearing_for_deep_chain(
+    mock_client: MagicMock,
+    sync_env: Tuple[MitosConfig, MitosSyncManager, str],
+) -> None:
+    """P10 'provoke the failure' — the same deep chain does NOT fully converge with the
+    fixpoint stubbed out, proving the fixpoint is load-bearing (not incidental).
+
+    With _commit_quarantine_fixpoint replaced by a no-op that commits nothing and
+    returns the whole quarantine set as residual, only the terminal q2 commits on the
+    main pass; the deepest decision d1 (two hops up the chain) does NOT — it would need
+    a second sync. This is the RED-without-4b proof the floor-only behaviour leaves.
+    """
+    config, manager, tmpdir = sync_env
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+    _set_enrichment_passthrough(mock_client)
+
+    _append_decision(
+        config,
+        "## 2026-05-21 — d1 — D1\n"
+        "**Decided:** The leaf decision, resolving q1.\n"
+        "**Rejected:** Leaving q1 open.\n"
+        "**Resolves:** q1\n\n"
+        "## 2026-05-19 — d2 — D2\n"
+        "**Decided:** The mid decision, resolving q2.\n"
+        "**Rejected:** Leaving q2 open.\n"
+        "**Resolves:** q2\n",
+    )
+    _write_questions(
+        tmpdir,
+        "### q1\n\n"
+        "**Topic:** The question d1 resolves and that derives from d2.\n"
+        "**Questions:** Does q1 hold given d2?\n"
+        "**Derives-From:** d2\n\n"
+        "### q2\n\n"
+        "**Topic:** The terminal question d2 resolves.\n"
+        "**Questions:** Which approach for q2?\n",
+    )
+
+    # Disable the fixpoint: commit nothing, surface everything as residual.
+    def _noop_fixpoint(self, quarantined, synced_blocks):  # type: ignore[no-untyped-def]
+        return list(quarantined)
+
+    with patch.object(MitosSyncManager, "_commit_quarantine_fixpoint", _noop_fixpoint):
+        manager.perform_sync(auto_accept=True)
+
+    store = GraphStore(config.db_path)
+    # The terminal OQ committed on the main pass; the deepest decision did NOT.
+    assert {q["slug"] for q in store.get_open_questions()} == {"q2"}
+    assert store.get_node_by_slug("d1") is None
+    assert store.get_node_by_slug("d2") is None
+
+
+@patch("google.genai.Client")
+def test_sync_true_cycle_surfaces_loud_and_returns(
+    mock_client: MagicMock,
+    sync_env: Tuple[MitosConfig, MitosSyncManager, str],
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """4b fixpoint, the cycle case (DoD #11 axis 2): a true 2-node mutual-reference
+    cycle commits NEITHER node, prints a loud per-entry vector for each, and the sync
+    RETURNS (no hang, no exception, no whole-sync abort).
+
+    cycle-decision Resolves: cycle-oq AND cycle-oq Derives-From: cycle-decision — each
+    references the other, so neither can commit first. The fixpoint makes zero progress,
+    terminates after one no-progress pass, and the residual is reported as a loud vector
+    per member. Reaching the assertions at all IS the no-hang proof (a wedge would never
+    return); P7 holds — no exception escapes perform_sync.
+    """
+    config, manager, tmpdir = sync_env
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+    _set_enrichment_passthrough(mock_client)
+
+    _append_decision(
+        config,
+        "## 2026-05-19 — cycle-decision — Cycle Decision\n"
+        "**Decided:** This decision resolves an OQ that derives from it.\n"
+        "**Rejected:** Breaking the cycle.\n"
+        "**Resolves:** cycle-oq\n",
+    )
+    _write_questions(
+        tmpdir,
+        "### cycle-oq\n\n"
+        "**Topic:** A question that derives from the decision that resolves it.\n"
+        "**Questions:** Which way does this cycle resolve?\n"
+        "**Derives-From:** cycle-decision\n",
+    )
+
+    # Must RETURN — not hang, not raise.
+    manager.perform_sync(auto_accept=True)
+
+    captured = capsys.readouterr()
+    # A loud per-entry vector named each member of the cycle.
+    assert captured.out.count("[Quarantined]") == 2
+    assert "cycle-decision" in captured.out
+    assert "cycle-oq" in captured.out
+    # Post-fixpoint (D4) wording — not the optimistic "settles next sync" framing.
+    assert "not present anywhere in this corpus" in captured.out
+
+    store = GraphStore(config.db_path)
+    # NEITHER node committed.
+    assert store.get_node_by_slug("cycle-decision") is None
+    assert {q["slug"] for q in store.get_open_questions()} == set()
+
+
+@patch("google.genai.Client")
+def test_sync_unauthored_target_residual_guiding_vector(
+    mock_client: MagicMock,
+    sync_env: Tuple[MitosConfig, MitosSyncManager, str],
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """4b residual (preserves 4a's guiding-vector UX for the genuinely-unresolvable
+    case): a reference to a target authored NOWHERE quarantines after the exhausted
+    fixpoint with the post-fixpoint (D4) vector, and the entry stays in its buffer.
+
+    This is the test that REPLACES 4a's guiding-vector coverage: under 4b a forward-ref
+    quarantine means the target is truly absent (the fixpoint already retried every
+    in-corpus dependency), so the vector names that honestly rather than promising a
+    next-sync commit.
+    """
+    config, manager, tmpdir = sync_env
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+    _set_enrichment_passthrough(mock_client)
+
+    _append_decision(
+        config,
+        "## 2026-05-19 — orphan-resolver — Orphan Resolver\n"
+        "**Decided:** This decision resolves a question that was never authored.\n"
+        "**Rejected:** Authoring the question.\n"
+        "**Resolves:** nonexistent-oq\n",
+    )
+
+    manager.perform_sync(auto_accept=True)
+
+    captured = capsys.readouterr()
+    assert "[Quarantined]" in captured.out
+    assert "orphan-resolver" in captured.out
+    assert "not present anywhere in this corpus" in captured.out
+    # Honest post-fixpoint framing — must NOT carry 4a's optimistic "settles next sync".
+    assert "commit on a subsequent sync once its target lands" not in captured.out
+
+    store = GraphStore(config.db_path)
+    assert store.get_node_by_slug("orphan-resolver") is None  # never committed
+
+    # Quarantined entry stays in its buffer (never rotated) for a fix-and-re-sync.
     with open(config.decisions_file, "r", encoding="utf-8") as f:
-        assert "resolver-decision" in f.read()
+        assert "orphan-resolver" in f.read()
 
 
 @patch("google.genai.Client")
@@ -607,6 +826,11 @@ def test_sync_quarantine_isolates_whole_commit_error_class(
     does NOT abort the sync — proof the catch is the CommitError CLASS, not a
     missing_target-only filter (P10: a missing_target-only catch would let this abort
     the whole batch, so the healthy OQ below would not commit).
+
+    Under 4b this is a *permanent* failure: the fixpoint retries the kind violation
+    once, makes no progress, and falls to the residual — reported via the relocated
+    _report_commit_quarantine. End state is unchanged from 4a (violator never commits,
+    survivor-OQ does, the code string still prints).
     """
     config, manager, tmpdir = sync_env
     os.environ["GEMINI_API_KEY"] = "mock_key"
