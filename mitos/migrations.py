@@ -263,11 +263,15 @@ _V1_SCHEMA_STATEMENTS: List[str] = [
         FOREIGN KEY (node_id) REFERENCES nodes(id)
     ) STRICT;
     """,
-    # signals — the active-state channel. The composite PK (node_id, signal_type,
-    # source) does all three jobs (the is_drifted EXISTS off the leading column,
-    # the source_reencounter (node, source) uniqueness, the retired singleton);
-    # no surrogate id, no secondary index. All three signal_type values are
-    # reserved-but-unwritten in V1a.
+    # signals — the audit/active-state channel. The composite PK (node_id,
+    # signal_type, source) does both load-bearing jobs (the is_drifted EXISTS off
+    # the leading node_id column; the source_reencounter per-(node, source)
+    # uniqueness — a repeat from the same source is a clean INSERT OR IGNORE no-op);
+    # no surrogate id, no secondary index. source_reencounter is written from V1b
+    # (the first live signal writer, 6a); drifted awaits the v0.2 Drift sensor;
+    # retired is vestigial and unwritten — successor-less death is modelled as a
+    # supersedes deletion decision (§4.5), so the slot has no planned writer (NOT a
+    # reserved singleton).
     """
     CREATE TABLE IF NOT EXISTS signals (
         node_id TEXT NOT NULL,
