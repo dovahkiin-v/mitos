@@ -28,6 +28,7 @@ from mitos.errors import (
 )
 from mitos.models import get_model_id
 from mitos.parser import ParsedEntry, parse_entry_stream, parse_file_reversed
+from mitos.replay import commit_quarantine_fixpoint
 from mitos.store import GraphStore, CommitDelta
 from mitos.identity import compute_node_id, embedding_text
 from mitos.embeddings import GeminiEmbeddingProvider
@@ -848,87 +849,51 @@ class MitosSyncManager:
         Sits on 4a's per-entry quarantine *floor*: the main pass collected every
         entry the store rejected with a :class:`CommitError` (a forward-ref whose
         in-corpus target had not committed yet, plus the structural rejections that
-        never self-heal). This re-attempts that set in repeated passes until a pass
-        commits nothing new — so any acyclic cross-file forward-ref chain (``D``
-        resolves ``Q``, ``Q`` derives_from ``D'``, … however deep, in any authoring
-        order) converges in a **single** sync, order-independently.
+        never self-heal). This re-attempts that set until a pass commits nothing new,
+        so any acyclic cross-file forward-ref chain converges in a **single** sync,
+        order-independently. A decision committed here is appended to ``synced_blocks``
+        so it rotates with the main-pass commits; OQ nodes never rotate (D5).
 
-        Each retry is the **same** isolated ``commit_parsed_entry(entry)`` call on the
-        **same** already-prepared entry — no enrichment, no collision prompt, no
-        re-stamp (those all ran in the main loop before the entry reached commit), no
-        batching, no ordering (D1/D5/MI-12). A failed retry rolls back wholly
-        (``CommitError`` is raised inside ``commit_parsed_entry``'s ``with conn:``), so
-        a clean DB plus any targets committed earlier in the same pass is what the next
-        retry sees — the load-bearing safety property that makes re-attempt safe.
-
-        **Termination (D2/D3).** The whole ``CommitError`` class is retried uniformly —
-        never a "retry only ``missing_target``" allowlist (the exact non-uniform
-        bulkhead the vision forbids). The progress metric is *a commit succeeded this
-        pass*, not *the set is non-empty*: a committed entry leaves the set and is never
-        revisited (none enter after the main pass), so the set is monotonically
-        non-increasing and the loop stops on the first zero-progress pass. A true
-        mutual-reference cycle (or a never-authored target) makes zero progress → one
-        no-progress pass → exit → the caller reports the residual loudly. Worst case is
-        O(k) passes for a depth-k chain; fine at sync batch sizes (P19 boring core).
+        The convergence loop is the shared :func:`mitos.replay.commit_quarantine_fixpoint`
+        primitive (the same engine the ``mitos rebuild`` corpus replay uses). This
+        wrapper supplies the sync-specific embed + rotation callbacks and the loud
+        convergence-observability line.
 
         Args:
             quarantined: The fully-prepared entries the main pass quarantined, each
                 with its decisions-snapshot raw text ("" for an OQ) and its latest
                 ``CommitError``.
-            synced_blocks: The rotation record; a decision committed here is appended
-                ``(entry, raw)`` so it rotates with the main-pass commits (mutated in
-                place — the fixpoint runs before rotation reads it).
+            synced_blocks: The rotation record; a committed decision is appended
+                ``(entry, raw)`` (mutated in place — the fixpoint runs before rotation
+                reads it).
 
         Returns:
             The residual entries that never committed, each still carrying its latest
             ``CommitError`` — ``[]`` when everything converged.
         """
-        if not quarantined:
-            return []
+        def _record_decision_block(entry: ParsedEntry, raw: str) -> None:
+            # Decisions rotate; OQs never do (raw is "" for an OQ, D5).
+            if entry.kind == "decision":
+                synced_blocks.append((entry, raw))
 
-        pending: List[Tuple[ParsedEntry, str, CommitError]] = list(quarantined)
-        committed = 0
-        passes = 0
-        while pending:
-            passes += 1
-            progressed = False
-            still_pending: List[Tuple[ParsedEntry, str, CommitError]] = []
-            for entry, raw, _exc in pending:
-                try:
-                    delta = self.store.commit_parsed_entry(entry)
-                except CommitError as new_exc:
-                    # Still blocked — keep it (carrying its LATEST failure) for the
-                    # next pass. The whole entry rolled back inside commit_parsed_entry's
-                    # `with conn:`, so the DB stays consistent for the other retries.
-                    still_pending.append((entry, raw, new_exc))
-                    continue
-                # Committed: its target landed in the main pass or an earlier retry.
-                progressed = True
-                committed += 1
-                print(f"Committed node: {entry.slug} ✓")
-                # Embed every fixpoint-committed node, exactly like the main pass —
-                # OQ nodes embed too. Idempotent on this path (the commit already
-                # enqueued the Outbox row; this drops it once indexed).
-                self._best_effort_embed(delta, entry)
-                # Decisions rotate; OQs never do (raw is "" for an OQ, D5).
-                if entry.kind == "decision":
-                    synced_blocks.append((entry, raw))
-            pending = still_pending
-            if not progressed:
-                # A full pass committed nothing — no remaining entry can ever make
-                # progress (the set only shrinks), so stop and leave them as residual.
-                break
+        committed, passes, residual = commit_quarantine_fixpoint(
+            self.store,
+            quarantined,
+            embed_fn=self._best_effort_embed,
+            on_commit=_record_decision_block,
+        )
 
         # Convergence observability: make the fixpoint's work visible (the vision
         # values loud diagnostics) without any timing assertion — a structural signal
         # a test can read. Only printed when the quarantine set was non-empty.
-        entry_word = "entry" if committed == 1 else "entries"
-        pass_word = "pass" if passes == 1 else "passes"
-        print(
-            f"\n[Fixpoint] converged {committed} quarantined {entry_word} over "
-            f"{passes} retry {pass_word}; {len(pending)} unresolved."
-        )
-        return pending
+        if quarantined:
+            entry_word = "entry" if committed == 1 else "entries"
+            pass_word = "pass" if passes == 1 else "passes"
+            print(
+                f"\n[Fixpoint] converged {committed} quarantined {entry_word} over "
+                f"{passes} retry {pass_word}; {len(residual)} unresolved."
+            )
+        return residual
 
     def _report_commit_quarantine(self, entry: ParsedEntry, exc: CommitError) -> None:
         """Reports a residual per-entry commit failure as a guiding vector.

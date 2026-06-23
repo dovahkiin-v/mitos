@@ -50,8 +50,8 @@ import os
 import re
 import shutil
 import sqlite3
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from mitos.config import MitosConfig
 from mitos.errors import (
@@ -65,6 +65,7 @@ from mitos.errors import (
 from mitos.identity import compute_node_id
 from mitos.migrations import is_pre_v1a_schema
 from mitos.parser import ParsedEntry, parse_file_reversed
+from mitos.replay import commit_quarantine_fixpoint
 from mitos.store import GraphStore, open_connection
 
 logger = logging.getLogger(__name__)
@@ -126,6 +127,47 @@ class MissingCore:
 
 
 @dataclass
+class Casualty:
+    """A corpus entry the rebuild replay could not commit — a punch-list item.
+
+    Surfaced by ``mitos rebuild`` (the resilient, non-strict caller of
+    :func:`rebuild_and_gate`): the entry stays in the buffer/markdown (the source of
+    truth, M7/P6), it simply did not enter the rebuilt graph. The common class is a
+    citation to a node that has since been superseded (``dangling_edge``) or never
+    authored (``missing_target``). ``cutover`` (the strict caller) never returns
+    these — a casualty there raises a :class:`~mitos.errors.CutoverError` instead.
+
+    Attributes:
+        slug: The entry's slug (or ``"<unknown>"`` for a pre-header failure).
+        line_start: 1-based start line of the entry's section span.
+        line_end: 1-based end line of the entry's section span.
+        codes: The store failure codes (e.g. ``["dangling_edge"]``); empty for a
+            non-``CommitError`` hard failure (validation / raw DB error).
+        detail: The human-readable rejection reason(s).
+    """
+
+    slug: str
+    line_start: int
+    line_end: int
+    codes: List[str]
+    detail: str
+
+    def to_dict(self) -> Dict[str, object]:
+        """Serializes the casualty into a JSON-compatible dict.
+
+        Returns:
+            A dict for the ``--json`` rebuild report.
+        """
+        return {
+            "slug": self.slug,
+            "line_start": self.line_start,
+            "line_end": self.line_end,
+            "codes": list(self.codes),
+            "detail": self.detail,
+        }
+
+
+@dataclass
 class RebuildResult:
     """The verdict of a clean :func:`rebuild_and_gate` run (7b consumes it).
 
@@ -146,6 +188,9 @@ class RebuildResult:
         reconstructed_active_count: Active node ids in the rebuild (both kinds).
         missing_cores: The shortfall offenders — active reference cores absent from
             the rebuild. Empty ⇒ the gate passed.
+        residual_casualties: Entries the replay could not commit (``mitos rebuild``'s
+            resilient path). Always empty for the strict ``cutover`` caller, which
+            raises on a casualty instead.
     """
 
     aside_db_path: str
@@ -154,6 +199,7 @@ class RebuildResult:
     reference_active_count: int
     reconstructed_active_count: int
     missing_cores: List[MissingCore]
+    residual_casualties: List[Casualty] = field(default_factory=list)
 
     @property
     def gate_passed(self) -> bool:
@@ -178,6 +224,7 @@ class RebuildResult:
             "reference_active_count": self.reference_active_count,
             "reconstructed_active_count": self.reconstructed_active_count,
             "missing_cores": [mc.to_dict() for mc in self.missing_cores],
+            "residual_casualties": [c.to_dict() for c in self.residual_casualties],
             "gate_passed": self.gate_passed,
         }
 
@@ -199,13 +246,16 @@ def default_aside_db_path(config: MitosConfig) -> str:
     return os.path.join(config.mitos_dir, "graph.sqlite.rebuild")
 
 
-def rebuild_and_gate(config: MitosConfig, *, aside_db_path: str) -> RebuildResult:
+def rebuild_and_gate(
+    config: MitosConfig, *, aside_db_path: str, strict: bool = True
+) -> RebuildResult:
     """Re-parses the corpus, replays it oldest-first, then gates against the old graph.
 
-    The single importable entry point for the V1a cutover's build-aside +
-    completeness-gate stage (Phase 7b's operator surface wraps this). The live
-    graph (``config.db_path``) is opened read-only for the gate and is otherwise
-    never touched; all writes go to ``aside_db_path``.
+    The shared build-aside + completeness-gate engine behind both the one-time
+    ``cutover`` (prototype→V1a) and the recurring ``mitos rebuild`` (re-commit the
+    corpus through the current catalog). The live graph (``config.db_path``) is
+    opened read-only for the gate and is otherwise never touched; all writes go to
+    ``aside_db_path``.
 
     Pipeline (§6):
 
@@ -213,26 +263,36 @@ def rebuild_and_gate(config: MitosConfig, *, aside_db_path: str) -> RebuildResul
        run — idempotent retry, no manual step (P5).
     2. Parse every corpus file in collector mode, accumulating all format defects;
        any defect raises :class:`~mitos.errors.CutoverError` before a single commit.
-    3. Replay strictly per-entry, oldest-first, into a fresh V1a graph; the first
-       referential/validation reject raises ``CutoverError``.
+    3. Replay per-entry, oldest-first, into a fresh graph, draining forward-refs via
+       the per-entry quarantine + intra-sync fixpoint (so an acyclic chain converges
+       in one pass regardless of authoring order). Entries that still cannot commit
+       are **casualties**.
     4. Bound the embedding seed to the active set.
     5. Run the completeness gate against the live old graph (read-only) — a verdict,
        not an abort.
+
+    **Per-caller policy on casualties (the shared-helper decision).** ``strict=True``
+    (the ``cutover`` default) raises a ``CutoverError`` on the first casualty — a
+    one-time prototype migration must halt on a genuine corpus defect. ``strict=False``
+    (``mitos rebuild``) carries the casualties back on ``RebuildResult.residual_casualties``
+    as a punch-list — an upgrade re-commit surfaces stale citations rather than aborting.
 
     Args:
         config: The active workspace config (supplies the corpus/archive/old-graph
             paths).
         aside_db_path: Where to build the rebuilt graph — a sibling of the live
-            graph for an atomic 7b swap (see :func:`default_aside_db_path`).
+            graph for an atomic swap (see :func:`default_aside_db_path`).
+        strict: When ``True``, a replay casualty raises ``CutoverError``; when
+            ``False``, casualties are returned on the verdict.
 
     Returns:
-        A :class:`RebuildResult` verdict (a clean replay, gate passed or shortfall).
+        A :class:`RebuildResult` verdict (committed counts, gate verdict, and — for
+        ``strict=False`` — any residual casualties).
 
     Raises:
-        CutoverError: On a genuine corpus defect — a parse-stage aggregate of
-            format failures, or the first referential/validation reject during
-            replay. The build-aside file is left for inspection; the live graph is
-            untouched.
+        CutoverError: On a parse-stage aggregate of format failures (always), or —
+            when ``strict=True`` — the first replay casualty. The build-aside file is
+            left for inspection; the live graph is untouched.
     """
     # 1. Clean the slate (idempotent retry, P5): a prior crashed run leaves an
     #    orphan aside file; discard it (+ sidecars) so this run starts fresh.
@@ -246,12 +306,25 @@ def rebuild_and_gate(config: MitosConfig, *, aside_db_path: str) -> RebuildResul
     if failures:
         raise CutoverError(_format_parse_aggregate_message(failures), failure=failures)
 
-    # 3. Replay oldest-first into a fresh V1a graph (a fresh file boots the ladder
-    #    to user_version 1; an empty/absent file is never a prototype).
+    # 3. Replay oldest-first into a fresh graph (a fresh file boots the ladder to the
+    #    current head). Forward-refs drain via the per-entry quarantine + intra-sync
+    #    fixpoint; entries that still cannot commit come back as casualties.
     store = GraphStore(aside_db_path)
-    decisions_committed, oq_committed = _replay_oldest_first(
+    decisions_committed, oq_committed, casualties = replay_corpus_oldest_first(
         store, decision_entries, oq_entries
     )
+    # Per-caller policy (the shared-helper decision): cutover (strict) halts on a
+    # genuine defect — reproducing _commit_or_abort's contract on the first casualty;
+    # rebuild (resilient) carries the casualties out as a punch-list.
+    if strict and casualties:
+        entry, exc = casualties[0]
+        if isinstance(exc, CommitError):
+            raise _cutover_error_for_commit(entry, exc) from exc
+        raise CutoverError(
+            f"Cutover replay aborted at entry '{entry.slug}' "
+            f"(lines {entry.line_start}-{entry.line_end}): {exc}"
+        ) from exc
+    residual_casualties = [_casualty_from(entry, exc) for entry, exc in casualties]
 
     # 4. Bound the embedding seed to the active set. Every commit self-enqueued one
     #    pending_embeddings row (5c), so the queue holds the whole corpus incl. dead
@@ -279,6 +352,7 @@ def rebuild_and_gate(config: MitosConfig, *, aside_db_path: str) -> RebuildResul
         reference_active_count=reference_active_count,
         reconstructed_active_count=len(reconstructed_ids),
         missing_cores=missing_cores,
+        residual_casualties=residual_casualties,
     )
 
 
@@ -520,68 +594,88 @@ def _format_parse_aggregate_message(failures: List[EntryFailure]) -> str:
 # --- replay --------------------------------------------------------------------
 
 
-def _replay_oldest_first(
+def replay_corpus_oldest_first(
     store: GraphStore,
     decision_entries: List[ParsedEntry],
     oq_entries: List[ParsedEntry],
-) -> Tuple[int, int]:
-    """Replays both kind-streams strictly per-entry into the build-aside graph.
+    *,
+    embed_fn: Optional[Callable] = None,
+) -> Tuple[int, int, List[Tuple[ParsedEntry, Exception]]]:
+    """Replays both kind-streams oldest-first with quarantine + intra-sync fixpoint.
 
-    Decisions then open questions (the two never interleave — no committed edge
-    crosses kinds, so their relative order is irrelevant). Each ``commit_parsed_entry``
-    is its own atomic transaction (V1-D10); the **first** reject aborts the whole
-    rebuild with a :class:`~mitos.errors.CutoverError` surfacing that entry.
+    The shared rebuild replay (``cutover`` and ``mitos rebuild``). Decisions then
+    open questions, each a single ``commit_parsed_entry`` transaction (V1-D10). A
+    ``CommitError`` quarantines the entry for the fixpoint to retry — so a forward-ref
+    whose oldest-first target lands later in the pass converges here rather than
+    aborting; a validation / raw-DB error is a non-retry-eligible hard failure
+    recorded immediately. The fixpoint
+    (:func:`mitos.replay.commit_quarantine_fixpoint`) drains the quarantine to
+    convergence; whatever never commits is a **casualty**. This function never raises
+    on a casualty — :func:`rebuild_and_gate` applies the strict-vs-resilient policy.
 
     Args:
-        store: The fresh build-aside ``GraphStore`` (booted to the V1a head).
+        store: The fresh build-aside ``GraphStore`` (booted to the current head).
         decision_entries: Decision entries, oldest-first.
         oq_entries: Open-question entries, oldest-first.
+        embed_fn: Optional per-commit embed callback. The rebuild leaves embeddings
+            to a later sync (the queue is pruned to active afterward), so this is
+            ``None`` by default.
 
     Returns:
-        ``(decisions_committed, open_questions_committed)``.
-
-    Raises:
-        CutoverError: On the first referential/validation reject (the entry that
-            failed, its line range, and the store code are surfaced).
+        ``(decisions_committed, open_questions_committed, casualties)`` — the commit
+        counts across both the main pass and the fixpoint, and the entries that never
+        committed, each ``(entry, exc)``.
     """
-    decisions_committed = 0
-    for entry in decision_entries:
-        _commit_or_abort(store, entry)
-        decisions_committed += 1
-    oq_committed = 0
-    for entry in oq_entries:
-        _commit_or_abort(store, entry)
-        oq_committed += 1
-    return decisions_committed, oq_committed
+    counts = {"decision": 0, "open_question": 0}
+    quarantined: List[Tuple[ParsedEntry, str, Optional[CommitError]]] = []
+    casualties: List[Tuple[ParsedEntry, Exception]] = []
+    for entry in list(decision_entries) + list(oq_entries):
+        try:
+            delta = store.commit_parsed_entry(entry)
+        except CommitError as exc:
+            quarantined.append((entry, "", exc))
+            continue
+        except (ValidationError, DatabaseError) as exc:
+            # No §5.2.2 envelope and not retry-eligible — an immediate casualty.
+            casualties.append((entry, exc))
+            continue
+        counts[entry.kind] += 1
+        if embed_fn is not None:
+            embed_fn(delta, entry)
+
+    def _count_commit(entry: ParsedEntry, _raw: str) -> None:
+        counts[entry.kind] += 1
+
+    _committed, _passes, residual = commit_quarantine_fixpoint(
+        store, quarantined, embed_fn=embed_fn, on_commit=_count_commit
+    )
+    casualties.extend((entry, exc) for entry, _raw, exc in residual)
+    return counts["decision"], counts["open_question"], casualties
 
 
-def _commit_or_abort(store: GraphStore, entry: ParsedEntry) -> None:
-    """Commits one entry, translating any store reject into a ``CutoverError`` abort.
-
-    A corpus defect surfaced by the store (a referential violation, or a
-    bypassed-parser validation/DB error) is never skipped (G7): it aborts the
-    rebuild so the operator fixes the corpus and re-runs against a still-untouched
-    live graph (R11).
+def _casualty_from(entry: ParsedEntry, exc: Exception) -> Casualty:
+    """Builds a :class:`Casualty` punch-list item from a rejected entry.
 
     Args:
-        store: The build-aside store.
-        entry: The entry to commit.
+        entry: The entry the store could not commit.
+        exc: The rejection — a ``CommitError`` (carries the §5.2.2 envelope) or a
+            validation / raw-DB error (no codes, message only).
 
-    Raises:
-        CutoverError: On any commit reject, carrying the store's failure envelope
-            when one exists.
+    Returns:
+        A serializable casualty carrying the slug, line span, failure codes, and
+        human-readable detail.
     """
-    try:
-        store.commit_parsed_entry(entry)
-    except CommitError as exc:
-        raise _cutover_error_for_commit(entry, exc) from exc
-    except (ValidationError, DatabaseError) as exc:
-        # No structured envelope on these (a bypassed-parser empty core, or a raw
-        # SQLite failure) — surface the entry locus and the underlying message.
-        raise CutoverError(
-            f"Cutover replay aborted at entry '{entry.slug}' "
-            f"(lines {entry.line_start}-{entry.line_end}): {exc}"
-        ) from exc
+    failure = getattr(exc, "failure", None)
+    items = failure.items if failure is not None else []
+    codes = sorted({item.code for item in items})
+    detail = "; ".join(item.message for item in items) or str(exc)
+    return Casualty(
+        slug=entry.slug or "<unknown>",
+        line_start=entry.line_start,
+        line_end=entry.line_end,
+        codes=codes,
+        detail=detail,
+    )
 
 
 def _cutover_error_for_commit(entry: ParsedEntry, exc: CommitError) -> CutoverError:
@@ -706,11 +800,14 @@ def check_reconstruction_completeness(
     rebuild is surfaced as a :class:`MissingCore`. **Never raises** — a shortfall
     is a verdict the operator may override (P6).
 
-    Two robustness guards run first (G7): an **absent** old graph means no
-    reference baseline (nothing could be lost → vacuous pass); an old graph that is
-    **not a prototype** (already V1a-or-later, or empty) means no prototype core
-    columns to read → a clear vacuous-pass verdict rather than a cryptic
-    ``no such column: core_axiom``.
+    The reference baseline depends on the live graph's shape. An **absent** old graph
+    means nothing could be lost → vacuous pass. A **prototype** graph is read through
+    the prototype-schema reader (the one-time ``cutover`` path). A current
+    **V1a/V1b** graph is read through the store's own active-view
+    (:func:`_read_current_graph_reference_cores` — the ``mitos rebuild`` path), so a
+    decision active in the live graph but dropped by a re-commit (e.g. an entry whose
+    now-stale citation the current catalog rejects) surfaces as a shortfall. An empty
+    graph of either shape yields no reference cores → a correct vacuous pass.
 
     The comparison keys on the **canonical core**, not the raw slug, so Q5
     convergence (two old slugs sharing one core) dedups silently — both old slugs
@@ -735,17 +832,17 @@ def check_reconstruction_completeness(
 
     conn = open_connection(db_path, read_only=True)
     try:
-        if not is_pre_v1a_schema(conn):
-            logger.info(
-                "Cutover gate: the live graph at %s is not a prototype graph "
-                "(already V1a-or-later, or empty) — no prototype reference to "
-                "compare against; nothing to cut over.",
-                db_path,
-            )
-            return [], 0
-        reference_cores = _read_prototype_reference_cores(conn)
+        prototype = is_pre_v1a_schema(conn)
+        reference_cores = (
+            _read_prototype_reference_cores(conn) if prototype else None
+        )
     finally:
         conn.close()
+    if reference_cores is None:
+        # A current (V1a/V1b) graph is the rebuild baseline — the prototype reader
+        # cannot read its columns. Read the active set through the store's own
+        # active-view (G5); an empty graph yields no cores → a correct vacuous pass.
+        reference_cores = _read_current_graph_reference_cores(db_path)
 
     missing_ids = set(reference_cores) - reconstructed_ids
     missing_cores = [
@@ -761,6 +858,42 @@ def check_reconstruction_completeness(
         )
     ]
     return missing_cores, len(reference_cores)
+
+
+def _read_current_graph_reference_cores(db_path: str) -> Dict[str, Dict[str, str]]:
+    """Reads a current (V1a/V1b) graph's active cores as the rebuild gate baseline.
+
+    The non-prototype twin of :func:`_read_prototype_reference_cores`: opens the live
+    graph **read-only** (no migration boot) and reads its active set through the
+    store's own ``get_active_decisions`` / ``get_open_questions`` — the single source
+    of the active predicate (G5), never a re-encoded anti-join. Each active node is
+    keyed on its already-minted slug-free id, directly comparable to the rebuild's.
+    ``mitos rebuild`` compares these against the rebuilt active set; an id present
+    here but absent there is a dropped node (e.g. an entry whose now-stale citation
+    the current catalog rejects).
+
+    Args:
+        db_path: The live graph path.
+
+    Returns:
+        ``{node_id: {"kind", "slug", "axiom_excerpt"}}`` for each active node.
+    """
+    store = GraphStore(db_path, read_only=True)
+    cores: Dict[str, Dict[str, str]] = {}
+    for node in store.get_active_decisions():
+        cores[node["id"]] = {
+            "kind": "decision",
+            "slug": node["slug"],
+            "axiom_excerpt": (node.get("core_axiom") or "")[:_AXIOM_EXCERPT_LEN],
+        }
+    for node in store.get_open_questions():
+        text = node.get("topic") or " ".join(node.get("questions_raised") or [])
+        cores[node["id"]] = {
+            "kind": "open_question",
+            "slug": node["slug"],
+            "axiom_excerpt": (text or "")[:_AXIOM_EXCERPT_LEN],
+        }
+    return cores
 
 
 def _read_prototype_reference_cores(

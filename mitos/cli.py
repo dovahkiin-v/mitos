@@ -1094,6 +1094,41 @@ def _print_overflow_detail(overflows: List[Dict[str, Any]]) -> None:
           "above, or split a broad scope.")
 
 
+def _graph_behind_buffer(db_path: str) -> bool:
+    """Detects a graph migrated to the V1b schema in place but never re-committed.
+
+    Cheap, **graph-only** signal (no buffer parse, no false positives): ``True`` iff
+    the ``mechanisms`` registry is empty while decision nodes still carry mechanism
+    refs — the signature of a corpus whose V1b catalog (the seven non-kill edge types
+    + the first-seen-wins mechanism registry) was never committed because the schema
+    migration only widened the DDL. A ``mitos rebuild`` populates them. Any read
+    failure (a pre-mechanisms V1a-schema graph, an absent/locked DB) is a safe
+    ``False`` — never a spurious nudge.
+
+    Args:
+        db_path: The live graph path.
+
+    Returns:
+        ``True`` if the graph is behind its buffer's catalog, else ``False``.
+    """
+    try:
+        conn = open_connection(db_path, read_only=True)
+    except Exception:
+        return False
+    try:
+        if conn.execute("SELECT COUNT(*) FROM mechanisms").fetchone()[0] > 0:
+            return False
+        carries_refs = conn.execute(
+            "SELECT 1 FROM nodes WHERE mechanism_refs_json IS NOT NULL "
+            "AND mechanism_refs_json NOT IN ('', '[]') LIMIT 1"
+        ).fetchone()
+        return carries_refs is not None
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
 def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
     """Reports whether Mitos is set up for a project, and what (if anything) is missing.
 
@@ -1168,6 +1203,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
     # health surface the write-path overflow nudge points at — the detailed breakdown
     # (which files, which decisions to re-scope) lives here, not on every `record`.
     overflows: List[Dict[str, Any]] = []
+    graph_behind = False
     if os.path.exists(config.db_path) and not pre_v1a:
         try:
             ro_store = GraphStore(config.db_path, read_only=True)
@@ -1175,6 +1211,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
             overflows = overflow_report(ro_store)
         except Exception:
             pass  # both reads are best-effort; a failure leaves the safe defaults
+        graph_behind = _graph_behind_buffer(config.db_path)
 
     initialized = mitos_dir_ok and decisions_ok
     # A fresh, initialized project has NO Qdrant collection yet — it auto-creates
@@ -1204,6 +1241,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
                 "graph_nodes": graph_nodes,
                 "mcp_wired": mcp_wired,
             },
+            "graph_behind_buffer": graph_behind,
             "scope_overflow": overflows,
             "agent_guide_version": AGENT_GUIDE_VERSION,
             "agent_files": agent_drift["files"],
@@ -1256,6 +1294,13 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
         print(f"  • graph holds {graph_nodes} node(s)")
     if overflows:
         _print_overflow_detail(overflows)
+    if graph_behind:
+        print(
+            "\n  ⚠ graph is behind your buffer — the V1b edge catalog + mechanism "
+            "registry were never committed for this corpus (a schema upgrade widens "
+            "the DDL but does not re-commit). Run `mitos rebuild` to populate them "
+            "(informational — not a readiness blocker; no decisions are at risk)."
+        )
     if agent_drift["stale"]:
         stale_files = ", ".join(
             f["file"] for f in agent_drift["files"]
@@ -1476,6 +1521,152 @@ def cmd_cutover(
     return 0
 
 
+def cmd_rebuild(
+    config: MitosConfig, *, allow_drops: bool, assume_yes: bool, as_json: bool
+) -> int:
+    """Rebuilds the graph from the full corpus through the current catalog.
+
+    The recurring twin of :func:`cmd_cutover`: re-commits every decision and open
+    question oldest-first (archives then buffer) into a build-aside graph and
+    atomically swaps it in, so a graph upgraded in place (the V1b schema on pre-V1b
+    data — the catalog flip's edges and the mechanism registry never re-committed)
+    gains the full catalog. Unlike cutover it runs on a **current** (V1a/V1b) graph
+    and is **resilient**: an entry the catalog now rejects (a citation to a since-
+    superseded or never-authored node) is a surfaced casualty, not an abort. No ADRs
+    are at risk — the markdown (buffer + archives) is the source of truth (M7/P6) and
+    the swap backs up the old graph.
+
+    A graph **format** defect still raises ``CutoverError`` (propagated to ``main()``).
+    A **casualty** (an entry that cannot commit) or a completeness **shortfall** (an
+    active decision the rebuild would drop) blocks the swap unless ``--allow-drops``.
+
+    Args:
+        config: The active workspace config.
+        allow_drops: Proceed past casualties / a shortfall (the dropped entries stay
+            in the markdown; fix their citations and re-run to re-include them).
+        assume_yes: Skip the interactive swap confirmation (automation / non-TTY).
+        as_json: Emit a machine-readable JSON report instead of the human summary.
+
+    Returns:
+        ``0`` on a successful swap, ``1`` otherwise (absent/prototype graph, refused
+        casualties/shortfall, declined/missing confirmation).
+
+    Raises:
+        CutoverError: On a corpus format defect during the rebuild (caught at the
+            ``main()`` boundary).
+    """
+    import json as _json
+
+    # 1. Probe: rebuild runs on a CURRENT graph. Absent → init; prototype → the
+    #    one-time cutover owns it (don't double-handle).
+    if not os.path.exists(config.db_path):
+        if as_json:
+            print(_json.dumps({"workspace": config.workspace_dir,
+                               "swapped": False, "reason": "no_graph"}, indent=2))
+        else:
+            print("No graph found at this workspace — run `mitos init` first "
+                  "(nothing to rebuild).")
+        return 1
+    probe_conn = open_connection(config.db_path, read_only=True)
+    try:
+        is_prototype = is_pre_v1a_schema(probe_conn)
+    finally:
+        probe_conn.close()
+    if is_prototype:
+        if as_json:
+            print(_json.dumps({"workspace": config.workspace_dir,
+                               "swapped": False, "reason": "prototype_graph"}, indent=2))
+        else:
+            print("Graph is a pre-V1a prototype — run `mitos cutover` (the one-time "
+                  "migration) instead of `mitos rebuild`.")
+        return 1
+
+    # 2. Rebuild + gate (resilient: casualties are surfaced, not raised). A corpus
+    #    FORMAT defect still raises CutoverError → main()'s boundary (exit 1).
+    aside_db_path = default_aside_db_path(config)
+    result = rebuild_and_gate(config, aside_db_path=aside_db_path, strict=False)
+
+    # 3. Present the verdict.
+    if not as_json:
+        print("\nRebuild verdict:")
+        print(f"  decisions committed:       {result.decisions_committed}")
+        print(f"  open questions committed:  {result.open_questions_committed}")
+        print(f"  active cores (live graph): {result.reference_active_count}")
+        print(f"  active cores (rebuild):    {result.reconstructed_active_count}")
+
+    casualties = result.residual_casualties
+    if casualties and not as_json:
+        noun = "entry" if len(casualties) == 1 else "entries"
+        print(f"\n⚠ {len(casualties)} {noun} could not be rebuilt (left in the buffer "
+              f"— fix the citation to re-include):")
+        for c in casualties:
+            code_str = ", ".join(c.codes) if c.codes else "rejected"
+            print(f"    - '{c.slug}' (lines {c.line_start}-{c.line_end}) "
+                  f"[{code_str}]: {c.detail}")
+
+    if not result.gate_passed and not as_json:
+        n = len(result.missing_cores)
+        print(f"\n⚠ {n} active decision(s) in the live graph would be DROPPED by this "
+              f"rebuild:")
+        for mc in result.missing_cores:
+            print(f"    - '{mc.slug}' [{mc.kind}]: {mc.axiom_excerpt}")
+
+    blocked = bool(casualties) or not result.gate_passed
+    if blocked and not allow_drops:
+        if as_json:
+            print(_json.dumps({**result.to_dict(), "swapped": False,
+                               "reason": "casualties_or_shortfall_refused"}, indent=2))
+        else:
+            print(f"\nRefusing to swap: the rebuild would drop content the live graph "
+                  f"holds. Fix the citations above in "
+                  f"{os.path.basename(config.decisions_file)} and re-run, or — if these "
+                  f"drops are intentional — re-run with --allow-drops. The live graph "
+                  f"is untouched.")
+        return 1
+    if blocked and not as_json:
+        print("\n--allow-drops set: proceeding despite the dropped content, treating "
+              "the corpus as authoritative (P6). Dropped entries remain in the markdown.")
+
+    # 4. Confirm the destructive swap (never call input() on a no-TTY).
+    if not assume_yes:
+        if as_json:
+            print(_json.dumps({**result.to_dict(), "swapped": False,
+                               "reason": "confirmation_required"}, indent=2))
+            return 1
+        if sys.stdin.isatty():
+            answer = input("\nProceed with the rebuild swap? This replaces the live "
+                           "graph (a backup is kept). [y/N] ")
+            if answer.strip().lower() not in ("y", "yes"):
+                print("Aborted — no changes made.")
+                return 1
+        else:
+            print("\nRefusing to prompt: this replaces the live graph and stdin is "
+                  "not a TTY. Re-run with --yes to proceed non-interactively.")
+            return 1
+
+    # 5. Swap — the single atomic instant (timestamp pinned by the caller, G8).
+    bak_path = perform_swap(
+        config, result.aside_db_path, timestamp=time.strftime("%Y%m%d-%H%M%S")
+    )
+
+    # 6. Post-swap guidance.
+    if as_json:
+        print(_json.dumps({**result.to_dict(), "swapped": True,
+                           "bak_path": bak_path}, indent=2))
+        return 0
+
+    print(f"\n✓ Rebuild complete — the graph at {config.db_path} now reflects the "
+          f"full catalog from your corpus.")
+    if bak_path:
+        print(f"  Old graph backed up to: {bak_path}")
+    print("\nNext:")
+    print("  - Re-embed so semantic surface/query reflect the rebuild:  mitos sync")
+    print("  - Verify:  mitos status   → expect READY ✓ (the rebuild nudge clears)")
+    if bak_path:
+        print(f"  - Once satisfied, remove the backup:  rm {bak_path}")
+    return 0
+
+
 def load_dotenv_file(path: str = ".env") -> None:
     """Loads ``KEY=value`` pairs from a ``.env`` file into the environment.
 
@@ -1627,6 +1818,19 @@ def main() -> None:
     cut_p.add_argument("--json", action="store_true", dest="as_json",
                        help="Emit a machine-readable JSON report.")
 
+    rebuild_p = subparsers.add_parser(
+        "rebuild",
+        help="Rebuild the graph from the full corpus through the current catalog "
+             "(e.g. after a 0.3.x→0.4.0 upgrade to populate the new edges + mechanisms).")
+    rebuild_p.add_argument("--allow-drops", action="store_true", dest="allow_drops",
+                           help="Proceed even if entries cannot be rebuilt or active "
+                                "decisions would be dropped (the markdown stays the "
+                                "source of truth; a drop may be deliberate).")
+    rebuild_p.add_argument("--yes", action="store_true",
+                           help="Skip the interactive confirmation (automation / non-TTY).")
+    rebuild_p.add_argument("--json", action="store_true", dest="as_json",
+                           help="Emit a machine-readable JSON report.")
+
     # agent-block — print the canonical agent-file block to paste, or --check pasted copies.
     ab_p = subparsers.add_parser(
         "agent-block",
@@ -1702,6 +1906,9 @@ def main() -> None:
             cmd_set_key(args.value, name=args.name, is_global=args.is_global)
         elif args.command == "cutover":
             sys.exit(cmd_cutover(config, allow_drops=args.allow_drops,
+                                 assume_yes=args.yes, as_json=args.as_json))
+        elif args.command == "rebuild":
+            sys.exit(cmd_rebuild(config, allow_drops=args.allow_drops,
                                  assume_yes=args.yes, as_json=args.as_json))
     except MitosError as e:
         print(f"Error: {str(e)}", file=sys.stderr)
