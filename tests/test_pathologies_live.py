@@ -110,44 +110,15 @@ def test_pathology_unicode_slug_integrity(isolated_workspace) -> None:
 
 # ==============================================================================
 # P2 — Circular Dependency Prevention & Loop Resolution
+#
+# RETIRED (V1b r1): the pre-V1b scalar-`supersedes` cycle this probed cannot form, and
+# its body called the phantom `compute_all_states` (retired in Phase 8a). V1b's write-time
+# mutation-cycle prevention is covered purpose-built by:
+#   - tests/test_lineage_and_cycles.py  (T10: test_direct_two_cycle_rejected,
+#     test_mixed_cross_type_cycle_rejected, test_self_loop_rejected_as_cycle,
+#     test_convergent_diamond_accepted, the ≥40-link depth + corrupt-cycle homeostasis gates)
+#   - tests/test_store.py 5b  (test_cycle_violation_self_edge, test_cycle_violation_inactive_source)
 # ==============================================================================
-@pytest.mark.skip(reason="V1a: state is a single incoming-kill-edge lookup (get_node_state), "
-                         "not a recursive DAG, so there is no RecursionError to guard against. "
-                         "A circular supersedes can't even form — the first commit references a "
-                         "not-yet-existing target (missing_target) and the source-active "
-                         "acyclicity guard (5b) rejects self/cycle kill-edges. The V1a cycle "
-                         "prevention is structural and pinned in the test_store 5b suite. Deferred (K5).")
-def test_pathology_circular_dependency_resolution(isolated_workspace) -> None:
-    """Tests how the GraphStore handle circular dependency edge declarations."""
-    config, tmpdir = isolated_workspace
-    store = GraphStore(config.db_path)
-    
-    # We establish two nodes that supersede each other circularly:
-    # A supersedes B, B supersedes A
-    eA = ParsedEntry("decision", "node-a", 1, 5)
-    eA.axiom = "Axiom A"
-    eA.rejected_paths = "None."
-    eA.supersedes = "node-b"
-    
-    eB = ParsedEntry("decision", "node-b", 1, 5)
-    eB.axiom = "Axiom B"
-    eB.rejected_paths = "None."
-    eB.supersedes = "node-a"
-    
-    dA = store.commit_parsed_entry(eA)
-    dB = store.commit_parsed_entry(eB)
-    
-    # In SQLite computed states, active/superseded resolution must terminate
-    # and not infinite loop. Since node-b was committed second, it points to node-a.
-    # Let's verify compute_all_states completes without RecursionError.
-    conn = store._get_connection()
-    try:
-        states = store.compute_all_states(conn)
-        assert states is not None
-        assert dA.node_id in states
-        assert dB.node_id in states
-    finally:
-        conn.close()
 
 
 # ==============================================================================

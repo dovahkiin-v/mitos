@@ -302,16 +302,17 @@ def test_invariant_m5_database_corruption_and_rebuild(isolated_workspace) -> Non
 # ==============================================================================
 # 4. M6 — Deduplicating Mechanisms Registry Verification
 # ==============================================================================
-@pytest.mark.skip(reason="V1b: the typed mechanism registry (M6) — the `mechanisms` / "
-                         "`node_mechanisms` SQL tables — is explicitly out of V1a's scope "
-                         "(negative-space fence: 'no mechanisms table (V1b)'). V1a stores "
-                         "mechanism_refs as a JSON tag list on the node, not a deduplicated "
-                         "registry table. Deferred to the V1b mechanisms vision (K5).")
 def test_invariant_m6_mechanism_registry_deduplication(isolated_workspace) -> None:
-    """Tests the Mechanism Registry (M6).
+    """Tests the deduplicating mechanism registry (M6).
 
-    Verifies that mechanism tags declared across multiple entries are successfully
-    extracted, normalized, and stored in a deduplicated SQL table.
+    V1b shipped the typed mechanism registry: the live ``mechanisms`` table is
+    keyed on a ``canonical_name`` primary key (``authored_name``/``source``/
+    ``created_at`` alongside), written first-seen-wins by ``commit_parsed_entry``'s
+    decision-gated Phase-5a auto-registration writer. This is the adversarial
+    suite's M6 invariant gate: mechanism tags declared across multiple entries are
+    normalized (whitespace-folded), deduplicated on the canonical PK, and stored
+    once each. Broader registry feature coverage lives in
+    ``tests/test_mechanisms.py``.
     """
     config, tmpdir = isolated_workspace
     store = GraphStore(config.db_path)
@@ -333,8 +334,8 @@ def test_invariant_m6_mechanism_registry_deduplication(isolated_workspace) -> No
     # Fetch from mechanisms registry table directly
     conn = sqlite3.connect(config.db_path)
     conn.row_factory = sqlite3.Row
-    rows = conn.execute("SELECT name FROM mechanisms ORDER BY name ASC").fetchall()
-    names = [r["name"] for r in rows]
+    rows = conn.execute("SELECT canonical_name FROM mechanisms ORDER BY canonical_name ASC").fetchall()
+    names = [r["canonical_name"] for r in rows]
     conn.close()
     
     # Verify normalization and deduplication
