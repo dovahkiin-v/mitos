@@ -18,6 +18,7 @@ from mitos import __version__
 from mitos.display import (
     apply_stdout_text_safety,
     dumps_display,
+    letter_payload,
     resolve_display_ensure_ascii,
 )
 from mitos.config import (
@@ -560,10 +561,7 @@ def cmd_list(config: MitosConfig, scope: Optional[str] = None,
               if oq["state"] == "parked"]
 
     def _list_item(d):
-        item = {"slug": d["slug"], "axiom": d["core_axiom"],
-                "scope": d["scope"], "state": d["computed_state"]}
-        if not brief:
-            item["rejected_paths"] = d["rejected_paths"]
+        item = letter_payload(d, brief=brief, extras={"state": d["computed_state"]})
         item.update(modifiers.get(d["id"], {}))
         return item
 
@@ -783,10 +781,7 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     store = manager.store
 
     def _shape(node, score):
-        d = {"slug": node["slug"], "axiom": node["core_axiom"],
-             "scope": node["scope"], "score": score}
-        if not brief:
-            d["rejected_paths"] = node["rejected_paths"]
+        d = letter_payload(node, brief=brief, extras={"score": score})
         d.update(store.get_modifiers(node["id"]))
         return d
 

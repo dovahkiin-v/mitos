@@ -4,10 +4,16 @@ Tier-1 leaf module (stdlib only). It carries three small, load-bearing pieces
 of display hygiene so they live in exactly one place and CLI⇄MCP drift becomes
 structurally impossible:
 
-* :func:`dumps_display` — the single shared display-JSON serializer. Both
-  ``cli.py`` and ``mcp_server.py`` route their display ``json.dumps`` through it
-  (wired in Phase 1b). It takes ``ensure_ascii`` as a *parameter* so it is
-  surface-neutral.
+* :func:`dumps_display` — the single shared display-JSON serializer (the
+  *encoding* seam). Both ``cli.py`` and ``mcp_server.py`` route their display
+  ``json.dumps`` through it (wired in Phase 1b). It takes ``ensure_ascii`` as a
+  *parameter* so it is surface-neutral.
+* :func:`letter_payload` — the single shared Letter-payload shaper (the *shape*
+  seam). Both ``cli.py`` and ``mcp_server.py`` route their per-decision
+  Letter-payload assembly through it (wired in Phase 2a) so the key set and the
+  M5 ``rejected_paths``-unless-``brief`` rule live in exactly one place. It is
+  the *sibling* of :func:`dumps_display`, never an extension: shape and encoding
+  are distinct seams and neither calls the other.
 * :func:`resolve_display_ensure_ascii` — **CLI-internal.** Decides
   ``ensure_ascii``'s value by sniffing the live stdout encoding.
 * :func:`apply_stdout_text_safety` — **CLI-internal.** Makes raw-text
@@ -25,7 +31,56 @@ This module is **not** the hash-input serializer. ``identity.py`` is fenced
 
 import codecs
 import json
-from typing import Any, Optional, TextIO
+from typing import Any, Dict, Mapping, Optional, TextIO
+
+
+def letter_payload(
+    node: Mapping[str, Any], *, brief: bool, extras: Optional[Mapping[str, Any]] = None
+) -> Dict[str, Any]:
+    """Shapes the Letter-complete decision-read core, shared CLI⇄MCP (the shape seam).
+
+    The single place the per-decision Letter payload key set lives: ``slug``,
+    ``axiom`` (from the node's ``core_axiom``), ``scope``, any caller ``extras``,
+    then ``rejected_paths`` *unless* ``brief``. ``extras`` land in a deterministic
+    slot — between ``scope`` and ``rejected_paths`` — reproducing each caller's
+    shipped key order byte-identically (the verb-envelope fields ``score`` /
+    ``state`` / ``depth_mode`` already occupy that slot at every routed site).
+
+    Returns an **un-stamped** core: modifier-stamping
+    (``superseded_by``/``amended_by``/…) is the caller's job via the
+    ``GraphStore.get_modifiers(...)`` seam — never folded in here. This keeps the
+    helper a pure dict→dict Tier-1 leaf (no ``store`` coupling) and preserves the
+    callers' batch (``get_modifiers_map``) vs per-node stamping paths. ``brief``
+    governs only the ``rejected_paths`` key inside this helper; because stamping
+    happens in the caller *after* this returns, ``brief`` can never drop a
+    modifier stamp.
+
+    This is display-only and shapes the *decision* dict; it is the sibling of
+    :func:`dumps_display` (which *encodes* any display dict) and never calls it.
+    NOT the hash-input serializer — ``identity.py`` is fenced (MI-7); the Letter
+    payload must never reach the hash/persistence path.
+
+    Args:
+        node: A decision node dict; reads ``slug``, ``core_axiom``, ``scope`` and
+            (unless ``brief``) ``rejected_paths``.
+        brief: When True, omit ``rejected_paths`` (the M4 opt-out) and nothing
+            else; when False, include it (the M5 anti-knowledge fence).
+        extras: Ordered verb-envelope fields to interleave between ``scope`` and
+            ``rejected_paths``, in the caller's order. ``None`` adds nothing.
+
+    Returns:
+        The un-stamped Letter-payload dict.
+    """
+    payload: Dict[str, Any] = {
+        "slug": node["slug"],
+        "axiom": node["core_axiom"],
+        "scope": node["scope"],
+    }
+    if extras:
+        payload.update(extras)
+    if not brief:
+        payload["rejected_paths"] = node["rejected_paths"]
+    return payload
 
 
 def dumps_display(obj: Any, *, ensure_ascii: bool, indent: Optional[int] = 2) -> str:

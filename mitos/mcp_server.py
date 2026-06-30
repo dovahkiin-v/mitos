@@ -8,7 +8,7 @@ import os
 from typing import Optional, List, Dict, Any, Tuple
 from mcp.server.fastmcp import FastMCP
 
-from mitos.display import dumps_display
+from mitos.display import dumps_display, letter_payload
 from mitos.config import MitosConfig
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS
 from mitos.embeddings import GeminiEmbeddingProvider
@@ -77,14 +77,7 @@ def _decision_payload(node: Dict[str, Any], score: float, *, brief: bool,
     Returns:
         A Letter-mode decision dict.
     """
-    payload: Dict[str, Any] = {
-        "slug": node["slug"],
-        "axiom": node["core_axiom"],
-        "scope": node["scope"],
-        "score": score,
-    }
-    if not brief:
-        payload["rejected_paths"] = node["rejected_paths"]
+    payload = letter_payload(node, brief=brief, extras={"score": score})
     if store is not None:
         _attach_modifiers(payload, node, store)
     return payload
@@ -294,14 +287,7 @@ def list_decisions(scope: Optional[str] = None, state: str = "active", brief: bo
     modifiers = store.get_modifiers_map([n["id"] for n in nodes])
     decisions = []
     for n in nodes:
-        d = {
-            "slug": n["slug"],
-            "axiom": n["core_axiom"],
-            "scope": n["scope"],
-            "state": n["computed_state"],
-        }
-        if not brief:
-            d["rejected_paths"] = n["rejected_paths"]
+        d = letter_payload(n, brief=brief, extras={"state": n["computed_state"]})
         d.update(modifiers.get(n["id"], {}))
         decisions.append(d)
 
@@ -387,16 +373,11 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False) -> s
                 if node_state not in ("active", "drifted"):
                     continue
 
-                match = {
-                    "slug": node["slug"],
-                    "axiom": node["core_axiom"],
-                    "scope": node["scope"],
-                    "state": node_state,
-                    "score": m["score"],
-                    "depth_mode": "letter"
-                }
-                if not brief:
-                    match["rejected_paths"] = node["rejected_paths"]
+                match = letter_payload(
+                    node,
+                    brief=brief,
+                    extras={"state": node_state, "score": m["score"], "depth_mode": "letter"},
+                )
                 match.update(store.get_modifiers(node["id"]))
                 output_list.append(match)
                 
