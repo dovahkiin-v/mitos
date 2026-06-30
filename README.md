@@ -14,11 +14,11 @@ Mitos is a strict, deterministic, local-first architectural decision graph syste
 
 ## Why mitos exists
 
-Mitos came out of a real problem, not a hunt for a tool.
+Intense work with agents, lots of ADR's, too much to track.
 
-This project is built through intensive, structured design reviews — and most of that reviewing happens between two LLMs, Claude and Gemini, rather than between people. Every review surfaces architectural decisions, and each one gets written down as an ADR (Architectural Decision Record). I started with the simplest possible thing: a single plain `DECISIONS.md` file.
+I have a project being built through intensive, structured design reviews — and most of that reviewing happens between LLM's  (Claude and Gemini). Every review surfaces architectural decisions, and each one gets written down as an ADR (Architectural Decision Record). I started with a single plain `DECISIONS.md` file.
 
-Within about a month of working this way, that file held **close to 900 ADRs**. On a very large codebase, it had tipped from a comfort into a genuine necessity — the file was no longer greppable, readable in one sitting, or manageable by hand, and I was running **five separate linters** just to keep it honest. So I started building an LLM-native ADR tool to replace the flat file. That tool became mitos.
+Within about a month of working this way, that file held **close to 900 ADRs**. On a very large codebase — the file was no longer greppable, readable in one sitting, or manageable by hand, and Claude was running **five separate linters** just to keep it honest. So I started building an LLM-native ADR tool: that tool became mitos.
 
 Established ADR tools do exist — I only found that out afterwards. But they're built for human teams logging the occasional decision; none of them fit a solo developer working with LLMs that generate decisions faster than a person can track them.
 
@@ -30,7 +30,7 @@ Mitos fits a specific way of working:
 - working with **heavy LLM automation**, where AI assistants are actively making and recording architectural decisions;
 - where those **decisions accumulate faster than you can track them by hand**.
 
-Project size isn't a gate — mitos is useful on small projects too. But the larger the codebase and the higher the decision volume, the faster it crosses from *comfort* to *necessity*. A very small team might get mileage out of it as well — but it isn't a team-coordination tool, and doesn't pretend to be.
+Project size isn't a gate — mitos is useful on small projects too. But the larger the codebase and the higher the decision volume, the faster it crosses from *comfort* to *necessity*. A very small team might get mileage out of it as well — but it isn't a team-coordination tool.
 
 ---
 
