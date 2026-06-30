@@ -18,6 +18,7 @@ async def test_mcp_tool_registration() -> None:
     tool_names = [tool.name for tool in tools]
     assert "surface_decisions" in tool_names
     assert "query_decisions" in tool_names
+    assert "show_node" in tool_names  # the 6th tool (5b)
 
 
 @patch("mitos.mcp_server.get_workspace_components")

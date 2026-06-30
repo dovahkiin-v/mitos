@@ -8,7 +8,7 @@ import os
 from typing import Optional, List, Dict, Any, Tuple
 from mcp.server.fastmcp import FastMCP
 
-from mitos.display import blackout_note, clamp_limit, dumps_display, letter_payload, order_scope_counts
+from mitos.display import blackout_note, clamp_limit, dumps_display, letter_payload, order_scope_counts, show_payload, SHOW_NOT_FOUND_HINT
 from mitos.config import MitosConfig
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS
 from mitos.embeddings import GeminiEmbeddingProvider
@@ -428,6 +428,55 @@ def list_scopes(include_archived: bool = False) -> str:
 
 
 @mcp.tool()
+def show_node(ident: str) -> str:
+    """Dereference ONE decision or open question by exact handle — slug OR content-hash id.
+
+    The exact-handle lookup that reaches the graveyard: it resolves a node
+    state-agnostically (active-first, else the most-recent superseded node in the
+    casefolded-slug lineage), so it answers for a SUPERSEDED node that
+    query_decisions' slug branch — active-view-only — cannot reach. Use it to
+    reconstruct *why* a now-retired call was made (don't relitigate a settled
+    rejection). Not a search: pass the precise slug or id you already hold, not a
+    claim (for ranked recall use query_decisions / surface_decisions).
+
+    Args:
+        ident: A content-hash id or a slug (case-insensitive) — the exact handle.
+
+    Returns:
+        A JSON string. A found **decision** is a Letter-complete object (`axiom` +
+        `rejected_paths`) with `kind`/`id`/`slug`/`scope`/`state`; a found **open
+        question** carries `topic`/`questions_raised`/`park_reason`. Both stamp the
+        present reverse-relation modifier keys — a superseded node names its
+        `superseded_by`, an amended one its `amended_by`/`narrowed_by` — so a
+        moved-on node never reads as the final word. A genuinely-absent handle
+        returns `{found: false, ident, hint}` (never an error), the hint pointing
+        at `mitos sync` for an authored-but-unsynced draft.
+    """
+    store, _embed, _vec = get_workspace_components()
+
+    # State-agnostic resolution via the SHARED 5a seam — the identical method
+    # cmd_show calls, so the resolution selection cannot drift between surfaces.
+    # A genuine MI-13 breach raises ValidationError out of resolve_handle; we do
+    # NOT swallow it into not-found (a breach is not "not found").
+    node = store.resolve_handle(ident)
+    if not node:
+        return dumps_display(
+            {"found": False, "ident": ident, "hint": SHOW_NOT_FOUND_HINT},
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    # state from the separate computed-state read (never node.get("state") —
+    # absent on the resolved dict); modifiers are the one kind-agnostic stamp
+    # source. Stamping is LOAD-BEARING: surfacing the superseded is this tool's
+    # whole job, so the superseded_by stamp is not decoration.
+    state = store.get_node_state(node["id"])
+    modifiers = store.get_modifiers(node["id"])
+    payload = show_payload(node, state=state, modifiers=modifiers)
+    return dumps_display(payload, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
 def query_decisions(query: str, depth: str = "letter", brief: bool = False, limit: int = 5) -> str:
     """Look up a SPECIFIC decision by slug or claim — the targeted lookup.
 
@@ -435,7 +484,8 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
     pointed claim). For the broad "is there precedent near this?" scan before
     deciding, use surface_decisions; for the EXHAUSTIVE set in a scope, list_decisions.
     If query matches a unique slug exactly, returns that one decision (full); otherwise
-    a ranked semantic search for the claim.
+    a ranked semantic search for the claim. Its slug branch is active-view-only — to
+    dereference an EXACT handle including a superseded node it can't reach, use show_node.
 
     Args:
         query: Unique decision slug identifier OR a semantic claim search query.
