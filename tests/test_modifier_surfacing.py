@@ -24,7 +24,7 @@ import pytest
 from unittest.mock import patch
 
 from mitos.config import MitosConfig
-from mitos.cli import cmd_init, cmd_list, cmd_show, cmd_surface
+from mitos.cli import cmd_init, cmd_list, cmd_query, cmd_show, cmd_surface
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS
 from mitos.sync import MitosSyncManager
 from mitos.renderer import render_node_markdown, MitosRenderer
@@ -359,6 +359,128 @@ def test_cli_surface_json_carries_modifiers(ws, capsys) -> None:
     out = json.loads(capsys.readouterr().out)
     target = next(d for d in out["active_decisions"] if d["slug"] == "s-target")
     assert target["amended_by"] == ["s-amender"]
+
+
+# --------------------------------------------------------------------------- #
+# CLI `query` — superseded-filter + Letter-complete + --json + --brief (Phase 2b)
+#
+# `cmd_query` constructs its own MitosSyncManager(config) internally, so the fakes
+# are injected by patching `mitos.cli.MitosSyncManager` to return a stub carrying
+# .store (real read store), .embed_provider, .vector_store (the MCP tests patch
+# get_workspace_components instead — that's MCP-only).
+# --------------------------------------------------------------------------- #
+
+class _StubManager:
+    """Stub MitosSyncManager: real read store + fake embed/vector providers."""
+
+    def __init__(self, store, embed_provider, vector_store):
+        self.store = store
+        self.embed_provider = embed_provider
+        self.vector_store = vector_store
+
+
+def test_cli_query_filters_superseded_and_stamps(ws, capsys) -> None:
+    """The R2 trap, the load-bearing pin: `query` drops a superseded-not-reused match
+    (active-view get_node_by_slug → None, before the state check) and stamps the survivor.
+
+    An all-active fixture would silently miss the trap, so `dead-v1` is superseded by
+    `dead-v2` with a DISTINCT slug — dropped at the `if not node` step, not the state check.
+    """
+    config, m = ws
+    _rec(m, "q-target", scope=["x"])
+    _rec(m, "q-amender", scope=["x"], amends="q-target")
+    _rec(m, "dead-v1", scope=["x"])
+    _rec(m, "dead-v2", scope=["x"], supersedes="dead-v1")
+    store = GraphStore(config.db_path, read_only=True)
+    fake_vec = _FakeVector([{"slug": "dead-v1", "score": 0.9}, {"slug": "q-target", "score": 0.8}])
+    stub = _StubManager(store, _FakeEmbed(), fake_vec)
+
+    # --json: dead-v1 absent, q-target present + stamped + fenced.
+    with patch("mitos.cli.MitosSyncManager", return_value=stub):
+        cmd_query(config, "a claim that is not any slug", as_json=True)
+    resp = json.loads(capsys.readouterr().out)
+    slugs = [d["slug"] for d in resp["matches"]]
+    assert "dead-v1" not in slugs
+    target = next(d for d in resp["matches"] if d["slug"] == "q-target")
+    assert target["amended_by"] == ["q-amender"]
+    assert target["rejected_paths"]
+
+    # text: dead-v1 omitted, q-target's ⚠ marker shown.
+    with patch("mitos.cli.MitosSyncManager", return_value=stub):
+        cmd_query(config, "a claim that is not any slug")
+    out = capsys.readouterr().out
+    assert "dead-v1" not in out
+    assert "q-target" in out and "⚠" in out and "amended by" in out and "q-amender" in out
+
+
+def test_cli_query_json_parity_with_mcp(ws) -> None:
+    """T4: `query --json` matches list is byte-equal to query_decisions' ranked matches.
+
+    The claim MUST be a non-slug phrase — query_decisions tries exact-slug dereference
+    first; a real-slug claim returns the single-decision shape, not the ranked envelope.
+    """
+    from mitos import mcp_server
+    config, m = ws
+    _rec(m, "q-target", scope=["x"])
+    _rec(m, "q-amender", scope=["x"], amends="q-target")
+    claim = "a claim that is not any slug"
+    matches = [{"slug": "q-target", "score": 0.88}]
+
+    store_cli = GraphStore(config.db_path, read_only=True)
+    stub = _StubManager(store_cli, _FakeEmbed(), _FakeVector(list(matches)))
+    with patch("mitos.cli.MitosSyncManager", return_value=stub):
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cmd_query(config, claim, as_json=True)
+    cli_resp = json.loads(buf.getvalue())
+
+    store_mcp = GraphStore(config.db_path, read_only=True)
+    with patch.object(mcp_server, "get_workspace_components",
+                      return_value=(store_mcp, _FakeEmbed(), _FakeVector(list(matches)))):
+        mcp_resp = json.loads(mcp_server.query_decisions(claim))
+
+    assert cli_resp["matches"] == mcp_resp["matches"]
+
+
+def test_cli_query_brief_drops_rejected_keeps_stamp(ws, capsys) -> None:
+    """`--brief` sheds only rejected_paths, never a modifier stamp (M4) — text + --json."""
+    config, m = ws
+    _rec(m, "q-target", scope=["x"])
+    _rec(m, "q-amender", scope=["x"], amends="q-target")
+    store = GraphStore(config.db_path, read_only=True)
+    fake_vec = _FakeVector([{"slug": "q-target", "score": 0.88}])
+    stub = _StubManager(store, _FakeEmbed(), fake_vec)
+
+    with patch("mitos.cli.MitosSyncManager", return_value=stub):
+        cmd_query(config, "a claim that is not any slug", as_json=True, brief=True)
+    target = next(d for d in json.loads(capsys.readouterr().out)["matches"] if d["slug"] == "q-target")
+    assert "rejected_paths" not in target and target["amended_by"] == ["q-amender"]
+
+    with patch("mitos.cli.MitosSyncManager", return_value=stub):
+        cmd_query(config, "a claim that is not any slug", brief=True)
+    out = capsys.readouterr().out
+    assert "Rejected:" not in out and "⚠" in out and "q-amender" in out
+
+
+def test_cli_query_empty_after_filter(ws, capsys) -> None:
+    """Empty-after-filter (all matches superseded-dropped): text → plain message,
+    --json → clean empty envelope. (2d upgrades this to the blackout recovery vector.)"""
+    config, m = ws
+    _rec(m, "dead-v1", scope=["x"])
+    _rec(m, "dead-v2", scope=["x"], supersedes="dead-v1")
+    store = GraphStore(config.db_path, read_only=True)
+    fake_vec = _FakeVector([{"slug": "dead-v1", "score": 0.9}])
+    stub = _StubManager(store, _FakeEmbed(), fake_vec)
+
+    with patch("mitos.cli.MitosSyncManager", return_value=stub):
+        cmd_query(config, "a claim that is not any slug", as_json=True)
+    resp = json.loads(capsys.readouterr().out)
+    assert resp == {"query": "a claim that is not any slug", "depth_mode": "letter", "matches": []}
+
+    with patch("mitos.cli.MitosSyncManager", return_value=stub):
+        cmd_query(config, "a claim that is not any slug")
+    assert "No matching decisions found." in capsys.readouterr().out
 
 
 # --------------------------------------------------------------------------- #

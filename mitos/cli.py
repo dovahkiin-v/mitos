@@ -449,38 +449,100 @@ def cmd_capture(config: MitosConfig, text: str) -> None:
         print(f"Failed to append captured entry: {str(e)}")
 
 
-def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter") -> None:
-    """Queries the vector store semantically for similar decisions."""
+def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
+              as_json: bool = False, brief: bool = False) -> None:
+    """Queries the vector store semantically for similar decisions — the CLI twin
+    of the MCP ``query_decisions`` tool's *ranked* branch.
+
+    Brings the CLI verb up to its MCP twin's bar: it filters superseded matches
+    (state not in ``active``/``drifted``), carries a modifier-stamped,
+    Letter-complete per-match payload (``core_axiom`` + ``rejected_paths`` fence)
+    built via the shared :func:`letter_payload`, and emits either text or, with
+    ``as_json``, the same ranked envelope ``query_decisions`` returns. The text
+    render is a *renderer over the same payload list* the ``--json`` path emits, so
+    the two can never disagree on what was filtered or stamped (kernel M5 + M3).
+
+    Unlike its MCP twin, the CLI verb stays semantic-only — there is no exact-slug
+    dereference branch (that is ``show``'s job, ADR
+    ``cli-query-stays-semantic-not-dereference-twin``).
+
+    Args:
+        config: The active workspace configuration.
+        query_text: The assertion or subsystem claim to find precedents for.
+        depth: The retrieval depth; v0.1 enforces ``letter``.
+        as_json: Emit the machine-readable ranked JSON envelope instead of text.
+        brief: Omit ``rejected_paths`` (axiom-only) — never sheds a modifier stamp.
+    """
     if depth != "letter":
-        raise ValueError(f"Depth mode '{depth}' is not yet implemented in v0.1 (Letter-only retrieval).")
+        msg = f"Depth mode '{depth}' is not yet implemented in v0.1 (Letter-only retrieval)."
+        if as_json:
+            _emit_json({"error": msg}, indent=None)
+            return
+        raise ValueError(msg)
+
     manager = MitosSyncManager(config)
     if not manager.embed_provider or not manager.vector_store:
+        if as_json:
+            _emit_json({"error": f"Could not resolve slug or run semantic query for '{query_text}'"}, indent=None)
+            return
         print("Semantic query unavailable (Qdrant or Gemini embedding provider down).")
         return
 
-
+    store = manager.store
     try:
         q_vector = manager.embed_provider.get_embedding(query_text, is_query=True)
-        matches = manager.vector_store.query(q_vector, limit=5)
-        
-        if not matches:
-            print("No matching decisions found.")
-            return
+        raw_matches = manager.vector_store.query(q_vector, limit=5)
 
-        print(f"\nSemantic Query Matches for: '{query_text}'")
-        print("-" * 60)
-        for idx, m in enumerate(matches, start=1):
-            print(f"{idx}. {m['slug']} (Score: {m['score']:.4f})")
-            print(f"   Decided: {m['embedding_text']}")
-            print(f"   Scope:   {', '.join(m['scope'])}")
-            print(f"   State:   {m['state']}")
-            node = manager.store.get_node_by_slug(m["slug"])
-            marker = _modifier_marker(manager.store.get_modifiers(node["id"])) if node else ""
-            if marker:
-                print(f"   {marker}")
-            print()
+        # Filter superseded first, then stamp + Letter — mirrors the ranked loop in
+        # mcp_server.query_decisions byte-for-byte (T4 parity). A superseded-not-reused
+        # slug is dropped at the active-view get_node_by_slug → None step, closing the
+        # M3 leak where a superseded node would otherwise read as live.
+        matches = []
+        for m in raw_matches:
+            node = store.get_node_by_slug(m["slug"])
+            if not node:
+                continue
+            node_state = store.get_node_state(node["id"])
+            if node_state not in ("active", "drifted"):
+                continue
+            match = letter_payload(
+                node,
+                brief=brief,
+                extras={"state": node_state, "score": m["score"], "depth_mode": "letter"},
+            )
+            match.update(store.get_modifiers(node["id"]))
+            matches.append(match)
     except Exception as e:
+        if as_json:
+            _emit_json({"error": f"Semantic claim query failed: {str(e)}"}, indent=None)
+            return
         print(f"Query failed: {str(e)}")
+        return
+
+    # Build the per-match list once, then branch the two renderings over it.
+    if as_json:
+        _emit_json({"query": query_text, "depth_mode": "letter", "matches": matches})
+        return
+
+    # Empty-after-filter is a real state (every retrieved match superseded-dropped).
+    # 2b emits the plain message; upgrading this to a blackout recovery vector is 2d's seam.
+    if not matches:
+        print("No matching decisions found.")
+        return
+
+    print(f"\nQuery matches for: '{query_text}'")
+    print("-" * 60)
+    for i, d in enumerate(matches, start=1):
+        print(f"{i}. {d['slug']}  (score {d['score']:.3f})")
+        print(f"   Decided:  {d['axiom']}")
+        marker = _modifier_marker(d)
+        if marker:
+            print(f"   {marker}")
+        if "rejected_paths" in d:
+            print(f"   Rejected: {d['rejected_paths']}")
+        if d["scope"]:
+            print(f"   Scope:    {', '.join(d['scope'])}")
+        print()
 
 
 def cmd_show(config: MitosConfig, ident: str) -> None:
@@ -1795,6 +1857,8 @@ def main() -> None:
     q_p = subparsers.add_parser("query", aliases=["query_decisions"], help="Semantic lookup for precedents.")
     q_p.add_argument("claim", help="Assertion or subsystem query.")
     q_p.add_argument("--depth", default="letter", help="Depth (default: letter).")
+    q_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON.")
+    q_p.add_argument("--brief", action="store_true", help="Axiom-only (omit rejected_paths) — a quick scan.")
 
     # surface (alias: surface_decisions — MCP tool name) — the precedent-recall loop
     surf_p = subparsers.add_parser("surface", aliases=["surface_decisions"],
@@ -1923,7 +1987,7 @@ def main() -> None:
         elif args.command == "capture":
             cmd_capture(config, args.text)
         elif args.command in ("query", "query_decisions"):
-            cmd_query(config, args.claim, depth=args.depth)
+            cmd_query(config, args.claim, depth=args.depth, as_json=args.as_json, brief=args.brief)
         elif args.command in ("surface", "surface_decisions"):
             cmd_surface(config, args.query, scope=args.scope, as_json=args.as_json, brief=args.brief)
         elif args.command == "show":
