@@ -641,23 +641,65 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         print()
 
 
-def cmd_show(config: MitosConfig, ident: str) -> None:
-    """Shows full details of a specific node by ID or slug."""
+def cmd_show(config: MitosConfig, ident: str, as_json: bool = False) -> None:
+    """Shows full details of a specific node by ID or slug.
+
+    Dereferences a single handle state-agnostically via ``GraphStore.resolve_handle``
+    — active-first, else the most-recent superseded node in the casefolded-slug
+    lineage (marked superseded) — so a moved-on node still answers to its own slug
+    instead of 404-ing. Only a genuinely-absent identifier reaches the not-found
+    branch, whose static, hedged ``mitos sync`` pointer reads no buffer (truthful for
+    both a typo and an authored-but-unsynced draft). With ``as_json`` it emits a
+    Letter-complete, modifier-stamped JSON object (the not-found case a JSON object
+    too, never a bare text print).
+
+    Args:
+        config: The active workspace config (supplies the graph db path).
+        ident: A content-hash id or a slug (case-insensitive).
+        as_json: When True, emit a machine-readable JSON object instead of text.
+
+    Returns:
+        None.
+    """
     store = GraphStore(config.db_path)
-    
-    # Try resolving as ID first, then as slug
-    node = store.get_node(ident)
+
+    # State-agnostic resolution: id → active slug → most-recent in lineage → None.
+    # The one seam 5b's `show_node` reuses, so resolution parity is structural.
+    node = store.resolve_handle(ident)
+
     if not node:
-        node = store.get_node_by_slug(ident)
-        
-    if not node:
-        print(f"Node with ID or Slug '{ident}' not found.")
+        # Genuine absence: a typo, or an authored-but-unsynced draft. The hint is
+        # static and hedged — it reads no buffer, never asserts presence to a typo.
+        hint = ("not in graph — if you just authored it in decisions.md/questions.md, "
+                "run `mitos sync`")
+        if as_json:
+            _emit_json({"found": False, "ident": ident, "hint": hint})
+            return
+        print(f"Node with ID or Slug '{ident}' not found — {hint}.")
         return
 
     # Compute current active/superseded state (single-node V1a derivation, 8a)
     state = store.get_node_state(node["id"])
 
+    # One stamp source for both the text and the --json branch (kind-agnostic — an OQ
+    # carries only amended_by/narrowed_by). A superseded show that omits its modifier
+    # keys reads as the final word ("amended axioms read as live" trap), and surfacing
+    # superseded nodes is exactly this verb's new job — so stamping is load-bearing.
     modifiers = store.get_modifiers(node["id"])
+
+    if as_json:
+        if node["kind"] == "decision":
+            payload = letter_payload(
+                node, brief=False,
+                extras={"kind": node["kind"], "id": node["id"], "state": state},
+            )
+        else:
+            # OQ body mirrors the canonical _oq_payload shape (cross-verb consistency).
+            payload = {"kind": node["kind"], "id": node["id"], "state": state,
+                       **_oq_payload(node)}
+        payload.update(modifiers)
+        _emit_json(payload)
+        return
 
     print(f"\n[{node['kind'].upper()}] {node['slug']}")
     print(f"ID:           {node['id']}")
@@ -2156,6 +2198,7 @@ def main() -> None:
     # show
     show_p = subparsers.add_parser("show", help="Display details of a specific node.")
     show_p.add_argument("ident", help="Slug or ID of node.")
+    show_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON (for agents).")
 
     # list (alias: list_decisions — the MCP tool name, so an agent's first instinct works)
     list_p = subparsers.add_parser("list", aliases=["list_decisions"],
@@ -2298,7 +2341,7 @@ def main() -> None:
         elif args.command in ("surface", "surface_decisions"):
             cmd_surface(config, args.query, scope=args.scope, as_json=args.as_json, brief=args.brief, limit=args.limit)
         elif args.command == "show":
-            cmd_show(config, args.ident)
+            cmd_show(config, args.ident, as_json=args.as_json)
         elif args.command in ("list", "list_decisions"):
             cmd_list(config, scope=args.scope, state_filter=args.state, as_json=args.as_json, brief=args.brief)
         elif args.command == "open-questions":

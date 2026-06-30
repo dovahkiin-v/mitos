@@ -333,6 +333,82 @@ def test_cli_show_prints_modifier(ws, capsys) -> None:
     assert "Amended by" in out and "shown-v2" in out
 
 
+def test_cli_show_resolves_superseded_not_reused_slug(ws, capsys) -> None:
+    """The R2 trap: a superseded slug with NO active bearer (the superseder carries a
+    DISTINCT slug) resolves marked-superseded instead of 404-ing — `show` as a vector."""
+    config, m = ws
+    _rec(m, "orig")
+    _rec(m, "orig-v2", supersedes="orig")  # distinct slug → "orig" has no active bearer
+    capsys.readouterr()
+    cmd_show(config, "orig")
+    out = capsys.readouterr().out
+    assert "not found" not in out.lower()
+    assert "superseded" in out.lower()
+    assert "orig-v2" in out
+
+
+def test_cli_show_active_slug_resolves_active(ws, capsys) -> None:
+    """Active-view precedence (step 2): a slug borne by an active node resolves to the
+    live node before the superseded-lineage recency step is ever consulted. (The write
+    path's slug-collision guard means a slug maps to exactly one graph node, so this is
+    the constructible form of active-view precedence.)"""
+    config, m = ws
+    _rec(m, "alive")
+    capsys.readouterr()
+    cmd_show(config, "alive", as_json=True)
+    out = json.loads(capsys.readouterr().out)
+    assert out["state"] == "active"
+    assert out["slug"] == "alive"
+    assert "superseded_by" not in out
+
+
+def test_cli_show_json_found_decision_letter_complete_stamped(ws, capsys) -> None:
+    """`show --json` on a superseded decision: Letter-complete (axiom + rejected_paths),
+    carries kind/id/state, and is modifier-stamped with `superseded_by`."""
+    config, m = ws
+    _rec(m, "auth")
+    _rec(m, "auth-v2", supersedes="auth")
+    capsys.readouterr()
+    cmd_show(config, "auth", as_json=True)
+    out = json.loads(capsys.readouterr().out)
+    assert out["kind"] == "decision"
+    assert out["id"] and out["slug"] == "auth"
+    assert out["state"] == "superseded"
+    assert out["axiom"]  # Letter core
+    assert out["rejected_paths"]  # the anti-knowledge fence (M5)
+    assert out["superseded_by"] == ["auth-v2"]  # the load-bearing stamp
+
+
+def test_cli_show_json_oq_body_and_modifier_subset(ws, capsys) -> None:
+    """`show --json` on an OQ emits the OQ body (topic/questions_raised/park_reason) and
+    only the OQ-applicable modifier keys (the subset is structural, not filtered)."""
+    config, m = ws
+    store = GraphStore(config.db_path)
+    _commit_oq(store, "rate-policy")
+    _commit_oq(store, "rate-policy-v2", amends="rate-policy")
+    capsys.readouterr()
+    cmd_show(config, "rate-policy", as_json=True)
+    out = json.loads(capsys.readouterr().out)
+    assert out["kind"] == "open_question"
+    assert out["topic"] == "rate-policy"  # _oq_payload keys topic off slug
+    assert out["questions_raised"]
+    assert "park_reason" in out
+    assert out["amended_by"] == ["rate-policy-v2"]
+    assert "superseded_by" not in out and "corrected_by" not in out
+
+
+def test_cli_show_json_not_found_is_object_with_hint(ws, capsys) -> None:
+    """`show --json` on a genuinely-absent slug emits a JSON object (falsy found-flag +
+    `mitos sync` hint), not a bare text line."""
+    config, m = ws
+    capsys.readouterr()
+    cmd_show(config, "no-such-slug", as_json=True)
+    out = json.loads(capsys.readouterr().out)
+    assert out["found"] is False
+    assert out["ident"] == "no-such-slug"
+    assert "mitos sync" in out["hint"].lower()
+
+
 def test_cli_list_text_marks_modified(ws, capsys) -> None:
     """`mitos list` text output flags a modified-but-live decision with ⚠."""
     config, m = ws

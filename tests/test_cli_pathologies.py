@@ -211,11 +211,13 @@ def test_cli_pathology_show_and_list(isolated_workspace, capsys) -> None:
     config, tmpdir = isolated_workspace
     cmd_init(config)
     
-    # 1. Attempt to show nonexistent slug
+    # 1. Attempt to show nonexistent slug — the genuine-absence branch carries the
+    #    static, hedged `mitos sync` pointer (5a: a None means typo or unsynced draft).
     cmd_show(config, "nonexistent-slug")
     captured = capsys.readouterr()
     assert "not found" in captured.out.lower()
-    
+    assert "mitos sync" in captured.out.lower()
+
     # 2. Attempt to list with empty database
     cmd_list(config)
     captured = capsys.readouterr()
