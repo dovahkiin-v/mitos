@@ -20,6 +20,31 @@ Claude: That breaks the local-first requirement in P10. Let's use SQLite.
 
 <!-- BEGIN ENTRIES — new decisions go directly below this line, newest first -->
 
+### conflict-sensor-defers-record-time-backstop-and-reuse-cache
+
+**Decided:** The Conflict sensor ships two structural write moments — write-time (`check_conflict` pre-write STOP) and sync-time (the per-entry undeclared-decision net) — and defers the record-time `record_decision` backstop plus any cross-moment judgment-reuse cache to the conflict-automation follow-on; `conflict_checks` stays pure append-only telemetry, never a real-time read-cache.
+**Rejected:** (1) The prior CONF-D11 + CONF-D12 design — a post-commit record-time advisory hook on `record_decision` PLUS a `conflict_checks` read-cache to dedup the check_conflict→record_decision double-judgment — rejected on two independent breaks (Claude + Gemini, 2026-06-30): (a) the hook is post-commit, so the proposal's own node has already advanced the graph head by the time it runs, making the cache's "graph-head-unchanged" reuse predicate false 100% of the time on the exact flow it was built to optimize; (b) the cache key (axiom verbatim, graph-head) omits scope + mechanisms, which co-determine the candidate set, so it would mis-reuse a judgment across differing scopes — surfacing phantom conflicts and missing real ones, and poisoning the CONF-C1 label corpus. A too-clever cache patching a self-inflicted double-tax (VISION_GUIDANCE "amendments that recurse signal a refactor, not another patch"; CONF-D12 was literally a review-patch on CONF-D11's seam).
+
+(2) Keep the record-time backstop but drop only the cache — rejected: with no dedup it double-charges the *disciplined* agent (the one who already ran the pre-write `check_conflict`) with a second SONNET judgment + ~5s latency on the primary agentic write surface — a perverse incentive that punishes the taught behaviour.
+
+(3) A cheap deterministic record-time nudge (mechanism-overlap / embedding candidates only, no LLM, no cache) — set aside: largely redundant with the existing `surface_decisions`, and adds an embedding round-trip to every `record_decision`.
+
+The deferral passes the P20 Retrofit Test (the OQ-rotation-deferral precedent's form): a post-commit advisory hook is purely additive when added later — it slots into the same best-effort section `_adjacent_decisions` already occupies, breaking no interface and no test, and `conflict_checks` is already wired as the telemetry corpus it would consult — so no walls break. Honest residual gap, named not hidden: `record_decision` commits directly and a re-sync of an already-committed hash is a no-op, so sync (CONF-D7) structurally cannot re-catch a `record_decision` contradiction until Vision 1b's corpus-wide `mitos check`; accepted for v0.2 because the sensor is advisory and the contradiction is non-corrupting (M3 computed state; the buffer-first + rollback write contract untouched), and the window before Vision 1b is short.
+**Mechanisms:** check_conflict, record_decision, conflict_checks
+**Scope:** conflict, build
+**Context:** Settled in the conflict-sensor vision paired review (Claude + Gemini, 2026-06-30). Reverses the vision-internal CONF-D11 (record-time backstop) and CONF-D12 (cross-moment reuse cache); the vision now ships two moments + pure telemetry. Side effect: the conflict sensor no longer reworks the record_decision write-pause surface (only the sync-time per-entry review), which softens one sequencing rationale in [[ax-ux-hardening-precedes-conflict-sensor]] for the near-dup-pause clear-by-reference fix. Vision: v-mitos-conflict-sensor-20260613.
+**Cites:** ax-ux-hardening-precedes-conflict-sensor, oq-rotation-deferral-passes-retrofit-test-additive
+
+
+### letter-payload-serializer-preserves-caller-key-order-via-extras-slot
+
+**Decided:** The shared Letter-payload serializer (2a, W3) inserts verb-envelope extras (score/state/depth_mode) between the scope key and rejected_paths so it reproduces every routed caller's shipped JSON key order byte-identically; modifier-stamping stays the per-caller get_modifiers seam and is never folded into the serializer; the query_decisions exact-slug dereference branch is left unrouted because its rejected_paths-second key order is anomalous and it never honors brief, with its canonical-shaped twin arriving as show_node in phase 5b.
+**Rejected:** Canonical post-rejected_paths slot (reorders keys on every shipped MCP/CLI shape — an avoidable visible diff on a pure-refactor phase, wrong trade when faithful byte-identical extraction is available); fold modifier-stamping into the serializer (couples the Tier-1 leaf to GraphStore and regresses list's get_modifiers_map batch into an N+1 single-node stamp); route the exact-slug branch too (would force an ugly position-override param or a visible key reorder of the dereference output).
+**Mechanisms:** json, display.py, letter_payload
+**Scope:** ax, cli, retrieval
+**Amends:** read-json-payload-letter-complete-mirrors-own-mcp-twin
+
+
 ### mcp-nudge-already-on-own-stderr-line
 
 **Decided:** The mitos '💡 wire the MCP' nudge already prints on its own stderr line via main()'s print(_hint, file=sys.stderr), gated to the decision-loop verbs (record/surface/query/list + aliases, never show), so the AX/UX-hardening §3-(1) ask to 'give the nudge its own line so it stops concatenating onto the axiom' was already satisfied before the vision was drafted (commit 8b3c90f, 2026-06-12); Phase 1b therefore pins the behaviour with a stderr-placement + stdout-absence assertion instead of manufacturing a text change against a stale premise.
