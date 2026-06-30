@@ -44,6 +44,16 @@ def test_query_decisions_alias_routes(mock_query, monkeypatch):
     assert mock_query.called
 
 
+@patch("mitos.cli.cmd_query")
+def test_query_json_brief_routes(mock_query, monkeypatch):
+    """`query c --json --brief` threads as_json=True, brief=True (non-exhaustive)."""
+    monkeypatch.setattr(sys, "argv", ["mitos", "query", "claim", "--json", "--brief"])
+    main()
+    assert mock_query.called
+    _, kwargs = mock_query.call_args
+    assert kwargs["as_json"] is True and kwargs["brief"] is True
+
+
 # --- file / stdin prose input --------------------------------------------------
 
 def test_read_text_arg_inline():
