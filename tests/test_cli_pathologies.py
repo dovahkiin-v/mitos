@@ -17,6 +17,7 @@ Mitos Framework.
 
 import os
 import sys
+import json
 import tempfile
 import shutil
 import socket
@@ -31,6 +32,7 @@ from mitos.cli import (
     cmd_sync,
     cmd_capture,
     cmd_query,
+    cmd_record,
     cmd_show,
     cmd_list,
     cmd_open_questions,
@@ -317,3 +319,137 @@ def test_cli_pathology_serve_port_clash(isolated_workspace, capsys) -> None:
             assert "Address already in use" in str(exc.value)
     finally:
         s.close()
+
+
+# ==============================================================================
+# 9. `record --json` — machine-readable write receipt (Phase 2c)
+#
+# Every outcome (created / error / needs_review / missing-rejected) speaks JSON on
+# stdout — never a stderr wall a --json consumer would miss — while keeping the
+# existing exit codes (0 / 1 / 2 / 2). Text mode stays byte-identical.
+# ==============================================================================
+
+class _StubReviewManager:
+    """A stand-in MitosSyncManager whose record_decision_entry returns a canned dict.
+
+    `cmd_record` builds its own `MitosSyncManager(config)` internally, so a forced
+    `needs_review` pause is injected by patching `mitos.cli.MitosSyncManager` to
+    return this — exercising the `--json` rendering + exit code without standing up
+    embeddings (offline never pauses: `_review_neighbors` returns `[]`).
+    """
+
+    def __init__(self, result):
+        self._result = result
+
+    def record_decision_entry(self, **kwargs):
+        return self._result
+
+
+def test_record_json_created_receipt(isolated_workspace, capsys) -> None:
+    """`record --json` emits the created receipt as a JSON object on stdout — slug,
+    id, state, status, embedding, path — and no modifier keys (it is a write result)."""
+    config, tmpdir = isolated_workspace
+    cmd_init(config)
+
+    capsys.readouterr()
+    cmd_record(config, axiom="Use WAL mode for the store.",
+               rejected="A rejected alternative, with reasons.",
+               slug="use-wal", as_json=True)
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "created"
+    assert out["slug"] == "use-wal"
+    for key in ("id", "state", "embedding", "path"):
+        assert key in out
+    # A write receipt is not a decision read — no modifier stamping.
+    for mod in ("superseded_by", "amended_by", "narrowed_by", "corrected_by"):
+        assert mod not in out
+
+
+def test_record_json_error_receipt_slug_collision(isolated_workspace, capsys) -> None:
+    """A real `slug_collision` (same slug, different axiom, no --supersedes) emits
+    `{error, code: "slug_collision"}` on stdout and exits 1 under --json."""
+    config, tmpdir = isolated_workspace
+    cmd_init(config)
+
+    cmd_record(config, axiom="First axiom for the handle.",
+               rejected="Rejected one.", slug="dup", as_json=True)
+    capsys.readouterr()
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_record(config, axiom="A DIFFERENT axiom on the same handle.",
+                   rejected="Rejected two.", slug="dup", as_json=True)
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    out = json.loads(captured.out)
+    assert out["code"] == "slug_collision"
+    assert "error" in out
+    assert captured.err == ""  # no stderr wall under --json
+
+
+def test_record_json_needs_review_receipt(isolated_workspace, capsys) -> None:
+    """A forced `needs_review` pause emits the JSON object on stdout (status, neighbors),
+    exits 2, and leaks nothing to stderr under --json."""
+    config, tmpdir = isolated_workspace
+    cmd_init(config)
+    canned = {
+        "status": "needs_review",
+        "code": "similar_decision_exists",
+        "slug": "near-dup",
+        "neighbors": [{"slug": "existing", "axiom": "An existing axiom.", "score": 0.91}],
+        "message": "Looks like an existing decision.",
+    }
+    stub = _StubReviewManager(canned)
+
+    capsys.readouterr()
+    with patch("mitos.cli.MitosSyncManager", return_value=stub):
+        with pytest.raises(SystemExit) as exc:
+            cmd_record(config, axiom="A near-duplicate axiom.",
+                       rejected="Rejected alt.", slug="near-dup", as_json=True)
+    assert exc.value.code == 2
+    captured = capsys.readouterr()
+    out = json.loads(captured.out)
+    assert out["status"] == "needs_review"
+    assert out["neighbors"][0]["slug"] == "existing"
+    assert captured.err == ""  # no stderr wall under --json
+
+
+def test_record_json_missing_rejected_guard(isolated_workspace, capsys, monkeypatch) -> None:
+    """The dispatch-level missing-`--rejected` guard speaks JSON on stdout under --json
+    (`code: "missing_rejected"`) and still exits 2 — no stderr wall."""
+    # Route through `main()` so the dispatch-level guard runs (it fires before any
+    # store access, so the cwd workspace is irrelevant — mirrors test_record_requires_rejected).
+    monkeypatch.setattr(sys, "argv",
+                        ["mitos", "record", "ax", "--slug", "s", "--json"])
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 2
+    captured = capsys.readouterr()
+    out = json.loads(captured.out)
+    assert out["code"] == "missing_rejected"
+    assert "error" in out
+
+
+def test_record_text_receipt_byte_identity(isolated_workspace, capsys) -> None:
+    """No-flag `record` text receipt is unchanged by 2c (byte-identity guard): the
+    `Recorded …✓` / `ID:` / `Handle:` lines still render on stdout."""
+    config, tmpdir = isolated_workspace
+    cmd_init(config)
+
+    capsys.readouterr()
+    cmd_record(config, axiom="Text-path axiom stays the same.",
+               rejected="Rejected alt.", slug="text-path")
+    out = capsys.readouterr().out
+    assert "Recorded decision 'text-path' (created) ✓" in out
+    assert "  ID:" in out
+    assert "  Handle:" in out
+
+
+def test_open_questions_text_byte_identity_empty(isolated_workspace, capsys) -> None:
+    """No-flag `open-questions` empty text is unchanged: `Zero parked open questions found.`"""
+    config, tmpdir = isolated_workspace
+    cmd_init(config)
+
+    capsys.readouterr()
+    cmd_open_questions(config)
+    assert "Zero parked open questions found." in capsys.readouterr().out
