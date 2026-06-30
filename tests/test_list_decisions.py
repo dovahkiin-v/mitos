@@ -192,3 +192,230 @@ def test_surface_note_points_to_exhaustive_path(ws) -> None:
         resp = json.loads(mcp_server.surface_decisions(query="anything", scope="db"))
     assert resp["active_decisions"]
     assert "note" in resp and "list_decisions" in resp["note"]
+
+
+# --------------------------------------------------------------------------- #
+# T8: absent-from-live scope hard-filter recovery (3d)
+#
+# A scoped read (`list`/`open-questions`/`list_decisions`) that returns empty
+# because the scope tag isn't in the live vocabulary surfaces a bounded
+# self-correction vector (text) / an in-band exit-0 signal (scope_known:false +
+# scope_recovery under --json/MCP) — never a silent empty, never a hard error.
+# A live-but-empty read stays clean honest-empty. (recovery payload carries no
+# node id → nothing to modifier-stamp.)
+# --------------------------------------------------------------------------- #
+
+from mitos.parser import ParsedEntry
+from mitos.recall import scope_filter_recovery
+from mitos.cli import cmd_open_questions
+
+
+def _commit_oq_scope(store: GraphStore, slug: str, scope) -> None:
+    """Commits a parked open question in a scope (makes the scope live-via-OQ)."""
+    e = ParsedEntry("open_question", slug, 1, 5)
+    e.topic = f"Topic for {slug}"
+    e.questions_raised = [f"What about {slug}?"]
+    e.scope = list(scope)
+    store.commit_parsed_entry(e)
+
+
+# ----- pure-function unit tests (the fast lane) ----------------------------- #
+
+def test_scope_filter_recovery_absent_scope_returns_note() -> None:
+    """An absent-from-live scope yields a {'note': ...} payload with the vector."""
+    counts = {"auth": {"active_decisions": 3, "parked_open_questions": 0}}
+    rec = scope_filter_recovery(scope="ath", scope_counts=counts, surface="cli")
+    assert rec is not None
+    note = rec["note"]
+    assert "unused scope tag" in note
+    assert "'auth'" in note  # did-you-mean
+    assert "--state all" in note  # the hard-filter affordance
+    assert not note.endswith(" ")  # rstripped at the recovery boundary
+
+
+def test_scope_filter_recovery_live_scope_returns_none() -> None:
+    """A live scope recovers nothing — it is real data, not a typo."""
+    counts = {"auth": {"active_decisions": 3, "parked_open_questions": 0}}
+    assert scope_filter_recovery(scope="auth", scope_counts=counts, surface="cli") is None
+
+
+def test_scope_filter_recovery_none_scope_and_none_counts_return_none() -> None:
+    """No scope, or uncheckable counts, degrade calmly to None (no fabricated hint)."""
+    counts = {"auth": {"active_decisions": 1, "parked_open_questions": 0}}
+    assert scope_filter_recovery(scope=None, scope_counts=counts, surface="cli") is None
+    assert scope_filter_recovery(scope="ath", scope_counts=None, surface="cli") is None
+
+
+def test_scope_filter_recovery_surface_wording_differs() -> None:
+    """MCP pointers use tool call-forms; CLI pointers use shell commands (T7)."""
+    counts = {"auth": {"active_decisions": 1, "parked_open_questions": 0}}
+    cli = scope_filter_recovery(scope="ath", scope_counts=counts, surface="cli")["note"]
+    mcp = scope_filter_recovery(scope="ath", scope_counts=counts, surface="mcp")["note"]
+    assert "mitos list --scope 'ath' --state all" in cli
+    assert "list_decisions(" not in cli  # the MCP-tool-leak invariant
+    assert "list_decisions(scope='ath', state='all')" in mcp
+
+
+# ----- MCP list_decisions in-band signal + CLI⇄MCP parity ------------------- #
+
+def test_mcp_list_decisions_absent_scope_in_band_signal(ws) -> None:
+    """list_decisions(scope=absent) → scope_known:false + scope_recovery, exit-0."""
+    from mitos import mcp_server
+    config, m = ws
+    _record(m, "a", scope=["auth"])
+    _record(m, "d", scope=["db"])
+    store = GraphStore(config.db_path, read_only=True)
+    with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
+        resp = json.loads(mcp_server.list_decisions(scope="ath"))
+    assert resp["decisions"] == [] and resp["open_questions"] == []
+    assert resp["scope_known"] is False
+    rec = resp["scope_recovery"]
+    assert "unused scope tag" in rec and "'auth'" in rec
+    # MCP-worded pointers, never the CLI `mitos` shell forms.
+    assert "list_decisions(scope='ath', state='all')" in rec
+    assert "mitos list" not in rec
+
+
+def test_mcp_list_decisions_live_scope_envelope_unchanged(ws) -> None:
+    """A live scope returns the existing envelope — no additive fields (truly additive)."""
+    from mitos import mcp_server
+    config, m = ws
+    _record(m, "a", scope=["auth"])
+    store = GraphStore(config.db_path, read_only=True)
+    with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
+        resp = json.loads(mcp_server.list_decisions(scope="auth"))
+    assert resp["decisions"]
+    assert "scope_known" not in resp and "scope_recovery" not in resp
+
+
+def test_cli_mcp_fire_same_signal(ws, capsys) -> None:
+    """cmd_list --json and list_decisions fire the same in-band signal, surface-worded."""
+    from mitos import mcp_server
+    config, m = ws
+    _record(m, "a", scope=["auth"])
+    capsys.readouterr()
+    cmd_list(config, scope="ath", as_json=True)
+    cli = json.loads(capsys.readouterr().out)
+    store = GraphStore(config.db_path, read_only=True)
+    with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
+        mcp = json.loads(mcp_server.list_decisions(scope="ath"))
+    assert cli["scope_known"] is False and mcp["scope_known"] is False
+    # Both name the same did-you-mean; the call-form differs by surface.
+    assert "'auth'" in cli["scope_recovery"] and "'auth'" in mcp["scope_recovery"]
+    assert "mitos list --scope 'ath' --state all" in cli["scope_recovery"]
+    assert "list_decisions(scope='ath', state='all')" in mcp["scope_recovery"]
+
+
+# ----- CLI text + json fire the vector -------------------------------------- #
+
+def test_cmd_list_absent_scope_text_vector(ws, capsys) -> None:
+    """`mitos list --scope <absent>` prints the bounded vector, exit-0 (no raise)."""
+    config, m = ws
+    _record(m, "a", scope=["auth"])
+    _record(m, "b", scope=["db"])
+    capsys.readouterr()
+    cmd_list(config, scope="ath")  # must not raise
+    out = capsys.readouterr().out
+    assert "unused scope tag" in out
+    assert "'auth'" in out  # did-you-mean
+    assert "Live scopes (busiest first)" in out
+    assert "--state all" in out
+    assert "No decisions match the given filters." not in out
+
+
+def test_cmd_list_absent_scope_json_in_band(ws, capsys) -> None:
+    """`mitos list --scope <absent> --json` carries the additive fields."""
+    config, m = ws
+    _record(m, "a", scope=["auth"])
+    capsys.readouterr()
+    cmd_list(config, scope="ath", as_json=True)
+    out = json.loads(capsys.readouterr().out)
+    assert out["decisions"] == [] and out["open_questions"] == []
+    assert out["scope_known"] is False
+    assert "unused scope tag" in out["scope_recovery"]
+
+
+def test_cmd_open_questions_absent_scope_text_and_json(ws, capsys) -> None:
+    """`mitos open-questions --scope <absent>` fires the vector in both modes."""
+    config, m = ws
+    _record(m, "a", scope=["auth"])
+    capsys.readouterr()
+    cmd_open_questions(config, scope="ath")
+    text = capsys.readouterr().out
+    assert "unused scope tag" in text and "'auth'" in text
+    assert "Zero parked open questions found." not in text
+
+    cmd_open_questions(config, scope="ath", as_json=True)
+    js = json.loads(capsys.readouterr().out)
+    assert js["scope_known"] is False
+    assert "unused scope tag" in js["scope_recovery"]
+
+
+# ----- negative pins: live-but-empty stays honest-empty --------------------- #
+
+def test_live_via_parked_oq_is_not_unused(ws, capsys) -> None:
+    """A scope live ONLY via a parked OQ is a real tag — `list` returns no decisions
+    for it, but it must NOT trip the unused-scope vector."""
+    config, m = ws
+    store = GraphStore(config.db_path)
+    _commit_oq_scope(store, "q-foo", scope=["foo"])
+    capsys.readouterr()
+    # list --scope foo returns no *decisions*, but foo is in the live map.
+    cmd_list(config, scope="foo")
+    out = capsys.readouterr().out
+    assert "unused scope tag" not in out
+    # json path: no additive fields either.
+    cmd_list(config, scope="foo", as_json=True)
+    js = json.loads(capsys.readouterr().out)
+    assert "scope_known" not in js
+
+
+def test_open_questions_live_scope_no_parked_oq_is_honest_empty(ws, capsys) -> None:
+    """A scope live via a decision but with no parked OQ → honest-empty, no vector.
+
+    Proves the gate keys on live-membership, not on emptiness alone."""
+    config, m = ws
+    _record(m, "a", scope=["auth"])  # auth is live (decision), but has no parked OQ
+    capsys.readouterr()
+    cmd_open_questions(config, scope="auth")
+    out = capsys.readouterr().out
+    assert "Zero parked open questions found." in out
+    assert "unused scope tag" not in out
+    cmd_open_questions(config, scope="auth", as_json=True)
+    js = json.loads(capsys.readouterr().out)
+    assert "scope_known" not in js
+
+
+# ----- empty-graph precedence + --state all dead-scope recovery ------------- #
+
+def test_cmd_list_empty_graph_precedence_over_vector(ws, capsys) -> None:
+    """A fresh graph yields the 'empty, run sync' line, NOT the unused-scope vector."""
+    config, _ = ws
+    capsys.readouterr()
+    cmd_list(config, scope="anything")
+    out = capsys.readouterr().out
+    assert "Graph database is empty. Run 'mitos sync' to ingest entries." in out
+    assert "unused scope tag" not in out
+
+
+def test_state_all_dead_scope_pair(ws, capsys) -> None:
+    """A superseded-only scope: default `active` is empty → vector with `--state all`
+    pointer; `--state all` returns the superseded decisions → no recovery (non-empty)."""
+    config, m = ws
+    _record(m, "v1", scope=["legacy"])
+    _record(m, "v2", scope=["legacy"], supersedes="v1")
+    # v2 also moves out so the scope has NO active decisions left.
+    _record(m, "v3", scope=["other"], supersedes="v2")
+    capsys.readouterr()
+
+    # default active view → empty → vector pointing at --state all.
+    cmd_list(config, scope="legacy")
+    out = capsys.readouterr().out
+    assert "unused scope tag" in out
+    assert "--state all" in out
+
+    # --state all → superseded decisions surface → honest non-empty, no recovery.
+    cmd_list(config, scope="legacy", state_filter="all", as_json=True)
+    js = json.loads(capsys.readouterr().out)
+    assert js["decisions"]  # superseded nodes present
+    assert "scope_known" not in js

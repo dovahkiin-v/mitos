@@ -453,3 +453,30 @@ def test_open_questions_text_byte_identity_empty(isolated_workspace, capsys) -> 
     capsys.readouterr()
     cmd_open_questions(config)
     assert "Zero parked open questions found." in capsys.readouterr().out
+
+
+def test_list_absent_scope_recovery_vector(isolated_workspace, capsys) -> None:
+    """`mitos list --scope <misspelled>` self-corrects instead of a silent empty (3d)."""
+    config, tmpdir = isolated_workspace
+    cmd_init(config)
+    cmd_record(config, axiom="Auth axiom.", rejected="Rejected.", scope=["auth"], slug="auth-one")
+
+    capsys.readouterr()
+    cmd_list(config, scope="ath")  # misspelled — absent from live
+    out = capsys.readouterr().out
+    assert "unused scope tag" in out
+    assert "'auth'" in out  # did-you-mean
+    assert "No decisions match the given filters." not in out
+
+
+def test_open_questions_absent_scope_recovery_vector(isolated_workspace, capsys) -> None:
+    """`mitos open-questions --scope <misspelled>` self-corrects, not a silent empty (3d)."""
+    config, tmpdir = isolated_workspace
+    cmd_init(config)
+    cmd_record(config, axiom="Auth axiom.", rejected="Rejected.", scope=["auth"], slug="auth-one")
+
+    capsys.readouterr()
+    cmd_open_questions(config, scope="ath")
+    out = capsys.readouterr().out
+    assert "unused scope tag" in out
+    assert "Zero parked open questions found." not in out
