@@ -115,6 +115,29 @@ def _oq_modifiers(oq: Dict[str, Any]) -> Dict[str, List[str]]:
     return {key: oq[key] for key in MODIFIER_EDGE_KEYS.values() if oq.get(key)}
 
 
+def _oq_payload(oq: Dict[str, Any]) -> Dict[str, Any]:
+    """Builds the machine-readable per-OQ dict shared by every OQ ``--json`` surface.
+
+    The single source of the open-question JSON shape: ``cmd_list``'s
+    ``open_questions[]`` array and ``cmd_open_questions --json`` both emit this so an
+    agent sees one OQ schema across both verbs. The present modifier keys ride via
+    ``_oq_modifiers`` (an amended-but-active OQ carries ``amended_by``/``narrowed_by``
+    so it never reads as the final word); the decision-only keys
+    (``superseded_by``/``corrected_by``) never appear because ``get_open_questions``
+    never stamps them on an OQ — the subset is structural, not filtered here.
+
+    Args:
+        oq: A hydrated, modifier-stamped open-question dict from
+            ``get_open_questions``.
+
+    Returns:
+        A JSON-native dict with ``topic``, ``questions_raised``, ``park_reason``, and
+        any present reverse-relation modifier keys.
+    """
+    return {"topic": oq["slug"], "questions_raised": oq["questions_raised"],
+            "park_reason": oq.get("park_reason"), **_oq_modifiers(oq)}
+
+
 def load_format_spec() -> str:
     """Loads the canonical format specification from the package's single source of truth."""
     spec_path = os.path.join(os.path.dirname(__file__), "format-spec.md")
@@ -630,11 +653,7 @@ def cmd_list(config: MitosConfig, scope: Optional[str] = None,
     if as_json:
         _emit_json({
             "decisions": [_list_item(d) for d in decisions],
-            "open_questions": [
-                {"topic": oq["slug"], "questions_raised": oq["questions_raised"],
-                 "park_reason": oq.get("park_reason"), **_oq_modifiers(oq)}
-                for oq in parked
-            ],
+            "open_questions": [_oq_payload(oq) for oq in parked],
             "total": len(decisions),
             "scope": scope,
             "state": effective_state,
@@ -672,12 +691,31 @@ def cmd_list(config: MitosConfig, scope: Optional[str] = None,
     print()
 
 
-def cmd_open_questions(config: MitosConfig, scope: Optional[str] = None) -> None:
-    """Lists all parked open questions."""
+def cmd_open_questions(config: MitosConfig, scope: Optional[str] = None,
+                       as_json: bool = False) -> None:
+    """Lists all parked open questions.
+
+    Args:
+        config: The active workspace configuration.
+        scope: Optional scope tag filter; omit for the whole project.
+        as_json: Emit a machine-readable JSON map (the parked OQ set, each carrying
+            its ``amended_by``/``narrowed_by`` modifier subset) instead of text.
+    """
     store = GraphStore(config.db_path)
     oqs = store.get_open_questions(scope=scope)
 
     parked = [q for q in oqs if q["state"] == "parked"]
+
+    if as_json:
+        # Honest-empty envelope on an empty/unmatched scope (never an error — empty is
+        # first-class). The absent-scope recovery vector is 3d's job, not 2c's.
+        _emit_json({
+            "open_questions": [_oq_payload(q) for q in parked],
+            "total": len(parked),
+            "scope": scope,
+        })
+        return
+
     if not parked:
         print("Zero parked open questions found.")
         return
@@ -732,8 +770,17 @@ def cmd_record(
     *,
     slug: str,
     acknowledge_neighbors: bool = False,
+    as_json: bool = False,
 ) -> None:
-    """Records a decision directly to the write-buffer and graph (thin wrapper)."""
+    """Records a decision directly to the write-buffer and graph (thin wrapper).
+
+    Under ``as_json``, every outcome — created/exists, the ``needs_review`` pause, and
+    error — is emitted as the raw ``record_decision_entry`` receipt dict (the same shape
+    the MCP ``record_decision`` tool serializes) on **stdout**, never a stderr wall a
+    ``--json`` consumer would miss. The existing exit codes are preserved (0
+    created/exists, 2 needs_review, 1 error): exit code is the shell's signal, the JSON
+    object is the agent's.
+    """
     manager = MitosSyncManager(config)
     result = manager.record_decision_entry(
         axiom=axiom,
@@ -753,6 +800,20 @@ def cmd_record(
         slug=slug,
         acknowledge_neighbors=acknowledge_neighbors,
     )
+
+    if as_json:
+        # Every outcome speaks JSON on stdout (no stderr walls); exit codes ride along.
+        # The receipt is already the structured dict — emit it verbatim, no reshaping
+        # (the record receipt is a write result, NOT a decision read: no modifier
+        # stamping; its related/neighbors are recall pointers the agent dereferences
+        # by slug). scope_overflow, when present, is already inside `result`.
+        _emit_json(result)
+        if "error" in result:
+            sys.exit(1)
+        if result.get("status") == "needs_review":
+            sys.exit(2)
+        return
+
     if "error" in result:
         print(f"Record failed [{result['code']}]: {result['error']}", file=sys.stderr)
         sys.exit(1)
@@ -1883,6 +1944,7 @@ def main() -> None:
     # open-questions
     oq_p = subparsers.add_parser("open-questions", help="List active open questions.")
     oq_p.add_argument("--scope", help="Filter by scope tag.")
+    oq_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON.")
 
     # import
     imp_p = subparsers.add_parser("import", help="Import legacy prose ADR.")
@@ -1920,6 +1982,7 @@ def main() -> None:
                             f"(≤{_SLUG_MAX_LEN} chars; an over-length slug is rejected, not truncated).")
     rec_p.add_argument("--acknowledge-neighbors", action="store_true", dest="acknowledge_neighbors",
                        help="Record past the near-duplicate review (the decision is genuinely independent).")
+    rec_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON.")
 
     # serve
     subparsers.add_parser("serve", help="Launch Mitos FastMCP server on stdio.")
@@ -1995,7 +2058,7 @@ def main() -> None:
         elif args.command in ("list", "list_decisions"):
             cmd_list(config, scope=args.scope, state_filter=args.state, as_json=args.as_json, brief=args.brief)
         elif args.command == "open-questions":
-            cmd_open_questions(config, scope=args.scope)
+            cmd_open_questions(config, scope=args.scope, as_json=args.as_json)
         elif args.command == "import":
             cmd_import(config, args.path, use_llm_extract=args.llm_extract)
         elif args.command == "render":
@@ -2003,8 +2066,14 @@ def main() -> None:
         elif args.command in ("record", "record_decision"):
             rejected = _read_text_arg(args.rejected, args.rejected_file)
             if not (rejected and rejected.strip()):
-                print("record requires --rejected or --rejected-file "
-                      "(the rejected alternatives are mandatory).", file=sys.stderr)
+                msg = ("record requires --rejected or --rejected-file "
+                       "(the rejected alternatives are mandatory).")
+                if args.as_json:
+                    # No stderr walls under --json: the dead-end speaks a structured
+                    # object on stdout, with the exit code preserved (2).
+                    _emit_json({"error": msg, "code": "missing_rejected"})
+                else:
+                    print(msg, file=sys.stderr)
                 sys.exit(2)
             context = _read_text_arg(args.context, args.context_file)
             cmd_record(
@@ -2025,6 +2094,7 @@ def main() -> None:
                 cites=args.cites,
                 slug=args.slug,
                 acknowledge_neighbors=args.acknowledge_neighbors,
+                as_json=args.as_json,
             )
         elif args.command == "serve":
             cmd_serve()

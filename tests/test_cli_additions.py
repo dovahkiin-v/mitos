@@ -54,6 +54,27 @@ def test_query_json_brief_routes(mock_query, monkeypatch):
     assert kwargs["as_json"] is True and kwargs["brief"] is True
 
 
+@patch("mitos.cli.cmd_open_questions")
+def test_open_questions_json_routes(mock_oq, monkeypatch):
+    """`open-questions --json` threads as_json=True through to the handler."""
+    monkeypatch.setattr(sys, "argv", ["mitos", "open-questions", "--json"])
+    main()
+    assert mock_oq.called
+    _, kwargs = mock_oq.call_args
+    assert kwargs["as_json"] is True
+
+
+@patch("mitos.cli.cmd_record")
+def test_record_json_routes(mock_record, monkeypatch):
+    """`record … --json` threads as_json=True through to the handler."""
+    monkeypatch.setattr(sys, "argv",
+                        ["mitos", "record", "ax", "--rejected", "r", "--slug", "s", "--json"])
+    main()
+    assert mock_record.called
+    _, kwargs = mock_record.call_args
+    assert kwargs["as_json"] is True
+
+
 # --- file / stdin prose input --------------------------------------------------
 
 def test_read_text_arg_inline():

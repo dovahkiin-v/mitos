@@ -24,7 +24,8 @@ import pytest
 from unittest.mock import patch
 
 from mitos.config import MitosConfig
-from mitos.cli import cmd_init, cmd_list, cmd_query, cmd_show, cmd_surface
+from mitos.cli import cmd_init, cmd_list, cmd_open_questions, cmd_query, cmd_show, cmd_surface
+from mitos.parser import ParsedEntry
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS
 from mitos.sync import MitosSyncManager
 from mitos.renderer import render_node_markdown, MitosRenderer
@@ -643,3 +644,43 @@ def test_partial_hub_deprojects_only_dead_amender(ws) -> None:
     store = GraphStore(config.db_path)
     assert store.get_modifiers(hub["id"]) == {"amended_by": ["x-amender"]}
     assert store.get_node_state(hub["id"]) == "active"
+
+
+# --------------------------------------------------------------------------- #
+# CLI `open-questions --json` — the OQ-subset modifier stamping (Phase 2c)
+#
+# The "every decision-read surface stamps modifiers" rule (CLAUDE.md), applied to
+# the OQ JSON read: an amended-but-active parked OQ must carry `amended_by` so it
+# doesn't read as the final word — and the decision-only keys (`superseded_by` /
+# `corrected_by`) must be STRUCTURALLY absent (an OQ is never the target of a
+# `supersedes`/`corrects` decision edge in the OQ view), proving `_oq_modifiers`
+# reuse yields the right subset without an allowlist.
+# --------------------------------------------------------------------------- #
+
+def _commit_oq(store: GraphStore, slug: str, **relations) -> dict:
+    """Commits a hand-built open_question ParsedEntry through the write path."""
+    e = ParsedEntry("open_question", slug, 1, 5)
+    e.topic = f"Topic for {slug}"
+    e.questions_raised = [f"What about {slug}?"]
+    e.scope = []
+    for name, val in relations.items():
+        setattr(e, name, val if isinstance(val, list) else [val])
+    return store.commit_parsed_entry(e)
+
+
+def test_cmd_open_questions_json_stamps_oq_modifier_subset(ws, capsys) -> None:
+    """`open-questions --json`: an amended-but-active OQ carries `amended_by`, and the
+    decision-only modifier keys are structurally absent (the subset is not filtered)."""
+    config, m = ws
+    store = GraphStore(config.db_path)
+    _commit_oq(store, "q-base")
+    _commit_oq(store, "q-amender", amends="q-base")
+
+    capsys.readouterr()
+    cmd_open_questions(config, as_json=True)
+    out = json.loads(capsys.readouterr().out)
+
+    base = next(oq for oq in out["open_questions"] if oq["topic"] == "q-base")
+    assert base["amended_by"] == ["q-amender"]
+    assert "superseded_by" not in base
+    assert "corrected_by" not in base

@@ -306,6 +306,53 @@ def test_cmd_list_json_open_questions_only_parked(ws, capsys) -> None:
     assert topics == {"q-open"}
 
 
+def test_cmd_open_questions_json_shape_parked_only(ws, capsys) -> None:
+    """`open-questions --json`: parked OQs appear with the cross-verb per-OQ shape
+    (`topic`/`questions_raised`/`park_reason`); a resolved OQ is bounded out."""
+    config, store = ws
+    _commit_oq(store, "q-open", scope=["s"])
+    _commit_oq(store, "q-answered", scope=["s"])
+    _commit_dec(store, "d-answer", resolves="q-answered", scope=["s"])
+
+    capsys.readouterr()
+    cmd_open_questions(config, scope="s", as_json=True)
+    out = json.loads(capsys.readouterr().out)
+    topics = {oq["topic"] for oq in out["open_questions"]}
+    assert topics == {"q-open"}
+    assert out["total"] == 1
+    assert out["scope"] == "s"
+    entry = out["open_questions"][0]
+    assert set(entry) >= {"topic", "questions_raised", "park_reason"}
+
+
+def test_cmd_open_questions_json_empty_is_honest_envelope(ws, capsys) -> None:
+    """`open-questions --json` on an empty graph emits a clean honest-empty envelope
+    (exit-0, no crash, never an error) — empty/fresh is first-class."""
+    config, store = ws
+
+    capsys.readouterr()
+    cmd_open_questions(config, as_json=True)  # must not raise
+    out = json.loads(capsys.readouterr().out)
+    assert out == {"open_questions": [], "total": 0, "scope": None}
+
+
+def test_cmd_open_questions_json_matches_list_json_oq_shape(ws, capsys) -> None:
+    """The cross-verb contract: a parked OQ's per-entry dict is byte-identical between
+    `open-questions --json` and `list --json`'s `open_questions[]` array."""
+    config, store = ws
+    _commit_oq(store, "q-listed", scope=["s"])
+    _commit_oq(store, "q-amender", scope=["s"], amends="q-listed")
+
+    capsys.readouterr()
+    cmd_open_questions(config, scope="s", as_json=True)
+    oq_entries = json.loads(capsys.readouterr().out)["open_questions"]
+
+    cmd_list(config, scope="s", as_json=True)
+    list_entries = json.loads(capsys.readouterr().out)["open_questions"]
+
+    assert oq_entries == list_entries
+
+
 def test_cmd_list_text_marks_amended_parked_oq(ws, capsys) -> None:
     """``mitos list`` text flags an amended-but-active parked OQ with a ⚠ marker."""
     config, store = ws
