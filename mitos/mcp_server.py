@@ -8,7 +8,7 @@ import os
 from typing import Optional, List, Dict, Any, Tuple
 from mcp.server.fastmcp import FastMCP
 
-from mitos.display import blackout_note, clamp_limit, dumps_display, letter_payload
+from mitos.display import blackout_note, clamp_limit, dumps_display, letter_payload, order_scope_counts
 from mitos.config import MitosConfig
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS
 from mitos.embeddings import GeminiEmbeddingProvider
@@ -369,6 +369,44 @@ def list_decisions(scope: Optional[str] = None, state: str = "active", brief: bo
         "scope": scope,
         "state": state,
     }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def list_scopes(include_archived: bool = False) -> str:
+    """List the project's scope-tag vocabulary with each domain's live-node counts.
+
+    The map an agent reads BEFORE recording or recalling: every scope tag that
+    carries a live node, ranked busiest-domain-first (total active decisions +
+    parked open questions, descending; ties alphabetical). record_decision /
+    surface_decisions / query_decisions / list_decisions all let you write into a
+    scope or read from one — but only this tells you *what scopes exist and how
+    alive each is*, so you can pick the project's real vocabulary instead of
+    inventing a near-duplicate tag. A pure graph read — no API key or Qdrant needed,
+    so it works even when semantic recall is degraded.
+
+    This returns a tag→counts AGGREGATE, not decision payloads: there is no node id
+    to stamp, so — unlike surface/query/list_decisions — it carries no
+    `superseded_by`/`amended_by`/… modifier keys (that is correct, not a missing
+    stamp). An empty/fresh project returns `{}` — a valid empty vocabulary, never an
+    error.
+
+    Args:
+        include_archived: When False (default), returns only live domains (≥1 active
+            decision OR ≥1 parked open question). When True, additionally includes
+            every other scope tag present in the graph at a `{active_decisions: 0,
+            parked_open_questions: 0}` floor — the scope-level parallel of
+            list_decisions(state="all").
+
+    Returns:
+        A JSON string: an ordered map `{scope: {active_decisions, parked_open_questions}}`,
+        busiest domain first. The key order IS the deliverable — iterate it as-is.
+    """
+    store, _embed, _vec = get_workspace_components()
+    return dumps_display(
+        order_scope_counts(store.get_scope_counts(include_archived=include_archived)),
+        ensure_ascii=False,
+        indent=2,
+    )
 
 
 @mcp.tool()

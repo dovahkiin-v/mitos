@@ -21,6 +21,7 @@ from mitos.display import (
     clamp_limit,
     dumps_display,
     letter_payload,
+    order_scope_counts,
     resolve_display_ensure_ascii,
 )
 from mitos.config import (
@@ -802,6 +803,57 @@ def cmd_open_questions(config: MitosConfig, scope: Optional[str] = None,
         marker = _modifier_marker(q)
         if marker:
             print(f"  {marker}")
+    print()
+
+
+def cmd_scopes(config: MitosConfig, as_json: bool = False, archived: bool = False) -> None:
+    """Enumerates the scope-tag vocabulary with each domain's live-node counts.
+
+    The discovery surface for the project's scope vocabulary — the CLI twin of the
+    MCP ``list_scopes`` tool. An agent landing in a project can already *record*
+    into a scope and *recall* from one, but this is how it *sees the map*: every
+    scope tag that carries a live node, ranked busiest-domain-first (total active
+    decisions + parked open questions, descending; ties alphabetical), so the
+    domains that matter most read first. Use it before recording or recalling, to
+    learn the project's vocabulary instead of guessing it. A pure graph read — no
+    API key or Qdrant needed.
+
+    This returns a tag→counts *aggregate*, not a decision payload: there is no node
+    ``id`` to stamp, so the "every decision-read surface stamps modifiers" rule does
+    **not** apply here (no modifier seam — that is correct, not a missing stamp).
+
+    Args:
+        config: The active workspace configuration.
+        as_json: Emit the machine-readable ordered ``{scope: {active_decisions,
+            parked_open_questions}}`` map (for agents) instead of the text table.
+        archived: Include fully-dead domains (every scope present in the graph at a
+            ``0/0`` floor) — the scope-level parallel of ``list --state all``.
+            Omit for the live vocabulary only.
+
+    Returns:
+        None.
+    """
+    store = GraphStore(config.db_path)
+    counts = order_scope_counts(store.get_scope_counts(include_archived=archived))
+
+    if as_json:
+        _emit_json(counts)
+        return
+
+    if not counts:
+        # Empty/fresh is first-class: an empty vocabulary IS the healthy empty state,
+        # never an error. A just-initialised project simply has no scopes yet.
+        print("No scopes yet — record a decision with --scope to start the vocabulary.")
+        return
+
+    name_w = max(len("scope"), max(len(s) for s in counts))
+    print(f"\nScopes ({len(counts)} found, busiest first):")
+    print("-" * (name_w + 30))
+    print(f"{'scope':{name_w}}   {'active':>6}  {'parked':>6}  {'total':>6}")
+    for scope, c in counts.items():
+        active = c["active_decisions"]
+        parked = c["parked_open_questions"]
+        print(f"{scope:{name_w}}   {active:>6}  {parked:>6}  {active + parked:>6}")
     print()
 
 
@@ -2044,6 +2096,13 @@ def main() -> None:
     oq_p.add_argument("--scope", help="Filter by scope tag.")
     oq_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON.")
 
+    # scopes (alias: list_scopes — the MCP tool name, so an agent's first instinct works)
+    scopes_p = subparsers.add_parser("scopes", aliases=["list_scopes"],
+                                     help="Enumerate the scope vocabulary with live-node counts (busiest first).")
+    scopes_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON (for agents).")
+    scopes_p.add_argument("--archived", action="store_true", dest="archived",
+                          help="Include fully-dead domains at a 0/0 floor (scope-level 'list --state all').")
+
     # import
     imp_p = subparsers.add_parser("import", help="Import legacy prose ADR.")
     imp_p.add_argument("path", help="Path to markdown prose file.")
@@ -2157,6 +2216,8 @@ def main() -> None:
             cmd_list(config, scope=args.scope, state_filter=args.state, as_json=args.as_json, brief=args.brief)
         elif args.command == "open-questions":
             cmd_open_questions(config, scope=args.scope, as_json=args.as_json)
+        elif args.command in ("scopes", "list_scopes"):
+            cmd_scopes(config, as_json=args.as_json, archived=args.archived)
         elif args.command == "import":
             cmd_import(config, args.path, use_llm_extract=args.llm_extract)
         elif args.command == "render":
