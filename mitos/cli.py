@@ -23,6 +23,8 @@ from mitos.display import (
     letter_payload,
     order_scope_counts,
     resolve_display_ensure_ascii,
+    show_payload,
+    SHOW_NOT_FOUND_HINT,
 )
 from mitos.config import (
     MitosConfig,
@@ -670,8 +672,9 @@ def cmd_show(config: MitosConfig, ident: str, as_json: bool = False) -> None:
     if not node:
         # Genuine absence: a typo, or an authored-but-unsynced draft. The hint is
         # static and hedged — it reads no buffer, never asserts presence to a typo.
-        hint = ("not in graph — if you just authored it in decisions.md/questions.md, "
-                "run `mitos sync`")
+        # Single-sourced in display.py so the `show_node` MCP twin emits the same
+        # not-found object byte-for-byte (parity is structural).
+        hint = SHOW_NOT_FOUND_HINT
         if as_json:
             _emit_json({"found": False, "ident": ident, "hint": hint})
             return
@@ -688,16 +691,11 @@ def cmd_show(config: MitosConfig, ident: str, as_json: bool = False) -> None:
     modifiers = store.get_modifiers(node["id"])
 
     if as_json:
-        if node["kind"] == "decision":
-            payload = letter_payload(
-                node, brief=False,
-                extras={"kind": node["kind"], "id": node["id"], "state": state},
-            )
-        else:
-            # OQ body mirrors the canonical _oq_payload shape (cross-verb consistency).
-            payload = {"kind": node["kind"], "id": node["id"], "state": state,
-                       **_oq_payload(node)}
-        payload.update(modifiers)
+        # The dereference payload shape is single-sourced in display.show_payload
+        # so the `show_node` MCP twin produces a byte-identical dict (parity is
+        # structural, not test-enforced). The 5a --json regression pins prove this
+        # extraction is byte-identical to the prior inline builder.
+        payload = show_payload(node, state=state, modifiers=modifiers)
         _emit_json(payload)
         return
 

@@ -189,6 +189,79 @@ def letter_payload(
     return payload
 
 
+# The single not-found hint for the state-agnostic dereference (`mitos show` /
+# the `show_node` MCP twin). Static and hedged — it reads no buffer, so it is
+# truthful for both a typo and an authored-but-unsynced draft (it never asserts
+# presence). Single-sourced here so the not-found JSON object (`{found, ident,
+# hint}`) is byte-equal CLI⇄MCP — the one string the genuine-absence parity
+# assertion reads. Must keep the `mitos sync` + `decisions.md/questions.md`
+# substrings (the CLI not-found test pins them).
+SHOW_NOT_FOUND_HINT = (
+    "not in graph — if you just authored it in decisions.md/questions.md, "
+    "run `mitos sync`"
+)
+
+
+def show_payload(
+    node: Mapping[str, Any], *, state: str, modifiers: Mapping[str, List[str]]
+) -> Dict[str, Any]:
+    """Shapes the state-agnostic single-handle dereference payload, shared CLI⇄MCP.
+
+    The one builder behind both ``mitos show --json`` (``cmd_show``) and the
+    ``show_node`` MCP tool, so the dereference shape **cannot drift** between the
+    two surfaces (the vision's DRY-first invariant; parity becomes structural, not
+    merely test-enforced). Kind-correct: a **decision** routes through
+    :func:`letter_payload` for the Letter-complete core (``slug``/``axiom``/
+    ``scope``/``rejected_paths``) with ``kind``/``id``/``state`` interleaved as
+    extras; an **open question** carries its body (``topic``/``questions_raised``/
+    ``park_reason``).
+
+    Modifier-stamping is the **single trailing** ``.update(modifiers)`` — the one
+    kind-agnostic stamp source. This is **load-bearing**: ``show_node``'s whole job
+    is surfacing superseded nodes, and a superseded payload that omits
+    ``superseded_by`` reads as the final word (the "amended axioms read as live"
+    trap). Because ``get_modifiers`` returns only the present reverse-relation keys,
+    an OQ automatically carries only ``amended_by``/``narrowed_by`` (never
+    ``superseded_by``/``corrected_by``) — the subset is structural, not filtered.
+
+    Stays a pure dict→dict Tier-1 leaf: it takes the already-hydrated ``node``, the
+    computed ``state``, and the ``modifiers`` dict as **arguments** — it never
+    imports or calls ``GraphStore`` (the P7 bulkhead; the caller does the three
+    store reads). NOT the hash-input serializer — ``identity.py`` is fenced (MI-7).
+
+    Args:
+        node: A hydrated, modifier-stamped node dict (decision or open question)
+            from ``GraphStore.resolve_handle``.
+        state: The computed single-node state from ``GraphStore.get_node_state`` —
+            never ``node.get("state")`` (absent on the resolved dict).
+        modifiers: The present reverse-relation keys from
+            ``GraphStore.get_modifiers``; ``{}`` for an unmodified node.
+
+    Returns:
+        The kind-correct, modifier-stamped dereference dict.
+    """
+    if node["kind"] == "decision":
+        payload = letter_payload(
+            node,
+            brief=False,
+            extras={"kind": node["kind"], "id": node["id"], "state": state},
+        )
+    else:
+        # OQ body: the three content fields only. The trailing `.update(modifiers)`
+        # supplies the modifier keys (one stamp source) — so no `_oq_payload`
+        # pre-merge is needed here, and the leaf stays store-free.
+        payload = {
+            "kind": node["kind"],
+            "id": node["id"],
+            "state": state,
+            "topic": node["slug"],
+            "questions_raised": node["questions_raised"],
+            "park_reason": node.get("park_reason"),
+        }
+    payload.update(modifiers)
+    return payload
+
+
 def dumps_display(obj: Any, *, ensure_ascii: bool, indent: Optional[int] = 2) -> str:
     """Serializes a display payload to JSON — the single CLI⇄MCP display seam.
 

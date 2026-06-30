@@ -409,6 +409,119 @@ def test_cli_show_json_not_found_is_object_with_hint(ws, capsys) -> None:
     assert "mitos sync" in out["hint"].lower()
 
 
+# --------------------------------------------------------------------------- #
+# show_node — the MCP twin of `mitos show` (5b). Same shared resolve_handle seam
+# + shared show_payload builder, so resolution AND payload shape are structural,
+# not test-enforced. T10 (the three resolution assertions on the MCP half) +
+# T11 (the modifier stamps, notably superseded_by on a superseded dereference)
+# + the CLI⇄MCP parity assertion (dict-equal over decision / OQ / not-found).
+# --------------------------------------------------------------------------- #
+
+def test_mcp_show_node_resolves_superseded_not_reused_slug(ws) -> None:
+    """T10 MCP half + T11 sharpest stamp: a superseded slug with NO active bearer
+    (distinct superseder slug) resolves marked-superseded and carries `superseded_by`
+    — NOT the not-found object. The graveyard the active-view slug branch can't reach."""
+    from mitos import mcp_server
+    config, m = ws
+    _rec(m, "dead-v1")
+    _rec(m, "dead-v2", supersedes="dead-v1")  # distinct slug → "dead-v1" has no active bearer
+    store = GraphStore(config.db_path, read_only=True)
+    with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
+        resp = json.loads(mcp_server.show_node("dead-v1"))
+    assert resp.get("found") is not False           # not the not-found object
+    assert resp["kind"] == "decision"
+    assert resp["slug"] == "dead-v1"
+    assert resp["state"] == "superseded"
+    assert resp["axiom"] and resp["rejected_paths"]  # Letter-complete (M5 fence)
+    assert resp["superseded_by"] == ["dead-v2"]      # the load-bearing stamp
+
+
+def test_mcp_show_node_active_slug_resolves_active(ws) -> None:
+    """T10: active-view precedence — a slug borne by an active node resolves to the live
+    node (the constructible form; the write-path slug-collision guard maps a slug to one
+    node, so a two-nodes-one-slug active case is un-constructible)."""
+    from mitos import mcp_server
+    config, m = ws
+    _rec(m, "alive-node")
+    store = GraphStore(config.db_path, read_only=True)
+    with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
+        resp = json.loads(mcp_server.show_node("alive-node"))
+    assert resp["state"] == "active"
+    assert resp["slug"] == "alive-node"
+    assert "superseded_by" not in resp
+
+
+def test_mcp_show_node_by_id_resolves(ws) -> None:
+    """T10 (id path): a content-hash id resolves regardless of state (the id branch of
+    resolve_handle, preserved on the twin)."""
+    from mitos import mcp_server
+    config, m = ws
+    res = _rec(m, "by-id")
+    node_id = res["id"]
+    store = GraphStore(config.db_path, read_only=True)
+    with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
+        resp = json.loads(mcp_server.show_node(node_id))
+    assert resp["id"] == node_id
+    assert resp["slug"] == "by-id"
+
+
+def test_mcp_show_node_oq_body_and_modifier_subset(ws) -> None:
+    """T11 (OQ): show_node on an OQ emits the OQ body (topic/questions_raised/park_reason)
+    and only the OQ-applicable modifier keys (subset is structural, not filtered)."""
+    from mitos import mcp_server
+    config, m = ws
+    store = GraphStore(config.db_path)
+    _commit_oq(store, "oq-policy")
+    _commit_oq(store, "oq-policy-v2", amends="oq-policy")
+    ro = GraphStore(config.db_path, read_only=True)
+    with patch.object(mcp_server, "get_workspace_components", return_value=(ro, None, None)):
+        resp = json.loads(mcp_server.show_node("oq-policy"))
+    assert resp["kind"] == "open_question"
+    assert resp["topic"] == "oq-policy"
+    assert resp["questions_raised"]
+    assert "park_reason" in resp
+    assert resp["amended_by"] == ["oq-policy-v2"]
+    assert "superseded_by" not in resp and "corrected_by" not in resp
+
+
+def test_mcp_show_node_not_found_is_object_with_hint(ws) -> None:
+    """T10 genuine-absence: an absent handle returns the JSON not-found object
+    (`found: false` + the `mitos sync` hint), never an error/exception."""
+    from mitos import mcp_server
+    config, m = ws
+    store = GraphStore(config.db_path, read_only=True)
+    with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
+        resp = json.loads(mcp_server.show_node("ghost-slug"))
+    assert resp["found"] is False
+    assert resp["ident"] == "ghost-slug"
+    assert "mitos sync" in resp["hint"].lower()
+
+
+def test_show_node_parity_with_cli_show_json(ws, capsys) -> None:
+    """CLI⇄MCP parity (the vision's load-bearing invariant): for the SAME ident over a
+    real store, `json.loads(show_node(ident))` == `json.loads(mitos show --json ident)`
+    — for a found decision, a found OQ, AND the not-found case. Structural via the shared
+    resolve_handle seam + the shared show_payload builder; pinned here too."""
+    from mitos import mcp_server
+    config, m = ws
+    store = GraphStore(config.db_path)
+    # found decision (superseded, the most demanding shape)
+    _rec(m, "par-v1")
+    _rec(m, "par-v2", supersedes="par-v1")
+    # found OQ (amended)
+    _commit_oq(store, "par-oq")
+    _commit_oq(store, "par-oq-v2", amends="par-oq")
+
+    ro = GraphStore(config.db_path, read_only=True)
+    for ident in ("par-v1", "par-oq", "nope-not-here"):
+        capsys.readouterr()
+        cmd_show(config, ident, as_json=True)
+        cli_out = json.loads(capsys.readouterr().out)
+        with patch.object(mcp_server, "get_workspace_components", return_value=(ro, None, None)):
+            mcp_out = json.loads(mcp_server.show_node(ident))
+        assert cli_out == mcp_out, f"CLI⇄MCP show parity drift on {ident!r}"
+
+
 def test_cli_list_text_marks_modified(ws, capsys) -> None:
     """`mitos list` text output flags a modified-but-live decision with ⚠."""
     config, m = ws
