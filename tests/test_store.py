@@ -1616,3 +1616,149 @@ def test_5d_get_transcript_supersession_does_not_borrow(temp_store: GraphStore) 
     new_delta = temp_store.commit_parsed_entry(new)
     assert temp_store.get_transcript(new_delta.node_id) is None  # not borrowed from old
     assert temp_store.get_transcript(old.node_id) == "OLD transcript."
+
+
+# ===========================================================================
+# Phase 3a — get_scope_counts: DB-side state-predicated scope-count aggregate
+#
+# The load-bearing pin (§6 gate, the definition of done): the per-scope live
+# counts EQUAL the read verbs' result sizes by construction. The aggregate reuses
+# the verbs' liveness PREDICATES in SQL via a different access pattern (a GROUP BY
+# over the node_scopes join, not the verbs' EXISTS-by-given-scope filter) — so they
+# *can* silently drift, and the counts==verbs test is what catches it. Expected
+# counts are computed against the verbs' own output, never against the aggregate,
+# so a shared bug can't tautologically pass.
+# ===========================================================================
+
+
+def _commit_resolve(store, slug, axiom, target_oq, **kw):
+    """Commits a decision declaring one ``resolves`` edge to an OQ (mirrors _commit_kill)."""
+    e = _decision(slug=slug, axiom=axiom, **kw)
+    e.resolves = [target_oq]
+    return store.commit_parsed_entry(e)
+
+
+def _seed_scope_graph(store: GraphStore) -> None:
+    """Seeds a multi-scope graph exercising every liveness path the aggregate counts.
+
+    Scopes:
+      - ``substrate``: 2 active decisions (one multi-valued into ``store``), 1 parked OQ.
+      - ``store``: shares the multi-valued decision (sums above its own total).
+      - ``auth``: 0 active decisions, 1 parked OQ (lives only via open questions).
+      - ``churned``: 1 superseded decision + 1 resolved OQ → fully dead (0/0).
+      - ``corrected``: 1 corrected decision → dead (0/0).
+    """
+    # substrate: two active decisions, the second multi-valued into ``store``.
+    store.commit_parsed_entry(_decision(slug="sub-a", axiom="Sub A.", scope=["substrate"]))
+    store.commit_parsed_entry(
+        _decision(slug="sub-b", axiom="Sub B.", scope=["substrate", "store"])
+    )
+    # substrate: a parked OQ.
+    store.commit_parsed_entry(_open_question(slug="sub-oq", topic="Sub Q?", scope=["substrate"]))
+
+    # auth: an OQ-only domain (no decisions at all) — must be visible.
+    store.commit_parsed_entry(_open_question(slug="auth-oq", topic="Auth Q?", scope=["auth"]))
+
+    # churned: a decision superseded out of the live set + an OQ resolved out of parked.
+    # The superseder/resolver are deliberately SCOPELESS — tagging them ``churned``
+    # would make ``churned`` carry a live decision and defeat the dead-domain intent.
+    store.commit_parsed_entry(_decision(slug="churn-d1", axiom="Churn old.", scope=["churned"]))
+    _commit_kill(store, "churn-d2", "Churn new.", "supersedes", "churn-d1")
+    store.commit_parsed_entry(_open_question(slug="churn-oq", topic="Churn Q?", scope=["churned"]))
+    _commit_resolve(store, "churn-resolver", "Resolved it.", "churn-oq")
+
+    # corrected: a decision corrected out of the live set (corrected ≠ active). The
+    # corrector is scopeless for the same reason.
+    store.commit_parsed_entry(_decision(slug="corr-d1", axiom="Typo.", scope=["corrected"]))
+    _commit_kill(store, "corr-d2", "Fixed typo.", "corrects", "corr-d1")
+
+
+def test_3a_counts_equal_verbs_for_every_scope(temp_store: GraphStore) -> None:
+    """THE load-bearing gate: per scope, counts == the read verbs' result sizes."""
+    _seed_scope_graph(temp_store)
+    result = temp_store.get_scope_counts(include_archived=True)
+
+    # Every scope the storage vocabulary knows about is cross-checked against the verbs.
+    for scope in temp_store.get_all_scopes():
+        expected_active = len(temp_store.get_decisions(scope=scope, state="active"))
+        expected_parked = len(
+            [q for q in temp_store.get_open_questions(scope=scope) if q["state"] == "parked"]
+        )
+        assert result[scope]["active_decisions"] == expected_active, scope
+        assert result[scope]["parked_open_questions"] == expected_parked, scope
+
+
+def test_3a_live_subset_excludes_fully_dead_domain(temp_store: GraphStore) -> None:
+    """Default (live) result excludes a 0/0 domain; archived mode includes it at 0/0."""
+    _seed_scope_graph(temp_store)
+
+    live = temp_store.get_scope_counts()
+    assert "churned" not in live  # all decisions superseded, all OQs resolved
+    assert "corrected" not in live  # the only decision is corrected
+
+    archived = temp_store.get_scope_counts(include_archived=True)
+    assert archived["churned"] == {"active_decisions": 0, "parked_open_questions": 0}
+    assert archived["corrected"] == {"active_decisions": 0, "parked_open_questions": 0}
+
+
+def test_3a_archived_keyset_equals_get_all_scopes(temp_store: GraphStore) -> None:
+    """include_archived=True enumerates exactly get_all_scopes() (Decision 4 lock)."""
+    _seed_scope_graph(temp_store)
+    assert set(temp_store.get_scope_counts(include_archived=True)) == set(
+        temp_store.get_all_scopes()
+    )
+
+
+def test_3a_superseded_not_counted(temp_store: GraphStore) -> None:
+    """A scope with only superseded decisions reports active_decisions: 0 (the over-count
+    a state-blind GROUP BY would produce — the regression this phase prevents)."""
+    _seed_scope_graph(temp_store)
+    archived = temp_store.get_scope_counts(include_archived=True)
+    assert archived["churned"]["active_decisions"] == 0
+    assert archived["corrected"]["active_decisions"] == 0
+
+
+def test_3a_oq_only_domain_is_visible(temp_store: GraphStore) -> None:
+    """A domain with 0 active decisions but ≥1 parked OQ appears in the default result."""
+    _seed_scope_graph(temp_store)
+    live = temp_store.get_scope_counts()
+    assert "auth" in live
+    assert live["auth"] == {"active_decisions": 0, "parked_open_questions": 1}
+
+
+def test_3a_multivalued_scope_sums_above_live_total(temp_store: GraphStore) -> None:
+    """A decision tagged [substrate, store] increments BOTH — per-tag sums may exceed
+    the live decision total (MI-9; asserted, not guarded)."""
+    _seed_scope_graph(temp_store)
+    live = temp_store.get_scope_counts()
+    assert live["substrate"]["active_decisions"] == 2  # sub-a + sub-b
+    assert live["store"]["active_decisions"] == 1  # sub-b, shared
+    # Sum across the two scopes (3) exceeds the 2 distinct live decisions — correct.
+    assert (
+        live["substrate"]["active_decisions"] + live["store"]["active_decisions"] == 3
+    )
+
+
+def test_3a_casefold_invariant_flows_through(temp_store: GraphStore) -> None:
+    """An entry authored with scope ["Auth"] is counted under the casefolded key "auth"
+    (the storage-casefold invariant flows through; no separate fold in the aggregate)."""
+    temp_store.commit_parsed_entry(_decision(slug="cf-d", axiom="Cf.", scope=["Auth"]))
+    live = temp_store.get_scope_counts()
+    assert "Auth" not in live
+    assert live["auth"]["active_decisions"] == 1
+
+
+def test_3a_empty_graph_returns_empty_dict(temp_store: GraphStore) -> None:
+    """A fresh graph (no nodes) returns {} — empty is healthy, never an error/sentinel."""
+    assert temp_store.get_scope_counts() == {}
+    assert temp_store.get_scope_counts(include_archived=True) == {}
+
+
+def test_3a_parked_oq_counted_resolved_excluded(temp_store: GraphStore) -> None:
+    """Parked OQs count; resolving one (active resolver) drops it from the parked count."""
+    temp_store.commit_parsed_entry(_open_question(slug="q1", topic="Q1?", scope=["dom"]))
+    temp_store.commit_parsed_entry(_open_question(slug="q2", topic="Q2?", scope=["dom"]))
+    assert temp_store.get_scope_counts()["dom"]["parked_open_questions"] == 2
+
+    _commit_resolve(temp_store, "resolver", "Done.", "q2", scope=["dom"])
+    assert temp_store.get_scope_counts()["dom"]["parked_open_questions"] == 1

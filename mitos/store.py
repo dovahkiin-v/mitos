@@ -204,13 +204,21 @@ _KILLER_TYPE_SQL: str = (
 # alias trap). Interpolated, not bound (P8 carve-out, exactly as the kill-edge
 # anti-joins) — the binding tuple is unchanged. Self-healing falls out for free
 # (M3): kill the resolver and this EXISTS recomputes ``parked`` at the next read.
-_OQ_RESOLVED_SQL: str = (
+# The bare boolean form (no ``AS is_resolved`` alias) — droppable into a ``CASE`` /
+# ``WHERE`` / ``NOT (...)``. Single-sourced here so the aggregate's parked filter
+# (``_ACTIVE_VIEW_PREDICATE AND NOT _OQ_RESOLVED_PREDICATE``) and ``get_open_questions``'
+# aliased SELECT expression share one definition (DRY / M8). Like
+# ``_ACTIVE_VIEW_PREDICATE``, the outer EXISTS correlates on the UNALIASED ``nodes``
+# (``r.target_id = nodes.id``) — bind it only in a SELECT whose FROM is the unaliased
+# ``nodes`` (the §4.3 alias trap).
+_OQ_RESOLVED_PREDICATE: str = (
     "EXISTS (SELECT 1 FROM edges r "
     "WHERE r.target_id = nodes.id AND r.edge_type = 'resolves' "
     "AND NOT EXISTS (SELECT 1 FROM edges k "
     "WHERE k.target_id = r.source_id "
-    f"AND k.edge_type IN {_KILL_EDGE_TYPES_SQL})) AS is_resolved"
+    f"AND k.edge_type IN {_KILL_EDGE_TYPES_SQL}))"
 )
+_OQ_RESOLVED_SQL: str = f"{_OQ_RESOLVED_PREDICATE} AS is_resolved"
 
 # Indexed scope-membership filter (P11: ``idx_node_scopes_scope`` serves
 # ``scope = ?``, then the PK joins back to ``node_id``). Appended to a read SELECT
@@ -2110,6 +2118,70 @@ class GraphStore:
             for node, row in zip(nodes, rows):
                 node["state"] = _computed_oq_state(row["is_resolved"])
             return nodes
+        finally:
+            conn.close()
+
+    def get_scope_counts(self, include_archived: bool = False) -> Dict[str, Dict[str, int]]:
+        """Per scope tag, the live-node counts the discovery surface advertises.
+
+        Computes, in one DB-side state-predicated aggregate over the
+        ``node_scopes``↔``nodes`` join, two *live* counts per scope tag: active
+        decisions and parked open questions. The counts reuse the read verbs' own
+        liveness predicates in SQL (``_ACTIVE_VIEW_PREDICATE`` for the kill-edge
+        anti-join; ``_OQ_RESOLVED_PREDICATE`` for OQ resolution) rather than the
+        verbs' materialized Python output — so by construction the active-decision
+        count for a scope equals ``len(get_decisions(scope=X, state="active"))`` and
+        the parked-OQ count equals the ``parked``-labeled subset of
+        ``get_open_questions(scope=X)``. The aggregation runs in SQLite; only the
+        small tag→counts map crosses into Python (no node hydration).
+
+        Scope keys are returned exactly as stored in ``node_scopes`` — *already
+        casefolded* at write time (MI-9 honored by the write path, not here), so no
+        runtime fold is applied and the keys are canonical MI-9 forms.
+
+        Args:
+            include_archived: When ``False`` (default), returns only *live* domains
+                (≥1 active decision OR ≥1 parked open question); a fully
+                superseded/resolved domain that computes to 0/0 is excluded (P4
+                self-tidying). When ``True``, additionally includes every other tag
+                present in ``node_scopes`` at a ``0/0`` floor — the scope-level
+                parallel of ``list --state all`` — enumeration-identical to
+                ``get_all_scopes()``.
+
+        Returns:
+            A map keyed by scope tag, each value
+            ``{"active_decisions": int, "parked_open_questions": int}``, ordered
+            alphabetically by scope (deterministic; presentation order is the
+            caller's job). Empty graph / empty vocabulary returns ``{}``.
+        """
+        conn = self._get_connection()
+        try:
+            # One pass, conditional aggregation. The JOIN keeps ``nodes`` UNALIASED
+            # so both reused liveness predicates (which correlate on the literal
+            # ``nodes.id``) bind correctly — aliasing ``nodes`` would silently make
+            # them match nothing (the §4.3 alias trap). ``node_scopes`` IS aliased
+            # (``ns``); the predicates never reference it.
+            sql = (
+                "SELECT ns.scope, "
+                f"SUM(CASE WHEN nodes.kind = 'decision' AND {_ACTIVE_VIEW_PREDICATE} "
+                "THEN 1 ELSE 0 END) AS active_decisions, "
+                f"SUM(CASE WHEN nodes.kind = 'open_question' AND {_ACTIVE_VIEW_PREDICATE} "
+                f"AND NOT {_OQ_RESOLVED_PREDICATE} THEN 1 ELSE 0 END) AS parked_open_questions "
+                "FROM node_scopes ns "
+                "JOIN nodes ON nodes.id = ns.node_id "
+                "GROUP BY ns.scope"
+            )
+            if not include_archived:
+                sql += " HAVING active_decisions > 0 OR parked_open_questions > 0"
+            sql += " ORDER BY ns.scope"
+            rows = conn.execute(sql).fetchall()
+            return {
+                row["scope"]: {
+                    "active_decisions": int(row["active_decisions"]),
+                    "parked_open_questions": int(row["parked_open_questions"]),
+                }
+                for row in rows
+            }
         finally:
             conn.close()
 
