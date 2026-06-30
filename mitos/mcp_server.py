@@ -8,7 +8,7 @@ import os
 from typing import Optional, List, Dict, Any, Tuple
 from mcp.server.fastmcp import FastMCP
 
-from mitos.display import dumps_display, letter_payload
+from mitos.display import blackout_note, clamp_limit, dumps_display, letter_payload
 from mitos.config import MitosConfig
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS
 from mitos.embeddings import GeminiEmbeddingProvider
@@ -56,6 +56,47 @@ def _attach_modifiers(payload: Dict[str, Any], node: Dict[str, Any], store: Grap
     except Exception:
         pass
     return payload
+
+
+def _retired_handle(store: GraphStore, slug: str) -> Optional[Dict[str, Any]]:
+    """Builds a retired-handle pointer for a superseded-filtered ranked match.
+
+    The MCP twin of ``cli._retired_handle`` — kept independent per surface (the
+    ranked loops collect retired handles separately, mirroring the deliberate
+    payload-shaper asymmetry), but emitting the identical ``{"slug", "state"}`` (+
+    ``superseded_by`` successor) shape so the blackout ``all_superseded`` field is
+    byte-equal CLI⇄MCP (T5 parity). State is read authoritatively from the computed
+    ``get_node_state`` via the state-agnostic ``resolve_slug`` (the vector payload's
+    ``state`` is stale-at-embed-time). Calm degradation (P9): an unresolvable slug
+    returns ``None`` (omitted by the caller), a failed state read falls back to
+    ``"superseded"``.
+
+    Args:
+        store: The graph store to resolve the slug and read state/modifiers from.
+        slug: The slug of the superseded-filtered match.
+
+    Returns:
+        The retired-handle dict, or ``None`` if the slug does not resolve.
+    """
+    try:
+        node_ids = store.resolve_slug(slug)
+    except Exception:
+        return None
+    if not node_ids:
+        return None
+    node_id = node_ids[0]
+    try:
+        state = store.get_node_state(node_id)
+    except Exception:
+        state = "superseded"
+    handle: Dict[str, Any] = {"slug": slug, "state": state}
+    try:
+        successors = store.get_modifiers(node_id).get("superseded_by")
+        if successors:
+            handle["superseded_by"] = successors
+    except Exception:
+        pass
+    return handle
 
 
 def _decision_payload(node: Dict[str, Any], score: float, *, brief: bool,
@@ -126,7 +167,7 @@ def _oq_payload(oq: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @mcp.tool()
-def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = False) -> str:
+def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = False, limit: int = 5) -> str:
     """Surface active precedents for a CLAIM before you decide — the recall loop, use first.
 
     The broad "is there a settled decision near this?" scan: a ranked, capped (top
@@ -146,6 +187,8 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
             surface that hard-filters by scope.
         brief: If True, omit `rejected_paths` from every result (axiom-only — a quick
             "is there anything nearby?" scan). Default False keeps the full reasoning.
+        limit: Ranked top-k to retrieve (default 5; clamped to 1–50). Raise it to dig
+            deeper, lower it to save context — a context-budget dial, not a cap at 5.
 
     Returns:
         A JSON string with `active_decisions` (ranked, Letter-mode), plus
@@ -159,32 +202,44 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         semantic ranking ran) and a `note`: `weak` or `none` means no settled precedent
         on this claim — treat it as no-precedent and decide, or call
         list_decisions(scope=...) for a certain check (don't read weak neighbours as a
-        settled decision).
+        settled decision). When ranked recall retrieved precedents but every one is
+        superseded (a blackout), `active_decisions` stays empty and a sibling
+        `all_superseded` list carries the retired handles (`slug`, `state`, and the live
+        `superseded_by` successor when known) with the `note` naming them — that is a
+        recoverable "it was settled before, go read the history", not a true miss.
     """
     store, embed_provider, vector_store = get_workspace_components()
+    top_k = clamp_limit(limit)
 
     results: Dict[str, Any] = {"active_decisions": []}
     semantic_ran = False
     top_score: Optional[float] = None
+    retired: List[Dict[str, Any]] = []
 
     # 1. Semantic search if embeddings and vector store are active
     if embed_provider and vector_store:
         try:
             # Generate query vector
             q_vector = embed_provider.get_embedding(query, is_query=True)
-            matches = vector_store.query(q_vector, limit=5)
+            matches = vector_store.query(q_vector, limit=top_k)
             semantic_ran = True
 
             for m in matches:
                 slug = m["slug"]
                 node = store.get_node_by_slug(slug)
                 if not node:
+                    handle = _retired_handle(store, slug)
+                    if handle:
+                        retired.append(handle)
                     continue
 
                 # Verify computed active status in SQLite (M3 computed state is source-of-truth)
                 node_state = store.get_node_state(node["id"])
                 if node_state not in ("active", "drifted"):
-                    # Stale vector reference, skip
+                    # Stale vector reference — a retired handle for the blackout vector.
+                    handle = _retired_handle(store, slug)
+                    if handle:
+                        retired.append(handle)
                     continue
 
                 results["active_decisions"].append(
@@ -246,6 +301,14 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
     if confidence is not None:
         results["confidence"] = confidence
     results["note"] = note
+
+    # Blackout: semantic ranking ran and retrieved precedents, but every one was
+    # superseded-filtered. Override the note with the recovery vector and attach the
+    # retired handles (CLI⇄MCP-identical shape, T5 parity). Distinct from a true miss
+    # (where `retired` is empty); fires regardless of any parked open questions.
+    if semantic_ran and not results["active_decisions"] and retired:
+        results["note"] = blackout_note(retired)
+        results["all_superseded"] = retired
 
     return dumps_display(results, ensure_ascii=False, indent=2)
 
@@ -309,7 +372,7 @@ def list_decisions(scope: Optional[str] = None, state: str = "active", brief: bo
 
 
 @mcp.tool()
-def query_decisions(query: str, depth: str = "letter", brief: bool = False) -> str:
+def query_decisions(query: str, depth: str = "letter", brief: bool = False, limit: int = 5) -> str:
     """Look up a SPECIFIC decision by slug or claim — the targeted lookup.
 
     Use this when you know roughly what you're after (a slug you're carrying, or a
@@ -323,13 +386,20 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False) -> s
         depth: The retrieval depth (e.g. 'letter', 'trace', 'vibe'). v0.1 enforces Letter mode.
         brief: If True, omit `rejected_paths` from ranked semantic matches (axiom-only).
             An exact-slug hit is always returned in full (you asked for that one).
+        limit: Ranked top-k for the SEMANTIC branch (default 5; clamped to 1–50). Raise
+            it to dig deeper, lower it to save context. Ignored by an exact-slug hit
+            (that returns the one decision you named).
 
     Returns:
         A JSON string containing the ranked results in Letter-mode payload shape.
         A decision a later one has moved on from also carries `superseded_by`/
         `amended_by`/`narrowed_by`/`corrected_by` (the modifying slugs) — an exact-slug
         hit on an amended decision still reads `state: "active"`, so chase these before
-        trusting its axiom's mechanism.
+        trusting its axiom's mechanism. When the semantic branch retrieved precedents but
+        every one is superseded (a blackout), `matches` stays empty and a sibling
+        `all_superseded` list carries the retired handles (`slug`, `state`, live
+        `superseded_by` when known) — settled before, not a true miss; read the history
+        with list_decisions(state="all").
     """
     if depth != "letter":
         return dumps_display({"error": f"Depth mode '{depth}' is not yet implemented in v0.1 (Letter-only retrieval)."}, ensure_ascii=False, indent=None)
@@ -359,18 +429,26 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False) -> s
     # 2. Perform ranked semantic claim search
     if embed_provider and vector_store:
         try:
+            top_k = clamp_limit(limit)
             q_vector = embed_provider.get_embedding(query, is_query=True)
-            matches = vector_store.query(q_vector, limit=5)
-            
+            matches = vector_store.query(q_vector, limit=top_k)
+
             output_list = []
+            retired: List[Dict[str, Any]] = []
             for m in matches:
                 slug = m["slug"]
                 node = store.get_node_by_slug(slug)
                 if not node:
+                    handle = _retired_handle(store, slug)
+                    if handle:
+                        retired.append(handle)
                     continue
-                    
+
                 node_state = store.get_node_state(node["id"])
                 if node_state not in ("active", "drifted"):
+                    handle = _retired_handle(store, slug)
+                    if handle:
+                        retired.append(handle)
                     continue
 
                 match = letter_payload(
@@ -380,8 +458,14 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False) -> s
                 )
                 match.update(store.get_modifiers(node["id"]))
                 output_list.append(match)
-                
-            return dumps_display({"query": query, "depth_mode": "letter", "matches": output_list}, ensure_ascii=False, indent=2)
+
+            # Blackout: retrieved precedents but every one superseded-filtered.
+            # Add the retired handles so the agent gets a pointer, not a false miss
+            # (CLI⇄MCP-identical `all_superseded` shape, T5 parity).
+            envelope: Dict[str, Any] = {"query": query, "depth_mode": "letter", "matches": output_list}
+            if not output_list and retired:
+                envelope["all_superseded"] = retired
+            return dumps_display(envelope, ensure_ascii=False, indent=2)
         except Exception as e:
             return dumps_display({"error": f"Semantic claim query failed: {str(e)}"}, ensure_ascii=False, indent=None)
 

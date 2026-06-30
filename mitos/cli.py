@@ -17,6 +17,8 @@ from google import genai
 from mitos import __version__
 from mitos.display import (
     apply_stdout_text_safety,
+    blackout_note,
+    clamp_limit,
     dumps_display,
     letter_payload,
     resolve_display_ensure_ascii,
@@ -472,8 +474,53 @@ def cmd_capture(config: MitosConfig, text: str) -> None:
         print(f"Failed to append captured entry: {str(e)}")
 
 
+def _retired_handle(store: GraphStore, slug: str) -> Optional[Dict[str, Any]]:
+    """Builds a retired-handle pointer for a superseded-filtered ranked match.
+
+    A match dropped by the active-view filter (``get_node_by_slug`` → ``None`` or a
+    non-``active``/``drifted`` computed state) is not noise — it is a genuine retired
+    handle the agent can chase (V1-D16: a vector-store slug always resolves to *some*
+    node; nodes are never deleted). This returns ``{"slug", "state"}`` — and, when the
+    graph knows it, the live successor under ``superseded_by`` — so the blackout vector
+    hands the agent a pointer, not a payload. The state is read authoritatively from the
+    *computed* ``get_node_state`` (the vector payload's ``state`` is stale-at-embed-time
+    and absent under test), via the state-agnostic ``resolve_slug``.
+
+    Calm degradation (P9): if the slug fails to resolve at all, returns ``None`` (the
+    caller omits it) rather than crash; if the state read fails, falls back to
+    ``"superseded"``.
+
+    Args:
+        store: The graph store to resolve the slug and read state/modifiers from.
+        slug: The slug of the superseded-filtered match.
+
+    Returns:
+        The retired-handle dict, or ``None`` if the slug does not resolve.
+    """
+    try:
+        node_ids = store.resolve_slug(slug)
+    except Exception:
+        return None
+    if not node_ids:
+        return None
+    node_id = node_ids[0]
+    try:
+        state = store.get_node_state(node_id)
+    except Exception:
+        state = "superseded"
+    handle: Dict[str, Any] = {"slug": slug, "state": state}
+    try:
+        successors = store.get_modifiers(node_id).get("superseded_by")
+        if successors:
+            handle["superseded_by"] = successors
+    except Exception:
+        pass
+    return handle
+
+
 def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
-              as_json: bool = False, brief: bool = False) -> None:
+              as_json: bool = False, brief: bool = False,
+              limit: Optional[int] = None) -> None:
     """Queries the vector store semantically for similar decisions — the CLI twin
     of the MCP ``query_decisions`` tool's *ranked* branch.
 
@@ -495,6 +542,9 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         depth: The retrieval depth; v0.1 enforces ``letter``.
         as_json: Emit the machine-readable ranked JSON envelope instead of text.
         brief: Omit ``rejected_paths`` (axiom-only) — never sheds a modifier stamp.
+        limit: Ranked top-k to retrieve; ``None`` ⇒ the default 5. SETS the count
+            (raises or lowers it), clamped to ``[1, RANKED_LIMIT_CEILING]`` — not a
+            ``min(default, N)`` truncation.
     """
     if depth != "letter":
         msg = f"Depth mode '{depth}' is not yet implemented in v0.1 (Letter-only retrieval)."
@@ -512,21 +562,30 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         return
 
     store = manager.store
+    top_k = clamp_limit(limit)
     try:
         q_vector = manager.embed_provider.get_embedding(query_text, is_query=True)
-        raw_matches = manager.vector_store.query(q_vector, limit=5)
+        raw_matches = manager.vector_store.query(q_vector, limit=top_k)
 
         # Filter superseded first, then stamp + Letter — mirrors the ranked loop in
         # mcp_server.query_decisions byte-for-byte (T4 parity). A superseded-not-reused
         # slug is dropped at the active-view get_node_by_slug → None step, closing the
-        # M3 leak where a superseded node would otherwise read as live.
+        # M3 leak where a superseded node would otherwise read as live. Each dropped
+        # match is a retired handle the blackout vector points the agent at.
         matches = []
+        retired: List[Dict[str, Any]] = []
         for m in raw_matches:
             node = store.get_node_by_slug(m["slug"])
             if not node:
+                handle = _retired_handle(store, m["slug"])
+                if handle:
+                    retired.append(handle)
                 continue
             node_state = store.get_node_state(node["id"])
             if node_state not in ("active", "drifted"):
+                handle = _retired_handle(store, m["slug"])
+                if handle:
+                    retired.append(handle)
                 continue
             match = letter_payload(
                 node,
@@ -542,13 +601,26 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         print(f"Query failed: {str(e)}")
         return
 
+    # Blackout: retrieval returned matches but every one was superseded-filtered
+    # (displayed == 0, retrieved > 0). That is NOT a true miss — surfacing it as one
+    # makes the agent assume novelty and re-derive a settled contradiction. Emit the
+    # retired handles + a distinct note instead. `retired` is non-empty only when the
+    # filter dropped something, so `not matches and retired` is exactly the blackout.
+    blackout = not matches and bool(retired)
+
     # Build the per-match list once, then branch the two renderings over it.
     if as_json:
-        _emit_json({"query": query_text, "depth_mode": "letter", "matches": matches})
+        envelope: Dict[str, Any] = {"query": query_text, "depth_mode": "letter", "matches": matches}
+        if blackout:
+            envelope["all_superseded"] = retired
+        _emit_json(envelope)
         return
 
-    # Empty-after-filter is a real state (every retrieved match superseded-dropped).
-    # 2b emits the plain message; upgrading this to a blackout recovery vector is 2d's seam.
+    if blackout:
+        print(blackout_note(retired))
+        return
+
+    # Genuine miss — nothing was retrieved (or nothing resolved). Keep the plain message.
     if not matches:
         print("No matching decisions found.")
         return
@@ -880,7 +952,8 @@ def _read_text_arg(inline: Optional[str], file_path: Optional[str]) -> Optional[
 
 
 def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
-                as_json: bool = False, brief: bool = False) -> None:
+                as_json: bool = False, brief: bool = False,
+                limit: Optional[int] = None) -> None:
     """Surfaces active decisions relevant to a query — the CLI twin of the MCP
     ``surface_decisions`` tool (the precedent-recall half of Mitos).
 
@@ -899,9 +972,12 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
             hard-filter by scope.
         as_json: Emit a machine-readable JSON report (for agents) instead of text.
         brief: Omit ``rejected_paths`` (axiom-only — a quick "anything nearby?" scan).
+        limit: Ranked top-k to retrieve; ``None`` ⇒ the default 5. SETS the count,
+            clamped to ``[1, RANKED_LIMIT_CEILING]`` — not a ``min(default, N)`` clamp.
     """
     manager = MitosSyncManager(config)
     store = manager.store
+    top_k = clamp_limit(limit)
 
     def _shape(node, score):
         d = letter_payload(node, brief=brief, extras={"score": score})
@@ -911,18 +987,25 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     results: Dict[str, Any] = {"active_decisions": []}
     semantic_ran = False
     top_score: Optional[float] = None
+    retired: List[Dict[str, Any]] = []
 
     if manager.embed_provider and manager.vector_store:
         try:
             q_vector = manager.embed_provider.get_embedding(query, is_query=True)
-            matches = manager.vector_store.query(q_vector, limit=5)
+            matches = manager.vector_store.query(q_vector, limit=top_k)
             semantic_ran = True
             for m in matches:
                 node = store.get_node_by_slug(m["slug"])
                 if not node:
+                    handle = _retired_handle(store, m["slug"])
+                    if handle:
+                        retired.append(handle)
                     continue
                 state = store.get_node_state(node["id"])
                 if state not in ("active", "drifted"):
+                    handle = _retired_handle(store, m["slug"])
+                    if handle:
+                        retired.append(handle)
                     continue
                 results["active_decisions"].append(_shape(node, m["score"]))
                 if top_score is None or m["score"] > top_score:
@@ -975,6 +1058,17 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     if confidence is not None:
         results["confidence"] = confidence
     results["note"] = note
+
+    # Blackout: semantic ranking ran and retrieved precedents, but every one was
+    # superseded-filtered (no active match). Override the note with the recovery
+    # vector and attach the retired handles — distinct from a true miss (where
+    # `retired` is empty). Fires regardless of any parked open questions (the
+    # all_superseded vector must not be suppressed by a non-empty open_questions).
+    blackout = semantic_ran and not results["active_decisions"] and bool(retired)
+    if blackout:
+        results["note"] = blackout_note(retired)
+        results["all_superseded"] = retired
+        note = results["note"]
 
     if as_json:
         _emit_json(results)
@@ -1920,6 +2014,8 @@ def main() -> None:
     q_p.add_argument("--depth", default="letter", help="Depth (default: letter).")
     q_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON.")
     q_p.add_argument("--brief", action="store_true", help="Axiom-only (omit rejected_paths) — a quick scan.")
+    q_p.add_argument("--limit", type=int, default=None,
+                     help="Set ranked top-k to retrieve (1–50; default 5). Raises or lowers the count — a context-budget dial.")
 
     # surface (alias: surface_decisions — MCP tool name) — the precedent-recall loop
     surf_p = subparsers.add_parser("surface", aliases=["surface_decisions"],
@@ -1928,6 +2024,8 @@ def main() -> None:
     surf_p.add_argument("--scope", default=None, help="Optional scope hint (does NOT filter semantic recall — scopes open-questions + note only). Use `list --scope` to hard-filter by scope.")
     surf_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON.")
     surf_p.add_argument("--brief", action="store_true", help="Axiom-only (omit rejected_paths) — a quick scan.")
+    surf_p.add_argument("--limit", type=int, default=None,
+                        help="Set ranked top-k to retrieve (1–50; default 5). Raises or lowers the count — a context-budget dial.")
 
     # show
     show_p = subparsers.add_parser("show", help="Display details of a specific node.")
@@ -2050,9 +2148,9 @@ def main() -> None:
         elif args.command == "capture":
             cmd_capture(config, args.text)
         elif args.command in ("query", "query_decisions"):
-            cmd_query(config, args.claim, depth=args.depth, as_json=args.as_json, brief=args.brief)
+            cmd_query(config, args.claim, depth=args.depth, as_json=args.as_json, brief=args.brief, limit=args.limit)
         elif args.command in ("surface", "surface_decisions"):
-            cmd_surface(config, args.query, scope=args.scope, as_json=args.as_json, brief=args.brief)
+            cmd_surface(config, args.query, scope=args.scope, as_json=args.as_json, brief=args.brief, limit=args.limit)
         elif args.command == "show":
             cmd_show(config, args.ident)
         elif args.command in ("list", "list_decisions"):

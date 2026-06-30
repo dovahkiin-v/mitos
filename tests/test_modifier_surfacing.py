@@ -233,13 +233,19 @@ class _FakeEmbed:
 
 
 class _FakeVector:
-    """Stand-in vector store — replays a fixed ranked match list."""
+    """Stand-in vector store — replays a fixed ranked match list.
+
+    Records the ``limit`` it was last called with (so a test can prove ``--limit``
+    threads through un-truncated) and slices its match list to ``[:limit]`` (so a
+    test can prove a lowered ``--limit`` trims and a raised one does not no-op)."""
 
     def __init__(self, matches):
         self._matches = matches
+        self.last_limit = None
 
     def query(self, vector, limit: int = 5):
-        return self._matches
+        self.last_limit = limit
+        return self._matches[:limit]
 
 
 def test_mcp_surface_semantic_path_surfaces_modifiers(ws) -> None:
@@ -464,9 +470,30 @@ def test_cli_query_brief_drops_rejected_keeps_stamp(ws, capsys) -> None:
     assert "Rejected:" not in out and "⚠" in out and "q-amender" in out
 
 
-def test_cli_query_empty_after_filter(ws, capsys) -> None:
-    """Empty-after-filter (all matches superseded-dropped): text → plain message,
-    --json → clean empty envelope. (2d upgrades this to the blackout recovery vector.)"""
+def test_cli_query_true_miss_keeps_plain_message(ws, capsys) -> None:
+    """A GENUINE miss — retrieval returned nothing — keeps the plain 2b message and a
+    clean empty envelope with NO `all_superseded` field. (The true-miss leg of the
+    split that 2d's blackout vector required; proves blackout ≠ miss.)"""
+    config, m = ws
+    _rec(m, "unrelated", scope=["x"])
+    store = GraphStore(config.db_path, read_only=True)
+    stub = _StubManager(store, _FakeEmbed(), _FakeVector([]))
+
+    with patch("mitos.cli.MitosSyncManager", return_value=stub):
+        cmd_query(config, "a claim that is not any slug", as_json=True)
+    resp = json.loads(capsys.readouterr().out)
+    assert resp == {"query": "a claim that is not any slug", "depth_mode": "letter", "matches": []}
+    assert "all_superseded" not in resp
+
+    with patch("mitos.cli.MitosSyncManager", return_value=stub):
+        cmd_query(config, "a claim that is not any slug")
+    assert "No matching decisions found." in capsys.readouterr().out
+
+
+def test_cli_query_blackout_vector(ws, capsys) -> None:
+    """Blackout: retrieval returned a match but it was superseded-filtered → the
+    recovery vector, NOT the bare-empty miss. `--json` gains `all_superseded` (with the
+    live successor); text shows the blackout note naming the retired handle + successor."""
     config, m = ws
     _rec(m, "dead-v1", scope=["x"])
     _rec(m, "dead-v2", scope=["x"], supersedes="dead-v1")
@@ -477,11 +504,161 @@ def test_cli_query_empty_after_filter(ws, capsys) -> None:
     with patch("mitos.cli.MitosSyncManager", return_value=stub):
         cmd_query(config, "a claim that is not any slug", as_json=True)
     resp = json.loads(capsys.readouterr().out)
-    assert resp == {"query": "a claim that is not any slug", "depth_mode": "letter", "matches": []}
+    assert resp["matches"] == []
+    assert resp["all_superseded"] == [{"slug": "dead-v1", "state": "superseded", "superseded_by": ["dead-v2"]}]
 
     with patch("mitos.cli.MitosSyncManager", return_value=stub):
         cmd_query(config, "a claim that is not any slug")
-    assert "No matching decisions found." in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "No matching decisions found." not in out
+    assert "dead-v1" in out and "dead-v2" in out and "superseded" in out
+
+
+def test_cli_query_limit_threads_through(ws, capsys) -> None:
+    """`--limit` SETS the top-k: a value above the default-5 must reach
+    vector_store.query un-truncated (the §6 no-op-above-default trap), a low value
+    trims, and out-of-range values clamp calmly to [1, RANKED_LIMIT_CEILING]."""
+    from mitos.display import RANKED_LIMIT_CEILING
+    config, m = ws
+    _rec(m, "q-target", scope=["x"])
+    store = GraphStore(config.db_path, read_only=True)
+
+    for requested, expected in [(20, 20), (3, 3), (999, RANKED_LIMIT_CEILING), (0, 1), (None, 5)]:
+        fake_vec = _FakeVector([{"slug": "q-target", "score": 0.8}])
+        stub = _StubManager(store, _FakeEmbed(), fake_vec)
+        with patch("mitos.cli.MitosSyncManager", return_value=stub):
+            cmd_query(config, "a claim that is not any slug", as_json=True, limit=requested)
+        capsys.readouterr()
+        assert fake_vec.last_limit == expected, f"--limit {requested} → {fake_vec.last_limit}, want {expected}"
+
+
+def test_cli_surface_blackout_vector(ws, capsys) -> None:
+    """Surface blackout: semantic ran, retrieved a match, all superseded → the recovery
+    vector. `--json` gains `all_superseded`; confidence stays `none`."""
+    config, m = ws
+    _rec(m, "dead-v1", scope=["x"])
+    _rec(m, "dead-v2", scope=["x"], supersedes="dead-v1")
+    store = GraphStore(config.db_path, read_only=True)
+    fake_vec = _FakeVector([{"slug": "dead-v1", "score": 0.9}])
+    stub = _StubManager(store, _FakeEmbed(), fake_vec)
+
+    with patch("mitos.cli.MitosSyncManager", return_value=stub):
+        cmd_surface(config, "a claim that is not any slug", as_json=True)
+    resp = json.loads(capsys.readouterr().out)
+    assert resp["active_decisions"] == []
+    assert resp["all_superseded"] == [{"slug": "dead-v1", "state": "superseded", "superseded_by": ["dead-v2"]}]
+    assert "dead-v1" in resp["note"]
+
+
+def test_cli_surface_mixed_result_no_blackout(ws, capsys) -> None:
+    """A mixed result (one survivor + one superseded) is byte-identical to 2b — NO
+    `all_superseded` field, normal render. The superseded filter itself is unchanged."""
+    config, m = ws
+    _rec(m, "live-one", scope=["x"])
+    _rec(m, "dead-v1", scope=["x"])
+    _rec(m, "dead-v2", scope=["x"], supersedes="dead-v1")
+    store = GraphStore(config.db_path, read_only=True)
+    fake_vec = _FakeVector([{"slug": "dead-v1", "score": 0.9}, {"slug": "live-one", "score": 0.8}])
+    stub = _StubManager(store, _FakeEmbed(), fake_vec)
+
+    with patch("mitos.cli.MitosSyncManager", return_value=stub):
+        cmd_surface(config, "a claim that is not any slug", as_json=True)
+    resp = json.loads(capsys.readouterr().out)
+    assert [d["slug"] for d in resp["active_decisions"]] == ["live-one"]
+    assert "all_superseded" not in resp
+
+
+# --------------------------------------------------------------------------- #
+# Blackout + --limit MCP twins + CLI⇄MCP parity (T5)
+# --------------------------------------------------------------------------- #
+
+def test_mcp_query_blackout_vector(ws) -> None:
+    """query_decisions' semantic branch fires the blackout vector when its whole
+    top-k is superseded — `matches` empty, `all_superseded` populated."""
+    from mitos import mcp_server
+    config, m = ws
+    _rec(m, "dead-v1", scope=["x"])
+    _rec(m, "dead-v2", scope=["x"], supersedes="dead-v1")
+    store = GraphStore(config.db_path, read_only=True)
+    fake_vec = _FakeVector([{"slug": "dead-v1", "score": 0.9}])
+    with patch.object(mcp_server, "get_workspace_components",
+                      return_value=(store, _FakeEmbed(), fake_vec)):
+        resp = json.loads(mcp_server.query_decisions("a claim that is not any slug"))
+    assert resp["matches"] == []
+    assert resp["all_superseded"] == [{"slug": "dead-v1", "state": "superseded", "superseded_by": ["dead-v2"]}]
+
+
+def test_mcp_surface_blackout_vector(ws) -> None:
+    """surface_decisions fires the blackout vector when its whole top-k is superseded."""
+    from mitos import mcp_server
+    config, m = ws
+    _rec(m, "dead-v1", scope=["x"])
+    _rec(m, "dead-v2", scope=["x"], supersedes="dead-v1")
+    store = GraphStore(config.db_path, read_only=True)
+    fake_vec = _FakeVector([{"slug": "dead-v1", "score": 0.9}])
+    with patch.object(mcp_server, "get_workspace_components",
+                      return_value=(store, _FakeEmbed(), fake_vec)):
+        resp = json.loads(mcp_server.surface_decisions(query="a claim that is not any slug"))
+    assert resp["active_decisions"] == []
+    assert resp["all_superseded"] == [{"slug": "dead-v1", "state": "superseded", "superseded_by": ["dead-v2"]}]
+
+
+def test_mcp_limit_threads_through(ws) -> None:
+    """The MCP `limit` arg SETS the top-k threaded to vector_store.query; clamps calmly."""
+    from mitos import mcp_server
+    from mitos.display import RANKED_LIMIT_CEILING
+    config, m = ws
+    _rec(m, "q-target", scope=["x"])
+    store = GraphStore(config.db_path, read_only=True)
+
+    for requested, expected in [(20, 20), (3, 3), (999, RANKED_LIMIT_CEILING), (0, 1)]:
+        fake_vec = _FakeVector([{"slug": "q-target", "score": 0.8}])
+        with patch.object(mcp_server, "get_workspace_components",
+                          return_value=(store, _FakeEmbed(), fake_vec)):
+            mcp_server.query_decisions("a claim that is not any slug", limit=requested)
+        assert fake_vec.last_limit == expected
+        fake_vec2 = _FakeVector([{"slug": "q-target", "score": 0.8}])
+        with patch.object(mcp_server, "get_workspace_components",
+                          return_value=(store, _FakeEmbed(), fake_vec2)):
+            mcp_server.surface_decisions(query="a claim that is not any slug", limit=requested)
+        assert fake_vec2.last_limit == expected
+
+
+def test_cli_mcp_blackout_parity(ws) -> None:
+    """T5: CLI⇄MCP `all_superseded` shape is identical for both query and surface."""
+    from mitos import mcp_server
+    import io, contextlib
+    config, m = ws
+    _rec(m, "dead-v1", scope=["x"])
+    _rec(m, "dead-v2", scope=["x"], supersedes="dead-v1")
+    claim = "a claim that is not any slug"
+    matches = [{"slug": "dead-v1", "score": 0.9}]
+
+    # query parity
+    store_cli = GraphStore(config.db_path, read_only=True)
+    stub = _StubManager(store_cli, _FakeEmbed(), _FakeVector(list(matches)))
+    with patch("mitos.cli.MitosSyncManager", return_value=stub):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cmd_query(config, claim, as_json=True)
+    cli_q = json.loads(buf.getvalue())
+    store_mcp = GraphStore(config.db_path, read_only=True)
+    with patch.object(mcp_server, "get_workspace_components",
+                      return_value=(store_mcp, _FakeEmbed(), _FakeVector(list(matches)))):
+        mcp_q = json.loads(mcp_server.query_decisions(claim))
+    assert cli_q["all_superseded"] == mcp_q["all_superseded"]
+
+    # surface parity
+    stub2 = _StubManager(GraphStore(config.db_path, read_only=True), _FakeEmbed(), _FakeVector(list(matches)))
+    with patch("mitos.cli.MitosSyncManager", return_value=stub2):
+        buf2 = io.StringIO()
+        with contextlib.redirect_stdout(buf2):
+            cmd_surface(config, claim, as_json=True)
+    cli_s = json.loads(buf2.getvalue())
+    with patch.object(mcp_server, "get_workspace_components",
+                      return_value=(GraphStore(config.db_path, read_only=True), _FakeEmbed(), _FakeVector(list(matches)))):
+        mcp_s = json.loads(mcp_server.surface_decisions(query=claim))
+    assert cli_s["all_superseded"] == mcp_s["all_superseded"]
 
 
 # --------------------------------------------------------------------------- #

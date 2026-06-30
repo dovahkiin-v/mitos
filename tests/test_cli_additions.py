@@ -54,6 +54,26 @@ def test_query_json_brief_routes(mock_query, monkeypatch):
     assert kwargs["as_json"] is True and kwargs["brief"] is True
 
 
+@patch("mitos.cli.cmd_query")
+def test_query_limit_routes(mock_query, monkeypatch):
+    """`query c --limit 7` threads limit=7 through the parser + dispatch."""
+    monkeypatch.setattr(sys, "argv", ["mitos", "query", "claim", "--limit", "7"])
+    main()
+    assert mock_query.called
+    _, kwargs = mock_query.call_args
+    assert kwargs["limit"] == 7
+
+
+@patch("mitos.cli.cmd_surface")
+def test_surface_limit_routes(mock_surface, monkeypatch):
+    """`surface c --limit 7` threads limit=7 through the parser + dispatch."""
+    monkeypatch.setattr(sys, "argv", ["mitos", "surface", "claim", "--limit", "7"])
+    main()
+    assert mock_surface.called
+    _, kwargs = mock_surface.call_args
+    assert kwargs["limit"] == 7
+
+
 @patch("mitos.cli.cmd_open_questions")
 def test_open_questions_json_routes(mock_oq, monkeypatch):
     """`open-questions --json` threads as_json=True through to the handler."""

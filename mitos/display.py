@@ -31,7 +31,73 @@ This module is **not** the hash-input serializer. ``identity.py`` is fenced
 
 import codecs
 import json
-from typing import Any, Dict, Mapping, Optional, TextIO
+from typing import Any, Dict, List, Mapping, Optional, TextIO
+
+
+# The sane upper bound on the ranked-recall top-k (`--limit` / the MCP `limit`
+# arg). `--limit` is the agent's context-budget lever (P15): it SETS the
+# top-k — raising it past the working default of 5 or trimming below it — so it
+# must NOT be clamped to the default (that would make any `--limit` above 5 a
+# silent no-op). It is bounded only by this ceiling — well above the default
+# working range, below any context-bomb. Lives here, in the one leaf both `cli.py`
+# and `mcp_server.py` already import, so the literal exists in exactly one place
+# and CLI⇄MCP can never disagree on it.
+RANKED_LIMIT_CEILING = 50
+
+
+def clamp_limit(limit: Optional[int]) -> int:
+    """Resolves a caller's ranked-recall ``limit`` to a sane top-k, calmly.
+
+    ``None`` (the flag was omitted) resolves to the default working top-k of 5.
+    Any explicit value is clamped to ``[1, RANKED_LIMIT_CEILING]`` — silently and
+    calmly (P9), never an error wall: a request below 1 clamps up to 1, a request
+    above the ceiling clamps down to it. The resolved value SETS the top-k passed
+    to ``vector_store.query(limit=…)`` — it is not a ``min(default, N)`` truncation,
+    so ``limit=20`` genuinely deepens recall past the default.
+
+    Args:
+        limit: The caller's requested top-k, or ``None`` to take the default.
+
+    Returns:
+        The clamped top-k in ``[1, RANKED_LIMIT_CEILING]``.
+    """
+    if limit is None:
+        return 5
+    return max(1, min(limit, RANKED_LIMIT_CEILING))
+
+
+def blackout_note(retired_handles: List[Mapping[str, Any]]) -> str:
+    """Builds the all-superseded blackout recovery note (the P3 vector text).
+
+    When ranked recall retrieved precedents but every one was superseded-filtered,
+    the surface would otherwise read as a true semantic *miss* — a false-novelty
+    signal that costs the agent an expensive re-derivation of a contradiction the
+    graveyard already settled. This note turns that dead-end into a vector: it names
+    the retired handles (and their live successors, when known) and points at the
+    command that reads the retired history. Calm, one short block (P9).
+
+    Args:
+        retired_handles: The filtered-out handles, each a dict with ``slug`` and
+            optionally ``superseded_by`` (the live successor slugs).
+
+    Returns:
+        The blackout note string.
+    """
+    n = len(retired_handles)
+    parts: List[str] = []
+    for h in retired_handles:
+        successors = h.get("superseded_by")
+        if successors:
+            parts.append(f"{h['slug']} (→ {', '.join(successors)})")
+        else:
+            parts.append(str(h["slug"]))
+    noun, verb = ("match", "is") if n == 1 else ("matches", "are")
+    return (
+        f"All {n} nearest {noun} {verb} superseded — no active precedent on "
+        f"this claim, but it was settled before. Retired: {'; '.join(parts)}. "
+        f"Read the retired history with: mitos list --state all "
+        f"(or list_decisions(state=\"all\"))."
+    )
 
 
 def letter_payload(
