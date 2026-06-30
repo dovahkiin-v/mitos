@@ -175,7 +175,9 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
     query_decisions to look up a SPECIFIC slug or claim, and list_decisions for the
     EXHAUSTIVE set in a scope. Each returned precedent carries its `rejected_paths`
     (why alternatives were ruled out) — the field that actually stops relitigation.
-    Every hit carries its full `rejected_paths` unless you pass `brief=True`.
+    Every hit carries its full `rejected_paths` unless you pass `brief=True`. Closing
+    the loop: after you decide, `record_decision` the outcome so the next agent
+    inherits it instead of relitigating.
 
     Args:
         query: The semantic claim or topic string (e.g. 'cache strategy').
@@ -486,6 +488,7 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
     If query matches a unique slug exactly, returns that one decision (full); otherwise
     a ranked semantic search for the claim. Its slug branch is active-view-only — to
     dereference an EXACT handle including a superseded node it can't reach, use show_node.
+    Once you decide, `record_decision` the outcome so the next agent inherits it.
 
     Args:
         query: Unique decision slug identifier OR a semantic claim search query.
