@@ -15,6 +15,7 @@ from typing import List, Optional, Dict, Any
 from google import genai
 
 from mitos import __version__
+from mitos.display import apply_stdout_text_safety
 from mitos.config import (
     MitosConfig,
     CONFIG_DEFAULTS,
@@ -1751,6 +1752,10 @@ def load_dotenv_file(path: str = ".env") -> None:
 
 def main() -> None:
     """Main CLI execution router."""
+    # Make raw-text print()s crash-safe on a non-UTF-8 stdout before any verb
+    # can print (R6). Inert on a UTF-8 terminal; CLI-only — the MCP transport
+    # has no terminal stdout to harden (P7 bulkhead).
+    apply_stdout_text_safety(sys.stdout)
     # Project .env (cwd) wins; the global ~/.config/mitos/.env fills any gaps —
     # load_dotenv_file never overwrites an already-set key, so loading project
     # first then global yields the precedence env > project > global.
