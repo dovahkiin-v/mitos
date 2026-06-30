@@ -2078,21 +2078,47 @@ def load_dotenv_file(path: str = ".env") -> None:
         pass
 
 
+def _enter_target_directory(directory: Optional[str]) -> None:
+    """chdir into a -C/--directory target, or no-op when none was given.
+
+    Git's ``-C`` semantics at the CLI boundary: the chdir runs once at process
+    entry, before any env load, config construction, or arg-driven file open, so
+    the whole workspace (graph, collection, ``.env``/keys, relative path args)
+    retargets at once — each downstream site derives from the process CWD.
+
+    Args:
+        directory: The ``-C``/``--directory`` value, or None when the flag was
+            absent (then this is a no-op and the launch CWD is unchanged).
+
+    Raises:
+        MitosError: When ``directory`` is given but is not an existing directory
+            (a clean P3 error — never a raw OSError traceback). Existence is
+            checked against the launch CWD, so a relative ``-C ./sub`` resolves
+            where mitos was started.
+    """
+    if directory is None:
+        return
+    if not os.path.isdir(directory):
+        raise MitosError(f"directory not found: {directory}")
+    os.chdir(directory)
+
+
 def main() -> None:
     """Main CLI execution router."""
     # Make raw-text print()s crash-safe on a non-UTF-8 stdout before any verb
     # can print (R6). Inert on a UTF-8 terminal; CLI-only — the MCP transport
     # has no terminal stdout to harden (P7 bulkhead).
     apply_stdout_text_safety(sys.stdout)
-    # Project .env (cwd) wins; the global ~/.config/mitos/.env fills any gaps —
-    # load_dotenv_file never overwrites an already-set key, so loading project
-    # first then global yields the precedence env > project > global.
-    load_dotenv_file()
-    load_dotenv_file(global_env_path())
     parser = argparse.ArgumentParser(
         description="Mitos: Architectural Decision Substrate for LLM-native workflows."
     )
     parser.add_argument("--version", action="version", version=f"mitos {__version__}")
+    parser.add_argument(
+        "-C", "--directory", dest="directory", default=None, metavar="DIR",
+        help="Run as if mitos were started in DIR (git's -C). Retargets the whole "
+             "workspace — graph, collection, .env/keys, and relative path args. "
+             "Must appear BEFORE the verb: `mitos -C /ws list`.",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # init
@@ -2247,6 +2273,19 @@ def main() -> None:
         # this boundary). The `finally`'s only config read (config.workspace_dir for
         # the MCP hint) is already wrapped in its own `except Exception: pass`, so an
         # unbound `config` after a construction failure stays silent.
+        #
+        # -C/--directory runs FIRST (before the project .env load + config) so the
+        # whole workspace retargets together: chdir into the target, THEN load the
+        # CWD-relative project .env, THEN the fixed-path global .env (CWD-independent
+        # — it stays global). An absent -C target raises MitosError here and renders
+        # through the `except MitosError` boundary as a clean one-line error. The
+        # project .env load also sits inside the try now (strictly safer — a .env
+        # read failure is caught, not a bare traceback). Precedence is unchanged:
+        # load_dotenv_file never overwrites an already-set key, so env > project >
+        # global still holds.
+        _enter_target_directory(args.directory)
+        load_dotenv_file()
+        load_dotenv_file(global_env_path())
         config = MitosConfig()
         if args.command == "init":
             cmd_init(config)
