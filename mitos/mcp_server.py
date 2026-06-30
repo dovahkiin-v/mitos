@@ -278,15 +278,13 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
 
     # Confidence signal — let the agent tell a settled precedent from loose neighbours
     # or genuine absence, instead of a boilerplate note that read the same every time
-    # (AX P5). Compute the scope's active-decision count only when it disambiguates an
-    # empty result ("tag unused" vs "populated but nothing matched").
-    scope_decision_count: Optional[int] = None
-    all_scopes: Optional[List[str]] = None
+    # (AX P5). Pass the live scope-count map (busiest-first) when a scope is given: it is
+    # the unused-scope oracle (a tag absent from it gets a bounded self-correction
+    # vector) and the did-you-mean / top-K source. Calm-degrade to None on error.
+    scope_counts: Optional[Dict[str, Dict[str, int]]] = None
     if scope:
         try:
-            scope_decision_count = len(store.get_active_decisions(scope=scope))
-            if scope_decision_count == 0:
-                all_scopes = store.get_all_scopes()
+            scope_counts = order_scope_counts(store.get_scope_counts())
         except Exception:
             pass
 
@@ -295,8 +293,8 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         top_score=top_score,
         result_count=len(results["active_decisions"]),
         scope=scope,
-        scope_decision_count=scope_decision_count,
-        all_scopes=all_scopes,
+        scope_counts=scope_counts,
+        surface="mcp",
     )
     if confidence is not None:
         results["confidence"] = confidence
