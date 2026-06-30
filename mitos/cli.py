@@ -44,6 +44,33 @@ from mitos.renderer import MitosRenderer, overflow_report
 from mitos.importer import MitosProseImporter
 
 
+# Worked-examples block rendered at the foot of `mitos --help` / `mitos -h`.
+# Lazy by design (§6 description economy): zero context cost until --help is
+# invoked, so it can afford the expansive examples the eager MCP descriptions
+# can't. Teaches the surface→record reflex, the scope vocabulary, workspace
+# targeting (-C), and the relation-edge guidance. Every flag/verb shown here is
+# real CLI surface — keep it runnable, never invent a flag (there is no
+# --retired edge). Rendered verbatim via RawDescriptionHelpFormatter.
+_EPILOG = """\
+Examples:
+  # Before deciding: surface precedent, then record the outcome you chose
+  mitos surface "cache invalidation strategy"
+  mitos record "Write-through cache for session data" \\
+    --rejected "write-back: data loss on crash" --scope cache --slug write-through-sessions
+
+  # Discover the scope vocabulary before you invent a near-duplicate tag
+  mitos scopes
+
+  # Operate on another workspace without cd (git's -C; must precede the verb)
+  mitos -C /path/to/repo list --scope auth
+
+Relating a decision to a prior (pass the prior's EXACT slug):
+  --supersedes a,b   priors you've outgrown / evolved past (comma-separated for several)
+  --corrects   slug  a prior that was WRONG (not merely outgrown)
+  (no "retired" edge type exists — a decision dies by being superseded or corrected)
+"""
+
+
 def _emit_json(obj: Any, *, indent: Optional[int] = 2) -> None:
     """Prints a display payload as adaptive-``ensure_ascii`` JSON to stdout.
 
@@ -2150,7 +2177,9 @@ def main() -> None:
     # has no terminal stdout to harden (P7 bulkhead).
     apply_stdout_text_safety(sys.stdout)
     parser = argparse.ArgumentParser(
-        description="Mitos: Architectural Decision Substrate for LLM-native workflows."
+        description="Mitos: Architectural Decision Substrate for LLM-native workflows.",
+        epilog=_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--version", action="version", version=f"mitos {__version__}")
     parser.add_argument(
@@ -2159,7 +2188,11 @@ def main() -> None:
              "workspace — graph, collection, .env/keys, and relative path args. "
              "Must appear BEFORE the verb: `mitos -C /ws list`.",
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    # metavar collapses the width-doubling {init,sync,query,query_decisions,…}
+    # brace-list in the usage banner to a single COMMAND token (R5). This is a
+    # render-only hint — it structurally cannot unregister an alias, so every
+    # `aliases=[...]` verb below stays callable while absent from the banner.
+    subparsers = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
     # init
     subparsers.add_parser("init", help="Initialize Mitos in current workspace.")

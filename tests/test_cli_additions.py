@@ -174,3 +174,64 @@ def test_decision_loop_commands_cover_aliases():
         assert verb in cli._DECISION_LOOP_COMMANDS
     for non_verb in ("init", "status", "sync", "serve", "set-key"):
         assert non_verb not in cli._DECISION_LOOP_COMMANDS
+
+
+# --- Phase 6a: help-as-API-doc (gate T12) -------------------------------------
+
+_ALIASES = ("query_decisions", "surface_decisions", "list_decisions", "record_decision")
+
+
+def test_help_renders_epilog_worked_examples(monkeypatch, capsys):
+    """Criterion 1: `mitos --help` exits 0 and renders the worked-examples epilog,
+    the surface→record compose, and the relation-edge guidance."""
+    monkeypatch.setattr(sys, "argv", ["mitos", "--help"])
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "Examples:" in out
+    # the surface→record compose appears as runnable example commands
+    assert "mitos surface" in out
+    assert "mitos record" in out
+    # relation-edge guidance — and the recurring "retired" misuse fenced off
+    assert "--supersedes" in out and "--corrects" in out
+    assert "retired" in out
+
+
+def test_help_usage_banner_collapsed_no_alias_brace_list(monkeypatch, capsys):
+    """Criterion 2: the usage *banner* shows COMMAND and none of the MCP-name
+    aliases (they double its width). Assert on the usage block only — the aliases
+    legitimately remain in the command-listing body (`query (query_decisions)`)."""
+    monkeypatch.setattr(sys, "argv", ["mitos", "--help"])
+    with pytest.raises(SystemExit):
+        main()
+    out = capsys.readouterr().out
+    # the usage block is everything before the first blank line (the description)
+    usage_block = out.split("\n\n", 1)[0]
+    assert "COMMAND" in usage_block
+    for alias in _ALIASES:
+        assert alias not in usage_block
+
+
+@patch("mitos.cli.cmd_list")
+def test_list_decisions_alias_routes(mock_list, monkeypatch):
+    """Criterion 3 (gap fill): the `list_decisions` alias still routes."""
+    monkeypatch.setattr(sys, "argv", ["mitos", "list_decisions"])
+    main()
+    assert mock_list.called
+
+
+@patch("mitos.cli.cmd_scopes")
+def test_list_scopes_alias_routes(mock_scopes, monkeypatch):
+    """Criterion 3 (gap fill): the `list_scopes` alias still routes."""
+    monkeypatch.setattr(sys, "argv", ["mitos", "list_scopes"])
+    main()
+    assert mock_scopes.called
+
+
+def test_surface_decisions_mcp_description_names_compose():
+    """Criterion 4 (W15): the surfacing tools' descriptions name the
+    surface→record compose so an MCP agent discovers the write-back step."""
+    from mitos.mcp_server import surface_decisions, query_decisions
+    assert "record_decision" in (surface_decisions.__doc__ or "")
+    assert "record_decision" in (query_decisions.__doc__ or "")
