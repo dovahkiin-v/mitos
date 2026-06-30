@@ -15,7 +15,11 @@ from typing import List, Optional, Dict, Any
 from google import genai
 
 from mitos import __version__
-from mitos.display import apply_stdout_text_safety
+from mitos.display import (
+    apply_stdout_text_safety,
+    dumps_display,
+    resolve_display_ensure_ascii,
+)
 from mitos.config import (
     MitosConfig,
     CONFIG_DEFAULTS,
@@ -32,6 +36,25 @@ from mitos.sync import MitosSyncManager, run_ambient_capture, _SLUG_MAX_LEN
 from mitos._agent_block import agent_block, agent_block_drift, AGENT_GUIDE_VERSION
 from mitos.renderer import MitosRenderer, overflow_report
 from mitos.importer import MitosProseImporter
+
+
+def _emit_json(obj: Any, *, indent: Optional[int] = 2) -> None:
+    """Prints a display payload as adaptive-``ensure_ascii`` JSON to stdout.
+
+    The single CLI display-JSON emit path: it resolves ``ensure_ascii`` against
+    the *live* ``sys.stdout`` at call time (a pytest capture, a pipe, or a real
+    terminal), so raw glyphs emit on a UTF-8 stdout and fall back to ``\\uXXXX``
+    escapes on a non-UTF-8 one — never a ``UnicodeEncodeError``. Centralizing the
+    resolution here keeps all CLI sites uniform and the CLI⇄MCP seam single.
+
+    Args:
+        obj: A JSON-native display payload.
+        indent: Pretty-print indent; ``None`` for single-line output.
+
+    Returns:
+        None.
+    """
+    print(dumps_display(obj, ensure_ascii=resolve_display_ensure_ascii(sys.stdout), indent=indent))
 
 
 # Shared route-to-cutover guidance. `mitos init` raises it (DatabaseError),
@@ -527,7 +550,6 @@ def cmd_list(config: MitosConfig, scope: Optional[str] = None,
             = an exact computed-state match (e.g. "superseded").
         as_json: Emit a machine-readable JSON report (for agents) instead of text.
     """
-    import json as _json
     store = GraphStore(config.db_path)
     # Default the view to the live set; an absent filter must not dump superseded
     # decisions into what an agent reads as a completeness pass.
@@ -546,7 +568,7 @@ def cmd_list(config: MitosConfig, scope: Optional[str] = None,
         return item
 
     if as_json:
-        print(_json.dumps({
+        _emit_json({
             "decisions": [_list_item(d) for d in decisions],
             "open_questions": [
                 {"topic": oq["slug"], "questions_raised": oq["questions_raised"],
@@ -556,7 +578,7 @@ def cmd_list(config: MitosConfig, scope: Optional[str] = None,
             "total": len(decisions),
             "scope": scope,
             "state": effective_state,
-        }, indent=2))
+        })
         return
 
     if not decisions and not parked:
@@ -757,7 +779,6 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         as_json: Emit a machine-readable JSON report (for agents) instead of text.
         brief: Omit ``rejected_paths`` (axiom-only — a quick "anything nearby?" scan).
     """
-    import json as _json
     manager = MitosSyncManager(config)
     store = manager.store
 
@@ -838,7 +859,7 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     results["note"] = note
 
     if as_json:
-        print(_json.dumps(results, indent=2))
+        _emit_json(results)
         return
 
     ad, oqs = results["active_decisions"], results.get("open_questions", [])
@@ -1145,7 +1166,6 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
     Returns:
         ``0`` if fully ready, ``1`` otherwise.
     """
-    import json as _json
     workspace_dir = os.path.abspath(workspace_dir)
 
     # `status` is the "is this set up?" probe, so a malformed config.toml is exactly
@@ -1156,12 +1176,12 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
         config = MitosConfig(workspace_dir)
     except ConfigError as e:
         if as_json:
-            print(_json.dumps({
+            _emit_json({
                 "workspace": workspace_dir,
                 "ready": False,
                 "initialized": False,
                 "config_error": str(e),
-            }, indent=2))
+            })
         else:
             print(f"\nMITOS STATUS for {workspace_dir} — NOT SET UP ✗\n")
             print(f"  ✗ config.toml malformed: {e}")
@@ -1224,7 +1244,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
     ready = initialized and key_ok and q["reachable"] and not pre_v1a
 
     if as_json:
-        print(_json.dumps({
+        _emit_json({
             "workspace": workspace_dir,
             "ready": ready,
             "initialized": initialized,
@@ -1246,7 +1266,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
             "scope_overflow": overflows,
             "agent_guide_version": AGENT_GUIDE_VERSION,
             "agent_files": agent_drift["files"],
-        }, indent=2))
+        })
         return 0 if ready else 1
 
     verdict = "READY ✓" if ready else ("NEEDS ATTENTION ⚠" if initialized else "NOT SET UP ✗")
@@ -1404,15 +1424,13 @@ def cmd_cutover(
         CutoverError: On a corpus defect during the rebuild (caught at the
             ``main()`` boundary).
     """
-    import json as _json
-
     # 1. Up-front prototype probe (G7) — mirrors the cmd_init / cmd_status RO-probe
     #    shape. An absent / already-V1a / empty graph is a cheap no-op: no rebuild,
     #    no swap, no Qdrant churn (and a post-success re-run is idempotent).
     if not os.path.exists(config.db_path):
         if as_json:
-            print(_json.dumps({"workspace": config.workspace_dir,
-                               "swapped": False, "reason": "no_graph"}, indent=2))
+            _emit_json({"workspace": config.workspace_dir,
+                        "swapped": False, "reason": "no_graph"})
         else:
             print("No graph found at this workspace — run `mitos init` for a fresh "
                   "V1a workspace (nothing to cut over).")
@@ -1424,8 +1442,8 @@ def cmd_cutover(
         probe_conn.close()
     if not is_prototype:
         if as_json:
-            print(_json.dumps({"workspace": config.workspace_dir,
-                               "swapped": False, "reason": "not_a_prototype"}, indent=2))
+            _emit_json({"workspace": config.workspace_dir,
+                        "swapped": False, "reason": "not_a_prototype"})
         else:
             print("Graph is already on the V1a schema (or empty) — nothing to "
                   "cut over.")
@@ -1458,9 +1476,9 @@ def cmd_cutover(
                 print(f"    - '{mc.slug}' [{mc.kind}]: {mc.axiom_excerpt}")
         if not allow_drops:
             if as_json:
-                print(_json.dumps({**result.to_dict(), "swapped": False,
-                                   "reason": "shortfall_refused",
-                                   "qdrant_wipe_cmd": qdrant_wipe_cmd}, indent=2))
+                _emit_json({**result.to_dict(), "swapped": False,
+                            "reason": "shortfall_refused",
+                            "qdrant_wipe_cmd": qdrant_wipe_cmd})
             else:
                 print(f"\nRefusing to swap: {n} active core(s) would be dropped. "
                       f"Review the offenders above. If this purge is intentional "
@@ -1476,9 +1494,9 @@ def cmd_cutover(
     if not assume_yes:
         if as_json:
             # JSON mode is for automation: never prompt; require an explicit --yes.
-            print(_json.dumps({**result.to_dict(), "swapped": False,
-                               "reason": "confirmation_required",
-                               "qdrant_wipe_cmd": qdrant_wipe_cmd}, indent=2))
+            _emit_json({**result.to_dict(), "swapped": False,
+                        "reason": "confirmation_required",
+                        "qdrant_wipe_cmd": qdrant_wipe_cmd})
             return 1
         if sys.stdin.isatty():
             answer = input("\nProceed with the cutover swap? This replaces the "
@@ -1499,9 +1517,9 @@ def cmd_cutover(
 
     # 6. Print the post-swap runbook (the operator must not have to remember it).
     if as_json:
-        print(_json.dumps({**result.to_dict(), "swapped": True,
-                           "bak_path": bak_path,
-                           "qdrant_wipe_cmd": qdrant_wipe_cmd}, indent=2))
+        _emit_json({**result.to_dict(), "swapped": True,
+                    "bak_path": bak_path,
+                    "qdrant_wipe_cmd": qdrant_wipe_cmd})
         return 0
 
     print(f"\n✓ Cutover complete — the V1a graph is live at {config.db_path}.")
@@ -1608,14 +1626,12 @@ def cmd_rebuild(
         CutoverError: On a corpus format defect during the rebuild (caught at the
             ``main()`` boundary).
     """
-    import json as _json
-
     # 1. Probe: rebuild runs on a CURRENT graph. Absent → init; prototype → the
     #    one-time cutover owns it (don't double-handle).
     if not os.path.exists(config.db_path):
         if as_json:
-            print(_json.dumps({"workspace": config.workspace_dir,
-                               "swapped": False, "reason": "no_graph"}, indent=2))
+            _emit_json({"workspace": config.workspace_dir,
+                        "swapped": False, "reason": "no_graph"})
         else:
             print("No graph found at this workspace — run `mitos init` first "
                   "(nothing to rebuild).")
@@ -1627,8 +1643,8 @@ def cmd_rebuild(
         probe_conn.close()
     if is_prototype:
         if as_json:
-            print(_json.dumps({"workspace": config.workspace_dir,
-                               "swapped": False, "reason": "prototype_graph"}, indent=2))
+            _emit_json({"workspace": config.workspace_dir,
+                        "swapped": False, "reason": "prototype_graph"})
         else:
             print("Graph is a pre-V1a prototype — run `mitos cutover` (the one-time "
                   "migration) instead of `mitos rebuild`.")
@@ -1667,8 +1683,8 @@ def cmd_rebuild(
     blocked = bool(casualties) or not result.gate_passed
     if blocked and not allow_drops:
         if as_json:
-            print(_json.dumps({**result.to_dict(), "swapped": False,
-                               "reason": "casualties_or_shortfall_refused"}, indent=2))
+            _emit_json({**result.to_dict(), "swapped": False,
+                        "reason": "casualties_or_shortfall_refused"})
         else:
             _print_rebuild_remediation(
                 casualties, result.missing_cores, os.path.basename(config.decisions_file)
@@ -1681,8 +1697,8 @@ def cmd_rebuild(
     # 4. Confirm the destructive swap (never call input() on a no-TTY).
     if not assume_yes:
         if as_json:
-            print(_json.dumps({**result.to_dict(), "swapped": False,
-                               "reason": "confirmation_required"}, indent=2))
+            _emit_json({**result.to_dict(), "swapped": False,
+                        "reason": "confirmation_required"})
             return 1
         if sys.stdin.isatty():
             answer = input("\nProceed with the rebuild swap? This replaces the live "
@@ -1702,8 +1718,8 @@ def cmd_rebuild(
 
     # 6. Post-swap guidance.
     if as_json:
-        print(_json.dumps({**result.to_dict(), "swapped": True,
-                           "bak_path": bak_path}, indent=2))
+        _emit_json({**result.to_dict(), "swapped": True,
+                    "bak_path": bak_path})
         return 0
 
     print(f"\n✓ Rebuild complete — the graph at {config.db_path} now reflects the "

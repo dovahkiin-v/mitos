@@ -5,10 +5,10 @@ exposing surface_decisions and query_decisions tools to LLM clients.
 """
 
 import os
-import json
 from typing import Optional, List, Dict, Any, Tuple
 from mcp.server.fastmcp import FastMCP
 
+from mitos.display import dumps_display
 from mitos.config import MitosConfig
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS
 from mitos.embeddings import GeminiEmbeddingProvider
@@ -254,7 +254,7 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         results["confidence"] = confidence
     results["note"] = note
 
-    return json.dumps(results, indent=2)
+    return dumps_display(results, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
@@ -313,13 +313,13 @@ def list_decisions(scope: Optional[str] = None, state: str = "active", brief: bo
     except Exception:
         pass
 
-    return json.dumps({
+    return dumps_display({
         "decisions": decisions,
         "open_questions": open_questions,
         "total": len(decisions),
         "scope": scope,
         "state": state,
-    }, indent=2)
+    }, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
@@ -346,7 +346,7 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False) -> s
         trusting its axiom's mechanism.
     """
     if depth != "letter":
-        return json.dumps({"error": f"Depth mode '{depth}' is not yet implemented in v0.1 (Letter-only retrieval)."})
+        return dumps_display({"error": f"Depth mode '{depth}' is not yet implemented in v0.1 (Letter-only retrieval)."}, ensure_ascii=False, indent=None)
 
     store, embed_provider, vector_store = get_workspace_components()
     
@@ -365,7 +365,7 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False) -> s
                 "depth_mode": "letter"
             }
             output.update(store.get_modifiers(node["id"]))
-            return json.dumps(output, indent=2)
+            return dumps_display(output, ensure_ascii=False, indent=2)
     except Exception:
         # Not a slug collision or lookup failed; proceed to semantic claim lookup
         pass
@@ -400,11 +400,11 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False) -> s
                 match.update(store.get_modifiers(node["id"]))
                 output_list.append(match)
                 
-            return json.dumps({"query": query, "depth_mode": "letter", "matches": output_list}, indent=2)
+            return dumps_display({"query": query, "depth_mode": "letter", "matches": output_list}, ensure_ascii=False, indent=2)
         except Exception as e:
-            return json.dumps({"error": f"Semantic claim query failed: {str(e)}"})
+            return dumps_display({"error": f"Semantic claim query failed: {str(e)}"}, ensure_ascii=False, indent=None)
 
-    return json.dumps({"error": f"Could not resolve slug or run semantic query for '{query}'"})
+    return dumps_display({"error": f"Could not resolve slug or run semantic query for '{query}'"}, ensure_ascii=False, indent=None)
 
 
 @mcp.tool()
@@ -500,4 +500,4 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
         slug=slug,
         acknowledge_neighbors=acknowledge_neighbors,
     )
-    return json.dumps(result)
+    return dumps_display(result, ensure_ascii=False, indent=None)

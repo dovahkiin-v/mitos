@@ -20,6 +20,13 @@ Claude: That breaks the local-first requirement in P10. Let's use SQLite.
 
 <!-- BEGIN ENTRIES — new decisions go directly below this line, newest first -->
 
+### mcp-nudge-already-on-own-stderr-line
+
+**Decided:** The mitos '💡 wire the MCP' nudge already prints on its own stderr line via main()'s print(_hint, file=sys.stderr), gated to the decision-loop verbs (record/surface/query/list + aliases, never show), so the AX/UX-hardening §3-(1) ask to 'give the nudge its own line so it stops concatenating onto the axiom' was already satisfied before the vision was drafted (commit 8b3c90f, 2026-06-12); Phase 1b therefore pins the behaviour with a stderr-placement + stdout-absence assertion instead of manufacturing a text change against a stale premise.
+**Rejected:** Manufacturing the nudge-own-line text change anyway (the vision's literal instruction) — rejected: the live code already emits it on a separate stderr line, so a fabricated change is churn with zero behavioural delta and risks regressing the existing separation. Also rejected: silently dropping the finding — that leaves the stale premise un-pinned, so a future regression re-concatenating the nudge onto stdout would go uncaught.
+**Scope:** cli
+
+
 ### scope-recovery-vector-carries-did-you-mean-and-top-k-candidates
 
 **Decided:** Q3's unused-scope soft recovery vector carries self-correction help inline — reversing the parent rule's no-inline-candidate-list clause: on a scope absent from the live vocabulary, the exit-0 soft vector leads with a DID-YOU-MEAN suggestion (the nearest live scope tag(s) by string similarity — stdlib difflib, no new dependency) when a close match exists, then a bounded TOP-K live-tags-by-count candidate slice, then the `mitos scopes`/`list_scopes` overflow pointer (and `--state all` for archives). The common typo self-corrects in ONE turn (P15 / OPERATIONAL_ECONOMICS §1) instead of being bounced to a separate `list_scopes` round-trip. Everything else in the parent stays: one soft rule firing on absence-from-live, exit-0, the in-band `scope_known`-style signal on `--json`/MCP, never a hard-error, and no 3-case split / dead-domain special-case / secondary spine probe — the discrimination machinery stays dropped; only the usability payload is restored.
