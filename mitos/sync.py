@@ -40,7 +40,16 @@ def run_sync_enrichment(
     entry: ParsedEntry,
     active_decisions: List[Dict[str, Any]]
 ) -> Dict[str, Any]:
-    """Calls Gemini to refine the decision, infer scopes, and suggest relationships."""
+    """Calls Gemini to refine a decision, infer scopes, and suggest relationships.
+
+    NOTE: no longer invoked by ``mitos sync`` — the sync runtime path is strict-
+    deterministic and commits the human-authored buffer verbatim (ADR
+    ``sync-strict-deterministic-no-llm-enrichment``). LLM refinement of genuinely-raw
+    input lives in ``capture`` / ``import --llm-extract``. This function is retained
+    only as the live test-suite's generative-quota probe target
+    (``tests/live_helpers.py``); it is dead in the production path and a candidate for
+    removal once that probe is repointed to a still-live generative call.
+    """
     active_summary = ""
     for d in active_decisions[:20]:  # Limit to top 20 active decisions for prompt budget
         active_summary += f"- slug: {d['slug']}\n  axiom: {d['core_axiom']}\n  scope: {','.join(d['scope'])}\n\n"
@@ -78,7 +87,7 @@ Respond strictly in valid JSON format with the following keys:
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                temperature=0.1
+                temperature=0.3
             )
         )
         return json.loads(response.text)
@@ -117,7 +126,7 @@ Make sure the slug is a clean, lowercase hyphenated string that matches the deci
             model=model_id,
             contents=prompt,
             config=types.GenerateContentConfig(
-                temperature=0.2
+                temperature=0.3
             )
         )
         return response.text.strip()
@@ -545,7 +554,6 @@ class MitosSyncManager:
             print("GEMINI_API_KEY environment variable is not set. Sync requires API keys.")
             return
             
-        genai_client = genai.Client(api_key=api_key)
         renderer = MitosRenderer(self.config.workspace_dir)
 
         synced_blocks: List[Tuple[ParsedEntry, str]] = []
@@ -626,94 +634,35 @@ class MitosSyncManager:
                             print("Invalid choice.")
 
             if entry.kind == "decision":
-                # LLM capture enrichment (FLASH_LITE)
-                active_decs = self.store.get_active_decisions()
-                
-                try:
-                    enrichment = run_sync_enrichment(genai_client, entry, active_decs)
-                except Exception as e:
-                    # Degradation F1: enrichment failed.
-                    print(f"\n[Error] LLM enrichment failed for '{entry.slug}': {str(e)}")
-                    if auto_accept or not sys.stdin.isatty():
-                        # Non-interactive degradation (4a fold-in, deferred here from
-                        # Phase 1): under auto-accept or a non-TTY stdin, never block
-                        # on input() — a transient enrichment failure would otherwise
-                        # EOF on the missing prompt and hard-fail the whole sync.
-                        # Skip this entry with a loud log (it stays in its buffer for a
-                        # later sync), so one degraded entry can't halt the batch — the
-                        # same per-entry robustness 4a's commit-stage quarantine builds.
-                        print(
-                            f"[Skipped] '{entry.slug}' — enrichment unavailable under "
-                            f"non-interactive sync; entry left in its buffer for a later sync."
-                        )
-                        continue
-                    choice = input("Would you like to [r]etry, [s]kip this entry, or [a]bort sync? ").strip().lower()
-                    if choice == 'r':
-                        # Retry once
-                        enrichment = run_sync_enrichment(genai_client, entry, active_decs)
-                    elif choice == 's':
-                        continue
-                    else:
-                        print("Sync aborted.")
-                        return
-
-                # Apply refinements
-                refined_axiom = enrichment.get("refined_core_axiom", entry.axiom)
-                refined_mechs = enrichment.get("refined_mechanisms", entry.mechanisms)
-                refined_scopes = enrichment.get("refined_scope", entry.scope)
-                sugg_rels = enrichment.get("suggested_relationships", {})
-
-                print(f"\nProposed Capture: {entry.slug}")
-                print(f"  Core Axiom:  {refined_axiom}")
+                # Strict-deterministic sync (A): the decision commits EXACTLY as
+                # authored — no LLM enrichment in the sync runtime path. Refining a
+                # rough axiom, inferring scopes, or suggesting relationships lives only
+                # where the input is genuinely raw (`capture`, `import --llm-extract`);
+                # `sync` reads the human-authored buffer and must never silently rewrite
+                # it (M7/P6 — markdown is the source of truth; ROADMAP — runtime parsing
+                # is strict-deterministic; ADR sync-strict-deterministic-no-llm-enrichment).
+                print(f"\nProposed Decision: {entry.slug}")
+                print(f"  Core Axiom:  {entry.axiom}")
                 print(f"  Rejected:    {entry.rejected_paths}")
-                print(f"  Mechanisms:  {', '.join(refined_mechs)}")
-                print(f"  Scope:       {', '.join(refined_scopes)}")
-                
-                for rel_type, rel_slug in sugg_rels.items():
-                    if rel_slug:
-                        print(f"  Suggested Relationship: {rel_type} -> {rel_slug}")
+                print(f"  Mechanisms:  {', '.join(entry.mechanisms)}")
+                print(f"  Scope:       {', '.join(entry.scope)}")
 
                 if not auto_accept:
-                    u_choice = input("Accept this decision? [a]ccept / [e]dit / [s]kip / [q]uit: ").strip().lower()
+                    u_choice = input("Accept this decision? [a]ccept / [s]kip / [q]uit: ").strip().lower()
                     if u_choice == 's':
                         continue
                     elif u_choice == 'q':
                         print("Sync paused by user.")
                         break
-                    elif u_choice == 'e':
-                        # Simple inline editing loop
-                        refined_axiom = input(f"Enter core axiom [{refined_axiom}]: ").strip() or refined_axiom
 
-                # Commit refined values back onto the entry (commit reads .axiom — V1a).
-                entry.axiom = refined_axiom
-                entry.mechanisms = refined_mechs
-                entry.scope = refined_scopes
-                
-                # Apply slug-collision override if present
+                # Deterministic slug-collision override (corrects/supersedes); the
+                # authored relationship edges otherwise stand exactly as parsed.
                 if edge_relationship == "corrects":
                     entry.corrects = [entry.slug]
                     entry.supersedes = []
                 elif edge_relationship == "supersedes":
                     entry.supersedes = [entry.slug]
                     entry.corrects = []
-                else:
-                    def norm_rel(v: Any) -> List[str]:
-                        # Coerce a single suggested relation to the List[str] shape the
-                        # relationship attrs now carry (V1b). ``sugg_rels`` feeds at most
-                        # one slug per relation, so a list input takes its first element;
-                        # absent → ``[]`` so ``entry.X or norm_rel(...)`` stays a list
-                        # either way (never a bare scalar — the `[] or scalar` foot-gun).
-                        if not v:
-                            return []
-                        if isinstance(v, list):
-                            return [str(v[0]).strip()] if v else []
-                        return [str(v).strip()]
-
-                    entry.supersedes = entry.supersedes or norm_rel(sugg_rels.get("supersedes"))
-                    entry.amends = entry.amends or norm_rel(sugg_rels.get("amends"))
-                    entry.narrows = entry.narrows or norm_rel(sugg_rels.get("narrows"))
-                    entry.depends_on = entry.depends_on or norm_rel(sugg_rels.get("depends_on"))
-                    entry.resolves = entry.resolves or norm_rel(sugg_rels.get("resolves"))
 
             else:
                 # Open Question Sync
@@ -728,7 +677,10 @@ class MitosSyncManager:
                         break
 
             # Populate OD3 confirmation metadata
-            entry.confirmed_by = get_model_id("FLASH_LITE") if entry.kind == "decision" else "user"
+            # Strict-deterministic sync commits the authored buffer verbatim — no model
+            # touches the decision here, so its provenance is the user/author, not an
+            # enrichment model (A: sync-strict-deterministic-no-llm-enrichment).
+            entry.confirmed_by = "user"
             entry.confirmed_at = datetime.now().isoformat()
 
             # Commit to graph database atomically per entry (C1 atomicity), now with

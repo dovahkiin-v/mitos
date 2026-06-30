@@ -47,7 +47,7 @@ def sync_env() -> Tuple[MitosConfig, MitosSyncManager, str]:
 
 @patch("google.genai.Client")
 def test_sync_happy_path(mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]) -> None:
-    """Verifies that new buffer entries are parsed, LLM-enriched, committed, and rotated."""
+    """New buffer entries are parsed, committed VERBATIM (strict-deterministic sync — no LLM enrichment), and rotated."""
     config, manager, tmpdir = sync_env
 
     # 1. Append valid decision entry to write buffer
@@ -62,15 +62,8 @@ def test_sync_happy_path(mock_client: MagicMock, sync_env: Tuple[MitosConfig, Mi
     with open(config.decisions_file, "a", encoding="utf-8") as f:
         f.write(entry_text + "\n")
 
-    # 2. Mock Gemini API Client responses
-    mock_gen_resp = MagicMock()
-    mock_gen_resp.text = json.dumps({
-        "refined_core_axiom": "We strictly use pure logic cores.",
-        "refined_mechanisms": ["python", "sqlite"],
-        "refined_scope": ["core", "substrate"],
-        "suggested_relationships": {}
-    })
-    mock_client.return_value.models.generate_content.return_value = mock_gen_resp
+    # 2. Strict-deterministic sync makes no LLM call — the entry commits verbatim.
+    #    (The google.genai.Client patch + mock key below only satisfy the key/embed gate.)
 
     # Set up environment variables to satisfy provider check
     os.environ["GEMINI_API_KEY"] = "mock_key"
@@ -85,12 +78,12 @@ def test_sync_happy_path(mock_client: MagicMock, sync_env: Tuple[MitosConfig, Mi
     node = nodes[0]
     
     assert node["slug"] == "isolation"
-    # Refined axiom saved
-    assert node["core_axiom"] == "We strictly use pure logic cores."
-    assert node["mechanisms"] == ["python", "sqlite"]
-    assert node["scope"] == ["core", "substrate"]
-    # Verify OD3 confirmation metadata populated
-    assert node["confirmed_by"] == "gemini-3.1-flash-lite"
+    # Committed VERBATIM — the authored axiom/mechanisms/scope, never an LLM rewrite.
+    assert node["core_axiom"] == "Use pure logic cores."
+    assert node["mechanisms"] == ["python"]
+    assert node["scope"] == ["core"]
+    # OD3 confirmation metadata: deterministic sync stamps the user/author, not a model.
+    assert node["confirmed_by"] == "user"
     assert node["confirmed_at"] is not None
 
     # 5. Assert content-aware archive rotation:
@@ -943,47 +936,3 @@ def test_sync_decisions_oldest_first_amend_commits_in_one_sync(
     assert len(amends) == 1
     assert amends[0]["source_id"] == newer["id"]
     assert amends[0]["target_id"] == older["id"]
-
-
-@patch("google.genai.Client")
-def test_sync_enrichment_failure_under_auto_accept_skips_not_blocks(
-    mock_client: MagicMock,
-    sync_env: Tuple[MitosConfig, MitosSyncManager, str],
-    capsys: pytest.CaptureFixture,
-) -> None:
-    """F1 degradation under non-interactive sync (4a fold-in): a per-entry enrichment
-    failure auto-skips the entry with a loud log instead of blocking on input() — so
-    one degraded entry can't EOF-hang or hard-fail the whole batch.
-
-    Without the fix, the F1 branch would call input() ignoring auto_accept and EOF on
-    the captured (non-TTY) stdin, aborting the sync. Here it degrades deterministically:
-    the entry is skipped, not committed, and left in its buffer for a later sync.
-    """
-    config, manager, tmpdir = sync_env
-    os.environ["GEMINI_API_KEY"] = "mock_key"
-
-    # Enrichment fails on every call (e.g. a transient 429). The OQ branch never
-    # enriches, so this only affects the decision.
-    mock_client.return_value.models.generate_content.side_effect = Exception(
-        "Resource Exhausted (429)"
-    )
-    _append_decision(
-        config,
-        "## 2026-05-19 — degraded-decision — Degraded\n"
-        "**Decided:** This entry's enrichment will fail.\n"
-        "**Rejected:** Blocking the whole batch.\n",
-    )
-
-    # Must not raise / must not block on input().
-    manager.perform_sync(auto_accept=True)
-
-    captured = capsys.readouterr()
-    assert "[Skipped] 'degraded-decision'" in captured.out
-
-    store = GraphStore(config.db_path)
-    assert store.get_node_by_slug("degraded-decision") is None  # skipped, not committed
-    # Left in its buffer for a later sync (never rotated).
-    with open(config.decisions_file, "r", encoding="utf-8") as f:
-        assert "degraded-decision" in f.read()
-
-

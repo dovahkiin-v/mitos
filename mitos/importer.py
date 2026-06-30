@@ -56,7 +56,7 @@ Respond strictly in valid JSON format with the following keys:
         message = client.messages.create(
             model=model_id,
             max_tokens=2000,
-            temperature=0.1,
+            temperature=0.3,
             messages=[
                 {"role": "user", "content": prompt}
             ]
