@@ -20,6 +20,22 @@ Claude: That breaks the local-first requirement in P10. Let's use SQLite.
 
 <!-- BEGIN ENTRIES — new decisions go directly below this line, newest first -->
 
+### llm-generative-temperature-floor-point-three
+
+**Decided:** Every LLM GENERATIVE call in mitos uses temperature >= 0.3 — never below. Sub-0.3 (e.g. 0.1) over-collapses the model toward a deterministic machine and loses the nuance that is the reason to use an LLM at all. The floor binds every generation-temperature site: `capture` synthesis (run_ambient_capture), `import --llm-extract` (importer), and the retained enrichment-probe call were all raised to 0.3. Embeddings carry no sampling temperature and are unaffected.
+**Rejected:** Temperature 0.1 for more deterministic extraction/synthesis: REJECTED — the small format-consistency gain is not worth lobotomizing the model's judgment, and structured-output mode (response_mime_type) already constrains the shape; nuance preservation outranks marginal determinism.
+**Scope:** ax, build, sync
+**Context:** Vinga's directive during the sync-strict-deterministic change: minimum of 0.3 at any point anywhere, nothing below, otherwise we lobotomize it. Audited all three generative-temperature sites (importer 0.1, the enrichment-probe 0.1, capture 0.2) and raised each to 0.3. Shipped 0.5.4.
+
+
+### sync-strict-deterministic-no-llm-enrichment
+
+**Decided:** `mitos sync` is strict-deterministic: it commits the human-authored buffer (decisions.md / questions.md) to the graph VERBATIM and makes no LLM generative call in the runtime path. The per-decision LLM enrichment that previously ran on every sync — refining the axiom, inferring scopes/mechanisms, and suggesting relationship edges, applied even under `--yes` — is removed; LLM refinement of genuinely-raw input lives only in `capture` and `import --llm-extract`. A synced decision's `confirmed_by` is `user` (no model touched it).
+**Rejected:** Keeping enrichment but only guarding `--yes` (stop auto-accepting LLM-suggested edges + add a `--strict` flag): REJECTED — it leaves sync silently rewriting authored axioms and still contradicts the ROADMAP guardrail. Skipping enrichment only for already-canonical entries: REJECTED — canonical is fuzzy to detect; the clean architectural line is no-LLM-in-sync. Deleting `run_sync_enrichment` outright: DEFERRED — the function is retained only as the live test-suite's generative-quota probe target (dead in the production path), a candidate for removal once that probe is repointed.
+**Scope:** sync, substrate, ax
+**Context:** AX/UX-hardening follow-up. Finding #1: `sync --yes` ran LLM enrichment on a hand-authored, already-canonical decisions.md entry — paraphrasing the authored axiom, adding an unwritten scope, and filling an empty `resolves` slot with a hallucinated edge that `--yes` auto-accepted, kind-invalid, so the whole valid entry quarantined (buffer-first+rollback held; nothing lost). This contradicted the ROADMAP guardrail (runtime parsing is strict deterministic only; LLM extraction never in mitos sync) and M7/P6 (markdown is the human-authored source of truth). Vinga chose option A — honor the ROADMAP — over guarding or scoping the enrichment. Shipped 0.5.4.
+
+
 ### scope-recovery-soft-one-rule-with-loud-in-band-signal
 
 **Decided:** An unknown/unused scope on a hard-filter read (`list`/`open-questions` and MCP `list_decisions`) is handled by ONE soft rule, never a hard-error: a scope absent from the live vocabulary returns exit-0 plus a recovery pointer (`run mitos scopes / list_scopes`, naming `--state all` for archived history), and a scope present-but-empty-for-this-read returns honest data; the structured (`--json`/MCP) envelope additionally carries the absent-scope signal IN-BAND (exit-0, e.g. a `scope_known: false`-style flag plus the pointer) so a machine consumer's typo is never a silent `{total: 0}` it forges past, but it is never a hard-error/exception (which agents misread as a call-syntax mistake and retry). No inline candidate list, no 3-case split, no dead-domain special-case, no secondary spine probe.
