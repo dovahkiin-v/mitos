@@ -100,6 +100,46 @@ def blackout_note(retired_handles: List[Mapping[str, Any]]) -> str:
     )
 
 
+def order_scope_counts(counts: Dict[str, Dict[str, int]]) -> Dict[str, Dict[str, int]]:
+    """Re-orders the scope→counts map by liveness, busiest domain first (the sort seam).
+
+    ``GraphStore.get_scope_counts`` returns its tag→counts map *alphabetically*
+    (deterministic, but presentation-neutral by design — 3a does not own display
+    order). This is the single place that imposes the discovery surface's order:
+    total live-node count (``active_decisions + parked_open_questions``)
+    **descending**, ties broken **alphabetically** by scope tag. The busiest
+    domains read first — the map an agent scans before recording or recalling.
+
+    Both surfaces (the ``scopes`` CLI verb and the ``list_scopes`` MCP tool) call
+    this on the same ``get_scope_counts`` result, so the rendered table and the
+    ``--json`` / MCP map share one ordered dict — CLI⇄MCP order parity is
+    structural, not coincidental. A Python ``dict`` preserves insertion order and
+    ``json.dumps`` honors it, so ordering once here orders every downstream render.
+
+    This is a tag→counts *aggregate*, not a decision-read payload: there is no node
+    ``id`` to stamp, so the "every decision-read surface stamps modifiers" rule does
+    **not** apply (no modifier seam). It only re-keys an existing dict into a new
+    insertion order — it never transforms keys or values.
+
+    Args:
+        counts: The ``{scope: {"active_decisions": int, "parked_open_questions":
+            int}}`` map from ``get_scope_counts`` (alphabetical, casefolded keys).
+
+    Returns:
+        The same map, re-inserted in total-live-count-descending, ties-alphabetical
+        order. Empty input returns ``{}``.
+    """
+    return dict(
+        sorted(
+            counts.items(),
+            key=lambda kv: (
+                -(kv[1]["active_decisions"] + kv[1]["parked_open_questions"]),
+                kv[0],
+            ),
+        )
+    )
+
+
 def letter_payload(
     node: Mapping[str, Any], *, brief: bool, extras: Optional[Mapping[str, Any]] = None
 ) -> Dict[str, Any]:
