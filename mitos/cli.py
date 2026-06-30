@@ -35,7 +35,7 @@ from mitos.errors import MitosError, ParseError, ValidationError, DatabaseError,
 from mitos.migrations import is_pre_v1a_schema
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS, open_connection
 from mitos.cutover import default_aside_db_path, perform_swap, rebuild_and_gate
-from mitos.recall import assess_surface_recall
+from mitos.recall import assess_surface_recall, scope_filter_recovery
 from mitos.sync import MitosSyncManager, run_ambient_capture, _SLUG_MAX_LEN
 from mitos._agent_block import agent_block, agent_block_drift, AGENT_GUIDE_VERSION
 from mitos.renderer import MitosRenderer, overflow_report
@@ -723,19 +723,44 @@ def cmd_list(config: MitosConfig, scope: Optional[str] = None,
         item.update(modifiers.get(d["id"], {}))
         return item
 
+    # On an empty scoped read, distinguish a genuinely-fresh scope from a misspelled
+    # one: an absent-from-live scope gets the same bounded self-correction vector the
+    # surface verbs use (3d). Computed once, before the as_json split, so the text and
+    # JSON emit points don't drift — and only on the miss path (guarded on emptiness),
+    # so the hot non-empty path never pays the get_scope_counts() read. The recovery
+    # payload carries no node id, so there is nothing to modifier-stamp here.
+    recovery = None
+    if scope and not decisions and not parked:
+        scope_counts: Optional[Dict[str, Dict[str, int]]] = None
+        try:
+            scope_counts = order_scope_counts(store.get_scope_counts())
+        except Exception:
+            pass
+        recovery = scope_filter_recovery(
+            scope=scope, scope_counts=scope_counts, surface="cli"
+        )
+
     if as_json:
-        _emit_json({
+        payload = {
             "decisions": [_list_item(d) for d in decisions],
             "open_questions": [_oq_payload(oq) for oq in parked],
             "total": len(decisions),
             "scope": scope,
             "state": effective_state,
-        })
+        }
+        if recovery:
+            payload["scope_known"] = False
+            payload["scope_recovery"] = recovery["note"]
+        _emit_json(payload)
         return
 
     if not decisions and not parked:
         if not store.get_all_nodes():
+            # Empty-graph precedence wins over the unused-scope vector: a graph with no
+            # nodes has an empty vocabulary, but "run sync" is the truer nudge.
             print("Graph database is empty. Run 'mitos sync' to ingest entries.")
+        elif recovery:
+            print(recovery["note"])
         else:
             print("No decisions match the given filters.")
         return
@@ -779,18 +804,42 @@ def cmd_open_questions(config: MitosConfig, scope: Optional[str] = None,
 
     parked = [q for q in oqs if q["state"] == "parked"]
 
+    # On an empty scoped read, an absent-from-live scope gets the bounded self-correction
+    # vector (3d) instead of a silent "zero parked" line. Only the miss path pays the
+    # get_scope_counts() read. No empty-graph precedence here (CLI asymmetry vs cmd_list):
+    # on an empty graph a scoped OQ read trips the vector whose static `mitos sync` hedge
+    # already covers the "just authored" case. The payload carries no node id — nothing
+    # to modifier-stamp.
+    recovery = None
+    if scope and not parked:
+        scope_counts: Optional[Dict[str, Dict[str, int]]] = None
+        try:
+            scope_counts = order_scope_counts(store.get_scope_counts())
+        except Exception:
+            pass
+        recovery = scope_filter_recovery(
+            scope=scope, scope_counts=scope_counts, surface="cli"
+        )
+
     if as_json:
         # Honest-empty envelope on an empty/unmatched scope (never an error — empty is
-        # first-class). The absent-scope recovery vector is 3d's job, not 2c's.
-        _emit_json({
+        # first-class). An absent-from-live scope rides the additive recovery fields (3d).
+        payload = {
             "open_questions": [_oq_payload(q) for q in parked],
             "total": len(parked),
             "scope": scope,
-        })
+        }
+        if recovery:
+            payload["scope_known"] = False
+            payload["scope_recovery"] = recovery["note"]
+        _emit_json(payload)
         return
 
     if not parked:
-        print("Zero parked open questions found.")
+        if recovery:
+            print(recovery["note"])
+        else:
+            print("Zero parked open questions found.")
         return
 
     print(f"\nParked Open Questions ({len(parked)} found):")

@@ -13,7 +13,7 @@ from mitos.config import MitosConfig
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.vector_store import QdrantVectorStore
-from mitos.recall import assess_surface_recall
+from mitos.recall import assess_surface_recall, scope_filter_recovery
 
 # Create FastMCP server instance
 mcp = FastMCP("Mitos")
@@ -360,13 +360,33 @@ def list_decisions(scope: Optional[str] = None, state: str = "active", brief: bo
     except Exception:
         pass
 
-    return dumps_display({
+    payload = {
         "decisions": decisions,
         "open_questions": open_questions,
         "total": len(decisions),
         "scope": scope,
         "state": state,
-    }, ensure_ascii=False, indent=2)
+    }
+
+    # On an empty scoped read, distinguish a genuinely-fresh scope from a misspelled one:
+    # an absent-from-live scope rides two additive, in-band fields (never an error object
+    # or non-zero exit — an LLM agent reads those as a call-syntax fault and thrashes).
+    # Only the miss path pays the get_scope_counts() read. The recovery payload carries no
+    # node id, so there is nothing to modifier-stamp here.
+    if scope and not decisions and not open_questions:
+        scope_counts: Optional[Dict[str, Dict[str, int]]] = None
+        try:
+            scope_counts = order_scope_counts(store.get_scope_counts())
+        except Exception:
+            pass
+        recovery = scope_filter_recovery(
+            scope=scope, scope_counts=scope_counts, surface="mcp"
+        )
+        if recovery:
+            payload["scope_known"] = False
+            payload["scope_recovery"] = recovery["note"]
+
+    return dumps_display(payload, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()

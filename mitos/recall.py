@@ -1,10 +1,17 @@
-"""Shared precedent-recall policy for the surface tools.
+"""Shared precedent-recall policy for the surface and scope hard-filter tools.
 
 The confidence threshold and the response ``note`` that distinguishes a settled
 precedent from loose neighbours / no match at all live here, so the MCP
 ``surface_decisions`` tool and its CLI twin ``mitos surface`` stay behaviourally
 identical (AX P5: a capped list of mid-score neighbours looked identical to a real
 hit, and an empty result looked identical to "precedent hiding below the cap").
+
+The same unused-scope self-correction also serves the **scope hard-filter** read
+verbs — ``mitos list`` / ``mitos open-questions`` and the MCP ``list_decisions``
+tool — via ``scope_filter_recovery``: when one of those returns an empty result
+because the scope tag is absent from the live vocabulary, the caller surfaces the
+bounded vector instead of a silent empty (the false-negative an agent reads as a
+real absence rather than its own typo).
 
 The policy is **surface-agnostic**: it emits the recall *signal* (which confidence
 branch, whether the scope tag is unused) and words each pointer from a per-surface
@@ -48,12 +55,14 @@ _SURFACE_POINTERS: Dict[str, Dict[str, str]] = {
         "complete": "mitos list",
         "complete_scope": "mitos list --scope '{scope}'",
         "discovery": "mitos scopes",
+        "state_all": "mitos list --scope '{scope}' --state all",
         "sync": "mitos sync",
     },
     "mcp": {
         "complete": "list_decisions()",
         "complete_scope": "list_decisions(scope='{scope}')",
         "discovery": "list_scopes",
+        "state_all": "list_decisions(scope='{scope}', state='all')",
         "sync": "mitos sync",
     },
 }
@@ -63,14 +72,18 @@ def _unused_scope_prefix(
     scope: str,
     scope_counts: Dict[str, Dict[str, int]],
     pointers: Dict[str, str],
+    *,
+    include_state_all: bool = False,
 ) -> str:
     """Builds the bounded self-correction vector for an unused scope tag.
 
     The vector is, in order: the unused-tag statement, an optional did-you-mean (the
     nearest live tag by string similarity), a top-K busiest-first slice of the live
-    vocabulary with an overflow pointer when it is truncated, and a static
-    authored-but-unsynced hedge. Bounded to at most ``SURFACE_TOP_SCOPES`` tags + one
-    overflow pointer — never the full vocabulary, regardless of corpus size (P11).
+    vocabulary with an overflow pointer when it is truncated, an optional ``--state
+    all`` pointer (the hard-filter verbs only — a dead/archived-only scope whose
+    decisions are all superseded is absent-from-live, so this is its recovery), and a
+    static authored-but-unsynced hedge. Bounded to at most ``SURFACE_TOP_SCOPES`` tags
+    + one overflow pointer — never the full vocabulary, regardless of corpus size (P11).
 
     Args:
         scope: The (unused) scope tag the caller passed.
@@ -78,6 +91,10 @@ def _unused_scope_prefix(
             by ``order_scope_counts`` at the callsite. Keys are canonical casefolded
             scope tags.
         pointers: The active surface's pointer table (``_SURFACE_POINTERS[surface]``).
+        include_state_all: When True, append a ``--state all`` pointer — the hard-filter
+            verbs (``list`` / ``open-questions`` / ``list_decisions``) offer this extra
+            affordance for a dead scope whose decisions are all superseded. The scope-blind
+            ``surface`` path leaves it False, so its output stays byte-identical (3c).
 
     Returns:
         The vector as a single trailing-spaced string, ready to prepend to whichever
@@ -99,10 +116,82 @@ def _unused_scope_prefix(
         if len(live_tags) > SURFACE_TOP_SCOPES:
             parts.append(f"Full map: {pointers['discovery']}.")
 
+    if include_state_all:
+        parts.append(
+            f"To see superseded decisions in this scope: "
+            f"{pointers['state_all'].format(scope=scope)}."
+        )
+
     parts.append(
         f"(or {pointers['sync']} if you just authored decisions in this scope.)"
     )
     return " ".join(parts) + " "
+
+
+def _scope_is_unused(
+    scope: Optional[str],
+    scope_counts: Optional[Dict[str, Dict[str, int]]],
+) -> bool:
+    """Tests whether a scope tag is absent from the live vocabulary.
+
+    The unused-scope signal keys on live-vocabulary membership (≥1 active decision OR
+    ≥1 parked OQ — 3a's ``get_scope_counts`` definition), NOT on an active-decision
+    count: a scope live only via a parked open question is a real tag, not a typo.
+    MI-9 casefold — ``scope_counts`` keys are already canonical casefolded forms, so
+    only the incoming scope is folded.
+
+    Args:
+        scope: The scope filter the caller passed, if any.
+        scope_counts: The live ``get_scope_counts`` map, or None when the callsite
+            could not compute it.
+
+    Returns:
+        True iff a non-empty scope is given, the map was computed, and the scope is
+        absent from it. A None scope or None map degrades calmly to False (never
+        fabricate a typo hint).
+    """
+    return (
+        bool(scope)
+        and scope_counts is not None
+        and scope.casefold() not in scope_counts
+    )
+
+
+def scope_filter_recovery(
+    *,
+    scope: Optional[str],
+    scope_counts: Optional[Dict[str, Dict[str, int]]],
+    surface: str,
+) -> Optional[Dict[str, str]]:
+    """Recovery payload for an absent-from-live scope hard-filter read, else None.
+
+    The scope hard-filter verbs (``mitos list`` / ``mitos open-questions`` / the MCP
+    ``list_decisions`` tool) consult this on their **empty-result** branch: when a
+    scoped read came back empty AND the scope is absent from the live vocabulary, the
+    bounded self-correction vector replaces the silent empty. A scope that is live but
+    empty for this particular read, or a no-scope read, recovers nothing — the caller
+    keeps its honest-empty line/envelope.
+
+    Args:
+        scope: The scope filter the caller passed, if any.
+        scope_counts: The live ``get_scope_counts`` map (busiest-first via
+            ``order_scope_counts``), or None when the callsite could not compute it
+            (degraded calmly — never fabricate a typo hint).
+        surface: ``"cli"`` or ``"mcp"`` — selects the pointer wording. Required keyword:
+            no callsite may silently emit the wrong surface's call-forms (the T7 gate).
+
+    Returns:
+        ``{"note": <bounded vector string>}`` when the scope is absent from the live
+        vocabulary; None when there is nothing to recover from (scope is None, the
+        scope is live, or ``scope_counts`` could not be computed).
+    """
+    if not _scope_is_unused(scope, scope_counts):
+        return None
+    pointers = _SURFACE_POINTERS[surface]
+    note = _unused_scope_prefix(
+        scope, scope_counts, pointers, include_state_all=True
+    ).rstrip()
+    return {"note": note}
 
 
 def assess_surface_recall(
@@ -145,14 +234,10 @@ def assess_surface_recall(
 
     # The unused-scope signal keys on live-vocabulary membership (≥1 active decision OR
     # ≥1 parked OQ — 3a's get_scope_counts definition), NOT on an active-decision count:
-    # a scope live only via a parked open question is a real tag, not a typo. MI-9
-    # casefold; scope_counts keys are already canonical casefolded forms (fold only the
-    # incoming scope). None scope_counts → treat as not-unused (calm degradation).
-    scope_unused = (
-        bool(scope)
-        and scope_counts is not None
-        and scope.casefold() not in scope_counts
-    )
+    # a scope live only via a parked open question is a real tag, not a typo. Shared with
+    # scope_filter_recovery via _scope_is_unused (the hard-filter verbs key on the same
+    # oracle). None scope_counts → treat as not-unused (calm degradation).
+    scope_unused = _scope_is_unused(scope, scope_counts)
     # The bounded vector is orthogonal to confidence — a prefix prepended to whichever
     # confidence branch fires, exactly as the old prefix was.
     scope_prefix = (
