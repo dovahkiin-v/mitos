@@ -424,7 +424,9 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
     recording WHY you ruled options out is what stops you (or the next agent) from
     re-proposing them. If this decision relates to an earlier one, look the earlier
     one up first with query_decisions/surface_decisions and pass its EXACT slug to the
-    matching relation arg below (each is validated to point at a real decision).
+    matching relation arg below (each is validated to point at a real decision). Each
+    relation arg also accepts a comma-separated list to link several at once
+    (e.g. supersedes="a, b").
     Returns the decision's slug; look it up afterwards with query_decisions.
 
     Args:

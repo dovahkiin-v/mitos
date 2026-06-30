@@ -186,6 +186,28 @@ _EXTRA_RELATIONS = (
 )
 
 
+def _split_relation_slugs(raw: Optional[str]) -> List[str]:
+    """Split a comma-separated relation argument into a list of stripped slugs.
+
+    The decisions.md relationship fields are comma-separated multi-valued (V1b,
+    format-spec.md "Relationship Fields"), and the markdown parser already tokenizes
+    them so; this mirrors that split for the CLI/MCP ``record`` edge args, so a single
+    ``--supersedes "a, b, c"`` (or ``supersedes="a, b, c"`` on the MCP twin) commits one
+    edge per slug. A lone slug is a 1-element list, so single-valued authoring stays
+    byte-for-byte unchanged — purely additive, no caller breaks.
+
+    Args:
+        raw: The relation argument as the caller passed it — ``None`` or a possibly
+            comma-separated string of exact slugs.
+
+    Returns:
+        The stripped, non-empty slugs in author order (``[]`` when ``raw`` is falsy).
+    """
+    if not raw:
+        return []
+    return [s.strip() for s in raw.split(",") if s.strip()]
+
+
 def _record_error(code: str, **fields: Any) -> Dict[str, str]:
     """Builds a structured {error, code} dict using the canonical message for ``code``."""
     return {"error": _ERROR_MESSAGES[code].format(**fields), "code": code}
@@ -1447,40 +1469,51 @@ class MitosSyncManager:
             return _record_error("parse_failed")
         entry = parsed[0]
 
-        # Pre-validate supersedes with an EXACT match.
-        if supersedes:
-            ids = self.store.resolve_slug(supersedes)
+        # Pre-validate supersedes with an EXACT match — comma-separated for a
+        # multi-target supersede (each slug resolved independently; a lone slug is the
+        # 1-element common case). Phase A read-only fast-fail: a miss on ANY target
+        # returns an error naming that slug and writes nothing.
+        supersedes_slugs = _split_relation_slugs(supersedes)
+        for _sup in supersedes_slugs:
+            ids = self.store.resolve_slug(_sup)
             if not ids:
-                return _record_error("supersedes_not_found", supersedes=supersedes)
+                return _record_error("supersedes_not_found", supersedes=_sup)
             if len(ids) > 1:
-                return _record_error("supersedes_ambiguous", supersedes=supersedes)
+                return _record_error("supersedes_ambiguous", supersedes=_sup)
             target = self.store.get_node(ids[0])
-            if not target or target.get("slug", "").casefold() != supersedes.casefold():
-                return _record_error("supersedes_not_found", supersedes=supersedes)
-            entry.supersedes = [supersedes]  # List[str] shape (V1b multi-valued)
+            if not target or target.get("slug", "").casefold() != _sup.casefold():
+                return _record_error("supersedes_not_found", supersedes=_sup)
+        if supersedes_slugs:
+            entry.supersedes = supersedes_slugs  # List[str] shape (V1b multi-valued)
 
         # Pre-validate corrects with an EXACT match — the kill-edge twin of supersedes
-        # (V1a's second kill-edge; the target leaves the active view). Same Phase-A
-        # read-only fast-fail shape, so a miss writes nothing.
-        if corrects:
-            ids = self.store.resolve_slug(corrects)
+        # (V1a's second kill-edge; the target leaves the active view), comma-separated
+        # for multiple. Same Phase-A read-only fast-fail shape, so a miss writes nothing.
+        corrects_slugs = _split_relation_slugs(corrects)
+        for _cor in corrects_slugs:
+            ids = self.store.resolve_slug(_cor)
             if not ids:
-                return _record_error("corrects_not_found", corrects=corrects)
+                return _record_error("corrects_not_found", corrects=_cor)
             if len(ids) > 1:
-                return _record_error("corrects_ambiguous", corrects=corrects)
+                return _record_error("corrects_ambiguous", corrects=_cor)
             target = self.store.get_node(ids[0])
-            if not target or target.get("slug", "").casefold() != corrects.casefold():
-                return _record_error("corrects_not_found", corrects=corrects)
-            entry.corrects = [corrects]  # List[str] shape (V1b multi-valued)
+            if not target or target.get("slug", "").casefold() != _cor.casefold():
+                return _record_error("corrects_not_found", corrects=_cor)
+        if corrects_slugs:
+            entry.corrects = corrects_slugs  # List[str] shape (V1b multi-valued)
 
-        # Validate every other typed relation EXACTLY like supersedes — each must
-        # point at a real, unambiguous decision. Still Phase A: a miss returns an
-        # error and writes nothing, so the buffer stays byte-for-byte unchanged.
-        for _name, _target in extra_relations.items():
-            err = self._validate_relation_target(_name, _target)
-            if err:
-                return err
-            setattr(entry, _name, [_target])  # List[str] shape (V1b multi-valued)
+        # Validate every other typed relation EXACTLY like supersedes — each must point
+        # at a real, unambiguous decision; each is comma-separated multi-valued too.
+        # Still Phase A: a miss on any target returns an error and writes nothing, so
+        # the buffer stays byte-for-byte unchanged.
+        for _name, _raw in extra_relations.items():
+            _targets = _split_relation_slugs(_raw)
+            for _t in _targets:
+                err = self._validate_relation_target(_name, _t)
+                if err:
+                    return err
+            if _targets:
+                setattr(entry, _name, _targets)  # List[str] shape (V1b multi-valued)
 
         # Identity (slug-free canonical-core hash — V1-D2). Computed over the SAME
         # fields commit_parsed_entry hashes, so this pre-commit idempotency id equals
@@ -1525,11 +1558,9 @@ class MitosSyncManager:
         # (no embeddings → no pause) and bypassable with acknowledge_neighbors=True.
         if not acknowledge_neighbors:
             declared_targets = {
-                t.casefold() for t in (
-                    ([supersedes] if supersedes else [])
-                    + ([corrects] if corrects else [])
-                    + list(extra_relations.values())
-                )
+                t.casefold()
+                for raw in ([supersedes, corrects] + list(extra_relations.values()))
+                for t in _split_relation_slugs(raw)
             }
             # Transitive-lineage suppression (3b): also suppress the pause for the
             # OLDER members of an amends/narrows/supersedes chain reachable through a
@@ -1543,8 +1574,9 @@ class MitosSyncManager:
             # consumer — §6.2), so a bridged predecessor still reads un-amended.
             if self.embed_provider and self.vector_store:
                 declared_targets |= self._lineage_suppression_slugs(
-                    [supersedes, extra_relations.get("amends"),
-                     extra_relations.get("narrows")]
+                    _split_relation_slugs(supersedes)
+                    + _split_relation_slugs(extra_relations.get("amends"))
+                    + _split_relation_slugs(extra_relations.get("narrows"))
                 )
             neighbors = self._review_neighbors(entry, declared_targets)
             if neighbors:
