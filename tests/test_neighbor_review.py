@@ -121,6 +121,33 @@ def test_declared_relation_skips_pause(ws):
     assert res["status"] == "created"
 
 
+def test_multi_value_supersedes_suppresses_pause_on_all_targets(ws):
+    """A comma-separated --supersedes suppresses the pause on EVERY declared target.
+
+    Regression for the multi-value record fix: ``declared_targets`` is built from the
+    SPLIT slugs, not the raw comma-string — otherwise each target spuriously re-pauses
+    (the exact friction hit committing the Q3 4-supersede ADR).
+    """
+    config, m = ws
+    m.record_decision_entry("Axiom A.", "rej", ["s"], slug="prior-a")
+    m.record_decision_entry("Axiom B.", "rej", ["s"], slug="prior-b")
+    _arm(m, [{"slug": "prior-a", "score": 0.9}, {"slug": "prior-b", "score": 0.9}])
+    res = m.record_decision_entry("Unifying axiom.", "rej", ["s"], slug="unifier",
+                                  supersedes="prior-a, prior-b")
+    assert res["status"] == "created", res
+
+
+def test_multi_value_extra_relation_suppresses_pause_on_all_targets(ws):
+    """A comma-separated non-kill relation (--cites) likewise suppresses every target."""
+    config, m = ws
+    m.record_decision_entry("Axiom A.", "rej", ["s"], slug="cited-a")
+    m.record_decision_entry("Axiom B.", "rej", ["s"], slug="cited-b")
+    _arm(m, [{"slug": "cited-a", "score": 0.9}, {"slug": "cited-b", "score": 0.9}])
+    res = m.record_decision_entry("Citing axiom.", "rej", ["s"], slug="citer",
+                                  cites="cited-a, cited-b")
+    assert res["status"] == "created", res
+
+
 def test_below_threshold_commits(ws):
     config, m = ws
     m.record_decision_entry("Use SQLite for the store.", "rej", ["db"], slug="use-sqlite")

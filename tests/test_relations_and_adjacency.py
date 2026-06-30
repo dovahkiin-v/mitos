@@ -264,6 +264,62 @@ def test_multiple_relations_in_one_entry(ws):
     assert _edge(store, "hub", "amended", "amends")
 
 
+def test_supersedes_comma_separated_multi_target(ws):
+    """`record --supersedes "a, b"` supersedes BOTH priors in one entry (V1b comma multi-value).
+
+    The decisions.md format is comma-separated multi-valued; the agentic write path now
+    splits + validates each slug, so a single decision can retire several priors at once
+    (the path the Q3 4-supersede ADR needs).
+    """
+    config, m = ws
+    a = m.record_decision_entry("Axiom A.", "rej", [], slug="prior-a")
+    b = m.record_decision_entry("Axiom B.", "rej", [], slug="prior-b")
+    res = m.record_decision_entry("Unifying axiom.", "rej", [], slug="unifier",
+                                  supersedes="prior-a, prior-b")
+    assert res["status"] == "created", res
+    # Serialized comma-joined into the buffer (round-trips through the parser).
+    assert "**Supersedes:** prior-a, prior-b" in _read(config)
+    store = GraphStore(config.db_path)
+    assert _edge(store, "unifier", "prior-a", "supersedes")
+    assert _edge(store, "unifier", "prior-b", "supersedes")
+    # Both priors leave the active view (kill-edge) — computed 'superseded'.
+    assert store.get_node_state(a["id"]) == "superseded"
+    assert store.get_node_state(b["id"]) == "superseded"
+
+
+def test_extra_relation_comma_separated_multi_target(ws):
+    """A non-kill relation (`--cites "a, b"`) commits one edge per comma-separated slug."""
+    config, m = ws
+    for slug in ("cited-a", "cited-b"):
+        m.record_decision_entry(f"Axiom {slug}.", "rej", [], slug=slug)
+    res = m.record_decision_entry("Citer.", "rej", [], slug="citer",
+                                  cites="cited-a, cited-b")
+    assert res["status"] == "created", res
+    assert "**Cites:** cited-a, cited-b" in _read(config)
+    store = GraphStore(config.db_path)
+    assert _edge(store, "citer", "cited-a", "cites")
+    assert _edge(store, "citer", "cited-b", "cites")
+
+
+def test_multi_target_one_bad_slug_rolls_back(ws):
+    """A multi-value relation with one bad slug → error names the bad slug, buffer intact.
+
+    The buffer-first + rollback contract holds for the multi-value path: a miss on ANY
+    target writes nothing and supersedes neither prior.
+    """
+    config, m = ws
+    a = m.record_decision_entry("Axiom A.", "rej", [], slug="prior-a")
+    before = _read(config)
+    res = m.record_decision_entry("Unifier.", "rej", [], slug="unifier",
+                                  supersedes="prior-a, ghost-slug")
+    assert res["code"] == "supersedes_not_found", res
+    assert "ghost-slug" in res["error"]            # names the offending slug, not the whole list
+    assert _read(config) == before                 # buffer rolled back, byte-for-byte
+    store = GraphStore(config.db_path)
+    assert store.get_node_by_slug("unifier") is None   # no orphan entry
+    assert store.get_node_state(a["id"]) == "active"   # the good prior was NOT superseded
+
+
 def test_relation_target_not_found_buffer_unchanged(ws):
     """Unknown relation target → error, NOTHING written, buffer byte-for-byte intact.
 
@@ -374,6 +430,33 @@ def test_mcp_record_decision_with_relation(ws):
     assert res["status"] == "created"
     assert "**Depends-On:** mcp-target" in _read(config)
     assert _edge(GraphStore(config.db_path), "mcp-linker", "mcp-target", "depends_on")
+
+
+def test_cli_record_supersedes_comma_separated(ws):
+    """cmd_record threads a comma-separated --supersedes to both kill-edges (CLI surface)."""
+    config, _ = ws
+    cmd_record(config, axiom="A.", rejected="rej", slug="c-a")
+    cmd_record(config, axiom="B.", rejected="rej", slug="c-b")
+    cmd_record(config, axiom="Unifier.", rejected="rej", slug="c-unifier",
+               supersedes="c-a, c-b")
+    store = GraphStore(config.db_path)
+    assert _edge(store, "c-unifier", "c-a", "supersedes")
+    assert _edge(store, "c-unifier", "c-b", "supersedes")
+
+
+def test_mcp_record_decision_supersedes_comma_separated(ws):
+    """The MCP record_decision twin accepts a comma-separated supersedes (CLI⇄MCP parity)."""
+    config, _ = ws
+    with patch("mitos.mcp_server.MitosConfig", return_value=config):
+        from mitos.mcp_server import record_decision
+        json.loads(record_decision("A.", "rej", ["s"], slug="m-a"))
+        json.loads(record_decision("B.", "rej", ["s"], slug="m-b"))
+        res = json.loads(record_decision("Unifier.", "rej", ["s"], slug="m-unifier",
+                                         supersedes="m-a, m-b"))
+    assert res["status"] == "created", res
+    store = GraphStore(config.db_path)
+    assert _edge(store, "m-unifier", "m-a", "supersedes")
+    assert _edge(store, "m-unifier", "m-b", "supersedes")
 
 
 def test_mcp_record_decision_corrects_kill_edge(ws):
