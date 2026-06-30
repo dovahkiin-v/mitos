@@ -688,6 +688,66 @@ class GraphStore:
         finally:
             conn.close()
 
+    def resolve_handle(self, ident: str) -> Optional[Dict[str, Any]]:
+        """Resolves an identifier to a node state-agnostically (the ``show`` seam).
+
+        The single dereference primitive shared by ``mitos show`` (5a) and the MCP
+        ``show_node`` twin (5b): given a content-hash id or a slug, return the
+        reader-facing node dict for *any* computed state (active or superseded), so a
+        node that has been moved on from still answers to its own slug instead of
+        404-ing. Both surfaces call this one method, making their resolution parity
+        structural — they cannot drift.
+
+        **Precedence (exact — 5b reproduces it byte-for-byte):**
+
+        1. **Exact content-hash id** — ``get_node(ident)`` (state-agnostic id read).
+           Preserves ``show <id>`` for any node.
+        2. **Active-view slug** — ``get_node_by_slug(ident)`` (≤1 per casefolded slug,
+           MI-13). A reused slug always resolves to the *live* node.
+        3. **Most-recent node in the casefolded-slug lineage** — reached only when no
+           active node bears the slug, so it returns a superseded / corrected node.
+           Recency = ``created_at`` DESC, ``id`` ASC (the deterministic tie-break;
+           ``created_at`` is the app-supplied UTC-µs commit stamp, MI-10, and ISO-8601
+           sorts lexicographically == chronologically). The hydrated dict carries its
+           stamped modifier keys, so the caller renders it marked-superseded.
+        4. Else → ``None`` (genuine absence — a typo or an authored-but-unsynced draft).
+
+        The ``ValidationError`` that ``get_node_by_slug`` may raise on an MI-13 breach
+        is **not** caught here: a real breach is not "not found" — it propagates.
+
+        Args:
+            ident: A content-hash id or a slug (case-insensitive via ``str.casefold()``).
+
+        Returns:
+            The reader-facing node dict (any state, modifier-stamped), or ``None`` for
+            genuine absence.
+        """
+        # 1. Exact content-hash id (state-agnostic).
+        node = self.get_node(ident)
+        if node:
+            return node
+        # 2. Active-view slug — a reused slug resolves to the live node (lets a
+        #    ValidationError on an MI-13 breach propagate, never swallowed).
+        node = self.get_node_by_slug(ident)
+        if node:
+            return node
+        # 3. Most-recent node in the casefolded-slug lineage (only reached when no
+        #    active node bears the slug → a superseded / corrected node). Order in SQL
+        #    over the live table; the hydrated dict may not carry created_at.
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT id FROM nodes WHERE slug_casefold = ? "
+                "ORDER BY created_at DESC, id ASC LIMIT 1",
+                (ident.casefold(),),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row:
+            return self.get_node(row["id"])
+        # 4. Genuine absence.
+        return None
+
     # --- Phase 5d read-layer helpers (one alias map, one anti-join, one bulk -----
     # scope fetch, one bulk modifier stamp; shared by every public read method so
     # the reader-facing shape and the active-view definition can never drift).
