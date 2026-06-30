@@ -1089,14 +1089,13 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         results["open_questions"] = open_questions
 
     # Confidence signal — distinguish a settled precedent from loose neighbours / no
-    # match (AX P5). Shared policy with the MCP tool via mitos.recall.
-    scope_decision_count: Optional[int] = None
-    all_scopes: Optional[List[str]] = None
+    # match (AX P5). Shared policy with the MCP tool via mitos.recall. The live
+    # scope-count map (busiest-first) is the unused-scope oracle + did-you-mean / top-K
+    # source; calm-degrade to None on error.
+    scope_counts: Optional[Dict[str, Dict[str, int]]] = None
     if scope:
         try:
-            scope_decision_count = len(store.get_active_decisions(scope=scope))
-            if scope_decision_count == 0:
-                all_scopes = store.get_all_scopes()
+            scope_counts = order_scope_counts(store.get_scope_counts())
         except Exception:
             pass
     confidence, note = assess_surface_recall(
@@ -1104,8 +1103,8 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         top_score=top_score,
         result_count=len(results["active_decisions"]),
         scope=scope,
-        scope_decision_count=scope_decision_count,
-        all_scopes=all_scopes,
+        scope_counts=scope_counts,
+        surface="cli",
     )
     if confidence is not None:
         results["confidence"] = confidence
