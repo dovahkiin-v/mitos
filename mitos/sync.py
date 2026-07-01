@@ -979,63 +979,90 @@ class MitosSyncManager:
         import uuid
         drainer_id = f"drainer-{uuid.uuid4()}"
 
+        printed_header = False
+        total_drained = 0
         try:
-            # Claim up to 10 pending embeddings atomically
-            pending = self.store.claim_pending_embeddings(drainer_id, limit=10)
-        except Exception as e:
-            print(f"[Warning] Failed to claim outbox queue: {str(e)}")
-            return
-
-        if not pending:
-            return
-
-        print(f"Draining pending embeddings queue ({len(pending)} items) ...")
-        
-        try:
-            for item in pending:
-                node_id = item["node_id"]
-
-                # Fetch node details from graph for Qdrant payload
-                node = self.store.get_node(node_id)
-                if not node:
-                    # Node has been deleted from graph; remove from queue
-                    try:
-                        self.store.remove_pending_embedding(node_id)
-                    except Exception:
-                        pass
-                    continue
-
-                # Re-derive the embedding text from the node's immutable core (the
-                # Outbox row no longer carries it — C2/M8); byte-identical to what the
-                # inline record-time embed used for the same node.
-                embed_text = _embedding_input_text(
-                    kind=node["kind"], axiom=node.get("core_axiom"),
-                    topic=node.get("topic"), questions_raised=node.get("questions_raised"),
-                )
-
-                payload = {
-                    "slug": node["slug"],
-                    "scope": node["scope"],
-                    "state": "active",
-                    "kind": node["kind"],
-                    "embedding_text": embed_text
-                }
-
+            # Drain the outbox in claim-batches until it is EMPTY. A single call must
+            # not stop after one `limit`-sized batch: a corpus with more than `limit`
+            # unembedded nodes — the common state right after `mitos rebuild`/`cutover`,
+            # which re-seed the outbox with the whole active set — would otherwise be
+            # left with `vectors < nodes` until the operator happened to run `sync`
+            # again (the documented single-`sync` re-embed silently under-delivering).
+            #
+            # Progress guard: a batch that resolves ZERO rows (every claimed row errored
+            # — e.g. an embedding-provider 429/outage) breaks the loop rather than
+            # re-claiming the same failing rows forever. Those rows keep their
+            # incremented `retry_count` and drain on a later sync — fail-fast in
+            # aggregate: one outage costs one batch of attempts, not a hot spin. An
+            # orphan row (node gone from the graph) counts as resolved (it LEAVES the
+            # outbox), so a batch of orphans still makes progress and the loop continues.
+            while True:
                 try:
-                    # 1. Fetch embedding vector
-                    vector = self.embed_provider.get_embedding(embed_text, is_query=False)
-                    # 2. Upsert to Qdrant
-                    self.vector_store.upsert(node_id, vector, payload)
-                    # 3. Clean up queue row on success
-                    self.store.remove_pending_embedding(node_id)
-                    print(f"Successfully drained embedding for '{node['slug']}' ✓")
+                    pending = self.store.claim_pending_embeddings(drainer_id, limit=10)
                 except Exception as e:
-                    # Increment retry count on failure (which also releases this row)
+                    print(f"[Warning] Failed to claim outbox queue: {str(e)}")
+                    return
+
+                if not pending:
+                    break
+
+                if not printed_header:
+                    print("Draining pending embeddings queue ...")
+                    printed_header = True
+
+                batch_resolved = 0  # rows that LEFT the outbox this batch (embedded or orphan-pruned)
+                for item in pending:
+                    node_id = item["node_id"]
+
+                    # Fetch node details from graph for Qdrant payload
+                    node = self.store.get_node(node_id)
+                    if not node:
+                        # Node has been deleted from graph; remove from queue
+                        try:
+                            self.store.remove_pending_embedding(node_id)
+                            batch_resolved += 1
+                        except Exception:
+                            pass
+                        continue
+
+                    # Re-derive the embedding text from the node's immutable core (the
+                    # Outbox row no longer carries it — C2/M8); byte-identical to what the
+                    # inline record-time embed used for the same node.
+                    embed_text = _embedding_input_text(
+                        kind=node["kind"], axiom=node.get("core_axiom"),
+                        topic=node.get("topic"), questions_raised=node.get("questions_raised"),
+                    )
+
+                    payload = {
+                        "slug": node["slug"],
+                        "scope": node["scope"],
+                        "state": "active",
+                        "kind": node["kind"],
+                        "embedding_text": embed_text
+                    }
+
                     try:
-                        self.store.increment_pending_attempts(node_id)
-                    except Exception:
-                        pass
-                    print(f"[Warning] Failed to drain embedding for '{node['slug']}': {str(e)}")
+                        # 1. Fetch embedding vector
+                        vector = self.embed_provider.get_embedding(embed_text, is_query=False)
+                        # 2. Upsert to Qdrant
+                        self.vector_store.upsert(node_id, vector, payload)
+                        # 3. Clean up queue row on success
+                        self.store.remove_pending_embedding(node_id)
+                        batch_resolved += 1
+                        total_drained += 1
+                        print(f"Successfully drained embedding for '{node['slug']}' ✓")
+                    except Exception as e:
+                        # Increment retry count on failure (which also releases this row)
+                        try:
+                            self.store.increment_pending_attempts(node_id)
+                        except Exception:
+                            pass
+                        print(f"[Warning] Failed to drain embedding for '{node['slug']}': {str(e)}")
+
+                # Nothing left the outbox this batch — every claimed row errored (a
+                # dead/erroring provider). Stop; re-claiming would return the same rows.
+                if batch_resolved == 0:
+                    break
         finally:
             # Clean up: release any remaining locks held by this specific drainer
             try:
