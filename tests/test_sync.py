@@ -296,6 +296,76 @@ def test_sync_outbox_drain_single_writer_semantics(sync_env: Tuple[MitosConfig, 
     assert "embedding_text" not in everyone[0]
 
 
+def test_sync_outbox_drain_loops_past_batch_limit(sync_env: Tuple[MitosConfig, MitosSyncManager, str]) -> None:
+    """A single drain empties an outbox larger than the claim batch (>10).
+
+    Regression: ``claim_pending_embeddings`` bounds each claim to ``limit=10`` and the
+    drain used to run exactly once, so a corpus with >10 pending nodes — the state
+    right after ``mitos rebuild``/``cutover`` re-seed the whole active set — was left
+    with ``vectors < nodes`` until ``sync`` happened to run again (the documented
+    single-``sync`` re-embed silently under-delivering). The drain now loops until the
+    outbox is empty.
+    """
+    config, manager, tmpdir = sync_env
+    store = GraphStore(config.db_path)
+
+    # Commit 15 nodes (> the 10-row claim batch); each commit enqueues its outbox row.
+    n = 15
+    for i in range(n):
+        e = ParsedEntry("decision", f"drain-{i:02d}", 1, 5)
+        e.axiom = f"Axiom {i}"
+        e.rejected_paths = "None."
+        d = store.commit_parsed_entry(e)
+        store.add_pending_embedding(d.node_id)
+    assert len(store.get_pending_embeddings()) == n
+
+    # Hermetic embedding deps (see test_sync_outbox_queue_and_drain).
+    manager.embed_provider = MagicMock()
+    manager.embed_provider.get_embedding = MagicMock(return_value=[0.1, 0.2, 0.3])
+    manager.vector_store = MagicMock()
+    manager.vector_store.upsert = MagicMock()
+
+    # One drain call must fully empty the outbox — not just the first batch of 10.
+    manager.drain_pending_embeddings()
+
+    assert len(store.get_pending_embeddings()) == 0
+    assert manager.vector_store.upsert.call_count == n
+
+
+def test_sync_outbox_drain_stops_on_total_failure(sync_env: Tuple[MitosConfig, MitosSyncManager, str]) -> None:
+    """The drain loop's progress guard: a fully-erroring provider terminates, not spins.
+
+    When every claimed row errors on upsert (an embedding-provider outage), the batch
+    resolves zero rows; re-claiming would return the same rows forever, so the loop
+    breaks after one batch. The rows stay in the outbox (retry_count incremented) to
+    drain on a later sync — fail-fast in aggregate: one outage costs one batch of
+    attempts, not a hot spin.
+    """
+    config, manager, tmpdir = sync_env
+    store = GraphStore(config.db_path)
+
+    n = 15
+    for i in range(n):
+        e = ParsedEntry("decision", f"fail-{i:02d}", 1, 5)
+        e.axiom = f"Axiom {i}"
+        e.rejected_paths = "None."
+        d = store.commit_parsed_entry(e)
+        store.add_pending_embedding(d.node_id)
+
+    manager.embed_provider = MagicMock()
+    manager.embed_provider.get_embedding = MagicMock(return_value=[0.1, 0.2, 0.3])
+    manager.vector_store = MagicMock()
+    manager.vector_store.upsert = MagicMock(side_effect=Exception("Qdrant down"))
+
+    # Must return (not hang). Only the first batch is attempted, then the guard breaks.
+    manager.drain_pending_embeddings()
+
+    # Nothing drained; the loop tried exactly one claim batch (<= the limit of 10)
+    # rather than re-claiming the same failing rows.
+    assert len(store.get_pending_embeddings()) == n
+    assert manager.vector_store.upsert.call_count <= 10
+
+
 def test_sync_auto_heal_sample_block(sync_env: Tuple[MitosConfig, MitosSyncManager, str]) -> None:
     """Verifies that the decisions.md header and sample format block are auto-restored if modified or missing."""
     config, manager, tmpdir = sync_env

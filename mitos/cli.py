@@ -1692,6 +1692,24 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
         print(f"      ({q['points']} vector(s) indexed)")
     if graph_nodes is not None:
         print(f"  • graph holds {graph_nodes} node(s)")
+    # Vector-completeness check: every graph node should carry a vector (superseded
+    # nodes stay indexed too), so a healthy corpus has `points == graph_nodes`. A
+    # shortfall means the embedding outbox has not fully drained — a past provider
+    # outage, or the state right after a `rebuild`/`cutover` (or a Qdrant wipe) —
+    # and every unembedded node is invisible to semantic surface/query. Surface it
+    # loudly so `vectors < nodes` never hides behind a green READY ✓ (informational —
+    # not a readiness blocker; it clears on the next `mitos sync`).
+    if (
+        q["reachable"] and q["collection_exists"]
+        and q["points"] is not None and graph_nodes is not None
+        and q["points"] < graph_nodes
+    ):
+        print(
+            f"\n  ⚠ vector index incomplete — {q['points']} vector(s) for "
+            f"{graph_nodes} node(s); the {graph_nodes - q['points']} unembedded "
+            f"node(s) are invisible to semantic surface/query. Re-run `mitos sync` "
+            f"until vectors == nodes (informational — not a readiness blocker)."
+        )
     if overflows:
         _print_overflow_detail(overflows)
     if graph_behind:

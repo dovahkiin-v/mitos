@@ -108,3 +108,41 @@ def test_status_reports_scope_overflow_detail(tmp_path, monkeypatch, capsys):
     assert len(over) == 1
     assert over[0]["threshold_chars"] == 200
     assert over[0]["top_decisions"][0]["slug"] == "big-axiom"
+
+
+def _commit_n(tmp_path, n):
+    from mitos.store import GraphStore
+    from mitos.parser import ParsedEntry
+    store = GraphStore(MitosConfig(str(tmp_path)).db_path)
+    for i in range(n):
+        e = ParsedEntry("decision", f"node-{i:02d}", 1, 5)
+        e.axiom = f"Axiom {i}"
+        e.rejected_paths = "n/a"
+        store.commit_parsed_entry(e)
+
+
+def test_status_warns_when_vectors_incomplete(tmp_path, monkeypatch, capsys):
+    """`vectors < nodes` (a partly-drained outbox) surfaces a loud ⚠, not a silent
+    READY ✓ — the outbox-drain shortfall must never hide behind green status."""
+    _init(tmp_path)
+    capsys.readouterr()  # discard cmd_init's message
+    monkeypatch.setenv("GEMINI_API_KEY", "testkey")
+    _commit_n(tmp_path, 3)
+    monkeypatch.setattr(cli, "_check_qdrant", _qdrant(True, True, points=1))  # 1 vector < 3 nodes
+
+    assert cli.cmd_status(str(tmp_path)) == 0  # informational — NOT a readiness blocker
+    out = capsys.readouterr().out
+    assert "vector index incomplete" in out
+    assert "2 unembedded" in out  # 3 nodes - 1 vector
+
+
+def test_status_silent_when_vectors_complete(tmp_path, monkeypatch, capsys):
+    """No warning when every node has a vector (`points == nodes`) — no false alarm."""
+    _init(tmp_path)
+    capsys.readouterr()
+    monkeypatch.setenv("GEMINI_API_KEY", "testkey")
+    _commit_n(tmp_path, 3)
+    monkeypatch.setattr(cli, "_check_qdrant", _qdrant(True, True, points=3))  # complete
+
+    assert cli.cmd_status(str(tmp_path)) == 0
+    assert "vector index incomplete" not in capsys.readouterr().out
