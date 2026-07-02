@@ -3,18 +3,27 @@
     "harbor-storage-is-sqlite": {
       "id": "031f7eb70553044daf35f5ffcb0dd300bc3f1f7f1f751e61e007a37dabc4050f",
       "state": "active",
+      "scope": [
+        "storage"
+      ],
       "modifiers": {},
       "lineage": []
     },
     "harbor-blobs-on-s3": {
       "id": "d20a3d9cc3efe874f42dc0883adbdd8fc16690485ae6b2b48401b6e779b48b82",
       "state": "active",
+      "scope": [
+        "storage"
+      ],
       "modifiers": {},
       "lineage": []
     },
     "harbor-auth-jwt-v1": {
       "id": "7d2c6fd078288d3c9c04b6e64ee5de3a0ada3d9948e7a444282d1c7e70314be4",
       "state": "superseded",
+      "scope": [
+        "auth"
+      ],
       "modifiers": {
         "superseded_by": [
           "harbor-auth-jwt-v2"
@@ -25,6 +34,9 @@
     "harbor-auth-jwt-v2": {
       "id": "fe76a6d4df0a8d87b05267880540c645aa6afc1fa98043d854bb40f77cfb0670",
       "state": "superseded",
+      "scope": [
+        "auth"
+      ],
       "modifiers": {
         "superseded_by": [
           "harbor-auth-sessions-v3"
@@ -37,6 +49,9 @@
     "harbor-auth-sessions-v3": {
       "id": "8105167afaa1179615e8a59f253f5d6ddc2060564c011b57ecfb687ad88f1ac6",
       "state": "active",
+      "scope": [
+        "auth"
+      ],
       "modifiers": {},
       "lineage": [
         "harbor-auth-jwt-v1",
@@ -46,6 +61,9 @@
     "harbor-blob-encryption-at-rest": {
       "id": "2fa6c80e9ebe6c7944965af2c450dae5731b46dd84d80b30b54aa67e90bdf173",
       "state": "active",
+      "scope": [
+        "storage"
+      ],
       "modifiers": {
         "amended_by": [
           "harbor-blob-key-rotation-quarterly"
@@ -56,6 +74,9 @@
     "harbor-blob-key-rotation-quarterly": {
       "id": "603843b54c0e6025bdcf31a9e0791230420e06bbed4a6b0baa7d4a55fceefc3e",
       "state": "active",
+      "scope": [
+        "storage"
+      ],
       "modifiers": {},
       "lineage": [
         "harbor-blob-encryption-at-rest"
@@ -64,6 +85,9 @@
     "harbor-api-rate-limit": {
       "id": "40fd45e1feee3f76227e82081fb301a2224befe054f22283685320191f69e223",
       "state": "active",
+      "scope": [
+        "api"
+      ],
       "modifiers": {
         "narrowed_by": [
           "harbor-premium-exempt-rate-limit"
@@ -74,6 +98,9 @@
     "harbor-premium-exempt-rate-limit": {
       "id": "caacb2955500bd6189ac921852c5d8e5fd12186b3173ae80c32108eed50ee1e1",
       "state": "active",
+      "scope": [
+        "api"
+      ],
       "modifiers": {},
       "lineage": [
         "harbor-api-rate-limit"
@@ -82,6 +109,9 @@
     "harbor-legacy-ftp-gateway": {
       "id": "ab1861d7e62f670d4b8bb8217ce53f9371666ff1e67261cba8e103f58ae17079",
       "state": "corrected",
+      "scope": [
+        "api"
+      ],
       "modifiers": {
         "corrected_by": [
           "harbor-drop-ftp-gateway"
@@ -92,18 +122,268 @@
     "harbor-drop-ftp-gateway": {
       "id": "6193348911908c8f0d78749d981b7f945ad06ec7d3d05ad8e51838fa9bff1b8e",
       "state": "active",
+      "scope": [
+        "api"
+      ],
+      "modifiers": {},
+      "lineage": []
+    },
+    "harbor-all-endpoints-authenticated": {
+      "id": "c2004c8ab6a56c1a0b05c53ff9c8b50e42dd13c7e8638a05d77031d59b2d2fab",
+      "state": "active",
+      "scope": [],
+      "modifiers": {
+        "narrowed_by": [
+          "harbor-health-endpoint-public"
+        ]
+      },
+      "lineage": []
+    },
+    "harbor-health-endpoint-public": {
+      "id": "2fa3a29b1625b66fb39ac9f7d3f5ea63278e10e9cfc811bb7b15129ce8427968",
+      "state": "active",
+      "scope": [
+        "api"
+      ],
+      "modifiers": {},
+      "lineage": [
+        "harbor-all-endpoints-authenticated"
+      ]
+    },
+    "harbor-api-versioning": {
+      "id": "2256398196cc05fb4e0cfb594e1c30bff4eedc467656c1b382d7f06646ebb1e6",
+      "state": "active",
+      "scope": [
+        "api"
+      ],
+      "modifiers": {},
+      "lineage": []
+    },
+    "harbor-webhook-delivery": {
+      "id": "52136625e8eeb3dcdc2c9f8400da44625587b9802bbaa711e811002442e3f097",
+      "state": "active",
+      "scope": [
+        "api"
+      ],
+      "modifiers": {},
+      "lineage": []
+    },
+    "harbor-structured-logging": {
+      "id": "be643fb8f2ab4b920e9e86d9f665de751df91807c08b73531e2c4c9a7ca523f4",
+      "state": "active",
+      "scope": [
+        "observability"
+      ],
+      "modifiers": {
+        "amended_by": [
+          "harbor-observability-otel"
+        ]
+      },
+      "lineage": []
+    },
+    "harbor-prometheus-metrics": {
+      "id": "e7f4c9d59cd389c38d68718d0e25d1de22ec44afccb6e90a32ec7d8cc2c1782a",
+      "state": "active",
+      "scope": [
+        "observability"
+      ],
+      "modifiers": {
+        "amended_by": [
+          "harbor-observability-otel"
+        ]
+      },
+      "lineage": []
+    },
+    "harbor-observability-otel": {
+      "id": "d9eede3cd1e4014718c218560ff9e9aca19a5cbddf16a853ea6cdf2ea47ed525",
+      "state": "active",
+      "scope": [
+        "observability"
+      ],
+      "modifiers": {},
+      "lineage": [
+        "harbor-prometheus-metrics",
+        "harbor-structured-logging"
+      ]
+    },
+    "harbor-sync-last-write-wins": {
+      "id": "42c4d47f2cfb5e35a12b075c48c10b735e577f09e88869afc357acacba243728",
+      "state": "active",
+      "scope": [
+        "sync"
+      ],
+      "modifiers": {},
+      "lineage": []
+    },
+    "harbor-sync-crdt-merge": {
+      "id": "93f519b9f18f2dcc7caa4aecc0efd0c8f07a490884ce8b13a1f8feee0c8d1219",
+      "state": "active",
+      "scope": [
+        "sync"
+      ],
+      "modifiers": {},
+      "lineage": []
+    },
+    "harbor-delete-is-soft-30d": {
+      "id": "e2c6e69e168350112a93e7a74a994c4f8c33ce3e5bfd3929bab520f0ba481f38",
+      "state": "active",
+      "scope": [
+        "storage"
+      ],
+      "modifiers": {},
+      "lineage": []
+    },
+    "harbor-delete-is-immediate-hard": {
+      "id": "a42c35518652475fa813de0c0caa4d1ae36d36b2fbfcacd8a59bce82b6878a44",
+      "state": "active",
+      "scope": [
+        "storage"
+      ],
+      "modifiers": {},
+      "lineage": []
+    },
+    "harbor-config-yaml": {
+      "id": "555b9c11f624db35cd1438bc933160a651467db3e0d3ee854f6565546ed71fd6",
+      "state": "active",
+      "scope": [
+        "api"
+      ],
+      "modifiers": {},
+      "lineage": []
+    },
+    "harbor-config-yaml-strict-schema": {
+      "id": "ae8c9a007b5bc204c6a0ad318800b647c4105d7893ac884c83dbac5d0f64c69f",
+      "state": "active",
+      "scope": [
+        "api"
+      ],
+      "modifiers": {},
+      "lineage": []
+    },
+    "harbor-no-global-mutable-state": {
+      "id": "f5867142fdf3c9460453745e347e4815f675c6c1f562b7e05cfd8f921ec2780a",
+      "state": "active",
+      "scope": [
+        "architecture"
+      ],
+      "modifiers": {},
+      "lineage": []
+    },
+    "harbor-cache-is-process-singleton": {
+      "id": "b336128f978de2e87b7e6106fe0374ba68e360ef3fc5ba57e705a2b12f6ced09",
+      "state": "active",
+      "scope": [
+        "performance"
+      ],
+      "modifiers": {},
+      "lineage": []
+    },
+    "harbor-duomenu-saugojimas-lietuvoje": {
+      "id": "45296a8eebb8f90dcb6dc2264957e13315eadd85be9374a9c2388aee58ffc045",
+      "state": "active",
+      "scope": [
+        "compliance"
+      ],
+      "modifiers": {},
+      "lineage": []
+    },
+    "harbor-duomenys-gali-buti-es": {
+      "id": "844063fba6b5a7a5279264159dd2967ec4958b73c4d1d6684dd6bf0829ba9d45",
+      "state": "active",
+      "scope": [
+        "compliance"
+      ],
       "modifiers": {},
       "lineage": []
     }
   },
+  "edges": [
+    [
+      "harbor-api-versioning",
+      "cites",
+      "harbor-storage-is-sqlite"
+    ],
+    [
+      "harbor-api-versioning",
+      "depends_on",
+      "harbor-auth-sessions-v3"
+    ],
+    [
+      "harbor-auth-jwt-v2",
+      "supersedes",
+      "harbor-auth-jwt-v1"
+    ],
+    [
+      "harbor-auth-sessions-v3",
+      "supersedes",
+      "harbor-auth-jwt-v2"
+    ],
+    [
+      "harbor-blob-key-rotation-quarterly",
+      "amends",
+      "harbor-blob-encryption-at-rest"
+    ],
+    [
+      "harbor-drop-ftp-gateway",
+      "corrects",
+      "harbor-legacy-ftp-gateway"
+    ],
+    [
+      "harbor-health-endpoint-public",
+      "narrows",
+      "harbor-all-endpoints-authenticated"
+    ],
+    [
+      "harbor-observability-otel",
+      "amends",
+      "harbor-prometheus-metrics"
+    ],
+    [
+      "harbor-observability-otel",
+      "amends",
+      "harbor-structured-logging"
+    ],
+    [
+      "harbor-premium-exempt-rate-limit",
+      "narrows",
+      "harbor-api-rate-limit"
+    ],
+    [
+      "harbor-sync-crdt-merge",
+      "contradicts",
+      "harbor-sync-last-write-wins"
+    ],
+    [
+      "harbor-webhook-delivery",
+      "cites",
+      "harbor-api-versioning"
+    ]
+  ],
   "active_view": [
+    "harbor-all-endpoints-authenticated",
     "harbor-api-rate-limit",
+    "harbor-api-versioning",
     "harbor-auth-sessions-v3",
     "harbor-blob-encryption-at-rest",
     "harbor-blob-key-rotation-quarterly",
     "harbor-blobs-on-s3",
+    "harbor-cache-is-process-singleton",
+    "harbor-config-yaml",
+    "harbor-config-yaml-strict-schema",
+    "harbor-delete-is-immediate-hard",
+    "harbor-delete-is-soft-30d",
     "harbor-drop-ftp-gateway",
+    "harbor-duomenu-saugojimas-lietuvoje",
+    "harbor-duomenys-gali-buti-es",
+    "harbor-health-endpoint-public",
+    "harbor-no-global-mutable-state",
+    "harbor-observability-otel",
     "harbor-premium-exempt-rate-limit",
-    "harbor-storage-is-sqlite"
+    "harbor-prometheus-metrics",
+    "harbor-storage-is-sqlite",
+    "harbor-structured-logging",
+    "harbor-sync-crdt-merge",
+    "harbor-sync-last-write-wins",
+    "harbor-webhook-delivery"
   ]
 }

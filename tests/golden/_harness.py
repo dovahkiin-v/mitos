@@ -53,16 +53,28 @@ def snapshot(store: GraphStore) -> Dict[str, Any]:
         A dict with per-node state/modifiers/lineage/id and the sorted active view.
     """
     nodes: Dict[str, Any] = {}
+    id_to_slug: Dict[str, str] = {}
+    for node in store.get_all_nodes():
+        id_to_slug[node["id"]] = node["slug"]
     for node in store.get_all_nodes():
         nid = node["id"]
         nodes[node["slug"]] = {
             "id": nid,
             "state": store.get_node_state(nid),
+            "scope": sorted(node.get("scope") or []),
             "modifiers": store.get_modifiers(nid),
             "lineage": [n.get("slug") for n in store.get_lineage(nid)],
         }
+    # Typed edge set, id→slug mapped and sorted; created_at is dropped (it is a
+    # non-deterministic application-supplied timestamp, MI-10).
+    edges = sorted(
+        [id_to_slug.get(e["source_id"], e["source_id"]),
+         e["edge_type"],
+         id_to_slug.get(e["target_id"], e["target_id"])]
+        for e in store.get_edges()
+    )
     active_view = sorted(d["slug"] for d in store.get_active_decisions())
-    return {"nodes": nodes, "active_view": active_view}
+    return {"nodes": nodes, "edges": edges, "active_view": active_view}
 
 
 def build_snapshot_in_tmp() -> Dict[str, Any]:
