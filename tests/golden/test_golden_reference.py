@@ -13,8 +13,33 @@ Regenerate the oracle after an INTENTIONAL corpus change (review the diff!):
 import os
 import sys
 
+import pytest
+
+from mitos.errors import CommitError
+from mitos.parser import parse_entry_stream
+from mitos.store import GraphStore
+
 sys.path.insert(0, os.path.dirname(__file__))
 from _harness import build_reference_graph, build_snapshot_in_tmp, load_oracle, snapshot  # noqa: E402
+
+
+def _commit_all(store, text, kind="decision"):
+    for entry in parse_entry_stream(text, kind):
+        store.commit_parsed_entry(entry)
+
+
+def _expect_rejection(tmp_path, text, code, pre=None):
+    """Commits `pre` (if any), then `text`; asserts a CommitError with FailureItem `code`."""
+    store = GraphStore(str(tmp_path / "graph.sqlite"))
+    if pre:
+        _commit_all(store, pre)
+    with pytest.raises(CommitError) as exc:
+        _commit_all(store, text)
+    codes = [it.code for it in exc.value.failure.items]
+    assert code in codes, f"expected {code}, got {codes}"
+
+
+_HDR = "#\n<!-- DO NOT MODIFY ABOVE THIS LINE -->\n<!-- BEGIN ENTRIES -->\n"
 
 
 def test_reference_snapshot_matches_oracle(tmp_path):
@@ -101,9 +126,45 @@ def test_non_kill_edges_and_scope_semantics(tmp_path):
     assert ["harbor-api-versioning", "depends_on", "harbor-auth-sessions-v3"] in edges
 
 
+def test_cross_kind_resolves_and_oq_state(tmp_path):
+    """OQ Stage-2 state: an OQ is 'resolved' iff a `resolves` edge points at it from an
+    active decision; otherwise 'parked'. This is derived by oq_state_view, separate from
+    node liveness (get_node_state)."""
+    store = build_reference_graph(str(tmp_path / "graph.sqlite"))
+    snap = snapshot(store)
+
+    assert snap["oq_state"]["oq-harbor-backup-cadence"] == "resolved"
+    assert snap["oq_state"]["oq-harbor-multiregion"] == "parked"
+    assert ["harbor-backup-nightly", "resolves", "oq-harbor-backup-cadence"] in snap["edges"]
+    # The resolving decision is an ordinary active decision.
+    assert snap["nodes"]["harbor-backup-nightly"]["state"] == "active"
+
+
 def test_non_ascii_axiom_round_trips(tmp_path):
     """P9 language sovereignty: a Lithuanian axiom parses, commits, and hashes intact."""
     store = build_reference_graph(str(tmp_path / "graph.sqlite"))
     node = store.get_node_by_slug("harbor-duomenu-saugojimas-lietuvoje")
     assert node is not None
     assert "Lietuvoje" in node["core_axiom"]  # non-ASCII content preserved verbatim
+
+
+# --- Cluster 8: adversarial — the write path must REJECT these (commit-layer) ---
+
+def test_reject_dangling_edge_to_uncommitted_target(tmp_path):
+    """An edge to a target not yet in the graph is rejected (missing_target): edges point
+    newer→older, so the cited entry must already exist. Guards the acyclic newer→older
+    ordering the graph depends on."""
+    text = (
+        _HDR
+        + "### harbor-bad-b\n**Decided:** B.\n**Rejected:** n/a.\n**Depends-On:** harbor-bad-a\n"
+        + "### harbor-bad-a\n**Decided:** A.\n**Rejected:** n/a.\n**Depends-On:** harbor-bad-b\n"
+    )
+    _expect_rejection(tmp_path, text, "missing_target")
+
+
+def test_reject_cross_kind_resolves(tmp_path):
+    """`resolves` is decision→open_question only; pointing it at a decision is rejected
+    (kind_constraint_violation)."""
+    pre = _HDR + "### harbor-target-decision\n**Decided:** A.\n**Rejected:** n/a.\n"
+    bad = _HDR + "### harbor-bad-resolver\n**Decided:** X.\n**Rejected:** n/a.\n**Resolves:** harbor-target-decision\n"
+    _expect_rejection(tmp_path, bad, "kind_constraint_violation", pre=pre)

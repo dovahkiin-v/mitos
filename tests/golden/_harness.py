@@ -16,6 +16,7 @@ from mitos.store import GraphStore
 
 GOLDEN_DIR = os.path.dirname(__file__)
 CORPUS_PATH = os.path.join(GOLDEN_DIR, "decisions.reference.md")
+QUESTIONS_PATH = os.path.join(GOLDEN_DIR, "questions.reference.md")
 ORACLE_PATH = os.path.join(GOLDEN_DIR, "oracle.reference.json")
 
 
@@ -32,12 +33,23 @@ def build_reference_graph(db_path: str) -> GraphStore:
     Returns:
         The populated GraphStore.
     """
-    text = open(CORPUS_PATH, encoding="utf-8").read()
+    store = GraphStore(db_path)
     failures: List[Any] = []
+
+    # Open questions commit FIRST so a decision's cross-kind `resolves` edge
+    # (decision→open_question) finds its target already in the graph.
+    if os.path.exists(QUESTIONS_PATH):
+        qtext = open(QUESTIONS_PATH, encoding="utf-8").read()
+        oqs = parse_entry_stream(qtext, "open_question", failures=failures)
+        if failures:
+            raise AssertionError(f"reference questions failed to parse cleanly: {failures}")
+        for oq in reversed(oqs):  # oldest-first
+            store.commit_parsed_entry(oq)
+
+    text = open(CORPUS_PATH, encoding="utf-8").read()
     entries = parse_entry_stream(text, "decision", failures=failures)
     if failures:
         raise AssertionError(f"reference corpus failed to parse cleanly: {failures}")
-    store = GraphStore(db_path)
     for entry in reversed(entries):  # oldest-first
         store.commit_parsed_entry(entry)
     return store
@@ -74,7 +86,11 @@ def snapshot(store: GraphStore) -> Dict[str, Any]:
         for e in store.get_edges()
     )
     active_view = sorted(d["slug"] for d in store.get_active_decisions())
-    return {"nodes": nodes, "edges": edges, "active_view": active_view}
+    # OQ Stage-2 state (parked/resolved) is derived separately from node liveness:
+    # get_open_questions IS the oq_state_view (resolved iff a `resolves` edge points
+    # from a still-active decision). Distinct from get_node_state (node-level).
+    oq_state = {oq["slug"]: oq["state"] for oq in store.get_open_questions()}
+    return {"nodes": nodes, "edges": edges, "active_view": active_view, "oq_state": oq_state}
 
 
 def build_snapshot_in_tmp() -> Dict[str, Any]:
