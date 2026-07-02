@@ -130,6 +130,23 @@ class GraphStoreProtocol(Protocol):
         """
         ...
 
+    def get_node_state(self, node_id: str) -> str:
+        """Computes one node's state from its incoming kill-edge (the M3 active view).
+
+        Returns ``active`` / ``superseded`` / ``corrected`` / ``drifted`` (the latter
+        reserved in v0.1). An absent node defaults to ``active`` (defensive) — every
+        live caller resolves the node first, so the absent branch never fires in
+        practice. The Conflict candidate stage (2a) injects the store via this
+        protocol and calls this for the M3 source-of-truth state re-verify.
+
+        Args:
+            node_id: The content-hash id of the node to derive state for.
+
+        Returns:
+            The computed state string.
+        """
+        ...
+
     def write_signal(self, node_id: str, stype: str, source: Optional[str] = None) -> None:
         """Writes a signal row (drifted, source_reencounter).
 

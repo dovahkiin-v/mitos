@@ -38,16 +38,47 @@ def test_similarity_floor_is_present_numeric_and_in_unit_range() -> None:
     assert 0.0 < floor < 1.0
 
 
-def test_module_exposes_only_the_five_constants() -> None:
-    """No stray names leak from the leaf — exactly the five catalog constants."""
+def test_module_exposes_the_five_constants_and_the_2a_pipeline_symbols() -> None:
+    """The five §8 constants plus the 2a candidate-gathering surface are all present.
+
+    Before 2a this was ``exposes_only_the_five_constants`` (exact-set equality). 2a
+    added the first pipeline stage, so the leaf is no longer constants-only and the
+    exact-set form is retired (it would only chase leaf-safe stdlib imports on every
+    refactor — the real "no heavy dep leaks" guard is the subprocess test below).
+    This now pins the *intended* public API: the five catalog constants (unchanged)
+    plus the 2a over-fetch dial, stage entry point, and three shared types. 3b extends
+    this set (the judgment call); update it there, and never hide a symbol to pass it.
+    """
     public = {name for name in vars(conflict) if not name.startswith("__")}
-    assert public == {
+    expected_api = {
+        # The five §8 constants (still exactly these — pinned by value below / above).
         "CONFLICT_SURFACE_THRESHOLD",
         "CONFLICT_TOP_K",
         "CONFLICT_JUDGMENT_TEMPERATURE",
         "CONFLICT_LLM_TIMEOUT_S",
         "CONFLICT_SIMILARITY_FLOOR",
+        # The 2a candidate-gathering surface.
+        "CONFLICT_OVERFETCH_LIMIT",
+        "gather_candidates",
+        "Candidate",
+        "Unavailable",
+        "ConflictUnavailableReason",
     }
+    missing = expected_api - public
+    assert not missing, f"conflict.py is missing intended public symbols: {sorted(missing)}"
+
+
+def test_overfetch_limit_is_a_bounded_margin_above_top_k() -> None:
+    """The 2a over-fetch dial is a single bounded window wider than the final top-K.
+
+    CONF-D3/D7: the raw KNN window must exceed CONFLICT_TOP_K so S3's non-live drops
+    and 2b's declared/own-slug drops cannot shadow an undeclared neighbour out of the
+    final batch. Pinned as an int strictly greater than TOP_K (not the exact value —
+    it is an operational tuning dial, like a config knob, not a calibrated constant).
+    """
+    limit = conflict.CONFLICT_OVERFETCH_LIMIT
+    assert isinstance(limit, int) and not isinstance(limit, bool)
+    assert limit > conflict.CONFLICT_TOP_K
 
 
 # ---------------------------------------------------------------------------
