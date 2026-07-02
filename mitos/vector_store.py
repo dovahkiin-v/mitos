@@ -23,6 +23,61 @@ def hash_to_uuid(sha256_hex: str) -> str:
     return f"{sha[:8]}-{sha[8:12]}-{sha[12:16]}-{sha[16:20]}-{sha[20:32]}"
 
 
+def scroll_point_ids(base_url: str, collection: str, page_size: int = 256) -> Set[str]:
+    """Enumerates every point id in a collection via a no-create paginated scroll.
+
+    A module-level read path that talks to Qdrant directly without constructing a
+    :class:`QdrantVectorStore` — so it NEVER triggers ``_ensure_collection`` and
+    NEVER creates a missing collection. This is what a read-only probe (e.g.
+    ``mitos status``) must use to diff the graph against Qdrant's actual points
+    without mutating the collection as a side effect. Payloads and vectors are
+    excluded from the response to keep each page cheap; the scan is bounded to one
+    pass over the collection (no per-node existence probes).
+
+    Args:
+        base_url: The Qdrant base URL (trailing slash tolerated).
+        collection: The collection name to scroll.
+        page_size: Maximum points fetched per scroll page.
+
+    Returns:
+        The set of point-id strings (the ``hash_to_uuid`` UUIDs) in the collection.
+
+    Raises:
+        VectorStoreError: If Qdrant is unreachable or returns a non-200 status.
+    """
+    scroll_url = f"{base_url.rstrip('/')}/collections/{collection}/points/scroll"
+    ids: Set[str] = set()
+    offset: Any = None
+    try:
+        while True:
+            body: Dict[str, Any] = {
+                "limit": page_size,
+                "with_payload": False,
+                "with_vector": False,
+            }
+            if offset is not None:
+                body["offset"] = offset
+            resp = requests.post(
+                scroll_url,
+                json=body,
+                headers={"Content-Type": "application/json"},
+                timeout=5,
+            )
+            if resp.status_code != 200:
+                raise VectorStoreError(f"Qdrant scroll failed: {resp.text}")
+
+            result = resp.json().get("result", {}) or {}
+            for point in result.get("points", []):
+                ids.add(str(point["id"]))
+
+            offset = result.get("next_page_offset")
+            if offset is None:
+                break
+        return ids
+    except requests.RequestException as e:
+        raise VectorStoreError(f"Qdrant scroll connection error: {str(e)}")
+
+
 class QdrantVectorStore:
     """REST client for Qdrant vector store managing points and semantic queries."""
 
@@ -161,10 +216,9 @@ class QdrantVectorStore:
     def list_point_ids(self, page_size: int = 256) -> Set[str]:
         """Lists every point id currently in the collection via a paginated scroll.
 
-        Enumerates the collection's actual point ids in one bounded scan (no
-        per-node existence probes), so a caller can diff the graph's node set
-        against what Qdrant really holds. Payloads and vectors are excluded from
-        the response to keep each page cheap.
+        A thin instance-bound delegate to :func:`scroll_point_ids` (the no-create
+        read path), kept so callers holding a store instance need not thread the
+        URL + collection by hand.
 
         Args:
             page_size: Maximum points fetched per scroll page.
@@ -175,37 +229,7 @@ class QdrantVectorStore:
         Raises:
             VectorStoreError: If Qdrant is unreachable or returns a non-200 status.
         """
-        scroll_url = f"{self.base_url}/collections/{self.collection}/points/scroll"
-        ids: Set[str] = set()
-        offset: Any = None
-        try:
-            while True:
-                body: Dict[str, Any] = {
-                    "limit": page_size,
-                    "with_payload": False,
-                    "with_vector": False,
-                }
-                if offset is not None:
-                    body["offset"] = offset
-                resp = requests.post(
-                    scroll_url,
-                    json=body,
-                    headers={"Content-Type": "application/json"},
-                    timeout=5,
-                )
-                if resp.status_code != 200:
-                    raise VectorStoreError(f"Qdrant scroll failed: {resp.text}")
-
-                result = resp.json().get("result", {}) or {}
-                for point in result.get("points", []):
-                    ids.add(str(point["id"]))
-
-                offset = result.get("next_page_offset")
-                if offset is None:
-                    break
-            return ids
-        except requests.RequestException as e:
-            raise VectorStoreError(f"Qdrant scroll connection error: {str(e)}")
+        return scroll_point_ids(self.base_url, self.collection, page_size=page_size)
 
     def delete_point(self, point_id: str) -> None:
         """Deletes a point from Qdrant by its SHA-256 node ID."""

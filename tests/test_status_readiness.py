@@ -19,6 +19,27 @@ def _qdrant(reachable, collection_exists, points=None):
     }
 
 
+def _scroll(present_uuids):
+    """Returns a no-create scroll stub reporting a fixed point-id set."""
+    return lambda base_url, collection, page_size=256: set(present_uuids)
+
+
+def _scroll_fails():
+    """Returns a scroll stub that raises, simulating an unreachable Qdrant mid-scroll."""
+    from mitos.errors import VectorStoreError
+
+    def _raise(base_url, collection, page_size=256):
+        raise VectorStoreError("Qdrant scroll connection error")
+
+    return _raise
+
+
+def _uuids(ids):
+    """Maps node ids to their Qdrant point-id UUIDs."""
+    from mitos.vector_store import hash_to_uuid
+    return {hash_to_uuid(i) for i in ids}
+
+
 def test_fresh_project_ready_without_collection(tmp_path, monkeypatch):
     _init(tmp_path)
     monkeypatch.setenv("GEMINI_API_KEY", "testkey")
@@ -30,6 +51,7 @@ def test_ready_with_existing_collection(tmp_path, monkeypatch):
     _init(tmp_path)
     monkeypatch.setenv("GEMINI_API_KEY", "testkey")
     monkeypatch.setattr(cli, "_check_qdrant", _qdrant(True, True, points=3))
+    monkeypatch.setattr(cli, "scroll_point_ids", _scroll(set()))  # no committed nodes → nothing to verify
     assert cli.cmd_status(str(tmp_path)) == 0
 
 
@@ -50,6 +72,7 @@ def test_not_ready_when_key_missing(tmp_path, monkeypatch):
     _init(tmp_path)
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)  # no key anywhere (XDG is tmp/empty)
     monkeypatch.setattr(cli, "_check_qdrant", _qdrant(True, True, points=1))
+    monkeypatch.setattr(cli, "scroll_point_ids", _scroll(set()))
     assert cli.cmd_status(str(tmp_path)) == 1
 
 
@@ -80,6 +103,7 @@ def test_status_reports_scope_overflow_detail(tmp_path, monkeypatch, capsys):
     capsys.readouterr()  # discard cmd_init's message
     monkeypatch.setenv("GEMINI_API_KEY", "testkey")
     monkeypatch.setattr(cli, "_check_qdrant", _qdrant(True, True, points=1))
+    monkeypatch.setattr(cli, "scroll_point_ids", _scroll(set()))  # completeness is not this test's concern
     monkeypatch.setattr(R, "SCOPE_OVERFLOW_WARN_CHARS", 200)  # cross a small ceiling cheaply
 
     config = MitosConfig(str(tmp_path))
@@ -111,45 +135,21 @@ def test_status_reports_scope_overflow_detail(tmp_path, monkeypatch, capsys):
 
 
 def _commit_n(tmp_path, n):
+    """Commits n active decisions; returns their node ids in order."""
     from mitos.store import GraphStore
     from mitos.parser import ParsedEntry
     store = GraphStore(MitosConfig(str(tmp_path)).db_path)
+    ids = []
     for i in range(n):
         e = ParsedEntry("decision", f"node-{i:02d}", 1, 5)
         e.axiom = f"Axiom {i}"
         e.rejected_paths = "n/a"
-        store.commit_parsed_entry(e)
-
-
-def test_status_warns_when_vectors_incomplete(tmp_path, monkeypatch, capsys):
-    """`vectors < nodes` (a partly-drained outbox) surfaces a loud ⚠, not a silent
-    READY ✓ — the outbox-drain shortfall must never hide behind green status."""
-    _init(tmp_path)
-    capsys.readouterr()  # discard cmd_init's message
-    monkeypatch.setenv("GEMINI_API_KEY", "testkey")
-    _commit_n(tmp_path, 3)
-    monkeypatch.setattr(cli, "_check_qdrant", _qdrant(True, True, points=1))  # 1 vector < 3 nodes
-
-    assert cli.cmd_status(str(tmp_path)) == 0  # informational — NOT a readiness blocker
-    out = capsys.readouterr().out
-    assert "vector index incomplete" in out
-    assert "2 unembedded" in out  # 3 nodes - 1 vector
-
-
-def test_status_silent_when_vectors_complete(tmp_path, monkeypatch, capsys):
-    """No warning when every node has a vector (`points == nodes`) — no false alarm."""
-    _init(tmp_path)
-    capsys.readouterr()
-    monkeypatch.setenv("GEMINI_API_KEY", "testkey")
-    _commit_n(tmp_path, 3)
-    monkeypatch.setattr(cli, "_check_qdrant", _qdrant(True, True, points=3))  # complete
-
-    assert cli.cmd_status(str(tmp_path)) == 0
-    assert "vector index incomplete" not in capsys.readouterr().out
+        ids.append(store.commit_parsed_entry(e).node_id)
+    return ids
 
 
 def _commit_active_and_superseded(tmp_path):
-    """Commits 2 active decisions + 1 superseded (3 graph nodes, 2 active)."""
+    """Commits 2 active decisions + 1 superseded; returns (keep_id, old_id, new_id)."""
     from mitos.store import GraphStore
     from mitos.parser import ParsedEntry
     store = GraphStore(MitosConfig(str(tmp_path)).db_path)
@@ -160,39 +160,128 @@ def _commit_active_and_superseded(tmp_path):
         e.rejected_paths = "n/a"
         if supersedes:
             e.supersedes = supersedes
-        store.commit_parsed_entry(e)
+        return store.commit_parsed_entry(e).node_id
 
-    _d("keep-me", "Live axiom.")
-    _d("old-one", "Doomed axiom.")
-    _d("new-one", "Replacement axiom.", supersedes=["old-one"])  # supersedes old-one
+    keep_id = _d("keep-me", "Live axiom.")
+    old_id = _d("old-one", "Doomed axiom.")
+    new_id = _d("new-one", "Replacement axiom.", supersedes=["old-one"])
+    return keep_id, old_id, new_id
 
 
-def test_status_completeness_keys_on_active_not_all_nodes(tmp_path, monkeypatch, capsys):
-    """The corrected invariant: `points == active` is healthy even when superseded nodes
-    inflate the all-nodes count. Superseded nodes are NOT re-embedded (they are filtered
-    from retrieval via has_id), so keying the warning on all-nodes would false-alarm."""
+def test_status_warns_by_id_diff_even_when_count_looks_healthy(tmp_path, monkeypatch, capsys):
+    """The incident shape: the point COUNT clears the active count (graveyard slack), yet
+    an active node has no vector. The id-diff catches it where `points >= active` couldn't."""
     _init(tmp_path)
     capsys.readouterr()
     monkeypatch.setenv("GEMINI_API_KEY", "testkey")
-    _commit_active_and_superseded(tmp_path)  # 3 graph nodes, 2 active
-    monkeypatch.setattr(cli, "_check_qdrant", _qdrant(True, True, points=2))  # == active count
+    ids = _commit_n(tmp_path, 3)
+    # Qdrant holds 2 of the 3 active nodes + 2 graveyard points → 4 points >= 3 active,
+    # so the old count proxy would read HEALTHY, but node-02 is genuinely missing.
+    present = _uuids(ids[:2]) | {"graveyard-a", "graveyard-b"}
+    monkeypatch.setattr(cli, "_check_qdrant", _qdrant(True, True, points=len(present)))
+    monkeypatch.setattr(cli, "scroll_point_ids", _scroll(present))
+
+    assert cli.cmd_status(str(tmp_path)) == 0  # informational — NOT a readiness blocker
+    out = capsys.readouterr().out
+    assert "vector index incomplete" in out
+    assert "1 active node(s) have no vector" in out
+    assert "node-02" in out  # names the missing slug at small N
+    assert "mitos reconcile" in out
+
+
+def test_status_silent_when_all_active_present(tmp_path, monkeypatch, capsys):
+    """No warning when every active node has a vector — even with graveyard points around."""
+    _init(tmp_path)
+    capsys.readouterr()
+    monkeypatch.setenv("GEMINI_API_KEY", "testkey")
+    ids = _commit_n(tmp_path, 3)
+    monkeypatch.setattr(cli, "_check_qdrant", _qdrant(True, True, points=3))
+    monkeypatch.setattr(cli, "scroll_point_ids", _scroll(_uuids(ids)))
+
+    assert cli.cmd_status(str(tmp_path)) == 0
+    assert "vector index incomplete" not in capsys.readouterr().out
+
+
+def test_status_active_only_superseded_absence_is_not_missing(tmp_path, monkeypatch, capsys):
+    """A superseded node absent from Qdrant is NOT a shortfall — the id-diff targets the
+    active surface only (proving the check honors the active-only invariant, not all-nodes)."""
+    _init(tmp_path)
+    capsys.readouterr()
+    monkeypatch.setenv("GEMINI_API_KEY", "testkey")
+    keep_id, old_id, new_id = _commit_active_and_superseded(tmp_path)  # 3 nodes, 2 active
+    # Qdrant holds only the two ACTIVE nodes; the superseded old-one has no vector.
+    monkeypatch.setattr(cli, "_check_qdrant", _qdrant(True, True, points=2))
+    monkeypatch.setattr(cli, "scroll_point_ids", _scroll(_uuids([keep_id, new_id])))
 
     assert cli.cmd_status(str(tmp_path)) == 0
     out = capsys.readouterr().out
     assert "graph holds 3 node(s)" in out  # all-nodes count still reported informationally
-    assert "vector index incomplete" not in out  # but completeness keys on active (2 == 2)
+    assert "vector index incomplete" not in out  # both active nodes present → healthy
 
 
-def test_status_warns_when_active_vectors_missing(tmp_path, monkeypatch, capsys):
-    """`points < active` still warns, counting only the unembedded ACTIVE nodes."""
+def test_status_orphan_points_reported_as_info_not_warning(tmp_path, monkeypatch, capsys):
+    """Graveyard points (vector present, node inactive) are reported neutrally, never warned —
+    they are the all-superseded blackout vector's substrate."""
     _init(tmp_path)
     capsys.readouterr()
     monkeypatch.setenv("GEMINI_API_KEY", "testkey")
-    _commit_active_and_superseded(tmp_path)  # 2 active
-    monkeypatch.setattr(cli, "_check_qdrant", _qdrant(True, True, points=1))  # 1 < 2 active
+    ids = _commit_n(tmp_path, 2)
+    present = _uuids(ids) | {"graveyard-x", "graveyard-y", "graveyard-z"}  # 3 orphans
+    monkeypatch.setattr(cli, "_check_qdrant", _qdrant(True, True, points=len(present)))
+    monkeypatch.setattr(cli, "scroll_point_ids", _scroll(present))
 
     assert cli.cmd_status(str(tmp_path)) == 0
     out = capsys.readouterr().out
-    assert "vector index incomplete" in out
-    assert "1 unembedded" in out  # 2 active - 1 vector
-    assert "mitos reconcile" in out  # the heal is surfaced
+    assert "vector index incomplete" not in out  # every active node has a vector
+    assert "3 graveyard point(s)" in out
+    assert "not an error" in out  # reported neutrally, not as a warning
+
+
+def test_status_degrades_when_scroll_fails(tmp_path, monkeypatch, capsys):
+    """A scroll failure surfaces 'could not verify' — never a silent fallback to the count."""
+    _init(tmp_path)
+    capsys.readouterr()
+    monkeypatch.setenv("GEMINI_API_KEY", "testkey")
+    _commit_n(tmp_path, 3)
+    monkeypatch.setattr(cli, "_check_qdrant", _qdrant(True, True, points=99))  # count would look fine
+    monkeypatch.setattr(cli, "scroll_point_ids", _scroll_fails())
+
+    assert cli.cmd_status(str(tmp_path)) == 0  # still not a readiness blocker
+    out = capsys.readouterr().out
+    assert "could not verify vector completeness" in out
+    assert "vector index incomplete" not in out  # no fabricated verdict
+
+
+def test_status_json_carries_missing_and_orphans(tmp_path, monkeypatch, capsys):
+    """The JSON surface carries the real missing-active count/slugs and orphan count."""
+    _init(tmp_path)
+    capsys.readouterr()
+    monkeypatch.setenv("GEMINI_API_KEY", "testkey")
+    ids = _commit_n(tmp_path, 3)
+    present = _uuids(ids[:2]) | {"graveyard-a"}  # node-02 missing, 1 orphan
+    monkeypatch.setattr(cli, "_check_qdrant", _qdrant(True, True, points=len(present)))
+    monkeypatch.setattr(cli, "scroll_point_ids", _scroll(present))
+
+    assert cli.cmd_status(str(tmp_path), as_json=True) == 0
+    data = json.loads(capsys.readouterr().out)
+    checks = data["checks"]
+    assert checks["missing_active_vectors"] == 1
+    assert checks["missing_active_slugs"] == ["node-02"]
+    assert checks["orphan_points"] == 1
+    assert checks["active_nodes"] == 3
+
+
+def test_status_json_null_missing_when_scroll_fails(tmp_path, monkeypatch, capsys):
+    """Scroll failure → JSON reports null (unknown), never 0 (which would read 'complete')."""
+    _init(tmp_path)
+    capsys.readouterr()
+    monkeypatch.setenv("GEMINI_API_KEY", "testkey")
+    _commit_n(tmp_path, 2)
+    monkeypatch.setattr(cli, "_check_qdrant", _qdrant(True, True, points=2))
+    monkeypatch.setattr(cli, "scroll_point_ids", _scroll_fails())
+
+    assert cli.cmd_status(str(tmp_path), as_json=True) == 0
+    checks = json.loads(capsys.readouterr().out)["checks"]
+    assert checks["missing_active_vectors"] is None
+    assert checks["missing_active_slugs"] is None
+    assert checks["orphan_points"] is None

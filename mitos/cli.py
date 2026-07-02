@@ -12,7 +12,7 @@ import time
 import json
 import hashlib
 import argparse
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Set
 from google import genai
 
 from mitos import __version__
@@ -35,6 +35,7 @@ from mitos.config import (
     hint_due,
 )
 from mitos.errors import MitosError, ParseError, ValidationError, DatabaseError, ConfigError, VectorStoreError
+from mitos.vector_store import scroll_point_ids, hash_to_uuid
 from mitos.migrations import is_pre_v1a_schema
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS, open_connection
 from mitos.cutover import default_aside_db_path, perform_swap, rebuild_and_gate
@@ -1639,6 +1640,8 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
 
     graph_nodes = None
     active_nodes = None
+    active_ids: Set[str] = set()
+    id_to_slug: Dict[str, str] = {}
     # Read-only size-ceiling report for the generated context files. This is the
     # health surface the write-path overflow nudge points at — the detailed breakdown
     # (which files, which decisions to re-scope) lives here, not on every `record`.
@@ -1647,12 +1650,45 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
     if os.path.exists(config.db_path) and not pre_v1a:
         try:
             ro_store = GraphStore(config.db_path, read_only=True)
-            graph_nodes = len(ro_store.get_all_nodes())
-            active_nodes = len(ro_store.get_active_node_ids())
+            all_nodes = ro_store.get_all_nodes()
+            graph_nodes = len(all_nodes)
+            id_to_slug = {n["id"]: n["slug"] for n in all_nodes}
+            active_ids = ro_store.get_active_node_ids()
+            active_nodes = len(active_ids)
             overflows = overflow_report(ro_store)
         except Exception:
             pass  # both reads are best-effort; a failure leaves the safe defaults
         graph_behind = _graph_behind_buffer(config.db_path)
+
+    # Vector-index completeness by EXACT id-diff, not a count proxy. `mitos status`
+    # is the SENSOR (reconcile is the heal), so it must catch a shortfall the count
+    # `points >= active` structurally can't — dead-vector slack in the graveyard
+    # (superseded vectors that linger, never GC'd) inflates the point total past the
+    # active threshold and hides genuinely-missing active vectors (the live-corpus
+    # incident: 181 >= 178 read healthy over 12 invisible active nodes). We scroll
+    # Qdrant's actual point ids via the NO-CREATE read path (never constructing a
+    # store that would `_ensure_collection` a missing collection) and diff.
+    #
+    # `missing_active` = active nodes with no vector (invisible to semantic search —
+    #   the warned state). `orphan_points` = points with no active node — the
+    #   graveyard substrate the all-superseded blackout vector consumes, per
+    #   graveyard-vectors-now-consumed-by-blackout-best-effort: reported neutrally,
+    #   never a warning, never deleted here. `None` means "could not verify" (scroll
+    #   failed) — distinct from `0` ("verified complete"); we never fall back to the
+    #   count proxy we just declared structurally blind.
+    missing_active_slugs: Optional[List[str]] = None
+    orphan_points: Optional[int] = None
+    if q["reachable"] and q["collection_exists"] and active_nodes is not None:
+        try:
+            present = scroll_point_ids(config.qdrant_url, config.qdrant_collection)
+            missing_active_slugs = sorted(
+                id_to_slug.get(nid, nid) for nid in active_ids if hash_to_uuid(nid) not in present
+            )
+            active_uuids = {hash_to_uuid(nid) for nid in active_ids}
+            orphan_points = len(present - active_uuids)
+        except VectorStoreError:
+            missing_active_slugs = None  # unknown — do not fabricate "complete"
+            orphan_points = None
 
     initialized = mitos_dir_ok and decisions_ok
     # A fresh, initialized project has NO Qdrant collection yet — it auto-creates
@@ -1681,6 +1717,11 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
                 "collection_points": q["points"],
                 "graph_nodes": graph_nodes,
                 "active_nodes": active_nodes,
+                "missing_active_vectors": (
+                    None if missing_active_slugs is None else len(missing_active_slugs)
+                ),
+                "missing_active_slugs": missing_active_slugs,
+                "orphan_points": orphan_points,
                 "mcp_wired": mcp_wired,
             },
             "graph_behind_buffer": graph_behind,
@@ -1734,27 +1775,39 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
         print(f"      ({q['points']} vector(s) indexed)")
     if graph_nodes is not None:
         print(f"  • graph holds {graph_nodes} node(s)")
-    # Vector-completeness check: every ACTIVE node should carry a vector, so a
-    # healthy corpus has `points >= active_nodes` (dead/superseded nodes are NOT
-    # re-embedded — retrieval filters them via has_id and never returns them; see
-    # cutover-bounds-embedding-seed-to-active). A shortfall means the outbox has
-    # not fully drained — a past provider outage, or the state right after a
-    # `rebuild`/`cutover` — or Qdrant was wiped directly and the outbox is now
-    # empty, so `sync` has nothing to drain. Every unembedded active node is
-    # invisible to semantic surface/query. Surface it loudly so `points < active`
-    # never hides behind a green READY ✓ (informational — not a readiness blocker).
-    if (
-        q["reachable"] and q["collection_exists"]
-        and q["points"] is not None and active_nodes is not None
-        and q["points"] < active_nodes
-    ):
-        print(
-            f"\n  ⚠ vector index incomplete — {q['points']} vector(s) for "
-            f"{active_nodes} active node(s); the {active_nodes - q['points']} unembedded "
-            f"node(s) are invisible to semantic surface/query. Run `mitos reconcile` "
-            f"to re-embed the missing active nodes (or `mitos sync` if the outbox is "
-            f"non-empty) — informational, not a readiness blocker."
-        )
+    # Vector-completeness verdict from the exact id-diff computed above (not a
+    # count). Three outcomes:
+    #   • scroll failed (missing_active_slugs is None) → we could not verify; say so
+    #     and never fall back to the count proxy (structurally blind, per
+    #     status-vector-completeness-by-id-diff-not-count-proxy).
+    #   • missing_active_slugs non-empty → the warned state: active nodes with no
+    #     vector, invisible to semantic surface/query (names slugs at small N).
+    #   • empty → verified complete; stay quiet.
+    # Orphan (graveyard) points are reported neutrally, never as a warning — they
+    # are the blackout vector's substrate (graveyard-vectors-now-consumed-by-blackout).
+    if q["reachable"] and q["collection_exists"] and active_nodes is not None:
+        if missing_active_slugs is None:
+            print(
+                "\n  ⚠ could not verify vector completeness — Qdrant scroll failed; "
+                "run `mitos status` again when Qdrant is reachable."
+            )
+        elif missing_active_slugs:
+            n = len(missing_active_slugs)
+            print(
+                f"\n  ⚠ vector index incomplete — {n} active node(s) have no vector "
+                f"and are invisible to semantic surface/query. Run `mitos reconcile` "
+                f"to re-embed them (or `mitos sync` if the outbox is non-empty) — "
+                f"informational, not a readiness blocker."
+            )
+            if n <= 5:
+                for slug in missing_active_slugs:
+                    print(f"      • {slug}")
+        if orphan_points:
+            print(
+                f"  • {orphan_points} graveyard point(s) belong to inactive/removed "
+                f"nodes — retained (they power all-superseded blackout recovery), "
+                f"not an error."
+            )
     if overflows:
         _print_overflow_detail(overflows)
     if graph_behind:
