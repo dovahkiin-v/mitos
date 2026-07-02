@@ -28,6 +28,12 @@ def _commit_all(store, text, kind="decision"):
         store.commit_parsed_entry(entry)
 
 
+def _write(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+
+
 def _expect_rejection(tmp_path, text, code, pre=None):
     """Commits `pre` (if any), then `text`; asserts a CommitError with FailureItem `code`."""
     store = GraphStore(str(tmp_path / "graph.sqlite"))
@@ -168,3 +174,48 @@ def test_reject_cross_kind_resolves(tmp_path):
     pre = _HDR + "### harbor-target-decision\n**Decided:** A.\n**Rejected:** n/a.\n"
     bad = _HDR + "### harbor-bad-resolver\n**Decided:** X.\n**Rejected:** n/a.\n**Resolves:** harbor-target-decision\n"
     _expect_rejection(tmp_path, bad, "kind_constraint_violation", pre=pre)
+
+
+# --- Polish: every read surface stamps modifiers; the real rebuild reproduces the golden ---
+
+def test_all_read_surfaces_stamp_modifiers(tmp_path):
+    """CLAUDE.md rule: every decision-read surface stamps modifiers. An amended/narrowed-
+    but-active node must carry its stamp through get_node_by_slug, get_active_decisions,
+    get_decisions, and the Letter-mode query_letter alike — no surface reads it as final."""
+    store = build_reference_graph(str(tmp_path / "graph.sqlite"))
+    cases = [
+        ("harbor-blob-encryption-at-rest", "amended_by", ["harbor-blob-key-rotation-quarterly"]),
+        ("harbor-api-rate-limit", "narrowed_by", ["harbor-premium-exempt-rate-limit"]),
+        ("harbor-all-endpoints-authenticated", "narrowed_by", ["harbor-health-endpoint-public"]),
+    ]
+    for slug, key, expected in cases:
+        surfaces = {
+            "get_node_by_slug": store.get_node_by_slug(slug),
+            "get_active_decisions": next(d for d in store.get_active_decisions() if d["slug"] == slug),
+            "get_decisions": next(d for d in store.get_decisions() if d["slug"] == slug),
+            "query_letter": store.query_letter(slug=slug)[0],
+        }
+        for name, payload in surfaces.items():
+            assert payload.get(key) == expected, f"{name} did not stamp {key} on {slug}: {payload.get(key)}"
+
+
+def test_real_rebuild_reproduces_the_golden(tmp_path):
+    """`mitos rebuild` — the real oldest-first replay + forward-ref fixpoint — reproduces
+    the golden graph exactly (content-hash ids, state, edges, active view, OQ state). This
+    cross-validates the harness's linear commit order AND pins rebuild determinism: a change
+    that silently reshaped a rebuilt corpus would fail here."""
+    from mitos.config import MitosConfig
+    from mitos.cutover import default_aside_db_path, rebuild_and_gate
+
+    from _harness import CORPUS_PATH, QUESTIONS_PATH, load_oracle
+
+    config = MitosConfig(str(tmp_path))
+    os.makedirs(config.mitos_dir, exist_ok=True)
+    _write(config.decisions_file, open(CORPUS_PATH, encoding="utf-8").read())
+    _write(config.questions_file, open(QUESTIONS_PATH, encoding="utf-8").read())
+
+    result = rebuild_and_gate(config, aside_db_path=default_aside_db_path(config), strict=False)
+    assert result.residual_casualties == []
+
+    store = GraphStore(result.aside_db_path, read_only=True)
+    assert snapshot(store) == load_oracle()
