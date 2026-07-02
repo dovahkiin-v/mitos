@@ -1,5 +1,23 @@
 {
   "nodes": {
+    "oq-harbor-backup-cadence": {
+      "id": "5cd37d3d1b4cc1c16600e344991132a7ca772162f1305d77983896899c443ede",
+      "state": "active",
+      "scope": [
+        "storage"
+      ],
+      "modifiers": {},
+      "lineage": []
+    },
+    "oq-harbor-multiregion": {
+      "id": "692d05109dcb40914f4fe1f9c11a4e5575f2626827934a4642b004727fa09c6d",
+      "state": "active",
+      "scope": [
+        "storage"
+      ],
+      "modifiers": {},
+      "lineage": []
+    },
     "harbor-storage-is-sqlite": {
       "id": "031f7eb70553044daf35f5ffcb0dd300bc3f1f7f1f751e61e007a37dabc4050f",
       "state": "active",
@@ -295,6 +313,15 @@
       ],
       "modifiers": {},
       "lineage": []
+    },
+    "harbor-backup-nightly": {
+      "id": "427c16f4cc1373012cf23088fb7a71b43209a2fbfd4b32bf4a73a73b16283afb",
+      "state": "active",
+      "scope": [
+        "storage"
+      ],
+      "modifiers": {},
+      "lineage": []
     }
   },
   "edges": [
@@ -317,6 +344,11 @@
       "harbor-auth-sessions-v3",
       "supersedes",
       "harbor-auth-jwt-v2"
+    ],
+    [
+      "harbor-backup-nightly",
+      "resolves",
+      "oq-harbor-backup-cadence"
     ],
     [
       "harbor-blob-key-rotation-quarterly",
@@ -364,6 +396,7 @@
     "harbor-api-rate-limit",
     "harbor-api-versioning",
     "harbor-auth-sessions-v3",
+    "harbor-backup-nightly",
     "harbor-blob-encryption-at-rest",
     "harbor-blob-key-rotation-quarterly",
     "harbor-blobs-on-s3",
@@ -385,5 +418,9 @@
     "harbor-sync-crdt-merge",
     "harbor-sync-last-write-wins",
     "harbor-webhook-delivery"
-  ]
+  ],
+  "oq_state": {
+    "oq-harbor-backup-cadence": "resolved",
+    "oq-harbor-multiregion": "parked"
+  }
 }

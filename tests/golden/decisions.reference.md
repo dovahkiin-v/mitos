@@ -8,6 +8,12 @@
 
 <!-- BEGIN ENTRIES — newest first -->
 
+### harbor-backup-nightly
+**Decided:** Harbor backs up the metadata database nightly and retains 14 days of history.
+**Rejected:** Continuous backup — operational cost unjustified at pilot scale.
+**Scope:** storage
+**Resolves:** oq-harbor-backup-cadence
+
 ### harbor-duomenys-gali-buti-es
 **Decided:** Harbor gali saugoti naudotojų duomenis bet kurioje Europos Sąjungos šalyje esančiuose serveriuose.
 **Rejected:** Tik Lietuva — brangesnė infrastruktūra ir prastesnis vėlavimas kitų ES šalių naudotojams.
