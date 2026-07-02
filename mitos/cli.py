@@ -1678,6 +1678,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
     #   count proxy we just declared structurally blind.
     missing_active_slugs: Optional[List[str]] = None
     orphan_points: Optional[int] = None
+    scroll_failed = False
     if q["reachable"] and q["collection_exists"] and active_nodes is not None:
         try:
             present = scroll_point_ids(config.qdrant_url, config.qdrant_collection)
@@ -1687,8 +1688,15 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
             active_uuids = {hash_to_uuid(nid) for nid in active_ids}
             orphan_points = len(present - active_uuids)
         except VectorStoreError:
-            missing_active_slugs = None  # unknown — do not fabricate "complete"
-            orphan_points = None
+            scroll_failed = True  # unknown — do not fabricate "complete"
+    elif q["reachable"] and not q["collection_exists"] and active_ids:
+        # Collection deleted OUTRIGHT (not just its points) while the graph holds
+        # active nodes — the whole active surface is missing (the diff against an
+        # empty collection). This is a full wipe, NOT the healthy fresh-project empty
+        # state; absence of the collection must not read as calm health next to a
+        # populated graph. `mitos reconcile` re-creates the collection and re-embeds.
+        missing_active_slugs = sorted(id_to_slug.get(nid, nid) for nid in active_ids)
+        orphan_points = 0
 
     initialized = mitos_dir_ok and decisions_ok
     # A fresh, initialized project has NO Qdrant collection yet — it auto-creates
@@ -1740,6 +1748,14 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
         coll_mark, coll_hint = None, "needs Qdrant up (see above)"
     elif q["collection_exists"]:
         coll_mark, coll_hint = True, None
+    elif active_ids:
+        # Absent collection but a populated graph = a full wipe, not a fresh project.
+        # Say so accurately rather than the calm "none recorded yet" (the warning
+        # below carries the detail); still neutral, never a readiness ✗.
+        coll_mark, coll_hint = (
+            None,
+            f"missing — {len(active_ids)} active node(s) have no vectors; run `mitos reconcile`",
+        )
     else:
         coll_mark, coll_hint = None, "auto-created on first record — none recorded yet"
     checks = [
@@ -1785,29 +1801,31 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
     #   • empty → verified complete; stay quiet.
     # Orphan (graveyard) points are reported neutrally, never as a warning — they
     # are the blackout vector's substrate (graveyard-vectors-now-consumed-by-blackout).
-    if q["reachable"] and q["collection_exists"] and active_nodes is not None:
-        if missing_active_slugs is None:
-            print(
-                "\n  ⚠ could not verify vector completeness — Qdrant scroll failed; "
-                "run `mitos status` again when Qdrant is reachable."
-            )
-        elif missing_active_slugs:
-            n = len(missing_active_slugs)
-            print(
-                f"\n  ⚠ vector index incomplete — {n} active node(s) have no vector "
-                f"and are invisible to semantic surface/query. Run `mitos reconcile` "
-                f"to re-embed them (or `mitos sync` if the outbox is non-empty) — "
-                f"informational, not a readiness blocker."
-            )
-            if n <= 5:
-                for slug in missing_active_slugs:
-                    print(f"      • {slug}")
-        if orphan_points:
-            print(
-                f"  • {orphan_points} graveyard point(s) belong to inactive/removed "
-                f"nodes — retained (they power all-superseded blackout recovery), "
-                f"not an error."
-            )
+    # Each branch is self-guarding on the diff outcome above — no collection_exists
+    # gate here, so a full collection wipe with a populated graph (which sets
+    # missing_active_slugs to the whole active set) warns just like a points wipe.
+    if scroll_failed:
+        print(
+            "\n  ⚠ could not verify vector completeness — Qdrant scroll failed; "
+            "run `mitos status` again when Qdrant is reachable."
+        )
+    elif missing_active_slugs:
+        n = len(missing_active_slugs)
+        print(
+            f"\n  ⚠ vector index incomplete — {n} active node(s) have no vector "
+            f"and are invisible to semantic surface/query. Run `mitos reconcile` "
+            f"to re-embed them (or `mitos sync` if the outbox is non-empty) — "
+            f"informational, not a readiness blocker."
+        )
+        if n <= 5:
+            for slug in missing_active_slugs:
+                print(f"      • {slug}")
+    if orphan_points:
+        print(
+            f"  • {orphan_points} graveyard point(s) belong to inactive/removed "
+            f"nodes — retained (they power all-superseded blackout recovery), "
+            f"not an error."
+        )
     if overflows:
         _print_overflow_detail(overflows)
     if graph_behind:
