@@ -68,3 +68,8 @@ ROADMAP.md
 # AX feedback from the vision loop's Claude — raw dev input, not for the public repo
 AX_FEEDBACK.md
 RESOLVED_AX_FEEDBACK.md
+
+# Layer-B semantic eval — per-run metrics reports + the model-keyed embed cache.
+# Only tests/golden/baseline.metrics.json is committed (the reviewed baseline).
+tests/golden/reports/
+tests/golden/.cache/
