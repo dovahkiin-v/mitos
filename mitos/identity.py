@@ -61,6 +61,14 @@ import string
 import unicodedata
 from typing import Dict, List, Mapping, Optional
 
+# The slug is the permanent citation handle (M3 active-slug uniqueness; folded into
+# the decision's identity, V1-D2), so an over-length slug is never silently truncated
+# — it is rejected at every write path. Home here (the identity leaf) so the parser,
+# the store's commit fence, and the record write path share one source of truth
+# without a dependency-tier inversion. The MCP `record_decision` slug docstring
+# carries this number as a literal — update it (mcp_server.py) if this changes.
+SLUG_MAX_LEN = 100
+
 # Maximal run of ASCII whitespace OR ASCII punctuation -> a single hyphen. The
 # ``re.ASCII`` flag restricts ``\s`` to ASCII whitespace ([ \t\n\r\f\v]) so the
 # fold is ASCII-only by design (V1-D3): a non-ASCII character (CJK, an accented

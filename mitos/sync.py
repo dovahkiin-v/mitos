@@ -30,7 +30,7 @@ from mitos.models import get_model_id
 from mitos.parser import ParsedEntry, parse_entry_stream, parse_file_reversed
 from mitos.replay import commit_quarantine_fixpoint
 from mitos.store import GraphStore, CommitDelta
-from mitos.identity import compute_node_id, embedding_text
+from mitos.identity import SLUG_MAX_LEN, compute_node_id, embedding_text
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.vector_store import QdrantVectorStore, hash_to_uuid
 from mitos.renderer import MitosRenderer, summarize_overflows
@@ -281,7 +281,7 @@ def _contains_structural_token(text: str) -> bool:
 # NOTE: this cap is advertised up-front to callers — the CLI `--slug` help imports this
 # constant; the MCP `record_decision` slug docstring carries the number as a literal. If
 # you change it, update that docstring (mcp_server.py) too.
-_SLUG_MAX_LEN = 100
+_SLUG_MAX_LEN = SLUG_MAX_LEN  # shared source of truth in identity.py (re-exported here for cli.py + the record path)
 _SLUG_MIN_LEN = 32  # auto-derive only: don't trim a word boundary back past here — hard-cap instead
 
 # A new decision at/above this document-document similarity to an existing one the
