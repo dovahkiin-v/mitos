@@ -1,0 +1,89 @@
+{
+  "version": 1,
+  "corpus": "reference-harbor-v1",
+  "_doc": {
+    "purpose": "Layer-B semantic oracle — retrieval (live) + conflict (shape-only, filled by the Conflict-sensor vision's section 6.3). SEPARATE from the frozen deterministic oracle.reference.json. Assertions here are BANDED, not exact: embedding order drifts by design.",
+    "retrieval_entry": {
+      "query": "natural-language query embedded is_query=True",
+      "scope": "null on the raw scoring path (vector_store.query is scope-blind by contract); consulted only by the MCP-surface smoke",
+      "expect_relevant": "slugs that SHOULD surface in the top-k",
+      "expect_absent": "hard negatives — plausible-but-wrong slugs that a healthy ranking keeps OUT of the top-k (precision guard)",
+      "measure_only": "when true, no recall floor is asserted — the fixture exists to MEASURE a known-hard case (e.g. the cross-domain embedding-recall ceiling), reported but never gating",
+      "min_recall_at_k": "OMITTED until calibrated from a first measured run (never pre-pinned). Added deliberately, reviewed like --update-golden. Absent → the live test applies only a loose smoke floor; the real measurement lives in the metrics report + baseline diff.",
+      "notes": "human rationale"
+    },
+    "conflict_entry": {
+      "_status": "SHAPE ONLY — fixtures authored by the Conflict-sensor vision (v0.2 V1) section 6.3, not here. Do NOT call any LLM judgment path from Layer B yet.",
+      "proposal": "slug of the incoming decision being judged",
+      "candidate": "slug of the existing decision it is judged against",
+      "kind": "one of: genuine-contradiction | same-polarity-agreement | cross-domain-structural | global-vs-scoped-narrows",
+      "expected_tenable": "bool — true means the pair coexists fine (must NOT be flagged); false means a real contradiction the sensor SHOULD flag not-tenable",
+      "expected_confidence_band": "[low, high] band on the judge's confidence, for the calibration curve"
+    }
+  },
+  "retrieval": [
+    {
+      "query": "How do we resolve two people editing the same file at the same time?",
+      "scope": null,
+      "expect_relevant": ["harbor-sync-last-write-wins", "harbor-sync-crdt-merge"],
+      "expect_absent": ["harbor-blobs-on-s3", "harbor-api-rate-limit"],
+      "notes": "Both concurrent-edit strategies are the precedent; blob storage and rate-limiting are topical noise."
+    },
+    {
+      "query": "What format is Harbor's configuration file written in and how is it validated?",
+      "scope": null,
+      "expect_relevant": ["harbor-config-yaml", "harbor-config-yaml-strict-schema"],
+      "expect_absent": ["harbor-structured-logging"],
+      "notes": "Same-polarity near-duplicate cluster (the #34 case) — for retrieval they co-cluster. Hard negative harbor-structured-logging is plausibly-near-but-decisively-wrong: it is saturated with format/JSON vocabulary (the direct rival to YAML) so drift pulls it in first, yet log-output format is unambiguously NOT config-file format — the earliest-firing tripwire at the true decision boundary. (harbor-storage-is-sqlite was the original choice but is a corpus HUB — it cracks top-5 of 5/6 fixtures regardless of query, so it measures hubness not discrimination; demoted to the measure_only twin below.)"
+    },
+    {
+      "query": "What format is Harbor's configuration file written in and how is it validated?",
+      "scope": null,
+      "measure_only": true,
+      "probe": "config-storage-entanglement",
+      "expect_relevant": ["harbor-config-yaml", "harbor-config-yaml-strict-schema"],
+      "expect_absent": ["harbor-storage-is-sqlite"],
+      "notes": "measure_only twin of the config fixture — tracks how close the (infra-adjacent, hub-like) storage decision sits to a config-format query. NOT gated (it fires on hubness, not this query's ranking quality); recorded because the config/storage semantic entanglement is a useful datapoint for later conflict-detection threshold calibration."
+    },
+    {
+      "query": "What happens to a file when a user deletes it — is it recoverable?",
+      "scope": null,
+      "expect_relevant": ["harbor-delete-is-soft-30d", "harbor-delete-is-immediate-hard"],
+      "expect_absent": [],
+      "notes": "The undeclared genuine-contradiction pair. Retrieval MUST co-surface both, or section 6.3's conflict sensor can never judge a contradiction it cannot retrieve."
+    },
+    {
+      "query": "Kur Harbor saugo Lietuvos naudotojų duomenis?",
+      "scope": null,
+      "expect_relevant": ["harbor-duomenu-saugojimas-lietuvoje", "harbor-duomenys-gali-buti-es"],
+      "expect_absent": [],
+      "notes": "P9 multilingual recall — a Lithuanian query must retrieve the Lithuanian data-residency cluster. If it cannot, the sensor is blind to non-English contradictions."
+    },
+    {
+      "query": "Which Harbor API endpoints require authentication and which are public?",
+      "scope": null,
+      "expect_relevant": ["harbor-all-endpoints-authenticated", "harbor-health-endpoint-public"],
+      "expect_absent": [],
+      "notes": "Global rule + its scoped narrowing exception; a data point on whether a global and its scoped exception co-rank."
+    },
+    {
+      "query": "Should Harbor components share global singletons or pass dependencies in explicitly?",
+      "scope": null,
+      "measure_only": true,
+      "probe": "cross-domain-ceiling-A-lexical",
+      "expect_relevant": ["harbor-no-global-mutable-state", "harbor-cache-is-process-singleton"],
+      "expect_absent": [],
+      "notes": "Cross-domain structural pair (architecture vs performance), opposed in substance. Probe A DELIBERATELY shares vocabulary ('singleton'/'global') with both decisions — it measures recall WHEN a lexical bridge exists. Paired with probe B (no shared vocabulary) to isolate lexical vs semantic recall: if A co-ranks but B does not, the recall was lexical, characterising the embedding-recall ceiling the spec names. measure_only."
+    },
+    {
+      "query": "How should Harbor manage state that is shared between concurrent requests?",
+      "scope": null,
+      "measure_only": true,
+      "probe": "cross-domain-ceiling-B-semantic",
+      "expect_relevant": ["harbor-no-global-mutable-state", "harbor-cache-is-process-singleton"],
+      "expect_absent": [],
+      "notes": "Probe B — the same cross-domain pair, but the query shares NO gift words ('singleton'/'global'/'dependency') with either decision. Tests the TRUE semantic ceiling: do an architecture decision and a performance decision co-surface on meaning alone? Contrast with probe A is the measurement. measure_only."
+    }
+  ],
+  "conflict": []
+}

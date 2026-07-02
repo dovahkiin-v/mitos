@@ -1,0 +1,24 @@
+{
+  "provenance": {
+    "embedding_model": "gemini-embedding-2",
+    "mitos_version": "0.5.21",
+    "commit_sha": "fbab0cd1f276193e7e16723a87a6673b6fc89ca2",
+    "dirty_tree": true,
+    "judgment_model": null,
+    "prompt_version": null,
+    "timestamp": "2026-07-02T13:18:54.920487+00:00"
+  },
+  "k": 5,
+  "aggregate": {
+    "recall_at_k": 1.0,
+    "precision_at_k": 0.4,
+    "mrr": 1.0,
+    "hard_negative_fp_rate": 0.0
+  },
+  "bands": {
+    "recall_at_k": 0.1,
+    "precision_at_k": 0.15,
+    "mrr": 0.15,
+    "hard_negative_fp_rate": 0.1
+  }
+}
