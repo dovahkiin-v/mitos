@@ -29,6 +29,7 @@ from mitos.errors import (
     PARSER_MALFORMED_ENTRY,
     PARSER_MISSING_REQUIRED_FIELD,
     PARSER_MALFORMED_MARKER,
+    PARSER_SLUG_TOO_LONG,
     PARSER_FAILURE_CODES,
 )
 from mitos.store import GraphStore
@@ -929,10 +930,12 @@ def test_parse_entry_stream_code_names_pinned() -> None:
     assert PARSER_MALFORMED_ENTRY == "malformed_entry"
     assert PARSER_MISSING_REQUIRED_FIELD == "missing_required_field"
     assert PARSER_MALFORMED_MARKER == "malformed_marker"
+    assert PARSER_SLUG_TOO_LONG == "slug_too_long"
     assert PARSER_FAILURE_CODES == {
         "malformed_entry",
         "missing_required_field",
         "malformed_marker",
+        "slug_too_long",
     }
     # And the parser emits exactly these, with source="parser".
     emitted = {
@@ -944,6 +947,9 @@ def test_parse_entry_stream_code_names_pinned() -> None:
         "malformed_marker": (
             "<!-- BEGIN ENTRIES -->\n### x\n**Decided:** a\n**Rejected:** y\n"
             "[DECISION_TRANSCRIPT]\nopen\n", "decision"),
+        "slug_too_long": (
+            "<!-- BEGIN ENTRIES -->\n### " + "x" * 101 + "\n**Decided:** a\n"
+            "**Rejected:** y\n", "decision"),
     }
     for expected_code, (text, kind) in emitted.items():
         failures: list = []

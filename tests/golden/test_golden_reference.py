@@ -15,8 +15,9 @@ import sys
 
 import pytest
 
-from mitos.errors import CommitError
-from mitos.parser import parse_entry_stream
+from mitos.errors import CommitError, PARSER_SLUG_TOO_LONG, ValidationError
+from mitos.identity import SLUG_MAX_LEN
+from mitos.parser import ParsedEntry, parse_entry_stream
 from mitos.store import GraphStore
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -174,6 +175,28 @@ def test_reject_cross_kind_resolves(tmp_path):
     pre = _HDR + "### harbor-target-decision\n**Decided:** A.\n**Rejected:** n/a.\n"
     bad = _HDR + "### harbor-bad-resolver\n**Decided:** X.\n**Rejected:** n/a.\n**Resolves:** harbor-target-decision\n"
     _expect_rejection(tmp_path, bad, "kind_constraint_violation", pre=pre)
+
+
+def test_reject_overlong_slug_on_file_route(tmp_path):
+    """A >100-char slug is rejected on the file route (mitos sync/rebuild/import), which
+    used to bypass the guard that only the record path enforced. Two layers:
+    the parser quarantines the entry (slug_too_long), and the store's identity-fence
+    backstop raises on any direct commit that bypasses the parser."""
+    long_slug = "harbor-" + "x" * (SLUG_MAX_LEN + 10)  # 117 chars
+    text = _HDR + f"### {long_slug}\n**Decided:** X.\n**Rejected:** n/a.\n"
+
+    # Parser (collector mode): the over-length entry is quarantined, not returned.
+    failures = []
+    returned = parse_entry_stream(text, "decision", failures=failures)
+    assert long_slug not in [e.slug for e in returned]
+    assert PARSER_SLUG_TOO_LONG in [item.code for f in failures for item in f.items]
+
+    # Store backstop: a direct commit bypassing the parser is fenced.
+    store = GraphStore(str(tmp_path / "graph.sqlite"))
+    entry = ParsedEntry("decision", long_slug, 1, 3)
+    entry.axiom, entry.rejected_paths = "X.", "n/a"
+    with pytest.raises(ValidationError):
+        store.commit_parsed_entry(entry)
 
 
 # --- Polish: every read surface stamps modifiers; the real rebuild reproduces the golden ---

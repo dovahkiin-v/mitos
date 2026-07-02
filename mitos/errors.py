@@ -170,6 +170,7 @@ class CutoverError(MitosError):
 PARSER_MALFORMED_ENTRY = "malformed_entry"
 PARSER_MISSING_REQUIRED_FIELD = "missing_required_field"
 PARSER_MALFORMED_MARKER = "malformed_marker"
+PARSER_SLUG_TOO_LONG = "slug_too_long"
 
 # The parser-stage whitelist. The store-stage codes (``slug_collision`` /
 # ``missing_target`` / ``dangling_edge`` / ``kind_constraint_violation`` /
@@ -181,6 +182,7 @@ PARSER_FAILURE_CODES = frozenset(
         PARSER_MALFORMED_ENTRY,
         PARSER_MISSING_REQUIRED_FIELD,
         PARSER_MALFORMED_MARKER,
+        PARSER_SLUG_TOO_LONG,
     }
 )
 

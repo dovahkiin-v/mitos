@@ -18,7 +18,9 @@ from mitos.errors import (
     PARSER_MALFORMED_ENTRY,
     PARSER_MISSING_REQUIRED_FIELD,
     PARSER_MALFORMED_MARKER,
+    PARSER_SLUG_TOO_LONG,
 )
+from mitos.identity import SLUG_MAX_LEN
 
 def load_dynamic_field_map() -> Dict[str, str]:
     """Builds the FIELD_MAP purely from format-spec.md (C5 single source, V1-D7).
@@ -1056,6 +1058,27 @@ def _validate_section(
     # violations with a line (unrecognized field, M5, marker balance) were
     # already appended to ``items`` during tokenization.
     _check_required_fields(entry, kind, sec, items)
+
+    # Slug-length is a format constraint (the slug is the permanent citation handle,
+    # folded into identity), so it belongs here at the C1 parse boundary — this is the
+    # ONLY slug-length gate on the file route (mitos sync / rebuild / import); the
+    # record write path has its own early check. Anchored to the header line.
+    if len(entry.slug) > SLUG_MAX_LEN:
+        items.append(
+            FailureItem(
+                code=PARSER_SLUG_TOO_LONG,
+                source="parser",
+                message=(
+                    f"Slug is {len(entry.slug)} characters — "
+                    f"{len(entry.slug) - SLUG_MAX_LEN} over the {SLUG_MAX_LEN}-character "
+                    "limit. The slug is the permanent citation handle (folded into the "
+                    "decision's identity), so it is not silently truncated; shorten it."
+                ),
+                field=None,
+                line_start=sec["line_start"],
+                line_end=sec["line_start"],
+            )
+        )
 
     if not items:
         return entry, None
