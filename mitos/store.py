@@ -2269,6 +2269,21 @@ class GraphStore:
         finally:
             conn.close()
             
+    def get_active_node_ids(self) -> Set[str]:
+        """Returns the active node id set (active decisions + open questions).
+
+        The single source of the V1a active predicate (G5): reads through the
+        store's own active-view methods rather than re-encoding the kill-edge
+        anti-join, so cutover, reconcile, and any future consumer share one
+        definition of "the live architectural surface."
+
+        Returns:
+            The set of active decision + open-question node ids (SHA-256 hashes).
+        """
+        active: Set[str] = {node["id"] for node in self.get_active_decisions()}
+        active.update(node["id"] for node in self.get_open_questions())
+        return active
+
     def get_edges(self) -> List[Dict[str, str]]:
         """Retrieves all edges in the database."""
         conn = self._get_connection()

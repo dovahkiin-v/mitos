@@ -227,6 +227,14 @@ leaves a workspace that simply re-runs clean — no manual restore. Run these st
    --embed-only`) to drain the embedding queue. Until it finishes there is a
    **bounded semantic-surface outage**: `surface`/`query` are degraded, but
    graph-only `mitos list` works throughout.
+
+   > **Healing a bare Qdrant wipe.** If you ever delete the Qdrant collection
+   > *without* a `cutover`/`rebuild` (which re-seed the embedding queue), the
+   > outbox is empty and `mitos sync` has nothing to drain. Run **`mitos
+   > reconcile`**: it diffs the active node set against Qdrant's actual points,
+   > re-queues the missing active nodes, and drains them in one pass (idempotent;
+   > re-embeds hit the cache, so no embedding-API spend when text is unchanged).
+   > `mitos status` flags this state as `⚠ vector index incomplete`.
 6. **Restart `mitos serve`** if it was running.
 7. **Verify.** `mitos status` → expect `READY ✓`.
 8. **Remove the backup.** Once you're satisfied, delete the

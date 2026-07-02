@@ -146,3 +146,53 @@ def test_status_silent_when_vectors_complete(tmp_path, monkeypatch, capsys):
 
     assert cli.cmd_status(str(tmp_path)) == 0
     assert "vector index incomplete" not in capsys.readouterr().out
+
+
+def _commit_active_and_superseded(tmp_path):
+    """Commits 2 active decisions + 1 superseded (3 graph nodes, 2 active)."""
+    from mitos.store import GraphStore
+    from mitos.parser import ParsedEntry
+    store = GraphStore(MitosConfig(str(tmp_path)).db_path)
+
+    def _d(slug, axiom, supersedes=None):
+        e = ParsedEntry("decision", slug, 1, 5)
+        e.axiom = axiom
+        e.rejected_paths = "n/a"
+        if supersedes:
+            e.supersedes = supersedes
+        store.commit_parsed_entry(e)
+
+    _d("keep-me", "Live axiom.")
+    _d("old-one", "Doomed axiom.")
+    _d("new-one", "Replacement axiom.", supersedes=["old-one"])  # supersedes old-one
+
+
+def test_status_completeness_keys_on_active_not_all_nodes(tmp_path, monkeypatch, capsys):
+    """The corrected invariant: `points == active` is healthy even when superseded nodes
+    inflate the all-nodes count. Superseded nodes are NOT re-embedded (they are filtered
+    from retrieval via has_id), so keying the warning on all-nodes would false-alarm."""
+    _init(tmp_path)
+    capsys.readouterr()
+    monkeypatch.setenv("GEMINI_API_KEY", "testkey")
+    _commit_active_and_superseded(tmp_path)  # 3 graph nodes, 2 active
+    monkeypatch.setattr(cli, "_check_qdrant", _qdrant(True, True, points=2))  # == active count
+
+    assert cli.cmd_status(str(tmp_path)) == 0
+    out = capsys.readouterr().out
+    assert "graph holds 3 node(s)" in out  # all-nodes count still reported informationally
+    assert "vector index incomplete" not in out  # but completeness keys on active (2 == 2)
+
+
+def test_status_warns_when_active_vectors_missing(tmp_path, monkeypatch, capsys):
+    """`points < active` still warns, counting only the unembedded ACTIVE nodes."""
+    _init(tmp_path)
+    capsys.readouterr()
+    monkeypatch.setenv("GEMINI_API_KEY", "testkey")
+    _commit_active_and_superseded(tmp_path)  # 2 active
+    monkeypatch.setattr(cli, "_check_qdrant", _qdrant(True, True, points=1))  # 1 < 2 active
+
+    assert cli.cmd_status(str(tmp_path)) == 0
+    out = capsys.readouterr().out
+    assert "vector index incomplete" in out
+    assert "1 unembedded" in out  # 2 active - 1 vector
+    assert "mitos reconcile" in out  # the heal is surfaced

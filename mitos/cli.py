@@ -9,6 +9,7 @@ import sys
 import os
 import re
 import time
+import json
 import hashlib
 import argparse
 from typing import List, Optional, Dict, Any
@@ -33,7 +34,7 @@ from mitos.config import (
     global_env_path,
     hint_due,
 )
-from mitos.errors import MitosError, ParseError, ValidationError, DatabaseError, ConfigError
+from mitos.errors import MitosError, ParseError, ValidationError, DatabaseError, ConfigError, VectorStoreError
 from mitos.migrations import is_pre_v1a_schema
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS, open_connection
 from mitos.cutover import default_aside_db_path, perform_swap, rebuild_and_gate
@@ -466,6 +467,44 @@ def cmd_sync(config: MitosConfig, auto_accept: bool = False, embed_only: bool = 
         except ValidationError as e:
             print(f"Sync Aborted: Validation error.\n{str(e)}", file=sys.stderr)
             sys.exit(1)
+
+
+def cmd_reconcile(config: MitosConfig, as_json: bool = False) -> int:
+    """Re-embeds active nodes missing from Qdrant, healing a direct vector wipe.
+
+    The one-command heal for the gap ``sync`` cannot reach: a bare Qdrant wipe
+    (``curl -X DELETE`` of the collection, no ``rebuild``/``cutover``) leaves the
+    graph populated, Qdrant empty, and the outbox empty — so ``sync`` drains
+    nothing. Reconcile diffs the ACTIVE node set against Qdrant's actual point
+    ids, enqueues the missing nodes, and drains. Idempotent.
+
+    Args:
+        config: The active workspace config.
+        as_json: Whether to emit the result as a JSON object.
+
+    Returns:
+        Process exit code (0 on success, 1 if Qdrant/embedding provider is down).
+    """
+    manager = MitosSyncManager(config)
+    try:
+        result = manager.reconcile_embeddings()
+    except VectorStoreError as e:
+        msg = f"Reconcile unavailable — Qdrant or embedding provider down: {str(e)}"
+        if as_json:
+            print(json.dumps({"error": msg}))
+        else:
+            print(msg, file=sys.stderr)
+        return 1
+
+    if as_json:
+        print(json.dumps(result))
+    else:
+        print(
+            f"Reconciled: {result['active']} active node(s), "
+            f"{result['present']} point(s) already indexed, "
+            f"{result['enqueued']} re-embedded."
+        )
+    return 0
 
 
 def cmd_capture(config: MitosConfig, text: str) -> None:
@@ -1599,6 +1638,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
     agent_drift = agent_block_drift(workspace_dir)
 
     graph_nodes = None
+    active_nodes = None
     # Read-only size-ceiling report for the generated context files. This is the
     # health surface the write-path overflow nudge points at — the detailed breakdown
     # (which files, which decisions to re-scope) lives here, not on every `record`.
@@ -1608,6 +1648,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
         try:
             ro_store = GraphStore(config.db_path, read_only=True)
             graph_nodes = len(ro_store.get_all_nodes())
+            active_nodes = len(ro_store.get_active_node_ids())
             overflows = overflow_report(ro_store)
         except Exception:
             pass  # both reads are best-effort; a failure leaves the safe defaults
@@ -1639,6 +1680,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
                 "collection_exists": q["collection_exists"],
                 "collection_points": q["points"],
                 "graph_nodes": graph_nodes,
+                "active_nodes": active_nodes,
                 "mcp_wired": mcp_wired,
             },
             "graph_behind_buffer": graph_behind,
@@ -1692,23 +1734,26 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
         print(f"      ({q['points']} vector(s) indexed)")
     if graph_nodes is not None:
         print(f"  • graph holds {graph_nodes} node(s)")
-    # Vector-completeness check: every graph node should carry a vector (superseded
-    # nodes stay indexed too), so a healthy corpus has `points == graph_nodes`. A
-    # shortfall means the embedding outbox has not fully drained — a past provider
-    # outage, or the state right after a `rebuild`/`cutover` (or a Qdrant wipe) —
-    # and every unembedded node is invisible to semantic surface/query. Surface it
-    # loudly so `vectors < nodes` never hides behind a green READY ✓ (informational —
-    # not a readiness blocker; it clears on the next `mitos sync`).
+    # Vector-completeness check: every ACTIVE node should carry a vector, so a
+    # healthy corpus has `points >= active_nodes` (dead/superseded nodes are NOT
+    # re-embedded — retrieval filters them via has_id and never returns them; see
+    # cutover-bounds-embedding-seed-to-active). A shortfall means the outbox has
+    # not fully drained — a past provider outage, or the state right after a
+    # `rebuild`/`cutover` — or Qdrant was wiped directly and the outbox is now
+    # empty, so `sync` has nothing to drain. Every unembedded active node is
+    # invisible to semantic surface/query. Surface it loudly so `points < active`
+    # never hides behind a green READY ✓ (informational — not a readiness blocker).
     if (
         q["reachable"] and q["collection_exists"]
-        and q["points"] is not None and graph_nodes is not None
-        and q["points"] < graph_nodes
+        and q["points"] is not None and active_nodes is not None
+        and q["points"] < active_nodes
     ):
         print(
             f"\n  ⚠ vector index incomplete — {q['points']} vector(s) for "
-            f"{graph_nodes} node(s); the {graph_nodes - q['points']} unembedded "
-            f"node(s) are invisible to semantic surface/query. Re-run `mitos sync` "
-            f"until vectors == nodes (informational — not a readiness blocker)."
+            f"{active_nodes} active node(s); the {active_nodes - q['points']} unembedded "
+            f"node(s) are invisible to semantic surface/query. Run `mitos reconcile` "
+            f"to re-embed the missing active nodes (or `mitos sync` if the outbox is "
+            f"non-empty) — informational, not a readiness blocker."
         )
     if overflows:
         _print_overflow_detail(overflows)
@@ -1929,6 +1974,8 @@ def cmd_cutover(
     print("  2. Re-embed the V1a active set:  mitos sync   (or: mitos sync --embed-only)")
     print("     Semantic surface/query stay degraded until the queue drains;")
     print("     graph-only `mitos list` works throughout.")
+    print("     (If you ever wipe Qdrant later with the outbox already empty,")
+    print("      `mitos reconcile` re-embeds the active set in one pass.)")
     print("  3. If `mitos serve` was running, restart it.")
     print("  4. Verify:  mitos status   → expect READY ✓")
     if bak_path:
@@ -2125,6 +2172,7 @@ def cmd_rebuild(
         print(f"  Old graph backed up to: {bak_path}")
     print("\nNext:")
     print("  - Re-embed so semantic surface/query reflect the rebuild:  mitos sync")
+    print("    (Or, if Qdrant was wiped directly and the outbox is empty:  mitos reconcile)")
     print("  - Verify:  mitos status   → expect READY ✓ (the rebuild nudge clears)")
     if bak_path:
         print(f"  - Once satisfied, remove the backup:  rm {bak_path}")
@@ -2220,6 +2268,13 @@ def main() -> None:
     sync_p.add_argument("--yes", action="store_true", help="Auto-accept all parsed changes.")
     sync_p.add_argument("--embed-only", action="store_true", help="Drain the pending embeddings outbox queue only.")
     sync_p.add_argument("--verbose", action="store_true", help="Show verbose cache statistics.")
+
+    # reconcile
+    rec_p = subparsers.add_parser(
+        "reconcile",
+        help="Re-embed active nodes missing from Qdrant (heal a direct vector wipe).",
+    )
+    rec_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON.")
 
     # capture
     cap_p = subparsers.add_parser("capture", help="Synthesize and append a decision.")
@@ -2383,6 +2438,8 @@ def main() -> None:
             cmd_init(config)
         elif args.command == "sync":
             cmd_sync(config, auto_accept=args.yes, embed_only=args.embed_only, verbose=args.verbose)
+        elif args.command == "reconcile":
+            sys.exit(cmd_reconcile(config, as_json=args.as_json))
         elif args.command == "capture":
             cmd_capture(config, args.text)
         elif args.command in ("query", "query_decisions"):

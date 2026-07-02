@@ -743,9 +743,7 @@ def _reconstructed_active_ids(store: GraphStore) -> Set[str]:
     Returns:
         The active decision + open-question node ids.
     """
-    active: Set[str] = {node["id"] for node in store.get_active_decisions()}
-    active.update(node["id"] for node in store.get_open_questions())
-    return active
+    return store.get_active_node_ids()
 
 
 def _reconstructed_all_ids(store: GraphStore) -> Set[str]:
