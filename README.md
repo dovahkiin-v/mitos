@@ -1,4 +1,4 @@
-# Mitos (v0.1)
+# Mitos
 
 ![Status: Alpha](https://img.shields.io/badge/status-alpha-orange) ![Python 3.13+](https://img.shields.io/badge/python-3.13+-blue) ![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)
 
@@ -39,7 +39,7 @@ Project size isn't a gate — mitos is useful on small projects too. But the lar
 *   **M1. Axiom Immutability**: The canonical core of a node (axiom + mechanisms for decisions; topic + questions for open questions) is strictly immutable. Changes generate a new node linked via `corrects` or `supersedes` edges. Commentary fields outside the core remain mutable in place.
 *   **M2. Content-Hash Identity (with Human-Readable Slugs)**: Node IDs are cryptographic SHA-256 hashes of their canonical core to prevent parallel work collisions. Human-readable slugs are used for citations. In Qdrant, the 256-bit hash is mapped to a 128-bit RFC-4122 UUID (`hash_to_uuid`) to preserve re-upsert idempotency.
 *   **M3. State is Computed, Not Stored**: Active states (`active`, `superseded`, `drifted` for decisions; `parked`, `resolved` for open questions) are derived dynamically from edges and signals at query time. No static `status` field exists, making status drift impossible within the graph.
-*   **M4. Three Retrieval Modes (Consumer Chooses)**: The system supports Letter, Trace, and Vibe modes. v0.1 ships with **Letter-only** retrieval, exposing only the axiom and rejected paths (~200–500 tokens) to keep LLM context thin and precise.
+*   **M4. Three Retrieval Modes (Consumer Chooses)**: The system supports Letter, Trace, and Vibe modes. The current release ships with **Letter-only** retrieval, exposing only the axiom and rejected paths (~200–500 tokens) to keep LLM context thin and precise.
 *   **M5. Anti-Knowledge as First-Class**: Mandates `rejected_paths` as a required field. This acts as a critical constraint boundary, preventing LLM partners from defaulting to common but incorrect patterns that have already been discarded.
 *   **M6. Typed Mechanism Entities (and Verification Anchors)**: Mechanisms (e.g. `sqlite`, `wal-mode`) are first-class registry entities rather than plain text strings. This enables dependency auditing and serves as the substrate for future automated drift sensing.
 *   **M7. Markdown is a Transient Render**: The SQLite graph is the database of record; Markdown files like `decisions.md` are write-buffers, and output files like `live_axioms.md` are transient projects generated or parsed on demand.
@@ -95,7 +95,7 @@ Start it once (shared across all your Mitos projects):
 ```bash
 docker compose up -d        # from the mitos repo root → mitos-qdrant on :7333
 ```
-One Qdrant instance, **one collection per project** (`mitos-<project>`), so projects never mix. To point Mitos at a different instance, set **`QDRANT_URL`** before `mitos init` (it's written into `config.toml`) or edit `qdrant_url` there. *(v0.2's `sqlite-vec` substrate will remove the separate-Qdrant requirement entirely.)*
+One Qdrant instance, **one collection per project** (`mitos-<project>`), so projects never mix. To point Mitos at a different instance, set **`QDRANT_URL`** before `mitos init` (it's written into `config.toml`) or edit `qdrant_url` there. *(A planned `sqlite-vec` substrate will remove the separate-Qdrant requirement entirely.)*
 
 ## 🛠️ CLI Operations
 
@@ -133,7 +133,7 @@ PYTHONPATH=. python3 mitos/cli.py render
 ```
 
 ### 5. Rebuild (upgrade path)
-Re-commits the full corpus (`decisions.md` + the quarterly archives) through the **current** edge catalog and mechanism registry, into a build-aside graph that is swapped in atomically (the old graph is backed up to `graph.sqlite.bak_<timestamp>`). Use it after upgrading across a schema change — e.g. **0.3.x → 0.4.0**, where the in-place migration widens the schema but does *not* re-commit, so the newer edge types (`amends`/`narrows`/`depends_on`/`cites`/…) and the mechanism registry stay empty until you rebuild. **No decisions are ever at risk** — the markdown is the source of truth; an entry the current catalog rejects (e.g. a citation to a since-superseded decision) is surfaced as a punch-list, never silently dropped. `mitos status` nudges when a rebuild is due.
+Re-commits the full corpus (`decisions.md` + the quarterly archives) through the **current** edge catalog and mechanism registry, into a build-aside graph that is swapped in atomically (the old graph is backed up to `graph.sqlite.bak_<timestamp>`). Use it after upgrading across a schema change, where the in-place migration widens the schema but does *not* re-commit, so the newer edge types (`amends`/`narrows`/`depends_on`/`cites`/…) and the mechanism registry stay empty until you rebuild. **No decisions are ever at risk** — the markdown is the source of truth; an entry the current catalog rejects (e.g. a citation to a since-superseded decision) is surfaced as a punch-list, never silently dropped. `mitos status` nudges when a rebuild is due.
 ```bash
 mitos rebuild                # refuses to swap if it would drop content; shows why
 mitos rebuild --allow-drops  # proceed, accepting the drops (they stay in the markdown)
