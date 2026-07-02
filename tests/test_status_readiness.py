@@ -237,6 +237,43 @@ def test_status_orphan_points_reported_as_info_not_warning(tmp_path, monkeypatch
     assert "not an error" in out  # reported neutrally, not as a warning
 
 
+def test_status_full_collection_wipe_warns_when_graph_populated(tmp_path, monkeypatch, capsys):
+    """Collection deleted OUTRIGHT (not just points) with a populated graph → the whole
+    active surface is missing. Absence of the collection must not read as calm health."""
+    _init(tmp_path)
+    capsys.readouterr()
+    monkeypatch.setenv("GEMINI_API_KEY", "testkey")
+    _commit_n(tmp_path, 3)
+    monkeypatch.setattr(cli, "_check_qdrant", _qdrant(True, False))  # collection absent
+    # The collection-absent path must NOT scroll; if it does, this stub raises and
+    # the test's "N active node(s) have no vector" assertion fails loudly.
+    monkeypatch.setattr(cli, "scroll_point_ids", _scroll_fails())
+
+    assert cli.cmd_status(str(tmp_path)) == 0  # informational, not a readiness blocker
+    out = capsys.readouterr().out
+    assert "vector index incomplete" in out
+    assert "3 active node(s) have no vector" in out
+    assert "mitos reconcile" in out
+    assert "auto-created on first record" not in out  # no longer misleadingly calm
+    assert "missing — 3 active node(s) have no vectors" in out  # accurate check-line hint
+
+
+def test_status_absent_collection_fresh_project_stays_quiet(tmp_path, monkeypatch, capsys):
+    """An absent collection with NO active nodes is a healthy fresh project — no warning,
+    no scroll, and the calm 'auto-created on first record' hint is correct here."""
+    _init(tmp_path)
+    capsys.readouterr()
+    monkeypatch.setenv("GEMINI_API_KEY", "testkey")
+    monkeypatch.setattr(cli, "_check_qdrant", _qdrant(True, False))  # absent, empty graph
+    monkeypatch.setattr(cli, "scroll_point_ids", _scroll_fails())  # must not be called
+
+    assert cli.cmd_status(str(tmp_path)) == 0
+    out = capsys.readouterr().out
+    assert "vector index incomplete" not in out
+    assert "could not verify" not in out
+    assert "auto-created on first record" in out
+
+
 def test_status_degrades_when_scroll_fails(tmp_path, monkeypatch, capsys):
     """A scroll failure surfaces 'could not verify' — never a silent fallback to the count."""
     _init(tmp_path)
