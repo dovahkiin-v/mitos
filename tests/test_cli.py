@@ -6,7 +6,7 @@ Verifies CLI argument parsing, help commands, and basic dry-runs for commands.
 import sys
 import pytest
 from unittest.mock import MagicMock, patch, ANY
-from mitos.cli import main
+from mitos.cli import main, _toml_scalar
 
 def test_cli_help_menu() -> None:
     """Verifies that the help menu is printed and exits cleanly with 0."""
@@ -156,3 +156,23 @@ def test_cli_malformed_config_exits_clean_no_traceback(
     assert "Traceback" not in captured.err
     assert "Error:" in captured.err
     assert "config" in captured.err.lower()
+
+
+# ---------------------------------------------------------------------------
+# _toml_scalar bool serialization (v0.2 conflict_check_on_sync is the first bool key)
+# ---------------------------------------------------------------------------
+
+def test_toml_scalar_serializes_bool_as_lowercase_literal() -> None:
+    """A bool serializes to native TOML ``true``/``false`` (not ``1``/``0``, not raise).
+
+    ``bool`` subclasses ``int``, so the bool branch must precede the int branch;
+    an int-first order would emit ``True`` as ``1``. Regression-pins that ordering.
+    """
+    assert _toml_scalar(True) == "true"
+    assert _toml_scalar(False) == "false"
+
+
+def test_toml_scalar_still_serializes_int_and_str() -> None:
+    """The bool branch doesn't disturb the existing int/str scalars."""
+    assert _toml_scalar(50) == "50"
+    assert _toml_scalar("archive") == '"archive"'

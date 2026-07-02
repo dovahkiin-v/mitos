@@ -235,26 +235,28 @@ def _extract_sample_block(spec: str, header: str) -> str:
 def _toml_scalar(value: Any) -> str:
     """Serializes a v0.1 config scalar to its TOML right-hand-side literal.
 
-    A deliberately tiny serializer for exactly the value set the v0.1 schema uses —
-    plain strings (no embedded ``"`` or newline) and integers — NOT a general TOML
-    writer. The stdlib ``tomllib`` is read-only and P19 forbids pulling ``tomli-w``
-    for nine flat scalars, so ``mitos init`` seeds ``config.toml`` through this
-    (mirrors the project's hand-rolled ``.env``/config readers). A ``bool`` is
-    rejected: it subclasses ``int`` (so it would slip through as ``0``/``1``), and
-    no v0.1 key is bool-typed.
+    A deliberately tiny serializer for exactly the value set the schema uses —
+    plain strings (no embedded ``"`` or newline), integers, and booleans — NOT a
+    general TOML writer. The stdlib ``tomllib`` is read-only and P19 forbids pulling
+    ``tomli-w`` for a handful of flat scalars, so ``mitos init`` seeds ``config.toml``
+    through this (mirrors the project's hand-rolled ``.env``/config readers).
+
+    The ``bool`` branch MUST stay above the ``int`` branch: ``bool`` subclasses
+    ``int``, so an int-first order would emit ``True`` as ``1`` instead of ``true``.
 
     Args:
-        value: The config value to serialize (``str`` or ``int``).
+        value: The config value to serialize (``str``, ``int``, or ``bool``).
 
     Returns:
-        The TOML literal — e.g. ``'"archive"'`` for a string, ``'50'`` for an int.
+        The TOML literal — e.g. ``'"archive"'`` for a string, ``'50'`` for an int,
+        ``'true'``/``'false'`` for a bool.
 
     Raises:
-        TypeError: If the value is not a plain ``str``/``int``, or is a ``str``
-            containing a ``"`` or newline (beyond this serializer's v0.1 scope).
+        TypeError: If the value is not a plain ``str``/``int``/``bool``, or is a
+            ``str`` containing a ``"`` or newline (beyond this serializer's scope).
     """
     if isinstance(value, bool):
-        raise TypeError(f"_toml_scalar does not serialize bool (got {value!r})")
+        return "true" if value else "false"
     if isinstance(value, int):
         return str(value)
     if isinstance(value, str):

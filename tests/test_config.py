@@ -150,6 +150,62 @@ def test_bool_rejected_for_int_key() -> None:
         assert "bool" in str(exc.value)
 
 
+# ---------------------------------------------------------------------------
+# The first bool-typed key: conflict_check_on_sync (v0.2 Conflict sensor toggle)
+# ---------------------------------------------------------------------------
+
+def test_conflict_check_on_sync_defaults_true() -> None:
+    """A workspace with no override falls back to the seeded default True."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # No config.toml at all → the CONFIG_DEFAULTS value takes effect.
+        assert MitosConfig(tmpdir).conflict_check_on_sync is True
+
+
+def test_conflict_check_on_sync_missing_key_falls_back_to_default() -> None:
+    """A config.toml present but WITHOUT the key still yields the True default."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _write_config(tmpdir, 'rotation_mode = "mark"\n')
+        assert MitosConfig(tmpdir).conflict_check_on_sync is True
+
+
+def test_conflict_check_on_sync_false_round_trips() -> None:
+    """A native TOML ``false`` loads to the Python boolean False."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _write_config(tmpdir, "conflict_check_on_sync = false\n")
+        assert MitosConfig(tmpdir).conflict_check_on_sync is False
+
+
+def test_conflict_check_on_sync_true_round_trips() -> None:
+    """A native TOML ``true`` loads to the Python boolean True."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _write_config(tmpdir, "conflict_check_on_sync = true\n")
+        assert MitosConfig(tmpdir).conflict_check_on_sync is True
+
+
+def test_conflict_check_on_sync_int_rejected() -> None:
+    """A bare ``1`` never satisfies the bool key (no silent int→bool coerce)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _write_config(tmpdir, "conflict_check_on_sync = 1\n")
+        with pytest.raises(ConfigError) as exc:
+            MitosConfig(tmpdir)
+        msg = str(exc.value)
+        assert "conflict_check_on_sync" in msg
+        assert "bool" in msg
+        assert "int" in msg  # names the got-type too
+
+
+def test_conflict_check_on_sync_quoted_string_rejected() -> None:
+    """A quoted ``"true"`` (TOML string) never satisfies the bool key."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _write_config(tmpdir, 'conflict_check_on_sync = "true"\n')
+        with pytest.raises(ConfigError) as exc:
+            MitosConfig(tmpdir)
+        msg = str(exc.value)
+        assert "conflict_check_on_sync" in msg
+        assert "bool" in msg
+        assert "str" in msg
+
+
 def test_rotation_mode_out_of_enum_raises_config_error() -> None:
     """A correctly-typed but out-of-enum rotation_mode hard-fails (no silent coerce)."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -273,7 +329,7 @@ def test_post_construction_attribute_assignment_untouched() -> None:
 
 
 def test_to_dict_carries_full_surface() -> None:
-    """to_dict exposes the convention paths, dynamic keys, and all seven schema keys."""
+    """to_dict exposes the convention paths, dynamic keys, and all eight schema keys."""
     with tempfile.TemporaryDirectory() as tmpdir:
         d = MitosConfig(tmpdir).to_dict()
         for key in CONFIG_DEFAULTS:
@@ -340,14 +396,16 @@ def test_render_defaults_match_renderer_constants() -> None:
     )
 
 
-def test_schema_covers_nine_keys_and_defaults_are_the_static_seven() -> None:
-    """CONFIG_SCHEMA recognizes nine file keys; CONFIG_DEFAULTS holds the static seven.
+def test_schema_covers_ten_keys_and_defaults_are_the_static_eight() -> None:
+    """CONFIG_SCHEMA recognizes ten file keys; CONFIG_DEFAULTS holds the static eight.
 
     The two dynamic qdrant keys are recognized + validated but defaulted in
-    __init__, so they are in CONFIG_SCHEMA but not CONFIG_DEFAULTS.
+    __init__, so they are in CONFIG_SCHEMA but not CONFIG_DEFAULTS. v0.2's
+    ``conflict_check_on_sync`` is in BOTH (static default True), so it lifts the
+    counts to ten/eight but leaves the qdrant-only difference unchanged.
     """
-    assert len(CONFIG_SCHEMA) == 9
-    assert len(CONFIG_DEFAULTS) == 7
+    assert len(CONFIG_SCHEMA) == 10
+    assert len(CONFIG_DEFAULTS) == 8
     assert set(CONFIG_DEFAULTS) < set(CONFIG_SCHEMA)
     assert set(CONFIG_SCHEMA) - set(CONFIG_DEFAULTS) == {"qdrant_url", "qdrant_collection"}
 

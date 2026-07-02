@@ -33,11 +33,14 @@ CONFIG_DEFAULTS: Dict[str, Any] = {
     # V4 wires the renderer to read these keys, making config the runtime source.
     "render_global_overflow_warn_chars": 50_000,
     "render_scope_overflow_warn_chars": 20_000,
+    # The Conflict sensor's licence toggle (v0.2). Read by the sync hook in Phase
+    # 5a; dormant until then. The first bool-typed key across this machinery.
+    "conflict_check_on_sync": True,
 }
 
 # The recognized file keys → expected (TOML scalar) type, for strict validation.
-# The seven static keys above PLUS the two dynamic-default qdrant keys = the §5.2.6
-# nine-key schema. A file key NOT in this map is tolerated and skipped — split into
+# The eight static keys above PLUS the two dynamic-default qdrant keys = the §5.2.6
+# ten-key schema. A file key NOT in this map is tolerated and skipped — split into
 # two buckets by `_load_config_file`: a RECOGNIZED-but-retired key (`RETIRED_CONFIG_KEYS`
 # below) is tolerated SILENTLY, while a genuinely unknown key (a typo) earns one
 # calm stderr line.
@@ -51,6 +54,7 @@ CONFIG_SCHEMA: Dict[str, type] = {
     "render_scope_overflow_warn_chars": int,
     "qdrant_url": str,
     "qdrant_collection": str,
+    "conflict_check_on_sync": bool,
 }
 
 # Keys the code DELIBERATELY dropped from the file schema but still recognizes —
@@ -76,8 +80,9 @@ def _value_matches_type(value: Any, expected: type) -> bool:
 
     Treats ``bool`` as distinct from ``int`` even though ``bool`` subclasses
     ``int``: a TOML ``true`` must NOT satisfy an int-typed key (the silent-coerce
-    the strict loader exists to kill). No v0.1 key expects a bool, so a bool is
-    always a type mismatch.
+    the strict loader exists to kill). Symmetrically, a bool-typed key (the v0.2
+    ``conflict_check_on_sync``) only accepts a native TOML boolean — a ``1`` or a
+    quoted ``"true"`` is a loud mismatch, not a coercion.
 
     Args:
         value: The value ``tomllib`` parsed for the key.
@@ -329,7 +334,7 @@ class MitosConfig:
         """Converts configuration to dictionary form.
 
         Includes the convention-path attributes, the two dynamic-default qdrant
-        keys, the kept-but-de-schema'd ``pending_threshold``, and the seven static
+        keys, the kept-but-de-schema'd ``pending_threshold``, and the eight static
         schema keys (sourced from ``CONFIG_DEFAULTS`` so the set can't drift). No
         consumer binds this today; it exists for a future ``--json``/debug surface.
 
@@ -347,7 +352,7 @@ class MitosConfig:
             "questions_file": self.questions_file,
             "archive_dir": self.archive_dir,
         }
-        # The seven static schema keys (incl. rotation_mode) from their one source.
+        # The eight static schema keys (incl. rotation_mode) from their one source.
         for key in CONFIG_DEFAULTS:
             result[key] = getattr(self, key)
         return result

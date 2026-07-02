@@ -111,17 +111,36 @@ def test_seeded_config_round_trips_clean(tmp_path, capsys):
     assert "pending_threshold" not in body
 
 
-def test_config_seeds_exactly_the_nine_schema_keys(tmp_path):
-    """The seed writes exactly CONFIG_DEFAULTS' seven keys + the two dynamic qdrant keys."""
+def test_config_seeds_exactly_the_schema_keys(tmp_path):
+    """The seed writes exactly CONFIG_DEFAULTS' static keys + the two dynamic qdrant keys."""
     _init(tmp_path)
     with open(tmp_path / ".mitos" / "config.toml", "rb") as f:
         data = tomllib.load(f)
 
-    assert set(data) == set(CONFIG_SCHEMA)  # the recognized nine, nothing else
+    assert set(data) == set(CONFIG_SCHEMA)  # every recognized key, nothing else
     assert set(data) == set(CONFIG_DEFAULTS) | {"qdrant_url", "qdrant_collection"}
     assert "pending_threshold" not in data
     for key, default in CONFIG_DEFAULTS.items():
         assert data[key] == default
+
+
+def test_config_seeds_conflict_check_as_native_bool(tmp_path):
+    """A fresh init seeds ``conflict_check_on_sync = true`` (lowercase, unquoted).
+
+    The v0.2 toggle is the first bool-typed key; ``mitos init`` must NOT crash on
+    it (the ``_toml_scalar`` bool-serializer trap) and must emit a native TOML
+    boolean that ``tomllib`` parses straight back to Python ``True``.
+    """
+    _init(tmp_path)  # must not raise — the central 1a gotcha
+
+    body = _read(tmp_path / ".mitos" / "config.toml")
+    assert "conflict_check_on_sync = true" in body  # lowercase, unquoted native bool
+    assert "conflict_check_on_sync = 1" not in body
+    assert 'conflict_check_on_sync = "true"' not in body
+
+    with open(tmp_path / ".mitos" / "config.toml", "rb") as f:
+        data = tomllib.load(f)
+    assert data["conflict_check_on_sync"] is True
 
 
 def test_questions_md_seeded_with_sentinel_and_sample(tmp_path):
