@@ -32,7 +32,7 @@ from mitos.replay import commit_quarantine_fixpoint
 from mitos.store import GraphStore, CommitDelta
 from mitos.identity import compute_node_id, embedding_text
 from mitos.embeddings import GeminiEmbeddingProvider
-from mitos.vector_store import QdrantVectorStore
+from mitos.vector_store import QdrantVectorStore, hash_to_uuid
 from mitos.renderer import MitosRenderer, summarize_overflows
 
 def run_sync_enrichment(
@@ -1069,6 +1069,52 @@ class MitosSyncManager:
                 self.store.release_pending_embeddings(drainer_id)
             except Exception:
                 pass
+
+    def reconcile_embeddings(self) -> Dict[str, int]:
+        """Re-embeds active nodes missing from Qdrant, then drains the outbox.
+
+        Heals the gap Fix 1's drain cannot reach: when Qdrant is wiped directly
+        (a bare ``curl -X DELETE`` of the collection) WITHOUT a ``rebuild``/
+        ``cutover`` — which re-seed the outbox — the graph has nodes, Qdrant has
+        none, and the outbox is empty, so ``sync`` drains nothing. This pass
+        diffs the graph's ACTIVE node set against Qdrant's actual point ids,
+        enqueues every missing active node, and drains.
+
+        Only the active surface is reconciled (``get_active_node_ids``): dead and
+        superseded nodes are intentionally not re-embedded (retrieval filters
+        them via ``has_id`` and never returns them — see the
+        ``cutover-bounds-embedding-seed-to-active`` decision). Bounded to one
+        paginated scroll + a set difference (no per-node probes), so it stays
+        cheap at the P11 horizon. Idempotent: a second run finds nothing missing
+        and enqueues nothing. Re-queued nodes hit the embedding cache, so the
+        heal costs no embedding-API calls when the text is unchanged.
+
+        Returns:
+            Counts ``{"active", "present", "enqueued"}`` — active nodes, points
+            already in Qdrant, and nodes enqueued for re-embedding.
+
+        Raises:
+            VectorStoreError: If Qdrant is unreachable while scrolling point ids.
+        """
+        if not self.embed_provider or not self.vector_store:
+            print("Cannot reconcile: Embedding provider or vector store down.")
+            return {"active": 0, "present": 0, "enqueued": 0}
+
+        active_ids = self.store.get_active_node_ids()
+        present = self.vector_store.list_point_ids()
+        missing = [nid for nid in active_ids if hash_to_uuid(nid) not in present]
+
+        for node_id in missing:
+            self.store.add_pending_embedding(node_id)
+
+        if missing:
+            self.drain_pending_embeddings()
+
+        return {
+            "active": len(active_ids),
+            "present": len(present),
+            "enqueued": len(missing),
+        }
 
     # --- record_decision: the write half of the MCP server (Fork A) ---
 

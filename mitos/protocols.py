@@ -4,7 +4,7 @@ This module defines Protocol classes for GraphStore, VectorStore, and
 EmbeddingProvider to decouple Mitos components and support seamless swap-ins.
 """
 
-from typing import Protocol, List, Dict, Optional, Any, Tuple
+from typing import Protocol, List, Dict, Optional, Any, Tuple, Set
 from mitos.parser import ParsedEntry
 from mitos.store import CommitDelta
 
@@ -76,6 +76,17 @@ class VectorStore(Protocol):
 
         Returns:
             A list of dictionary results with payload and scores.
+        """
+        ...
+
+    def list_point_ids(self, page_size: int = 256) -> Set[str]:
+        """Lists every point id currently in the index.
+
+        Args:
+            page_size: Maximum points fetched per page.
+
+        Returns:
+            The set of point-id strings in the index.
         """
         ...
 
