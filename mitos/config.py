@@ -212,6 +212,14 @@ class MitosConfig:
         # (store/sync/importer/cli/mcp_server) bind these by name (R12), so they
         # stay real instance attributes even though the file can no longer set them.
         self.db_path = os.path.join(self.mitos_dir, "graph.sqlite")
+        # The Conflict sensor's non-rebuildable telemetry store (v0.2), a sibling of
+        # the graph deliberately fenced OUTSIDE the rebuild/cutover swap set so it
+        # survives ``rm graph.sqlite`` / ``mitos rebuild`` (CONF-D8, the T8
+        # guarantee). A derived attribute, NOT a user-overridable file-schema key —
+        # deriving it here gives the store + the 5b sync surface one canonical path
+        # expression sitting next to ``db_path``, instead of reassembling "sibling of
+        # the graph" at each call site.
+        self.telemetry_path = os.path.join(self.mitos_dir, "telemetry.sqlite")
         self.decisions_file = os.path.join(self.workspace_dir, "decisions.md")
         # The open-question authoring buffer, a fixed v0.1 convention path
         # paralleling ``decisions_file`` (ADR
@@ -345,6 +353,7 @@ class MitosConfig:
             "workspace_dir": self.workspace_dir,
             "mitos_dir": self.mitos_dir,
             "db_path": self.db_path,
+            "telemetry_path": self.telemetry_path,
             "qdrant_url": self.qdrant_url,
             "qdrant_collection": self.qdrant_collection,
             "pending_threshold": self.pending_threshold,
