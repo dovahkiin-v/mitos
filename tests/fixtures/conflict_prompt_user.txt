@@ -1,0 +1,19 @@
+<proposal>
+  <axiom>Cache entries expire 24 hours after they are written.</axiom>
+  <rejected_paths>Considered an unbounded TTL; rejected — it serves stale reads.</rejected_paths>
+  <scope>cache, backend</scope>
+</proposal>
+<candidates>
+<candidate>
+  <slug>cache-policy</slug>
+  <axiom>Cache entries never expire; they are evicted only under memory pressure.</axiom>
+  <rejected_paths>Considered TTL-based expiry; rejected — needless churn.</rejected_paths>
+  <scope>cache</scope>
+</candidate>
+<candidate>
+  <slug>global-logging</slug>
+  <axiom>Every service emits structured JSON logs.</axiom>
+  <rejected_paths>(none recorded)</rejected_paths>
+  <scope>(global — no scope declared)</scope>
+</candidate>
+</candidates>

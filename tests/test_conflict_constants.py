@@ -67,6 +67,15 @@ def test_module_exposes_the_five_constants_and_the_2a_pipeline_symbols() -> None
         "declared_strong_targets",
         "screen_candidates",
         "candidate_payload",
+        # The 3a judgment render + parse surface.
+        "JudgeInput",
+        "RenderedPrompt",
+        "Judgment",
+        "judge_input_from_entry",
+        "judge_input_from_node",
+        "render_judgment_prompt",
+        "parse_judgment_response",
+        "CONFLICT_PROMPT_VERSION",
     }
     missing = expected_api - public
     assert not missing, f"conflict.py is missing intended public symbols: {sorted(missing)}"
