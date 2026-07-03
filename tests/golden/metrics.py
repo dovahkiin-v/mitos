@@ -186,7 +186,7 @@ def evaluate_fixture(
 #   }
 #
 # "Not judged" (candidate absent from `judged_pairs`) means either an expected
-# declared-target drop (fixture 4) or an unexpected retrieval miss at the provisional
+# declared-target drop (fixture 4) or an unexpected retrieval miss at the active
 # floor — the harness distinguishes them; the metrics only care that the pair carries
 # no verdict (its `actual_*` fields are None/False and it is excluded from the
 # judged-only aggregates below).

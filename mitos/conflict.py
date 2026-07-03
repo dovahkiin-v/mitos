@@ -310,8 +310,8 @@ def screen_candidates(
     degradation upstream ("Degraded ≠ empty", §6.5).
 
     ``floor`` and ``top_k`` default to the module constants but are injectable so tests
-    pin behaviour with an explicit floor rather than chasing the PROVISIONAL
-    ``CONFLICT_SIMILARITY_FLOOR`` (4b recalibrates it — CONF-D2).
+    pin behaviour with an explicit floor rather than chasing the corpus-empirical
+    ``CONFLICT_SIMILARITY_FLOOR`` (4b calibrated it — CONF-D2).
 
     Args:
         candidates: 2a's gathered live neighbours (similarity-descending; may be empty).
@@ -984,7 +984,7 @@ def run_conflict_check(
     and re-checks none of that (plan §7). The ``judge`` is injected — the facade never
     imports :mod:`mitos.conflict_judgment`, keeping this leaf dep-free (plan D1). ``floor`` /
     ``top_k`` / ``surface_threshold`` default to the §8 constants but are injectable so tests
-    pin behaviour without chasing the PROVISIONAL floor (2b pattern).
+    pin behaviour without chasing the corpus-empirical floor (2b pattern).
 
     Args:
         entry: The proposed decision entry (already kind/toggle-admitted by 5a).

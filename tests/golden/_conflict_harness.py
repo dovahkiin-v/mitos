@@ -58,7 +58,7 @@ CONFLICT_LOWER_IS_BETTER = ("same_polarity_fp_rate",)
 
 # Distinct `reason` values on a per-fixture outcome, telling the two judged=false
 # meanings apart (§7): the EXPECTED declared-target drop vs the UNEXPECTED retrieval
-# miss at the provisional floor (the loud-but-soft 4b signal).
+# miss at the active floor (the loud-but-soft 4b signal).
 REASON_JUDGED = "judged"
 REASON_DECLARED_DROP = "declared_drop"
 REASON_RETRIEVAL_MISS = "unexpected_retrieval_miss"
@@ -97,7 +97,7 @@ def _outcome_and_fixture(
     Reads the NAMED candidate off the facade's ``judged_pairs`` (other judged pairs
     from the over-fetch are noise — not oracle-scored). The named candidate being
     absent means ``judged=false``, whose *meaning* splits on the oracle: an expected
-    declared-drop (fixture 4) vs an unexpected retrieval miss at the provisional floor.
+    declared-drop (fixture 4) vs an unexpected retrieval miss at the active floor.
     The gate (``pair.surfaced``) and verdict (``pair.judgment.*``) are read off the
     result, NEVER recomputed (D2).
 
@@ -213,8 +213,8 @@ def run_conflict_eval(
         vstore: A ``QdrantVectorStore`` bound to the populated test collection.
         store: The populated ``GraphStore`` (2a's computed-state source).
         judge: The bound SONNET judge (from :func:`make_live_judge`).
-        floor: The similarity floor passed to the facade (default the PROVISIONAL
-            ``CONFLICT_SIMILARITY_FLOOR``; 4b calibrates it).
+        floor: The similarity floor passed to the facade (default the calibrated
+            ``CONFLICT_SIMILARITY_FLOOR``; the probe run passes ``floor=0.0``).
         top_k: The judged-batch cap (default ``CONFLICT_TOP_K``).
         surface_threshold: The CONF-D4 confidence gate (default
             ``CONFLICT_SURFACE_THRESHOLD``).
@@ -378,7 +378,7 @@ def conflict_human_summary(report: Dict[str, Any]) -> str:
     """Renders a short human-readable summary of a conflict report for the test log.
 
     Loudly flags any ``unexpected_retrieval_miss`` — a fixture whose candidate was
-    expected to reach the judge but did not at the provisional floor (a soft 4b signal,
+    expected to reach the judge but did not at the active floor (a soft 4b signal,
     never a CI red).
 
     Args:

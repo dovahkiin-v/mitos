@@ -2,8 +2,9 @@
 
 Two contracts:
 1. The five constants exist with the pinned values (the four fixed dials pinned
-   exactly; the provisional similarity floor pinned only as present + in (0, 1),
-   since Phase 4b recalibrates it against golden fixtures).
+   exactly; the corpus-empirical similarity floor pinned only as present + in
+   (0, 1), since Phase 4b calibrated it against golden fixtures and it drifts as
+   the corpus grows).
 2. ``mitos.conflict`` is a Tier-1 leaf: importing it drags NO heavy dependency
    (``anthropic``, the Qdrant/genai clients). This pins the boundary for the whole
    vision — 2a/3b must keep those imports function-local / ``TYPE_CHECKING``-guarded.
