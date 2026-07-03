@@ -11,12 +11,13 @@ import shutil
 import re
 import json
 from datetime import datetime
-from typing import List, Dict, Optional, Any, Tuple
+from typing import List, Dict, Optional, Any, Tuple, Callable
 from filelock import FileLock, Timeout
 from google import genai
 from google.genai import types
 
 from mitos.config import MitosConfig, hint_due
+from mitos.conflict import ConflictFinding, Unavailable, run_conflict_check
 from mitos.errors import (
     SynthesisError,
     ParseError,
@@ -569,6 +570,17 @@ class MitosSyncManager:
         # failure (for the post-fixpoint residual report).
         quarantined: List[Tuple[ParsedEntry, str, CommitError]] = []
 
+        # Conflict sensor (5a): build the judgment executor ONCE per run (CONF-D4/D7) —
+        # one Anthropic client, one availability decision — and reference it per entry
+        # inside the loop. Skipped (left None) when the sensor is inactive: `--yes`
+        # (auto_accept runs no per-entry review at all) or the `conflict_check_on_sync`
+        # toggle is off. `_build_conflict_judge` folds in the remaining availability gate
+        # (ANTHROPIC_API_KEY + live embed/vector components) and lazy-imports `anthropic`,
+        # so the SDK never rides a sync when the sensor is off.
+        conflict_judge: Optional[Callable] = None
+        if not auto_accept and self.config.conflict_check_on_sync:
+            conflict_judge = self._build_conflict_judge()
+
         # 3. Process each parsed entry
         for entry in entries:
             # Read exact raw text block of this entry from snapshot for content-aware
@@ -646,6 +658,17 @@ class MitosSyncManager:
                 print(f"  Rejected:    {entry.rejected_paths}")
                 print(f"  Mechanisms:  {', '.join(entry.mechanisms)}")
                 print(f"  Scope:       {', '.join(entry.scope)}")
+
+                # Conflict sensor (5a): judge this decision against its undeclared close
+                # neighbours and surface any high-confidence contradiction BEFORE the
+                # accept prompt (CONF-D7), so the tension is named while the author can
+                # still choose. `conflict_judge is not None` already implies the full gate
+                # (decision-kind here, not auto_accept, toggle on, judge available). RF-1:
+                # this runs before the collision verb is applied below, so `entry` still
+                # holds the parsed declarations only. Advisory — it prints, never blocks;
+                # the accept prompt below is untouched.
+                if conflict_judge is not None:
+                    self._run_and_surface_conflict(entry, conflict_judge)
 
                 if not auto_accept:
                     u_choice = input("Accept this decision? [a]ccept / [s]kip / [q]uit: ").strip().lower()
@@ -914,6 +937,183 @@ class MitosSyncManager:
                 f"the store rejected it ({code_str}). Entry left in its buffer for a later "
                 f"sync once fixed. ({detail})"
             )
+
+    def _build_conflict_judge(self) -> Optional[Callable]:
+        """Builds the bound conflict-judgment executor for this sync run, or None (5a).
+
+        The availability gate for the sync-time conflict sensor: the judgment needs an
+        Anthropic client (``ANTHROPIC_API_KEY``, read from env like ``importer.py``) AND
+        the live ``embed_provider`` + ``vector_store`` the facade's candidate gather reads
+        (both ``Optional``, ``None`` when Qdrant/Gemini were down at manager init). If any
+        is absent the sensor cannot run, so this returns ``None`` and the per-entry hook is
+        skipped for the whole run — the sensor is advisory and its absence must be invisible
+        to a commit (P14/CONF-D7). The caller's kind/toggle/``--yes`` gates sit above this;
+        this method owns only component + key availability.
+
+        Built once per run (CONF-D4): one client, one availability decision — never per
+        entry (that would re-read env + re-import ``anthropic`` N times). The SDK import is
+        lazy so ``import anthropic`` never rides a ``mitos sync`` when the sensor is off (the
+        caller skips this builder when the toggle is off; a missing key returns before the
+        import here). The executor caps retries/timeout itself via ``with_options``, so the
+        client needs no retry knobs (IMPL_NOTES 3b).
+
+        Returns:
+            The bound one-arg ``judge`` callable
+            ``(RenderedPrompt) -> JudgmentExecution | Unavailable``, or ``None`` when the
+            sensor is unavailable.
+        """
+        if self.embed_provider is None or self.vector_store is None:
+            return None
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            return None
+        # Lazy import (CONF-D4/§8, load-bearing): `conflict_judgment` is the sole
+        # module-scope `import anthropic` in the conflict pipeline. Importing it here keeps
+        # the SDK off the `mitos sync` import path whenever the sensor is inactive.
+        import anthropic
+        from mitos.conflict_judgment import make_judgment_executor
+
+        client = anthropic.Anthropic(api_key=api_key)
+        return make_judgment_executor(client)
+
+    def _run_and_surface_conflict(self, entry: ParsedEntry, judge: Callable) -> None:
+        """Runs the conflict check for one decision entry and surfaces any findings (5a).
+
+        The sync-time surface of the Conflict sensor. Called under the caller's gates
+        (decision-kind, ``not auto_accept``, toggle on, judge available) immediately before
+        the accept prompt, so a high-confidence contradiction is named at the moment the
+        author can still choose (CONF-D7). Advisory only: it prints, applies no verb, writes
+        nothing, and **never blocks the commit**.
+
+        Contract (load-bearing, §8): no conflict-path outcome may abort a real decision
+        commit. A typed :class:`~mitos.conflict.Unavailable` (degraded check) is swallowed
+        here — 5b turns it into a loud notice + aggregate breaker; 5a only guarantees it is
+        *safe*. A genuine local graph-store fault propagates past the facade (2a's D4
+        ``DatabaseError``/``ValidationError``), so the whole call is wrapped defensively and
+        any exception is treated the same as ``Unavailable`` (logged to stderr, commit
+        proceeds) — matching this file's best-effort bulkhead idiom (the embed / render /
+        drain / rotation siblings).
+
+        Args:
+            entry: The proposed decision entry — passed raw, before the slug-collision verb
+                is applied (RF-1), so the facade reads the parsed declarations only.
+            judge: The bound judgment executor from :meth:`_build_conflict_judge`.
+
+        Returns:
+            None. Output is the printed finding block, or nothing on a clean / tenable /
+            degraded check (P9 quiet success — only a gated finding speaks).
+        """
+        # First-fire activation disclosure (CONF-D5/P15): reached only after every gate has
+        # passed, so the notice never prints when the sensor is inactive (no key, toggle
+        # off, `--yes`).
+        self._disclose_conflict_sensor_once()
+
+        try:
+            result = run_conflict_check(
+                entry,
+                embed_provider=self.embed_provider,
+                vector_store=self.vector_store,
+                store=self.store,
+                judge=judge,
+            )
+        except Exception as exc:
+            # Bulkhead (§8): a graph-store fault propagates past the facade (2a D4). Treat
+            # any raise the same as an Unavailable — log, never block the commit.
+            print(
+                f"[Warning] Conflict check failed for '{entry.slug}': {exc}",
+                file=sys.stderr,
+            )
+            return
+
+        if isinstance(result, Unavailable):
+            # Degraded check — swallowed in 5a (5b makes it a loud notice). The commit must
+            # proceed exactly as if the sensor were off (DoD-2: degraded ≠ empty, but
+            # neither blocks the commit).
+            return
+
+        # Healthy result: only surfaced (gated) findings speak (P9). Clean-empty or tenable
+        # → `findings == []` → print nothing.
+        if result.findings:
+            self._print_conflict_findings(result.findings)
+
+    def _disclose_conflict_sensor_once(self) -> None:
+        """Prints the conflict-sensor activation notice once per project (CONF-D5).
+
+        The ``conflict_check_on_sync`` toggle defaults on, so an upgrade silently enables a
+        feature that can spend Claude-tier tokens. Per P15 / progressive activation, disclose
+        it the first time it actually fires: if the ``.mitos/.conflict_disclosed`` sentinel
+        is absent, print a calm one-time notice (what it does, the tier + rough cost, how to
+        turn it off) and create the sentinel. A **presence-only** marker, zero content —
+        derivative state, safe to delete (the notice simply re-fires, harmlessly).
+        """
+        sentinel = os.path.join(self.config.mitos_dir, ".conflict_disclosed")
+        if os.path.exists(sentinel):
+            return
+        print(
+            "\n[Conflict sensor active] mitos now checks each synced decision against its\n"
+            "  close neighbours in the graph and, before you accept, names any active one it\n"
+            "  may contradict without linking to. It uses the Claude judgment tier (roughly a\n"
+            "  few cents only for an entry with a contradiction-suspect neighbour; most cost\n"
+            "  nothing — the similarity floor screens them out first). It only advises: it\n"
+            "  never blocks a commit and writes nothing. To turn it off, set\n"
+            "  `conflict_check_on_sync = false` in .mitos/config.toml."
+        )
+        try:
+            with open(sentinel, "w", encoding="utf-8") as f:
+                f.write("")
+        except Exception as exc:
+            # A derivative marker; if it can't be written the notice re-fires next run
+            # (harmless). Never let it block the sensor or the commit.
+            print(
+                f"[Warning] Could not write conflict-disclosure sentinel: {exc}",
+                file=sys.stderr,
+            )
+
+    def _print_conflict_findings(self, findings: List[ConflictFinding]) -> None:
+        """Renders surfaced conflict findings as a calm plain-text block (5a, §7).
+
+        For each surfaced finding, prints the conflicting decision's slug + similarity, its
+        Letter fields (axiom, rejected_paths, scope) and any modifier stamps, then the
+        judgment rationale — the "why" the two may not both stand (the payload describes the
+        *candidate*; the rationale describes the *tension*). The existing accept prompt runs
+        unchanged afterwards.
+
+        All conflict/notice wording lives HERE, in the surface (P7 core/surface bulkhead):
+        :mod:`mitos.conflict` returns structured findings and never prints. Plain text, ASCII
+        markers, no emoji, no required colour (P9 A11y). Wording is calm and non-accusatory
+        ("may contradict"): the calibrated floor cannot screen a legitimate scoped narrows
+        carve-out (4b), so a false positive is possible — and accept-anyway (the unchanged
+        prompt) is the one-keystroke backstop.
+
+        Args:
+            findings: The gated (surfaced) findings from a healthy ``ConflictCheckResult``.
+        """
+        plural = "decisions it does not link to" if len(findings) > 1 else \
+            "decision it does not link to"
+        print(f"\n[Conflict] This decision may contradict an active {plural}:")
+        for finding in findings:
+            payload = finding.payload
+            print(f"  -> {payload['slug']}   (similarity {payload['score']:.2f})")
+            print(f"       Axiom:    {payload['axiom']}")
+            # rejected_paths rides a non-brief finding payload; guard anyway (a brief
+            # payload would omit it). Modifier stamps ride CONDITIONALLY — a key is present
+            # only when non-empty (blind indexing KeyErrors on the common unmodified
+            # candidate), so guard every optional key (mirrors 2b's own copy guard).
+            if "rejected_paths" in payload:
+                print(f"       Rejected: {payload['rejected_paths']}")
+            scope = payload.get("scope") or []
+            scope_text = ", ".join(scope) if scope else "(global — no scope declared)"
+            print(f"       Scope:    {scope_text}")
+            for key in ("superseded_by", "amended_by", "narrowed_by", "corrected_by"):
+                if key in payload:
+                    print(f"       ({key.replace('_', ' ')}: {', '.join(payload[key])})")
+            print("     Why they may not both stand:")
+            print(f"       {finding.rationale}")
+        print(
+            "  Accept commits this decision as-is (unlinked). To resolve, skip and add a\n"
+            "  relationship (Supersedes: / Amends: / Narrows: / Contradicts:) in\n"
+            "  decisions.md, then re-sync. Quit to abort."
+        )
 
     def _best_effort_embed(self, delta: CommitDelta, entry: ParsedEntry) -> Optional[List[float]]:
         """Best-effort async embedding upsert pipeline (C2).
