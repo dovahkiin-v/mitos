@@ -10,14 +10,26 @@ import sys
 import shutil
 import re
 import json
+import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Dict, Optional, Any, Tuple, Callable
 from filelock import FileLock, Timeout
 from google import genai
 from google.genai import types
 
+from mitos import __version__ as MITOS_VERSION
 from mitos.config import MitosConfig, hint_due
-from mitos.conflict import ConflictFinding, Unavailable, run_conflict_check
+from mitos.conflict import (
+    CONFLICT_CANDIDATE_SOURCE,
+    CONFLICT_PROMPT_VERSION,
+    ConflictCheckResult,
+    ConflictFinding,
+    ConflictUnavailableReason,
+    Unavailable,
+    run_conflict_check,
+)
+from mitos.telemetry import ConflictCheckRow, JudgmentBatch, TelemetryStore
 from mitos.errors import (
     SynthesisError,
     ParseError,
@@ -30,11 +42,42 @@ from mitos.errors import (
 from mitos.models import get_model_id
 from mitos.parser import ParsedEntry, parse_entry_stream, parse_file_reversed
 from mitos.replay import commit_quarantine_fixpoint
-from mitos.store import GraphStore, CommitDelta
+from mitos.store import GraphStore, CommitDelta, _utc_now_iso
 from mitos.identity import SLUG_MAX_LEN, compute_node_id, embedding_text
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.vector_store import QdrantVectorStore, hash_to_uuid
 from mitos.renderer import MitosRenderer, summarize_overflows
+
+
+@dataclass
+class _ConflictSyncRun:
+    """The per-run context the sync-time Conflict sensor threads through its checks (5b).
+
+    The one piece of mutable per-run state the sensor needs, built ONCE per
+    ``perform_sync`` at the judge-build site and passed to every
+    :meth:`MitosSyncManager._run_and_surface_conflict` call of the loop. Threading it
+    explicitly (rather than hiding it on ``self``) makes the write-then-read aggregate
+    breaker legible: ``breaker_tripped`` is set on the entry that degrades and read at
+    the top of the next entry's check, so a single downstream outage costs one penalty,
+    not N (P7 active-bulkhead, vision §4). Reset is structural — a fresh run means a
+    fresh instance (``breaker_tripped=False``), so a prior sync's trip can never leak
+    into the next; there is no explicit un-trip step to forget.
+
+    Attributes:
+        sync_run_id: The run-correlation id minted per sync (a ``uuid4().hex``), stamped
+            on every ``conflict_checks`` row so a run's judgments read as one thread
+            (P16 One Thread of Truth).
+        telemetry: The best-effort telemetry store, or ``None`` when it could not be
+            constructed — the sensor still surfaces findings, it just can't persist them.
+        breaker_tripped: Set ``True`` on the first typed degradation of the run; every
+            later entry's check then short-circuits to a true no-op (no gather, no
+            query, no judge).
+    """
+
+    sync_run_id: str
+    telemetry: Optional[TelemetryStore]
+    breaker_tripped: bool = False
+
 
 def run_sync_enrichment(
     client: genai.Client,
@@ -577,9 +620,18 @@ class MitosSyncManager:
         # toggle is off. `_build_conflict_judge` folds in the remaining availability gate
         # (ANTHROPIC_API_KEY + live embed/vector components) and lazy-imports `anthropic`,
         # so the SDK never rides a sync when the sensor is off.
+        # 5b builds the per-run conflict context (sync_run_id + telemetry + breaker)
+        # alongside the judge, ONCE per run, under the SAME availability guard — so no
+        # TelemetryStore is constructed when the sensor is off, and the single
+        # `_ConflictSyncRun` instance is what the write-then-read aggregate breaker
+        # depends on (build it per entry and the breaker never trips). `conflict_run`
+        # is non-None exactly when `conflict_judge` is.
         conflict_judge: Optional[Callable] = None
+        conflict_run: Optional[_ConflictSyncRun] = None
         if not auto_accept and self.config.conflict_check_on_sync:
             conflict_judge = self._build_conflict_judge()
+            if conflict_judge is not None:
+                conflict_run = self._new_conflict_run()
 
         # 3. Process each parsed entry
         for entry in entries:
@@ -668,7 +720,7 @@ class MitosSyncManager:
                 # holds the parsed declarations only. Advisory — it prints, never blocks;
                 # the accept prompt below is untouched.
                 if conflict_judge is not None:
-                    self._run_and_surface_conflict(entry, conflict_judge)
+                    self._run_and_surface_conflict(entry, conflict_judge, conflict_run)
 
                 if not auto_accept:
                     u_choice = input("Accept this decision? [a]ccept / [s]kip / [q]uit: ").strip().lower()
@@ -976,33 +1028,56 @@ class MitosSyncManager:
         client = anthropic.Anthropic(api_key=api_key)
         return make_judgment_executor(client)
 
-    def _run_and_surface_conflict(self, entry: ParsedEntry, judge: Callable) -> None:
-        """Runs the conflict check for one decision entry and surfaces any findings (5a).
+    def _run_and_surface_conflict(
+        self, entry: ParsedEntry, judge: Callable, run: "_ConflictSyncRun"
+    ) -> None:
+        """Runs the conflict check for one decision entry, surfaces + persists it (5a/5b).
 
         The sync-time surface of the Conflict sensor. Called under the caller's gates
         (decision-kind, ``not auto_accept``, toggle on, judge available) immediately before
         the accept prompt, so a high-confidence contradiction is named at the moment the
         author can still choose (CONF-D7). Advisory only: it prints, applies no verb, writes
-        nothing, and **never blocks the commit**.
+        nothing to the graph, and **never blocks the commit**.
 
         Contract (load-bearing, §8): no conflict-path outcome may abort a real decision
-        commit. A typed :class:`~mitos.conflict.Unavailable` (degraded check) is swallowed
-        here — 5b turns it into a loud notice + aggregate breaker; 5a only guarantees it is
-        *safe*. A genuine local graph-store fault propagates past the facade (2a's D4
+        commit. 5b gives the surface its memory and its failure manners:
+
+        * **Aggregate breaker (P7, vision §4).** If a prior entry's check tripped the run's
+          breaker, this returns immediately — a true no-op (no gather, no query, no judge),
+          so a single downstream outage costs ONE penalty for the run, not N.
+        * **Loud degradation notice.** A typed :class:`~mitos.conflict.Unavailable` (the
+          sensor's downstream deps went dark) now prints one calm ``[Conflict sensor
+          unavailable]`` notice and trips the breaker for the rest of the run (write-then-
+          read: set here, read at the top of the next entry's check). The commit proceeds
+          untouched (fail-open, CONF-D10).
+        * **Best-effort telemetry.** A healthy JUDGED result (``execution is not None``)
+          persists one ``judgment_batches`` row + N ``conflict_checks`` rows; the write is
+          decoupled from surfacing and never aborts the sync (D5).
+
+        A genuine local graph-store fault propagates past the facade (2a's D4
         ``DatabaseError``/``ValidationError``), so the whole call is wrapped defensively and
-        any exception is treated the same as ``Unavailable`` (logged to stderr, commit
-        proceeds) — matching this file's best-effort bulkhead idiom (the embed / render /
-        drain / rotation siblings).
+        any exception is logged to stderr, commit proceeds — matching this file's best-effort
+        bulkhead idiom. This generic seam does NOT trip the breaker (it is a rare local fault,
+        not a downstream-dep outage — IMPL_NOTES 5a, D3).
 
         Args:
             entry: The proposed decision entry — passed raw, before the slug-collision verb
                 is applied (RF-1), so the facade reads the parsed declarations only.
             judge: The bound judgment executor from :meth:`_build_conflict_judge`.
+            run: The per-run :class:`_ConflictSyncRun` context (sync_run_id + telemetry +
+                breaker), built once per sync and threaded through every entry's check.
 
         Returns:
-            None. Output is the printed finding block, or nothing on a clean / tenable /
-            degraded check (P9 quiet success — only a gated finding speaks).
+            None. Output is the printed finding block or a degradation notice; nothing on a
+            clean / tenable check (P9 quiet success — only a gated finding or a degradation
+            speaks).
         """
+        # Aggregate breaker gate (5b, §8): a prior entry already saw the sensor's downstream
+        # go dark, so skip the whole check — including the disclosure below (harmless: it
+        # already fired on the tripping entry or earlier). One penalty, not N (P3/P7).
+        if run.breaker_tripped:
+            return
+
         # First-fire activation disclosure (CONF-D5/P15): reached only after every gate has
         # passed, so the notice never prints when the sensor is inactive (no key, toggle
         # off, `--yes`).
@@ -1017,8 +1092,9 @@ class MitosSyncManager:
                 judge=judge,
             )
         except Exception as exc:
-            # Bulkhead (§8): a graph-store fault propagates past the facade (2a D4). Treat
-            # any raise the same as an Unavailable — log, never block the commit.
+            # Bulkhead (§8/D3): a graph-store fault propagates past the facade (2a D4). Log
+            # and never block the commit — but do NOT trip the breaker (this is a local
+            # fault, not a downstream-dep outage; the breaker is for the typed Unavailable).
             print(
                 f"[Warning] Conflict check failed for '{entry.slug}': {exc}",
                 file=sys.stderr,
@@ -1026,15 +1102,192 @@ class MitosSyncManager:
             return
 
         if isinstance(result, Unavailable):
-            # Degraded check — swallowed in 5a (5b makes it a loud notice). The commit must
-            # proceed exactly as if the sensor were off (DoD-2: degraded ≠ empty, but
-            # neither blocks the commit).
+            # Degraded check (5b): a loud one-time notice + trip the aggregate breaker so
+            # every later entry skips the check. The commit proceeds exactly as if the
+            # sensor were off (fail-open, CONF-D10); no row is persisted for a degradation.
+            self._notice_conflict_unavailable(result.reason)
+            run.breaker_tripped = True
             return
 
         # Healthy result: only surfaced (gated) findings speak (P9). Clean-empty or tenable
         # → `findings == []` → print nothing.
         if result.findings:
             self._print_conflict_findings(result.findings)
+
+        # 5b persistence: a JUDGED result (the LLM fired) writes its judged pairs to the
+        # telemetry corpus — the surfaced findings AND the silent-but-judged negative labels
+        # (CONF-D8). Clean-empty (`execution is None`) is a healthy novel entry, not a
+        # judged batch — it writes nothing (the canonical DoD-2 discriminator). Best-effort:
+        # a telemetry failure never aborts the sync (D5).
+        if result.execution is not None:
+            self._persist_conflict_batch(result, run)
+
+    def _new_conflict_run(self) -> "_ConflictSyncRun":
+        """Mints the per-run conflict context for one sync (5b): id + telemetry + breaker.
+
+        Called ONCE per ``perform_sync`` at the judge-build site, under the same
+        availability guard as :meth:`_build_conflict_judge` — so no telemetry store is
+        constructed when the sensor is off, and the single returned instance is what the
+        write-then-read aggregate breaker threads through the loop (§8). The
+        :class:`~mitos.telemetry.TelemetryStore` construction is best-effort: it boots its
+        own ladder against ``config.telemetry_path`` and, on any failure, the run keeps a
+        ``None`` telemetry handle — the sensor still surfaces findings, it simply can't
+        persist them (a persistence outage must never disable the advisory surface, P7).
+
+        Returns:
+            A fresh :class:`_ConflictSyncRun` with a minted ``sync_run_id``, a (possibly
+            ``None``) telemetry store, and ``breaker_tripped=False``.
+        """
+        sync_run_id = uuid.uuid4().hex
+        telemetry: Optional[TelemetryStore] = None
+        try:
+            telemetry = TelemetryStore(self.config.telemetry_path)
+        except Exception as exc:
+            # Best-effort: a telemetry store that can't boot must not disable the surface.
+            print(
+                f"[Warning] Conflict telemetry unavailable ({exc}); "
+                f"judged checks will not be persisted this sync.",
+                file=sys.stderr,
+            )
+            telemetry = None
+        return _ConflictSyncRun(sync_run_id=sync_run_id, telemetry=telemetry)
+
+    def _persist_conflict_batch(
+        self, result: ConflictCheckResult, run: "_ConflictSyncRun"
+    ) -> None:
+        """Persists one judged conflict batch to the telemetry corpus (5b, best-effort).
+
+        Maps a healthy JUDGED :class:`~mitos.conflict.ConflictCheckResult` to its
+        ``(JudgmentBatch, [ConflictCheckRow])`` and hands it to 1b's atomic writer. Every
+        fed-context field is read off the result's :class:`~mitos.conflict.JudgeInput`\\ s
+        (``result.proposal_input`` / ``pair.candidate_input``) — exactly what the judge saw,
+        VERBATIM — never a re-read of the node (which would risk drift and hit the 2a
+        ``core_axiom`` key-name gotcha). Empty proposal ``rejected_paths``/scope and empty
+        candidate scope serialize to ``NULL`` (MI-9); the NOT-NULL ``candidate_rejected_paths``
+        is stored raw (even the degenerate ``""``).
+
+        Best-effort bulkhead (D5): the write is a separate step after the print, wrapped so a
+        telemetry failure (a wrapped ``DatabaseError`` from the writer, or a raw ``TypeError``
+        a bad Python value dies on in ``to_params`` before SQLite sees it — IMPL_NOTES 1b)
+        logs a stderr ``[Warning]`` and returns. It never aborts the sync and never trips the
+        breaker (the breaker is for the *sensor's* downstream, not the corpus store).
+
+        Args:
+            result: A healthy judged result — the caller guards ``execution is not None``, so
+                ``result.execution`` and ``result.judged_pairs`` are populated here.
+            run: The per-run context carrying ``sync_run_id`` (stamped on every row) and the
+                (possibly ``None``) telemetry store.
+        """
+        if run.telemetry is None:
+            return
+        try:
+            execution = result.execution
+            batch = JudgmentBatch(
+                batch_id=execution.batch_id,
+                token_input=execution.token_input,
+                token_output=execution.token_output,
+                token_cache_read=execution.token_cache_read,
+                token_cache_creation=execution.token_cache_creation,
+                elapsed_ms=execution.elapsed_ms,
+            )
+            proposal = result.proposal_input
+            rows: List[ConflictCheckRow] = []
+            for pair in result.judged_pairs:
+                candidate_input = pair.candidate_input
+                rows.append(
+                    ConflictCheckRow(
+                        batch_id=execution.batch_id,
+                        sync_run_id=run.sync_run_id,
+                        judged_axiom=proposal.axiom,
+                        # MI-9: an empty proposal rejected_paths ("") / scope ([]) is NULL,
+                        # never "" — the NULL column already expresses "nothing here".
+                        proposal_rejected_paths=proposal.rejected_paths or None,
+                        proposal_scope=", ".join(proposal.scope) or None,
+                        proposed_hash_if_any=result.proposed_hash_if_any,
+                        candidate_slug=pair.candidate.slug,  # verbatim, no casefold
+                        candidate_hash=pair.candidate.node["id"],  # M2 content hash, not slug
+                        # NOT NULL (M5 guarantees a committed decision has it): store the raw
+                        # str, even the degenerate "" — never coerce to None here.
+                        candidate_rejected_paths=candidate_input.rejected_paths,
+                        candidate_scope=", ".join(candidate_input.scope) or None,
+                        tenable=pair.judgment.tenable_together,
+                        confidence=pair.judgment.confidence,
+                        surfaced=pair.surfaced,
+                        candidate_source=CONFLICT_CANDIDATE_SOURCE,
+                        model_alias=execution.model_alias,
+                        prompt_version=CONFLICT_PROMPT_VERSION,
+                        mitos_version=MITOS_VERSION,
+                        rationale=pair.judgment.rationale,
+                    )
+                )
+            # One MI-10 UTC stamp per batch, shared by every row (D5).
+            self._record_conflict_batch(run.telemetry, batch, rows)
+        except Exception as exc:
+            # Best-effort (D5/§8): a mapping or write failure never aborts the sync. Mirror
+            # the file's `[Warning] ...: {exc}` stderr idiom (the embed/drain/rotation
+            # siblings). No breaker trip — the corpus store is not the sensor's downstream.
+            print(
+                f"[Warning] Could not persist conflict telemetry: {exc}",
+                file=sys.stderr,
+            )
+
+    def _record_conflict_batch(
+        self,
+        telemetry: TelemetryStore,
+        batch: JudgmentBatch,
+        rows: List[ConflictCheckRow],
+    ) -> None:
+        """Stamps one MI-10 UTC timestamp and writes the batch (the sole telemetry write).
+
+        A thin seam over :meth:`~mitos.telemetry.TelemetryStore.record_judged_batch` that
+        takes the single ``created_at`` stamp (MI-10: application-supplied UTC ISO-8601, one
+        per batch, shared by every row — never ``CURRENT_TIMESTAMP``). Kept separate from
+        :meth:`_persist_conflict_batch`'s mapping so a test can monkeypatch the write in
+        isolation and so the one wall-clock read has a single home.
+
+        Args:
+            telemetry: The run's telemetry store (non-``None`` — the caller guards it).
+            batch: The per-batch metrics row.
+            rows: The judged candidate rows.
+        """
+        telemetry.record_judged_batch(batch, rows, _utc_now_iso())
+
+    def _notice_conflict_unavailable(self, reason: ConflictUnavailableReason) -> None:
+        """Prints the loud one-time degradation notice for a typed Unavailable (5b, §7).
+
+        The surface's disposition of a typed :class:`~mitos.conflict.Unavailable`: a calm,
+        plain-text notice that (a) names WHICH subsystem went dark — switching on ``reason``
+        (embedding/vector-store → semantic recall; judgment/timeout → the judge) — (b) states
+        the breaker consequence (conflict checking is off for the rest of this sync), and
+        (c) reassures that the commit is unaffected (fail-open, CONF-D10). All conflict UX
+        wording lives HERE in the surface (P7 core/surface bulkhead); ``mitos.conflict``
+        returns the typed reason and ``result.detail`` is logging-only, NEVER rendered.
+
+        A tag distinct from 5a's ``[Conflict]`` (finding) and ``[Conflict sensor active]``
+        (disclosure) — ``[Conflict sensor unavailable]`` — so the three surfaces don't blur.
+        Plain ASCII, no emoji, no required colour (P9 A11y).
+
+        Args:
+            reason: The typed :class:`~mitos.conflict.ConflictUnavailableReason` from the
+                degraded result — the machine-readable discriminator the surface words.
+        """
+        if reason in (
+            ConflictUnavailableReason.EMBEDDING,
+            ConflictUnavailableReason.VECTOR_STORE,
+        ):
+            what = (
+                "Semantic recall is unavailable (the vector store or embedding service did "
+                "not respond)"
+            )
+        else:
+            what = (
+                "Conflict judgment is unavailable (the judgment model did not respond in "
+                "time)"
+            )
+        print(
+            f"\n[Conflict sensor unavailable] {what}. Conflict checking is skipped for the\n"
+            "  rest of this sync; your decisions still commit normally."
+        )
 
     def _disclose_conflict_sensor_once(self) -> None:
         """Prints the conflict-sensor activation notice once per project (CONF-D5).

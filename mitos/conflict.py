@@ -83,6 +83,14 @@ CONFLICT_SIMILARITY_FLOOR = 0.76
 # this is an operational tuning value, not a 4b-calibrated corpus-empirical number.
 CONFLICT_OVERFETCH_LIMIT = 4 * CONFLICT_TOP_K   # = 20
 
+# CONF-D8 / vision §7 — how a judged candidate was gathered, stamped onto every
+# telemetry row's ``candidate_source`` column (5b). In v0.2 the sole gather path is
+# the S2 embedding KNN over-fetch, so the value is constant; it is a named constant
+# (not a bare string buried in the 5b row mapper) so the forward-wire to a second
+# candidate source — the ROADMAP'd mechanism-overlap gather feeding the Drift vision —
+# reads as an explicit enumeration point, not a magic literal to hunt for later.
+CONFLICT_CANDIDATE_SOURCE = "embedding_topk"
+
 # The two computed states that count as "live" for candidate gathering. Mirrors the
 # proven recall idiom (surface_decisions, _adjacent_decisions): keep active ∪ drifted,
 # drop superseded/corrected. Re-derived per-node via get_node_state (M3), never trusted
