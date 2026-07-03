@@ -15,6 +15,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
 from metrics import (  # noqa: E402
+    DEFAULT_FLOOR_MARGIN,
     _dedupe_preserve_order,
     confidence_calibration_curve,
     evaluate_fixture,
@@ -24,6 +25,7 @@ from metrics import (  # noqa: E402
     not_tenable_recall,
     precision_at_k,
     recall_at_k,
+    recommend_floor,
     same_polarity_fp_rate,
 )
 
@@ -346,3 +348,64 @@ class TestConfidenceCalibrationCurve:
         curve = confidence_calibration_curve([_oc(confidence=1.0)], n_bins=4)
         assert curve[3]["count"] == 1
         assert curve[3]["observed_not_tenable_fraction"] == 1.0
+
+
+# --------------------------------------------------------------------------- #
+# recommend_floor — the floor-calibration selector (plan D1). Hand-authored REPORT
+# records (which carry `similarity`, unlike the leaner `_oc` outcome records) with
+# hand-computed min−margin. Pins the selector, the margin arithmetic, and the
+# empty-contradiction-set convention the live calibration test relies on.
+# --------------------------------------------------------------------------- #
+
+
+def _rec(expected_tenable=False, judged=True, similarity=0.7, kind="genuine-contradiction"):
+    """Builds one conflict REPORT record (the `fixtures` shape carrying `similarity`)."""
+    return {
+        "kind": kind,
+        "expected_tenable": expected_tenable,
+        "judged": judged,
+        "similarity": similarity,
+    }
+
+
+class TestRecommendFloor:
+    def test_min_contradiction_minus_margin(self):
+        # Three judged contradictions at distinct similarities; the min (0.60) sets it.
+        recs = [
+            _rec(similarity=0.72),
+            _rec(similarity=0.60, kind="cross-domain-structural"),
+            _rec(similarity=0.81, kind="multilingual"),
+        ]
+        assert recommend_floor(recs) == pytest.approx(0.60 - DEFAULT_FLOOR_MARGIN)
+
+    def test_explicit_margin_overrides_default(self):
+        recs = [_rec(similarity=0.60)]
+        assert recommend_floor(recs, margin=0.05) == pytest.approx(0.55)
+
+    def test_tenable_and_screened_fixtures_do_not_constrain(self):
+        # A tenable pair (higher-tenable) and a not-judged declared-drop are ignored;
+        # only the single judged contradiction at 0.65 counts → 0.65 − margin.
+        recs = [
+            _rec(similarity=0.65),
+            _rec(expected_tenable=True, similarity=0.40, kind="same-polarity-agreement"),
+            _rec(expected_tenable=None, judged=False, similarity=None,
+                 kind="declared-contradiction"),
+        ]
+        assert recommend_floor(recs) == pytest.approx(0.65 - DEFAULT_FLOOR_MARGIN)
+
+    def test_none_similarity_is_skipped(self):
+        # A contradiction whose candidate never retrieved (similarity None) is defensively
+        # skipped; the 0.70 one remains the min.
+        recs = [
+            _rec(similarity=None),
+            _rec(similarity=0.70, kind="cross-domain-structural"),
+        ]
+        assert recommend_floor(recs) == pytest.approx(0.70 - DEFAULT_FLOOR_MARGIN)
+
+    def test_empty_convention_no_judged_contradictions(self):
+        # Only a tenable pair → nothing to calibrate against → None (keep the standing floor).
+        recs = [_rec(expected_tenable=True, similarity=0.90, kind="same-polarity-agreement")]
+        assert recommend_floor(recs) is None
+
+    def test_empty_list_is_none(self):
+        assert recommend_floor([]) is None

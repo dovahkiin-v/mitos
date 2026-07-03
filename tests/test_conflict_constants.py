@@ -28,10 +28,13 @@ def test_fixed_constants_have_pinned_values() -> None:
 
 
 def test_similarity_floor_is_present_numeric_and_in_unit_range() -> None:
-    """The provisional floor exists and is a sane (0, 1) similarity — value NOT pinned.
+    """The calibrated floor exists and is a sane (0, 1) similarity — value NOT pinned.
 
-    It is the one corpus-empirical constant, recalibrated against golden fixtures
-    in Phase 4b; pinning its exact number here would just make this test chase it.
+    It is the one corpus-empirical constant. Phase 4b calibrated it against the golden
+    fixtures (see its Calibration block), but the exact number stays UNpinned here: it
+    drifts as the Harbor corpus grows, so pinning it would just make this test chase it.
+    The recall-first guarantee is enforced instead by the live-gated calibration test
+    (``test_conflict_floor_calibration``), not by an absolute-value assertion.
     """
     floor = conflict.CONFLICT_SIMILARITY_FLOOR
     assert isinstance(floor, (int, float)) and not isinstance(floor, bool)

@@ -35,7 +35,7 @@ import warnings
 import pytest
 import requests
 
-from mitos.conflict import Unavailable
+from mitos.conflict import CONFLICT_SIMILARITY_FLOOR, Unavailable
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.models import get_embedding_model_id
 from mitos.parser import parse_entry_stream
@@ -47,6 +47,7 @@ from _harness import CORPUS_PATH, build_reference_graph  # noqa: E402
 import _conflict_harness as CH  # noqa: E402  (pulls anthropic in — the quarantine boundary)
 import _semantic_harness as H  # noqa: E402
 from live_helpers import skip_on_embed_quota  # noqa: E402
+from metrics import recommend_floor  # noqa: E402
 
 # Loose smoke floor — of the genuine contradictions that reached the judge, at least half
 # must surface. NOT a calibrated per-fixture floor (the real measurement is the report +
@@ -54,6 +55,12 @@ from live_helpers import skip_on_embed_quota  # noqa: E402
 # enough that ordinary judge jitter never reds it. Raise deliberately (reviewed) once 4b
 # has measured the numbers. Mirrors `SMOKE_RECALL_FLOOR` in the retrieval suite.
 SMOKE_NOT_TENABLE_RECALL_FLOOR = 0.5
+
+# The calibration probe floor (plan D1/§7). At 0.0 the S5 gate screens NOTHING, so every
+# candidate ranked in the top-K is scored and its raw similarity captured — the worst case
+# for truncation (a lower floor only ADDS candidates, never removes the named one). Fixture
+# 4's declared-drop (S4) is floor-independent, so it still drops here.
+CALIBRATION_PROBE_FLOOR = 0.0
 
 # Per-metric regression bands stored with a seeded baseline (4b seeds; 4a only ships the hook).
 CONFLICT_BASELINE_BANDS = {
@@ -195,6 +202,63 @@ def test_conflict_declared_drop_and_smoke_floor(conflict_index):
         f"not_tenable_recall={recall:.2f} < {SMOKE_NOT_TENABLE_RECALL_FLOOR} smoke floor "
         f"— the sensor is missing genuine contradictions it judged. See the report."
     )
+
+
+def test_conflict_floor_calibration(conflict_index):
+    """Probe run at floor=0.0: capture similarities, recommend the floor, HARD-assert recall.
+
+    The 4b calibration act. Runs the eval at :data:`CALIBRATION_PROBE_FLOOR` so every named
+    candidate is scored (nothing screened by S5), writes the calibration readout, and computes
+    :func:`recommend_floor`. The one HARD invariant (deterministic — embeddings are stable for
+    fixed text+model, so this reds CI on a genuine recall regression, not judge jitter): every
+    judged contradiction fixture retrieves at a similarity **>= the landed
+    ``CONFLICT_SIMILARITY_FLOOR``** — i.e. the calibrated floor never screens a real
+    contradiction (recall-first). Everything judge-quality stays soft (the report + the
+    soft-diff test), never red — the Layer B law.
+    """
+    store, provider, vstore, entries_by_slug, _ = conflict_index
+    oracle = H.load_semantic_oracle()
+    with skip_on_embed_quota():
+        report = CH.run_conflict_eval(
+            oracle, entries_by_slug, provider, vstore, store, CH.make_live_judge(),
+            floor=CALIBRATION_PROBE_FLOOR,
+        )
+    _skip_if_unavailable(report)
+
+    summary = CH.conflict_human_summary(report)
+    path = H.write_report(report, "conflict-calibration-probe")
+    recommended = recommend_floor(report["fixtures"])
+    print(
+        f"\n{summary}\n"
+        f"[recommended floor] {recommended}  "
+        f"(landed CONFLICT_SIMILARITY_FLOOR = {CONFLICT_SIMILARITY_FLOOR})\n"
+        f"[report] {path}"
+    )
+
+    # The judged contradictions (oracle expected_tenable is False) — the recall-first set.
+    contradictions = [
+        f for f in report["fixtures"]
+        if f["expected_tenable"] is False and f["judged"]
+    ]
+    assert contradictions, (
+        "no judged contradiction fixtures in the probe run — the corpus/oracle changed, or "
+        "every contradiction was screened/truncated even at floor=0.0 (a top_k-ceiling / hub "
+        "signal, not a floor issue). See the report."
+    )
+    for f in contradictions:
+        # A judged contradiction MUST carry a similarity (its candidate reached the judge).
+        assert f["similarity"] is not None, (
+            f"judged contradiction {f['proposal']} ✗ {f['candidate']} ({f['kind']}) has no "
+            f"similarity — inconsistent report record."
+        )
+        # RECALL-FIRST: the landed floor must not screen a genuine contradiction.
+        assert f["similarity"] >= CONFLICT_SIMILARITY_FLOOR, (
+            f"recall-first VIOLATION: {f['kind']} {f['proposal']} ✗ {f['candidate']} "
+            f"retrieves at similarity={f['similarity']:.4f} < landed "
+            f"CONFLICT_SIMILARITY_FLOOR={CONFLICT_SIMILARITY_FLOOR} — the calibrated floor "
+            f"would screen this real contradiction before judgment. Recalibrate the floor "
+            f"DOWN (min contradiction similarity − margin). See the calibration readout."
+        )
 
 
 def test_conflict_baseline_diff_soft_gate(conflict_index):

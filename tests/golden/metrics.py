@@ -285,6 +285,58 @@ def _confidence_bin_index(confidence: float, n_bins: int) -> int:
     return min(int(confidence * n_bins), n_bins - 1)
 
 
+# The recall-first jitter margin subtracted from the min-contradiction similarity when
+# recommending the floor (plan D1 / §14). Small and deliberate: it hedges recall against
+# future corpus/embedding drift (err LOW), without dropping the floor into the
+# clearly-irrelevant tail (which would re-admit noise and raise judge cost/FP surface).
+# 0.03 sits mid-range of the plan's ≈0.02–0.05 band. It is a RECOMMENDATION margin — the
+# actual landed CONFLICT_SIMILARITY_FLOOR is a reviewed constant (its Calibration block
+# records the measured min, this margin, and the resulting value).
+DEFAULT_FLOOR_MARGIN = 0.03
+
+
+def recommend_floor(
+    records: Sequence[Dict[str, Any]], margin: float = DEFAULT_FLOOR_MARGIN
+) -> Optional[float]:
+    """Recommends the similarity floor from measured per-fixture report records.
+
+    Recall-first (OpEcon §11): the highest cutoff that still admits *every* known
+    contradiction that reached the judge — ``min(similarity)`` over the fixtures whose
+    oracle ``expected_tenable is False`` and that were ``judged`` — minus a small jitter
+    ``margin`` (err low, hedge recall against drift). The genuine / cross-domain /
+    multilingual contradictions set the floor; tenable pairs and screened candidates do
+    not constrain it.
+
+    This reads the **report** records (which carry ``similarity``), NOT the leaner metrics
+    ``outcome`` records (which do not). A judged contradiction always carries a non-``None``
+    ``similarity`` (its candidate reached the judge); the ``None`` guard is defensive.
+
+    Empty-set convention: no judged contradiction fixtures ⇒ ``None`` (there is nothing to
+    calibrate against — the caller keeps the standing floor rather than inventing one).
+    Never raises.
+
+    Args:
+        records: Per-fixture report records (each ``{expected_tenable, judged, similarity,
+            ...}`` — the ``fixtures`` list of a ``run_conflict_eval`` report).
+        margin: The recall-first jitter margin subtracted from the min (default
+            :data:`DEFAULT_FLOOR_MARGIN`).
+
+    Returns:
+        The recommended floor as a ``float``, or ``None`` when no judged contradiction
+        fixture is present.
+    """
+    sims = [
+        r["similarity"]
+        for r in records
+        if r.get("expected_tenable") is False
+        and r.get("judged")
+        and r.get("similarity") is not None
+    ]
+    if not sims:
+        return None
+    return min(sims) - margin
+
+
 def confidence_calibration_curve(
     outcomes: Sequence[Dict[str, Any]], n_bins: int = 4
 ) -> List[Dict[str, Any]]:

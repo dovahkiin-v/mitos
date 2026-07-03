@@ -45,6 +45,7 @@ from metrics import (  # noqa: E402
     confidence_calibration_curve,
     not_tenable_precision,
     not_tenable_recall,
+    recommend_floor,
     same_polarity_fp_rate,
 )
 
@@ -117,11 +118,16 @@ def _outcome_and_fixture(
         actual_surfaced = pair.surfaced
         confidence: Optional[float] = pair.judgment.confidence
         reason = REASON_JUDGED
+        # The Qdrant similarity S5 gates on (`candidate.score >= floor`) — the SOLE
+        # input to 4b's floor calibration. `null` when the named candidate never
+        # retrieved/reached the judge (below).
+        similarity: Optional[float] = pair.candidate.score
     else:
         judged = False
         actual_tenable = None
         actual_surfaced = False
         confidence = None
+        similarity = None
         # judged=false is EXPECTED for the declared-drop fixture, an unexpected soft
         # signal otherwise (a below-floor retrieval miss the eval records but never reds).
         reason = (
@@ -129,6 +135,24 @@ def _outcome_and_fixture(
             if not fx["expected_candidate_judged"]
             else REASON_RETRIEVAL_MISS
         )
+
+    # One batched judgment call fires per proposal, so `result.execution` is this
+    # fixture's whole batch cost/latency (§8). `execution is None` on a clean-empty
+    # (all-screened) result ⇒ no LLM call fired ⇒ `null` token/latency. NOTE:
+    # JudgmentExecution has FOUR scalar token fields, not a `token_usage` object —
+    # assemble the dict here (reading `execution.token_usage` would AttributeError).
+    ex = result.execution
+    if ex is not None:
+        token_usage: Optional[Dict[str, int]] = {
+            "input": ex.token_input,
+            "output": ex.token_output,
+            "cache_read": ex.token_cache_read,
+            "cache_creation": ex.token_cache_creation,
+        }
+        elapsed_ms: Optional[int] = ex.elapsed_ms
+    else:
+        token_usage = None
+        elapsed_ms = None
 
     # The metrics record — the minimal shape metrics.py consumes.
     outcome = {
@@ -153,6 +177,10 @@ def _outcome_and_fixture(
         "actual_surfaced": actual_surfaced,
         "confidence": confidence,
         "reason": reason,
+        # 4b additions — the floor-calibration input + the prompt-fit budget/latency.
+        "similarity": similarity,
+        "token_usage": token_usage,
+        "elapsed_ms": elapsed_ms,
     }
     return {"outcome": outcome, "fixture": fixture}
 
@@ -373,10 +401,12 @@ def conflict_human_summary(report: Dict[str, Any]) -> str:
     for f in report["fixtures"]:
         conf = f["confidence"]
         conf_s = f"{conf:.2f}" if conf is not None else "  — "
+        sim = f.get("similarity")
+        sim_s = f"{sim:.4f}" if sim is not None else "  —   "
         lines.append(
             f"  {f['kind']:26} judged={str(f['judged']):5} "
             f"tenable={str(f['actual_tenable']):5} surfaced={str(f['actual_surfaced']):5} "
-            f"conf={conf_s} [{f['reason']}]  {f['proposal']} ✗ {f['candidate']}"
+            f"conf={conf_s} sim={sim_s} [{f['reason']}]  {f['proposal']} ✗ {f['candidate']}"
         )
         if f["reason"] == REASON_RETRIEVAL_MISS:
             misses.append(f"  {f['proposal']} ✗ {f['candidate']} ({f['kind']})")
@@ -386,10 +416,32 @@ def conflict_human_summary(report: Dict[str, Any]) -> str:
         f"not_tenable_precision={agg['not_tenable_precision']:.3f} "
         f"same_polarity_fp_rate={agg['same_polarity_fp_rate']:.3f}"
     )
+
+    # Calibration readout (§5): the contradiction similarity table that SETS the floor,
+    # plus the recommended value vs the landed constant. `similarity`-bearing report ⇒
+    # a real readout; a legacy report without it ⇒ the recommendation is None.
+    contradictions = [
+        f for f in report["fixtures"]
+        if f["expected_tenable"] is False and f["judged"] and f.get("similarity") is not None
+    ]
+    if contradictions:
+        lines.append("CALIBRATION (contradiction similarities — the floor's binding set):")
+        for f in sorted(contradictions, key=lambda r: r["similarity"]):
+            lines.append(
+                f"  sim={f['similarity']:.4f}  {f['kind']:26} "
+                f"{f['proposal']} ✗ {f['candidate']}"
+            )
+        rec = recommend_floor(report["fixtures"])
+        rec_s = f"{rec:.4f}" if rec is not None else "None (no judged contradictions)"
+        lines.append(
+            f"  → recommended floor = min(contradiction sim) − margin = {rec_s}   "
+            f"(landed CONFLICT_SIMILARITY_FLOOR = {CONFLICT_SIMILARITY_FLOOR})"
+        )
+
     if misses:
         lines.append(
             "⚠ RETRIEVAL MISSES (expected to be judged, did not retrieve above the "
-            "PROVISIONAL floor — soft signal for 4b's floor calibration, NOT a defect):"
+            "floor — soft signal for floor calibration, NOT a defect):"
         )
         lines.extend(misses)
     return "\n".join(lines)

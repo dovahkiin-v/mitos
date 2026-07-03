@@ -50,7 +50,30 @@ CONFLICT_SURFACE_THRESHOLD = 0.85       # CONF-D4 — surface a not-tenable find
 CONFLICT_TOP_K = 5                      # CONF-D2/D7 — cap on the FINAL post-filter batch the LLM judge sees.
 CONFLICT_JUDGMENT_TEMPERATURE = 0.3     # CONF-D5 — nuance task; temp-0 over-literalizes the contradiction judgment.
 CONFLICT_LLM_TIMEOUT_S = 15             # CONF-D5/D10 — hard cap on the judgment call, 3× the P95 budget ("slow AI is failed AI", P14).
-CONFLICT_SIMILARITY_FLOOR = 0.55        # ⚠️ PROVISIONAL — corpus-empirical; calibrated against the §6.3 golden fixtures in Phase 4b (CONF-D2). NOT first-principles-derivable — recall-first, so err low. Do not treat this number as final.
+# CONF-D2 — the relevance gate that short-circuits the SONNET call. Recall-first
+# (OpEcon §11): the highest cutoff that still admits EVERY known-contradiction fixture.
+# ── Calibration block (Phase 4b, 2026-07-03; PLANNING_NOTES "show your work") ──────────
+# Corpus-empirical, NOT first-principles-derivable: calibrated against the §6.3 golden
+# fixtures (frozen Harbor corpus) via a live probe at floor=0.0
+# (tests/golden/test_conflict_eval_live.py::test_conflict_floor_calibration; report at
+# tests/golden/reports/conflict-calibration-probe.json). Measured document-space
+# similarity (is_query=False, per 2a) of each JUDGED contradiction candidate — the set
+# whose minimum the floor must not exceed:
+#     cross-domain-structural  0.7972  (cache-is-process-singleton ✗ no-global-mutable-state)  ← MIN
+#     genuine-contradiction    0.8681  (delete-is-immediate-hard   ✗ delete-is-soft-30d)
+#     multilingual             0.9311  (duomenu-saugojimas-lietuvoje ✗ duomenys-gali-buti-es)
+#   recommended = min(0.7972) − 0.03 recall-first margin = 0.7672; landed 0.76 (rounded
+#   DOWN — err low; effective margin ≈0.037, within the 0.02–0.05 band; the margin hedges
+#   recall against future corpus/embedding drift).
+# D2: the cross-domain pair IS the binding constraint yet clears comfortably (0.7972 ≫ the
+#   old provisional 0.55) — the embedding-recall ceiling is NARROWER than §9 hypothesized;
+#   no embedding-only-recall design signal (this pair retrieves fine in document space).
+# D4: the TENABLE narrows candidate (harbor-health-endpoint-public, sim 0.7870) sits ABOVE
+#   this floor and only 0.0102 below the binding contradiction — recall-first FORBIDS
+#   raising the floor into that gap, so the floor cannot screen the narrows false positive.
+#   It is a judge/prompt-fit gap with a TRACKED disposition (mitos ADR + ROADMAP follow-on
+#   + VINGA_QUESTIONS), never a prose deferral. See tests/golden/CONFLICT_PROMPT_FIT.md.
+CONFLICT_SIMILARITY_FLOOR = 0.76
 
 # CONF-D3/D7 — the single bounded over-fetch width for candidate gathering (S2). The
 # raw KNN window must be wide enough that S3's non-live drops AND 2b's S4 declared/
