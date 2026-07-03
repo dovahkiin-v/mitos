@@ -1,0 +1,26 @@
+{
+  "provenance": {
+    "embedding_model": "gemini-embedding-2",
+    "mitos_version": "0.5.21",
+    "commit_sha": "c29127f4ddc243f1f8b036bcf353383cbb3522ce",
+    "dirty_tree": false,
+    "judgment_model": "SONNET",
+    "prompt_version": "conflict-tenability-v1",
+    "timestamp": "2026-07-03T02:44:55.050753+00:00"
+  },
+  "params": {
+    "floor": 0.76,
+    "top_k": 5,
+    "surface_threshold": 0.85
+  },
+  "aggregate": {
+    "not_tenable_recall": 1.0,
+    "not_tenable_precision": 0.75,
+    "same_polarity_fp_rate": 0.0
+  },
+  "bands": {
+    "not_tenable_recall": 0.2,
+    "not_tenable_precision": 0.2,
+    "same_polarity_fp_rate": 0.2
+  }
+}
