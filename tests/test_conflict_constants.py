@@ -63,6 +63,10 @@ def test_module_exposes_the_five_constants_and_the_2a_pipeline_symbols() -> None
         "Candidate",
         "Unavailable",
         "ConflictUnavailableReason",
+        # The 2b candidate filter + Letter-payload surface.
+        "declared_strong_targets",
+        "screen_candidates",
+        "candidate_payload",
     }
     missing = expected_api - public
     assert not missing, f"conflict.py is missing intended public symbols: {sorted(missing)}"

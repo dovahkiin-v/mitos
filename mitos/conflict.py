@@ -15,8 +15,9 @@ module or a heavy dependency (``anthropic``, the Qdrant/genai clients) at module
 scope — ``from mitos.conflict import CONFLICT_TOP_K`` must stay cheap forever. When
 2a/3b need a client, inject it as a parameter and guard the type annotation behind
 ``if TYPE_CHECKING:`` (the ``importer.py`` shape). The dep-free import test pins this.
-The 2a imports below (``mitos.errors``, ``mitos.identity``) are pure-stdlib leaves;
-the injected clients arrive as params, typed only under ``TYPE_CHECKING``.
+The module-scope imports below (``mitos.errors``, ``mitos.identity``, and 2b's
+``mitos.display``) are pure-stdlib Tier-1 leaves; the injected clients arrive as
+params, typed only under ``TYPE_CHECKING``.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List
 
+from mitos.display import letter_payload
 from mitos.errors import EmbeddingError, VectorStoreError
 from mitos.identity import embedding_text
 
@@ -32,6 +34,7 @@ if TYPE_CHECKING:
     # Runtime-injected, duck-typed clients — annotated only for the type checker.
     # Importing ``mitos.protocols`` at runtime pulls ``parser`` + ``store`` (not a
     # leaf-cheap import), so these stay behind the guard. See §6 of the 2a plan.
+    from mitos.parser import ParsedEntry
     from mitos.protocols import EmbeddingProvider, GraphStoreProtocol, VectorStore
 
 # The §8 constants catalog — the sensor's honesty made numeric. Each value is the
@@ -100,7 +103,7 @@ class Candidate:
     Carried forward from 2a (gather) to 2b (filter/rank/render). 2a returns *every*
     live over-fetched neighbour un-filtered, un-floored, un-truncated; 2b applies the
     declared-target/own-slug drop, the similarity floor, the ranking, and the top-K
-    truncation, then renders ``node`` via ``_decision_payload``.
+    truncation, then renders ``node`` via :func:`candidate_payload`.
 
     Attributes:
         slug: The neighbour's slug (as returned by the vector store).
@@ -200,3 +203,145 @@ def gather_candidates(
             Candidate(slug=slug, score=match.get("score", 0.0), node=node, state=state)
         )
     return candidates
+
+
+# The CONF-D7 "strong relationship" set — the resolution-bearing fields the author has
+# already reasoned about, so a declared target is dropped (not re-litigated). Weak edges
+# (``cites``/``depends_on``/``derives_from``/``resolves``) are deliberately absent: they
+# express dependence, not a resolved tension, so they must NOT shield an undeclared
+# conflict from judgment. Read off ``ParsedEntry`` by attribute name at runtime (no
+# import — duck-typed).
+_STRONG_RELATIONSHIP_FIELDS = ("supersedes", "amends", "narrows", "contradicts", "corrects")
+
+# The four reverse-relation modifier stamp keys ``candidate_payload`` copies from a
+# hydrated node onto the surfaced finding. String-identical to
+# ``store.MODIFIER_EDGE_KEYS.values()`` (store.py:66) — mirrored here as a local constant
+# to keep ``conflict.py`` a leaf (no ``store`` import). Copied conditionally: a node only
+# carries the non-empty ones (``_stamp_modifiers`` adds a key only when a modifier exists).
+_MODIFIER_STAMP_KEYS = ("superseded_by", "amended_by", "narrowed_by", "corrected_by")
+
+
+def declared_strong_targets(entry: "ParsedEntry") -> "set[str]":
+    """The casefolded slugs the entry declares a STRONG relationship with.
+
+    Union of ``entry.{supersedes, amends, narrows, contradicts, corrects}`` — the
+    resolution-bearing fields the author has already reasoned about (CONF-D7). Weak
+    edges (``cites`` / ``depends_on`` / ``derives_from`` / ``resolves``) are
+    deliberately excluded: they express dependence, not a resolved tension, so an
+    undeclared conflict hiding behind a mere ``Cites:`` still reaches judgment. The
+    result is casefolded (P9 / Lesson 22 — fold at the boundary so callers can't pass
+    raw case) and deduped by the ``set`` (a multi-valued field's within-field
+    duplicates collapse for free). An empty declaration set is the common case.
+
+    Args:
+        entry: The parsed decision entry whose strong-relationship targets to collect.
+
+    Returns:
+        The set of casefolded declared strong-target slugs (possibly empty).
+    """
+    targets: set[str] = set()
+    for field in _STRONG_RELATIONSHIP_FIELDS:
+        for slug in getattr(entry, field, ()) or ():
+            targets.add(slug.casefold())
+    return targets
+
+
+def screen_candidates(
+    candidates: "List[Candidate]",
+    *,
+    declared_targets: "set[str]",
+    own_slug: str,
+    floor: float = CONFLICT_SIMILARITY_FLOOR,
+    top_k: int = CONFLICT_TOP_K,
+) -> "List[Candidate]":
+    """Filters, floors, ranks and truncates 2a's gathered neighbours (§6.5 S4–S6).
+
+    The second and final candidate-pipeline stage. Given 2a's raw ``list[Candidate]``
+    (every live over-fetched neighbour, un-filtered), produce the judged batch:
+
+    * **S4 — drop the already-reasoned.** Remove any candidate whose slug is a declared
+      strong-relationship target (``declared_targets``) or the proposal's own slug
+      (``own_slug`` — the false-self-conflict guard, RF-1). Both compared casefolded.
+    * **S5 — floor gate.** Keep only candidates with ``score >= floor`` (inclusive).
+    * **S6 — rank + truncate.** Sort the survivors similarity-descending and keep at
+      most ``top_k``.
+
+    The S4 → S5 → S6 order is load-bearing (CONF-D7 "Shadowing"): dropping declared/self
+    *before* the floor and *before* truncation means a high-similarity declared neighbour
+    can never consume a ``top_k`` slot and shadow a genuine undeclared conflict out of the
+    window. 2a's over-fetch sizes the raw list so the margin is spent on real candidates.
+
+    Storeless and pure — no I/O, no embedding, no state re-verify (2a did that). Returns
+    ``[]`` (a *clean* short-circuit) when the input is empty, everything was
+    declared/self, or every survivor fell below the floor. This ``[]`` is never
+    :class:`Unavailable` — 2b has no degradation type; the facade (3b) handles 2a's
+    degradation upstream ("Degraded ≠ empty", §6.5).
+
+    ``floor`` and ``top_k`` default to the module constants but are injectable so tests
+    pin behaviour with an explicit floor rather than chasing the PROVISIONAL
+    ``CONFLICT_SIMILARITY_FLOOR`` (4b recalibrates it — CONF-D2).
+
+    Args:
+        candidates: 2a's gathered live neighbours (similarity-descending; may be empty).
+        declared_targets: The casefolded declared strong-target slugs, from
+            :func:`declared_strong_targets`.
+        own_slug: The proposal's own slug at check time (RF-1); folded here.
+        floor: The inclusive similarity floor (default ``CONFLICT_SIMILARITY_FLOOR``).
+        top_k: The cap on the returned batch (default ``CONFLICT_TOP_K``).
+
+    Returns:
+        The judged batch — undeclared live neighbours at or above ``floor``, ranked
+        similarity-descending, truncated to ``top_k``. Possibly empty.
+    """
+    # S4 — build the drop set once (declared_targets is already folded; add the folded
+    # own slug) and drop by casefolded membership. casefold on BOTH sides (Lesson 22, P9).
+    drop = declared_targets | {own_slug.casefold()}
+    kept = [c for c in candidates if c.slug.casefold() not in drop]
+    # S5 — inclusive floor gate.
+    above = [c for c in kept if c.score >= floor]
+    # S6 — rank similarity-descending, truncate to top_k.
+    ranked = sorted(above, key=lambda c: c.score, reverse=True)
+    return ranked[:top_k]
+
+
+def candidate_payload(candidate: "Candidate", *, brief: bool = False) -> "Dict[str, Any]":
+    """Renders a surfaced candidate into its Letter-mode finding (modifier stamps ride along).
+
+    The finding shape 5a surfaces at the accept prompt: the shared Letter core
+    (``slug`` / ``axiom`` / ``scope`` / — unless ``brief`` — ``rejected_paths``) from
+    :func:`~mitos.display.letter_payload`, the raw similarity under ``score``, plus the
+    reverse-relation modifier stamps (``amended_by`` / ``narrowed_by`` / ``superseded_by``
+    / ``corrected_by``).
+
+    Storeless (plan D4-primary): the stamps are copied straight off ``candidate.node``,
+    which 2a hydrated via ``get_node_by_slug`` — already ``_stamp_modifiers``-run
+    (store.py:1037), so the node carries the *non-empty* stamps from the same
+    ``get_modifiers`` source, one hop earlier. No redundant store read, no fault surface.
+    ``letter_payload`` drops modifier keys (a store-free leaf), so 2b re-copies them here —
+    the third caller mirroring the ``cli.py`` / ``mcp_server._decision_payload`` pattern
+    (each caller stamps around the shared leaf, D1). Stamping happens *after*
+    ``letter_payload`` returns, so ``brief`` (which governs only ``rejected_paths``) never
+    drops a stamp — an amended-but-active candidate never reads as the final word (the
+    "amended axioms read as live" trap).
+
+    Args:
+        candidate: A survivor of :func:`screen_candidates`; its ``node`` is the hydrated,
+            modifier-stamped ``get_node_by_slug`` reader dict.
+        brief: When True, omit ``rejected_paths`` (keeps stamps). Default False — the
+            surfaced finding wants the candidate's M5 anti-knowledge.
+
+    Returns:
+        The Letter-mode finding dict: ``slug``, ``axiom``, ``scope``, ``score``, any
+        present modifier stamps, and (unless ``brief``) ``rejected_paths``.
+    """
+    payload = letter_payload(
+        candidate.node, brief=brief, extras={"score": candidate.score}
+    )
+    # Copy the reverse-relation stamps already on the hydrated node (D4-primary). Only the
+    # non-empty ones are present (``_stamp_modifiers`` adds a key only when a modifier
+    # exists), so copy conditionally — blind indexing would KeyError on the common
+    # unmodified case.
+    for key in _MODIFIER_STAMP_KEYS:
+        if key in candidate.node:
+            payload[key] = candidate.node[key]
+    return payload
