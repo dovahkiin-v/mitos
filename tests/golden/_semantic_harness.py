@@ -223,13 +223,23 @@ def _git(*args: str) -> Optional[str]:
         return None
 
 
-def provenance() -> Dict[str, Any]:
+def provenance(
+    judgment_model: Optional[str] = None, prompt_version: Optional[str] = None
+) -> Dict[str, Any]:
     """Stamps a run's provenance so metrics are comparable and replayable.
 
-    Mirrors the conflict vision's CONF-D8 telemetry discipline. Carries
-    ``judgment_model`` / ``prompt_version`` as ``None`` placeholders now — the
-    conflict slice (§6.3) fills them when it lands. ``dirty_tree`` flags an uncommitted
-    working tree, which makes ``commit_sha`` a partial lie for replay.
+    Mirrors the conflict vision's CONF-D8 telemetry discipline. The retrieval eval
+    calls this with no args, leaving ``judgment_model`` / ``prompt_version`` ``None``
+    (retrieval has no LLM judge). The conflict eval (§6.3) passes both — the SONNET
+    alias off the live ``JudgmentExecution`` and ``CONFLICT_PROMPT_VERSION`` — so its
+    report/baseline stamp the judge identity the stub was built to carry. ``dirty_tree``
+    flags an uncommitted working tree, which makes ``commit_sha`` a partial lie for replay.
+
+    Args:
+        judgment_model: The conflict judge's family+tier alias (e.g. ``"SONNET"``), or
+            ``None`` for a judge-free run.
+        prompt_version: The conflict judgment prompt version, or ``None`` for a
+            judge-free run.
 
     Returns:
         A provenance dict. ``timestamp`` is the one intentionally non-deterministic
@@ -241,8 +251,8 @@ def provenance() -> Dict[str, Any]:
         "mitos_version": MITOS_VERSION,
         "commit_sha": _git("rev-parse", "HEAD"),
         "dirty_tree": bool(status) if status is not None else None,
-        "judgment_model": None,
-        "prompt_version": None,
+        "judgment_model": judgment_model,
+        "prompt_version": prompt_version,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 

@@ -13,12 +13,14 @@
       "notes": "human rationale"
     },
     "conflict_entry": {
-      "_status": "SHAPE ONLY — fixtures authored by the Conflict-sensor vision (v0.2 V1) section 6.3, not here. Do NOT call any LLM judgment path from Layer B yet.",
-      "proposal": "slug of the incoming decision being judged",
-      "candidate": "slug of the existing decision it is judged against",
-      "kind": "one of: genuine-contradiction | same-polarity-agreement | cross-domain-structural | global-vs-scoped-narrows",
-      "expected_tenable": "bool — true means the pair coexists fine (must NOT be flagged); false means a real contradiction the sensor SHOULD flag not-tenable",
-      "expected_confidence_band": "[low, high] band on the judge's confidence, for the calibration curve"
+      "_status": "authored by conflict-sensor 4a — six Harbor-pair fixtures driving the real run_conflict_check facade + SONNET judge (test_conflict_eval_live.py). The judge is stochastic: the live test soft-diffs the tenable/surfaced/confidence expectations (never reds CI) and hard-asserts ONLY the deterministic declared-target drop.",
+      "proposal": "slug of the incoming decision being judged (keys entries_by_slug; == a corpus H3 header slug)",
+      "candidate": "slug of the existing decision it is judged against (matched against pair.candidate.slug in judged_pairs)",
+      "kind": "one of: genuine-contradiction | same-polarity-agreement | cross-domain-structural | global-vs-scoped-narrows | declared-contradiction | multilingual",
+      "expected_candidate_judged": "bool — did the candidate reach the judge? false means 2b screened it out (a declared-target drop, or a below-floor retrieval miss); the eval hard-asserts this only for the declared-drop fixture. When false, expected_tenable and expected_confidence_band are null — a screened pair has no verdict and no confidence.",
+      "expected_tenable": "bool|null — the judge's verdict IF judged (true = the pair coexists fine, must NOT be flagged; false = a real contradiction the sensor SHOULD flag not-tenable). null when expected_candidate_judged is false.",
+      "expected_surfaced": "bool — the final CONF-D4 ≥0.85 not-tenable gate outcome (read off pair.surfaced; never recomputed). A screened or tenable pair is false.",
+      "expected_confidence_band": "[low, high] list|null — a WIDE, coarse pre-4b sanity envelope on the judge's confidence-that-it-is-a-conflict (the not-tenable axis: high for a genuine contradiction, low for a tenable agreement), NOT the validator. 4b reads confidence_calibration_curve (over the raw verdict confidence in the report), not this band, to validate the 0.85 pin. null when not judged. UNMEASURED until 4b runs the judge — deliberately loose so it chases no jitter."
     }
   },
   "retrieval": [
@@ -85,5 +87,66 @@
       "notes": "Probe B — the same cross-domain pair, but the query shares NO gift words ('singleton'/'global'/'dependency') with either decision. Tests the TRUE semantic ceiling: do an architecture decision and a performance decision co-surface on meaning alone? Contrast with probe A is the measurement. measure_only."
     }
   ],
-  "conflict": []
+  "conflict": [
+    {
+      "proposal": "harbor-delete-is-immediate-hard",
+      "candidate": "harbor-delete-is-soft-30d",
+      "kind": "genuine-contradiction",
+      "expected_candidate_judged": true,
+      "expected_tenable": false,
+      "expected_surfaced": true,
+      "expected_confidence_band": [0.7, 1.0],
+      "notes": "The sensor's core catch: an UNDECLARED genuine contradiction — immediate hard-delete vs a 30-day soft-delete window cannot both hold. Neither declares an edge to the other, so 2b screens nothing out; both retrieve (verified co-surfacing in the retrieval delete fixture); the judge should rule them not-tenable at high confidence and the ≥0.85 gate should surface it. Symmetric — either direction works; proposal is the hard-delete side. Band is WIDE/unmeasured pre-4b (see _doc)."
+    },
+    {
+      "proposal": "harbor-config-yaml-strict-schema",
+      "candidate": "harbor-config-yaml",
+      "kind": "same-polarity-agreement",
+      "expected_candidate_judged": true,
+      "expected_tenable": true,
+      "expected_surfaced": false,
+      "expected_confidence_band": [0.0, 0.5],
+      "notes": "The #34 must-NOT-flag guard (CONF-D4): a base decision (config is YAML) and its stricter refinement (validate that YAML against a strict schema) merely AGREE — same polarity, no tension. The judge must rule them tenable; nothing should surface. same_polarity_fp_rate keys on this kind and must read 0. Band is on the not-tenable (conflict) axis — LOW, because this is not a conflict. Direction is not load-bearing (both agree); proposal is the stricter side."
+    },
+    {
+      "proposal": "harbor-cache-is-process-singleton",
+      "candidate": "harbor-no-global-mutable-state",
+      "kind": "cross-domain-structural",
+      "expected_candidate_judged": true,
+      "expected_tenable": false,
+      "expected_surfaced": true,
+      "expected_confidence_band": [0.6, 1.0],
+      "notes": "Cross-domain structural contradiction (performance vs architecture): a process-wide singleton cache IS global mutable state, which the architecture rule forbids. Opposed in substance, low lexical overlap — yet LAYER_B_FINDINGS §3 measured this pair co-ranking SEMANTICALLY (recall 1.0), so it should retrieve and reach the judge. Treat survival as MEASURED, not assumed: gather_candidates embeds in document space (is_query=False), subtly different from retrieval's is_query=True, so if it does not retrieve at the provisional floor the eval records a soft retrieval-miss (never reds). Band slightly wider-low than the delete pair — a cross-domain tension may read less certain to the judge."
+    },
+    {
+      "proposal": "harbor-sync-crdt-merge",
+      "candidate": "harbor-sync-last-write-wins",
+      "kind": "declared-contradiction",
+      "expected_candidate_judged": false,
+      "expected_tenable": null,
+      "expected_surfaced": false,
+      "expected_confidence_band": null,
+      "notes": "The DETERMINISTIC hard-assert (D3). proposal harbor-sync-crdt-merge declares `Contradicts: harbor-sync-last-write-wins` (decisions.reference.md:62), so 2b's declared-target screen drops the candidate BEFORE the judge runs — it is absent from judged_pairs, judged=false, and that is EXPECTED (the author already resolved this tension; re-flagging it would be noise). DIRECTION IS LOAD-BEARING: the drop keys on the PROPOSAL's declarations. Reverse it (proposal = last-write-wins, which declares nothing) and crdt-merge becomes a live, undeclared, JUDGED candidate — a different fixture. Do not flip. last-write-wins is verified `active` (a contradicts edge does NOT retire its target), so the drop is the pure 2b declared path, not state-filtering. expected_tenable/band are null: a screened pair has no verdict."
+    },
+    {
+      "proposal": "harbor-all-endpoints-authenticated",
+      "candidate": "harbor-health-endpoint-public",
+      "kind": "global-vs-scoped-narrows",
+      "expected_candidate_judged": true,
+      "expected_tenable": true,
+      "expected_surfaced": false,
+      "expected_confidence_band": [0.0, 0.5],
+      "notes": "A global rule and its scoped exception coexisting — must NOT flag. proposal harbor-all-endpoints-authenticated declares NOTHING (verified: no Narrows/etc; carries only a reverse `narrowed_by` STAMP, which declared_strong_targets ignores — it reads forward declarations only), so its declared_strong_targets is empty and the candidate IS judged. The candidate harbor-health-endpoint-public declares `Narrows: harbor-all-endpoints-authenticated` (decisions.reference.md:104) — a scoped carve-out, not a contradiction. This tests the JUDGE correctly ruling a narrowing tenable. DIRECTION IS THE OPPOSITE CHOICE from fixture 4: if you flipped it (proposal = health-public) the global would be declared-dropped, duplicating fixture 4 — don't. Band LOW on the conflict axis (this is not a conflict)."
+    },
+    {
+      "proposal": "harbor-duomenu-saugojimas-lietuvoje",
+      "candidate": "harbor-duomenys-gali-buti-es",
+      "kind": "multilingual",
+      "expected_candidate_judged": true,
+      "expected_tenable": false,
+      "expected_surfaced": true,
+      "expected_confidence_band": [0.6, 1.0],
+      "notes": "P9 multilingual: a Lithuanian-authored contradiction the sensor must catch as well as an English one — data-residency-strictly-in-Lithuania vs data-may-live-anywhere-in-the-EU cannot both hold. Both axioms/rejected-paths are in Lithuanian; the retrieval eval confirms the Lithuanian cluster co-retrieves. Undeclared, so both reach the judge; the judge should rule them not-tenable and surface. If the multilingual pair does not retrieve at the provisional floor, that is itself a measurement the eval records softly for 4b (never reds). Band WIDE/unmeasured pre-4b."
+    }
+  ]
 }

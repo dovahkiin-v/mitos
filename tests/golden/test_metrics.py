@@ -11,14 +11,20 @@ than ``k`` results.
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(__file__))
 from metrics import (  # noqa: E402
     _dedupe_preserve_order,
+    confidence_calibration_curve,
     evaluate_fixture,
     hard_negative_fp_rate,
     mrr,
+    not_tenable_precision,
+    not_tenable_recall,
     precision_at_k,
     recall_at_k,
+    same_polarity_fp_rate,
 )
 
 # A small stable universe. Ranked lists below are hand-authored, best-first.
@@ -147,3 +153,196 @@ class TestEvaluateFixture:
             "mrr": 1.0,
             "hard_negative_fp_rate": 0.5,
         }
+
+
+# =========================================================================== #
+# Conflict-sensor metric math (Part C / Conflict-sensor vision §6.3)
+# --------------------------------------------------------------------------- #
+# Hand-authored outcome records with hand-computed expected values; no services.
+# These pin the conflict-metric empty-set/edge conventions the live conflict harness
+# (`_conflict_harness.run_conflict_eval`) depends on. Outcome-record shape is defined
+# in the metrics.py conflict-section header.
+# =========================================================================== #
+
+
+def _oc(
+    kind="genuine-contradiction",
+    expected_tenable=False,
+    expected_surfaced=True,
+    judged=True,
+    actual_tenable=False,
+    actual_surfaced=True,
+    confidence=0.9,
+):
+    """Builds one conflict outcome record with contradiction-catch defaults."""
+    return {
+        "kind": kind,
+        "expected_tenable": expected_tenable,
+        "expected_surfaced": expected_surfaced,
+        "judged": judged,
+        "actual_tenable": actual_tenable,
+        "actual_surfaced": actual_surfaced,
+        "confidence": confidence,
+    }
+
+
+# A not-judged fixture (declared drop / retrieval miss): no verdict, nothing surfaced.
+def _not_judged(kind="declared-contradiction"):
+    return _oc(
+        kind=kind,
+        expected_tenable=None,
+        expected_surfaced=False,
+        judged=False,
+        actual_tenable=None,
+        actual_surfaced=False,
+        confidence=None,
+    )
+
+
+class TestNotTenableRecall:
+    def test_all_judged_contradictions_surfaced(self):
+        outs = [_oc(actual_surfaced=True), _oc(actual_surfaced=True)]
+        assert not_tenable_recall(outs) == 1.0
+
+    def test_half_surfaced(self):
+        # Two judged contradictions, one missed (judged tenable-together, not surfaced).
+        outs = [
+            _oc(actual_surfaced=True),
+            _oc(actual_tenable=True, actual_surfaced=False),
+        ]
+        assert not_tenable_recall(outs) == 0.5
+
+    def test_not_judged_contradiction_excluded_from_denominator(self):
+        # A judged+surfaced contradiction, plus a declared-dropped one (judged=False) and
+        # a tenable pair — only the first counts → 1/1 = 1.0.
+        outs = [
+            _oc(actual_surfaced=True),
+            _not_judged(),
+            _oc(kind="same-polarity-agreement", expected_tenable=True,
+                actual_tenable=True, actual_surfaced=False),
+        ]
+        assert not_tenable_recall(outs) == 1.0
+
+    def test_empty_convention_no_judged_contradictions(self):
+        # Only a tenable pair → no not-tenable-and-judged fixtures → vacuous 1.0.
+        outs = [_oc(kind="same-polarity-agreement", expected_tenable=True,
+                    actual_tenable=True, actual_surfaced=False)]
+        assert not_tenable_recall(outs) == 1.0
+
+    def test_empty_list(self):
+        assert not_tenable_recall([]) == 1.0
+
+
+class TestNotTenablePrecision:
+    def test_all_surfaced_genuine(self):
+        outs = [_oc(actual_surfaced=True), _oc(actual_surfaced=True)]
+        assert not_tenable_precision(outs) == 1.0
+
+    def test_false_positive_drops_precision(self):
+        # Two surfaced: one genuine contradiction, one wrongly-surfaced tenable pair.
+        outs = [
+            _oc(actual_surfaced=True),
+            _oc(kind="same-polarity-agreement", expected_tenable=True,
+                actual_tenable=False, actual_surfaced=True),
+        ]
+        assert not_tenable_precision(outs) == 0.5
+
+    def test_empty_convention_nothing_surfaced(self):
+        outs = [
+            _oc(actual_surfaced=False),
+            _oc(kind="same-polarity-agreement", expected_tenable=True,
+                actual_tenable=True, actual_surfaced=False),
+        ]
+        assert not_tenable_precision(outs) == 1.0
+
+    def test_empty_list(self):
+        assert not_tenable_precision([]) == 1.0
+
+
+class TestSamePolarityFPRate:
+    def test_no_false_positive(self):
+        outs = [_oc(kind="same-polarity-agreement", expected_tenable=True,
+                    actual_tenable=True, actual_surfaced=False)]
+        assert same_polarity_fp_rate(outs) == 0.0
+
+    def test_the_34_case_surfaced(self):
+        # The #34 must-not-flag failure: a same-polarity pair got surfaced → FP rate 1.0.
+        outs = [_oc(kind="same-polarity-agreement", expected_tenable=True,
+                    actual_tenable=False, actual_surfaced=True)]
+        assert same_polarity_fp_rate(outs) == 1.0
+
+    def test_mixed_same_polarity(self):
+        outs = [
+            _oc(kind="same-polarity-agreement", expected_tenable=True,
+                actual_tenable=True, actual_surfaced=False),
+            _oc(kind="same-polarity-agreement", expected_tenable=True,
+                actual_tenable=False, actual_surfaced=True),
+        ]
+        assert same_polarity_fp_rate(outs) == 0.5
+
+    def test_ignores_other_kinds(self):
+        # A surfaced genuine contradiction is NOT a same-polarity false positive.
+        outs = [
+            _oc(actual_surfaced=True),
+            _oc(kind="same-polarity-agreement", expected_tenable=True,
+                actual_tenable=True, actual_surfaced=False),
+        ]
+        assert same_polarity_fp_rate(outs) == 0.0
+
+    def test_empty_convention_no_same_polarity(self):
+        outs = [_oc(actual_surfaced=True)]
+        assert same_polarity_fp_rate(outs) == 0.0
+
+    def test_empty_list(self):
+        assert same_polarity_fp_rate([]) == 0.0
+
+
+class TestConfidenceCalibrationCurve:
+    def test_empty_outcomes_is_empty_list(self):
+        assert confidence_calibration_curve([]) == []
+
+    def test_two_distinct_bins(self):
+        # n_bins=4 → widths of 0.25. conf 0.1 → bin0 (tenable, not_tenable frac 0.0);
+        # conf 0.9 → bin3 (not-tenable, frac 1.0). Bins 1 & 2 stay empty.
+        outs = [
+            _oc(actual_tenable=True, actual_surfaced=False, confidence=0.1),
+            _oc(actual_tenable=False, actual_surfaced=True, confidence=0.9),
+        ]
+        curve = confidence_calibration_curve(outs, n_bins=4)
+        assert len(curve) == 4
+        assert curve[0]["lo"] == 0.0 and curve[0]["hi"] == 0.25
+        assert curve[0]["count"] == 1
+        assert curve[0]["observed_not_tenable_fraction"] == 0.0
+        assert curve[0]["mean_confidence"] == 0.1
+        assert curve[1]["count"] == 0
+        assert curve[1]["observed_not_tenable_fraction"] is None
+        assert curve[1]["mean_confidence"] is None
+        assert curve[2]["count"] == 0
+        assert curve[3]["count"] == 1
+        assert curve[3]["observed_not_tenable_fraction"] == 1.0
+        assert curve[3]["mean_confidence"] == 0.9
+
+    def test_not_judged_excluded(self):
+        # A not-judged fixture (confidence None) is never binned; only the judged one is.
+        outs = [_not_judged(), _oc(confidence=0.9)]
+        curve = confidence_calibration_curve(outs, n_bins=4)
+        assert sum(b["count"] for b in curve) == 1
+        assert curve[3]["count"] == 1
+
+    def test_multiple_in_one_bin_mean_and_fraction(self):
+        # Two judged fixtures both land in bin3 [0.75, 1.0]: one not-tenable, one tenable →
+        # observed fraction 0.5, mean confidence (0.8 + 0.9) / 2 = 0.85.
+        outs = [
+            _oc(actual_tenable=False, confidence=0.8),
+            _oc(actual_tenable=True, actual_surfaced=False, confidence=0.9),
+        ]
+        curve = confidence_calibration_curve(outs, n_bins=4)
+        assert curve[3]["count"] == 2
+        assert curve[3]["observed_not_tenable_fraction"] == 0.5
+        assert curve[3]["mean_confidence"] == pytest.approx(0.85)
+
+    def test_confidence_one_lands_in_top_bin(self):
+        # A confidence of exactly 1.0 must not overflow past the last bin.
+        curve = confidence_calibration_curve([_oc(confidence=1.0)], n_bins=4)
+        assert curve[3]["count"] == 1
+        assert curve[3]["observed_not_tenable_fraction"] == 1.0

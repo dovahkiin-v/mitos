@@ -21,7 +21,7 @@ Design decisions pinned here (see MITOS_GOLDEN_DATASET_SPEC Part C):
   degenerate fixture yields a defined number, never a ``ZeroDivisionError``.
 """
 
-from typing import Dict, List, Sequence, Set
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 
 def _dedupe_preserve_order(slugs: Sequence[str]) -> List[str]:
@@ -161,3 +161,196 @@ def evaluate_fixture(
         "mrr": mrr(ranked, expect_relevant),
         "hard_negative_fp_rate": hard_negative_fp_rate(ranked, expect_absent, k),
     }
+
+
+# =========================================================================== #
+# Conflict-sensor metric math (Part C / Conflict-sensor vision §6.3)
+# --------------------------------------------------------------------------- #
+# The retrieval math above scores a ranked slug list; these score the *conflict
+# judgment* — did the sensor flag the real contradictions, hold fire on the merely
+# agreeing pairs, and calibrate its confidence honestly? Same discipline: pure
+# functions, no services, documented empty-set conventions, unit-tested in bare CI.
+#
+# Each function takes a list of per-fixture **outcome records** — one dict per
+# conflict fixture, produced by the live harness (`_conflict_harness.run_conflict_eval`)
+# from the real `run_conflict_check` facade output. The record shape:
+#
+#   {
+#     "kind": str,                    # the fixture's kind (e.g. "same-polarity-agreement")
+#     "expected_tenable": bool|None,  # oracle: the judge's verdict IF judged; None when not judged
+#     "expected_surfaced": bool,      # oracle: the final ≥0.85 gate outcome
+#     "judged": bool,                 # did the NAMED candidate reach the judge?
+#     "actual_tenable": bool|None,    # the judge's real verdict; None when not judged
+#     "actual_surfaced": bool,        # the facade's real gate result (read off `pair.surfaced`)
+#     "confidence": float|None,       # the judge's raw confidence; None when not judged
+#   }
+#
+# "Not judged" (candidate absent from `judged_pairs`) means either an expected
+# declared-target drop (fixture 4) or an unexpected retrieval miss at the provisional
+# floor — the harness distinguishes them; the metrics only care that the pair carries
+# no verdict (its `actual_*` fields are None/False and it is excluded from the
+# judged-only aggregates below).
+# =========================================================================== #
+
+
+def not_tenable_recall(outcomes: Sequence[Dict[str, Any]]) -> float:
+    """Fraction of genuine (judged) contradictions the sensor actually surfaced.
+
+    "Did we catch the real contradictions?" The denominator is the fixtures that
+    are genuinely not-tenable AND reached the judge (``expected_tenable is False and
+    judged``); the numerator is those the facade surfaced (``actual_surfaced``).
+    A not-judged contradiction (declared-dropped, or a retrieval miss) is excluded
+    from the denominator — it was never given to the judge, so it can't count as a
+    recall failure of the *judge*. Higher-is-better.
+
+    Empty-set convention: no genuinely-not-tenable-and-judged fixtures ⇒ ``1.0``
+    (vacuously — there was nothing to catch).
+
+    Args:
+        outcomes: Per-fixture outcome records (see module header for the shape).
+
+    Returns:
+        A value in ``[0.0, 1.0]``.
+    """
+    judged_contradictions = [
+        o for o in outcomes if o["expected_tenable"] is False and o["judged"]
+    ]
+    if not judged_contradictions:
+        return 1.0
+    surfaced = sum(1 for o in judged_contradictions if o["actual_surfaced"])
+    return surfaced / len(judged_contradictions)
+
+
+def not_tenable_precision(outcomes: Sequence[Dict[str, Any]]) -> float:
+    """Fraction of what the sensor surfaced that was a genuine contradiction.
+
+    "Of what we flagged, how much was real?" The denominator is the fixtures the
+    facade actually surfaced (``actual_surfaced``); the numerator is those that were
+    genuinely not-tenable (``expected_tenable is False``). A false positive — a
+    tenable pair the judge wrongly surfaced — drops it. Higher-is-better.
+
+    Empty-set convention: nothing surfaced ⇒ ``1.0`` (vacuously — nothing was
+    wrongly flagged).
+
+    Args:
+        outcomes: Per-fixture outcome records (see module header for the shape).
+
+    Returns:
+        A value in ``[0.0, 1.0]``.
+    """
+    surfaced = [o for o in outcomes if o["actual_surfaced"]]
+    if not surfaced:
+        return 1.0
+    genuine = sum(1 for o in surfaced if o["expected_tenable"] is False)
+    return genuine / len(surfaced)
+
+
+def same_polarity_fp_rate(outcomes: Sequence[Dict[str, Any]]) -> float:
+    """Fraction of same-polarity-agreement fixtures the sensor wrongly surfaced.
+
+    The #34 CONF-D4 guard: two decisions that merely *agree* (same-polarity, e.g.
+    a base decision and its stricter refinement) must NEVER be flagged as a conflict.
+    Of the ``kind == "same-polarity-agreement"`` fixtures, the fraction that got
+    surfaced — which should be ``0.0``. Lower-is-better.
+
+    Empty-set convention: no same-polarity fixtures ⇒ ``0.0`` (none present → none
+    can be a false positive).
+
+    Args:
+        outcomes: Per-fixture outcome records (see module header for the shape).
+
+    Returns:
+        A value in ``[0.0, 1.0]`` — 0.0 is the healthy outcome.
+    """
+    same_polarity = [o for o in outcomes if o["kind"] == "same-polarity-agreement"]
+    if not same_polarity:
+        return 0.0
+    false_positives = sum(1 for o in same_polarity if o["actual_surfaced"])
+    return false_positives / len(same_polarity)
+
+
+def _confidence_bin_index(confidence: float, n_bins: int) -> int:
+    """Maps a confidence in ``[0, 1]`` to its bin index in ``[0, n_bins - 1]``.
+
+    Bins are equal-width over ``[0, 1]``; the top bin is right-closed so a confidence
+    of exactly ``1.0`` lands in the last bin rather than overflowing.
+
+    Args:
+        confidence: The judge's confidence, in ``[0, 1]``.
+        n_bins: The number of equal-width bins.
+
+    Returns:
+        The bin index, clamped to ``[0, n_bins - 1]``.
+    """
+    return min(int(confidence * n_bins), n_bins - 1)
+
+
+def confidence_calibration_curve(
+    outcomes: Sequence[Dict[str, Any]], n_bins: int = 4
+) -> List[Dict[str, Any]]:
+    """Bins the judged fixtures by confidence and reports the observed conflict rate.
+
+    The raw (confidence ↔ actual-not-tenable) relationship 4b reads to validate the
+    pinned ``CONFLICT_SURFACE_THRESHOLD = 0.85`` (CONF-D4). ``observed_not_tenable_fraction``
+    is the fraction of the bin the judge itself ruled not-tenable (``actual_tenable is
+    False``) — the judge's own verdicts, NOT the oracle ground truth (``expected_tenable``);
+    for a well-calibrated judge this should rise with stated confidence, and the 0.85 gate
+    should sit where it is high. 4b, wanting a true reliability diagram against ground
+    truth, recomputes from the per-fixture report records (which carry both
+    ``expected_tenable`` and the raw ``confidence``) rather than reading this curve blind.
+
+    **Honestly sparse at n=6.** With only six fixtures (fewer once the declared-drop
+    and any retrieval miss are excluded — those are not judged, so carry no
+    confidence), most bins hold zero or one fixture. The curve is a scaffold that
+    grows dense as the conflict corpus grows; do not read a trend into it yet. Bins
+    with no members are still returned (deterministic structure) with ``count = 0``
+    and ``None`` for the two fraction/mean fields.
+
+    Only **judged** fixtures (``judged`` true and a non-``None`` ``confidence``) are
+    binned; a declared-drop / retrieval-miss fixture has no verdict to place.
+
+    Empty-set convention: an empty ``outcomes`` list ⇒ ``[]`` (no curve at all).
+    A non-empty run in which nothing was judged returns the full ``n_bins`` scaffold
+    with every bin at ``count = 0``.
+
+    Args:
+        outcomes: Per-fixture outcome records (see module header for the shape).
+        n_bins: The number of equal-width confidence bins over ``[0, 1]``.
+
+    Returns:
+        A list of ``n_bins`` bin dicts (or ``[]`` for empty input), each
+        ``{lo, hi, count, observed_not_tenable_fraction, mean_confidence}``, where
+        the last two are ``None`` for an empty bin.
+    """
+    if not outcomes:
+        return []
+    judged = [
+        o for o in outcomes if o["judged"] and o.get("confidence") is not None
+    ]
+    curve: List[Dict[str, Any]] = []
+    for i in range(n_bins):
+        lo = i / n_bins
+        hi = (i + 1) / n_bins
+        members = [
+            o for o in judged if _confidence_bin_index(o["confidence"], n_bins) == i
+        ]
+        count = len(members)
+        observed: Optional[float]
+        mean_conf: Optional[float]
+        if count:
+            not_tenable = sum(1 for o in members if o["actual_tenable"] is False)
+            observed = not_tenable / count
+            mean_conf = sum(o["confidence"] for o in members) / count
+        else:
+            observed = None
+            mean_conf = None
+        curve.append(
+            {
+                "lo": lo,
+                "hi": hi,
+                "count": count,
+                "observed_not_tenable_fraction": observed,
+                "mean_confidence": mean_conf,
+            }
+        )
+    return curve
