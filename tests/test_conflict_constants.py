@@ -76,6 +76,12 @@ def test_module_exposes_the_five_constants_and_the_2a_pipeline_symbols() -> None
         "render_judgment_prompt",
         "parse_judgment_response",
         "CONFLICT_PROMPT_VERSION",
+        # The 3b executor↔facade boundary types + the pipeline facade.
+        "JudgmentExecution",
+        "JudgedPair",
+        "ConflictFinding",
+        "ConflictCheckResult",
+        "run_conflict_check",
     }
     missing = expected_api - public
     assert not missing, f"conflict.py is missing intended public symbols: {sorted(missing)}"

@@ -30,11 +30,11 @@ import html
 import json
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from mitos.display import letter_payload
 from mitos.errors import EmbeddingError, VectorStoreError
-from mitos.identity import embedding_text
+from mitos.identity import compute_node_id, embedding_text
 
 if TYPE_CHECKING:
     # Runtime-injected, duck-typed clients — annotated only for the type checker.
@@ -72,7 +72,7 @@ class ConflictUnavailableReason(Enum):
 
     Defined here in 2a and shared across the pipeline: 2a raises the two
     semantic-substrate reasons; 3a adds ``JUDGMENT`` (a malformed judgment batch —
-    its first consumer, plan D4); 3b later adds ``JUDGMENT_TIMEOUT`` for the executor's
+    its first consumer, plan D4); 3b adds ``JUDGMENT_TIMEOUT`` for the executor's
     timeout/error path (additive — no edit to the members below). The reason is the
     machine-readable discriminator a surface (5a) switches on to word its user-facing
     notice; the core never formats UX text (core/surface bulkhead, CONF-D10).
@@ -81,6 +81,7 @@ class ConflictUnavailableReason(Enum):
     EMBEDDING = "embedding_unavailable"        # Gemini embed raised (S1).
     VECTOR_STORE = "vector_store_unavailable"  # Qdrant query raised (S2).
     JUDGMENT = "judgment_unavailable"          # A malformed judgment batch (3a parse) — never a partial batch.
+    JUDGMENT_TIMEOUT = "judgment_timeout"      # The 3b executor timed out OR hit any Anthropic error (fail-open, D4).
 
 
 @dataclass(frozen=True)
@@ -804,3 +805,278 @@ def parse_judgment_response(
             )
         )
     return judgments
+
+
+# =========================================================================== #
+# Phase 3b — the executor↔facade boundary types + the pipeline facade.
+#
+# ``JudgmentExecution`` is the executor's return shape. It lives HERE, in the
+# leaf — NOT in ``conflict_judgment.py`` — so the facade can name it without a
+# module-scope import of the executor (plan D3/D1): the ONLY real import edge stays
+# ``conflict_judgment → conflict``, never the reverse, and the dep-free subprocess
+# guard on this leaf stays green. ``run_conflict_check`` composes the whole pipeline
+# (2a → 2b → 3a render → injected executor → 3a parse → CONF-D4 gate), receiving the
+# executor as a ``judge`` callable it never constructs or imports.
+# =========================================================================== #
+
+
+@dataclass(frozen=True)
+class JudgmentExecution:
+    """One batched judgment call's raw result + cost/latency metrics (executor→facade).
+
+    The narrow boundary the executor (:func:`mitos.conflict_judgment.execute_judgment`)
+    hands back on success: the model's raw text (the facade feeds it to
+    :func:`parse_judgment_response`) plus the batch's provenance and usage. A flat frozen
+    dataclass of scalars — maps almost 1:1 onto ``telemetry.JudgmentBatch`` (5b field-copies
+    it; ``model_alias`` rides here too so each row stamps the P19 alias, not a raw id).
+
+    Attributes:
+        raw_text: The model's response text, verbatim (parsed by the facade, not here).
+        batch_id: Minted once per call in the executor (W8); shared by every
+            ``conflict_checks`` row 5b writes for this batch (the batch⋈checks join key).
+        model_alias: The family+tier alias (``"SONNET"``) — never a versioned id (P19).
+        token_input: ``usage.input_tokens``.
+        token_output: ``usage.output_tokens``.
+        token_cache_read: ``usage.cache_read_input_tokens`` — 0 when caching is off
+            (RF-3, the sync surface); a ``None`` usage field is coerced to 0 at the read.
+        token_cache_creation: ``usage.cache_creation_input_tokens`` — 0 / None-coerced likewise.
+        elapsed_ms: Wall-clock of the ``messages.create`` call (a ``time.perf_counter`` delta).
+    """
+
+    raw_text: str
+    batch_id: str
+    model_alias: str
+    token_input: int
+    token_output: int
+    token_cache_read: int
+    token_cache_creation: int
+    elapsed_ms: int
+
+
+@dataclass(frozen=True)
+class JudgedPair:
+    """One judged (candidate, verdict) pair — the telemetry unit (5b → one ConflictCheckRow).
+
+    Every screened candidate that reached the judge produces exactly one of these,
+    whether or not it surfaced. 5b persists all of them (a check row per pair); the
+    ``surfaced`` flag records the CONF-D4 gate outcome so the corpus captures both the
+    findings AND the silent-but-judged pairs (the future classifier's negative labels).
+
+    Attributes:
+        candidate: 2a's :class:`Candidate` — carries ``.slug``, ``.score``, ``.node``
+            (``node["id"]`` is the candidate content-hash 5b reads as ``candidate_hash``),
+            ``.state``.
+        candidate_input: The :class:`JudgeInput` fed to the judge for this candidate,
+            VERBATIM as judged (5b persists this fed context, never a re-read of the node).
+        judgment: The raw :class:`Judgment` (rationale, tenable_together, confidence).
+        surfaced: The CONF-D4 gate result — ``(not tenable_together) and (confidence >= threshold)``.
+    """
+
+    candidate: Candidate
+    candidate_input: JudgeInput
+    judgment: Judgment
+    surfaced: bool
+
+
+@dataclass(frozen=True)
+class ConflictFinding:
+    """A surfaced conflict — the gated subset 5a renders at the accept prompt (C4).
+
+    Only not-tenable pairs at confidence ≥ the surface threshold become findings; an empty
+    ``findings`` list means 5a prints nothing (P9 quiet success). ``payload`` is the
+    candidate's Letter-mode render (from :func:`candidate_payload`); ``rationale`` is the
+    judgment's "why" about *this contradiction* — kept a separate field, never merged into
+    the payload dict (the payload is about the candidate; the rationale is about the tension).
+
+    Attributes:
+        payload: :func:`candidate_payload` output — Letter fields + ``score`` + modifier stamps.
+        rationale: The judgment's reasoning for THIS contradiction (not the candidate).
+        slug: Convenience mirror of ``payload["slug"]``.
+        confidence: The judgment's raw confidence.
+    """
+
+    payload: Dict[str, Any]
+    rationale: str
+    slug: str
+    confidence: float
+
+
+@dataclass(frozen=True)
+class ConflictCheckResult:
+    """The non-degraded result of :func:`run_conflict_check` (5a disposes; 5b persists).
+
+    One type spans the three healthy outcomes, distinguished by its fields:
+
+    * **clean-empty** — nothing survived screening: ``judged_pairs == []`` and
+      ``execution is None`` (no LLM call fired). NEVER an :class:`Unavailable` — a healthy
+      novel entry, not a degradation (DoD-2).
+    * **judged-none-surfaced** — the judge ran, nothing crossed the gate: ``findings == []``,
+      ``judged_pairs`` non-empty, ``execution`` set.
+    * **judged-some-surfaced** — all three populated.
+
+    Degradation is the SEPARATE :class:`Unavailable` return (2a substrate, 3b timeout/error,
+    or a malformed batch) — never one of these.
+
+    Attributes:
+        proposal_input: The proposal's fed context VERBATIM (5b →
+            judged_axiom / proposal_rejected_paths / proposal_scope).
+        proposed_hash_if_any: :func:`~mitos.identity.compute_node_id` over the SAME canonical
+            core the commit path hashes — byte-equal to the eventually-committed node id (DoD-6).
+        findings: The surfaced (gated) subset; ``[]`` ⇒ 5a prints nothing (P9).
+        judged_pairs: ALL judged pairs (the telemetry source); ``[]`` ⇒ the clean short-circuit.
+        execution: The batch's :class:`JudgmentExecution`; ``None`` ⇒ no LLM call fired (clean-empty).
+    """
+
+    proposal_input: JudgeInput
+    proposed_hash_if_any: str
+    findings: List[ConflictFinding]
+    judged_pairs: List[JudgedPair]
+    execution: Optional[JudgmentExecution]
+
+
+def run_conflict_check(
+    entry: "ParsedEntry",
+    *,
+    embed_provider: "EmbeddingProvider",
+    vector_store: "VectorStore",
+    store: "GraphStoreProtocol",
+    judge: "Callable[[RenderedPrompt], JudgmentExecution | Unavailable]",
+    floor: float = CONFLICT_SIMILARITY_FLOOR,
+    top_k: int = CONFLICT_TOP_K,
+    surface_threshold: float = CONFLICT_SURFACE_THRESHOLD,
+) -> "ConflictCheckResult | Unavailable":
+    """Runs the full Conflict pipeline for one proposed decision (the deliverable-1 facade).
+
+    Composes the five shipped stages into the reusable core every later conflict surface
+    consumes: 2a :func:`gather_candidates` → 2b :func:`screen_candidates` → 3a
+    :func:`render_judgment_prompt` → the injected ``judge`` executor → 3a
+    :func:`parse_judgment_response` → the CONF-D4 confidence gate. Returns a typed
+    :class:`ConflictCheckResult` (clean-empty / judged-none / judged-some) or a typed
+    :class:`Unavailable` (degraded) — never raising past the seam except a genuine local
+    graph-store fault (2a's D4 propagation), and never writing to the graph or
+    ``decisions.md``.
+
+    The caller (5a) owns the kind/toggle/``--yes`` gates and disposes fail-open vs
+    fail-closed; this facade assumes it was called for a toggle-admitted ``decision`` entry
+    and re-checks none of that (plan §7). The ``judge`` is injected — the facade never
+    imports :mod:`mitos.conflict_judgment`, keeping this leaf dep-free (plan D1). ``floor`` /
+    ``top_k`` / ``surface_threshold`` default to the §8 constants but are injectable so tests
+    pin behaviour without chasing the PROVISIONAL floor (2b pattern).
+
+    Args:
+        entry: The proposed decision entry (already kind/toggle-admitted by 5a).
+        embed_provider: The injected embedding provider (Gemini), for 2a.
+        vector_store: The injected vector store (Qdrant), for 2a.
+        store: The injected graph store — 2a's computed-state source of truth.
+        judge: The bound executor callable (from
+            :func:`mitos.conflict_judgment.make_judgment_executor`); one arg, a
+            :class:`RenderedPrompt`, returns :class:`JudgmentExecution` or :class:`Unavailable`.
+        floor: The inclusive similarity floor passed to 2b (default ``CONFLICT_SIMILARITY_FLOOR``).
+        top_k: The judged-batch cap passed to 2b (default ``CONFLICT_TOP_K``).
+        surface_threshold: The CONF-D4 confidence gate (default ``CONFLICT_SURFACE_THRESHOLD``).
+
+    Returns:
+        A :class:`ConflictCheckResult` on any non-degraded outcome, or an :class:`Unavailable`
+        (propagated verbatim) when 2a's substrate, the executor, or the parse degraded.
+
+    Raises:
+        DatabaseError: If a graph-store read fails inside 2a (propagated, never masked — D4).
+    """
+    # The proposal projection + the DoD-6 join hash. Mint the hash by mirroring the commit
+    # path's ``compute_node_id`` EXACTLY (sync.py:586/:1547): the decision canonical core is
+    # ``{kind, axiom, mechanism_refs}``, and the field is ``entry.mechanisms`` — ParsedEntry
+    # has no ``mechanism_refs`` attribute (that is compute_node_id's *parameter* name). 5a only
+    # calls this for a decision, so ``kind="decision"`` is hard-coded (the commit path passes
+    # the variable ``entry.kind``, harmlessly identical here). Minting it before the substrate
+    # calls means even a clean-empty result carries the join hash.
+    proposal = judge_input_from_entry(entry)
+    proposed_hash = compute_node_id(
+        kind="decision", axiom=entry.axiom, mechanism_refs=entry.mechanisms
+    )
+
+    # S1–S3 (2a). A substrate degradation (EMBEDDING / VECTOR_STORE) short-circuits verbatim —
+    # the judge is never called.
+    gathered = gather_candidates(
+        entry.axiom,
+        embed_provider=embed_provider,
+        vector_store=vector_store,
+        store=store,
+    )
+    if isinstance(gathered, Unavailable):
+        return gathered
+
+    # S4–S6 (2b) — drop declared/self, floor, rank, truncate to top_k. The batch is capped
+    # HERE; the facade never re-caps, so render/executor always see ≤ top_k candidates
+    # (the ~3K-token budget, CONF-D7).
+    screened = screen_candidates(
+        gathered,
+        declared_targets=declared_strong_targets(entry),
+        own_slug=entry.slug,
+        floor=floor,
+        top_k=top_k,
+    )
+    if not screened:
+        # Clean-empty (Qdrant healthy, nothing above floor / all declared): no LLM call, no
+        # rows, ``execution is None``. This is NEVER an Unavailable (DoD-2 — degraded ≠ empty).
+        return ConflictCheckResult(
+            proposal_input=proposal,
+            proposed_hash_if_any=proposed_hash,
+            findings=[],
+            judged_pairs=[],
+            execution=None,
+        )
+
+    # Project each candidate ONCE (judge the raw node via 3a's adapter — never the display
+    # payload, CONF-D3). The same JudgeInput objects feed both the render and the JudgedPair's
+    # ``candidate_input``, so what 5b persists is byte-identical to what the judge saw.
+    candidate_inputs = [judge_input_from_node(c.node) for c in screened]
+    prompt = render_judgment_prompt(
+        proposal, list(zip((c.slug for c in screened), candidate_inputs))
+    )
+
+    # The one live call, behind the injected seam. A timeout/error degradation short-circuits.
+    execution = judge(prompt)
+    if isinstance(execution, Unavailable):
+        return execution
+
+    # 3a parse — strict, all-or-nothing. A malformed batch degrades (JUDGMENT); the spent
+    # tokens on ``execution`` are intentionally discarded, NOT rescued into a row (CONF-D8 —
+    # a degraded check writes no row; see IMPLEMENTATION_NOTES).
+    judgments = parse_judgment_response(
+        execution.raw_text, [c.slug for c in screened]
+    )
+    if isinstance(judgments, Unavailable):
+        return judgments
+
+    # Zip + gate. Every pair is telemetry; only not-tenable-at-confidence surfaces (CONF-D4).
+    judged_pairs: List[JudgedPair] = []
+    findings: List[ConflictFinding] = []
+    for candidate, candidate_input, judgment in zip(screened, candidate_inputs, judgments):
+        surfaced = (not judgment.tenable_together) and (
+            judgment.confidence >= surface_threshold
+        )
+        judged_pairs.append(
+            JudgedPair(
+                candidate=candidate,
+                candidate_input=candidate_input,
+                judgment=judgment,
+                surfaced=surfaced,
+            )
+        )
+        if surfaced:
+            findings.append(
+                ConflictFinding(
+                    payload=candidate_payload(candidate),
+                    rationale=judgment.rationale,
+                    slug=candidate.slug,
+                    confidence=judgment.confidence,
+                )
+            )
+
+    return ConflictCheckResult(
+        proposal_input=proposal,
+        proposed_hash_if_any=proposed_hash,
+        findings=findings,
+        judged_pairs=judged_pairs,
+        execution=execution,
+    )
