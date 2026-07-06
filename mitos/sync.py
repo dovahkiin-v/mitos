@@ -1158,7 +1158,9 @@ class MitosSyncManager:
         """Persists one judged conflict batch to the telemetry corpus (5b, best-effort).
 
         Maps a healthy JUDGED :class:`~mitos.conflict.ConflictCheckResult` to its
-        ``(JudgmentBatch, [ConflictCheckRow])`` and hands it to 1b's atomic writer. Every
+        ``(JudgmentBatch, [ConflictCheckRow])`` and hands it to 1b's atomic writer. Stamps
+        ``surface='sync'`` on every row (this writer IS the sync surface, CHK-D7) and the
+        batch's ``model_id`` resolved from ``execution.model_alias`` at call time. Every
         fed-context field is read off the result's :class:`~mitos.conflict.JudgeInput`\\ s
         (``result.proposal_input`` / ``pair.candidate_input``) — exactly what the judge saw,
         VERBATIM — never a re-read of the node (which would risk drift and hit the 2a
@@ -1182,8 +1184,18 @@ class MitosSyncManager:
             return
         try:
             execution = result.execution
+            # CHK-D3: resolve the versioned model id HERE — same process, same env,
+            # moments after the call — without widening the frozen executor boundary.
+            # Deliberately narrower than the batch's best-effort wrap: an unknown
+            # alias degrades to NULL (the column is provenance-only), never to a
+            # lost batch whose rationale is non-regenerable (M8).
+            try:
+                model_id: Optional[str] = get_model_id(execution.model_alias)
+            except ValueError:
+                model_id = None
             batch = JudgmentBatch(
                 batch_id=execution.batch_id,
+                model_id=model_id,
                 token_input=execution.token_input,
                 token_output=execution.token_output,
                 token_cache_read=execution.token_cache_read,
@@ -1198,6 +1210,9 @@ class MitosSyncManager:
                     ConflictCheckRow(
                         batch_id=execution.batch_id,
                         sync_run_id=run.sync_run_id,
+                        # This writer IS the sync surface — stamped explicitly on
+                        # every row, never left to the schema DEFAULT (CHK-D7).
+                        surface="sync",
                         judged_axiom=proposal.axiom,
                         # MI-9: an empty proposal rejected_paths ("") / scope ([]) is NULL,
                         # never "" — the NULL column already expresses "nothing here".

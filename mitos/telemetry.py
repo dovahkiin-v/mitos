@@ -71,8 +71,18 @@ class ConflictCheckRow:
     Attributes:
         batch_id: Join key to :class:`JudgmentBatch` (a plain column, NOT an FK — a
             training label must outlive graph surgery, CONF-D8). Minted by 3b/5b.
-        sync_run_id: The sync run this judgment fired in. Nullable for the deferred
-            non-sync write-time path; the 1b/5b sync writer always supplies it.
+        sync_run_id: The originating command run's id — the sync run today; the
+            check run's ``run_id`` once the corpus-audit surface lands (CHK-D7
+            widened the semantics; the column name stays, P1 additive evolution).
+            Nullable for the deferred non-sync write-time path; the sync and check
+            writers always supply it.
+        surface: Which command surface fired the judgment — exact strings
+            ``'sync'`` (the sync-time sensor) or ``'check'`` (the corpus audit);
+            ``'record'`` is reserved for the record-write-pause vision. The label
+            corpus must not fork by surface (CHK-D7), so every writer stamps this
+            explicitly: the field is defaultless on purpose — the schema's
+            permanent ``DEFAULT 'sync'`` is only the rung-2 backfill and can never
+            catch an omitting writer; this constructor can.
         judged_axiom: The proposal's axiom text as fed to the judge, verbatim.
         proposal_rejected_paths: The proposal's ``rejected_paths`` fed context, or
             ``None`` when absent on the parsed entry.
@@ -101,6 +111,7 @@ class ConflictCheckRow:
 
     batch_id: str
     sync_run_id: Optional[str]
+    surface: str
     judged_axiom: str
     proposal_rejected_paths: Optional[str]
     proposal_scope: Optional[str]
@@ -135,6 +146,7 @@ class ConflictCheckRow:
         return (
             self.batch_id,
             self.sync_run_id,
+            self.surface,
             self.judged_axiom,
             self.proposal_rejected_paths,
             self.proposal_scope,
@@ -172,6 +184,12 @@ class JudgmentBatch:
     Attributes:
         batch_id: The PK; the same minted id string carried by every
             :class:`ConflictCheckRow` of the batch.
+        model_id: The resolved versioned model id live at call time (what
+            ``models.get_model_id`` returned for the execution's alias) — the
+            CHK-D3 staleness-bound provenance. Provenance-only: never part of any
+            reuse key (that pins the per-row ``model_alias``). ``None`` when
+            resolution failed (and on pre-rung-2 rows); defaultless on purpose —
+            ``None`` is a legal *explicit* value, silence is not.
         token_input: Input tokens billed for the batched call.
         token_output: Output tokens billed for the batched call.
         token_cache_read: Cache-read tokens billed for the batched call.
@@ -180,6 +198,7 @@ class JudgmentBatch:
     """
 
     batch_id: str
+    model_id: Optional[str]
     token_input: int
     token_output: int
     token_cache_read: int
@@ -194,6 +213,7 @@ class JudgmentBatch:
         """
         return (
             self.batch_id,
+            self.model_id,
             self.token_input,
             self.token_output,
             self.token_cache_read,
@@ -289,11 +309,110 @@ def _conflict_checks_schema(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+# --- Schema (migration ladder step 2) -------------------------------------------
+#
+# Rung 2 (the `mitos check` vision, CHK-D3/D7): attribute every judgment row to the
+# command surface that fired it, stamp the resolved model id on each batch, and give
+# check runs a summary table so a sweep's story survives process exit (P18/P20 —
+# unrecorded runs are unrecoverable). All three are additive: no existing column is
+# renamed, retyped, or dropped (P1 interoperability-across-time). Replay safety
+# rides the runner's ``user_version`` rung guard, NOT statement re-runnability — a
+# bare ALTER raises "duplicate column" on a re-run, and that is fine because an
+# applied rung is never re-entered (MI-3). The ALTERs target rung-1 tables; rung
+# ORDER (1 before 2) is what makes a fresh install replay 1→2 cleanly — never amend
+# rung 1's shipped CREATEs.
+
+# ``conflict_checks.surface`` — which surface fired the judgment: 'sync' | 'check'
+# ('record' reserved for the record-write-pause vision). SQLite requires ``ADD
+# COLUMN ... NOT NULL`` to carry a DEFAULT and makes it PERMANENT, so ``DEFAULT
+# 'sync'`` is the backfill for pre-rung-2 rows AND the reason the constraint can
+# never catch a writer omitting the column — the fence is the defaultless dataclass
+# field plus the writers' column-tuple lockstep test (CHK-D7). No value CHECK:
+# 'record' is a named reserved value with a committed future consumer, and widening
+# a CHECK later costs a table rebuild — CHECK closed contracts, never an evolving
+# vocabulary (contrast ``check_runs.mode``/``exit_code`` below).
+_CONFLICT_CHECKS_ADD_SURFACE = """
+    ALTER TABLE conflict_checks ADD COLUMN surface TEXT NOT NULL DEFAULT 'sync';
+"""
+
+# ``judgment_batches.model_id`` — the resolved versioned id live at call time
+# (CHK-D3: makes the alias-vs-version staleness bound observable). Nullable: NULL on
+# pre-rung-2 rows and when resolution fails — provenance-only, so losing a batch
+# (whose rationale is non-regenerable, M8) over a provenance lookup would invert the
+# value hierarchy. STRICT requires the explicit datatype on ADD COLUMN.
+_JUDGMENT_BATCHES_ADD_MODEL_ID = """
+    ALTER TABLE judgment_batches ADD COLUMN model_id TEXT;
+"""
+
+# ``check_runs`` — one summary row per check run: the run-level repetition memory
+# (P18: standing-count trend, time-to-resolution/nag-count per finding, the
+# long-standing-unresolved FP-suspect list). Written best-effort at run end by the
+# check engine's ``record_check_run`` (a later phase); this rung ships the table
+# empty. Nullability is the semantic line, pinned NOW because SQLite constraints are
+# rebuild-only to change: NOT NULL = the run always knows it at run end; NULL =
+# "value not computable this run", deliberately distinct from a genuine zero
+# (CHK-D10 — a degraded run must never masquerade as "zero findings").
+# ``mode``/``exit_code`` DO get belt-and-suspenders CHECKs: those sets are pinned
+# shipped APIs (CHK-C2), closed contracts — not evolving vocabularies.
+_CHECK_RUNS_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS check_runs (
+        run_id TEXT NOT NULL,                -- CHK-D7 correlation id (uuid4().hex); also lands in conflict_checks.sync_run_id
+        mode TEXT NOT NULL,                  -- 'corpus' | 'staged' (closed set, CHECKed)
+        started_at TEXT NOT NULL,            -- application-supplied UTC ISO-8601, never CURRENT_TIMESTAMP (MI-10)
+        ended_at TEXT NOT NULL,              -- application-supplied UTC ISO-8601 (MI-10)
+        exit_code INTEGER NOT NULL,          -- the shipped 0/1/2 exit contract (CHK-C2)
+        nodes_swept INTEGER NOT NULL,        -- always known at run end, even degraded
+        pairs_judged_fresh INTEGER NOT NULL, -- always known at run end
+        pairs_reused INTEGER NOT NULL,       -- reuse-unavailable => 0, a TRUE zero
+        findings_new INTEGER,                -- NULL = partition unavailable (CHK-D10), NOT a zero
+        findings_known INTEGER,              -- NULL = partition unavailable (CHK-D10), NOT a zero
+        coverage_exclusions INTEGER,         -- count only (named nodes ride the report); NULL = probe never completed
+        degraded_reason TEXT,                -- NULL = healthy; value vocabulary is the engine's, unconstrained here
+        mitos_version TEXT NOT NULL,         -- a reuse-only run writes no conflict_checks rows to join for version
+        PRIMARY KEY (run_id),
+        CHECK (mode IN ('corpus', 'staged')),
+        CHECK (exit_code IN (0, 1, 2))
+    ) STRICT;
+"""
+
+# One statement per list element — ``conn.execute`` runs only the first statement
+# in a string. The two ALTERs must not be merged with the CREATE.
+_TELEMETRY_V2_STATEMENTS: List[str] = [
+    _CONFLICT_CHECKS_ADD_SURFACE,
+    _JUDGMENT_BATCHES_ADD_MODEL_ID,
+    _CHECK_RUNS_SCHEMA,
+]
+
+
+def _check_attribution_schema(conn: sqlite3.Connection) -> None:
+    """Migration step 2: surface attribution + model provenance + ``check_runs``.
+
+    Adds ``conflict_checks.surface`` (existing rows backfill ``'sync'`` via the
+    permanent DEFAULT — a schema operation, no row is UPDATEd),
+    ``judgment_batches.model_id`` (NULL on pre-rung-2 rows), and creates the empty
+    ``check_runs`` summary table. Issues each statement via ``conn.execute`` (one
+    per statement, never ``executescript``); does NOT touch ``user_version`` or
+    manage the transaction — ``run_migrations`` owns both. Replay-safe via the
+    runner's rung guard, not statement re-runnability (a bare ALTER raises on
+    re-run; an applied rung is never re-entered).
+
+    Args:
+        conn: An open, writable SQLite connection inside the runner's transaction
+            (opened via ``store.open_connection``, MI-8).
+    """
+    for statement in _TELEMETRY_V2_STATEMENTS:
+        conn.execute(statement)
+
+
 # Telemetry's OWN ladder registry — a separate ``user_version`` space from the
-# graph's ``migrations.MIGRATION_STEPS``. Authored fresh with step 1 inline; a
-# future telemetry migration would ``.append((2, ...))`` (never rebind — a rebind is
-# invisible to a def-time-bound default arg; the graph ladder learned this).
-TELEMETRY_MIGRATION_STEPS: List[MigrationStep] = [(1, _conflict_checks_schema)]
+# graph's ``migrations.MIGRATION_STEPS``. ONE binding statement, ever: a future
+# telemetry migration extends this literal or ``.append((3, ...))`` after it —
+# never a second binding (a rebind is invisible to a def-time-bound default arg;
+# the graph ladder learned this).
+TELEMETRY_MIGRATION_STEPS: List[MigrationStep] = [
+    (1, _conflict_checks_schema),
+    (2, _check_attribution_schema),
+]
 
 
 # --- Parameterized INSERTs ----------------------------------------------------
@@ -306,6 +425,7 @@ TELEMETRY_MIGRATION_STEPS: List[MigrationStep] = [(1, _conflict_checks_schema)]
 _CONFLICT_CHECKS_COLUMNS: Tuple[str, ...] = (
     "batch_id",
     "sync_run_id",
+    "surface",
     "judged_axiom",
     "proposal_rejected_paths",
     "proposal_scope",
@@ -327,6 +447,7 @@ _CONFLICT_CHECKS_COLUMNS: Tuple[str, ...] = (
 
 _JUDGMENT_BATCHES_COLUMNS: Tuple[str, ...] = (
     "batch_id",
+    "model_id",
     "token_input",
     "token_output",
     "token_cache_read",

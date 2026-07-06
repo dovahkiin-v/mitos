@@ -8,23 +8,30 @@ the ``judgment_batches`` side-table attributes cost/latency exactly once (RF-2),
 partial write rolls the whole batch back, the writer is append-only, and the
 sibling store survives a real ``mitos rebuild`` swap (T8).
 
-Dynamic values only: ``PRAGMA user_version`` is read back through the DB, never a
-bare literal beyond the single head expectation; metric fields are fixture inputs
+Dynamic values only: ``PRAGMA user_version`` expectations come from
+``_pending_head(TELEMETRY_MIGRATION_STEPS)``, never a hardcoded rung literal (the
+sliced-ladder ``== 1`` in the upgrade fixture is the one deliberate exception —
+it pins the *pre-upgrade* rung, not the head); metric fields are fixture inputs
 echoed back and asserted for round-trip equality, not a computed count.
 """
 
+import dataclasses
+import inspect
 import os
 import sqlite3
 
 import pytest
 
+import mitos.telemetry as telemetry_module
 from mitos.config import MitosConfig
 from mitos.cutover import default_aside_db_path, perform_swap, rebuild_and_gate
 from mitos.errors import DatabaseError
-from mitos.store import GraphStore, open_connection
+from mitos.migrations import _pending_head, run_migrations
+from mitos.store import BUSY_TIMEOUT_MS, GraphStore, open_connection
 from mitos.telemetry import (
     _CONFLICT_CHECKS_COLUMNS,
     _JUDGMENT_BATCHES_COLUMNS,
+    TELEMETRY_MIGRATION_STEPS,
     ConflictCheckRow,
     JudgmentBatch,
     TelemetryStore,
@@ -42,6 +49,7 @@ def _row(**overrides) -> ConflictCheckRow:
     base = dict(
         batch_id="batch-1",
         sync_run_id="sync-1",
+        surface="sync",
         judged_axiom="Use SQLite for the graph store.",
         proposal_rejected_paths="Considered Postgres; rejected for portability.",
         proposal_scope="storage, persistence",
@@ -67,6 +75,7 @@ def _batch(**overrides) -> JudgmentBatch:
     """Builds a JudgmentBatch with sensible defaults; override any field."""
     base = dict(
         batch_id="batch-1",
+        model_id="test-model-versioned-1",
         token_input=1200,
         token_output=340,
         token_cache_read=0,
@@ -132,16 +141,39 @@ def test_to_params_arity_matches_column_tuples() -> None:
     """``to_params`` emits exactly one value per INSERT column (order-lockstep pin)."""
     assert len(_row().to_params(CREATED_AT)) == len(_CONFLICT_CHECKS_COLUMNS)
     assert len(_batch().to_params()) == len(_JUDGMENT_BATCHES_COLUMNS)
+    # Rung 2 widened both tuples — the INSERTs self-assemble from these.
+    assert "surface" in _CONFLICT_CHECKS_COLUMNS
+    assert "model_id" in _JUDGMENT_BATCHES_COLUMNS
+
+
+def test_rung2_fields_have_no_defaults() -> None:
+    """``surface``/``model_id`` are required at construction — the writers' fence.
+
+    The schema's permanent ``DEFAULT 'sync'`` can never catch a writer omitting the
+    column (an omitting INSERT silently gets ``'sync'``), so the enforcement is the
+    defaultless dataclass field: omission is a ``TypeError`` at construction
+    (CHK-D7). ``model_id=None`` stays a legal *explicit* value; silence is not.
+    """
+    row_fields = {f.name: f for f in dataclasses.fields(ConflictCheckRow)}
+    surface = row_fields["surface"]
+    assert surface.default is dataclasses.MISSING
+    assert surface.default_factory is dataclasses.MISSING
+
+    batch_fields = {f.name: f for f in dataclasses.fields(JudgmentBatch)}
+    model_id = batch_fields["model_id"]
+    assert model_id.default is dataclasses.MISSING
+    assert model_id.default_factory is dataclasses.MISSING
 
 
 # --- criterion 1: fresh boot ---------------------------------------------------
 
 
 def test_fresh_boot_creates_schema(tmp_path) -> None:
-    """Constructing on an absent path creates the file, both tables, user_version=1.
+    """Constructing on an absent path creates the file, all three tables, head version.
 
     Also proves the makedirs-before-open guard: the parent ``.mitos/`` does not
-    exist before construction.
+    exist before construction. The head expectation is dynamic
+    (``_pending_head``) — never a hardcoded rung literal.
     """
     path = _telemetry_path(tmp_path)
     assert not os.path.exists(path)
@@ -153,7 +185,94 @@ def test_fresh_boot_creates_schema(tmp_path) -> None:
     try:
         assert _table_exists(conn, "conflict_checks")
         assert _table_exists(conn, "judgment_batches")
-        assert _user_version(conn) == 1
+        assert _table_exists(conn, "check_runs")
+        assert _user_version(conn) == _pending_head(TELEMETRY_MIGRATION_STEPS)
+    finally:
+        conn.close()
+
+
+def _table_info(conn: sqlite3.Connection, table: str):
+    """Returns ``PRAGMA table_info`` as (name, type, notnull, pk) tuples."""
+    return [
+        (r["name"], r["type"], r["notnull"], r["pk"])
+        for r in conn.execute(f"PRAGMA table_info({table});").fetchall()
+    ]
+
+
+def test_check_runs_column_contract(tmp_path) -> None:
+    """``check_runs`` matches the §3/W1 contract exactly — 2d's writer builds on this.
+
+    Nullability is the semantic line and is pinned NOW (SQLite constraints are
+    rebuild-only to change): NOT NULL = always known at run end; NULL = "value not
+    computable this run", distinct from a genuine zero (CHK-D10).
+    """
+    path = _telemetry_path(tmp_path)
+    TelemetryStore(path)
+    conn = _open(path)
+    try:
+        got = _table_info(conn, "check_runs")
+    finally:
+        conn.close()
+    assert got == [
+        ("run_id", "TEXT", 1, 1),
+        ("mode", "TEXT", 1, 0),
+        ("started_at", "TEXT", 1, 0),
+        ("ended_at", "TEXT", 1, 0),
+        ("exit_code", "INTEGER", 1, 0),
+        ("nodes_swept", "INTEGER", 1, 0),
+        ("pairs_judged_fresh", "INTEGER", 1, 0),
+        ("pairs_reused", "INTEGER", 1, 0),
+        ("findings_new", "INTEGER", 0, 0),
+        ("findings_known", "INTEGER", 0, 0),
+        ("coverage_exclusions", "INTEGER", 0, 0),
+        ("degraded_reason", "TEXT", 0, 0),
+        ("mitos_version", "TEXT", 1, 0),
+    ]
+
+
+def test_widened_columns_shapes(tmp_path) -> None:
+    """``conflict_checks.surface`` is NOT NULL DEFAULT 'sync'; ``model_id`` is nullable TEXT."""
+    path = _telemetry_path(tmp_path)
+    TelemetryStore(path)
+    conn = _open(path)
+    try:
+        checks = {
+            r["name"]: (r["type"], r["notnull"], r["dflt_value"])
+            for r in conn.execute("PRAGMA table_info(conflict_checks);").fetchall()
+        }
+        batches = {
+            r["name"]: (r["type"], r["notnull"], r["dflt_value"])
+            for r in conn.execute("PRAGMA table_info(judgment_batches);").fetchall()
+        }
+    finally:
+        conn.close()
+    # The DEFAULT is the rung-2 backfill mechanism (and permanent — SQLite requires
+    # it on ADD COLUMN NOT NULL); the writers' lockstep is the real fence.
+    assert checks["surface"] == ("TEXT", 1, "'sync'")
+    assert batches["model_id"] == ("TEXT", 0, None)
+
+
+def test_check_runs_checks_reject_out_of_contract_values(tmp_path) -> None:
+    """The belt-and-suspenders CHECKs pin the closed sets: mode, exit_code, one-row-per-run."""
+    path = _telemetry_path(tmp_path)
+    TelemetryStore(path)
+    insert = (
+        "INSERT INTO check_runs (run_id, mode, started_at, ended_at, exit_code, "
+        "nodes_swept, pairs_judged_fresh, pairs_reused, findings_new, findings_known, "
+        "coverage_exclusions, degraded_reason, mitos_version) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"
+    )
+    good = ("run-1", "corpus", CREATED_AT, CREATED_AT, 0, 5, 2, 3, 1, 0, 0, None, "test-v")
+    conn = _open(path)
+    try:
+        with conn:
+            conn.execute(insert, good)
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(insert, ("run-2", "watch") + good[2:])  # mode outside the set
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(insert, ("run-3", "staged", CREATED_AT, CREATED_AT, 3) + good[5:])
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(insert, good)  # duplicate run_id — one row per run is structural
     finally:
         conn.close()
 
@@ -168,21 +287,128 @@ def test_replay_idempotency_is_noop(tmp_path) -> None:
     conn = _open(path)
     try:
         first_schema = _schema_snapshot(conn)
-        assert _user_version(conn) == 1
+        assert _user_version(conn) == _pending_head(TELEMETRY_MIGRATION_STEPS)
     finally:
         conn.close()
 
     # Re-boot twice over an at-head file — the user_version gate skips the applied
-    # rung; the IF NOT EXISTS DDL is the structural backstop.
+    # rungs (rung 2's bare ALTERs are NOT re-runnable; the guard is what makes the
+    # replay a no-op, MI-3).
     TelemetryStore(path)
     TelemetryStore(path)
 
     conn = _open(path)
     try:
-        assert _user_version(conn) == 1
+        assert _user_version(conn) == _pending_head(TELEMETRY_MIGRATION_STEPS)
         assert _schema_snapshot(conn) == first_schema
     finally:
         conn.close()
+
+
+# --- rung-2 upgrade: 'sync' backfill + NULL model_id on legacy rows -------------
+
+
+def test_upgrade_backfills_surface_and_null_model_id(tmp_path) -> None:
+    """A rung-1 DB with legacy rows boots to head: ``surface='sync'``, ``model_id`` NULL.
+
+    The post-rung-2 writer cannot author a pre-rung-2 row (its INSERT names
+    ``surface``), so the legacy fixture is built by running the SLICED ladder and
+    INSERTing over the rung-1 column set via raw parameterized SQL. Every other
+    field must read back byte-unchanged (``ADD COLUMN … DEFAULT`` is a schema
+    operation — no row is UPDATEd; the append-only corpus is untouched).
+    """
+    path = _telemetry_path(tmp_path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    conn = open_connection(path)
+    try:
+        run_migrations(conn, TELEMETRY_MIGRATION_STEPS[:1])
+        conn.execute(
+            "INSERT INTO judgment_batches (batch_id, token_input, token_output, "
+            "token_cache_read, token_cache_creation, elapsed_ms) "
+            "VALUES (?, ?, ?, ?, ?, ?);",
+            ("legacy-batch", 1200, 340, 0, 800, 2500),
+        )
+        conn.execute(
+            "INSERT INTO conflict_checks (batch_id, sync_run_id, judged_axiom, "
+            "proposal_rejected_paths, proposal_scope, proposed_hash_if_any, "
+            "candidate_slug, candidate_hash, candidate_rejected_paths, "
+            "candidate_scope, tenable, confidence, surfaced, candidate_source, "
+            "model_alias, prompt_version, mitos_version, rationale, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+            (
+                "legacy-batch", "sync-legacy", "Legacy judged axiom.", None, None,
+                "hash-legacy", "legacy-cand", "cafe1234", "Rejected X.", None,
+                0, 0.9, 1, "embedding_topk", "SONNET", "conflict-judge-v1",
+                "0.5.21", "Legacy rationale.", CREATED_AT,
+            ),
+        )
+        row_before = dict(conn.execute("SELECT * FROM conflict_checks;").fetchone())
+        batch_before = dict(conn.execute("SELECT * FROM judgment_batches;").fetchone())
+        assert _user_version(conn) == 1  # the deliberate pre-upgrade rung
+    finally:
+        conn.close()
+
+    TelemetryStore(path)  # advance the ladder 1 -> head
+
+    conn = _open(path)
+    try:
+        assert _user_version(conn) == _pending_head(TELEMETRY_MIGRATION_STEPS)
+        row_after = dict(conn.execute("SELECT * FROM conflict_checks;").fetchone())
+        batch_after = dict(conn.execute("SELECT * FROM judgment_batches;").fetchone())
+        upgraded_schema = _schema_snapshot(conn)
+    finally:
+        conn.close()
+    assert row_after.pop("surface") == "sync"  # the DEFAULT backfill
+    assert row_after == row_before  # every pre-existing field byte-unchanged
+    assert batch_after.pop("model_id") is None  # pre-rung-2 provenance is unknowable
+    assert batch_after == batch_before
+
+    # Stretch pin: fresh-install and upgraded-install execute the identical DDL
+    # sequence (rung 1 then rung 2), so their stored schemas are byte-identical.
+    fresh_path = str(tmp_path / ".mitos" / "fresh-telemetry.sqlite")
+    TelemetryStore(fresh_path)
+    conn = _open(fresh_path)
+    try:
+        assert _schema_snapshot(conn) == upgraded_schema
+    finally:
+        conn.close()
+
+
+# --- MI-8: every connection routes through the store.open_connection chokepoint --
+
+
+def test_connections_route_through_mi8_chokepoint(tmp_path, monkeypatch) -> None:
+    """Boot + write open exactly two connections, both fully PRAGMA-configured.
+
+    Asserts the chokepoint discipline behaviourally: a spy wraps
+    ``mitos.telemetry.open_connection`` (the import-time binding — patching
+    ``mitos.store`` would not intercept) and records each connection's live
+    ``foreign_keys``/``busy_timeout``. A bare ``sqlite3.connect`` anywhere in the
+    module would bypass the spy — the source-level pin closes that gap.
+    """
+    path = _telemetry_path(tmp_path)
+    real_open = telemetry_module.open_connection
+    pragmas = []
+
+    def spy(db_path: str, read_only: bool = False) -> sqlite3.Connection:
+        conn = real_open(db_path, read_only=read_only)
+        pragmas.append(
+            (
+                conn.execute("PRAGMA foreign_keys;").fetchone()[0],
+                conn.execute("PRAGMA busy_timeout;").fetchone()[0],
+            )
+        )
+        return conn
+
+    monkeypatch.setattr("mitos.telemetry.open_connection", spy)
+    store = TelemetryStore(path)
+    store.record_judged_batch(_batch(), [_row()], CREATED_AT)
+
+    assert len(pragmas) == 2  # one boot connection + one per-write connection
+    assert all(fk == 1 for fk, _ in pragmas)
+    assert all(busy == BUSY_TIMEOUT_MS for _, busy in pragmas)
+    # Supplementary source pin: telemetry never opens a bare sqlite3.connect.
+    assert "sqlite3.connect" not in inspect.getsource(telemetry_module)
 
 
 # --- criterion 3: verbatim uncapped round-trip ---------------------------------
@@ -201,12 +427,15 @@ def test_verbatim_uncapped_roundtrip(tmp_path) -> None:
     multiline_rejected = "Rejected path A.\nRejected path B.\n\tindented C\n"
 
     store.record_judged_batch(
-        _batch(),
+        # 'check' (not the builder's 'sync' default) proves the writer's VALUE binds
+        # — a 'sync' read-back could be the schema DEFAULT masking an omitted column.
+        _batch(model_id="claude-test-9"),
         [
             _row(
                 judged_axiom=long_axiom,
                 rationale=multiline_rationale,
                 candidate_rejected_paths=multiline_rejected,
+                surface="check",
             )
         ],
         CREATED_AT,
@@ -215,8 +444,11 @@ def test_verbatim_uncapped_roundtrip(tmp_path) -> None:
     conn = _open(path)
     try:
         got = conn.execute(
-            "SELECT judged_axiom, rationale, candidate_rejected_paths, created_at "
-            "FROM conflict_checks;"
+            "SELECT judged_axiom, rationale, candidate_rejected_paths, created_at, "
+            "surface FROM conflict_checks;"
+        ).fetchone()
+        got_batch = conn.execute(
+            "SELECT model_id FROM judgment_batches;"
         ).fetchone()
     finally:
         conn.close()
@@ -224,6 +456,8 @@ def test_verbatim_uncapped_roundtrip(tmp_path) -> None:
     assert got["rationale"] == multiline_rationale
     assert got["candidate_rejected_paths"] == multiline_rejected
     assert got["created_at"] == CREATED_AT
+    assert got["surface"] == "check"
+    assert got_batch["model_id"] == "claude-test-9"
 
 
 # --- criterion 4: NULL semantics ------------------------------------------------
@@ -235,7 +469,9 @@ def test_null_semantics_roundtrip(tmp_path) -> None:
     store = TelemetryStore(path)
 
     store.record_judged_batch(
-        _batch(),
+        # model_id=None is a legal EXPLICIT value (resolution failed) → SQL NULL,
+        # never the empty string.
+        _batch(model_id=None),
         [
             _row(
                 proposal_scope=None,
@@ -254,6 +490,9 @@ def test_null_semantics_roundtrip(tmp_path) -> None:
             "SELECT proposal_scope, candidate_scope, proposal_rejected_paths, "
             "sync_run_id, proposed_hash_if_any FROM conflict_checks;"
         ).fetchone()
+        got_batch = conn.execute(
+            "SELECT model_id FROM judgment_batches;"
+        ).fetchone()
     finally:
         conn.close()
     assert got["proposal_scope"] is None
@@ -261,6 +500,7 @@ def test_null_semantics_roundtrip(tmp_path) -> None:
     assert got["proposal_rejected_paths"] is None
     assert got["sync_run_id"] == "sync-9"
     assert got["proposed_hash_if_any"] == "hash-9"
+    assert got_batch["model_id"] is None
 
 
 def test_not_null_field_fails_loudly_and_rolls_back(tmp_path) -> None:

@@ -51,6 +51,8 @@ Thumbs.db
 .mitos/
 live_axioms.md
 *sync_snapshot.md
+# filelock's buffer lock leaves a zero-byte sibling behind by design
+decisions.md.lock
 # Root-anchored: the repo root is a dogfood `mitos init` workspace, so `init`
 # regenerates a workspace `format-spec.md` at root. The package copy is the only
 # tracked C5 source (V1-D7). Leading slash is load-bearing — a bare `format-spec.md`

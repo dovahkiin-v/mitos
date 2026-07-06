@@ -122,11 +122,18 @@ class _SequenceJudge:
         return ret
 
 
-def _execution(verdicts: List[tuple], *, batch_id: str = "batch-fixed-id") -> JudgmentExecution:
+def _execution(
+    verdicts: List[tuple],
+    *,
+    batch_id: str = "batch-fixed-id",
+    model_alias: str = "SONNET",
+) -> JudgmentExecution:
     """Builds a JudgmentExecution whose `raw_text` is the judge JSON for `verdicts`.
 
     `verdicts`: list of `(slug, tenable_together, confidence, rationale)`. The set/count
     must match the screened batch (3a's parse realigns by casefolded slug).
+    `model_alias` overrides the alias the execution carries — the 1a defensive-resolution
+    case needs one `get_model_id` rejects (e.g. "CLAUDE_SONNET").
     """
     import json
 
@@ -144,7 +151,7 @@ def _execution(verdicts: List[tuple], *, batch_id: str = "batch-fixed-id") -> Ju
     return JudgmentExecution(
         raw_text=raw,
         batch_id=batch_id,
-        model_alias="SONNET",
+        model_alias=model_alias,
         token_input=100,
         token_output=40,
         token_cache_read=0,

@@ -48,6 +48,7 @@ from mitos.conflict import (
 )
 from mitos.errors import DatabaseError
 from mitos.identity import embedding_text
+from mitos.models import get_model_id
 from mitos.parser import ParsedEntry
 from mitos.sync import MitosSyncManager
 
@@ -473,6 +474,9 @@ def test_judged_surfaced_row_persists_and_reads_back(
     # mitos_version is read programmatically — never a hardcoded literal.
     assert row["mitos_version"] == mitos.__version__
     assert row["sync_run_id"]  # non-null
+    # The sync surface stamps its own name explicitly (CHK-D7 — the writers' fence,
+    # never the schema DEFAULT).
+    assert row["surface"] == "sync"
     # created_at is a real, parseable UTC ISO-8601 stamp (never CURRENT_TIMESTAMP, MI-10).
     assert _datetime.datetime.fromisoformat(row["created_at"])
 
@@ -481,6 +485,9 @@ def test_judged_surfaced_row_persists_and_reads_back(
     assert batches[0]["batch_id"] == "batch-fixed-id"
     assert batches[0]["token_input"] == 100
     assert batches[0]["elapsed_ms"] == 12
+    # model_id is the versioned id resolved from the EXECUTION's alias at call time —
+    # computed here too (get_model_id honours MITOS_MODEL_OVERRIDE_*), never hardcoded.
+    assert batches[0]["model_id"] == get_model_id("SONNET")
 
     # The entry committed — persistence rode alongside the commit, never blocked it.
     assert manager.store.get_node_by_slug("health-public") is not None
@@ -523,9 +530,56 @@ def test_all_judged_pairs_persist_not_only_surfaced(
     assert by_slug["endpoints-auth"]["surfaced"] == 1
     assert by_slug["rate-limit"]["surfaced"] == 0  # judged but not surfaced — still stored
     assert by_slug["rate-limit"]["tenable"] == 1
+    # EVERY row of the batch carries the surface stamp, surfaced or not (CHK-D7).
+    assert all(r["surface"] == "sync" for r in rows)
     # One batch, shared batch_id across both rows (the intra-corpus join key).
     assert len({r["batch_id"] for r in rows}) == 1
-    assert len(_read_batch_rows(config)) == 1
+    batches = _read_batch_rows(config)
+    assert len(batches) == 1
+    assert batches[0]["model_id"] == get_model_id("SONNET")
+
+
+# --------------------------------------------------------------------------- #
+# 1a (check vision) — defensive model_id resolution: NULL, never a lost batch
+# --------------------------------------------------------------------------- #
+
+def test_unknown_model_alias_degrades_model_id_to_null(
+    env: Tuple[MitosConfig, MitosSyncManager, str], capsys: pytest.CaptureFixture
+) -> None:
+    """An alias ``get_model_id`` rejects → the batch persists with ``model_id`` NULL.
+
+    Pins 1a Key Decision 4's failure mode: ``model_id`` is provenance-only, so a
+    resolve ``ValueError`` costs exactly that column — never the batch (whose
+    rationale is non-regenerable, M8), never the sync. The outer best-effort
+    boundary must NOT be the thing that catches it (that would skip the rows).
+    """
+    config, manager, _ = env
+    _seed_active(manager, "endpoints-auth", "All API endpoints require authentication.")
+    judge = _RecordingJudge(
+        _execution(
+            [("endpoints-auth", False, 0.9, "Health exemption contradicts blanket auth.")],
+            # In MODEL_IDS' key-space this alias is unknown (raises ValueError);
+            # "EMBEDDING" would NOT work here — absent from MODEL_ALIASES yet
+            # present in MODEL_IDS, it resolves instead of raising.
+            model_alias="CLAUDE_SONNET",
+        )
+    )
+    _wire_fakes(manager, judge=judge, matches=[_match("endpoints-auth", 0.9)])
+
+    _append_decision(config, "health-public", "The /health endpoint is publicly accessible.")
+    with patch("builtins.input", side_effect=["a"]):
+        manager.perform_sync(auto_accept=False)
+
+    rows = _read_conflict_rows(config)
+    assert len(rows) == 1  # the batch landed — resolution failure cost nothing but the column
+    assert rows[0]["surface"] == "sync"
+    assert rows[0]["model_alias"] == "CLAUDE_SONNET"  # the per-row ALIAS stays verbatim
+    batches = _read_batch_rows(config)
+    assert len(batches) == 1
+    assert batches[0]["model_id"] is None
+    # The degradation is the NULL itself — no best-effort warning fired, nothing skipped.
+    assert "Could not persist conflict telemetry" not in capsys.readouterr().err
+    assert manager.store.get_node_by_slug("health-public") is not None
 
 
 # --------------------------------------------------------------------------- #
