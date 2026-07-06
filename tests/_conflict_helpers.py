@@ -86,6 +86,103 @@ class _FakeVector:
         pass
 
 
+class _KeyedEmbed:
+    """Returns a DISTINCT vector per exact text — per-proposal neighbourhoods (2b).
+
+    The shared ``_FakeEmbed`` returns one fixed vector, so every query looks identical
+    to the vector fake and per-proposal neighbourhoods are impossible; the corpus sweep
+    (``tests/test_check_sweep.py``) needs each swept axiom to map to its own canned
+    KNN result. ``raises`` maps a text to the exception its embed call should raise —
+    the per-node degradation seam (§9-6). An unknown text fails loud (``KeyError``):
+    a fixture gap, never a silent default vector.
+    """
+
+    def __init__(
+        self,
+        vectors: Dict[str, List[float]],
+        *,
+        raises: Optional[Dict[str, BaseException]] = None,
+    ) -> None:
+        self._vectors = vectors
+        self._raises = raises if raises is not None else {}
+        self.calls: List[Tuple[str, bool]] = []
+
+    def get_embedding(self, text: str, is_query: bool = False) -> List[float]:
+        self.calls.append((text, is_query))
+        if text in self._raises:
+            raise self._raises[text]
+        return list(self._vectors[text])
+
+
+class _KeyedVector:
+    """Returns canned matches keyed on the exact query VECTOR; records every query.
+
+    The ``_KeyedEmbed`` counterpart: sentinel vector in → that node's canned matches
+    out (keyed on ``tuple(vector)`` — lists aren't hashable). ``queried`` is the
+    per-query log the 2b laziness test reads: an unconsumed sweep node must leave no
+    entry here. ``raises`` (also vector-keyed) is the vector-substrate fault seam —
+    folded in now so 2c's breaker tests don't grow a third private fork.
+    """
+
+    def __init__(
+        self,
+        matches: Dict[Tuple[float, ...], List[Dict[str, Any]]],
+        *,
+        raises: Optional[Dict[Tuple[float, ...], BaseException]] = None,
+    ) -> None:
+        self._matches = matches
+        self._raises = raises if raises is not None else {}
+        self.queried: List[Tuple[float, ...]] = []
+
+    def query(self, vector: List[float], limit: int = 5) -> List[Dict[str, Any]]:
+        key = tuple(vector)
+        self.queried.append(key)
+        if key in self._raises:
+            raise self._raises[key]
+        return list(self._matches[key])
+
+    def upsert(self, node_id: str, vector: List[float], payload: Dict[str, Any]) -> None:
+        pass
+
+
+def _keyed_substrate(
+    neighbourhoods: Dict[str, List[Dict[str, Any]]],
+    *,
+    embed_raises: Optional[Dict[str, BaseException]] = None,
+    vector_raises: Optional[Dict[str, BaseException]] = None,
+) -> Tuple[_KeyedEmbed, _KeyedVector]:
+    """Builds a coherent ``(_KeyedEmbed, _KeyedVector)`` pair from ``{axiom_text: matches}``.
+
+    Mints one sentinel vector per text (insertion-order indexed) and wires the two
+    fakes so sweeping the node with that axiom sees exactly its canned matches. Note
+    the text key is what gather actually embeds — ``embedding_text(...)`` = NFC+strip
+    of the axiom, so plain ASCII fixture axioms key verbatim. Both ``raises`` maps are
+    TEXT-keyed (the vector fake's is translated onto its sentinel vector here), so one
+    builder covers per-node embed faults and vector faults alike. A ``vector_raises``
+    key absent from ``neighbourhoods`` has no sentinel to ride — that is a fixture gap
+    and fails loud here, never a silently un-armed fault.
+    """
+    if vector_raises:
+        unknown = set(vector_raises) - set(neighbourhoods)
+        if unknown:
+            raise ValueError(
+                f"vector_raises keys missing from neighbourhoods: {sorted(unknown)}"
+            )
+    vectors: Dict[str, List[float]] = {}
+    matches: Dict[Tuple[float, ...], List[Dict[str, Any]]] = {}
+    translated: Dict[Tuple[float, ...], BaseException] = {}
+    for index, (text, canned) in enumerate(neighbourhoods.items()):
+        sentinel = [float(index + 1), 0.5]
+        vectors[text] = sentinel
+        matches[tuple(sentinel)] = canned
+        if vector_raises and text in vector_raises:
+            translated[tuple(sentinel)] = vector_raises[text]
+    return (
+        _KeyedEmbed(vectors, raises=embed_raises),
+        _KeyedVector(matches, raises=translated),
+    )
+
+
 class _RecordingJudge:
     """A fake `judge` returning a canned value; records whether/how often it was called."""
 
