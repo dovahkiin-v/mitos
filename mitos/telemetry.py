@@ -16,10 +16,13 @@ rebuildable graph (P7 bulkhead): the swap/backup machinery in ``cutover.py`` onl
 ever touches ``graph.sqlite``-derived paths, so a different basename survives the
 truth-rebuild untouched (CONF-D8; the T8 guarantee).
 
-This module is deliberately **write-only** in v0.2: an append-only whole-row
-writer and nothing more — no retention, decay, or pruning (P4 deferred), and no
-consumer-facing read/query surface (the CONF-C1 ``edges ⋈ conflict_checks`` corpus
-join belongs to a future vision). Every judged row lands **whole and uncapped** —
+This module pairs an append-only whole-row **writer** with one non-mutating bulk
+**reader** — ``load_reuse_index``, the corpus's first in-tool consumer (verdict
+reuse + novelty; CHK-D3/D10). The reader opens the sibling DB ``mode=ro`` so it
+*physically* cannot mutate the corpus, and it never chains derived state (it reads
+the primary judged rows verbatim, M8). There is still no retention, decay, or
+pruning (P4 deferred), and the full CONF-C1 ``edges ⋈ conflict_checks`` corpus join
+still belongs to a future vision. Every judged row lands **whole and uncapped** —
 the longest, thorniest contradiction is exactly the example the future classifier
 will most need (CONF-D8 verbatim-and-whole).
 
@@ -35,7 +38,7 @@ stays acyclic.
 import os
 import sqlite3
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from mitos.errors import DatabaseError
 from mitos.migrations import MigrationStep, run_migrations
@@ -475,14 +478,157 @@ _INSERT_CONFLICT_CHECK_SQL = _insert_sql("conflict_checks", _CONFLICT_CHECKS_COL
 _INSERT_JUDGMENT_BATCH_SQL = _insert_sql("judgment_batches", _JUDGMENT_BATCHES_COLUMNS)
 
 
+# --- Read-side boundary shapes (verdict-reuse / novelty projection) -----------
+#
+# The corpus's first consumer-facing read. ``load_reuse_index`` projects
+# ``conflict_checks`` into an in-memory, orientation-blind, latest-wins verdict
+# index the run engine (2c) consults once per run for BOTH the CHK-D3 reuse
+# partition (reuse yesterday's verdict at zero LLM spend) and the CHK-D10 novelty
+# partition (tell a new tension from a standing one). Both readers want the SAME
+# rows read the SAME way, so there is one read path, not two.
+
+
+@dataclass(frozen=True)
+class StoredVerdict:
+    """One prior judged verdict, the latest for its pair at the queried pins.
+
+    Carries only the raw judge output the engine needs — NOT a pre-derived
+    ``is_finding`` bool. "Is this verdict a finding?" is ``not tenable ∧ confidence
+    ≥ CONFLICT_SURFACE_THRESHOLD`` (CONF-D4), and that threshold lives in
+    ``conflict.py`` where the run engine already imports it; deriving it here would
+    couple the sibling store to the judgment leaf and fork the one gate formula
+    (Key Decision 4). The engine applies the formula to both the reused verdict and
+    the latest-prior verdict — a single gate site.
+
+    Attributes:
+        tenable: The judge's verdict (``0/1`` in SQLite → ``bool`` here).
+        confidence: The judge's raw self-reported confidence in ``[0, 1]``.
+        rationale: The judge's verbatim output — the reused finding's report text
+            (M8: the standing-finding report reuses this, never a re-render).
+        batch_id: The source batch — CHK-D3 reuse provenance.
+        created_at: The row's UTC ISO-8601 stamp — reuse provenance and the
+            latest-wins ordering key (MI-10).
+    """
+
+    tenable: bool
+    confidence: float
+    rationale: str
+    batch_id: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class ReuseUnavailable:
+    """Typed degradation: the read itself failed (corrupt image, unopenable path).
+
+    Returned, never raised — a read failure must not abort the run, and must never
+    be a silent empty (the ``except: return {}`` the typed-degradation pattern
+    forbids). It is a **different type** from an empty :class:`ReuseIndex`: an empty
+    index means *no priors* (a healthy first-run state), this means *the read broke*.
+    The engine's exit-0-vs-exit-2 fork keys on exactly that line — both partitions
+    (reuse AND novelty) read the same rows in the same call, so one read failure
+    takes out both, and the engine's response is run-as-``--fresh`` **and**
+    report-unpartitioned (Key Decision 5).
+
+    Telemetry-local by design: ``conflict.Unavailable``'s reasons are all
+    pipeline-substrate (EMBEDDING/VECTOR_STORE/JUDGMENT/…); bolting a TELEMETRY
+    member onto that enum would couple telemetry's failure vocabulary into the
+    conflict leaf (the wrong direction) and force this module to import ``conflict``.
+
+    Attributes:
+        detail: The underlying exception message — logging/telemetry ONLY, never
+            user-rendered (mirrors ``conflict.Unavailable.detail``).
+    """
+
+    detail: str
+
+
+class ReuseIndex:
+    """An in-memory, orientation-blind, latest-wins index of prior verdicts.
+
+    Wraps ``{ tuple(sorted((h_lo, h_hi))) : StoredVerdict }`` — one entry per judged
+    pair, keyed on the sorted content-hash pair so a lookup hits regardless of which
+    side was the proposal when the row was written (which side was the sweep node is
+    a discovery-direction accident, CHK-D2/Key Decision 3). Every entry is confined
+    to rows matching the ``prompt_version`` + ``model_alias`` the index was loaded at.
+    An empty index (``len == 0``) is a healthy no-priors state, distinct from
+    :class:`ReuseUnavailable`.
+    """
+
+    def __init__(self, verdicts: "Dict[Tuple[str, str], StoredVerdict]") -> None:
+        """Wraps the built pair→verdict map (the reader owns construction).
+
+        Args:
+            verdicts: The latest-wins map keyed on the sorted hash pair.
+        """
+        self._verdicts = verdicts
+
+    def lookup(self, hash_a: str, hash_b: str) -> Optional[StoredVerdict]:
+        """Returns the latest verdict for the unordered pair, or ``None`` on a miss.
+
+        Orientation-blind: ``lookup(a, b)`` and ``lookup(b, a)`` resolve identically.
+        A ``None`` means no prior verdict at these pins (the caller need not sort).
+
+        Args:
+            hash_a: One side's content hash.
+            hash_b: The other side's content hash.
+
+        Returns:
+            The pair's latest :class:`StoredVerdict`, or ``None`` if unjudged.
+        """
+        return self._verdicts.get(tuple(sorted((hash_a, hash_b))))
+
+    def __contains__(self, pair: "Tuple[str, str]") -> bool:
+        """Orientation-blind membership for a ``(hash_a, hash_b)`` pair."""
+        return tuple(sorted(pair)) in self._verdicts
+
+    def __len__(self) -> int:
+        """The count of distinct prior pairs at these pins (2c's reused-set size)."""
+        return len(self._verdicts)
+
+
+# The read-side projected columns — a narrow sibling of ``_CONFLICT_CHECKS_COLUMNS``
+# (the 20-col write order). ``prompt_version``/``model_alias`` are pinned in the
+# WHERE (per-row exact-string match), not projected; ``candidate_slug`` is NOT
+# carried (MI-2: a mutable historical citation — the standing-finding report
+# resolves display slugs live from nodes by hash, M8); ``surfaced`` is NOT carried
+# (finding-ness is re-derived in the engine from raw ``tenable`` + ``confidence``,
+# Key Decision 4).
+_REUSE_INDEX_COLUMNS: Tuple[str, ...] = (
+    "proposed_hash_if_any",
+    "candidate_hash",
+    "tenable",
+    "confidence",
+    "rationale",
+    "batch_id",
+    "created_at",
+)
+
+# One bulk read per run — never a per-pair SQL probe over the un-indexed append-only
+# table (§6.2 mandate / Key Decision 1). Ascending ``created_at`` then ``rowid``
+# makes last-write-wins deterministic on a shared-timestamp batch (``rowid`` is a safe
+# monotonic-with-insertion proxy because the corpus is append-only and never deleted).
+# ``proposed_hash_if_any IS NOT NULL`` drops rows that can form no pair key. Values
+# bind via ``?`` (P8); the only interpolation is over code-internal column literals.
+_SELECT_REUSE_INDEX_SQL = (
+    f"SELECT {', '.join(_REUSE_INDEX_COLUMNS)} FROM conflict_checks "
+    "WHERE prompt_version = ? AND model_alias = ? "
+    "AND proposed_hash_if_any IS NOT NULL "
+    "ORDER BY created_at ASC, rowid ASC"
+)
+
+
 class TelemetryStore:
     """Append-only sibling store for the Conflict sensor's judged batches.
 
     Boots its own migration ladder on construction (mirroring
     ``GraphStore.__init__``'s boot-on-init shape) and is otherwise
     connection-stateless: every operation opens its own connection through the MI-8
-    chokepoint and closes it, holding no long-lived handle. The store is
-    write-only in v0.2 — one append-only writer, no query/consumer surface.
+    chokepoint and closes it, holding no long-lived handle. It pairs one append-only
+    writer (``record_judged_batch``) with one read-only bulk projection
+    (``load_reuse_index``, the sibling's first consumer-facing read surface) — the
+    reader opens ``mode=ro``, so "no writes on the read path" is structural, not
+    disciplinary.
     """
 
     def __init__(self, telemetry_path: str) -> None:
@@ -560,3 +706,66 @@ class TelemetryStore:
             raise DatabaseError(f"Failed to persist judged batch: {e}") from e
         finally:
             conn.close()
+
+    def load_reuse_index(
+        self, *, prompt_version: str, model_alias: str
+    ) -> "ReuseIndex | ReuseUnavailable":
+        """Projects prior verdicts into an orientation-blind latest-wins index.
+
+        One read-only bulk projection of ``conflict_checks`` — routed through the
+        MI-8 chokepoint with ``read_only=True`` so "no writes on the read path" is a
+        structural property of the connection mode, not a discipline (Key Decision 2)
+        — streamed into a dict keyed on the sorted content-hash pair. The scan is
+        ascending by ``created_at`` then ``rowid`` and each key is overwritten, so the
+        *latest* matching row per pair wins and only the winners are retained: peak
+        memory is O(distinct pairs at these pins), never O(total history). Never a
+        per-pair SQL probe over the un-indexed append-only table (§6.2 mandate).
+
+        The index carries only rows whose ``prompt_version`` **and** ``model_alias``
+        match the passed pins (WHERE-filtered) — a prompt or tier change invalidates
+        reuse by construction (CHK-D3). Rows with a NULL ``proposed_hash_if_any`` form
+        no pair key and are filtered in SQL. Serves BOTH the reuse and novelty
+        partitions from the same entries; it is ``--fresh``-agnostic (2c decides
+        whether to *use* a reused verdict, but always consults the index for novelty).
+
+        A read failure (corrupt image, unopenable path, lock timeout) returns a typed
+        :class:`ReuseUnavailable` — never raised, never a silent empty. An empty
+        :class:`ReuseIndex` (no priors) is a *different type* from ``ReuseUnavailable``
+        (a broken read); the engine's exit-0-vs-exit-2 fork keys on exactly that line
+        (Key Decision 5).
+
+        Args:
+            prompt_version: The judgment prompt version to pin reuse to (exact match).
+            model_alias: The family+tier model alias to pin reuse to (exact match).
+
+        Returns:
+            A :class:`ReuseIndex` of latest-wins verdicts (possibly empty), or a
+            :class:`ReuseUnavailable` if the read failed. Never raises on a bad DB.
+        """
+        conn = None
+        try:
+            conn = open_connection(self.telemetry_path, read_only=True)
+            verdicts: Dict[Tuple[str, str], StoredVerdict] = {}
+            # Stream the cursor (never ``fetchall``); ascending order + overwrite
+            # means the last row seen per pair is the newest, so only winners survive.
+            for row in conn.execute(
+                _SELECT_REUSE_INDEX_SQL, (prompt_version, model_alias)
+            ):
+                key = tuple(sorted((row["proposed_hash_if_any"], row["candidate_hash"])))
+                verdicts[key] = StoredVerdict(
+                    tenable=bool(row["tenable"]),
+                    confidence=row["confidence"],
+                    rationale=row["rationale"],
+                    batch_id=row["batch_id"],
+                    created_at=row["created_at"],
+                )
+            return ReuseIndex(verdicts)
+        except (sqlite3.Error, DatabaseError) as e:
+            # Both surface as a read failure: a corrupt image raises
+            # ``sqlite3.DatabaseError`` at query time, while an unopenable path is
+            # wrapped by ``open_connection`` into Mitos's ``DatabaseError`` *before*
+            # any query runs (store.py:474) — catch BOTH or the second escapes.
+            return ReuseUnavailable(str(e))
+        finally:
+            if conn is not None:
+                conn.close()

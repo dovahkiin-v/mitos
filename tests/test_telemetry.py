@@ -18,6 +18,7 @@ echoed back and asserted for round-trip equality, not a computed count.
 import dataclasses
 import inspect
 import os
+import shutil
 import sqlite3
 
 import pytest
@@ -34,6 +35,9 @@ from mitos.telemetry import (
     TELEMETRY_MIGRATION_STEPS,
     ConflictCheckRow,
     JudgmentBatch,
+    ReuseIndex,
+    ReuseUnavailable,
+    StoredVerdict,
     TelemetryStore,
 )
 
@@ -701,3 +705,330 @@ def test_telemetry_survives_rebuild_swap(tmp_path) -> None:
         assert got["judged_axiom"] == "A judgment that must outlive rebuild."
     finally:
         conn.close()
+
+
+# --- Phase 1b: verdict-reuse + novelty bulk-read path (load_reuse_index) --------
+#
+# The reuse key pins {hash_lo, hash_hi, prompt_version, model_alias}. The pins are
+# self-consistent TEST values, NOT production literals: the `_row()` builder's
+# defaults (`"conflict-judge-v1"` / `"CLAUDE_SONNET"`) differ from what production
+# stamps, so a test that pinned the production values against a default-`_row()` seed
+# would MISS by accident and mask a real bug. Each test seeds and queries the SAME
+# pins; PIN_B_* is a deliberately-distinct second pin for the mismatch case.
+PIN_PROMPT = "prompt-vA"
+PIN_ALIAS = "ALIAS_A"
+PIN_PROMPT_B = "prompt-vB"
+PIN_ALIAS_B = "ALIAS_B"
+
+
+def _seed_pair(
+    store: TelemetryStore,
+    *,
+    proposed,
+    candidate: str,
+    batch_id: str,
+    created_at: str = CREATED_AT,
+    prompt_version: str = PIN_PROMPT,
+    model_alias: str = PIN_ALIAS,
+    tenable: bool = False,
+    confidence: float = 0.9,
+    rationale: str = "The two axioms stand in tension.",
+    **row_overrides,
+) -> None:
+    """Seeds one judged pair as its OWN batch (distinct ``batch_id`` per call, §6).
+
+    ``batch_id`` is the ``judgment_batches`` PK — a seed loop reusing one id collides
+    and a row silently vanishes, so every seeded pair mints its own. ``created_at`` is
+    ``record_judged_batch``'s 3rd positional arg (batch-wide), which the latest-wins
+    tests control directly.
+    """
+    store.record_judged_batch(
+        _batch(batch_id=batch_id),
+        [
+            _row(
+                batch_id=batch_id,
+                proposed_hash_if_any=proposed,
+                candidate_hash=candidate,
+                prompt_version=prompt_version,
+                model_alias=model_alias,
+                tenable=tenable,
+                confidence=confidence,
+                rationale=rationale,
+                **row_overrides,
+            )
+        ],
+        created_at,
+    )
+
+
+def test_lookup_is_orientation_blind(tmp_path) -> None:
+    """A stored pair resolves the same whichever side is queried first (§8-1).
+
+    Seeds one pair as ``(proposed=A, candidate=C)`` and a second in the *reverse*
+    orientation ``(proposed=E, candidate=B)``; both resolve regardless of the
+    argument order — the sorted-tuple key makes hits direction-free (Key Decision 3).
+    """
+    store = TelemetryStore(_telemetry_path(tmp_path))
+    _seed_pair(store, proposed="A", candidate="C", batch_id="b1")
+    _seed_pair(store, proposed="E", candidate="B", batch_id="b2")
+
+    index = store.load_reuse_index(prompt_version=PIN_PROMPT, model_alias=PIN_ALIAS)
+    assert isinstance(index, ReuseIndex)
+
+    forward = index.lookup("A", "C")
+    reverse = index.lookup("C", "A")
+    assert forward is not None
+    assert isinstance(forward, StoredVerdict)
+    assert forward == reverse  # same verdict, orientation-blind
+
+    # The reverse-orientation seed hits from either query direction too.
+    assert index.lookup("B", "E") is not None
+    assert index.lookup("E", "B") is not None
+    assert len(index) == 2
+
+
+def test_judge_pin_mismatch_is_a_miss(tmp_path) -> None:
+    """Only rows matching BOTH ``prompt_version`` and ``model_alias`` enter (§8-2).
+
+    A prompt-version change and a model-alias change each invalidate reuse *by
+    construction* (CHK-D3) — the safety mechanism the scheduled role eval ships
+    behind.
+    """
+    store = TelemetryStore(_telemetry_path(tmp_path))
+    # Pair whose only rows carry a different prompt_version.
+    _seed_pair(
+        store, proposed="A", candidate="C", batch_id="b1", prompt_version=PIN_PROMPT_B
+    )
+    # Pair whose only rows carry a different model_alias.
+    _seed_pair(
+        store, proposed="D", candidate="F", batch_id="b2", model_alias=PIN_ALIAS_B
+    )
+    # A pair matching both pins.
+    _seed_pair(store, proposed="G", candidate="H", batch_id="b3")
+
+    index = store.load_reuse_index(prompt_version=PIN_PROMPT, model_alias=PIN_ALIAS)
+    assert index.lookup("A", "C") is None  # prompt_version mismatch
+    assert index.lookup("D", "F") is None  # model_alias mismatch
+    assert index.lookup("G", "H") is not None  # both pins match
+    assert len(index) == 1
+
+
+def test_latest_row_wins_per_pair(tmp_path) -> None:
+    """Conflicting verdicts for one pair collapse to the newest row (§8-3).
+
+    Two separate ``record_judged_batch`` calls (distinct ``batch_id`` + ``created_at``)
+    stamp *opposite* ``tenable`` on the same pair; the index carries the newer row's
+    verdict, orientation-blind (the older row wrote the reverse orientation).
+    """
+    store = TelemetryStore(_telemetry_path(tmp_path))
+    _seed_pair(
+        store,
+        proposed="A",
+        candidate="C",
+        batch_id="old",
+        created_at="2026-07-03T00:00:00.000000+00:00",
+        tenable=True,
+        confidence=0.70,
+        rationale="Older: no tension.",
+    )
+    _seed_pair(
+        store,
+        proposed="C",  # reverse orientation on the newer write
+        candidate="A",
+        batch_id="new",
+        created_at="2026-07-04T00:00:00.000000+00:00",
+        tenable=False,
+        confidence=0.95,
+        rationale="Newer: they contradict.",
+    )
+
+    index = store.load_reuse_index(prompt_version=PIN_PROMPT, model_alias=PIN_ALIAS)
+    verdict = index.lookup("A", "C")
+    assert verdict.tenable is False  # newer row's verdict
+    assert verdict.confidence == 0.95
+    assert verdict.rationale == "Newer: they contradict."
+    assert verdict.batch_id == "new"
+    assert verdict.created_at == "2026-07-04T00:00:00.000000+00:00"
+    assert len(index) == 1
+
+
+def test_same_created_at_tie_breaks_on_rowid(tmp_path) -> None:
+    """On a ``created_at`` tie the later-inserted (higher rowid) row wins (§8-3).
+
+    Two batches share one ``created_at``; ``ORDER BY created_at ASC, rowid ASC`` +
+    last-write-wins makes the later INSERT deterministically win — safe because the
+    append-only corpus never deletes, so no freed rowid is reused (§6).
+    """
+    store = TelemetryStore(_telemetry_path(tmp_path))
+    tie = "2026-07-05T12:00:00.000000+00:00"
+    _seed_pair(
+        store,
+        proposed="A",
+        candidate="C",
+        batch_id="first",
+        created_at=tie,
+        tenable=True,
+        confidence=0.60,
+    )
+    _seed_pair(
+        store,
+        proposed="A",
+        candidate="C",
+        batch_id="second",
+        created_at=tie,
+        tenable=False,
+        confidence=0.99,
+    )
+
+    index = store.load_reuse_index(prompt_version=PIN_PROMPT, model_alias=PIN_ALIAS)
+    verdict = index.lookup("A", "C")
+    assert verdict.batch_id == "second"  # later rowid wins
+    assert verdict.tenable is False
+    assert verdict.confidence == 0.99
+    assert len(index) == 1
+
+
+def test_null_proposed_hash_is_skipped(tmp_path) -> None:
+    """A row with NULL ``proposed_hash_if_any`` forms no key and never appears (§8-4)."""
+    path = _telemetry_path(tmp_path)
+    store = TelemetryStore(path)
+    _seed_pair(store, proposed=None, candidate="C", batch_id="b1")  # no pair key
+    _seed_pair(store, proposed="A", candidate="C", batch_id="b2")  # valid pair
+
+    index = store.load_reuse_index(prompt_version=PIN_PROMPT, model_alias=PIN_ALIAS)
+    assert len(index) == 1
+    assert index.lookup("A", "C") is not None
+
+    # Both rows are physically written — the NULL row is filtered in SQL, not unwritten.
+    conn = _open(path)
+    try:
+        assert _count(conn, "conflict_checks") == 2
+    finally:
+        conn.close()
+
+
+def test_corrupt_db_returns_reuse_unavailable(tmp_path) -> None:
+    """A corrupt image degrades to a typed ``ReuseUnavailable``, never raises (§8-5a).
+
+    ``mode=ro`` opens the garbage file fine; the ``SELECT`` iteration raises
+    ``sqlite3.DatabaseError`` — caught and returned as the typed value.
+    """
+    path = _telemetry_path(tmp_path)
+    store = TelemetryStore(path)  # boots a real schema first
+    with open(path, "wb") as fh:
+        fh.write(b"this is not a sqlite database at all\x00\xff\x01\x02")
+
+    result = store.load_reuse_index(prompt_version=PIN_PROMPT, model_alias=PIN_ALIAS)
+    assert isinstance(result, ReuseUnavailable)
+    assert not isinstance(result, ReuseIndex)
+    assert result.detail  # a non-empty machine/log string
+
+
+def test_unopenable_path_returns_reuse_unavailable(tmp_path) -> None:
+    """An unopenable path (parent dir removed) degrades to ``ReuseUnavailable`` (§8-5b).
+
+    ``open_connection`` wraps the connect-time ``sqlite3.OperationalError`` in Mitos's
+    ``DatabaseError`` *before* any query runs — the reader must catch that too, or the
+    degradation escapes (scout Discrepancy #1).
+    """
+    path = _telemetry_path(tmp_path)
+    store = TelemetryStore(path)
+    shutil.rmtree(os.path.dirname(path))  # remove .mitos/ — file can't be opened
+
+    result = store.load_reuse_index(prompt_version=PIN_PROMPT, model_alias=PIN_ALIAS)
+    assert isinstance(result, ReuseUnavailable)
+    assert result.detail
+
+
+def test_empty_store_returns_empty_index(tmp_path) -> None:
+    """A freshly-booted store with zero rows → an empty ``ReuseIndex``, NOT unavailable (§8-6).
+
+    The load-bearing distinction (Key Decision 5): healthy-empty and degraded are
+    *different types* — 2c's exit-0-vs-exit-2 fork keys on exactly this line.
+    """
+    store = TelemetryStore(_telemetry_path(tmp_path))
+    result = store.load_reuse_index(prompt_version=PIN_PROMPT, model_alias=PIN_ALIAS)
+    assert isinstance(result, ReuseIndex)
+    assert not isinstance(result, ReuseUnavailable)
+    assert len(result) == 0
+    assert result.lookup("A", "C") is None
+
+
+def test_load_reuse_index_does_not_mutate(tmp_path) -> None:
+    """The read leaves row counts and schema byte-identical (§8-7)."""
+    path = _telemetry_path(tmp_path)
+    store = TelemetryStore(path)
+    _seed_pair(store, proposed="A", candidate="C", batch_id="b1")
+    _seed_pair(store, proposed="D", candidate="F", batch_id="b2")
+
+    conn = _open(path)
+    try:
+        rows_before = _count(conn, "conflict_checks")
+        schema_before = _schema_snapshot(conn)
+    finally:
+        conn.close()
+
+    store.load_reuse_index(prompt_version=PIN_PROMPT, model_alias=PIN_ALIAS)
+
+    conn = _open(path)
+    try:
+        assert _count(conn, "conflict_checks") == rows_before
+        assert _schema_snapshot(conn) == schema_before
+    finally:
+        conn.close()
+
+
+def test_read_only_connection_physically_rejects_writes(tmp_path) -> None:
+    """The ``mode=ro`` reader connection makes "no writes" structural (§8-7 stretch).
+
+    A write on a ``read_only=True`` connection raises ``sqlite3.OperationalError``
+    ("attempt to write a readonly database") — a stronger guarantee than row-count
+    invariance (Key Decision 2). This proves the connection mode the reader opens with
+    (asserted in the MI-8 test below) cannot mutate the corpus.
+    """
+    path = _telemetry_path(tmp_path)
+    store = TelemetryStore(path)
+    _seed_pair(store, proposed="A", candidate="C", batch_id="b1")
+
+    ro = open_connection(path, read_only=True)
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            ro.execute("DELETE FROM conflict_checks;")
+    finally:
+        ro.close()
+
+
+def test_load_reuse_index_routes_through_mi8_chokepoint(tmp_path, monkeypatch) -> None:
+    """The read opens exactly one connection, ``read_only=True``, via the chokepoint (§8-8).
+
+    Extends the 1a spy: the read-only path still carries ``foreign_keys=ON`` and
+    ``busy_timeout`` (both live outside ``open_connection``'s write-only PRAGMA guard).
+    The spy is installed AFTER boot + seed, so it captures only the read's connection.
+    """
+    path = _telemetry_path(tmp_path)
+    store = TelemetryStore(path)
+    _seed_pair(store, proposed="A", candidate="C", batch_id="b1")
+
+    real_open = telemetry_module.open_connection
+    calls = []  # (read_only, foreign_keys, busy_timeout)
+
+    def spy(db_path: str, read_only: bool = False) -> sqlite3.Connection:
+        conn = real_open(db_path, read_only=read_only)
+        calls.append(
+            (
+                read_only,
+                conn.execute("PRAGMA foreign_keys;").fetchone()[0],
+                conn.execute("PRAGMA busy_timeout;").fetchone()[0],
+            )
+        )
+        return conn
+
+    monkeypatch.setattr("mitos.telemetry.open_connection", spy)
+    result = store.load_reuse_index(prompt_version=PIN_PROMPT, model_alias=PIN_ALIAS)
+    assert isinstance(result, ReuseIndex)
+
+    assert len(calls) == 1  # exactly one bulk read, no per-pair probe
+    read_only, foreign_keys, busy_timeout = calls[0]
+    assert read_only is True
+    assert foreign_keys == 1
+    assert busy_timeout == BUSY_TIMEOUT_MS
