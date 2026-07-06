@@ -395,3 +395,28 @@ def test_judge_input_from_node_handles_global_and_absent() -> None:
     node = {"slug": "g", "core_axiom": "ax", "rejected_paths": "", "scope": []}
     ji = judge_input_from_node(node)
     assert ji.scope == [] and ji.rejected_paths == ""
+
+
+def test_cross_feeding_the_two_adapters_fails_loud() -> None:
+    """Crossing the adapters raises — never a silent empty (the phantom-tenable trap).
+
+    The corpus screen (Phase 2a) routes a swept *node* proposal through
+    ``judge_input_from_node`` unconditionally; the entry adapter is the write-time
+    path. Each reads its own key *directly*, so a cross-feed fails loud rather than
+    yielding an empty ``JudgeInput`` an LLM judge would read as "tenable". The two
+    exception types are distinct and asserted precisely (not a generic ``Exception``):
+
+    * a ``ParsedEntry`` fed to the node adapter → ``node['core_axiom']`` → **TypeError**
+      (a ``ParsedEntry`` is not subscriptable);
+    * a hydrated node dict fed to the entry adapter → ``dict.axiom`` → **AttributeError**.
+    """
+    node = {"core_axiom": "ax", "rejected_paths": "", "scope": []}
+    entry = ParsedEntry("decision", "prop", 0, 0)
+    entry.axiom = "ax"
+    entry.rejected_paths = ""
+    entry.scope = []
+
+    with pytest.raises(TypeError):
+        judge_input_from_node(entry)  # ParsedEntry is not subscriptable
+    with pytest.raises(AttributeError):
+        judge_input_from_entry(node)  # a dict has no ``.axiom`` attribute
