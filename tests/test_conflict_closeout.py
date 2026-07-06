@@ -37,7 +37,7 @@ would rot.
 
 import ast
 import os
-from typing import List, Optional, Tuple
+from typing import List, Optional, Set, Tuple
 from unittest.mock import patch
 
 import pytest
@@ -538,3 +538,155 @@ def test_t8_telemetry_survives_rebuild_swap_e2e(
     assert os.path.exists(config.telemetry_path)
     assert _read_conflict_rows(config) == rows_before
     assert _read_batch_rows(config) == batches_before
+
+
+# --------------------------------------------------------------------------- #
+# DoD-6 (2c extension) — the no-write lint over the CHECK family, discovered by
+# runtime-import closure (KD7): no hand-maintained allowlist, one sanctioned
+# boundary. Tomorrow's additions (3b's staged predicate, 2d's probe consumption)
+# join mechanically the moment their imports land in check.py.
+# --------------------------------------------------------------------------- #
+
+# The one CHK-C1-sanctioned write sink: ``mitos/telemetry.py`` writes its own
+# sibling DB (``conn.execute`` against telemetry.sqlite) — a write path the
+# denylist would red instantly yet the vision explicitly sanctions. It is a
+# BOUNDARY: neither linted nor traversed (its runtime imports would drag
+# ``store.py``, the legitimate graph committer, plus ``migrations.py`` into a
+# lint that is nonsense over them). One named constant, not an allowlist — it
+# never grows as the check family grows (5a's T6 audits exactly that).
+_LINT_BOUNDARY_BASENAMES = frozenset({"telemetry.py"})
+
+
+def _module_source_path(module_name: str) -> Optional[str]:
+    """Maps a dotted ``mitos``-family module name to its source file, or ``None``.
+
+    The bare package ``mitos`` maps to ``mitos/__init__.py`` (the ``from mitos
+    import __version__`` edge must enter the closure, not silently vanish); a
+    non-``mitos`` name or a name that is an attribute rather than a module (no
+    matching file) returns ``None``. Path arithmetic off ``_MITOS_PKG_DIR`` — the
+    same locate-by-path idiom as ``_CONFLICT_LEAF_SOURCES`` (never an import).
+    """
+    if module_name == "mitos":
+        return os.path.join(_MITOS_PKG_DIR, "__init__.py")
+    if not module_name.startswith("mitos."):
+        return None
+    candidate = os.path.join(
+        _MITOS_PKG_DIR, *module_name[len("mitos."):].split(".")
+    ) + ".py"
+    return candidate if os.path.exists(candidate) else None
+
+
+def _runtime_mitos_imports(source: str, filename: str) -> List[str]:
+    """The module names a source imports at RUNTIME — ``TYPE_CHECKING`` blocks skipped.
+
+    Walks the AST manually so any ``if TYPE_CHECKING:`` body is pruned (annotation
+    imports cannot execute a write; traversing them would drag ``protocols`` →
+    ``parser``/``store`` into the lint — an instant false red). Both guard shapes
+    are recognized (bare ``TYPE_CHECKING`` and ``typing.TYPE_CHECKING``); the
+    ``orelse`` of such an ``If`` DOES run at runtime and is walked. For a
+    ``from X import Y`` the walker records ``X`` and, additively, ``X.Y`` — so a
+    ``from mitos import conflict``-style module import still resolves (a plain
+    attribute name simply maps to no file and drops out).
+    """
+    tree = ast.parse(source, filename=filename)
+    imports: List[str] = []
+
+    def _is_type_checking_guard(test: ast.expr) -> bool:
+        return (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or (
+            isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+        )
+
+    def _walk(node: ast.AST) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.If) and _is_type_checking_guard(child.test):
+                for runtime_branch in child.orelse:
+                    _walk(runtime_branch)
+                continue
+            if isinstance(child, ast.Import):
+                for alias in child.names:
+                    imports.append(alias.name)
+            elif isinstance(child, ast.ImportFrom):
+                if child.level == 0 and child.module:
+                    imports.append(child.module)
+                    for alias in child.names:
+                        imports.append(f"{child.module}.{alias.name}")
+            _walk(child)
+
+    _walk(tree)
+    return imports
+
+
+def _check_family_closure() -> List[str]:
+    """KD7's discovery: the check family's source files, by runtime-import closure.
+
+    Starts at ``mitos/check.py``, resolves every runtime ``mitos``-family import to
+    its source file, and recurses — except the sanctioned-sink boundary, which is
+    neither returned (linted) nor traversed. Returns sorted absolute paths.
+    """
+    entry = os.path.join(_MITOS_PKG_DIR, "check.py")
+    discovered: List[str] = []
+    seen: Set[str] = set()
+    queue = [entry]
+    while queue:
+        path = queue.pop()
+        if path in seen:
+            continue
+        seen.add(path)
+        if os.path.basename(path) in _LINT_BOUNDARY_BASENAMES:
+            continue  # the sanctioned sink: neither linted nor traversed
+        discovered.append(path)
+        with open(path, encoding="utf-8") as f:
+            source = f.read()
+        for module_name in _runtime_mitos_imports(source, os.path.basename(path)):
+            resolved = _module_source_path(module_name)
+            if resolved is not None:
+                queue.append(resolved)
+    return sorted(discovered)
+
+
+def test_dod6_discovery_covers_the_check_family_and_respects_the_boundary() -> None:
+    """KD7 mechanics: discovery yields ⊇ {check.py, conflict.py} plus the pure
+    leaves (incl. ``mitos/__init__.py`` via the ``__version__`` edge — the bare
+    package must resolve, not silently vanish), and excludes BOTH ``telemetry.py``
+    (the sanctioned sink) AND everything only reachable through it
+    (``store.py``/``migrations.py`` — the graph committer must never enter this
+    lint). The TYPE_CHECKING-guarded ``protocols`` import is skipped, so neither
+    ``protocols.py`` nor its ``parser.py``/``store.py`` pulls appear."""
+    names = {os.path.basename(path) for path in _check_family_closure()}
+    assert {"check.py", "conflict.py", "models.py", "__init__.py"} <= names
+    assert "telemetry.py" not in names
+    assert "store.py" not in names
+    assert "migrations.py" not in names
+    assert "protocols.py" not in names
+    assert "parser.py" not in names
+    assert "sync.py" not in names
+
+
+def test_dod6_no_write_lint_over_the_discovered_check_family() -> None:
+    """DoD-6: every discovered check-family source, unioned with the parent's two
+    static conflict leaves, passes the shared write-call walker — the fence
+    extends mechanically as the family grows (no allowlist to forget)."""
+    paths = sorted(set(_check_family_closure()) | set(_CONFLICT_LEAF_SOURCES))
+    assert len(paths) >= 3  # the family is discovered, not an empty vacuous pass
+    violations: List[Tuple[str, int, str]] = []
+    for path in paths:
+        assert os.path.exists(path), f"check-family source not found to lint: {path}"
+        with open(path, encoding="utf-8") as f:
+            violations.extend(_write_call_violations(f.read(), os.path.basename(path)))
+    assert violations == [], (
+        "Check-family modules must issue no graph/markdown write (MI-11 / DoD-6). "
+        "Offending write calls: "
+        + "; ".join(f"{fn}:{ln} → {name}" for fn, ln, name in violations)
+    )
+
+
+def test_dod6_walker_trips_on_a_synthetic_write_call() -> None:
+    """§9-18's mechanism proof: a synthetic module holding a denylisted write call
+    DOES trip the shared walker — the fence is proven live, not just
+    currently-green over clean sources."""
+    synthetic = (
+        "def sneaky(store, entry):\n"
+        "    return store.commit_parsed_entry(entry)\n"
+    )
+    violations = _write_call_violations(synthetic, "synthetic.py")
+    assert [name for (_, _, name) in violations] == ["commit_parsed_entry"]

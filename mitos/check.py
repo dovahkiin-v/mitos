@@ -32,28 +32,75 @@ so it must reach judgment. A lineage walk would bury that real, re-opened questi
 lapsed relationship; knowing when a relationship has lapsed is as load-bearing as knowing
 when it holds.
 
+Phase 2c composes everything above into the **run engine** — two stages split at the
+load-bearing plan/execute seam: :func:`plan_corpus_check` (deterministic, zero LLM
+contact, zero writes — sweep → dedup → reuse partition → the exact fresh-batch
+disclosure count) strictly before :func:`execute_corpus_check` (the only spend site:
+batched judgment via an injected judge, per-batch telemetry persistence, the novelty
+partition). The seam is *structural*: the plan stage has no judge parameter, and the
+execute stage's first argument is the :class:`CheckPlan` carrying the disclosure count —
+no code path can reach the spend without holding the object that disclosed its cost
+(CHK-D5). The engine renders nothing and decides no exit code — 3a maps the typed
+:class:`CheckRunResult` to output + 0/1/2; 2d extends the accounting.
+
 **Tier-1 leaf, same discipline as ``conflict.py``.** This module must never import a
 higher-tier ``mitos`` module or a heavy dependency (``anthropic``, the Qdrant/genai
-clients) at module scope — the judge arrives injected in later phases, and the CHK-*
-constants land here as later phases build the sweep/run engine. ``check`` sits *above*
-``conflict`` in the import DAG (``check → conflict``, never the reverse); its only
-module-scope import is ``conflict``, itself a dep-free leaf. A dep-free import guard pins
-this (``test_importing_check_drags_no_heavy_dependency``).
+clients) at module scope — the judge arrives injected, never imported. ``check`` sits
+*above* ``conflict`` in the import DAG (``check → conflict``, never the reverse); its
+module-scope ``mitos`` imports are ``conflict`` plus the 2c-sanctioned sink edge
+``check → telemetry`` (the sibling corpus store — ``ConflictCheckRow``/``JudgmentBatch``
+construction and the ``ReuseUnavailable`` fork) and the pure leaves ``models``
+(defensive ``model_id`` resolution) and the package ``__init__`` (``__version__``
+stamping) — none of which drags a heavy dependency. A dep-free import guard pins this
+(``test_importing_check_drags_no_heavy_dependency``); the KD7 no-write lint walks this
+module's runtime-import closure with ``telemetry`` as the one sanctioned boundary.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
+from datetime import datetime, timezone
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Set,
+    Tuple,
+)
+from uuid import uuid4
 
+from mitos import __version__
 from mitos.conflict import (
+    CONFLICT_CANDIDATE_SOURCE,
+    CONFLICT_PROMPT_VERSION,
     CONFLICT_SIMILARITY_FLOOR,
+    CONFLICT_SURFACE_THRESHOLD,
     CONFLICT_TOP_K,
     Candidate,
+    ConflictUnavailableReason,
+    JudgmentExecution,
+    RenderedPrompt,
     Unavailable,
     _STRONG_RELATIONSHIP_FIELDS,
     gather_candidates,
+    judge_input_from_node,
+    parse_judgment_response,
+    render_judgment_prompt,
     screen_candidates,
+)
+from mitos.models import get_model_id
+from mitos.telemetry import (
+    ConflictCheckRow,
+    JudgmentBatch,
+    ReuseIndex,
+    ReuseUnavailable,
+    StoredVerdict,
+    TelemetryStore,
 )
 
 if TYPE_CHECKING:
@@ -511,3 +558,605 @@ def group_judgment_batches(
                 )
             )
     return groups
+
+
+# --------------------------------------------------------------------------- #
+# Phase 2c — the run engine (plan/execute seam, reuse partition, persistence)
+# --------------------------------------------------------------------------- #
+
+# CHK-D5 — above this many pending fresh batches an interactive run confirms before
+# spending (3a's confirm flow reads this; forward wiring, unconsumed in-phase).
+CHECK_CONFIRM_BATCHES = 10
+
+# CHK-D4 — a stale-index backlog row retried at least this many times is a named
+# coverage exclusion, not a transient gate (2d's probe partition reads this;
+# forward wiring, unconsumed in-phase).
+CHECK_STALE_RETRY_TOLERANCE = 3
+
+
+def _utc_now_iso() -> str:
+    """One UTC ISO-8601 stamp — µs precision + ``+00:00`` offset (MI-10).
+
+    A deliberate local twin of ``store._utc_now_iso`` (byte-compatible output):
+    importing it would put a runtime ``check → store`` edge on the Tier-1 leaf and
+    drag the graph committer into the KD7 no-write lint closure — one line is
+    cheaper than either.
+    """
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _is_finding(tenable: bool, confidence: float) -> bool:
+    """The ONE gate site (KD4): is a raw verdict a reportable finding?
+
+    Applies the CONF-D4 formula — not tenable, at ``CONFLICT_SURFACE_THRESHOLD`` or
+    above — identically to fresh :class:`~mitos.conflict.Judgment` values and reused
+    :class:`~mitos.telemetry.StoredVerdict` rows. Finding-ness is always re-derived
+    from the raw ``tenable`` + ``confidence`` at read time; the stored ``surfaced``
+    flag records only what the *writing* run reported and is never read back
+    (§8's widened semantics — 1b deliberately does not even project it).
+
+    Args:
+        tenable: The judge's raw verdict (fresh ``tenable_together`` or stored
+            ``tenable``).
+        confidence: The judge's raw self-reported confidence in ``[0, 1]``.
+
+    Returns:
+        True iff this verdict surfaces as a finding.
+    """
+    return (not tenable) and confidence >= CONFLICT_SURFACE_THRESHOLD
+
+
+@dataclass(frozen=True)
+class ReusedPair:
+    """One pair whose judgment is reused from a prior verdict (CHK-D3 — zero spend).
+
+    The verdict is the RAW stored row (no pre-derived finding-ness): the engine
+    applies the one KD4 gate to it at result assembly, exactly as it does to a
+    fresh judgment — so the standing report always re-derives from primary values,
+    never from the historical ``surfaced`` flag.
+
+    Attributes:
+        pair: The oriented corpus pair the verdict covers.
+        verdict: The latest prior verdict at the run's pins, verbatim (M8).
+    """
+
+    pair: CorpusPair
+    verdict: StoredVerdict
+
+
+@dataclass(frozen=True)
+class CheckPlan:
+    """The deterministic plan half of a corpus check — cost disclosed, nothing spent.
+
+    Produced by :func:`plan_corpus_check` with zero LLM contact and zero writes;
+    consumed by :func:`execute_corpus_check`, which cannot be reached without it
+    (KD1 — the seam is a property of the type graph, not a discipline).
+    ``len(fresh_groups)`` is the exact CHK-D5 disclosure count the CLI confirms.
+
+    Attributes:
+        run_id: The CHK-D7 correlation id (``uuid4().hex``) — stamped as
+            ``sync_run_id`` on every row this run persists.
+        started_at: The MI-10 stamp taken at plan entry (2d's ``check_runs`` seam).
+        model_alias: The judge pin the reuse index was loaded at; execute re-asserts
+            every execution against it (KD5). Sourcing is the caller's (KD3): 3a
+            threads ``conflict_judgment._JUDGMENT_MODEL_ALIAS`` — this leaf cannot
+            import the executor module.
+        prompt_version: The prompt pin, ditto (defaults to the production
+            ``CONFLICT_PROMPT_VERSION``).
+        fresh: Whether the reuse partition was bypassed (``--fresh``). The index
+            load and the novelty read are NEVER bypassed — a ``--fresh``
+            re-confirmation of a standing finding stays "known".
+        nodes_total: ``len(snapshot.nodes)`` — the swept-vs-skipped denominator.
+        nodes_swept: Healthy sweeps consumed before any trip.
+        sweep_degraded: The tripping sweep degradation, if any (KD2 — the partial
+            plan still executes; the substrates are disjoint).
+        pairs: Every deduped oriented pair, pair-key-sorted.
+        reused: The pairs with a prior verdict at the pins (empty under ``fresh``).
+        fresh_groups: The spend units — ``len()`` IS the disclosure count.
+        reuse_index: The pre-run index (the CHK-D10 novelty boundary), or ``None``
+            when unavailable. Loaded ONCE, before any of this run's writes exist —
+            never reloaded (a mid-run reload would read this run's own rows back
+            as "known").
+        reuse_unavailable: The typed read degradation, if the load failed (CHK-D3/
+            D10 — the run proceeds all-fresh and reports unpartitioned).
+    """
+
+    run_id: str
+    started_at: str
+    model_alias: str
+    prompt_version: str
+    fresh: bool
+    nodes_total: int
+    nodes_swept: int
+    sweep_degraded: Optional[Unavailable]
+    pairs: Tuple[CorpusPair, ...]
+    reused: Tuple[ReusedPair, ...]
+    fresh_groups: Tuple[JudgmentGroup, ...]
+    reuse_index: Optional[ReuseIndex]
+    reuse_unavailable: Optional[ReuseUnavailable]
+
+
+@dataclass(frozen=True)
+class CheckFinding:
+    """One reported contradiction — fresh or reused, partitioned by novelty.
+
+    Attributes:
+        proposal_hash: The oriented pair identity, proposal side (M2).
+        partner_hash: The oriented pair identity, partner side.
+        proposal_node: The proposal's hydrated live-at-snapshot node (3a resolves
+            display slugs from here — MI-2, the stored slug is a citation).
+        partner_node: The partner's hydrated node, ditto.
+        score: The gathered similarity — informational context (2b's carried float).
+        rationale: Fresh — this run's judgment rationale; reused — the stored
+            verdict's, verbatim (M8: never a re-render).
+        confidence: The raw judge confidence behind the gate.
+        reused: Whether this finding rode a prior verdict (zero spend).
+        source_batch_id: Fresh — this run's batch; reused — the prior row's batch
+            (CHK-D3 provenance).
+        source_created_at: The provenance timestamp, same split.
+        novelty: ``"new"`` / ``"known"`` (CHK-D10), or ``None`` when the run could
+            not tell (reuse read unavailable — unpartitioned; the exit-1 gate never
+            fires on such a run, 3a exits 2).
+    """
+
+    proposal_hash: str
+    partner_hash: str
+    proposal_node: Dict[str, Any]
+    partner_node: Dict[str, Any]
+    score: float
+    rationale: str
+    confidence: float
+    reused: bool
+    source_batch_id: str
+    source_created_at: str
+    novelty: Optional[str]
+
+
+@dataclass(frozen=True)
+class CheckRunResult:
+    """The typed outcome of one corpus check — counts, findings, degradations.
+
+    The engine computes partitions and accounting; it renders nothing, colors
+    nothing, maps no exit code — 3a owns presentation and the 0/1/2 contract, 2d
+    the ``check_runs`` summary row (its scalars come from here; ``findings_new`` /
+    ``findings_known`` derive from ``findings[i].novelty`` — no duplicated counts).
+
+    Attributes:
+        run_id: Echoed from the plan (CHK-D7).
+        started_at: Echoed plan-entry stamp.
+        ended_at: The MI-10 stamp taken at execute exit.
+        nodes_total: Echoed plan accounting.
+        nodes_swept: Echoed plan accounting.
+        sweep_degraded: Echoed plan-stage trip, if any.
+        findings: Every reported finding, pair-key-ordered; the novelty partition
+            rides ``.novelty``.
+        pairs_judged_fresh: Pairs whose fresh verdicts landed (parsed healthy).
+        pairs_reused: ``len(plan.reused)``.
+        batches_planned: ``len(plan.fresh_groups)``.
+        batches_executed: Batches on which a judge call was fired — includes a
+            batch whose execution or parse then failed (billed but unpersisted is
+            a named cost, not a silent drop).
+        batches_skipped: Batches never rendered or judged after a judgment trip.
+        judgment_degraded: The tripping judgment failure (executor error/timeout
+            or parse malformation), or the judge-absent degradation.
+        reuse_unavailable: Echoed from the plan.
+        telemetry_write_failures: Per-batch write-failure details (KD6 — the run
+            is degraded but the judgment loop never aborts; findings still report).
+    """
+
+    run_id: str
+    started_at: str
+    ended_at: str
+    nodes_total: int
+    nodes_swept: int
+    sweep_degraded: Optional[Unavailable]
+    findings: Tuple[CheckFinding, ...]
+    pairs_judged_fresh: int
+    pairs_reused: int
+    batches_planned: int
+    batches_executed: int
+    batches_skipped: int
+    judgment_degraded: Optional[Unavailable]
+    reuse_unavailable: Optional[ReuseUnavailable]
+    telemetry_write_failures: Tuple[str, ...]
+
+
+def _finding(
+    *,
+    pair: CorpusPair,
+    rationale: str,
+    confidence: float,
+    reused: bool,
+    source_batch_id: str,
+    source_created_at: str,
+    reuse_index: Optional[ReuseIndex],
+) -> CheckFinding:
+    """Assembles one finding, deriving its CHK-D10 novelty from the pre-run index.
+
+    The partition rule (KD5): a finding is **known** iff the pre-run index holds a
+    verdict for its pair that re-derives as a finding through the one KD4 gate —
+    for a reused finding that lookup is its own source row, so "known" holds by
+    construction; a first-ever pair, or a pair whose prior verdict was tenable/
+    below-threshold, is **new**. With the index unavailable the finding is
+    unpartitioned (``novelty=None``) — a run that cannot tell new from known must
+    not pretend to (3a exits 2, the exit-1 gate never fires).
+
+    Args:
+        pair: The oriented pair this finding reports.
+        rationale: The verdict rationale riding the finding (M8-verbatim).
+        confidence: The raw confidence behind the gate.
+        reused: Whether the verdict was reused (CHK-D3).
+        source_batch_id: The provenance batch id (this run's or the prior row's).
+        source_created_at: The provenance timestamp, same split.
+        reuse_index: The plan's pre-run index, or ``None`` when unavailable.
+
+    Returns:
+        The assembled :class:`CheckFinding`.
+    """
+    if reuse_index is None:
+        novelty: Optional[str] = None
+    else:
+        prior = reuse_index.lookup(pair.proposal_hash, pair.partner_hash)
+        known = prior is not None and _is_finding(prior.tenable, prior.confidence)
+        novelty = "known" if known else "new"
+    return CheckFinding(
+        proposal_hash=pair.proposal_hash,
+        partner_hash=pair.partner_hash,
+        proposal_node=pair.proposal_node,
+        partner_node=pair.partner_node,
+        score=pair.score,
+        rationale=rationale,
+        confidence=confidence,
+        reused=reused,
+        source_batch_id=source_batch_id,
+        source_created_at=source_created_at,
+        novelty=novelty,
+    )
+
+
+def plan_corpus_check(
+    *,
+    store: "GraphStoreProtocol",
+    embed_provider: "EmbeddingProvider",
+    vector_store: "VectorStore",
+    telemetry: Optional[TelemetryStore],
+    model_alias: str,
+    prompt_version: str = CONFLICT_PROMPT_VERSION,
+    scope: Optional[str] = None,
+    fresh: bool = False,
+    floor: float = CONFLICT_SIMILARITY_FLOOR,
+    top_k: int = CONFLICT_TOP_K,
+) -> CheckPlan:
+    """Plans a corpus check — deterministic, zero LLM contact, zero writes (KD1).
+
+    The 2b wiring contract, composed: mint the run id + the MI-10 ``started_at``
+    stamp → :func:`snapshot_corpus` → load the reuse index ONCE → drive
+    :func:`iter_sweep`, stopping at the first :class:`Unavailable` (laziness IS the
+    breaker — nothing beyond the trip is gathered, no post-trip node eats its own
+    timeout) → :func:`dedup_oriented_pairs` → the reuse partition →
+    :func:`group_judgment_batches`. There is no judge parameter anywhere in this
+    stage — the spend site is structurally unreachable before the disclosure count
+    exists.
+
+    The one telemetry contact is the single bulk ``load_reuse_index`` at the pins
+    ``{prompt_version, model_alias}`` — before any of this run's writes exist, so
+    the index holds only pre-run rows and IS the CHK-D10 novelty boundary for free.
+    A ``telemetry`` of ``None`` (the store never constructed) is the same typed
+    read degradation as a failed load: the run proceeds all-fresh and its findings
+    report unpartitioned. A sweep trip does NOT abort planning (KD2): the partial
+    plan carries every pair the healthy prefix discovered, labeled by
+    ``nodes_swept < nodes_total`` + ``sweep_degraded``.
+
+    Graph-store faults propagate (2a KD5) — a broken graph must never masquerade
+    as a clean corpus.
+
+    Args:
+        store: The graph store (snapshot + gather's live re-verify source).
+        embed_provider: The injected embedding provider.
+        vector_store: The injected vector store.
+        telemetry: The sibling telemetry store, or ``None`` when it could not be
+            constructed (reuse/novelty degrade typed; nothing raises).
+        model_alias: The judge's family+tier alias — the reuse pin. The single
+            production source stays ``conflict_judgment._JUDGMENT_MODEL_ALIAS``
+            (KD3): the CLI threads it in; this leaf never imports the executor.
+        prompt_version: The prompt pin (production default). A plan pinned at any
+            other version cannot execute — the renderer always stamps the
+            production version and execute's KD5 guard refuses the mismatch.
+        scope: Optional scope tag filtering the sweep set (proposal set only —
+            candidate recall stays scope-blind, CONF-D2).
+        fresh: Bypass the reuse partition (every pair is judged). The index load
+            and the novelty read are never bypassed.
+        floor: The similarity floor threaded to every per-node sweep.
+        top_k: The per-node survivor cap and the batch-size cap.
+
+    Returns:
+        The :class:`CheckPlan` — ``len(plan.fresh_groups)`` is the exact CHK-D5
+        disclosure count.
+    """
+    run_id = uuid4().hex
+    started_at = _utc_now_iso()
+    snapshot = snapshot_corpus(store, scope=scope)
+
+    if telemetry is None:
+        loaded: "ReuseIndex | ReuseUnavailable" = ReuseUnavailable(
+            "telemetry store unavailable (never constructed)"
+        )
+    else:
+        loaded = telemetry.load_reuse_index(
+            prompt_version=prompt_version, model_alias=model_alias
+        )
+    if isinstance(loaded, ReuseUnavailable):
+        reuse_index: Optional[ReuseIndex] = None
+        reuse_unavailable: Optional[ReuseUnavailable] = loaded
+    else:
+        reuse_index = loaded
+        reuse_unavailable = None
+
+    consumed: List[NodeSweep] = []
+    sweep_degraded: Optional[Unavailable] = None
+    for sweep in iter_sweep(
+        snapshot,
+        embed_provider=embed_provider,
+        vector_store=vector_store,
+        store=store,
+        floor=floor,
+        top_k=top_k,
+    ):
+        consumed.append(sweep)
+        if isinstance(sweep.result, Unavailable):
+            sweep_degraded = sweep.result
+            break
+    nodes_swept = len(consumed) - (1 if sweep_degraded is not None else 0)
+
+    pairs = tuple(dedup_oriented_pairs(consumed))
+
+    # The reuse partition (CHK-D3): a pair with a prior verdict at these exact pins
+    # never re-enters a batch. ``fresh`` bypasses THIS partition only — the index
+    # stays on the plan for the novelty read (a --fresh re-confirmation is "known").
+    reused: List[ReusedPair] = []
+    fresh_pairs: List[CorpusPair] = []
+    for pair in pairs:
+        verdict = None
+        if reuse_index is not None and not fresh:
+            verdict = reuse_index.lookup(pair.proposal_hash, pair.partner_hash)
+        if verdict is not None:
+            reused.append(ReusedPair(pair=pair, verdict=verdict))
+        else:
+            fresh_pairs.append(pair)
+
+    return CheckPlan(
+        run_id=run_id,
+        started_at=started_at,
+        model_alias=model_alias,
+        prompt_version=prompt_version,
+        fresh=fresh,
+        nodes_total=len(snapshot.nodes),
+        nodes_swept=nodes_swept,
+        sweep_degraded=sweep_degraded,
+        pairs=pairs,
+        reused=tuple(reused),
+        fresh_groups=tuple(group_judgment_batches(fresh_pairs, top_k=top_k)),
+        reuse_index=reuse_index,
+        reuse_unavailable=reuse_unavailable,
+    )
+
+
+def execute_corpus_check(
+    plan: CheckPlan,
+    *,
+    judge: Optional[Callable[[RenderedPrompt], "JudgmentExecution | Unavailable"]],
+    telemetry: Optional[TelemetryStore],
+) -> CheckRunResult:
+    """Executes a planned corpus check — the only spend site, persisting per batch.
+
+    Reused verdicts report first (zero spend, provenance riding the stored row).
+    Then, per fresh group in plan order: build both sides' ``JudgeInput`` via the
+    node adapter → render → ``judge(prompt)`` → parse → the one KD4 gate per pair →
+    **persist THIS batch now** (P5 — a killed run loses nothing already judged; the
+    re-run's reuse partition absorbs the persisted prefix). The first batch-level
+    :class:`Unavailable` — an executor error/timeout OR an all-or-nothing parse
+    malformation — trips the remainder: later groups are never rendered or judged
+    (one penalty per run; a malformed batch is billed but unpersisted, a named
+    cost). A telemetry write failure degrades the RUN, never the loop (KD6): the
+    failure is recorded per batch, the judgment still reports as findings, and
+    later batches are still judged AND their writes attempted (each write is
+    independent — a transient lock may clear).
+
+    ``judge=None`` is lazy availability (P14): healthy when nothing fresh is
+    pending (a reuse-only/empty run needs no key), a typed judgment degradation
+    when fresh groups exist (zero spend, reused findings unaffected).
+
+    KD5 join-key guards — the data-level half of the seam: every render must carry
+    ``plan.prompt_version`` and every execution must stamp ``plan.model_alias``,
+    else this raises ``ValueError`` before anything persists. A plan partitioned
+    at one pin must never write rows at another — that mismatch would poison the
+    reuse corpus for every later run, which is worse than a dead run.
+
+    Args:
+        plan: The disclosed plan (the only path here — KD1).
+        judge: The injected judgment callable (the ``make_judgment_executor``
+            shape), or ``None`` when unavailable. This leaf never constructs one.
+        telemetry: The sibling store for per-batch persistence, or ``None`` (each
+            executed batch then records one write failure — fail-closed
+            disclosure, CHK-D7: an audit that cannot record its provenance is
+            incomplete).
+
+    Returns:
+        The typed :class:`CheckRunResult` — findings pair-key-ordered, every
+        degradation surfaced, accounting exact under every failure combination.
+
+    Raises:
+        ValueError: On a KD5 pin mismatch (prompt or alias) — a programming/wiring
+            error, never a substrate failure.
+    """
+    findings: List[CheckFinding] = []
+    write_failures: List[str] = []
+    judgment_degraded: Optional[Unavailable] = None
+    batches_executed = 0
+    batches_skipped = 0
+    pairs_judged_fresh = 0
+
+    # Reused verdicts first — findings at zero spend. The gate re-derives from the
+    # raw stored verdict (KD4); a tenable or below-threshold prior stays silent.
+    for reused_pair in plan.reused:
+        verdict = reused_pair.verdict
+        if not _is_finding(verdict.tenable, verdict.confidence):
+            continue
+        findings.append(
+            _finding(
+                pair=reused_pair.pair,
+                rationale=verdict.rationale,
+                confidence=verdict.confidence,
+                reused=True,
+                source_batch_id=verdict.batch_id,
+                source_created_at=verdict.created_at,
+                reuse_index=plan.reuse_index,
+            )
+        )
+
+    if judge is None and plan.fresh_groups:
+        judgment_degraded = Unavailable(
+            reason=ConflictUnavailableReason.JUDGMENT,
+            detail=(
+                f"no judge available for {len(plan.fresh_groups)} pending fresh "
+                "batch(es); fresh judgment skipped, reused findings unaffected"
+            ),
+        )
+
+    for group in plan.fresh_groups:
+        if judgment_degraded is not None:
+            batches_skipped += 1  # never rendered, never judged — the trip holds
+            continue
+
+        proposal_input = judge_input_from_node(group.proposal_node)
+        partner_slugs = [pair.partner_node["slug"] for pair in group.pairs]
+        partner_inputs = [
+            judge_input_from_node(pair.partner_node) for pair in group.pairs
+        ]
+        prompt = render_judgment_prompt(
+            proposal_input, list(zip(partner_slugs, partner_inputs))
+        )
+        # KD5, prompt half — before any spend: the renderer always stamps the
+        # production version, so a synthetic-pin plan dies HERE, judge untouched.
+        if prompt.prompt_version != plan.prompt_version:
+            raise ValueError(
+                f"prompt_version mismatch: plan pinned {plan.prompt_version!r} but "
+                f"the renderer produced {prompt.prompt_version!r} — a plan "
+                "partitioned at one pin must never execute at another"
+            )
+
+        execution = judge(prompt)
+        batches_executed += 1
+        if isinstance(execution, Unavailable):
+            judgment_degraded = execution  # the first failure trips the remainder
+            continue
+        # KD5, alias half — before parse/persist: rows at a pin the partition was
+        # not computed at would poison every later run's reuse join.
+        if execution.model_alias != plan.model_alias:
+            raise ValueError(
+                f"model_alias mismatch: plan pinned {plan.model_alias!r} but the "
+                f"execution stamped {execution.model_alias!r} — refusing to "
+                "persist rows at the wrong reuse pin"
+            )
+
+        judgments = parse_judgment_response(execution.raw_text, partner_slugs)
+        if isinstance(judgments, Unavailable):
+            judgment_degraded = judgments  # billed but unpersisted — a named cost
+            continue
+
+        # One MI-10 stamp per batch, taken at persist time — shared by the batch's
+        # rows and by its fresh findings' provenance.
+        created_at = _utc_now_iso()
+        try:
+            model_id: Optional[str] = get_model_id(execution.model_alias)
+        except ValueError:
+            model_id = None  # provenance-only column — degrade, never lose the batch
+        batch = JudgmentBatch(
+            batch_id=execution.batch_id,
+            model_id=model_id,
+            token_input=execution.token_input,
+            token_output=execution.token_output,
+            token_cache_read=execution.token_cache_read,
+            token_cache_creation=execution.token_cache_creation,
+            elapsed_ms=execution.elapsed_ms,
+        )
+        rows: List[ConflictCheckRow] = []
+        for pair, partner_input, judgment in zip(
+            group.pairs, partner_inputs, judgments
+        ):
+            surfaced = _is_finding(judgment.tenable_together, judgment.confidence)
+            rows.append(
+                ConflictCheckRow(
+                    batch_id=execution.batch_id,
+                    sync_run_id=plan.run_id,
+                    # This writer IS the check surface — stamped explicitly on
+                    # every row, never left to the schema DEFAULT (CHK-D7).
+                    surface="check",
+                    judged_axiom=proposal_input.axiom,
+                    # MI-9: empty proposal rejected_paths ("") / scope ([]) is
+                    # NULL, never "" (mirrors sync.py's mapping verbatim).
+                    proposal_rejected_paths=proposal_input.rejected_paths or None,
+                    proposal_scope=", ".join(proposal_input.scope) or None,
+                    proposed_hash_if_any=group.proposal_hash,
+                    candidate_slug=pair.partner_node["slug"],  # verbatim, no casefold
+                    candidate_hash=pair.partner_hash,
+                    # NOT NULL (M5): the raw str, even the degenerate "".
+                    candidate_rejected_paths=partner_input.rejected_paths,
+                    candidate_scope=", ".join(partner_input.scope) or None,
+                    tenable=judgment.tenable_together,
+                    confidence=judgment.confidence,
+                    surfaced=surfaced,
+                    candidate_source=CONFLICT_CANDIDATE_SOURCE,
+                    model_alias=execution.model_alias,
+                    # From the render that produced the judgment, never a
+                    # re-imported literal — row provenance stays tied to it.
+                    prompt_version=prompt.prompt_version,
+                    mitos_version=__version__,
+                    rationale=judgment.rationale,
+                )
+            )
+            if surfaced:
+                findings.append(
+                    _finding(
+                        pair=pair,
+                        rationale=judgment.rationale,
+                        confidence=judgment.confidence,
+                        reused=False,
+                        source_batch_id=execution.batch_id,
+                        source_created_at=created_at,
+                        reuse_index=plan.reuse_index,
+                    )
+                )
+        pairs_judged_fresh += len(group.pairs)
+
+        # Persist THIS batch now (P5) — wrapped individually (KD6): a write
+        # failure is recorded and the loop continues judging and writing.
+        if telemetry is None:
+            write_failures.append(
+                f"batch {execution.batch_id}: telemetry store unavailable "
+                "(never constructed)"
+            )
+        else:
+            try:
+                telemetry.record_judged_batch(batch, rows, created_at)
+            except Exception as exc:
+                write_failures.append(f"batch {execution.batch_id}: {exc}")
+
+    findings.sort(key=lambda finding: (finding.proposal_hash, finding.partner_hash))
+    return CheckRunResult(
+        run_id=plan.run_id,
+        started_at=plan.started_at,
+        ended_at=_utc_now_iso(),
+        nodes_total=plan.nodes_total,
+        nodes_swept=plan.nodes_swept,
+        sweep_degraded=plan.sweep_degraded,
+        findings=tuple(findings),
+        pairs_judged_fresh=pairs_judged_fresh,
+        pairs_reused=len(plan.reused),
+        batches_planned=len(plan.fresh_groups),
+        batches_executed=batches_executed,
+        batches_skipped=batches_skipped,
+        judgment_degraded=judgment_degraded,
+        reuse_unavailable=plan.reuse_unavailable,
+        telemetry_write_failures=tuple(write_failures),
+    )

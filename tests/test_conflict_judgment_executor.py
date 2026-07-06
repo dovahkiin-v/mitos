@@ -14,6 +14,7 @@ Anthropic exception classes need ``httpx.Request``/``httpx.Response`` to constru
 only substrate.
 """
 
+import json
 from typing import Any, Optional
 from unittest.mock import MagicMock
 
@@ -22,16 +23,23 @@ import pytest
 
 import anthropic
 
+from mitos.check import CheckPlan, CorpusPair, JudgmentGroup, execute_corpus_check
 from mitos.conflict import (
     CONFLICT_JUDGMENT_TEMPERATURE,
     CONFLICT_LLM_TIMEOUT_S,
+    CONFLICT_PROMPT_VERSION,
     ConflictUnavailableReason,
     JudgmentExecution,
     RenderedPrompt,
     Unavailable,
 )
-from mitos.conflict_judgment import execute_judgment, make_judgment_executor
+from mitos.conflict_judgment import (
+    _JUDGMENT_MODEL_ALIAS,
+    execute_judgment,
+    make_judgment_executor,
+)
 from mitos.models import get_model_id
+from mitos.telemetry import ReuseUnavailable
 
 
 # --------------------------------------------------------------------------- #
@@ -249,3 +257,92 @@ def test_make_judgment_executor_propagates_unavailable() -> None:
     result = judge(_prompt())
     assert isinstance(result, Unavailable)
     assert result.reason is ConflictUnavailableReason.JUDGMENT_TIMEOUT
+
+
+# --------------------------------------------------------------------------- #
+# 8. T10 (the 2c half) — check-run requests carry NO cache_control (CHK-D6)
+# --------------------------------------------------------------------------- #
+
+def _assert_no_cache_control(value: Any) -> None:
+    """Deep-scans a kwargs tree: no dict anywhere may carry a ``cache_control`` key."""
+    if isinstance(value, dict):
+        assert "cache_control" not in value
+        for nested in value.values():
+            _assert_no_cache_control(nested)
+    elif isinstance(value, (list, tuple)):
+        for nested in value:
+            _assert_no_cache_control(nested)
+
+
+def _posture_node(node_id: str, slug: str, axiom: str) -> dict:
+    """A minimal hydrated-node shape — the keys the engine's adapters read."""
+    return {
+        "id": node_id,
+        "slug": slug,
+        "core_axiom": axiom,
+        "rejected_paths": "",
+        "scope": [],
+    }
+
+
+def test_t10_check_run_judgment_requests_carry_no_cache_control() -> None:
+    """T10 (CHK-D6, the 2c half): the REAL executor driven through
+    ``execute_corpus_check`` on a one-group plan issues a ``messages.create``
+    whose kwargs tree contains no ``cache_control`` anywhere and whose ``system``
+    is a plain string (not a content-block list) — caching stays OFF at the check
+    surface; the cache-ready prompt ORDERING is the wired half, the flip is a
+    later vision's."""
+    proposal = _posture_node("hash-aaaa", "posture-proposal", "Posture proposal axiom.")
+    partner = _posture_node("hash-bbbb", "posture-partner", "Posture partner axiom.")
+    pair = CorpusPair(
+        proposal_hash=proposal["id"],
+        partner_hash=partner["id"],
+        proposal_node=proposal,
+        partner_node=partner,
+        score=0.9,
+    )
+    plan = CheckPlan(
+        run_id="posture-run",
+        started_at="2026-07-06T00:00:00+00:00",
+        model_alias=_JUDGMENT_MODEL_ALIAS,          # the real executor's stamp (KD5)
+        prompt_version=CONFLICT_PROMPT_VERSION,
+        fresh=False,
+        nodes_total=2,
+        nodes_swept=2,
+        sweep_degraded=None,
+        pairs=(pair,),
+        reused=(),
+        fresh_groups=(
+            JudgmentGroup(
+                proposal_hash=proposal["id"],
+                proposal_node=proposal,
+                pairs=(pair,),
+            ),
+        ),
+        reuse_index=None,
+        reuse_unavailable=ReuseUnavailable("posture test: no telemetry"),
+    )
+    message = _fake_message(
+        text=json.dumps(
+            [
+                {
+                    "slug": "posture-partner",
+                    "rationale": "Both can stand.",
+                    "tenable_together": True,
+                    "confidence": 0.6,
+                }
+            ]
+        )
+    )
+    client = _client_returning(message)
+
+    result = execute_corpus_check(
+        plan, judge=make_judgment_executor(client), telemetry=None
+    )
+
+    assert result.judgment_degraded is None          # the round-trip parsed healthy
+    create = client.with_options.return_value.messages.create
+    create.assert_called_once()
+    kwargs = create.call_args.kwargs
+    _assert_no_cache_control(kwargs)
+    assert isinstance(kwargs["system"], str)         # a plain string, no block list

@@ -204,7 +204,10 @@ class _SequenceJudge:
 
     `_RecordingJudge` returns one fixed value forever; a multi-entry sync that persists a row
     per entry needs a DISTINCT `batch_id` per judged batch (it is the `judgment_batches` PK),
-    so this returns `rets[i]` on the i-th call.
+    so this returns `rets[i]` on the i-th call. An entry that IS a `BaseException` instance
+    is RAISED when reached instead of returned — the 2c simulated-kill seam (a judge dying
+    mid-run, distinct from a typed `Unavailable` return). Calling past the end raises
+    `IndexError` — a free "judge called more often than planned" tripwire.
     """
 
     def __init__(self, rets: List[Any]) -> None:
@@ -216,6 +219,8 @@ class _SequenceJudge:
         self.last_prompt = prompt
         ret = self._rets[self.calls]
         self.calls += 1
+        if isinstance(ret, BaseException):
+            raise ret
         return ret
 
 
