@@ -41,23 +41,37 @@ partition). The seam is *structural*: the plan stage has no judge parameter, and
 execute stage's first argument is the :class:`CheckPlan` carrying the disclosure count —
 no code path can reach the spend without holding the object that disclosed its cost
 (CHK-D5). The engine renders nothing and decides no exit code — 3a maps the typed
-:class:`CheckRunResult` to output + 0/1/2; 2d extends the accounting.
+:class:`CheckRunResult` to output + 0/1/2 through :func:`exit_code_for`.
+
+Phase 2d adds the run's **honesty hardware** (CHK-D4) and its **memory** (CHK-D7): the
+deterministic stale-index probe (:func:`probe_stale_index`) reads the pending-embeddings
+Outbox at plan entry and execute exit — a backlog row below ``CHECK_STALE_RETRY_TOLERANCE``
+gates the run partial (an index that never drained those nodes silently thinned the
+sweep's recall), while a row at or above tolerance is a *disclosed coverage exclusion*
+that never gates (the poison-row escape). One derivation site, :func:`run_degradations`,
+feeds both :func:`exit_code_for` (degraded-2 dominates findings-1) and the persisted
+``degraded_reason``, and :func:`check_run_row_from_result` derives every ``check_runs``
+scalar from the same :class:`CheckRunResult` the report reads — the row and the report
+can never disagree.
 
 **Tier-1 leaf, same discipline as ``conflict.py``.** This module must never import a
 higher-tier ``mitos`` module or a heavy dependency (``anthropic``, the Qdrant/genai
 clients) at module scope — the judge arrives injected, never imported. ``check`` sits
 *above* ``conflict`` in the import DAG (``check → conflict``, never the reverse); its
 module-scope ``mitos`` imports are ``conflict`` plus the 2c-sanctioned sink edge
-``check → telemetry`` (the sibling corpus store — ``ConflictCheckRow``/``JudgmentBatch``
-construction and the ``ReuseUnavailable`` fork) and the pure leaves ``models``
-(defensive ``model_id`` resolution) and the package ``__init__`` (``__version__``
-stamping) — none of which drags a heavy dependency. A dep-free import guard pins this
-(``test_importing_check_drags_no_heavy_dependency``); the KD7 no-write lint walks this
-module's runtime-import closure with ``telemetry`` as the one sanctioned boundary.
+``check → telemetry`` (the sibling corpus store — ``ConflictCheckRow``/``JudgmentBatch``/
+``CheckRunRow`` construction and the ``ReuseUnavailable`` fork) and the pure leaves
+``errors`` (the ``DatabaseError`` half of the end-probe twin-catch — exception classes
+only, zero calls), ``models`` (defensive ``model_id`` resolution) and the package
+``__init__`` (``__version__`` stamping) — none of which drags a heavy dependency. A
+dep-free import guard pins this (``test_importing_check_drags_no_heavy_dependency``);
+the KD7 no-write lint walks this module's runtime-import closure with ``telemetry`` as
+the one sanctioned boundary.
 """
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import (
@@ -93,8 +107,10 @@ from mitos.conflict import (
     render_judgment_prompt,
     screen_candidates,
 )
+from mitos.errors import DatabaseError
 from mitos.models import get_model_id
 from mitos.telemetry import (
+    CheckRunRow,
     ConflictCheckRow,
     JudgmentBatch,
     ReuseIndex,
@@ -606,6 +622,129 @@ def _is_finding(tenable: bool, confidence: float) -> bool:
     return (not tenable) and confidence >= CONFLICT_SURFACE_THRESHOLD
 
 
+# --------------------------------------------------------------------------- #
+# Phase 2d — the stale-index probe (CHK-D4 honesty hardware)
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class BacklogRow:
+    """One pending-embeddings Outbox row, typed for the probe/report surface.
+
+    Attributes:
+        node_id: The backlogged node's content hash (== ``nodes.id`` — 3a's
+            report resolves a live display slug from it, MI-2).
+        queued_at: The row's UTC ISO-8601 enqueue stamp (MI-10).
+        retry_count: Drain attempts so far — the partition key against
+            ``CHECK_STALE_RETRY_TOLERANCE``.
+    """
+
+    node_id: str
+    queued_at: str
+    retry_count: int
+
+
+@dataclass(frozen=True)
+class StaleProbe:
+    """One deterministic read of the embedding backlog, partitioned at the tolerance.
+
+    An undrained Outbox row means the vector index never received that node — a
+    reachable-but-behind index produces no typed degradation downstream
+    (``gather_candidates`` succeeds and silently thins recall), so this probe is
+    the only place the thinning becomes visible (CHK-D4). The partition is
+    computed once, at probe time; gating is derived at read time from the raw
+    rows (KD3). An empty probe (``StaleProbe((), ())``) is HEALTHY — a drained
+    backlog, never a degradation.
+
+    The probe is conservative by design: a payload-only re-sync row is
+    indistinguishable from a missing re-embed in the 3-column Outbox (no intent
+    discriminator), so it may over-fire — the fail-closed price, disclosed loudly
+    rather than discovered as a thinned audit. A ``--scope``-narrowed run still
+    gates on the corpus-global backlog: candidate recall is scope-blind (CONF-D2),
+    so a backlogged node outside the scope could still have surfaced as a
+    candidate.
+
+    Attributes:
+        transient: Rows with ``retry_count < CHECK_STALE_RETRY_TOLERANCE`` —
+            expected to drain on the next ``mitos sync``; their presence GATES
+            the run partial (the ``"stale_index"`` degradation).
+        excluded: Rows at or above the tolerance — chronic failures the drain
+            keeps retrying (poison rows). Disclosed as named coverage
+            exclusions, they NEVER gate: without this escape one poison row
+            would turn the gate red forever and a pre-commit hook would
+            permanently block (the CHK-D4 escape). The durable fix (an Outbox
+            dead-letter) is substrate-owned and out of this vision's scope.
+    """
+
+    transient: Tuple[BacklogRow, ...]
+    excluded: Tuple[BacklogRow, ...]
+
+
+@dataclass(frozen=True)
+class ProbeUnavailable:
+    """Typed degradation: the END-probe read itself failed — stored, never raised.
+
+    Mirrors :class:`~mitos.telemetry.ReuseUnavailable`'s posture (check-local by
+    design — ``conflict.Unavailable``'s reason enum is pipeline-substrate
+    vocabulary; this leaf mints no members from outside it). Only the end probe
+    degrades to this: at plan entry nothing is spent and a store fault
+    propagates (KD2), but at execute exit the judgment spend has happened and
+    the findings must survive. An end probe that could not read cannot certify
+    completeness → the ``"probe_read"`` degradation, exit 2, findings intact,
+    ``coverage_exclusions`` NULL. This degrades to *loudly-uncertifiable*, never
+    to a silently-healthy empty probe — the opposite failure direction from the
+    fallback the KD5-2a rule forbids.
+
+    Attributes:
+        detail: The underlying exception message — disclosure/logging only.
+    """
+
+    detail: str
+
+
+def probe_stale_index(store: "GraphStoreProtocol") -> StaleProbe:
+    """Reads the pending-embeddings backlog once and partitions it at the tolerance.
+
+    One ``store.get_pending_embeddings()`` read (the GRAPH store — telemetry
+    reads stay one-per-run, §6.2), partitioned on ``retry_count`` against
+    ``CHECK_STALE_RETRY_TOLERANCE`` and node-id-sorted in both halves, so two
+    probes over an unchanged backlog are byte-identical (DoD-3 determinism).
+    Public: 3b composes it directly around the staged facade, outside this
+    engine's two call sites.
+
+    Row fields are read by direct key — a schema drift is a loud ``KeyError``,
+    never a ``.get(..., 0)`` (a silently-zero ``retry_count`` would turn poison
+    into transient and resurrect the permanent-red-gate bug the tolerance
+    exists to kill). There is deliberately NO try/except here: the two call
+    sites dispose of faults differently (KD2 — plan propagates, execute wraps),
+    so the caller owns the disposition.
+
+    Args:
+        store: The graph store (the injected duck-typed collaborator; only
+            ``get_pending_embeddings`` is read).
+
+    Returns:
+        The partitioned, sorted :class:`StaleProbe`. Empty backlog → healthy
+        ``StaleProbe((), ())``.
+    """
+    transient: List[BacklogRow] = []
+    excluded: List[BacklogRow] = []
+    for raw in store.get_pending_embeddings():
+        row = BacklogRow(
+            node_id=raw["node_id"],
+            queued_at=raw["queued_at"],
+            retry_count=raw["retry_count"],
+        )
+        if row.retry_count >= CHECK_STALE_RETRY_TOLERANCE:
+            excluded.append(row)
+        else:
+            transient.append(row)
+    return StaleProbe(
+        transient=tuple(sorted(transient, key=lambda row: row.node_id)),
+        excluded=tuple(sorted(excluded, key=lambda row: row.node_id)),
+    )
+
+
 @dataclass(frozen=True)
 class ReusedPair:
     """One pair whose judgment is reused from a prior verdict (CHK-D3 — zero spend).
@@ -659,6 +798,9 @@ class CheckPlan:
             as "known").
         reuse_unavailable: The typed read degradation, if the load failed (CHK-D3/
             D10 — the run proceeds all-fresh and reports unpartitioned).
+        start_probe: The run-entry backlog read (CHK-D4), taken BEFORE the corpus
+            snapshot — the backlog that predates the snapshot is exactly what
+            thinned the sweep the snapshot defines (KD1).
     """
 
     run_id: str
@@ -674,6 +816,7 @@ class CheckPlan:
     fresh_groups: Tuple[JudgmentGroup, ...]
     reuse_index: Optional[ReuseIndex]
     reuse_unavailable: Optional[ReuseUnavailable]
+    start_probe: StaleProbe
 
 
 @dataclass(frozen=True)
@@ -742,6 +885,13 @@ class CheckRunResult:
         reuse_unavailable: Echoed from the plan.
         telemetry_write_failures: Per-batch write-failure details (KD6 — the run
             is degraded but the judgment loop never aborts; findings still report).
+        start_probe: Echoed from the plan (CHK-D4) — the run-entry backlog read.
+        end_probe: The certification read, taken at execute exit: a
+            :class:`StaleProbe` when readable, or :class:`ProbeUnavailable` when
+            the read failed (KD2 — the paid-for findings survive, the run just
+            cannot certify). Fork on the TYPE, never on emptiness — an empty
+            probe is healthy. Completeness is certified only when BOTH probes
+            read clean of transient rows.
     """
 
     run_id: str
@@ -759,6 +909,8 @@ class CheckRunResult:
     judgment_degraded: Optional[Unavailable]
     reuse_unavailable: Optional[ReuseUnavailable]
     telemetry_write_failures: Tuple[str, ...]
+    start_probe: StaleProbe
+    end_probe: "StaleProbe | ProbeUnavailable"
 
 
 def _finding(
@@ -830,7 +982,9 @@ def plan_corpus_check(
     """Plans a corpus check — deterministic, zero LLM contact, zero writes (KD1).
 
     The 2b wiring contract, composed: mint the run id + the MI-10 ``started_at``
-    stamp → :func:`snapshot_corpus` → load the reuse index ONCE → drive
+    stamp → the start probe (:func:`probe_stale_index`, BEFORE the snapshot —
+    KD1; a store fault here propagates) → :func:`snapshot_corpus` → load the
+    reuse index ONCE → drive
     :func:`iter_sweep`, stopping at the first :class:`Unavailable` (laziness IS the
     breaker — nothing beyond the trip is gathered, no post-trip node eats its own
     timeout) → :func:`dedup_oriented_pairs` → the reuse partition →
@@ -875,6 +1029,11 @@ def plan_corpus_check(
     """
     run_id = uuid4().hex
     started_at = _utc_now_iso()
+    # The start probe fires BEFORE the snapshot (KD1): a backlog row present here
+    # predates the corpus the sweep will define, so the probe can never miss a row
+    # the sweep suffers from. Faults propagate — nothing is spent yet, and a store
+    # broken at entry must fail fast, not masquerade as a clean corpus (KD2).
+    start_probe = probe_stale_index(store)
     snapshot = snapshot_corpus(store, scope=scope)
 
     if telemetry is None:
@@ -938,6 +1097,7 @@ def plan_corpus_check(
         fresh_groups=tuple(group_judgment_batches(fresh_pairs, top_k=top_k)),
         reuse_index=reuse_index,
         reuse_unavailable=reuse_unavailable,
+        start_probe=start_probe,
     )
 
 
@@ -946,6 +1106,7 @@ def execute_corpus_check(
     *,
     judge: Optional[Callable[[RenderedPrompt], "JudgmentExecution | Unavailable"]],
     telemetry: Optional[TelemetryStore],
+    store: "GraphStoreProtocol",
 ) -> CheckRunResult:
     """Executes a planned corpus check — the only spend site, persisting per batch.
 
@@ -966,6 +1127,18 @@ def execute_corpus_check(
     pending (a reuse-only/empty run needs no key), a typed judgment degradation
     when fresh groups exist (zero spend, reused findings unaffected).
 
+    After the batch loop the END probe fires (:func:`probe_stale_index` over the
+    required ``store``) — the certification read: a row enqueued after the start
+    probe (a commit landing mid-run) is caught here, so completeness is certified
+    only when both reads come back clean (CHK-D4). Its fault disposition is the
+    OPPOSITE of the start probe's (KD2): the judgment spend has happened and
+    per-batch rows are on disk, so a read failure degrades typed to
+    :class:`ProbeUnavailable` — catching BOTH raw ``sqlite3.Error`` (the
+    unwrapped query path) and Mitos's ``DatabaseError`` (the wrapped open path);
+    catch one and the other escapes with the findings. ``store`` is required, not
+    defaulted: an optional probe source would let a caller silently skip
+    certification — fail-closed must not be opt-in (KD1).
+
     KD5 join-key guards — the data-level half of the seam: every render must carry
     ``plan.prompt_version`` and every execution must stamp ``plan.model_alias``,
     else this raises ``ValueError`` before anything persists. A plan partitioned
@@ -980,6 +1153,8 @@ def execute_corpus_check(
             executed batch then records one write failure — fail-closed
             disclosure, CHK-D7: an audit that cannot record its provenance is
             incomplete).
+        store: The graph store the end probe reads (REQUIRED — certification is
+            not opt-in). Only ``get_pending_embeddings`` is touched here.
 
     Returns:
         The typed :class:`CheckRunResult` — findings pair-key-ordered, every
@@ -1142,6 +1317,16 @@ def execute_corpus_check(
             except Exception as exc:
                 write_failures.append(f"batch {execution.batch_id}: {exc}")
 
+    # The end probe — the certification read (CHK-D4), beside the ended_at stamp.
+    # Twin-catch (KD2): `get_pending_embeddings` has NO internal wrapping, so a
+    # query fault arrives as raw sqlite3.Error while an open failure arrives
+    # wrapped as DatabaseError — catch both, and ONLY these two (a KeyError on
+    # schema drift must stay loud, so never a broad Exception here).
+    try:
+        end_probe: "StaleProbe | ProbeUnavailable" = probe_stale_index(store)
+    except (sqlite3.Error, DatabaseError) as exc:
+        end_probe = ProbeUnavailable(detail=str(exc))
+
     findings.sort(key=lambda finding: (finding.proposal_hash, finding.partner_hash))
     return CheckRunResult(
         run_id=plan.run_id,
@@ -1159,4 +1344,195 @@ def execute_corpus_check(
         judgment_degraded=judgment_degraded,
         reuse_unavailable=plan.reuse_unavailable,
         telemetry_write_failures=tuple(write_failures),
+        start_probe=plan.start_probe,
+        end_probe=end_probe,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Phase 2d — degradation/exit derivation + the check_runs summary row (CHK-D7)
+# --------------------------------------------------------------------------- #
+
+# The stable degradation vocabulary, in declaration (= emission) order. A P18
+# trend-query surface (`check_runs.degraded_reason` persists the comma-join):
+# additive evolution ONLY — never rename or reorder a shipped token.
+_DEGRADATION_TOKENS: Tuple[str, ...] = (
+    "sweep",
+    "judgment",
+    "reuse_read",
+    "telemetry_write",
+    "stale_index",
+    "probe_read",
+)
+
+
+def run_degradations(result: CheckRunResult) -> Tuple[str, ...]:
+    """Derives the run's degradation tokens — the ONE site feeding exit and row (KD4).
+
+    Both :func:`exit_code_for` and ``check_runs.degraded_reason`` read this tuple,
+    so the 2-dominates-1 precedence and the healthy-NULL rule can never fork
+    between the process exit and the persisted row (the same one-site discipline
+    as :func:`_is_finding`). Tokens appear in declaration order, one per
+    degradation class present:
+
+    * ``"sweep"`` — the sweep tripped (``sweep_degraded``).
+    * ``"judgment"`` — the judgment stage tripped (``judgment_degraded``).
+    * ``"reuse_read"`` — the reuse/novelty bulk read failed (``reuse_unavailable``).
+    * ``"telemetry_write"`` — at least one per-batch persist failed.
+    * ``"stale_index"`` — a TRANSIENT backlog row in the start probe, or in the
+      end probe when it is readable. ``excluded`` (poison) rows produce NO token:
+      an only-poison backlog completes and exits on its findings — the CHK-D4
+      poison-row escape (KD3).
+    * ``"probe_read"`` — the end probe itself was unreadable
+      (:class:`ProbeUnavailable`): the run cannot certify completeness.
+
+    Args:
+        result: The typed run outcome.
+
+    Returns:
+        A deterministic tuple of stable tokens; empty == healthy.
+    """
+    present = {
+        "sweep": result.sweep_degraded is not None,
+        "judgment": result.judgment_degraded is not None,
+        "reuse_read": result.reuse_unavailable is not None,
+        "telemetry_write": bool(result.telemetry_write_failures),
+        "stale_index": bool(result.start_probe.transient)
+        or (
+            isinstance(result.end_probe, StaleProbe)
+            and bool(result.end_probe.transient)
+        ),
+        "probe_read": isinstance(result.end_probe, ProbeUnavailable),
+    }
+    return tuple(token for token in _DEGRADATION_TOKENS if present[token])
+
+
+def exit_code_for(result: CheckRunResult) -> int:
+    """Maps a completed run to the shipped 0/1/2 exit contract (CHK-C2).
+
+    Degraded dominates findings: an incomplete check must not certify its
+    finding set, so ANY degradation is 2 — even alongside new findings (they
+    still ride the result; partial is labeled, never discarded). A healthy run
+    exits 1 iff any finding is ``novelty == "new"`` (the gate consumes the
+    already-derived novelty — never re-derives finding-ness, the one-gate-site
+    discipline), else 0. Unpartitioned findings (``novelty is None``)
+    structurally cannot reach the exit-1 branch: they only occur under
+    ``reuse_unavailable``, which is already ``"reuse_read"`` → 2.
+
+    This is the mapping for COMPLETED runs — 3a calls it on a
+    :class:`CheckRunResult`. Pre-execute exits (invocation errors, headless
+    refusal, boundary errors) are CLI-side exit-2 classes outside this
+    function.
+
+    Args:
+        result: The typed run outcome.
+
+    Returns:
+        ``2`` if degraded, else ``1`` on any new finding, else ``0``.
+    """
+    if run_degradations(result):
+        return 2
+    if any(finding.novelty == "new" for finding in result.findings):
+        return 1
+    return 0
+
+
+def coverage_exclusion_ids(result: CheckRunResult) -> Tuple[str, ...]:
+    """Projects the named coverage exclusions — poison node ids, deduped, sorted.
+
+    The union of ``excluded`` node ids across the start probe and (when
+    readable) the end probe: the list the report/`--json` disclose by name (3a)
+    and whose ``len()`` is the ``check_runs.coverage_exclusions`` count. When
+    the end probe is :class:`ProbeUnavailable` the union is not fully knowable —
+    the ROW stamps NULL there (:func:`check_run_row_from_result`), but this
+    function still returns the start-probe half for the report: disclose what
+    you know; certify nothing.
+
+    Args:
+        result: The typed run outcome.
+
+    Returns:
+        Sorted, deduplicated excluded node ids (content hashes — 3a resolves
+        display slugs live, MI-2).
+    """
+    ids = {row.node_id for row in result.start_probe.excluded}
+    if isinstance(result.end_probe, StaleProbe):
+        ids.update(row.node_id for row in result.end_probe.excluded)
+    return tuple(sorted(ids))
+
+
+def check_run_row_from_result(
+    result: CheckRunResult, *, mode: str, exit_code: int
+) -> CheckRunRow:
+    """Assembles the corpus-mode ``check_runs`` row from the one result object.
+
+    The T12 law made structural: every scalar derives from the same
+    :class:`CheckRunResult` the run report reads — the row and the report can
+    never disagree. ``mode`` and ``exit_code`` are the two facts the engine
+    doesn't own: the caller passes them (``exit_code`` from
+    :func:`exit_code_for`; this builder never recounts, never re-derives
+    finding-ness), and both are validated here with a loud ``ValueError`` — a
+    programming error caught before any connection opens, cheaper than the
+    schema CHECK's ``IntegrityError`` at write time.
+
+    The NULL rules are FLAG-derived on purpose, including the edge where it
+    costs something: a run with zero findings under ``reuse_unavailable`` stamps
+    ``findings_new/known = NULL``, not ``0/0`` — 0/0 would be technically
+    knowable there, but NULL keeps the rule one-flag-derivable and keeps
+    degraded runs out of P18 clean-trend aggregates (such a run is exit 2 and
+    must not read as a clean data point). ``pairs_reused`` under
+    ``reuse_unavailable`` stays a TRUE zero: the run genuinely reused nothing.
+
+    The seam order, pinned for 3a (KD5): compute ``exit_code_for(result)`` →
+    build this row → ``TelemetryStore.record_check_run`` LAST, so a write
+    failure can only move the exit toward 2 and a persisted row's ``exit_code``
+    always equals the actual process exit. 3b hand-builds its staged row
+    instead of calling this (staged accounting is not a :class:`CheckRunResult`).
+
+    Args:
+        result: The typed run outcome (the same object the report reads).
+        mode: ``'corpus'`` or ``'staged'`` — validated against the closed set.
+        exit_code: The actual process exit for this run — validated against
+            ``{0, 1, 2}``; pass :func:`exit_code_for`'s value, never a recount.
+
+    Returns:
+        The assembled :class:`~mitos.telemetry.CheckRunRow`.
+
+    Raises:
+        ValueError: On a ``mode`` or ``exit_code`` outside its closed set.
+    """
+    if mode not in ("corpus", "staged"):
+        raise ValueError(
+            f"mode must be 'corpus' or 'staged', got {mode!r} — the check_runs "
+            "mode set is a closed, shipped contract (CHK-C2)"
+        )
+    if exit_code not in (0, 1, 2):
+        raise ValueError(
+            f"exit_code must be 0, 1 or 2, got {exit_code!r} — pass "
+            "exit_code_for(result), never a hand-derived code"
+        )
+    if result.reuse_unavailable is not None:
+        findings_new: Optional[int] = None
+        findings_known: Optional[int] = None
+    else:
+        findings_new = sum(1 for f in result.findings if f.novelty == "new")
+        findings_known = sum(1 for f in result.findings if f.novelty == "known")
+    if isinstance(result.end_probe, ProbeUnavailable):
+        coverage_exclusions: Optional[int] = None  # the probe never completed
+    else:
+        coverage_exclusions = len(coverage_exclusion_ids(result))
+    return CheckRunRow(
+        run_id=result.run_id,
+        mode=mode,
+        started_at=result.started_at,
+        ended_at=result.ended_at,
+        exit_code=exit_code,
+        nodes_swept=result.nodes_swept,
+        pairs_judged_fresh=result.pairs_judged_fresh,
+        pairs_reused=result.pairs_reused,
+        findings_new=findings_new,
+        findings_known=findings_known,
+        coverage_exclusions=coverage_exclusions,
+        degraded_reason=",".join(run_degradations(result)) or None,
+        mitos_version=__version__,
     )

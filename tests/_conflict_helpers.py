@@ -266,6 +266,20 @@ def _match(slug: str, score: float) -> Dict[str, Any]:
     return {"slug": slug, "score": score}
 
 
+def _drain_outbox(store: Any) -> None:
+    """Drains the pending-embeddings Outbox — the healthy post-sync fixture state.
+
+    Every ``commit_parsed_entry`` unconditionally enqueues its node (MI-12), so a
+    keyless test corpus carries a transient backlog by default — under the 2d stale
+    probe that reads as an incomplete audit (exit 2), not a healthy run. Fixtures
+    asserting exit/degradation/row outcomes state their backlog posture explicitly:
+    healthy ones drain (this helper mirrors sync.py's post-upsert
+    ``remove_pending_embedding``); stale ones seed deliberately.
+    """
+    for row in store.get_pending_embeddings():
+        store.remove_pending_embedding(row["node_id"])
+
+
 # --------------------------------------------------------------------------- #
 # Environment + harness (mirrors tests/test_sync.py's sync_env)
 # --------------------------------------------------------------------------- #

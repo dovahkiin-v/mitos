@@ -23,7 +23,13 @@ import pytest
 
 import anthropic
 
-from mitos.check import CheckPlan, CorpusPair, JudgmentGroup, execute_corpus_check
+from mitos.check import (
+    CheckPlan,
+    CorpusPair,
+    JudgmentGroup,
+    StaleProbe,
+    execute_corpus_check,
+)
 from mitos.conflict import (
     CONFLICT_JUDGMENT_TEMPERATURE,
     CONFLICT_LLM_TIMEOUT_S,
@@ -321,6 +327,7 @@ def test_t10_check_run_judgment_requests_carry_no_cache_control() -> None:
         ),
         reuse_index=None,
         reuse_unavailable=ReuseUnavailable("posture test: no telemetry"),
+        start_probe=StaleProbe((), ()),
     )
     message = _fake_message(
         text=json.dumps(
@@ -336,8 +343,13 @@ def test_t10_check_run_judgment_requests_carry_no_cache_control() -> None:
     )
     client = _client_returning(message)
 
+    # A minimal drained-outbox stub — this file deliberately owns no GraphStore
+    # (the posture test's substrate is the mocked Anthropic client, nothing else).
+    class _EmptyOutbox:
+        get_pending_embeddings = staticmethod(lambda: [])
+
     result = execute_corpus_check(
-        plan, judge=make_judgment_executor(client), telemetry=None
+        plan, judge=make_judgment_executor(client), telemetry=None, store=_EmptyOutbox()
     )
 
     assert result.judgment_degraded is None          # the round-trip parsed healthy

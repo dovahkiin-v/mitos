@@ -30,9 +30,11 @@ from mitos.errors import DatabaseError
 from mitos.migrations import _pending_head, run_migrations
 from mitos.store import BUSY_TIMEOUT_MS, GraphStore, open_connection
 from mitos.telemetry import (
+    _CHECK_RUNS_COLUMNS,
     _CONFLICT_CHECKS_COLUMNS,
     _JUDGMENT_BATCHES_COLUMNS,
     TELEMETRY_MIGRATION_STEPS,
+    CheckRunRow,
     ConflictCheckRow,
     JudgmentBatch,
     ReuseIndex,
@@ -90,6 +92,27 @@ def _batch(**overrides) -> JudgmentBatch:
     return JudgmentBatch(**base)
 
 
+def _check_run_row(**overrides) -> CheckRunRow:
+    """Builds a CheckRunRow with sensible defaults; override any field."""
+    base = dict(
+        run_id="run-2d",
+        mode="corpus",
+        started_at=CREATED_AT,
+        ended_at="2026-07-03T01:47:02.000001+00:00",
+        exit_code=1,
+        nodes_swept=5,
+        pairs_judged_fresh=2,
+        pairs_reused=3,
+        findings_new=1,
+        findings_known=0,
+        coverage_exclusions=0,
+        degraded_reason=None,
+        mitos_version="0.6.0-test",
+    )
+    base.update(overrides)
+    return CheckRunRow(**base)
+
+
 def _telemetry_path(tmp_path) -> str:
     """A telemetry path whose parent ``.mitos/`` does NOT yet exist.
 
@@ -145,6 +168,7 @@ def test_to_params_arity_matches_column_tuples() -> None:
     """``to_params`` emits exactly one value per INSERT column (order-lockstep pin)."""
     assert len(_row().to_params(CREATED_AT)) == len(_CONFLICT_CHECKS_COLUMNS)
     assert len(_batch().to_params()) == len(_JUDGMENT_BATCHES_COLUMNS)
+    assert len(_check_run_row().to_params()) == len(_CHECK_RUNS_COLUMNS) == 13
     # Rung 2 widened both tuples — the INSERTs self-assemble from these.
     assert "surface" in _CONFLICT_CHECKS_COLUMNS
     assert "model_id" in _JUDGMENT_BATCHES_COLUMNS
@@ -279,6 +303,144 @@ def test_check_runs_checks_reject_out_of_contract_values(tmp_path) -> None:
             conn.execute(insert, good)  # duplicate run_id — one row per run is structural
     finally:
         conn.close()
+
+
+# --- the check_runs summary writer (Phase 2d, W7) --------------------------------
+
+
+def test_record_check_run_roundtrips_field_for_field(tmp_path) -> None:
+    """One happy corpus row lands and reads back exactly — including the three
+    NULL-vs-zero distinctions (0 = a partitioned/probed fact; NULL = "could not
+    tell", stamped here on none of them)."""
+    path = _telemetry_path(tmp_path)
+    store = TelemetryStore(path)
+    row = _check_run_row(
+        findings_new=1, findings_known=2, coverage_exclusions=0, degraded_reason=None
+    )
+
+    store.record_check_run(row)
+
+    conn = _open(path)
+    try:
+        got = conn.execute("SELECT * FROM check_runs;").fetchall()
+    finally:
+        conn.close()
+    assert len(got) == 1
+    persisted = {key: got[0][key] for key in got[0].keys()}
+    assert persisted == {
+        "run_id": row.run_id,
+        "mode": "corpus",
+        "started_at": row.started_at,
+        "ended_at": row.ended_at,
+        "exit_code": 1,
+        "nodes_swept": 5,
+        "pairs_judged_fresh": 2,
+        "pairs_reused": 3,
+        "findings_new": 1,
+        "findings_known": 2,
+        "coverage_exclusions": 0,  # a genuine zero, not NULL
+        "degraded_reason": None,  # healthy
+        "mitos_version": row.mitos_version,
+    }
+
+
+def test_record_check_run_null_semantics_bind_exactly(tmp_path) -> None:
+    """A degraded row's NULLs land as SQL NULL, never coerced to 0 — the CHK-D10
+    line (partition unavailable / probe never completed) survives the boundary."""
+    path = _telemetry_path(tmp_path)
+    store = TelemetryStore(path)
+    store.record_check_run(
+        _check_run_row(
+            findings_new=None,
+            findings_known=None,
+            coverage_exclusions=None,
+            degraded_reason="reuse_read,probe_read",
+            exit_code=2,
+        )
+    )
+
+    conn = _open(path)
+    try:
+        got = conn.execute(
+            "SELECT findings_new, findings_known, coverage_exclusions, "
+            "degraded_reason FROM check_runs;"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert tuple(got) == (None, None, None, "reuse_read,probe_read")
+
+
+def test_record_check_run_accepts_a_staged_shaped_row(tmp_path) -> None:
+    """T12's stamps-mode/zeros half at the writer grain: ``mode='staged'`` with
+    ``pairs_reused=0`` (staged never reuses) lands — 3b owns the semantics e2e."""
+    path = _telemetry_path(tmp_path)
+    store = TelemetryStore(path)
+
+    store.record_check_run(_check_run_row(run_id="run-staged", mode="staged", pairs_reused=0))
+
+    conn = _open(path)
+    try:
+        got = conn.execute(
+            "SELECT mode, pairs_reused FROM check_runs WHERE run_id='run-staged';"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert tuple(got) == ("staged", 0)
+
+
+def test_record_check_run_duplicate_run_id_raises(tmp_path) -> None:
+    """One row per run is STRUCTURAL (``run_id`` PK): a second write for the same
+    run raises ``DatabaseError`` — the seam calls the writer once, at the end."""
+    path = _telemetry_path(tmp_path)
+    store = TelemetryStore(path)
+    store.record_check_run(_check_run_row())
+
+    with pytest.raises(DatabaseError):
+        store.record_check_run(_check_run_row())
+
+    conn = _open(path)
+    try:
+        assert _count(conn, "check_runs") == 1
+    finally:
+        conn.close()
+
+
+def test_record_check_run_out_of_contract_mode_raises_database_error(tmp_path) -> None:
+    """The row dataclass does not police the closed sets (that is the check.py
+    builder's ``ValueError``); a row carrying an out-of-contract ``mode`` dies on
+    the schema CHECK at write time, wrapped as ``DatabaseError`` — and no row lands."""
+    path = _telemetry_path(tmp_path)
+    store = TelemetryStore(path)
+
+    with pytest.raises(DatabaseError):
+        store.record_check_run(_check_run_row(mode="watch"))
+
+    conn = _open(path)
+    try:
+        assert _count(conn, "check_runs") == 0
+    finally:
+        conn.close()
+
+
+def test_record_check_run_unwritable_store_raises_database_error(tmp_path) -> None:
+    """§9-10: a telemetry path that cannot be opened for writing raises a loud
+    ``DatabaseError`` — the writer never swallows (the caller's disclose-and-exit-2
+    seam is 3a's to test; 2d pins that the failure surfaces)."""
+    path = _telemetry_path(tmp_path)
+    store = TelemetryStore(path)
+    shutil.rmtree(os.path.dirname(path))  # the .mitos/ dir vanishes out from under it
+
+    with pytest.raises(DatabaseError):
+        store.record_check_run(_check_run_row())
+
+
+def test_check_run_row_fields_have_no_defaults() -> None:
+    """Every ``CheckRunRow`` field is required at construction (the 1a fence idiom):
+    a NULL is a legal *explicit* value, silence is not — an omitting caller is a
+    ``TypeError`` at construction, never a silently-defaulted column."""
+    for field in dataclasses.fields(CheckRunRow):
+        assert field.default is dataclasses.MISSING, field.name
+        assert field.default_factory is dataclasses.MISSING, field.name
 
 
 # --- criterion 2: replay idempotency x2 ----------------------------------------

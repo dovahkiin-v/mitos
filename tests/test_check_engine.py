@@ -356,7 +356,9 @@ def test_execute_never_reloads_the_reuse_index(
     spy = _SpyTelemetry(temp_telemetry)
     plan = _plan(temp_store, neighbourhoods, spy)
 
-    result = execute_corpus_check(plan, judge=_canned_judge(plan), telemetry=spy)
+    result = execute_corpus_check(
+        plan, judge=_canned_judge(plan), telemetry=spy, store=temp_store
+    )
 
     assert spy.load_calls == 1      # still the plan-time read; execute added none
     assert spy.record_calls == 2    # one persist per batch, nothing else
@@ -382,7 +384,9 @@ def test_execute_on_zero_fresh_groups_with_no_judge_is_healthy(
     plan = _plan(temp_store, neighbourhoods, temp_telemetry)
     assert plan.fresh_groups == () and len(plan.reused) == 1
 
-    result = execute_corpus_check(plan, judge=None, telemetry=temp_telemetry)
+    result = execute_corpus_check(
+        plan, judge=None, telemetry=temp_telemetry, store=temp_store
+    )
 
     assert result.judgment_degraded is None
     assert (result.batches_planned, result.batches_executed, result.batches_skipped) == (0, 0, 0)
@@ -408,7 +412,9 @@ def test_kill_after_batch_k_of_n_leaves_k_batches_durable(
         plan, batch_prefix="kill", overrides={2: RuntimeError("killed mid-run")}
     )
     with pytest.raises(RuntimeError, match="killed mid-run"):
-        execute_corpus_check(plan, judge=judge, telemetry=temp_telemetry)
+        execute_corpus_check(
+            plan, judge=judge, telemetry=temp_telemetry, store=temp_store
+        )
 
     persisted = _batches(temp_telemetry)
     assert [b["batch_id"] for b in persisted] == ["kill-0", "kill-1"]
@@ -430,7 +436,9 @@ def test_unavailable_on_batch_k_trips_the_remainder_without_raising(
         reason=ConflictUnavailableReason.JUDGMENT_TIMEOUT, detail="judge severed"
     )
     judge = _canned_judge(plan, overrides={1: trip})
-    result = execute_corpus_check(plan, judge=judge, telemetry=temp_telemetry)
+    result = execute_corpus_check(
+        plan, judge=judge, telemetry=temp_telemetry, store=temp_store
+    )
 
     assert judge.calls == 2                      # batch 3 never rendered or judged
     assert result.judgment_degraded is trip
@@ -469,7 +477,9 @@ def test_judgment_trip_on_first_batch_skips_remainder_and_keeps_reused_findings(
         reason=ConflictUnavailableReason.JUDGMENT_TIMEOUT, detail="first batch died"
     )
     judge = _canned_judge(plan, overrides={0: trip})
-    result = execute_corpus_check(plan, judge=judge, telemetry=temp_telemetry)
+    result = execute_corpus_check(
+        plan, judge=judge, telemetry=temp_telemetry, store=temp_store
+    )
 
     assert judge.calls == 1                        # one penalty per run, never N
     assert result.judgment_degraded is trip
@@ -497,7 +507,9 @@ def test_parse_malformation_trips_and_persists_nothing_for_the_bad_batch(
     healthy = _canned_judge(plan, batch_prefix="malformed")
     garbage = dataclasses.replace(healthy._rets[0], raw_text="utterly not json {")
     judge = _canned_judge(plan, batch_prefix="malformed", overrides={0: garbage})
-    result = execute_corpus_check(plan, judge=judge, telemetry=temp_telemetry)
+    result = execute_corpus_check(
+        plan, judge=judge, telemetry=temp_telemetry, store=temp_store
+    )
 
     assert judge.calls == 1
     assert result.judgment_degraded is not None
@@ -551,7 +563,9 @@ def test_sweep_trip_mid_plan_carries_the_healthy_prefix_and_still_executes(
     assert len(embed.calls) == 3  # nodes 0..2 gathered; node 3 structurally skipped
 
     judge = _canned_judge(plan, batch_prefix="kd2")
-    result = execute_corpus_check(plan, judge=judge, telemetry=temp_telemetry)
+    result = execute_corpus_check(
+        plan, judge=judge, telemetry=temp_telemetry, store=temp_store
+    )
 
     assert judge.calls == 1                       # the discovered pair WAS judged
     assert result.judgment_degraded is None       # the trips are independent
@@ -577,7 +591,9 @@ def test_telemetry_write_failure_mid_run_degrades_run_not_judgment_loop(
     assert len(plan.fresh_groups) == 2
 
     judge = _canned_judge(plan, batch_prefix="wf")
-    result = execute_corpus_check(plan, judge=judge, telemetry=failing)
+    result = execute_corpus_check(
+        plan, judge=judge, telemetry=failing, store=temp_store
+    )
 
     assert judge.calls == 2                       # the loop never aborted
     assert result.judgment_degraded is None       # the corpus store is not the judge's downstream
@@ -598,7 +614,9 @@ def test_execute_with_no_telemetry_records_one_write_failure_per_batch(
     plan = _plan(temp_store, neighbourhoods, temp_telemetry)
 
     judge = _canned_judge(plan, batch_prefix="nt")
-    result = execute_corpus_check(plan, judge=judge, telemetry=None)
+    result = execute_corpus_check(
+        plan, judge=judge, telemetry=None, store=temp_store
+    )
 
     assert judge.calls == 2
     assert len(result.telemetry_write_failures) == 2
@@ -624,7 +642,9 @@ def test_judge_none_with_fresh_groups_is_a_typed_degradation_zero_spend(
     plan = _plan(temp_store, neighbourhoods, temp_telemetry)
     assert len(plan.fresh_groups) == 1 and len(plan.reused) == 1
 
-    result = execute_corpus_check(plan, judge=None, telemetry=temp_telemetry)
+    result = execute_corpus_check(
+        plan, judge=None, telemetry=temp_telemetry, store=temp_store
+    )
 
     assert result.judgment_degraded is not None
     assert result.judgment_degraded.reason is ConflictUnavailableReason.JUDGMENT
@@ -659,7 +679,9 @@ def test_reused_standing_finding_no_judge_call_known_with_prior_provenance(
     assert plan.fresh_groups == () and len(plan.reused) == 1
 
     judge = _RecordingJudge(None)  # must never be consulted
-    result = execute_corpus_check(plan, judge=judge, telemetry=temp_telemetry)
+    result = execute_corpus_check(
+        plan, judge=judge, telemetry=temp_telemetry, store=temp_store
+    )
 
     assert judge.called is False
     (finding,) = result.findings
@@ -679,7 +701,9 @@ def test_first_ever_finding_is_new(
     plan = _plan(temp_store, neighbourhoods, temp_telemetry)
 
     judge = _canned_judge(plan, batch_prefix="first")
-    result = execute_corpus_check(plan, judge=judge, telemetry=temp_telemetry)
+    result = execute_corpus_check(
+        plan, judge=judge, telemetry=temp_telemetry, store=temp_store
+    )
 
     (finding,) = result.findings
     assert finding.reused is False and finding.novelty == "new"
@@ -718,7 +742,9 @@ def test_fresh_bypasses_reuse_but_never_novelty(
     assert len(plan.fresh_groups) == 2            # full spend disclosed
 
     judge = _canned_judge(plan, batch_prefix="fresh")  # not-tenable 0.9 for both
-    result = execute_corpus_check(plan, judge=judge, telemetry=temp_telemetry)
+    result = execute_corpus_check(
+        plan, judge=judge, telemetry=temp_telemetry, store=temp_store
+    )
 
     assert judge.calls == 2
     # Findings ride pair-key-sorted (the DoD-3 determinism half at the result).
@@ -748,7 +774,9 @@ def test_corrupt_telemetry_degrades_reuse_and_findings_are_unpartitioned(
     assert len(plan.fresh_groups) == 1            # everything fresh
 
     judge = _canned_judge(plan, batch_prefix="corrupt")
-    result = execute_corpus_check(plan, judge=judge, telemetry=temp_telemetry)
+    result = execute_corpus_check(
+        plan, judge=judge, telemetry=temp_telemetry, store=temp_store
+    )
 
     assert result.reuse_unavailable is plan.reuse_unavailable
     (finding,) = result.findings
@@ -798,7 +826,9 @@ def test_reused_tenable_and_below_threshold_verdicts_yield_no_finding(
     assert plan.fresh_groups == () and len(plan.reused) == 2
 
     judge = _RecordingJudge(None)
-    result = execute_corpus_check(plan, judge=judge, telemetry=temp_telemetry)
+    result = execute_corpus_check(
+        plan, judge=judge, telemetry=temp_telemetry, store=temp_store
+    )
 
     assert judge.called is False
     assert result.findings == ()                  # silent — but judged and reused
@@ -833,7 +863,9 @@ def test_latest_verdict_shadows_the_older_one(
     assert plan.fresh_groups == () and len(plan.reused) == 1
     assert plan.reused[0].verdict.batch_id == "newer-tenable"
 
-    result = execute_corpus_check(plan, judge=None, telemetry=temp_telemetry)
+    result = execute_corpus_check(
+        plan, judge=None, telemetry=temp_telemetry, store=temp_store
+    )
     assert result.findings == () and result.judgment_degraded is None
 
 
@@ -891,7 +923,9 @@ def test_row_contract_e2e_stamps_the_oriented_proposal(
         assert group.pairs[0].partner_hash == partner_id
 
         judge = _canned_judge(plan, batch_prefix="rowc", confidence=0.9)
-        result = execute_corpus_check(plan, judge=judge, telemetry=temp_telemetry)
+        result = execute_corpus_check(
+            plan, judge=judge, telemetry=temp_telemetry, store=temp_store
+        )
 
         (row,) = _rows(temp_telemetry)
         assert row["surface"] == "check"
@@ -940,7 +974,9 @@ def test_unknown_alias_degrades_model_id_to_null_but_the_row_lands(
     judge = _SequenceJudge(
         [_execution(verdicts, batch_id="alias-x", model_alias="NOT_A_TIER")]
     )
-    result = execute_corpus_check(plan, judge=judge, telemetry=temp_telemetry)
+    result = execute_corpus_check(
+        plan, judge=judge, telemetry=temp_telemetry, store=temp_store
+    )
 
     (batch,) = _batches(temp_telemetry)
     assert batch["model_id"] is None
@@ -964,7 +1000,9 @@ def test_alias_join_key_guard_raises_loud_on_mismatch(
     ]
     judge = _SequenceJudge([_execution(verdicts, model_alias="FLASH")])
     with pytest.raises(ValueError, match="model_alias mismatch"):
-        execute_corpus_check(plan, judge=judge, telemetry=temp_telemetry)
+        execute_corpus_check(
+            plan, judge=judge, telemetry=temp_telemetry, store=temp_store
+        )
 
     assert _rows(temp_telemetry) == [] and _batches(temp_telemetry) == []
 
@@ -983,7 +1021,9 @@ def test_synthetic_prompt_pin_cannot_execute_and_spends_nothing(
 
     judge = _RecordingJudge(None)
     with pytest.raises(ValueError, match="prompt_version mismatch"):
-        execute_corpus_check(plan, judge=judge, telemetry=temp_telemetry)
+        execute_corpus_check(
+            plan, judge=judge, telemetry=temp_telemetry, store=temp_store
+        )
 
     assert judge.called is False                  # zero spend
     assert _rows(temp_telemetry) == []
@@ -1055,7 +1095,9 @@ def test_empty_corpus_plans_empty_and_executes_healthy_with_zero_contact(
     assert plan.pairs == () and plan.fresh_groups == () and plan.reused == ()
     assert embed.calls == [] and vector.queried == []
 
-    result = execute_corpus_check(plan, judge=None, telemetry=temp_telemetry)
+    result = execute_corpus_check(
+        plan, judge=None, telemetry=temp_telemetry, store=temp_store
+    )
     assert result.judgment_degraded is None and result.findings == ()
     assert isinstance(result.ended_at, str) and result.ended_at >= result.started_at
 

@@ -16,8 +16,10 @@ rebuildable graph (P7 bulkhead): the swap/backup machinery in ``cutover.py`` onl
 ever touches ``graph.sqlite``-derived paths, so a different basename survives the
 truth-rebuild untouched (CONF-D8; the T8 guarantee).
 
-This module pairs an append-only whole-row **writer** with one non-mutating bulk
-**reader** — ``load_reuse_index``, the corpus's first in-tool consumer (verdict
+This module pairs two append-only whole-row **writers** (``record_judged_batch``,
+the per-batch judgment grain; ``record_check_run``, the per-run summary grain —
+the CHK-D7 run memory) with one non-mutating bulk **reader** —
+``load_reuse_index``, the corpus's first in-tool consumer (verdict
 reuse + novelty; CHK-D3/D10). The reader opens the sibling DB ``mode=ro`` so it
 *physically* cannot mutate the corpus, and it never chains derived state (it reads
 the primary judged rows verbatim, M8). There is still no retention, decay, or
@@ -46,7 +48,7 @@ from mitos.store import open_connection
 
 # --- Boundary-crossing row shapes ---------------------------------------------
 #
-# Two frozen dataclasses cross the persistence boundary (Python -> parameterized
+# Three frozen dataclasses cross the persistence boundary (Python -> parameterized
 # INSERT -> STRICT columns -> read-back). Each carries a ``to_params()`` producing
 # a value tuple in a *fixed column order* that must match the module-level column
 # tuples below, so a single INSERT is fully parameterized (P8) and column/param
@@ -222,6 +224,84 @@ class JudgmentBatch:
             self.token_cache_read,
             self.token_cache_creation,
             self.elapsed_ms,
+        )
+
+
+@dataclass(frozen=True)
+class CheckRunRow:
+    """One check run's summary — the per-run grain of the audit's memory (CHK-D7).
+
+    A dumb boundary row: every semantic decision behind these values — the NULL
+    rules, the ``degraded_reason`` token vocabulary, the finding/novelty counts —
+    lives in the check engine's row builder (``check.check_run_row_from_result``),
+    never here. Telemetry stores what it is handed; the DDL comments on
+    ``check_runs`` (above) are the NULL-semantics authority. Defaultless on
+    purpose (the 1a fence idiom): ``None`` is a legal *explicit* value for the
+    nullable columns, silence is not — an omitting writer is a ``TypeError`` at
+    construction, which the schema's constraints alone could never catch.
+
+    Attributes:
+        run_id: The CHK-D7 correlation id — the PK, so "one summary row per run"
+            is structural; the same id rides this run's ``conflict_checks`` rows
+            as ``sync_run_id`` (the one-thread-of-truth join).
+        mode: ``'corpus'`` or ``'staged'`` (the schema CHECKs the closed set; the
+            engine's builder validates it before any connection opens).
+        started_at: Caller-supplied UTC ISO-8601 plan-entry stamp (MI-10).
+        ended_at: Caller-supplied UTC ISO-8601 execute-exit stamp (MI-10).
+        exit_code: The actual process exit for the run — 0, 1 or 2 (CHECKed).
+        nodes_swept: Always known at run end, even degraded.
+        pairs_judged_fresh: Always known at run end.
+        pairs_reused: Reuse-unavailable ⇒ 0, a TRUE zero (the run genuinely
+            reused nothing) — never NULLed.
+        findings_new: ``None`` = novelty partition unavailable (CHK-D10), NOT a
+            zero.
+        findings_known: ``None`` = partition unavailable, same line.
+        coverage_exclusions: The exclusion COUNT (named nodes ride the report);
+            ``None`` = the probe never completed.
+        degraded_reason: ``None`` = healthy; else the engine's comma-joined
+            degradation tokens (the vocabulary is the engine's, P18).
+        mitos_version: The Mitos version that ran the check — NOT NULL (a
+            reuse-only run writes no ``conflict_checks`` rows to join for it).
+    """
+
+    run_id: str
+    mode: str
+    started_at: str
+    ended_at: str
+    exit_code: int
+    nodes_swept: int
+    pairs_judged_fresh: int
+    pairs_reused: int
+    findings_new: Optional[int]
+    findings_known: Optional[int]
+    coverage_exclusions: Optional[int]
+    degraded_reason: Optional[str]
+    mitos_version: str
+
+    def to_params(self) -> Tuple:
+        """Produces the INSERT parameter tuple in ``_CHECK_RUNS_COLUMNS`` order.
+
+        Takes no ``created_at`` argument (unlike :meth:`ConflictCheckRow.to_params`):
+        this row carries its own MI-10 stamps as fields — ``started_at``/``ended_at``
+        are run facts echoed off the result, not a write-time annotation.
+
+        Returns:
+            A value tuple positionally matching ``_CHECK_RUNS_COLUMNS``.
+        """
+        return (
+            self.run_id,
+            self.mode,
+            self.started_at,
+            self.ended_at,
+            self.exit_code,
+            self.nodes_swept,
+            self.pairs_judged_fresh,
+            self.pairs_reused,
+            self.findings_new,
+            self.findings_known,
+            self.coverage_exclusions,
+            self.degraded_reason,
+            self.mitos_version,
         )
 
 
@@ -458,6 +538,24 @@ _JUDGMENT_BATCHES_COLUMNS: Tuple[str, ...] = (
     "elapsed_ms",
 )
 
+# INSERT order == the ``check_runs`` DDL order == the ``test_check_runs_column_contract``
+# pin — one source of truth, lockstep-tested against ``CheckRunRow.to_params()``.
+_CHECK_RUNS_COLUMNS: Tuple[str, ...] = (
+    "run_id",
+    "mode",
+    "started_at",
+    "ended_at",
+    "exit_code",
+    "nodes_swept",
+    "pairs_judged_fresh",
+    "pairs_reused",
+    "findings_new",
+    "findings_known",
+    "coverage_exclusions",
+    "degraded_reason",
+    "mitos_version",
+)
+
 
 def _insert_sql(table: str, columns: Tuple[str, ...]) -> str:
     """Builds a fully-parameterized INSERT over code-internal column literals.
@@ -476,6 +574,7 @@ def _insert_sql(table: str, columns: Tuple[str, ...]) -> str:
 
 _INSERT_CONFLICT_CHECK_SQL = _insert_sql("conflict_checks", _CONFLICT_CHECKS_COLUMNS)
 _INSERT_JUDGMENT_BATCH_SQL = _insert_sql("judgment_batches", _JUDGMENT_BATCHES_COLUMNS)
+_INSERT_CHECK_RUN_SQL = _insert_sql("check_runs", _CHECK_RUNS_COLUMNS)
 
 
 # --- Read-side boundary shapes (verdict-reuse / novelty projection) -----------
@@ -624,8 +723,9 @@ class TelemetryStore:
     Boots its own migration ladder on construction (mirroring
     ``GraphStore.__init__``'s boot-on-init shape) and is otherwise
     connection-stateless: every operation opens its own connection through the MI-8
-    chokepoint and closes it, holding no long-lived handle. It pairs one append-only
-    writer (``record_judged_batch``) with one read-only bulk projection
+    chokepoint and closes it, holding no long-lived handle. It pairs two append-only
+    writers (``record_judged_batch`` — the per-batch grain; ``record_check_run`` —
+    the per-run summary grain) with one read-only bulk projection
     (``load_reuse_index``, the sibling's first consumer-facing read surface) — the
     reader opens ``mode=ro``, so "no writes on the read path" is structural, not
     disciplinary.
@@ -704,6 +804,40 @@ class TelemetryStore:
             # one-line ``Error: …`` under the CLI's ``except MitosError`` boundary
             # (§13; mint no new error class).
             raise DatabaseError(f"Failed to persist judged batch: {e}") from e
+        finally:
+            conn.close()
+
+    def record_check_run(self, row: CheckRunRow) -> None:
+        """Persists one check run's summary row — the CHK-D7 run memory (W7).
+
+        Mirrors :meth:`record_judged_batch`'s manners exactly: its own fresh
+        deferred-isolation connection, one INSERT under ``with conn:``,
+        append-only (never UPDATE/DELETE), no wall-clock read — the row carries
+        the caller's MI-10 stamps. ``run_id`` is the table PK, so a second write
+        for the same run raises (one summary row per run is structural).
+
+        This writer is a dumb sink (the 1b sibling-store bulkhead): the scalars'
+        semantics — NULL rules, degradation tokens, novelty counts — are the
+        check engine's, computed in ``check.check_run_row_from_result`` from the
+        same result object the run report reads. The seam order is the CLI's
+        (3a): compute the exit code → build the row → this write, LAST, so a
+        failure here can only move the exit toward 2 and a persisted row's
+        ``exit_code`` always equals the actual process exit.
+
+        Args:
+            row: The assembled summary row, verbatim.
+
+        Raises:
+            DatabaseError: If the row cannot be persisted (duplicate ``run_id``,
+                a CHECK/NOT NULL breach, or any other SQLite error) — never
+                swallowed; the caller owns the disclose-and-exit disposition.
+        """
+        conn = open_connection(self.telemetry_path)
+        try:
+            with conn:
+                conn.execute(_INSERT_CHECK_RUN_SQL, row.to_params())
+        except sqlite3.Error as e:
+            raise DatabaseError(f"Failed to persist check run: {e}") from e
         finally:
             conn.close()
 
