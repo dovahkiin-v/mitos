@@ -10,12 +10,14 @@ import os
 import re
 import time
 import json
+import sqlite3
 import hashlib
 import argparse
-from typing import List, Optional, Dict, Any, Set
+from typing import Callable, List, Optional, Dict, Any, Set, Tuple
 from google import genai
 
 from mitos import __version__
+from mitos import check
 from mitos.display import (
     apply_stdout_text_safety,
     blackout_note,
@@ -34,8 +36,13 @@ from mitos.config import (
     global_env_path,
     hint_due,
 )
-from mitos.errors import MitosError, ParseError, ValidationError, DatabaseError, ConfigError, VectorStoreError
-from mitos.vector_store import scroll_point_ids, hash_to_uuid
+from mitos.errors import (
+    MitosError, ParseError, ValidationError, DatabaseError, ConfigError,
+    VectorStoreError, EmbeddingError,
+)
+from mitos.vector_store import scroll_point_ids, hash_to_uuid, QdrantVectorStore
+from mitos.embeddings import GeminiEmbeddingProvider
+from mitos.telemetry import TelemetryStore
 from mitos.migrations import is_pre_v1a_schema
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS, open_connection
 from mitos.cutover import default_aside_db_path, perform_swap, rebuild_and_gate
@@ -2284,6 +2291,488 @@ def load_dotenv_file(path: str = ".env") -> None:
         pass
 
 
+# =========================================================================== #
+# Phase 3a — `mitos check`: the read-only corpus conflict audit / CI gate.
+#
+# Presentation + disposition only: the engine (mitos/check.py) computes every
+# partition and count; `cmd_check` maps a typed CheckRunResult to human/JSON
+# output and the shipped 0/1/2 exit contract (CHK-C2). The load-bearing rules —
+# the exit table, the no-row-on-refusal rule (KD4), the plan→confirm→execute→
+# row seam order (KD5), the `_emit_json`-only discipline — live in the phase plan.
+# =========================================================================== #
+
+# The parent's P15 per-check token budget estimate, per judged batch — used only
+# to size the TTY confirm's disclosure (a rough figure, not a billed number).
+_CHECK_TOKENS_PER_BATCH_ESTIMATE = 3000
+
+# The four reverse-relation modifier stamp keys copied off a hydrated finding node
+# (the `candidate_payload` manner, conflict.py). Single-sourced from the store's
+# canonical map so a new modifier edge type never drifts this surface.
+_CHECK_MODIFIER_STAMP_KEYS: Tuple[str, ...] = tuple(MODIFIER_EDGE_KEYS.values())
+
+
+def _build_check_substrate(
+    config: MitosConfig,
+) -> Tuple[Optional[GeminiEmbeddingProvider], Optional[QdrantVectorStore],
+           Optional[str], Optional[str]]:
+    """Constructs the two best-effort external substrate providers (KD2).
+
+    Both providers RAISE at construction — ``GeminiEmbeddingProvider`` when
+    ``GEMINI_API_KEY`` is unset, ``QdrantVectorStore`` when Qdrant is unreachable
+    (its ``__init__`` contacts the network). Each is caught NARROWLY (its own typed
+    error, never a blanket ``except``) and degraded to ``None`` + a kept detail
+    string, so an unexpected error still propagates. The disposition (refuse iff the
+    run has sweep work) is the caller's — this only reports availability. Separated
+    into a module-level helper so tests inject keyed fakes at this seam.
+
+    Args:
+        config: The active workspace config (paths + Qdrant coordinates).
+
+    Returns:
+        ``(embed, vector, embed_detail, vector_detail)`` — a provider or ``None``,
+        and the failure message string (``None`` on success) for each.
+    """
+    embed: Optional[GeminiEmbeddingProvider] = None
+    embed_detail: Optional[str] = None
+    try:
+        embed = GeminiEmbeddingProvider(
+            os.path.join(config.mitos_dir, "embedding_cache.sqlite")
+        )
+    except EmbeddingError as exc:
+        embed_detail = str(exc)
+    vector: Optional[QdrantVectorStore] = None
+    vector_detail: Optional[str] = None
+    try:
+        vector = QdrantVectorStore(config.qdrant_url, config.qdrant_collection)
+    except VectorStoreError as exc:
+        vector_detail = str(exc)
+    return embed, vector, embed_detail, vector_detail
+
+
+def _build_check_telemetry(config: MitosConfig) -> Optional[TelemetryStore]:
+    """Constructs the sibling telemetry store best-effort (KD2), or ``None``.
+
+    A telemetry-construction failure is the engine's documented ``reuse_read``
+    degradation (the run proceeds all-fresh, reports unpartitioned, and the KD5
+    seam records no row) — it must never crash a read-only audit. Mirrors
+    ``_new_conflict_run``'s best-effort posture (sync.py). A module-level seam so
+    tests inject ``None`` or a failing-write wrapper here.
+
+    Args:
+        config: The active workspace config.
+
+    Returns:
+        The :class:`TelemetryStore`, or ``None`` when it could not be constructed.
+    """
+    try:
+        return TelemetryStore(config.telemetry_path)
+    except (sqlite3.Error, DatabaseError, MitosError):
+        return None
+
+
+def _build_check_judge() -> Optional[Callable]:
+    """Builds the bound conflict-judgment executor, or ``None`` when keyless (KD6).
+
+    The ``_build_conflict_judge`` shape with the OPPOSITE disposition: it does NOT
+    couple to embed/vector presence (check's candidate gather already ran at plan
+    time), and ``None`` means "let the engine degrade typed" (``judge=None`` + fresh
+    groups → a typed judgment degradation, exit 2, zero spend), not "skip the
+    surface". The Anthropic SDK import is lazy so no other verb drags ``anthropic``
+    onto its import path (Tier discipline). Built only after the confirm passes and
+    only when fresh groups exist, so a reuse-only/clean run never constructs a client.
+
+    Returns:
+        The bound one-arg ``judge`` callable, or ``None`` when ``ANTHROPIC_API_KEY``
+        is absent.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return None
+    import anthropic
+    from mitos.conflict_judgment import make_judgment_executor
+
+    return make_judgment_executor(anthropic.Anthropic(api_key=api_key))
+
+
+def _check_finding_side(node: Dict[str, Any]) -> Dict[str, Any]:
+    """Shapes one finding side as ``id`` + the Letter core + non-empty stamps (C4).
+
+    The node is already hydrated + modifier-stamped (2b snapshot / ``Candidate.node``)
+    — slugs and stamps ride free, no per-finding store read. Reuses
+    :func:`display.letter_payload` for the Letter core (never a raw node), then copies
+    only the present modifier stamps (the ``candidate_payload`` conditional-copy
+    manner — blind indexing would KeyError on the common unmodified node).
+
+    Args:
+        node: A finding's hydrated ``proposal_node`` / ``partner_node`` dict.
+
+    Returns:
+        The JSON-native finding-side object (``id``, ``slug``, ``axiom``, ``scope``,
+        ``rejected_paths``, plus any non-empty modifier stamps).
+    """
+    side: Dict[str, Any] = {"id": node["id"]}
+    side.update(letter_payload(node, brief=False))
+    for key in _CHECK_MODIFIER_STAMP_KEYS:
+        if key in node:
+            side[key] = node[key]
+    return side
+
+
+def _check_finding_json(finding: "check.CheckFinding") -> Dict[str, Any]:
+    """Renders one :class:`~mitos.check.CheckFinding` as its flat JSON object (§8/KD7)."""
+    return {
+        "novelty": finding.novelty,
+        "confidence": finding.confidence,
+        "rationale": finding.rationale,
+        "score": finding.score,
+        "reused": finding.reused,
+        "source_batch_id": finding.source_batch_id,
+        "source_created_at": finding.source_created_at,
+        "proposal": _check_finding_side(finding.proposal_node),
+        "partner": _check_finding_side(finding.partner_node),
+    }
+
+
+def _resolve_exclusion_display(
+    store: GraphStore, ids: Tuple[str, ...]
+) -> List[Dict[str, Any]]:
+    """Resolves display slugs for coverage-exclusion node ids, best-effort live (MI-2).
+
+    ``coverage_exclusion_ids`` returns content hashes; ``get_node`` is
+    state-agnostic (a since-superseded node still resolves), so the raw-id fallback
+    covers only a genuinely absent node (``None`` → ``slug`` ``None``). These reads
+    sit in the display-model build, before the write seam.
+    """
+    out: List[Dict[str, Any]] = []
+    for node_id in ids:
+        node = store.get_node(node_id)
+        out.append({"id": node_id, "slug": node.get("slug") if node else None})
+    return out
+
+
+def _check_transient_count(result: "check.CheckRunResult") -> int:
+    """Distinct transient-backlog node count across the readable probes (§8)."""
+    ids = {row.node_id for row in result.start_probe.transient}
+    if isinstance(result.end_probe, check.StaleProbe):
+        ids |= {row.node_id for row in result.end_probe.transient}
+    return len(ids)
+
+
+def _check_json_object(
+    result: "check.CheckRunResult",
+    row: "check.CheckRunRow",
+    *,
+    exclusions: List[Dict[str, Any]],
+    exit_code: int,
+    row_written: bool,
+    scope: Optional[str],
+    fresh: bool,
+    transient_count: int,
+) -> Dict[str, Any]:
+    """Assembles the single §8 ``--json`` object (a shipped API — additive only).
+
+    ``findings_new`` / ``findings_known`` are read off ``row`` (built via
+    :func:`check.check_run_row_from_result`) so the JSON and the ``check_runs`` row
+    can never disagree on the NULL-when-unpartitioned rule. ``scope`` is ABSENT when
+    unset (MI-9: never ``""``). Emission is deferred to :func:`_emit_json` by the
+    caller (the ONLY JSON path).
+    """
+    obj: Dict[str, Any] = {
+        "run_id": result.run_id,
+        "mode": "corpus",
+        "exit_code": exit_code,
+        "started_at": result.started_at,
+        "ended_at": result.ended_at,
+        "fresh": fresh,
+    }
+    if scope is not None:
+        obj["scope"] = scope
+    obj.update({
+        "nodes_total": result.nodes_total,
+        "nodes_swept": result.nodes_swept,
+        "pairs_judged_fresh": result.pairs_judged_fresh,
+        "pairs_reused": result.pairs_reused,
+        "batches_planned": result.batches_planned,
+        "batches_executed": result.batches_executed,
+        "batches_skipped": result.batches_skipped,
+        "findings": [_check_finding_json(f) for f in result.findings],
+        "findings_new": row.findings_new,
+        "findings_known": row.findings_known,
+        "degradations": list(check.run_degradations(result)),
+        "coverage_exclusions": exclusions,
+        "index_backlog_transient": transient_count,
+        "summary_row_written": row_written,
+    })
+    return obj
+
+
+def _print_check_finding_side(node: Dict[str, Any]) -> None:
+    """Prints one finding side's Letter fields as a calm plain-text block (P9)."""
+    print(f"    {node['slug']}")
+    print(f"      Axiom:    {node['core_axiom']}")
+    scope = node.get("scope") or []
+    scope_text = ", ".join(scope) if scope else "(global — no scope declared)"
+    print(f"      Scope:    {scope_text}")
+    rejected = node.get("rejected_paths")
+    if rejected:
+        print(f"      Rejected: {rejected}")
+    for key in _CHECK_MODIFIER_STAMP_KEYS:
+        if key in node:
+            print(f"      ({key.replace('_', ' ')}: {', '.join(node[key])})")
+
+
+def _print_full_finding(finding: "check.CheckFinding") -> None:
+    """Prints both sides of a finding plus its rationale (the full new-finding block)."""
+    _print_check_finding_side(finding.proposal_node)
+    _print_check_finding_side(finding.partner_node)
+    print("      Why they may not both stand:")
+    print(f"        {finding.rationale}   (confidence {finding.confidence:.2f})")
+
+
+def _check_degradation_summary(degradations: Tuple[str, ...]) -> str:
+    """Renders the degradation tokens as calm human wording (KD4 — from tokens, never
+    by re-parsing ``degraded_reason``)."""
+    words = {
+        "sweep": "the corpus sweep degraded mid-run",
+        "judgment": "the judgment stage could not complete",
+        "reuse_read": "prior-verdict history was unreadable (findings shown unpartitioned)",
+        "telemetry_write": "some per-batch results could not be recorded",
+        "stale_index": "the vector index is behind (recall may be thinned)",
+        "probe_read": "completeness could not be certified (the index probe was unreadable)",
+    }
+    return "; ".join(words[token] for token in degradations)
+
+
+def _print_check_report(
+    result: "check.CheckRunResult",
+    *,
+    exclusions: List[Dict[str, Any]],
+    denominator: Optional[int],
+    scope: Optional[str],
+    row_written: bool,
+    transient_count: int,
+) -> None:
+    """Renders the human report to stdout (findings + disposition), calm ASCII (P9).
+
+    All wording lives HERE (the surface); the engine renders nothing. Findings are
+    partitioned by the already-derived ``novelty`` (never re-derived): new findings
+    print in full with the resolution pointer, standing (known) findings ride a
+    compact section under the index-pinned ``standing (previously reported)`` label,
+    and unpartitioned findings (novelty unknown — only under a reuse-read failure)
+    get their own labeled section rather than reading as new.
+    """
+    degradations = check.run_degradations(result)
+    new = [f for f in result.findings if f.novelty == "new"]
+    known = [f for f in result.findings if f.novelty == "known"]
+    unpartitioned = [f for f in result.findings if f.novelty is None]
+
+    if new:
+        noun = "contradiction" if len(new) == 1 else "contradictions"
+        print(f"\n[Conflict] {len(new)} new {noun} — these decisions may not both stand:")
+        for finding in new:
+            _print_full_finding(finding)
+        print("  Resolve by declaring a relationship in decisions.md "
+              "(Supersedes: / Amends: / Narrows: / Contradicts:), then re-sync.")
+
+    if unpartitioned:
+        print("\nfindings (history unavailable — unpartitioned):")
+        for finding in unpartitioned:
+            _print_full_finding(finding)
+
+    if known:
+        print("\nstanding (previously reported):")
+        for finding in known:
+            a, b = finding.proposal_node["slug"], finding.partner_node["slug"]
+            print(f"  {a} — {b}   (confidence {finding.confidence:.2f}, "
+                  f"first reported {finding.source_created_at})")
+
+    if degradations:
+        print(f"\n[partial] This check could not fully run "
+              f"({_check_degradation_summary(degradations)}).")
+        print(f"  Swept {result.nodes_swept} of {result.nodes_total} decisions; any "
+              f"findings above are labeled partial, not certified complete.")
+
+    if not row_written:
+        print("  Note: this run was not recorded to check history "
+              "(the summary row could not be written).")
+
+    if exclusions:
+        print("\nCoverage exclusions (chronically un-embedded — NOT audited):")
+        for item in exclusions:
+            print(f"  - {item['slug'] or item['id']}")
+        print("  These keep failing to embed; the durable fix is outbox quarantine "
+              "(substrate-owned). Re-run `mitos sync` to retry.")
+
+    if transient_count:
+        print(f"\n{transient_count} decision(s) are behind the vector index — recall "
+              f"may be thinned. Run `mitos sync` to catch up.")
+
+    if not result.findings and not degradations:
+        if scope is not None and result.nodes_total == 0:
+            print(f"0 of {denominator} live decisions match scope '{scope}' — "
+                  f"nothing audited.")
+        elif result.nodes_total == 0:
+            print("No decisions to audit — the corpus is empty.")
+        else:
+            noun = "decision" if result.nodes_swept == 1 else "decisions"
+            print(f"Corpus coherent — {result.nodes_swept} {noun} audited, "
+                  f"no contradictions found.")
+
+
+def cmd_check(
+    config: MitosConfig,
+    *,
+    scope: Optional[str],
+    fresh: bool,
+    assume_yes: bool,
+    as_json: bool,
+) -> int:
+    """Audits the live corpus for undeclared contradictions (read-only) → exit 0/1/2.
+
+    The one sequence (each step's contract in the phase plan §4): build substrate →
+    provider-absent disposition (KD2) → ``plan_corpus_check`` → CHK-D5 confirm (KD3)
+    → build judge iff fresh groups (KD6) → ``execute_corpus_check`` → build the full
+    display model → the run-end seam (``exit_code_for`` → row → ``record_check_run``
+    LAST, KD5) → emit. ``cmd_check`` owns its error boundary (KD1a): store faults
+    around plan/execute/display map to a calm exit-2 vector message, never a traceback
+    read by CI as "new findings".
+
+    Args:
+        config: The active workspace config.
+        scope: Optional scope tag filtering the audited (proposal) set (candidate
+            recall stays scope-blind, CONF-D2).
+        fresh: Re-judge every pair, bypassing verdict reuse (never the novelty read).
+        assume_yes: Waive the CHK-D5 spend confirm (the opt-in on every surface).
+        as_json: Emit one machine-readable object via :func:`_emit_json` (never prompts).
+
+    Returns:
+        ``0`` clean or known-only, ``1`` a NEW contradiction, ``2`` degraded, refused,
+        or could-not-run.
+    """
+    # Lazy at entry (KD6): the alias is needed at PLAN time, but importing
+    # `conflict_judgment` module-scope would drag `anthropic` onto every other verb.
+    from mitos.conflict_judgment import _JUDGMENT_MODEL_ALIAS
+
+    try:
+        store = GraphStore(config.db_path)
+        embed, vector, embed_detail, vector_detail = _build_check_substrate(config)
+        telemetry = _build_check_telemetry(config)
+
+        # KD2 — provider-absent disposition keys on whether the run has sweep work.
+        if embed is None or vector is None:
+            active = store.get_active_decisions(scope)
+            if active:
+                parts: List[str] = []
+                if embed is None:
+                    parts.append(f"embeddings ({embed_detail})")
+                if vector is None:
+                    parts.append(f"vector store ({vector_detail})")
+                msg = (f"check could not run: cannot audit {len(active)} live "
+                       f"decision(s) — {' and '.join(parts)} unavailable.")
+                if as_json:
+                    _emit_json({"error": msg, "code": "substrate_unavailable"})
+                else:
+                    print(msg, file=sys.stderr)
+                return 2
+            # Empty snapshot → the providers are never touched (iter_sweep is lazy
+            # over zero nodes); fall through to the one healthy-empty engine path.
+
+        plan = check.plan_corpus_check(
+            store=store,
+            embed_provider=embed,
+            vector_store=vector,
+            telemetry=telemetry,
+            model_alias=_JUDGMENT_MODEL_ALIAS,
+            scope=scope,
+            fresh=fresh,
+        )
+
+        # CHK-D5 confirm (KD3) — strictly above the threshold; all refusals exit 2,
+        # zero spend, no row. Read the threshold as a module attribute so tests can
+        # monkeypatch it to 1 instead of building an 11-batch corpus.
+        n = len(plan.fresh_groups)
+        if n > check.CHECK_CONFIRM_BATCHES and not assume_yes:
+            if as_json:
+                # Automation never prompts (a prompt would also corrupt the object).
+                _emit_json({
+                    "error": (f"{n} judgment batches pending — re-run with --yes to "
+                              f"authorize the spend."),
+                    "code": "confirmation_required",
+                    "batches_planned": n,
+                })
+                return 2
+            if not sys.stdin.isatty():
+                print(f"{n} judgment batches pending — re-run with --yes to authorize "
+                      f"the spend.", file=sys.stderr)
+                return 2
+            estimate = n * _CHECK_TOKENS_PER_BATCH_ESTIMATE
+            print(f"{n} judgment batches pending (≈{estimate:,} tokens) — this run "
+                  f"will call the judge model.")
+            if input("Proceed with the spend? [y/N] ").strip().lower() not in ("y", "yes"):
+                print("Aborted — nothing spent.")
+                return 2
+
+        # Build the judge only after the confirm passes and only when there is fresh
+        # work (KD6): a reuse-only/clean run never constructs a client.
+        judge = _build_check_judge() if plan.fresh_groups else None
+        result = check.execute_corpus_check(
+            plan, judge=judge, telemetry=telemetry, store=store
+        )
+
+        # The full display model — every remaining store read happens HERE, before
+        # the write seam (KD5).
+        exclusions = _resolve_exclusion_display(
+            store, check.coverage_exclusion_ids(result)
+        )
+        transient_count = _check_transient_count(result)
+        denominator: Optional[int] = None
+        if scope is not None and plan.nodes_total == 0:
+            # The zero-match denominator needs the unscoped live count the plan does
+            # not carry (plan.nodes_total is already scope-filtered).
+            denominator = len(store.get_active_decisions())
+
+        # Run-end seam (KD5): exit → row → write LAST. Build the row unconditionally
+        # (pure) so the JSON scalars derive from the one source; write it only when
+        # telemetry exists.
+        exit_code = check.exit_code_for(result)
+        row = check.check_run_row_from_result(result, mode="corpus", exit_code=exit_code)
+        row_written = False
+        if telemetry is not None:
+            try:
+                telemetry.record_check_run(row)
+                row_written = True
+            except DatabaseError:
+                # The write is the last fallible act: a failure only moves toward 2.
+                exit_code = 2
+        else:
+            # telemetry None is already exit 2 via reuse_read; the no-row disclosure
+            # is additive, not a second exit driver.
+            exit_code = 2
+    except (sqlite3.Error, DatabaseError, MitosError) as exc:
+        # KD1a — the verb owns its boundary: a store fault is exit 2 with a calm
+        # vector message, never a traceback CI would read as "new findings".
+        msg = f"check could not run: {exc}"
+        if as_json:
+            _emit_json({"error": msg, "code": "check_faulted"})
+        else:
+            print(msg, file=sys.stderr)
+        return 2
+
+    # Emission is pure (out of the write contract): one JSON object or the report.
+    if as_json:
+        _emit_json(_check_json_object(
+            result, row, exclusions=exclusions, exit_code=exit_code,
+            row_written=row_written, scope=scope, fresh=fresh,
+            transient_count=transient_count,
+        ))
+    else:
+        _print_check_report(
+            result, exclusions=exclusions, denominator=denominator, scope=scope,
+            row_written=row_written, transient_count=transient_count,
+        )
+    return exit_code
+
+
 def _enter_target_directory(directory: Optional[str]) -> None:
     """chdir into a -C/--directory target, or no-op when none was given.
 
@@ -2475,6 +2964,23 @@ def main() -> None:
     rebuild_p.add_argument("--json", action="store_true", dest="as_json",
                            help="Emit a machine-readable JSON report.")
 
+    # check — read-only corpus conflict audit / CI gate (exit 0/1/2).
+    check_p = subparsers.add_parser(
+        "check",
+        help="Audit the live corpus for undeclared contradictions (read-only). "
+             "Exit 0 = clean or known-only, 1 = a NEW contradiction, 2 = degraded, "
+             "refused, or could not run.")
+    check_p.add_argument("--scope", default=None,
+                         help="Restrict the audited (proposal) set to one scope tag "
+                              "(candidate recall stays scope-blind).")
+    check_p.add_argument("--fresh", action="store_true",
+                         help="Re-judge every pair, bypassing verdict reuse.")
+    check_p.add_argument("--yes", action="store_true",
+                         help="Authorize the LLM spend without prompting (the opt-in "
+                              "on every non-interactive surface).")
+    check_p.add_argument("--json", action="store_true", dest="as_json",
+                         help="Emit one machine-readable JSON object (never prompts).")
+
     # agent-block — print the canonical agent-file block to paste, or --check pasted copies.
     ab_p = subparsers.add_parser(
         "agent-block",
@@ -2578,12 +3084,20 @@ def main() -> None:
         elif args.command == "rebuild":
             sys.exit(cmd_rebuild(config, allow_drops=args.allow_drops,
                                  assume_yes=args.yes, as_json=args.as_json))
+        elif args.command == "check":
+            sys.exit(cmd_check(config, scope=args.scope, fresh=args.fresh,
+                               assume_yes=args.yes, as_json=args.as_json))
     except MitosError as e:
+        # KD1: `check` maps every pre-verb/boundary failure (bad -C, ConfigError, an
+        # escaped store fault) to exit 2 — for CI, "could not run" is one routing
+        # class with the verb's own exit-2 refusals; no other verb's contract moves.
         print(f"Error: {str(e)}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(2 if args.command == "check" else 1)
     except Exception as e:
+        # The generic arm needs the same conditional: an unexpected crash under
+        # `check` must not read as exit-1 "findings" to a CI consumer.
         print(f"Fatal Unexpected Error: {str(e)}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(2 if args.command == "check" else 1)
     finally:
         # Best-effort 'new version available' nudge, AFTER the command's own
         # output (the finally runs even on the sys.exit paths above). Skipped for
