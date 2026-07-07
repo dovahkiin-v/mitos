@@ -29,7 +29,7 @@ from typing import Dict, List, Optional
 # copies to refresh. The marker embeds this number; `mitos status` compares a project's
 # pasted marker against it. (Not tied to the package __version__ — most releases don't
 # touch the block.)
-AGENT_GUIDE_VERSION = 1
+AGENT_GUIDE_VERSION = 2
 
 # The agent-instruction filenames mitos knows about (the SETUP.md §6 list), checked at
 # the project root only — these are where the block is pasted.
@@ -78,6 +78,10 @@ def agent_block(version: int = AGENT_GUIDE_VERSION) -> str:
         "self-describing — their schemas state the required fields and constraints "
         "(including the slug handle) — and SETUP.md is the full guide: what's worth "
         "recording, how to choose a slug, and how to link related decisions.\n"
+        "- **Keep the graph honest:** after a burst of `record_decision` writes — or "
+        "when starting a session — run `mitos check` to audit the live corpus for "
+        "undeclared contradictions (read-only; it never edits anything). Resolve any "
+        "finding the normal way: declare the relationship in `decisions.md`.\n"
         "<!-- /mitos-agent-guide -->"
     )
 

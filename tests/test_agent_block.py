@@ -46,6 +46,7 @@ def test_agent_block_carries_current_marker_and_pointers():
     # the guide rather than inlining the field list / slug cap (which can change).
     assert "mitos status" in block
     assert "record_decision" in block
+    assert "mitos check" in block  # the habit line pointing at the conflict sweep (4a)
     assert "SETUP.md" in block.replace("setup.md", "SETUP.md") or "github.com/dovahkiin-v/mitos" in block
     assert "≤100" not in block and "100 characters" not in block  # volatile detail stays out
 
@@ -74,6 +75,23 @@ def test_scan_old_marker_is_outdated(tmp_path):
     files = scan_agent_files(str(tmp_path))
     assert files[0]["status"] == "outdated"
     assert files[0]["marker_version"] == 0
+
+
+def test_scan_v1_paste_without_habit_line_is_outdated(tmp_path, capsys):
+    """A pre-4a v1 paste (no `mitos check` habit line) flags for refresh.
+
+    The habit line landed at guide v2, so a v1 marker is behind the running version:
+    `scan_agent_files` reads it `outdated`, `agent_block_drift` reports `stale`, and
+    `mitos agent-block --check` exits 1 — the nudge to re-paste the current block.
+    """
+    (tmp_path / "AGENTS.md").write_text(
+        "<!-- mitos-agent-guide: v1 -->\n## Architectural Decisions — Mitos\n"
+        "record_decision etc.", encoding="utf-8")
+    files = scan_agent_files(str(tmp_path))
+    assert files[0]["status"] == "outdated"
+    assert files[0]["marker_version"] == 1
+    assert agent_block_drift(str(tmp_path))["stale"] is True
+    assert cli.cmd_agent_block(str(tmp_path), check=True) == 1
 
 
 # A pre-marker pasted block: it has the distinctive heading but no version marker.
