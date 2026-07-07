@@ -139,6 +139,29 @@ mitos rebuild                # refuses to swap if it would drop content; shows w
 mitos rebuild --allow-drops  # proceed, accepting the drops (they stay in the markdown)
 ```
 
+### 6. Conflict Audit (`mitos check`)
+Audits the live corpus for undeclared contradictions between active decisions — read-only (writes only telemetry). It can also gate the pending `decisions.md` buffer as a pre-commit / CI check with `--staged`.
+
+**Exit contract (a stable API callers may script against):**
+- `0` — clean, or only previously-reported ("known") findings.
+- `1` — a NEW undeclared contradiction.
+- `2` — degraded / refused / could-not-run. A check that cannot certify never returns `0`/`1`, and **`2` dominates `1`**.
+
+**Flags:**
+- `--scope TAG` — restrict the audited (proposal) set to one scope tag; candidate recall stays scope-blind (corpus only).
+- `--fresh` — re-judge every pair, bypassing verdict reuse (corpus only).
+- `--yes` — authorize the LLM spend without prompting (the opt-in on every non-interactive surface).
+- `--json` — emit one machine-readable JSON object (never prompts).
+- `--staged` — gate the PENDING buffer of the working-tree `decisions.md` (the pre-commit / CI gate) instead of sweeping the live corpus. Fails closed: exit `2` when it cannot run. Not git's staging area — it reads the working-tree `decisions.md`. Rejects `--scope`/`--fresh`.
+
+```bash
+mitos check                 # audit the live corpus
+mitos check --json          # machine-readable, for tooling
+mitos check --staged        # gate the pending decisions.md buffer (pre-commit)
+```
+
+For pre-commit hook, CI, and cron recipes — and the keys, Qdrant, and latency they require — see **[SETUP.md](SETUP.md)** → *Gating commits with `mitos check`*.
+
 ---
 
 ## 🧪 Testing

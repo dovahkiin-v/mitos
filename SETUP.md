@@ -181,6 +181,87 @@ one is genuinely connected, link it.
 
 ---
 
+## Gating commits with `mitos check` (pre-commit / CI / cron)
+
+`mitos check` audits the corpus for undeclared contradictions. Two modes: the
+default **corpus sweep** (`mitos check`) audits every active decision; `--staged`
+gates just the **pending buffer** of `decisions.md` before it lands. The exit
+contract is scriptable — `0` clean or known-only, `1` a NEW contradiction, `2`
+degraded / refused / could-not-run (a check that cannot certify never returns
+`0`/`1`).
+
+### Pre-commit hook
+
+Wire the staged gate into `.git/hooks/pre-commit` (or your hook manager). Guard
+the divergence first — `mitos check --staged` reads the **working tree**, but git
+commits the **index**; if they differ, the gate checks the wrong bytes:
+
+```sh
+# Fail loudly if decisions.md differs between the index and the working tree —
+# `mitos check --staged` reads the WORKING TREE, git commits the INDEX; a divergence
+# would gate the wrong bytes (a bad entry fixed-but-not-restaged slips the gate).
+if ! git diff --quiet -- decisions.md; then
+    echo "decisions.md has unstaged changes — stage or stash them before committing" >&2
+    exit 1
+fi
+mitos check --staged
+```
+
+A commit that touches no pending decision entries short-circuits to exit `0` with
+**zero LLM contact** — the hook is effectively free on the overwhelming majority
+of commits.
+
+### Keys, Qdrant, and the secretless-CI consequence
+
+`--staged` with pending entries needs a **Gemini key + Anthropic key + reachable
+Qdrant** in the hook's environment. A secretless CI runner **cannot** pass the
+gate on a buffer with pending entries — it exits `2` (fail-closed: a gate that
+cannot check must not pass). This is correct behavior, not a bug.
+
+Two sanctioned ways to live with it:
+
+- Run the `--staged` gate **only in the keyed dev environment** (local
+  pre-commit), where the keys and Qdrant are already present.
+- In **secretless CI**, run the **corpus sweep** (`mitos check`) on a **keyed
+  schedule** instead of a per-commit staged gate.
+
+`git commit --no-verify` is the deliberate human bypass — the intended escape
+hatch when you need to commit past the gate on purpose.
+
+### Latency
+
+- **No pending decision entries** → exit `0`, zero LLM contact, effectively
+  instant (the common commit).
+- **N pending entries** → N sequential judgment calls at ~**5s P95 each**, so a
+  5-entry buffer ≈ **25s** of hook time. That is expected and acceptable for a
+  decisions-file commit — the first slow commit is the gate working, not a hang.
+
+### Scheduled corpus sweep (cron / CI)
+
+For a periodic audit of the whole corpus, run the sweep non-interactively:
+
+```sh
+# Nightly corpus audit — non-interactive, so --yes authorizes the spend.
+# Scope-bind where spend matters.
+mitos check --yes                 # full corpus
+mitos check --yes --scope <tag>   # narrow to one scope
+```
+
+`--yes` is **required** on any non-interactive surface once the pending-batch
+count exceeds the confirm threshold: without a TTY and without `--yes` above
+threshold, the run refuses and exits `2` (it never prompts and never spends). In
+a CI schedule, branch on the exit code: `0` clean, `1` a new finding (fail the
+job / open an issue), `2` degraded (alert — the audit couldn't certify).
+
+### First-run sticker shock
+
+The first corpus sweep judges every fresh pair, so its preflight budget estimate
+(~3K tokens/batch) can print a large one-time number. It does not recur: `--scope`
+narrows the sweep, and verdict **reuse** means subsequent runs re-judge only
+genuinely-changed pairs. The big number on run 1 is expected, not alarming.
+
+---
+
 ## Cutover (migrating a prototype graph to V1a)
 
 A graph created by an **older (pre-V1a) Mitos** uses a different node identity, so
