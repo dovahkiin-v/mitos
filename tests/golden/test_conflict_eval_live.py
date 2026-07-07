@@ -624,10 +624,16 @@ def test_corpus_reuse_determinism_and_scalar_law(conflict_index):
         _skip_if_unavailable(run3)
         r3 = run3["result"]
         assert r3.pairs_judged_fresh > 0, "--fresh must re-judge (bypass the reuse partition)"
-        # The reuse index still loads (novelty read is never bypassed), so a
-        # re-confirmation of a standing finding stays known → exit 0. The judge is
-        # stochastic, so assert the UNAMBIGUOUS delete pin specifically, not the
-        # whole set (a borderline cross-domain/multilingual pair may jitter).
+        # The reuse index still loads (novelty read is never bypassed), so every
+        # standing finding re-confirmed on a --fresh re-judge stays "known". But the
+        # judge is stochastic at the check surface: --fresh re-judges ALL 67 pairs,
+        # so it may ALSO surface a borderline pair that run 1 judged not-tenable.
+        # Per the novelty rule (check.py:951-952 — "known" iff the pre-run index holds
+        # a prior *finding* for the pair) such a pair is correctly "new" → exit 1.
+        # So the load-bearing invariant is NOT a fixed whole-run exit code (that is
+        # judge-stochastic) but: (a) the standing delete pin re-confirms as known,
+        # (b) no run-1 standing finding regresses to "new" (a CHK-D10 bypass would),
+        # and (c) the exit is novelty-driven — never a masked degradation.
         r3_findings = {
             tuple(sorted((f.proposal_hash, f.partner_hash))): f for f in r3.findings
         }
@@ -638,8 +644,22 @@ def test_corpus_reuse_determinism_and_scalar_law(conflict_index):
             "a --fresh re-confirmation of a standing finding must stay 'known' "
             "(novelty read is not bypassed) — do not assert exit 1 here."
         )
-        assert check.exit_code_for(r3) == 0, (
-            f"--fresh re-confirmation of standing findings must exit 0; got "
-            f"{check.exit_code_for(r3)} — degradations {check.run_degradations(r3)}."
+        for key in run1_surfaced:
+            if key in r3_findings:
+                assert r3_findings[key].novelty == "known", (
+                    "a run-1 standing finding regressed to 'new' under --fresh — "
+                    "the novelty read was bypassed (CHK-D10 violation)."
+                )
+        assert not check.run_degradations(r3), (
+            f"--fresh re-run degraded unexpectedly: {check.run_degradations(r3)} "
+            f"— exit must stay novelty-driven, not masked by a degradation."
         )
-        print(f"[T3 run3 --fresh] re-judged {r3.pairs_judged_fresh} fresh, delete pin stays known/exit 0")
+        assert check.exit_code_for(r3) in (0, 1), (
+            f"--fresh re-run exit must be novelty-driven (0 if no borderline pair "
+            f"newly surfaced, 1 if one did); got {check.exit_code_for(r3)}."
+        )
+        print(
+            f"[T3 run3 --fresh] re-judged {r3.pairs_judged_fresh} fresh, "
+            f"delete pin stays known, exit {check.exit_code_for(r3)} "
+            f"(novelty-driven, no degradation)"
+        )
