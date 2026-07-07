@@ -358,3 +358,39 @@ def test_t10_check_run_judgment_requests_carry_no_cache_control() -> None:
     kwargs = create.call_args.kwargs
     _assert_no_cache_control(kwargs)
     assert isinstance(kwargs["system"], str)         # a plain string, no block list
+
+
+# --------------------------------------------------------------------------- #
+# 9. T10 (the 5a half) — the CLI-built judge (the production seam) carries no
+#    cache_control (CHK-D6 posture proven at the check surface, not just the engine)
+# --------------------------------------------------------------------------- #
+
+def test_t10_5a_cli_built_judge_issues_no_cache_control(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T10 (CHK-D6, the 5a half): the judge the CLI seam constructs issues no ``cache_control``.
+
+    The 2c pin above drives the executor built directly via ``make_judgment_executor``; this
+    proves the SAME posture at the production boundary — ``cli._build_check_judge()`` (the
+    seam ``cmd_check`` calls) binds a real ``anthropic.Anthropic`` into the judge, and that
+    judge's ``messages.create`` carries no ``cache_control`` anywhere and a plain-string
+    ``system``. A fake key satisfies the keyless guard; the SDK constructor is patched so no
+    network is touched — the check surface stays cache-off by decision (the ordering is
+    wired, the flip is a later vision's)."""
+    from mitos import cli
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key-for-construction-only")
+    fake_client = _client_returning(_fake_message(text="[]"))
+    monkeypatch.setattr(anthropic, "Anthropic", lambda api_key: fake_client)
+
+    judge = cli._build_check_judge()
+    assert judge is not None                          # the keyed seam built a bound executor
+
+    result = judge(_prompt())
+
+    assert isinstance(result, JudgmentExecution)
+    create = fake_client.with_options.return_value.messages.create
+    create.assert_called_once()
+    kwargs = create.call_args.kwargs
+    _assert_no_cache_control(kwargs)
+    assert isinstance(kwargs["system"], str)

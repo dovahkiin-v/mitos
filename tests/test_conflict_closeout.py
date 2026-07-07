@@ -645,15 +645,24 @@ def _check_family_closure() -> List[str]:
 
 
 def test_dod6_discovery_covers_the_check_family_and_respects_the_boundary() -> None:
-    """KD7 mechanics: discovery yields ⊇ {check.py, conflict.py} plus the pure
-    leaves (incl. ``mitos/__init__.py`` via the ``__version__`` edge — the bare
-    package must resolve, not silently vanish), and excludes BOTH ``telemetry.py``
-    (the sanctioned sink) AND everything only reachable through it
-    (``store.py``/``migrations.py`` — the graph committer must never enter this
-    lint). The TYPE_CHECKING-guarded ``protocols`` import is skipped, so neither
-    ``protocols.py`` nor its ``parser.py``/``store.py`` pulls appear."""
+    """KD7 mechanics + 5a's W12 drift-pin: discovery yields the check family EXACTLY.
+
+    2c/2d asserted ``⊇``; 5a tightens it to ``==`` against the final runtime closure, so a
+    future import silently dragging a NEW module into the fence — or dropping one out of it
+    — trips this test rather than passing unnoticed. The closure is the seven source files
+    ``check.py`` runtime-reaches (``conflict.py`` → ``display.py``/``identity.py``;
+    ``models.py``; ``errors.py`` — 2d's twin-catch; ``mitos/__init__.py`` via the
+    ``__version__`` edge), and it excludes BOTH ``telemetry.py`` (the sanctioned sink) AND
+    everything only reachable through it (``store.py``/``migrations.py`` — the graph
+    committer must never enter this lint). The TYPE_CHECKING-guarded ``protocols`` import is
+    skipped, so neither ``protocols.py`` nor its ``parser.py``/``store.py`` pulls appear."""
     names = {os.path.basename(path) for path in _check_family_closure()}
-    assert {"check.py", "conflict.py", "models.py", "__init__.py"} <= names
+    assert names == {
+        "check.py", "conflict.py", "display.py", "errors.py",
+        "identity.py", "models.py", "__init__.py",
+    }
+    # The boundary + everything only reachable through it stay out (belt-and-suspenders
+    # over the exact-set pin: a regression names the offender, not just a set diff).
     assert "telemetry.py" not in names
     assert "store.py" not in names
     assert "migrations.py" not in names
