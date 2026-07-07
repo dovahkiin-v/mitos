@@ -10,9 +10,11 @@ import os
 import re
 import time
 import json
+import uuid
 import sqlite3
 import hashlib
 import argparse
+from datetime import datetime, timezone
 from typing import Callable, List, Optional, Dict, Any, Set, Tuple
 from google import genai
 
@@ -42,7 +44,11 @@ from mitos.errors import (
 )
 from mitos.vector_store import scroll_point_ids, hash_to_uuid, QdrantVectorStore
 from mitos.embeddings import GeminiEmbeddingProvider
-from mitos.telemetry import TelemetryStore
+from mitos.telemetry import TelemetryStore, ConflictCheckRow, JudgmentBatch
+from mitos.identity import compute_node_id
+from mitos.models import get_model_id
+from mitos.parser import ParsedEntry, parse_entry_stream, read_text_or_none
+from mitos.conflict import run_conflict_check, ConflictUnavailableReason
 from mitos.migrations import is_pre_v1a_schema
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS, open_connection
 from mitos.cutover import default_aside_db_path, perform_swap, rebuild_and_gate
@@ -2311,6 +2317,50 @@ _CHECK_TOKENS_PER_BATCH_ESTIMATE = 3000
 _CHECK_MODIFIER_STAMP_KEYS: Tuple[str, ...] = tuple(MODIFIER_EDGE_KEYS.values())
 
 
+def _confirm_spend(n: int, *, assume_yes: bool, as_json: bool) -> Optional[int]:
+    """The shared CHK-D5 spend confirm — corpus + staged (KD4).
+
+    The single gate both ``check`` modes pass ``n`` (corpus: fresh judgment groups;
+    staged: pending decision entries) through before any judge call, so the ``>``
+    comparison and the three refusal surfaces can never fork between the two. Fires
+    strictly ``n > check.CHECK_CONFIRM_BATCHES`` (read as a module attribute so a test
+    monkeypatch is seen); at/below the threshold or with ``assume_yes`` it returns
+    ``None`` (proceed) without prompting. All three refusals return exit ``2``, zero
+    spend: ``--json`` emits an error object (automation never prompts), a non-TTY
+    prints the vector message, an interactive decline prints "nothing spent".
+
+    Args:
+        n: The disclosure unit — the count of pending judgment batches.
+        assume_yes: Waive the confirm (the ``--yes`` opt-in).
+        as_json: Automation surface — emit an error object instead of prompting.
+
+    Returns:
+        A refusal exit code (``2``) when the spend is declined, or ``None`` to proceed.
+    """
+    if n <= check.CHECK_CONFIRM_BATCHES or assume_yes:
+        return None
+    if as_json:
+        # Automation never prompts (a prompt would also corrupt the object).
+        _emit_json({
+            "error": (f"{n} judgment batches pending — re-run with --yes to "
+                      f"authorize the spend."),
+            "code": "confirmation_required",
+            "batches_planned": n,
+        })
+        return 2
+    if not sys.stdin.isatty():
+        print(f"{n} judgment batches pending — re-run with --yes to authorize "
+              f"the spend.", file=sys.stderr)
+        return 2
+    estimate = n * _CHECK_TOKENS_PER_BATCH_ESTIMATE
+    print(f"{n} judgment batches pending (≈{estimate:,} tokens) — this run "
+          f"will call the judge model.")
+    if input("Proceed with the spend? [y/N] ").strip().lower() not in ("y", "yes"):
+        print("Aborted — nothing spent.")
+        return 2
+    return None
+
+
 def _build_check_substrate(
     config: MitosConfig,
 ) -> Tuple[Optional[GeminiEmbeddingProvider], Optional[QdrantVectorStore],
@@ -2622,6 +2672,7 @@ def _print_check_report(
 def cmd_check(
     config: MitosConfig,
     *,
+    staged: bool = False,
     scope: Optional[str],
     fresh: bool,
     assume_yes: bool,
@@ -2639,6 +2690,8 @@ def cmd_check(
 
     Args:
         config: The active workspace config.
+        staged: Gate the pending buffer instead of sweeping the live corpus (the
+            pre-commit / CI gate mode — a self-contained sequence, Phase 3b).
         scope: Optional scope tag filtering the audited (proposal) set (candidate
             recall stays scope-blind, CONF-D2).
         fresh: Re-judge every pair, bypassing verdict reuse (never the novelty read).
@@ -2649,6 +2702,23 @@ def cmd_check(
         ``0`` clean or known-only, ``1`` a NEW contradiction, ``2`` degraded, refused,
         or could-not-run.
     """
+    # Flag-combo guard (staged §4 step 1) — pure, pre-store: staged never reuses
+    # (nothing to bypass) and always gates the whole pending buffer (no proposal-set
+    # filter), so `--scope`/`--fresh` are invocation errors, rejected before any store
+    # contact. argparse can't express this (both flags are valid alone).
+    if staged and (scope is not None or fresh):
+        msg = ("check --staged cannot combine with --scope or --fresh — the gate always "
+               "checks the whole pending buffer and never reuses verdicts.")
+        if as_json:
+            _emit_json({"error": msg, "code": "invalid_flags"})
+        else:
+            print(msg, file=sys.stderr)
+        return 2
+    # The gate is a self-contained sequence (its own error boundary); 3a's corpus body
+    # below is untouched so its exit contract cannot regress.
+    if staged:
+        return _run_staged_check(config, assume_yes=assume_yes, as_json=as_json)
+
     # Lazy at entry (KD6): the alias is needed at PLAN time, but importing
     # `conflict_judgment` module-scope would drag `anthropic` onto every other verb.
     from mitos.conflict_judgment import _JUDGMENT_MODEL_ALIAS
@@ -2688,29 +2758,13 @@ def cmd_check(
         )
 
         # CHK-D5 confirm (KD3) — strictly above the threshold; all refusals exit 2,
-        # zero spend, no row. Read the threshold as a module attribute so tests can
-        # monkeypatch it to 1 instead of building an 11-batch corpus.
-        n = len(plan.fresh_groups)
-        if n > check.CHECK_CONFIRM_BATCHES and not assume_yes:
-            if as_json:
-                # Automation never prompts (a prompt would also corrupt the object).
-                _emit_json({
-                    "error": (f"{n} judgment batches pending — re-run with --yes to "
-                              f"authorize the spend."),
-                    "code": "confirmation_required",
-                    "batches_planned": n,
-                })
-                return 2
-            if not sys.stdin.isatty():
-                print(f"{n} judgment batches pending — re-run with --yes to authorize "
-                      f"the spend.", file=sys.stderr)
-                return 2
-            estimate = n * _CHECK_TOKENS_PER_BATCH_ESTIMATE
-            print(f"{n} judgment batches pending (≈{estimate:,} tokens) — this run "
-                  f"will call the judge model.")
-            if input("Proceed with the spend? [y/N] ").strip().lower() not in ("y", "yes"):
-                print("Aborted — nothing spent.")
-                return 2
+        # zero spend, no row. The shared `_confirm_spend` helper (KD4) is byte-identical
+        # for corpus and staged, so the `>` comparison can never fork between the modes.
+        refusal = _confirm_spend(
+            len(plan.fresh_groups), assume_yes=assume_yes, as_json=as_json
+        )
+        if refusal is not None:
+            return refusal
 
         # Build the judge only after the confirm passes and only when there is fresh
         # work (KD6): a reuse-only/clean run never constructs a client.
@@ -2771,6 +2825,507 @@ def cmd_check(
             row_written=row_written, transient_count=transient_count,
         )
     return exit_code
+
+
+# =========================================================================== #
+# Phase 3b — `mitos check --staged`: the pre-commit / CI gate mode.
+#
+# The proactive half of the `check` verb: it gates the PENDING (not-yet-committed)
+# decision entries of the working-tree `decisions.md` and fails CLOSED — a pending
+# undeclared contradiction blocks the commit (exit 1), a clean buffer passes (0),
+# a gate that cannot run says so (exit 2) rather than a silent pass. Self-contained
+# (its own sequence + error boundary) so 3a's corpus contract cannot regress. The
+# load-bearing rules — the exit table (§3), the pure-read predicate (KD1: no graph
+# write), the no-row-unless-judged rule (KD2/KD8), the `surface='check'` attribution
+# (KD7), `_emit_json`-only — live in the phase plan.
+# =========================================================================== #
+
+
+def _pending_decision_entries(
+    store: GraphStore, entries: List[ParsedEntry]
+) -> List[ParsedEntry]:
+    """Selects the pending decision entries via the sync idempotency predicate (KD1).
+
+    A pure READ: an entry is pending iff its slug-free canonical-core content hash is
+    not yet a committed node. Replicates sync.py:650-656's ``compute_node_id`` call and
+    the ``get_node`` test — but deliberately NOT the ``note_source_reencounter`` write
+    two lines below it (sync.py:668): a gate that mutates the graph while gating it is a
+    contradiction of its own. OQ entries are skipped (the facade is decision-only).
+
+    Args:
+        store: The graph store — touched only through ``get_node`` (read).
+        entries: The parsed working-tree entries (already all ``decision`` kind when
+            they come from ``parse_entry_stream(text, "decision")``; the filter is a
+            harmless safety belt).
+
+    Returns:
+        The pending decision entries, in parse order.
+    """
+    pending: List[ParsedEntry] = []
+    for entry in entries:
+        if entry.kind != "decision":
+            continue
+        node_id = compute_node_id(
+            kind=entry.kind,
+            axiom=entry.axiom,
+            mechanism_refs=entry.mechanisms,
+            topic=entry.topic,
+            questions_raised=entry.questions_raised,
+        )
+        if store.get_node(node_id) is None:
+            pending.append(entry)
+    return pending
+
+
+def _persist_staged_batch(
+    telemetry: Optional[TelemetryStore],
+    result: "Any",
+    *,
+    run_id: str,
+) -> Optional[str]:
+    """Persists one judged staged batch with ``surface='check'`` (KD7), best-effort.
+
+    Mirrors ``sync._persist_conflict_batch``'s ``ConflictCheckResult`` → ``(JudgmentBatch,
+    [ConflictCheckRow])`` mapping (sync.py:1196-1239) verbatim EXCEPT for two data-level
+    values: ``surface='check'`` (this is the check surface, not sync) and ``sync_run_id``
+    = this run's id. Every fed-context field is read off the result's ``JudgeInput``\\ s
+    (what the judge saw), never a node re-read. The MI-9 ``""→None`` proposal/candidate
+    scope + rejected coercions are load-bearing.
+
+    Args:
+        telemetry: The run's telemetry store, or ``None`` (a judged run needs it — a
+            ``None`` store is a write failure the caller degrades on, KD7).
+        result: A judged :class:`~mitos.conflict.ConflictCheckResult` (``execution`` set;
+            the caller guards ``execution is not None``).
+        run_id: This run's id, stamped as ``sync_run_id`` on every row (the one-thread-of-
+            truth join to the ``check_runs`` PK).
+
+    Returns:
+        ``None`` on a clean write, or a write-failure detail string (the caller marks the
+        run degraded and reports it) — never raising, so one bad batch never crashes the gate.
+    """
+    if telemetry is None:
+        return "telemetry store unavailable"
+    try:
+        execution = result.execution
+        # CHK-D3: resolve the versioned model id here (same process/env, moments after
+        # the call); an unknown alias degrades to NULL (provenance-only), never a lost row.
+        try:
+            model_id: Optional[str] = get_model_id(execution.model_alias)
+        except ValueError:
+            model_id = None
+        batch = JudgmentBatch(
+            batch_id=execution.batch_id,
+            model_id=model_id,
+            token_input=execution.token_input,
+            token_output=execution.token_output,
+            token_cache_read=execution.token_cache_read,
+            token_cache_creation=execution.token_cache_creation,
+            elapsed_ms=execution.elapsed_ms,
+        )
+        proposal = result.proposal_input
+        rows: List[ConflictCheckRow] = []
+        for pair in result.judged_pairs:
+            candidate_input = pair.candidate_input
+            rows.append(
+                ConflictCheckRow(
+                    batch_id=execution.batch_id,
+                    sync_run_id=run_id,
+                    # The staged difference from the sync mapper: this IS the check
+                    # surface, stamped explicitly (CHK-D7), never the schema DEFAULT.
+                    surface="check",
+                    judged_axiom=proposal.axiom,
+                    proposal_rejected_paths=proposal.rejected_paths or None,
+                    proposal_scope=", ".join(proposal.scope) or None,
+                    proposed_hash_if_any=result.proposed_hash_if_any,
+                    candidate_slug=pair.candidate.slug,
+                    candidate_hash=pair.candidate.node["id"],
+                    candidate_rejected_paths=candidate_input.rejected_paths,
+                    candidate_scope=", ".join(candidate_input.scope) or None,
+                    tenable=pair.judgment.tenable_together,
+                    confidence=pair.judgment.confidence,
+                    surfaced=pair.surfaced,
+                    candidate_source=check.CONFLICT_CANDIDATE_SOURCE,
+                    model_alias=execution.model_alias,
+                    prompt_version=check.CONFLICT_PROMPT_VERSION,
+                    mitos_version=__version__,
+                    rationale=pair.judgment.rationale,
+                )
+            )
+        telemetry.record_judged_batch(
+            batch, rows, datetime.now(timezone.utc).isoformat()
+        )
+        return None
+    except (sqlite3.Error, DatabaseError, TypeError, ValueError) as exc:
+        # Best-effort (KD7): a mapping/write failure degrades the run, never crashes it.
+        return str(exc)
+
+
+# The staged degradation vocabulary — a subset of the corpus tokens that a gate can
+# reach (KD8). Rendered to calm human wording; the raw tokens ride the `--json`.
+_STAGED_DEGRADATION_WORDS = {
+    "stale_index": "the vector index is behind (recall may be thinned)",
+    "sweep": "the semantic substrate went dark mid-run (findings shown are partial)",
+    "judgment": "the judge became unavailable mid-run (findings shown are partial)",
+    "telemetry_write": "some results could not be recorded",
+}
+
+
+def _staged_finding_json(
+    entry: ParsedEntry, proposed_hash: str, finding: "Any", partner_hash: Optional[str]
+) -> Dict[str, Any]:
+    """Renders one staged finding as its §8 JSON object — both sides named (KD9).
+
+    Every staged finding is ``novelty:"new"`` (the gate never partitions, CHK-D10). The
+    proposal side is the pending entry (not yet a node — no id-in-graph, no modifier
+    stamps); the partner side is the facade's candidate ``payload`` (a Letter render) plus
+    the candidate content hash resolved from ``judged_pairs``.
+    """
+    payload = finding.payload
+    partner: Dict[str, Any] = {"id": partner_hash}
+    for key in ("slug", "axiom", "scope", "rejected_paths"):
+        if key in payload:
+            partner[key] = payload[key]
+    for key in _CHECK_MODIFIER_STAMP_KEYS:
+        if key in payload:
+            partner[key] = payload[key]
+    return {
+        "novelty": "new",
+        "confidence": finding.confidence,
+        "rationale": finding.rationale,
+        "score": payload.get("score"),
+        "proposal": {
+            "id": proposed_hash,
+            "slug": entry.slug,
+            "axiom": entry.axiom,
+            "scope": list(entry.scope),
+            "rejected_paths": entry.rejected_paths,
+        },
+        "partner": partner,
+    }
+
+
+def _print_staged_finding(entry: ParsedEntry, finding: "Any") -> None:
+    """Prints both sides of one staged finding plus its rationale (calm ASCII, P9)."""
+    print(f"  Pending entry '{entry.slug}':")
+    print(f"      Axiom:    {entry.axiom}")
+    scope_text = ", ".join(entry.scope) if entry.scope else "(global — no scope declared)"
+    print(f"      Scope:    {scope_text}")
+    if entry.rejected_paths:
+        print(f"      Rejected: {entry.rejected_paths}")
+    payload = finding.payload
+    print(f"  conflicts with active decision '{payload['slug']}'   "
+          f"(similarity {payload['score']:.2f}):")
+    print(f"      Axiom:    {payload['axiom']}")
+    p_scope = payload.get("scope") or []
+    p_scope_text = ", ".join(p_scope) if p_scope else "(global — no scope declared)"
+    print(f"      Scope:    {p_scope_text}")
+    if "rejected_paths" in payload:
+        print(f"      Rejected: {payload['rejected_paths']}")
+    for key in _CHECK_MODIFIER_STAMP_KEYS:
+        if key in payload:
+            print(f"      ({key.replace('_', ' ')}: {', '.join(payload[key])})")
+    print("      Why they may not both stand:")
+    print(f"        {finding.rationale}   (confidence {finding.confidence:.2f})")
+
+
+def _print_staged_report(
+    findings: List[Tuple[ParsedEntry, str, "Any", Optional[str]]],
+    *,
+    nodes_swept: int,
+    nodes_total: int,
+    degraded: "Set[str]",
+    exclusions: List[Dict[str, Any]],
+    transient_count: int,
+) -> None:
+    """Renders the human gate report to stdout — calm, both sides named (P9)."""
+    if findings:
+        noun = "contradiction" if len(findings) == 1 else "contradictions"
+        print(f"\n[Conflict] {len(findings)} pending {noun} — these decisions may "
+              f"not both stand:")
+        for entry, _hash, finding, _pid in findings:
+            _print_staged_finding(entry, finding)
+        print("  Resolve by declaring a relationship in decisions.md "
+              "(Supersedes: / Amends: / Narrows: / Contradicts:) before committing, "
+              "or `git commit --no-verify` to bypass the gate deliberately.")
+
+    if degraded:
+        summary = "; ".join(
+            _STAGED_DEGRADATION_WORDS[t] for t in sorted(degraded)
+            if t in _STAGED_DEGRADATION_WORDS
+        )
+        print(f"\n[partial] This gate could not fully run ({summary}).")
+        print(f"  Checked {nodes_swept} of {nodes_total} pending decision(s); any "
+              f"findings above are partial, not certified complete.")
+
+    if exclusions:
+        print("\nCoverage exclusions (chronically un-embedded — NOT audited):")
+        for item in exclusions:
+            print(f"  - {item['slug'] or item['id']}")
+        print("  These keep failing to embed; run `mitos sync` to retry (the durable "
+              "fix is outbox quarantine, substrate-owned).")
+
+    if transient_count:
+        print(f"\n{transient_count} decision(s) are behind the vector index — recall "
+              f"may be thinned. Run `mitos sync` to catch up.")
+
+    if not findings and not degraded:
+        noun = "decision" if nodes_swept == 1 else "decisions"
+        print(f"Gate clear — {nodes_swept} pending {noun} checked, "
+              f"no contradictions found.")
+
+
+def _run_staged_check(
+    config: MitosConfig, *, assume_yes: bool, as_json: bool
+) -> int:
+    """Gates the pending decision buffer, fail-closed → exit 0/1/2 (Phase 3b).
+
+    The one sequence (§4): parse the working-tree ``decisions.md`` → select pending via
+    the pure-read predicate (KD1) → no-pending short-circuit (exit 0, no probe/substrate/
+    row, KD2) → build substrate (absent + pending ⇒ fail-closed exit 2) → start probe
+    (KD3) → CHK-D5 confirm (KD4) → build judge (absent + pending ⇒ fail-closed exit 2,
+    KD5) → per-entry facade loop with the aggregate breaker (KD6) → exit derivation +
+    the hand-built ``mode='staged'`` row written LAST, only when a judgment fired (KD8).
+    Owns its own error boundary: a store/parse fault is exit 2 with a calm vector message,
+    never a traceback CI reads as "new findings".
+
+    Args:
+        config: The active workspace config (paths).
+        assume_yes: Waive the CHK-D5 spend confirm.
+        as_json: Emit one machine-readable object via :func:`_emit_json` (never prompts).
+
+    Returns:
+        ``0`` clean / no pending, ``1`` a pending contradiction, ``2`` degraded, refused,
+        or could-not-gate.
+    """
+    run_id = uuid.uuid4().hex
+    started_at = datetime.now(timezone.utc).isoformat()
+    try:
+        store = GraphStore(config.db_path)
+        # Parse the WORKING-TREE decisions.md (git-agnostic; absent file → no pending).
+        # `parse_entry_stream` STRICT mode raises ParseError(MitosError) on a malformed
+        # buffer → the boundary below maps it to exit 2 (fail-closed). Never pass a
+        # `failures=` collector (that would silently isolate a bad entry).
+        text = read_text_or_none(config.decisions_file)
+        entries = parse_entry_stream(text, "decision") if text else []
+        pending = _pending_decision_entries(store, entries)
+
+        # KD2 — no-pending short-circuit: exit 0 with zero LLM contact, no probe, no
+        # substrate build, no row. The overwhelmingly common commit is free.
+        if not pending:
+            ended_at = datetime.now(timezone.utc).isoformat()
+            if as_json:
+                _emit_json(_staged_json_object(
+                    run_id=run_id, started_at=started_at, ended_at=ended_at,
+                    exit_code=0, nodes_total=0, nodes_swept=0, batches_executed=0,
+                    pairs_judged_fresh=0, finding_objs=[], degradations=[],
+                    exclusions=[], transient_count=0, row_written=False,
+                ))
+            else:
+                print("Gate clear — no pending decisions to check.")
+            return 0
+
+        embed, vector, embed_detail, vector_detail = _build_check_substrate(config)
+        # Providers absent WITH pending work → fail-closed (the hook precondition), no row.
+        if embed is None or vector is None:
+            parts: List[str] = []
+            if embed is None:
+                parts.append(f"embeddings ({embed_detail})")
+            if vector is None:
+                parts.append(f"vector store ({vector_detail})")
+            msg = (f"check --staged could not gate {len(pending)} pending decision(s) — "
+                   f"{' and '.join(parts)} unavailable.")
+            if as_json:
+                _emit_json({"error": msg, "code": "substrate_unavailable"})
+            else:
+                print(msg, file=sys.stderr)
+            return 2
+
+        telemetry = _build_check_telemetry(config)
+
+        # KD3 — start probe only (no end probe: staged judges a fixed buffer, not a
+        # sweep). A probe fault propagates to the boundary. A transient backlog gates
+        # partial (exit 2) but does NOT skip the judgment; over-tolerance rows are
+        # disclosed coverage exclusions that never gate (the poison-row escape).
+        start_probe = check.probe_stale_index(store)
+        transient_count = len({row.node_id for row in start_probe.transient})
+        degraded: Set[str] = set()
+        if transient_count:
+            degraded.add("stale_index")
+
+        # KD4 — the shared confirm on the pending count. All refusals exit 2, no row.
+        refusal = _confirm_spend(len(pending), assume_yes=assume_yes, as_json=as_json)
+        if refusal is not None:
+            return refusal
+
+        # KD5 — the judge is required to gate real work: `run_conflict_check` CALLS it
+        # (unlike corpus, which absorbs `judge=None` as a typed degradation), so a
+        # missing key with pending entries is fail-closed exit 2, no row. `--no-verify`
+        # is the deliberate human bypass (documented in 4b).
+        judge = _build_check_judge()
+        if judge is None:
+            msg = (f"check --staged could not gate {len(pending)} pending decision(s) — "
+                   f"ANTHROPIC_API_KEY is not set (the judge is required to gate).")
+            if as_json:
+                _emit_json({"error": msg, "code": "judge_unavailable"})
+            else:
+                print(msg, file=sys.stderr)
+            return 2
+
+        # KD6 — per-entry facade loop, verbatim + sequential, aggregate breaker on the
+        # first typed `Unavailable` (one penalty, not N). A genuine local store fault
+        # RAISES past the facade → the boundary below (prior findings lost, the rare case).
+        findings: List[Tuple[ParsedEntry, str, "Any", Optional[str]]] = []
+        nodes_swept = 0
+        pairs_judged_fresh = 0
+        batches_executed = 0
+        for entry in pending:
+            result = run_conflict_check(
+                entry, embed_provider=embed, vector_store=vector, store=store, judge=judge
+            )
+            if isinstance(result, check.Unavailable):
+                # Trip the breaker: stop calling the facade for the remaining entries.
+                # The token is faithful to WHICH downstream went dark (aligning with the
+                # corpus P18 vocabulary): the semantic substrate (embedding/vector) reads
+                # as `sweep`, the judge as `judgment`.
+                degraded.add(
+                    "sweep" if result.reason in (
+                        ConflictUnavailableReason.EMBEDDING,
+                        ConflictUnavailableReason.VECTOR_STORE,
+                    ) else "judgment"
+                )
+                break
+            nodes_swept += 1
+            pairs_judged_fresh += len(result.judged_pairs)
+            if result.execution is not None:
+                batches_executed += 1
+                detail = _persist_staged_batch(telemetry, result, run_id=run_id)
+                if detail is not None:
+                    degraded.add("telemetry_write")
+            # Map each surfaced finding to its candidate content hash (from judged_pairs).
+            hash_by_slug = {
+                pair.candidate.slug: pair.candidate.node["id"]
+                for pair in result.judged_pairs
+            }
+            for finding in result.findings:
+                findings.append((
+                    entry, result.proposed_hash_if_any, finding,
+                    hash_by_slug.get(finding.slug),
+                ))
+
+        exclusions = _resolve_exclusion_display(
+            store, tuple(row.node_id for row in start_probe.excluded)
+        )
+
+        # KD8 — exit derivation (degraded 2 dominates finding 1 dominates clean 0), then
+        # the hand-built row, written LAST and only when a judgment actually fired.
+        exit_code = 2 if degraded else (1 if findings else 0)
+        ended_at = datetime.now(timezone.utc).isoformat()
+        row_written = False
+        if batches_executed > 0:
+            row = check.CheckRunRow(
+                run_id=run_id,
+                mode="staged",
+                started_at=started_at,
+                ended_at=ended_at,
+                exit_code=exit_code,
+                nodes_swept=nodes_swept,
+                pairs_judged_fresh=pairs_judged_fresh,
+                pairs_reused=0,
+                findings_new=len(findings),
+                findings_known=0,
+                coverage_exclusions=len(start_probe.excluded),
+                degraded_reason=",".join(sorted(degraded)) or None,
+                mitos_version=__version__,
+            )
+            if telemetry is not None:
+                try:
+                    telemetry.record_check_run(row)
+                    row_written = True
+                except DatabaseError:
+                    # The write is the last fallible act: a failure only moves toward 2.
+                    degraded.add("telemetry_write")
+                    exit_code = 2
+            else:
+                # A judged run whose telemetry could not be built cannot record — degrade.
+                degraded.add("telemetry_write")
+                exit_code = 2
+    except (sqlite3.Error, DatabaseError, MitosError) as exc:
+        # The gate's error boundary (mirrors 3a's): a store/parse/probe/facade fault is
+        # exit 2 with a calm vector message, never a traceback CI reads as "new findings".
+        msg = f"check --staged could not run: {exc}"
+        if as_json:
+            _emit_json({"error": msg, "code": "check_faulted"})
+        else:
+            print(msg, file=sys.stderr)
+        return 2
+
+    # Emission is pure (out of the write contract): one JSON object or the report.
+    if as_json:
+        _emit_json(_staged_json_object(
+            run_id=run_id, started_at=started_at, ended_at=ended_at,
+            exit_code=exit_code, nodes_total=len(pending), nodes_swept=nodes_swept,
+            batches_executed=batches_executed, pairs_judged_fresh=pairs_judged_fresh,
+            finding_objs=[_staged_finding_json(e, h, f, p) for e, h, f, p in findings],
+            degradations=sorted(degraded), exclusions=exclusions,
+            transient_count=transient_count, row_written=row_written,
+        ))
+    else:
+        _print_staged_report(
+            findings, nodes_swept=nodes_swept, nodes_total=len(pending),
+            degraded=degraded, exclusions=exclusions, transient_count=transient_count,
+        )
+    return exit_code
+
+
+def _staged_json_object(
+    *,
+    run_id: str,
+    started_at: str,
+    ended_at: str,
+    exit_code: int,
+    nodes_total: int,
+    nodes_swept: int,
+    batches_executed: int,
+    pairs_judged_fresh: int,
+    finding_objs: List[Dict[str, Any]],
+    degradations: List[str],
+    exclusions: List[Dict[str, Any]],
+    transient_count: int,
+    row_written: bool,
+) -> Dict[str, Any]:
+    """Assembles the single §8 staged ``--json`` object (a shipped API — additive only).
+
+    The same key set as 3a §8 with staged values (KD9): ``mode:"staged"``, ``scope`` key
+    ABSENT (staged never scopes), ``fresh:false``, ``pairs_reused:0``, every finding
+    ``novelty:"new"``, ``findings_known:0`` — so a CI consumer's cross-surface invariant
+    ``exit_code == 1 ⟺ findings_new > 0`` holds on staged exactly as on corpus. The
+    ``batches_*`` accounting reads: planned = one potential batch per pending entry;
+    executed = entries that fired the judge; skipped = clean-empty or breaker-skipped
+    (so ``planned == executed + skipped`` holds).
+    """
+    return {
+        "run_id": run_id,
+        "mode": "staged",
+        "exit_code": exit_code,
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "fresh": False,
+        "nodes_total": nodes_total,
+        "nodes_swept": nodes_swept,
+        "pairs_judged_fresh": pairs_judged_fresh,
+        "pairs_reused": 0,
+        "batches_planned": nodes_total,
+        "batches_executed": batches_executed,
+        "batches_skipped": nodes_total - batches_executed,
+        "findings": finding_objs,
+        "findings_new": len(finding_objs),
+        "findings_known": 0,
+        "degradations": degradations,
+        "coverage_exclusions": exclusions,
+        "index_backlog_transient": transient_count,
+        "summary_row_written": row_written,
+    }
 
 
 def _enter_target_directory(directory: Optional[str]) -> None:
@@ -2980,6 +3535,11 @@ def main() -> None:
                               "on every non-interactive surface).")
     check_p.add_argument("--json", action="store_true", dest="as_json",
                          help="Emit one machine-readable JSON object (never prompts).")
+    check_p.add_argument("--staged", action="store_true",
+                         help="Gate the PENDING buffer of decisions.md (the pre-commit / "
+                              "CI gate) instead of sweeping the live corpus. Fails closed: "
+                              "exit 2 when it cannot run. Not git's staging — reads the "
+                              "working-tree decisions.md. Rejects --scope/--fresh.")
 
     # agent-block — print the canonical agent-file block to paste, or --check pasted copies.
     ab_p = subparsers.add_parser(
@@ -3085,8 +3645,9 @@ def main() -> None:
             sys.exit(cmd_rebuild(config, allow_drops=args.allow_drops,
                                  assume_yes=args.yes, as_json=args.as_json))
         elif args.command == "check":
-            sys.exit(cmd_check(config, scope=args.scope, fresh=args.fresh,
-                               assume_yes=args.yes, as_json=args.as_json))
+            sys.exit(cmd_check(config, staged=args.staged, scope=args.scope,
+                               fresh=args.fresh, assume_yes=args.yes,
+                               as_json=args.as_json))
     except MitosError as e:
         # KD1: `check` maps every pre-verb/boundary failure (bad -C, ConfigError, an
         # escaped store fault) to exit 2 — for CI, "could not run" is one routing
