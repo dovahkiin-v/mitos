@@ -29,6 +29,14 @@ from typing import Any, Callable, Dict, List, Optional
 
 import anthropic
 
+from mitos.check import (
+    check_run_row_from_result,
+    coverage_exclusion_ids,
+    execute_corpus_check,
+    exit_code_for,
+    plan_corpus_check,
+    run_degradations,
+)
 from mitos.conflict import (
     CONFLICT_PROMPT_VERSION,
     CONFLICT_SIMILARITY_FLOOR,
@@ -37,7 +45,7 @@ from mitos.conflict import (
     Unavailable,
     run_conflict_check,
 )
-from mitos.conflict_judgment import make_judgment_executor
+from mitos.conflict_judgment import _JUDGMENT_MODEL_ALIAS, make_judgment_executor
 
 sys.path.insert(0, os.path.dirname(__file__))
 import _semantic_harness as H  # noqa: E402
@@ -444,4 +452,301 @@ def conflict_human_summary(report: Dict[str, Any]) -> str:
             "floor — soft signal for floor calibration, NOT a defect):"
         )
         lines.extend(misses)
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Corpus-mode driver (Phase 5b) — the `mitos check` sweep over the frozen corpus
+# ---------------------------------------------------------------------------
+#
+# Where `run_conflict_eval` (above) drives the per-proposal FACADE
+# (`run_conflict_check`) once per named candidate, this driver drives the corpus
+# ENGINE (`plan_corpus_check` → `execute_corpus_check`) over the WHOLE store once —
+# the sweep the CLI's `mitos check` performs (KD1). It reads the typed
+# `CheckRunResult` (a different shape from `ConflictCheckResult`: findings expose
+# hydrated NODE dicts + content HASHES, no `slug`/`payload`/`surfaced` fields — the
+# scout's biggest trap), and rolls it into the same `{provenance, params, ...}`
+# report envelope + a surfaced-pair SET for oracle comparison.
+
+
+class _JudgeSpy:
+    """Wraps a judge callable, counting calls and recording the prompts it saw.
+
+    The real executor mints a distinct ``batch_id`` per call; this spy only
+    observes (it returns the wrapped result verbatim), so per-call uniqueness is
+    preserved — a fixed ``batch_id`` would collide on the ``judgment_batches`` PK
+    across a re-run (PATTERNS). ``calls`` is the T3 "zero fresh judgments on the
+    reuse run" witness; ``prompts`` is the general attribution record.
+    """
+
+    def __init__(self, inner: Callable) -> None:
+        self._inner = inner
+        self.calls = 0
+        self.prompts: List[Any] = []
+
+    def __call__(self, prompt: Any) -> Any:
+        self.calls += 1
+        self.prompts.append(prompt)
+        return self._inner(prompt)
+
+
+def _pair_key(a: str, b: str) -> tuple:
+    """The orientation-blind pair key — the ReuseIndex/dedup convention (2b)."""
+    return tuple(sorted((a, b)))
+
+
+def run_corpus_check_eval(
+    oracle: Dict[str, Any],
+    entries_by_slug: Dict[str, Any],
+    provider: Any,
+    vstore: Any,
+    store: Any,
+    judge: Optional[Callable],
+    telemetry: Any,
+    *,
+    floor: float = CONFLICT_SIMILARITY_FLOOR,
+    top_k: int = CONFLICT_TOP_K,
+    surface_threshold: float = CONFLICT_SURFACE_THRESHOLD,
+    fresh: bool = False,
+) -> Any:
+    """Drives one corpus `mitos check` sweep over the frozen corpus and scores it.
+
+    The population is the reused ``conflict_index`` fixture's job — this driver
+    only drives the engine. It **drains the transient outbox first** (every
+    ``commit_parsed_entry``/``populate_index`` enqueues a ``retry_count=0`` row;
+    the start probe would read it as ``stale_index`` → exit 2 masking every
+    finding — the single most likely false-red, plan §6). It threads the production
+    pins (``model_alias=_JUDGMENT_MODEL_ALIAS``, ``prompt_version=CONFLICT_PROMPT_VERSION``)
+    or the engine's alias/prompt guards raise.
+
+    A substrate/judge outage (``plan.sweep_degraded`` or ``result.judgment_degraded``
+    an :class:`Unavailable`) is handed back verbatim so the caller skips loudly —
+    it is environmental, never a measured signal (mirrors ``run_conflict_eval``).
+    ``reuse_unavailable`` / ``telemetry_write_failures`` are NOT skips — they are
+    T3/T5 assertion targets, so they ride the result.
+
+    Args:
+        oracle: The parsed ``oracle.semantic.json`` (the six ``conflict:`` fixtures
+            derive the expected surfaced/screened sets — KD2).
+        entries_by_slug: ``{slug: ParsedEntry}`` (unused for driving; kept for a
+            signature symmetric with ``run_conflict_eval`` and future use).
+        provider: A ``GeminiEmbeddingProvider``.
+        vstore: A ``QdrantVectorStore`` bound to the populated collection.
+        store: The populated ``GraphStore``.
+        judge: The bound judge (or a :class:`_JudgeSpy` over it); ``None`` is legal
+            for a reuse-only/empty run (P14 — no key needed when nothing is fresh).
+        telemetry: A real ``TelemetryStore`` — NOT ``None`` (a ``None`` telemetry is
+            the ``reuse_unavailable`` fork → exit 2, which would mask the exit-1/0
+            assertions). An empty store is healthy (``ReuseIndex`` len 0 ≠
+            ``ReuseUnavailable``).
+        floor: The similarity floor.
+        top_k: The judged-batch cap.
+        surface_threshold: Kept for report parity (the engine reads the shipped
+            ``CONFLICT_SURFACE_THRESHOLD`` internally via ``_is_finding``).
+        fresh: ``--fresh`` — bypass the reuse partition (re-judge), never the
+            novelty read (a re-confirmation of a standing finding stays ``known``).
+
+    Returns:
+        On a healthy run a dict ``{report, plan, result, outcomes, aggregate}`` —
+        ``report`` is the JSON-safe envelope for ``H.write_report``; ``plan`` /
+        ``result`` are the raw engine objects for structural assertions (T2 reads
+        ``plan.pairs``; T3/T12 read ``result`` scalars). On an outage the
+        :class:`~mitos.conflict.Unavailable` verbatim (the caller skips loudly).
+    """
+    # (1) Drain the transient outbox — the plan §6 gotcha (else exit 2 masks all).
+    for row in store.get_pending_embeddings():
+        store.remove_pending_embedding(row["node_id"])
+
+    # (2) Plan (deterministic, judge-free) — threading the production pins (plan §6).
+    plan = plan_corpus_check(
+        store=store,
+        embed_provider=provider,
+        vector_store=vstore,
+        telemetry=telemetry,
+        model_alias=_JUDGMENT_MODEL_ALIAS,
+        prompt_version=CONFLICT_PROMPT_VERSION,
+        scope=None,
+        fresh=fresh,
+        floor=floor,
+        top_k=top_k,
+    )
+    if plan.sweep_degraded is not None:
+        return plan.sweep_degraded  # environmental (embed/vector outage) → loud skip
+
+    # (3) Execute (the one spend site).
+    result = execute_corpus_check(plan, judge=judge, telemetry=telemetry, store=store)
+    if result.judgment_degraded is not None:
+        return result.judgment_degraded  # judge timeout/5xx/quota → loud skip
+
+    # (4) Roll the typed result into the surfaced-pair set + oracle outcomes.
+    surfaced_keys = {
+        _pair_key(f.proposal_hash, f.partner_hash) for f in result.findings
+    }
+    plan_pair_keys = {
+        _pair_key(p.proposal_hash, p.partner_hash) for p in plan.pairs
+    }
+    finding_by_key = {
+        _pair_key(f.proposal_hash, f.partner_hash): f for f in result.findings
+    }
+
+    def _hash(slug: str) -> Optional[str]:
+        node = store.get_node_by_slug(slug)
+        return node["id"] if node else None
+
+    outcomes: List[Dict[str, Any]] = []
+    fixtures_out: List[Dict[str, Any]] = []
+    for fx in oracle["conflict"]:
+        ph, ch = _hash(fx["proposal"]), _hash(fx["candidate"])
+        key = _pair_key(ph, ch) if ph and ch else None
+        # "judged" in corpus mode = the pair survived screening and became a
+        # candidate for judgment (reused ∪ fresh) — i.e. it is in `plan.pairs`.
+        # A screened (declared-drop) pair or a retrieval miss is absent.
+        judged = key in plan_pair_keys
+        actual_surfaced = key in surfaced_keys
+        fnd = finding_by_key.get(key)
+        # The corpus engine retains ONLY surfaced pairs as findings (judged-but-
+        # not-surfaced verdicts are absorbed into counts — the CheckFinding
+        # discrepancy). So a surfaced pair is not-tenable (that is why it
+        # surfaced); a judged-but-not-surfaced pair reads as tenable/unknown.
+        actual_tenable: Optional[bool] = False if actual_surfaced else None
+        confidence: Optional[float] = fnd.confidence if fnd is not None else None
+        outcomes.append(
+            {
+                "kind": fx["kind"],
+                "expected_tenable": fx["expected_tenable"],
+                "expected_surfaced": fx["expected_surfaced"],
+                "judged": judged,
+                "actual_tenable": actual_tenable,
+                "actual_surfaced": actual_surfaced,
+                "confidence": confidence,
+            }
+        )
+        fixtures_out.append(
+            {
+                "proposal": fx["proposal"],
+                "candidate": fx["candidate"],
+                "kind": fx["kind"],
+                "expected_candidate_judged": fx["expected_candidate_judged"],
+                "expected_tenable": fx["expected_tenable"],
+                "expected_surfaced": fx["expected_surfaced"],
+                "judged": judged,
+                "actual_surfaced": actual_surfaced,
+                "novelty": fnd.novelty if fnd is not None else None,
+                "confidence": confidence,
+            }
+        )
+
+    aggregate = {
+        "not_tenable_recall": not_tenable_recall(outcomes),
+        "not_tenable_precision": not_tenable_precision(outcomes),
+        "same_polarity_fp_rate": same_polarity_fp_rate(outcomes),
+    }
+
+    exit_code = exit_code_for(result)
+    corpus_block = {
+        "run_id": result.run_id,
+        "exit_code": exit_code,
+        "nodes_total": result.nodes_total,
+        "nodes_swept": result.nodes_swept,
+        "pairs_judged_fresh": result.pairs_judged_fresh,
+        "pairs_reused": result.pairs_reused,
+        "batches_planned": result.batches_planned,
+        "batches_executed": result.batches_executed,
+        "findings_new": sum(1 for f in result.findings if f.novelty == "new"),
+        "findings_known": sum(1 for f in result.findings if f.novelty == "known"),
+        "degradations": list(run_degradations(result)),
+        "coverage_exclusions": list(coverage_exclusion_ids(result)),
+        # Orientation-blind, replayable, no tuples (plan §7).
+        "surfaced_pairs": sorted([list(k) for k in surfaced_keys]),
+        "findings": [
+            {
+                "proposal_slug": f.proposal_node["slug"],
+                "partner_slug": f.partner_node["slug"],
+                "proposal_hash": f.proposal_hash,
+                "partner_hash": f.partner_hash,
+                # "both Letter payloads" (T1) — the finding carries both hydrated
+                # nodes; their axioms ARE the Letter core.
+                "proposal_axiom": f.proposal_node.get("core_axiom"),
+                "partner_axiom": f.partner_node.get("core_axiom"),
+                "rationale": f.rationale,
+                "confidence": f.confidence,
+                "novelty": f.novelty,
+                "reused": f.reused,
+            }
+            for f in sorted(
+                result.findings, key=lambda x: (x.proposal_hash, x.partner_hash)
+            )
+        ],
+    }
+
+    report = {
+        "provenance": H.provenance(
+            judgment_model=plan.model_alias, prompt_version=CONFLICT_PROMPT_VERSION
+        ),
+        "params": {
+            "floor": floor,
+            "top_k": top_k,
+            "surface_threshold": surface_threshold,
+            "fresh": fresh,
+        },
+        "corpus": corpus_block,
+        "outcomes": outcomes,
+        "fixtures": fixtures_out,
+        "aggregate": aggregate,
+    }
+    return {
+        "report": report,
+        "plan": plan,
+        "result": result,
+        "outcomes": outcomes,
+        "aggregate": aggregate,
+    }
+
+
+def corpus_human_summary(bundle: Dict[str, Any]) -> str:
+    """Renders a short human-readable summary of a corpus-check bundle for the log.
+
+    Args:
+        bundle: A :func:`run_corpus_check_eval` return dict (the healthy shape).
+
+    Returns:
+        A multi-line string: provenance header, run counts, per-finding lines, the
+        aggregate, and the derived per-fixture judged/surfaced trace.
+    """
+    report = bundle["report"]
+    c = report["corpus"]
+    p = report["provenance"]
+    params = report["params"]
+    lines = [
+        f"Corpus check eval — judge={p['judgment_model']} "
+        f"prompt={p['prompt_version']} embed={p['embedding_model']} @ mitos "
+        f"{p['mitos_version']} ({p['commit_sha']}, dirty={p['dirty_tree']})",
+        f"floor={params['floor']} top_k={params['top_k']} fresh={params['fresh']}",
+        f"RUN {c['run_id'][:8]} exit={c['exit_code']} "
+        f"swept={c['nodes_swept']}/{c['nodes_total']} "
+        f"fresh={c['pairs_judged_fresh']} reused={c['pairs_reused']} "
+        f"new={c['findings_new']} known={c['findings_known']} "
+        f"degradations={c['degradations'] or '—'}",
+    ]
+    for f in c["findings"]:
+        conf = f["confidence"]
+        conf_s = f"{conf:.2f}" if conf is not None else "  — "
+        lines.append(
+            f"  FINDING novelty={str(f['novelty']):5} reused={str(f['reused']):5} "
+            f"conf={conf_s}  {f['proposal_slug']} ✗ {f['partner_slug']}"
+        )
+    agg = report["aggregate"]
+    lines.append(
+        f"AGGREGATE: not_tenable_recall={agg['not_tenable_recall']:.3f} "
+        f"not_tenable_precision={agg['not_tenable_precision']:.3f} "
+        f"same_polarity_fp_rate={agg['same_polarity_fp_rate']:.3f}"
+    )
+    for fx in report["fixtures"]:
+        lines.append(
+            f"  {fx['kind']:26} judged={str(fx['judged']):5} "
+            f"surfaced={str(fx['actual_surfaced']):5} "
+            f"[exp_judged={str(fx['expected_candidate_judged']):5} "
+            f"exp_surfaced={str(fx['expected_surfaced']):5}]  "
+            f"{fx['proposal']} ✗ {fx['candidate']}"
+        )
     return "\n".join(lines)

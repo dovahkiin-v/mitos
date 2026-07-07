@@ -29,16 +29,19 @@ soft-diff test skips loudly when it is absent; seeding is `MITOS_UPDATE_BASELINE
 
 import os
 import sys
+import tempfile
 import uuid
 import warnings
 
 import pytest
 import requests
 
+from mitos import conflict
 from mitos.conflict import CONFLICT_SIMILARITY_FLOOR, Unavailable
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.models import get_embedding_model_id
 from mitos.parser import parse_entry_stream
+from mitos.telemetry import TelemetryStore
 from mitos.vector_store import QdrantVectorStore
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -314,3 +317,329 @@ def test_seed_conflict_baseline(conflict_index):
         f"\n[conflict baseline seeded — REVIEW before committing]\n"
         f"{CH.conflict_human_summary(report)}"
     )
+
+
+# =========================================================================== #
+# Phase 5b — corpus-mode fixtures (the `mitos check` SWEEP over the frozen corpus)
+#
+# Where the four tests above drive the per-proposal FACADE, these drive the corpus
+# ENGINE (`plan_corpus_check` → `execute_corpus_check`) over the whole store once —
+# the sweep `mitos check` performs. They reuse the `conflict_index` fixture verbatim
+# and derive the expected surfaced/screened sets from the same six `conflict:`
+# fixtures (KD2 — "reuse, don't re-author"). HARD-assert the structural properties
+# (declared-pair screen, exit contract, reuse determinism); keep judge quality a
+# lenient smoke floor (the judge is stochastic; `not_tenable_precision=0.75` is a
+# named v0.2 limit).
+# =========================================================================== #
+
+from mitos import check  # noqa: E402
+
+# The two declared strong-edge pairs in the frozen corpus (verified
+# decisions.reference.md:62 / :104) — the DoD-2 must-NEVER-judge pins.
+_DECLARED_CONTRADICTS = ("harbor-sync-crdt-merge", "harbor-sync-last-write-wins")
+_DECLARED_NARROWS = ("harbor-all-endpoints-authenticated", "harbor-health-endpoint-public")
+# The DoD-1 unambiguous pin — an UNDECLARED genuine contradiction.
+_DELETE_PAIR = ("harbor-delete-is-immediate-hard", "harbor-delete-is-soft-30d")
+# The P9 multilingual pair.
+_MULTILINGUAL_PAIR = ("harbor-duomenu-saugojimas-lietuvoje", "harbor-duomenys-gali-buti-es")
+
+
+def _hash(store, slug: str) -> str:
+    """Resolves an oracle slug to its live content hash (MI-2 — never a stored slug)."""
+    node = store.get_node_by_slug(slug)
+    assert node is not None, f"corpus/oracle drift: {slug} is not an active node"
+    return node["id"]
+
+
+def _pair_key(store, a_slug: str, b_slug: str) -> tuple:
+    """The orientation-blind pair key over two slugs' live hashes."""
+    return tuple(sorted((_hash(store, a_slug), _hash(store, b_slug))))
+
+
+def _fresh_telemetry():
+    """A fresh, migrated, EMPTY TelemetryStore (healthy no-priors — ReuseIndex len 0)."""
+    tmp = tempfile.mkdtemp(prefix="mitos-golden-corpus-tel-")
+    return TelemetryStore(os.path.join(tmp, "telemetry.sqlite"))
+
+
+def _plan_only(store, provider, vstore):
+    """Drains the outbox, then plans a corpus check (judge-free, zero spend, telemetry=None).
+
+    T2 and P9 assert PLAN-stage structural properties (`plan.pairs`) that the reuse
+    partition and judgment never touch — so telemetry=None (the reuse_unavailable
+    fork) is harmless here: it changes the fresh/reused partition, not the pair set.
+    """
+    for row in store.get_pending_embeddings():
+        store.remove_pending_embedding(row["node_id"])
+    return check.plan_corpus_check(
+        store=store,
+        embed_provider=provider,
+        vector_store=vstore,
+        telemetry=None,
+        model_alias=CH._JUDGMENT_MODEL_ALIAS,
+    )
+
+
+def test_corpus_check_delete_pair_new_finding_exit_1(conflict_index):
+    """T1/DoD-1: a full corpus sweep surfaces the undeclared delete contradiction, exit 1.
+
+    The vision's core proof at the corpus level: an UNDECLARED genuine contradiction
+    (immediate hard-delete ✗ 30-day soft-delete) that neither side declares an edge to
+    is caught by a single sweep as a NEW finding — both nodes named, rationale +
+    confidence carried — over a fresh (empty) telemetry (so nothing is "known"), exit 1.
+    The aggregate recall is a lenient smoke floor (KD2 — the judge is imperfect;
+    DoD-1 rides on the delete pair, not the whole set).
+    """
+    store, provider, vstore, entries_by_slug, _ = conflict_index
+    oracle = H.load_semantic_oracle()
+    telemetry = _fresh_telemetry()
+    with skip_on_embed_quota():
+        bundle = CH.run_corpus_check_eval(
+            oracle, entries_by_slug, provider, vstore, store,
+            CH.make_live_judge(), telemetry,
+        )
+    _skip_if_unavailable(bundle)
+
+    path = H.write_report(bundle["report"], "conflict-corpus-latest")
+    print(f"\n{CH.corpus_human_summary(bundle)}\n[report] {path}")
+
+    result = bundle["result"]
+    delete_key = _pair_key(store, *_DELETE_PAIR)
+    surfaced = {tuple(sorted((f.proposal_hash, f.partner_hash))) for f in result.findings}
+
+    # (1) The delete pair surfaced as a NEW finding.
+    assert delete_key in surfaced, (
+        "DoD-1 FAILED: the undeclared delete contradiction did not surface in a full "
+        "corpus sweep. See the report."
+    )
+    delete_finding = next(
+        f for f in result.findings
+        if tuple(sorted((f.proposal_hash, f.partner_hash))) == delete_key
+    )
+    assert delete_finding.novelty == "new", (
+        f"delete finding novelty={delete_finding.novelty!r}, expected 'new' over an "
+        f"empty telemetry — the novelty partition regressed."
+    )
+    # (2) Both Letter payloads + rationale + confidence ride the finding (both nodes).
+    assert delete_finding.proposal_node.get("core_axiom"), "proposal axiom missing"
+    assert delete_finding.partner_node.get("core_axiom"), "partner axiom missing"
+    assert delete_finding.rationale, "finding carries no rationale"
+    assert 0.0 <= delete_finding.confidence <= 1.0
+    assert {delete_finding.proposal_node["slug"], delete_finding.partner_node["slug"]} == set(
+        _DELETE_PAIR
+    ), "the finding names the wrong pair of decisions"
+
+    # (3) A new finding on a healthy run ⇒ exit 1 (2 dominates only under degradation).
+    assert not result.telemetry_write_failures, result.telemetry_write_failures
+    assert check.exit_code_for(result) == 1, (
+        f"expected exit 1 (new finding, healthy run); got "
+        f"{check.exit_code_for(result)} — degradations "
+        f"{check.run_degradations(result)}."
+    )
+
+    # (4) Lenient smoke floor (KD2) — the sensor fundamentally catches contradictions.
+    recall = bundle["aggregate"]["not_tenable_recall"]
+    assert recall >= SMOKE_NOT_TENABLE_RECALL_FLOOR, (
+        f"corpus not_tenable_recall={recall:.2f} < {SMOKE_NOT_TENABLE_RECALL_FLOOR} — "
+        f"the sweep is missing genuine contradictions it judged. See the report."
+    )
+
+
+def test_corpus_declared_pairs_never_judged(conflict_index):
+    """T2/DoD-2: both declared strong-edge pairs are screened before judgment (zero spend).
+
+    The strong-edge screen runs inside `plan_corpus_check`, BEFORE any judgment — so
+    the assertion is at the PLAN stage, keyless on the judgment axis (KD3). Each
+    declared pair's orientation-blind key is absent from `plan.pairs` (and thus from
+    every fresh group → the judge is never called on it → zero LLM spend). Non-vacuity
+    (mandatory): the drop is the SCREEN, not a retrieval miss — proven by (a) the
+    declared edge existing between the two hashes in `get_edges()`, and (b) a
+    screenless `gather_candidates` over one endpoint retrieving the other. (The
+    single-pair harness's `global-vs-scoped-narrows` fixture — reason `declared_drop`
+    — is the standing per-proposal witness of the same retrieval-then-screen path.)
+    """
+    store, provider, vstore, entries_by_slug, _ = conflict_index
+    with skip_on_embed_quota():
+        plan = _plan_only(store, provider, vstore)
+    if plan.sweep_degraded is not None:
+        _skip_if_unavailable(plan.sweep_degraded)
+
+    plan_pair_keys = {
+        tuple(sorted((p.proposal_hash, p.partner_hash))) for p in plan.pairs
+    }
+    edges = store.get_edges()
+    edge_pairs = {
+        tuple(sorted((e["source_id"], e["target_id"]))) for e in edges
+    }
+
+    for a_slug, b_slug in (_DECLARED_CONTRADICTS, _DECLARED_NARROWS):
+        key = _pair_key(store, a_slug, b_slug)
+        # Absence from the plan ⇒ never a candidate ⇒ never judged (zero spend).
+        assert key not in plan_pair_keys, (
+            f"DoD-2 FAILED: the declared pair {a_slug} ✗ {b_slug} reached judgment "
+            f"(present in plan.pairs) — the strong-edge screen regressed."
+        )
+        # Non-vacuity (a): the declared edge exists for the screen to act on.
+        assert key in edge_pairs, (
+            f"non-vacuity broken: no declared edge between {a_slug} and {b_slug} in "
+            f"get_edges() — the corpus/oracle changed."
+        )
+        # Non-vacuity (b): retrieval WOULD surface the partner (screenless gather).
+        node = store.get_node_by_slug(a_slug)
+        with skip_on_embed_quota():
+            gathered = conflict.gather_candidates(
+                node["core_axiom"],
+                embed_provider=provider,
+                vector_store=vstore,
+                store=store,
+            )
+        _skip_if_unavailable(gathered)
+        gathered_ids = {c.node["id"] for c in gathered}
+        assert _hash(store, b_slug) in gathered_ids, (
+            f"non-vacuity broken: {b_slug} did not co-retrieve for {a_slug} — the "
+            f"absence-from-plan would be a retrieval miss, not a screen drop. "
+            f"(gathered {len(gathered_ids)} candidates)"
+        )
+
+    print(
+        f"\n[T2] both declared pairs screened pre-judgment over {len(plan.pairs)} "
+        f"swept pairs (run {plan.run_id[:8]})"
+    )
+
+
+def test_corpus_multilingual_pair_exercised(conflict_index):
+    """P9: the Lithuanian contradiction pair reaches judgment in corpus mode (not dropped).
+
+    Language sovereignty (§6.3): the multilingual pair must keep being exercised by
+    the corpus sweep — neither declares an edge, so both reach judgment. Asserted at
+    the PLAN stage (in `plan.pairs` ⇒ judged-or-reused, never silently dropped),
+    deterministic and zero-spend (the judge's verdict quality is the stochastic part,
+    covered by T1's smoke floor).
+    """
+    store, provider, vstore, entries_by_slug, _ = conflict_index
+    with skip_on_embed_quota():
+        plan = _plan_only(store, provider, vstore)
+    if plan.sweep_degraded is not None:
+        _skip_if_unavailable(plan.sweep_degraded)
+
+    plan_pair_keys = {
+        tuple(sorted((p.proposal_hash, p.partner_hash))) for p in plan.pairs
+    }
+    key = _pair_key(store, *_MULTILINGUAL_PAIR)
+    assert key in plan_pair_keys, (
+        "P9 FAILED: the Lithuanian contradiction pair did not reach judgment in the "
+        "corpus sweep — the sensor is blind to non-English contradictions. (If this is "
+        "a retrieval miss at the provisional floor, it is a soft calibration signal, "
+        "but the pair must at least co-retrieve to be exercised.)"
+    )
+    print(f"\n[P9] multilingual pair reaches judgment (run {plan.run_id[:8]})")
+
+
+def test_corpus_reuse_determinism_and_scalar_law(conflict_index):
+    """T3/DoD-3 + T12: run 2 over run-1's telemetry judges nothing fresh, exit 0.
+
+    One telemetry file across both runs (the reuse index loads once at plan-start from
+    pre-run rows — the CHK-D10 novelty boundary). Run 1 (fresh, real judge) writes
+    verdicts; run 2 (same telemetry, judge=None) reuses them: `pairs_judged_fresh==0`,
+    every finding `novelty=='known'`, findings IDENTICAL to run 1, exit 0. T12 (5b
+    half): the run-2 `check_runs` row scalars equal the report. A `--fresh` run
+    re-judges (`pairs_judged_fresh>0`) yet a re-confirmation of the standing delete
+    finding stays `known` / exit 0.
+    """
+    store, provider, vstore, entries_by_slug, _ = conflict_index
+    oracle = H.load_semantic_oracle()
+    telemetry = _fresh_telemetry()  # ONE store, shared across all three runs
+
+    # --- Run 1: fresh, real judge (writes verdicts) --------------------------
+    spy = CH._JudgeSpy(CH.make_live_judge())
+    with skip_on_embed_quota():
+        run1 = CH.run_corpus_check_eval(
+            oracle, entries_by_slug, provider, vstore, store, spy, telemetry,
+        )
+    _skip_if_unavailable(run1)
+    r1 = run1["result"]
+    assert spy.calls > 0, "run 1 should have fired fresh judgments"
+    assert r1.pairs_judged_fresh > 0, "run 1 judged nothing fresh — corpus/oracle drift"
+    assert r1.findings, "run 1 surfaced no findings — expected at least the delete pair"
+    assert all(f.novelty == "new" for f in r1.findings), (
+        "run 1 over empty telemetry should be all-new"
+    )
+    run1_surfaced = {
+        tuple(sorted((f.proposal_hash, f.partner_hash))): f.rationale
+        for f in r1.findings
+    }
+
+    # --- Run 2: reuse-only, judge=None (zero fresh spend) --------------------
+    with skip_on_embed_quota():
+        run2 = CH.run_corpus_check_eval(
+            oracle, entries_by_slug, provider, vstore, store, None, telemetry,
+        )
+    _skip_if_unavailable(run2)
+    r2 = run2["result"]
+    path = H.write_report(run2["report"], "conflict-corpus-reuse")
+    print(f"\n[T3 run2]\n{CH.corpus_human_summary(run2)}\n[report] {path}")
+
+    assert r2.pairs_judged_fresh == 0, (
+        f"reuse run judged {r2.pairs_judged_fresh} pairs fresh — reuse regressed."
+    )
+    assert r2.pairs_reused > 0, "reuse run reused nothing — the index did not carry run 1"
+    assert all(f.novelty == "known" for f in r2.findings), (
+        "reuse run findings must all be 'known' (standing)"
+    )
+    run2_surfaced = {
+        tuple(sorted((f.proposal_hash, f.partner_hash))): f.rationale
+        for f in r2.findings
+    }
+    assert run2_surfaced == run1_surfaced, (
+        "reuse run findings differ from run 1 — reuse must replay the SAME verdicts "
+        "(same pairs, same rationale verbatim, M8)."
+    )
+    assert check.exit_code_for(r2) == 0, (
+        f"reuse-only run of standing findings must exit 0; got "
+        f"{check.exit_code_for(r2)} — degradations {check.run_degradations(r2)}."
+    )
+
+    # --- T12 (5b half): the run-2 check_runs row scalars equal the report ----
+    exit2 = check.exit_code_for(r2)
+    row = check.check_run_row_from_result(r2, mode="corpus", exit_code=exit2)
+    c2 = run2["report"]["corpus"]
+    assert row.pairs_reused == r2.pairs_reused == c2["pairs_reused"] > 0
+    assert row.pairs_judged_fresh == 0 == c2["pairs_judged_fresh"]
+    assert row.findings_known == c2["findings_known"] == len(r2.findings)
+    assert row.findings_new == c2["findings_new"] == 0
+    assert row.degraded_reason is None, (
+        f"healthy reuse run stamped degraded_reason={row.degraded_reason!r}"
+    )
+    assert row.exit_code == exit2 == c2["exit_code"] == 0
+
+    # --- Run 3: --fresh re-judges, but a standing finding stays known/exit 0 --
+    delete_key = _pair_key(store, *_DELETE_PAIR)
+    if delete_key in run1_surfaced:  # the DoD-1 pin surfaced on run 1
+        spy3 = CH._JudgeSpy(CH.make_live_judge())
+        with skip_on_embed_quota():
+            run3 = CH.run_corpus_check_eval(
+                oracle, entries_by_slug, provider, vstore, store, spy3, telemetry,
+                fresh=True,
+            )
+        _skip_if_unavailable(run3)
+        r3 = run3["result"]
+        assert r3.pairs_judged_fresh > 0, "--fresh must re-judge (bypass the reuse partition)"
+        # The reuse index still loads (novelty read is never bypassed), so a
+        # re-confirmation of a standing finding stays known → exit 0. The judge is
+        # stochastic, so assert the UNAMBIGUOUS delete pin specifically, not the
+        # whole set (a borderline cross-domain/multilingual pair may jitter).
+        r3_findings = {
+            tuple(sorted((f.proposal_hash, f.partner_hash))): f for f in r3.findings
+        }
+        assert delete_key in r3_findings, (
+            "--fresh re-run dropped the standing delete contradiction"
+        )
+        assert r3_findings[delete_key].novelty == "known", (
+            "a --fresh re-confirmation of a standing finding must stay 'known' "
+            "(novelty read is not bypassed) — do not assert exit 1 here."
+        )
+        assert check.exit_code_for(r3) == 0, (
+            f"--fresh re-confirmation of standing findings must exit 0; got "
+            f"{check.exit_code_for(r3)} — degradations {check.run_degradations(r3)}."
+        )
+        print(f"[T3 run3 --fresh] re-judged {r3.pairs_judged_fresh} fresh, delete pin stays known/exit 0")

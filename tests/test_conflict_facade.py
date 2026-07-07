@@ -107,6 +107,7 @@ def _node(slug: str, *, axiom: Optional[str] = None, scope: Optional[List[str]] 
     node = {
         "id": f"id-{slug}",
         "slug": slug,
+        "kind": "decision",
         "core_axiom": axiom if axiom is not None else f"axiom for {slug}",
         "scope": scope if scope is not None else [],
         "rejected_paths": rejected if rejected is not None else f"rejected for {slug}",

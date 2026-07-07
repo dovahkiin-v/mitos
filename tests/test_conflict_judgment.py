@@ -380,6 +380,7 @@ def test_judge_input_from_node_reads_core_axiom_not_axiom() -> None:
     """judge_input_from_node reads node['core_axiom'] — a hydrated node has no ``axiom`` key."""
     node = {
         "slug": "cand",
+        "kind": "decision",
         "core_axiom": "the hydrated axiom",
         "rejected_paths": "raw rejected str",
         "scope": ["backend"],
@@ -392,7 +393,7 @@ def test_judge_input_from_node_reads_core_axiom_not_axiom() -> None:
 
 def test_judge_input_from_node_handles_global_and_absent() -> None:
     """A global node (scope=[]) with empty rejected_paths projects cleanly (MI-9)."""
-    node = {"slug": "g", "core_axiom": "ax", "rejected_paths": "", "scope": []}
+    node = {"slug": "g", "kind": "decision", "core_axiom": "ax", "rejected_paths": "", "scope": []}
     ji = judge_input_from_node(node)
     assert ji.scope == [] and ji.rejected_paths == ""
 
@@ -420,3 +421,22 @@ def test_cross_feeding_the_two_adapters_fails_loud() -> None:
         judge_input_from_node(entry)  # ParsedEntry is not subscriptable
     with pytest.raises(AttributeError):
         judge_input_from_entry(node)  # a dict has no ``.axiom`` attribute
+
+
+def test_judge_input_from_node_rejects_a_non_decision_node_loudly() -> None:
+    """A hydrated open_question node fails loud with a named invariant, not a raw KeyError.
+
+    The belt-and-suspenders half of the parent conflict-sensor OQ-candidate fix:
+    gather_candidates screens kind upstream, but if any future path feeds a non-decision
+    node here, the boundary names the invariant (an OQ carries no ``core_axiom``) rather
+    than surfacing a cryptic ``KeyError: 'core_axiom'`` mid-sweep.
+    """
+    oq_node = {
+        "slug": "oq-cache-cadence",
+        "kind": "open_question",
+        "topic": "cache invalidation cadence",
+        "questions_raised": ["How often?"],
+        "scope": ["cache"],
+    }
+    with pytest.raises(ValueError, match="requires a decision node"):
+        judge_input_from_node(oq_node)

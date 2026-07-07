@@ -236,6 +236,16 @@ def gather_candidates(
         node = store.get_node_by_slug(slug)
         if not node:  # retired (active-scoped miss) or genuinely absent — the primary filter.
             continue
+        # Scope to decisions. The Qdrant collection also holds open_question vectors
+        # (sync embeds every committed node), and get_node_by_slug is kind-agnostic, so a
+        # KNN match can resolve to an OQ. An OQ is out of scope for conflict gathering AND
+        # carries no ``core_axiom`` — passing it downstream would KeyError in
+        # judge_input_from_node. get_node_state can't screen it either: it derives
+        # decision state from kill edges only, so a resolved/parked OQ reports "active"
+        # (OQ resolution rides the ``resolves`` edge, which is not a kill edge — store.py).
+        # Filter kind here, at the one gather site, rather than teach get_node_state OQ state.
+        if node["kind"] != "decision":
+            continue
         state = store.get_node_state(node["id"])
         if state not in _LIVE_STATES:  # superseded/corrected slipped past under a race — drop.
             continue
@@ -527,7 +537,21 @@ def judge_input_from_node(node: Dict[str, Any]) -> JudgeInput:
 
     Returns:
         The candidate's :class:`JudgeInput` — its axiom, rejected_paths, and scope only.
+
+    Raises:
+        ValueError: If ``node`` is a hydrated node of a non-decision kind (an
+            open_question carries no ``core_axiom``). gather_candidates filters kind
+            upstream, so this is a defensive vector (P3) — a loud, named invariant
+            rather than the raw ``KeyError: 'core_axiom'`` a future bypass would hit.
+        TypeError: If ``node`` is not subscriptable (e.g. a ``ParsedEntry`` cross-fed
+            to the node adapter) — the ``node["kind"]`` read fails loud, as before.
     """
+    if node["kind"] != "decision":
+        raise ValueError(
+            f"judge_input_from_node requires a decision node, got kind="
+            f"{node['kind']!r} (slug={node.get('slug')!r}) — a non-decision "
+            "carries no core_axiom and must be screened at gather."
+        )
     return JudgeInput(
         axiom=node["core_axiom"],
         rejected_paths=node.get("rejected_paths", "") or "",

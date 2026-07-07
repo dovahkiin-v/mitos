@@ -66,6 +66,27 @@ def _seed_decision(store: GraphStore, slug: str, axiom: str) -> None:
     store.commit_parsed_entry(entry)
 
 
+def _seed_open_question(store: GraphStore, slug: str, topic: str) -> None:
+    """Commits one open_question (keyless). Its kill-edge state is 'active' (OQ
+    resolution rides the ``resolves`` edge, not a kill edge — get_node_state can't see it)."""
+    entry = ParsedEntry("open_question", slug, 40, 50)
+    entry.topic = topic
+    entry.questions_raised = [f"How should we handle {topic}?"]
+    entry.scope = ["cache"]
+    store.commit_parsed_entry(entry)
+
+
+def _resolve(store: GraphStore, decision_slug: str, oq_slug: str) -> None:
+    """Commits a decision that resolves ``oq_slug`` (the OQ-view state becomes 'resolved',
+    while get_node_state still reports 'active' — the exact production reachability)."""
+    entry = ParsedEntry("decision", decision_slug, 60, 70)
+    entry.axiom = f"Resolving decision for {oq_slug}."
+    entry.rejected_paths = "Rejected leaving it parked."
+    entry.scope = ["cache"]
+    entry.resolves = [oq_slug]
+    store.commit_parsed_entry(entry)
+
+
 def _supersede(store: GraphStore, new_slug: str, dead_slug: str) -> None:
     """Commits a superseder so ``dead_slug`` leaves the active view (→ get_node_by_slug None)."""
     entry = ParsedEntry("decision", new_slug, 20, 30)
@@ -277,6 +298,41 @@ def test_s3_absent_and_retired_drop_at_none_without_probing_state(store: GraphSt
     assert result == []
     assert spy.slug_calls == ["ghost-never-committed", "eviction-lru"]
     assert spy.state_calls == []  # never probed — the None short-circuit held
+
+
+# --------------------------------------------------------------------------- #
+# 4b. S3 — a non-decision match (open_question) is screened at gather, never judged
+# --------------------------------------------------------------------------- #
+
+def test_open_question_match_is_dropped_by_kind_not_crashed_on(store: GraphStore) -> None:
+    """An open_question that the KNN surfaces is filtered at gather — never reaches judgment.
+
+    The parent conflict-sensor regression: the Qdrant collection holds OQ vectors too
+    (sync embeds every committed node), get_node_by_slug is kind-agnostic, and
+    get_node_state derives decision state from kill edges only — so a resolved OQ reports
+    'active' and would survive to judge_input_from_node, which reads node["core_axiom"]
+    an OQ lacks → KeyError mid-sweep. gather_candidates must screen kind and keep only the
+    decision neighbour, with no crash.
+    """
+    _seed_decision(store, "cache-policy", "Cache aggressively.")
+    _seed_open_question(store, "oq-cache-cadence", "cache invalidation cadence")
+    _resolve(store, "cache-cadence-hourly", "oq-cache-cadence")  # OQ-view resolved; state still 'active'
+
+    # Sanity: the OQ is live-by-get_node_state (the exact trap) and resolvable by slug.
+    oq_node = store.get_node_by_slug("oq-cache-cadence")
+    assert oq_node is not None and oq_node["kind"] == "open_question"
+    assert store.get_node_state(oq_node["id"]) == "active"  # kill-edge state, blind to resolution
+    assert "core_axiom" not in oq_node                       # the missing key that would KeyError
+
+    matches = [
+        {"slug": "oq-cache-cadence", "score": 0.95},  # nearest neighbour is the OQ — must be dropped
+        {"slug": "cache-policy", "score": 0.80},      # the one real decision candidate
+    ]
+    result = _gather("Cache invalidation policy.", _FakeEmbed(), _FakeVector(matches), store)
+
+    assert isinstance(result, list)                          # no crash, no Unavailable
+    assert [c.slug for c in result] == ["cache-policy"]      # OQ screened, decision kept
+    assert all(c.node["kind"] == "decision" for c in result)
 
 
 # --------------------------------------------------------------------------- #

@@ -285,6 +285,7 @@ def _posture_node(node_id: str, slug: str, axiom: str) -> dict:
     return {
         "id": node_id,
         "slug": slug,
+        "kind": "decision",
         "core_axiom": axiom,
         "rejected_paths": "",
         "scope": [],
