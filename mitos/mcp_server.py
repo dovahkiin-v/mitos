@@ -619,7 +619,10 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
         depends_on: Exact slug of a decision this one depends on.
         resolves: Exact slug of an open question this one resolves (the resolves edge is decision→open_question only).
         contradicts: Exact slug of a decision this one is in tension with.
-        derives_from: Exact slug of a decision this one is derived from.
+        derives_from: Not valid when recording a decision — a derives_from edge
+            originates from an open question (open_question -> decision), so a
+            decision cannot be its source. Use cites to link a decision this one
+            builds on.
         cites: Exact slug of a decision this one cites.
         slug: The short, descriptive handle for the decision (e.g. 'sqlite-wal-mode').
             Keep it to at most 100 characters — the slug is the permanent citation

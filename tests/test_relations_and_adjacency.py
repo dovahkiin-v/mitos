@@ -222,24 +222,43 @@ def test_record_resolves_open_question_commits_cross_kind(ws):
     assert _edge(GraphStore(config.db_path), "oauth-decision", "auth-q", "resolves")
 
 
-@pytest.mark.parametrize("kwarg", ["resolves", "derives_from"])
-def test_record_kind_violating_relation_rejects_gracefully(ws, kwarg):
-    """A decision-source ``resolves``-to-a-decision / ``derives_from`` is a loud kind violation.
+def test_record_resolves_to_decision_rejects_gracefully(ws):
+    """A decision-source ``resolves`` pointed at a DECISION is a loud kind violation.
 
-    V1a silently warn-deferred these (a no-op); V1b 2a attempts the commit and the
-    widened CHECK rejects the kind-violating shape as ``kind_constraint_violation``.
-    The write path must reject GRACEFULLY — a structured error, the buffer
-    byte-for-byte unchanged, NO orphan node (the buffer-first + rollback contract
-    holds for the new failure mode; not a crash, not a half-write).
+    ``resolves`` is D→OQ, so it is valid on a recorded decision only when the target
+    is an open question (see ``test_record_resolves_open_question_commits_cross_kind``).
+    Pointed at a decision, the widened CHECK rejects the kind-violating shape at commit.
+    The write path must reject GRACEFULLY — a structured error, the buffer byte-for-byte
+    unchanged, NO orphan node (buffer-first + rollback holds; not a crash/half-write).
     """
     config, m = ws
     m.record_decision_entry("Target axiom.", "rej", [], slug="target")
     before = _read(config)
     res = m.record_decision_entry("Linker axiom.", "rej", [], slug="linker",
-                                  **{kwarg: "target"})
+                                  resolves="target")
     assert "error" in res and res["code"] == "commit_failed", res
     assert "kind" in res["error"].lower()
     assert _read(config) == before  # buffer rolled back — no orphan entry
+    assert GraphStore(config.db_path).get_node_by_slug("linker") is None
+
+
+def test_record_derives_from_rejected_early_with_redirect(ws):
+    """``derives_from`` on a recorded decision is rejected in the VALIDATE phase.
+
+    ``record_decision_entry`` always mints a decision, but a ``derives_from`` edge must
+    originate from an open question (OQ→decision), so a decision can never be its source
+    — it is *always* invalid here. Rather than passing validation and failing only at the
+    store's kind CHECK ("validated but the commit failed"), it is rejected up front with a
+    distinct code and a redirect to ``cites``; the buffer is untouched and no node lands.
+    """
+    config, m = ws
+    m.record_decision_entry("Target axiom.", "rej", [], slug="target")
+    before = _read(config)
+    res = m.record_decision_entry("Linker axiom.", "rej", [], slug="linker",
+                                  derives_from="target")
+    assert "error" in res and res["code"] == "derives_from_on_decision", res
+    assert "cites" in res["error"].lower()  # the redirect the author should take
+    assert _read(config) == before  # buffer untouched — rejected before any write
     assert GraphStore(config.db_path).get_node_by_slug("linker") is None
 
 

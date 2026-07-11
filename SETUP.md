@@ -175,9 +175,9 @@ If yes, record it — and `surface_decisions` first when unsure.
 **Link related decisions.** When a new decision relates to an existing one, pass
 that one's exact slug to the matching relation argument so the graph stays
 connected instead of accumulating silent tension: `supersedes` (replaces it),
-`amends`, `narrows`, `depends_on`, `resolves`, `contradicts`, `derives_from`,
-`cites`. After a record, the result may surface nearby decisions (`related`) — if
-one is genuinely connected, link it.
+`amends`, `narrows`, `depends_on`, `resolves`, `contradicts`, `cites`. After a
+record, the result may surface nearby decisions (`related`) — if one is genuinely
+connected, link it.
 
 ---
 

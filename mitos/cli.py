@@ -430,7 +430,7 @@ def cmd_init(config: MitosConfig) -> None:
             "- has cross-cutting blast radius (touches many areas).\n"
             "Skip the local, easily-reversible, or already-settled choice. A quick self-test at any fork: *would the next agent waste time re-deriving or re-litigating this?* If yes, record it. When unsure, `surface_decisions` first — if nothing is there and it clears the bar, record it.\n\n"
             "## Linking decisions\n"
-            "When a decision relates to an existing one, pass that one's EXACT slug to the matching relation arg so the graph stays connected instead of accumulating silent tension: `supersedes` (replaces it), `amends`, `narrows`, `depends_on`, `resolves`, `contradicts`, `derives_from`, `cites`. On `record_decision` these are args; on the CLI they are flags (`--supersedes`, `--depends-on`, …). Look the target up first to get its exact slug. After you record, the result may list nearby existing decisions (`related`) — if one is genuinely connected, link it.\n"
+            "When a decision relates to an existing one, pass that one's EXACT slug to the matching relation arg so the graph stays connected instead of accumulating silent tension: `supersedes` (replaces it), `amends`, `narrows`, `depends_on`, `resolves`, `contradicts`, `cites`. On `record_decision` these are args; on the CLI they are flags (`--supersedes`, `--depends-on`, …). Look the target up first to get its exact slug. After you record, the result may list nearby existing decisions (`related`) — if one is genuinely connected, link it.\n"
         )
 
     # 3. Seed the decisions.md buffer when absent (with the extracted ## 3 sample).
@@ -3470,7 +3470,7 @@ def main() -> None:
     rec_p.add_argument("--depends-on", default=None, dest="depends_on", help="Exact slug(s) of decision(s) this one depends on — comma-separated for several.")
     rec_p.add_argument("--resolves", default=None, help="Exact slug(s) of open question(s) this one resolves (resolves is decision→open-question only) — comma-separated for several.")
     rec_p.add_argument("--contradicts", default=None, help="Exact slug(s) of decision(s) this one contradicts — comma-separated for several.")
-    rec_p.add_argument("--derives-from", default=None, dest="derives_from", help="Exact slug(s) of decision(s) this one derives from — comma-separated for several.")
+    rec_p.add_argument("--derives-from", default=None, dest="derives_from", help="Not valid when recording a decision — a derives_from edge originates from an open question (open_question -> decision), so a decision cannot be its source. Use --cites to link a decision this one builds on.")
     rec_p.add_argument("--cites", default=None, help="Exact slug(s) of decision(s) this one cites — comma-separated for several.")
     rec_p.add_argument("--slug", required=True,
                        help=f"Explicit slug (handle) for the decision, required "

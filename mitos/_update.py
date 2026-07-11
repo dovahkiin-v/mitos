@@ -2,10 +2,14 @@
 
 Mitos ships from a git repo via pipx, so the only "is there something newer?"
 signal is the ``__version__`` on ``main``. This module fetches that at most once
-per day (cached under ``~/.cache/mitos/``), compares it to the running version,
-and returns a one-line notice the CLI prints to stderr. Everything here is
-best-effort and fail-silent: no network, a timeout, or a parse error simply
-yields no notice — it must never disrupt a real command.
+per day (``checked_at``, cached under ``~/.cache/mitos/``), compares it to the
+running version, and returns a one-line notice the CLI prints to stderr. The
+notice itself is also throttled to at most once per day (``notified_at``) — being
+behind is a standing state, so re-printing the reminder on every command would be
+noise; a genuinely new remote version resets that throttle so the bump is still
+announced promptly. Everything here is best-effort and fail-silent: no network, a
+timeout, or a parse error simply yields no notice — it must never disrupt a real
+command.
 
 Opt out entirely with ``MITOS_NO_UPDATE_CHECK=1``.
 """
@@ -58,13 +62,19 @@ def _read_cache() -> Optional[dict]:
         return None
 
 
-def _write_cache(latest: Optional[str], now: float) -> None:
-    """Persists the last-checked timestamp and latest seen version."""
+def _write_cache(payload: dict) -> None:
+    """Persists the update-check cache payload verbatim.
+
+    The payload carries ``checked_at`` (last network fetch — the *fetch* throttle),
+    ``latest`` (newest seen remote version), and ``notified_at`` (last time the
+    notice was actually shown — the *display* throttle). Callers merge into the
+    existing payload so writing one field never drops another.
+    """
     try:
         path = _cache_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
-            json.dump({"checked_at": now, "latest": latest}, f)
+            json.dump(payload, f)
     except OSError:
         pass
 
@@ -89,14 +99,21 @@ def _latest_version(now: float) -> Optional[str]:
     stale, one fetch is attempted; on failure the previous cached value (if any)
     is reused rather than thrashing the network on every invocation.
     """
-    cache = _read_cache()
-    if cache and (now - cache.get("checked_at", 0)) < _CACHE_TTL_SECONDS:
+    cache = _read_cache() or {}
+    if (now - cache.get("checked_at", 0)) < _CACHE_TTL_SECONDS:
         return cache.get("latest")
     latest = _fetch_remote_version()
     if latest:
-        _write_cache(latest, now)
+        # A genuinely new remote version resets the display throttle, so the
+        # bump is announced once promptly rather than waiting out the last
+        # notice's window.
+        if latest != cache.get("latest"):
+            cache.pop("notified_at", None)
+        cache["checked_at"] = now
+        cache["latest"] = latest
+        _write_cache(cache)
         return latest
-    return cache.get("latest") if cache else None
+    return cache.get("latest") or None
 
 
 def update_notice(current_version: str, now: Optional[float] = None) -> Optional[str]:
@@ -118,6 +135,15 @@ def update_notice(current_version: str, now: Optional[float] = None) -> Optional
         return None
     try:
         if _version_tuple(latest) > _version_tuple(current_version):
+            # Display throttle: show the reminder at most once per TTL, not on
+            # every command. `_latest_version` already throttles the *network*
+            # via `checked_at`; `notified_at` throttles the *display* the same
+            # way, so a user who is behind is reminded ~once/day, not each run.
+            cache = _read_cache() or {}
+            if (now - cache.get("notified_at", 0)) < _CACHE_TTL_SECONDS:
+                return None
+            cache["notified_at"] = now
+            _write_cache(cache)
             return (
                 f"📦 A new version of mitos is available ({current_version} → {latest}).\n"
                 f"   Update: {_UPDATE_COMMAND}"

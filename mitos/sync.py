@@ -221,6 +221,7 @@ _ERROR_MESSAGES: Dict[str, str] = {
     "relation_target_not_found": "{relation}='{target}' does not match any existing decision. Look it up first with surface_decisions/query_decisions to get the exact slug, or omit '{relation}' if no such link applies.",
     "relation_target_ambiguous": "{relation}='{target}' matches more than one decision. Use query_decisions to find the exact, full slug and pass that.",
     "commit_failed": "The decision validated but the commit failed and nothing was written: {reason}. Retry; if it persists, the workspace store may be locked or corrupt.",
+    "derives_from_on_decision": "derives_from is not valid when recording a decision: a derives_from edge originates from an open question (open_question -> decision), so a decision can never be its source. If you mean 'this decision builds on that one', use cites instead.",
 }
 
 # The user-facing typed relations beyond `supersedes` (which is special: it changes
@@ -1913,6 +1914,14 @@ class MitosSyncManager:
             _val = _provided.get(_name)
             if _val and _val.strip():
                 extra_relations[_name] = _val.strip()
+
+        # record_decision always mints a `decision`, but a `derives_from` edge must
+        # ORIGINATE from an open question (open_question -> decision) — a decision can
+        # never be its source, so this relation is always invalid here. Reject it in
+        # the validate phase with a redirect, rather than letting it pass validation
+        # and fail only at the store's kind CHECK ("validated but the commit failed").
+        if "derives_from" in extra_relations:
+            return _record_error("derives_from_on_decision")
 
         # 4. Slug — validate, don't mangle. The slug is now mandatory and explicit, and
         #    it is folded into the canonical-core identity (V1-D2), so it is permanent

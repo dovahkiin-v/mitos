@@ -62,6 +62,29 @@ def test_cache_avoids_refetch_within_ttl(enable_update_check, monkeypatch):
         return "9.9.9"
 
     monkeypatch.setattr(_update, "_fetch_remote_version", fake_fetch)
-    assert _update.update_notice("0.1.3") is not None  # fetch #1, caches
-    assert _update.update_notice("0.1.3") is not None  # served from cache
+    assert _update.update_notice("0.1.3") is not None  # fetch #1, notice #1
+    # Second call within TTL: served from cache (no refetch) AND display-throttled
+    # (the reminder is once/TTL, not once/command).
+    assert _update.update_notice("0.1.3") is None
     assert calls["n"] == 1
+
+
+def test_notice_throttled_to_once_per_ttl(enable_update_check, monkeypatch):
+    monkeypatch.setattr(_update, "_fetch_remote_version", lambda: "9.9.9")
+    t0 = 1_000_000.0
+    assert _update.update_notice("0.1.3", now=t0) is not None       # first: shown
+    assert _update.update_notice("0.1.3", now=t0 + 60) is None      # within TTL: quiet
+    later = t0 + _update._CACHE_TTL_SECONDS + 1
+    assert _update.update_notice("0.1.3", now=later) is not None    # past TTL: shown again
+
+
+def test_new_remote_version_resets_display_throttle(enable_update_check, monkeypatch):
+    versions = iter(["9.9.9", "9.9.10"])
+    monkeypatch.setattr(_update, "_fetch_remote_version", lambda: next(versions))
+    t0 = 1_000_000.0
+    assert _update.update_notice("0.1.3", now=t0) is not None       # first version: shown
+    # Past the fetch TTL so a new remote version is picked up; a *changed* latest
+    # resets the display throttle, so the new bump announces promptly.
+    later = t0 + _update._CACHE_TTL_SECONDS + 1
+    notice = _update.update_notice("0.1.3", now=later)
+    assert notice is not None and "9.9.10" in notice
