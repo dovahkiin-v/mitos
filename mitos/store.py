@@ -2308,6 +2308,34 @@ class GraphStore:
         finally:
             conn.close()
 
+    def get_outgoing_edges(self, node_id: str) -> List[Dict[str, str]]:
+        """Lists the committed outgoing edges of a node as write facts.
+
+        Returns each edge as ``{"kind": edge_type, "target": <target's current
+        slug>}`` in insertion order. This reads what the commit actually wired
+        (the receipt's ``edges_created`` source of truth), never a re-derivation
+        from author input.
+
+        Args:
+            node_id: The source node's id.
+
+        Returns:
+            A list of ``{"kind", "target"}`` dicts, empty when the node has no
+            outgoing edges.
+        """
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            rows = cursor.execute(
+                "SELECT e.edge_type AS edge_type, n.slug AS slug "
+                "FROM edges e JOIN nodes n ON n.id = e.target_id "
+                "WHERE e.source_id = ? ORDER BY e.rowid",
+                (node_id,),
+            ).fetchall()
+            return [{"kind": r["edge_type"], "target": r["slug"]} for r in rows]
+        finally:
+            conn.close()
+
     def get_modifiers_map(self, node_ids: List[str]) -> Dict[str, Dict[str, List[str]]]:
         """Maps each node to the slugs of later decisions that modify it.
 

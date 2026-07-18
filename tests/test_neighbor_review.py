@@ -3,7 +3,8 @@
 Loop-Claude's friction: a new decision's nearest neighbour only surfaced in the
 POST-commit `related` echo — one step too late to point an amends/supersedes at it
 (a re-record is a no-op, so the link could never be added). `record_decision` now
-embeds the axiom BEFORE the write, and if it is >=0.85 similar to an existing decision
+embeds the axiom BEFORE the write, and if it is >=0.80 similar to an existing decision
+(the strong-match band floor — ADR `record-pause-floor-lowered-to-strong-match-band`)
 the author did not reference, it PAUSES (`status: needs_review`, nothing written) so the
 author can re-record with the relation or `acknowledge_neighbors=True`.
 
@@ -174,6 +175,35 @@ def test_possible_tension_flagged_on_polarity_flip(ws):
                                   ["chrome"], slug="marker-is-persona")
     assert res["status"] == "needs_review"
     assert res["neighbors"][0]["possible_tension"] is True
+
+
+def test_strong_match_band_pauses(ws):
+    """A 0.80–0.85 unreferenced active neighbour now pauses (the lowered floor's
+    whole point — ADR `record-pause-floor-lowered-to-strong-match-band`: at 0.85
+    this band was a visibility-only `related` echo, the mechanism that already
+    failed the five-week prose-obsoletion trap)."""
+    config, m = ws
+    m.record_decision_entry("Use SQLite for the store.", "rej", ["db"], slug="use-sqlite")
+    _arm(m, [{"slug": "use-sqlite", "score": 0.82}])
+    res = m.record_decision_entry("Adopt SQLite as the engine.", "rej", ["db"],
+                                  slug="adopt-sqlite")
+    assert res["status"] == "needs_review"
+    assert res["neighbors"][0]["slug"] == "use-sqlite"
+
+
+def test_strong_match_band_declared_target_still_commits(ws):
+    """A 0.82 neighbour that IS the declared target stays exempt at the new floor."""
+    config, m = ws
+    m.record_decision_entry("Use SQLite for the store.", "rej", ["db"], slug="use-sqlite")
+    _arm(m, [{"slug": "use-sqlite", "score": 0.82}])
+    res = m.record_decision_entry("Use SQLite with WAL mode.", "rej", ["db"],
+                                  slug="use-sqlite-wal", amends="use-sqlite")
+    assert res["status"] == "created", res
+
+
+def test_threshold_value_matches_adr():
+    """The floor is 0.80 — pinned so a drive-by retune goes through the ADR."""
+    assert _NEIGHBOR_REVIEW_THRESHOLD == 0.80
 
 
 def test_threshold_is_inclusive(ws):

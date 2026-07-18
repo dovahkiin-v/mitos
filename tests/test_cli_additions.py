@@ -235,3 +235,61 @@ def test_surface_decisions_mcp_description_names_compose():
     from mitos.mcp_server import surface_decisions, query_decisions
     assert "record_decision" in (surface_decisions.__doc__ or "")
     assert "record_decision" in (query_decisions.__doc__ or "")
+
+
+# --- --axiom-file (quoting-safe axiom, symmetric with --rejected-file) ----------
+
+@patch("mitos.cli.cmd_record")
+def test_record_reads_axiom_from_file(mock_record, tmp_path, monkeypatch):
+    af = tmp_path / "axiom.txt"
+    af.write_text("Camila's axiom, apostrophe-safe\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv",
+                        ["mitos", "record", "--axiom-file", str(af),
+                         "--rejected", "r", "--slug", "s"])
+    main()
+    _, kwargs = mock_record.call_args
+    # The single trailing newline a file/heredoc adds is stripped.
+    assert kwargs["axiom"] == "Camila's axiom, apostrophe-safe"
+
+
+@patch("mitos.cli.cmd_record")
+def test_record_reads_axiom_from_stdin(mock_record, monkeypatch):
+    monkeypatch.setattr(sys, "stdin", io.StringIO("axiom from stdin\n"))
+    monkeypatch.setattr(sys, "argv",
+                        ["mitos", "record", "--axiom-file", "-",
+                         "--rejected", "r", "--slug", "s"])
+    main()
+    _, kwargs = mock_record.call_args
+    assert kwargs["axiom"] == "axiom from stdin"
+
+
+def test_record_rejects_both_axiom_sources(tmp_path, monkeypatch, capsys):
+    af = tmp_path / "axiom.txt"
+    af.write_text("file axiom", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv",
+                        ["mitos", "record", "inline axiom", "--axiom-file", str(af),
+                         "--rejected", "r", "--slug", "s"])
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 2
+    assert "exactly one axiom source" in capsys.readouterr().err
+
+
+def test_record_rejects_neither_axiom_source(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["mitos", "record", "--rejected", "r", "--slug", "s"])
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 2
+    assert "exactly one axiom source" in capsys.readouterr().err
+
+
+def test_record_neither_axiom_source_json_speaks_json(monkeypatch, capsys):
+    """Under --json the dead-end is a structured object on stdout, exit 2 preserved."""
+    import json
+    monkeypatch.setattr(sys, "argv",
+                        ["mitos", "record", "--rejected", "r", "--slug", "s", "--json"])
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["code"] == "missing_axiom"

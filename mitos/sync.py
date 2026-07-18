@@ -333,8 +333,13 @@ _SLUG_MIN_LEN = 32  # auto-derive only: don't trim a word boundary back past her
 # author did NOT reference is paused for review (AX P4): the neighbour was invisible
 # until the post-commit `related` echo, one step too late to point an
 # amends/supersedes/contradicts at it (you can't relink after commit — re-record is a
-# no-op). Same score scale as the `related` echo. Tune here.
-_NEIGHBOR_REVIEW_THRESHOLD = 0.85
+# no-op). 0.80 is the floor of the strong-match band (see recall.py's calibration):
+# an unlinked strong match must force an explicit confirm-or-link, because prose-only
+# obsoletion is invisible to state-filtered retrieval — only edges retire a node (ADR
+# `record-pause-floor-lowered-to-strong-match-band`; the routine-case pause tax stays
+# low via --acknowledge-neighbors, the declared-target exemption, and transitive
+# lineage suppression). Same score scale as the `related` echo. Tune here.
+_NEIGHBOR_REVIEW_THRESHOLD = 0.80
 
 # Cheap polarity cues for the `possible_tension` hint — a high-similarity pair where
 # one axiom negates and the other doesn't ("never a per-persona field" vs "is a
@@ -1857,9 +1862,12 @@ class MitosSyncManager:
 
         Returns:
             A success dict ``{slug, id, state, embedding, status}`` (status
-            "created"|"exists"), plus an optional ``related`` list of the nearest
-            existing live decisions (a write-time adjacency hint on the "created"
-            path); OR, when a highly-similar unreferenced decision exists and
+            "created"|"exists"); on the "created" path it also carries
+            ``edges_created`` (the edges the commit actually wired, each
+            ``{kind, target}`` — write facts read back from the store, not an
+            echo of the input args), the resolved ``scope`` and ``mechanisms``
+            as committed, plus an optional ``related`` list of the nearest
+            existing live decisions (a write-time adjacency hint); OR, when a highly-similar unreferenced decision exists and
             ``acknowledge_neighbors`` is False, a ``{status: "needs_review", code:
             "similar_decision_exists", neighbors, message}`` pause that wrote NOTHING;
             OR a structured ``{error, code}`` failure (see spec §5).
@@ -2216,6 +2224,13 @@ class MitosSyncManager:
             "embedding": self._embedding_status(node_id),
             "status": "created",
             "path": self.config.decisions_file,
+            # Write FACTS read back from the committed node — what the commit actually
+            # wired/stored, never re-derived from the author's input args. Distinct from
+            # the similarity-based `related` recall pointers below, and deliberately
+            # unstamped (ADR `record-receipt-neighbors-are-recall-pointers-not-stamped-reads`).
+            "edges_created": self.store.get_outgoing_edges(node_id),
+            "scope": entry.scope,
+            "mechanisms": entry.mechanisms,
         }
         related = self._adjacent_decisions(vector, exclude_slug=entry.slug)
         if related:

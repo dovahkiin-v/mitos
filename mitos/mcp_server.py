@@ -716,12 +716,16 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
         identical decision was already recorded and is now confirmed present, not an
         error and not something to retry. Only a top-level {error, code} is a failure.
         status="needs_review" (code "similar_decision_exists") is a PAUSE, not a failure
-        and not a write: your decision is ≥0.85 similar to existing `neighbors` you did
+        and not a write: your decision is ≥0.80 similar to existing `neighbors` you did
         not reference. Inspect them — if this amends/supersedes/contradicts/cites one,
         re-record with that relation arg pointing at the neighbour's slug (`possible_tension`
         on a neighbour flags a likely contradiction, not a duplicate); if it is genuinely
         independent, re-record with acknowledge_neighbors=True. Nothing was written, so a
         re-record is the right move here (unlike an "exists" no-op).
+        The "created" result also carries `edges_created` — the relation edges this
+        record actually wired, each `{kind, target}` (write facts read back from the
+        committed graph, so an empty list means no edge landed) — and the resolved
+        `scope`/`mechanisms` as committed.
         On the "created" path the result MAY include `related`: the nearest existing
         live decisions to the one you just recorded — a write-time adjacency hint, so
         you notice an adjacent or contradictory prior decision. If one is genuinely

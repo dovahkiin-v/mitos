@@ -422,7 +422,7 @@ def cmd_init(config: MitosConfig) -> None:
             "## Recording & recall — MCP tools (preferred) or CLI fallback\n"
             "All decisions you record, surface, and query are scoped to THIS project's decision graph and its own Qdrant collection — you will not see, and cannot contaminate, other projects' decisions.\n"
             "If the Mitos MCP server is wired into your agent, call these tools directly — best experience: structured args, no shell-quoting. If it is NOT wired, each maps to a CLI verb (and the CLI also accepts the long names as aliases, e.g. `mitos record_decision`):\n"
-            "- `record_decision`  (CLI: `mitos record`) — the moment you commit to a foundational choice (a schema, a library, a pattern, a path you're abandoning), persist it WITH the alternatives you rejected and why, so future sessions inherit it instead of relitigating. Recording rich prose via the CLI? Use `--rejected-file -` / `--context-file -` to read from stdin and avoid shell-quoting.\n"
+            "- `record_decision`  (CLI: `mitos record`) — the moment you commit to a foundational choice (a schema, a library, a pattern, a path you're abandoning), persist it WITH the alternatives you rejected and why, so future sessions inherit it instead of relitigating. Recording rich prose via the CLI? Use `--axiom-file -` / `--rejected-file -` / `--context-file -` to read from stdin and avoid shell-quoting.\n"
             "- `surface_decisions` (CLI: `mitos surface`) — surface active precedents for a claim/scope BEFORE you decide, so you don't relitigate a settled call. This is the recall loop — use it first. Every hit carries its full `rejected_paths`; pass `brief=True` (CLI `--brief`) for an axiom-only scan.\n"
             "- `query_decisions`   (CLI: `mitos query`) — semantic or slug lookup when unsure whether a precedent exists.\n"
             "- `list_decisions`    (CLI: `mitos list`) — the EXHAUSTIVE recall path. surface/query are semantic and capped at the top few matches; this returns EVERY decision in a scope, deterministically, so a completeness pass or audit doesn't miss anything below the relevance cliff. Needs no key or Qdrant.\n\n"
@@ -1210,6 +1210,17 @@ def cmd_record(
     if result.get("path"):
         print(f"  Written:   {result['path']}  (the human-readable entry — eyeball it)")
     print(f"  Handle:    '{result['slug']}' — pass this to --supersedes/--amends/--depends-on/… to link future decisions.")
+    # Write facts read back from the committed node (NOT an echo of the flags):
+    # the edges the commit actually wired, and scope/mechanisms as stored. Lines
+    # are omitted when empty — a bare decision keeps a bare receipt.
+    edges = result.get("edges_created")
+    if edges:
+        edges_s = ", ".join(f"{e['kind']} → {e['target']}" for e in edges)
+        print(f"  Edges:     {edges_s}")
+    if result.get("scope"):
+        print(f"  Scope:     {', '.join(result['scope'])}")
+    if result.get("mechanisms"):
+        print(f"  Mechanisms: {', '.join(result['mechanisms'])}")
     related = result.get("related")
     if related:
         print("  ↔ Nearest existing decisions (an intended neighbour, or a tension to reconcile?):")
@@ -3564,7 +3575,12 @@ def main() -> None:
 
     # record (alias: record_decision — the MCP tool name, so an agent's first instinct works)
     rec_p = subparsers.add_parser("record", aliases=["record_decision"], help="Record a decision directly to buffer and graph.")
-    rec_p.add_argument("axiom", help="The decision as a single clear sentence true going forward.")
+    rec_p.add_argument("axiom", nargs="?", default=None,
+                       help="The decision as a single clear sentence true going forward "
+                            "(or use --axiom-file; exactly one of the two).")
+    rec_p.add_argument("--axiom-file", default=None, dest="axiom_file",
+                       help="Read the axiom from a file ('-' = stdin) to avoid shell-quoting; "
+                            "replaces the positional axiom (supply one, not both).")
     rec_p.add_argument("--rejected", default=None, help="Alternatives considered and rejected, and why (REQUIRED — or use --rejected-file).")
     rec_p.add_argument("--rejected-file", default=None, dest="rejected_file",
                        help="Read --rejected from a file ('-' = stdin) to avoid shell-quoting long prose.")
@@ -3708,6 +3724,21 @@ def main() -> None:
         elif args.command == "render":
             cmd_render(config, scope=args.scope, render_format=args.format)
         elif args.command in ("record", "record_decision"):
+            # Exactly one axiom source: the positional or --axiom-file (the
+            # quoting-safe twin of --rejected-file). Same JSON-aware dead-end
+            # shape as the missing-rejected check below.
+            if (args.axiom is None) == (args.axiom_file is None):
+                msg = ("record requires exactly one axiom source: the positional "
+                       "axiom OR --axiom-file ('-' = stdin), not both and not neither.")
+                if args.as_json:
+                    _emit_json({"error": msg, "code": "ambiguous_axiom_source"
+                                if args.axiom is not None else "missing_axiom"})
+                else:
+                    print(msg, file=sys.stderr)
+                sys.exit(2)
+            axiom = _read_text_arg(args.axiom, args.axiom_file)
+            if args.axiom_file is not None and axiom.endswith("\n"):
+                axiom = axiom[:-1]  # strip the single trailing newline files/heredocs add
             rejected = _read_text_arg(args.rejected, args.rejected_file)
             if not (rejected and rejected.strip()):
                 msg = ("record requires --rejected or --rejected-file "
@@ -3722,7 +3753,7 @@ def main() -> None:
             context = _read_text_arg(args.context, args.context_file)
             cmd_record(
                 config,
-                axiom=args.axiom,
+                axiom=axiom,
                 rejected=rejected,
                 scope=args.scope,
                 mechanisms=args.mechanisms,

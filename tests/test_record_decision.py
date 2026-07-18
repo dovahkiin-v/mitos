@@ -285,7 +285,12 @@ def test_slug_prefix_is_not_a_collision(ws) -> None:
     """A new slug that is a prefix of an existing one commits normally (fuzzy match must not block)."""
     config, m = ws
     m.record_decision_entry("Use SQLite WAL.", "no", [], slug="use-sqlite-wal")
-    res = m.record_decision_entry("Use SQLite generally.", "no", [], slug="use-sqlite")
+    # acknowledge_neighbors: with live embeddings this near-twin pair lands in the
+    # strong-match band the 0.80 pause floor now catches (ADR
+    # `record-pause-floor-lowered-to-strong-match-band`); the pause is not this
+    # test's subject — slug-prefix collision logic is.
+    res = m.record_decision_entry("Use SQLite generally.", "no", [], slug="use-sqlite",
+                                  acknowledge_neighbors=True)
     assert "error" not in res and res["status"] == "created"
 
 
@@ -587,3 +592,92 @@ def _mk_entry(axiom: str, slug: str):
     e.axiom = axiom
     e.rejected_paths = "setup rejection"
     return e
+
+
+# --------------------------------------------------------------------------- #
+# Receipt enrichment: edges_created + resolved scope/mechanisms (write facts)
+# --------------------------------------------------------------------------- #
+
+def test_receipt_carries_committed_edges_and_resolved_fields(ws) -> None:
+    """The "created" receipt echoes the edges the commit actually wired (incl. a
+    comma-split multi-target flag) and scope/mechanisms as normalised — write
+    facts read back from the store, not the raw input args."""
+    config, m = ws
+    for slug in ("old-a", "old-b", "cited-c"):
+        # acknowledge_neighbors: the seeds are near-twins of each other; with live
+        # embeddings the 0.80 pause floor would otherwise pause the later seeds.
+        assert m.record_decision_entry(f"Prior axiom {slug}.", "rej", [], slug=slug,
+                                       acknowledge_neighbors=True)["status"] == "created"
+    res = m.record_decision_entry(
+        axiom="Unifying axiom.", rejected_paths="rej",
+        scope=[" db ", "", "auth"], mechanisms=[" sqlite ", ""],
+        supersedes="old-a, old-b", cites="cited-c", slug="unifier",
+    )
+    assert res["status"] == "created"
+    # Normalised echo of what was committed (whitespace stripped, empties dropped).
+    assert res["scope"] == ["db", "auth"]
+    assert res["mechanisms"] == ["sqlite"]
+    # Edge facts, one per wired edge; order-insensitive compare.
+    got = {(e["kind"], e["target"]) for e in res["edges_created"]}
+    assert got == {("supersedes", "old-a"), ("supersedes", "old-b"),
+                   ("cites", "cited-c")}
+    # And they match the committed graph exactly.
+    store = GraphStore(config.db_path)
+    node_id = store.resolve_slug("unifier")[0]
+    committed = {(e["kind"], e["target"]) for e in store.get_outgoing_edges(node_id)}
+    assert got == committed
+
+
+def test_receipt_edges_created_empty_on_bare_record(ws) -> None:
+    """No relation flags → edges_created is present and empty (a fact, not an omission)."""
+    config, m = ws
+    res = m.record_decision_entry("A lone axiom.", "rej", [], slug="lone")
+    assert res["status"] == "created"
+    assert res["edges_created"] == []
+    assert res["scope"] == [] and res["mechanisms"] == []
+
+
+def test_cli_json_receipt_carries_edges_and_fields(ws, capsys) -> None:
+    """`mitos record --json` emits the enriched receipt verbatim."""
+    from mitos.cli import cmd_record
+    config, m = ws
+    m.record_decision_entry("Prior axiom.", "rej", [], slug="prior")
+    cmd_record(config, axiom="Follow-up axiom.", rejected="rej", scope=["db"],
+               mechanisms=["sqlite"], amends="prior", slug="follow-up", as_json=True)
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["edges_created"] == [{"kind": "amends", "target": "prior"}]
+    assert payload["scope"] == ["db"] and payload["mechanisms"] == ["sqlite"]
+
+
+def test_cli_text_receipt_renders_edges_scope_mechanisms(ws, capsys) -> None:
+    """The human receipt prints Edges/Scope/Mechanisms lines after Handle, and
+    omits them all on a bare record."""
+    from mitos.cli import cmd_record
+    config, m = ws
+    m.record_decision_entry("Prior axiom.", "rej", [], slug="prior")
+    cmd_record(config, axiom="Follow-up axiom.", rejected="rej", scope=["db", "auth"],
+               mechanisms=["sqlite"], amends="prior", slug="follow-up")
+    out = capsys.readouterr().out
+    assert "Edges:     amends → prior" in out
+    assert "Scope:     db, auth" in out
+    assert "Mechanisms: sqlite" in out
+    # Bare record: no empty Edges/Scope/Mechanisms lines. (acknowledge_neighbors:
+    # under live embeddings the earlier entries sit in the 0.80 pause band.)
+    cmd_record(config, axiom="A lone axiom.", rejected="rej", slug="lone",
+               acknowledge_neighbors=True)
+    out = capsys.readouterr().out
+    assert "Edges:" not in out and "Scope:" not in out and "Mechanisms:" not in out
+
+
+def test_mcp_receipt_carries_edges_and_fields(ws) -> None:
+    """The MCP record_decision result carries the same enrichment (CLI⇄MCP sync)."""
+    from mitos import mcp_server
+    config, m = ws
+    m.record_decision_entry("Prior axiom.", "rej", [], slug="prior")
+    with patch("mitos.mcp_server.MitosConfig", return_value=config):
+        res = json.loads(mcp_server.record_decision(
+            "Follow-up axiom.", "rej", ["db"], slug="follow-up",
+            mechanisms=["sqlite"], amends="prior"))
+    assert res["status"] == "created"
+    assert res["edges_created"] == [{"kind": "amends", "target": "prior"}]
+    assert res["scope"] == ["db"] and res["mechanisms"] == ["sqlite"]
