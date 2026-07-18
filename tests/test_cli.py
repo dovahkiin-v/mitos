@@ -75,7 +75,8 @@ def test_cli_list_routing(mock_list: MagicMock) -> None:
         scope="backend",
         state_filter="active",
         as_json=False,
-        brief=False
+        brief=False,
+        oneline=False
     )
 
 

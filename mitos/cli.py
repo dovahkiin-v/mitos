@@ -26,7 +26,10 @@ from mitos.display import (
     clamp_limit,
     dumps_display,
     letter_payload,
+    oneline_axiom,
+    oneline_payload,
     order_scope_counts,
+    truncate_words,
     resolve_display_ensure_ascii,
     show_payload,
     SHOW_NOT_FOUND_HINT,
@@ -888,7 +891,7 @@ def cmd_show(config: MitosConfig, ident: str, as_json: bool = False) -> None:
 
 def cmd_list(config: MitosConfig, scope: Optional[str] = None,
              state_filter: Optional[str] = None, as_json: bool = False,
-             brief: bool = False) -> None:
+             brief: bool = False, oneline: bool = False) -> None:
     """Enumerates the complete set of decisions (+ parked open questions) for a scope.
 
     The CLI twin of the MCP ``list_decisions`` tool — the exhaustive, deterministic
@@ -903,6 +906,11 @@ def cmd_list(config: MitosConfig, scope: Optional[str] = None,
             drifted); ``"all"`` = every decision regardless of state; any other value
             = an exact computed-state match (e.g. "superseded").
         as_json: Emit a machine-readable JSON report (for agents) instead of text.
+        brief: Axiom-only (omit ``rejected_paths``) — the M4 opt-out. Mutually
+            exclusive with ``oneline`` (argparse enforces it on the CLI surface).
+        oneline: One row per decision (slug + word-boundary-truncated axiom) — the
+            orientation/table-of-contents tier below ``brief`` for big scopes.
+            Modifier markers survive (stamps ride every thinner tier).
     """
     store = GraphStore(config.db_path)
     # Default the view to the live set; an absent filter must not dump superseded
@@ -914,7 +922,13 @@ def cmd_list(config: MitosConfig, scope: Optional[str] = None,
               if oq["state"] == "parked"]
 
     def _list_item(d):
-        item = letter_payload(d, brief=brief, extras={"state": d["computed_state"]})
+        # The oneline tier swaps the Letter core for the minimal {slug,
+        # axiom_oneline, state} object; modifier stamps ride either shape
+        # (stamps survive every thinner tier).
+        if oneline:
+            item = oneline_payload(d)
+        else:
+            item = letter_payload(d, brief=brief, extras={"state": d["computed_state"]})
         item.update(modifiers.get(d["id"], {}))
         return item
 
@@ -967,14 +981,18 @@ def cmd_list(config: MitosConfig, scope: Optional[str] = None,
           f"[{provenance_line(config)}]:")
     print("-" * 80)
     for d in decisions:
+        marker = _modifier_marker(modifiers.get(d["id"], {}))
+        if oneline:
+            # One row per decision: slug + word-boundary-truncated axiom (the
+            # orientation tier); a compact modifier marker rides the same row.
+            row = f"{d['slug']}  {oneline_axiom(d)}"
+            print(f"{row}  {marker}" if marker else row)
+            continue
         scopes = f"[{', '.join(d['scope'])}]" if d["scope"] else ""
         print(f"{d['computed_state']:11} | {d['slug']:30} {scopes}")
-        axiom_snip = d.get("core_axiom", "")
-        if len(axiom_snip) > 66:
-            axiom_snip = axiom_snip[:63] + "..."
+        axiom_snip = truncate_words(d.get("core_axiom", ""), 66)
         if axiom_snip:
             print(f"              {axiom_snip}")
-        marker = _modifier_marker(modifiers.get(d["id"], {}))
         if marker:
             print(f"              {marker}")
     if parked:
@@ -1197,7 +1215,8 @@ def cmd_record(
             score = n.get("score")
             score_s = f"{score:.2f}" if isinstance(score, (int, float)) else "?"
             tension = "  [possible tension]" if n.get("possible_tension") else ""
-            print(f"  ↔ {n['slug']}  ({score_s}){tension}  {(n.get('axiom') or '')[:60]}",
+            print(f"  ↔ {n['slug']}  ({score_s}){tension}  "
+                  f"{truncate_words(n.get('axiom') or '', 60)}",
                   file=sys.stderr)
         print("  → Re-record with --supersedes/--amends/--contradicts/--cites <slug> to link "
               "it, or --acknowledge-neighbors to record as independent.", file=sys.stderr)
@@ -1227,7 +1246,7 @@ def cmd_record(
         for r in related:
             score = r.get("score")
             score_s = f"{score:.2f}" if isinstance(score, (int, float)) else "?"
-            axiom_snip = (r.get("axiom") or "")[:60]
+            axiom_snip = truncate_words(r.get("axiom") or "", 60)
             print(f"     - {r['slug']}  ({score_s})  {axiom_snip}")
     # Debounced size-ceiling nudge — AFTER the receipt, on stderr (an ancillary health
     # hint, never the receipt itself), so a healthy growing corpus can't bury "Recorded ✓".
@@ -3548,7 +3567,11 @@ def main() -> None:
     list_p.add_argument("--scope", help="Filter by scope tag.")
     list_p.add_argument("--state", help="Computed state filter: 'active' (default, live set), 'all', or an exact state.")
     list_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON (for agents).")
-    list_p.add_argument("--brief", action="store_true", help="Axiom-only (omit rejected_paths) — lighter over a big scope.")
+    # brief and oneline are depth tiers below the Letter-complete default — pick one.
+    list_depth = list_p.add_mutually_exclusive_group()
+    list_depth.add_argument("--brief", action="store_true", help="Axiom-only (omit rejected_paths) — lighter over a big scope.")
+    list_depth.add_argument("--oneline", action="store_true",
+                            help="One row per decision: slug + truncated axiom — the orientation tier for big scopes (modifier markers kept).")
 
     # open-questions
     oq_p = subparsers.add_parser("open-questions", help="List active open questions.")
@@ -3714,7 +3737,8 @@ def main() -> None:
         elif args.command == "show":
             cmd_show(config, args.ident, as_json=args.as_json)
         elif args.command in ("list", "list_decisions"):
-            cmd_list(config, scope=args.scope, state_filter=args.state, as_json=args.as_json, brief=args.brief)
+            cmd_list(config, scope=args.scope, state_filter=args.state, as_json=args.as_json,
+                     brief=args.brief, oneline=args.oneline)
         elif args.command == "open-questions":
             cmd_open_questions(config, scope=args.scope, as_json=args.as_json)
         elif args.command in ("scopes", "list_scopes"):

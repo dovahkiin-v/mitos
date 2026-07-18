@@ -66,6 +66,87 @@ def clamp_limit(limit: Optional[int]) -> int:
     return max(1, min(limit, RANKED_LIMIT_CEILING))
 
 
+# The oneline tier's row-width budget (slug + axiom, chars) and the floor the
+# axiom never shrinks below even against a very long slug. Lives here — the one
+# leaf both `cli.py` and `mcp_server.py` import — so the CLI text row, the CLI
+# `--json` payload, and the MCP `list_decisions(oneline=True)` payload all
+# truncate identically (CLI⇄MCP parity is structural, not coincidental).
+ONELINE_ROW_WIDTH = 100
+_ONELINE_AXIOM_FLOOR = 24
+
+
+def truncate_words(text: str, limit: int) -> str:
+    """Truncates text at a word boundary within ``limit`` chars, with an ellipsis.
+
+    The single truncation seam for every preview cut (list snippets, record-receipt
+    neighbour previews, renderer pointer lines) — replacing the old mid-word
+    ``[:60]``-style slices. Guarantees: text at or under the limit is returned
+    unchanged (no ellipsis); a truncated result never ends mid-word and never
+    exceeds ``limit`` chars including the trailing ``…``. The one exception is a
+    single unbroken token longer than the limit (a slug-like string with no
+    spaces), which is hard-cut — there is no word boundary to respect.
+
+    Args:
+        text: The text to truncate.
+        limit: The maximum result length in characters, ellipsis included.
+
+    Returns:
+        The (possibly truncated) text.
+    """
+    if len(text) <= limit:
+        return text
+    cut = text[: limit - 1]  # reserve one char for the ellipsis
+    if " " in cut:
+        # Back up to the last word boundary so no word is cut mid-way — the kept
+        # prefix is always whole words, never a dangling fragment of one.
+        boundary = cut.rsplit(" ", 1)[0].rstrip()
+        if boundary:
+            return boundary + "…"
+    # No boundary to respect (one unbroken token, or leading whitespace only).
+    return cut.rstrip() + "…"
+
+
+def oneline_axiom(node: Mapping[str, Any]) -> str:
+    """Truncates a node's axiom to its oneline-row budget (word-boundary, ellipsis).
+
+    The row budget is ``ONELINE_ROW_WIDTH`` minus the slug and its two-space
+    separator, floored so a very long slug can't starve the axiom entirely.
+    Shared by the CLI text row, the CLI ``--json`` payload, and the MCP
+    ``list_decisions(oneline=True)`` payload — one truncation, three surfaces.
+
+    Args:
+        node: A decision node dict; reads ``slug`` and ``core_axiom``.
+
+    Returns:
+        The word-boundary-truncated axiom.
+    """
+    width = max(_ONELINE_AXIOM_FLOOR, ONELINE_ROW_WIDTH - len(node["slug"]) - 2)
+    return truncate_words(node["core_axiom"], width)
+
+
+def oneline_payload(node: Mapping[str, Any]) -> Dict[str, Any]:
+    """Shapes the minimal oneline-tier decision object, shared CLI⇄MCP.
+
+    The orientation/table-of-contents tier below ``brief``: just
+    ``{slug, axiom_oneline, state}``. Returns an **un-stamped** core (mirroring
+    :func:`letter_payload`): modifier-stamping is the caller's job via the
+    ``GraphStore`` modifier seam — the stamps-survive-every-thinner-tier rule
+    means the caller MUST still ``.update`` the modifier keys onto this.
+
+    Args:
+        node: A decision node dict; reads ``slug``, ``core_axiom`` and
+            ``computed_state``.
+
+    Returns:
+        The un-stamped minimal oneline dict.
+    """
+    return {
+        "slug": node["slug"],
+        "axiom_oneline": oneline_axiom(node),
+        "state": node["computed_state"],
+    }
+
+
 def blackout_note(retired_handles: List[Mapping[str, Any]]) -> str:
     """Builds the all-superseded blackout recovery note (the P3 vector text).
 

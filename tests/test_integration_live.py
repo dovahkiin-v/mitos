@@ -221,8 +221,14 @@ def test_cli_subprocess_list_decisions_json(tmp_path):
              "Committed .env rejected: leaks on a public mirror"),
         ]
         for i, (axiom, rejected) in enumerate(records):
+            # --acknowledge-neighbors: under live embeddings these fixtures land in
+            # the 0.80–0.85 strong-match band, which now pauses an unlinked record
+            # (ADR record-pause-floor-lowered-to-strong-match-band). They are
+            # deliberately independent decisions, so take the sanctioned bypass —
+            # the pause itself is pinned by test_neighbor_review.py.
             rec = subprocess.run(
-                [mitos_bin, "record", axiom, "--rejected", rejected, "--scope", "infra", "--slug", f"slug-{i}"],
+                [mitos_bin, "record", axiom, "--rejected", rejected, "--scope", "infra",
+                 "--slug", f"slug-{i}", "--acknowledge-neighbors"],
                 cwd=ws, env=env, capture_output=True, text=True,
             )
             assert rec.returncode == 0, rec.stderr

@@ -8,7 +8,7 @@ import os
 from typing import Optional, List, Dict, Any, Tuple
 from mcp.server.fastmcp import FastMCP
 
-from mitos.display import blackout_note, clamp_limit, dumps_display, letter_payload, order_scope_counts, show_payload, SHOW_NOT_FOUND_HINT
+from mitos.display import blackout_note, clamp_limit, dumps_display, letter_payload, oneline_payload, order_scope_counts, show_payload, SHOW_NOT_FOUND_HINT
 from mitos.config import MitosConfig
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS
 from mitos.embeddings import GeminiEmbeddingProvider
@@ -375,7 +375,8 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
 
 
 @mcp.tool()
-def list_decisions(scope: Optional[str] = None, state: str = "active", brief: bool = False) -> str:
+def list_decisions(scope: Optional[str] = None, state: str = "active", brief: bool = False,
+                   oneline: bool = False) -> str:
     """Enumerate the COMPLETE set of decisions (optionally scope-filtered) — no ranking, no top-k.
 
     surface_decisions / query_decisions are SEMANTIC and capped at the top few
@@ -397,21 +398,40 @@ def list_decisions(scope: Optional[str] = None, state: str = "active", brief: bo
             other value is an exact computed-state match (e.g. 'superseded').
         brief: If True, omit `rejected_paths` from every decision (axiom-only). Useful
             here — an exhaustive scope can otherwise return many full reasoning walls.
+        oneline: If True, return the orientation/table-of-contents tier: one minimal
+            object per decision — {slug, axiom_oneline (word-boundary-truncated),
+            state} plus modifier slugs when present. For big scopes where even
+            brief=True blows the result ceiling (measured: a 45-decision scope did) —
+            scan the map here, then dereference the few that matter with query/show.
+            Letter-complete stays the default depth; this is an explicit opt-down,
+            never a default. Mutually exclusive with brief.
 
     Returns:
         A JSON string: {decisions, open_questions, total, scope, state}. Each
         decision carries the same Letter-mode shape as surface_decisions (slug,
         axiom, rejected_paths, scope) plus its computed `state`, and — when a later
         decision modifies it — `superseded_by`/`amended_by`/`narrowed_by`/
-        `corrected_by` modifier slugs. UNBOUNDED.
+        `corrected_by` modifier slugs (the stamps survive every thinner tier,
+        including oneline). UNBOUNDED.
     """
+    if brief and oneline:
+        return dumps_display(
+            {"error": "brief and oneline are mutually exclusive — pick one depth tier."},
+            ensure_ascii=False, indent=None)
+
     store, _embed, _vec = get_workspace_components()
 
     nodes = store.get_decisions(scope=scope, state=state)
     modifiers = store.get_modifiers_map([n["id"] for n in nodes])
     decisions = []
     for n in nodes:
-        d = letter_payload(n, brief=brief, extras={"state": n["computed_state"]})
+        # oneline swaps the Letter core for the minimal {slug, axiom_oneline, state}
+        # object (same shape as the CLI's `list --oneline --json` — parity seam in
+        # display.oneline_payload); modifier stamps ride either shape.
+        if oneline:
+            d = oneline_payload(n)
+        else:
+            d = letter_payload(n, brief=brief, extras={"state": n["computed_state"]})
         d.update(modifiers.get(n["id"], {}))
         decisions.append(d)
 

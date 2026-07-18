@@ -189,3 +189,99 @@ def test_overflow_report_ranks_largest_decision_first(
     # Largest decision is ranked first, so an author knows what to re-scope.
     assert o["top_decisions"][0]["slug"] == "big-one"
     assert o["top_decisions"][0]["chars"] >= o["top_decisions"][-1]["chars"]
+
+
+# --------------------------------------------------------------------------- #
+# Primary-tag dedupe (the render-dedupe ADR): full body once, pointers elsewhere
+# --------------------------------------------------------------------------- #
+
+def _commit(store: GraphStore, slug: str, scope, axiom: str = None) -> None:
+    e = ParsedEntry("decision", slug, 1, 5)
+    e.axiom = axiom or f"Axiom for {slug} with enough words to truncate cleanly at a boundary."
+    e.rejected_paths = f"Rejected for {slug}."
+    e.scope = scope
+    store.commit_parsed_entry(e)
+
+
+def test_multi_tag_full_body_only_under_primary(temp_workspace) -> None:
+    """A multi-tag decision renders its full body under its FIRST tag only;
+    every secondary tag's file carries a one-line pointer to the primary file."""
+    store, workspace = temp_workspace
+    _commit(store, "multi-call", ["alpha", "beta", "gamma"])
+
+    assembled = assemble_render(store)
+    alpha = assembled["scopes"]["alpha"]["content"]
+    beta = assembled["scopes"]["beta"]["content"]
+    gamma = assembled["scopes"]["gamma"]["content"]
+
+    # Full body (with its Rejected block) only under the primary tag.
+    assert "## multi-call" in alpha and "Rejected for multi-call." in alpha
+    for secondary in (beta, gamma):
+        assert "## multi-call" not in secondary
+        assert "Rejected for multi-call." not in secondary
+        assert R.POINTER_SECTION_HEADING in secondary
+        assert "multi-call" in secondary
+        assert "→ full entry: alpha.md" in secondary
+    # The primary file carries no pointer section for this decision.
+    assert R.POINTER_SECTION_HEADING not in alpha
+
+
+def test_single_tag_scope_file_unchanged(temp_workspace) -> None:
+    """A single-tag decision's scope file renders exactly as before (no pointers)."""
+    store, workspace = temp_workspace
+    _commit(store, "solo-call", ["solo"])
+
+    assembled = assemble_render(store)
+    content = assembled["scopes"]["solo"]["content"]
+    assert "## solo-call" in content and "Rejected for solo-call." in content
+    assert R.POINTER_SECTION_HEADING not in content
+    assert "→ full entry" not in content
+
+
+def test_global_file_unaffected_by_dedupe(temp_workspace) -> None:
+    """live_axioms.md keeps one full body per decision — no pointers."""
+    store, workspace = temp_workspace
+    _commit(store, "multi-call", ["alpha", "beta"])
+    assembled = assemble_render(store)
+    g = assembled["global"]["content"]
+    assert g.count("## multi-call") == 1
+    assert "Rejected for multi-call." in g
+    assert R.POINTER_SECTION_HEADING not in g
+
+
+def test_pointer_line_truncates_at_word_boundary(temp_workspace) -> None:
+    """The pointer's axiom is word-boundary-truncated with an ellipsis."""
+    store, workspace = temp_workspace
+    long_axiom = "This deliberately long axiom keeps going with many words " * 4
+    _commit(store, "long-call", ["prime", "second"], axiom=long_axiom.strip())
+    assembled = assemble_render(store)
+    second = assembled["scopes"]["second"]["content"]
+    pointer = next(l for l in second.splitlines() if l.startswith("- **long-call**"))
+    assert "…" in pointer and "→ full entry: prime.md" in pointer
+    # No mid-word cut: the char before the ellipsis ends a whole word.
+    snippet = pointer.split("— ", 1)[1].split(" → full entry", 1)[0]
+    assert snippet.endswith("…")
+    assert long_axiom.startswith(snippet[:-1])
+    assert long_axiom[len(snippet) - 1] == " "
+
+
+def test_overflow_accounting_reflects_pointer_weight(temp_workspace, monkeypatch) -> None:
+    """A secondary scope's size-contributor list carries the decision at pointer
+    weight (one line), not full-body weight — the accounting matches the content."""
+    store, workspace = temp_workspace
+    big_axiom = "A very heavy rationale block indeed. " * 30
+    _commit(store, "heavy-call", ["main", "side"], axiom=big_axiom.strip())
+    _commit(store, "side-own", ["side"])
+
+    assembled = assemble_render(store)
+    side = assembled["scopes"]["side"]
+    sizes = dict(side["decisions"])
+    main_sizes = dict(assembled["scopes"]["main"]["decisions"])
+    # Pointer weight is a single line — far below the full-body weight.
+    assert sizes["heavy-call"] < 200 < main_sizes["heavy-call"]
+    # The per-decision sizes sum to less than the file (header + section heading).
+    assert sum(sizes.values()) < len(side["content"])
+    # And render_all's disk write matches the assembled accounting source.
+    MitosRenderer(workspace).render_all(store)
+    with open(os.path.join(workspace, ".mitos", "axioms", "side.md"), encoding="utf-8") as f:
+        assert f.read() == side["content"]

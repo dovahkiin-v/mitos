@@ -7,6 +7,7 @@ generating global and per-scope markdown files atomically from primary source da
 import os
 import tempfile
 from typing import List, Dict, Any, Optional, Tuple
+from mitos.display import truncate_words
 from mitos.protocols import GraphStoreProtocol
 
 # Size ceilings for the generated context files, named in CHARACTERS — the unit the
@@ -18,6 +19,35 @@ from mitos.protocols import GraphStoreProtocol
 GLOBAL_OVERFLOW_WARN_CHARS = 50_000
 SCOPE_OVERFLOW_WARN_CHARS = 20_000
 _CHARS_PER_TOKEN = 4
+
+# Width of the truncated axiom in a secondary-scope pointer line (chars).
+POINTER_AXIOM_CHARS = 70
+
+# Section heading grouping the secondary-scope pointer lines below a scope
+# file's full entries (see render_pointer_line).
+POINTER_SECTION_HEADING = "## Also scoped here (full entries elsewhere)"
+
+
+def render_pointer_line(node: Dict[str, Any], primary_scope: str) -> str:
+    """Renders the one-line secondary-scope pointer for a multi-tag decision.
+
+    Per the render-dedupe ADR, a decision's full Letter-complete body renders only
+    under its PRIMARY tag (the first tag in its scope list as hydrated); every
+    secondary tag's file carries this pointer instead — slug, word-boundary-
+    truncated axiom, and where the full body lives — so scope-file weight stops
+    converging toward tags× corpus while the decision stays discoverable from
+    every scope it touches.
+
+    Args:
+        node: The decision node dict.
+        primary_scope: The decision's primary scope tag (its first, author order).
+
+    Returns:
+        The pointer line, newline-terminated.
+    """
+    slug = node.get("slug", "")
+    axiom = truncate_words(node.get("core_axiom", ""), POINTER_AXIOM_CHARS)
+    return f"- **{slug}** — {axiom} → full entry: {primary_scope}.md\n"
 
 
 def estimate_tokens(char_count: int) -> int:
@@ -148,12 +178,34 @@ def assemble_render(store: GraphStoreProtocol) -> Dict[str, Any]:
             f"# Active Axioms for Scope: {s}\n"
             f"*Generated automatically by Mitos. Derived statelessly from primary sources (M8).*\n\n"
         )
-        s_blocks = blocks_for(decs)  # always non-empty: scope_groups only holds non-empty scopes
+        # Dedupe by primary tag (the render-dedupe ADR): the full Letter-complete
+        # body renders only under a decision's FIRST scope tag; under every
+        # secondary tag a one-line pointer names the primary file. Single-tag
+        # decisions therefore render exactly as before. Note: the ADR says
+        # "author order", but the graph does not persist it — node_scopes is
+        # committed as a sorted set and hydrated sorted — so "first tag" here is
+        # the first of the node's scope list as every read surface presents it.
+        primaries = [d for d in decs if d.get("scope", [None])[0] == s]
+        secondaries = [d for d in decs if d.get("scope", [None])[0] != s]
+        s_blocks = blocks_for(primaries)
+        pointers = [(d.get("slug", ""), render_pointer_line(d, d["scope"][0]))
+                    for d in secondaries]
+        content = header + "\n".join(b for _, b in s_blocks)
+        if pointers:
+            # Full blocks end with "\n"; the extra "\n" leaves one blank line
+            # before the pointer section (or sits flush under the header's own
+            # trailing blank line when the file is pointers-only).
+            if s_blocks:
+                content += "\n"
+            content += POINTER_SECTION_HEADING + "\n" + "".join(p for _, p in pointers)
         scopes[s] = {
             "name": f"{s}.md",
             "scope": s,
-            "content": header + "\n".join(b for _, b in s_blocks),
-            "decisions": [(slug, len(b)) for slug, b in s_blocks],
+            "content": content,
+            # Size-contributor accounting reflects the real contents: full blocks
+            # at body weight, pointers at their one-line weight.
+            "decisions": ([(slug, len(b)) for slug, b in s_blocks]
+                          + [(slug, len(p)) for slug, p in pointers]),
         }
 
     return {
