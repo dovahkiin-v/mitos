@@ -671,7 +671,10 @@ def test_cli_query_true_miss_keeps_plain_message(ws, capsys) -> None:
     with patch("mitos.cli.MitosSyncManager", return_value=stub):
         cmd_query(config, "a claim that is not any slug", as_json=True)
     resp = json.loads(capsys.readouterr().out)
-    assert resp == {"query": "a claim that is not any slug", "depth_mode": "letter", "matches": []}
+    assert resp == {"query": "a claim that is not any slug", "depth_mode": "letter",
+                    "matches": [],
+                    "collection": config.qdrant_collection,
+                    "workspace": config.workspace_dir}
     assert "all_superseded" not in resp
 
     with patch("mitos.cli.MitosSyncManager", return_value=stub):

@@ -503,13 +503,16 @@ def _boot_migrations(
     snapshot_path: Optional[str] = None
     try:
         # Refuse a prototype graph rather than ladder-advance it into an
-        # undiagnosable hybrid (R3/R11) — route it to the §2.1 one-time cutover.
-        # Message unchanged from the pre-1a in-__init__ guard (relocated here).
+        # undiagnosable hybrid (R3/R11) — route it to the §2.1 one-time cutover,
+        # naming the meanwhile-fallback so a read-only caller isn't dead-ended.
         if is_pre_v1a_schema(conn):
             raise DatabaseError(
                 "This graph predates the V1a schema (a prototype layout "
                 "was detected). Mitos will not migrate it in place. Run "
-                "the one-time cutover to rebuild it into the V1a store."
+                "the one-time cutover to rebuild it into the V1a store. "
+                "Meanwhile `mitos surface`/`query` fall back to a text match "
+                "over decisions.md, and `grep decisions.md` always works — "
+                "nothing is lost."
             )
         snapshot_path = take_pre_ladder_snapshot(conn, db_path, steps)
         run_migrations(conn, steps)

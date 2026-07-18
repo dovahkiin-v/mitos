@@ -52,7 +52,9 @@ from mitos.conflict import run_conflict_check, ConflictUnavailableReason
 from mitos.migrations import is_pre_v1a_schema
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS, open_connection
 from mitos.cutover import default_aside_db_path, perform_swap, rebuild_and_gate
-from mitos.recall import assess_surface_recall, scope_filter_recovery
+from mitos.lexical import degraded_reason_from_error, lexical_fallback
+from mitos.recall import (assess_surface_recall, corpus_provenance,
+                          provenance_line, scope_filter_recovery)
 from mitos.sync import MitosSyncManager, run_ambient_capture, _SLUG_MAX_LEN
 from mitos._agent_block import agent_block, agent_block_drift, AGENT_GUIDE_VERSION
 from mitos.renderer import MitosRenderer, overflow_report
@@ -114,7 +116,10 @@ def _emit_json(obj: Any, *, indent: Optional[int] = 2) -> None:
 _CUTOVER_GUIDANCE = (
     "This graph predates the V1a schema (a prototype layout was detected). "
     "Mitos will not migrate it in place — run the one-time cutover (`mitos "
-    "cutover`) to rebuild it into the V1a store (see SETUP.md → Cutover)."
+    "cutover`) to rebuild it into the V1a store (see SETUP.md → Cutover). "
+    "Meanwhile the markdown gold source still answers: `mitos surface`/`query` "
+    "fall back to a text match over decisions.md, and `grep decisions.md` "
+    "always works — nothing is lost."
 )
 
 
@@ -603,6 +608,58 @@ def _retired_handle(store: GraphStore, slug: str) -> Optional[Dict[str, Any]]:
     return handle
 
 
+def _emit_lexical_degraded(config: MitosConfig, query: str, *, reason: str,
+                           store: Optional[GraphStore], as_json: bool,
+                           brief: bool, limit: Optional[int],
+                           open_questions: Optional[List[Dict[str, Any]]] = None) -> None:
+    """Runs the deterministic lexical fallback and renders it on the CLI.
+
+    The shared degraded exit for ``surface``/``query`` (ADR
+    ``read-verbs-degrade-to-lexical-decisions-md-fallback``): one calm header
+    naming the cause, then a term-match over decisions.md — never the raw
+    provider blob, never the clean-empty header. Exit code stays 0 (deliberate:
+    the JSON ``degraded`` marker + changed header already disambiguate).
+
+    Args:
+        config: The active workspace configuration (supplies decisions.md path).
+        query: The claim/topic the caller was trying to recall.
+        reason: One-line cause phrase (see ``degraded_reason_from_error``).
+        store: A readable graph store for active-filtering + modifier stamps,
+            or None when the graph itself is down (pre-V1a).
+        as_json: Emit the degraded JSON envelope instead of text.
+        brief: Omit ``rejected_paths`` from each match.
+        limit: Max matches; None ⇒ the lexical default.
+        open_questions: An already-computed scoped parked-OQ list to carry on
+            the envelope (present-if-scanned semantics — None means omitted).
+    """
+    envelope = lexical_fallback(
+        query, config.decisions_file, reason=reason, store=store,
+        limit=limit, brief=brief,
+    )
+    envelope["query"] = query
+    envelope.update(corpus_provenance(config))
+    if open_questions is not None:
+        envelope["open_questions"] = open_questions
+    if as_json:
+        _emit_json(envelope)
+        return
+    print(provenance_line(config))
+    print(envelope["note"])
+    for i, d in enumerate(envelope["matches"], start=1):
+        print(f"{i}. {d['slug']}")
+        print(f"   Decided:  {d['axiom']}")
+        marker = _modifier_marker(d)
+        if marker:
+            print(f"   {marker}")
+        if "rejected_paths" in d:
+            print(f"   Rejected: {d['rejected_paths']}")
+        if d["scope"]:
+            print(f"   Scope:    {', '.join(d['scope'])}")
+        print()
+    for oq in envelope.get("open_questions", []):
+        print(f"[open question in scope] {oq['topic']}")
+
+
 def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
               as_json: bool = False, brief: bool = False,
               limit: Optional[int] = None) -> None:
@@ -638,12 +695,22 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
             return
         raise ValueError(msg)
 
-    manager = MitosSyncManager(config)
+    # A pre-V1a graph raises at store construction — the SQLite graph is unusable,
+    # so the fallback parses decisions.md directly and must not touch the graph.
+    try:
+        manager = MitosSyncManager(config)
+    except Exception as e:
+        _emit_lexical_degraded(
+            config, query_text, reason=degraded_reason_from_error(e),
+            store=None, as_json=as_json, brief=brief, limit=limit,
+        )
+        return
+
     if not manager.embed_provider or not manager.vector_store:
-        if as_json:
-            _emit_json({"error": f"Could not resolve slug or run semantic query for '{query_text}'"}, indent=None)
-            return
-        print("Semantic query unavailable (Qdrant or Gemini embedding provider down).")
+        _emit_lexical_degraded(
+            config, query_text, reason=degraded_reason_from_error(None),
+            store=manager.store, as_json=as_json, brief=brief, limit=limit,
+        )
         return
 
     store = manager.store
@@ -680,10 +747,12 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
             match.update(store.get_modifiers(node["id"]))
             matches.append(match)
     except Exception as e:
-        if as_json:
-            _emit_json({"error": f"Semantic claim query failed: {str(e)}"}, indent=None)
-            return
-        print(f"Query failed: {str(e)}")
+        # Embedding/Qdrant failure mid-query (e.g. a 429): never the raw
+        # provider blob — one calm cause line + the deterministic fallback.
+        _emit_lexical_degraded(
+            config, query_text, reason=degraded_reason_from_error(e),
+            store=store, as_json=as_json, brief=brief, limit=limit,
+        )
         return
 
     # Blackout: retrieval returned matches but every one was superseded-filtered
@@ -696,6 +765,7 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
     # Build the per-match list once, then branch the two renderings over it.
     if as_json:
         envelope: Dict[str, Any] = {"query": query_text, "depth_mode": "letter", "matches": matches}
+        envelope.update(corpus_provenance(config))
         if blackout:
             envelope["all_superseded"] = retired
         _emit_json(envelope)
@@ -705,12 +775,15 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         print(blackout_note(retired))
         return
 
-    # Genuine miss — nothing was retrieved (or nothing resolved). Keep the plain message.
+    # Genuine miss — nothing was retrieved (or nothing resolved). The provenance
+    # line disambiguates "no precedent" from "wrong workspace" — the miss is
+    # exactly where that ambiguity bites.
     if not matches:
+        print(provenance_line(config))
         print("No matching decisions found.")
         return
 
-    print(f"\nQuery matches for: '{query_text}'")
+    print(f"\nQuery matches for: '{query_text}'  [{provenance_line(config)}]")
     print("-" * 60)
     for i, d in enumerate(matches, start=1):
         print(f"{i}. {d['slug']}  (score {d['score']:.3f})")
@@ -869,6 +942,7 @@ def cmd_list(config: MitosConfig, scope: Optional[str] = None,
             "total": len(decisions),
             "scope": scope,
             "state": effective_state,
+            **corpus_provenance(config),
         }
         if recovery:
             payload["scope_known"] = False
@@ -877,6 +951,7 @@ def cmd_list(config: MitosConfig, scope: Optional[str] = None,
         return
 
     if not decisions and not parked:
+        print(provenance_line(config))
         if not store.get_all_nodes():
             # Empty-graph precedence wins over the unused-scope vector: a graph with no
             # nodes has an empty vocabulary, but "run sync" is the truer nudge.
@@ -888,7 +963,8 @@ def cmd_list(config: MitosConfig, scope: Optional[str] = None,
         return
 
     scope_note = f"  (scope: {scope})" if scope else ""
-    print(f"\nDecisions ({len(decisions)} found, state={effective_state}){scope_note}:")
+    print(f"\nDecisions ({len(decisions)} found, state={effective_state}){scope_note}  "
+          f"[{provenance_line(config)}]:")
     print("-" * 80)
     for d in decisions:
         scopes = f"[{', '.join(d['scope'])}]" if d["scope"] else ""
@@ -1198,7 +1274,17 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         limit: Ranked top-k to retrieve; ``None`` ⇒ the default 5. SETS the count,
             clamped to ``[1, RANKED_LIMIT_CEILING]`` — not a ``min(default, N)`` clamp.
     """
-    manager = MitosSyncManager(config)
+    # A pre-V1a graph raises at store construction — the graph is unusable, so
+    # the lexical fallback parses decisions.md directly (no graph access).
+    try:
+        manager = MitosSyncManager(config)
+    except Exception as e:
+        _emit_lexical_degraded(
+            config, query, reason=degraded_reason_from_error(e),
+            store=None, as_json=as_json, brief=brief, limit=limit,
+        )
+        return
+
     store = manager.store
     top_k = clamp_limit(limit)
 
@@ -1208,9 +1294,11 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         return d
 
     results: Dict[str, Any] = {"active_decisions": []}
+    results.update(corpus_provenance(config))
     semantic_ran = False
     top_score: Optional[float] = None
     retired: List[Dict[str, Any]] = []
+    degraded_error: Optional[Exception] = None
 
     if manager.embed_provider and manager.vector_store:
         try:
@@ -1233,8 +1321,9 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
                 results["active_decisions"].append(_shape(node, m["score"]))
                 if top_score is None or m["score"] > top_score:
                     top_score = m["score"]
-        except Exception:
+        except Exception as e:
             semantic_ran = False
+            degraded_error = e
 
     # Scope listing fallback ONLY in degraded mode (mirrors the MCP tool, P5): a
     # semantic run that found nothing must not masquerade as an unranked scope dump.
@@ -1258,6 +1347,19 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         except Exception:
             pass
         results["open_questions"] = open_questions
+
+    # Degraded and empty-handed on decisions: route into the deterministic
+    # lexical fallback (ADR read-verbs-degrade-to-lexical-decisions-md-fallback)
+    # instead of the self-contradicting "No active precedents found" +
+    # unavailable note. The scoped parked-OQ scan (a pure graph read that
+    # survived) rides along on the degraded output.
+    if not semantic_ran and not results["active_decisions"]:
+        _emit_lexical_degraded(
+            config, query, reason=degraded_reason_from_error(degraded_error),
+            store=store, as_json=as_json, brief=brief, limit=limit,
+            open_questions=results.get("open_questions"),
+        )
+        return
 
     # Confidence signal — distinguish a settled precedent from loose neighbours / no
     # match (AX P5). Shared policy with the MCP tool via mitos.recall. The live
@@ -1299,11 +1401,19 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     ad, oqs = results["active_decisions"], results.get("open_questions", [])
     conf = results.get("confidence")
     if not ad and not oqs:
-        scope_note = f" (scope: {scope})" if scope else ""
-        print(f"No active precedents found for: '{query}'{scope_note}")
+        # The clean-empty header asserts "checked, none found" — it must never
+        # co-occur with a degraded/unavailable note ("couldn't check"). With the
+        # lexical fallback routing above this branch only fires when semantic
+        # ran (confidence is set); the guard is belt-and-braces against any
+        # future path that reaches here degraded.
+        if conf is not None:
+            scope_note = f" (scope: {scope})" if scope else ""
+            print(provenance_line(config))
+            print(f"No active precedents found for: '{query}'{scope_note}")
         print(f"→ {note}")
         return
-    print(f"\nPrecedents for: '{query}'" + (f"  (scope: {scope})" if scope else ""))
+    print(f"\nPrecedents for: '{query}'" + (f"  (scope: {scope})" if scope else "")
+          + f"  [{provenance_line(config)}]")
     if conf == "weak":
         print("⚠ confidence: weak — twilight zone: matches are close but may not settle this.")
     elif conf == "none":

@@ -13,7 +13,9 @@ from mitos.config import MitosConfig
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.vector_store import QdrantVectorStore
-from mitos.recall import assess_surface_recall, scope_filter_recovery
+from mitos.lexical import degraded_reason_from_error, lexical_fallback
+from mitos.recall import (assess_surface_recall, corpus_provenance,
+                          scope_filter_recovery)
 
 # Create FastMCP server instance
 mcp = FastMCP("Mitos")
@@ -140,6 +142,42 @@ def get_workspace_components() -> Tuple[GraphStore, Optional[GeminiEmbeddingProv
     return store, embed_provider, vector_store
 
 
+def _lexical_degraded_response(query: str, *, reason: str,
+                               store: Optional[GraphStore], brief: bool,
+                               limit: int,
+                               open_questions: Optional[List[Dict[str, Any]]] = None) -> str:
+    """Builds the degraded lexical-fallback JSON for the MCP read tools.
+
+    The MCP twin of ``cli._emit_lexical_degraded`` (ADR
+    ``read-verbs-degrade-to-lexical-decisions-md-fallback``): the shared
+    ``lexical_fallback`` runs the term-match over decisions.md, so the two
+    surfaces cannot drift. The envelope carries ``degraded: "lexical"`` and a
+    ``degraded_reason`` — never an ``{error}`` object or raw provider text.
+
+    Args:
+        query: The claim/topic the caller was trying to recall.
+        reason: One-line cause phrase (see ``degraded_reason_from_error``).
+        store: A readable graph store for active-filtering + modifier stamps,
+            or None when the graph itself is down (pre-V1a).
+        brief: Omit ``rejected_paths`` from each match.
+        limit: Max matches to return.
+        open_questions: An already-computed scoped parked-OQ list to carry on
+            the envelope (present-if-scanned semantics — None means omitted).
+
+    Returns:
+        The degraded envelope as a JSON string.
+    """
+    envelope = lexical_fallback(
+        query, MitosConfig().decisions_file, reason=reason, store=store,
+        limit=limit, brief=brief,
+    )
+    envelope["query"] = query
+    envelope.update(corpus_provenance(MitosConfig()))
+    if open_questions is not None:
+        envelope["open_questions"] = open_questions
+    return dumps_display(envelope, ensure_ascii=False, indent=2)
+
+
 def _oq_payload(oq: Dict[str, Any]) -> Dict[str, Any]:
     """Builds the open-question output sub-dict for the MCP visibility tools.
 
@@ -210,13 +248,23 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         `superseded_by` successor when known) with the `note` naming them — that is a
         recoverable "it was settled before, go read the history", not a true miss.
     """
-    store, embed_provider, vector_store = get_workspace_components()
     top_k = clamp_limit(limit)
+    # A pre-V1a graph raises at store construction — the graph is unusable, so
+    # the lexical fallback parses decisions.md directly (no graph access).
+    try:
+        store, embed_provider, vector_store = get_workspace_components()
+    except Exception as e:
+        return _lexical_degraded_response(
+            query, reason=degraded_reason_from_error(e), store=None,
+            brief=brief, limit=top_k,
+        )
 
     results: Dict[str, Any] = {"active_decisions": []}
+    results.update(corpus_provenance(MitosConfig()))
     semantic_ran = False
     top_score: Optional[float] = None
     retired: List[Dict[str, Any]] = []
+    degraded_error: Optional[Exception] = None
 
     # 1. Semantic search if embeddings and vector store are active
     if embed_provider and vector_store:
@@ -252,6 +300,7 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         except Exception as e:
             # Degrade to exact/scope filtering only
             semantic_ran = False
+            degraded_error = e
 
     # 2. Scope pre-filtering fallback — ONLY when semantic recall is down (degraded).
     #    When semantic ran and simply found nothing, do NOT dump an unranked scope
@@ -277,6 +326,18 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         except Exception:
             pass
         results["open_questions"] = open_questions
+
+    # Degraded and empty-handed on decisions: route into the deterministic
+    # lexical fallback (ADR read-verbs-degrade-to-lexical-decisions-md-fallback)
+    # instead of the self-contradicting clean-empty result + unavailable note.
+    # The scoped open-questions scan (a pure graph read that survived) rides
+    # along on the degraded envelope.
+    if not semantic_ran and not results["active_decisions"]:
+        return _lexical_degraded_response(
+            query, reason=degraded_reason_from_error(degraded_error),
+            store=store, brief=brief, limit=top_k,
+            open_questions=results.get("open_questions"),
+        )
 
     # Confidence signal — let the agent tell a settled precedent from loose neighbours
     # or genuine absence, instead of a boilerplate note that read the same every time
@@ -368,6 +429,7 @@ def list_decisions(scope: Optional[str] = None, state: str = "active", brief: bo
         "total": len(decisions),
         "scope": scope,
         "state": state,
+        **corpus_provenance(MitosConfig()),
     }
 
     # On an empty scoped read, distinguish a genuinely-fresh scope from a misspelled one:
@@ -513,8 +575,16 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
     if depth != "letter":
         return dumps_display({"error": f"Depth mode '{depth}' is not yet implemented in v0.1 (Letter-only retrieval)."}, ensure_ascii=False, indent=None)
 
-    store, embed_provider, vector_store = get_workspace_components()
-    
+    # A pre-V1a graph raises at store construction — the graph is unusable, so
+    # the lexical fallback parses decisions.md directly (no graph access).
+    try:
+        store, embed_provider, vector_store = get_workspace_components()
+    except Exception as e:
+        return _lexical_degraded_response(
+            query, reason=degraded_reason_from_error(e), store=None,
+            brief=brief, limit=clamp_limit(limit),
+        )
+
     # 1. Try resolving query as direct slug first
     try:
         node = store.get_node_by_slug(query)
@@ -572,13 +642,23 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             # Add the retired handles so the agent gets a pointer, not a false miss
             # (CLI⇄MCP-identical `all_superseded` shape, T5 parity).
             envelope: Dict[str, Any] = {"query": query, "depth_mode": "letter", "matches": output_list}
+            envelope.update(corpus_provenance(MitosConfig()))
             if not output_list and retired:
                 envelope["all_superseded"] = retired
             return dumps_display(envelope, ensure_ascii=False, indent=2)
         except Exception as e:
-            return dumps_display({"error": f"Semantic claim query failed: {str(e)}"}, ensure_ascii=False, indent=None)
+            # Embedding/Qdrant failure mid-query (e.g. a 429): never the raw
+            # provider blob — the deterministic lexical fallback instead.
+            return _lexical_degraded_response(
+                query, reason=degraded_reason_from_error(e), store=store,
+                brief=brief, limit=clamp_limit(limit),
+            )
 
-    return dumps_display({"error": f"Could not resolve slug or run semantic query for '{query}'"}, ensure_ascii=False, indent=None)
+    # No embedding provider / vector store wired at all — degrade lexically.
+    return _lexical_degraded_response(
+        query, reason=degraded_reason_from_error(None), store=store,
+        brief=brief, limit=clamp_limit(limit),
+    )
 
 
 @mcp.tool()

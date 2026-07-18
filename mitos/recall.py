@@ -296,3 +296,30 @@ def assess_surface_recall(
         f"No semantic match for {scope_phrase} — likely no settled precedent. Decide "
         f"and record it, or call {complete_hint} for a certain completeness check."
     )
+
+
+def corpus_provenance(config: "object") -> Dict[str, str]:
+    """Builds the corpus-provenance fields every recall answer should carry.
+
+    Names which corpus an answer came from (AX: an empty or twilight result is
+    ambiguous between "no precedent exists" and "you're standing in the wrong
+    workspace" — the reviewing cwd and a vision's decision store can diverge).
+    Shared by the CLI verbs and their MCP twins so the field names can't drift.
+
+    Args:
+        config: The active ``MitosConfig`` (duck-typed to avoid an import cycle
+            — recall is a leaf module).
+
+    Returns:
+        ``{"collection": <qdrant collection>, "workspace": <workspace dir>}``.
+    """
+    return {
+        "collection": getattr(config, "qdrant_collection", ""),
+        "workspace": getattr(config, "workspace_dir", ""),
+    }
+
+
+def provenance_line(config: "object") -> str:
+    """Formats ``corpus_provenance`` as the one-line text header."""
+    p = corpus_provenance(config)
+    return f"corpus: {p['collection']} · {p['workspace']}"
