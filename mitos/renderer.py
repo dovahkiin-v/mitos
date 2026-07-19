@@ -7,8 +7,9 @@ generating global and per-scope markdown files atomically from primary source da
 import os
 import tempfile
 from typing import List, Dict, Any, Optional, Tuple
-from mitos.display import truncate_words
+from mitos.display import oneline_axiom, truncate_words
 from mitos.protocols import GraphStoreProtocol
+from mitos.store import MODIFIER_EDGE_KEYS
 
 # Size ceilings for the generated context files, named in CHARACTERS — the unit the
 # check actually measures. (A `len(content)` is characters, so the threshold is named
@@ -48,6 +49,101 @@ def render_pointer_line(node: Dict[str, Any], primary_scope: str) -> str:
     slug = node.get("slug", "")
     axiom = truncate_words(node.get("core_axiom", ""), POINTER_AXIOM_CHARS)
     return f"- **{slug}** — {axiom} → full entry: {primary_scope}.md\n"
+
+
+def _index_marker(modifiers: Optional[Dict[str, List[str]]]) -> str:
+    """Builds the compact modifier marker riding a global-index row.
+
+    Mirrors the CLI oneline tier's ``⚠ amended by: <slug>`` marker (the
+    stamps-survive-every-thinner-tier rule): a still-active decision that a later
+    ``amends``/``narrows``/``corrects``/``supersedes`` has moved on from must not
+    read as the final word even in a one-line index.
+
+    Args:
+        modifiers: Reverse-relation modifiers for the node (from
+            ``GraphStore.get_modifiers_map``), or None.
+
+    Returns:
+        A ``  ⚠ …`` suffix, or ``""`` when the node is unmodified.
+    """
+    if not modifiers:
+        return ""
+    parts = []
+    for key in MODIFIER_EDGE_KEYS.values():
+        slugs = modifiers.get(key)
+        if slugs:
+            parts.append(f"{key.replace('_', ' ')}: {', '.join(slugs)}")
+    return ("  ⚠ " + "; ".join(parts)) if parts else ""
+
+
+def render_index_row(node: Dict[str, Any],
+                     modifiers: Optional[Dict[str, List[str]]] = None) -> str:
+    """Renders one global-index line for a decision.
+
+    Slug + word-boundary-truncated axiom (via ``oneline_axiom`` — the same
+    truncation seam as the CLI/MCP oneline tier, one seam not two) + a compact
+    modifier marker when the decision has incoming modifier edges.
+
+    Args:
+        node: The decision node dict.
+        modifiers: Optional reverse-relation modifiers for the node.
+
+    Returns:
+        The index row, newline-terminated.
+    """
+    slug = node.get("slug", "")
+    return f"- **{slug}** — {oneline_axiom(node)}{_index_marker(modifiers)}\n"
+
+
+def _assemble_global_index(
+    active_decisions: List[Dict[str, Any]],
+    modifiers: Dict[str, Dict[str, List[str]]],
+    full_chars: int,
+) -> Tuple[str, List[Tuple[str, int]]]:
+    """Builds the over-ceiling global file: a oneline index grouped by primary scope.
+
+    Per the global-render-degrades ADR: once the full global render would exceed
+    ``GLOBAL_OVERFLOW_WARN_CHARS``, live_axioms.md becomes an index — one line per
+    decision, grouped under its PRIMARY scope tag with a pointer to that scope's
+    per-scope file (the canonical full render). Untagged decisions gather in a
+    final unscoped group.
+
+    Args:
+        active_decisions: The active decision nodes, hydrated.
+        modifiers: Reverse-relation modifiers keyed by node id.
+        full_chars: The char size the full render would have been (for the banner).
+
+    Returns:
+        ``(content, decisions)`` where ``decisions`` is the ``(slug, char_count)``
+        accounting list at index-row weight.
+    """
+    banner = (
+        "# Live Axioms — Index\n"
+        "*Generated automatically by Mitos. Derived statelessly from primary sources (M8).*\n\n"
+        f"The full render of this corpus ({full_chars:,} chars, "
+        f"~{estimate_tokens(full_chars):,} tokens) exceeds the global size ceiling "
+        f"({GLOBAL_OVERFLOW_WARN_CHARS:,} chars), so this file is a one-line index of "
+        "every active decision. The per-scope files named under each heading are the "
+        "canonical full renders.\n"
+    )
+    groups: Dict[Optional[str], List[Dict[str, Any]]] = {}
+    for dec in active_decisions:
+        primary = (dec.get("scope") or [None])[0]
+        groups.setdefault(primary, []).append(dec)
+
+    sections: List[str] = []
+    accounting: List[Tuple[str, int]] = []
+    ordered = sorted((s for s in groups if s is not None)) + ([None] if None in groups else [])
+    for s in ordered:
+        if s is None:
+            heading = "## (unscoped) — no scope file; full entries live in decisions.md"
+        else:
+            heading = f"## {s} — full entries: .mitos/axioms/{s}.md"
+        rows = [(d.get("slug", ""), render_index_row(d, modifiers.get(d["id"])))
+                for d in groups[s]]
+        accounting.extend((slug, len(r)) for slug, r in rows)
+        sections.append(heading + "\n" + "".join(r for _, r in rows))
+    return banner + "\n" + "\n".join(sections), accounting
 
 
 def estimate_tokens(char_count: int) -> int:
@@ -146,7 +242,9 @@ def assemble_render(store: GraphStoreProtocol) -> Dict[str, Any]:
         is ``{"name", "scope", "content", "decisions"}`` and ``decisions`` is a list of
         ``(slug, char_count)`` per rendered decision block — enough for a caller to find
         the largest contributors to a file's size. Only scopes with at least one active
-        decision appear in ``scopes``.
+        decision appear in ``scopes``. The global file additionally carries ``mode``:
+        ``"full"`` (the Letter-complete single file, under the global ceiling) or
+        ``"index"`` (the oneline index a corpus over the ceiling degrades to).
     """
     active_decisions = store.get_active_decisions()
     # Reverse-relation modifiers, so a live-but-amended axiom carries its
@@ -166,6 +264,19 @@ def assemble_render(store: GraphStoreProtocol) -> Dict[str, Any]:
         global_content = global_header + "\n".join(b for _, b in global_blocks)
     else:
         global_content = global_header + "*No active decisions committed in this workspace.*\n"
+    global_decisions = [(slug, len(b)) for slug, b in global_blocks]
+    global_mode = "full"
+    # Graceful degradation (the global-render-degrades ADR): while the full render
+    # fits the global ceiling, the file is byte-identical to the pre-ADR output; once
+    # it would exceed the ceiling, the global file becomes a oneline index instead —
+    # a pure deterministic function of the would-be rendered size, no config knob.
+    # The size-contributor accounting follows the real contents (index-row weight),
+    # so the overflow report stays honest in either mode: the index rarely breaches
+    # the ceiling, but an enormous corpus whose INDEX does is still reported.
+    if len(global_content) > GLOBAL_OVERFLOW_WARN_CHARS:
+        global_content, global_decisions = _assemble_global_index(
+            active_decisions, modifiers, len(global_content))
+        global_mode = "index"
 
     scope_groups: Dict[str, List[Dict[str, Any]]] = {}
     for dec in active_decisions:
@@ -213,7 +324,8 @@ def assemble_render(store: GraphStoreProtocol) -> Dict[str, Any]:
             "name": "live_axioms.md",
             "scope": None,
             "content": global_content,
-            "decisions": [(slug, len(b)) for slug, b in global_blocks],
+            "decisions": global_decisions,
+            "mode": global_mode,
         },
         "scopes": scopes,
     }

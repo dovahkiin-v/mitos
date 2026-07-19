@@ -349,16 +349,18 @@ def test_pathology_rotation_mode_mark(isolated_workspace) -> None:
 # P7 — Renderer Warning on Budget Overflow
 # ==============================================================================
 def test_pathology_renderer_budget_overflow_warning(isolated_workspace, capsys) -> None:
-    """Verifies the renderer RECORDS a size-ceiling overflow on ``.overflows`` (never prints it).
+    """Verifies an over-ceiling corpus renders silently and degrades to the index.
 
-    The warnings used to print mid-render, burying the record receipt under a wall of
-    repeated lines. They are now structured data the write path debounces and the
-    ``status`` surface details — so the render itself must stay silent.
+    The warnings used to print mid-render, burying the record receipt under a wall
+    of repeated lines — the render itself must stay silent. And per the
+    global-render-degrades ADR, a corpus whose full render would breach the global
+    ceiling now writes the oneline index instead, so live_axioms.md itself no
+    longer appears in ``.overflows`` (the index fits comfortably).
     """
     config, tmpdir = isolated_workspace
     store = GraphStore(config.db_path)
 
-    # Commit a massive node to push live_axioms.md over the 50,000-char ceiling.
+    # Commit a massive node to push the would-be full render over the 50,000-char ceiling.
     entry = ParsedEntry("decision", "massive-axiom", 1, 5)
     entry.axiom = "We strictly use large text buffers to overflow budget." * 1500
     entry.rejected_paths = "None."
@@ -367,16 +369,18 @@ def test_pathology_renderer_budget_overflow_warning(isolated_workspace, capsys) 
     renderer = MitosRenderer(config.workspace_dir)
     renderer.render_all(store)
 
-    # Verify global live_axioms.md exists.
+    # The global file exists — as the degraded oneline index, well under the ceiling.
     live_axioms_path = os.path.join(config.workspace_dir, "live_axioms.md")
     assert os.path.exists(live_axioms_path)
+    with open(live_axioms_path, "r", encoding="utf-8") as f:
+        content = f.read()
+    assert content.startswith("# Live Axioms — Index")
+    assert "massive-axiom" in content
+    assert len(content) < 50000
 
-    # The overflow is recorded structurally and NOT printed (so it can't bury a receipt).
+    # Nothing is printed (so a record receipt can't be buried), and the index-mode
+    # global file no longer reports itself over-ceiling.
     captured = capsys.readouterr()
     assert "exceeds" not in captured.out
     assert "[Warning]" not in captured.out
-    over = [o for o in renderer.overflows if o["name"] == "live_axioms.md"]
-    assert len(over) == 1
-    assert over[0]["chars"] > 50000
-    assert over[0]["threshold_chars"] == 50000
-    assert over[0]["est_tokens"] > 0
+    assert not [o for o in renderer.overflows if o["name"] == "live_axioms.md"]

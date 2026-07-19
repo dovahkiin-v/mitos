@@ -285,3 +285,120 @@ def test_overflow_accounting_reflects_pointer_weight(temp_workspace, monkeypatch
     MitosRenderer(workspace).render_all(store)
     with open(os.path.join(workspace, ".mitos", "axioms", "side.md"), encoding="utf-8") as f:
         assert f.read() == side["content"]
+
+
+# --------------------------------------------------------------------------- #
+# Global degradation (the global-render-degrades ADR): full under the ceiling,
+# oneline index over it — a pure deterministic function of rendered size.
+# --------------------------------------------------------------------------- #
+
+def test_under_ceiling_global_is_full_and_bannerless(temp_workspace) -> None:
+    """A corpus under the global ceiling renders the unchanged full global file."""
+    store, workspace = temp_workspace
+    _commit(store, "small-one", ["alpha"])
+    _commit(store, "small-two", ["beta"])
+
+    assembled = assemble_render(store)
+    g = assembled["global"]
+    assert g["mode"] == "full"
+    assert g["content"].startswith("# Live Axioms\n")
+    assert "Index" not in g["content"]
+    assert "## small-one" in g["content"] and "Rejected for small-one." in g["content"]
+
+
+def test_over_ceiling_global_degrades_to_index(temp_workspace, monkeypatch) -> None:
+    """Over the ceiling, the global file is a banner + grouped oneline index."""
+    monkeypatch.setattr(R, "GLOBAL_OVERFLOW_WARN_CHARS", 400)
+    store, workspace = temp_workspace
+    _commit(store, "alpha-one", ["alpha", "beta"])
+    _commit(store, "alpha-two", ["alpha"])
+    _commit(store, "beta-one", ["beta"])
+    untagged = ParsedEntry("decision", "no-scope-one", 1, 5)
+    untagged.axiom = "An untagged decision with a perfectly reasonable axiom sentence."
+    untagged.rejected_paths = "Rejected for no-scope-one."
+    store.commit_parsed_entry(untagged)
+
+    assembled = assemble_render(store)
+    g = assembled["global"]
+    assert g["mode"] == "index"
+    content = g["content"]
+    # Banner states plainly what happened and where the full renders live.
+    assert content.startswith("# Live Axioms — Index")
+    assert "exceeds the global size ceiling" in content
+    assert "canonical full renders" in content
+    # Grouped by PRIMARY scope tag, each heading pointing at the per-scope file.
+    assert "## alpha — full entries: .mitos/axioms/alpha.md" in content
+    assert "## beta — full entries: .mitos/axioms/beta.md" in content
+    # Multi-tag decision indexes once, under its primary tag's group only.
+    assert content.count("**alpha-one**") == 1
+    # One row per decision; no full bodies, no rejected_paths.
+    for slug in ("alpha-one", "alpha-two", "beta-one", "no-scope-one"):
+        assert f"- **{slug}** — " in content
+    assert "Rejected for" not in content
+    assert "## alpha-one" not in content
+    # Untagged decisions gather in the final unscoped group.
+    assert "## (unscoped)" in content
+    assert content.index("## (unscoped)") > content.index("## beta")
+    # render_all writes exactly the assembled index (no drift between the seams).
+    MitosRenderer(workspace).render_all(store)
+    with open(os.path.join(workspace, "live_axioms.md"), encoding="utf-8") as f:
+        assert f.read() == content
+
+
+def test_index_rows_carry_modifier_markers(temp_workspace, monkeypatch) -> None:
+    """An amended-but-active decision's index row carries the compact ⚠ marker."""
+    monkeypatch.setattr(R, "GLOBAL_OVERFLOW_WARN_CHARS", 300)
+    store, workspace = temp_workspace
+    _commit(store, "base-call", ["alpha"])
+    amender = ParsedEntry("decision", "amend-call", 1, 5)
+    amender.axiom = "We refine the base call with a narrower rule."
+    amender.rejected_paths = "n/a"
+    amender.scope = ["alpha"]
+    amender.amends = ["base-call"]
+    store.commit_parsed_entry(amender)
+
+    content = assemble_render(store)["global"]["content"]
+    base_row = next(l for l in content.splitlines() if l.startswith("- **base-call**"))
+    assert "⚠ amended by: amend-call" in base_row
+    amend_row = next(l for l in content.splitlines() if l.startswith("- **amend-call**"))
+    assert "⚠" not in amend_row
+
+
+def test_threshold_boundary_is_deterministic(temp_workspace, monkeypatch) -> None:
+    """Exactly-at-ceiling stays full; one char over flips to the index."""
+    store, workspace = temp_workspace
+    _commit(store, "boundary-call", ["alpha"])
+    full_len = len(assemble_render(store)["global"]["content"])
+
+    monkeypatch.setattr(R, "GLOBAL_OVERFLOW_WARN_CHARS", full_len)
+    assert assemble_render(store)["global"]["mode"] == "full"
+    monkeypatch.setattr(R, "GLOBAL_OVERFLOW_WARN_CHARS", full_len - 1)
+    assert assemble_render(store)["global"]["mode"] == "index"
+
+
+def test_overflow_accounting_in_index_mode(temp_workspace, monkeypatch) -> None:
+    """In index mode the global file drops out of overflows (the index fits) —
+    but an index that itself breaches the ceiling is still reported honestly."""
+    monkeypatch.setattr(R, "GLOBAL_OVERFLOW_WARN_CHARS", 1200)
+    monkeypatch.setattr(R, "SCOPE_OVERFLOW_WARN_CHARS", 10_000_000)
+    store, workspace = temp_workspace
+    for i in range(6):
+        # Distinct axioms — identical content hashes to the same node id.
+        _commit(store, f"bulk-{i}", ["alpha"],
+                axiom=f"A comfortably verbose axiom sentence for overflow test {i}. " * 3)
+
+    # Full render > 1200 → index mode; the index is small → no global overflow entry.
+    assembled = assemble_render(store)
+    assert assembled["global"]["mode"] == "index"
+    assert len(assembled["global"]["content"]) <= 1200
+    assert overflow_report(store) == []
+    # Accounting reflects index-row weight, not full-body weight.
+    assert all(size < 200 for _, size in assembled["global"]["decisions"])
+
+    # Squeeze the ceiling below even the index: the index reports itself honestly.
+    monkeypatch.setattr(R, "GLOBAL_OVERFLOW_WARN_CHARS", 200)
+    report = overflow_report(store)
+    entries = [o for o in report if o["name"] == "live_axioms.md"]
+    assert len(entries) == 1
+    assert entries[0]["threshold_chars"] == 200
+    assert entries[0]["chars"] > 200
