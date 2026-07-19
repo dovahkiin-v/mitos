@@ -5,9 +5,22 @@ Qdrant collection, sharing one Qdrant instance. Setting it up for a new project
 takes a couple of minutes. Run **`mitos status`** at any time to see exactly
 what's done and what's left (it exits `0` when ready, `1` otherwise).
 
-> **For LLM agents:** run `mitos status` first. If it isn't `READY`, follow the
-> steps below, then re-run `mitos status` to confirm. When done, do **step 6** so
-> the next agent in this project inherits the setup.
+> **For LLM agents setting mitos up:** run `mitos status` first — if it already
+> says `READY ✓`, there is nothing to install. Otherwise work through this guide
+> top to bottom; everything you will install is listed under *Prerequisites*
+> (the `mitos` CLI via pipx from this repository, and one Docker container:
+> `qdrant/qdrant` on port `7333`). Two rules:
+> - **Never handle the API key value.** When you reach step 2, ask the user to
+>   run the `mitos set-key` command themselves and wait; do not ask them to
+>   paste the key to you, and do not read or edit key values in any `.env`.
+> - **If a step fails, stop and report** — `mitos status` names what is missing
+>   and what to do next; fix only that. Finish with step 6 (the agent-block, so
+>   the next agent inherits the setup), then re-run `mitos status` and report
+>   the result to the user.
+>
+> If Docker is unavailable and you cannot start Qdrant, say so and finish the
+> rest anyway — recording works without it (embeddings queue for later); only
+> semantic search waits.
 
 ---
 
@@ -16,11 +29,20 @@ what's done and what's left (it exits `0` when ready, `1` otherwise).
 - **Mitos installed** — the recommended global install is **pipx**: `pipx install git+https://github.com/dovahkiin-v/mitos` (isolated, on PATH). Or `pip install git+https://github.com/dovahkiin-v/mitos` into a venv; or `pip install -e .` from a clone if you're hacking on Mitos. *(A PyPI release — `pip install mitos-adr` — is planned but not yet published.)*
   - **Updating:** `pipx install --force git+https://github.com/dovahkiin-v/mitos` (use `--force`, not `pipx upgrade` — a git install can otherwise no-op). Mitos checks for a newer version at most once a day and prints a one-line nudge on stderr when one exists; silence it with `MITOS_NO_UPDATE_CHECK=1`.
 - **Docker** — for Mitos's Qdrant.
-- **A Google Gemini API key** — <https://aistudio.google.com/app/apikey>. (An Anthropic key is only needed for `mitos import --llm-extract`.)
+- **A Google Gemini API key** — <https://aistudio.google.com/app/apikey> — required; it covers embeddings and synthesis.
+- **An Anthropic API key** — <https://console.anthropic.com/settings/keys> — strongly recommended: it powers the LLM-judged layer (the `mitos check` conflict audit, the sync-time conflict notice, and `mitos import --llm-extract`). Mitos runs without it, but only as a basic record-and-search store — the conflict sensing that keeps a growing decision corpus honest is the part worth having.
 
 ### Start Mitos's Qdrant (once per machine, shared by all projects)
+From a clone of this repo:
 ```bash
-docker compose up -d        # from the mitos repo → mitos-qdrant on :7333
+docker compose up -d        # → mitos-qdrant on :7333
+```
+Or without a clone (identical result; safe to re-run — if the container already
+exists, `docker start mitos-qdrant` instead):
+```bash
+docker run -d --name mitos-qdrant --restart unless-stopped \
+  -p 7333:6333 -p 7334:6334 \
+  -v mitos-qdrant-storage:/qdrant/storage qdrant/qdrant
 ```
 Mitos uses its **own** Qdrant on `:7333` — *not* the standard `:6333` — so it
 never lands in another Qdrant you run for other work. It fails safe: if Qdrant
@@ -53,6 +75,12 @@ mitos set-key <your-key>              # writes ./.env (gitignored)
 ```
 One key covers embeddings *and* synthesis. `mitos status` shows which source it
 found (`from global .env` / `from project .env` / `from environment`).
+
+For the strongly-recommended Anthropic key (the conflict-audit layer), same
+mechanism:
+```bash
+mitos set-key --global --name ANTHROPIC_API_KEY <your-key>
+```
 
 ### 3. Wire the MCP server into your agent (strongly recommended for agents)
 **This is the recommended interface for any agent working in the project.** It

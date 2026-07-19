@@ -419,7 +419,7 @@ def cmd_init(config: MitosConfig) -> None:
             "## Setup — API Keys\n"
             "Mitos reads keys from a `.env` file at the workspace root (`mitos init` scaffolds it with empty slots; it is gitignored). Set exactly one required key:\n"
             "- **`GEMINI_API_KEY`** (Google Gemini) — REQUIRED for semantic `surface_decisions`/`query_decisions` and for `mitos sync`. One key covers both embeddings and synthesis.\n"
-            "- `ANTHROPIC_API_KEY` — OPTIONAL, only for `mitos import --llm-extract` (legacy prose import).\n"
+            "- `ANTHROPIC_API_KEY` — strongly recommended: it powers the LLM-judged layer (the `mitos check` conflict audit, the sync-time conflict notice, `mitos import --llm-extract`). Mitos runs without it, but only as a basic record-and-search store; with it, the corpus is audited for decisions that silently contradict each other. Degrades calmly when absent.\n"
             "Without `GEMINI_API_KEY`, `record_decision` still works (it commits to the local graph; the embedding is queued and drains on the next `mitos sync` once the key is set), but semantic surface/query are unavailable. If a tool reports a missing key, tell the human to put it in `.env`.\n\n"
             "Mitos uses its own Qdrant on **:7333** (not the standard :6333), started with `docker compose up -d`. If semantic tools report Qdrant unreachable, tell the human to start it; `record_decision` still works meanwhile (embeddings queue and drain once it's up).\n\n"
             "## Recording & recall — MCP tools (preferred) or CLI fallback\n"
