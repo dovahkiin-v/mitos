@@ -77,3 +77,10 @@ RESOLVED_AX_FEEDBACK.md
 # and the embed cache are ignored.
 tests/golden/reports/
 tests/golden/.cache/
+
+# The dogfood decision corpus — mitos-pub is itself a mitos workspace; its
+# decisions never ship (erased from history 2026-07-19). Users exercise the
+# format against tests/golden/ instead.
+decisions.md
+decisions/
+live_axioms.md
