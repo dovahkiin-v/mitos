@@ -17,7 +17,10 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    # vision/** — workshop-loop phase pushes land on a vision branch (one release
+    # + one version bump at merge to main; ADR vision-phases-on-branch-one-bump-at-merge),
+    # and each phase push still gets the full gate here.
+    branches: [main, "vision/**"]
   pull_request:
 
 # Least privilege: this job only reads the repo and runs tests — no writes, no token
