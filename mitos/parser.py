@@ -165,6 +165,28 @@ def strip_html_comments(text: str) -> str:
     return "\n".join(cleaned_lines)
 
 
+_INLINE_CODE_RE = re.compile(r'`[^`\n]+`')
+
+
+def mask_inline_code(line: str) -> str:
+    """Blanks the contents of inline-code spans for marker scanning.
+
+    A backtick-quoted token — a documented ``[NOTE: …]``, a quoted
+    BEGIN-ENTRIES sentinel — is prose *about* a marker, not the marker, so the
+    inline scanners (and sync's structural-token guard, which must agree with
+    them) scan a masked copy where span contents are replaced with same-length
+    spaces (column positions stay accurate). Single-line spans only; fenced
+    blocks are already protected upstream.
+
+    Args:
+        line: One raw line of markdown.
+
+    Returns:
+        The line with inline-code span contents blanked.
+    """
+    return _INLINE_CODE_RE.sub(lambda m: " " * len(m.group(0)), line)
+
+
 def parse_header(header_line: str) -> Tuple[str, Optional[str], Optional[str]]:
     """Parses a markdown heading line to extract slug, date, and title.
 
@@ -328,7 +350,7 @@ def parse_decisions_file(text: str, errors: Optional[List[ParseError]] = None) -
     begin_line_idx = 0
     raw_lines = text.splitlines()
     for idx, line in enumerate(raw_lines):
-        if "BEGIN ENTRIES" in line:
+        if "BEGIN ENTRIES" in mask_inline_code(line):
             begin_line_idx = idx
             break
 
@@ -342,9 +364,11 @@ def parse_decisions_file(text: str, errors: Optional[List[ParseError]] = None) -
             
         stripped = line.strip()
 
-        # Check section start conditions
+        # Check section start conditions. The OQ marker scan is code-span-masked:
+        # a backtick-quoted `[DECISION_PARKED: …]` inside an entry body is prose
+        # about the marker and must not split a new section.
         is_decision_start = (line.startswith("##") or line.startswith("###")) and not line.startswith("####")
-        is_oq_start = "[DECISION_PARKED:" in line
+        is_oq_start = "[DECISION_PARKED:" in mask_inline_code(line)
 
         if is_decision_start or is_oq_start:
             if current_section:
@@ -455,11 +479,14 @@ def _parse_section(sec: Dict[str, Any]) -> ParsedEntry:
 
         # Scan for inline markers (NOTE, PARKED)
         for line in sec["lines"]:
-            note_matches = re.findall(r'\[NOTE:\s*([^\]]+)\]', line)
+            # Code-span-masked: a quoted `[NOTE: …]`/`[PARKED: …]` is prose about
+            # the marker, never siphoned.
+            marker_scan_line = mask_inline_code(line)
+            note_matches = re.findall(r'\[NOTE:\s*([^\]]+)\]', marker_scan_line)
             for nm in note_matches:
                 entry.notes.append(nm.strip())
 
-            parked_matches = re.findall(r'\[PARKED:\s*([^\]]+)\]', line)
+            parked_matches = re.findall(r'\[PARKED:\s*([^\]]+)\]', marker_scan_line)
             for pm in parked_matches:
                 entry.parked_questions.append(pm.strip())
 
@@ -1157,7 +1184,7 @@ def parse_entry_stream(
     # begin_idx 0 -> the whole file is the entry stream.
     begin_idx = 0
     for i, line in enumerate(lines):
-        if "BEGIN ENTRIES" in line:
+        if "BEGIN ENTRIES" in mask_inline_code(line):
             begin_idx = i + 1
             break
 

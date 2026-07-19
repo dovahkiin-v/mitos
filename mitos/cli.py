@@ -1916,7 +1916,11 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
     checks = [
         ("workspace (.mitos/ + config.toml)", mitos_dir_ok, "run `mitos init`"),
         ("decisions.md buffer", decisions_ok, "created by `mitos init`"),
-        ("format-spec.md", spec_ok, "created by `mitos init`"),
+        # Reference copy for humans/agents — the parser reads the spec from the
+        # installed package, so a missing workspace copy never gates readiness:
+        # neutral "—", never a ✗ under a READY ✓ verdict (✗ is for real blockers).
+        ("format-spec.md", True if spec_ok else None,
+         "restore the reference copy: re-run `mitos init` (non-destructive)"),
         ("GEMINI_API_KEY" + (f" (from {key_source})" if key_source else ""), key_ok,
          "set it once for all projects: `mitos set-key --global <KEY>`"),
         (f"Qdrant reachable ({config.qdrant_url})", q["reachable"],

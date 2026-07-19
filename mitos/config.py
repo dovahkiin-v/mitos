@@ -259,6 +259,15 @@ class MitosConfig:
 
         self._load_config_file()
 
+        # Env wins over the config file for the Qdrant URL — matching the key
+        # resolution order (env → project .env → global .env) and the documented
+        # contract above ("QDRANT_URL overrides for anyone pointing at a different
+        # instance"). Before this re-assert, a toml-pinned qdrant_url silently
+        # shadowed the env var (AX 2026-07-18): the caller's override did nothing
+        # and nothing said so.
+        if os.environ.get("QDRANT_URL"):
+            self.qdrant_url = os.environ["QDRANT_URL"]
+
     def _load_config_file(self) -> None:
         """Overlays `.mitos/config.toml` onto the defaults under the strict policy.
 

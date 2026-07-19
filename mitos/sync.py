@@ -40,7 +40,8 @@ from mitos.errors import (
     STORE_MISSING_TARGET,
 )
 from mitos.models import get_model_id
-from mitos.parser import ParsedEntry, parse_entry_stream, parse_file_reversed
+from mitos.parser import (ParsedEntry, mask_inline_code, parse_entry_stream,
+                          parse_file_reversed)
 from mitos.replay import commit_quarantine_fixpoint
 from mitos.store import GraphStore, CommitDelta, _utc_now_iso
 from mitos.identity import SLUG_MAX_LEN, compute_node_id, embedding_text
@@ -212,7 +213,7 @@ _ERROR_MESSAGES: Dict[str, str] = {
     "empty_slug": "'slug' is empty. Provide a short, explicit, hyphenated handle (e.g. 'sqlite-wal-mode').",
     "slug_too_long": "slug '{slug}' is {length} characters — {over} over the {max}-character limit. The slug is the permanent citation handle (it is folded into the decision's identity), so it is NOT silently truncated. Pass a shorter 'slug' of at most {max} characters.",
     "missing_rejected_paths": "'rejected_paths' is required: state the alternatives you considered and why you ruled them out — this is what stops you or another agent from re-proposing them later.",
-    "parse_failed": "The decision could not be serialised into a valid entry — most likely a structural token in axiom/rejected_paths/context: a line beginning with '##' or '###' (indent it or use '#'/'####' instead), a line shaped like '**Something:**', or a '[DECISION_TRANSCRIPT]' / '[DECISION_PARKED:' / 'BEGIN ENTRIES' / '[NOTE:' / '[PARKED:' marker. Remove or rephrase that line and retry.",
+    "parse_failed": "The decision could not be serialised into a valid entry — most likely a structural token in axiom/rejected_paths/context: a line beginning with '##' or '###' (indent it or use '#'/'####' instead), a line shaped like '**Something:**', or a '[DECISION_TRANSCRIPT]' / '[DECISION_PARKED:' / 'BEGIN ENTRIES' / '[NOTE:' / '[PARKED:' marker. Remove or rephrase that line and retry — or, to mention a marker as prose, wrap it in backticks (`...`): inline-code spans are exempt.",
     "slug_collision": "A different decision already uses the slug '{slug}'. Give this one a distinct 'slug'; and if it is meant to replace the existing decision, also set supersedes='{slug}' (the new decision must still have its own slug — two decisions cannot share one).",
     "supersedes_not_found": "supersedes='{supersedes}' does not match any existing decision. Look it up first with query_decisions to get the exact slug, or omit 'supersedes' if this is a brand-new decision.",
     "supersedes_ambiguous": "supersedes='{supersedes}' matches more than one decision. Use query_decisions to find the exact, full slug and pass that.",
@@ -312,7 +313,11 @@ def _contains_structural_token(text: str) -> bool:
             return True
         if _FIELD_LINE_RE.match(line):
             return True
-        if any(marker in line for marker in _STRUCTURAL_MARKERS):
+        # Code-span-masked, matching the parser's own scanners: a backtick-quoted
+        # marker (`BEGIN ENTRIES`, `[NOTE: …]`) is prose about the marker, and the
+        # parser no longer reacts to it — so the guard must not reject it either.
+        masked = mask_inline_code(line)
+        if any(marker in masked for marker in _STRUCTURAL_MARKERS):
             return True
     return False
 
