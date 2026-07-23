@@ -438,7 +438,7 @@ def cmd_init(config: MitosConfig) -> None:
             "- has cross-cutting blast radius (touches many areas).\n"
             "Skip the local, easily-reversible, or already-settled choice. A quick self-test at any fork: *would the next agent waste time re-deriving or re-litigating this?* If yes, record it. When unsure, `surface_decisions` first — if nothing is there and it clears the bar, record it.\n\n"
             "## Linking decisions\n"
-            "When a decision relates to an existing one, pass that one's EXACT slug to the matching relation arg so the graph stays connected instead of accumulating silent tension: `supersedes` (replaces it), `amends`, `narrows`, `depends_on`, `resolves`, `contradicts`, `cites`. On `record_decision` these are args; on the CLI they are flags (`--supersedes`, `--depends-on`, …). Look the target up first to get its exact slug. After you record, the result may list nearby existing decisions (`related`) — if one is genuinely connected, link it.\n"
+            "When a decision relates to an existing one, pass that one's EXACT slug to the matching relation arg so the graph stays connected instead of accumulating silent tension: `supersedes` (replaces it), `amends`, `narrows`, `depends_on`, `resolves`, `contradicts`, `cites`. On `record_decision` these are args; on the CLI they are flags (`--supersedes`, `--depends-on`, …). Look the target up first to get its exact slug.\n"
         )
 
     # 3. Seed the decisions.md buffer when absent (with the extracted ## 3 sample).
@@ -1194,7 +1194,7 @@ def cmd_record(
         # Every outcome speaks JSON on stdout (no stderr walls); exit codes ride along.
         # The receipt is already the structured dict — emit it verbatim, no reshaping
         # (the record receipt is a write result, NOT a decision read: no modifier
-        # stamping; its related/neighbors are recall pointers the agent dereferences
+        # stamping; its neighbors are recall pointers the agent dereferences
         # by slug). scope_overflow, when present, is already inside `result`.
         _emit_json(result)
         if "error" in result:
@@ -1240,14 +1240,6 @@ def cmd_record(
         print(f"  Scope:     {', '.join(result['scope'])}")
     if result.get("mechanisms"):
         print(f"  Mechanisms: {', '.join(result['mechanisms'])}")
-    related = result.get("related")
-    if related:
-        print("  ↔ Nearest existing decisions (an intended neighbour, or a tension to reconcile?):")
-        for r in related:
-            score = r.get("score")
-            score_s = f"{score:.2f}" if isinstance(score, (int, float)) else "?"
-            axiom_snip = truncate_words(r.get("axiom") or "", 60)
-            print(f"     - {r['slug']}  ({score_s})  {axiom_snip}")
     # Debounced size-ceiling nudge — AFTER the receipt, on stderr (an ancillary health
     # hint, never the receipt itself), so a healthy growing corpus can't bury "Recorded ✓".
     # Flush stdout first so the receipt lands before the nudge even when stdout is piped

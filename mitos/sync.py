@@ -338,15 +338,16 @@ _SLUG_MAX_LEN = SLUG_MAX_LEN  # shared source of truth in identity.py (re-export
 _SLUG_MIN_LEN = 32  # auto-derive only: don't trim a word boundary back past here — hard-cap instead
 
 # A new decision at/above this document-document similarity to an existing one the
-# author did NOT reference is paused for review (AX P4): the neighbour was invisible
-# until the post-commit `related` echo, one step too late to point an
-# amends/supersedes/contradicts at it (you can't relink after commit — re-record is a
-# no-op). 0.80 is the floor of the strong-match band (see recall.py's calibration):
+# author did NOT reference is paused for review (AX P4): the neighbour must surface
+# BEFORE commit, while the author can still point an amends/supersedes/contradicts
+# at it (you can't relink after commit — re-record is a no-op; the retired
+# post-commit `related` echo was exactly one step too late).
+# 0.80 is the floor of the strong-match band (see recall.py's calibration):
 # an unlinked strong match must force an explicit confirm-or-link, because prose-only
 # obsoletion is invisible to state-filtered retrieval — only edges retire a node (ADR
 # `record-pause-floor-lowered-to-strong-match-band`; the routine-case pause tax stays
 # low via --acknowledge-neighbors, the declared-target exemption, and transitive
-# lineage suppression). Same score scale as the `related` echo. Tune here.
+# lineage suppression). Tune here.
 _NEIGHBOR_REVIEW_THRESHOLD = 0.80
 
 # Cheap polarity cues for the `possible_tension` hint — a high-similarity pair where
@@ -1670,43 +1671,6 @@ class MitosSyncManager:
             return _record_error("relation_target_not_found", relation=relation, target=target)
         return None
 
-    def _adjacent_decisions(self, vector: Optional[List[float]], exclude_slug: str,
-                            limit: int = 3) -> List[Dict[str, Any]]:
-        """Best-effort: the nearest OTHER live decisions to a just-recorded one.
-
-        A write-time guardrail — surfaces semantic neighbours so an agent notices an
-        adjacent or contradictory prior decision instead of silently accumulating
-        tension in the graph. Needs embeddings (it is semantic), so it is empty when
-        offline. A pure read that runs AFTER the commit and is fully fail-silent: it
-        never touches the buffer-first + rollback write contract.
-
-        Args:
-            vector: The just-recorded decision's document embedding (reused), or None.
-            exclude_slug: The new decision's own slug, filtered out of the neighbours.
-            limit: Maximum neighbours to return.
-
-        Returns:
-            Up to ``limit`` dicts ``{slug, axiom, score}`` for live neighbours, most
-            similar first; empty if offline or nothing comparable exists.
-        """
-        if vector is None or not self.vector_store:
-            return []
-        out: List[Dict[str, Any]] = []
-        try:
-            for m in self.vector_store.query(vector, limit=limit + 3):
-                slug = m.get("slug")
-                if not slug or slug == exclude_slug:
-                    continue
-                node = self.store.get_node_by_slug(slug)
-                if not node or self.store.get_node_state(node["id"]) not in ("active", "drifted"):
-                    continue
-                out.append({"slug": slug, "axiom": node["core_axiom"], "score": m.get("score")})
-                if len(out) >= limit:
-                    break
-        except Exception:
-            return []
-        return out
-
     def _review_neighbors(self, entry: ParsedEntry,
                           declared_targets: set) -> "List[Dict[str, Any]] | Unavailable":
         """Pre-commit: existing live decisions too similar to ``entry`` to ignore (P4).
@@ -1916,8 +1880,7 @@ class MitosSyncManager:
             ``edges_created`` (the edges the commit actually wired, each
             ``{kind, target}`` — write facts read back from the store, not an
             echo of the input args), the resolved ``scope`` and ``mechanisms``
-            as committed, plus an optional ``related`` list of the nearest
-            existing live decisions (a write-time adjacency hint) and an optional
+            as committed, plus an optional
             ``neighbor_review_unavailable`` notice when the pre-commit near-dup
             check could not run (the record fails open — the commit proceeds
             unchecked and `mitos check` covers it retroactively); OR, when a highly-similar unreferenced decision exists and
@@ -2115,9 +2078,9 @@ class MitosSyncManager:
             return _record_error("slug_collision", slug=entry.slug)
 
         # Near-duplicate / possible-tension review (P4) — still Phase A, so a pause
-        # writes NOTHING (buffer byte-for-byte unchanged). Surfacing the neighbour now,
-        # not in the post-commit `related` echo, is the point: after commit the author
-        # can no longer point a relation at it (a re-record is a no-op). Offline-safe
+        # writes NOTHING (buffer byte-for-byte unchanged). Surfacing the neighbour
+        # BEFORE commit is the point: after commit the author can no longer point a
+        # relation at it (a re-record is a no-op). Offline-safe
         # (no embeddings → no pause) and bypassable with acknowledge_neighbors=True.
         # The record surface fails OPEN on any pause-read fault: the check degrading
         # must never block the commit, but "couldn't check" must not read as "checked,
@@ -2270,9 +2233,8 @@ class MitosSyncManager:
             )
 
         # 8. Embed best-effort (queues to the outbox if Gemini/Qdrant are down).
-        vector: Optional[List[float]] = None
         try:
-            vector = self._best_effort_embed(delta, entry)
+            self._best_effort_embed(delta, entry)
         except Exception as e:
             # stderr: the MCP write tool shares this path and uses stdout for JSON-RPC.
             print(f"[Warning] Embedding step failed for '{entry.slug}': {str(e)}", file=sys.stderr)
@@ -2293,9 +2255,9 @@ class MitosSyncManager:
             # stderr: the MCP write tool shares this path and uses stdout for JSON-RPC.
             print(f"[Warning] Failed to render active axioms: {str(e)}", file=sys.stderr)
 
-        # 10. Return. A freshly recorded decision is always active. Adjacency is a
-        #     post-commit, fail-silent guardrail — surfacing it here never affects the
-        #     write contract (the commit already succeeded above).
+        # 10. Return. A freshly recorded decision is always active. Everything below is
+        #     post-commit read-back — the write contract is untouched (the commit
+        #     already succeeded above).
         result: Dict[str, Any] = {
             "slug": entry.slug,
             "id": node_id,
@@ -2304,16 +2266,12 @@ class MitosSyncManager:
             "status": "created",
             "path": self.config.decisions_file,
             # Write FACTS read back from the committed node — what the commit actually
-            # wired/stored, never re-derived from the author's input args. Distinct from
-            # the similarity-based `related` recall pointers below, and deliberately
+            # wired/stored, never re-derived from the author's input args. Deliberately
             # unstamped (ADR `record-receipt-neighbors-are-recall-pointers-not-stamped-reads`).
             "edges_created": self.store.get_outgoing_edges(node_id),
             "scope": entry.scope,
             "mechanisms": entry.mechanisms,
         }
-        related = self._adjacent_decisions(vector, exclude_slug=entry.slug)
-        if related:
-            result["related"] = related
         # Honest degradation (KDD-4): when the pre-commit near-dup check could not run,
         # say so on the receipt — one calm sentence, only on a genuinely failed check
         # (never on clean-empty, unconfigured, or acknowledged-past records).

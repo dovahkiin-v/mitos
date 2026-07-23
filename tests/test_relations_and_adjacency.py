@@ -1,4 +1,4 @@
-"""Tests for slug ergonomics (②) and typed relations + write-time adjacency (③).
+"""Tests for slug ergonomics (②) and typed relations (③).
 
 Driven by loop-Claude's friction:
 - Slugs truncated mid-word (`…brazilian-portug`) made a poor handle for chaining
@@ -6,11 +6,13 @@ Driven by loop-Claude's friction:
 - Only `supersedes` was writable; the other typed edges existed end-to-end but
   weren't reachable from the agentic write path → record now serializes + validates
   all of them, exactly like supersedes (EXACT target, Phase-A, buffer-rollback safe).
-- Recording was silent about neighbours → record returns a best-effort `related`
-  adjacency hint (post-commit, fail-silent — never touches the write contract).
+- Recording was silent about neighbours → a post-commit `related` echo was tried,
+  then retired: neighbours now surface BEFORE commit via the P4 near-dup pause
+  (pinned in test_neighbor_review.py), while a relation can still be pointed at them.
 
 Forced fully offline (unreachable Qdrant + no keys) so the graph/contract behaviour
-is deterministic; the live adjacency loop is covered in test_integration_live.py.
+is deterministic; the live pause loop is covered in test_integration_live.py
+(test_record_pause_fires_on_live_similarity).
 """
 
 import json
@@ -488,46 +490,3 @@ def test_mcp_record_decision_corrects_kill_edge(ws):
                                          corrects="mcp-ktarget"))
     assert res["status"] == "created"
     assert _edge(GraphStore(config.db_path), "mcp-kcorrector", "mcp-ktarget", "corrects")
-
-
-# --------------------------------------------------------------------------- #
-# ③c Adjacency-at-write
-# --------------------------------------------------------------------------- #
-
-def test_no_related_field_when_offline(ws):
-    """Adjacency is semantic — offline (no vector) it is simply absent, not an error."""
-    config, m = ws
-    res = m.record_decision_entry("Solo decision.", "rej", [], slug="solo")
-    assert res["status"] == "created"
-    assert "related" not in res
-
-
-def test_adjacent_decisions_empty_without_vector(ws):
-    """The helper short-circuits to [] when there is no vector to query with."""
-    _, m = ws
-    assert m._adjacent_decisions(None, exclude_slug="x") == []
-
-
-def test_adjacent_decisions_excludes_self_missing_and_superseded(ws):
-    """Neighbour surfacing drops self, unknown slugs, and non-live decisions."""
-    config, m = ws
-    m.record_decision_entry("Keep me active.", "rej", [], slug="keep")
-    m.record_decision_entry("Old one.", "rej", [], slug="old")
-    m.record_decision_entry("New replaces old.", "rej", [], slug="new", supersedes="old")
-    m.record_decision_entry("The just-recorded self.", "rej", [], slug="self-node")
-
-    class FakeVectorStore:
-        def query(self, vector, limit=5):
-            return [
-                {"slug": "self-node", "score": 1.0},  # itself — must be excluded
-                {"slug": "keep", "score": 0.82},      # live — kept
-                {"slug": "old", "score": 0.71},       # superseded — filtered
-                {"slug": "missing", "score": 0.6},    # not in graph — skipped
-            ]
-
-    m.vector_store = FakeVectorStore()
-    related = m._adjacent_decisions([0.1, 0.2, 0.3], exclude_slug="self-node", limit=3)
-    slugs = [r["slug"] for r in related]
-    assert slugs == ["keep"]
-    assert related[0]["axiom"] == "Keep me active."
-    assert related[0]["score"] == 0.82

@@ -746,11 +746,7 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
         record actually wired, each `{kind, target}` (write facts read back from the
         committed graph, so an empty list means no edge landed) — and the resolved
         `scope`/`mechanisms` as committed.
-        On the "created" path the result MAY include `related`: the nearest existing
-        live decisions to the one you just recorded — a write-time adjacency hint, so
-        you notice an adjacent or contradictory prior decision. If one is genuinely
-        related, record the link (re-record with the matching relation arg, or capture
-        a follow-up). NOTE: identity is (slug + axiom + mechanisms). Re-recording an
+        NOTE: identity is (slug + axiom + mechanisms). Re-recording an
         existing decision is a no-op — a changed `context`/`rejected_paths`/`scope` or
         relation on a re-record is NOT saved. To record different reasoning or a new
         relationship, make a NEW decision (a distinct axiom), don't resubmit the old one.

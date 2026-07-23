@@ -1,7 +1,7 @@
 """Tests for the pre-commit near-duplicate / possible-tension review (AX P4).
 
 Loop-Claude's friction: a new decision's nearest neighbour only surfaced in the
-POST-commit `related` echo — one step too late to point an amends/supersedes at it
+POST-commit `related` echo (since deleted) — one step too late to point an amends/supersedes at it
 (a re-record is a no-op, so the link could never be added). `record_decision` now
 embeds the axiom BEFORE the write, and if it is >=0.80 similar to an existing decision
 (the strong-match band floor — ADR `record-pause-floor-lowered-to-strong-match-band`)
@@ -183,8 +183,8 @@ def test_possible_tension_flagged_on_polarity_flip(ws):
 def test_strong_match_band_pauses(ws):
     """A 0.80–0.85 unreferenced active neighbour now pauses (the lowered floor's
     whole point — ADR `record-pause-floor-lowered-to-strong-match-band`: at 0.85
-    this band was a visibility-only `related` echo, the mechanism that already
-    failed the five-week prose-obsoletion trap)."""
+    this band fell to the visibility-only `related` echo (since deleted), the
+    mechanism that already failed the five-week prose-obsoletion trap)."""
     config, m = ws
     m.record_decision_entry("Use SQLite for the store.", "rej", ["db"], slug="use-sqlite")
     _arm(m, [{"slug": "use-sqlite", "score": 0.82}])
@@ -619,8 +619,8 @@ def test_graph_fault_during_pause_read_commits_with_notice(ws):
     gather_candidates propagates graph-store faults by design; the record call site
     catches exactly (DatabaseError, ValidationError). Phase B uses get_node /
     commit_parsed_entry / get_outgoing_edges — none of them the patched read — so the
-    commit proceeds. (`_adjacent_decisions` also hits the patched method post-commit;
-    its own still-alive blanket catch absorbs that — the `related` echo just goes empty.)
+    commit proceeds. (Nothing post-commit calls the patched method anymore: the
+    `related` echo and its blanket-catch scan were deleted.)
     """
     config, m = ws
     _seed(m, "gf-prior", "The sync lock is held during commit.")
@@ -667,6 +667,25 @@ def test_acknowledge_bypass_carries_no_notice(ws):
                                   slug="ack-clean", acknowledge_neighbors=True)
     assert res["status"] == "created"
     assert "neighbor_review_unavailable" not in res
+
+
+# --------------------------------------------------------------------------- #
+# The retired `related` echo (T4)
+# --------------------------------------------------------------------------- #
+
+def test_created_receipt_carries_no_related_echo(ws):
+    """T4: the post-commit `related` echo is DELETED, not merely offline — an armed
+    high-similarity neighbour plus acknowledge_neighbors=True (the exact scenario
+    the old echo fired on: pause bypassed, embed + vector store answering) yields
+    a created receipt with no `related` key."""
+    config, m = ws
+    _seed(m, "echo-prior", "Retries use exponential backoff with jitter.")
+    _arm(m, [{"slug": "echo-prior", "score": 0.9}])
+    res = m.record_decision_entry("Retry policy is exponential backoff plus jitter.",
+                                  "rej", ["s"], slug="echo-new",
+                                  acknowledge_neighbors=True)
+    assert res["status"] == "created"
+    assert "related" not in res
 
 
 def test_cli_record_renders_degraded_notice(ws, capsys):
