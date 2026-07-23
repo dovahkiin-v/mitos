@@ -1256,6 +1256,12 @@ def cmd_record(
     if overflow:
         sys.stdout.flush()
         print(f"\n{overflow}", file=sys.stderr)
+    # Degraded-check notice — same post-receipt stderr shape: the commit succeeded,
+    # but the near-dup review could not run, and silence would read as "checked, clean".
+    review_notice = result.get("neighbor_review_unavailable")
+    if review_notice:
+        sys.stdout.flush()
+        print(f"\n{review_notice}", file=sys.stderr)
 
 
 def _read_text_arg(inline: Optional[str], file_path: Optional[str]) -> Optional[str]:

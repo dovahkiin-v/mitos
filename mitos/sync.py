@@ -23,11 +23,14 @@ from mitos.config import MitosConfig, hint_due
 from mitos.conflict import (
     CONFLICT_CANDIDATE_SOURCE,
     CONFLICT_PROMPT_VERSION,
+    CONFLICT_TOP_K,
     ConflictCheckResult,
     ConflictFinding,
     ConflictUnavailableReason,
     Unavailable,
+    gather_candidates,
     run_conflict_check,
+    screen_candidates,
 )
 from mitos.telemetry import ConflictCheckRow, JudgmentBatch, TelemetryStore
 from mitos.errors import (
@@ -363,6 +366,35 @@ def _has_negation(text: str) -> bool:
 def _polarity_mismatch(a: str, b: str) -> bool:
     """True when exactly one of two axioms negates — a possible-tension signal."""
     return _has_negation(a) != _has_negation(b)
+
+
+# Surface wording for the record receipt's degraded-check causes. The record surface
+# owns this text (the core returns only the typed reason — the same core/surface split
+# as _notice_conflict_unavailable, the sync-surface sibling). ``Unavailable.detail`` is
+# logging-only by contract and never lands in the sentence.
+_REVIEW_UNAVAILABLE_CAUSES = {
+    ConflictUnavailableReason.EMBEDDING: "embedding service unavailable",
+    ConflictUnavailableReason.VECTOR_STORE: "vector store unavailable",
+}
+
+
+def _review_unavailable_notice(cause: str) -> str:
+    """One calm receipt sentence for a near-dup check that could not run (fail-open).
+
+    Structure fixed by the vision: name the cause, state that the decision committed
+    without the check, point at the retroactive net. "Couldn't check" must never read
+    as "checked, clean".
+
+    Args:
+        cause: Short prose naming what failed (e.g. "embedding service unavailable").
+
+    Returns:
+        The receipt notice sentence.
+    """
+    return (
+        f"Near-duplicate review could not run ({cause}); this decision committed "
+        "without a neighbour check — `mitos check` covers it retroactively."
+    )
 
 
 def _normalize_slug(text: str) -> str:
@@ -1676,51 +1708,63 @@ class MitosSyncManager:
         return out
 
     def _review_neighbors(self, entry: ParsedEntry,
-                          declared_targets: set) -> List[Dict[str, Any]]:
+                          declared_targets: set) -> "List[Dict[str, Any]] | Unavailable":
         """Pre-commit: existing live decisions too similar to ``entry`` to ignore (P4).
 
-        Embeds the about-to-be-recorded axiom (same document vector and score scale as
-        the post-commit ``related`` echo), finds its nearest live neighbours, and keeps
-        those at/above ``_NEIGHBOR_REVIEW_THRESHOLD`` that the author did NOT already
-        reference via a relation. Surfacing these BEFORE the write is the whole point:
-        after the commit the author can no longer point an amends/supersedes at them (a
-        re-record is a no-op). Fully fail-silent and offline-safe — no embeddings/vector
-        store, or any error, means an empty list (never block a write we can't check).
+        Composes the Conflict sensor's candidate stages (the same discovery `mitos
+        check` uses): :func:`gather_candidates` embeds the axiom in document space,
+        over-fetches one bounded KNN window, and keeps only live *decisions* — an
+        open question in the window is screened by kind, never crashed on — then
+        :func:`screen_candidates` drops declared/self, floors at
+        ``_NEIGHBOR_REVIEW_THRESHOLD``, and truncates to ``CONFLICT_TOP_K``.
+        Surfacing survivors BEFORE the write is the whole point: after the commit the
+        author can no longer point an amends/supersedes at them (a re-record is a no-op).
+
+        Degradation is typed, never silent: a failed embed or KNN query returns the
+        gather's :class:`Unavailable` untouched (the caller words the receipt notice
+        from its reason), and graph-store faults (``DatabaseError``/``ValidationError``)
+        propagate — the record call site owns the fail-open disposition. Only the
+        *structural* no-providers state (a graph-only workspace, first-class healthy)
+        returns a clean ``[]`` here.
 
         Args:
             entry: The parsed entry about to be committed.
-            declared_targets: Casefolded slugs the entry already links to (its declared
-                supersedes/amends/… targets), excluded so a linked neighbour is not re-flagged.
+            declared_targets: Casefolded slugs the entry already links to — its declared
+                relation targets plus their transitive mutation lineage — excluded so a
+                linked neighbour is not re-flagged.
 
         Returns:
             A list of ``{slug, axiom, score, possible_tension}`` for unreferenced
-            high-similarity neighbours, most similar first; empty when there is nothing
-            to flag or the check could not run.
+            high-similarity live neighbours, most similar first (possibly empty), or
+            the :class:`Unavailable` the gather returned when the semantic substrate
+            was unreachable.
         """
         if not self.embed_provider or not self.vector_store:
             return []
-        try:
-            text = _embedding_input_text(
-                kind=entry.kind, axiom=entry.axiom,
-                topic=entry.topic, questions_raised=entry.questions_raised,
-            )
-            vector = self.embed_provider.get_embedding(text, is_query=False)
-        except Exception:
-            return []
-        flagged: List[Dict[str, Any]] = []
-        for n in self._adjacent_decisions(vector, exclude_slug=entry.slug, limit=5):
-            score = n.get("score")
-            if score is None or score < _NEIGHBOR_REVIEW_THRESHOLD:
-                continue
-            if n["slug"].casefold() in declared_targets:
-                continue
-            flagged.append({
-                "slug": n["slug"],
-                "axiom": n["axiom"],
-                "score": score,
-                "possible_tension": _polarity_mismatch(entry.axiom, n["axiom"]),
-            })
-        return flagged
+        gathered = gather_candidates(
+            entry.axiom,
+            embed_provider=self.embed_provider,
+            vector_store=self.vector_store,
+            store=self.store,
+        )
+        if isinstance(gathered, Unavailable):
+            return gathered
+        screened = screen_candidates(
+            gathered,
+            declared_targets=declared_targets,
+            own_slug=entry.slug,
+            floor=_NEIGHBOR_REVIEW_THRESHOLD,
+            top_k=CONFLICT_TOP_K,
+        )
+        return [
+            {
+                "slug": c.slug,
+                "axiom": c.node["core_axiom"],
+                "score": c.score,
+                "possible_tension": _polarity_mismatch(entry.axiom, c.node["core_axiom"]),
+            }
+            for c in screened
+        ]
 
     def _lineage_suppression_slugs(
         self, mutation_target_slugs: List[Optional[str]]
@@ -1736,8 +1780,9 @@ class MitosSyncManager:
         walks :meth:`GraphStore.get_lineage` (the transitive ``supersedes`` ∪ ``amends``
         ∪ ``narrows`` ancestor walk, Phase 3a) from it, returning every ancestor's
         casefolded slug to merge into ``declared_targets`` — the suppression set
-        :meth:`_review_neighbors` already filters on (``n["slug"].casefold() in
-        declared_targets``). Both sides casefold, matching that filter exactly. Merging
+        :meth:`_review_neighbors` passes to ``screen_candidates``, whose S4 stage drops
+        candidates by casefolded membership. Both sides casefold, matching that filter
+        exactly. Merging
         into the set only ever *grows* suppression, so V1a's DIRECT suppression of all
         nine relation types is preserved by construction (must-not-regress, DoD #13b).
 
@@ -1872,7 +1917,10 @@ class MitosSyncManager:
             ``{kind, target}`` — write facts read back from the store, not an
             echo of the input args), the resolved ``scope`` and ``mechanisms``
             as committed, plus an optional ``related`` list of the nearest
-            existing live decisions (a write-time adjacency hint); OR, when a highly-similar unreferenced decision exists and
+            existing live decisions (a write-time adjacency hint) and an optional
+            ``neighbor_review_unavailable`` notice when the pre-commit near-dup
+            check could not run (the record fails open — the commit proceeds
+            unchecked and `mitos check` covers it retroactively); OR, when a highly-similar unreferenced decision exists and
             ``acknowledge_neighbors`` is False, a ``{status: "needs_review", code:
             "similar_decision_exists", neighbors, message}`` pause that wrote NOTHING;
             OR a structured ``{error, code}`` failure (see spec §5).
@@ -2071,29 +2119,55 @@ class MitosSyncManager:
         # not in the post-commit `related` echo, is the point: after commit the author
         # can no longer point a relation at it (a re-record is a no-op). Offline-safe
         # (no embeddings → no pause) and bypassable with acknowledge_neighbors=True.
+        # The record surface fails OPEN on any pause-read fault: the check degrading
+        # must never block the commit, but "couldn't check" must not read as "checked,
+        # clean" either — the threaded notice lands on the created receipt (step 10).
+        review_unavailable: Optional[str] = None
         if not acknowledge_neighbors:
-            declared_targets = {
-                t.casefold()
-                for raw in ([supersedes, corrects] + list(extra_relations.values()))
-                for t in _split_relation_slugs(raw)
-            }
-            # Transitive-lineage suppression (3b): also suppress the pause for the
-            # OLDER members of an amends/narrows/supersedes chain reachable through a
-            # declared mutation edge — by naming the chain head the author has
-            # acknowledged the whole lineage (consuming get_lineage from 3a). Seed only
-            # the mutation three (corrects + the other five stay direct-only). Skip the
-            # walk when the gate is a no-op (offline → _review_neighbors returns []);
-            # the augmentation only ever GROWS the set, so direct suppression of all
-            # nine types is preserved (DoD #13b). The walk is suppression-only: it does
-            # NOT re-declare amends/narrows (that serves modifier stamping, a different
-            # consumer — §6.2), so a bridged predecessor still reads un-amended.
-            if self.embed_provider and self.vector_store:
-                declared_targets |= self._lineage_suppression_slugs(
-                    _split_relation_slugs(supersedes)
-                    + _split_relation_slugs(extra_relations.get("amends"))
-                    + _split_relation_slugs(extra_relations.get("narrows"))
-                )
-            neighbors = self._review_neighbors(entry, declared_targets)
+            neighbors: List[Dict[str, Any]] = []
+            try:
+                declared_targets = {
+                    t.casefold()
+                    for raw in ([supersedes, corrects] + list(extra_relations.values()))
+                    for t in _split_relation_slugs(raw)
+                }
+                # Transitive-lineage suppression (3b): also suppress the pause for the
+                # OLDER members of an amends/narrows/supersedes chain reachable through a
+                # declared mutation edge — by naming the chain head the author has
+                # acknowledged the whole lineage (consuming get_lineage from 3a). Seed only
+                # the mutation three (corrects + the other five stay direct-only). Skip the
+                # walk when the gate is a no-op (offline → _review_neighbors returns []);
+                # the augmentation only ever GROWS the set, so direct suppression of all
+                # nine types is preserved (DoD #13b). The walk is suppression-only: it does
+                # NOT re-declare amends/narrows (that serves modifier stamping, a different
+                # consumer — §6.2), so a bridged predecessor still reads un-amended.
+                if self.embed_provider and self.vector_store:
+                    declared_targets |= self._lineage_suppression_slugs(
+                        _split_relation_slugs(supersedes)
+                        + _split_relation_slugs(extra_relations.get("amends"))
+                        + _split_relation_slugs(extra_relations.get("narrows"))
+                    )
+                reviewed = self._review_neighbors(entry, declared_targets)
+            except (DatabaseError, ValidationError) as exc:
+                # A graph-store fault during the pause read (gather's node reads or the
+                # lineage walk). Fail open — a fault this severe fails Phase B anyway,
+                # where commit-arbitration belongs; a pre-commit crash never does.
+                # Exactly these two classes: anything else is a real bug and propagates.
+                review_unavailable = _review_unavailable_notice("graph read failed")
+                # stderr: the MCP write tool shares this path and uses stdout for JSON-RPC.
+                print(f"[Warning] Neighbor review skipped for '{entry.slug}': {exc}",
+                      file=sys.stderr)
+            else:
+                if isinstance(reviewed, Unavailable):
+                    # Embed/vector-store degradation, typed by the gather. The reason
+                    # words the notice; `.detail` is logging-only, never rendered.
+                    review_unavailable = _review_unavailable_notice(
+                        _REVIEW_UNAVAILABLE_CAUSES.get(
+                            reviewed.reason, reviewed.reason.value.replace("_", " ")
+                        )
+                    )
+                else:
+                    neighbors = reviewed
             if neighbors:
                 return {
                     "status": "needs_review",
@@ -2240,6 +2314,11 @@ class MitosSyncManager:
         related = self._adjacent_decisions(vector, exclude_slug=entry.slug)
         if related:
             result["related"] = related
+        # Honest degradation (KDD-4): when the pre-commit near-dup check could not run,
+        # say so on the receipt — one calm sentence, only on a genuinely failed check
+        # (never on clean-empty, unconfigured, or acknowledged-past records).
+        if review_unavailable:
+            result["neighbor_review_unavailable"] = review_unavailable
         # Debounced, presentation-only: a one-line "N files over the size ceiling — run
         # `mitos status`" nudge, never on the burying-the-receipt critical path. Shared
         # by both surfaces (CLI prints it after the receipt; MCP returns it structured).

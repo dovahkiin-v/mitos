@@ -23,6 +23,9 @@ from unittest.mock import patch
 
 from mitos.config import MitosConfig
 from mitos.cli import cmd_init, cmd_record
+from mitos.conflict import ConflictUnavailableReason, Unavailable
+from mitos.errors import DatabaseError, EmbeddingError, VectorStoreError
+from mitos.parser import ParsedEntry
 from mitos.store import GraphStore
 from mitos.sync import (MitosSyncManager, _has_negation, _polarity_mismatch,
                         _NEIGHBOR_REVIEW_THRESHOLD)
@@ -484,3 +487,209 @@ def test_corrupt_cycle_suppression_is_loud_partial_and_never_hangs(ws, caplog):
     # Loud, non-fatal: get_lineage emitted the homeostasis WARNING naming the cycle.
     assert any("cycle" in r.getMessage().lower() for r in caplog.records), \
         "expected a loud homeostasis WARNING on the corrupt cycle"
+
+
+# --------------------------------------------------------------------------- #
+# Gather-composed pause: OQ-safety + honest degradation (Phase 1a)
+#
+# The pause's discovery now composes the Conflict sensor's gather+screen stages.
+# Two properties the old pause-local scan lacked, pinned here:
+#   * OQ-safe by construction — an open question in the KNN window is screened by
+#     kind at gather, never crashed on (the old scan KeyError'd on `core_axiom`
+#     and its blanket catch converted that into a silently EMPTY pause, hiding
+#     genuine duplicates).
+#   * "Couldn't check" ≠ "checked, clean" — a degraded pause read (embed/vector
+#     Unavailable, or a propagated graph fault caught at the record call site)
+#     fails open: the record commits and the created receipt carries ONE calm
+#     `neighbor_review_unavailable` notice. Clean-empty, offline-unconfigured,
+#     and acknowledged-past records carry NO notice.
+# --------------------------------------------------------------------------- #
+
+
+class _RaisingEmbed:
+    """An embed provider that always raises — the constructor-injected fault shape."""
+
+    def __init__(self, exc):
+        self._exc = exc
+
+    def get_embedding(self, text, is_query=False):
+        raise self._exc
+
+
+class _RaisingVector:
+    """A vector store whose query always raises (upsert stays a harmless no-op)."""
+
+    def __init__(self, exc):
+        self._exc = exc
+
+    def query(self, vector, limit=5):
+        raise self._exc
+
+    def upsert(self, *a, **k):
+        pass
+
+
+def test_active_oq_in_window_pauses_on_genuine_decision(ws):
+    """T1 (the mandatory regression): an active OQ in the KNN window never empties the pause.
+
+    Mirror of test_conflict_gather.py::test_open_question_match_is_dropped_by_kind_
+    not_crashed_on at the pause level. The old scan subscripted `core_axiom` (which an
+    OQ lacks) and its blanket catch turned the KeyError into an empty pause — an agent
+    could sail past a genuine duplicate because an unrelated OQ happened to be nearby.
+    The gather screens the OQ by kind; the decision near-dup still pauses.
+    """
+    config, m = ws
+    _seed(m, "cache-policy", "Cache aggressively at the edge.")
+    # Seed an open question via parse→commit (the deterministic keyless path —
+    # record_decision_entry only mints decisions).
+    oq = ParsedEntry("open_question", "oq-cache-cadence", 40, 50)
+    oq.topic = "cache invalidation cadence"
+    oq.questions_raised = ["How often should the cache invalidate?"]
+    oq.scope = ["s"]
+    m.store.commit_parsed_entry(oq)
+    # Sanity anchors (the exact trap): kill-edge state calls the OQ 'active', and it
+    # lacks the `core_axiom` key the old scan hard-subscripted.
+    oq_node = m.store.get_node_by_slug("oq-cache-cadence")
+    assert oq_node is not None and oq_node["kind"] == "open_question"
+    assert m.store.get_node_state(oq_node["id"]) == "active"
+    assert "core_axiom" not in oq_node
+    # The OQ is the NEAREST match, beside a genuine decision near-dup.
+    _arm(m, [{"slug": "oq-cache-cadence", "score": 0.95},
+             {"slug": "cache-policy", "score": 0.9}])
+    res = m.record_decision_entry("Cache aggressively at the CDN edge.", "rej", ["s"],
+                                  slug="cache-policy-v2")
+    assert res["status"] == "needs_review"
+    assert [n["slug"] for n in res["neighbors"]] == ["cache-policy"]
+    # The pause wrote nothing.
+    assert GraphStore(config.db_path).get_node_by_slug("cache-policy-v2") is None
+
+
+def test_declared_weak_edge_exempt_while_undeclared_pauses(ws):
+    """T2 (invariant 3): the pause screens on its own BROAD declared set, in one window.
+
+    A declared weak-edge (`cites`) target at 0.9 is exempt while an UNDECLARED 0.9
+    neighbour in the same window still pauses — proving the broad all-relations set
+    (not `declared_strong_targets`, which ignores weak edges) reached screen_candidates.
+    """
+    config, m = ws
+    _seed(m, "weak-cited", "Embedding upserts are batched per sync.")
+    _seed(m, "weak-undeclared", "Embedding upserts are batched per run.")
+    _arm(m, [{"slug": "weak-cited", "score": 0.9},
+             {"slug": "weak-undeclared", "score": 0.9}])
+    res = m.record_decision_entry("Embedding upserts batch across the sync run.",
+                                  "rej", ["s"], slug="weak-new", cites="weak-cited")
+    assert res["status"] == "needs_review"
+    assert [n["slug"] for n in res["neighbors"]] == ["weak-undeclared"]
+
+
+def test_degraded_embedding_commits_with_notice(ws):
+    """T3: an EmbeddingError during the pause read fails open — commit + calm notice."""
+    config, m = ws
+    m.embed_provider = _RaisingEmbed(EmbeddingError("quota exhausted"))
+    m.vector_store = _FakeVector([])
+    res = m.record_decision_entry("The renderer emits MADR markdown.", "rej", ["s"],
+                                  slug="deg-embed")
+    assert res["status"] == "created"
+    notice = res["neighbor_review_unavailable"]
+    assert "embedding service unavailable" in notice
+    assert "mitos check" in notice
+    # Unavailable.detail is logging-only — never rendered into the receipt.
+    assert "quota exhausted" not in notice
+    assert GraphStore(config.db_path).get_node_by_slug("deg-embed") is not None
+
+
+def test_degraded_vector_store_commits_with_notice(ws):
+    """T3: a VectorStoreError during the pause read fails open — commit + calm notice."""
+    config, m = ws
+    m.embed_provider = _FakeEmbed()
+    m.vector_store = _RaisingVector(VectorStoreError("connection refused"))
+    res = m.record_decision_entry("The renderer emits MADR markdown.", "rej", ["s"],
+                                  slug="deg-vector")
+    assert res["status"] == "created"
+    notice = res["neighbor_review_unavailable"]
+    assert "vector store unavailable" in notice
+    assert "mitos check" in notice
+    assert "connection refused" not in notice
+    assert GraphStore(config.db_path).get_node_by_slug("deg-vector") is not None
+
+
+def test_graph_fault_during_pause_read_commits_with_notice(ws):
+    """T3 (the call-site catch): a propagated DatabaseError fails open, never crashes.
+
+    gather_candidates propagates graph-store faults by design; the record call site
+    catches exactly (DatabaseError, ValidationError). Phase B uses get_node /
+    commit_parsed_entry / get_outgoing_edges — none of them the patched read — so the
+    commit proceeds. (`_adjacent_decisions` also hits the patched method post-commit;
+    its own still-alive blanket catch absorbs that — the `related` echo just goes empty.)
+    """
+    config, m = ws
+    _seed(m, "gf-prior", "The sync lock is held during commit.")
+    _arm(m, [{"slug": "gf-prior", "score": 0.9}])
+    with patch.object(m.store, "get_node_by_slug",
+                      side_effect=DatabaseError("disk I/O error")):
+        res = m.record_decision_entry("The sync lock is held for the commit duration.",
+                                      "rej", ["s"], slug="gf-new")
+    assert res["status"] == "created"
+    notice = res["neighbor_review_unavailable"]
+    assert "graph read failed" in notice
+    assert "mitos check" in notice
+    assert "disk I/O error" not in notice
+    assert GraphStore(config.db_path).get_node_by_slug("gf-new") is not None
+
+
+def test_clean_empty_carries_no_notice(ws):
+    """T3 negative: a healthy check that found nothing is silent — no degradation key."""
+    config, m = ws
+    _arm(m, [])  # substrate healthy, window empty
+    res = m.record_decision_entry("A decision with no neighbours at all.", "rej", ["s"],
+                                  slug="clean-empty")
+    assert res["status"] == "created"
+    assert "neighbor_review_unavailable" not in res
+
+
+def test_offline_unconfigured_carries_no_notice(ws):
+    """Structural absence (a graph-only workspace) is healthy, not degraded — no notice."""
+    config, m = ws
+    # m left offline: no embed provider, no vector store.
+    res = m.record_decision_entry("A decision recorded offline.", "rej", ["s"],
+                                  slug="offline-clean")
+    assert res["status"] == "created"
+    assert "neighbor_review_unavailable" not in res
+
+
+def test_acknowledge_bypass_carries_no_notice(ws):
+    """A declined check is not a failed one: acknowledge_neighbors=True runs no gather,
+    so even a broken embed provider yields a clean receipt with no notice."""
+    config, m = ws
+    m.embed_provider = _RaisingEmbed(EmbeddingError("would raise if consulted"))
+    m.vector_store = _FakeVector([])
+    res = m.record_decision_entry("An acknowledged independent decision.", "rej", ["s"],
+                                  slug="ack-clean", acknowledge_neighbors=True)
+    assert res["status"] == "created"
+    assert "neighbor_review_unavailable" not in res
+
+
+def test_cli_record_renders_degraded_notice(ws, capsys):
+    """The human surface: receipt on stdout, one calm notice line after it on stderr."""
+    config, _ = ws
+    unavailable = Unavailable(reason=ConflictUnavailableReason.EMBEDDING, detail="quota")
+    with patch.object(MitosSyncManager, "_review_neighbors", return_value=unavailable):
+        cmd_record(config, axiom="A new call.", rejected="rej", slug="degcall")
+    out, err = capsys.readouterr()
+    assert "Recorded decision 'degcall'" in out
+    assert "Near-duplicate review could not run" in err
+    assert "mitos check" in err
+    assert "quota" not in err  # detail is logging-only, never rendered
+
+
+def test_cli_record_json_carries_degraded_notice(ws, capsys):
+    """The JSON surface: the receipt dict rides verbatim, notice key included."""
+    config, _ = ws
+    unavailable = Unavailable(reason=ConflictUnavailableReason.VECTOR_STORE, detail="down")
+    with patch.object(MitosSyncManager, "_review_neighbors", return_value=unavailable):
+        cmd_record(config, axiom="A new call.", rejected="rej", slug="degjson",
+                   as_json=True)
+    data = json.loads(capsys.readouterr().out)
+    assert data["status"] == "created"
+    assert "vector store unavailable" in data["neighbor_review_unavailable"]
+    assert "down" not in data["neighbor_review_unavailable"]
