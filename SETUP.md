@@ -203,9 +203,16 @@ If yes, record it — and `surface_decisions` first when unsure.
 **Link related decisions.** When a new decision relates to an existing one, pass
 that one's exact slug to the matching relation argument so the graph stays
 connected instead of accumulating silent tension: `supersedes` (replaces it),
-`amends`, `narrows`, `depends_on`, `resolves`, `contradicts`, `cites`. After a
-record, the result may surface nearby decisions (`related`) — if one is genuinely
-connected, link it.
+`amends`, `narrows`, `depends_on`, `resolves`, `contradicts`, `cites`. A record
+that is strongly similar (≥0.80) to an existing decision it does not reference
+pauses instead of committing (`needs_review` — nothing is written) and surfaces
+each neighbour's axiom, `rejected_paths`, `scope`, and modifier stamps. Judge
+each neighbour from that payload: if the new decision
+amends/supersedes/contradicts/cites one, re-record with that relation pointing
+at its slug; if it is genuinely independent, re-record with
+`acknowledge_neighbors=True`. An
+`amended_by`/`narrowed_by` stamp means the neighbour has moved on — dereference
+that slug before linking.
 
 ---
 
