@@ -250,9 +250,9 @@ def test_cli_subprocess_list_decisions_json(tmp_path):
         _drop_collection(collection)
 
 
-def test_adjacency_surfaces_related_decision(live_workspace):
-    """Recording a decision surfaces its nearest existing live neighbour — the
-    write-time adjacency guardrail, proven against REAL embeddings (③)."""
+def test_record_pause_fires_on_live_similarity(live_workspace):
+    """An unlinked, unacknowledged record with a strong live neighbour pauses —
+    the pre-commit near-dup review (P4), proven against REAL embeddings."""
     ws, _ = live_workspace
     m = MitosSyncManager(MitosConfig(str(ws)))
     m.record_decision_entry(
@@ -261,25 +261,27 @@ def test_adjacency_surfaces_related_decision(live_workspace):
         scope=["payments"], slug="stripe-single-psp",
     )
     res = m.record_decision_entry(
-        axiom="Stripe webhooks are the source of truth for charge status",
-        rejected_paths="Polling the Stripe API rejected: rate limits and latency",
-        scope=["payments"], slug="stripe-webhooks-source-of-truth",
-        # This test deliberately records a decision with a known live neighbour to
-        # prove the post-commit `related` echo — acknowledge the P4 review so a high
-        # real-embedding similarity doesn't pause the write (the echo still fires).
-        acknowledge_neighbors=True,
+        axiom="Stripe is the single payment processor through which payments settle",
+        rejected_paths="Adyen rejected: heavier integration for our volume",
+        scope=["payments"], slug="stripe-sole-processor",
+        # No relation and no acknowledge_neighbors: a paraphrase of the seed axiom
+        # (measured 0.96 document-document under live embeddings — comfortably
+        # above the 0.80 floor), so the P4 pause must fire. NOT the old
+        # webhooks axiom: that pair measures 0.77, under the floor.
     )
-    assert res["status"] == "created"
-    related_slugs = [r["slug"] for r in res.get("related", [])]
-    if not related_slugs:
-        # The adjacency echo is fail-silent (production swallows embed errors,
-        # sync.py:1688); an empty echo under a spent embed quota is environmental,
-        # not a code defect. Probe to distinguish: skip loudly on a 429, else let
-        # the assert fire on a real regression.
+    if res.get("status") == "created":
+        # Degraded path: the pause read fails OPEN, so a spent embed quota turns
+        # the pause into a commit (with a neighbor_review_unavailable notice — or
+        # a clean-empty read when the seed record's vector never upserted).
+        # Environmental, not a code defect. Probe to distinguish: skip loudly on
+        # a 429, else let the assert fire red on a real regression.
         skip_if_embed_quota_exhausted(m.embed_provider)
-    assert "stripe-single-psp" in related_slugs, related_slugs
-    # The new decision never lists itself as its own neighbour.
-    assert "stripe-webhooks-source-of-truth" not in related_slugs
+    assert res.get("status") == "needs_review", res
+    # Shape-agnostic on the neighbour dicts (their fields evolve): slugs only.
+    neighbor_slugs = [n["slug"] for n in res["neighbors"]]
+    assert "stripe-single-psp" in neighbor_slugs, neighbor_slugs
+    # The paused decision never lists itself as its own neighbour.
+    assert "stripe-sole-processor" not in neighbor_slugs
 
 
 def test_surface_brief_omits_rejected_paths_real_semantic(live_workspace, capsys):

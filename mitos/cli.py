@@ -438,7 +438,7 @@ def cmd_init(config: MitosConfig) -> None:
             "- has cross-cutting blast radius (touches many areas).\n"
             "Skip the local, easily-reversible, or already-settled choice. A quick self-test at any fork: *would the next agent waste time re-deriving or re-litigating this?* If yes, record it. When unsure, `surface_decisions` first — if nothing is there and it clears the bar, record it.\n\n"
             "## Linking decisions\n"
-            "When a decision relates to an existing one, pass that one's EXACT slug to the matching relation arg so the graph stays connected instead of accumulating silent tension: `supersedes` (replaces it), `amends`, `narrows`, `depends_on`, `resolves`, `contradicts`, `cites`. On `record_decision` these are args; on the CLI they are flags (`--supersedes`, `--depends-on`, …). Look the target up first to get its exact slug. After you record, the result may list nearby existing decisions (`related`) — if one is genuinely connected, link it.\n"
+            "When a decision relates to an existing one, pass that one's EXACT slug to the matching relation arg so the graph stays connected instead of accumulating silent tension: `supersedes` (replaces it), `amends`, `narrows`, `depends_on`, `resolves`, `contradicts`, `cites`. On `record_decision` these are args; on the CLI they are flags (`--supersedes`, `--depends-on`, …). Look the target up first to get its exact slug.\n"
         )
 
     # 3. Seed the decisions.md buffer when absent (with the extracted ## 3 sample).
@@ -1193,9 +1193,10 @@ def cmd_record(
     if as_json:
         # Every outcome speaks JSON on stdout (no stderr walls); exit codes ride along.
         # The receipt is already the structured dict — emit it verbatim, no reshaping
-        # (the record receipt is a write result, NOT a decision read: no modifier
-        # stamping; its related/neighbors are recall pointers the agent dereferences
-        # by slug). scope_overflow, when present, is already inside `result`.
+        # (the pause's `neighbors` is a stamped decision-read surface: each entry is
+        # the enriched candidate_payload, modifier stamps included; the created
+        # receipt's write-facts stay unstamped write results). scope_overflow, when
+        # present, is already inside `result`.
         _emit_json(result)
         if "error" in result:
             sys.exit(1)
@@ -1208,16 +1209,27 @@ def cmd_record(
         sys.exit(1)
 
     if result.get("status") == "needs_review":
-        # P4 pause — nothing was written. Show the neighbours and how to proceed.
+        # P4 pause — nothing was written. Render each neighbour's enrichment (axiom,
+        # rejected_paths, scope, modifier stamps) so the author can judge and link
+        # without a dereference round-trip. Enrichment keys via .get(): production
+        # always sends the full candidate_payload shape, but leaner dicts reach this
+        # render from canned fixtures.
         print(f"⚠ Paused — '{result['slug']}' looks like an existing decision. Nothing written.",
               file=sys.stderr)
         for n in result.get("neighbors", []):
             score = n.get("score")
             score_s = f"{score:.2f}" if isinstance(score, (int, float)) else "?"
-            tension = "  [possible tension]" if n.get("possible_tension") else ""
-            print(f"  ↔ {n['slug']}  ({score_s}){tension}  "
-                  f"{truncate_words(n.get('axiom') or '', 60)}",
-                  file=sys.stderr)
+            stamps = "".join(
+                f"  [{key.replace('_', ' ')}: {', '.join(n[key])}]"
+                for key in ("amended_by", "narrowed_by") if n.get(key))
+            print(f"  ↔ {n['slug']}  ({score_s}){stamps}", file=sys.stderr)
+            if n.get("axiom"):
+                print(f"      {truncate_words(n['axiom'], 60)}", file=sys.stderr)
+            if n.get("rejected_paths"):
+                print(f"      rejected: {truncate_words(n['rejected_paths'], 80)}",
+                      file=sys.stderr)
+            if n.get("scope"):
+                print(f"      scope: {', '.join(n['scope'])}", file=sys.stderr)
         print("  → Re-record with --supersedes/--amends/--contradicts/--cites <slug> to link "
               "it, or --acknowledge-neighbors to record as independent.", file=sys.stderr)
         sys.exit(2)
@@ -1240,14 +1252,6 @@ def cmd_record(
         print(f"  Scope:     {', '.join(result['scope'])}")
     if result.get("mechanisms"):
         print(f"  Mechanisms: {', '.join(result['mechanisms'])}")
-    related = result.get("related")
-    if related:
-        print("  ↔ Nearest existing decisions (an intended neighbour, or a tension to reconcile?):")
-        for r in related:
-            score = r.get("score")
-            score_s = f"{score:.2f}" if isinstance(score, (int, float)) else "?"
-            axiom_snip = truncate_words(r.get("axiom") or "", 60)
-            print(f"     - {r['slug']}  ({score_s})  {axiom_snip}")
     # Debounced size-ceiling nudge — AFTER the receipt, on stderr (an ancillary health
     # hint, never the receipt itself), so a healthy growing corpus can't bury "Recorded ✓".
     # Flush stdout first so the receipt lands before the nudge even when stdout is piped
@@ -1256,6 +1260,12 @@ def cmd_record(
     if overflow:
         sys.stdout.flush()
         print(f"\n{overflow}", file=sys.stderr)
+    # Degraded-check notice — same post-receipt stderr shape: the commit succeeded,
+    # but the near-dup review could not run, and silence would read as "checked, clean".
+    review_notice = result.get("neighbor_review_unavailable")
+    if review_notice:
+        sys.stdout.flush()
+        print(f"\n{review_notice}", file=sys.stderr)
 
 
 def _read_text_arg(inline: Optional[str], file_path: Optional[str]) -> Optional[str]:

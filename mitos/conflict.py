@@ -92,7 +92,7 @@ CONFLICT_OVERFETCH_LIMIT = 4 * CONFLICT_TOP_K   # = 20
 CONFLICT_CANDIDATE_SOURCE = "embedding_topk"
 
 # The two computed states that count as "live" for candidate gathering. Mirrors the
-# proven recall idiom (surface_decisions, _adjacent_decisions): keep active ∪ drifted,
+# proven recall idiom (surface_decisions): keep active ∪ drifted,
 # drop superseded/corrected. Re-derived per-node via get_node_state (M3), never trusted
 # from the Qdrant payload's stale ``state`` field.
 _LIVE_STATES = ("active", "drifted")

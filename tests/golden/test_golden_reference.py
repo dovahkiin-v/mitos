@@ -222,6 +222,44 @@ def test_all_read_surfaces_stamp_modifiers(tmp_path):
             assert payload.get(key) == expected, f"{name} did not stamp {key} on {slug}: {payload.get(key)}"
 
 
+def test_record_pause_surface_stamps_modifiers(tmp_path):
+    """The record pause is a decision-read surface too: `_review_neighbors` output
+    (candidate_payload dicts the authoring agent judges from) must stamp an
+    amended-but-active Harbor node exactly as the store-level surfaces above do.
+    Deterministic and keyless: tiny local fakes stand in for embed/vector; the
+    neighbour itself is hydrated from the real reference graph, so the stamp
+    comes from the true `get_node_by_slug` path."""
+    from mitos.cli import cmd_init
+    from mitos.config import MitosConfig
+    from mitos.sync import MitosSyncManager
+
+    class _Embed:
+        def get_embedding(self, text, is_query=False):
+            return [0.1, 0.2, 0.3]
+
+    class _Vector:
+        def query(self, vector, limit=5):
+            return [{"slug": "harbor-blob-encryption-at-rest", "score": 0.9}]
+
+        def upsert(self, *a, **k):
+            pass
+
+    config = MitosConfig(str(tmp_path / "ws"))
+    cmd_init(config)
+    manager = MitosSyncManager(config)
+    manager.store = build_reference_graph(str(tmp_path / "graph.sqlite"))
+    manager.embed_provider = _Embed()
+    manager.vector_store = _Vector()
+
+    entry = ParsedEntry("decision", "probe-blob-encryption", 1, 2)
+    entry.axiom = "Encrypt every stored blob at rest."
+    neighbors = manager._review_neighbors(entry, declared_targets=set())
+    assert isinstance(neighbors, list) and neighbors, neighbors
+    payload = neighbors[0]
+    assert payload["slug"] == "harbor-blob-encryption-at-rest"
+    assert payload["amended_by"] == ["harbor-blob-key-rotation-quarterly"]
+
+
 def test_real_rebuild_reproduces_the_golden(tmp_path):
     """`mitos rebuild` — the real oldest-first replay + forward-ref fixpoint — reproduces
     the golden graph exactly (content-hash ids, state, edges, active view, OQ state). This

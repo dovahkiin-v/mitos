@@ -100,14 +100,16 @@ def skip_on_embed_quota():
 def skip_if_embed_quota_exhausted(embed_provider) -> None:
     """Probe an embed provider and skip loudly if the quota is exhausted.
 
-    For the adjacency boundary, where production swallows the embed error
-    (fail-silent echo) so the 429 never reaches the test as an ``EmbeddingError``
-    — it surfaces only as an empty ``related`` echo. This fires an **active**
-    probe (an explicit embed call the test can see 429) **only on the empty-echo
-    path**, so it costs an extra embed only when the test is already degraded
-    (zero extra cost on the healthy path). If the echo is empty for a *non-quota*
-    reason (a real bug), the probe succeeds (no 429) → returns → the caller's
-    assertion fires loudly.
+    For the record-pause boundary, where production swallows the embed error
+    (the pre-commit near-dup review fails OPEN) so the 429 never reaches the
+    test as an ``EmbeddingError`` — it surfaces only as a ``"created"`` result
+    where a pause was expected (with a ``neighbor_review_unavailable`` notice,
+    or without one when the seed vector never upserted). This fires an
+    **active** probe (an explicit embed call the test can see 429) **only on
+    that degraded path**, so it costs an extra embed only when the test is
+    already degraded (zero extra cost on the healthy path). If the pause is
+    absent for a *non-quota* reason (a real bug), the probe succeeds (no 429)
+    → returns → the caller's assertion fires loudly.
 
     Args:
         embed_provider: The provider to probe (a ``GeminiEmbeddingProvider`` or

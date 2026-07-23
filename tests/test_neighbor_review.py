@@ -1,7 +1,7 @@
-"""Tests for the pre-commit near-duplicate / possible-tension review (AX P4).
+"""Tests for the pre-commit near-duplicate review (AX P4).
 
 Loop-Claude's friction: a new decision's nearest neighbour only surfaced in the
-POST-commit `related` echo — one step too late to point an amends/supersedes at it
+POST-commit `related` echo (since deleted) — one step too late to point an amends/supersedes at it
 (a re-record is a no-op, so the link could never be added). `record_decision` now
 embeds the axiom BEFORE the write, and if it is >=0.80 similar to an existing decision
 (the strong-match band floor — ADR `record-pause-floor-lowered-to-strong-match-band`)
@@ -23,9 +23,11 @@ from unittest.mock import patch
 
 from mitos.config import MitosConfig
 from mitos.cli import cmd_init, cmd_record
+from mitos.conflict import ConflictUnavailableReason, Unavailable
+from mitos.errors import DatabaseError, EmbeddingError, VectorStoreError
+from mitos.parser import ParsedEntry
 from mitos.store import GraphStore
-from mitos.sync import (MitosSyncManager, _has_negation, _polarity_mismatch,
-                        _NEIGHBOR_REVIEW_THRESHOLD)
+from mitos.sync import MitosSyncManager, _NEIGHBOR_REVIEW_THRESHOLD
 
 
 @pytest.fixture
@@ -64,21 +66,6 @@ def _arm(m, matches):
     """Wire fake embeddings/vector so the review runs deterministically."""
     m.embed_provider = _FakeEmbed()
     m.vector_store = _FakeVector(matches)
-
-
-# --------------------------------------------------------------------------- #
-# Polarity helpers
-# --------------------------------------------------------------------------- #
-
-def test_has_negation_detects_cues():
-    assert _has_negation("It is never a per-persona field")
-    assert _has_negation("Names are not interpolated")
-    assert not _has_negation("It is a per-persona field")
-
-
-def test_polarity_mismatch():
-    assert _polarity_mismatch("X is a field", "X is never a field")
-    assert not _polarity_mismatch("X is a field", "X is the field")
 
 
 # --------------------------------------------------------------------------- #
@@ -166,22 +153,11 @@ def test_offline_never_pauses(ws):
     assert res["status"] == "created"
 
 
-def test_possible_tension_flagged_on_polarity_flip(ws):
-    config, m = ws
-    m.record_decision_entry("The marker is never a per-persona field.", "rej",
-                            ["chrome"], slug="marker-not-persona")
-    _arm(m, [{"slug": "marker-not-persona", "score": 0.9}])
-    res = m.record_decision_entry("The marker is a per-persona field.", "rej",
-                                  ["chrome"], slug="marker-is-persona")
-    assert res["status"] == "needs_review"
-    assert res["neighbors"][0]["possible_tension"] is True
-
-
 def test_strong_match_band_pauses(ws):
     """A 0.80–0.85 unreferenced active neighbour now pauses (the lowered floor's
     whole point — ADR `record-pause-floor-lowered-to-strong-match-band`: at 0.85
-    this band was a visibility-only `related` echo, the mechanism that already
-    failed the five-week prose-obsoletion trap)."""
+    this band fell to the visibility-only `related` echo (since deleted), the
+    mechanism that already failed the five-week prose-obsoletion trap)."""
     config, m = ws
     m.record_decision_entry("Use SQLite for the store.", "rej", ["db"], slug="use-sqlite")
     _arm(m, [{"slug": "use-sqlite", "score": 0.82}])
@@ -215,11 +191,84 @@ def test_threshold_is_inclusive(ws):
 
 
 # --------------------------------------------------------------------------- #
+# The enriched payload (candidate_payload shape + modifier stamps)
+# --------------------------------------------------------------------------- #
+
+def test_pause_neighbor_carries_enriched_letter_shape(ws):
+    """Each pause neighbour is the full candidate_payload finding — the Letter core
+    (axiom / scope / rejected_paths) plus score — with no polarity guess: the retired
+    ``possible_tension`` key must not reappear (nothing guessed replaces it; the
+    authoring agent judges tenability from the enrichment itself)."""
+    config, m = ws
+    m.record_decision_entry(
+        "Catalog owns the per-persona gallery markers.",
+        "Rejected a per-persona marker table: markers are catalog facts.",
+        ["catalog"], slug="catalog-owns-markers")  # offline → commits
+    _arm(m, [{"slug": "catalog-owns-markers", "score": 0.9}])
+    res = m.record_decision_entry("The catalog module owns per-persona gallery markers.",
+                                  "rej", ["catalog"], slug="catalog-module-markers")
+    assert res["status"] == "needs_review"
+    n = res["neighbors"][0]
+    assert n["slug"] == "catalog-owns-markers"
+    assert n["axiom"] == "Catalog owns the per-persona gallery markers."
+    assert n["scope"] == ["catalog"]
+    assert n["rejected_paths"] == (
+        "Rejected a per-persona marker table: markers are catalog facts.")
+    assert n["score"] == 0.9
+    assert "possible_tension" not in n
+
+
+def test_amended_but_active_neighbor_surfaces_amended_by(ws):
+    """An active-but-amended neighbour carries its ``amended_by`` stamp on the pause.
+
+    The pause is a decision-read surface, so the every-read-surface stamping
+    invariant binds it: the agent judging tenability must see the neighbour has
+    already moved on, never read it as the final word (the "amended axioms read
+    as live" trap).
+
+    There is deliberately no ``superseded_by``/``corrected_by`` fixture: the
+    gather keeps only ``active ∪ drifted`` nodes, and a kill edge
+    (supersedes/corrects) never points at a live target (store.py's kill-edge
+    rule) — a kill-stamped neighbour is structurally unreachable on this
+    surface, a documented impossibility rather than a coverage gap.
+    """
+    config, m = ws
+    m.record_decision_entry("Use SQLite for the store.", "rej", ["db"], slug="use-sqlite")
+    m.record_decision_entry("Use SQLite with WAL mode.", "rej", ["db"],
+                            slug="use-sqlite-wal", amends="use-sqlite")
+    _arm(m, [{"slug": "use-sqlite", "score": 0.9}])
+    res = m.record_decision_entry("Adopt SQLite as the storage engine.", "rej", ["db"],
+                                  slug="adopt-sqlite")
+    assert res["status"] == "needs_review"
+    n = res["neighbors"][0]
+    assert n["slug"] == "use-sqlite"
+    assert n["amended_by"] == ["use-sqlite-wal"]
+
+
+def test_unmodified_neighbor_carries_no_stamp_keys(ws):
+    """A never-modified neighbour carries NO stamp keys — stamps are conditional
+    (present only when non-empty), so the unmodified majority stays clean."""
+    config, m = ws
+    m.record_decision_entry("Use SQLite for the store.", "rej", ["db"], slug="use-sqlite")
+    _arm(m, [{"slug": "use-sqlite", "score": 0.9}])
+    res = m.record_decision_entry("Adopt SQLite as the storage engine.", "rej", ["db"],
+                                  slug="adopt-sqlite")
+    assert res["status"] == "needs_review"
+    n = res["neighbors"][0]
+    for key in ("amended_by", "narrowed_by", "superseded_by", "corrected_by"):
+        assert key not in n
+
+
+# --------------------------------------------------------------------------- #
 # MCP + CLI surfaces (patch _review_neighbors for determinism)
 # --------------------------------------------------------------------------- #
 
-_FLAGGED = [{"slug": "existing", "axiom": "An existing decision.", "score": 0.9,
-             "possible_tension": False}]
+# The enriched candidate_payload shape in its contractual key order (slug, axiom,
+# scope, score, rejected_paths[, stamps]). No stamp key here — this is the
+# unmodified-majority shape; the stamped case rides the real-path tests below.
+_FLAGGED = [{"slug": "existing", "axiom": "An existing decision.", "scope": ["s"],
+             "score": 0.9,
+             "rejected_paths": "Rejected the obvious alternative, with reasons."}]
 
 
 def test_mcp_record_decision_pauses(ws):
@@ -252,6 +301,11 @@ def test_cli_record_pause_exits_nonzero(ws, capsys):
     assert exc.value.code == 2
     err = capsys.readouterr().err
     assert "Paused" in err and "existing" in err and "acknowledge-neighbors" in err
+    # The enriched render: each neighbour block carries its rejected_paths
+    # fragment and scope tag; the retired polarity marker must not reappear.
+    assert "Rejected the obvious alternative" in err
+    assert "scope: s" in err
+    assert "possible tension" not in err
 
 
 def test_cli_record_acknowledge_commits(ws):
@@ -260,6 +314,127 @@ def test_cli_record_acknowledge_commits(ws):
         cmd_record(config, axiom="A new call.", rejected="rej", slug="newcall",
                    acknowledge_neighbors=True)
     assert GraphStore(config.db_path).get_node_by_slug("newcall") is not None
+
+
+# --------------------------------------------------------------------------- #
+# CLI⇄MCP parity (Phase 2b)
+#
+# Both surfaces build their own MitosSyncManager internally, so the REAL review
+# path (gather → screen → candidate_payload) is armed via a shared factory
+# patched in at each surface's own resolution point: `mitos.cli.MitosSyncManager`
+# (module-top import) and `mitos.sync.MitosSyncManager` (the MCP tool's
+# function-local import, resolved at call time).
+# --------------------------------------------------------------------------- #
+
+def _armed_real_manager_factory(matches):
+    """A side_effect factory both surface patches share: real manager, armed fakes.
+
+    Captures the real class at build time, BEFORE any patch goes up — a factory
+    body that resolved ``mitos.sync.MitosSyncManager`` while the patch is active
+    would get the mock back and recurse.
+    """
+    real_cls = MitosSyncManager
+
+    def factory(config):
+        m = real_cls(config)
+        _arm(m, matches)
+        return m
+
+    return factory
+
+
+def test_cli_mcp_record_pause_parity(ws, capsys):
+    """T7 (KDD-5): both surfaces emit the identical enriched pause payload.
+
+    Drives the real review path on both surfaces — injected dicts structurally
+    cannot prove the whole chain (gather → screen → candidate_payload → both
+    serializers) agrees — over one seeded near-dup carrying an `amends` modifier
+    stamp. Compares the *parsed* CLI --json stdout against the *parsed* MCP tool
+    return (the two emissions differ in indentation by design), and pins the
+    protocol semantics riding the shared message: both exits named, no
+    tension/judged wording.
+    """
+    from mitos import mcp_server
+    config, m = ws
+    # Seed through the directly-built manager BEFORE the patches: offline →
+    # _review_neighbors returns [] → seeding never pauses. The paused record
+    # must NOT declare these slugs (a declared target is screened out).
+    m.record_decision_entry("Use SQLite for the store.",
+                            "Rejected Postgres: operational weight.", ["db"],
+                            slug="use-sqlite")
+    m.record_decision_entry("Use SQLite with WAL mode.", "rej", ["db"],
+                            slug="use-sqlite-wal", amends="use-sqlite")
+    factory = _armed_real_manager_factory([{"slug": "use-sqlite", "score": 0.9}])
+
+    with patch("mitos.cli.MitosSyncManager", side_effect=factory), \
+         patch("mitos.sync.MitosSyncManager", side_effect=factory), \
+         patch("mitos.mcp_server.MitosConfig", return_value=config):
+        capsys.readouterr()
+        with pytest.raises(SystemExit) as exc:
+            cmd_record(config, axiom="Adopt SQLite as the storage engine.",
+                       rejected="rej", scope=["db"], slug="adopt-sqlite",
+                       as_json=True)
+        assert exc.value.code == 2
+        cli_payload = json.loads(capsys.readouterr().out)
+        mcp_payload = json.loads(mcp_server.record_decision(
+            "Adopt SQLite as the storage engine.", "rej", ["db"],
+            slug="adopt-sqlite"))
+
+    assert cli_payload["neighbors"] == mcp_payload["neighbors"]
+    assert cli_payload["code"] == mcp_payload["code"] == "similar_decision_exists"
+    assert cli_payload["message"] == mcp_payload["message"]
+
+    # The enriched shape in its contractual key order, the stamp riding last.
+    n = cli_payload["neighbors"][0]
+    assert list(n.keys()) == ["slug", "axiom", "scope", "score", "rejected_paths",
+                              "amended_by"]
+    assert n["slug"] == "use-sqlite"
+    assert n["rejected_paths"] == "Rejected Postgres: operational weight."
+    assert n["amended_by"] == ["use-sqlite-wal"]
+
+    msg = cli_payload["message"]
+    assert "amends/supersedes/contradicts/cites" in msg      # the relation exit
+    assert "acknowledge_neighbors=True" in msg               # the independence exit
+    assert "tension" not in msg.lower() and "judged" not in msg.lower()
+    # A pause on either surface writes nothing.
+    assert GraphStore(config.db_path).get_node_by_slug("adopt-sqlite") is None
+
+
+def test_cli_record_pause_renders_enrichment_and_stamp(ws, capsys):
+    """The human pause render shows each neighbour's enrichment — rejected_paths
+    fragment, scope tag — and the `amended_by` stamp slug on the head line (a
+    stamped neighbour must never read as final). Real path via the armed
+    factory: the stamp rides only because the amends edge is genuinely in the
+    store."""
+    config, m = ws
+    m.record_decision_entry("Use SQLite for the store.",
+                            "Rejected Postgres: operational weight.", ["db"],
+                            slug="use-sqlite")
+    m.record_decision_entry("Use SQLite with WAL mode.", "rej", ["db"],
+                            slug="use-sqlite-wal", amends="use-sqlite")
+    factory = _armed_real_manager_factory([{"slug": "use-sqlite", "score": 0.9}])
+
+    with patch("mitos.cli.MitosSyncManager", side_effect=factory):
+        with pytest.raises(SystemExit) as exc:
+            cmd_record(config, axiom="Adopt SQLite as the storage engine.",
+                       rejected="rej", scope=["db"], slug="adopt-sqlite")
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "use-sqlite" in err
+    assert "Rejected Postgres" in err
+    assert "scope: db" in err
+    assert "amended by: use-sqlite-wal" in err
+    assert "possible tension" not in err
+
+
+def test_mcp_record_docstring_pins_enriched_protocol():
+    """The greppable halves of T6/KD-2 on the docstring (P13 prompt code): the
+    retired `possible_tension` key must not reappear, and the degraded-commit
+    key `neighbor_review_unavailable` must stay documented."""
+    from mitos import mcp_server
+    doc = mcp_server.record_decision.__doc__
+    assert "possible_tension" not in doc
+    assert "neighbor_review_unavailable" in doc
 
 
 # --------------------------------------------------------------------------- #
@@ -484,3 +659,228 @@ def test_corrupt_cycle_suppression_is_loud_partial_and_never_hangs(ws, caplog):
     # Loud, non-fatal: get_lineage emitted the homeostasis WARNING naming the cycle.
     assert any("cycle" in r.getMessage().lower() for r in caplog.records), \
         "expected a loud homeostasis WARNING on the corrupt cycle"
+
+
+# --------------------------------------------------------------------------- #
+# Gather-composed pause: OQ-safety + honest degradation (Phase 1a)
+#
+# The pause's discovery now composes the Conflict sensor's gather+screen stages.
+# Two properties the old pause-local scan lacked, pinned here:
+#   * OQ-safe by construction — an open question in the KNN window is screened by
+#     kind at gather, never crashed on (the old scan KeyError'd on `core_axiom`
+#     and its blanket catch converted that into a silently EMPTY pause, hiding
+#     genuine duplicates).
+#   * "Couldn't check" ≠ "checked, clean" — a degraded pause read (embed/vector
+#     Unavailable, or a propagated graph fault caught at the record call site)
+#     fails open: the record commits and the created receipt carries ONE calm
+#     `neighbor_review_unavailable` notice. Clean-empty, offline-unconfigured,
+#     and acknowledged-past records carry NO notice.
+# --------------------------------------------------------------------------- #
+
+
+class _RaisingEmbed:
+    """An embed provider that always raises — the constructor-injected fault shape."""
+
+    def __init__(self, exc):
+        self._exc = exc
+
+    def get_embedding(self, text, is_query=False):
+        raise self._exc
+
+
+class _RaisingVector:
+    """A vector store whose query always raises (upsert stays a harmless no-op)."""
+
+    def __init__(self, exc):
+        self._exc = exc
+
+    def query(self, vector, limit=5):
+        raise self._exc
+
+    def upsert(self, *a, **k):
+        pass
+
+
+def test_active_oq_in_window_pauses_on_genuine_decision(ws):
+    """T1 (the mandatory regression): an active OQ in the KNN window never empties the pause.
+
+    Mirror of test_conflict_gather.py::test_open_question_match_is_dropped_by_kind_
+    not_crashed_on at the pause level. The old scan subscripted `core_axiom` (which an
+    OQ lacks) and its blanket catch turned the KeyError into an empty pause — an agent
+    could sail past a genuine duplicate because an unrelated OQ happened to be nearby.
+    The gather screens the OQ by kind; the decision near-dup still pauses.
+    """
+    config, m = ws
+    _seed(m, "cache-policy", "Cache aggressively at the edge.")
+    # Seed an open question via parse→commit (the deterministic keyless path —
+    # record_decision_entry only mints decisions).
+    oq = ParsedEntry("open_question", "oq-cache-cadence", 40, 50)
+    oq.topic = "cache invalidation cadence"
+    oq.questions_raised = ["How often should the cache invalidate?"]
+    oq.scope = ["s"]
+    m.store.commit_parsed_entry(oq)
+    # Sanity anchors (the exact trap): kill-edge state calls the OQ 'active', and it
+    # lacks the `core_axiom` key the old scan hard-subscripted.
+    oq_node = m.store.get_node_by_slug("oq-cache-cadence")
+    assert oq_node is not None and oq_node["kind"] == "open_question"
+    assert m.store.get_node_state(oq_node["id"]) == "active"
+    assert "core_axiom" not in oq_node
+    # The OQ is the NEAREST match, beside a genuine decision near-dup.
+    _arm(m, [{"slug": "oq-cache-cadence", "score": 0.95},
+             {"slug": "cache-policy", "score": 0.9}])
+    res = m.record_decision_entry("Cache aggressively at the CDN edge.", "rej", ["s"],
+                                  slug="cache-policy-v2")
+    assert res["status"] == "needs_review"
+    assert [n["slug"] for n in res["neighbors"]] == ["cache-policy"]
+    # The pause wrote nothing.
+    assert GraphStore(config.db_path).get_node_by_slug("cache-policy-v2") is None
+
+
+def test_declared_weak_edge_exempt_while_undeclared_pauses(ws):
+    """T2 (invariant 3): the pause screens on its own BROAD declared set, in one window.
+
+    A declared weak-edge (`cites`) target at 0.9 is exempt while an UNDECLARED 0.9
+    neighbour in the same window still pauses — proving the broad all-relations set
+    (not `declared_strong_targets`, which ignores weak edges) reached screen_candidates.
+    """
+    config, m = ws
+    _seed(m, "weak-cited", "Embedding upserts are batched per sync.")
+    _seed(m, "weak-undeclared", "Embedding upserts are batched per run.")
+    _arm(m, [{"slug": "weak-cited", "score": 0.9},
+             {"slug": "weak-undeclared", "score": 0.9}])
+    res = m.record_decision_entry("Embedding upserts batch across the sync run.",
+                                  "rej", ["s"], slug="weak-new", cites="weak-cited")
+    assert res["status"] == "needs_review"
+    assert [n["slug"] for n in res["neighbors"]] == ["weak-undeclared"]
+
+
+def test_degraded_embedding_commits_with_notice(ws):
+    """T3: an EmbeddingError during the pause read fails open — commit + calm notice."""
+    config, m = ws
+    m.embed_provider = _RaisingEmbed(EmbeddingError("quota exhausted"))
+    m.vector_store = _FakeVector([])
+    res = m.record_decision_entry("The renderer emits MADR markdown.", "rej", ["s"],
+                                  slug="deg-embed")
+    assert res["status"] == "created"
+    notice = res["neighbor_review_unavailable"]
+    assert "embedding service unavailable" in notice
+    assert "mitos check" in notice
+    # Unavailable.detail is logging-only — never rendered into the receipt.
+    assert "quota exhausted" not in notice
+    assert GraphStore(config.db_path).get_node_by_slug("deg-embed") is not None
+
+
+def test_degraded_vector_store_commits_with_notice(ws):
+    """T3: a VectorStoreError during the pause read fails open — commit + calm notice."""
+    config, m = ws
+    m.embed_provider = _FakeEmbed()
+    m.vector_store = _RaisingVector(VectorStoreError("connection refused"))
+    res = m.record_decision_entry("The renderer emits MADR markdown.", "rej", ["s"],
+                                  slug="deg-vector")
+    assert res["status"] == "created"
+    notice = res["neighbor_review_unavailable"]
+    assert "vector store unavailable" in notice
+    assert "mitos check" in notice
+    assert "connection refused" not in notice
+    assert GraphStore(config.db_path).get_node_by_slug("deg-vector") is not None
+
+
+def test_graph_fault_during_pause_read_commits_with_notice(ws):
+    """T3 (the call-site catch): a propagated DatabaseError fails open, never crashes.
+
+    gather_candidates propagates graph-store faults by design; the record call site
+    catches exactly (DatabaseError, ValidationError). Phase B uses get_node /
+    commit_parsed_entry / get_outgoing_edges — none of them the patched read — so the
+    commit proceeds. (Nothing post-commit calls the patched method anymore: the
+    `related` echo and its blanket-catch scan were deleted.)
+    """
+    config, m = ws
+    _seed(m, "gf-prior", "The sync lock is held during commit.")
+    _arm(m, [{"slug": "gf-prior", "score": 0.9}])
+    with patch.object(m.store, "get_node_by_slug",
+                      side_effect=DatabaseError("disk I/O error")):
+        res = m.record_decision_entry("The sync lock is held for the commit duration.",
+                                      "rej", ["s"], slug="gf-new")
+    assert res["status"] == "created"
+    notice = res["neighbor_review_unavailable"]
+    assert "graph read failed" in notice
+    assert "mitos check" in notice
+    assert "disk I/O error" not in notice
+    assert GraphStore(config.db_path).get_node_by_slug("gf-new") is not None
+
+
+def test_clean_empty_carries_no_notice(ws):
+    """T3 negative: a healthy check that found nothing is silent — no degradation key."""
+    config, m = ws
+    _arm(m, [])  # substrate healthy, window empty
+    res = m.record_decision_entry("A decision with no neighbours at all.", "rej", ["s"],
+                                  slug="clean-empty")
+    assert res["status"] == "created"
+    assert "neighbor_review_unavailable" not in res
+
+
+def test_offline_unconfigured_carries_no_notice(ws):
+    """Structural absence (a graph-only workspace) is healthy, not degraded — no notice."""
+    config, m = ws
+    # m left offline: no embed provider, no vector store.
+    res = m.record_decision_entry("A decision recorded offline.", "rej", ["s"],
+                                  slug="offline-clean")
+    assert res["status"] == "created"
+    assert "neighbor_review_unavailable" not in res
+
+
+def test_acknowledge_bypass_carries_no_notice(ws):
+    """A declined check is not a failed one: acknowledge_neighbors=True runs no gather,
+    so even a broken embed provider yields a clean receipt with no notice."""
+    config, m = ws
+    m.embed_provider = _RaisingEmbed(EmbeddingError("would raise if consulted"))
+    m.vector_store = _FakeVector([])
+    res = m.record_decision_entry("An acknowledged independent decision.", "rej", ["s"],
+                                  slug="ack-clean", acknowledge_neighbors=True)
+    assert res["status"] == "created"
+    assert "neighbor_review_unavailable" not in res
+
+
+# --------------------------------------------------------------------------- #
+# The retired `related` echo (T4)
+# --------------------------------------------------------------------------- #
+
+def test_created_receipt_carries_no_related_echo(ws):
+    """T4: the post-commit `related` echo is DELETED, not merely offline — an armed
+    high-similarity neighbour plus acknowledge_neighbors=True (the exact scenario
+    the old echo fired on: pause bypassed, embed + vector store answering) yields
+    a created receipt with no `related` key."""
+    config, m = ws
+    _seed(m, "echo-prior", "Retries use exponential backoff with jitter.")
+    _arm(m, [{"slug": "echo-prior", "score": 0.9}])
+    res = m.record_decision_entry("Retry policy is exponential backoff plus jitter.",
+                                  "rej", ["s"], slug="echo-new",
+                                  acknowledge_neighbors=True)
+    assert res["status"] == "created"
+    assert "related" not in res
+
+
+def test_cli_record_renders_degraded_notice(ws, capsys):
+    """The human surface: receipt on stdout, one calm notice line after it on stderr."""
+    config, _ = ws
+    unavailable = Unavailable(reason=ConflictUnavailableReason.EMBEDDING, detail="quota")
+    with patch.object(MitosSyncManager, "_review_neighbors", return_value=unavailable):
+        cmd_record(config, axiom="A new call.", rejected="rej", slug="degcall")
+    out, err = capsys.readouterr()
+    assert "Recorded decision 'degcall'" in out
+    assert "Near-duplicate review could not run" in err
+    assert "mitos check" in err
+    assert "quota" not in err  # detail is logging-only, never rendered
+
+
+def test_cli_record_json_carries_degraded_notice(ws, capsys):
+    """The JSON surface: the receipt dict rides verbatim, notice key included."""
+    config, _ = ws
+    unavailable = Unavailable(reason=ConflictUnavailableReason.VECTOR_STORE, detail="down")
+    with patch.object(MitosSyncManager, "_review_neighbors", return_value=unavailable):
+        cmd_record(config, axiom="A new call.", rejected="rej", slug="degjson",
+                   as_json=True)
+    data = json.loads(capsys.readouterr().out)
+    assert data["status"] == "created"
+    assert "vector store unavailable" in data["neighbor_review_unavailable"]
+    assert "down" not in data["neighbor_review_unavailable"]
