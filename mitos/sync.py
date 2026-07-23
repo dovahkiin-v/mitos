@@ -28,6 +28,7 @@ from mitos.conflict import (
     ConflictFinding,
     ConflictUnavailableReason,
     Unavailable,
+    candidate_payload,
     gather_candidates,
     run_conflict_check,
     screen_candidates,
@@ -349,25 +350,6 @@ _SLUG_MIN_LEN = 32  # auto-derive only: don't trim a word boundary back past her
 # low via --acknowledge-neighbors, the declared-target exemption, and transitive
 # lineage suppression). Tune here.
 _NEIGHBOR_REVIEW_THRESHOLD = 0.80
-
-# Cheap polarity cues for the `possible_tension` hint — a high-similarity pair where
-# one axiom negates and the other doesn't ("never a per-persona field" vs "is a
-# per-persona field") is a likely contradiction, not a duplicate. Heuristic only: it
-# flags a neighbour for the author's eye, never changes the pause decision.
-_NEGATION_CUES = (" not ", " never ", " no ", "n't", " without ", " cannot ",
-                  " neither ", " nor ", " none ", " non-")
-
-
-def _has_negation(text: str) -> bool:
-    """Reports whether ``text`` carries a surface negation cue (whitespace-padded scan)."""
-    padded = f" {text.lower()} "
-    return any(cue in padded for cue in _NEGATION_CUES)
-
-
-def _polarity_mismatch(a: str, b: str) -> bool:
-    """True when exactly one of two axioms negates — a possible-tension signal."""
-    return _has_negation(a) != _has_negation(b)
-
 
 # Surface wording for the record receipt's degraded-check causes. The record surface
 # owns this text (the core returns only the typed reason — the same core/surface split
@@ -1698,10 +1680,14 @@ class MitosSyncManager:
                 linked neighbour is not re-flagged.
 
         Returns:
-            A list of ``{slug, axiom, score, possible_tension}`` for unreferenced
-            high-similarity live neighbours, most similar first (possibly empty), or
-            the :class:`Unavailable` the gather returned when the semantic substrate
-            was unreachable.
+            A list of :func:`~mitos.conflict.candidate_payload` dicts for
+            unreferenced high-similarity live neighbours, most similar first
+            (possibly empty) — the enriched Letter shape (``slug`` / ``axiom`` /
+            ``scope`` / ``score`` / ``rejected_paths``) plus any present
+            ``amended_by``/``narrowed_by`` modifier stamps (this is a
+            decision-read surface; an amended-but-active neighbour must not read
+            as the final word) — or the :class:`Unavailable` the gather returned
+            when the semantic substrate was unreachable.
         """
         if not self.embed_provider or not self.vector_store:
             return []
@@ -1720,15 +1706,7 @@ class MitosSyncManager:
             floor=_NEIGHBOR_REVIEW_THRESHOLD,
             top_k=CONFLICT_TOP_K,
         )
-        return [
-            {
-                "slug": c.slug,
-                "axiom": c.node["core_axiom"],
-                "score": c.score,
-                "possible_tension": _polarity_mismatch(entry.axiom, c.node["core_axiom"]),
-            }
-            for c in screened
-        ]
+        return [candidate_payload(c) for c in screened]
 
     def _lineage_suppression_slugs(
         self, mutation_target_slugs: List[Optional[str]]
@@ -1885,7 +1863,11 @@ class MitosSyncManager:
             check could not run (the record fails open — the commit proceeds
             unchecked and `mitos check` covers it retroactively); OR, when a highly-similar unreferenced decision exists and
             ``acknowledge_neighbors`` is False, a ``{status: "needs_review", code:
-            "similar_decision_exists", neighbors, message}`` pause that wrote NOTHING;
+            "similar_decision_exists", neighbors, message}`` pause that wrote NOTHING —
+            each ``neighbors`` element is an enriched, modifier-stamped decision-read
+            payload (:func:`~mitos.conflict.candidate_payload`: ``slug`` / ``axiom`` /
+            ``scope`` / ``score`` / ``rejected_paths`` plus any ``amended_by``/
+            ``narrowed_by`` stamps) the authoring agent judges tenability from;
             OR a structured ``{error, code}`` failure (see spec §5).
         """
         # === Phase A — validate everything in memory (no writes) ===
@@ -2077,8 +2059,9 @@ class MitosSyncManager:
         if coll_id and coll_id != node_id:
             return _record_error("slug_collision", slug=entry.slug)
 
-        # Near-duplicate / possible-tension review (P4) — still Phase A, so a pause
-        # writes NOTHING (buffer byte-for-byte unchanged). Surfacing the neighbour
+        # Near-duplicate review (P4) — still Phase A, so a pause writes NOTHING
+        # (buffer byte-for-byte unchanged). The neighbours payload is a stamped
+        # decision-read surface (candidate_payload) the agent judges from. Surfacing
         # BEFORE commit is the point: after commit the author can no longer point a
         # relation at it (a re-record is a no-op). Offline-safe
         # (no embeddings → no pause) and bypassable with acknowledge_neighbors=True.
@@ -2140,10 +2123,14 @@ class MitosSyncManager:
                     "message": (
                         f"Paused: '{entry.slug}' is ≥{_NEIGHBOR_REVIEW_THRESHOLD:.2f} "
                         f"similar to {len(neighbors)} existing decision(s) you did not "
-                        "reference. If it amends/supersedes/contradicts/cites one, "
-                        "re-record with that relation pointing at the neighbour's slug; "
-                        "if it is genuinely independent, re-record with "
-                        "acknowledge_neighbors=True. Nothing was written."
+                        "reference. Judge each neighbour from its axiom, "
+                        "rejected_paths, scope, and modifier stamps: if this decision "
+                        "amends/supersedes/contradicts/cites one, re-record with that "
+                        "relation pointing at its slug; if it is genuinely "
+                        "independent, re-record with acknowledge_neighbors=True. An "
+                        "amended_by/narrowed_by stamp means the neighbour has moved "
+                        "on — dereference that slug before linking. Nothing was "
+                        "written."
                     ),
                 }
 

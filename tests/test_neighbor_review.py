@@ -1,4 +1,4 @@
-"""Tests for the pre-commit near-duplicate / possible-tension review (AX P4).
+"""Tests for the pre-commit near-duplicate review (AX P4).
 
 Loop-Claude's friction: a new decision's nearest neighbour only surfaced in the
 POST-commit `related` echo (since deleted) — one step too late to point an amends/supersedes at it
@@ -27,8 +27,7 @@ from mitos.conflict import ConflictUnavailableReason, Unavailable
 from mitos.errors import DatabaseError, EmbeddingError, VectorStoreError
 from mitos.parser import ParsedEntry
 from mitos.store import GraphStore
-from mitos.sync import (MitosSyncManager, _has_negation, _polarity_mismatch,
-                        _NEIGHBOR_REVIEW_THRESHOLD)
+from mitos.sync import MitosSyncManager, _NEIGHBOR_REVIEW_THRESHOLD
 
 
 @pytest.fixture
@@ -67,21 +66,6 @@ def _arm(m, matches):
     """Wire fake embeddings/vector so the review runs deterministically."""
     m.embed_provider = _FakeEmbed()
     m.vector_store = _FakeVector(matches)
-
-
-# --------------------------------------------------------------------------- #
-# Polarity helpers
-# --------------------------------------------------------------------------- #
-
-def test_has_negation_detects_cues():
-    assert _has_negation("It is never a per-persona field")
-    assert _has_negation("Names are not interpolated")
-    assert not _has_negation("It is a per-persona field")
-
-
-def test_polarity_mismatch():
-    assert _polarity_mismatch("X is a field", "X is never a field")
-    assert not _polarity_mismatch("X is a field", "X is the field")
 
 
 # --------------------------------------------------------------------------- #
@@ -169,17 +153,6 @@ def test_offline_never_pauses(ws):
     assert res["status"] == "created"
 
 
-def test_possible_tension_flagged_on_polarity_flip(ws):
-    config, m = ws
-    m.record_decision_entry("The marker is never a per-persona field.", "rej",
-                            ["chrome"], slug="marker-not-persona")
-    _arm(m, [{"slug": "marker-not-persona", "score": 0.9}])
-    res = m.record_decision_entry("The marker is a per-persona field.", "rej",
-                                  ["chrome"], slug="marker-is-persona")
-    assert res["status"] == "needs_review"
-    assert res["neighbors"][0]["possible_tension"] is True
-
-
 def test_strong_match_band_pauses(ws):
     """A 0.80–0.85 unreferenced active neighbour now pauses (the lowered floor's
     whole point — ADR `record-pause-floor-lowered-to-strong-match-band`: at 0.85
@@ -215,6 +188,75 @@ def test_threshold_is_inclusive(ws):
     _arm(m, [{"slug": "use-sqlite", "score": _NEIGHBOR_REVIEW_THRESHOLD}])
     res = m.record_decision_entry("Adopt SQLite engine.", "rej", ["db"], slug="adopt-sqlite")
     assert res["status"] == "needs_review"
+
+
+# --------------------------------------------------------------------------- #
+# The enriched payload (candidate_payload shape + modifier stamps)
+# --------------------------------------------------------------------------- #
+
+def test_pause_neighbor_carries_enriched_letter_shape(ws):
+    """Each pause neighbour is the full candidate_payload finding — the Letter core
+    (axiom / scope / rejected_paths) plus score — with no polarity guess: the retired
+    ``possible_tension`` key must not reappear (nothing guessed replaces it; the
+    authoring agent judges tenability from the enrichment itself)."""
+    config, m = ws
+    m.record_decision_entry(
+        "Catalog owns the per-persona gallery markers.",
+        "Rejected a per-persona marker table: markers are catalog facts.",
+        ["catalog"], slug="catalog-owns-markers")  # offline → commits
+    _arm(m, [{"slug": "catalog-owns-markers", "score": 0.9}])
+    res = m.record_decision_entry("The catalog module owns per-persona gallery markers.",
+                                  "rej", ["catalog"], slug="catalog-module-markers")
+    assert res["status"] == "needs_review"
+    n = res["neighbors"][0]
+    assert n["slug"] == "catalog-owns-markers"
+    assert n["axiom"] == "Catalog owns the per-persona gallery markers."
+    assert n["scope"] == ["catalog"]
+    assert n["rejected_paths"] == (
+        "Rejected a per-persona marker table: markers are catalog facts.")
+    assert n["score"] == 0.9
+    assert "possible_tension" not in n
+
+
+def test_amended_but_active_neighbor_surfaces_amended_by(ws):
+    """An active-but-amended neighbour carries its ``amended_by`` stamp on the pause.
+
+    The pause is a decision-read surface, so the every-read-surface stamping
+    invariant binds it: the agent judging tenability must see the neighbour has
+    already moved on, never read it as the final word (the "amended axioms read
+    as live" trap).
+
+    There is deliberately no ``superseded_by``/``corrected_by`` fixture: the
+    gather keeps only ``active ∪ drifted`` nodes, and a kill edge
+    (supersedes/corrects) never points at a live target (store.py's kill-edge
+    rule) — a kill-stamped neighbour is structurally unreachable on this
+    surface, a documented impossibility rather than a coverage gap.
+    """
+    config, m = ws
+    m.record_decision_entry("Use SQLite for the store.", "rej", ["db"], slug="use-sqlite")
+    m.record_decision_entry("Use SQLite with WAL mode.", "rej", ["db"],
+                            slug="use-sqlite-wal", amends="use-sqlite")
+    _arm(m, [{"slug": "use-sqlite", "score": 0.9}])
+    res = m.record_decision_entry("Adopt SQLite as the storage engine.", "rej", ["db"],
+                                  slug="adopt-sqlite")
+    assert res["status"] == "needs_review"
+    n = res["neighbors"][0]
+    assert n["slug"] == "use-sqlite"
+    assert n["amended_by"] == ["use-sqlite-wal"]
+
+
+def test_unmodified_neighbor_carries_no_stamp_keys(ws):
+    """A never-modified neighbour carries NO stamp keys — stamps are conditional
+    (present only when non-empty), so the unmodified majority stays clean."""
+    config, m = ws
+    m.record_decision_entry("Use SQLite for the store.", "rej", ["db"], slug="use-sqlite")
+    _arm(m, [{"slug": "use-sqlite", "score": 0.9}])
+    res = m.record_decision_entry("Adopt SQLite as the storage engine.", "rej", ["db"],
+                                  slug="adopt-sqlite")
+    assert res["status"] == "needs_review"
+    n = res["neighbors"][0]
+    for key in ("amended_by", "narrowed_by", "superseded_by", "corrected_by"):
+        assert key not in n
 
 
 # --------------------------------------------------------------------------- #
