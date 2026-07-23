@@ -2254,7 +2254,9 @@ class MitosSyncManager:
             "path": self.config.decisions_file,
             # Write FACTS read back from the committed node — what the commit actually
             # wired/stored, never re-derived from the author's input args. Deliberately
-            # unstamped (ADR `record-receipt-neighbors-are-recall-pointers-not-stamped-reads`).
+            # unstamped: write facts are not a decision-read surface — a reader acting on
+            # a target dereferences it by slug. (Contrast the pause `neighbors`, which IS
+            # stamped: ADR `record-pause-neighbors-are-stamped-decision-read-surface`.)
             "edges_created": self.store.get_outgoing_edges(node_id),
             "scope": entry.scope,
             "mechanisms": entry.mechanisms,
