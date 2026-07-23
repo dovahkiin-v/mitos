@@ -263,8 +263,12 @@ def test_unmodified_neighbor_carries_no_stamp_keys(ws):
 # MCP + CLI surfaces (patch _review_neighbors for determinism)
 # --------------------------------------------------------------------------- #
 
-_FLAGGED = [{"slug": "existing", "axiom": "An existing decision.", "score": 0.9,
-             "possible_tension": False}]
+# The enriched candidate_payload shape in its contractual key order (slug, axiom,
+# scope, score, rejected_paths[, stamps]). No stamp key here — this is the
+# unmodified-majority shape; the stamped case rides the real-path tests below.
+_FLAGGED = [{"slug": "existing", "axiom": "An existing decision.", "scope": ["s"],
+             "score": 0.9,
+             "rejected_paths": "Rejected the obvious alternative, with reasons."}]
 
 
 def test_mcp_record_decision_pauses(ws):
@@ -297,6 +301,11 @@ def test_cli_record_pause_exits_nonzero(ws, capsys):
     assert exc.value.code == 2
     err = capsys.readouterr().err
     assert "Paused" in err and "existing" in err and "acknowledge-neighbors" in err
+    # The enriched render: each neighbour block carries its rejected_paths
+    # fragment and scope tag; the retired polarity marker must not reappear.
+    assert "Rejected the obvious alternative" in err
+    assert "scope: s" in err
+    assert "possible tension" not in err
 
 
 def test_cli_record_acknowledge_commits(ws):
@@ -305,6 +314,127 @@ def test_cli_record_acknowledge_commits(ws):
         cmd_record(config, axiom="A new call.", rejected="rej", slug="newcall",
                    acknowledge_neighbors=True)
     assert GraphStore(config.db_path).get_node_by_slug("newcall") is not None
+
+
+# --------------------------------------------------------------------------- #
+# CLI⇄MCP parity (Phase 2b)
+#
+# Both surfaces build their own MitosSyncManager internally, so the REAL review
+# path (gather → screen → candidate_payload) is armed via a shared factory
+# patched in at each surface's own resolution point: `mitos.cli.MitosSyncManager`
+# (module-top import) and `mitos.sync.MitosSyncManager` (the MCP tool's
+# function-local import, resolved at call time).
+# --------------------------------------------------------------------------- #
+
+def _armed_real_manager_factory(matches):
+    """A side_effect factory both surface patches share: real manager, armed fakes.
+
+    Captures the real class at build time, BEFORE any patch goes up — a factory
+    body that resolved ``mitos.sync.MitosSyncManager`` while the patch is active
+    would get the mock back and recurse.
+    """
+    real_cls = MitosSyncManager
+
+    def factory(config):
+        m = real_cls(config)
+        _arm(m, matches)
+        return m
+
+    return factory
+
+
+def test_cli_mcp_record_pause_parity(ws, capsys):
+    """T7 (KDD-5): both surfaces emit the identical enriched pause payload.
+
+    Drives the real review path on both surfaces — injected dicts structurally
+    cannot prove the whole chain (gather → screen → candidate_payload → both
+    serializers) agrees — over one seeded near-dup carrying an `amends` modifier
+    stamp. Compares the *parsed* CLI --json stdout against the *parsed* MCP tool
+    return (the two emissions differ in indentation by design), and pins the
+    protocol semantics riding the shared message: both exits named, no
+    tension/judged wording.
+    """
+    from mitos import mcp_server
+    config, m = ws
+    # Seed through the directly-built manager BEFORE the patches: offline →
+    # _review_neighbors returns [] → seeding never pauses. The paused record
+    # must NOT declare these slugs (a declared target is screened out).
+    m.record_decision_entry("Use SQLite for the store.",
+                            "Rejected Postgres: operational weight.", ["db"],
+                            slug="use-sqlite")
+    m.record_decision_entry("Use SQLite with WAL mode.", "rej", ["db"],
+                            slug="use-sqlite-wal", amends="use-sqlite")
+    factory = _armed_real_manager_factory([{"slug": "use-sqlite", "score": 0.9}])
+
+    with patch("mitos.cli.MitosSyncManager", side_effect=factory), \
+         patch("mitos.sync.MitosSyncManager", side_effect=factory), \
+         patch("mitos.mcp_server.MitosConfig", return_value=config):
+        capsys.readouterr()
+        with pytest.raises(SystemExit) as exc:
+            cmd_record(config, axiom="Adopt SQLite as the storage engine.",
+                       rejected="rej", scope=["db"], slug="adopt-sqlite",
+                       as_json=True)
+        assert exc.value.code == 2
+        cli_payload = json.loads(capsys.readouterr().out)
+        mcp_payload = json.loads(mcp_server.record_decision(
+            "Adopt SQLite as the storage engine.", "rej", ["db"],
+            slug="adopt-sqlite"))
+
+    assert cli_payload["neighbors"] == mcp_payload["neighbors"]
+    assert cli_payload["code"] == mcp_payload["code"] == "similar_decision_exists"
+    assert cli_payload["message"] == mcp_payload["message"]
+
+    # The enriched shape in its contractual key order, the stamp riding last.
+    n = cli_payload["neighbors"][0]
+    assert list(n.keys()) == ["slug", "axiom", "scope", "score", "rejected_paths",
+                              "amended_by"]
+    assert n["slug"] == "use-sqlite"
+    assert n["rejected_paths"] == "Rejected Postgres: operational weight."
+    assert n["amended_by"] == ["use-sqlite-wal"]
+
+    msg = cli_payload["message"]
+    assert "amends/supersedes/contradicts/cites" in msg      # the relation exit
+    assert "acknowledge_neighbors=True" in msg               # the independence exit
+    assert "tension" not in msg.lower() and "judged" not in msg.lower()
+    # A pause on either surface writes nothing.
+    assert GraphStore(config.db_path).get_node_by_slug("adopt-sqlite") is None
+
+
+def test_cli_record_pause_renders_enrichment_and_stamp(ws, capsys):
+    """The human pause render shows each neighbour's enrichment — rejected_paths
+    fragment, scope tag — and the `amended_by` stamp slug on the head line (a
+    stamped neighbour must never read as final). Real path via the armed
+    factory: the stamp rides only because the amends edge is genuinely in the
+    store."""
+    config, m = ws
+    m.record_decision_entry("Use SQLite for the store.",
+                            "Rejected Postgres: operational weight.", ["db"],
+                            slug="use-sqlite")
+    m.record_decision_entry("Use SQLite with WAL mode.", "rej", ["db"],
+                            slug="use-sqlite-wal", amends="use-sqlite")
+    factory = _armed_real_manager_factory([{"slug": "use-sqlite", "score": 0.9}])
+
+    with patch("mitos.cli.MitosSyncManager", side_effect=factory):
+        with pytest.raises(SystemExit) as exc:
+            cmd_record(config, axiom="Adopt SQLite as the storage engine.",
+                       rejected="rej", scope=["db"], slug="adopt-sqlite")
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "use-sqlite" in err
+    assert "Rejected Postgres" in err
+    assert "scope: db" in err
+    assert "amended by: use-sqlite-wal" in err
+    assert "possible tension" not in err
+
+
+def test_mcp_record_docstring_pins_enriched_protocol():
+    """The greppable halves of T6/KD-2 on the docstring (P13 prompt code): the
+    retired `possible_tension` key must not reappear, and the degraded-commit
+    key `neighbor_review_unavailable` must stay documented."""
+    from mitos import mcp_server
+    doc = mcp_server.record_decision.__doc__
+    assert "possible_tension" not in doc
+    assert "neighbor_review_unavailable" in doc
 
 
 # --------------------------------------------------------------------------- #

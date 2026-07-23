@@ -1193,9 +1193,10 @@ def cmd_record(
     if as_json:
         # Every outcome speaks JSON on stdout (no stderr walls); exit codes ride along.
         # The receipt is already the structured dict — emit it verbatim, no reshaping
-        # (the record receipt is a write result, NOT a decision read: no modifier
-        # stamping; its neighbors are recall pointers the agent dereferences
-        # by slug). scope_overflow, when present, is already inside `result`.
+        # (the pause's `neighbors` is a stamped decision-read surface: each entry is
+        # the enriched candidate_payload, modifier stamps included; the created
+        # receipt's write-facts stay unstamped write results). scope_overflow, when
+        # present, is already inside `result`.
         _emit_json(result)
         if "error" in result:
             sys.exit(1)
@@ -1208,16 +1209,27 @@ def cmd_record(
         sys.exit(1)
 
     if result.get("status") == "needs_review":
-        # P4 pause — nothing was written. Show the neighbours and how to proceed.
+        # P4 pause — nothing was written. Render each neighbour's enrichment (axiom,
+        # rejected_paths, scope, modifier stamps) so the author can judge and link
+        # without a dereference round-trip. Enrichment keys via .get(): production
+        # always sends the full candidate_payload shape, but leaner dicts reach this
+        # render from canned fixtures.
         print(f"⚠ Paused — '{result['slug']}' looks like an existing decision. Nothing written.",
               file=sys.stderr)
         for n in result.get("neighbors", []):
             score = n.get("score")
             score_s = f"{score:.2f}" if isinstance(score, (int, float)) else "?"
-            tension = "  [possible tension]" if n.get("possible_tension") else ""
-            print(f"  ↔ {n['slug']}  ({score_s}){tension}  "
-                  f"{truncate_words(n.get('axiom') or '', 60)}",
-                  file=sys.stderr)
+            stamps = "".join(
+                f"  [{key.replace('_', ' ')}: {', '.join(n[key])}]"
+                for key in ("amended_by", "narrowed_by") if n.get(key))
+            print(f"  ↔ {n['slug']}  ({score_s}){stamps}", file=sys.stderr)
+            if n.get("axiom"):
+                print(f"      {truncate_words(n['axiom'], 60)}", file=sys.stderr)
+            if n.get("rejected_paths"):
+                print(f"      rejected: {truncate_words(n['rejected_paths'], 80)}",
+                      file=sys.stderr)
+            if n.get("scope"):
+                print(f"      scope: {', '.join(n['scope'])}", file=sys.stderr)
         print("  → Re-record with --supersedes/--amends/--contradicts/--cites <slug> to link "
               "it, or --acknowledge-neighbors to record as independent.", file=sys.stderr)
         sys.exit(2)

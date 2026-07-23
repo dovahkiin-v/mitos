@@ -727,8 +727,9 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
         slug: The short, descriptive handle for the decision (e.g. 'sqlite-wal-mode').
             Keep it to at most 100 characters — the slug is the permanent citation
             handle, so an over-length one is rejected (not silently truncated).
-        acknowledge_neighbors: Record past the near-duplicate review (the decision is genuinely independent). you have looked at the flagged neighbour(s) and this decision is
-            genuinely independent. Leave False (default) on the first attempt.
+        acknowledge_neighbors: Record past the near-duplicate review after inspecting
+            the flagged neighbours and judging this decision genuinely independent.
+            Leave False (default) on the first attempt.
 
     Returns:
         A JSON string: {slug, id, state, embedding, status} or {error, code}.
@@ -736,12 +737,13 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
         identical decision was already recorded and is now confirmed present, not an
         error and not something to retry. Only a top-level {error, code} is a failure.
         status="needs_review" (code "similar_decision_exists") is a PAUSE, not a failure
-        and not a write: your decision is ≥0.80 similar to existing `neighbors` you did
-        not reference. Inspect them — if this amends/supersedes/contradicts/cites one,
-        re-record with that relation arg pointing at the neighbour's slug (`possible_tension`
-        on a neighbour flags a likely contradiction, not a duplicate); if it is genuinely
-        independent, re-record with acknowledge_neighbors=True. Nothing was written, so a
-        re-record is the right move here (unlike an "exists" no-op).
+        and not a write: this decision is ≥0.80 similar to existing `neighbors` it does
+        not reference. Each neighbour carries its axiom, rejected_paths, scope, score,
+        and an amended_by/narrowed_by stamp when a later decision has moved it on
+        (dereference that slug before linking). Re-record with the resolving relation
+        arg (amends/supersedes/contradicts/cites) pointing at the neighbour's slug, or
+        with acknowledge_neighbors=True if genuinely independent. Nothing was written,
+        so a re-record is the right move (unlike an "exists" no-op).
         The "created" result also carries `edges_created` — the relation edges this
         record actually wired, each `{kind, target}` (write facts read back from the
         committed graph, so an empty list means no edge landed) — and the resolved
@@ -750,6 +752,9 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
         existing decision is a no-op — a changed `context`/`rejected_paths`/`scope` or
         relation on a re-record is NOT saved. To record different reasoning or a new
         relationship, make a NEW decision (a distinct axiom), don't resubmit the old one.
+        A "created" result MAY carry `neighbor_review_unavailable`: the commit
+        succeeded but the near-duplicate review could not run — absent neighbours are
+        not checked-clean; `mitos check` covers the gap retroactively.
         The result MAY also carry `scope_overflow`: a one-line, debounced (≤once/24h)
         health nudge that the generated context files have grown past their size ceiling
         — not an error and not about this decision; run `mitos status` for the breakdown.
