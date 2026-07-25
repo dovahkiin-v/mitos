@@ -47,6 +47,15 @@ mitos = "mitos.cli:main"
 test = [
     "pytest>=8.0",
     "pytest-asyncio>=1.0",
+    # Parallel runner for the OFFLINE suite only — `-n auto` takes it from ~78s to
+    # ~48s with identical results. NOT safe for the live tier: conftest's
+    # sweep_leaked_qdrant_collections is session-scoped, and under xdist every
+    # worker is its own session, so the first to finish deletes the `mitos-tmp*`
+    # collections the others are still using. Measured 2026-07-25: the same live
+    # module went 5 passed → 4 → 2 across runs, exiting 0 every time. Use it as
+    # `MITOS_NO_LIVE_TESTS=1 pytest -m "not packaging" -n auto`; run the live tier
+    # serially until that sweep is made worker-aware.
+    "pytest-xdist>=3.8",
 ]
 
 [tool.setuptools]

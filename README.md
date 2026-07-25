@@ -70,9 +70,15 @@ If that's your way of working, project size doesn't matter much — the higher t
 ## Development
 
 ```bash
-PYTHONPATH=. pytest -m "not packaging"   # the suite; run sequentially — parallel runs can trip SQLite locking
-PYTHONPATH=. pytest -m packaging         # real-install check: fresh venv + non-editable pip install
+pip install -e '.[test]'
+MITOS_NO_LIVE_TESTS=1 pytest -m "not packaging" -n auto   # offline suite, parallel (~50s)
+pytest -m "not packaging"                                 # adds the live tier — serial only
+pytest -m packaging                                       # real-install check: fresh venv + pip install
 ```
+
+`-n auto` is safe for the offline suite and **not** for the live tier: the test-collection
+sweep is session-scoped, so parallel workers delete each other's Qdrant collections and
+the affected tests degrade to skips rather than failures.
 
 The `*_live.py` suites and golden Layer B make **real Gemini and Anthropic API calls**
 against your own keys, and need Qdrant on `:7333`. They skip when no key is resolvable,

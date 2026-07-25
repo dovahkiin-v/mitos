@@ -114,3 +114,106 @@ def sweep_leaked_qdrant_collections():
                 requests.delete(f"{url}/collections/{name}", timeout=5)
             except Exception:
                 pass
+
+
+# --------------------------------------------------------------------------- #
+# The live-tier coverage floor
+# --------------------------------------------------------------------------- #
+#
+# The live suites degrade EVERY environmental fault to a loud skip (a judge
+# timeout, an embed 429, an unreachable vector store) so live-red stays
+# trustworthy. That is the right call for a single fault — but it means a run
+# where half the tier silently did not execute is indistinguishable from a
+# healthy one, and exits 0. Observed: two identical serial runs of the same code
+# gave 10 and 9 skips; under `-n 5` the same module went 5 passed → 4 → 2, green
+# every time.
+#
+# The floor closes that. It does NOT police *whether* the tier runs — being
+# switched off (MITOS_NO_LIVE_TESTS), keyless (a fork, CI), or wholly unable to
+# reach a service are all honest states in which nothing pretended to check.
+# It polices the PARTIAL state: the tier demonstrably worked, and some of it
+# still didn't run.
+
+#: Marker every environmental-degradation skip reason carries (live_helpers.py and
+#: the live modules). A legitimate always-skip — "baseline seeding is
+#: explicit-only" — deliberately does not, which is what keeps it out of the count.
+_ENV_SKIP_MARKER = "not a code defect"
+
+#: Test modules that make real Anthropic/Gemini calls. Held in sync with the set
+#: consulting ``live_helpers.live_tests_disabled`` by the meta-test in
+#: tests/test_live_floor.py — a new live module that skips registration fails there,
+#: rather than quietly falling outside the floor.
+LIVE_MODULES: tuple[str, ...] = (
+    "test_conflict_eval_live.py",
+    "test_retrieval_live.py",
+    "test_conflict_dogfood_live.py",
+    "test_check_hook_recipe.py",
+    "test_integration_live.py",
+    "test_pathologies_live.py",
+    "test_scenarios_live.py",
+)
+
+
+def live_floor_verdict(live_passed: int, live_env_skipped: int) -> str | None:
+    """Judges whether the live tier ran completely enough to be believed.
+
+    Args:
+        live_passed: Live-tier tests that actually executed and passed.
+        live_env_skipped: Live-tier tests that skipped for an environmental cause.
+
+    Returns:
+        A failure message when the tier ran only partially, else None. Zero passes
+        means the tier was off or unavailable wholesale — honest, not a hole.
+    """
+    if live_passed and live_env_skipped:
+        total = live_passed + live_env_skipped
+        return (
+            f"live-tier coverage hole: {live_env_skipped} of {total} live tests "
+            f"degraded to environmental skips while {live_passed} ran — so this "
+            f"run checked less than it appears to, and would otherwise have "
+            f"exited 0.\n"
+            f"  Re-run the live tier before trusting it as a pre-push gate.\n"
+            f"  Common causes: the SONNET judge's 15s ceiling under load, a Gemini "
+            f"429, or parallel workers sweeping each other's Qdrant collections "
+            f"(do not run the live tier under pytest-xdist).\n"
+            f"  Set MITOS_STRICT_LIVE=1 to make this state a hard failure."
+        )
+    return None
+
+
+def _is_live(nodeid: str) -> bool:
+    """Reports whether a test nodeid belongs to a live-tier module."""
+    return any(nodeid.split("::")[0].endswith(m) for m in LIVE_MODULES)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Fails a session whose live tier ran only partially (see the floor note above)."""
+    # xdist: only the controller aggregates, and only it owns the exit status.
+    if hasattr(session.config, "workerinput"):
+        return
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is None:
+        return
+
+    passed = sum(1 for r in reporter.stats.get("passed", []) if _is_live(r.nodeid))
+    env_skipped = 0
+    for r in reporter.stats.get("skipped", []):
+        if not _is_live(r.nodeid):
+            continue
+        reason = str(getattr(r, "longrepr", "") or "")
+        if _ENV_SKIP_MARKER in reason.lower():
+            env_skipped += 1
+
+    verdict = live_floor_verdict(passed, env_skipped)
+    if not verdict:
+        return
+    # Reports by default, fails only on request. The bug this closes is
+    # INVISIBILITY, not the skipping itself: a transient judge timeout is genuinely
+    # environmental, and it fired on 3 of 3 serial runs the day this was written —
+    # so a hard failure here would red almost every pre-push run and train the
+    # bypass it exists to prevent. Loud-and-green keeps the state legible; strict
+    # mode is for a release gate that must not proceed on a partial check.
+    strict = bool(os.environ.get("MITOS_STRICT_LIVE"))
+    reporter.write_line(f"\n[live-floor] {verdict}", red=strict, bold=True, yellow=not strict)
+    if strict:
+        session.exitstatus = 1
