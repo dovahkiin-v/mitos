@@ -681,3 +681,52 @@ def test_mcp_receipt_carries_edges_and_fields(ws) -> None:
     assert res["status"] == "created"
     assert res["edges_created"] == [{"kind": "amends", "target": "prior"}]
     assert res["scope"] == ["db"] and res["mechanisms"] == ["sqlite"]
+
+
+def test_exists_receipt_reports_the_no_op_without_dropping_the_pointer(ws) -> None:
+    """A re-record writes nothing and must say so — while still pointing at the entry.
+
+    Regression: the ``exists`` short-circuit's ``path`` was rendered as ``Written: …``
+    under a ``Recorded ✓`` headline, so a caller correcting commentary — or restoring
+    a source block for a graph-only node — read it as a successful write while
+    nothing had changed. The fix moves the *claim* into ``no_op_reason``; the
+    ``path`` pointer stays, since "already recorded — so where is it?" is a fair
+    question (the #5b contract in test_payload_economy.py).
+    """
+    config, m = ws
+    r1 = m.record_decision_entry("Pin the digest length.", "Leave it to the implementer.",
+                                 [], slug="pin-digest-length")
+    assert r1["status"] == "created" and r1.get("path")
+    assert "no_op_reason" not in r1, "a real write must not claim to be a no-op"
+
+    r2 = m.record_decision_entry("Pin the digest length.", "CORRECTED rejected text.",
+                                 [], slug="pin-digest-length")
+    assert r2["status"] == "exists"
+    assert r2["path"] == config.decisions_file, "the pointer stays (#5b)"
+    assert r2.get("no_op_reason"), "a no-op must say so in-band"
+    # The note names the path that actually works, and not the one that doesn't.
+    assert "mitos rebuild" in r2["no_op_reason"]
+    assert "mitos sync" not in r2["no_op_reason"]
+
+
+def test_exists_no_op_leaves_a_missing_source_block_missing(ws) -> None:
+    """Re-recording does NOT restore a graph-only node's source block.
+
+    The state a decision-corpus audit meets: node live in the graph, ``###`` block
+    absent from ``decisions.md``. Re-recording is the obvious repair and does not
+    work — so the receipt has to say it did not, or an audit records edges against
+    targets that dangle on the next rebuild.
+    """
+    config, m = ws
+    m.record_decision_entry("Restore me later.", "Nothing.", [], slug="graph-only-node")
+    text = _read(config)
+    assert "### graph-only-node" in text
+    # Excise the block, leaving the node in the graph — the graph-only state.
+    head, _, tail = text.partition("### graph-only-node")
+    with open(config.decisions_file, "w", encoding="utf-8") as f:
+        f.write(head + tail.partition("\n### ")[1] + tail.partition("\n### ")[2])
+
+    res = m.record_decision_entry("Restore me later.", "Nothing.", [], slug="graph-only-node")
+    assert res["status"] == "exists"
+    assert "### graph-only-node" not in _read(config), "re-record must not be believed to restore"
+    assert "restore a missing source block" in res["no_op_reason"]

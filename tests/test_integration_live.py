@@ -21,6 +21,8 @@ import shutil
 import pytest
 import requests
 
+from live_helpers import live_tests_disabled
+
 from mitos import cli
 from mitos.config import MitosConfig, default_collection_name
 from mitos.store import GraphStore
@@ -69,7 +71,7 @@ def _qdrant_up():
 
 
 _REAL_KEY = _resolve_real_gemini_key()
-HAS_SERVICES = bool(_REAL_KEY) and _qdrant_up()
+HAS_SERVICES = (not live_tests_disabled()) and bool(_REAL_KEY) and _qdrant_up()
 
 pytestmark = pytest.mark.skipif(
     not HAS_SERVICES,

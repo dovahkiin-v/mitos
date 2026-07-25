@@ -338,6 +338,22 @@ def _contains_structural_token(text: str) -> bool:
 _SLUG_MAX_LEN = SLUG_MAX_LEN  # shared source of truth in identity.py (re-exported here for cli.py + the record path)
 _SLUG_MIN_LEN = 32  # auto-derive only: don't trim a word boundary back past here — hard-cap instead
 
+# Returned on the two "exists" short-circuits, which write nothing at all. The
+# no-op is deliberate (a committed canonical core is immutable, M1) — what was
+# NOT deliberate is that the receipt used to report the buffer path, so a
+# re-record aimed at correcting commentary, or at restoring a source block for a
+# graph-only node, reported success while changing nothing. The note names the
+# path that does work; `mitos sync` does not, since it re-commits nothing for a
+# node already in the graph.
+_EXISTS_NO_OP_NOTE = (
+    "already recorded — this call wrote nothing, to the buffer or the graph. "
+    "A committed decision's axiom and mechanisms are immutable (M1): re-recording "
+    "them is a no-op. To correct or extend its commentary (rejected_paths, context) "
+    "or to restore a missing source block, edit the entry in decisions.md and run "
+    "`mitos rebuild`. To record a changed decision, write a new one with "
+    "--supersedes/--amends pointing at this slug."
+)
+
 # A new decision at/above this document-document similarity to an existing one the
 # author did NOT reference is paused for review (AX P4): the neighbour must surface
 # BEFORE commit, while the author can still point an amends/supersedes/contradicts
@@ -2051,7 +2067,15 @@ class MitosSyncManager:
                 "state": self._node_state(node_id),
                 "embedding": self._embedding_status(node_id),
                 "status": "exists",
+                # `path` stays: it points at where the existing entry LIVES, which is
+                # the useful answer to "already recorded — so where is it?" (#5b).
+                # What was wrong is that the renderer labelled it `Written:` under a
+                # `Recorded ✓` headline, so a re-record aimed at correcting commentary
+                # — or at restoring a source block on a graph-only node — read as a
+                # successful write while nothing had changed. The claim moves to
+                # no_op_reason; the pointer stays.
                 "path": self.config.decisions_file,
+                "no_op_reason": _EXISTS_NO_OP_NOTE,
             }
 
         # Slug-collision fast-fail (exact match only).
@@ -2157,7 +2181,9 @@ class MitosSyncManager:
                         "state": self._node_state(node_id),
                         "embedding": self._embedding_status(node_id),
                         "status": "exists",
+                        # See the gate-3 twin above: the path points, it does not claim.
                         "path": self.config.decisions_file,
+                        "no_op_reason": _EXISTS_NO_OP_NOTE,
                     }
                 coll_id, _coll_node = self._exact_slug_node(entry.slug)
                 if coll_id and coll_id != node_id:

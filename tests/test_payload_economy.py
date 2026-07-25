@@ -198,3 +198,21 @@ def test_surface_includes_open_questions_with_scope(ws):
     with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
         resp = json.loads(mcp_server.surface_decisions("anything", scope="scoped"))
     assert "open_questions" in resp and resp["open_questions"] == []
+
+
+def test_cli_record_exists_does_not_label_the_path_as_written(ws, capsys):
+    """The #5b pointer survives a no-op re-record, but not as a claimed write.
+
+    Guards the seam between #5b (the receipt points at the markdown) and the
+    no-op honesty fix: dropping ``path`` would break #5b, and keeping the
+    ``Written:`` label would keep the false claim. Both must hold at once.
+    """
+    config, _ = ws
+    cmd_record(config, axiom="Twice recorded.", rejected="rej", slug="twice")
+    capsys.readouterr()
+    cmd_record(config, axiom="Twice recorded.", rejected="rej", slug="twice")
+    out = capsys.readouterr().out
+    assert config.decisions_file in out, "#5b: still points at the entry"
+    assert "Written:" not in out, "nothing was written on the exists path"
+    assert "Recorded decision" not in out, "a no-op must not borrow the success headline"
+    assert "wrote nothing" in out and "mitos rebuild" in out

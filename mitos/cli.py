@@ -1234,12 +1234,25 @@ def cmd_record(
               "it, or --acknowledge-neighbors to record as independent.", file=sys.stderr)
         sys.exit(2)
 
-    print(f"Recorded decision '{result['slug']}' ({result['status']}) ✓")
+    # The "exists" short-circuit writes nothing, so it must not borrow the
+    # success headline — a no-op reported as "Recorded ✓" is the same
+    # couldn't-do-it-reads-as-done inversion the degraded-check notice below
+    # exists to prevent, on the write itself rather than on the review.
+    no_op = result.get("no_op_reason")
+    if no_op:
+        print(f"Decision '{result['slug']}' {no_op}")
+    else:
+        print(f"Recorded decision '{result['slug']}' ({result['status']}) ✓")
     print(f"  ID:        {result['id']}")
     print(f"  State:     {result['state']}")
     print(f"  Embedding: {result['embedding']}")
     if result.get("path"):
-        print(f"  Written:   {result['path']}  (the human-readable entry — eyeball it)")
+        # On the no-op branch the path still points at where the entry lives (#5b) —
+        # it just must not be labelled as an action this call performed.
+        if no_op:
+            print(f"  Entry:     {result['path']}  (where the existing entry lives)")
+        else:
+            print(f"  Written:   {result['path']}  (the human-readable entry — eyeball it)")
     print(f"  Handle:    '{result['slug']}' — pass this to --supersedes/--amends/--depends-on/… to link future decisions.")
     # Write facts read back from the committed node (NOT an echo of the flags):
     # the edges the commit actually wired, and scope/mechanisms as stored. Lines
@@ -3771,6 +3784,20 @@ def main() -> None:
                 if args.as_json:
                     _emit_json({"error": msg, "code": "ambiguous_axiom_source"
                                 if args.axiom is not None else "missing_axiom"})
+                else:
+                    print(msg, file=sys.stderr)
+                sys.exit(2)
+            # Only one argument can read stdin — the first reader drains it and the
+            # rest come back empty. Left unchecked that surfaced as a downstream
+            # "record requires --rejected" wall, which names a flag the caller
+            # already passed and sends them to add it twice.
+            _stdin_args = [f"--{n}-file" for n in ("axiom", "rejected", "context")
+                           if getattr(args, f"{n}_file", None) == "-"]
+            if len(_stdin_args) > 1:
+                msg = ("only one argument can read from stdin — these ask for it: "
+                       f"{', '.join(_stdin_args)}. Pass a file path for all but one.")
+                if args.as_json:
+                    _emit_json({"error": msg, "code": "multiple_stdin_args"})
                 else:
                     print(msg, file=sys.stderr)
                 sys.exit(2)

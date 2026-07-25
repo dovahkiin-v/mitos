@@ -14,6 +14,8 @@ import multiprocessing
 from typing import Tuple
 
 from mitos.config import MitosConfig
+
+from live_helpers import live_tests_disabled
 from mitos.store import GraphStore
 from mitos.parser import ParsedEntry
 from mitos.sync import MitosSyncManager
@@ -32,7 +34,7 @@ def load_live_env() -> None:
 
 load_live_env()
 
-HAS_LIVE_KEYS = bool(os.environ.get("GEMINI_API_KEY") and os.environ.get("ANTHROPIC_API_KEY"))
+HAS_LIVE_KEYS = (not live_tests_disabled()) and bool(os.environ.get("GEMINI_API_KEY") and os.environ.get("ANTHROPIC_API_KEY"))
 
 @pytest.fixture
 def isolated_workspace() -> Tuple[MitosConfig, str]:

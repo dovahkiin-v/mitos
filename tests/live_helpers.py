@@ -49,6 +49,31 @@ EMBED_QUOTA_SKIP_REASON = (
 
 
 # ---------------------------------------------------------------------------
+# The live-tier brake
+# ---------------------------------------------------------------------------
+
+#: Env var that opts the whole live tier out. Default (unset) keeps live tests
+#: ON, so the run-with-services-before-push discipline cannot be lost by accident.
+LIVE_OPT_OUT_ENV = "MITOS_NO_LIVE_TESTS"
+
+
+def live_tests_disabled() -> bool:
+    """Reports whether the caller has explicitly opted out of the live tiers.
+
+    The live suites spend real Anthropic + Gemini tokens, and several of them
+    re-supply keys from the repo's ``.env`` via their own ``_load_live_env``
+    before evaluating ``HAS_LIVE_KEYS`` — so clearing the shell environment
+    cannot switch them off. Without a brake there is no supported way to run the
+    suite without paying for it, which is why this exists and why every live
+    module consults it rather than only checking for keys.
+
+    Returns:
+        True when ``MITOS_NO_LIVE_TESTS`` is set to a non-empty value.
+    """
+    return bool(os.environ.get(LIVE_OPT_OUT_ENV))
+
+
+# ---------------------------------------------------------------------------
 # Embed-quota (429) robustness
 # ---------------------------------------------------------------------------
 

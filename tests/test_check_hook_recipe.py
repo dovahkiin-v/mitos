@@ -26,6 +26,8 @@ import uuid
 import pytest
 import requests
 
+from live_helpers import live_tests_disabled
+
 # --- The recipe under test (VERBATIM from SETUP.md — keep in lockstep, KD4) ----
 # The shebang is hook scaffolding (implementer's latitude); the load-bearing
 # verbatim parts are the guard command and the divergence message.
@@ -83,7 +85,7 @@ def _load_live_env() -> None:
 
 
 _load_live_env()
-HAS_LIVE_KEYS = bool(
+HAS_LIVE_KEYS = (not live_tests_disabled()) and bool(
     os.environ.get("GEMINI_API_KEY") and os.environ.get("ANTHROPIC_API_KEY")
 )
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:7333")

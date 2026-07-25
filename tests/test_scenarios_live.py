@@ -25,7 +25,7 @@ from mitos.importer import MitosProseImporter
 from mitos.mcp_server import query_decisions, surface_decisions
 from mitos.errors import ParseError
 
-from live_helpers import skip_on_embed_quota
+from live_helpers import live_tests_disabled, skip_on_embed_quota
 
 # 1. Load live environment keys from .env if present
 def load_live_env() -> None:
@@ -41,7 +41,7 @@ def load_live_env() -> None:
 load_live_env()
 
 # Only run live-dependent tests if real credentials exist
-HAS_LIVE_KEYS = bool(os.environ.get("GEMINI_API_KEY") and os.environ.get("ANTHROPIC_API_KEY"))
+HAS_LIVE_KEYS = (not live_tests_disabled()) and bool(os.environ.get("GEMINI_API_KEY") and os.environ.get("ANTHROPIC_API_KEY"))
 
 @pytest.fixture(autouse=True)
 def force_live_env() -> None:

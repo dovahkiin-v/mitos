@@ -70,7 +70,20 @@ If that's your way of working, project size doesn't matter much — the higher t
 ## Development
 
 ```bash
-PYTHONPATH=. pytest        # run sequentially — parallel runs can trip SQLite locking
+PYTHONPATH=. pytest -m "not packaging"   # the suite; run sequentially — parallel runs can trip SQLite locking
+PYTHONPATH=. pytest -m packaging         # real-install check: fresh venv + non-editable pip install
+```
+
+The `*_live.py` suites and golden Layer B make **real Gemini and Anthropic API calls**
+against your own keys, and need Qdrant on `:7333`. They skip when no key is resolvable,
+so a fresh clone runs the fast path by default.
+
+Keys resolve from the environment, a repo-root `.env`, or `~/.config/mitos/.env` — so if
+you already *use* mitos, a test run can pick up your personal key and spend against it.
+Opt out explicitly:
+
+```bash
+MITOS_NO_LIVE_TESTS=1 PYTHONPATH=. pytest -m "not packaging"
 ```
 
 The canonical decision format lives in [`mitos/format-spec.md`](mitos/format-spec.md). License: [Apache 2.0](LICENSE).

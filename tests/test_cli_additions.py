@@ -293,3 +293,40 @@ def test_record_neither_axiom_source_json_speaks_json(monkeypatch, capsys):
     assert exc.value.code == 2
     payload = json.loads(capsys.readouterr().out)
     assert payload["code"] == "missing_axiom"
+
+
+# --- stdin arity on record's prose-file args -----------------------------------
+
+@pytest.mark.parametrize("argv_extra, expected_in_msg", [
+    (["--axiom-file", "-", "--rejected-file", "-"], "--axiom-file"),
+    (["--axiom-file", "-", "--rejected-file", "-", "--context-file", "-"], "--context-file"),
+])
+def test_multiple_stdin_file_args_fail_with_their_own_error(
+    argv_extra, expected_in_msg, monkeypatch, capsys
+):
+    """Only one argument can read stdin; asking twice names that, not a missing flag.
+
+    Regression: the first reader drained stdin and the rest came back empty, so the
+    failure surfaced downstream as "record requires --rejected or --rejected-file" —
+    a wall naming a flag the caller had already passed.
+    """
+    monkeypatch.setattr(sys, "argv", ["mitos", "record", "--slug", "s"] + argv_extra)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("some prose"))
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "only one argument can read from stdin" in err
+    assert expected_in_msg in err
+    assert "requires --rejected" not in err, "must not send the caller after a flag they passed"
+
+
+def test_single_stdin_file_arg_still_works(monkeypatch):
+    """The guard must not break the ordinary one-arg-from-stdin case."""
+    monkeypatch.setattr(sys, "argv",
+                        ["mitos", "record", "--slug", "s", "--axiom-file", "-", "--rejected", "r"])
+    monkeypatch.setattr(sys, "stdin", io.StringIO("An axiom from stdin.\n"))
+    with patch("mitos.cli.cmd_record") as mock_record:
+        main()
+    assert mock_record.called
+    assert mock_record.call_args.kwargs["axiom"] == "An axiom from stdin."

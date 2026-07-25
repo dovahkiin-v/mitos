@@ -49,7 +49,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))  # tests/ for liv
 from _harness import CORPUS_PATH, build_reference_graph  # noqa: E402
 import _conflict_harness as CH  # noqa: E402  (pulls anthropic in — the quarantine boundary)
 import _semantic_harness as H  # noqa: E402
-from live_helpers import skip_on_embed_quota  # noqa: E402
+from live_helpers import live_tests_disabled, skip_on_embed_quota  # noqa: E402
 from metrics import recommend_floor  # noqa: E402
 
 # Loose smoke floor — of the genuine contradictions that reached the judge, at least half
@@ -89,7 +89,7 @@ def _load_live_env() -> None:
 
 _load_live_env()
 # Conflict needs BOTH surfaces: Gemini embeddings (candidate gather) + Anthropic judgment.
-HAS_LIVE_KEYS = bool(
+HAS_LIVE_KEYS = (not live_tests_disabled()) and bool(
     os.environ.get("GEMINI_API_KEY") and os.environ.get("ANTHROPIC_API_KEY")
 )
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:7333")

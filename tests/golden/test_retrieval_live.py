@@ -38,7 +38,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))  # tests/ for live_helpers
 from _harness import build_reference_graph  # noqa: E402
 import _semantic_harness as H  # noqa: E402
-from live_helpers import skip_on_embed_quota  # noqa: E402
+from live_helpers import live_tests_disabled, skip_on_embed_quota  # noqa: E402
 
 # Loose smoke floor — at least half of each relevant set must surface in the top-k.
 # NOT a calibrated per-fixture floor: the real measurement is the report + baseline
@@ -70,7 +70,7 @@ def _load_live_env() -> None:
 
 
 _load_live_env()
-HAS_LIVE_KEYS = bool(os.environ.get("GEMINI_API_KEY"))  # retrieval needs embeddings only
+HAS_LIVE_KEYS = (not live_tests_disabled()) and bool(os.environ.get("GEMINI_API_KEY"))  # retrieval needs embeddings only
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:7333")
 
 pytestmark = pytest.mark.skipif(

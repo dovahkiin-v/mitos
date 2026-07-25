@@ -55,7 +55,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "golden"))
 sys.path.insert(0, os.path.dirname(__file__))
 import _semantic_harness as H  # noqa: E402
 from _conflict_harness import make_live_judge  # noqa: E402  (pulls anthropic — the quarantine boundary)
-from live_helpers import skip_on_embed_quota  # noqa: E402
+from live_helpers import live_tests_disabled, skip_on_embed_quota  # noqa: E402
 
 # The framework's live gold decision corpus (241 lines). READ-ONLY — never synced against.
 DOGFOOD_CORPUS_PATH = "/home/vinga/Forge/mt/decisions.md"
@@ -82,7 +82,7 @@ def _load_live_env() -> None:
 
 _load_live_env()
 # The dogfood needs BOTH surfaces: Gemini embeddings (candidate gather) + Anthropic judgment.
-HAS_LIVE_KEYS = bool(
+HAS_LIVE_KEYS = (not live_tests_disabled()) and bool(
     os.environ.get("GEMINI_API_KEY") and os.environ.get("ANTHROPIC_API_KEY")
 )
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:7333")
