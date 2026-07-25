@@ -66,6 +66,12 @@ RECORD_DECISION_SPEC.md
 CLAUDE.md
 FRAMEWORK.md
 ROADMAP.md
+# Bare DECISIONS.md (the Blacksmith-scoped entries above are a different project's
+# path). Internal planning docs never ship in the public repo.
+DECISIONS.md
+# Internal docs folder. Ignored even though it does not exist yet, so the natural
+# instinct to put planning docs in docs/ cannot leak them into a public repo.
+docs/
 
 # AX feedback from the vision loop's Claude — raw dev input, not for the public repo
 AX_FEEDBACK.md
