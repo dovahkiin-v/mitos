@@ -14,6 +14,7 @@ import subprocess
 import sys
 
 from mitos import conflict
+from mitos.conflict_judgment import _JUDGMENT_MAX_TOKENS
 
 
 # ---------------------------------------------------------------------------
@@ -25,7 +26,7 @@ def test_fixed_constants_have_pinned_values() -> None:
     assert conflict.CONFLICT_SURFACE_THRESHOLD == 0.85
     assert conflict.CONFLICT_TOP_K == 5
     assert conflict.CONFLICT_JUDGMENT_TEMPERATURE == 0.3
-    assert conflict.CONFLICT_LLM_TIMEOUT_S == 15
+    assert conflict.CONFLICT_LLM_TIMEOUT_S == 30
 
 
 def test_similarity_floor_is_present_numeric_and_in_unit_range() -> None:
@@ -134,3 +135,37 @@ def test_importing_conflict_drags_no_heavy_dependency() -> None:
         f"dep-free import probe failed:\nstdout={result.stdout}\nstderr={result.stderr}"
     )
     assert "OK" in result.stdout
+
+
+def test_timeout_can_accommodate_the_output_it_permits() -> None:
+    """The two judge dials must stay coherent: a maxed response must fit its timeout.
+
+    Regression (2026-07-26). ``_JUDGMENT_MAX_TOKENS`` was 2000 while
+    ``CONFLICT_LLM_TIMEOUT_S`` was 15 — so a response using its full allowance needed
+    ~42s against a cap that would kill it at 15, and a full-width batch was *expected*
+    to time out. Those expiries surfaced as ``Unavailable(judgment_timeout)``, which the
+    live suites classify as "environmental, NOT a code defect" — so a mis-set constant
+    wore an environmental label and survived weeks of being seen.
+
+    The rate is measured, not assumed: four live batches in ``judgment_batches`` ran
+    ~21ms per output token at full batch width (20.8-27.7 across sizes, the higher
+    figures being small batches where time-to-first-token dominates).
+    """
+    observed_ms_per_output_token = 21
+    worst_case_s = (_JUDGMENT_MAX_TOKENS * observed_ms_per_output_token) / 1000
+    assert worst_case_s <= conflict.CONFLICT_LLM_TIMEOUT_S, (
+        f"a maxed {_JUDGMENT_MAX_TOKENS}-token judgment needs ~{worst_case_s:.0f}s but "
+        f"the cap is {conflict.CONFLICT_LLM_TIMEOUT_S}s — raise the timeout or lower "
+        f"max_tokens; they are one decision, not two."
+    )
+
+
+def test_max_tokens_covers_a_full_width_batch() -> None:
+    """The output cap must fit CONFLICT_TOP_K verdicts at the observed per-verdict cost.
+
+    Truncation is safe (the parser's count check turns a cut array into Unavailable),
+    but a cap below the structural worst case would make full-width batches
+    systematically unjudgeable — trading a timeout failure for a truncation one.
+    """
+    observed_tokens_per_verdict = 200  # the worst of four live batches (133-200)
+    assert _JUDGMENT_MAX_TOKENS >= conflict.CONFLICT_TOP_K * observed_tokens_per_verdict

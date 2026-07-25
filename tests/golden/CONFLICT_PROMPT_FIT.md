@@ -60,9 +60,17 @@ under the CONF-D8 ~3K/batch budget. `cache_read = cache_creation = 0`: prompt ca
 ### Latency (honest fit note)
 
 At the **full ≤5-candidate batch width** (this probe runs at floor 0.0, so batches are
-maximal), the judgment call takes ≈ **9–11 s** — **above** the P95 ≤5 s budget (CONF-D8),
-though comfortably under the `CONFLICT_LLM_TIMEOUT_S = 15` hard cap ("slow AI is failed
-AI", P14). In production the calibrated floor (`0.76`) admits far fewer candidates per
+maximal), the judgment call takes ≈ **9–11 s** — **above** the P95 ≤5 s budget (CONF-D8).
+
+> **Corrected 2026-07-26.** This note originally read "comfortably under the
+> `CONFLICT_LLM_TIMEOUT_S = 15` hard cap." It was not. Live telemetry
+> (`judgment_batches`) records 5.5 / 11.3 / 13.8 / **14.6 s** — a median at 84% of that
+> cap and a max at 97%, i.e. 433 ms of headroom, with recurring
+> `Unavailable(judgment_timeout)` expiries filed as environmental. The cap is now **30 s**
+> and `_JUDGMENT_MAX_TOKENS` is **1000**, sized against the measured ~21 ms/output-token
+> rate and the ≤5 × ~200-token structural worst case; the pair is held coherent by
+> `tests/test_conflict_constants.py`. The 9–11 s figure below is a genuine probe
+> datapoint, but it was the low end of the real distribution, not the middle. In production the calibrated floor (`0.76`) admits far fewer candidates per
 proposal, so real batches are smaller and faster; but the ≤5-width latency is a genuine
 prompt-fit datapoint, and per §6.2 the lever (smaller batches / tier change) is the
 **scheduled Sonnet-vs-Flash eval's** call, not a 4b tuning act.

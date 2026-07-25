@@ -49,7 +49,18 @@ if TYPE_CHECKING:
 CONFLICT_SURFACE_THRESHOLD = 0.85       # CONF-D4 — surface a not-tenable finding only at ≥ this confidence (high precision over recall; a sensor that cries wolf gets muted).
 CONFLICT_TOP_K = 5                      # CONF-D2/D7 — cap on the FINAL post-filter batch the LLM judge sees.
 CONFLICT_JUDGMENT_TEMPERATURE = 0.3     # CONF-D5 — nuance task; temp-0 over-literalizes the contradiction judgment.
-CONFLICT_LLM_TIMEOUT_S = 15             # CONF-D5/D10 — hard cap on the judgment call, 3× the P95 budget ("slow AI is failed AI", P14).
+# CONF-D5/D10 — hard cap on the judgment call ("slow AI is failed AI", P14). Raised
+# from 15s on 2026-07-26 against measured latency, not a budget estimate: the four
+# live batches in judgment_batches ran 5.5s / 11.3s / 13.8s / 14.6s — a median at 84%
+# of the old cap and a max at 97% of it. The old comment claimed "3x the P95 budget"
+# (i.e. a P95 of 5s); the observed MINIMUM was 5.5s. So the cap sat at the normal
+# distribution's right tail and its expiries were being read as environmental faults
+# rather than as the arithmetic they were. Sized now against _JUDGMENT_MAX_TOKENS:
+# latency tracks output at ~21ms/token at full batch width, so a maxed 1000-token
+# response lands near 21s + time-to-first-token, and 30 leaves genuine headroom while
+# still meaning "something is actually wrong". The pair is kept coherent by
+# tests/test_conflict_constants.py.
+CONFLICT_LLM_TIMEOUT_S = 30
 # CONF-D2 — the relevance gate that short-circuits the SONNET call. Recall-first
 # (OpEcon §11): the highest cutoff that still admits EVERY known-contradiction fixture.
 # ── Calibration block (Phase 4b, 2026-07-03; PLANNING_NOTES "show your work") ──────────

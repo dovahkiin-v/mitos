@@ -43,9 +43,14 @@ from mitos.models import get_model_id
 _JUDGMENT_MODEL_ALIAS = "SONNET"
 
 # Bounds the JSON-array OUTPUT (≤ CONFLICT_TOP_K rationale+verdict objects), not the input.
-# Sized for the worst-case 5-candidate batch's rationales; a generous cap, cheap because
-# output is what is billed and the judge emits at most K short objects.
-_JUDGMENT_MAX_TOKENS = 2000
+# Sized from measurement rather than generosity (2026-07-26): live batches emitted
+# 133-200 tokens per verdict, so the structural worst case is CONFLICT_TOP_K (5) x 200
+# = 1000. The old 2000 was not merely slack — it permitted an output that
+# CONFLICT_LLM_TIMEOUT_S could not wait for (~42s at the measured rate against a 15s
+# cap), which is the incoherence that made a full-width batch expected to time out.
+# Truncation itself is SAFE: parse_judgment_response rejects a short array on its
+# count check, so a cut response degrades to Unavailable, never to partial verdicts.
+_JUDGMENT_MAX_TOKENS = 1000
 
 
 def execute_judgment(
