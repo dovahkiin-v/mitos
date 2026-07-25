@@ -193,6 +193,93 @@ def test_sync_slug_collision_correction(mock_input: MagicMock, mock_client: Magi
     assert store.get_node_state(original_id) == "corrected"
 
 
+def _seed_active_decision(store: GraphStore, slug: str, axiom: str) -> str:
+    """Commits one active decision under ``slug`` and returns its node id."""
+    entry = ParsedEntry("decision", slug, 1, 10)
+    entry.axiom = axiom
+    entry.rejected_paths = "No SQL."
+    entry.scope = ["database"]
+    return store.commit_parsed_entry(entry).node_id
+
+
+@patch("google.genai.Client")
+def test_sync_undeclared_slug_collision_is_skipped_under_auto_accept(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """An UNDECLARED slug collision under ``--yes`` is reported and skipped, not auto-retired.
+
+    Auto-mode used to default the collision verb to ``corrects``, minting a killer node
+    that retired a real decision on nothing but a slug match. A canonical core can shift
+    from any hand-edit to a ``**Mechanisms:**`` line, so that default converted an
+    accident into permanent data loss (P5 Ironclad).
+    """
+    config, manager, tmpdir = sync_env
+    store = GraphStore(config.db_path)
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+
+    _seed_active_decision(store, "database", "We use PostgreSQL.")
+
+    # A colliding entry that declares NO relation at the slug it collides with.
+    with open(config.decisions_file, "a", encoding="utf-8") as f:
+        f.write(
+            "\n### database\n\n"
+            "**Decided:** We actually use SQLite for local WAL reads.\n"
+            "**Rejected:** PostgreSQL dependency.\n"
+            "**Mechanisms:** sqlite\n"
+        )
+
+    manager.perform_sync(auto_accept=True)
+
+    # Nothing committed, nothing retired.
+    nodes = store.get_all_nodes()
+    assert len(nodes) == 1, "the colliding entry must not commit"
+    assert store.get_edges() == [], "no kill-edge may be minted for an undeclared collision"
+    assert store.get_node_state(nodes[0]["id"]) == "active"
+
+    # The entry stays in the buffer, so the author can declare the relation and re-run.
+    with open(config.decisions_file, "r", encoding="utf-8") as f:
+        assert "### database" in f.read()
+
+
+@patch("google.genai.Client")
+def test_sync_declared_same_slug_supersession_commits_under_auto_accept(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """A DECLARED same-slug supersession commits as declared under ``--yes`` (MI-13 FM1).
+
+    The carve-out that keeps the skip above from breaking a supported pattern: an author
+    evolving an axiom while preserving the citation handle. The collision override must
+    not rewrite the declared ``supersedes`` into ``corrects``.
+    """
+    config, manager, tmpdir = sync_env
+    store = GraphStore(config.db_path)
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+
+    original_id = _seed_active_decision(store, "database", "We use PostgreSQL.")
+
+    with open(config.decisions_file, "a", encoding="utf-8") as f:
+        f.write(
+            "\n### database\n\n"
+            "**Decided:** We actually use SQLite for local WAL reads.\n"
+            "**Rejected:** PostgreSQL dependency.\n"
+            "**Mechanisms:** sqlite\n"
+            "**Supersedes:** [database]\n"
+        )
+
+    manager.perform_sync(auto_accept=True)
+
+    nodes = store.get_all_nodes()
+    assert len(nodes) == 2, "the declared supersession must commit"
+
+    edges = store.get_edges()
+    assert len(edges) == 1
+    assert edges[0]["edge_type"] == "supersedes", "a declared supersedes must not become corrects"
+
+    successor_id = [n["id"] for n in nodes if n["id"] != original_id][0]
+    assert store.get_node_state(original_id) == "superseded"
+    assert store.get_node_state(successor_id) == "active"
+
+
 @patch("google.genai.Client")
 def test_sync_outbox_queue_and_drain(mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]) -> None:
     """Verifies that failed embeddings enter pending_embeddings queue and drain on recovery (C2)."""

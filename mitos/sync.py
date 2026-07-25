@@ -47,7 +47,13 @@ from mitos.models import get_model_id
 from mitos.parser import (ParsedEntry, mask_inline_code, parse_entry_stream,
                           parse_file_reversed)
 from mitos.replay import commit_quarantine_fixpoint
-from mitos.store import GraphStore, CommitDelta, _utc_now_iso
+from mitos.store import (
+    GraphStore,
+    CommitDelta,
+    _utc_now_iso,
+    _strip_citation,
+    _KILL_EDGE_FIELDS,
+)
 from mitos.identity import SLUG_MAX_LEN, compute_node_id, embedding_text
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.vector_store import QdrantVectorStore, hash_to_uuid
@@ -717,14 +723,53 @@ class MitosSyncManager:
             edge_relationship: Optional[str] = None
             
             if collision:
-                print(f"\n[Collision] Slug '{entry.slug}' already exists in graph.")
-                print(f"  Existing Axiom: {collision.get('core_axiom')}")
-                print(f"  New Axiom:      {entry.axiom}")
-                
-                if auto_accept:
-                    # Default to correction in auto-mode
-                    edge_relationship = "corrects"
+                # A kill-edge the entry ALREADY declares at the colliding slug is the
+                # supported same-slug supersession pattern (MI-13 rationale / FM1): the
+                # author is evolving an axiom while keeping the citation handle. Commit
+                # it exactly as declared — the override below would rewrite a declared
+                # `supersedes` into `corrects` and silently contradict the author.
+                # Normalize exactly as the edge resolver does (``_strip_citation`` +
+                # casefold, MI-7): the deterministic parser stores `[slug]` with the
+                # brackets on, the agentic write path stores a bare slug, and both are
+                # the same declaration. Driving off ``_KILL_EDGE_FIELDS`` rather than a
+                # re-hand-rolled pair keeps this carve-out correct if the kill-edge set
+                # ever widens.
+                declared_kill = {
+                    _strip_citation(raw).casefold()
+                    for field in _KILL_EDGE_FIELDS
+                    for raw in (getattr(entry, field, None) or [])
+                }
+                if entry.slug.casefold() in declared_kill:
+                    print(
+                        f"\n[Collision] Slug '{entry.slug}' already exists in graph — "
+                        "the entry declares a relation at it; committing as declared."
+                    )
+                elif auto_accept:
+                    # An UNDECLARED collision in auto-mode is reported and skipped, never
+                    # auto-retired. Defaulting to `corrects` here mints a killer node that
+                    # retires a real decision on nothing but a slug match — and a canonical
+                    # core can shift from any hand-edit to a `**Mechanisms:**` line, so the
+                    # collision is as likely to be an accident as an intent (P5 Ironclad:
+                    # automated recovery never destroys user data). A vector, not a wall:
+                    # the entry stays in the buffer and the fix is one authored line.
+                    print(f"\n[Collision] Slug '{entry.slug}' already exists in graph.")
+                    print(f"  Existing Axiom: {collision.get('core_axiom')}")
+                    print(f"  New Axiom:      {entry.axiom}")
+                    print(
+                        "  Skipped — nothing written. This entry declares no relation at "
+                        f"'{entry.slug}', and auto-mode will not retire a decision on a "
+                        "slug match alone."
+                    )
+                    print(
+                        f"  To supersede it, add `**Supersedes:** [{entry.slug}]` to the "
+                        f"entry; to correct it, add `**Corrects:** [{entry.slug}]`. "
+                        "Then re-run sync."
+                    )
+                    continue
                 else:
+                    print(f"\n[Collision] Slug '{entry.slug}' already exists in graph.")
+                    print(f"  Existing Axiom: {collision.get('core_axiom')}")
+                    print(f"  New Axiom:      {entry.axiom}")
                     while True:
                         choice = input("Is this a [c]orrection, [s]upersession, or [a]bort? ").strip().lower()
                         if choice == 'c':
