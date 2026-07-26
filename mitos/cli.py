@@ -2215,7 +2215,22 @@ def cmd_restore_source(
             return 1
         targets = [slug]
     else:
-        targets = orphan_slugs
+        # Emit in COMMIT order, not the detector's report order (which is actives
+        # alphabetically, then retireds). Order decides whether the restored SET
+        # replays at all: every citation resolves against the active view, so a
+        # supersession emitted before the entry that amends its victim retires the
+        # target early and the amend is rejected. Measured on the live corpus — report
+        # order produced 24 missing cores and 31 casualties from three such roots, all
+        # of which vanished in commit order. `rowid` order is provably legal because it
+        # is the sequence in which those commits already succeeded.
+        slug_of = {n["id"]: n["slug"] for n in store.get_all_nodes()}
+        rank_of_slug = {}
+        for position, node_id in enumerate(store.node_ids_in_commit_order()):
+            slug = slug_of.get(node_id)
+            if slug is not None:
+                rank_of_slug[slug] = position
+        targets = sorted(orphan_slugs,
+                         key=lambda s: rank_of_slug.get(s, len(rank_of_slug)))
 
     if not targets:
         if as_json:
@@ -2252,7 +2267,10 @@ def cmd_restore_source(
         def _splice(original: str) -> str:
             """Inserts every block just below the entries marker, newest-first."""
             baseline["before"] = original
-            payload = "\n\n".join(b.rstrip("\n") for _s, b in blocks)
+            # REVERSED: the buffer is authored newest-first, so the oldest-committed
+            # block must land lowest — `parse_file_reversed` flips the file back to
+            # oldest-first for replay, which is the order the edges need.
+            payload = "\n\n".join(b.rstrip("\n") for _s, b in reversed(blocks))
             if _ENTRIES_MARKER in original:
                 return original.replace(
                     _ENTRIES_MARKER, f"{_ENTRIES_MARKER}\n\n{payload}\n", 1

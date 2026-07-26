@@ -492,3 +492,90 @@ def test_graph_fingerprint_moves_with_every_write_path(tmp_path):
                      ("2026-12-31T00:00:00.000000+00:00",))
     after_edit = store.graph_fingerprint()
     assert after_edit[0] == 2 and after_edit[1] != after_second[1]
+
+
+# --- emit ORDER, not just content (found running Phase 5 on the live corpus) -------
+
+def test_restored_blocks_replay_legally_when_one_supersedes_another(tmp_path, capsys):
+    """A restored SET must be replayable, not merely individually faithful.
+
+    Every citation resolves against the ACTIVE view (`store.py`'s
+    `STORE_DANGLING_EDGE`: "a {edge_type} edge must target an active entry"), which
+    makes it a COMMIT-TIME rule rather than an invariant on the final state — a
+    completed supersession permanently points at a retired node, and that is fine
+    because the target was active at the moment the citer committed.
+
+    So emit order decides whether the corpus replays. Restoring in the detector's
+    report order (actives alphabetically, then retireds) can put a supersession BEFORE
+    the entry that amends its victim: the target is retired early, the amend is
+    rejected, and `rebuild` refuses. Measured on the live corpus: 24 missing cores and
+    31 casualties from three such roots, all of which vanished when the set was emitted
+    in the order the nodes were originally committed.
+
+    That order is `rowid` — provably legal, because it is the sequence in which these
+    commits actually SUCCEEDED in this graph, so each one's constraints held in turn.
+    """
+    from mitos.cli import cmd_rebuild
+
+    older = _block("older-decision", "The original axiom.", mechanisms=("m1",))
+    amender = _block("amends-the-older", "An axiom that amends the original.",
+                     mechanisms=("m2",))
+    # Authored LAST, and it retires `older-decision`.
+    superseder = _block("supersedes-the-older", "The replacement axiom.",
+                        mechanisms=("m3",))
+
+    config = MitosConfig(str(tmp_path))
+    os.makedirs(config.mitos_dir, exist_ok=True)
+    with open(config.decisions_file, "w", encoding="utf-8") as fh:
+        fh.write(_SENTINEL + "\n\n")
+    store = GraphStore(config.db_path)
+
+    # Commit in true authoring order, so the amend lands while its target is active.
+    for block, extra in ((older, ""),
+                         (amender, "**Amends:** [older-decision]\n"),
+                         (superseder, "**Supersedes:** [older-decision]\n")):
+        for entry in parse_entry_stream(block + "\n" + extra, "decision"):
+            store.commit_parsed_entry(entry)
+
+    # Now orphan all three — this is the state the live corpus was in.
+    with open(config.decisions_file, "w", encoding="utf-8") as fh:
+        fh.write(_SENTINEL + "\n\n")
+
+    assert cmd_restore_source(config, all_graph_only=True) == 0
+    capsys.readouterr()
+
+    cmd_rebuild(config, allow_drops=False, assume_yes=True, as_json=True)
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["residual_casualties"] == [], payload["residual_casualties"]
+    assert payload["missing_cores"] == [], payload["missing_cores"]
+    assert payload["gate_passed"] is True, "the restored set must replay legally"
+
+
+def test_restore_emits_in_commit_order(tmp_path, capsys):
+    """The buffer is newest-first, so the OLDEST-committed block must land lowest.
+
+    Asserted on position rather than only on the gate, because the gate can pass for
+    the wrong reason on a corpus with no interdependencies — and this is the property
+    that makes it pass for the right one.
+    """
+    config = MitosConfig(str(tmp_path))
+    os.makedirs(config.mitos_dir, exist_ok=True)
+    with open(config.decisions_file, "w", encoding="utf-8") as fh:
+        fh.write(_SENTINEL + "\n\n")
+    store = GraphStore(config.db_path)
+    # Commit in an order that is NOT alphabetical, so report order cannot pass by luck.
+    for slug in ("zulu-first", "alpha-second", "mike-third"):
+        for entry in parse_entry_stream(_block(slug, f"Axiom for {slug}.",
+                                               mechanisms=(slug[:4],)), "decision"):
+            store.commit_parsed_entry(entry)
+    with open(config.decisions_file, "w", encoding="utf-8") as fh:
+        fh.write(_SENTINEL + "\n\n")
+
+    assert cmd_restore_source(config, all_graph_only=True) == 0
+    capsys.readouterr()
+
+    text = _buffer(config)
+    pos = {s: text.index(f"### {s}") for s in ("zulu-first", "alpha-second", "mike-third")}
+    assert pos["mike-third"] < pos["alpha-second"] < pos["zulu-first"], (
+        f"newest-committed must sit highest in the buffer, got {pos}"
+    )

@@ -2298,6 +2298,32 @@ class GraphStore:
         active.update(node["id"] for node in self.get_open_questions())
         return active
 
+    def node_ids_in_commit_order(self) -> List[str]:
+        """Returns every node id in the order it was committed into THIS graph file.
+
+        `rowid` order, and the guarantee that buys is stronger than "chronological":
+        it is the sequence in which these commits actually **succeeded**, so every
+        commit-time constraint held at each step. Replaying in this order therefore
+        reproduces a sequence already proven legal.
+
+        That matters because edge citations resolve against the **active view** — a
+        `{edge_type}` edge must target an *active* entry — which makes the rule
+        commit-time rather than an invariant on the final state. A completed
+        supersession permanently points at a retired node, and that is correct: the
+        target was active when the citer committed. So any consumer re-materializing a
+        SET of entries must emit them in an order where each citation's target still
+        commits first, and this is that order.
+
+        Returns:
+            Node ids, oldest commit first.
+        """
+        conn = self._get_connection()
+        try:
+            return [row["id"] for row in
+                    conn.execute("SELECT id FROM nodes ORDER BY rowid")]
+        finally:
+            conn.close()
+
     def graph_fingerprint(self) -> Tuple[int, str]:
         """Returns a cheap ``(node_count, max_updated_at)`` change fingerprint.
 
