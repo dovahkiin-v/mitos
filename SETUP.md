@@ -404,6 +404,14 @@ restored entry would mean inventing a date in your gold source.
 
 `--slug <name>` restores one node; `--json` emits a machine-readable report.
 
+> **One more reason to restore rather than live with it.** `mitos rebuild` carries
+> `confirmed_by`, `confirmed_at` and `created_at` forward from the graph it replaces —
+> those three have no markdown home, so a rebuild replaying only the corpus would
+> otherwise re-mint all three and leave you with a corpus claiming it was decided the
+> day it was rebuilt. But carry-forward can only reach nodes the rebuild actually
+> reconstructs, so **a node with no source block loses its provenance along with
+> itself.** Restoring the blocks first is what lets the rebuild reach them.
+
 > **Commentary that differs is a separate case.** Today `mitos rebuild` is the only
 > thing that propagates a hand-edit to a committed entry; the rung reports the drift so
 > it is at least visible. Scope drift is worth acting on first — it is a *findability*

@@ -522,3 +522,160 @@ def test_cmd_rebuild_without_json_still_reports_progress(tmp_path, capsys):
     cmd_rebuild(config, allow_drops=False, assume_yes=True, as_json=False)
 
     assert "Committed node: citer" in capsys.readouterr().out
+
+
+# --- provenance carry-forward (P) -------------------------------------------------
+#
+# `confirmed_by`, `confirmed_at` and `created_at` have NO markdown home: nothing
+# authors them in the corpus, so a rebuild that replays only the markdown re-mints all
+# three from nothing. Measured on the live dogfood corpus before this shipped: a swap
+# destroyed 114 confirmation stamps (113 `agent` plus one model) and re-minted every
+# `created_at` to the rebuild's own month. Graph-side carry-forward is the ONLY
+# mechanism that can fix the dating dishonesty, because `created_at` has no markdown
+# home even in principle.
+
+def _stamp(config, slug, *, by, at, created):
+    """Stamps a node's provenance triple directly, as a legacy corpus would carry it."""
+    store = GraphStore(config.db_path)
+    with store._get_connection() as conn:
+        conn.execute(
+            "UPDATE nodes SET confirmed_by = ?, confirmed_at = ?, created_at = ? "
+            "WHERE slug = ?",
+            (by, at, created, slug),
+        )
+
+
+def _provenance(db_path, slug):
+    node = GraphStore(db_path, read_only=True).get_node_by_slug(slug)
+    return node["confirmed_by"], node["confirmed_at"], node["created_at"]
+
+
+def test_rebuild_carries_confirmation_and_creation_provenance_forward(tmp_path):
+    """The case that saves the live corpus's 114 stamps.
+
+    A rebuild has no value for any of the three — nothing authors them in markdown —
+    so it must take the old graph's, not mint fresh ones.
+    """
+    config = _config(tmp_path)
+    block = _decision("alpha", "Alpha axiom.", mechanisms=["m1"])
+    _commit(GraphStore(config.db_path), block)
+    _write(config.decisions_file, _stream(block))
+    _stamp(config, "alpha", by="agent", at="2026-06-23T13:04:17.147973+00:00",
+           created="2026-06-01T09:00:00.000000+00:00")
+
+    result = rebuild_and_gate(config, aside_db_path=_aside(config), strict=False)
+
+    assert _provenance(result.aside_db_path, "alpha") == (
+        "agent", "2026-06-23T13:04:17.147973+00:00", "2026-06-01T09:00:00.000000+00:00"
+    )
+
+
+def test_a_genuinely_new_entry_mints_fresh_provenance(tmp_path):
+    """Carry-forward must not fabricate provenance for a node the old graph never had."""
+    config = _config(tmp_path)
+    old = _decision("alpha", "Alpha axiom.", mechanisms=["m1"])
+    _commit(GraphStore(config.db_path), old)
+    _stamp(config, "alpha", by="agent", at="2026-06-23T13:04:17.147973+00:00",
+           created="2026-06-01T09:00:00.000000+00:00")
+    fresh = _decision("beta", "Beta axiom.", mechanisms=["m2"])
+    _write(config.decisions_file, _stream(fresh, old))
+
+    result = rebuild_and_gate(config, aside_db_path=_aside(config), strict=False)
+
+    carried = _provenance(result.aside_db_path, "alpha")
+    minted = _provenance(result.aside_db_path, "beta")
+    assert carried[0] == "agent", "the pre-existing node carries forward"
+    assert minted[0] is None, "a new node must not inherit anyone's confirmation"
+    # NOT asserted here: `minted[2] != carried[2]`. Two fresh mints differ by
+    # microseconds anyway, so it would hold even against a build that carries nothing.
+    # `minted[0] is None` is the assertion that actually catches fabrication.
+
+
+def test_created_at_survives_a_double_rebuild(tmp_path):
+    """Carry-forward must be idempotent, or every rebuild re-dates the corpus a little.
+
+    The first rebuild is the interesting one only if the second does not undo it: the
+    live graph after a swap becomes the reference graph for the next rebuild.
+    """
+    config = _config(tmp_path)
+    block = _decision("alpha", "Alpha axiom.", mechanisms=["m1"])
+    _commit(GraphStore(config.db_path), block)
+    _write(config.decisions_file, _stream(block))
+    _stamp(config, "alpha", by="agent", at="2026-06-23T13:04:17.147973+00:00",
+           created="2026-06-01T09:00:00.000000+00:00")
+
+    first = rebuild_and_gate(config, aside_db_path=_aside(config), strict=False)
+    once = _provenance(first.aside_db_path, "alpha")
+    # Make the rebuilt graph live, exactly as a swap would, then rebuild again.
+    import shutil as _shutil
+    _shutil.copy(first.aside_db_path, config.db_path)
+    second = rebuild_and_gate(config, aside_db_path=_aside(config) + "2", strict=False)
+
+    assert _provenance(second.aside_db_path, "alpha") == once
+
+
+def test_rebuild_against_an_absent_old_graph_still_succeeds(tmp_path):
+    """The vacuous-pass path: no reference graph means nothing to carry, not a crash.
+
+    Stated plainly: this does NOT discriminate the carry-forward — with no old graph,
+    carrying and not carrying are the same behaviour, so it passes against a build that
+    does neither. It pins the `os.path.exists` early return, and its value is that a
+    first-ever rebuild must not become a crash on a missing file.
+    """
+    config = _config(tmp_path)
+    block = _decision("alpha", "Alpha axiom.", mechanisms=["m1"])
+    _write(config.decisions_file, _stream(block))
+    assert not os.path.exists(config.db_path)
+
+    result = rebuild_and_gate(config, aside_db_path=_aside(config), strict=False)
+
+    assert result.decisions_committed == 1
+    by, at, created = _provenance(result.aside_db_path, "alpha")
+    assert by is None and at is None and created
+
+
+def test_a_legacy_naive_confirmed_at_is_carried_verbatim_not_normalized(tmp_path):
+    """A naive legacy stamp is carried AS-IS — normalizing would invent an offset.
+
+    118 of the live corpus's 125 stamps predate the MI-10 fix and carry no offset. The
+    writing machine's offset is not recorded, so assuming UTC would silently shift every
+    instant by hours — an honestly-imprecise value beats a precisely-wrong one. This is
+    a deliberate choice with a consequence worth pinning: carry-forward makes these
+    permanent, where the previous behaviour replaced all 118 with NULL. That is still
+    strictly better (a real value beats a lost one), and a normalization pass would be
+    its own recorded decision rather than a side effect of this one.
+    """
+    from datetime import datetime
+
+    config = _config(tmp_path)
+    block = _decision("alpha", "Alpha axiom.", mechanisms=["m1"])
+    _commit(GraphStore(config.db_path), block)
+    _write(config.decisions_file, _stream(block))
+    naive = "2026-05-02T11:00:00.000000"  # no offset, as the pre-MI-10 writers left it
+    _stamp(config, "alpha", by="agent", at=naive, created="2026-05-01T09:00:00+00:00")
+
+    result = rebuild_and_gate(config, aside_db_path=_aside(config), strict=False)
+
+    _by, at, _created = _provenance(result.aside_db_path, "alpha")
+    assert at == naive, "carried verbatim — no offset may be invented"
+    assert datetime.fromisoformat(at).tzinfo is None, "and it stays naive, knowingly"
+
+
+def test_the_carried_count_reaches_the_json_surface(tmp_path):
+    """`rebuild --json` reports the provenance rescue — the surface an operator trusts.
+
+    SETUP.md tells operators to read this command's JSON, and confirming that the
+    stamps survived is exactly what they need it for. A count that only appears on the
+    progress lines is invisible to the caller that matters.
+    """
+    config = _config(tmp_path)
+    block = _decision("alpha", "Alpha axiom.", mechanisms=["m1"])
+    _commit(GraphStore(config.db_path), block)
+    _write(config.decisions_file, _stream(block))
+    _stamp(config, "alpha", by="agent", at="2026-06-23T13:04:17.147973+00:00",
+           created="2026-06-01T09:00:00.000000+00:00")
+
+    result = rebuild_and_gate(config, aside_db_path=_aside(config), strict=False)
+
+    assert result.provenance_carried == 1
+    assert result.to_dict()["provenance_carried"] == 1

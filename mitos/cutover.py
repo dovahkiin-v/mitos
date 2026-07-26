@@ -191,6 +191,10 @@ class RebuildResult:
         residual_casualties: Entries the replay could not commit (``mitos rebuild``'s
             resilient path). Always empty for the strict ``cutover`` caller, which
             raises on a casualty instead.
+        provenance_carried: How many reconstructed nodes had ``confirmed_by`` /
+            ``confirmed_at`` / ``created_at`` written from the graph being replaced.
+            Reaches ``--json`` because an operator confirming the provenance rescue
+            reads the machine surface, not the progress lines.
     """
 
     aside_db_path: str
@@ -200,6 +204,7 @@ class RebuildResult:
     reconstructed_active_count: int
     missing_cores: List[MissingCore]
     residual_casualties: List[Casualty] = field(default_factory=list)
+    provenance_carried: int = 0
 
     @property
     def gate_passed(self) -> bool:
@@ -225,6 +230,7 @@ class RebuildResult:
             "reconstructed_active_count": self.reconstructed_active_count,
             "missing_cores": [mc.to_dict() for mc in self.missing_cores],
             "residual_casualties": [c.to_dict() for c in self.residual_casualties],
+            "provenance_carried": self.provenance_carried,
             "gate_passed": self.gate_passed,
         }
 
@@ -244,6 +250,94 @@ def default_aside_db_path(config: MitosConfig) -> str:
         ``<config.mitos_dir>/graph.sqlite.rebuild``.
     """
     return os.path.join(config.mitos_dir, "graph.sqlite.rebuild")
+
+
+def _carry_provenance_forward(old_db_path: str, aside_db_path: str) -> int:
+    """Copies `confirmed_by`/`confirmed_at`/`created_at` from the old graph by node id.
+
+    These three have **no markdown home**: nothing authors them in the corpus, so a
+    rebuild replaying only the markdown re-mints all three from nothing. Measured on the
+    live dogfood corpus before this shipped — a swap destroyed 124 confirmation stamps
+    and re-dated every ``created_at`` to the rebuild's own month, which is a corpus
+    claiming it was decided the day it was rebuilt.
+
+    Graph-side carry-forward is the ONLY mechanism that can fix the dating: giving the
+    confirmation pair a markdown field was weighed and deliberately deferred (a verified
+    one-way door — every earlier parser hard-rejects an unrecognized field, with no
+    rollback), and ``created_at`` has no markdown home even in principle.
+
+    **Two residuals, named rather than left to be discovered.**
+
+    1. *A legacy naive ``confirmed_at`` is carried VERBATIM, not normalized.* 118 of the
+       live corpus's 125 stamps predate the MI-10 fix and carry no offset. Normalizing
+       would mean inventing one — the writing machine's offset is not recorded, so
+       assuming UTC would silently shift every instant by hours. Carrying an
+       honestly-imprecise value beats fabricating a precise wrong one, and it is still
+       strictly better than the previous behaviour, which replaced all 118 with NULL.
+       The consequence is that carry-forward makes them permanent where a rebuild used
+       to wash them out; a normalization pass would be its own recorded decision.
+    2. *This is not a complete sweep of graph-primary state.* Two other field classes
+       have no markdown home and are still lost on every rebuild: ``signals`` rows
+       (including MI-4's ``source_reencounter`` audit channel) are destroyed outright,
+       and ``mechanisms.created_at`` is re-minted. Both are pre-existing defects this
+       carry-forward did not create and does not fix — stated because the wording above
+       otherwise reads as a finished job.
+
+    Keyed on node id, so a decision the rebuild reconstructs identically keeps its
+    history while a genuinely new entry mints fresh. Idempotent by construction: a
+    second rebuild reads the swapped-in graph, which already carries the values.
+
+    Runs read-only against the old graph — the same file the completeness gate already
+    opens — and writes only into the build-aside DB, so a failure here can never touch
+    the live graph.
+
+    Args:
+        old_db_path: The live graph being replaced. An absent file is a no-op.
+        aside_db_path: The freshly rebuilt graph.
+
+    Returns:
+        How many old-graph nodes the rebuild reconstructed, and so had their provenance
+        written. NOT a delta — SQLite's ``rowcount`` counts matched rows, so a
+        steady-state rebuild reports the whole surviving corpus rather than "what
+        changed".
+    """
+    if not os.path.exists(old_db_path):
+        # The vacuous-pass path: no reference graph means nothing to carry, and a
+        # first-ever rebuild is not a provenance loss.
+        return 0
+
+    old_conn = open_connection(old_db_path, read_only=True)
+    try:
+        if is_pre_v1a_schema(old_conn):
+            # A prototype graph's identities are not comparable — the cutover exists
+            # precisely because the node ids differ — so there is nothing to key on.
+            return 0
+        stored = {
+            row["id"]: (row["confirmed_by"], row["confirmed_at"], row["created_at"])
+            for row in old_conn.execute(
+                "SELECT id, confirmed_by, confirmed_at, created_at FROM nodes"
+            )
+        }
+    finally:
+        old_conn.close()
+
+    if not stored:
+        return 0
+
+    carried = 0
+    conn = open_connection(aside_db_path)
+    try:
+        with conn:
+            for node_id, (by, at, created) in stored.items():
+                cursor = conn.execute(
+                    "UPDATE nodes SET confirmed_by = ?, confirmed_at = ?, created_at = ? "
+                    "WHERE id = ?",
+                    (by, at, created, node_id),
+                )
+                carried += cursor.rowcount
+    finally:
+        conn.close()
+    return carried
 
 
 def rebuild_and_gate(
@@ -326,6 +420,16 @@ def rebuild_and_gate(
         ) from exc
     residual_casualties = [_casualty_from(entry, exc) for entry, exc in casualties]
 
+    # 3b. Carry provenance forward from the graph being replaced. Must happen BEFORE the
+    #     gate and the swap, so the aside DB is already honest if it becomes live.
+    carried = _carry_provenance_forward(config.db_path, aside_db_path)
+    if carried and not quiet:
+        # No ✓ here: the gate has not ruled yet, and on a refusal this aside DB is
+        # discarded — a checkmark would assert a completed action on a file the next run
+        # deletes. Stated as what it is, a step of the build.
+        print(f"Provenance written for {carried} reconstructed node(s) "
+              f"(from the graph being replaced)")
+
     # 4. Bound the embedding seed to the active set. Every commit self-enqueued one
     #    pending_embeddings row (5c), so the queue holds the whole corpus incl. dead
     #    nodes; prune it to the store's own active set (G5 — never a re-encoded
@@ -358,6 +462,7 @@ def rebuild_and_gate(
         reconstructed_active_count=len(reconstructed_active_ids),
         missing_cores=missing_cores,
         residual_casualties=residual_casualties,
+        provenance_carried=carried,
     )
 
 
