@@ -1104,3 +1104,213 @@ def test_field_map_regex_rejects_malformed_field_names(monkeypatch) -> None:
     # (special_mappings + alias_variations only ever add space/underscore/hyphen keys.)
     for key in fm:
         assert re.fullmatch(r"[a-z _-]+", key), f"unexpected chars in harvested key {key!r}"
+
+
+# ---------------------------------------------------------------------------
+# Legacy `rotation_mode = "mark"` buffers — permanent read tolerance
+# ---------------------------------------------------------------------------
+#
+# The shipped mark writer wrapped a synced block as
+#     <!-- ROTATED START
+#     …the entry…
+#     ROTATED END -->
+# and the entry-stream tokenizer keeps HTML comments as literal field text
+# (V1-D7), so neither sentinel was recognized as a delimiter. Both survived as
+# ordinary lines and were absorbed as CONTINUATION lines of the adjacent field —
+# and when that field is `**Mechanisms:**`, part of the canonical core, the node
+# id SHIFTS. The leading sentinel does this to the entry ABOVE the block, which
+# was never rotated and may be un-synced live work.
+#
+# The mode is deprecated, but buffers marked in the wild are never rewritten, so
+# this tolerance is permanent. Its precise shape matters: the sentinel LINES are
+# non-content, the ENCLOSED BLOCK REMAINS CONTENT. Skipping the whole span would
+# silently turn every legacy mark buffer into rebuild-lossy `prune` — re-creating
+# the exact defect being deprecated.
+
+_HEADER = ("# Decisions\n"
+           "<!-- BEGIN ENTRIES — new decisions go directly below this line, newest first -->\n")
+_ABOVE = ("\n### entry-above\n\n"
+          "**Decided:** The entry above stays live.\n"
+          "**Rejected:** Nothing.\n"
+          "**Mechanisms:** sqlite\n")
+_BELOW = ("\n### entry-below\n\n"
+          "**Decided:** The entry below was rotated.\n"
+          "**Rejected:** Nothing.\n"
+          "**Mechanisms:** qdrant\n")
+
+
+def _fields_and_ids(text: str):
+    """Parses a decision stream and returns {slug: (fields…, node_id)} plus failures."""
+    failures = []
+    entries = parse_entry_stream(text, "decision", failures=failures)
+    out = {}
+    for e in entries:
+        out[e.slug] = {
+            "axiom": e.axiom,
+            "rejected_paths": e.rejected_paths,
+            "mechanisms": e.mechanisms,
+            "scope": e.scope,
+            "context": e.context,
+            "id": identity.compute_node_id(
+                kind=e.kind, axiom=e.axiom, mechanism_refs=e.mechanisms,
+                topic=e.topic, questions_raised=e.questions_raised,
+            ),
+        }
+    return out, failures
+
+
+def test_legacy_mark_wrapped_buffer_parses_field_identical_to_the_unrotated_corpus() -> None:
+    """A mark-wrapped buffer parses byte-identically to the same corpus unwrapped.
+
+    Both entries, not just the wrapped one — the leading sentinel corrupts the entry
+    ABOVE the block. Node ids must be stable for both, or the next sync sees each
+    mangled entry as a new node colliding on slug.
+    """
+    clean = _HEADER + _ABOVE + _BELOW
+    wrapped = _HEADER + _ABOVE + "\n<!-- ROTATED START\n" + _BELOW.strip("\n") + "\nROTATED END -->\n"
+
+    clean_parsed, clean_failures = _fields_and_ids(clean)
+    wrapped_parsed, wrapped_failures = _fields_and_ids(wrapped)
+
+    assert clean_failures == [] and wrapped_failures == []
+    assert set(wrapped_parsed) == {"entry-above", "entry-below"}
+    for slug in ("entry-above", "entry-below"):
+        assert wrapped_parsed[slug] == clean_parsed[slug], (
+            f"{slug} parsed differently inside a legacy mark wrapper"
+        )
+
+
+def test_legacy_mark_sentinels_are_non_content_but_the_block_stays_content() -> None:
+    """The enclosed entry is still parsed — the tolerance must not act like `prune`.
+
+    Treating the whole span as skippable would leave the node with no source block,
+    which is precisely what breaks `rebuild` and what deprecating `prune` fixes.
+    """
+    wrapped = _HEADER + "\n<!-- ROTATED START\n" + _BELOW.strip("\n") + "\nROTATED END -->\n"
+    parsed, failures = _fields_and_ids(wrapped)
+
+    assert failures == []
+    assert "entry-below" in parsed, "the enclosed block must remain content"
+    assert parsed["entry-below"]["mechanisms"] == ["qdrant"]
+    # No sentinel text bled into any field.
+    for value in parsed["entry-below"].values():
+        rendered = " ".join(value) if isinstance(value, list) else str(value)
+        assert "ROTATED START" not in rendered and "ROTATED END" not in rendered
+
+
+def test_rotated_sentinels_inside_a_transcript_stay_literal_text() -> None:
+    """A sentinel-looking line inside `[DECISION_TRANSCRIPT]` is transcript prose.
+
+    The transcript block is protected content by design; the tolerance must not
+    reach into it and silently delete a line an author wrote.
+    """
+    text = (
+        _HEADER
+        + "\n### quoted-sentinel\n\n"
+        "**Decided:** Transcripts keep their text verbatim.\n"
+        "**Rejected:** Stripping them.\n"
+        "**Mechanisms:** python\n"
+        "[DECISION_TRANSCRIPT]\n"
+        "<!-- ROTATED START\n"
+        "someone pasted a marked buffer into the transcript\n"
+        "ROTATED END -->\n"
+        "[/DECISION_TRANSCRIPT]\n"
+    )
+    failures = []
+    entries = parse_entry_stream(text, "decision", failures=failures)
+    assert failures == []
+    assert len(entries) == 1
+    transcript = entries[0].transcript or ""
+    assert "<!-- ROTATED START" in transcript
+    assert "ROTATED END -->" in transcript
+
+
+def test_a_sentinel_never_sits_inside_an_entrys_rotation_span() -> None:
+    """Neither neighbouring span may contain a legacy sentinel line.
+
+    `sync` slices the raw buffer by `[line_start, line_end]` to rotate an entry, so a
+    sentinel inside a span is carried into the archive while its partner stays behind.
+    A stranded `<!-- ROTATED START` is an unterminated HTML comment, and
+    `strip_html_comments` carries that state across lines — blanking every entry below
+    it for `parse_decisions_file`, the lexical fallback's only reader. Degraded search
+    would go silently blind over text sitting right there in the file.
+
+    Excluding the sentinels from BOTH spans keeps the pair intact under any rotation
+    order: whichever entry moves, the pair stays put wrapping nothing, which is a
+    well-formed comment every reader already handles.
+    """
+    from mitos.parser import _split_entry_sections
+
+    text = (
+        _HEADER
+        + _ABOVE
+        + "\n<!-- ROTATED START\n" + _BELOW.strip("\n") + "\nROTATED END -->\n"
+        + "\n### entry-after\n\n"
+        "**Decided:** The entry after the wrapper.\n"
+        "**Rejected:** Nothing.\n"
+        "**Mechanisms:** redis\n"
+    )
+    lines = text.splitlines()
+    sections = _split_entry_sections(lines, 2)
+    assert [s["header_line"].strip() for s in sections] == [
+        "### entry-above", "### entry-below", "### entry-after"
+    ]
+    for section in sections:
+        span = lines[section["line_start"] - 1 : section["line_end"]]
+        offenders = [ln for ln in span if ln.strip() in
+                     {"<!-- ROTATED START", "ROTATED END -->"}]
+        assert offenders == [], f"{section['header_line']!r} span carries {offenders}"
+
+
+def test_a_sentinel_inside_a_fenced_block_is_author_content() -> None:
+    """A decision documenting the retired wrapper in a ``` block keeps its lines.
+
+    The tolerance drops the wrapper mitos itself wrote, not prose about it — and a
+    decision explaining why `mark` was deprecated is exactly the entry most likely to
+    quote the format.
+    """
+    text = (
+        _HEADER
+        + "\n### documents-the-wrapper\n\n"
+        "**Decided:** The retired mark writer emitted a two-line wrapper.\n"
+        "**Rejected:** Nothing.\n"
+        "**Mechanisms:** python\n"
+        "**Context:** It looked like this:\n"
+        "```\n"
+        "<!-- ROTATED START\n"
+        "the entry body\n"
+        "ROTATED END -->\n"
+        "```\n"
+        "and that shape is what shifted the node id.\n"
+    )
+    failures = []
+    entries = parse_entry_stream(text, "decision", failures=failures)
+    assert failures == []
+    context = entries[0].context or ""
+    assert "<!-- ROTATED START" in context, "in-fence prose must survive"
+    assert "ROTATED END -->" in context
+
+
+def test_dropped_sentinels_do_not_shift_parse_error_line_numbers() -> None:
+    """A structural defect is still reported at its true file line.
+
+    The tolerance consumes sentinels in the tokenizer, which walks the section's
+    lines by offset from `line_start` — so dropping a line at the SPLITTER instead
+    would slide every later diagnostic up by one, pointing authors at a line that is
+    not there.
+    """
+    text = (
+        _HEADER
+        + "\n### has-a-bogus-field\n\n"
+        "**Decided:** An axiom.\n"
+        "ROTATED END -->\n"
+        "**Bogusfield:** not a real field\n"
+        "**Rejected:** Nothing.\n"
+    )
+    bogus_line = text.splitlines().index("**Bogusfield:** not a real field") + 1
+    failures = []
+    parse_entry_stream(text, "decision", failures=failures)
+    assert failures, "an unrecognized field must be reported"
+    reported = [i.line_start for f in failures for i in f.items
+                if "Bogusfield" in (i.message or "")]
+    assert reported == [bogus_line], f"reported {reported}, true line {bogus_line}"

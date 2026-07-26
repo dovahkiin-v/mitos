@@ -469,3 +469,56 @@ def test_cmd_rebuild_refusal_prints_actionable_remediation(tmp_path, capsys):
     assert "dangling_edge" in out            # per-class fix
     assert "active successor" in out
     assert "--allow-drops" in out            # the safe escape
+
+
+def _forward_ref_corpus(config):
+    """Writes a corpus whose OLDEST entry cites its newest — forcing the quarantine.
+
+    Replay is oldest-first, so a citation pointing at a later entry cannot resolve on
+    the first attempt: the entry quarantines and is retried by the fixpoint, which is
+    the only path that prints ``Committed node: … ✓``.
+    """
+    target = _decision("target", "The cited axiom.", mechanisms=["m2"])
+    citer = _decision("citer", "The citing axiom.", mechanisms=["m1"], cites="target")
+    # `cmd_rebuild` needs a live graph to gate against; seed it target-first so the
+    # citation resolves there, then author the corpus newest-first so the REBUILD
+    # replays `citer` before its target and has to quarantine it.
+    _commit(GraphStore(config.db_path), target, citer)
+    _write(config.decisions_file, _stream(target, citer))
+
+
+def test_cmd_rebuild_json_emits_only_the_object(tmp_path, capsys):
+    """`rebuild --json` puts ONE parseable object on stdout, nothing else.
+
+    ``replay.commit_quarantine_fixpoint`` printed ``Committed node: … ✓``
+    unconditionally — 40 lines ahead of the object on the live corpus — so
+    ``json.loads(stdout)`` failed outright. That is a contract break, not cosmetic
+    noise: the corpus repair's whole verification is reading ``gate_passed`` out of
+    this command, and a caller cannot parse what it cannot parse.
+    """
+    import json
+
+    config = _config(tmp_path)
+    _forward_ref_corpus(config)
+
+    cmd_rebuild(config, allow_drops=False, assume_yes=True, as_json=True)
+
+    out = capsys.readouterr().out
+    assert "Committed node:" not in out
+    payload = json.loads(out)
+    assert payload["decisions_committed"] == 2
+    assert payload["residual_casualties"] == []
+
+
+def test_cmd_rebuild_without_json_still_reports_progress(tmp_path, capsys):
+    """The human surface keeps its per-commit lines — the gate is `--json`, not silence.
+
+    Guards the over-correction: silencing the fixpoint unconditionally would take the
+    only progress signal off the interactive path too.
+    """
+    config = _config(tmp_path)
+    _forward_ref_corpus(config)
+
+    cmd_rebuild(config, allow_drops=False, assume_yes=True, as_json=False)
+
+    assert "Committed node: citer" in capsys.readouterr().out

@@ -2148,7 +2148,7 @@ def cmd_cutover(
     #    to main()'s `except MitosError` boundary (one-line error, exit 1) — never
     #    overridable here, it is malformed markdown the operator must fix.
     aside_db_path = default_aside_db_path(config)
-    result = rebuild_and_gate(config, aside_db_path=aside_db_path)
+    result = rebuild_and_gate(config, aside_db_path=aside_db_path, quiet=as_json)
 
     qdrant_wipe_cmd = (
         f"curl -X DELETE {config.qdrant_url}/collections/{config.qdrant_collection}"
@@ -2350,7 +2350,8 @@ def cmd_rebuild(
     # 2. Rebuild + gate (resilient: casualties are surfaced, not raised). A corpus
     #    FORMAT defect still raises CutoverError → main()'s boundary (exit 1).
     aside_db_path = default_aside_db_path(config)
-    result = rebuild_and_gate(config, aside_db_path=aside_db_path, strict=False)
+    result = rebuild_and_gate(config, aside_db_path=aside_db_path, strict=False,
+                              quiet=as_json)
 
     # 3. Present the verdict.
     if not as_json:
@@ -3520,6 +3521,38 @@ def _enter_target_directory(directory: Optional[str]) -> None:
     os.chdir(directory)
 
 
+def _warn_deprecated_rotation_mode(config: MitosConfig) -> None:
+    """Prints one calm stderr line when the workspace configures a deprecated mode.
+
+    Epoch 1 of narrowing ``rotation_mode`` to ``archive``: the value is accepted and
+    pinned by the loader, and this is what keeps that coercion from being *silent* —
+    which is the thing ``config-loader-rotation-mode-enum-hard-fail`` forbids.
+
+    Called at verb dispatch and **only** there. A once-per-invocation guard inside the
+    loader would need module-level state, which makes "warns once" tests
+    order-dependent inside one pytest process; dispatch needs no flag, because the CLI
+    is a fresh process per invocation. It also keeps MCP TOOL CALLS silent:
+    ``mcp_server`` builds a ``MitosConfig`` per call over a stdio JSON-RPC channel, so
+    a warning there would be per-call spam — and on stdout, protocol corruption. No
+    config author is present on that surface anyway. (``mitos serve`` itself routes
+    through ``main`` and so warns once at startup, on stderr, before the protocol
+    opens — harmless, and the operator launching the server is a fair audience.)
+
+    Args:
+        config: The dispatch-time configuration.
+    """
+    mode = getattr(config, "deprecated_rotation_mode", None)
+    if not mode:
+        return
+    print(
+        f"Warning: rotation_mode = '{mode}' is deprecated and now behaves as "
+        "'archive'. Rotated entries are written to decisions/archive/ instead of "
+        f"{'being wrapped in place' if mode == 'mark' else 'being discarded'}; "
+        "update .mitos/config.toml to silence this.",
+        file=sys.stderr,
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Builds the CLI argument parser.
 
@@ -3795,6 +3828,16 @@ def main() -> None:
         load_dotenv_file()
         load_dotenv_file(global_env_path())
         config = MitosConfig()
+        # Warn about the workspace the VERB will act on, not merely the CWD. `status`
+        # and `agent-block` take a path argument and build their own config for it, so
+        # warning on the CWD config would stay silent about the very workspace the
+        # operator asked to diagnose — and `mitos status` is precisely the command the
+        # deprecation's rationale names as the one that must keep working.
+        _warn_target = getattr(args, "path", None) if args.command in (
+            "status", "agent-block") else None
+        _warn_deprecated_rotation_mode(
+            MitosConfig(_warn_target) if _warn_target else config
+        )
         if args.command == "init":
             cmd_init(config)
         elif args.command == "sync":

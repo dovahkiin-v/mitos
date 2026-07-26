@@ -8,7 +8,7 @@ import os
 import re
 import sys
 import tomllib
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from mitos.errors import ConfigError
 
@@ -73,6 +73,40 @@ RETIRED_CONFIG_KEYS: frozenset = frozenset(
 # then archiving when the author meant "mark" is exactly the silent-coerce OD1
 # forbids (a deliberate behavior change from the prototype's silent-ignore).
 ROTATION_MODES = frozenset({"archive", "mark", "prune"})
+
+# Epoch 1 of narrowing `rotation_mode` to `archive`. Both values stay ACCEPTED and
+# both behave as `archive`; the CLI dispatcher prints one calm stderr line naming the
+# mode. Grounds are corpus preservation (P6/M7 rebuild-faithfulness) plus ROADMAP
+# Vision 7's "never an in-place purge" — deliberately NOT P5's literal "Sync never
+# deletes entries from decisions.md", which read alone would also indict `archive`.
+#
+#   `mark`  wraps a synced block as `<!-- ROTATED START … ROTATED END -->`, and the
+#           entry-stream tokenizer keeps comments as literal field text (V1-D7), so
+#           both sentinel lines are absorbed as CONTINUATION lines of the adjacent
+#           field. When that field is `**Mechanisms:**` the node id SHIFTS — for the
+#           rotated entry AND for the un-rotated one above it. The next sync then
+#           sees a new node colliding on slug. What shipped is also not what was
+#           designed: the design specifies a single-line `<!-- synced: … -->`
+#           annotation on an entry that stays live content, and two ADRs require any
+#           parser-skipped annotation to sit in a reserved namespace — `parser.py`
+#           has no namespace predicate at all. Deprecating it loses nothing that was
+#           ever built.
+#   `prune` removes the block from the buffer and writes it NOWHERE (the archive
+#           write is gated on `rotation_mode == "archive"`), so the node has no source
+#           block and `rebuild` — the tool's own repair story — permanently cannot
+#           reconstruct it. Its "for users who fully trust the graph as source"
+#           rationale belongs to the pre-M7/P6 "storage is the graph, markdown is a
+#           render target" direction, which was later reversed.
+#
+# The values are NOT removed from `ROTATION_MODES`. Removing them raises ConfigError
+# at load, which fires BEFORE verb dispatch and bricks the whole workspace — including
+# `mitos status`, the one command needed to diagnose it. Epoch 2 (moving the key into
+# `RETIRED_CONFIG_KEYS`) is tracked in ROADMAP and needs several releases of warning
+# first. The coercion is safe both ways: for `mark` it is a rescue (today's behaviour
+# is corruption); for `prune` it is strictly preserving (both remove from the buffer,
+# archive additionally keeps the text), the only user-visible delta being new files
+# under `decisions/archive/`, which the warning names.
+DEPRECATED_ROTATION_MODES = frozenset({"mark", "prune"})
 
 
 def _value_matches_type(value: Any, expected: type) -> bool:
@@ -257,6 +291,17 @@ class MitosConfig:
         for key, default in CONFIG_DEFAULTS.items():
             setattr(self, key, default)
 
+        # The configured-but-deprecated rotation mode, kept so the CLI dispatcher can
+        # name it in its one stderr line. `None` on every healthy workspace, so a
+        # clean project reads clean. The loader itself stays MUTE: `mitos status`
+        # builds a second MitosConfig of its own, and `mcp_server` builds one per tool
+        # call over a stdio JSON-RPC channel — a warning here would print twice on
+        # status, once per MCP call, and anything on stdout there is protocol
+        # corruption rather than noise. Warning at dispatch needs no once-flag (a
+        # fresh process per CLI invocation) and means MCP never warns, which is right:
+        # no config author is present on that surface.
+        self.deprecated_rotation_mode: Optional[str] = None
+
         self._load_config_file()
 
         # Env wins over the config file for the Qdrant URL — matching the key
@@ -343,6 +388,16 @@ class MitosConfig:
                     f"Config key 'rotation_mode' in {config_path} must be one of "
                     f"{{{allowed}}}, got {val!r}."
                 )
+
+            if key == "rotation_mode" and val in DEPRECATED_ROTATION_MODES:
+                # Epoch 1: accepted, pinned to `archive`, and remembered so the CLI
+                # dispatcher can name it. Not silent coercion — which is the thing
+                # `config-loader-rotation-mode-enum-hard-fail` forbids — because the
+                # dispatcher warns every run. That ADR commits to loud validation,
+                # not to three modes.
+                self.deprecated_rotation_mode = val
+                self.rotation_mode = "archive"
+                continue
 
             # Schema keys are exactly the attribute names (R12 surface).
             setattr(self, key, val)

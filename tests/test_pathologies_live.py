@@ -277,17 +277,43 @@ def test_pathology_sync_advisory_lock_serialization(isolated_workspace) -> None:
 
 
 # ==============================================================================
-# P6 — Alternate Rotation Modes: Prune and Mark
+# P6 — Deprecated Rotation Modes: Prune and Mark both behave as Archive
 # ==============================================================================
+def _write_rotation_mode(config, mode: str) -> None:
+    """Writes `rotation_mode` into the workspace's config.toml and reloads it.
+
+    The epoch-1 pinning lives in the config LOADER, so a test that assigns
+    ``config.rotation_mode`` directly bypasses the behaviour it means to check.
+
+    Args:
+        config: The workspace config to rewrite and reload in place.
+        mode: The rotation mode to write.
+    """
+    from mitos.config import MitosConfig
+
+    os.makedirs(config.mitos_dir, exist_ok=True)
+    with open(os.path.join(config.mitos_dir, "config.toml"), "w", encoding="utf-8") as f:
+        f.write(f'rotation_mode = "{mode}"\n')
+    config.rotation_mode = MitosConfig(config.workspace_dir).rotation_mode
 @pytest.mark.skipif(not HAS_LIVE_KEYS, reason="Requires live GEMINI API key")
-def test_pathology_rotation_mode_prune(isolated_workspace) -> None:
-    """Verifies that rotation_mode='prune' deletes entries from buffer instead of archiving."""
+def test_pathology_rotation_mode_prune_now_behaves_as_archive(isolated_workspace) -> None:
+    """A `prune` workspace now ARCHIVES — the deprecation's regression fixture.
+
+    Retargeted from "prune deletes entries from the buffer instead of archiving".
+    `prune` removed the block from the buffer and wrote it NOWHERE, so the node had
+    no source block and `rebuild` — the tool's own repair story — could never
+    reconstruct it. The coercion is strictly preserving: both modes clear the buffer,
+    archive additionally keeps the text.
+
+    The mode is loaded from `.mitos/config.toml`, not assigned onto the config
+    object, because the pinning lives in the loader — assigning the attribute
+    directly would bypass the very behaviour under test.
+    """
     config, tmpdir = isolated_workspace
     from mitos.cli import cmd_init, cmd_sync
     cmd_init(config)
-    
-    # Configure rotation mode override to prune
-    config.rotation_mode = "prune"
+
+    _write_rotation_mode(config, "prune")
     config.pending_threshold = 1 # Immediate rotation
     
     # Write a new entry to decisions.md
@@ -303,24 +329,37 @@ def test_pathology_rotation_mode_prune(isolated_workspace) -> None:
         
     cmd_sync(config, auto_accept=True)
     
-    # Verify buffer is cleared
+    # Buffer is cleared, exactly as `prune` did.
     with open(config.decisions_file, "r", encoding="utf-8") as f:
         content = f.read()
     assert "s1-prune" not in content
-    
-    # Verify no archive file was created in archive directory
-    assert not os.path.exists(config.archive_dir) or len(os.listdir(config.archive_dir)) == 0
+
+    # But the text SURVIVES in the archive now — the whole point of the deprecation.
+    # Under `prune` the entry existed in neither the buffer nor an archive, and its
+    # node was permanently unreconstructable.
+    assert os.path.exists(config.archive_dir)
+    archives = os.listdir(config.archive_dir)
+    assert len(archives) == 1
+    with open(os.path.join(config.archive_dir, archives[0]), "r", encoding="utf-8") as f:
+        assert "s1-prune" in f.read()
 
 
 @pytest.mark.skipif(not HAS_LIVE_KEYS, reason="Requires live GEMINI API key")
-def test_pathology_rotation_mode_mark(isolated_workspace) -> None:
-    """Verifies that rotation_mode='mark' comments out entries in buffer instead of deleting or archiving."""
+def test_pathology_rotation_mode_mark_now_behaves_as_archive(isolated_workspace) -> None:
+    """A `mark` workspace now ARCHIVES and writes NO sentinel wrapper.
+
+    Retargeted from "mark comments out entries in the buffer". The wrapper it wrote
+    was never recognized as a delimiter by the entry-stream tokenizer, so both
+    sentinel lines were absorbed as continuation lines of the adjacent field — and
+    when that field is `**Mechanisms:**`, part of the canonical core, the node id
+    shifts, for the rotated entry AND for the un-rotated one above it. Here the
+    coercion is a rescue, not merely a change.
+    """
     config, tmpdir = isolated_workspace
     from mitos.cli import cmd_init, cmd_sync
     cmd_init(config)
-    
-    # Configure rotation mode override to mark
-    config.rotation_mode = "mark"
+
+    _write_rotation_mode(config, "mark")
     config.pending_threshold = 1 # Immediate rotation
     
     # Write a new entry to decisions.md
@@ -336,15 +375,21 @@ def test_pathology_rotation_mode_mark(isolated_workspace) -> None:
         
     cmd_sync(config, auto_accept=True)
     
-    # Verify buffer still has it, but it is commented out
+    # No sentinel wrapper is written any more, anywhere.
     with open(config.decisions_file, "r", encoding="utf-8") as f:
         content = f.read()
-    assert "s1-mark" in content
-    assert "<!-- ROTATED START" in content
-    assert "ROTATED END -->" in content
-    
-    # Verify no archive file was created in archive directory
-    assert not os.path.exists(config.archive_dir) or len(os.listdir(config.archive_dir)) == 0
+    assert "s1-mark" not in content
+    assert "<!-- ROTATED START" not in content
+    assert "ROTATED END -->" not in content
+
+    # The entry is archived intact, so `rebuild` can still find its source block.
+    assert os.path.exists(config.archive_dir)
+    archives = os.listdir(config.archive_dir)
+    assert len(archives) == 1
+    with open(os.path.join(config.archive_dir, archives[0]), "r", encoding="utf-8") as f:
+        archived = f.read()
+    assert "s1-mark" in archived
+    assert "ROTATED" not in archived
 
 
 # ==============================================================================

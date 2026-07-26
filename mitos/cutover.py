@@ -247,7 +247,7 @@ def default_aside_db_path(config: MitosConfig) -> str:
 
 
 def rebuild_and_gate(
-    config: MitosConfig, *, aside_db_path: str, strict: bool = True
+    config: MitosConfig, *, aside_db_path: str, strict: bool = True, quiet: bool = False
 ) -> RebuildResult:
     """Re-parses the corpus, replays it oldest-first, then gates against the old graph.
 
@@ -311,7 +311,7 @@ def rebuild_and_gate(
     #    fixpoint; entries that still cannot commit come back as casualties.
     store = GraphStore(aside_db_path)
     decisions_committed, oq_committed, casualties = replay_corpus_oldest_first(
-        store, decision_entries, oq_entries
+        store, decision_entries, oq_entries, quiet=quiet
     )
     # Per-caller policy (the shared-helper decision): cutover (strict) halts on a
     # genuine defect — reproducing _commit_or_abort's contract on the first casualty;
@@ -605,6 +605,7 @@ def replay_corpus_oldest_first(
     oq_entries: List[ParsedEntry],
     *,
     embed_fn: Optional[Callable] = None,
+    quiet: bool = False,
 ) -> Tuple[int, int, List[Tuple[ParsedEntry, Exception]]]:
     """Replays both kind-streams oldest-first with quarantine + intra-sync fixpoint.
 
@@ -652,7 +653,7 @@ def replay_corpus_oldest_first(
         counts[entry.kind] += 1
 
     _committed, _passes, residual = commit_quarantine_fixpoint(
-        store, quarantined, embed_fn=embed_fn, on_commit=_count_commit
+        store, quarantined, embed_fn=embed_fn, on_commit=_count_commit, quiet=quiet
     )
     casualties.extend((entry, exc) for entry, _raw, exc in residual)
     return counts["decision"], counts["open_question"], casualties

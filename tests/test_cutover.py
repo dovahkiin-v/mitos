@@ -990,3 +990,44 @@ def test_cmd_cutover_json_success_payload(tmp_path, capsys):
     assert payload["gate_passed"] is True
     assert payload["bak_path"] and ".bak_" in payload["bak_path"]
     assert payload["qdrant_wipe_cmd"].startswith("curl -X DELETE")
+
+
+def test_legacy_mark_wrapped_buffer_still_feeds_the_rebuild_corpus_stream(tmp_path) -> None:
+    """A mark-wrapped entry is still rebuild source — the tolerance is not `prune`.
+
+    The reading that matters: the sentinel LINES are non-content, the ENCLOSED BLOCK
+    REMAINS CONTENT. Skipping the whole span would silently convert every legacy mark
+    buffer into rebuild-lossy `prune`, re-creating the exact defect the deprecation
+    exists to remove — and `rebuild` is the tool's own repair story, so a node whose
+    source block the stream skips is a node the repair can never reconstruct.
+    """
+    from mitos.config import MitosConfig
+    from mitos.cutover import _load_decision_stream
+
+    workspace = tmp_path / "ws"
+    (workspace / ".mitos").mkdir(parents=True)
+    (workspace / "decisions.md").write_text(
+        "# Decisions\n"
+        "<!-- BEGIN ENTRIES — new decisions go directly below this line, newest first -->\n"
+        "\n### live-entry\n\n"
+        "**Decided:** This one was never rotated.\n"
+        "**Rejected:** Nothing.\n"
+        "**Mechanisms:** sqlite\n"
+        "\n<!-- ROTATED START\n"
+        "### marked-entry\n\n"
+        "**Decided:** This one was rotated by the retired mark mode.\n"
+        "**Rejected:** Nothing.\n"
+        "**Mechanisms:** qdrant\n"
+        "ROTATED END -->\n",
+        encoding="utf-8",
+    )
+
+    failures: list = []
+    entries = _load_decision_stream(MitosConfig(str(workspace)), failures)
+
+    assert failures == []
+    by_slug = {e.slug: e for e in entries}
+    assert set(by_slug) == {"live-entry", "marked-entry"}
+    # Fields are clean on BOTH — the leading sentinel corrupts the entry above it.
+    assert by_slug["live-entry"].mechanisms == ["sqlite"]
+    assert by_slug["marked-entry"].mechanisms == ["qdrant"]

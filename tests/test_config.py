@@ -84,17 +84,21 @@ def test_default_collection_name_is_per_project() -> None:
 # ---------------------------------------------------------------------------
 
 def test_config_file_loading_applies_valid_overrides() -> None:
-    """A well-formed config.toml overlays recognized keys onto the defaults."""
+    """A well-formed config.toml overlays recognized keys onto the defaults.
+
+    `rotation_mode` deliberately does NOT appear: its only non-deprecated value is
+    `archive`, which is also its default, so it can no longer demonstrate that an
+    override was APPLIED — the assertion would pass even against a loader that
+    ignored the file. Its own contract is pinned by the deprecation tests below.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         _write_config(
             tmpdir,
-            'rotation_mode = "mark"\n'
             'rotation_volume_threshold_entries = 99\n'
             'qdrant_collection = "custom_collection"\n'
             'qdrant_url = "http://example:7333"\n',
         )
         config = MitosConfig(tmpdir)
-        assert config.rotation_mode == "mark"
         assert config.rotation_volume_threshold_entries == 99
         assert config.qdrant_collection == "custom_collection"
         assert config.qdrant_url == "http://example:7333"
@@ -102,12 +106,21 @@ def test_config_file_loading_applies_valid_overrides() -> None:
         assert config.stale_entry_window_days == CONFIG_DEFAULTS["stale_entry_window_days"]
 
 
-def test_config_all_rotation_modes_accepted() -> None:
-    """Every enum member of rotation_mode loads without raising."""
+def test_config_every_enum_member_still_loads_without_raising() -> None:
+    """No value in `ROTATION_MODES` bricks the workspace at load.
+
+    Retargeted from "each mode yields itself", and stated as the bare no-raise
+    property it now is: every member resolves to `archive`, so any per-mode assertion
+    would read as discriminating while checking nothing. That resolution is a real
+    contract, pinned by the deprecation tests below; THIS test exists for the reason
+    the epoch-1 shape exists at all — a `ConfigError` here fires inside
+    `MitosConfig()` construction, which `cli.py` performs before verb dispatch, so it
+    would take `mitos status` down with it.
+    """
     for mode in sorted(ROTATION_MODES):
         with tempfile.TemporaryDirectory() as tmpdir:
             _write_config(tmpdir, f'rotation_mode = "{mode}"\n')
-            assert MitosConfig(tmpdir).rotation_mode == mode
+            MitosConfig(tmpdir)  # must not raise
 
 
 # ---------------------------------------------------------------------------
@@ -245,14 +258,18 @@ def test_unreadable_config_raises_config_error() -> None:
 def test_missing_known_key_falls_back_to_default() -> None:
     """Deleting a key from a written file re-loads to the CONFIG_DEFAULTS value."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        # File sets only rotation_mode; everything else must default.
-        _write_config(tmpdir, 'rotation_mode = "prune"\n')
+        # File sets only stale_entry_window_days; everything else must default.
+        # (This used `rotation_mode = "prune"` as its one set key, which no longer
+        # demonstrates an applied override — `prune` is deprecated and pins to
+        # `archive`, which is also the default, so the assertion would pass either
+        # way. A key whose set value differs from its default is the real test.)
+        _write_config(tmpdir, 'stale_entry_window_days = 7\n')
         config = MitosConfig(tmpdir)
-        assert config.rotation_mode == "prune"
+        assert config.stale_entry_window_days == 7
         assert config.rotation_volume_threshold_entries == CONFIG_DEFAULTS[
             "rotation_volume_threshold_entries"
         ]
-        assert config.stale_entry_window_days == CONFIG_DEFAULTS["stale_entry_window_days"]
+        assert config.rotation_mode == CONFIG_DEFAULTS["rotation_mode"]
 
 
 def test_retired_keys_silent_unknown_keys_warn(capsys: pytest.CaptureFixture) -> None:
@@ -271,11 +288,13 @@ def test_retired_keys_silent_unknown_keys_warn(capsys: pytest.CaptureFixture) ->
             'pending_threshold = 99\n'
             'db_path = "/somewhere/else.sqlite"\n'
             'frobnicate = 1\n'
-            'rotation_mode = "mark"\n',
+            'stale_entry_window_days = 7\n',
         )
         config = MitosConfig(tmpdir)
-        # Recognized key still applies.
-        assert config.rotation_mode == "mark"
+        # Recognized key still applies. (Was `rotation_mode = "mark"`, retargeted:
+        # `mark` is deprecated and pins to `archive`, so it no longer demonstrates
+        # an applied override.)
+        assert config.stale_entry_window_days == 7
         # Retired file keys are ignored — the attributes keep their defaults.
         assert config.pending_threshold == 30
         assert "graph.sqlite" in config.db_path
@@ -432,3 +451,179 @@ def test_hint_due_debounces_within_window(tmp_path) -> None:
     assert hint_due("other_test.json", key, 10_000) is True
     # A zero-second window always re-fires (the elapsed time is never < 0).
     assert hint_due("overflow_test.json", key, 0) is True
+
+
+# ---------------------------------------------------------------------------
+# rotation_mode narrows to `archive` — epoch-1 accept-and-warn deprecation
+# ---------------------------------------------------------------------------
+
+def test_deprecated_rotation_modes_are_accepted_and_pinned_to_archive() -> None:
+    """`mark` and `prune` still LOAD, and both behave as `archive`.
+
+    Removing them from the enum would raise ``ConfigError`` at load — which fires
+    before verb dispatch, bricking the whole workspace including ``mitos status``,
+    the one command needed to diagnose it. A wall, not a vector, and a breaking
+    change with no epoch. So the values stay accepted and the attribute is pinned.
+    """
+    from mitos.config import DEPRECATED_ROTATION_MODES
+
+    assert DEPRECATED_ROTATION_MODES == {"mark", "prune"}
+    for mode in sorted(DEPRECATED_ROTATION_MODES):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _write_config(tmpdir, f'rotation_mode = "{mode}"\n')
+            config = MitosConfig(tmpdir)
+            assert config.rotation_mode == "archive", (
+                f"{mode!r} must behave as archive, not as itself"
+            )
+            assert config.deprecated_rotation_mode == mode, (
+                "the original value must survive so the CLI can name it in the warning"
+            )
+
+
+def test_archive_is_not_flagged_as_deprecated() -> None:
+    """The surviving mode carries no deprecation marker — a clean project stays quiet."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _write_config(tmpdir, 'rotation_mode = "archive"\n')
+        config = MitosConfig(tmpdir)
+        assert config.rotation_mode == "archive"
+        assert config.deprecated_rotation_mode is None
+
+
+def test_absent_rotation_mode_carries_no_deprecation_marker() -> None:
+    """A workspace with no config.toml at all is healthy and quiet (empty states first-class)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = MitosConfig(tmpdir)
+        assert config.rotation_mode == "archive"
+        assert config.deprecated_rotation_mode is None
+
+
+def test_unknown_rotation_mode_still_hard_fails() -> None:
+    """Deprecation is not a loosening: a typo is still a loud, located ConfigError.
+
+    ``config-loader-rotation-mode-enum-hard-fail`` commits to *loud validation*, not
+    to three modes. Silent coercion is what it forbids — and the epoch-1 warning is
+    exactly what keeps the coercion from being silent.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _write_config(tmpdir, 'rotation_mode = "archiv"\n')
+        with pytest.raises(ConfigError) as exc:
+            MitosConfig(tmpdir)
+        assert "rotation_mode" in str(exc.value)
+
+
+def test_config_loading_never_writes_to_stdout(capsys) -> None:
+    """A deprecated mode must not print to stdout — it would corrupt MCP's JSON-RPC.
+
+    ``mcp_server.py`` constructs ``MitosConfig()`` per tool call over a stdio
+    JSON-RPC channel, so anything on stdout there is protocol corruption rather than
+    noise. The warning is the CLI dispatcher's job, on stderr; the loader stays mute.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _write_config(tmpdir, 'rotation_mode = "mark"\n')
+        MitosConfig(tmpdir)
+    captured = capsys.readouterr()
+    assert captured.out == "", f"the config loader wrote to stdout: {captured.out!r}"
+    assert captured.err == "", (
+        "the loader must not warn either — per-construction warnings fire twice on "
+        "`mitos status` and once per MCP tool call"
+    )
+
+
+def test_deprecated_rotation_mode_warns_once_at_dispatch(tmp_path, monkeypatch, capsys) -> None:
+    """The CLI warns exactly once per invocation, on stderr, naming the mode.
+
+    "Once per invocation" is load-bearing: `cmd_status` builds a SECOND MitosConfig
+    of its own, so a warning inside the loader prints twice on `mitos status`. It is
+    emitted at verb dispatch instead, which needs no once-flag — a fresh process per
+    CLI invocation — and structurally cannot double-fire.
+    """
+    import sys as _sys
+    from mitos.cli import main
+
+    mitos_dir = tmp_path / ".mitos"
+    mitos_dir.mkdir()
+    (mitos_dir / "config.toml").write_text('rotation_mode = "mark"\n', encoding="utf-8")
+
+    monkeypatch.setattr(_sys, "argv", ["mitos", "-C", str(tmp_path), "status"])
+    try:
+        main()
+    except SystemExit:
+        pass
+
+    err = capsys.readouterr().err
+    assert err.count("rotation_mode = 'mark' is deprecated") == 1, (
+        f"expected exactly one deprecation warning, got:\n{err}"
+    )
+    assert "archive" in err, "the warning must name what happens instead"
+
+
+def test_clean_rotation_mode_warns_nothing_at_dispatch(tmp_path, monkeypatch, capsys) -> None:
+    """A healthy workspace prints no deprecation line — clean projects read clean."""
+    import sys as _sys
+    from mitos.cli import main
+
+    mitos_dir = tmp_path / ".mitos"
+    mitos_dir.mkdir()
+    (mitos_dir / "config.toml").write_text('rotation_mode = "archive"\n', encoding="utf-8")
+
+    monkeypatch.setattr(_sys, "argv", ["mitos", "-C", str(tmp_path), "status"])
+    try:
+        main()
+    except SystemExit:
+        pass
+
+    assert "deprecated" not in capsys.readouterr().err
+
+
+def test_status_with_a_path_warns_about_that_workspace(tmp_path, monkeypatch, capsys) -> None:
+    """`mitos status <path>` warns for the workspace it INSPECTS, not the CWD.
+
+    `cmd_status` builds its own config for the path argument, so warning on the
+    dispatcher's CWD config stayed silent about exactly the workspace the operator
+    asked to diagnose — while `mitos status` is the command this deprecation's own
+    rationale names as the one that must keep working.
+    """
+    import os as _os
+    import sys as _sys
+    from mitos.cli import main
+
+    target = tmp_path / "target"
+    (target / ".mitos").mkdir(parents=True)
+    (target / ".mitos" / "config.toml").write_text('rotation_mode = "prune"\n', encoding="utf-8")
+
+    clean_cwd = tmp_path / "clean"
+    (clean_cwd / ".mitos").mkdir(parents=True)
+    monkeypatch.chdir(clean_cwd)
+
+    monkeypatch.setattr(_sys, "argv", ["mitos", "status", str(target)])
+    try:
+        main()
+    except SystemExit:
+        pass
+
+    err = capsys.readouterr().err
+    assert err.count("rotation_mode = 'prune' is deprecated") == 1, (
+        f"expected one warning for the inspected workspace, got:\n{err}"
+    )
+
+
+def test_status_with_a_path_stays_quiet_about_a_deprecated_cwd(tmp_path, monkeypatch, capsys) -> None:
+    """The converse: a deprecated CWD must not warn when reporting on a clean path."""
+    import sys as _sys
+    from mitos.cli import main
+
+    clean_target = tmp_path / "target"
+    (clean_target / ".mitos").mkdir(parents=True)
+
+    dirty_cwd = tmp_path / "dirty"
+    (dirty_cwd / ".mitos").mkdir(parents=True)
+    (dirty_cwd / ".mitos" / "config.toml").write_text('rotation_mode = "mark"\n', encoding="utf-8")
+    monkeypatch.chdir(dirty_cwd)
+
+    monkeypatch.setattr(_sys, "argv", ["mitos", "status", str(clean_target)])
+    try:
+        main()
+    except SystemExit:
+        pass
+
+    assert "deprecated" not in capsys.readouterr().err

@@ -240,6 +240,16 @@ class ParsedEntry:
         self.topic: Optional[str] = None
         self.source: Optional[str] = None
 
+        # The corpus file this entry was tokenized from, when the caller declared one
+        # (`parse_file_reversed` always does). Metadata like `line_start`/`line_end`,
+        # never hashed and never serialized into a decision payload — it exists so a
+        # consumer reading the whole corpus stream can tell a BUFFER entry from an
+        # ARCHIVED one. That distinction is load-bearing for the divergence detector:
+        # `sync` reads only the buffer, so an archived entry's divergence is reportable
+        # but not reconcilable, and conflating the two would advertise a repair that
+        # silently does nothing.
+        self.source_path: Optional[str] = None
+
         # Decision fields
         self.date: Optional[str] = None
         self.title: Optional[str] = None
@@ -691,6 +701,60 @@ def _normalize_questions_list(items: List[str]) -> List[str]:
     )
 
 
+# The exact two lines the retired `rotation_mode = "mark"` writer emitted, matched
+# after `.strip()`. Deliberately exact rather than a prefix test: an author's own
+# `<!-- ROTATED START of the migration -->` prose is content, and only the literal
+# wrapper mitos itself wrote is dropped.
+_LEGACY_ROTATION_SENTINELS = frozenset({"<!-- ROTATED START", "ROTATED END -->"})
+
+
+def _span_end_excluding_trailing_sentinels(
+    section_lines: List[str], line_start: int, default_end: int
+) -> int:
+    """Rolls a section's ``line_end`` back over trailing legacy rotation sentinels.
+
+    A section's span is what ``sync`` slices out of the raw buffer to rotate the
+    entry, so a sentinel inside the span gets carried into the archive while its
+    partner stays behind. A stranded ``<!-- ROTATED START`` is an unterminated HTML
+    comment, and ``strip_html_comments`` carries that state across lines — blanking
+    every entry below it for ``parse_decisions_file``, the lexical fallback's only
+    reader. Degraded search would then go silently blind over text sitting right
+    there in the file.
+
+    Excluding the sentinels from BOTH neighbouring spans keeps a legacy pair intact
+    under any rotation order: whichever entry moves, the pair stays in the buffer
+    wrapping nothing, which is a well-formed (if pointless) comment that every reader
+    already handles.
+
+    Trailing blank lines are deliberately NOT trimmed on their own — they are part of
+    an entry's raw block today, and trimming them would change rotation's output for
+    every ordinary entry. They are skipped only while looking PAST a sentinel.
+
+    Args:
+        section_lines: The section's collected lines, header first.
+        line_start: The header's 1-based absolute file line.
+        default_end: The span end this section would otherwise take.
+
+    Returns:
+        ``default_end``, or the earlier line that excludes a trailing sentinel run.
+    """
+    scan = min(len(section_lines) - 1, default_end - line_start)
+    index = scan
+    saw_sentinel = False
+    while scan > 0:
+        stripped = section_lines[scan].strip()
+        if stripped in _LEGACY_ROTATION_SENTINELS:
+            saw_sentinel = True
+            scan -= 1
+            index = scan  # trim to just before the sentinel
+            continue
+        if not stripped:
+            scan -= 1  # blanks are transparent: a sentinel may sit behind one
+            continue
+        break
+    return line_start + index if saw_sentinel else default_end
+
+
 def _split_entry_sections(
     lines: List[str], begin_idx: int
 ) -> List[Dict[str, Any]]:
@@ -739,7 +803,9 @@ def _split_entry_sections(
         )
         if is_header:
             if current is not None:
-                current["line_end"] = file_line - 1
+                current["line_end"] = _span_end_excluding_trailing_sentinels(
+                    current["lines"], current["line_start"], file_line - 1
+                )
                 sections.append(current)
             current = {
                 "line_start": file_line,
@@ -750,7 +816,9 @@ def _split_entry_sections(
             current["lines"].append(line)
 
     if current is not None:
-        current["line_end"] = len(lines)
+        current["line_end"] = _span_end_excluding_trailing_sentinels(
+            current["lines"], current["line_start"], len(lines)
+        )
         sections.append(current)
 
     return sections
@@ -803,6 +871,7 @@ def _tokenize_entry(
 
     fields: Dict[str, List[str]] = {}
     current_field: Optional[str] = None
+    in_fence = False
     in_transcript = False
     transcript_open_line: Optional[int] = None
     transcript_lines: List[str] = []
@@ -825,6 +894,41 @@ def _tokenize_entry(
         if in_transcript:
             transcript_lines.append(line)
             continue
+        # Fenced-code state, tracked ONLY to protect the legacy-sentinel skip below:
+        # a decision documenting the retired wrapper inside a ``` block is authoring
+        # it as prose, and must keep its lines. The fence line itself stays ordinary
+        # content, so this observes without consuming.
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+
+        # Legacy `rotation_mode = "mark"` sentinels are never field content. The
+        # retired writer wrapped a synced block as
+        # `<!-- ROTATED START … ROTATED END -->`, and this tokenizer keeps HTML
+        # comments as literal field text (V1-D7), so neither line was recognized as a
+        # delimiter: both were absorbed as CONTINUATION lines of the adjacent field,
+        # and when that field is `**Mechanisms:**` — canonical core — the node id
+        # SHIFTS. The leading sentinel does it to the entry ABOVE the block, which
+        # was never rotated and may be un-synced live work.
+        #
+        # Consumed HERE rather than in `_split_entry_sections` deliberately. Dropping
+        # the line at the splitter leaves it inside the section's `[line_start,
+        # line_end]` span, and `sync` slices the raw snapshot by exactly that span to
+        # rotate an entry — so rotation would carry away ONE HALF of a sentinel pair
+        # and strand the other. A stranded `<!-- ROTATED START` is not cosmetic: it
+        # is an unterminated HTML comment, and `strip_html_comments` carries that
+        # state across lines, blanking every entry below it for `parse_decisions_file`
+        # — which is the lexical fallback's only reader, so degraded search would go
+        # silently blind over text that is right there in the file. Consuming at the
+        # tokenizer leaves spans and per-line offsets exactly as they were.
+        #
+        # The precise reading matters: the sentinel LINES are non-content, the
+        # ENCLOSED BLOCK REMAINS CONTENT. Skipping the whole span would silently turn
+        # every legacy mark buffer into rebuild-lossy `prune` — re-creating the exact
+        # defect being deprecated. Buffers marked in the wild are never rewritten, so
+        # this tolerance is permanent and does not expire with epoch 2.
+        if not in_fence and stripped in _LEGACY_ROTATION_SENTINELS:
+            continue
+
         if stripped == "[/DECISION_TRANSCRIPT]":
             # A close marker with no matching open (latitude, Decision 4): a
             # marker line is never field content, so it is consumed here. Loud
@@ -1108,6 +1212,7 @@ def _validate_section(
         )
 
     if not items:
+        entry.source_path = source_path
         return entry, None
 
     envelope = EntryFailure(

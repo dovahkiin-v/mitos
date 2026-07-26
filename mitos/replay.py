@@ -37,6 +37,7 @@ def commit_quarantine_fixpoint(
     *,
     embed_fn: Optional[Callable[[CommitDelta, ParsedEntry], object]] = None,
     on_commit: Optional[Callable[[ParsedEntry, str], None]] = None,
+    quiet: bool = False,
 ) -> Tuple[int, int, List[Tuple[ParsedEntry, str, CommitError]]]:
     """Drains a per-entry quarantine set to a fixpoint.
 
@@ -92,7 +93,13 @@ def commit_quarantine_fixpoint(
                 continue
             progressed = True
             committed += 1
-            print(f"Committed node: {entry.slug} ✓")
+            # Silenced under a machine-readable surface: `mitos rebuild --json`
+            # promises ONE object on stdout, and these lines land 40-deep before it
+            # on the live corpus, so `json.loads(stdout)` fails outright. A contract
+            # break rather than cosmetic noise — Phase 5's whole verification is
+            # reading `gate_passed` out of this command.
+            if not quiet:
+                print(f"Committed node: {entry.slug} ✓")
             if embed_fn is not None:
                 embed_fn(delta, entry)
             if on_commit is not None:
