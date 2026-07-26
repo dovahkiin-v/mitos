@@ -4,6 +4,7 @@ Verifies private snapshotting, advisory locking, LLM enrichment mocks, slug coll
 correction prompts, and content-aware archive rotation.
 """
 
+import sys
 import tempfile
 import os
 import shutil
@@ -1315,3 +1316,472 @@ def test_collision_never_discards_a_kill_edge_authored_at_another_slug(
         "the edge authored at another slug must survive the collision branch"
     )
     assert store.get_node_state(legacy_id) == "superseded"
+
+
+# ===========================================================================
+# C′ — the commentary reconcile at the idempotency gate
+# ===========================================================================
+#
+# `sync` skipped every already-committed entry, so a hand-edit to a committed
+# entry's commentary was invisible: the receipt said `Regenerated live_axioms.md ✓`
+# and the graph kept serving the stale value to every read. The store has ALWAYS
+# been able to update commentary in place on a matching canonical core — the branch
+# was simply unreachable, gated away by all four callers. C′ routes one caller to it,
+# divergence-GATED so a clean corpus behaves exactly as before.
+
+def _seed_committed_buffer(config, manager, *, amends=None, slug="reconcile-me"):
+    """Commits one entry through `record`, leaving it IN the buffer for a re-sync.
+
+    Deliberately `record_decision_entry` rather than `perform_sync`: rotation is tied
+    to a first sync commit, so a sync-authored entry leaves the buffer immediately and
+    is no longer reconcilable (its reconciler is `rebuild`). `record`-authored entries
+    never rotate — which is exactly why the live corpus holds 203 entries in the buffer
+    against 6 in the archive, and why they are the entries the reconcile actually meets.
+    """
+    result = manager.record_decision_entry(
+        "The reconcilable axiom.", "The original rejected reasoning.",
+        ["alpha"], mechanisms=["sqlite"], slug=slug, amends=amends,
+        acknowledge_neighbors=True,
+    )
+    assert result.get("state") == "active", result
+    return GraphStore(config.db_path)
+
+
+def _edit_buffer(config, old, new):
+    with open(config.decisions_file, "r", encoding="utf-8") as f:
+        text = f.read()
+    assert old in text, f"fixture edit target missing: {old!r}"
+    with open(config.decisions_file, "w", encoding="utf-8") as f:
+        f.write(text.replace(old, new))
+
+
+@patch("google.genai.Client")
+def test_a_clean_corpus_resync_is_byte_identical_behaviour(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """No divergence → the same `continue` as before, and MI-3's no-tick holds.
+
+    The gate is what keeps a 203-entry corpus from becoming 203 prompts and a SONNET
+    bill per sync. It is also what keeps `updated_at` still on a byte-identical
+    re-commit, which MI-3 requires.
+    """
+    config, manager, tmpdir = sync_env
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+    store = _seed_committed_buffer(config, manager)
+    before = store.get_all_nodes()[0]
+
+    manager.perform_sync(auto_accept=True)
+
+    after = GraphStore(config.db_path).get_all_nodes()[0]
+    assert after["updated_at"] == before["updated_at"], "MI-3: no tick without a change"
+    assert len(GraphStore(config.db_path).get_all_nodes()) == 1
+
+
+@patch("google.genai.Client")
+def test_a_commentary_edit_is_reconciled_under_auto_accept(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """The brief's flagship case: a corrected `rejected_paths` reaches the graph."""
+    config, manager, tmpdir = sync_env
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+    store = _seed_committed_buffer(config, manager)
+    node_before = store.get_all_nodes()[0]
+
+    _edit_buffer(config, "The original rejected reasoning.", "The CORRECTED reasoning.")
+    manager.perform_sync(auto_accept=True)
+
+    nodes = GraphStore(config.db_path).get_all_nodes()
+    assert len(nodes) == 1, "a commentary correction must not mint a second node"
+    assert nodes[0]["rejected_paths"] == "The CORRECTED reasoning."
+    assert nodes[0]["id"] == node_before["id"], "the canonical core is untouched (M1)"
+
+
+@patch("google.genai.Client")
+def test_a_scope_edit_is_reconciled(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """Scope is the species with real-use evidence — a findability defect, now repairable."""
+    config, manager, tmpdir = sync_env
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+    _seed_committed_buffer(config, manager)
+
+    _edit_buffer(config, "**Scope:** alpha", "**Scope:** alpha, beta")
+    manager.perform_sync(auto_accept=True)
+
+    assert sorted(GraphStore(config.db_path).get_all_nodes()[0]["scope"]) == ["alpha", "beta"]
+
+
+@patch("google.genai.Client")
+def test_the_reconcile_carries_stored_confirmation_provenance_forward(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """A commentary correction must NOT rewrite or NULL `confirmed_by`/`confirmed_at`.
+
+    Both columns sit in the store's commentary `UPDATE SET`, and at the gate the PARSED
+    entry carries `confirmed_by=None` (sync's `"user"` stamp happens further down). So
+    a naive reconcile NULLs the stamps, and one that reuses sync's stamping rewrites
+    them to `"user"`. Measured on the live corpus: either would destroy 114 stamps —
+    113 `agent` plus one model — on a change that touched only prose.
+    """
+    config, manager, tmpdir = sync_env
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+    store = _seed_committed_buffer(config, manager)
+    node_id = store.get_all_nodes()[0]["id"]
+    with store._get_connection() as conn:
+        conn.execute(
+            "UPDATE nodes SET confirmed_by = 'agent', confirmed_at = ? WHERE id = ?",
+            ("2026-06-23T13:04:17.147973+00:00", node_id),
+        )
+
+    _edit_buffer(config, "The original rejected reasoning.", "The CORRECTED reasoning.")
+    manager.perform_sync(auto_accept=True)
+
+    node = GraphStore(config.db_path).get_all_nodes()[0]
+    assert node["rejected_paths"] == "The CORRECTED reasoning.", "the fixture must reconcile"
+    assert node["confirmed_by"] == "agent", "provenance must survive a commentary fix"
+    assert node["confirmed_at"] == "2026-06-23T13:04:17.147973+00:00"
+
+
+@patch("google.genai.Client")
+def test_the_reconcile_does_not_rotate_the_entry(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """Rotation stays tied to a FIRST commit — this is the invisibility mechanism.
+
+    An entry that rotates out of the buffer leaves `sync`'s read-set, so its future
+    divergence becomes undetectable by the very surface that just repaired it. A
+    reconcile that rotated would quietly re-create the disease it cures.
+    """
+    config, manager, tmpdir = sync_env
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+    manager.config.pending_threshold = 1
+    _seed_committed_buffer(config, manager)
+
+    _edit_buffer(config, "The original rejected reasoning.", "The CORRECTED reasoning.")
+    manager.perform_sync(auto_accept=True)
+
+    with open(config.decisions_file, "r", encoding="utf-8") as f:
+        assert "### reconcile-me" in f.read(), "a reconciled entry must stay in the buffer"
+
+
+@patch("google.genai.Client")
+def test_an_edge_deletion_is_skipped_under_auto_accept_and_reported(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str],
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """`--yes` widens sync from append-only to mutate — but never to DELETE an edge.
+
+    `commit_parsed_entry` mirrors edges declaratively, so a removed markdown line
+    DELETES that edge. You cannot apply an entry's commentary while withholding its
+    edge state, so an entry carrying BOTH is wholly skipped — which means its
+    commentary divergence stays unreconciled on every non-interactive run. That is the
+    right call and it must be stated, not discovered.
+    """
+    config, manager, tmpdir = sync_env
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+    store = GraphStore(config.db_path)
+    _seed_active_decision(store, "predecessor", "The earlier axiom.")
+
+    _seed_committed_buffer(config, manager, amends="predecessor")
+    assert len(store.get_edges()) == 1, "the fixture must commit the edge"
+
+    # Drop the relation line AND correct the commentary — the mixed case.
+    _edit_buffer(config, "**Amends:** predecessor\n", "")
+    _edit_buffer(config, "The original rejected reasoning.", "The CORRECTED reasoning.")
+    manager.perform_sync(auto_accept=True)
+
+    after = GraphStore(config.db_path)
+    assert len(after.get_edges()) == 1, "the edge must NOT be deleted under --yes"
+    node = [n for n in after.get_all_nodes() if n["slug"] == "reconcile-me"][0]
+    assert node["rejected_paths"] == "The original rejected reasoning.", (
+        "a mixed entry is WHOLLY skipped — commentary cannot be applied alone"
+    )
+    out = capsys.readouterr().out
+    assert "reconcile-me" in out and "skip" in out.lower()
+
+
+@patch("google.genai.Client")
+def test_an_edge_addition_applies_under_auto_accept(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """Additions apply, deletions do not — an asymmetry, matching `record --yes`."""
+    config, manager, tmpdir = sync_env
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+    store = GraphStore(config.db_path)
+    _seed_active_decision(store, "predecessor", "The earlier axiom.")
+    _seed_committed_buffer(config, manager)
+    assert store.get_edges() == []
+
+    _edit_buffer(config, "**Scope:** alpha", "**Scope:** alpha\n**Amends:** [predecessor]")
+    manager.perform_sync(auto_accept=True)
+
+    edges = GraphStore(config.db_path).get_edges()
+    assert len(edges) == 1 and edges[0]["edge_type"] == "amends"
+
+
+@patch("google.genai.Client")
+@patch("builtins.input", side_effect=["s"])
+@patch("sys.stdin.isatty", return_value=True)
+def test_an_interactive_skip_leaves_the_graph_untouched(
+    mock_isatty: MagicMock, mock_input: MagicMock, mock_client: MagicMock,
+    sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """The reconcile has its OWN prompt verb, so answering `[s]kip` changes nothing."""
+    config, manager, tmpdir = sync_env
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+    _seed_committed_buffer(config, manager)
+
+    _edit_buffer(config, "The original rejected reasoning.", "The CORRECTED reasoning.")
+    manager.perform_sync(auto_accept=False)
+
+    node = GraphStore(config.db_path).get_all_nodes()[0]
+    assert node["rejected_paths"] == "The original rejected reasoning."
+
+
+@patch("google.genai.Client")
+@patch("builtins.input", side_effect=["r"])
+@patch("sys.stdin.isatty", return_value=True)
+def test_an_interactive_reconcile_deletes_exactly_the_dropped_edge(
+    mock_isatty: MagicMock, mock_input: MagicMock, mock_client: MagicMock,
+    sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """Interactively, a deletion IS applied — the author saw it named and said yes."""
+    config, manager, tmpdir = sync_env
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+    store = GraphStore(config.db_path)
+    _seed_active_decision(store, "predecessor", "The earlier axiom.")
+    _seed_committed_buffer(config, manager, amends="predecessor")
+    assert len(store.get_edges()) == 1
+
+    _edit_buffer(config, "**Amends:** predecessor\n", "")
+    manager.perform_sync(auto_accept=False)
+
+    assert GraphStore(config.db_path).get_edges() == []
+
+
+@patch("google.genai.Client")
+def test_the_reconcile_writes_a_write_ahead_audit_row(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """P8: every applied reconcile leaves a durable record of what changed.
+
+    `updated_at` says only THAT something changed. Without this row an agent's edit
+    plus `sync --yes` is exactly as unattributable as mutating the graph directly.
+    """
+    from mitos.telemetry import TelemetryStore
+
+    config, manager, tmpdir = sync_env
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+    _seed_committed_buffer(config, manager)
+
+    _edit_buffer(config, "The original rejected reasoning.", "The CORRECTED reasoning.")
+    manager.perform_sync(auto_accept=True)
+
+    rows = TelemetryStore(config.telemetry_path).read_commentary_audit()
+    applied = [r for r in rows if r["slug"] == "reconcile-me" and r["outcome"] is None]
+    assert len(applied) == 1, f"expected one intent row, got {rows}"
+    row = applied[0]
+    assert row["fields_changed"] == ["rejected_paths"]
+    assert row["prior_values"] == {"rejected_paths": "The original rejected reasoning."}
+    assert row["new_values"] == {"rejected_paths": "The CORRECTED reasoning."}
+
+
+@patch("google.genai.Client")
+def test_an_unavailable_audit_store_refuses_the_reconcile(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str],
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """The discipline inversion: mandatory, not best-effort.
+
+    `TelemetryStore` is best-effort by design — a boot failure warns and continues,
+    because a telemetry failure must never abort a sync. A P8-MANDATORY row cannot
+    inherit that ambient posture: if the audit store is unavailable the reconcile is
+    refused and reported, never applied unaudited, or P8 holds only when the disk
+    cooperates. This is the sharpest way the design fails in practice if left unstated.
+    """
+    config, manager, tmpdir = sync_env
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+    _seed_committed_buffer(config, manager)
+    _edit_buffer(config, "The original rejected reasoning.", "The CORRECTED reasoning.")
+
+    from mitos.errors import DatabaseError
+
+    with patch("mitos.sync.TelemetryStore.record_commentary_intent",
+               side_effect=DatabaseError("audit store unavailable")):
+        manager.perform_sync(auto_accept=True)
+
+    node = GraphStore(config.db_path).get_all_nodes()[0]
+    assert node["rejected_paths"] == "The original rejected reasoning.", (
+        "an unauditable reconcile must NOT be applied"
+    )
+    # ONE readouterr call: it drains the buffer, so a second returns "" and would
+    # silently reduce this to an err-only assertion.
+    captured = capsys.readouterr()
+    combined = (captured.err + captured.out).lower()
+    assert "audit" in combined or "refus" in combined
+
+
+@patch("google.genai.Client")
+def test_a_reconcile_never_carries_a_transcript_rewrite_along(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str],
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A transcript edit must NOT ride along on a reconcile triggered by another field.
+
+    `commit_parsed_entry` UPDATEs `transcripts` whenever the incoming text differs, and
+    the transcript is not in the divergence set — so left attached it landed with no
+    printed diff, no `fields_changed`, and no `prior_values`. An agent editing
+    `**Rejected:**` and rewriting the transcript block got both applied, and the prior
+    transcript then existed nowhere: markdown rewritten, graph updated, audit row
+    silent. That is exactly the unattributed graph mutation P8 forbids, inside the
+    feature that adds the attribution row.
+    """
+    from mitos.telemetry import TelemetryStore
+
+    config, manager, tmpdir = sync_env
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+    _seed_committed_buffer(config, manager)
+
+    _edit_buffer(config, "**Scope:** alpha",
+                 "**Scope:** alpha\n[DECISION_TRANSCRIPT]\n"
+                 "User: the ORIGINAL conversation.\n[/DECISION_TRANSCRIPT]")
+    manager.perform_sync(auto_accept=True)
+    store = GraphStore(config.db_path)
+    node_id = store.get_all_nodes()[0]["id"]
+    original_transcript = store.get_transcript(node_id)
+
+    # Now edit a reconcilable field AND rewrite the transcript in the same pass.
+    _edit_buffer(config, "The original rejected reasoning.", "The CORRECTED reasoning.")
+    _edit_buffer(config, "User: the ORIGINAL conversation.", "User: a FABRICATED replacement.")
+    manager.perform_sync(auto_accept=True)
+
+    after = GraphStore(config.db_path)
+    assert after.get_all_nodes()[0]["rejected_paths"] == "The CORRECTED reasoning.", (
+        "the fixture must actually have reconciled"
+    )
+    assert after.get_transcript(node_id) == original_transcript, (
+        "the stored transcript must be preserved, not silently replaced"
+    )
+    rows = TelemetryStore(config.telemetry_path).read_commentary_audit()
+    applied = [r for r in rows if r["outcome"] is None]
+    assert all("transcript" not in (r["fields_changed"] or []) for r in applied)
+
+
+@patch("google.genai.Client")
+def test_sync_without_a_tty_and_without_yes_skips_instead_of_dying(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str],
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A non-interactive `mitos sync` must not die on the reconcile prompt.
+
+    This gate fires on a corpus state that used to produce ZERO prompts, so prompting
+    turned every agent, CI job, cron and piped invocation into a fatal
+    `EOF when reading a line`. Skipping is the fail-closed choice: `--yes` is an
+    explicit authorization to mutate, and the absence of a terminal is not it.
+    """
+    config, manager, tmpdir = sync_env
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+    _seed_committed_buffer(config, manager)
+    _edit_buffer(config, "The original rejected reasoning.", "The CORRECTED reasoning.")
+
+    # pytest already runs with a non-TTY stdin; assert that explicitly so the test
+    # cannot silently start exercising the interactive path.
+    assert not sys.stdin.isatty()
+    manager.perform_sync(auto_accept=False)  # must not raise
+
+    node = GraphStore(config.db_path).get_all_nodes()[0]
+    assert node["rejected_paths"] == "The original rejected reasoning.", "fail closed"
+    assert "no terminal" in capsys.readouterr().out
+
+
+@patch("google.genai.Client")
+def test_an_open_question_divergence_does_not_reconcile_forever(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """An open question carrying `**Context:**` must not reconcile on every sync.
+
+    The parser assigns `context`/`invalidates_if` kind-agnostically while the store
+    NULLs them for an open question, so a reconcile of one can never converge: it
+    printed `Reconciled ✓` and appended a fresh attribution row every single sync, for
+    a mutation that provably cannot land.
+    """
+    from mitos.telemetry import TelemetryStore
+
+    config, manager, tmpdir = sync_env
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+    with open(config.questions_file, "w", encoding="utf-8") as f:
+        f.write("# Questions\n<!-- BEGIN ENTRIES -->\n\n### embedding-choice\n\n"
+                "**Topic:** which embedding model\n**Questions:**\n- Which dimension?\n")
+    manager.perform_sync(auto_accept=True)
+
+    with open(config.questions_file, "r", encoding="utf-8") as f:
+        text = f.read()
+    with open(config.questions_file, "w", encoding="utf-8") as f:
+        f.write(text.replace("**Questions:**",
+                             "**Context:** Not permitted on an OQ but parses fine.\n**Questions:**"))
+    for _ in range(3):
+        manager.perform_sync(auto_accept=True)
+
+    rows = TelemetryStore(config.telemetry_path).read_commentary_audit()
+    assert rows == [], f"an open question must never enter the reconcile: {rows}"
+
+
+@patch("google.genai.Client")
+def test_an_unresolvable_citation_is_reported_once_not_audited_forever(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """A citation naming no decision is pre-flighted, not retried into the audit trail.
+
+    The commit raises `missing_target` regardless, and the reconcile correctly never
+    quarantines and never retries — but it re-fired every sync, appending an intent row
+    PLUS a failure row each time, forever, with retention deliberately deferred. That
+    unbounded write also falsified the "reconciles are rare" premise that both the
+    retention deferral and the `synchronous=FULL` fsync cost rest on.
+    """
+    from mitos.telemetry import TelemetryStore
+
+    config, manager, tmpdir = sync_env
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+    _seed_committed_buffer(config, manager)
+
+    _edit_buffer(config, "**Scope:** alpha", "**Scope:** alpha\n**Cites:** ghost-slug")
+    for _ in range(3):
+        manager.perform_sync(auto_accept=True)
+
+    assert TelemetryStore(config.telemetry_path).read_commentary_audit() == [], (
+        "an unreconcilable citation must write no attribution rows at all"
+    )
+    assert GraphStore(config.db_path).get_edges() == []
+
+
+@patch("google.genai.Client")
+def test_the_audit_row_records_full_edge_state_not_a_delta(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """`prior_values["edges"]` must be what the graph HELD, not merely what was removed.
+
+    The documented read rule is "an intent row over a graph matching its `new_values`
+    means applied". With deltas, a node that RETAINS an edge has `prior: []` — a
+    positive false claim — and the rule then mismatches and reports a
+    successfully-applied reconcile as not applied, inverting the P8 verdict.
+    """
+    from mitos.telemetry import TelemetryStore
+
+    config, manager, tmpdir = sync_env
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+    store = GraphStore(config.db_path)
+    _seed_active_decision(store, "kept-target", "The retained axiom.")
+    _seed_active_decision(store, "added-target", "The newly cited axiom.")
+    _seed_committed_buffer(config, manager, amends="kept-target")
+
+    _edit_buffer(config, "**Amends:** kept-target",
+                 "**Amends:** kept-target\n**Cites:** added-target")
+    manager.perform_sync(auto_accept=True)
+
+    rows = [r for r in TelemetryStore(config.telemetry_path).read_commentary_audit()
+            if r["outcome"] is None]
+    assert len(rows) == 1, rows
+    assert rows[0]["prior_values"]["edges"] == ["amends:kept-target"], (
+        "the retained edge must appear in the prior STATE"
+    )
+    assert rows[0]["new_values"]["edges"] == ["amends:kept-target", "cites:added-target"]

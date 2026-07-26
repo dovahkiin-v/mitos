@@ -1255,6 +1255,12 @@ def cmd_record(
             print(f"  Entry:     {result['path']}  (where the existing entry lives)")
         else:
             print(f"  Written:   {result['path']}  (the human-readable entry — eyeball it)")
+    differs = result.get("differs")
+    if differs:
+        # AX round 10's ask, verbatim: *say what it ignored*. Named BEFORE the handle
+        # line, because on a no-op this is the actionable part of the receipt.
+        print(f"  Ignored:   this call carried different {', '.join(differs)} than the "
+              f"graph holds — run `mitos sync` to reconcile the entry in decisions.md.")
     print(f"  Handle:    '{result['slug']}' — pass this to --supersedes/--amends/--depends-on/… to link future decisions.")
     # Write facts read back from the committed node (NOT an echo of the flags):
     # the edges the commit actually wired, and scope/mechanisms as stored. Lines
@@ -2121,6 +2127,12 @@ def _print_divergence_rung(report: Dict[str, Any]) -> None:
               f"them, so its completeness gate refuses. Run "
               f"`mitos restore-source --all-graph-only --dry-run` to review.")
 
+    reconcilable = report.get("reconcilable") or 0
+    if reconcilable:
+        print(f"      → {reconcilable} of these can be repaired now: `mitos sync` "
+              f"reconciles a diverged buffer entry, printing the field diff first "
+              f"(add `--yes` to apply without prompting; an edge DELETION is always "
+              f"skipped under `--yes`).")
     if report.get("archived_drift"):
         print(f"      ({report['archived_drift']} of these sit in an ARCHIVE file — "
               f"`sync` reads only the buffer, so their reconciler is `mitos rebuild`.)")

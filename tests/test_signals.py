@@ -411,3 +411,68 @@ def test_record_same_source_reencounter_is_noop(
 
     assert result["status"] == "exists"
     assert _reencounter_rows(manager.store, nid) == []
+
+
+def test_reencounter_signal_still_fires_once_when_a_reconcile_follows_it(
+    tmp_path, monkeypatch
+) -> None:
+    """The reencounter audit must not double-fire now that a commit can follow it.
+
+    The commentary reconcile was added directly BELOW `note_source_reencounter` at the
+    idempotency gate — the one pass the skip must never swallow (MI-4 / V1-D14, §6.2
+    Lesson 13). So the signal now runs on a path that can go on to re-commit the entry,
+    and `commit_parsed_entry` has its own reencounter handling. `write_signal` is
+    `INSERT OR IGNORE` / first-encounter-wins, which is exactly the property three
+    tests above depend on; this pins that the reconcile does not disturb it.
+    """
+    import os
+
+    from mitos.config import MitosConfig
+    from mitos.store import GraphStore
+    from mitos.sync import MitosSyncManager
+
+    # `perform_sync` gates on a key being present before it reaches the entry loop, so
+    # without this the sync never runs and the assertions below would pass vacuously.
+    monkeypatch.setenv("GEMINI_API_KEY", "mock_key")
+    monkeypatch.setenv("QDRANT_URL", "http://localhost:9")
+
+    config = MitosConfig(str(tmp_path))
+    os.makedirs(config.mitos_dir, exist_ok=True)
+    with open(config.decisions_file, "w", encoding="utf-8") as fh:
+        fh.write("# Decisions\n<!-- BEGIN ENTRIES — new decisions go directly below "
+                 "this line, newest first -->\n")
+    manager = MitosSyncManager(config)
+    result = manager.record_decision_entry(
+        "The reconcilable axiom.", "The original rejected reasoning.",
+        ["alpha"], mechanisms=["sqlite"], slug="reconcile-me",
+        acknowledge_neighbors=True,
+    )
+    assert result.get("state") == "active", result
+
+    # A markdown edit that WILL reconcile, plus a `**Source:**` line so the entry
+    # arrives from a different source than the stored one and the signal is eligible.
+    with open(config.decisions_file, "r", encoding="utf-8") as fh:
+        text = fh.read()
+    with open(config.decisions_file, "w", encoding="utf-8") as fh:
+        fh.write(text.replace(
+            "**Rejected:** The original rejected reasoning.",
+            "**Rejected:** The CORRECTED reasoning.\n**Source:** capture_llm",
+        ))
+
+    for _ in range(3):
+        manager.perform_sync(auto_accept=True)
+
+    store = GraphStore(config.db_path)
+    node_id = store.get_all_nodes()[0]["id"]
+    with store._get_connection() as conn:
+        rows = conn.execute(
+            "SELECT source, COUNT(*) AS n FROM signals "
+            "WHERE node_id = ? AND signal_type = 'source_reencounter' GROUP BY source",
+            (node_id,),
+        ).fetchall()
+    assert all(row["n"] == 1 for row in rows), (
+        f"the reencounter signal must stay first-encounter-wins, got {[dict(r) for r in rows]}"
+    )
+    assert store.get_all_nodes()[0]["rejected_paths"] == "The CORRECTED reasoning.", (
+        "the fixture must actually have reconciled"
+    )

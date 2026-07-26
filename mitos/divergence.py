@@ -43,17 +43,19 @@ did not know:
   on every confirmed node (114 of them on the dogfood corpus), because the markdown
   has no field to compare against. Their primary source **is** the graph, so there is
   nothing to diff. Permanent.
-* **Transcripts.** ``transcripts`` is a separate table with no reconcile path yet;
-  a transcript-only edit is not merely invisible but never reconciled. Stated rather
-  than silently omitted, and homed in the future ``amend-commentary`` verb.
+* **Transcripts.** ``transcripts`` is a separate table with no reconcile path, so a
+  transcript edit is invisible here and is never applied — the reconcile explicitly
+  WITHHOLDS the parsed transcript when it re-commits, because otherwise a transcript
+  rewrite would ride along on a reconcile triggered by another species and land
+  undiffed and unattributed. Write-once-preserved, with reconciliation (and its own
+  attribution) homed in the future ``amend-commentary`` verb.
 
 The module has two halves, and the split is the point:
 
 * ``entry_divergence`` and its helpers are a **pure leaf** — dict in, dict out, no
-  I/O. It is shaped as the unit both surfaces call, so that ``status`` and ``sync``
-  cannot grow two comparators that drift apart. Today the fold below is its only
-  caller: ``sync``'s reconcile is a later release, and this docstring will not claim
-  the seam is live before it is.
+  I/O. It is the unit BOTH surfaces call — ``status``'s rung through the fold below,
+  and ``sync``'s reconcile gate directly — which is what stops the two growing
+  comparators that drift apart.
 * ``corpus_graph_divergence`` is the whole-corpus **fold** — it owns the read, the
   advisory lock, and the sidecar cache, and it is ``status``'s half alone.
 
@@ -170,9 +172,8 @@ def entry_divergence(
     """Diffs one parsed entry against its committed node.
 
     Pure and I/O-free, which is what makes it safe for ``sync``'s per-entry loop to
-    call once the reconcile lands: sync iterates a locked snapshot, and a comparator
-    that re-read the live file would compare against a different document than the one
-    being synced. (Not yet wired — the fold below is currently the only caller.)
+    call: sync iterates a locked snapshot, and a comparator that re-read the live file
+    would compare against a different document than the one being synced.
 
     The caller supplies ``stored_scopes`` and ``stored_edges`` rather than having
     them looked up here, which is what lets the whole-corpus surface batch every read
@@ -279,10 +280,9 @@ def is_reconcilable(report: Dict[str, Any]) -> bool:
 # replay machinery. `sync`'s per-entry loop imports this module for `entry_divergence`
 # alone and must not pay for any of that; the import-graph property is pinned by test.
 #
-# When sync's reconcile lands it must call `entry_divergence` and never this: calling
-# the fold inside sync's per-entry loop would re-read the LIVE corpus against the
-# locked snapshot sync is iterating, and re-acquire the lock mid-pass — inconsistent
-# by construction.
+# `sync` calls `entry_divergence` and never this: calling the fold inside sync's
+# per-entry loop would re-read the LIVE corpus against the locked snapshot sync is
+# iterating, and re-acquire the lock mid-pass — inconsistent by construction.
 # ---------------------------------------------------------------------------
 
 # The advisory-lock acquire budget, seconds. Deliberately NOT the sync manager's

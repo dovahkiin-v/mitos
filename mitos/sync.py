@@ -33,7 +33,9 @@ from mitos.conflict import (
     run_conflict_check,
     screen_candidates,
 )
-from mitos.telemetry import ConflictCheckRow, JudgmentBatch, TelemetryStore
+from mitos.telemetry import (CommentaryAuditRow, ConflictCheckRow, JudgmentBatch,
+                            TelemetryStore)
+from mitos.divergence import declared_edges, entry_divergence, is_reconcilable
 from mitos.errors import (
     MitosError,
     SynthesisError,
@@ -352,16 +354,31 @@ _SLUG_MIN_LEN = 32  # auto-derive only: don't trim a word boundary back past her
 # graph-only node, reported success while changing nothing. The note names the
 # path that does work; `mitos sync` does not, since it re-commits nothing for a
 # node already in the graph.
+def _edge_state_labels(pairs: List[Dict[str, str]]) -> List[str]:
+    """Renders edges as a sorted ``["kind:target", ...]`` state list for the audit row.
+
+    Args:
+        pairs: Edge dicts carrying ``kind`` and ``target``.
+
+    Returns:
+        The sorted labels, deduplicated.
+    """
+    return sorted({f"{p['kind']}:{p['target'].strip().casefold()}" for p in pairs
+                   if p.get("target")})
+
+
 _EXISTS_NO_OP_NOTE = (
     "already recorded — this call wrote nothing, to the buffer or the graph. "
     "A committed decision's axiom and mechanisms are immutable (M1): re-recording "
-    "them is a no-op. To correct or extend its commentary (rejected_paths, context) "
-    "or to restore a missing source block, edit the entry in decisions.md and run "
-    "`mitos rebuild`. Two limits that path has today: a node whose `### ` block is "
-    "missing from decisions.md has no entry to edit, and `mitos rebuild` refuses the "
-    "swap when it cannot reconstruct every active decision from the corpus — so a "
-    "corpus in either state needs repair before a rebuild can carry the correction. "
-    "To record a changed decision, write a new one with --supersedes/--amends "
+    "them is a no-op. To correct its commentary (rejected_paths, scope, "
+    "invalidates_if, context), edit the entry in decisions.md and run `mitos sync` — "
+    "it reconciles a diverged committed entry, printing the field diff first. "
+    "Two states sync cannot reach: a node with no `### ` block (run "
+    "`mitos restore-source --slug <slug>` first), and an entry already rotated into "
+    "decisions/archive/ — sync reads only the buffer, so that one's reconciler is "
+    "`mitos rebuild`, which can refuse the swap and which re-mints confirmation "
+    "metadata, so correct it while it is still in the buffer if you can. "
+    "To record a CHANGED decision, write a new one with --supersedes/--amends "
     "pointing at this slug."
 )
 
@@ -729,6 +746,45 @@ class MitosSyncManager:
                 self.store.note_source_reencounter(
                     node_id, existing["source"], entry.source or "user"
                 )
+
+                # C′ — the commentary reconcile, DIVERGENCE-GATED. Without the gate
+                # this branch would reach `commit_parsed_entry` for every
+                # already-committed entry: on the dogfood corpus that is 203 accept
+                # prompts, 203 SONNET conflict judgments per sync, and the whole buffer
+                # rotated into the archive. Gated, a clean corpus takes the same
+                # `continue` as before — zero behavioural delta, and MI-3's
+                # no-tick-on-a-byte-identical-recommit property stays intact.
+                if entry.kind != "decision":
+                    # Decisions only, matching the detector, which excludes open
+                    # questions on both sides. The parser assigns `context` and
+                    # `invalidates_if` kind-agnostically while the store NULLs them for
+                    # an open question, so a reconcile of one can never converge: it
+                    # would print "Reconciled ✓" and append a fresh attribution row on
+                    # every single sync, for a mutation that provably cannot land.
+                    continue
+
+                divergence = entry_divergence(
+                    entry,
+                    existing,
+                    existing.get("scope") or [],
+                    self.store.get_outgoing_edges(node_id),
+                )
+                if not is_reconcilable(divergence):
+                    # `source` divergence is reported by `status` but is NOT
+                    # reconcilable — MI-4 fences it out of the commentary UPDATE, so
+                    # re-committing provably cannot change it.
+                    continue
+
+                if not self._apply_commentary_reconcile(
+                    entry, existing, node_id, divergence, auto_accept
+                ):
+                    continue
+                # Reconciled. Deliberately falls through to `continue` rather than the
+                # commit path below: no conflict judge (the canonical core is unchanged,
+                # so there is no new claim to judge), no accept prompt, no confirmation
+                # re-stamp, and above all NO ROTATION — rotation stays tied to a FIRST
+                # commit, because an entry that leaves the buffer leaves sync's read-set
+                # and its future divergence becomes invisible again.
                 continue
 
             # Slug collision check
@@ -1863,6 +1919,279 @@ class MitosSyncManager:
             pass
         return "indexed"
 
+    def _exists_receipt_extras(
+        self, entry: ParsedEntry, existing: Dict[str, Any], node_id: str
+    ) -> Dict[str, Any]:
+        """Builds the `exists` receipt's divergence hint.
+
+        AX round 10's actual ask, verbatim: *say what it ignored*. A re-record aimed at
+        correcting commentary got a clean `(exists) ✓` and no indication that the values
+        it carried differed from the stored ones — so the caller had to go and check by
+        hand to learn that nothing had changed.
+
+        Args:
+            entry: The parsed entry this call built.
+            existing: The committed node.
+            node_id: The node's id.
+
+        Returns:
+            ``{"differs": [field, ...]}`` when the call carried different commentary
+            than the graph holds, else ``{}`` — an empty list would read as a
+            measurement rather than an absence.
+        """
+        try:
+            report = entry_divergence(
+                entry,
+                existing,
+                existing.get("scope") or [],
+                self.store.get_outgoing_edges(node_id),
+            )
+        except Exception:
+            return {}  # a receipt hint must never fail the receipt
+        differs = list(report.get("commentary") or [])
+        if report.get("scope"):
+            differs.append("scope")
+        if report.get("edges"):
+            differs.append("edges")
+        return {"differs": sorted(differs)} if differs else {}
+
+    def _unresolved_edge_targets(self, divergence: Dict[str, Any]) -> List[str]:
+        """Returns the newly-declared edge targets that resolve to no decision.
+
+        A pre-flight, so a citation that can never commit is reported ONCE per sync
+        instead of writing an intent row plus a failure row every sync forever. The
+        commit would raise ``missing_target`` regardless; catching it there is correct
+        but leaves an unbounded attribution trail behind a typo, and retention is
+        deliberately deferred.
+
+        Args:
+            divergence: The ``entry_divergence`` report.
+
+        Returns:
+            The unresolvable target slugs, in report order.
+        """
+        added = (divergence.get("edges") or {}).get("added") or []
+        missing: List[str] = []
+        for spec in added:
+            _kind, _, target = spec.partition(":")
+            if not target:
+                continue
+            ids = self.store.resolve_slug(target)
+            if not ids:
+                missing.append(f"'{target}'")
+        return missing
+
+    def _apply_commentary_reconcile(
+        self,
+        entry: ParsedEntry,
+        existing: Dict[str, Any],
+        node_id: str,
+        divergence: Dict[str, Any],
+        auto_accept: bool,
+    ) -> bool:
+        """Applies one commentary reconcile, or reports why it was skipped.
+
+        The store has always been able to update commentary in place on a matching
+        canonical core; all four callers gated the branch away, so it was reachable only
+        from unit tests. This routes one caller to it — which is why Phase 3 is the
+        first production consumer of MI-4 and MI-5.
+
+        Args:
+            entry: The parsed corpus entry.
+            existing: The committed node, as stored.
+            node_id: The node's id.
+            divergence: The ``entry_divergence`` report.
+            auto_accept: Whether ``--yes`` is in force.
+
+        Returns:
+            True if the reconcile was applied.
+        """
+        edges = divergence.get("edges") or {}
+        removals = edges.get("removed") or []
+
+        print(f"\n[Divergence] '{existing.get('slug')}' — the corpus and graph disagree.")
+        for field in divergence.get("commentary") or []:
+            print(f"  {field}:")
+            print(f"    graph:    {existing.get(field)!r}")
+            print(f"    markdown: {getattr(entry, field, None)!r}")
+        if divergence.get("scope"):
+            print(f"  scope:      graph {divergence['scope']['graph']} → "
+                  f"markdown {divergence['scope']['markdown']}")
+        for added in edges.get("added") or []:
+            print(f"  edge ADDED:   {added}")
+        for removed in removals:
+            # Printed explicitly, and named as a deletion, because a re-commit mirrors
+            # edges declaratively: a line removed from the markdown DELETES that edge.
+            print(f"  edge DELETED: {removed}")
+
+        if auto_accept and removals:
+            # `--yes` widens sync from append-only to mutate, but never to delete an
+            # edge unattended. And because `commit_parsed_entry` mirrors edges
+            # declaratively, an entry's commentary cannot be applied while withholding
+            # its edge state — so a MIXED entry is wholly skipped, and its commentary
+            # divergence stays unreconciled on every non-interactive run. Stated here
+            # rather than left to be discovered.
+            print("  Skipped — an edge DELETION cannot be applied under --yes, and an "
+                  "entry's commentary cannot be applied while withholding its edge "
+                  "state. Restore the relation line in decisions.md to reconcile the "
+                  "commentary alone, or re-run `mitos sync` from a terminal to confirm "
+                  "the deletion.")
+            return False
+
+        if not auto_accept:
+            if not sys.stdin.isatty():
+                # No TTY and no `--yes`: report and skip, never prompt. This gate fires
+                # on a corpus state that used to produce ZERO prompts (the old code
+                # `continue`d unconditionally), so prompting here turned every
+                # non-interactive `mitos sync` — an agent, a CI job, a cron, a piped
+                # invocation — into a fatal `EOF when reading a line`. Skipping is the
+                # fail-closed choice: `--yes` is an explicit authorization to mutate,
+                # and the absence of a terminal is not that authorization.
+                print("  Skipped — no terminal to confirm on. Re-run with `--yes` to "
+                      "apply commentary reconciles non-interactively.")
+                return False
+            choice = input("Reconcile the graph to the markdown? "
+                           "[r]econcile / [s]kip: ").strip().lower()
+            if choice != "r":
+                print("  Skipped.")
+                return False
+
+        unresolved = self._unresolved_edge_targets(divergence)
+        if unresolved:
+            print(f"  Skipped — cannot reconcile: {', '.join(unresolved)} "
+                  f"{'do' if len(unresolved) > 1 else 'does'} not name any decision in "
+                  "the graph. Fix the citation in decisions.md, or restore the cited "
+                  "entry with `mitos restore-source`.",
+                  file=sys.stderr)
+            return False
+
+        # Write-AHEAD: the attribution row lands BEFORE the mutation. A best-effort
+        # write-after can leave a mutation with no attribution, which is undetectable
+        # and exactly what P8 forbids; write-ahead leaves at worst a phantom row for a
+        # change that never landed, and a phantom never violates P8 — it forbids
+        # unattributed mutations, not attributed non-mutations.
+        stored_edges = self.store.get_outgoing_edges(node_id)
+        prior, new_values = self._reconcile_value_pair(
+            entry, existing, divergence, stored_edges
+        )
+        audit_id = uuid.uuid4().hex
+        try:
+            telemetry = TelemetryStore(self.config.telemetry_path)
+            telemetry.record_commentary_intent(
+                CommentaryAuditRow(
+                    audit_id=audit_id,
+                    node_id=node_id,
+                    slug=existing.get("slug"),
+                    fields_changed=sorted(new_values),
+                    prior_values=prior,
+                    new_values=new_values,
+                    mitos_version=MITOS_VERSION,
+                ),
+                created_at=_utc_now_iso(),
+            )
+        except Exception as exc:
+            # MANDATORY writer, inverting this store's ambient best-effort posture: a
+            # telemetry failure must never abort a sync of real decisions, but a
+            # P8-mandatory row cannot inherit that. An unauditable reconcile is REFUSED,
+            # not applied unaudited — otherwise P8 holds only when the disk cooperates.
+            print(f"  Skipped — cannot write the attribution row ({exc}); "
+                  "refusing to reconcile unaudited.", file=sys.stderr)
+            return False
+
+        # Carry the STORED confirmation pair forward. Both columns sit in the store's
+        # commentary UPDATE SET, and the parsed entry carries `confirmed_by=None` here
+        # (sync's "user" stamp happens further down the commit path) — so a naive
+        # reconcile NULLs them and one reusing sync's stamping rewrites them to "user".
+        # Measured: either destroys 114 stamps on a change that touched only prose.
+        entry.confirmed_by = existing.get("confirmed_by")
+        entry.confirmed_at = existing.get("confirmed_at")
+
+        # Withhold the transcript. `commit_parsed_entry` UPDATEs `transcripts` whenever
+        # the incoming text is non-None and differs — but the transcript is NOT in the
+        # divergence set, so it appears in no printed diff, no `fields_changed`, and no
+        # `prior_values`. Left attached it RIDES ALONG on any reconcile triggered by
+        # another species: an agent that edits `**Rejected:**` and rewrites the
+        # transcript block gets both applied, the operator pressing `[r]` sees only
+        # `rejected_paths` named, and the prior transcript then exists nowhere — markdown
+        # rewritten, graph updated, audit row silent. That is exactly the unattributed
+        # graph mutation P8 forbids, inside the feature that adds the attribution row.
+        # `None` means no-change to the store, which restores the documented
+        # write-once-preserved semantics; transcript reconciliation is homed in the
+        # future `amend-commentary` verb along with its own attribution.
+        entry.transcript = None
+
+        try:
+            self.store.commit_parsed_entry(entry)
+        except CommitError as exc:
+            # Reported per-entry and moved past — NEVER routed to the quarantine
+            # fixpoint. A retry cannot help: nothing later in this pass changes the
+            # outcome, and MI-13's FM2 (dropping a `Supersedes:` line resurrects a
+            # predecessor into a slug_collision rollback) would re-fail every pass.
+            reason = "; ".join(i.message for i in exc.failure.items) if exc.failure else str(exc)
+            print(f"  Reconcile FAILED for '{existing.get('slug')}': {reason}",
+                  file=sys.stderr)
+            # Append-only closure: the intent row stays and a correlated outcome row
+            # records the failure. Telemetry never UPDATEs or DELETEs, and this write
+            # IS best-effort — the mutation did not happen, so there is no unattributed
+            # mutation to hide.
+            try:
+                telemetry.record_commentary_outcome(
+                    audit_id=uuid.uuid4().hex,
+                    correlates_to=audit_id,
+                    outcome=f"failed: {reason}",
+                    created_at=_utc_now_iso(),
+                    mitos_version=MITOS_VERSION,
+                )
+            except Exception:
+                pass
+            return False
+
+        print(f"  Reconciled '{existing.get('slug')}' ✓")
+        return True
+
+    @staticmethod
+    def _reconcile_value_pair(
+        entry: ParsedEntry,
+        existing: Dict[str, Any],
+        divergence: Dict[str, Any],
+        stored_edges: List[Dict[str, str]],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Builds the audit row's ``(prior, new)`` value pair.
+
+        Both sides, not just the prior: self-detection of a crash-phantom compares the
+        NEW values against the graph, and chain consistency compares a successor's
+        ``prior`` against its predecessor's ``new``.
+
+        Args:
+            entry: The parsed corpus entry.
+            existing: The committed node.
+            divergence: The ``entry_divergence`` report.
+            stored_edges: The node's outgoing edges as stored, so the edge columns can
+                record full state rather than a delta.
+
+        Returns:
+            The ``(prior_values, new_values)`` pair, keyed identically.
+        """
+        prior: Dict[str, Any] = {}
+        new_values: Dict[str, Any] = {}
+        for field in divergence.get("commentary") or []:
+            prior[field] = existing.get(field)
+            new_values[field] = getattr(entry, field, None)
+        if divergence.get("scope"):
+            prior["scope"] = divergence["scope"]["graph"]
+            new_values["scope"] = divergence["scope"]["markdown"]
+        if divergence.get("edges"):
+            # FULL STATE on both sides, not the delta. `prior["edges"] = removed` reads
+            # as "the graph held exactly these", which is false whenever the node keeps
+            # an edge — and the documented read rule (an intent row over a graph
+            # matching its `new_values` means applied) would then mismatch and report a
+            # successfully-applied reconcile as NOT applied, inverting the P8 verdict.
+            stored = _edge_state_labels(stored_edges)
+            declared = _edge_state_labels(declared_edges(entry))
+            prior["edges"] = stored
+            new_values["edges"] = declared
+        return prior, new_values
+
     def splice_buffer(
         self,
         transform: Callable[[str], str],
@@ -2197,6 +2526,7 @@ class MitosSyncManager:
                 # no_op_reason; the pointer stays.
                 "path": self.config.decisions_file,
                 "no_op_reason": _EXISTS_NO_OP_NOTE,
+                **self._exists_receipt_extras(entry, existing, node_id),
             }
 
         # Slug-collision fast-fail (exact match only).
@@ -2305,6 +2635,7 @@ class MitosSyncManager:
                         # See the gate-3 twin above: the path points, it does not claim.
                         "path": self.config.decisions_file,
                         "no_op_reason": _EXISTS_NO_OP_NOTE,
+                        **self._exists_receipt_extras(entry, existing, node_id),
                     }
                 coll_id, _coll_node = self._exact_slug_node(entry.slug)
                 if coll_id and coll_id != node_id:

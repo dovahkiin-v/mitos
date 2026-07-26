@@ -215,4 +215,8 @@ def test_cli_record_exists_does_not_label_the_path_as_written(ws, capsys):
     assert config.decisions_file in out, "#5b: still points at the entry"
     assert "Written:" not in out, "nothing was written on the exists path"
     assert "Recorded decision" not in out, "a no-op must not borrow the success headline"
-    assert "wrote nothing" in out and "mitos rebuild" in out
+    assert "wrote nothing" in out
+    # The note names a repair per reachable state: `sync` for a buffer entry (as of the
+    # reconcile release), `restore-source` for a node with no block, `rebuild` for one
+    # that has rotated into an archive.
+    assert "mitos sync" in out and "restore-source" in out and "mitos rebuild" in out

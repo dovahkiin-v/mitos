@@ -1194,3 +1194,200 @@ def test_load_reuse_index_routes_through_mi8_chokepoint(tmp_path, monkeypatch) -
     assert read_only is True
     assert foreign_keys == 1
     assert busy_timeout == BUSY_TIMEOUT_MS
+
+
+# ===========================================================================
+# Rung 3 — the commentary-reconcile attribution row (P8)
+# ===========================================================================
+#
+# Every applied commentary reconcile writes one durable record of what changed.
+# Without it, an agent's markdown edit plus `sync --yes` is exactly as
+# unattributable afterwards as mutating the graph directly would have been —
+# `updated_at` says only THAT something changed. P8 requires every graph mutation
+# to be attributable, so this row is what makes the reconcile's whole argument
+# hold rather than being polish on top of it.
+#
+# It lives HERE, in the sibling, and not in `graph.sqlite`, because after a
+# reconcile the prior values exist nowhere else on earth — the markdown was
+# rewritten by the agent and the graph was updated by the reconcile. That makes the
+# row non-rebuildable in the exact sense two recorded ADRs already ruled on, both
+# the same way: the corpus must survive the truth-rebuild.
+
+def test_commentary_audit_table_exists_at_rung_three(tmp_path) -> None:
+    """The audit table ships as a plain additive rung on telemetry's own ladder."""
+    from mitos.telemetry import TELEMETRY_MIGRATION_STEPS, TelemetryStore
+
+    assert [rung for rung, _fn in TELEMETRY_MIGRATION_STEPS] == [1, 2, 3]
+
+    path = str(tmp_path / "telemetry.sqlite")
+    TelemetryStore(path)
+    conn = sqlite3.connect(path)
+    try:
+        cols = {row[1]: row for row in conn.execute("PRAGMA table_info(commentary_audit)")}
+    finally:
+        conn.close()
+    assert cols, "rung 3 must create `commentary_audit`"
+    for column in ("audit_id", "node_id", "slug", "fields_changed", "prior_values",
+                   "new_values", "outcome", "correlates_to", "mitos_version",
+                   "created_at"):
+        assert column in cols, f"missing column: {column}"
+
+
+def test_node_id_is_a_plain_column_not_a_foreign_key(tmp_path) -> None:
+    """No FK to `nodes` — the graph is a different, disposable file.
+
+    Following the verbatim in-file precedent (`batch_id` is a plain column, NOT an
+    FK — a training label outlives graph surgery). An FK here would be worse than
+    useless: the table is not even in the same database, and an attribution row must
+    outlive the node it attributes, which a retired-and-dropped node would otherwise
+    take with it.
+    """
+    from mitos.telemetry import TelemetryStore
+
+    path = str(tmp_path / "telemetry.sqlite")
+    TelemetryStore(path)
+    conn = sqlite3.connect(path)
+    try:
+        # Assert the table EXISTS first: `PRAGMA foreign_key_list` on a missing table
+        # returns an empty list, so the FK assertion alone passes vacuously.
+        assert list(conn.execute("PRAGMA table_info(commentary_audit)")), \
+            "commentary_audit must exist for this assertion to mean anything"
+        fks = list(conn.execute("PRAGMA foreign_key_list(commentary_audit)"))
+    finally:
+        conn.close()
+    assert fks == [], f"commentary_audit must carry no foreign keys, found {fks}"
+
+
+def test_an_intent_row_records_both_prior_and_new_values(tmp_path) -> None:
+    """The row carries BOTH sides, because self-detection depends on both.
+
+    "Carrying the prior values" under-specifies: sync holds the FileLock, so a
+    crash-phantom is necessarily the newest row and its NEW values can be compared
+    against the graph to spot it. Historically, chain consistency still fingers a
+    phantom, because its successor records a `prior` equal to the phantom's `prior`
+    rather than its `new`.
+    """
+    from mitos.telemetry import CommentaryAuditRow, TelemetryStore
+
+    store = TelemetryStore(str(tmp_path / "telemetry.sqlite"))
+    audit_id = store.record_commentary_intent(
+        CommentaryAuditRow(
+            audit_id="a1", node_id="node-abc", slug="probe-slug",
+            fields_changed=["rejected_paths"],
+            prior_values={"rejected_paths": "the old reasoning"},
+            new_values={"rejected_paths": "the corrected reasoning"},
+            mitos_version="0.12.0",
+        ),
+        created_at="2026-07-27T00:00:00.000000+00:00",
+    )
+    assert audit_id == "a1"
+
+    rows = store.read_commentary_audit()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["prior_values"] == {"rejected_paths": "the old reasoning"}
+    assert row["new_values"] == {"rejected_paths": "the corrected reasoning"}
+    assert row["fields_changed"] == ["rejected_paths"]
+    assert row["outcome"] is None, "an intent row is open until an outcome closes it"
+
+
+def test_a_failure_is_closed_by_an_appended_outcome_row_never_a_delete(tmp_path) -> None:
+    """Append-only failure closure — telemetry never UPDATEs or DELETEs.
+
+    A reconcile can raise `CommitError` (MI-13 FM2: dropping a `Supersedes:` line
+    resurrects a predecessor into a slug-collision rollback). Deleting the intent row
+    would be the obvious cleanup and is forbidden: the discipline here is append-only,
+    so the failure is recorded as a correlated outcome row. Intent row + no failure
+    row + a graph matching the new values ⇒ applied.
+    """
+    from mitos.telemetry import CommentaryAuditRow, TelemetryStore
+
+    store = TelemetryStore(str(tmp_path / "telemetry.sqlite"))
+    store.record_commentary_intent(
+        CommentaryAuditRow(
+            audit_id="a1", node_id="node-abc", slug="probe-slug",
+            fields_changed=["context"], prior_values={"context": "old"},
+            new_values={"context": "new"}, mitos_version="0.12.0",
+        ),
+        created_at="2026-07-27T00:00:00.000000+00:00",
+    )
+    store.record_commentary_outcome(
+        audit_id="a2", correlates_to="a1", outcome="failed: slug_collision",
+        created_at="2026-07-27T00:00:01.000000+00:00", mitos_version="0.12.0",
+    )
+
+    rows = store.read_commentary_audit()
+    assert len(rows) == 2, "the intent row must survive — closure is an APPEND"
+    intent = [r for r in rows if r["audit_id"] == "a1"][0]
+    closure = [r for r in rows if r["audit_id"] == "a2"][0]
+    assert intent["outcome"] is None
+    assert closure["correlates_to"] == "a1"
+    assert closure["outcome"] == "failed: slug_collision"
+
+
+def test_the_audit_connection_runs_synchronous_full(tmp_path) -> None:
+    """`PRAGMA synchronous=FULL` on the audit write, closing the power-loss window.
+
+    Both databases run WAL with `synchronous=NORMAL`, so their WAL syncs are
+    INDEPENDENT: on power loss the graph commit can survive while the earlier
+    telemetry write is lost — the one thing write-ahead ordering exists to prevent.
+    One line, and reconciles are rare.
+    """
+    from mitos.telemetry import TelemetryStore
+
+    from mitos.telemetry import CommentaryAuditRow
+
+    store = TelemetryStore(str(tmp_path / "telemetry.sqlite"))
+    with store._audit_connection() as conn:
+        assert conn.execute("PRAGMA synchronous").fetchone()[0] == 2, "2 == FULL"
+        # `open_connection` applies its own pragma suite, including
+        # `synchronous=NORMAL` — so the value that matters is the one in force AFTER a
+        # real write on the same connection, not merely at hand-out time.
+        conn.execute("INSERT INTO commentary_audit (audit_id, mitos_version, created_at) "
+                     "VALUES (?, ?, ?)", ("probe", "0.12.0", "2026-07-27T00:00:00+00:00"))
+        conn.commit()
+        assert conn.execute("PRAGMA synchronous").fetchone()[0] == 2, (
+            "FULL must still be in force after the INSERT"
+        )
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+
+    # And the mandatory writer itself uses that connection.
+    store.record_commentary_intent(
+        CommentaryAuditRow(audit_id="a1", node_id="n", slug="s", fields_changed=["context"],
+                           prior_values={"context": "a"}, new_values={"context": "b"},
+                           mitos_version="0.12.0"),
+        created_at="2026-07-27T00:00:01.000000+00:00",
+    )
+    assert len(store.read_commentary_audit()) == 2
+
+
+def test_audit_rows_survive_a_rebuild_and_a_graph_wipe(tmp_path) -> None:
+    """The whole reason for the sibling: the row is non-rebuildable data.
+
+    After a reconcile the prior commentary values exist nowhere else — the markdown
+    was rewritten, the graph was updated. `rm graph.sqlite` is sanctioned by P6 and
+    named verbatim in two recorded ADRs; a graph-homed audit table would die there
+    with nothing to rebuild from.
+    """
+    from mitos.telemetry import CommentaryAuditRow, TelemetryStore
+
+    config = MitosConfig(str(tmp_path))
+    os.makedirs(config.mitos_dir, exist_ok=True)
+    GraphStore(config.db_path)  # a real graph beside it
+
+    store = TelemetryStore(config.telemetry_path)
+    store.record_commentary_intent(
+        CommentaryAuditRow(
+            audit_id="a1", node_id="node-abc", slug="probe-slug",
+            fields_changed=["context"], prior_values={"context": "old"},
+            new_values={"context": "new"}, mitos_version="0.12.0",
+        ),
+        created_at="2026-07-27T00:00:00.000000+00:00",
+    )
+
+    os.remove(config.db_path)
+    for sidecar in (config.db_path + "-wal", config.db_path + "-shm"):
+        if os.path.exists(sidecar):
+            os.remove(sidecar)
+
+    assert len(TelemetryStore(config.telemetry_path).read_commentary_audit()) == 1

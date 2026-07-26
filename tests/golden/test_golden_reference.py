@@ -280,3 +280,180 @@ def test_real_rebuild_reproduces_the_golden(tmp_path):
 
     store = GraphStore(result.aside_db_path, read_only=True)
     assert snapshot(store) == load_oracle()
+
+
+# --- Layer A: the store transitions the commentary reconcile is built on ----------
+#
+# The reconcile routes a caller to the store's in-place commentary UPDATE, which was
+# reachable only from unit tests before it — so the three tests below pin the STORE
+# transitions it depends on (in-place update, MI-3's no-tick, declarative edge
+# deletion) as deterministic emergent behaviour, and the fourth drives the real
+# `perform_sync` path end to end. Stated precisely because the distinction matters:
+# the first three would pass against a build with no reconcile at all, which makes
+# them a foundation rather than a regression guard for it.
+#
+# Deliberately NOT added to `decisions.reference.md` + a re-frozen oracle: the corpus
+# is a set of committed FACTS, and a reconcile is a TRANSITION between two states of
+# one. Baking a diverged entry into the reference corpus would change what the corpus
+# *is* and make every other oracle assertion read against a corpus that disagrees with
+# its own graph.
+
+def _harbor_entry(slug):
+    """Returns the reference corpus's parsed entry for `slug`."""
+    from mitos.parser import parse_entry_stream
+
+    from _harness import CORPUS_PATH
+
+    text = open(CORPUS_PATH, encoding="utf-8").read()
+    matches = [e for e in parse_entry_stream(text, "decision") if e.slug == slug]
+    assert len(matches) == 1, f"{slug} must appear exactly once in the reference corpus"
+    return matches[0]
+
+
+def test_a_commentary_reconcile_updates_in_place_and_touches_nothing_else(tmp_path):
+    """A corrected `rejected_paths` lands on the SAME node, leaving the core untouched.
+
+    Pins the whole shape of the reconcile in one place: same id, same axiom, same
+    mechanisms, same scope, same edges, same node count — one field changed and
+    `updated_at` ticked.
+    """
+    store = build_reference_graph(str(tmp_path / "golden.sqlite"))
+    before = {n["slug"]: n for n in store.get_all_nodes()}
+    count_before = len(before)
+    target = before["harbor-backup-nightly"]
+    edges_before = sorted(
+        (e["source_id"], e["target_id"], e["edge_type"]) for e in store.get_edges()
+    )
+
+    # The golden fixture commits with a NULL confirmation pair, so stamp a real one —
+    # otherwise the carry-forward assertion below compares None to None and holds
+    # against a build that destroys the stamps.
+    with store._get_connection() as conn:
+        conn.execute("UPDATE nodes SET confirmed_by = 'agent', confirmed_at = ? WHERE id = ?",
+                     ("2026-06-23T13:04:17.147973+00:00", target["id"]))
+    target = {n["slug"]: n for n in store.get_all_nodes()}["harbor-backup-nightly"]
+    before["harbor-backup-nightly"] = target
+
+    entry = _harbor_entry("harbor-backup-nightly")
+    entry.rejected_paths = "Continuous backup — CORRECTED: revisited at pilot scale."
+    # The reconcile carries the stored confirmation pair forward rather than restamping.
+    entry.confirmed_by = target["confirmed_by"]
+    entry.confirmed_at = target["confirmed_at"]
+    store.commit_parsed_entry(entry)
+
+    after = {n["slug"]: n for n in store.get_all_nodes()}
+    node = after["harbor-backup-nightly"]
+
+    assert len(after) == count_before, "a commentary correction mints no new node"
+    assert node["id"] == target["id"], "the canonical core is immutable (M1)"
+    assert node["core_axiom"] == target["core_axiom"]
+    assert node["mechanisms"] == target["mechanisms"]
+    assert node["rejected_paths"] == "Continuous backup — CORRECTED: revisited at pilot scale."
+    assert sorted(node["scope"]) == sorted(target["scope"]), "scope untouched by an S1 fix"
+    assert node["created_at"] == target["created_at"], "created_at never re-mints"
+    assert node["confirmed_by"] == "agent", "the stored confirmation pair carries forward"
+    assert node["confirmed_at"] == "2026-06-23T13:04:17.147973+00:00"
+    assert node["updated_at"] != target["updated_at"], "a real change ticks updated_at"
+    assert sorted(
+        (e["source_id"], e["target_id"], e["edge_type"]) for e in store.get_edges()
+    ) == edges_before, "an unchanged declaration must not disturb any edge (MI-5)"
+    # Every other node is byte-identical.
+    for slug, row in after.items():
+        if slug != "harbor-backup-nightly":
+            assert row == before[slug], f"the reconcile disturbed '{slug}'"
+
+
+def test_a_byte_identical_recommit_does_not_tick_updated_at(tmp_path):
+    """MI-3, which the divergence gate exists to preserve.
+
+    If the gate ever stopped gating, every sync would re-commit every entry — and this
+    is the property that would break first and most visibly, since `updated_at` is half
+    the divergence cache's fingerprint.
+    """
+    store = build_reference_graph(str(tmp_path / "golden.sqlite"))
+    before = {n["slug"]: n for n in store.get_all_nodes()}
+    target = before["harbor-cache-is-process-singleton"]
+
+    entry = _harbor_entry("harbor-cache-is-process-singleton")
+    entry.confirmed_by = target["confirmed_by"]
+    entry.confirmed_at = target["confirmed_at"]
+    store.commit_parsed_entry(entry)
+
+    node = [n for n in store.get_all_nodes() if n["slug"] == target["slug"]][0]
+    assert node == target, "a byte-identical re-commit is a true no-op (MI-3)"
+
+
+def test_dropping_a_declared_edge_deletes_exactly_that_edge(tmp_path):
+    """Declarative mirroring: a removed markdown line DELETES the stored edge.
+
+    This is why the reconcile splits edge additions from deletions and why `--yes`
+    refuses the deletions — pinned here so the mirroring semantics cannot drift out
+    from under that policy.
+    """
+    store = build_reference_graph(str(tmp_path / "golden.sqlite"))
+    before = {n["slug"]: n for n in store.get_all_nodes()}
+    target = before["harbor-backup-nightly"]
+    resolved_id = before["oq-harbor-backup-cadence"]["id"]
+    assert any(e["source_id"] == target["id"] and e["target_id"] == resolved_id
+               for e in store.get_edges()), "the fixture must start with the edge"
+
+    entry = _harbor_entry("harbor-backup-nightly")
+    entry.resolves = []
+    entry.confirmed_by = target["confirmed_by"]
+    entry.confirmed_at = target["confirmed_at"]
+    store.commit_parsed_entry(entry)
+
+    assert not any(e["source_id"] == target["id"] and e["target_id"] == resolved_id
+                   for e in store.get_edges()), "the declaration's removal deletes it"
+    assert len(store.get_all_nodes()) == len(before), "and mints no node"
+
+
+def test_the_real_sync_path_reconciles_a_harbor_entry_end_to_end(tmp_path, monkeypatch):
+    """The Harbor fixture driven through `perform_sync`, not the store directly.
+
+    The three tests above pin the store transitions the reconcile stands on; this one
+    pins the reconcile itself — it fails against a build whose gate still skips every
+    already-committed entry. Deterministic and service-free: the mock key satisfies the
+    key gate, and no reconcile path makes a model call (the conflict judge fires below
+    the gate and the reconcile never reaches it).
+    """
+    import os
+
+    from mitos.config import MitosConfig
+    from mitos.sync import MitosSyncManager
+
+    monkeypatch.setenv("GEMINI_API_KEY", "mock_key")
+    monkeypatch.setenv("QDRANT_URL", "http://localhost:9")
+
+    config = MitosConfig(str(tmp_path))
+    os.makedirs(config.mitos_dir, exist_ok=True)
+    with open(config.decisions_file, "w", encoding="utf-8") as fh:
+        fh.write("# Decisions\n<!-- BEGIN ENTRIES — new decisions go directly below "
+                 "this line, newest first -->\n")
+    manager = MitosSyncManager(config)
+
+    # `record` rather than `sync` to seed: a sync-committed entry ROTATES out of the
+    # buffer, and sync reads only the buffer — so a rotated entry is not reconcilable
+    # at all. Record-authored entries never rotate, which is why they are the ones the
+    # reconcile actually meets on a live corpus.
+    seeded = manager.record_decision_entry(
+        "Harbor backs up the metadata database nightly and retains 14 days of history.",
+        "Continuous backup — operational cost unjustified at pilot scale.",
+        ["storage"], mechanisms=["postgres"], slug="harbor-backup-nightly",
+        acknowledge_neighbors=True,
+    )
+    assert seeded.get("state") == "active", seeded
+
+    with open(config.decisions_file, "r", encoding="utf-8") as fh:
+        text = fh.read()
+    with open(config.decisions_file, "w", encoding="utf-8") as fh:
+        fh.write(text.replace(
+            "Continuous backup — operational cost unjustified at pilot scale.",
+            "Continuous backup — CORRECTED: revisited at pilot scale.",
+        ))
+
+    manager.perform_sync(auto_accept=True)
+
+    node = GraphStore(config.db_path).get_node_by_slug("harbor-backup-nightly")
+    assert node["rejected_paths"] == "Continuous backup — CORRECTED: revisited at pilot scale."
+    assert node["core_axiom"].startswith("Harbor backs up"), "the core is untouched (M1)"

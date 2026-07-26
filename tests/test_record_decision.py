@@ -704,20 +704,25 @@ def test_exists_receipt_reports_the_no_op_without_dropping_the_pointer(ws) -> No
     assert r2["status"] == "exists"
     assert r2["path"] == config.decisions_file, "the pointer stays (#5b)"
     assert r2.get("no_op_reason"), "a no-op must say so in-band"
-    # The note names the path that actually works, and not the one that doesn't.
-    # `mitos sync` does not reconcile a committed entry's commentary yet, so naming it
-    # here would ship a receipt pointing at a silent no-op.
-    assert "mitos rebuild" in r2["no_op_reason"]
-    assert "mitos sync" not in r2["no_op_reason"]
+    # INVERTED, deliberately and only now: `mitos sync` reconciles a diverged committed
+    # entry as of the C′ release, so the note finally names a path that WORKS. Before
+    # that it pointed at a silent no-op, and this assertion was what kept the receipt
+    # honest in the meantime — the exact bug class the divergence work exists to kill,
+    # held off for three releases until the capability was real.
+    assert "mitos sync" in r2["no_op_reason"]
+    assert "restore-source" in r2["no_op_reason"], (
+        "a graph-only node has no entry to edit — the note must name the verb that "
+        "re-materializes one"
+    )
 
 
-def test_exists_no_op_note_names_the_two_limits_of_the_path_it_prescribes(ws) -> None:
-    """The note owns `rebuild`'s two failure modes instead of leaving them discovered.
+def test_exists_no_op_note_covers_the_graph_only_case(ws) -> None:
+    """The note distinguishes "edit the entry" from "there is no entry to edit".
 
-    Measured on the live dogfood corpus: ``mitos rebuild`` is *refused* there (81
-    active decisions it cannot reconstruct), and for a graph-only node the note's
-    "edit the entry in decisions.md" names an entry that does not exist. A receipt
-    that prescribes a path has to say where the path stops.
+    Both halves are reachable, and they need different verbs: a buffer entry is
+    reconciled by `mitos sync`, while a node with no `### ` block has nothing to edit
+    until `mitos restore-source` re-materializes it. Sending a caller to edit an entry
+    that does not exist is the failure this replaced.
     """
     config, m = ws
     m.record_decision_entry("Pin the digest length.", "Leave it to the implementer.",
@@ -725,8 +730,29 @@ def test_exists_no_op_note_names_the_two_limits_of_the_path_it_prescribes(ws) ->
     note = m.record_decision_entry("Pin the digest length.", "CORRECTED rejected text.",
                                    [], slug="pin-digest-length")["no_op_reason"]
 
-    assert "no entry to edit" in note, "a graph-only node has no `###` block to edit"
-    assert "refuses" in note, "a gate refusal means the corpus needs repair first"
+    assert "no `### ` block" in note, "the graph-only case must be named"
+    assert "restore-source" in note, "and pointed at its verb"
+
+
+def test_exists_receipt_names_the_fields_it_ignored(ws) -> None:
+    """AX round 10's ask, verbatim: *say what it ignored*.
+
+    A re-record aimed at correcting commentary got a clean `(exists) ✓` with no
+    indication that the values it carried differed from the stored ones, so the caller
+    had to check by hand to learn nothing had changed. Both surfaces reported success
+    for an operation that changed nothing.
+    """
+    config, m = ws
+    m.record_decision_entry("Pin the digest length.", "The original reasoning.",
+                            ["alpha"], slug="pin-digest-length")
+
+    same = m.record_decision_entry("Pin the digest length.", "The original reasoning.",
+                                   ["alpha"], slug="pin-digest-length")
+    assert "differs" not in same, "an identical re-record ignored nothing"
+
+    changed = m.record_decision_entry("Pin the digest length.", "CORRECTED reasoning.",
+                                      ["alpha", "beta"], slug="pin-digest-length")
+    assert changed["differs"] == ["rejected_paths", "scope"], changed
 
 
 def test_exists_no_op_leaves_a_missing_source_block_missing(ws) -> None:
@@ -749,4 +775,7 @@ def test_exists_no_op_leaves_a_missing_source_block_missing(ws) -> None:
     res = m.record_decision_entry("Restore me later.", "Nothing.", [], slug="graph-only-node")
     assert res["status"] == "exists"
     assert "### graph-only-node" not in _read(config), "re-record must not be believed to restore"
-    assert "restore a missing source block" in res["no_op_reason"]
+    # The note names the VERB that restores it, not merely the possibility — a
+    # re-record cannot, and until `restore-source` shipped there was nothing that could.
+    assert "restore-source" in res["no_op_reason"]
+    assert "no `### ` block" in res["no_op_reason"]

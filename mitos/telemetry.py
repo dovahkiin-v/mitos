@@ -37,10 +37,12 @@ imports *this*, never the reverse — so ``telemetry -> {store, migrations, erro
 stays acyclic.
 """
 
+import contextlib
+import json
 import os
 import sqlite3
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from mitos.errors import DatabaseError
 from mitos.migrations import MigrationStep, run_migrations
@@ -224,6 +226,61 @@ class JudgmentBatch:
             self.token_cache_read,
             self.token_cache_creation,
             self.elapsed_ms,
+        )
+
+
+@dataclass(frozen=True)
+class CommentaryAuditRow:
+    """One commentary-reconcile attribution — the P8 row for an in-place graph edit.
+
+    Records BOTH sides of the change, not just the prior values. Self-detection of a
+    crash-phantom depends on both: its ``new_values`` can be compared against the graph,
+    and chain consistency fingers it historically too, because a phantom's successor
+    records a ``prior`` equal to the phantom's ``prior`` rather than its ``new`` — which
+    holds for the double-edit and revert cases alike. Note the entry loop does NOT run
+    under sync's ``FileLock`` (only the snapshot, rotation and record writes do), so two
+    concurrent syncs can interleave rows: a phantom is not guaranteed to be the NEWEST
+    row, and the chain comparison rather than recency is the reliable test.
+
+    Attributes:
+        audit_id: This row's id (``uuid4().hex``), minted by the caller.
+        node_id: The reconciled node — a plain column, NOT an FK (the graph is a
+            different, disposable file, and the attribution must outlive its node).
+        slug: The node's slug, stored verbatim as a citation handle.
+        fields_changed: The diverged field names.
+        prior_values: The values as the GRAPH held them before the reconcile.
+        new_values: The values the corpus now declares.
+        mitos_version: The build that wrote the row.
+    """
+
+    audit_id: str
+    node_id: Optional[str]
+    slug: Optional[str]
+    fields_changed: List[str]
+    prior_values: Dict[str, Any]
+    new_values: Dict[str, Any]
+    mitos_version: str
+
+    def to_params(self, created_at: str) -> Tuple[Any, ...]:
+        """Returns the INSERT value tuple in ``_COMMENTARY_AUDIT_COLUMNS`` order.
+
+        Args:
+            created_at: The application-supplied UTC ISO-8601 stamp (MI-10).
+
+        Returns:
+            The parameter tuple for one intent row.
+        """
+        return (
+            self.audit_id,
+            self.node_id,
+            self.slug,
+            json.dumps(list(self.fields_changed)),
+            json.dumps(self.prior_values, sort_keys=True),
+            json.dumps(self.new_values, sort_keys=True),
+            None,  # outcome — an intent row is OPEN until a correlated row closes it
+            None,  # correlates_to — set only on an outcome row
+            self.mitos_version,
+            created_at,
         )
 
 
@@ -487,6 +544,69 @@ def _check_attribution_schema(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+# --- Rung 3: the commentary-reconcile attribution row (P8) --------------------
+#
+# Every applied commentary reconcile writes one durable record of WHAT changed.
+# Without it, an agent's markdown edit plus `sync --yes` is exactly as unattributable
+# afterwards as mutating the graph directly would have been — `updated_at` says only
+# THAT something changed, never what. P8 requires every graph mutation to be
+# attributable, so this row is what makes the reconcile's argument hold rather than
+# polish on top of it.
+#
+# Homed HERE and not in `graph.sqlite` because after a reconcile the prior values
+# exist nowhere else on earth: the markdown was rewritten by the agent, the graph was
+# updated by the reconcile. That is non-rebuildable data in the exact sense two
+# recorded ADRs already ruled on, both the same way — the corpus must survive the
+# truth-rebuild. A graph-homed table would contradict recorded precedent without
+# superseding it, which in a decision-memory tool is corpus incoherence.
+#
+# Honest limit: the row attributes WHAT and WHEN, not WHO. `sync` has no way to know
+# who edited the markdown, and the `git log decisions.md` fallback fails at home —
+# this project gitignores its own corpus.
+_COMMENTARY_AUDIT_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS commentary_audit (
+        audit_id TEXT NOT NULL,        -- uuid4().hex, minted per row (intent or outcome)
+        node_id TEXT,                  -- the reconciled node; a PLAIN COLUMN, NOT an FK
+                                       -- (the graph is a different, disposable file, and
+                                       -- an attribution row must outlive its node —
+                                       -- same precedent as batch_id above). NULL on an
+                                       -- outcome row, which correlates instead.
+        slug TEXT,                     -- citation handle, verbatim, for reading by eye
+        fields_changed TEXT,           -- JSON array of the diverged field names
+        prior_values TEXT,             -- JSON object: the values as the GRAPH held them
+        new_values TEXT,               -- JSON object: the values the corpus now declares
+        outcome TEXT,                  -- NULL on an intent row; a reason string on the
+                                       -- correlated outcome row that CLOSES a failure
+        correlates_to TEXT,            -- an outcome row's intent audit_id (plain column)
+        mitos_version TEXT NOT NULL,   -- which build wrote the row
+        created_at TEXT NOT NULL,      -- application-supplied UTC ISO-8601 (MI-10)
+        PRIMARY KEY (audit_id)
+    ) STRICT;
+"""
+
+
+def _commentary_audit_schema(conn: sqlite3.Connection) -> None:
+    """Migration step 3: the commentary-reconcile attribution table.
+
+    A plain additive rung — one CREATE, no ALTER, no table rebuild, nothing to
+    back-fill — so reverting the release leaves one unread table in a sibling DB with
+    no data lost and no contract broken. Does NOT touch ``user_version`` or manage the
+    transaction; ``run_migrations`` owns both.
+
+    **Death story (P4).** Rows live as long as the workspace. Retention is
+    **explicitly deferred**, following this module's own deferred-P4 precedent for the
+    judgment corpus ("no retention, decay, or pruning"): an attribution trail that
+    silently forgot would be worse than none, because a reader could not tell an
+    unattributed mutation from a pruned one. When retention does arrive it must be an
+    explicit, recorded decision — not a default that grew in.
+
+    Args:
+        conn: An open, writable SQLite connection inside the runner's transaction
+            (opened via ``store.open_connection``, MI-8).
+    """
+    conn.execute(_COMMENTARY_AUDIT_SCHEMA)
+
+
 # Telemetry's OWN ladder registry — a separate ``user_version`` space from the
 # graph's ``migrations.MIGRATION_STEPS``. ONE binding statement, ever: a future
 # telemetry migration extends this literal or ``.append((3, ...))`` after it —
@@ -495,6 +615,7 @@ def _check_attribution_schema(conn: sqlite3.Connection) -> None:
 TELEMETRY_MIGRATION_STEPS: List[MigrationStep] = [
     (1, _conflict_checks_schema),
     (2, _check_attribution_schema),
+    (3, _commentary_audit_schema),
 ]
 
 
@@ -717,6 +838,22 @@ _SELECT_REUSE_INDEX_SQL = (
 )
 
 
+_COMMENTARY_AUDIT_COLUMNS: Tuple[str, ...] = (
+    "audit_id", "node_id", "slug", "fields_changed", "prior_values", "new_values",
+    "outcome", "correlates_to", "mitos_version", "created_at",
+)
+
+_INSERT_COMMENTARY_AUDIT_SQL = (
+    f"INSERT INTO commentary_audit ({', '.join(_COMMENTARY_AUDIT_COLUMNS)}) "
+    f"VALUES ({', '.join('?' * len(_COMMENTARY_AUDIT_COLUMNS))})"
+)
+
+_SELECT_COMMENTARY_AUDIT_SQL = (
+    f"SELECT {', '.join(_COMMENTARY_AUDIT_COLUMNS)} FROM commentary_audit "
+    "ORDER BY created_at ASC, rowid ASC"
+)
+
+
 class TelemetryStore:
     """Append-only sibling store for the Conflict sensor's judged batches.
 
@@ -806,6 +943,131 @@ class TelemetryStore:
             raise DatabaseError(f"Failed to persist judged batch: {e}") from e
         finally:
             conn.close()
+
+    @contextlib.contextmanager
+    def _audit_connection(self):
+        """Yields a write connection with ``synchronous=FULL`` for the audit row.
+
+        Both databases run WAL with ``synchronous=NORMAL``, so their WAL syncs are
+        INDEPENDENT: on power loss the graph commit can survive while the earlier
+        telemetry write is lost — the one thing write-ahead ordering exists to prevent.
+        `FULL` closes that window. One line, and reconciles are rare, so the fsync cost
+        is paid nowhere that matters. Residual, named rather than left to be discovered:
+        this narrows the window, it does not abolish it — a filesystem that lies about
+        fsync lies to both databases.
+
+        Yields:
+            An open connection with the pragma applied.
+        """
+        conn = open_connection(self.telemetry_path)
+        try:
+            conn.execute("PRAGMA synchronous=FULL")
+            yield conn
+        finally:
+            conn.close()
+
+    def record_commentary_intent(
+        self, row: CommentaryAuditRow, created_at: str
+    ) -> str:
+        """Writes the attribution row for a reconcile that is ABOUT to be applied.
+
+        Write-**ahead**, deliberately, and the failure modes are asymmetric. A
+        best-effort write-AFTER (the ``note_source_reencounter`` pattern) can leave a
+        **mutation with no attribution** on a crash between the two — undetectable, and
+        exactly what P8 forbids. Write-ahead instead leaves a **phantom row for a change
+        that never landed**, and a phantom never violates P8: it forbids unattributed
+        *mutations*, not attributed *non-mutations*. Losing cross-database atomicity is
+        the price, and it is the cheaper failure.
+
+        Unlike every other writer in this module this one is **mandatory**, not
+        best-effort: the caller must let a failure here refuse the reconcile rather than
+        proceed unaudited, or P8 holds only when the disk cooperates. That inversion of
+        this module's ambient posture is the sharpest way the design fails in practice
+        if left unstated.
+
+        Args:
+            row: The attribution row.
+            created_at: The application-supplied UTC ISO-8601 stamp (MI-10).
+
+        Returns:
+            The written ``audit_id``, so the caller can correlate an outcome row to it.
+
+        Raises:
+            DatabaseError: If the row cannot be persisted. The caller MUST NOT swallow
+                this — refusing the reconcile is the contract.
+        """
+        try:
+            with self._audit_connection() as conn:
+                with conn:
+                    conn.execute(_INSERT_COMMENTARY_AUDIT_SQL, row.to_params(created_at))
+        except sqlite3.Error as exc:
+            raise DatabaseError(
+                f"Could not write the commentary attribution row for '{row.slug}': {exc}"
+            ) from exc
+        return row.audit_id
+
+    def record_commentary_outcome(
+        self, *, audit_id: str, correlates_to: str, outcome: str, created_at: str,
+        mitos_version: str,
+    ) -> None:
+        """Appends the row that CLOSES a failed reconcile's intent row.
+
+        Append-only closure: telemetry never UPDATEs or DELETEs, so a reconcile that
+        raised (``CommitError`` — MI-13 FM2's slug-collision rollback is reachable on
+        this path) is recorded as a correlated outcome rather than by deleting the
+        intent. The read rule follows from that: an intent row with no correlated
+        failure row, over a graph matching its ``new_values``, means applied.
+
+        A failure to write THIS row is best-effort by contrast — the mutation did not
+        happen, so there is no unattributed mutation to hide.
+
+        Args:
+            audit_id: This outcome row's own id.
+            correlates_to: The intent row's ``audit_id``.
+            outcome: Why the reconcile did not land.
+            created_at: The application-supplied UTC ISO-8601 stamp (MI-10).
+            mitos_version: The writing build. Passed in rather than imported, so this
+                module reads no ambient state — the same reason it takes ``created_at``
+                instead of reading a clock.
+
+        Raises:
+            DatabaseError: If the row cannot be persisted.
+        """
+        params = (audit_id, None, None, None, None, None, outcome, correlates_to,
+                  mitos_version, created_at)
+        try:
+            with self._audit_connection() as conn:
+                with conn:
+                    conn.execute(_INSERT_COMMENTARY_AUDIT_SQL, params)
+        except sqlite3.Error as exc:
+            raise DatabaseError(
+                f"Could not write the commentary outcome row for '{correlates_to}': {exc}"
+            ) from exc
+
+    def read_commentary_audit(self) -> List[Dict[str, Any]]:
+        """Reads the whole attribution trail, oldest first, JSON columns decoded.
+
+        Opens ``mode=ro`` so "no writes on the read path" is structural rather than
+        disciplinary, matching ``load_reuse_index``.
+
+        Returns:
+            One dict per row, ``fields_changed``/``prior_values``/``new_values``
+            decoded from JSON (``None`` when the column is NULL, as on an outcome row).
+        """
+        conn = open_connection(self.telemetry_path, read_only=True)
+        try:
+            rows = conn.execute(_SELECT_COMMENTARY_AUDIT_SQL).fetchall()
+        finally:
+            conn.close()
+
+        out: List[Dict[str, Any]] = []
+        for raw in rows:
+            record = {name: raw[name] for name in _COMMENTARY_AUDIT_COLUMNS}
+            for json_column in ("fields_changed", "prior_values", "new_values"):
+                if record[json_column] is not None:
+                    record[json_column] = json.loads(record[json_column])
+            out.append(record)
+        return out
 
     def record_check_run(self, row: CheckRunRow) -> None:
         """Persists one check run's summary row — the CHK-D7 run memory (W7).
