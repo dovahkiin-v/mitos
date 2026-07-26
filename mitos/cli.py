@@ -45,6 +45,7 @@ from mitos.errors import (
     MitosError, ParseError, ValidationError, DatabaseError, ConfigError,
     VectorStoreError, EmbeddingError,
 )
+from mitos.divergence import corpus_graph_divergence, divergence_total
 from mitos.vector_store import scroll_point_ids, hash_to_uuid, QdrantVectorStore
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.telemetry import TelemetryStore, ConflictCheckRow, JudgmentBatch
@@ -58,7 +59,8 @@ from mitos.cutover import default_aside_db_path, perform_swap, rebuild_and_gate
 from mitos.lexical import degraded_reason_from_error, lexical_fallback
 from mitos.recall import (assess_surface_recall, corpus_provenance,
                           provenance_line, scope_filter_recovery)
-from mitos.sync import MitosSyncManager, run_ambient_capture, _SLUG_MAX_LEN
+from mitos.sync import (MitosSyncManager, run_ambient_capture, _SLUG_MAX_LEN,
+                        _ENTRIES_MARKER)
 from mitos._agent_block import agent_block, agent_block_drift, AGENT_GUIDE_VERSION
 from mitos.renderer import MitosRenderer, overflow_report
 from mitos.importer import MitosProseImporter
@@ -1876,6 +1878,18 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
         missing_active_slugs = sorted(id_to_slug.get(nid, nid) for nid in active_ids)
         orphan_points = 0
 
+    # Corpus↔graph divergence (B′). Purely informational — a corpus mid-edit is a
+    # normal state, so gating readiness on it would make an ordinary hand edit read
+    # as breakage. Best-effort like every other read here: a fault leaves the safe
+    # `None`, which prints nothing, rather than taking `status` down.
+    divergence_report = None
+    if os.path.exists(config.db_path) and not pre_v1a:
+        try:
+            ro_store = GraphStore(config.db_path, read_only=True)
+            divergence_report = corpus_graph_divergence(ro_store, config)
+        except Exception:
+            pass
+
     initialized = mitos_dir_ok and decisions_ok
     # A fresh, initialized project has NO Qdrant collection yet — it auto-creates
     # on the first `record_decision`. So an absent (or empty) collection is a
@@ -1911,6 +1925,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
                 "mcp_wired": mcp_wired,
             },
             "graph_behind_buffer": graph_behind,
+            "corpus_divergence": divergence_report,
             "scope_overflow": overflows,
             "agent_guide_version": AGENT_GUIDE_VERSION,
             "agent_files": agent_drift["files"],
@@ -2010,6 +2025,8 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
         )
     if overflows:
         _print_overflow_detail(overflows)
+    if divergence_report is not None:
+        _print_divergence_rung(divergence_report)
     if graph_behind:
         print(
             "\n  ⚠ graph is behind your buffer — the V1b edge catalog + mechanism "
@@ -2041,6 +2058,249 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
               "(https://github.com/dovahkiin-v/mitos/blob/main/SETUP.md)")
         print()
     return 0 if ready else 1
+
+
+def _print_divergence_rung(report: Dict[str, Any]) -> None:
+    """Prints the corpus↔graph divergence rung — informational, never a blocker.
+
+    A corpus mid-edit is a normal state, so gating readiness here would make an
+    ordinary hand edit read as breakage; and a clean corpus must print nothing at all,
+    since a rung that speaks on healthy projects is a rung readers learn to skip.
+
+    Phrased like the vector-completeness rung above it, and for the same reason: this
+    is a SENSOR, and the repair verbs (`mitos sync`, `mitos restore-source`) are named
+    so the reader has somewhere to go rather than only something to worry about.
+
+    Every key is read with ``.get``: the report may have come from the sidecar cache,
+    written by a build whose species set differed, and a ``KeyError`` raised from here
+    would take down the one command an operator runs to find out what is wrong. The
+    cache key carries a schema version so this should not arise — belt and braces,
+    because the cost of the braces is one method call.
+
+    Args:
+        report: A ``corpus_graph_divergence`` result.
+    """
+    if report.get("skipped"):
+        # Never a verdict from a read we could not take. "corpus busy" is the normal
+        # case — another process holds the lock — and is not worth a ⚠.
+        if report["skipped"] == "corpus busy":
+            print("\n  • divergence check skipped — corpus busy (another mitos "
+                  "process holds the lock); re-run when it finishes.")
+        return
+
+    total = divergence_total(report)
+    if total == 0:
+        return
+
+    print(f"\n  ⚠ corpus and graph disagree in {total} place(s) — informational, "
+          f"not a readiness blocker.")
+
+    commentary, scope = report.get("commentary") or [], report.get("scope") or []
+    if commentary:
+        print(f"      • {len(commentary)} entry(s) whose commentary text differs "
+              f"(the graph serves the stale value to every read)")
+        for row in commentary[:5]:
+            print(f"          - {row['slug']}: {', '.join(row['fields'])}")
+    if scope:
+        print(f"      • {len(scope)} entry(s) whose scope differs — a FINDABILITY "
+              f"defect: scope-filtered reads and `mitos scopes` miss them")
+        for row in scope[:5]:
+            print(f"          - {row['slug']}: graph {row['graph']} vs "
+                  f"markdown {row['markdown']}")
+    if report.get("edges"):
+        print(f"      • {len(report['edges'])} entry(s) whose declared relations "
+              f"differ from the stored edges")
+    if report.get("source"):
+        print(f"      • {len(report['source'])} entry(s) whose `**Source:**` line "
+              f"differs from the stored provenance — a rebuild would adopt the "
+              f"markdown value; restore the line to match the graph")
+    if report.get("graph_only"):
+        active = sum(1 for row in report["graph_only"] if row.get("active"))
+        print(f"      • {len(report['graph_only'])} node(s) have NO `### ` block in "
+              f"the corpus ({active} active) — `mitos rebuild` cannot reconstruct "
+              f"them, so its completeness gate refuses. Run "
+              f"`mitos restore-source --all-graph-only --dry-run` to review.")
+
+    if report.get("archived_drift"):
+        print(f"      ({report['archived_drift']} of these sit in an ARCHIVE file — "
+              f"`sync` reads only the buffer, so their reconciler is `mitos rebuild`.)")
+
+
+def cmd_restore_source(
+    config: MitosConfig,
+    *,
+    slug: Optional[str] = None,
+    all_graph_only: bool = False,
+    dry_run: bool = False,
+    as_json: bool = False,
+) -> int:
+    """Re-materializes the `### slug` source block of a node the corpus has lost.
+
+    A graph-only node is invisible to `mitos rebuild`, which replays only what the
+    markdown holds — so the node is dropped and the completeness gate refuses the
+    swap, disabling the repair path on exactly the corpus that needs it. The graph
+    already carries every field the parser reads, so this is a derivation rather than
+    an authoring act, and it refuses to write anything whose round trip it cannot
+    prove.
+
+    Restored into the BUFFER, never an archive: archives are quarter-partitioned and
+    `created_at` is stamped at commit time, so choosing a quarter would put a
+    fabricated date in the gold source.
+
+    Args:
+        config: The workspace config.
+        slug: Restore one node by slug.
+        all_graph_only: Restore every node with no source block.
+        dry_run: Print what would be written and write nothing.
+        as_json: Emit one machine-readable object.
+
+    Returns:
+        ``0`` on success or a clean no-op, ``1`` when something was refused.
+    """
+    from mitos.divergence import corpus_graph_divergence
+    from mitos.restore import (
+        RestoreError,
+        render_source_block,
+        verify_block_in_isolation,
+        verify_whole_buffer,
+    )
+
+    if bool(slug) == bool(all_graph_only):
+        msg = "restore-source needs exactly one of --slug or --all-graph-only."
+        if as_json:
+            _emit_json({"error": msg, "code": "ambiguous_target"})
+        else:
+            print(msg, file=sys.stderr)
+        return 1
+
+    if not os.path.exists(config.db_path):
+        msg = "No graph found — nothing to restore from."
+        if as_json:
+            _emit_json({"error": msg, "code": "no_graph"})
+        else:
+            print(msg, file=sys.stderr)
+        return 1
+
+    store = GraphStore(config.db_path, read_only=True)
+    report = corpus_graph_divergence(store, config)
+    if report.get("skipped"):
+        msg = f"Cannot restore — {report['skipped']}."
+        if as_json:
+            _emit_json({"error": msg, "code": "unavailable"})
+        else:
+            print(msg, file=sys.stderr)
+        return 1
+
+    orphan_slugs = [row["slug"] for row in report["graph_only"]]
+    if slug is not None:
+        if slug not in orphan_slugs:
+            msg = (f"'{slug}' is not a graph-only node — it already has a `### ` block "
+                   f"in the corpus, or no such node exists.")
+            if as_json:
+                _emit_json({"error": msg, "code": "not_graph_only"})
+            else:
+                print(msg, file=sys.stderr)
+            return 1
+        targets = [slug]
+    else:
+        targets = orphan_slugs
+
+    if not targets:
+        if as_json:
+            _emit_json({"restored": [], "refused": [], "dry_run": dry_run,
+                        "written": False})
+        else:
+            print("No graph-only nodes — every node has a source block. ✓")
+        return 0
+
+    nodes_by_slug = {n["slug"]: n for n in store.get_all_nodes()}
+    blocks: List[Tuple[str, str]] = []
+    refused: List[Dict[str, str]] = []
+    for target in targets:
+        node = nodes_by_slug.get(target)
+        if node is None:
+            refused.append({"slug": target, "reason": "node not found"})
+            continue
+        try:
+            block = render_source_block(
+                node,
+                store.get_outgoing_edges(node["id"]),
+                store.get_transcript(node["id"]),
+            )
+            verify_block_in_isolation(block, node)
+        except RestoreError as exc:
+            refused.append({"slug": target, "reason": str(exc)})
+            continue
+        blocks.append((target, block))
+
+    written = False
+    if blocks and not dry_run:
+        manager = MitosSyncManager(config)
+
+        def _splice(original: str) -> str:
+            """Inserts every block just below the entries marker, newest-first."""
+            baseline["before"] = original
+            payload = "\n\n".join(b.rstrip("\n") for _s, b in blocks)
+            if _ENTRIES_MARKER in original:
+                return original.replace(
+                    _ENTRIES_MARKER, f"{_ENTRIES_MARKER}\n\n{payload}\n", 1
+                )
+            return original.rstrip("\n") + f"\n\n{payload}\n"
+
+        # Captured INSIDE `transform`, which `splice_buffer` calls under the lock and
+        # after auto-heal. Reading it out here instead would compare the splice against
+        # a pre-lock snapshot, so an entry appended by a concurrent `record` would
+        # surface as "the splice disturbed a neighbouring entry" — a fabricated
+        # diagnosis for a correct splice, and a refusal the operator cannot act on.
+        baseline: Dict[str, str] = {}
+
+        def _verify(after_text: str) -> None:
+            """Whole-buffer fidelity: isolation cannot prove neighbour safety."""
+            verify_whole_buffer(baseline["before"], after_text, added=len(blocks))
+
+        try:
+            manager.splice_buffer(_splice, after_write=_verify)
+            written = True
+        except (RestoreError, MitosError, OSError) as exc:
+            # RestoreError = the fidelity check refused (buffer already rolled back).
+            # OSError = an unwritable workspace or an unavailable lock file.
+            # MitosError = splice_buffer's both-write-AND-rollback-failed case, whose
+            # message names the state the file is in. All three must land in the
+            # structured report rather than escaping to `main()`, which would print a
+            # bare stderr line and leave `--json` with EMPTY stdout — a caller parsing
+            # this verb would see no object at all.
+            refused.extend({"slug": s, "reason": str(exc)} for s, _b in blocks)
+            blocks = []
+
+    restored = [s for s, _b in blocks]
+    if as_json:
+        _emit_json({
+            "restored": restored,
+            "refused": refused,
+            "dry_run": dry_run,
+            "written": written,
+            "path": config.decisions_file,
+        })
+        return 1 if refused else 0
+
+    if dry_run:
+        print(f"\nWould restore {len(blocks)} source block(s) to "
+              f"{config.decisions_file} — nothing written (--dry-run).\n")
+        for target, block in blocks:
+            print(f"--- {target} " + "-" * max(0, 60 - len(target)))
+            print(block)
+    elif written:
+        print(f"\nRestored {len(restored)} source block(s) to {config.decisions_file} ✓")
+        for target in restored:
+            print(f"  • {target}")
+        print("\nReview the entries, then `mitos rebuild --json` to confirm the "
+              "completeness gate passes.")
+    for row in refused:
+        print(f"  ✗ refused: {row['slug']} — {row['reason']}", file=sys.stderr)
+    if refused and not written and not dry_run:
+        print("\nNothing was written.", file=sys.stderr)
+    print()
+    return 1 if refused else 0
 
 
 def cmd_agent_block(workspace_dir: str, check: bool = False) -> int:
@@ -3773,6 +4033,20 @@ def _build_parser() -> argparse.ArgumentParser:
                               "exit 2 when it cannot run. Not git's staging — reads the "
                               "working-tree decisions.md. Rejects --scope/--fresh.")
 
+    # restore-source — re-materialize a graph-only node's `### slug` block.
+    rs_p = subparsers.add_parser(
+        "restore-source",
+        help="Re-materialize the decisions.md entry of a node whose source block is "
+             "missing (so `mitos rebuild` can reconstruct it again).")
+    rs_target = rs_p.add_mutually_exclusive_group(required=True)
+    rs_target.add_argument("--slug", default=None, help="Restore one node by slug.")
+    rs_target.add_argument("--all-graph-only", action="store_true", dest="all_graph_only",
+                           help="Restore every node that has no source block.")
+    rs_p.add_argument("--dry-run", action="store_true", dest="dry_run",
+                      help="Print the blocks that would be written and write nothing.")
+    rs_p.add_argument("--json", action="store_true", dest="as_json",
+                      help="Emit a machine-readable JSON report.")
+
     # agent-block — print the canonical agent-file block to paste, or --check pasted copies.
     ab_p = subparsers.add_parser(
         "agent-block",
@@ -3929,6 +4203,10 @@ def main() -> None:
             cmd_serve()
         elif args.command == "status":
             sys.exit(cmd_status(args.path or os.getcwd(), as_json=args.as_json))
+        elif args.command == "restore-source":
+            sys.exit(cmd_restore_source(
+                config, slug=args.slug, all_graph_only=args.all_graph_only,
+                dry_run=args.dry_run, as_json=args.as_json))
         elif args.command == "agent-block":
             sys.exit(cmd_agent_block(args.path or os.getcwd(), check=args.check))
         elif args.command == "set-key":

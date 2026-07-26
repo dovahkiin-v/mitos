@@ -2298,6 +2298,41 @@ class GraphStore:
         active.update(node["id"] for node in self.get_open_questions())
         return active
 
+    def graph_fingerprint(self) -> Tuple[int, str]:
+        """Returns a cheap ``(node_count, max_updated_at)`` change fingerprint.
+
+        The corpus↔graph divergence cache keys on the corpus content hash AND this,
+        because divergence is a property of the corpus *versus* the graph: keying on
+        corpus content alone means any graph-side change under a static corpus returns
+        a stale verdict. The sharp case is a `.bak` restore after a rebuild swap — the
+        graph reverts while the corpus keeps its restored blocks, so the corpus hash is
+        unchanged, the cache hits, and `status` reports clean over a corpus that has
+        diverged the *other* way. P6 invites this directly: "delete the graph and Mitos
+        rebuilds" is a sanctioned operation that changes the graph without touching a
+        byte of corpus.
+
+        Sufficient against every supported write path: any commentary/scope/edge change
+        ticks the committing node's ``updated_at`` through the deferred single-tick
+        UPDATE, a new node changes the count, a rebuild re-mints both, and a `.bak`
+        restore lowers the MAX. Note one exotic residual, named rather than left to be
+        discovered: a wall-clock regression can let a fresh stamp sort below the
+        standing MAX with the count unchanged.
+
+        String MAX is safe because every timestamp is offset-aware UTC ISO-8601 with
+        one fixed offset (MI-10), so lexical order is chronological order.
+
+        Returns:
+            ``(node_count, max_updated_at)``; the string is ``""`` on an empty graph.
+        """
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n, COALESCE(MAX(updated_at), '') AS m FROM nodes"
+            ).fetchone()
+            return int(row["n"]), str(row["m"])
+        finally:
+            conn.close()
+
     def get_edges(self) -> List[Dict[str, str]]:
         """Retrieves all edges in the database."""
         conn = self._get_connection()

@@ -358,3 +358,53 @@ leaves a workspace that simply re-runs clean — no manual restore. Run these st
 9. **Upgrade the global install.** *Now* run `pipx install --force
    git+https://github.com/dovahkiin-v/mitos` — the operational carry is resolved,
    and the global Mitos will accept the V1a graph.
+
+---
+
+## When the corpus and the graph disagree
+
+The graph is a derivative of `decisions.md`, but nothing stops the two drifting apart:
+a hand-edit to an already-committed entry is skipped by `mitos sync` (a committed
+canonical core is treated as done), and an entry that leaves the corpus altogether
+leaves its node behind with no source block. `mitos status` reports both as an
+informational rung — never a readiness blocker, because a corpus mid-edit is a normal
+state, not breakage:
+
+```
+  ⚠ corpus and graph disagree in 4 place(s) — informational, not a readiness blocker.
+      • 1 entry(s) whose commentary text differs (the graph serves the stale value to every read)
+      • 3 node(s) have NO `### ` block in the corpus (2 active) — `mitos rebuild` cannot
+        reconstruct them, so its completeness gate refuses.
+```
+
+**A node with no source block is the one that matters**, because it is what makes the
+completeness shortfall in step 3 above unfixable: `rebuild` replays only what the
+markdown holds, so the node is dropped, the gate refuses, and the repair path is
+disabled on exactly the corpus that needs it. Do **not** reach for `--allow-drops` —
+that discards the decisions rather than restoring them.
+
+Instead, re-materialize the entries. The graph already holds every field the parser
+reads, so this is a derivation, not re-authoring:
+
+```bash
+mitos restore-source --all-graph-only --dry-run   # review the blocks, writes nothing
+mitos restore-source --all-graph-only             # splice them into decisions.md
+mitos rebuild --json                              # expect gate_passed: true
+```
+
+It refuses rather than guesses. Every block is re-parsed before anything is written —
+it must come back as exactly one entry, hashing to the same node id, with every
+commentary field byte-identical — and the whole buffer is re-parsed after the splice to
+prove no neighbouring entry was disturbed. Anything short of that is reported and
+skipped, and the file is rolled back byte-for-byte.
+
+Restored entries land in the **buffer**, not an archive: archives are
+quarter-partitioned and a node's `created_at` is stamped at commit time, so dating a
+restored entry would mean inventing a date in your gold source.
+
+`--slug <name>` restores one node; `--json` emits a machine-readable report.
+
+> **Commentary that differs is a separate case.** Today `mitos rebuild` is the only
+> thing that propagates a hand-edit to a committed entry; the rung reports the drift so
+> it is at least visible. Scope drift is worth acting on first — it is a *findability*
+> defect, so a wrong value hides the decision from every scope-filtered read.

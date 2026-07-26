@@ -35,6 +35,7 @@ from mitos.conflict import (
 )
 from mitos.telemetry import ConflictCheckRow, JudgmentBatch, TelemetryStore
 from mitos.errors import (
+    MitosError,
     SynthesisError,
     ParseError,
     ValidationError,
@@ -518,13 +519,21 @@ class MitosSyncManager:
                 new_content = canonical_header + marker + entries_content
                 with open(filepath, "w", encoding="utf-8") as f:
                     f.write(new_content)
-                print("Auto-restored decisions.md sample format header block ✓")
+                # stderr, not stdout: this method is on `record_decision_entry`'s path,
+                # which the MCP write tool shares — and that transport uses stdout for
+                # JSON-RPC, so a stray line here is protocol corruption, not noise. It
+                # is also ahead of `restore-source --json`'s object, which a caller
+                # parses. Matches this file's existing stderr discipline on the
+                # embedding/render warnings below.
+                print("Auto-restored decisions.md sample format header block ✓",
+                      file=sys.stderr)
         else:
             if "## SAMPLE FORMAT" not in content:
                 new_content = canonical_header + marker + "\n\n" + content
                 with open(filepath, "w", encoding="utf-8") as f:
                     f.write(new_content)
-                print("Auto-restored missing sample format header and BEGIN ENTRIES marker ✓")
+                print("Auto-restored missing sample format header and BEGIN ENTRIES "
+                      "marker ✓", file=sys.stderr)
 
     def perform_sync(self, auto_accept: bool = False, verbose: bool = False) -> None:
         """Executes the complete transactional sync flow."""
@@ -1853,6 +1862,75 @@ class MitosSyncManager:
         except Exception:
             pass
         return "indexed"
+
+    def splice_buffer(
+        self,
+        transform: Callable[[str], str],
+        *,
+        after_write: Optional[Callable[[str], None]] = None,
+    ) -> str:
+        """Rewrites `decisions.md` under the lock, rolling back on any failure.
+
+        The buffer-surgery primitive: **lock → auto-heal → read → splice → write →
+        verify → roll back on failure.** Extracted rather than inlined at its first
+        caller because it is exactly what a future ``amend-commentary`` verb consumes
+        — the P20 Retrofit Test allows deferring that verb only on the condition that
+        its wiring is not left to be retrofitted.
+
+        Modelled on ``record_decision_entry``'s buffer-first + rollback contract,
+        which this project treats as sacred. That method is deliberately NOT refactored
+        to route through here: it interleaves the graph commit with the buffer write in
+        a way this generic seam would have to special-case, and rewriting a sacred
+        contract to serve a new caller is the wrong direction of dependency. The
+        equivalence is pinned by test instead.
+
+        Args:
+            transform: Maps the current buffer text to its replacement. Runs before the
+                splice write, so a raise here writes no entry — though note the
+                auto-heal above it may already have restored a drifted header, which is
+                an idempotent repair and deliberately outside the rollback. This is the
+                one ordering difference from ``record_decision_entry``, which runs its
+                gates BEFORE auto-heal precisely so a rejected record leaves the buffer
+                byte-for-byte untouched; here the transform NEEDS the healed marker to
+                splice against.
+            after_write: Optional verification invoked with the written text. A raise
+                rolls the buffer back — this is where a fidelity check belongs, so a
+                splice that would corrupt a neighbour never survives.
+
+        Returns:
+            The buffer text as written.
+
+        Raises:
+            MitosError: If the rollback ITSELF fails, naming the state the file is in —
+                the one case where silence would leave an operator guessing.
+            Exception: Whatever ``transform`` or ``after_write`` raised, re-raised after
+                a successful rollback.
+        """
+        with self.lock:
+            self.auto_heal_decisions_file()
+            with open(self.config.decisions_file, "r", encoding="utf-8") as fh:
+                original = fh.read()
+
+            # Computed before the write, so a transform failure is a pure no-op.
+            new_content = transform(original)
+
+            try:
+                with open(self.config.decisions_file, "w", encoding="utf-8") as fh:
+                    fh.write(new_content)
+                if after_write is not None:
+                    after_write(new_content)
+            except Exception:
+                try:
+                    with open(self.config.decisions_file, "w", encoding="utf-8") as fh:
+                        fh.write(original)
+                except Exception as restore_exc:
+                    raise MitosError(
+                        "The splice failed AND decisions.md could not be rolled back "
+                        f"(rollback error: {restore_exc}). The file may hold a partial "
+                        "edit — check it before running `mitos sync`."
+                    ) from restore_exc
+                raise
+            return new_content
 
     def record_decision_entry(
         self,
