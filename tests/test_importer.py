@@ -96,3 +96,52 @@ def test_import_with_llm_extract(mock_anthropic: MagicMock, import_env: Tuple[Mi
     # is a dropped column, §6.5). The file:line provenance has no V1a home (deferred).
     assert node["source"] == "import_llm"
     assert "source_ref" not in node
+
+
+@patch("anthropic.Anthropic")
+def test_import_confirmed_at_is_utc_with_offset(
+    mock_anthropic: MagicMock, import_env: Tuple[MitosConfig, MitosProseImporter, str]
+) -> None:
+    """The import path's OD3 stamp carries an explicit UTC offset (MI-10).
+
+    The third ``confirmed_at`` writer. The two in ``sync.py`` were converted while this
+    one kept ``datetime.now().isoformat()``, so a single legacy-ADR import would have
+    re-introduced naive local-time stamps beside the offset-aware ones and left MI-10
+    holding only for the paths someone happened to look at.
+    """
+    from datetime import datetime
+
+    config, importer, tmpdir = import_env
+
+    legacy_file = os.path.join(tmpdir, "legacy.md")
+    with open(legacy_file, "w", encoding="utf-8") as f:
+        f.write(
+            "## 2026-05-19 — legacy-utc — Legacy timestamp decision\n"
+            "Prose explaining the choice.\n"
+        )
+
+    mock_msg = MagicMock()
+    mock_msg.content = [
+        MagicMock(text=json.dumps({
+            "core_axiom": "We use SQLite in WAL mode.",
+            "rejected_paths": "pgvector.",
+            "mechanisms": ["sqlite"],
+            "scope": ["substrate"],
+            "supersedes": None,
+            "amends": None,
+            "resolves": None,
+        }))
+    ]
+    mock_anthropic.return_value.messages.create.return_value = mock_msg
+    os.environ["ANTHROPIC_API_KEY"] = "mock_anthropic_key"
+
+    importer.import_from_file(legacy_file, use_llm_extract=True)
+
+    node = GraphStore(config.db_path).get_all_nodes()[0]
+    stamp = node["confirmed_at"]
+    assert stamp, "the import path must stamp confirmed_at"
+    parsed = datetime.fromisoformat(stamp)
+    assert parsed.tzinfo is not None, (
+        f"{stamp!r} is naive local time — MI-10 requires an explicit offset"
+    )
+    assert parsed.utcoffset().total_seconds() == 0, f"{stamp!r} is not UTC"

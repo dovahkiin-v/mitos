@@ -356,8 +356,12 @@ _EXISTS_NO_OP_NOTE = (
     "A committed decision's axiom and mechanisms are immutable (M1): re-recording "
     "them is a no-op. To correct or extend its commentary (rejected_paths, context) "
     "or to restore a missing source block, edit the entry in decisions.md and run "
-    "`mitos rebuild`. To record a changed decision, write a new one with "
-    "--supersedes/--amends pointing at this slug."
+    "`mitos rebuild`. Two limits that path has today: a node whose `### ` block is "
+    "missing from decisions.md has no entry to edit, and `mitos rebuild` refuses the "
+    "swap when it cannot reconstruct every active decision from the corpus — so a "
+    "corpus in either state needs repair before a rebuild can carry the correction. "
+    "To record a changed decision, write a new one with --supersedes/--amends "
+    "pointing at this slug."
 )
 
 # A new decision at/above this document-document similarity to an existing one the
@@ -720,8 +724,7 @@ class MitosSyncManager:
 
             # Slug collision check
             collision = self.store.get_node_by_slug(entry.slug)
-            edge_relationship: Optional[str] = None
-            
+
             if collision:
                 # A kill-edge the entry ALREADY declares at the colliding slug is the
                 # supported same-slug supersession pattern (MI-13 rationale / FM1): the
@@ -744,21 +747,36 @@ class MitosSyncManager:
                         f"\n[Collision] Slug '{entry.slug}' already exists in graph — "
                         "the entry declares a relation at it; committing as declared."
                     )
-                elif auto_accept:
-                    # An UNDECLARED collision in auto-mode is reported and skipped, never
-                    # auto-retired. Defaulting to `corrects` here mints a killer node that
-                    # retires a real decision on nothing but a slug match — and a canonical
-                    # core can shift from any hand-edit to a `**Mechanisms:**` line, so the
-                    # collision is as likely to be an accident as an intent (P5 Ironclad:
-                    # automated recovery never destroys user data). A vector, not a wall:
-                    # the entry stays in the buffer and the fix is one authored line.
+                else:
+                    # An UNDECLARED collision is reported and skipped in BOTH modes,
+                    # never auto-retired and never prompted for. Defaulting to `corrects`
+                    # mints a killer node that retires a real decision on nothing but a
+                    # slug match — and a canonical core can shift from any hand-edit to a
+                    # `**Mechanisms:**` line, so the collision is as likely to be an
+                    # accident as an intent (P5 Ironclad: automated recovery never
+                    # destroys user data). A vector, not a wall: the entry stays in the
+                    # buffer and the fix is one authored line.
+                    #
+                    # The interactive `[c]orrection / [s]upersession` prompt used to sit
+                    # here, and it is retired rather than fixed. Its answer was only ever
+                    # applied in memory — nothing spliced the chosen line into the buffer,
+                    # and rotation archives the raw unmodified snapshot slice — so every
+                    # interactively-resolved collision committed a kill-edge the gold
+                    # source does not declare. Against P6/M7 (the markdown must remain the
+                    # rebuildable truth): the entry replays at rebuild without its
+                    # declaration, collides at the store, and becomes a permanent
+                    # casualty. Sending the author to the markdown puts the declaration
+                    # where a rebuild can find it again, and deleting the prompt also
+                    # deletes the override below it, which wholesale-replaced both kill
+                    # lists and so discarded any kill-edge the entry authored at a
+                    # *different* slug.
                     print(f"\n[Collision] Slug '{entry.slug}' already exists in graph.")
                     print(f"  Existing Axiom: {collision.get('core_axiom')}")
                     print(f"  New Axiom:      {entry.axiom}")
                     print(
                         "  Skipped — nothing written. This entry declares no relation at "
-                        f"'{entry.slug}', and auto-mode will not retire a decision on a "
-                        "slug match alone."
+                        f"'{entry.slug}', and sync will not retire a decision on a slug "
+                        "match alone."
                     )
                     print(
                         f"  To supersede it, add `**Supersedes:** [{entry.slug}]` to the "
@@ -766,23 +784,6 @@ class MitosSyncManager:
                         "Then re-run sync."
                     )
                     continue
-                else:
-                    print(f"\n[Collision] Slug '{entry.slug}' already exists in graph.")
-                    print(f"  Existing Axiom: {collision.get('core_axiom')}")
-                    print(f"  New Axiom:      {entry.axiom}")
-                    while True:
-                        choice = input("Is this a [c]orrection, [s]upersession, or [a]bort? ").strip().lower()
-                        if choice == 'c':
-                            edge_relationship = "corrects"
-                            break
-                        elif choice == 's':
-                            edge_relationship = "supersedes"
-                            break
-                        elif choice == 'a':
-                            print("Sync aborted by user.")
-                            return
-                        else:
-                            print("Invalid choice.")
 
             if entry.kind == "decision":
                 # Strict-deterministic sync (A): the decision commits EXACTLY as
@@ -803,9 +804,10 @@ class MitosSyncManager:
                 # accept prompt (CONF-D7), so the tension is named while the author can
                 # still choose. `conflict_judge is not None` already implies the full gate
                 # (decision-kind here, not auto_accept, toggle on, judge available). RF-1:
-                # this runs before the collision verb is applied below, so `entry` still
-                # holds the parsed declarations only. Advisory — it prints, never blocks;
-                # the accept prompt below is untouched.
+                # `entry` holds the parsed declarations and nothing else — the slug-collision
+                # override that used to rewrite them below is retired, so the property RF-1
+                # relied on is now structural. Advisory — it prints, never blocks; the accept
+                # prompt below is untouched.
                 if conflict_judge is not None:
                     self._run_and_surface_conflict(entry, conflict_judge, conflict_run)
 
@@ -816,15 +818,6 @@ class MitosSyncManager:
                     elif u_choice == 'q':
                         print("Sync paused by user.")
                         break
-
-                # Deterministic slug-collision override (corrects/supersedes); the
-                # authored relationship edges otherwise stand exactly as parsed.
-                if edge_relationship == "corrects":
-                    entry.corrects = [entry.slug]
-                    entry.supersedes = []
-                elif edge_relationship == "supersedes":
-                    entry.supersedes = [entry.slug]
-                    entry.corrects = []
 
             else:
                 # Open Question Sync
@@ -843,7 +836,11 @@ class MitosSyncManager:
             # touches the decision here, so its provenance is the user/author, not an
             # enrichment model (A: sync-strict-deterministic-no-llm-enrichment).
             entry.confirmed_by = "user"
-            entry.confirmed_at = datetime.now().isoformat()
+            # MI-10: application-supplied UTC ISO-8601 with an explicit offset — the
+            # same helper `created_at` uses on the very same row. `datetime.now()` is
+            # naive local time, which is what put 114 offset-less stamps beside 114
+            # offset-aware ones in the live graph.
+            entry.confirmed_at = _utc_now_iso()
 
             # Commit to graph database atomically per entry (C1 atomicity), now with
             # the per-entry commit-stage quarantine (4a floor — P5 dead-letter / P7
@@ -1148,8 +1145,9 @@ class MitosSyncManager:
         not a downstream-dep outage — IMPL_NOTES 5a, D3).
 
         Args:
-            entry: The proposed decision entry — passed raw, before the slug-collision verb
-                is applied (RF-1), so the facade reads the parsed declarations only.
+            entry: The proposed decision entry — passed raw, so the facade reads the parsed
+                declarations only (RF-1; structural since the slug-collision override that
+                rewrote them was retired).
             judge: The bound judgment executor from :meth:`_build_conflict_judge`.
             run: The per-run :class:`_ConflictSyncRun` context (sync_run_id + telemetry +
                 breaker), built once per sync and threaded through every entry's check.
@@ -2249,7 +2247,7 @@ class MitosSyncManager:
 
                 # Provenance (mirror perform_sync).
                 entry.confirmed_by = actor
-                entry.confirmed_at = datetime.now().isoformat()
+                entry.confirmed_at = _utc_now_iso()  # MI-10, as in perform_sync above
 
                 # Write the buffer, then commit the graph. On ANY failure of either
                 # — including an OSError on the write itself — roll the buffer back

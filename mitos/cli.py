@@ -3520,12 +3520,16 @@ def _enter_target_directory(directory: Optional[str]) -> None:
     os.chdir(directory)
 
 
-def main() -> None:
-    """Main CLI execution router."""
-    # Make raw-text print()s crash-safe on a non-UTF-8 stdout before any verb
-    # can print (R6). Inert on a UTF-8 terminal; CLI-only — the MCP transport
-    # has no terminal stdout to harden (P7 bulkhead).
-    apply_stdout_text_safety(sys.stdout)
+def _build_parser() -> argparse.ArgumentParser:
+    """Builds the CLI argument parser.
+
+    Split out of ``main`` so the argument grammar can be asserted on directly —
+    verifying an option's spelling by running the verb costs a real workspace read
+    and, on a prefix bug, a real write.
+
+    Returns:
+        The fully configured top-level parser, subparsers registered.
+    """
     parser = argparse.ArgumentParser(
         description="Mitos: Architectural Decision Substrate for LLM-native workflows.",
         epilog=_EPILOG,
@@ -3634,8 +3638,27 @@ def main() -> None:
     rec_p.add_argument("--rejected", default=None, help="Alternatives considered and rejected, and why (REQUIRED — or use --rejected-file).")
     rec_p.add_argument("--rejected-file", default=None, dest="rejected_file",
                        help="Read --rejected from a file ('-' = stdin) to avoid shell-quoting long prose.")
-    rec_p.add_argument("--scope", nargs="*", default=[], help="Area tags, e.g. --scope database auth.")
-    rec_p.add_argument("--mechanisms", nargs="*", default=None, help="Concrete technologies/entities, e.g. --mechanisms sqlite wal-mode.")
+    # `action="extend"` so BOTH spellings accumulate: `--scope a b` and `--scope a
+    # --scope b`. With `nargs="*"` alone a repeated flag overwrote the destination
+    # and silently kept only the last value, while the receipt echoed the truncated
+    # list back as if it were the request — the direct cause of every measured scope
+    # divergence on the live corpus (AX_FEEDBACK rounds 10 and 11). `extend` copies
+    # the destination before extending it, so the `default=[]` list is never mutated
+    # in place and a second parse in one process starts empty.
+    rec_p.add_argument("--scope", nargs="*", action="extend", default=[],
+                       help="Area tags. Repeatable and space-separated both accumulate: "
+                            "`--scope database auth` == `--scope database --scope auth`.")
+    # `extend` for the same reason as `--scope` above, and with a strictly worse
+    # consequence if left out: `mechanisms` is CANONICAL CORE — it feeds
+    # `compute_node_id(mechanism_refs=…)` — so a silently dropped value gives the
+    # decision a different content-hash id than the author asked for, and re-recording
+    # with the full list mints a second node rather than correcting the first (M1: the
+    # core is immutable by construction). `default=None` is kept deliberately: absent
+    # and empty are distinguished downstream, and `extend` only ever runs when the flag
+    # is present, so it never sees the None.
+    rec_p.add_argument("--mechanisms", nargs="*", action="extend", default=None,
+                       help="Concrete technologies/entities. Repeatable and space-separated "
+                            "both accumulate: `--mechanisms sqlite wal-mode`.")
     rec_p.add_argument("--context", default=None, help="Optional background on why this was decided.")
     rec_p.add_argument("--context-file", default=None, dest="context_file",
                        help="Read --context from a file ('-' = stdin).")
@@ -3726,6 +3749,29 @@ def main() -> None:
     ab_p.add_argument("--check", action="store_true",
                       help="Scan the project's agent files and report stale/unversioned mitos notes.")
 
+    # Prefix abbreviation OFF on every verb. argparse defaults it ON, which made
+    # `--axiom` an unambiguous prefix of `--axiom-file`: a 470-character axiom went
+    # to the file reader and the command died as `[Errno 36] File name too long`
+    # through the outermost boundary, as a "Fatal Unexpected Error" naming nothing
+    # the caller could act on. Setting `allow_abbrev=False` on the top-level parser
+    # does NOT propagate — an `add_parser()` child keeps its own True — so it is
+    # pinned here over the whole registered set rather than as a kwarg on `record`,
+    # which the next verb added would be one forgotten argument away from missing.
+    # argparse reads the attribute at parse time, so assigning it after
+    # registration is equivalent to passing it in.
+    for _verb_parser in subparsers.choices.values():
+        _verb_parser.allow_abbrev = False
+
+    return parser
+
+
+def main() -> None:
+    """Main CLI execution router."""
+    # Make raw-text print()s crash-safe on a non-UTF-8 stdout before any verb
+    # can print (R6). Inert on a UTF-8 terminal; CLI-only — the MCP transport
+    # has no terminal stdout to harden (P7 bulkhead).
+    apply_stdout_text_safety(sys.stdout)
+    parser = _build_parser()
     args = parser.parse_args()
 
     try:

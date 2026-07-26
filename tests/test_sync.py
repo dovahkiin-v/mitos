@@ -138,9 +138,15 @@ def test_sync_stale_entry_detection(mock_client: MagicMock, sync_env: Tuple[Mito
 
 
 @patch("google.genai.Client")
-@patch("builtins.input", side_effect=["c", "a"])
+@patch("builtins.input", side_effect=["a"])
 def test_sync_slug_collision_correction(mock_input: MagicMock, mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]) -> None:
-    """Verifies S4 correction flow on slug collision, checking that a corrects edge is created."""
+    """A DECLARED correction at the colliding slug commits as declared, interactively.
+
+    Retargeted: this pinned the ``[c]orrection / [s]upersession`` prompt, which is
+    retired — its answer was applied in memory only and never reached the markdown, so
+    it minted kill-edges the gold source did not declare. The relation now comes from
+    the entry, and the only prompt left on this path is the ordinary accept prompt.
+    """
     config, manager, tmpdir = sync_env
     store = GraphStore(config.db_path)
     os.environ["GEMINI_API_KEY"] = "mock_key"
@@ -152,11 +158,12 @@ def test_sync_slug_collision_correction(mock_input: MagicMock, mock_client: Magi
     entry1.scope = ["database"]
     store.commit_parsed_entry(entry1)
 
-    # 2. Add colliding slug in decisions.md
+    # 2. Add a colliding slug that DECLARES the correction, as the skip message asks.
     entry2_text = (
         "## 2026-06-01 — database — Database Update\n"
         "**Decided:** We actually use SQLite for local WAL reads.\n"
         "**Rejected:** PostgreSQL dependency.\n"
+        "**Corrects:** [database]\n"
     )
     with open(config.decisions_file, "a", encoding="utf-8") as f:
         f.write(entry2_text + "\n")
@@ -171,7 +178,7 @@ def test_sync_slug_collision_correction(mock_input: MagicMock, mock_client: Magi
     })
     mock_client.return_value.models.generate_content.return_value = mock_gen_resp
 
-    # 3. Run sync (interactive input mock selects "c" for correction and "a" for accept)
+    # 3. Run sync (interactive; the sole input is "a" for the accept prompt)
     manager.perform_sync(auto_accept=False)
 
     # 4. Assert corrects relationship was created in database (V1a edge column edge_type)
@@ -1093,3 +1100,218 @@ def test_sync_decisions_oldest_first_amend_commits_in_one_sync(
     assert len(amends) == 1
     assert amends[0]["source_id"] == newer["id"]
     assert amends[0]["target_id"] == older["id"]
+
+
+# --- MI-10: confirmed_at is UTC with an explicit offset -------------------------
+
+def _assert_utc_offset(stamp: str, where: str) -> None:
+    """Asserts a timestamp is offset-aware UTC (MI-10), not a naive local-time string."""
+    from datetime import datetime, timezone
+
+    assert stamp, f"{where}: no stamp written"
+    parsed = datetime.fromisoformat(stamp)
+    assert parsed.tzinfo is not None, (
+        f"{where}: {stamp!r} is naive local time — MI-10 requires an explicit offset"
+    )
+    assert parsed.utcoffset().total_seconds() == 0, f"{where}: {stamp!r} is not UTC"
+
+
+@patch("google.genai.Client")
+def test_sync_confirmed_at_is_utc_with_offset(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """`perform_sync`'s OD3 stamp is application-supplied UTC ISO-8601 (MI-10).
+
+    Both ``confirmed_at`` writers used ``datetime.now().isoformat()`` while
+    ``created_at`` on the very same row used ``_utc_now_iso()`` — so every stamp on
+    the live corpus was a naive local-time string sitting beside an offset-aware one.
+    """
+    config, manager, tmpdir = sync_env
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+
+    with open(config.decisions_file, "a", encoding="utf-8") as f:
+        f.write(
+            "\n### utc-stamp\n\n"
+            "**Decided:** Timestamps carry their offset.\n"
+            "**Rejected:** Naive local time.\n"
+            "**Mechanisms:** datetime\n"
+        )
+
+    manager.perform_sync(auto_accept=True)
+
+    node = GraphStore(config.db_path).get_all_nodes()[0]
+    _assert_utc_offset(node["confirmed_at"], "perform_sync")
+    _assert_utc_offset(node["created_at"], "created_at (already correct)")
+
+
+def test_record_confirmed_at_is_utc_with_offset(
+    sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """`record_decision_entry`'s OD3 stamp carries an offset too (MI-10).
+
+    The second of the two naive writers — the agent-facing write path, which is the
+    one that authored 113 of the corpus's 114 confirmation stamps.
+    """
+    config, manager, tmpdir = sync_env
+
+    result = manager.record_decision_entry(
+        "Timestamps carry their offset.", "Naive local time.", ["datetime"],
+        slug="utc-stamp-record",
+    )
+    assert result["state"] == "active", result
+
+    node = GraphStore(config.db_path).get_all_nodes()[0]
+    _assert_utc_offset(node["confirmed_at"], "record_decision_entry")
+
+
+# --- the interactive collision prompt is retired (R6 N1) ------------------------
+#
+# The prompt asked the author for a relation they could only express in memory:
+# `edge_relationship` was set at the prompt and consumed by an in-memory mutation of
+# `entry`, and nothing ever spliced the chosen `Corrects:`/`Supersedes:` line into the
+# buffer — rotation archives the raw unmodified snapshot slice. So every
+# interactively-resolved collision committed a kill-edge the gold source does not
+# declare (against P6/M7), which surfaces as removed-edge divergence, offers itself
+# for DELETION on the next reconcile, and replays at rebuild without the declaration
+# as a permanent casualty. Auto-mode's report-and-skip was the right shape all along:
+# it names the exact line to add, so the declaration lands in the markdown.
+
+@patch("google.genai.Client")
+@patch("builtins.input", side_effect=AssertionError("no collision prompt may be shown"))
+def test_undeclared_collision_is_skipped_interactively_too(
+    mock_input: MagicMock, mock_client: MagicMock,
+    sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """An undeclared collision is reported and skipped in BOTH modes, never prompted.
+
+    The skip lands above the accept prompt, so a colliding entry consumes no input at
+    all — mocking ``input`` to raise is the assertion.
+    """
+    config, manager, tmpdir = sync_env
+    store = GraphStore(config.db_path)
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+
+    original_id = _seed_active_decision(store, "database", "We use PostgreSQL.")
+
+    # Sync an empty buffer first so the sample-format header auto-heal — a legitimate
+    # write, unrelated to the collision — has already happened when the snapshot is taken.
+    manager.perform_sync(auto_accept=False)
+
+    with open(config.decisions_file, "a", encoding="utf-8") as f:
+        f.write(
+            "\n### database\n\n"
+            "**Decided:** We actually use SQLite for local WAL reads.\n"
+            "**Rejected:** PostgreSQL dependency.\n"
+            "**Mechanisms:** sqlite\n"
+        )
+    with open(config.decisions_file, "r", encoding="utf-8") as f:
+        before = f.read()
+
+    manager.perform_sync(auto_accept=False)
+
+    assert store.get_edges() == [], "no kill-edge the gold source does not declare"
+    assert len(store.get_all_nodes()) == 1, "the colliding entry must not commit"
+    assert store.get_node_state(original_id) == "active"
+
+    with open(config.decisions_file, "r", encoding="utf-8") as f:
+        assert f.read() == before, "the buffer entry must be left byte-unchanged"
+
+
+@patch("google.genai.Client")
+def test_collision_resyncs_cleanly_once_the_author_declares_the_relation(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """The skip is a vector, not a wall: adding the named line commits on re-sync.
+
+    This is what the retired prompt was reaching for, done in the one place a rebuild
+    can find it again.
+    """
+    config, manager, tmpdir = sync_env
+    store = GraphStore(config.db_path)
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+
+    original_id = _seed_active_decision(store, "database", "We use PostgreSQL.")
+
+    entry = ("\n### database\n\n"
+             "**Decided:** We actually use SQLite for local WAL reads.\n"
+             "**Rejected:** PostgreSQL dependency.\n"
+             "**Mechanisms:** sqlite\n")
+    with open(config.decisions_file, "a", encoding="utf-8") as f:
+        f.write(entry)
+
+    manager.perform_sync(auto_accept=True)
+    assert store.get_edges() == []
+
+    # The author does what the message told them to.
+    with open(config.decisions_file, "r", encoding="utf-8") as f:
+        buffered = f.read()
+    with open(config.decisions_file, "w", encoding="utf-8") as f:
+        f.write(buffered.replace(
+            "**Mechanisms:** sqlite\n",
+            "**Mechanisms:** sqlite\n**Corrects:** [database]\n",
+        ))
+
+    manager.perform_sync(auto_accept=True)
+
+    edges = store.get_edges()
+    assert len(edges) == 1 and edges[0]["edge_type"] == "corrects", edges
+    assert store.get_node_state(original_id) == "corrected"
+
+
+@patch("google.genai.Client")
+@patch("builtins.input", side_effect=AssertionError("no collision prompt may be shown"))
+def test_collision_never_discards_a_kill_edge_authored_at_another_slug(
+    mock_input: MagicMock, mock_client: MagicMock,
+    sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """An entry colliding on its own slug never loses a kill-edge authored elsewhere.
+
+    The retired override wholesale-replaced both kill lists (``entry.corrects =
+    [entry.slug]; entry.supersedes = []``), so an entry that collided on ``database``
+    while declaring ``Supersedes: [legacy-store]`` committed with that authored edge
+    silently dropped. Only the interactive path could reach it — auto-mode has skipped
+    undeclared collisions since 0.10.2 — which is why retiring the prompt dissolves
+    the bug rather than patching it.
+
+    The entry declares nothing at the slug it collides with, so the correct outcome is
+    a skip: nothing committed, nothing dropped, and the fix in the author's hands.
+    """
+    config, manager, tmpdir = sync_env
+    store = GraphStore(config.db_path)
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+
+    _seed_active_decision(store, "database", "We use PostgreSQL.")
+    legacy_id = _seed_active_decision(store, "legacy-store", "We use a flat file.")
+
+    with open(config.decisions_file, "a", encoding="utf-8") as f:
+        f.write(
+            "\n### database\n\n"
+            "**Decided:** We actually use SQLite for local WAL reads.\n"
+            "**Rejected:** PostgreSQL dependency.\n"
+            "**Mechanisms:** sqlite\n"
+            "**Supersedes:** [legacy-store]\n"
+        )
+
+    manager.perform_sync(auto_accept=False)
+
+    assert store.get_edges() == [], "a skipped entry commits no edges at all"
+    assert store.get_node_state(legacy_id) == "active", "nothing may be retired by a skip"
+    assert len(store.get_all_nodes()) == 2
+
+    # The author declares at the colliding slug too; now BOTH authored edges land —
+    # which is the property the override destroyed.
+    with open(config.decisions_file, "r", encoding="utf-8") as f:
+        buffered = f.read()
+    with open(config.decisions_file, "w", encoding="utf-8") as f:
+        f.write(buffered.replace(
+            "**Supersedes:** [legacy-store]\n",
+            "**Supersedes:** [legacy-store], [database]\n",
+        ))
+
+    manager.perform_sync(auto_accept=True)
+
+    types_by_target = {e["target_id"]: e["edge_type"] for e in store.get_edges()}
+    assert types_by_target.get(legacy_id) == "supersedes", (
+        "the edge authored at another slug must survive the collision branch"
+    )
+    assert store.get_node_state(legacy_id) == "superseded"

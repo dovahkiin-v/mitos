@@ -705,8 +705,28 @@ def test_exists_receipt_reports_the_no_op_without_dropping_the_pointer(ws) -> No
     assert r2["path"] == config.decisions_file, "the pointer stays (#5b)"
     assert r2.get("no_op_reason"), "a no-op must say so in-band"
     # The note names the path that actually works, and not the one that doesn't.
+    # `mitos sync` does not reconcile a committed entry's commentary yet, so naming it
+    # here would ship a receipt pointing at a silent no-op.
     assert "mitos rebuild" in r2["no_op_reason"]
     assert "mitos sync" not in r2["no_op_reason"]
+
+
+def test_exists_no_op_note_names_the_two_limits_of_the_path_it_prescribes(ws) -> None:
+    """The note owns `rebuild`'s two failure modes instead of leaving them discovered.
+
+    Measured on the live dogfood corpus: ``mitos rebuild`` is *refused* there (81
+    active decisions it cannot reconstruct), and for a graph-only node the note's
+    "edit the entry in decisions.md" names an entry that does not exist. A receipt
+    that prescribes a path has to say where the path stops.
+    """
+    config, m = ws
+    m.record_decision_entry("Pin the digest length.", "Leave it to the implementer.",
+                            [], slug="pin-digest-length")
+    note = m.record_decision_entry("Pin the digest length.", "CORRECTED rejected text.",
+                                   [], slug="pin-digest-length")["no_op_reason"]
+
+    assert "no entry to edit" in note, "a graph-only node has no `###` block to edit"
+    assert "refuses" in note, "a gate refusal means the corpus needs repair first"
 
 
 def test_exists_no_op_leaves_a_missing_source_block_missing(ws) -> None:

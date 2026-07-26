@@ -16,7 +16,7 @@ from mitos.config import MitosConfig
 from mitos.errors import SynthesisError, ValidationError
 from mitos.models import get_model_id
 from mitos.parser import ParsedEntry, parse_header
-from mitos.store import GraphStore, CommitDelta
+from mitos.store import GraphStore, CommitDelta, _utc_now_iso
 from mitos.identity import compute_node_id, embedding_text
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.vector_store import QdrantVectorStore
@@ -207,7 +207,7 @@ class MitosProseImporter:
                 # deferred (a V1b importer concern), not silently crash-on-write.
                 entry.source = "import_llm"
                 entry.confirmed_by = get_model_id("SONNET") if use_llm_extract else "user"
-                entry.confirmed_at = datetime.now().isoformat()
+                entry.confirmed_at = _utc_now_iso()  # MI-10, as in sync's two writers
 
                 # Compute the stable slug-free V1a id (V1-D2) — matches commit_parsed_entry.
                 node_id = compute_node_id(
