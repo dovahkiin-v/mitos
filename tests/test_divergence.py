@@ -586,7 +586,11 @@ def test_a_cache_entry_of_an_unexpected_shape_cannot_crash_status(tmp_path, caps
     _report(config)
     cache_path = os.path.join(config.mitos_dir, "divergence_cache.json")
     payload = _json.loads(open(cache_path, encoding="utf-8").read())
-    assert payload["key"].startswith("1:"), "the cache key must carry a schema version"
+    # Bound to the constant, not a literal: the property under test is that the key
+    # CARRIES a schema version, and every legitimate shape change bumps it.
+    assert payload["key"].startswith(f"{divergence._CACHE_VERSION}:"), (
+        "the cache key must carry a schema version"
+    )
 
 
 def test_rotation_mode_is_not_served_stale_from_the_cache(tmp_path) -> None:
@@ -650,3 +654,75 @@ def _lock_is_free(probe) -> bool:
             return True
     except Timeout:
         return False
+
+
+# --- The repairability verdict (§5.3.2) ---------------------------------------
+
+
+def _graph_node(kind: str = "decision", state: str = "active"):
+    """A minimal graph-node dict as `classify_absent_edge` reads it."""
+    return {"kind": kind, "computed_state": state}
+
+
+def test_absent_edge_verdicts_cover_the_four_repair_paths() -> None:
+    """Each verdict must name a DIFFERENT repair, because each has a different verb.
+
+    The rung already detected all 169 of cartolina's absent edges; what it could not
+    say was what to do about them, and its one suggestion (`mitos sync`) is wrong for
+    19. A count is a symptom — the reader needs the verb.
+    """
+    from mitos.divergence import EDGE_VERDICTS, classify_absent_edge
+
+    # Legal, resolvable, active target — a rebuild simply replays it.
+    assert classify_absent_edge(
+        "cites", "decision", "t", [_graph_node()]
+    ) == "repairable"
+
+    # Legal and resolvable, but every candidate is retired: a replay has to reach it
+    # in commit order, because citations resolve against the active view (§4.1).
+    assert classify_absent_edge(
+        "amends", "decision", "t", [_graph_node(state="superseded")]
+    ) == "target_retired"
+
+    # Names nothing at all.
+    assert classify_absent_edge("cites", "decision", "t", []) == "unresolvable"
+
+    # Cartolina's 19: `derives_from` must originate from an open question, so a
+    # decision declaring it can never commit no matter what it points at.
+    assert classify_absent_edge(
+        "derives_from", "decision", "t", [_graph_node()]
+    ) == "illegal"
+    assert classify_absent_edge(
+        "derives_from", "decision", "t", [_graph_node(kind="open_question")]
+    ) == "illegal"
+
+    assert set(EDGE_VERDICTS) == {
+        "illegal", "unresolvable", "target_retired", "repairable"
+    }
+
+
+def test_a_lineage_slug_is_repairable_if_any_candidate_is_active() -> None:
+    """One active legal candidate is enough — the verdict must not be first-wins.
+
+    A slug can name a whole same-slug supersession lineage (MI-13). Judging on the
+    first candidate would report a repairable edge as needing re-ordering, sending the
+    reader to the harder verb for no reason.
+    """
+    from mitos.divergence import classify_absent_edge
+
+    lineage = [_graph_node(state="superseded"), _graph_node(state="active")]
+    assert classify_absent_edge("cites", "decision", "t", lineage) == "repairable"
+
+
+def test_an_illegal_edge_is_legal_from_an_open_question_source() -> None:
+    """The verdict reads the SOURCE kind, not just the edge type.
+
+    `derives_from` is the correct relation from an open question to a decision — the
+    illegality is entirely about where it is declared. A verdict that condemned the
+    edge type outright would tell an author to remove a perfectly good relation.
+    """
+    from mitos.divergence import classify_absent_edge
+
+    assert classify_absent_edge(
+        "derives_from", "open_question", "t", [_graph_node(kind="decision")]
+    ) == "repairable"

@@ -81,6 +81,13 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # divergence the reconcile cannot repair.
 COMMENTARY_FIELDS: tuple = ("slug", "rejected_paths", "invalidates_if", "context")
 
+# The repairability verdicts for a declared-but-absent edge, worst-first. Detection
+# alone was never the gap — cartolina's 169 absent edges were all found by `status`.
+# What it could not say was what to DO, and its one suggestion (`mitos sync`) is wrong
+# for most of them: 19 of cartolina's can never commit at all. A count is a symptom; a
+# reader needs a verdict and the verb that serves it.
+EDGE_VERDICTS: tuple = ("illegal", "unresolvable", "target_retired", "repairable")
+
 # The nine relationship fields, in `parser._RELATIONSHIP_FIELDS` order. Duplicated as
 # a literal rather than imported: this module is a leaf by design, and the parser
 # pulls in `format-spec.md` at import time. A drift guard test pins the two together.
@@ -298,7 +305,15 @@ _CACHE_BASENAME: str = "divergence_cache.json"
 # a different species set is served verbatim to a reader that indexes the keys it
 # expects — a `KeyError` out of `mitos status`, from a stale file, for a command whose
 # entire job is to be the thing that still works.
-_CACHE_VERSION: str = "1"
+#
+# "2" — the repairability verdict (`edge_verdicts` / `illegal_edge_types`) joined the
+# report, and `reconcilable` stopped counting entries whose edges foreclose the commit.
+# Caught by running the new rung against cartolina and getting the OLD output: the key
+# hashes corpus bytes and the graph fingerprint, and on a corpus nobody has edited
+# since, neither moves — so a schema change is invisible until an unrelated edit. Every
+# future shape change needs this bump, and it is easy to forget precisely because the
+# dogfood corpus changes often enough to mask it.
+_CACHE_VERSION: str = "2"
 
 
 def _empty_report(**overrides: Any) -> Dict[str, Any]:
@@ -315,9 +330,62 @@ def _empty_report(**overrides: Any) -> Dict[str, Any]:
         "source": [],
         "reconcilable": 0,
         "archived_drift": 0,
+        "edge_verdicts": {v: 0 for v in EDGE_VERDICTS},
+        "illegal_edge_types": [],
     }
     report.update(overrides)
     return report
+
+
+def classify_absent_edge(
+    edge_type: str,
+    source_kind: str,
+    target_slug: str,
+    candidates: List[Dict[str, Any]],
+) -> str:
+    """Classifies one declared-but-absent edge by what could repair it.
+
+    The four verdicts, worst first:
+
+    ``illegal``
+        The kind matrix can never admit it — cartolina's 19 ``derives_from``-on-a-
+        decision edges. No verb repairs this; the relation must be re-authored
+        (usually as ``Cites:``) or removed. Naming a repair that provably cannot work
+        is worse than naming none.
+    ``unresolvable``
+        The citation names no entry at all. ``restore-source`` if the target's block
+        went missing, otherwise fix the typo.
+    ``target_retired``
+        Legal and resolvable, but every candidate is already retired. A replay must
+        reach it in COMMIT order — edge citations resolve against the active view, so
+        a supersession replayed ahead of the entry that amends its victim retires the
+        target early and the edge is rejected (the §4.1 finding).
+    ``repairable``
+        Legal, resolvable, and at least one candidate is active — the edge should
+        simply be there, and a rebuild replays it.
+
+    Args:
+        edge_type: The declared relationship type.
+        source_kind: The declaring entry's kind.
+        target_slug: The cited slug.
+        candidates: The graph nodes carrying that slug (``kind`` + ``computed_state``).
+
+    Returns:
+        One of ``EDGE_VERDICTS``.
+    """
+    from mitos.store import edge_kind_is_legal
+
+    if not candidates:
+        return "unresolvable"
+    legal = [
+        node for node in candidates
+        if edge_kind_is_legal(edge_type, source_kind, node.get("kind") or "")
+    ]
+    if not legal:
+        return "illegal"
+    if any(node.get("computed_state") == "active" for node in legal):
+        return "repairable"
+    return "target_retired"
 
 
 def _corpus_files(config: Any) -> List[str]:
@@ -498,6 +566,12 @@ def corpus_graph_divergence(store: Any, config: Any) -> Dict[str, Any]:
 
     nodes_by_id = {n["id"]: n for n in all_nodes}
     slug_by_id = {nid: n.get("slug") for nid, n in nodes_by_id.items()}
+    # Slug → every node carrying it. A slug can name a whole same-slug supersession
+    # lineage (MI-13), and the verdict must consider all of them: one active legal
+    # candidate makes the edge repairable even if its siblings are retired.
+    nodes_by_slug: Dict[str, List[Dict[str, Any]]] = {}
+    for node in all_nodes:
+        nodes_by_slug.setdefault((node.get("slug") or "").casefold(), []).append(node)
     edges_by_source: Dict[str, List[Dict[str, str]]] = {}
     for edge in all_edges:
         target_slug = slug_by_id.get(edge["target_id"])
@@ -550,8 +624,35 @@ def corpus_graph_divergence(store: Any, config: Any) -> Dict[str, Any]:
             report["commentary"].append({**label, "fields": per_entry["commentary"]})
         if per_entry["scope"]:
             report["scope"].append({**label, **per_entry["scope"]})
+        foreclosed = False
         if per_entry["edges"]:
             report["edges"].append({**label, **per_entry["edges"]})
+            # Classify only ADDITIONS — an edge declared in the corpus and absent from
+            # the graph. A removal is the opposite defect (the graph holds an edge the
+            # corpus no longer declares) and its repair is a re-commit, not a replay.
+            for spec in per_entry["edges"].get("added") or []:
+                edge_type, _, target_slug = spec.partition(":")
+                if not target_slug:
+                    continue
+                verdict = classify_absent_edge(
+                    edge_type,
+                    node.get("kind") or "decision",
+                    target_slug,
+                    nodes_by_slug.get(target_slug.casefold(), []),
+                )
+                report["edge_verdicts"][verdict] += 1
+                if verdict == "illegal" and edge_type not in report["illegal_edge_types"]:
+                    # Name the ACTUAL offenders rather than an example: cartolina holds
+                    # both `derives_from` (19) and `resolves` (3), and a rung hardcoding
+                    # one of them misdescribes any corpus carrying only the other.
+                    report["illegal_edge_types"].append(edge_type)
+                if verdict in ("illegal", "unresolvable"):
+                    # `sync`'s pre-flight refuses the WHOLE entry on one of these —
+                    # edges are mirrored declaratively, so its commentary cannot be
+                    # applied while withholding its edge state. Counting it as
+                    # reconcilable would promise a repair that then declines to run,
+                    # which is how a reader learns to distrust the whole rung.
+                    foreclosed = True
         if per_entry["source"]:
             report["source"].append({**label, **per_entry["source"]})
 
@@ -560,7 +661,7 @@ def corpus_graph_divergence(store: Any, config: Any) -> Dict[str, Any]:
             # reads the buffer only, and reconciling archives would turn a settled
             # partition into a live authoring surface. Its reconciler is `rebuild`.
             report["archived_drift"] += 1
-        elif is_reconcilable(per_entry):
+        elif is_reconcilable(per_entry) and not foreclosed:
             report["reconcilable"] += 1
 
     # S3 — a node with no `### ` block anywhere in the corpus. `rebuild` drops it and

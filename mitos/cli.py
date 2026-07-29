@@ -2116,6 +2116,28 @@ def _print_divergence_rung(report: Dict[str, Any]) -> None:
     if report.get("edges"):
         print(f"      • {len(report['edges'])} entry(s) whose declared relations "
               f"differ from the stored edges")
+        # A verdict, not a count. Detection was never the gap — what a reader needs is
+        # which of these a verb can actually repair, because the generic "run `mitos
+        # sync`" below is wrong for the illegal ones and they will never drain.
+        verdicts = report.get("edge_verdicts") or {}
+        if verdicts.get("repairable"):
+            print(f"          - {verdicts['repairable']} declared edge(s) whose target "
+                  f"is active and legal — `mitos rebuild` replays them")
+        if verdicts.get("target_retired"):
+            print(f"          - {verdicts['target_retired']} point at a since-retired "
+                  f"target — legal, but a replay must reach them in COMMIT order "
+                  f"(citations resolve against the active view)")
+        if verdicts.get("unresolvable"):
+            print(f"          - {verdicts['unresolvable']} name no entry in the graph "
+                  f"— fix the citation, or `mitos restore-source` if its block went "
+                  f"missing")
+        if verdicts.get("illegal"):
+            offenders = report.get("illegal_edge_types") or []
+            named = f" ({', '.join(sorted(offenders))})" if offenders else ""
+            print(f"          - {verdicts['illegal']} can NEVER commit{named} — the "
+                  f"kind matrix forbids them where they are declared. No verb repairs "
+                  f"these: re-author the relation (a decision citing a precedent wants "
+                  f"`Cites:`), or remove the line.")
     if report.get("source"):
         print(f"      • {len(report['source'])} entry(s) whose `**Source:**` line "
               f"differs from the stored provenance — a rebuild would adopt the "

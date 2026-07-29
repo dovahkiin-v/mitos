@@ -110,6 +110,41 @@ _EDGE_KIND_REQUIREMENT: Dict[str, str] = {
     "cites": "connect any two entries",
 }
 
+# The six same-kind edge types, as the ``edges`` DDL CHECK's first clause lists them.
+_SAME_KIND_EDGE_TYPES: frozenset = frozenset(
+    {"supersedes", "corrects", "amends", "narrows", "depends_on", "contradicts"}
+)
+
+
+def edge_kind_is_legal(edge_type: str, source_kind: str, target_kind: str) -> bool:
+    """Reports whether the kind matrix permits this edge — the DDL CHECK, in Python.
+
+    A pure mirror of the four-clause ``CHECK`` on the ``edges`` table, and it exists
+    ONLY so a caller can ask the question **before** attempting the INSERT. The DDL
+    stays the structural gate; nothing here relaxes it. It lives beside
+    ``_EDGE_KIND_REQUIREMENT`` (which phrases the same matrix for humans) so the two
+    move together, and ``test_edge_kind_matrix_matches_ddl`` proves the equivalence
+    over the entire ``edge_type × source_kind × target_kind`` grid by attempting a real
+    INSERT for every cell — so this cannot drift from the schema undetected.
+
+    Args:
+        edge_type: One of the nine relationship types.
+        source_kind: The citing node's kind ("decision" or "open_question").
+        target_kind: The cited node's kind.
+
+    Returns:
+        True if the CHECK would admit the edge.
+    """
+    if edge_type == "cites":
+        return True
+    if edge_type in _SAME_KIND_EDGE_TYPES:
+        return source_kind == target_kind
+    if edge_type == "derives_from":
+        return source_kind == "open_question" and target_kind == "decision"
+    if edge_type == "resolves":
+        return source_kind == "decision" and target_kind == "open_question"
+    return False
+
 # The seven NON-KILL relationship types. As of V1b (Phase 2a) these COMMIT their
 # edges — both endpoints stay active (unlike the two kill-edges, which retire their
 # target). They are kept as a named set because the two reconciliation gates that
@@ -660,6 +695,32 @@ class GraphStore:
                 conn.executescript(schema)
         except sqlite3.Error as e:
             raise DatabaseError(f"Failed to initialize schema: {str(e)}")
+        finally:
+            conn.close()
+
+    def resolve_slug_kinds(self, slug: str) -> List[str]:
+        """Resolves a slug to the DISTINCT kinds of the nodes carrying it.
+
+        ``resolve_slug``'s sibling, for callers that need to reason about the kind
+        matrix rather than identity — chiefly ``sync``'s reconcile pre-flight, which
+        must know whether an edge could ever satisfy the ``edges`` CHECK. Returns kinds
+        rather than rows because a slug can name a whole same-slug supersession lineage
+        (MI-13), and a pre-flight may only refuse when EVERY candidate is illegal.
+
+        Args:
+            slug: The slug to find (case-insensitive via ``str.casefold()``).
+
+        Returns:
+            The distinct kinds among matching nodes (empty if the slug resolves to
+            nothing — that is ``missing_target``'s case, not this one's).
+        """
+        conn = self._get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT DISTINCT kind FROM nodes WHERE slug_casefold = ?",
+                (slug.casefold(),),
+            ).fetchall()
+            return [row["kind"] for row in rows]
         finally:
             conn.close()
 

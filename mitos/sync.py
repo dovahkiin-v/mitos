@@ -44,7 +44,11 @@ from mitos.errors import (
     DatabaseError,
     EntryFailure,
     CommitError,
+    STORE_CYCLE_VIOLATION,
+    STORE_DANGLING_EDGE,
+    STORE_KIND_CONSTRAINT_VIOLATION,
     STORE_MISSING_TARGET,
+    STORE_SLUG_COLLISION,
 )
 from mitos.models import get_model_id
 from mitos.parser import (ParsedEntry, mask_inline_code, parse_entry_stream,
@@ -55,7 +59,9 @@ from mitos.store import (
     CommitDelta,
     _utc_now_iso,
     _strip_citation,
+    _EDGE_KIND_REQUIREMENT,
     _KILL_EDGE_FIELDS,
+    edge_kind_is_legal,
 )
 from mitos.identity import SLUG_MAX_LEN, compute_node_id, embedding_text
 from mitos.embeddings import GeminiEmbeddingProvider
@@ -402,6 +408,39 @@ _NEIGHBOR_REVIEW_THRESHOLD = 0.80
 _REVIEW_UNAVAILABLE_CAUSES = {
     ConflictUnavailableReason.EMBEDDING: "embedding service unavailable",
     ConflictUnavailableReason.VECTOR_STORE: "vector store unavailable",
+}
+
+# What the reconcile pre-flight (``_uncommittable_edges``) does about each store
+# failure code — the whole class, declared, so none can be silently missed.
+#
+# Phase 3 shipped the pre-flight against `missing_target` alone and called it done;
+# `kind_constraint_violation` then sailed through and wrote two audit rows per sync
+# forever. The lesson was not "add one more check" but "the class must be enumerated
+# somewhere a test can read." ``test_preflight_covers_store_codes`` asserts this table
+# has an entry for every member of ``STORE_FAILURE_CODES``, so adding a code to the
+# store forces a deliberate decision here rather than a silent gap.
+#
+# A code is CAUGHT (refused before the intent row) or NOT_CAUGHT with a reason.
+# "Not caught" is a real position, not a TODO: the commit still rejects it correctly
+# and the correlated outcome row still records the failure — the pre-flight's only job
+# is to stop an UNBOUNDED trail behind a defect that repeats every sync.
+_PREFLIGHT_CAUGHT = "caught"
+_PREFLIGHT_DISPOSITIONS: Dict[str, str] = {
+    STORE_MISSING_TARGET: _PREFLIGHT_CAUGHT,
+    STORE_DANGLING_EDGE: _PREFLIGHT_CAUGHT,  # same probe: the citation resolves to nothing
+    STORE_KIND_CONSTRAINT_VIOLATION: _PREFLIGHT_CAUGHT,
+    STORE_SLUG_COLLISION: (
+        "unreachable from a reconcile — the branch is entered only on a canonical-core "
+        "hash MATCH against an existing node, so the committing node already owns the "
+        "slug and cannot collide with itself"
+    ),
+    STORE_CYCLE_VIOLATION: (
+        "not pre-flighted deliberately — deciding it needs the store's mutation-lineage "
+        "walk, and re-implementing that in a pre-flight is exactly the duplication that "
+        "drifts. It is also self-limiting rather than unbounded in practice: it needs a "
+        "hand-edit that adds a kill/mutation edge closing a cycle, and the printed "
+        "per-entry failure names it. Revisit if one is ever observed repeating."
+    ),
 }
 
 
@@ -1955,31 +1994,66 @@ class MitosSyncManager:
             differs.append("edges")
         return {"differs": sorted(differs)} if differs else {}
 
-    def _unresolved_edge_targets(self, divergence: Dict[str, Any]) -> List[str]:
-        """Returns the newly-declared edge targets that resolve to no decision.
+    def _uncommittable_edges(self, entry: ParsedEntry,
+                             divergence: Dict[str, Any]) -> List[str]:
+        """Returns why each newly-declared edge provably cannot commit, if any.
 
-        A pre-flight, so a citation that can never commit is reported ONCE per sync
-        instead of writing an intent row plus a failure row every sync forever. The
-        commit would raise ``missing_target`` regardless; catching it there is correct
-        but leaves an unbounded attribution trail behind a typo, and retention is
-        deliberately deferred.
+        The reconcile pre-flight. A reconcile whose commit is FORECLOSED must be
+        refused before the write-ahead intent row, because the commit failure then
+        writes a correlated outcome row too — so every sync of an uncommittable entry
+        appends two audit rows, forever, and retention is deliberately deferred.
+
+        **Scoped to the class, not an instance.** Phase 3 shipped this as a
+        `missing_target`-only check and was too narrow: a kind-illegal edge has a
+        perfectly resolvable target, sailed through, and repeated indefinitely
+        (measured on cartolina: 19 such edges, 6 audit rows after 3 syncs). The
+        disposition of EVERY store failure code is now declared in
+        ``_PREFLIGHT_DISPOSITIONS`` and pinned by ``test_preflight_covers_store_codes``,
+        so a code added later cannot be silently missed the same way again.
+
+        Refusal is deliberately conservative: it fires only when the commit is
+        foreclosed for EVERY node the citation could bind to. A false positive here
+        silently skips a legitimate reconcile, which is worse than an extra audit row.
 
         Args:
+            entry: The parsed corpus entry (its ``kind`` is the edge source kind).
             divergence: The ``entry_divergence`` report.
 
         Returns:
-            The unresolvable target slugs, in report order.
+            Human-readable reasons, in report order. Empty means nothing forecloses
+            the commit — not that it will necessarily succeed.
         """
         added = (divergence.get("edges") or {}).get("added") or []
-        missing: List[str] = []
+        reasons: List[str] = []
         for spec in added:
-            _kind, _, target = spec.partition(":")
+            edge_type, _, target = spec.partition(":")
             if not target:
                 continue
-            ids = self.store.resolve_slug(target)
-            if not ids:
-                missing.append(f"'{target}'")
-        return missing
+            # `missing_target` / `dangling_edge` — the citation names nothing.
+            target_kinds = self.store.resolve_slug_kinds(target)
+            if not target_kinds:
+                reasons.append(
+                    f"'{target}' does not name any entry in the graph — fix the "
+                    "citation in decisions.md, or restore the cited entry with "
+                    "`mitos restore-source`"
+                )
+                continue
+            # `kind_constraint_violation` — the citation resolves, but the `edges`
+            # CHECK can never admit the edge. Refuse only if EVERY candidate kind is
+            # illegal (a slug can name a whole supersession lineage, MI-13).
+            if not any(
+                edge_kind_is_legal(edge_type, entry.kind, target_kind)
+                for target_kind in target_kinds
+            ):
+                requirement = _EDGE_KIND_REQUIREMENT.get(
+                    edge_type, "satisfy the kind matrix"
+                )
+                reasons.append(
+                    f"'{target}' has an incompatible kind for a {edge_type} edge — "
+                    f"{edge_type} edges must {requirement}. Re-author the relation "
+                    "(a decision citing a precedent wants `Cites:`) or remove the line"
+                )
+        return reasons
 
     def _apply_commentary_reconcile(
         self,
@@ -2056,13 +2130,12 @@ class MitosSyncManager:
                 print("  Skipped.")
                 return False
 
-        unresolved = self._unresolved_edge_targets(divergence)
-        if unresolved:
-            print(f"  Skipped — cannot reconcile: {', '.join(unresolved)} "
-                  f"{'do' if len(unresolved) > 1 else 'does'} not name any decision in "
-                  "the graph. Fix the citation in decisions.md, or restore the cited "
-                  "entry with `mitos restore-source`.",
-                  file=sys.stderr)
+        uncommittable = self._uncommittable_edges(entry, divergence)
+        if uncommittable:
+            print("  Skipped — cannot reconcile; this commit is foreclosed, so no "
+                  "attribution row was written:", file=sys.stderr)
+            for reason in uncommittable:
+                print(f"    - {reason}.", file=sys.stderr)
             return False
 
         # Write-AHEAD: the attribution row lands BEFORE the mutation. A best-effort

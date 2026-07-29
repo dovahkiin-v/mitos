@@ -1755,6 +1755,90 @@ def test_an_unresolvable_citation_is_reported_once_not_audited_forever(
 
 
 @patch("google.genai.Client")
+def test_a_kind_illegal_edge_is_reported_once_not_audited_forever(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """A `derives_from` declared on a DECISION can never commit — pre-flight it too.
+
+    The sibling of the unresolvable-citation case above, and the reason that fix was
+    too narrow: this target resolves perfectly, so the `missing_target`-only pre-flight
+    passed it straight through to a commit the `edges` CHECK can never admit. Every
+    sync then wrote an intent row plus a correlated failure row, forever. Measured on
+    the cartolina corpus the day it was found: 19 such edges, 6 rows after 3 syncs.
+
+    `derives_from` originates from an open question by definition, so a decision
+    declaring it is illegal no matter what it points at.
+    """
+    from mitos.telemetry import TelemetryStore
+
+    config, manager, tmpdir = sync_env
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+    store = GraphStore(config.db_path)
+    _seed_active_decision(store, "a-real-decision", "A perfectly resolvable axiom.")
+    _seed_committed_buffer(config, manager)
+
+    _edit_buffer(config, "**Scope:** alpha",
+                 "**Scope:** alpha\n**Derives-From:** a-real-decision")
+    for _ in range(3):
+        manager.perform_sync(auto_accept=True)
+
+    assert TelemetryStore(config.telemetry_path).read_commentary_audit() == [], (
+        "a kind-illegal edge must write no attribution rows at all — the commit is "
+        "foreclosed, so the write-ahead intent row is itself the defect"
+    )
+    assert GraphStore(config.db_path).get_edges() == []
+
+
+def test_preflight_declares_a_disposition_for_every_store_code() -> None:
+    """The pre-flight must account for the whole failure class, not an instance of it.
+
+    This is the drift guard that makes §4.3's lesson mechanical. Phase 3 handled
+    `missing_target` and silently left `kind_constraint_violation` to repeat forever;
+    nothing failed, because nothing was watching the class. Now a store code with no
+    declared disposition reds this test, forcing the author to either catch it or
+    write down why not.
+    """
+    from mitos.errors import STORE_FAILURE_CODES
+    from mitos.sync import _PREFLIGHT_DISPOSITIONS
+
+    assert set(_PREFLIGHT_DISPOSITIONS) == set(STORE_FAILURE_CODES), (
+        "every store failure code needs a pre-flight disposition — declare it caught, "
+        "or record the reason it is deliberately not pre-flighted"
+    )
+    for code, disposition in _PREFLIGHT_DISPOSITIONS.items():
+        assert disposition and isinstance(disposition, str), code
+
+
+@patch("google.genai.Client")
+def test_a_legal_edge_to_a_lineage_slug_still_reconciles(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """The pre-flight refuses only when EVERY candidate kind is illegal.
+
+    A slug can name a whole same-slug supersession lineage (MI-13), so a naive
+    "first candidate wins" probe would refuse a reconcile the commit would have
+    accepted — silently dropping a legitimate repair, which is strictly worse than
+    the extra audit row the pre-flight exists to prevent.
+    """
+    from mitos.telemetry import TelemetryStore
+
+    config, manager, tmpdir = sync_env
+    os.environ["GEMINI_API_KEY"] = "mock_key"
+    store = GraphStore(config.db_path)
+    _seed_active_decision(store, "cited-decision", "A cited axiom.")
+    _seed_committed_buffer(config, manager)
+
+    _edit_buffer(config, "**Scope:** alpha",
+                 "**Scope:** alpha\n**Cites:** cited-decision")
+    manager.perform_sync(auto_accept=True)
+
+    assert TelemetryStore(config.telemetry_path).read_commentary_audit(), (
+        "a legal edge must still reconcile and still be attributed"
+    )
+    assert GraphStore(config.db_path).get_edges(), "the legal edge must have committed"
+
+
+@patch("google.genai.Client")
 def test_the_audit_row_records_full_edge_state_not_a_delta(
     mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
 ) -> None:

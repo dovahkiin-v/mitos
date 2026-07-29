@@ -1762,3 +1762,67 @@ def test_3a_parked_oq_counted_resolved_excluded(temp_store: GraphStore) -> None:
 
     _commit_resolve(temp_store, "resolver", "Done.", "q2", scope=["dom"])
     assert temp_store.get_scope_counts()["dom"]["parked_open_questions"] == 1
+
+
+def test_edge_kind_matrix_matches_ddl(temp_store: GraphStore) -> None:
+    """`edge_kind_is_legal` must agree with the `edges` CHECK on every cell.
+
+    The predicate exists so `sync`'s reconcile pre-flight can ask "could this edge
+    ever commit?" without attempting the INSERT. That is only safe while it mirrors
+    the DDL exactly — a predicate that drifts permissive re-opens the unbounded audit
+    trail it was written to close, and one that drifts strict silently refuses
+    legitimate reconciles.
+
+    So this proves the equivalence rather than restating the rule: for all nine edge
+    types across both source kinds and both target kinds, attempt the real INSERT and
+    assert the CHECK's verdict is the predicate's. Rolled back each time, so the graph
+    is untouched.
+    """
+    from mitos.store import edge_kind_is_legal, _EDGE_KIND_REQUIREMENT
+
+    ids = {
+        ("decision", "source"): temp_store.commit_parsed_entry(
+            _decision(slug="d-source", axiom="Source axiom.")).node_id,
+        ("decision", "target"): temp_store.commit_parsed_entry(
+            _decision(slug="d-target", axiom="Target axiom.")).node_id,
+        ("open_question", "source"): temp_store.commit_parsed_entry(
+            _open_question(slug="q-source")).node_id,
+        ("open_question", "target"): temp_store.commit_parsed_entry(
+            _open_question(slug="q-target")).node_id,
+    }
+
+    conn = temp_store._get_connection()
+    checked = 0
+    try:
+        for edge_type in _EDGE_KIND_REQUIREMENT:
+            for source_kind in ("decision", "open_question"):
+                for target_kind in ("decision", "open_question"):
+                    try:
+                        conn.execute(
+                            "INSERT INTO edges (source_id, source_kind, target_id, "
+                            "target_kind, edge_type, created_at) VALUES (?,?,?,?,?,?)",
+                            (
+                                ids[(source_kind, "source")], source_kind,
+                                ids[(target_kind, "target")], target_kind,
+                                edge_type, "2026-01-01T00:00:00+00:00",
+                            ),
+                        )
+                        ddl_admits = True
+                    except sqlite3.IntegrityError:
+                        ddl_admits = False
+                    finally:
+                        conn.rollback()
+
+                    assert ddl_admits == edge_kind_is_legal(
+                        edge_type, source_kind, target_kind
+                    ), (
+                        f"{edge_type}: {source_kind}->{target_kind} — the DDL CHECK "
+                        f"{'admits' if ddl_admits else 'rejects'} it but "
+                        f"edge_kind_is_legal says "
+                        f"{edge_kind_is_legal(edge_type, source_kind, target_kind)}"
+                    )
+                    checked += 1
+    finally:
+        conn.close()
+
+    assert checked == 36, f"expected the full 9x2x2 grid, checked {checked}"
