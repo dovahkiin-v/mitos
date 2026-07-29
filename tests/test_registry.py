@@ -671,3 +671,48 @@ def test_the_registry_file_carries_nothing_but_name_and_path(tmp_path):
     assert all(isinstance(v, str) for v in data.values())
     assert "collection" not in _read_registry()
     assert "version" not in _read_registry()
+
+
+# --- the encoding boundary -------------------------------------------------
+
+def test_a_registry_that_is_not_utf_8_renders_a_calm_named_error():
+    """A hand-edit saved in a legacy encoding reads as a named fault, not a traceback.
+
+    The file invites hand-editing, so an editor that writes latin-1 is an ordinary
+    way to meet it — and ``open(..., encoding="utf-8")`` raises ``UnicodeDecodeError``,
+    which is a ``ValueError`` and therefore slips the ``OSError`` arm above it. Its
+    own arm is what keeps this inside ``RegistryError``.
+    """
+    path = registry.registry_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(b'"caf\xe9" = "/ws/cafe"\n')   # latin-1, not UTF-8
+
+    with pytest.raises(RegistryError) as exc:
+        registry.load()
+
+    message = str(exc.value)
+    assert path in message
+    assert "UTF-8" in message
+
+
+def test_a_workspace_path_with_non_utf_8_bytes_refuses_and_touches_nothing(tmp_path):
+    """A directory name that is not valid UTF-8 (legal on Linux) refuses by name.
+
+    ``os.fsdecode`` hands such a path back carrying lone surrogates, which have no
+    UTF-8 encoding at all — so composing the file succeeds in memory and only the
+    encode fails. Without the write's own postcondition this reached the CLI's
+    generic unexpected-error arm; here it is a named refusal with the existing
+    registry byte-intact.
+    """
+    raw = os.path.join(os.fsencode(str(tmp_path)), b"bad\xffname")
+    os.makedirs(raw)
+    _write_registry('"alpha" = "/ws/alpha"\n')
+    before = _read_registry()
+
+    with pytest.raises(RegistryError) as exc:
+        registry.register(os.fsdecode(raw), name="badbytes")
+
+    assert "UTF-8" in str(exc.value)
+    assert _read_registry() == before
+    assert registry.load() == {"alpha": "/ws/alpha"}

@@ -482,6 +482,12 @@ def cmd_init(config: MitosConfig, name: Optional[str] = None, force: bool = Fals
     #    workspace stays valid and unregistered, and nothing is rolled back.
     #    The path registered is the CANONICAL (symlink-resolved) one, which is not
     #    necessarily `config.workspace_dir`'s abspath spelling.
+    #    Flush stdout first — the same shape as the post-receipt nudges in
+    #    `cmd_record`: a refusal here goes to stderr (unbuffered) while the success
+    #    line above sits in a block-buffered pipe, so without this the `Error:` line
+    #    overtakes it and the reader's opening line is a refusal for a job that in
+    #    fact finished. The no-unwind posture is only legible in the right order.
+    sys.stdout.flush()
     outcome = registry.register(config.workspace_dir, name=name, force=force)
     print(_registration_line(outcome))
 

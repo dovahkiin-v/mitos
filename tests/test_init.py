@@ -9,6 +9,8 @@ filesystem + idempotency + pre-V1a-refusal outcomes (no external services; the
 
 import os
 import sqlite3
+import subprocess
+import sys
 import tomllib
 from unittest.mock import patch
 
@@ -502,3 +504,39 @@ def test_the_registration_line_names_no_collection_and_no_reconcile(tmp_path, ca
     assert "collection" not in out.lower()
     assert default_collection_name(str(second)) not in out
     assert default_collection_name(str(first)) not in out
+
+
+def test_the_success_line_reaches_a_captured_stream_before_the_refusal(tmp_path):
+    """On a refused registration the "Initialized ✓" line still prints FIRST.
+
+    Driven as a subprocess with **one combined pipe**, because that is the only
+    stream shape where the ordering can break and the only one `capsys` cannot
+    model: stdout is block-buffered when it is not a terminal while stderr never
+    is, so without an explicit flush the `Error:` line overtakes the success line
+    it is supposed to follow. The whole no-unwind posture is a *message* — the
+    workspace is fine, only the routing entry is missing — and a reader (an agent,
+    a CI log) whose first line is a refusal reads a failed `init`.
+    """
+    workspace = tmp_path / ".hidden"          # an illegal DEFAULT name (leading dot)
+    workspace.mkdir()
+    env = {
+        **os.environ,
+        "MITOS_NO_UPDATE_CHECK": "1",
+        "MITOS_NO_MCP_HINT": "1",
+        "XDG_CONFIG_HOME": str(tmp_path / "xdg_config"),
+    }
+
+    done = subprocess.run(
+        [sys.executable, "-m", "mitos.cli", "init"],
+        cwd=str(workspace), env=env, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+
+    assert done.returncode == 1
+    combined = done.stdout
+    assert "Traceback" not in combined
+    assert "Initialized Mitos workspace" in combined
+    assert "Error:" in combined
+    assert combined.index("Initialized Mitos workspace") < combined.index("Error:"), (
+        f"the refusal overtook the success line it follows:\n{combined}"
+    )
