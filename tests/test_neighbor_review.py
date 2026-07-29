@@ -841,6 +841,48 @@ def test_acknowledge_bypass_carries_no_notice(ws):
     assert "neighbor_review_unavailable" not in res
 
 
+def test_mixed_neighbors_declared_edge_survives_acknowledge_bypass(ws):
+    """The mixed multi-neighbour resolution composes: a declared edge plus
+    acknowledge_neighbors=True commits AND writes the declared edge.
+
+    The round-31 field case: a record pauses on two neighbours where one deserves
+    a real edge (`cites`) and the other is a pure shape-match. The pause message
+    offers two recoveries; resolving the mixed case needs both in ONE invocation.
+    That works today only incidentally — `acknowledge_neighbors=True` skips the
+    entire gate block (including the `declared_targets` computation over
+    `_split_relation_slugs`), while Phase B writes edges from the raw relation
+    args. Nothing else holds those facts apart: a refactor moving edge
+    normalization into the skipped block would silently drop declared edges
+    exactly when both flags travel together, and every other test would stay
+    green. The store-read edge assertion below is the load-bearing line.
+    """
+    config, m = ws
+    _seed(m, "mixed-related", "Divergence is reported on status as an informational rung.")
+    _seed(m, "mixed-unrelated", "Scope discovery lists the live subset, not the full spine.")
+    _arm(m, [{"slug": "mixed-related", "score": 0.82},
+             {"slug": "mixed-unrelated", "score": 0.80}])
+
+    # Premise half (redundant with T2 by design — makes THIS fixture prove the
+    # state the composition half depends on): the declared target is exempt,
+    # the undeclared shape-match still pauses alone.
+    paused = m.record_decision_entry("Reads distinguish empty from unbuilt.", "rej", ["s"],
+                                     slug="mixed-new", cites="mixed-related")
+    assert paused["status"] == "needs_review"
+    assert [n["slug"] for n in paused["neighbors"]] == ["mixed-unrelated"]
+    assert GraphStore(config.db_path).get_node_by_slug("mixed-new") is None
+
+    # Composition half: both recoveries in one re-record commit the entry AND
+    # keep the declared edge — a bulk acknowledge must not discard a true edge.
+    res = m.record_decision_entry("Reads distinguish empty from unbuilt.", "rej", ["s"],
+                                  slug="mixed-new", cites="mixed-related",
+                                  acknowledge_neighbors=True)
+    assert res["status"] == "created", res
+    store = GraphStore(config.db_path)
+    node = store.get_node_by_slug("mixed-new")
+    assert node is not None
+    assert {"kind": "cites", "target": "mixed-related"} in store.get_outgoing_edges(node["id"])
+
+
 # --------------------------------------------------------------------------- #
 # The retired `related` echo (T4)
 # --------------------------------------------------------------------------- #
