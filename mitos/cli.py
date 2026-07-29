@@ -60,7 +60,7 @@ from mitos.lexical import degraded_reason_from_error, lexical_fallback
 from mitos.recall import (assess_surface_recall, corpus_provenance,
                           provenance_line, scope_filter_recovery)
 from mitos.sync import (MitosSyncManager, run_ambient_capture, _SLUG_MAX_LEN,
-                        _ENTRIES_MARKER)
+                        _ENTRIES_MARKER, _PAUSE_RESOLVING_RELATIONS)
 from mitos._agent_block import agent_block, agent_block_drift, AGENT_GUIDE_VERSION
 from mitos.renderer import MitosRenderer, overflow_report
 from mitos.importer import MitosProseImporter
@@ -1232,10 +1232,13 @@ def cmd_record(
                       file=sys.stderr)
             if n.get("scope"):
                 print(f"      scope: {', '.join(n['scope'])}", file=sys.stderr)
-        print("  → Re-record with --supersedes/--amends/--narrows/--contradicts/--cites "
-              "<slug> to link it, --acknowledge-neighbors to record as independent, or "
-              "both together — link the true neighbour(s) and acknowledge the rest.",
-              file=sys.stderr)
+        # Same co-equal framing as the shared needs_review message (one constant,
+        # two spellings — the CLI renders flags, the message bare names).
+        menu = "/".join(f"--{r}" for r in _PAUSE_RESOLVING_RELATIONS)
+        print(f"  → Judge each neighbour, then re-record with that judgment: {menu} "
+              "<slug> at any neighbour this decision relates to, "
+              "--acknowledge-neighbors for neighbours that stand independently — or "
+              "both at once for a mixed set.", file=sys.stderr)
         sys.exit(2)
 
     # The "exists" short-circuit writes nothing, so it must not borrow the

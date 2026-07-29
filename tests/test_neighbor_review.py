@@ -27,7 +27,8 @@ from mitos.conflict import ConflictUnavailableReason, Unavailable
 from mitos.errors import DatabaseError, EmbeddingError, VectorStoreError
 from mitos.parser import ParsedEntry
 from mitos.store import GraphStore
-from mitos.sync import MitosSyncManager, _NEIGHBOR_REVIEW_THRESHOLD
+from mitos.sync import (MitosSyncManager, _NEIGHBOR_REVIEW_THRESHOLD,
+                        _PAUSE_RESOLVING_RELATIONS)
 
 
 @pytest.fixture
@@ -393,9 +394,9 @@ def test_cli_mcp_record_pause_parity(ws, capsys):
     assert n["amended_by"] == ["use-sqlite-wal"]
 
     msg = cli_payload["message"]
-    assert "amends/narrows/supersedes/contradicts/cites" in msg  # the relation exit
+    assert "/".join(_PAUSE_RESOLVING_RELATIONS) in msg       # the relation exit, from the one set
     assert "acknowledge_neighbors=True" in msg               # the independence exit
-    assert "combine" in msg                                  # the mixed-case composition
+    assert "both at once" in msg                             # the mixed-case composition
     assert "tension" not in msg.lower() and "judged" not in msg.lower()
     # A pause on either surface writes nothing.
     assert GraphStore(config.db_path).get_node_by_slug("adopt-sqlite") is None
@@ -436,6 +437,20 @@ def test_mcp_record_docstring_pins_enriched_protocol():
     doc = mcp_server.record_decision.__doc__
     assert "possible_tension" not in doc
     assert "neighbor_review_unavailable" in doc
+
+
+def test_mcp_record_docstring_carries_pause_relation_menu():
+    """The docstring's recovery menu matches _PAUSE_RESOLVING_RELATIONS verbatim.
+
+    The docstring is the one pause surface that cannot render from the constant
+    (@mcp.tool captures it at decoration; an f-string is not a docstring), so this
+    pin is its rendering: adding or removing a member of the set fails here until
+    the docstring is edited to match. Three hand-kept copies of this list let
+    `narrows` go missing across three review rounds — two surfaces now render
+    from the constant, this one is held to it.
+    """
+    from mitos import mcp_server
+    assert "/".join(_PAUSE_RESOLVING_RELATIONS) in mcp_server.record_decision.__doc__
 
 
 # --------------------------------------------------------------------------- #

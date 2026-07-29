@@ -401,6 +401,31 @@ _EXISTS_NO_OP_NOTE = (
 # lineage suppression). Tune here.
 _NEIGHBOR_REVIEW_THRESHOLD = 0.80
 
+# The relations the pause offers for resolving a flagged neighbour — a fourth
+# edge-field set beside store.py's kill/deferred/mutation trio, derivable from none
+# of them (those are graph semantics; this is authoring guidance). Every surface
+# that teaches the recovery renders from here: sync's needs_review message and the
+# CLI's pause render join it directly, and the MCP record_decision docstring is
+# pinned to it by test (a docstring can't render dynamically — @mcp.tool captures
+# it at decoration). Three hand-kept copies let `narrows` go missing across three
+# review rounds; one named set is the fix.
+#
+# Omissions are decisions, not gaps:
+#   resolves     — decision→open_question only, and the pause gather keeps only
+#                  live decisions, so a paused neighbour is structurally never an
+#                  open question.
+#   derives_from — originates from an open question; invalid on record and
+#                  early-rejected before the pause can matter.
+#   depends_on   — a ≥0.80 near-restatement is not a dependency; the "builds on"
+#                  reading of a near-twin is what `cites` is for.
+# corrects is included deliberately: it suppresses like the rest, and steering an
+# author whose near-twin was WRONG (not outgrown) to `supersedes` stamps the
+# target superseded_by instead of corrected_by on every future read — the same
+# durable mislabel that let the missing `narrows` coerce false `amends` edges.
+_PAUSE_RESOLVING_RELATIONS = (
+    "amends", "narrows", "supersedes", "corrects", "contradicts", "cites",
+)
+
 # Surface wording for the record receipt's degraded-check causes. The record surface
 # owns this text (the core returns only the typed reason — the same core/surface split
 # as _notice_conflict_unavailable, the sync-surface sibling). ``Unavailable.detail`` is
@@ -2672,15 +2697,15 @@ class MitosSyncManager:
                         f"Paused: '{entry.slug}' is ≥{_NEIGHBOR_REVIEW_THRESHOLD:.2f} "
                         f"similar to {len(neighbors)} existing decision(s) you did not "
                         "reference. Judge each neighbour from its axiom, "
-                        "rejected_paths, scope, and modifier stamps: if this decision "
-                        "amends/narrows/supersedes/contradicts/cites one, re-record "
-                        "with that relation pointing at its slug; if it is genuinely "
-                        "independent, re-record with acknowledge_neighbors=True; with "
-                        "mixed neighbours the two combine in one re-record — declare "
-                        "the true relations and acknowledge the rest. An "
-                        "amended_by/narrowed_by stamp means the neighbour has moved "
-                        "on — dereference that slug before linking. Nothing was "
-                        "written."
+                        "rejected_paths, scope, and modifier stamps, then re-record "
+                        "with that judgment: a relation arg "
+                        f"({'/'.join(_PAUSE_RESOLVING_RELATIONS)}) pointing at any "
+                        "neighbour this decision genuinely relates to, "
+                        "acknowledge_neighbors=True for neighbours that stand "
+                        "independently alongside it — or both at once for a mixed "
+                        "set. An amended_by/narrowed_by stamp means the neighbour "
+                        "has moved on — dereference that slug before linking. "
+                        "Nothing was written."
                     ),
                 }
 

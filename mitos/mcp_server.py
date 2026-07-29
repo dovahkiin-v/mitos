@@ -741,11 +741,12 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
         and not a write: this decision is ≥0.80 similar to existing `neighbors` it does
         not reference. Each neighbour carries its axiom, rejected_paths, scope, score,
         and an amended_by/narrowed_by stamp when a later decision has moved it on
-        (dereference that slug before linking). Re-record with the resolving relation
-        arg (amends/narrows/supersedes/contradicts/cites) pointing at the neighbour's
-        slug, or with acknowledge_neighbors=True if genuinely independent; with mixed
-        neighbours the two combine in one re-record — declare the true relations and
-        acknowledge the rest. Nothing was written,
+        (dereference that slug before linking). Judge each neighbour, then re-record
+        with that judgment: a relation arg
+        (amends/narrows/supersedes/corrects/contradicts/cites) pointing at any
+        neighbour this decision genuinely relates to, acknowledge_neighbors=True for
+        neighbours that stand independently alongside it — or both at once for a
+        mixed set. Nothing was written,
         so a re-record is the right move (unlike an "exists" no-op).
         The "created" result also carries `edges_created` — the relation edges this
         record actually wired, each `{kind, target}` (write facts read back from the
