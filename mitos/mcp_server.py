@@ -729,7 +729,8 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
             handle, so an over-length one is rejected (not silently truncated).
         acknowledge_neighbors: Record past the near-duplicate review after inspecting
             the flagged neighbours and judging this decision genuinely independent.
-            Leave False (default) on the first attempt.
+            Leave False (default) on the first attempt. Combines with the relation
+            args — declared edges are still written.
 
     Returns:
         A JSON string: {slug, id, state, embedding, status} or {error, code}.
@@ -741,8 +742,10 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
         not reference. Each neighbour carries its axiom, rejected_paths, scope, score,
         and an amended_by/narrowed_by stamp when a later decision has moved it on
         (dereference that slug before linking). Re-record with the resolving relation
-        arg (amends/supersedes/contradicts/cites) pointing at the neighbour's slug, or
-        with acknowledge_neighbors=True if genuinely independent. Nothing was written,
+        arg (amends/narrows/supersedes/contradicts/cites) pointing at the neighbour's
+        slug, or with acknowledge_neighbors=True if genuinely independent; with mixed
+        neighbours the two combine in one re-record — declare the true relations and
+        acknowledge the rest. Nothing was written,
         so a re-record is the right move (unlike an "exists" no-op).
         The "created" result also carries `edges_created` — the relation edges this
         record actually wired, each `{kind, target}` (write facts read back from the

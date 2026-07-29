@@ -1232,8 +1232,10 @@ def cmd_record(
                       file=sys.stderr)
             if n.get("scope"):
                 print(f"      scope: {', '.join(n['scope'])}", file=sys.stderr)
-        print("  → Re-record with --supersedes/--amends/--contradicts/--cites <slug> to link "
-              "it, or --acknowledge-neighbors to record as independent.", file=sys.stderr)
+        print("  → Re-record with --supersedes/--amends/--narrows/--contradicts/--cites "
+              "<slug> to link it, --acknowledge-neighbors to record as independent, or "
+              "both together — link the true neighbour(s) and acknowledge the rest.",
+              file=sys.stderr)
         sys.exit(2)
 
     # The "exists" short-circuit writes nothing, so it must not borrow the
@@ -4020,7 +4022,9 @@ def _build_parser() -> argparse.ArgumentParser:
                        help=f"Explicit slug (handle) for the decision, required "
                             f"(≤{_SLUG_MAX_LEN} chars; an over-length slug is rejected, not truncated).")
     rec_p.add_argument("--acknowledge-neighbors", action="store_true", dest="acknowledge_neighbors",
-                       help="Record past the near-duplicate review (the decision is genuinely independent).")
+                       help="Record past the near-duplicate review (the decision is genuinely "
+                            "independent). Combines with the relation flags — declared edges "
+                            "are still written.")
     rec_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON.")
 
     # serve

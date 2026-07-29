@@ -393,8 +393,9 @@ def test_cli_mcp_record_pause_parity(ws, capsys):
     assert n["amended_by"] == ["use-sqlite-wal"]
 
     msg = cli_payload["message"]
-    assert "amends/supersedes/contradicts/cites" in msg      # the relation exit
+    assert "amends/narrows/supersedes/contradicts/cites" in msg  # the relation exit
     assert "acknowledge_neighbors=True" in msg               # the independence exit
+    assert "combine" in msg                                  # the mixed-case composition
     assert "tension" not in msg.lower() and "judged" not in msg.lower()
     # A pause on either surface writes nothing.
     assert GraphStore(config.db_path).get_node_by_slug("adopt-sqlite") is None
