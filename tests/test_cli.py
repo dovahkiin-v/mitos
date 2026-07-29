@@ -4,9 +4,11 @@ Verifies CLI argument parsing, help commands, and basic dry-runs for commands.
 """
 
 import sys
+import tomllib
 import pytest
 from unittest.mock import MagicMock, patch, ANY
-from mitos.cli import main, _toml_scalar
+from mitos.cli import main
+from mitos.config import toml_scalar
 
 def test_cli_help_menu() -> None:
     """Verifies that the help menu is printed and exits cleanly with 0."""
@@ -160,7 +162,11 @@ def test_cli_malformed_config_exits_clean_no_traceback(
 
 
 # ---------------------------------------------------------------------------
-# _toml_scalar bool serialization (v0.2 conflict_check_on_sync is the first bool key)
+# toml_scalar — the shared config/registry serializer (config.py). It moved out of
+# cli.py when the registry became its second consumer: the registry leaf cannot
+# import cli (cli imports the registry), and config.py already owns the TOML read
+# side. The four assertions below are UNCHANGED across that move and the widening
+# — they are the byte-compatibility gate for every config.toml line ever seeded.
 # ---------------------------------------------------------------------------
 
 def test_toml_scalar_serializes_bool_as_lowercase_literal() -> None:
@@ -169,11 +175,59 @@ def test_toml_scalar_serializes_bool_as_lowercase_literal() -> None:
     ``bool`` subclasses ``int``, so the bool branch must precede the int branch;
     an int-first order would emit ``True`` as ``1``. Regression-pins that ordering.
     """
-    assert _toml_scalar(True) == "true"
-    assert _toml_scalar(False) == "false"
+    assert toml_scalar(True) == "true"
+    assert toml_scalar(False) == "false"
 
 
 def test_toml_scalar_still_serializes_int_and_str() -> None:
     """The bool branch doesn't disturb the existing int/str scalars."""
-    assert _toml_scalar(50) == "50"
-    assert _toml_scalar("archive") == '"archive"'
+    assert toml_scalar(50) == "50"
+    assert toml_scalar("archive") == '"archive"'
+
+
+@pytest.mark.parametrize(
+    "value, why",
+    [
+        ("/x/a\\tb", "a backslash: a basic string would re-read `\\t` as a TAB"),
+        ('quote"bearing', "a `\"`: the pre-widening serializer raised on this outright"),
+        ("both'and\"quotes", "both quote kinds: neither literal form is available"),
+        ("line\nbreak", "a newline: must escape rather than emit a raw break"),
+        ("ctrl\x01char", "a control character: illegal raw in either string form"),
+        ("ąžuolas", "non-ASCII: legal unescaped, and must not be mangled (P9)"),
+        ("plain", "the clean case still takes the shipped basic form"),
+    ],
+)
+def test_toml_scalar_round_trips_the_widened_domain(value, why) -> None:
+    """Every value shape the registry can carry survives a serialize→parse cycle.
+
+    The registry's domain is wider than the config schema's: project names can hold
+    a quote and workspace paths can hold a backslash. Both are silent-corruption
+    hazards rather than exotic ones — a path written into a TOML *basic* string has
+    its escapes interpreted on the next read, so ``/x/a\\tb`` comes back carrying a
+    TAB and points at a directory that does not exist.
+    """
+    assert tomllib.loads(f"k = {toml_scalar(value)}")["k"] == value, why
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["plain", "dotted.name", "ąžuolas", 'quote"bearing', "back\\slash"],
+)
+def test_toml_scalar_also_serves_as_a_quoted_key(key) -> None:
+    """The same serializer quotes registry KEYS, which is why names are never bare.
+
+    A bare dotted key parses as a nested table (``example.com`` — an ordinary
+    directory name), and a bare non-ASCII key does not parse at all, which would
+    make the whole registry unreadable rather than merely mis-read.
+    """
+    assert list(tomllib.loads(f'{toml_scalar(key)} = "v"')) == [key]
+
+
+def test_toml_scalar_refuses_a_non_scalar_loudly() -> None:
+    """A value with no TOML scalar form raises ``TypeError``, never emits a guess.
+
+    Callers at a user-facing boundary convert this into their own calm error; the
+    serializer itself stays a pure function that refuses rather than improvises.
+    """
+    with pytest.raises(TypeError):
+        toml_scalar({"not": "a scalar"})

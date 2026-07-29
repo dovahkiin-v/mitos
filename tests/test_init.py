@@ -10,10 +10,12 @@ filesystem + idempotency + pre-V1a-refusal outcomes (no external services; the
 import os
 import sqlite3
 import tomllib
+from unittest.mock import patch
 
 import pytest
 
 from mitos import cli
+from mitos import registry
 from mitos.config import (
     MitosConfig,
     CONFIG_DEFAULTS,
@@ -22,7 +24,7 @@ from mitos.config import (
 )
 from mitos.migrations import MIGRATION_STEPS, _pending_head
 from mitos.store import GraphStore
-from mitos.errors import DatabaseError
+from mitos.errors import DatabaseError, RegistryError
 
 
 # --- helpers ---------------------------------------------------------------
@@ -128,7 +130,7 @@ def test_config_seeds_conflict_check_as_native_bool(tmp_path):
     """A fresh init seeds ``conflict_check_on_sync = true`` (lowercase, unquoted).
 
     The v0.2 toggle is the first bool-typed key; ``mitos init`` must NOT crash on
-    it (the ``_toml_scalar`` bool-serializer trap) and must emit a native TOML
+    it (the ``toml_scalar`` bool-serializer trap) and must emit a native TOML
     boolean that ``tomllib`` parses straight back to Python ``True``.
     """
     _init(tmp_path)  # must not raise — the central 1a gotcha
@@ -344,3 +346,159 @@ def test_init_preserves_env_gitignore_qdrant_scaffolding(tmp_path):
         data = tomllib.load(f)
     assert data["qdrant_url"] == "http://localhost:7333"
     assert data["qdrant_collection"] == default_collection_name(str(tmp_path))
+
+
+# --- registration: init introduces the project globally --------------------
+#
+# `init` is the registry's SOLE writer, and registration is its LAST step. Paths
+# are asserted against `os.path.realpath(tmp_path)`, never the raw fixture path:
+# the registry canonicalizes with `realpath` while `MitosConfig` uses `abspath`,
+# so on a machine whose `/tmp` is a symlink the two legitimately differ.
+
+def test_fresh_init_registers_the_workspace_under_its_directory_name(tmp_path, capsys):
+    """A fresh init registers the workspace and says so, naming name + resolved path."""
+    workspace = tmp_path / "proj"
+    workspace.mkdir()
+
+    _init(workspace)
+
+    assert registry.load() == {"proj": os.path.realpath(str(workspace))}
+    out = capsys.readouterr().out
+    assert "proj" in out
+    assert os.path.realpath(str(workspace)) in out
+
+
+def test_init_registers_the_canonical_path_not_the_abspath_spelling(tmp_path):
+    """A workspace reached through a symlink registers its REAL directory and name.
+
+    The registry's canonical form (``realpath``) is what a later collection
+    derivation and a resolver both consume, so ``init`` must not record the
+    ``abspath`` spelling ``MitosConfig`` happens to hold. Registering the link path
+    would give one workspace two identities depending on how it was entered.
+    """
+    real = tmp_path / "real-project"
+    real.mkdir()
+    link = tmp_path / "linked"
+    link.symlink_to(real, target_is_directory=True)
+
+    _init(link)
+
+    assert registry.load() == {"real-project": os.path.realpath(str(real))}
+
+
+def test_init_name_flag_overrides_the_derived_name(tmp_path):
+    """``--name`` registers under the given name instead of the directory's."""
+    workspace = tmp_path / "proj"
+    workspace.mkdir()
+
+    cli.cmd_init(MitosConfig(str(workspace)), name="chosen")
+
+    assert registry.load() == {"chosen": os.path.realpath(str(workspace))}
+
+
+def test_reinit_is_an_idempotent_reassert(tmp_path, capsys):
+    """A second init re-asserts the same pair without erroring or duplicating it."""
+    workspace = tmp_path / "proj"
+    workspace.mkdir()
+    _init(workspace)
+    capsys.readouterr()
+
+    _init(workspace)  # must not raise — re-init is how a project joins/stays joined
+
+    assert registry.load() == {"proj": os.path.realpath(str(workspace))}
+    assert "Already registered" in capsys.readouterr().out
+
+
+def test_a_dot_directory_basename_refuses_but_leaves_a_complete_workspace(tmp_path, capsys):
+    """An illegal DEFAULT name refuses registration — and scaffolds the workspace fully.
+
+    ``mitos init`` inside a dot-directory derives ``.config``-shaped name, which no
+    selector can reach. The refusal must not unwind the scaffold: the workspace
+    itself is legitimate and unregistered workspaces are an ordinary supported
+    state, so withholding a valid workspace to prevent a routing entry would be the
+    Ironclad Invariant inverted. The recovery is a re-run with ``--name``.
+    """
+    workspace = tmp_path / ".hidden"
+    workspace.mkdir()
+
+    with pytest.raises(RegistryError) as exc:
+        _init(workspace)
+
+    assert "--name" in str(exc.value)
+    assert registry.load() == {}
+    # The scaffold is complete despite the failed registration.
+    for rel in (".mitos/config.toml", ".mitos/graph.sqlite", ".mitos/skill.md",
+                "format-spec.md", "decisions.md", "questions.md", ".env"):
+        assert (workspace / rel).exists(), f"missing {rel} after a refused registration"
+    assert "Initialized Mitos workspace" in capsys.readouterr().out
+
+    # And the named recovery really is one: the same directory, one flag on.
+    cli.cmd_init(MitosConfig(str(workspace)), name="hidden")
+    assert registry.load() == {"hidden": os.path.realpath(str(workspace))}
+
+
+def test_registration_is_the_last_mutation_and_never_unwinds_the_scaffold(tmp_path, capsys):
+    """With registration forced to fail, the graph is booted and the scaffold intact.
+
+    Pins the ORDER, not just the no-unwind posture: the "Initialized …" line has
+    already printed and ``graph.sqlite`` already exists when registration runs, so
+    a registry fault can only ever add an error line to a finished job.
+    """
+    workspace = tmp_path / "proj"
+    workspace.mkdir()
+
+    with patch.object(registry, "register",
+                      side_effect=RegistryError("registry is on fire")):
+        with pytest.raises(RegistryError):
+            _init(workspace)
+
+    assert (workspace / ".mitos" / "graph.sqlite").exists()
+    assert (workspace / "decisions.md").exists()
+    assert "Initialized Mitos workspace" in capsys.readouterr().out
+
+
+def test_init_force_repoints_a_name_to_this_workspace(tmp_path, capsys):
+    """``--force`` moves an existing registration here and reports what it displaced."""
+    first = tmp_path / "a" / "proj"
+    second = tmp_path / "b" / "proj"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    _init(first)
+
+    with pytest.raises(RegistryError) as exc:
+        _init(second)              # same derived name, different path
+    assert "--force" in str(exc.value)
+    capsys.readouterr()
+
+    cli.cmd_init(MitosConfig(str(second)), force=True)
+
+    assert registry.load() == {"proj": os.path.realpath(str(second))}
+    out = capsys.readouterr().out
+    assert "Repointed" in out
+    assert os.path.realpath(str(first)) in out   # names what it displaced
+
+
+def test_the_registration_line_names_no_collection_and_no_reconcile(tmp_path, capsys):
+    """``init``'s registration output states name → path and nothing further.
+
+    Deliberately pinned as an *absence*. A repoint changes no collection in this
+    phase, so printing one would be false when read; the name → path → collection
+    echo and the ``reconcile`` pointer belong to the phase that makes them true.
+    Whoever lands that echo must invert this assertion consciously rather than
+    hoping to notice a comment.
+    """
+    first = tmp_path / "a" / "proj"
+    second = tmp_path / "b" / "proj"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    _init(first)
+    capsys.readouterr()
+
+    cli.cmd_init(MitosConfig(str(second)), force=True)
+
+    out = capsys.readouterr().out
+    assert "Repointed" in out
+    assert "reconcile" not in out.lower()
+    assert "collection" not in out.lower()
+    assert default_collection_name(str(second)) not in out
+    assert default_collection_name(str(first)) not in out

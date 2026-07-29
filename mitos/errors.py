@@ -68,6 +68,30 @@ class ConfigError(MitosError):
     pass
 
 
+class RegistryError(MitosError):
+    """Raised when the global project registry is unusable or a registration is refused.
+
+    The registry (``<config-home>/mitos/registry.toml``) is the machine-local
+    ``name → workspace path`` routing map ``mitos init`` writes and every
+    name-targeted command reads. This covers both classes of fault in it: the
+    **file** being unusable (unparseable TOML, a value that is not a path string,
+    an unwritable config dir) and a **registration attempt** being refused (an
+    illegal name, a name already registered at another path, a path already
+    registered under another name).
+
+    A ``MitosError`` subclass so the CLI's ``except MitosError`` boundary renders
+    it as a one-line ``Error: …`` message instead of a raw traceback. Every
+    message names the resolved registry path (never the literal ``~/.config/…``)
+    plus the located cause, **and a recovery** — ``--name``/``--force``, or the
+    hand-edit the file invites (P3: a vector, not a wall).
+
+    Deliberately distinct from the *targeting* errors a later phase's resolver
+    raises when a selector cannot be resolved: those are faults of a lookup, these
+    are faults of the file and of a write to it.
+    """
+    pass
+
+
 class VectorStoreError(MitosError):
     """Raised when Qdrant vector store operations fail."""
     pass

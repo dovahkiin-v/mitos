@@ -164,6 +164,19 @@ def test_non_editable_install_real_read_path(built_wheel, tmp_path):
         "installed format-spec.md differs from the package source"
     )
 
+    # The registry leaf ships. `pyproject.toml` declares `packages = ["mitos"]` — an
+    # explicit list, not `find_packages()` — so a *subpackage* would be silently
+    # excluded from the wheel while the editable dev install resolved it happily.
+    # `registry.py` is flat in `mitos/`, on the right side of that trap; this is the
+    # net that catches a future move to the wrong side.
+    registry_import = subprocess.run([str(venv_python), "-c", "import mitos.registry"],
+                                     env=_mitos_env(tmp_path), capture_output=True,
+                                     text=True, timeout=60)
+    assert registry_import.returncode == 0, (
+        f"`import mitos.registry` failed in the installed venv — the module is "
+        f"missing from the wheel:\n{registry_import.stderr}"
+    )
+
     # `mitos init` reads the spec from the installed package dir and scaffolds a workspace.
     workspace = tmp_path / "proj"
     workspace.mkdir()
@@ -171,3 +184,11 @@ def test_non_editable_install_real_read_path(built_wheel, tmp_path):
                           capture_output=True, text=True, timeout=120)
     assert init.returncode == 0, f"`mitos init` failed:\n{init.stdout}\n{init.stderr}"
     assert (workspace / "format-spec.md").is_file(), "`mitos init` did not seed format-spec.md"
+
+    # …and registers the project it just scaffolded, into the redirected config root
+    # (`_mitos_env` carries XDG_CONFIG_HOME explicitly — the autouse parent-process
+    # fixture does not reach a subprocess). The real-install path is the only place
+    # the whole chain runs against a non-editable package.
+    registry_file = tmp_path / "xdg_config" / "mitos" / "registry.toml"
+    assert registry_file.is_file(), "`mitos init` did not write the project registry"
+    assert str(workspace.resolve()) in registry_file.read_text(encoding="utf-8")

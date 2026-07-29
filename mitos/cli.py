@@ -20,6 +20,7 @@ from google import genai
 
 from mitos import __version__
 from mitos import check
+from mitos import registry
 from mitos.display import (
     apply_stdout_text_safety,
     blackout_note,
@@ -40,6 +41,7 @@ from mitos.config import (
     default_collection_name,
     global_env_path,
     hint_due,
+    toml_scalar,
 )
 from mitos.errors import (
     MitosError, ParseError, ValidationError, DatabaseError, ConfigError,
@@ -255,46 +257,23 @@ def _extract_sample_block(spec: str, header: str) -> str:
     return match.group(1).strip() if match else ""
 
 
-def _toml_scalar(value: Any) -> str:
-    """Serializes a v0.1 config scalar to its TOML right-hand-side literal.
+def _registration_line(outcome: registry.RegistrationOutcome) -> str:
+    """Renders ``init``'s one-line registration confirmation.
 
-    A deliberately tiny serializer for exactly the value set the schema uses —
-    plain strings (no embedded ``"`` or newline), integers, and booleans — NOT a
-    general TOML writer. The stdlib ``tomllib`` is read-only and P19 forbids pulling
-    ``tomli-w`` for a handful of flat scalars, so ``mitos init`` seeds ``config.toml``
-    through this (mirrors the project's hand-rolled ``.env``/config readers).
-
-    The ``bool`` branch MUST stay above the ``int`` branch: ``bool`` subclasses
-    ``int``, so an int-first order would emit ``True`` as ``1`` instead of ``true``.
-
-    Args:
-        value: The config value to serialize (``str``, ``int``, or ``bool``).
-
-    Returns:
-        The TOML literal — e.g. ``'"archive"'`` for a string, ``'50'`` for an int,
-        ``'true'``/``'false'`` for a bool.
-
-    Raises:
-        TypeError: If the value is not a plain ``str``/``int``/``bool``, or is a
-            ``str`` containing a ``"`` or newline (beyond this serializer's scope).
+    Names the registered name and the resolved path — the whole truth available at
+    registration time, and the pair a later name-targeted command resolves through.
     """
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, str):
-        if '"' in value or "\n" in value:
-            raise TypeError(
-                f"_toml_scalar only handles simple strings without quotes or "
-                f"newlines (got {value!r})"
-            )
-        return f'"{value}"'
-    raise TypeError(
-        f"_toml_scalar cannot serialize {type(value).__name__}: {value!r}"
-    )
+    if outcome.action == "reasserted":
+        return f'Already registered as "{outcome.name}" → {outcome.path}'
+    if outcome.action == "repointed":
+        return (
+            f'Repointed "{outcome.name}" → {outcome.path} '
+            f"(was {outcome.previous_path})"
+        )
+    return f'Registered as "{outcome.name}" → {outcome.path}'
 
 
-def cmd_init(config: MitosConfig) -> None:
+def cmd_init(config: MitosConfig, name: Optional[str] = None, force: bool = False) -> None:
     """Initializes (or idempotently re-initializes) the Mitos workspace.
 
     Scaffolds the V1a ``.mitos/`` layout: the graph boots at the migration-ladder
@@ -306,12 +285,30 @@ def cmd_init(config: MitosConfig) -> None:
     (prototype) graph is refused **before any file mutation** with route-to-cutover
     guidance, never ladder-advanced into a hybrid.
 
+    ``init`` is also how a project introduces itself to Mitos *globally*: its final
+    step registers the workspace's name and absolute path in the machine-local
+    registry, so later commands can target it by name instead of inferring it from
+    a working directory. An existing workspace joins by re-running ``init`` — that
+    is the sole registration path, and it is idempotent.
+
+    Registration is deliberately **last**, and its failure does not unwind the
+    scaffold: an unwritable or malformed registry leaves a fully valid workspace
+    that is merely unregistered (still reachable by its path, registrable by a
+    later re-run). Rolling working files back to undo a routing entry would destroy
+    user-visible state to fix a bookkeeping one.
+
     Args:
         config: The workspace configuration to initialize.
+        name: Register under this name instead of the workspace directory's name.
+        force: Repoint an existing registration of ``name`` at this workspace. It
+            waives only the name collision, never the path-uniqueness guard.
 
     Raises:
         DatabaseError: If a pre-V1a (prototype) graph is detected — the workspace
             is left in its pre-init state; route the operator to the cutover.
+        RegistryError: If registration fails (illegal name, either guard, or an
+            unusable registry file). The workspace is fully scaffolded and valid,
+            and simply not registered.
     """
     # 0. Refuse a pre-V1a (prototype) graph BEFORE any file mutation. The RW
     #    GraphStore boot guard would also refuse it, but only at the very end —
@@ -368,15 +365,15 @@ def cmd_init(config: MitosConfig) -> None:
     if not os.path.exists(config_path):
         lines = ["# Mitos Workspace Configuration"]
         for key, default in CONFIG_DEFAULTS.items():
-            lines.append(f"{key} = {_toml_scalar(default)}")
+            lines.append(f"{key} = {toml_scalar(default)}")
         lines += [
             "# Qdrant REST endpoint. Defaults to Mitos's dedicated :7333 (not the",
             "# standard :6333) so Mitos never co-locates its collections in another",
             "# Qdrant you run. Set QDRANT_URL before `init` or edit this line.",
-            f"qdrant_url = {_toml_scalar(config.qdrant_url)}",
+            f"qdrant_url = {toml_scalar(config.qdrant_url)}",
             "# Per-project collection: keeps this project's vectors isolated",
             "# from other Mitos workspaces sharing the same Qdrant instance.",
-            f"qdrant_collection = {_toml_scalar(config.qdrant_collection)}",
+            f"qdrant_collection = {toml_scalar(config.qdrant_collection)}",
         ]
         with open(config_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
@@ -477,6 +474,16 @@ def cmd_init(config: MitosConfig) -> None:
     # ladder-advances a prototype into a hybrid.
     GraphStore(config.db_path)
     print(f"Initialized Mitos workspace at {config.workspace_dir} ✓")
+
+    # 5. Introduce the project to Mitos globally — the LAST mutation, after the
+    #    scaffold exists and after the line above has already told the operator it
+    #    does. A registry fault raises RegistryError from here, which main()'s
+    #    `except MitosError` boundary renders as one calm `Error: …` line: the
+    #    workspace stays valid and unregistered, and nothing is rolled back.
+    #    The path registered is the CANONICAL (symlink-resolved) one, which is not
+    #    necessarily `config.workspace_dir`'s abspath spelling.
+    outcome = registry.register(config.workspace_dir, name=name, force=force)
+    print(_registration_line(outcome))
 
 
 def cmd_sync(config: MitosConfig, auto_accept: bool = False, embed_only: bool = False, verbose: bool = False) -> None:
@@ -1121,6 +1128,53 @@ def cmd_scopes(config: MitosConfig, as_json: bool = False, archived: bool = Fals
         active = c["active_decisions"]
         parked = c["parked_open_questions"]
         print(f"{scope:{name_w}}   {active:>6}  {parked:>6}  {active + parked:>6}")
+    print()
+
+
+def cmd_projects(as_json: bool = False) -> None:
+    """Lists the Mitos projects registered on this machine.
+
+    The discovery read over the global registry: which project names exist and
+    which workspace each one reaches. A **global** verb — it takes no workspace
+    config and works from anywhere, including a machine with no Mitos workspace at
+    all, which is the state it is most likely to be met in.
+
+    It reports registrations, not health. Whether a registered path still holds a
+    valid workspace is ``mitos status``'s question; answering it here too would be
+    a second source that drifts from the first.
+
+    Args:
+        as_json: Emit the machine-readable payload (``registry_path``, ``count``,
+            ``projects``) instead of the text table.
+
+    Returns:
+        None.
+
+    Raises:
+        RegistryError: If the registry file exists but is unusable.
+    """
+    path = registry.registry_path()
+    projects = [{"name": name, "path": p} for name, p in registry.load().items()]
+
+    if as_json:
+        _emit_json({"registry_path": path, "count": len(projects), "projects": projects})
+        return
+
+    if not projects:
+        # Empty/fresh is first-class: a machine with nothing registered yet is
+        # healthy, and an absent registry file is the same healthy state.
+        print(f"No projects registered yet — `mitos init` introduces one ({path}).")
+        return
+
+    # File order throughout, never sorted: it is the order a reverse lookup
+    # resolves its first match in, so the listing must show what actually decides.
+    name_w = max(len("project"), max(len(p["name"]) for p in projects))
+    print(f"\nProjects ({len(projects)} registered, in registry order):")
+    print(f"Registry: {path}")
+    print("-" * (name_w + 30))
+    print(f"{'project':{name_w}}   workspace")
+    for project in projects:
+        print(f"{project['name']:{name_w}}   {project['path']}")
     print()
 
 
@@ -3899,7 +3953,19 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
     # init
-    subparsers.add_parser("init", help="Initialize Mitos in current workspace.")
+    init_p = subparsers.add_parser("init", help="Initialize Mitos in current workspace.")
+    init_p.add_argument(
+        "--name", default=None, metavar="NAME",
+        help="Register the workspace under NAME (default: this directory's name).")
+    init_p.add_argument(
+        "--force", action="store_true",
+        help="Repoint an existing registration of NAME at this workspace.")
+
+    # projects — the global registry read (needs no workspace; works anywhere).
+    proj_p = subparsers.add_parser(
+        "projects", help="List the Mitos projects registered on this machine.")
+    proj_p.add_argument("--json", action="store_true", dest="as_json",
+                        help="Emit machine-readable JSON.")
 
     # sync
     sync_p = subparsers.add_parser("sync", help="Sync buffer decisions to graph database.")
@@ -4172,7 +4238,12 @@ def main() -> None:
             MitosConfig(_warn_target) if _warn_target else config
         )
         if args.command == "init":
-            cmd_init(config)
+            # `config` stays the first POSITIONAL argument: the suite asserts on
+            # `mock_init.call_args.args[0]` to check which workspace a -C run
+            # targeted, and a keyword here would empty that tuple.
+            cmd_init(config, name=args.name, force=args.force)
+        elif args.command == "projects":
+            cmd_projects(as_json=args.as_json)
         elif args.command == "sync":
             cmd_sync(config, auto_accept=args.yes, embed_only=args.embed_only, verbose=args.verbose)
         elif args.command == "reconcile":

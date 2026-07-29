@@ -191,6 +191,24 @@ def hint_due(cache_name: str, key: str, window_seconds: float) -> bool:
     return True
 
 
+def config_home() -> str:
+    """Returns the machine-local config root Mitos keeps its global state under.
+
+    The single XDG resolution for every global (non-workspace) Mitos file — the
+    shared ``.env`` and the project registry both hang off it. It is one mechanism
+    on purpose: the test suite redirects ``XDG_CONFIG_HOME`` per test, so a second
+    hand-rolled ``expanduser("~/.config")`` anywhere would slip that isolation and
+    write into the real user config.
+
+    Returns:
+        Absolute path to the config root (``$XDG_CONFIG_HOME``, else
+        ``~/.config``). The directory need not exist.
+    """
+    return os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+        os.path.expanduser("~"), ".config"
+    )
+
+
 def global_env_path() -> str:
     """Returns the path to Mitos's global ``.env`` (shared across all projects).
 
@@ -204,10 +222,130 @@ def global_env_path() -> str:
         Absolute path to ``<config>/mitos/.env`` (``~/.config/mitos/.env`` by
         default). The file need not exist.
     """
-    config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
-        os.path.expanduser("~"), ".config"
+    return os.path.join(config_home(), "mitos", ".env")
+
+
+def global_registry_path() -> str:
+    """Returns the path to Mitos's global project registry.
+
+    The registry is the machine-local ``name → absolute workspace path`` routing
+    map: ``mitos init`` registers the workspace it scaffolds, and name-targeted
+    commands resolve a selector through it instead of inferring a workspace from
+    the process's working directory. It lives beside the global ``.env`` (one
+    config root, one XDG mechanism) and deliberately **outside** every workspace —
+    it routes between projects, so no project owns it.
+
+    It stores routing only. Nothing about a project's identity (its collection,
+    its graph, its corpus) is derived from this file, so editing, removing, or
+    repointing an entry can never change what a workspace *is*.
+
+    Returns:
+        Absolute path to ``<config>/mitos/registry.toml``
+        (``~/.config/mitos/registry.toml`` by default). The file need not exist —
+        an absent registry is the healthy "no projects registered yet" state.
+    """
+    return os.path.join(config_home(), "mitos", "registry.toml")
+
+
+def toml_scalar(value: Any) -> str:
+    """Serializes a scalar to its TOML right-hand-side literal (or a quoted key).
+
+    A deliberately tiny serializer — NOT a general TOML writer. The stdlib
+    ``tomllib`` is read-only and P19 forbids pulling ``tomli-w`` for a handful of
+    flat scalars, so both hand-rolled writers use this one: ``mitos init`` seeds
+    ``.mitos/config.toml`` through it, and the registry writes both its keys
+    (project names) and its values (workspace paths) through it.
+
+    The string form is chosen by *value shape*, because the registry's real domain
+    includes paths and names a config value never carries:
+
+    * clean (no ``"``, no ``\\``, no control character) → today's **basic**
+      string, byte-identical to what the config seeder has always emitted;
+    * carrying a ``\\`` or a ``"`` but no ``'`` or control character → a TOML
+      **literal** string, which processes no escapes at all. This is the
+      load-bearing case: a path written into a *basic* string has its escapes
+      interpreted on the next read (``"/x/a\\tb"`` comes back with a TAB), which
+      would silently register a path that does not exist;
+    * anything left (both quote kinds, or a newline/control character) → a basic
+      string with ``\\\\`` / ``\\"`` / ``\\n`` / ``\\uXXXX`` escapes.
+
+    The ``bool`` branch MUST stay above the ``int`` branch: ``bool`` subclasses
+    ``int``, so an int-first order would emit ``True`` as ``1`` instead of ``true``.
+
+    Args:
+        value: The value to serialize (``str``, ``int``, or ``bool``).
+
+    Returns:
+        The TOML literal — e.g. ``'"archive"'`` for a string, ``'50'`` for an int,
+        ``'true'``/``'false'`` for a bool. Every string form round-trips back to
+        the original value through ``tomllib``.
+
+    Raises:
+        TypeError: If the value is not a plain ``str``/``int``/``bool``. Callers
+            at a user-facing boundary convert this to their own calm error rather
+            than letting it surface (I5).
+    """
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str):
+        return _toml_string(value)
+    raise TypeError(
+        f"toml_scalar cannot serialize {type(value).__name__}: {value!r}"
     )
-    return os.path.join(config_home, "mitos", ".env")
+
+
+def _is_toml_control(char: str) -> bool:
+    """Reports whether a character may not appear raw inside a TOML string.
+
+    TOML forbids raw control characters in both string kinds, with the single
+    exception of a tab. Anything this returns True for has to be escaped, which
+    also rules the value out of the literal-string form (literal strings have no
+    escape mechanism at all).
+    """
+    return (char < "\x20" and char != "\t") or char == "\x7f"
+
+
+#: Control characters TOML gives a short escape to; everything else goes \uXXXX.
+_TOML_SHORT_ESCAPES = {
+    "\b": "\\b",
+    "\t": "\\t",
+    "\n": "\\n",
+    "\f": "\\f",
+    "\r": "\\r",
+}
+
+
+def _toml_string(value: str) -> str:
+    """Serializes a string to the TOML form that round-trips it byte-identically.
+
+    See :func:`toml_scalar` for the three-way choice and why it is value-driven.
+    The same function serves keys and values: a basic- or literal-quoted key is
+    legal TOML, and the registry always quotes its keys — a bare key would parse a
+    dotted name (``example.com``) as a nested table and a non-ASCII name (P9:
+    ``ąžuolas``) not at all.
+    """
+    has_control = any(_is_toml_control(c) for c in value)
+    needs_escaping = '"' in value or "\\" in value
+
+    if not needs_escaping and not has_control:
+        # The shipped form. Every existing config.toml line keeps these bytes.
+        return f'"{value}"'
+    if "'" not in value and not has_control:
+        # A literal string processes no escapes — the faithful form for a path.
+        return f"'{value}'"
+
+    # Both quote kinds, or a control character: a fully escaped basic string.
+    # `\\` MUST be escaped before `"`, or the backslash just added is doubled.
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    out = []
+    for char in escaped:
+        if _is_toml_control(char) or char == "\t":
+            out.append(_TOML_SHORT_ESCAPES.get(char) or f"\\u{ord(char):04X}")
+        else:
+            out.append(char)
+    return '"' + "".join(out) + '"'
 
 
 def default_collection_name(workspace_dir: str) -> str:
