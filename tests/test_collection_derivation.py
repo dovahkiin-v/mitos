@@ -583,9 +583,14 @@ class TestInertPinReporting:
         """`init` is the other place a human is already asking about this workspace.
 
         It never rewrites `config.toml`, so the line stays and would otherwise silently
-        disagree with the collection in force. A bare receipt line: no `reconcile`
-        pointer and no old→new mapping — those belong to the phase whose echo makes
-        them true.
+        disagree with the collection in force.
+
+        A surviving pin is the *second* carry-over trigger (the first is a `--force`
+        repoint, pinned in `test_init.py`), so the `mitos reconcile` pointer follows
+        — the inversion of a tripwire planted here for exactly this phase. What does
+        NOT double up is the old → new mapping: `_inert_pin_note` already renders
+        both values, and one renderer for one fact is why the two cannot drift into
+        two half-truths. Hence `count(... ) == 1` still, on both.
         """
         ws = tmp_path / "project"
         ws.mkdir()
@@ -596,7 +601,8 @@ class TestInertPinReporting:
         out = capsys.readouterr().out
         assert out.count("inert legacy config") == 1
         assert MitosConfig(str(ws)).qdrant_collection in out
-        assert "reconcile" not in out.lower()
+        assert "reconcile" in out.lower()
+        assert out.lower().count("reconcile") == 1
 
     def test_init_on_a_clean_workspace_prints_no_note(self, tmp_path, capsys) -> None:
         """The twin. Also the reason the 3e echo tripwire in `test_init.py` stays green:

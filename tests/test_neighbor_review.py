@@ -431,12 +431,20 @@ def test_cli_record_pause_renders_enrichment_and_stamp(ws, capsys):
             cmd_record(config, axiom="Adopt SQLite as the storage engine.",
                        rejected="rej", scope=["db"], slug="adopt-sqlite")
     assert exc.value.code == 2
-    err = capsys.readouterr().err
+    captured = capsys.readouterr()
+    err = captured.err
     assert "use-sqlite" in err
     assert "Rejected Postgres" in err
     assert "scope: db" in err
     assert "amended by: use-sqlite-wal" in err
     assert "possible tension" not in err
+    # The pause answers on STDERR, so its corpus echo does too (§4.7 rides the
+    # response's own channel). This is the sharpest case for that rule: nothing
+    # was written, and the agent reading the refusal is reading stderr — an echo
+    # pinned to stdout would be missing from exactly the response that needs it.
+    assert f"corpus: {config.project}" in err
+    assert config.qdrant_collection in err and config.workspace_dir in err
+    assert "corpus: " not in captured.out
 
 
 def test_mcp_record_docstring_pins_enriched_protocol():

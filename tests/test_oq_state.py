@@ -333,7 +333,13 @@ def test_cmd_open_questions_json_empty_is_honest_envelope(ws, capsys) -> None:
     capsys.readouterr()
     cmd_open_questions(config, as_json=True)  # must not raise
     out = json.loads(capsys.readouterr().out)
-    assert out == {"open_questions": [], "total": 0, "scope": None}
+    # Whole-dict equality, kept whole: the envelope gained the three corpus-echo
+    # fields (§4.7), so they are named here rather than the comparison being
+    # loosened to a subset — "honest-empty" is a claim about the WHOLE envelope.
+    assert out == {"open_questions": [], "total": 0, "scope": None,
+                   "project": config.workspace_dir,
+                   "collection": config.qdrant_collection,
+                   "workspace": config.workspace_dir}
 
 
 def test_cmd_open_questions_json_matches_list_json_oq_shape(ws, capsys) -> None:

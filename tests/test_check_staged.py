@@ -318,6 +318,111 @@ def test_4_no_pending_exits_0_zero_contact_no_probe_no_row(workspace, monkeypatc
     assert _read_check_runs(config) == []
 
 
+class TestTheFreePathCarveOut:
+    """§4.7's obligation carve-out: the echo rides output the surface already emits.
+
+    Every other verb on the require-list names the corpus it answered from. This
+    one path does not, and the reason is specific: it is a pre-commit hook's
+    dominant path, sold in SETUP.md as effectively free — free in *noise* as much
+    as in spend — and its target is a literal in a committed hook (`-p .`), so it
+    is the one target in the set that cannot drift. Spending a shipped near-silence
+    to name a target that cannot be wrong is the trade this branch declines.
+
+    Not to be confused with `agent-block`'s carve-out, which is about the CHANNEL
+    (its stdout is a travelling artifact) and leaves the obligation intact.
+    """
+
+    def test_the_free_short_circuit_prints_exactly_its_gate_clear_line(
+        self, workspace, monkeypatch, capsys
+    ) -> None:
+        """Exact equality, not membership.
+
+        `"Gate clear"` appears on BOTH the free short-circuit and the report path
+        (`cli.py`'s `_print_staged_report`), so a membership assertion here is green
+        whichever line printed — and would stay green if the echo were added. The
+        whole line, and nothing else, is the claim.
+        """
+        config, store, telemetry = workspace
+        _commit(store, "committed-x", "A committed axiom already in the graph.")
+        _drain_outbox(store)
+        _write_decisions(config, ("committed-x", "A committed axiom already in the graph."))
+        capsys.readouterr()
+
+        code = cli.cmd_check(config, staged=True, scope=None, fresh=False,
+                             assume_yes=False, as_json=False)
+
+        captured = capsys.readouterr()
+        assert code == 0
+        assert captured.out == "Gate clear — no pending decisions to check.\n"
+        assert captured.err == ""
+
+    def test_the_free_paths_json_branch_is_not_carved_out(
+        self, workspace, monkeypatch, capsys
+    ) -> None:
+        """`--json` on the same path DOES carry it — it already emits a full object.
+
+        The carve-out is about not converting a silence into output, and a payload
+        is not a silence. Stated as its own row so a later reader does not
+        "harmonize" the two branches into one rule.
+        """
+        config, store, telemetry = workspace
+        _commit(store, "committed-x", "A committed axiom already in the graph.")
+        _drain_outbox(store)
+        _write_decisions(config, ("committed-x", "A committed axiom already in the graph."))
+        capsys.readouterr()
+
+        cli.cmd_check(config, staged=True, scope=None, fresh=False,
+                      assume_yes=False, as_json=True)
+
+        obj = json.loads(capsys.readouterr().out)
+        assert obj["project"] == config.project
+        assert obj["collection"] == config.qdrant_collection
+        assert obj["workspace"] == config.workspace_dir
+
+    def test_the_report_path_carries_the_echo(self, workspace, monkeypatch, capsys) -> None:
+        """With pending work the gate reports — and a report names its corpus."""
+        config, store, telemetry = workspace
+        _seed_active(store)
+        _write_decisions(config, ("pending-y", _PENDING_AXIOM))
+        _wire_substrate(monkeypatch, {_PENDING_AXIOM: []})
+        _wire_judge(monkeypatch, _SequenceJudge([]))
+        capsys.readouterr()
+
+        code = cli.cmd_check(config, staged=True, scope=None, fresh=False,
+                             assume_yes=False, as_json=False)
+
+        out = capsys.readouterr().out
+        assert code == 0
+        assert f"corpus: {config.project}" in out
+        assert config.qdrant_collection in out
+        assert "Gate clear" in out          # the REPORT's line, this time
+
+    def test_the_fail_closed_refusal_carries_it_on_stderr(
+        self, workspace, monkeypatch, capsys
+    ) -> None:
+        """The gate could not run — and that answer rides stderr, so the echo does.
+
+        Fail-closed with pending work is the shape a hook actually meets on a
+        machine with no key, and it is precisely when "which corpus?" is worth
+        knowing.
+        """
+        config, store, telemetry = workspace
+        _seed_active(store)
+        _write_decisions(config, ("pending-y", _PENDING_AXIOM))
+        monkeypatch.setattr(cli, "_build_check_substrate",
+                            lambda config: (None, object(), "no key"))
+        capsys.readouterr()
+
+        code = cli.cmd_check(config, staged=True, scope=None, fresh=False,
+                             assume_yes=False, as_json=False)
+
+        captured = capsys.readouterr()
+        assert code == 2
+        assert f"corpus: {config.project}" in captured.err
+        assert "could not gate" in captured.err
+        assert captured.out == ""
+
+
 def test_4b_absent_decisions_file_exits_0(workspace, monkeypatch) -> None:
     """An absent working-tree decisions.md is an empty pending set → exit 0."""
     config, store, telemetry = workspace

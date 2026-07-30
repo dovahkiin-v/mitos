@@ -16,15 +16,23 @@ rules the ``project`` field follows, one per selector form.
 import asyncio
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 
 import pytest
 
-from mitos import mcp_server, registry, routing
-from mitos.cli import cmd_init, main
+from mitos import cli, mcp_server, registry, routing
+from mitos._agent_block import agent_block
+from mitos.cli import _build_parser, cmd_init, main
 from mitos.config import MitosConfig
 from mitos.recall import corpus_provenance, provenance_line
+
+# 3b's in-process driver and its subparser accessor, imported rather than
+# re-derived: `_run` calls the real `main()` (which is where the CLI's single
+# resolution site and the two dispatch-site echoes live), and `_subparsers` is
+# already the tree's one spelling of "every verb the parser accepts".
+from test_cli_selector import _make_workspace, _run, _subparsers
 
 
 class TestHelpers:
@@ -94,18 +102,35 @@ def workspace(tmp_path):
     return ws, run
 
 
+def _echo_line(text: str) -> str:
+    """The one rendered corpus echo line in ``text``, or ``""`` if there is none.
+
+    Both spellings: the standalone `corpus: …` line the CLI's text sites print, and
+    the bracketed `[corpus: …]` form the three shipped read headers carry inline.
+    Extracting the LINE is the whole defence — several in-scope verbs already print
+    a workspace path of their own, so a bare `workspace_dir in stdout` is green with
+    no echo at all (3b's finding: an assertion satisfied by a neighbouring line).
+    """
+    return next((l for l in text.splitlines() if l.lstrip().startswith("corpus: ")
+                 or "[corpus: " in l), "")
+
+
 def _both_tokens(stdout: str, config: MitosConfig) -> bool:
-    """Whether a rendered provenance line names both the collection and the project.
+    """Whether a rendered provenance line names all three fields of the corpus.
 
     The shipped rows here asserted the `f"corpus: {collection}"` prefix, which
     `project`-first breaks. They are rewritten to check for the tokens they were
     actually protecting rather than for a field order the line no longer has —
     the alternative (moving `project` to the tail to keep the substring) would
     have made a decision look like an accident.
+
+    3e extends it from two fields to three: `workspace` is a field of the rendered
+    line and of every `--json` payload, and a helper that checked two of three left
+    the third pinned only on the JSON side.
     """
-    line = next((l for l in stdout.splitlines() if l.lstrip().startswith("corpus: ")
-                 or "[corpus: " in l), "")
-    return config.qdrant_collection in line and config.project in line
+    line = _echo_line(stdout)
+    return (config.qdrant_collection in line and config.project in line
+            and config.workspace_dir in line)
 
 
 class TestCliJson:
@@ -451,6 +476,514 @@ class TestTheRecordReceipt:
         assert receipt["status"] == "created"
         for field in ("project", "collection", "workspace"):
             assert field not in receipt
+
+
+#: What each require-list verb needs beyond its selector, so the per-verb row below
+#: can actually invoke it. Hand-written on purpose — argparse knows the arity, not a
+#: value that makes the verb run — and fenced by the computed require-list row, so a
+#: verb added in a later phase lands as a failing set comparison rather than as
+#: silent non-coverage. (3d's `TOOL_ARGS` fence, with the parser standing in for
+#: `mcp.list_tools()`.)
+#:
+#: Every entry runs OFFLINE: no key, no reachable Qdrant, no judge. Several verbs
+#: therefore answer with a refusal rather than a report — which is the point, since
+#: a refusal is a response and §4.7's obligation is on responses.
+CLI_VERB_ARGS = {
+    "agent-block": [],                     # positional path is optional; it is a selector source
+    "capture": ["a raw architectural thought"],   # keyless refusal, on stdout
+    "check": [],                           # embed absent + live decisions ⇒ fail-closed, on stderr
+    "cutover": [],                         # already-V1a graph ⇒ the cheap no-op
+    "import": ["legacy.md"],               # a cwd-rooted FILE, not a selector (3b)
+    "list": [],
+    "list_decisions": [],
+    "list_scopes": [],
+    "open-questions": [],
+    "query": ["a claim to place"],
+    "query_decisions": ["a claim to place"],
+    "rebuild": [],                         # no TTY ⇒ refuses to prompt, after the echo
+    "reconcile": [],
+    "record": ["An axiom recorded by the per-verb row.",
+               "--slug", "per-verb-row-record",
+               "--rejected", "Leaving the corpus unnamed."],
+    "record_decision": ["An axiom recorded through the alias.",
+                        "--slug", "per-verb-row-record-alias",
+                        "--rejected", "Leaving the corpus unnamed."],
+    "render": [],
+    "restore-source": ["--all-graph-only"],  # --slug/--all-graph-only is a required mutex
+    "scopes": [],
+    "set-key": ["a-value-that-is-not-a-key"],
+    "show": ["no-such-handle"],
+    "surface": ["a topic to recall"],
+    "surface_decisions": ["a topic to recall"],
+    "sync": [],
+}
+
+#: In the computed require-list, satisfies §4.7 in-body rather than with the
+#: standard echo line: its report IS a statement about one workspace, and 4b owns
+#: the header gaining the registered name. Carved out by NAME and reason, exactly as
+#: 3d's MCP row carves out `list_projects`, so the gap is a row rather than a
+#: silence.
+CLI_ECHO_CARVE_OUTS = {"status"}
+
+
+def _register_workspace(tmp_path, monkeypatch, *, name="named", decisions=True):
+    """A registered workspace holding one committed decision, addressed by name.
+
+    The working directory is the workspace's PARENT, which is deliberately not a
+    workspace itself: a row that quietly resolved the cwd instead of the selector
+    would fail loudly here rather than assert against the wrong corpus and pass.
+    """
+    target = _init_workspace(tmp_path / "target")
+    _write_registry(**{name: target})
+    monkeypatch.chdir(tmp_path)
+    if decisions:
+        # Seeded through `record`, not `sync`: `perform_sync` refuses outright
+        # without a GEMINI key, so a keyless `sync` commits nothing and every row
+        # downstream would silently assert against an EMPTY graph. `record` commits
+        # and defers the embedding, which is exactly the offline write path.
+        _run(["-p", name, "record", "Every CLI verb names the corpus it answered from.",
+              "--slug", "the-cli-echo-names-its-corpus",
+              "--rejected", "A success line that names no target.",
+              "--scope", "echo"])
+    return name, target
+
+
+class TestTheCliRequireList:
+    """T14's CLI half: every verb the parser accepts, minus the exempt three.
+
+    T14's MCP half is already discharged by
+    ``test_every_targeting_tool_carries_the_envelope`` above, which reads the tool
+    set off ``mcp.list_tools()`` and asserts all three *values* on every targeting
+    tool's payload — it is cited rather than duplicated here.
+    """
+
+    def test_the_require_list_is_computed_off_the_parser(self):
+        """The set under test is derived, not remembered.
+
+        ``VERB_ARGS`` is hand-written because argparse cannot supply a value that
+        makes a verb *run*; the SET is computed, so a verb added in a later phase
+        reds this row instead of shipping unstamped. Verified to bite by deleting a
+        name from ``CLI_VERB_ARGS``.
+
+        The five shipped aliases (``query_decisions``, ``surface_decisions``,
+        ``list_decisions``, ``list_scopes``, ``record_decision``) are members in
+        their own right: they are separate ``choices`` keys, and a
+        canonical-names-only list would leave five invocable verbs unpinned on
+        exactly the agent-facing path.
+        """
+        require = set(_subparsers(_build_parser())) - set(cli._SELECTOR_EXEMPT_VERBS)
+
+        assert require == set(CLI_VERB_ARGS) | CLI_ECHO_CARVE_OUTS
+        assert {"query_decisions", "surface_decisions", "list_decisions",
+                "list_scopes", "record_decision"} <= set(CLI_VERB_ARGS)
+
+    @pytest.mark.parametrize("verb", sorted(CLI_VERB_ARGS))
+    def test_every_require_list_verb_names_its_corpus(
+        self, verb, tmp_path, offline, monkeypatch, capsys
+    ):
+        """``mitos -p named <verb>`` names project + collection + workspace.
+
+        Driven through real ``main()``: a verb never builds its own config in
+        production, and the two dispatch-site echoes (``set-key``, ``agent-block``)
+        exist only there.
+
+        The assertion targets the rendered echo LINE, never "the three strings
+        appear somewhere in stdout" — on a verb whose report already prints a
+        workspace path that check is green with no echo at all (3b's finding). The
+        channel is not pinned here (several verbs answer on stderr, and which one
+        does is per-branch); the channel discipline has its own rows below.
+        """
+        name, target = _register_workspace(tmp_path, monkeypatch)
+        (tmp_path / "legacy.md").write_text("no headings here\n", encoding="utf-8")
+        config = MitosConfig(target, project=name)
+        capsys.readouterr()
+
+        _run(["-p", name, verb, *CLI_VERB_ARGS[verb]])
+
+        captured = capsys.readouterr()
+        assert _both_tokens(captured.out + captured.err, config), (
+            f"{verb} named no corpus:\n--- stdout ---\n{captured.out}"
+            f"\n--- stderr ---\n{captured.err}")
+
+    def test_a_json_verb_carries_the_three_keys_not_a_text_line(
+        self, tmp_path, offline, monkeypatch, capsys
+    ):
+        """``--json`` gets FIELDS; the text line must not leak onto that branch.
+
+        The independent half of the pair: a text echo printed unconditionally
+        corrupts every ``json.loads`` in the tree, and a stamp added only to the
+        text branch leaves the machine surface unattributed. Both are pinned, on
+        one verb whose two branches this phase wrote from scratch.
+        """
+        name, target = _register_workspace(tmp_path, monkeypatch)
+        config = MitosConfig(target, project=name)
+        capsys.readouterr()
+
+        _run(["-p", name, "open-questions", "--json"])
+
+        out = capsys.readouterr().out
+        payload = json.loads(out)          # reds if a text line leaked above it
+        assert payload["project"] == name
+        assert payload["collection"] == config.qdrant_collection
+        assert payload["workspace"] == target
+        assert _echo_line(out) == ""       # …and no rendered line on this branch
+
+    def test_a_path_form_selector_binds_the_registered_and_unregistered_rules(
+        self, tmp_path, offline, monkeypatch, capsys
+    ):
+        """T14's named clause — the two value rules that diverge only here.
+
+        A *registered* workspace addressed by absolute path echoes its registered
+        NAME (the reverse lookup `resolve_project` already did); an *unregistered*
+        one addressed the same way echoes the absolute PATH. Every other selector
+        form collapses the two, so this is the row that tells them apart on the CLI
+        text surface — W4's last consumer.
+        """
+        registered = _init_workspace(tmp_path / "registered")
+        unregistered = _init_workspace(tmp_path / "loose")
+        _write_registry(known=registered)   # `loose` deliberately dropped
+        monkeypatch.chdir(tmp_path)
+        assert registry.reverse_lookup(unregistered) is None  # the premise, asserted
+        capsys.readouterr()
+
+        _run(["-p", registered, "scopes"])
+        assert "known" in _echo_line(capsys.readouterr().out)
+
+        _run(["-p", unregistered, "scopes"])
+        line = _echo_line(capsys.readouterr().out)
+        assert unregistered in line and "known" not in line
+
+
+class TestTheEchoRidesTheResponsesOwnChannel:
+    """D3: a handler answering on stderr carries its echo there, not on stdout.
+
+    An echo pinned to stdout is invisible to a caller reading the stderr answer —
+    which is precisely the agent-facing path on ``record``'s pause and on every
+    fail-closed refusal.
+    """
+
+    def test_record_reports_its_corpus_on_stdout(
+        self, tmp_path, offline, monkeypatch, capsys
+    ):
+        name, target = _register_workspace(tmp_path, monkeypatch)
+        config = MitosConfig(target, project=name)
+        capsys.readouterr()
+
+        _run(["-p", name, "record", "A decision that lands.",
+              "--slug", "a-decision-that-lands",
+              "--rejected", "Writing into a neighbouring project."])
+
+        captured = capsys.readouterr()
+        assert _both_tokens(captured.out, config)
+        assert "Recorded decision" in captured.out
+
+    def test_record_reports_its_corpus_on_stderr_when_it_refuses(
+        self, tmp_path, offline, monkeypatch, capsys
+    ):
+        """The write did NOT land — and that answer rides stderr, so the echo does.
+
+        A citation to a non-existent slug is the cheapest offline refusal shape.
+        """
+        name, target = _register_workspace(tmp_path, monkeypatch)
+        config = MitosConfig(target, project=name)
+        capsys.readouterr()
+
+        _run(["-p", name, "record", "A decision that cannot land.",
+              "--slug", "a-decision-that-cannot-land",
+              "--rejected", "A silent failure.",
+              "--supersedes", "no-such-decision"])
+
+        captured = capsys.readouterr()
+        assert "Record failed" in captured.err
+        assert _both_tokens(captured.err, config)
+        assert _echo_line(captured.out) == ""
+
+    def test_check_reports_its_corpus_on_stderr_when_it_cannot_run(
+        self, tmp_path, offline, monkeypatch, capsys
+    ):
+        """The fail-closed refusal is inside the handler, so it echoes (D5).
+
+        Keyless with live decisions ⇒ `check` cannot audit them and refuses on
+        stderr, exit 2. Contrast `main()`'s pre-dispatch refusals, which carry no
+        echo because no config exists yet to name.
+        """
+        name, target = _register_workspace(tmp_path, monkeypatch)
+        config = MitosConfig(target, project=name)
+        capsys.readouterr()
+
+        code = _run(["-p", name, "check"])
+
+        captured = capsys.readouterr()
+        assert code == 2
+        assert "could not run" in captured.err
+        assert _both_tokens(captured.err, config)
+
+
+class TestTheTwoCarveOuts:
+    """§4.7's two exceptions — and they are different exceptions.
+
+    ``check --staged``'s free path is an **obligation** carve-out (the echo rides
+    output the surface already emits; a pre-commit hook's near-silence is a shipped
+    feature, and its target is a literal in a committed hook so it cannot drift).
+    ``agent-block`` is a **channel** carve-out (its stdout is a travelling artifact
+    the tool's own text tells the reader to paste into a committed file, so a
+    resolved name and a path-hashed collection must not land inside it). Collapsing
+    the two into "these verbs are special" loses both arguments.
+    """
+
+    def test_agent_block_stdout_stays_byte_identical(
+        self, tmp_path, offline, monkeypatch, capsys
+    ):
+        """The paste-ready block, byte for byte, with the echo out of band.
+
+        Asserted by EQUALITY against `agent_block()` rather than by containment, so
+        the row cannot degrade into "the block contains the block". Driven through
+        `main()` because the echo lives at the dispatch site — a row calling
+        `cmd_agent_block` directly exercises nothing this phase wrote.
+        """
+        name, target = _register_workspace(tmp_path, monkeypatch, decisions=False)
+        config = MitosConfig(target, project=name)
+        capsys.readouterr()
+
+        _run(["-p", name, "agent-block"])
+
+        captured = capsys.readouterr()
+        assert captured.out == agent_block() + "\n"   # `print` adds exactly one
+        assert _both_tokens(captured.err, config)
+
+    def test_agent_block_check_uses_the_same_channel(
+        self, tmp_path, offline, monkeypatch, capsys
+    ):
+        """One rule, both forms. ``--check``'s report is a diagnostic and could
+        safely take stdout — but two channels for one verb is a drift seam for no
+        gain, and the single rule is what keeps the plain form's stdout clean."""
+        name, target = _register_workspace(tmp_path, monkeypatch, decisions=False)
+        config = MitosConfig(target, project=name)
+        capsys.readouterr()
+
+        _run(["-p", name, "agent-block", "--check"])
+
+        captured = capsys.readouterr()
+        assert _echo_line(captured.out) == ""
+        assert _both_tokens(captured.err, config)
+
+    def test_set_key_echoes_in_its_project_form(
+        self, tmp_path, offline, monkeypatch, capsys
+    ):
+        """A credential landing in the wrong project's ``.env`` is the mis-aim this
+        names. The echo is at the dispatch site because ``cmd_set_key`` takes a bare
+        path, not a config — a shape W24 signed deliberately."""
+        name, target = _register_workspace(tmp_path, monkeypatch, decisions=False)
+        config = MitosConfig(target, project=name)
+        capsys.readouterr()
+
+        _run(["-p", name, "set-key", "not-a-real-key"])
+
+        out = capsys.readouterr().out
+        assert _both_tokens(out, config)
+        assert "Stored GEMINI_API_KEY" in out
+
+    def test_set_key_global_names_no_corpus(self, tmp_path, offline, monkeypatch,
+                                            capsys):
+        """``--global`` writes the machine-wide ``.env`` shared by every project, so
+        there is no corpus to name — and the verb is selector-exempt in that form,
+        which is why this row is driven without one."""
+        target = _init_workspace(tmp_path / "target")
+        monkeypatch.chdir(target)
+        capsys.readouterr()
+
+        _run(["set-key", "--global", "not-a-real-key"])
+
+        out = capsys.readouterr().out
+        assert "globally (all projects)" in out
+        assert _echo_line(out) == ""
+
+
+#: `--json` verbs whose payload is knowingly NOT parseable at this commit, with the
+#: owner of the fix. One row across every JSON verb catches "a text line leaked above
+#: the object" for all of them at once — but a silent exclusion would read as "all
+#: payloads parse clean", which is false, so the exclusion is named here and logged
+#: by the row itself.
+#:
+#: `reconcile`: `MitosSyncManager.reconcile_embeddings` (`sync.py`) prints its
+#: provider-down line to stdout unconditionally, `as_json`-blind, so
+#: `mitos reconcile --json` has emitted a stray text line above its object since
+#: before this vision. The fix is a one-line `as_json` thread in `sync.py`, whose
+#: diff this phase's structural gate requires to be EMPTY (T8b) — so it is recorded
+#: as a named deferral rather than smuggled in here.
+JSON_PARSE_EXCLUSIONS = {
+    "reconcile": "pre-existing stray stdout line from sync.py — deferred, T8b fences the fix",
+}
+
+
+def test_no_json_payload_carries_a_stray_text_line(tmp_path, offline, monkeypatch,
+                                                   capsys, caplog):
+    """Every `--json` verb on the require-list emits a parseable object and nothing else.
+
+    The independent half of gotcha 5 for the whole surface at once: a leading text
+    echo that is not gated off the `--json` branch corrupts the payload, and one
+    verb-at-a-time row would catch it one verb at a time. `json.loads` over the
+    whole of stdout is the strictest available assertion — it fails on so much as a
+    blank prefix line.
+    """
+    name, target = _register_workspace(tmp_path, monkeypatch)
+    parser_choices = _subparsers(_build_parser())
+    json_verbs = sorted(
+        verb for verb in set(parser_choices) - set(cli._SELECTOR_EXEMPT_VERBS)
+        if any(opt == "--json"
+               for action in parser_choices[verb]._actions
+               for opt in action.option_strings)
+    )
+    checked, skipped = [], []
+
+    for verb in json_verbs:
+        if verb in JSON_PARSE_EXCLUSIONS:
+            skipped.append(verb)
+            continue
+        capsys.readouterr()
+        _run(["-p", name, verb, *CLI_VERB_ARGS.get(verb, []), "--json"])
+        out = capsys.readouterr().out
+        try:
+            json.loads(out)
+        except json.JSONDecodeError as exc:
+            pytest.fail(f"`mitos {verb} --json` did not emit one object ({exc}):\n{out}")
+        checked.append(verb)
+
+    # No silent caps: the row states what it covered and what it did not.
+    assert len(checked) >= 15, checked
+    assert skipped == sorted(JSON_PARSE_EXCLUSIONS), (
+        f"checked {checked}; excluded {skipped} — see JSON_PARSE_EXCLUSIONS")
+
+
+def test_the_projects_verb_carries_no_echo(tmp_path, offline, monkeypatch, capsys):
+    """§11's explicit CLI N/A row, mirroring 3d's on `list_projects`.
+
+    `mitos projects` resolves no project — it answers for the MACHINE — so it
+    carries no echo, on either branch. Asserted as a ROW rather than left as a
+    silence, so review does not read the absence as a missed verb.
+    """
+    target = _init_workspace(tmp_path / "target")
+    _write_registry(named=target)
+    monkeypatch.chdir(tmp_path)
+    capsys.readouterr()
+
+    _run(["projects"])
+    assert _echo_line(capsys.readouterr().out) == ""
+
+    _run(["projects", "--json"])
+    listing = json.loads(capsys.readouterr().out)
+    assert not {"project", "collection", "workspace"} & set(listing)
+
+
+def test_a_leading_echo_reaches_a_combined_pipe_before_a_boundary_error(tmp_path):
+    """The echo survives a handler that raises one line later.
+
+    Several verbs take the echo at the TOP of the handler, before the store
+    construction — and a fault there is rendered by `main()`'s boundary on stderr,
+    which is unbuffered while a piped stdout is not. Measured before the fix:
+    `mitos scopes | cat` on an unopenable graph printed `Error: …` ABOVE the echo,
+    so the reader's opening line was a refusal for a command that had in fact named
+    its corpus first. `_echo_corpus` flushes for exactly this; the row exists
+    because `capsys` keeps the streams apart and cannot see the inversion, and
+    because the fix is one line a future tidy would remove without hesitating.
+    """
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    env = {
+        **os.environ,
+        "MITOS_NO_UPDATE_CHECK": "1",
+        "MITOS_NO_MCP_HINT": "1",
+        "XDG_CONFIG_HOME": str(tmp_path / "xdg_config"),
+        "GEMINI_API_KEY": "", "GOOGLE_API_KEY": "",
+        "QDRANT_URL": "http://localhost:1",
+    }
+
+    def run(*argv):
+        return subprocess.run(
+            [sys.executable, "-m", "mitos.cli", *argv], cwd=str(workspace), env=env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+
+    run("init")
+    # An unopenable graph: `GraphStore(config.db_path)` raises one statement after
+    # the echo, and the refusal renders outside the handler (so it carries none).
+    graph = workspace / ".mitos" / "graph.sqlite"
+    graph.unlink()
+    graph.mkdir()
+
+    done = run("scopes")
+
+    combined = done.stdout
+    assert "Error:" in combined
+    assert "corpus: " in combined
+    assert combined.index("corpus: ") < combined.index("Error:"), (
+        f"the boundary error overtook the leading echo:\n{combined}")
+
+
+def test_the_report_reaches_a_combined_pipe_before_the_refusals(tmp_path):
+    """Ordering, proved where it can actually break: ONE pipe, a real subprocess.
+
+    `capsys` keeps the two streams apart and is structurally blind to this: off a
+    TTY stdout is block-buffered while stderr never is, so without an explicit
+    flush a stderr refusal overtakes the stdout report it annotates, and the
+    reader's opening line is the wrong one.
+
+    `restore-source` is the seam: one run can report on stdout AND refuse on
+    stderr, and until this phase that branch carried no flush at all. Both channels
+    now lead with the echo, and the report precedes the refusals. The fixture damages
+    the GRAPH rather than the corpus — a node whose canonical core is gone is exactly
+    the state this verb refuses on, and it is the cheapest way to get one restorable
+    and one refused block out of the same run.
+    """
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    env = {
+        **os.environ,
+        "MITOS_NO_UPDATE_CHECK": "1",
+        "MITOS_NO_MCP_HINT": "1",
+        "XDG_CONFIG_HOME": str(tmp_path / "xdg_config"),
+        "GEMINI_API_KEY": "", "GOOGLE_API_KEY": "",
+        "QDRANT_URL": "http://localhost:1",
+    }
+
+    def run(*argv):
+        return subprocess.run(
+            [sys.executable, "-m", "mitos.cli", *argv], cwd=str(workspace), env=env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+
+    run("init")
+    for slug, axiom in (("alpha-block", "The alpha decision restores cleanly."),
+                        ("beta-block", "The beta decision cannot be rendered.")):
+        run("record", axiom, "--slug", slug, "--rejected", f"Losing {slug}.")
+
+    # Make both nodes graph-only (drop their `### ` blocks), then blank one node's
+    # axiom so `render_source_block` refuses it while the other still renders.
+    decisions = workspace / "decisions.md"
+    kept, skipping = [], False
+    for line in decisions.read_text(encoding="utf-8").splitlines(keepends=True):
+        if line.startswith("### "):
+            skipping = line.startswith("### alpha-block") or line.startswith("### beta-block")
+        elif line.startswith("#") and not line.startswith("###"):
+            skipping = False
+        if not skipping:
+            kept.append(line)
+    decisions.write_text("".join(kept), encoding="utf-8")
+    graph = sqlite3.connect(str(workspace / ".mitos" / "graph.sqlite"))
+    graph.execute("UPDATE nodes SET axiom = '' WHERE slug = 'beta-block'")
+    graph.commit()
+    graph.close()
+
+    done = run("restore-source", "--all-graph-only", "--dry-run")
+
+    combined = done.stdout
+    assert "Would restore 1 source block(s)" in combined
+    assert "✗ refused: beta-block" in combined
+    assert combined.index("Would restore") < combined.index("✗ refused"), (
+        f"the refusal overtook the report it annotates:\n{combined}")
+    # Both channels lead with the echo, so BOTH readings name the corpus.
+    assert combined.index("corpus: ") < combined.index("Would restore")
+    assert combined.count("corpus: ") == 2
 
 
 class TestTheTwoResolutionSitesArePinnedIndependently:

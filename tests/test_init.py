@@ -500,14 +500,87 @@ def test_init_force_repoints_a_name_to_this_workspace(tmp_path, capsys):
     assert os.path.realpath(str(first)) in out   # names what it displaced
 
 
-def test_the_registration_line_names_no_collection_and_no_reconcile(tmp_path, capsys):
-    """``init``'s registration output states name → path and nothing further.
+def test_a_clean_init_prints_name_then_path_then_collection(tmp_path, capsys):
+    """The trio a human only ever meets together here (§4.7).
 
-    Deliberately pinned as an *absence*. A repoint changes no collection in this
-    phase, so printing one would be false when read; the name → path → collection
-    echo and the ``reconcile`` pointer belong to the phase that makes them true.
-    Whoever lands that echo must invert this assertion consciously rather than
-    hoping to notice a comment.
+    ``init`` is selector-exempt, so ``main()`` resolves no target and the standard
+    corpus echo would print the workspace PATH where the whole point is the NAME —
+    which is why this line is composed from the registration outcome instead. The
+    ordering assertion is what makes that observable: name and path come from
+    ``_registration_line``, the collection from the config's derivation.
+
+    On a clean workspace it is a bare receipt: no carry-over pointer (nothing was
+    displaced and no legacy pin survives), and no ``mitos reconcile`` nudge for a
+    collection that was never anywhere else.
+    """
+    workspace = tmp_path / "proj"
+    workspace.mkdir()
+
+    # `--name` is load-bearing for this row, not decoration: on a default
+    # registration the name IS the directory basename, so the path CONTAINS the
+    # name and a `provenance_line(config)` build — which prints the path, because
+    # `init` is selector-exempt and resolves no target — satisfies a naive "the
+    # name appears" check. A name that is not the basename is the only fixture that
+    # tells the two builds apart.
+    cli.cmd_init(MitosConfig(str(workspace)), name="a-name-that-is-not-the-dir")
+
+    out = capsys.readouterr().out
+    collection = MitosConfig(str(workspace)).qdrant_collection
+    assert 'Registered as "a-name-that-is-not-the-dir"' in out
+    assert collection in out
+    assert out.index("a-name-that-is-not-the-dir") < out.index(collection)
+    # The tell of the wrong build: the standard corpus echo, which names a path
+    # where §4.7 says a human meets the registered NAME.
+    assert "corpus: " not in out
+    # `qdrant_collection` is the RETIRED config key, and a workspace carrying one
+    # gets `_inert_pin_note` instead — this line must not borrow its spelling.
+    assert "qdrant_collection" not in out
+    assert "reconcile" not in out.lower()
+    assert "(was " not in out
+
+
+def test_the_collection_echo_makes_no_network_call(tmp_path, capsys):
+    """Both carry-over triggers are computed locally — `init` never probes Qdrant.
+
+    The tempting version of the pointer is a diagnosis ("the new collection is
+    empty"), and answering that honestly needs a round trip. `init` is the one verb
+    that must work on a fresh, service-less machine, so the pointer is a statement
+    of fact plus the named heal instead, and this row is what keeps the difference
+    from being re-litigated by a future "wouldn't it be nicer if…".
+
+    Driven on the `--force` repoint, the trigger that computes the *old* name from
+    a path the caller never named — the branch most likely to reach for a probe.
+    """
+    first = tmp_path / "a" / "proj"
+    second = tmp_path / "b" / "proj"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    _init(first)
+
+    with patch.object(cli, "QdrantVectorStore") as vector_store, \
+         patch.object(cli, "scroll_point_ids") as scroll:
+        cli.cmd_init(MitosConfig(str(second)), force=True)
+
+    assert vector_store.call_count == 0
+    assert scroll.call_count == 0
+    assert "reconcile" in capsys.readouterr().out.lower()   # the pointer did render
+
+
+def test_a_repoint_names_both_collections_and_points_at_reconcile(tmp_path, capsys):
+    """``init``'s echo states name → path → collection, and carries the repoint over.
+
+    **The inversion of a planted tripwire.** Until this phase the assertions below
+    were their own negatives: a repoint changed no collection *that anything
+    printed*, so naming one would have been false when read, and the absence was
+    pinned so that whoever landed the echo had to invert it consciously rather than
+    hope to notice a comment. This is that inversion.
+
+    A ``--force`` repoint is one of the two carry-over triggers (the other is a
+    surviving legacy ``qdrant_collection`` pin, pinned in
+    ``test_collection_derivation.py``). Both the displaced path's collection and the
+    new one are named, and the ``mitos reconcile`` pointer follows — a statement of
+    fact plus the named heal, never a diagnosis: ``init`` makes no network call and
+    so cannot know whether the new collection is empty.
     """
     first = tmp_path / "a" / "proj"
     second = tmp_path / "b" / "proj"
@@ -520,10 +593,15 @@ def test_the_registration_line_names_no_collection_and_no_reconcile(tmp_path, ca
 
     out = capsys.readouterr().out
     assert "Repointed" in out
-    assert "reconcile" not in out.lower()
-    assert "collection" not in out.lower()
-    assert default_collection_name(str(second)) not in out
-    assert default_collection_name(str(first)) not in out
+    assert "reconcile" in out.lower()
+    assert "collection" in out.lower()
+    # Both sides of the old → new mapping, read dynamically off the derivation —
+    # never a hardcoded `mitos-…` literal.
+    assert default_collection_name(str(second)) in out
+    assert default_collection_name(str(first)) in out
+    # Ordering is the claim: the registration line first, then the collection it
+    # derives, so a reader meets name → path → collection in that order.
+    assert out.index("Repointed") < out.index(default_collection_name(str(second)))
 
 
 def test_the_success_line_reaches_a_captured_stream_before_the_refusal(tmp_path):

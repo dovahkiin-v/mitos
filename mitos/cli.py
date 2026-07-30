@@ -123,6 +123,44 @@ def _emit_json(obj: Any, *, indent: Optional[int] = 2) -> None:
     print(dumps_display(obj, ensure_ascii=resolve_display_ensure_ascii(sys.stdout), indent=indent))
 
 
+def _echo_corpus(config: MitosConfig, *, file=None) -> None:
+    """Prints the standard corpus echo, leading a response on its own channel (§4.7).
+
+    One spelling for every text site: ``recall.provenance_line`` renders the three
+    fields the ``--json`` payloads carry as keys, so the two channels can never
+    disagree about which corpus answered. The value is read off the config the
+    caller's selector resolved — never re-derived here (``recall``'s docstrings
+    state why: a stamp-time reverse lookup silently echoes a path for a registered
+    project on a symlinked route).
+
+    ``file`` exists because several handlers answer on stderr in some branches and
+    stdout in others: an echo pinned to stdout is invisible to a caller reading the
+    stderr answer, which is exactly the agent-facing path on ``record``'s pause. The
+    echo leads the response *on the response's own channel*.
+
+    **It flushes, and that is load-bearing rather than tidy.** Several handlers take
+    this echo at the top, *before* the store construction that can raise — and a
+    raise there is rendered by ``main()``'s boundary on stderr, which is unbuffered
+    while a piped stdout is not. Measured without the flush:
+    ``mitos scopes | cat`` on an unopenable graph printed ``Error: …`` *above* the
+    echo, so the reader's opening line was a refusal for a command that had already
+    named its corpus. Flushing here fixes the whole class in one place instead of at
+    every leading site; a handler that then prints more before a stderr write still
+    owes its own flush (``cmd_restore_source`` does).
+
+    Args:
+        config: The resolved workspace config (carries ``project`` /
+            ``qdrant_collection`` / ``workspace_dir``).
+        file: The stream the response rides; ``None`` ⇒ stdout.
+
+    Returns:
+        None.
+    """
+    stream = file or sys.stdout
+    print(provenance_line(config), file=stream)
+    stream.flush()
+
+
 # Shared route-to-cutover guidance. `mitos init` raises it (DatabaseError),
 # `mitos status` reports it (both the pre-V1a check-line and the next-steps line)
 # when a prototype graph is detected, so every operator surface points the same
@@ -332,6 +370,64 @@ def _inert_pin_note(config: MitosConfig, *, offer_deletion: bool = False) -> Opt
     if offer_deletion:
         note += ". The line can be deleted; nothing reads it"
     return note
+
+
+#: The one wording for "your vectors may be under a different name" — rendered on
+#: both carry-over triggers, so the two cannot drift into two half-truths. It is a
+#: statement of fact plus the named heal, never a diagnosis: `init` must work on a
+#: fresh, service-less machine, so it makes NO network call and therefore cannot
+#: know whether the new collection is actually empty. `mitos reconcile` ships today
+#: (it re-embeds the active set against whatever collection is in force), so the
+#: pointer names a capability this release has, not one a later phase brings.
+_COLLECTION_CARRY_OVER_POINTER = (
+    "If this workspace's vectors were built under the old name, "
+    "`mitos reconcile` rebuilds them here."
+)
+
+
+def _collection_echo_lines(config: MitosConfig,
+                           outcome: registry.RegistrationOutcome) -> List[str]:
+    """Renders ``init``'s collection line, plus the carry-over pointer when it applies.
+
+    ``init`` is the moment a project *becomes* resolvable, and the only place a
+    human meets its registered name, its path and its derived collection together —
+    which matters more since the collection name became a path hash, deliberately
+    less legible than the old basename. This is the line that pays that cost down.
+
+    Composed from the **registration outcome**, never from
+    :func:`~mitos.recall.provenance_line`: ``init`` is selector-exempt, so ``main()``
+    resolves no target and ``config.project`` is the workspace *path*. The standard
+    echo would therefore print a path at the one surface whose whole point is the
+    *name*, and every existing row would stay green.
+
+    Two triggers, both computable with no network probe:
+
+    * a ``--force`` repoint — the previous path derived a different collection;
+    * a surviving legacy ``qdrant_collection`` pin — ``_inert_pin_note`` has already
+      printed the pinned and derived values, so only the pointer is added here (one
+      renderer for the old → new information; saying it twice is how the two drift).
+
+    Args:
+        config: The workspace config (supplies the derived collection and the
+            retired-key set).
+        outcome: What ``registry.register`` did, and to which path.
+
+    Returns:
+        The lines to print, in order, beneath the registration line.
+    """
+    collection = f"collection: {config.qdrant_collection}"
+    repointed = (outcome.action == "repointed" and outcome.previous_path is not None)
+    previous = (default_collection_name(outcome.previous_path)
+                if repointed else None)
+    # `default_collection_name` realpaths its own input, and `outcome.path` is
+    # already canonical, so this agrees with `config.qdrant_collection` by
+    # construction — even on a symlinked route. No canonicalization needed here.
+    if previous and previous != config.qdrant_collection:
+        collection += f"  (was {previous})"
+    lines = [collection]
+    if previous or "qdrant_collection" in config.inert_file_keys:
+        lines.append(_COLLECTION_CARRY_OVER_POINTER)
+    return lines
 
 
 def cmd_init(config: MitosConfig, name: Optional[str] = None, force: bool = False) -> None:
@@ -562,10 +658,26 @@ def cmd_init(config: MitosConfig, name: Optional[str] = None, force: bool = Fals
     sys.stdout.flush()
     outcome = registry.register(config.workspace_dir, name=name, force=force)
     print(_registration_line(outcome))
+    # 6. Name → path → collection, the trio a human only ever meets together here
+    #    (§4.7). Composed from the outcome, not from `provenance_line` — see
+    #    `_collection_echo_lines`. Placed AFTER the register call, never between
+    #    the flush and it: a line in that gap re-opens the stdout/stderr inversion
+    #    the flush exists to close. Flushed again for the same reason, because the
+    #    entry-point notices (`update_notice`, the MCP hint) write stderr after
+    #    every verb returns.
+    for line in _collection_echo_lines(config, outcome):
+        print(line)
+    sys.stdout.flush()
 
 
 def cmd_sync(config: MitosConfig, auto_accept: bool = False, embed_only: bool = False, verbose: bool = False) -> None:
-    """Synchronizes the decisions write buffer with the graph store."""
+    """Synchronizes the decisions write buffer with the graph store.
+
+    The handler prints nothing itself — ``perform_sync`` does — so the corpus echo
+    leads its stdout report from here, and the two abort branches carry their own on
+    stderr (an echo pinned to stdout is invisible to a caller reading the refusal).
+    """
+    _echo_corpus(config)
     manager = MitosSyncManager(config)
     if embed_only:
         manager.drain_pending_embeddings()
@@ -573,9 +685,13 @@ def cmd_sync(config: MitosConfig, auto_accept: bool = False, embed_only: bool = 
         try:
             manager.perform_sync(auto_accept=auto_accept, verbose=verbose)
         except ParseError as e:
+            sys.stdout.flush()
+            _echo_corpus(config, file=sys.stderr)
             print(f"Sync Aborted: Parse error in write-buffer.\n{str(e)}", file=sys.stderr)
             sys.exit(1)
         except ValidationError as e:
+            sys.stdout.flush()
+            _echo_corpus(config, file=sys.stderr)
             print(f"Sync Aborted: Validation error.\n{str(e)}", file=sys.stderr)
             sys.exit(1)
 
@@ -597,18 +713,25 @@ def cmd_reconcile(config: MitosConfig, as_json: bool = False) -> int:
         Process exit code (0 on success, 1 if Qdrant/embedding provider is down).
     """
     manager = MitosSyncManager(config)
+    # Ahead of the call, not ahead of the report: `reconcile_embeddings` prints its
+    # own provider-down line to stdout before returning, so an echo placed beside
+    # the report below would not be the leading line the reader sees.
+    if not as_json:
+        _echo_corpus(config)
     try:
         result = manager.reconcile_embeddings()
     except VectorStoreError as e:
         msg = f"Reconcile unavailable — Qdrant or embedding provider down: {str(e)}"
         if as_json:
-            print(json.dumps({"error": msg}))
+            print(json.dumps({"error": msg, **corpus_provenance(config)}))
         else:
+            sys.stdout.flush()
+            _echo_corpus(config, file=sys.stderr)
             print(msg, file=sys.stderr)
         return 1
 
     if as_json:
-        print(json.dumps(result))
+        print(json.dumps({**result, **corpus_provenance(config)}))
     else:
         print(
             f"Reconciled: {result['active']} active node(s), "
@@ -619,7 +742,12 @@ def cmd_reconcile(config: MitosConfig, as_json: bool = False) -> int:
 
 
 def cmd_capture(config: MitosConfig, text: str) -> None:
-    """Captures a raw architectural thought and appends it to decisions.md."""
+    """Captures a raw architectural thought and appends it to decisions.md.
+
+    Every branch — the keyless refusal included — answers on stdout, so one leading
+    echo covers the whole verb.
+    """
+    _echo_corpus(config)
     api_key = transitional_env_fallback(
         config.env.get("GEMINI_API_KEY"), "GEMINI_API_KEY"
     )
@@ -785,7 +913,11 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
     if depth != "letter":
         msg = f"Depth mode '{depth}' is not yet implemented in v0.1 (Letter-only retrieval)."
         if as_json:
-            _emit_json({"error": msg}, indent=None)
+            # Inside the handler, so it stamps (the locus rule). Its text twin one
+            # line below deliberately does not: `raise` renders through `main()`'s
+            # generic boundary, i.e. outside any handler, where no resolved config
+            # is in scope and the response is not this verb's to shape.
+            _emit_json({"error": msg, **corpus_provenance(config)}, indent=None)
             return
         raise ValueError(msg)
 
@@ -882,6 +1014,12 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         return
 
     if blackout:
+        # Stamped for the same reason as the miss below: "everything here is
+        # superseded" and "you asked the wrong project" are the two readings this
+        # line separates. `cmd_surface`'s blackout already names its corpus (it
+        # falls through the stamped empty header); this branch returns early and
+        # was the one text exit of the read verbs that named none.
+        _echo_corpus(config)
         print(blackout_note(retired))
         return
 
@@ -930,6 +1068,11 @@ def cmd_show(config: MitosConfig, ident: str, as_json: bool = False) -> None:
     Returns:
         None.
     """
+    # Both text exits (the dereferenced node and the not-found pointer) answer on
+    # stdout, so one gated leading echo covers them; the two `--json` branches
+    # carry the same three fields as keys and must not also carry a text line.
+    if not as_json:
+        _echo_corpus(config)
     store = GraphStore(config.db_path)
 
     # State-agnostic resolution: id → active slug → most-recent in lineage → None.
@@ -1130,6 +1273,10 @@ def cmd_open_questions(config: MitosConfig, scope: Optional[str] = None,
         as_json: Emit a machine-readable JSON map (the parked OQ set, each carrying
             its ``amended_by``/``narrowed_by`` modifier subset) instead of text.
     """
+    # All three text branches (the listing, the empty line, the scope-recovery
+    # vector) answer on stdout — one leading echo, gated off the `--json` path.
+    if not as_json:
+        _echo_corpus(config)
     store = GraphStore(config.db_path)
     oqs = store.get_open_questions(scope=scope)
 
@@ -1159,6 +1306,7 @@ def cmd_open_questions(config: MitosConfig, scope: Optional[str] = None,
             "open_questions": [_oq_payload(q) for q in parked],
             "total": len(parked),
             "scope": scope,
+            **corpus_provenance(config),
         }
         if recovery:
             payload["scope_known"] = False
@@ -1216,6 +1364,10 @@ def cmd_scopes(config: MitosConfig, as_json: bool = False, archived: bool = Fals
     Returns:
         None.
     """
+    # Both text branches (the table and the empty-vocabulary line) are stdout; the
+    # `--json` envelope already carries the same three fields as keys.
+    if not as_json:
+        _echo_corpus(config)
     store = GraphStore(config.db_path)
     counts = order_scope_counts(store.get_scope_counts(include_archived=archived))
 
@@ -1300,13 +1452,21 @@ def cmd_projects(as_json: bool = False) -> None:
 
 
 def cmd_import(config: MitosConfig, filepath: str, use_llm_extract: bool = False) -> None:
-    """Imports legacy prose ADR file."""
+    """Imports legacy prose ADR file.
+
+    The handler prints nothing itself (``MitosProseImporter`` does), so the echo
+    leads its report from here — and it is the one verb whose positional is a
+    cwd-rooted *file* while its target is a selector, which is exactly the pair a
+    reader needs named.
+    """
+    _echo_corpus(config)
     importer = MitosProseImporter(config)
     importer.import_from_file(filepath, use_llm_extract)
 
 
 def cmd_render(config: MitosConfig, scope: Optional[str] = None, render_format: str = "live-axioms") -> None:
     """Statelessly regenerates live_axioms.md and scope axioms."""
+    _echo_corpus(config)
     if render_format != "live-axioms":
         print(f"Warning: format '{render_format}' is not supported in v0.1. Falling back to live-axioms.")
     store = GraphStore(config.db_path)
@@ -1386,7 +1546,12 @@ def cmd_record(
             sys.exit(2)
         return
 
+    # Three text outcomes on two channels — D3's sharpest case. The pause and the
+    # error answer on stderr, and that is the agent-facing path: an echo pinned to
+    # stdout would be missing from exactly the response a caller reads when the
+    # write did NOT land.
     if "error" in result:
+        _echo_corpus(config, file=sys.stderr)
         print(f"Record failed [{result['code']}]: {result['error']}", file=sys.stderr)
         sys.exit(1)
 
@@ -1396,6 +1561,7 @@ def cmd_record(
         # without a dereference round-trip. Enrichment keys via .get(): production
         # always sends the full candidate_payload shape, but leaner dicts reach this
         # render from canned fixtures.
+        _echo_corpus(config, file=sys.stderr)
         print(f"⚠ Paused — '{result['slug']}' looks like an existing decision. Nothing written.",
               file=sys.stderr)
         for n in result.get("neighbors", []):
@@ -1425,6 +1591,7 @@ def cmd_record(
     # success headline — a no-op reported as "Recorded ✓" is the same
     # couldn't-do-it-reads-as-done inversion the degraded-check notice below
     # exists to prevent, on the write itself rather than on the review.
+    _echo_corpus(config)
     no_op = result.get("no_op_reason")
     if no_op:
         print(f"Decision '{result['slug']}' {no_op}")
@@ -2426,19 +2593,27 @@ def cmd_restore_source(
         verify_whole_buffer,
     )
 
+    # Every refusal below answers on stderr and every report on stdout, so the echo
+    # rides each branch rather than leading the handler. This verb writes
+    # `config.decisions_file` — the user-authored gold source P6 makes immutable —
+    # so naming the corpus is not decoration here: a mis-aimed
+    # `--all-graph-only` rewrites *another* project's input in bulk.
     if bool(slug) == bool(all_graph_only):
         msg = "restore-source needs exactly one of --slug or --all-graph-only."
         if as_json:
-            _emit_json({"error": msg, "code": "ambiguous_target"})
+            _emit_json({"error": msg, "code": "ambiguous_target",
+                        **corpus_provenance(config)})
         else:
+            _echo_corpus(config, file=sys.stderr)
             print(msg, file=sys.stderr)
         return 1
 
     if not os.path.exists(config.db_path):
         msg = "No graph found — nothing to restore from."
         if as_json:
-            _emit_json({"error": msg, "code": "no_graph"})
+            _emit_json({"error": msg, "code": "no_graph", **corpus_provenance(config)})
         else:
+            _echo_corpus(config, file=sys.stderr)
             print(msg, file=sys.stderr)
         return 1
 
@@ -2447,8 +2622,9 @@ def cmd_restore_source(
     if report.get("skipped"):
         msg = f"Cannot restore — {report['skipped']}."
         if as_json:
-            _emit_json({"error": msg, "code": "unavailable"})
+            _emit_json({"error": msg, "code": "unavailable", **corpus_provenance(config)})
         else:
+            _echo_corpus(config, file=sys.stderr)
             print(msg, file=sys.stderr)
         return 1
 
@@ -2458,8 +2634,10 @@ def cmd_restore_source(
             msg = (f"'{slug}' is not a graph-only node — it already has a `### ` block "
                    f"in the corpus, or no such node exists.")
             if as_json:
-                _emit_json({"error": msg, "code": "not_graph_only"})
+                _emit_json({"error": msg, "code": "not_graph_only",
+                            **corpus_provenance(config)})
             else:
+                _echo_corpus(config, file=sys.stderr)
                 print(msg, file=sys.stderr)
             return 1
         targets = [slug]
@@ -2484,8 +2662,9 @@ def cmd_restore_source(
     if not targets:
         if as_json:
             _emit_json({"restored": [], "refused": [], "dry_run": dry_run,
-                        "written": False})
+                        "written": False, **corpus_provenance(config)})
         else:
+            _echo_corpus(config)
             print("No graph-only nodes — every node has a source block. ✓")
         return 0
 
@@ -2559,8 +2738,15 @@ def cmd_restore_source(
             "dry_run": dry_run,
             "written": written,
             "path": config.decisions_file,
+            **corpus_provenance(config),
         })
         return 1 if refused else 0
+
+    # One run can answer on BOTH channels (a partial write reports on stdout and
+    # refuses on stderr), so the echo leads each channel that carries an answer
+    # rather than picking one — the same shape `cmd_sync` and `cmd_reconcile` take.
+    if dry_run or written:
+        _echo_corpus(config)
 
     if dry_run:
         print(f"\nWould restore {len(blocks)} source block(s) to "
@@ -2574,6 +2760,13 @@ def cmd_restore_source(
             print(f"  • {target}")
         print("\nReview the entries, then `mitos rebuild --json` to confirm the "
               "completeness gate passes.")
+    if refused:
+        # Flush first: stderr is unbuffered while a piped stdout is not, so without
+        # this the refusals overtake the report they annotate (the inversion
+        # `cmd_init` and `cmd_record` already guard against — this branch had no
+        # such flush before, and the leading echo above makes the order load-bearing).
+        sys.stdout.flush()
+        _echo_corpus(config, file=sys.stderr)
     for row in refused:
         print(f"  ✗ refused: {row['slug']} — {row['reason']}", file=sys.stderr)
     if refused and not written and not dry_run:
@@ -2658,13 +2851,25 @@ def cmd_cutover(
         CutoverError: On a corpus defect during the rebuild (caught at the
             ``main()`` boundary).
     """
+    # 0. The echo leads every text branch — including the two early returns below
+    #    and `rebuild_and_gate`'s own stdout — so one call covers all 28 sites. All
+    #    of them are stdout; this verb has no stderr answer.
+    if not as_json:
+        _echo_corpus(config)
+
     # 1. Up-front prototype probe (G7) — mirrors the cmd_init / cmd_status RO-probe
     #    shape. An absent / already-V1a / empty graph is a cheap no-op: no rebuild,
     #    no swap, no Qdrant churn (and a post-success re-run is idempotent).
     if not os.path.exists(config.db_path):
         if as_json:
+            # The stamp overwrites the hand-built `workspace` key with the same
+            # value (`corpus_provenance` reads `config.workspace_dir` too), so it
+            # is additive in effect on these four early returns. The `to_dict()`
+            # shapes below carry no `workspace` key at all — `aside_db_path` is a
+            # *different* directory and nothing here touches it.
             _emit_json({"workspace": config.workspace_dir,
-                        "swapped": False, "reason": "no_graph"})
+                        "swapped": False, "reason": "no_graph",
+                        **corpus_provenance(config)})
         else:
             print("No graph found at this workspace — run `mitos init` for a fresh "
                   "V1a workspace (nothing to cut over).")
@@ -2677,7 +2882,8 @@ def cmd_cutover(
     if not is_prototype:
         if as_json:
             _emit_json({"workspace": config.workspace_dir,
-                        "swapped": False, "reason": "not_a_prototype"})
+                        "swapped": False, "reason": "not_a_prototype",
+                        **corpus_provenance(config)})
         else:
             print("Graph is already on the V1a schema (or empty) — nothing to "
                   "cut over.")
@@ -2712,7 +2918,8 @@ def cmd_cutover(
             if as_json:
                 _emit_json({**result.to_dict(), "swapped": False,
                             "reason": "shortfall_refused",
-                            "qdrant_wipe_cmd": qdrant_wipe_cmd})
+                            "qdrant_wipe_cmd": qdrant_wipe_cmd,
+                            **corpus_provenance(config)})
             else:
                 print(f"\nRefusing to swap: {n} active core(s) would be dropped. "
                       f"Review the offenders above. If this purge is intentional "
@@ -2730,7 +2937,8 @@ def cmd_cutover(
             # JSON mode is for automation: never prompt; require an explicit --yes.
             _emit_json({**result.to_dict(), "swapped": False,
                         "reason": "confirmation_required",
-                        "qdrant_wipe_cmd": qdrant_wipe_cmd})
+                        "qdrant_wipe_cmd": qdrant_wipe_cmd,
+                        **corpus_provenance(config)})
             return 1
         if sys.stdin.isatty():
             answer = input("\nProceed with the cutover swap? This replaces the "
@@ -2753,7 +2961,8 @@ def cmd_cutover(
     if as_json:
         _emit_json({**result.to_dict(), "swapped": True,
                     "bak_path": bak_path,
-                    "qdrant_wipe_cmd": qdrant_wipe_cmd})
+                    "qdrant_wipe_cmd": qdrant_wipe_cmd,
+                    **corpus_provenance(config)})
         return 0
 
     print(f"\n✓ Cutover complete — the V1a graph is live at {config.db_path}.")
@@ -2862,12 +3071,18 @@ def cmd_rebuild(
         CutoverError: On a corpus format defect during the rebuild (caught at the
             ``main()`` boundary).
     """
+    # 0. One leading echo for all 21 text sites — every one of them is stdout,
+    #    including the two early returns and `rebuild_and_gate`'s own output.
+    if not as_json:
+        _echo_corpus(config)
+
     # 1. Probe: rebuild runs on a CURRENT graph. Absent → init; prototype → the
     #    one-time cutover owns it (don't double-handle).
     if not os.path.exists(config.db_path):
         if as_json:
             _emit_json({"workspace": config.workspace_dir,
-                        "swapped": False, "reason": "no_graph"})
+                        "swapped": False, "reason": "no_graph",
+                        **corpus_provenance(config)})
         else:
             print("No graph found at this workspace — run `mitos init` first "
                   "(nothing to rebuild).")
@@ -2880,7 +3095,8 @@ def cmd_rebuild(
     if is_prototype:
         if as_json:
             _emit_json({"workspace": config.workspace_dir,
-                        "swapped": False, "reason": "prototype_graph"})
+                        "swapped": False, "reason": "prototype_graph",
+                        **corpus_provenance(config)})
         else:
             print("Graph is a pre-V1a prototype — run `mitos cutover` (the one-time "
                   "migration) instead of `mitos rebuild`.")
@@ -2921,7 +3137,8 @@ def cmd_rebuild(
     if blocked and not allow_drops:
         if as_json:
             _emit_json({**result.to_dict(), "swapped": False,
-                        "reason": "casualties_or_shortfall_refused"})
+                        "reason": "casualties_or_shortfall_refused",
+                        **corpus_provenance(config)})
         else:
             _print_rebuild_remediation(
                 casualties, result.missing_cores, os.path.basename(config.decisions_file)
@@ -2935,7 +3152,8 @@ def cmd_rebuild(
     if not assume_yes:
         if as_json:
             _emit_json({**result.to_dict(), "swapped": False,
-                        "reason": "confirmation_required"})
+                        "reason": "confirmation_required",
+                        **corpus_provenance(config)})
             return 1
         if sys.stdin.isatty():
             answer = input("\nProceed with the rebuild swap? This replaces the live "
@@ -2956,7 +3174,8 @@ def cmd_rebuild(
     # 6. Post-swap guidance.
     if as_json:
         _emit_json({**result.to_dict(), "swapped": True,
-                    "bak_path": bak_path})
+                    "bak_path": bak_path,
+                    **corpus_provenance(config)})
         return 0
 
     print(f"\n✓ Rebuild complete — the graph at {config.db_path} now reflects the "
@@ -3437,8 +3656,13 @@ def cmd_check(
         msg = ("check --staged cannot combine with --scope or --fresh — the gate always "
                "checks the whole pending buffer and never reuses verdicts.")
         if as_json:
-            _emit_json({"error": msg, "code": "invalid_flags"})
+            _emit_json({"error": msg, "code": "invalid_flags",
+                        **corpus_provenance(config)})
         else:
+            # Inside the handler, so it echoes (D5's locus rule). An argument-shape
+            # refusal that `main()` renders would not — but this one has a reader
+            # and a resolved config, and the two are what the rule turns on.
+            _echo_corpus(config, file=sys.stderr)
             print(msg, file=sys.stderr)
         return 2
     # The gate is a self-contained sequence (its own error boundary); 3a's corpus body
@@ -3466,8 +3690,10 @@ def cmd_check(
                 msg = (f"check could not run: cannot audit {len(active)} live "
                        f"decision(s) — embeddings ({embed_detail}) unavailable.")
                 if as_json:
-                    _emit_json({"error": msg, "code": "substrate_unavailable"})
+                    _emit_json({"error": msg, "code": "substrate_unavailable",
+                                **corpus_provenance(config)})
                 else:
+                    _echo_corpus(config, file=sys.stderr)
                     print(msg, file=sys.stderr)
                 return 2
             # Empty snapshot → the providers are never touched (iter_sweep is lazy
@@ -3533,19 +3759,26 @@ def cmd_check(
         # vector message, never a traceback CI would read as "new findings".
         msg = f"check could not run: {exc}"
         if as_json:
-            _emit_json({"error": msg, "code": "check_faulted"})
+            _emit_json({"error": msg, "code": "check_faulted",
+                        **corpus_provenance(config)})
         else:
+            _echo_corpus(config, file=sys.stderr)
             print(msg, file=sys.stderr)
         return 2
 
     # Emission is pure (out of the write contract): one JSON object or the report.
     if as_json:
-        _emit_json(_check_json_object(
+        # Stamped at the CALL SITE, never by threading `config` into
+        # `_check_json_object`: that assembler is a shipped API whose signature has
+        # no business gaining a routing parameter (the same argument D1 makes
+        # against stamping inside `_emit_json`).
+        _emit_json({**_check_json_object(
             result, row, exclusions=exclusions, exit_code=exit_code,
             row_written=row_written, scope=scope, fresh=fresh,
             transient_count=transient_count,
-        ))
+        ), **corpus_provenance(config)})
     else:
+        _echo_corpus(config)
         _print_check_report(
             result, exclusions=exclusions, denominator=denominator, scope=scope,
             row_written=row_written, transient_count=transient_count,
@@ -3850,13 +4083,28 @@ def _run_staged_check(
         if not pending:
             ended_at = datetime.now(timezone.utc).isoformat()
             if as_json:
-                _emit_json(_staged_json_object(
+                # The `--json` branch of the free path is NOT carved out: it already
+                # emits a full object, so a key costs no shipped silence. Only the
+                # one-line text branch below is the carve-out, and the two must not
+                # be "harmonized" into one rule later.
+                _emit_json({**_staged_json_object(
                     run_id=run_id, started_at=started_at, ended_at=ended_at,
                     exit_code=0, nodes_total=0, nodes_swept=0, batches_executed=0,
                     pairs_judged_fresh=0, finding_objs=[], degradations=[],
                     exclusions=[], transient_count=0, row_written=False,
-                ))
+                ), **corpus_provenance(config)})
             else:
+                # THE OBLIGATION CARVE-OUT (§4.7): the echo rides output the surface
+                # already emits and never converts a near-silent success into
+                # output. This is a pre-commit hook's dominant path — SETUP.md sells
+                # it as effectively free, in noise as much as in spend — and its
+                # target is a literal in a committed hook (`-p .`), so it cannot
+                # drift. Measured at 8523259: this prints exactly ONE line (the
+                # vision's "printed nothing at all" is false; the conclusion is
+                # not). Tripling it to name a target that cannot drift is the trade
+                # this branch declines. Distinct from `agent-block`'s carve-out,
+                # which is about the CHANNEL, not the obligation — collapsing the
+                # two into "check and agent-block are special" loses both arguments.
                 print("Gate clear — no pending decisions to check.")
             return 0
 
@@ -3869,8 +4117,12 @@ def _run_staged_check(
             msg = (f"check --staged could not gate {len(pending)} pending decision(s) — "
                    f"embeddings ({embed_detail}) unavailable.")
             if as_json:
-                _emit_json({"error": msg, "code": "substrate_unavailable"})
+                _emit_json({"error": msg, "code": "substrate_unavailable",
+                            **corpus_provenance(config)})
             else:
+                # The fail-closed refusal DOES echo — the carve-out below is the
+                # free short-circuit alone, and this branch is already speaking.
+                _echo_corpus(config, file=sys.stderr)
                 print(msg, file=sys.stderr)
             return 2
 
@@ -3900,8 +4152,10 @@ def _run_staged_check(
             msg = (f"check --staged could not gate {len(pending)} pending decision(s) — "
                    f"ANTHROPIC_API_KEY is not set (the judge is required to gate).")
             if as_json:
-                _emit_json({"error": msg, "code": "judge_unavailable"})
+                _emit_json({"error": msg, "code": "judge_unavailable",
+                            **corpus_provenance(config)})
             else:
+                _echo_corpus(config, file=sys.stderr)
                 print(msg, file=sys.stderr)
             return 2
 
@@ -3994,22 +4248,27 @@ def _run_staged_check(
         # exit 2 with a calm vector message, never a traceback CI reads as "new findings".
         msg = f"check --staged could not run: {exc}"
         if as_json:
-            _emit_json({"error": msg, "code": "check_faulted"})
+            _emit_json({"error": msg, "code": "check_faulted",
+                        **corpus_provenance(config)})
         else:
+            _echo_corpus(config, file=sys.stderr)
             print(msg, file=sys.stderr)
         return 2
 
     # Emission is pure (out of the write contract): one JSON object or the report.
     if as_json:
-        _emit_json(_staged_json_object(
+        # Stamped at the call site, like the corpus twin — `_staged_json_object` is
+        # a shipped assembler and stays signature-stable.
+        _emit_json({**_staged_json_object(
             run_id=run_id, started_at=started_at, ended_at=ended_at,
             exit_code=exit_code, nodes_total=len(pending), nodes_swept=nodes_swept,
             batches_executed=batches_executed, pairs_judged_fresh=pairs_judged_fresh,
             finding_objs=[_staged_finding_json(e, h, f, p) for e, h, f, p in findings],
             degradations=sorted(degraded), exclusions=exclusions,
             transient_count=transient_count, row_written=row_written,
-        ))
+        ), **corpus_provenance(config)})
     else:
+        _echo_corpus(config)
         _print_staged_report(
             findings, nodes_swept=nodes_swept, nodes_total=len(pending),
             degraded=degraded, exclusions=exclusions, transient_count=transient_count,
@@ -4921,8 +5180,29 @@ def main() -> None:
                 config, slug=args.slug, all_graph_only=args.all_graph_only,
                 dry_run=args.dry_run, as_json=args.as_json))
         elif args.command == "agent-block":
+            # THE CHANNEL CARVE-OUT (§4.7) — not an obligation carve-out; the two
+            # are different arguments and must stay distinct. `agent-block`'s plain
+            # form prints a paste-ready block whose own text tells the reader to
+            # paste it into AGENTS.md / CLAUDE.md, so an echo on stdout would land a
+            # resolved name and a path-hashed collection INSIDE a committed,
+            # travelling artifact — the persisted machine-specific identity §4.3
+            # forbids. So it answers out of band, on stderr, for BOTH forms: the
+            # `--check` report is a diagnostic and could safely take stdout, but two
+            # channels for one verb is a drift seam for no gain.
+            #
+            # Emitted here rather than in the handler on purpose: `cmd_agent_block`
+            # gains no echo code at all, so "the block is byte-identical across
+            # machines" stays a structural fact rather than a discipline someone
+            # could later tidy onto stdout.
+            _echo_corpus(config, file=sys.stderr)
             sys.exit(cmd_agent_block(config.workspace_dir, check=args.check))
         elif args.command == "set-key":
+            # The other dispatch-site echo, for the same reason: `cmd_set_key` takes
+            # a bare path, not a config, and `main()` is the only place that holds
+            # both. Project form only — `--global` is selector-exempt and writes the
+            # machine-wide .env, which names no corpus.
+            if not args.is_global:
+                _echo_corpus(config)
             cmd_set_key(args.value, name=args.name, is_global=args.is_global,
                         workspace_dir=target.root if target else None)
         elif args.command == "cutover":

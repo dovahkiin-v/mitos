@@ -293,6 +293,33 @@ def test_exactly_one_target_is_required(tmp_path, capsys):
     assert json.loads(capsys.readouterr().out)["code"] == "ambiguous_target"
 
 
+def test_every_refusal_names_the_corpus_it_refused_for(tmp_path, capsys):
+    """The refusals echo too — this verb rewrites the user-authored gold source.
+
+    A mis-aimed `--all-graph-only` re-materializes THIS project's graph into
+    ANOTHER project's `decisions.md`, in bulk, so which corpus a refusal is
+    speaking about is not decoration. Under the locus rule (a response echoes iff
+    it is emitted inside a `cmd_*` handler) `ambiguous_target` qualifies — but
+    `--slug`/`--all-graph-only` is a *required mutually-exclusive* argparse group,
+    so argparse refuses first and that branch is reachable **only** by calling the
+    handler directly. Hence this row is a direct call, not a `main()`-driven one:
+    driven through `main()` it would exit 2 at argparse with nothing on stdout and
+    prove nothing.
+    """
+    config = _workspace(tmp_path, [_block("kept", "Kept axiom.")], kept=[])
+
+    assert cmd_restore_source(config) == 1          # neither target — text mode
+    err = capsys.readouterr().err
+    assert f"corpus: {config.project}" in err
+    assert config.qdrant_collection in err and config.workspace_dir in err
+
+    assert cmd_restore_source(config, as_json=True) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["project"] == config.project
+    assert payload["collection"] == config.qdrant_collection
+    assert payload["workspace"] == config.workspace_dir
+
+
 def test_a_clean_corpus_is_a_quiet_success(tmp_path, capsys):
     """Zero orphans is healthy, not an error — empty states are first-class."""
     kept = _block("kept", "Kept axiom.")

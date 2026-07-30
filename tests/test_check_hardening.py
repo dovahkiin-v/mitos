@@ -73,15 +73,25 @@ from test_check_probe import _canned_judge, _commit, _seed_verdict
 
 PRODUCTION_ALIAS = "SONNET"
 
-# The machine contract a CI consumer parses — the full §8 corpus ``--json`` key set
-# (test_check_cli.py:297). 5a proves it stays byte-stable when the run goes RED: a
-# degraded run discloses its degradation without dropping or renaming a key.
+# The machine contract a CI consumer parses — the full §8 corpus ``--json`` key set.
+# 5a proves it stays byte-stable when the run goes RED: a degraded run discloses its
+# degradation without dropping or renaming a key.
+#
+# `test_check_cli.py::test_7_json_shape_snapshot` now IMPORTS this rather than
+# re-listing it: the duplicate copy is what let a radius analysis miss five of the
+# six rows here when the corpus echo added three keys. One constant, one edit.
+#
+# The three provenance keys are the corpus echo (§4.7): every response that resolves
+# a project names it. They are asserted as MEMBERS of the exact-equality set, never
+# by relaxing the comparison to a subset — the whole point of these rows is that the
+# key set is machine-stable under degradation, and `>=` would gut that.
 _CORPUS_JSON_KEYS = {
     "run_id", "mode", "exit_code", "started_at", "ended_at", "fresh",
     "nodes_total", "nodes_swept", "pairs_judged_fresh", "pairs_reused",
     "batches_planned", "batches_executed", "batches_skipped", "findings",
     "findings_new", "findings_known", "degradations", "coverage_exclusions",
     "index_backlog_transient", "summary_row_written",
+    "project", "collection", "workspace",
 }
 
 
