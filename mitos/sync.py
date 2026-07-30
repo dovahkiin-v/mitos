@@ -27,6 +27,7 @@ from mitos.conflict import (
     ConflictCheckResult,
     ConflictFinding,
     ConflictUnavailableReason,
+    SEMANTIC_SUBSTRATE_REASONS,
     Unavailable,
     candidate_payload,
     gather_candidates,
@@ -37,6 +38,7 @@ from mitos.telemetry import (CommentaryAuditRow, ConflictCheckRow, JudgmentBatch
                             TelemetryStore)
 from mitos.divergence import declared_edges, entry_divergence, is_reconcilable
 from mitos.errors import (
+    CollectionMissingError,
     MitosError,
     SynthesisError,
     ParseError,
@@ -433,6 +435,9 @@ _PAUSE_RESOLVING_RELATIONS = (
 _REVIEW_UNAVAILABLE_CAUSES = {
     ConflictUnavailableReason.EMBEDDING: "embedding service unavailable",
     ConflictUnavailableReason.VECTOR_STORE: "vector store unavailable",
+    ConflictUnavailableReason.COLLECTION_MISSING: (
+        "the vector collection is missing — run `mitos reconcile`"
+    ),
 }
 
 # What the reconcile pre-flight (``_uncommittable_edges``) does about each store
@@ -1500,10 +1505,15 @@ class MitosSyncManager:
             reason: The typed :class:`~mitos.conflict.ConflictUnavailableReason` from the
                 degraded result — the machine-readable discriminator the surface words.
         """
-        if reason in (
-            ConflictUnavailableReason.EMBEDDING,
-            ConflictUnavailableReason.VECTOR_STORE,
-        ):
+        if reason is ConflictUnavailableReason.COLLECTION_MISSING:
+            # Inside the semantic-substrate bucket, but worded apart: the vector store
+            # DID respond, so "did not respond" would be the missing-as-unreachable
+            # conflation, on the surface an operator meets most often.
+            what = (
+                "Semantic recall is unavailable (the vector collection is missing — run "
+                "`mitos reconcile`)"
+            )
+        elif reason in SEMANTIC_SUBSTRATE_REASONS:
             what = (
                 "Semantic recall is unavailable (the vector store or embedding service did "
                 "not respond)"
@@ -1775,15 +1785,27 @@ class MitosSyncManager:
             Counts ``{"active", "present", "enqueued"}`` — active nodes, points
             already in Qdrant, and nodes enqueued for re-embedding.
 
+        An **absent collection reads as empty**, not as an error: it is the very
+        state this heal exists for (a wipe, or a rename that left the old name
+        behind), so every active node is missing and every one gets enqueued — the
+        drain's first upsert then creates the collection. Only genuine
+        unreachability raises.
+
         Raises:
             VectorStoreError: If Qdrant is unreachable while scrolling point ids.
+                A *missing collection* does not raise (see above).
         """
         if not self.embed_provider or not self.vector_store:
             print("Cannot reconcile: Embedding provider or vector store down.")
             return {"active": 0, "present": 0, "enqueued": 0}
 
         active_ids = self.store.get_active_node_ids()
-        present = self.vector_store.list_point_ids()
+        try:
+            present = self.vector_store.list_point_ids()
+        except CollectionMissingError:
+            # Narrow by design: a connection-level VectorStoreError must keep
+            # propagating so `mitos reconcile` can still report Qdrant down.
+            present = set()
         missing = [nid for nid in active_ids if hash_to_uuid(nid) not in present]
 
         for node_id in missing:

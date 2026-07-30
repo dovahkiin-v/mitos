@@ -12,6 +12,7 @@ serialization roundtrip (§10).
 
 import hashlib
 import json
+import pathlib
 import os
 import shutil
 import sqlite3
@@ -871,6 +872,37 @@ def test_cmd_cutover_gate_pass_swaps(tmp_path, capsys):
     assert not _is_prototype(config.db_path)
     decs, oqs = _active_slugs(config.db_path)
     assert decs == {"alpha"}
+
+
+def test_cutover_finish_block_still_promises_the_next_sync_recreates(tmp_path, capsys):
+    """The wipe-then-sync instruction is TRUE, and pinned so it can only die knowingly.
+
+    Read against I10's headline ("reads never create") the post-cutover state —
+    populated graph, absent collection — looks exactly like the case 1c is about to
+    defer, so a grep-driven sweep naturally marks this false and "fixes" a working
+    instruction. It survives because ``rebuild``/``cutover`` issue no upsert and
+    ``_prune_embedding_queue_to_active`` bounds the outbox to exactly the active
+    set: the prescribed ``sync`` is therefore a **covering** drain, and creating is
+    precisely what a covering write is allowed to do.
+
+    Pinned in both places it is written — the finish block and its SETUP.md twin —
+    so 1c has to invert a test rather than notice a comment.
+    """
+    config = _config(tmp_path)
+    _plant_prototype(
+        config.db_path,
+        [{"slug": "alpha", "kind": "decision", "core_axiom": "Alpha axiom."}],
+    )
+    _write(config.decisions_file, _stream(_decision("alpha", "Alpha axiom.")))
+
+    rc = cmd_cutover(config, allow_drops=False, assume_yes=True, as_json=False)
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "it auto-recreates on the next sync" in out
+
+    setup = pathlib.Path(__file__).resolve().parent.parent / "SETUP.md"
+    assert "it auto-recreates on the\n   next sync" in setup.read_text(encoding="utf-8")
 
 
 def test_cmd_cutover_shortfall_refuses_then_allow_drops_overrides(tmp_path, capsys):

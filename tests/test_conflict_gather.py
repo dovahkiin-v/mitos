@@ -24,12 +24,15 @@ from mitos import conflict
 from mitos.conflict import (
     Candidate,
     ConflictUnavailableReason,
+    JUDGMENT_REASONS,
+    SEMANTIC_SUBSTRATE_REASONS,
     Unavailable,
     gather_candidates,
 )
 from mitos.cli import cmd_init
 from mitos.config import MitosConfig
-from mitos.errors import DatabaseError, EmbeddingError, VectorStoreError
+from mitos.errors import (CollectionMissingError, DatabaseError, EmbeddingError,
+                          VectorStoreError)
 from mitos.identity import canonical_core_string_norm, embedding_text
 from mitos.parser import ParsedEntry
 from mitos.store import GraphStore
@@ -392,6 +395,26 @@ def test_vector_store_failure_is_typed_unavailable(store: GraphStore) -> None:
     assert "qdrant unreachable" in result.detail
 
 
+def test_collection_missing_is_its_own_typed_unavailable(store: GraphStore) -> None:
+    """A missing collection is a THIRD reason, not the unreachable one it subclasses.
+
+    Ordering-sensitive: ``CollectionMissingError`` is a ``VectorStoreError``, so an
+    arm below the broad one would be dead and the receipt, the sync notice and the
+    check token would all report "unreachable" for a running Qdrant.
+    """
+    embed = _FakeEmbed()
+    vector = _FakeVector(
+        raises=CollectionMissingError(
+            "Qdrant collection 'mitos-x' does not exist", collection="mitos-x"
+        )
+    )
+    result = _gather("Axiom.", embed, vector, store)
+
+    assert isinstance(result, Unavailable)
+    assert result.reason is ConflictUnavailableReason.COLLECTION_MISSING
+    assert "mitos-x" in result.detail
+
+
 # --------------------------------------------------------------------------- #
 # 9. A graph-store fault PROPAGATES — it is never masked as Unavailable/[]  (D4)
 # --------------------------------------------------------------------------- #
@@ -452,9 +475,60 @@ def test_unavailable_reason_enum_exposes_the_two_substrate_reasons() -> None:
     """``ConflictUnavailableReason`` carries the 2a substrate reasons (3b adds judgment members)."""
     assert ConflictUnavailableReason.EMBEDDING.value == "embedding_unavailable"
     assert ConflictUnavailableReason.VECTOR_STORE.value == "vector_store_unavailable"
+    # 1b. This string is a SHIPPED CONTRACT, not an internal label: it is also the
+    # `check` degradation token, and the token is what lands in the persisted
+    # `check_runs.degraded_reason` trend column. If the two ever drift, a trend
+    # query and the enum disagree about the same event.
+    assert ConflictUnavailableReason.COLLECTION_MISSING.value == "collection_missing"
     # The shared typed-degradation shape: reason + raw detail, frozen.
     u = Unavailable(reason=ConflictUnavailableReason.EMBEDDING, detail="boom")
     assert u.reason is ConflictUnavailableReason.EMBEDDING
     assert u.detail == "boom"
     with pytest.raises(Exception):
         u.reason = ConflictUnavailableReason.VECTOR_STORE  # frozen — no mutation
+
+
+# --------------------------------------------------------------------------- #
+# 13. The bucketing meta-test — a new reason must be CLASSIFIED, not just added
+# --------------------------------------------------------------------------- #
+
+def test_every_unavailable_reason_is_classified_into_exactly_one_bucket() -> None:
+    """Both surfaces that bucket a reason do it as ``if semantic … else the judge``.
+
+    That ``else`` is the hole: ``sync._notice_conflict_unavailable`` and the staged
+    gate's token map would each file a new semantic member under "the judgment model
+    did not respond" — silently, and confidently wrong. Nothing had ever iterated
+    this enum before, so nothing could notice. Modelled on
+    ``test_preflight_declares_a_disposition_for_every_store_code``: declare the
+    class, then assert the declaration covers it.
+    """
+    semantic = set(SEMANTIC_SUBSTRATE_REASONS)
+    judgment = set(JUDGMENT_REASONS)
+
+    assert semantic | judgment == set(ConflictUnavailableReason)
+    assert semantic & judgment == set()
+    # Non-empty on both sides, so a future "classify everything as semantic" edit
+    # cannot pass the coverage assertion by emptying the other bucket.
+    assert semantic and judgment
+
+
+def test_both_bucketing_surfaces_bind_the_shared_constant() -> None:
+    """The two consumers read the constant rather than re-listing its members.
+
+    A second hand-rolled ``(EMBEDDING, VECTOR_STORE)`` tuple anywhere would make the
+    meta-test above pass while the surface still mis-files — the same
+    grep-for-a-second-copy discipline as ``_KILL_EDGE_TYPES_SQL``.
+    """
+    import inspect
+
+    from mitos import cli, sync
+
+    for module in (sync, cli):
+        source = inspect.getsource(module)
+        assert "SEMANTIC_SUBSTRATE_REASONS" in source, (
+            f"{module.__name__} no longer binds the shared membership constant"
+        )
+        assert "ConflictUnavailableReason.EMBEDDING,\n" not in source, (
+            f"{module.__name__} re-lists the semantic-substrate members instead of "
+            "binding SEMANTIC_SUBSTRATE_REASONS"
+        )

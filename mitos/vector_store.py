@@ -2,13 +2,110 @@
 
 This module implements the vector store pipeline (D) using the Qdrant REST API
 directly, reducing dependency bloat and ensuring maximum interoperability.
+
+Two contracts hold across every member here. **Reading never writes:** neither
+constructing a store nor querying/scrolling one can bring a collection into
+existence — creation attaches to :meth:`QdrantVectorStore.upsert`, lazily, on a
+404. And **missing is not unreachable:** an absent collection raises the typed
+:class:`~mitos.errors.CollectionMissingError`, which every surface words as the
+recoverable state it is (``mitos reconcile``) rather than as an outage.
 """
 
 import requests
 import json
 from typing import List, Dict, Any, Set
-from mitos.errors import VectorStoreError
+from mitos.errors import CollectionMissingError, VectorStoreError
 from mitos.models import EMBEDDING_DIM
+
+
+def _collection_is_missing(resp: "requests.Response") -> bool:
+    """Decides whether a Qdrant response means "that collection does not exist".
+
+    The single place this question is answered, so a fifth endpoint cannot drift
+    from the other four. Keyed on the **status code**, never on the body text:
+    measured 2026-07-30 against Qdrant 1.16.3, an absent collection answers 404 to
+    ``GET /collections/{c}``, ``POST …/points/search``, ``POST …/points/scroll``
+    and ``PUT …/points`` alike, while the error string carries backticks and an
+    exclamation mark and is plainly version-shaped.
+
+    Args:
+        resp: The Qdrant response.
+
+    Returns:
+        True when the response says the collection is absent.
+    """
+    return resp.status_code == 404
+
+
+def _raise_response_error(resp: "requests.Response", *, operation: str,
+                          collection: str) -> None:
+    """Raises the typed error for a non-200 Qdrant response — missing ≠ unreachable.
+
+    Args:
+        resp: The non-200 response.
+        operation: The operation name for the message (``"query"``, ``"upsert"``, …).
+        collection: The collection the operation addressed.
+
+    Raises:
+        CollectionMissingError: If the collection does not exist (HTTP 404).
+        VectorStoreError: For any other non-200 response.
+    """
+    if _collection_is_missing(resp):
+        raise CollectionMissingError(
+            f"Qdrant collection '{collection}' does not exist "
+            f"(Qdrant is up and answered 404 to the {operation}).",
+            collection=collection,
+        )
+    raise VectorStoreError(f"Qdrant {operation} failed: {resp.text}")
+
+
+def _decode_result(resp: "requests.Response", *, operation: str) -> Any:
+    """Extracts Qdrant's ``result`` from a 200 body, or raises a typed error.
+
+    A 200 carrying a non-JSON body, or a JSON body of the wrong shape, is a
+    substrate fault like any other and must reach the caller as a
+    :class:`VectorStoreError`. Left unguarded it escapes as a raw
+    ``ValueError``/``AttributeError`` — ``requests.RequestException`` does not
+    cover a JSON decode failure — slipping every net keyed on the typed class and
+    landing on a generic fatal handler. On the read path that matters more than it
+    sounds: a malformed 200 is the one shape that could reach a fail-closed
+    consumer looking like a healthy empty answer.
+
+    An **absent** ``result`` key raises too, rather than defaulting to empty. The
+    two states must not blur: Qdrant says "nothing matched" with ``result: []``, and
+    a body with no ``result`` at all is a different protocol, not an empty answer.
+    Defaulting it (the shipped ``.get("result", [])``) is the precise shape that
+    reaches a fail-closed consumer as a clean, certified-complete zero.
+
+    Args:
+        resp: A 200 response.
+        operation: The operation name for the message.
+
+    Returns:
+        The value of the body's ``result`` key.
+
+    Raises:
+        VectorStoreError: If the body is not JSON, is not a JSON object, or carries
+            no ``result`` key.
+    """
+    try:
+        body = resp.json()
+    except ValueError as exc:
+        raise VectorStoreError(
+            f"Qdrant {operation} returned a malformed (non-JSON) body: {exc}"
+        )
+    if not isinstance(body, dict):
+        raise VectorStoreError(
+            f"Qdrant {operation} returned an unexpected body shape "
+            f"({type(body).__name__}, expected a JSON object)."
+        )
+    if "result" not in body:
+        raise VectorStoreError(
+            f"Qdrant {operation} returned a 200 with no `result` key — a body this "
+            "shape is a protocol mismatch, not an empty answer."
+        )
+    return body["result"]
+
 
 def hash_to_uuid(sha256_hex: str) -> str:
     """Converts a 64-character SHA-256 hex string deterministically into a UUID format.
@@ -27,12 +124,12 @@ def scroll_point_ids(base_url: str, collection: str, page_size: int = 256) -> Se
     """Enumerates every point id in a collection via a no-create paginated scroll.
 
     A module-level read path that talks to Qdrant directly without constructing a
-    :class:`QdrantVectorStore` — so it NEVER triggers ``_ensure_collection`` and
-    NEVER creates a missing collection. This is what a read-only probe (e.g.
-    ``mitos status``) must use to diff the graph against Qdrant's actual points
-    without mutating the collection as a side effect. Payloads and vectors are
-    excluded from the response to keep each page cheap; the scan is bounded to one
-    pass over the collection (no per-node existence probes).
+    :class:`QdrantVectorStore` — kept so a read-only probe (e.g. ``mitos status``)
+    can diff the graph against Qdrant's actual points without needing a store at
+    all. Reads create nothing: an absent collection is *reported*, never
+    materialized. Payloads and vectors are excluded from the response to keep each
+    page cheap; the scan is bounded to one pass over the collection (no per-node
+    existence probes).
 
     Args:
         base_url: The Qdrant base URL (trailing slash tolerated).
@@ -43,7 +140,9 @@ def scroll_point_ids(base_url: str, collection: str, page_size: int = 256) -> Se
         The set of point-id strings (the ``hash_to_uuid`` UUIDs) in the collection.
 
     Raises:
-        VectorStoreError: If Qdrant is unreachable or returns a non-200 status.
+        CollectionMissingError: If Qdrant is up but the collection does not exist.
+        VectorStoreError: If Qdrant is unreachable, returns another non-200 status,
+            or answers 200 with a body of the wrong shape.
     """
     scroll_url = f"{base_url.rstrip('/')}/collections/{collection}/points/scroll"
     ids: Set[str] = set()
@@ -64,10 +163,28 @@ def scroll_point_ids(base_url: str, collection: str, page_size: int = 256) -> Se
                 timeout=5,
             )
             if resp.status_code != 200:
-                raise VectorStoreError(f"Qdrant scroll failed: {resp.text}")
+                _raise_response_error(
+                    resp, operation="scroll", collection=collection
+                )
 
-            result = resp.json().get("result", {}) or {}
-            for point in result.get("points", []):
+            # No `or {}` — a JSON `null` result must reach the shape guard below
+            # rather than be coerced into a clean empty page. That coercion is the
+            # same certified-complete-zero the absent-key guard exists to refuse.
+            result = _decode_result(resp, operation="scroll")
+            if not isinstance(result, dict):
+                raise VectorStoreError(
+                    "Qdrant scroll returned an unexpected result shape "
+                    f"({type(result).__name__}, expected an object)."
+                )
+            points = result.get("points") or []
+            if not isinstance(points, list) or any(
+                not isinstance(point, dict) or "id" not in point for point in points
+            ):
+                raise VectorStoreError(
+                    "Qdrant scroll returned an unexpected points shape "
+                    "(expected a list of objects carrying an `id`)."
+                )
+            for point in points:
                 ids.add(str(point["id"]))
 
             offset = result.get("next_page_offset")
@@ -82,12 +199,28 @@ class QdrantVectorStore:
     """REST client for Qdrant vector store managing points and semantic queries."""
 
     def __init__(self, qdrant_url: str, collection_name: str = "mitos") -> None:
+        """Binds the store to a Qdrant endpoint and collection — **no network I/O**.
+
+        Construction is pure: it dispatches zero HTTP requests and therefore cannot
+        create, probe, or fail. Creation attaches to the *write* instead (see
+        :meth:`upsert`), which is what makes a read structurally incapable of
+        materializing the collection it was only meant to look at — one
+        constructor serves every reader and every writer, so the policy cannot
+        live here.
+
+        Args:
+            qdrant_url: The Qdrant REST endpoint (trailing slash tolerated).
+            collection_name: The project's collection.
+        """
         self.base_url = qdrant_url.rstrip("/")
         self.collection = collection_name
-        self._ensure_collection()
 
     def _ensure_collection(self) -> None:
-        """Verifies if the collection exists, creating it with Cosine configuration if missing."""
+        """Verifies if the collection exists, creating it with Cosine configuration if missing.
+
+        Reached from exactly one place: :meth:`upsert`'s 404 recovery branch. It is
+        the only path in this module that may create.
+        """
         check_url = f"{self.base_url}/collections/{self.collection}"
         try:
             resp = requests.get(check_url, timeout=5)
@@ -95,7 +228,7 @@ class QdrantVectorStore:
                 # Collection exists
                 return
 
-            if resp.status_code == 404:
+            if _collection_is_missing(resp):
                 # Create collection
                 create_url = f"{self.base_url}/collections/{self.collection}"
                 payload = {
@@ -124,14 +257,26 @@ class QdrantVectorStore:
     def upsert(self, point_id: str, vector: List[float], payload: Dict[str, Any]) -> None:
         """Upserts a single point into Qdrant using the deterministic UUID mapping.
 
+        Creation lives here, lazily: the write is attempted first, and only a 404 —
+        the collection does not exist — triggers ``_ensure_collection`` and **one**
+        retry. The healthy case pays zero extra round trips, and a 404 that turns
+        out to mean something else (a renamed endpoint in a future Qdrant) costs one
+        wasted create and then raises on the second 404 — never a loop, never a
+        silent success.
+
         Args:
             point_id: The SHA-256 node ID.
             vector: The embedding vector values.
             payload: Node metadata {slug, scope, state, kind, embedding_text}.
+
+        Raises:
+            CollectionMissingError: If the collection is still absent after the
+                create-and-retry.
+            VectorStoreError: If Qdrant is unreachable or rejects the write.
         """
         uuid_id = hash_to_uuid(point_id)
         upsert_url = f"{self.base_url}/collections/{self.collection}/points"
-        
+
         body = {
             "points": [
                 {
@@ -141,16 +286,28 @@ class QdrantVectorStore:
                 }
             ]
         }
-        
-        try:
-            resp = requests.put(
+
+        def _put() -> "requests.Response":
+            return requests.put(
                 upsert_url,
                 json=body,
                 headers={"Content-Type": "application/json"},
                 timeout=5
             )
+
+        try:
+            resp = _put()
+            if _collection_is_missing(resp):
+                # ── The one place an absent collection is created. ──────────────
+                # Phase 1c narrows WHICH writes may take this branch (a write that
+                # covers the workspace's active set); keep it a single, clearly
+                # marked seam so that predicate has one place to go.
+                self._ensure_collection()
+                resp = _put()
             if resp.status_code != 200:
-                raise VectorStoreError(f"Qdrant upsert failed: {resp.text}")
+                _raise_response_error(
+                    resp, operation="upsert", collection=self.collection
+                )
         except requests.RequestException as e:
             raise VectorStoreError(f"Qdrant connection error during upsert: {str(e)}")
 
@@ -173,6 +330,14 @@ class QdrantVectorStore:
 
         Returns:
             A list of dictionary results with payload and scores.
+
+        Raises:
+            CollectionMissingError: If Qdrant is up but the collection does not
+                exist. Reads never create it — absence is reported, and the
+                calling surface decides whether that is a gap or simply the empty
+                index of a project with nothing to index yet.
+            VectorStoreError: If Qdrant is unreachable, returns another non-200
+                status, or answers 200 with a body of the wrong shape.
         """
         search_url = f"{self.base_url}/collections/{self.collection}/points/search"
 
@@ -190,9 +355,21 @@ class QdrantVectorStore:
                 timeout=5
             )
             if resp.status_code != 200:
-                raise VectorStoreError(f"Qdrant query failed: {resp.text}")
+                _raise_response_error(
+                    resp, operation="query", collection=self.collection
+                )
 
-            results = resp.json().get("result", [])
+            # No `or []` — see the scroll's twin above. On the read path a `null`
+            # result coerced to empty is the one shape that reaches a fail-closed
+            # consumer looking like a healthy "nothing matched".
+            results = _decode_result(resp, operation="query")
+            if not isinstance(results, list) or any(
+                not isinstance(item, dict) for item in results
+            ):
+                raise VectorStoreError(
+                    "Qdrant query returned an unexpected result shape "
+                    "(expected a list of objects)."
+                )
 
             output = []
             for item in results:
@@ -216,9 +393,10 @@ class QdrantVectorStore:
     def list_point_ids(self, page_size: int = 256) -> Set[str]:
         """Lists every point id currently in the collection via a paginated scroll.
 
-        A thin instance-bound delegate to :func:`scroll_point_ids` (the no-create
-        read path), kept so callers holding a store instance need not thread the
-        URL + collection by hand.
+        A thin instance-bound delegate to :func:`scroll_point_ids`, kept so callers
+        holding a store instance need not thread the URL + collection by hand. It
+        inherits that function's typed contract, including the missing-collection
+        classification.
 
         Args:
             page_size: Maximum points fetched per scroll page.
@@ -227,7 +405,9 @@ class QdrantVectorStore:
             The set of point-id strings (the ``hash_to_uuid`` UUIDs) in the collection.
 
         Raises:
-            VectorStoreError: If Qdrant is unreachable or returns a non-200 status.
+            CollectionMissingError: If Qdrant is up but the collection does not exist.
+            VectorStoreError: If Qdrant is unreachable, returns another non-200
+                status, or answers 200 with a body of the wrong shape.
         """
         return scroll_point_ids(self.base_url, self.collection, page_size=page_size)
 

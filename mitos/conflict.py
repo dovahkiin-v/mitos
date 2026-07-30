@@ -33,7 +33,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from mitos.display import letter_payload
-from mitos.errors import EmbeddingError, VectorStoreError
+from mitos.errors import CollectionMissingError, EmbeddingError, VectorStoreError
 from mitos.identity import compute_node_id, embedding_text
 
 if TYPE_CHECKING:
@@ -115,15 +115,43 @@ class ConflictUnavailableReason(Enum):
     Defined here in 2a and shared across the pipeline: 2a raises the two
     semantic-substrate reasons; 3a adds ``JUDGMENT`` (a malformed judgment batch —
     its first consumer, plan D4); 3b adds ``JUDGMENT_TIMEOUT`` for the executor's
-    timeout/error path (additive — no edit to the members below). The reason is the
+    timeout/error path; the registry vision's 1b adds ``COLLECTION_MISSING`` (all
+    additive — no edit to the members already below). The reason is the
     machine-readable discriminator a surface (5a) switches on to word its user-facing
     notice; the core never formats UX text (core/surface bulkhead, CONF-D10).
+
+    A new member is only half a decision: every member must also be classified into
+    exactly one of the two buckets below, and
+    ``test_every_unavailable_reason_is_classified_into_exactly_one_bucket`` fails
+    until it is.
     """
 
     EMBEDDING = "embedding_unavailable"        # Gemini embed raised (S1).
     VECTOR_STORE = "vector_store_unavailable"  # Qdrant query raised (S2).
     JUDGMENT = "judgment_unavailable"          # A malformed judgment batch (3a parse) — never a partial batch.
     JUDGMENT_TIMEOUT = "judgment_timeout"      # The 3b executor timed out OR hit any Anthropic error (fail-open, D4).
+    COLLECTION_MISSING = "collection_missing"  # Qdrant is up; the collection does not exist (1b) — heals with `mitos reconcile`.
+
+
+# Every reason that means "semantic recall went dark", as opposed to "the judge went
+# dark". Bound by both surfaces that bucket a reason (``sync``'s sensor notice and the
+# staged gate's degradation token), because each was written as
+# ``if reason in (EMBEDDING, VECTOR_STORE): … else: <the judge>`` — an ``else`` that
+# mis-files a new member **silently, in the confidently-wrong direction**. Nothing had
+# ever iterated this enum before 1b, which is exactly why the hole stayed invisible.
+SEMANTIC_SUBSTRATE_REASONS: Tuple[ConflictUnavailableReason, ...] = (
+    ConflictUnavailableReason.EMBEDDING,
+    ConflictUnavailableReason.VECTOR_STORE,
+    ConflictUnavailableReason.COLLECTION_MISSING,
+)
+
+# The complement: the judgment stage went dark. Declared rather than left implicit in
+# the `else` branches so the membership rule is a fact a test can read (the same
+# enumerate-the-class discipline as ``sync._PREFLIGHT_DISPOSITIONS``).
+JUDGMENT_REASONS: Tuple[ConflictUnavailableReason, ...] = (
+    ConflictUnavailableReason.JUDGMENT,
+    ConflictUnavailableReason.JUDGMENT_TIMEOUT,
+)
 
 
 @dataclass(frozen=True)
@@ -231,6 +259,12 @@ def gather_candidates(
     # iterative: the wide window absorbs S3's non-live drops and 2b's S4 declared/self drops.
     try:
         matches = vector_store.query(vector, limit=CONFLICT_OVERFETCH_LIMIT)
+    except CollectionMissingError as exc:
+        # Subclass first — an absent collection is a recoverable state with a named
+        # heal, not the unreachable-Qdrant fault the broader arm below describes.
+        return Unavailable(
+            reason=ConflictUnavailableReason.COLLECTION_MISSING, detail=str(exc)
+        )
     except VectorStoreError as exc:
         return Unavailable(reason=ConflictUnavailableReason.VECTOR_STORE, detail=str(exc))
 

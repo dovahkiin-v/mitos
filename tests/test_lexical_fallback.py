@@ -21,7 +21,8 @@ from unittest.mock import patch
 
 from mitos.config import MitosConfig
 from mitos.cli import cmd_init, cmd_query, cmd_surface
-from mitos.errors import DatabaseError, EmbeddingError
+from mitos.errors import (CollectionMissingError, DatabaseError, EmbeddingError,
+                          VectorStoreError)
 from mitos.lexical import (
     degraded_reason_from_error,
     lexical_fallback,
@@ -95,6 +96,36 @@ class TestTermMatching:
 
     def test_reason_none_means_unwired(self):
         assert "unavailable" in degraded_reason_from_error(None)
+
+    def test_reason_collection_missing_beats_the_vector_store_arm(self):
+        """G1: the subclass arm must precede the one it subclasses, or it is dead.
+
+        ``isinstance(exc, VectorStoreError)`` is True for a
+        ``CollectionMissingError``, so an arm ordered after it never runs and every
+        read reports "Qdrant unavailable" — the blame-the-infrastructure phrase this
+        phase exists to remove, on the most-used read verb. The classifier is the
+        single shared leaf behind all four read surfaces, so the ordering is worth
+        pinning here as well as through them.
+        """
+        exc = CollectionMissingError(
+            "Qdrant collection 'mitos-x' does not exist", collection="mitos-x"
+        )
+        reason = degraded_reason_from_error(exc)
+
+        assert "mitos-x" in reason
+        assert "mitos reconcile" in reason
+        assert "Qdrant unavailable" not in reason
+        # The broad arm still answers for a genuine outage.
+        assert degraded_reason_from_error(
+            VectorStoreError("Qdrant connection refused")
+        ) == "Qdrant unavailable"
+
+    def test_reason_collection_missing_without_a_name_still_reads(self):
+        """The name is an affordance, not a dependency — an unnamed instance degrades."""
+        reason = degraded_reason_from_error(CollectionMissingError("gone"))
+        assert "collection missing" in reason
+        assert "mitos reconcile" in reason
+        assert "''" not in reason  # no empty-quote artefact
 
 
 class TestLexicalFallbackCore:
@@ -368,3 +399,151 @@ class TestMcpParity:
         assert by_slug["cache-strategy"]["amended_by"] == [
             "cache-strategy-amendment"
         ]
+
+
+# ---------------------------------------------------------------------------
+# I8 — an absent Qdrant collection on the four semantic read surfaces
+#
+# The two things that must be true at once, and holding both IS the gate:
+#   * absence over a POPULATED graph speaks — a real hole in recall, worded as
+#     itself with `mitos reconcile`, never as "Qdrant unavailable";
+#   * absence over an EMPTY graph stays quiet — a just-initialized project has an
+#     empty index by definition, and making that read as broken would break the
+#     "empty/fresh is healthy" line on the very first `mitos query` a new keyed
+#     project runs.
+#
+# A fixture with only the populated row passes under EITHER behaviour, which is
+# exactly how the regression would ship. Both halves, all four surfaces.
+# ---------------------------------------------------------------------------
+
+_ABSENT = "mitos-tmp-absent-collection"
+
+
+class _MissingCollection:
+    """A vector store answering: Qdrant is up, that collection does not exist."""
+
+    def query(self, vector, limit=5):
+        raise CollectionMissingError(
+            f"Qdrant collection '{_ABSENT}' does not exist "
+            "(Qdrant is up and answered 404 to the query).",
+            collection=_ABSENT,
+        )
+
+
+class _Embeds:
+    """An embedding provider that succeeds — the fault under test is downstream."""
+
+    def get_embedding(self, text, is_query=False):
+        return [0.1, 0.2, 0.3]
+
+
+class TestAbsentCollectionOnTheReadSurfaces:
+    def _cli(self, config, verb, **kwargs):
+        with patch("mitos.cli.MitosSyncManager") as MM:
+            mgr = MitosSyncManager(config)
+            mgr.embed_provider = _Embeds()
+            mgr.vector_store = _MissingCollection()
+            MM.return_value = mgr
+            return _capture(verb, config, "cache strategy", **kwargs)
+
+    def _mcp(self, config, monkeypatch, tool):
+        from mitos.store import GraphStore
+        monkeypatch.chdir(config.workspace_dir)
+        from mitos import mcp_server
+        comps = (GraphStore(config.db_path, read_only=True),
+                 _Embeds(), _MissingCollection())
+        with patch.object(mcp_server, "get_workspace_components",
+                          return_value=comps):
+            return json.loads(getattr(mcp_server, tool)("cache strategy"))
+
+    # -- populated graph: absence announces itself, by name, with the heal ----
+
+    @pytest.mark.parametrize("verb_name", ["cmd_query", "cmd_surface"])
+    def test_cli_populated_graph_names_the_collection_and_the_heal(self, ws, verb_name):
+        config, m = ws
+        _rec(m, "cache-strategy", "Use a write-through cache.")
+        verb = {"cmd_query": cmd_query, "cmd_surface": cmd_surface}[verb_name]
+
+        out = self._cli(config, verb)
+
+        assert "Semantic recall unavailable" in out
+        assert _ABSENT in out
+        assert "mitos reconcile" in out
+        # The phrase this whole phase exists to stop: Qdrant is RUNNING.
+        assert "Qdrant unavailable" not in out
+        assert "Traceback" not in out
+        assert "cache-strategy" in out          # the lexical fallback still answers
+
+    @pytest.mark.parametrize("tool", ["query_decisions", "surface_decisions"])
+    def test_mcp_populated_graph_names_the_collection_and_the_heal(
+        self, ws, monkeypatch, tool
+    ):
+        config, m = ws
+        _rec(m, "cache-strategy", "Use a write-through cache.")
+
+        out = self._mcp(config, monkeypatch, tool)
+
+        assert out["degraded"] == "lexical"
+        assert _ABSENT in out["degraded_reason"]
+        assert "mitos reconcile" in out["degraded_reason"]
+        assert "Qdrant unavailable" not in out["degraded_reason"]
+        assert out["matches"][0]["slug"] == "cache-strategy"
+
+    # -- empty graph: the ordinary nothing-found result, no diagnostic --------
+
+    def test_cli_query_empty_graph_stays_the_ordinary_miss(self, ws):
+        config, _m = ws
+        out = self._cli(config, cmd_query)
+
+        assert "No matching decisions found." in out
+        assert "Semantic recall unavailable" not in out
+        assert "reconcile" not in out
+
+    def test_cli_query_empty_graph_json_is_the_clean_envelope(self, ws):
+        config, _m = ws
+        data = json.loads(self._cli(config, cmd_query, as_json=True))
+
+        assert data["matches"] == []
+        assert "degraded" not in data
+        assert "all_superseded" not in data
+        assert data["collection"]                # provenance still rides
+
+    def test_cli_surface_empty_graph_stays_the_ordinary_miss(self, ws):
+        config, _m = ws
+        out = self._cli(config, cmd_surface)
+
+        assert "No active precedents found" in out
+        assert "Semantic recall unavailable" not in out
+
+    @pytest.mark.parametrize("tool", ["query_decisions", "surface_decisions"])
+    def test_mcp_empty_graph_is_the_clean_envelope(self, ws, monkeypatch, tool):
+        config, _m = ws
+        out = self._mcp(config, monkeypatch, tool)
+
+        assert "degraded" not in out
+        assert "degraded_reason" not in out
+        assert out.get("matches", out.get("active_decisions")) == []
+
+    # -- the gate reads the set `reconcile` would index, not just decisions ---
+
+    def test_a_graph_holding_only_an_open_question_still_speaks(self, ws):
+        """``get_active_node_ids`` is decisions ∪ open questions — the set the heal covers.
+
+        Gated on ``get_active_decisions`` instead, a workspace whose only content is
+        a parked open question would read as clean-empty while ``mitos reconcile``
+        did in fact have a node to index. The gate and the heal must agree by
+        construction, not by coincidence.
+        """
+        from mitos.parser import ParsedEntry
+        from mitos.store import GraphStore
+
+        config, _m = ws
+        oq = ParsedEntry("open_question", "an-unsettled-topic", 1, 5)
+        oq.topic = "Cache eviction policy"
+        oq.questions_raised = ["Which cache eviction policy?"]
+        GraphStore(config.db_path).commit_parsed_entry(oq)
+
+        out = self._cli(config, cmd_query)
+
+        assert "Semantic recall unavailable" in out
+        assert "mitos reconcile" in out

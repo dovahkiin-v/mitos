@@ -319,6 +319,40 @@ def corpus_provenance(config: "object") -> Dict[str, str]:
     }
 
 
+def missing_index_is_a_gap(store: "object") -> bool:
+    """Decides whether an absent vector collection is a gap worth reporting (I8).
+
+    The one predicate behind all four semantic read surfaces (``mitos query`` /
+    ``mitos surface`` and their MCP twins), so the two shapes they take cannot
+    become two behaviours. Over a graph holding **no** active nodes an absent
+    collection *is* the empty index — a just-initialized project is healthy, not
+    broken — and the read renders its ordinary nothing-found result with no
+    diagnostic. Over a populated graph it is a real hole in recall, and the read
+    says so and names the heal.
+
+    Gated on ``get_active_node_ids`` rather than ``get_active_decisions`` for a
+    reason stronger than "open questions are embedded too": that set — active
+    decisions ∪ surviving open questions — is exactly what
+    ``reconcile_embeddings`` enqueues, so the diagnostic fires if and only if the
+    ``mitos reconcile`` it points at would actually have something to index. The
+    gate and the heal agree by construction.
+
+    An unreadable graph answers **True**, the loud branch: "I could not check"
+    must never render as the healthy-empty "I checked, there is nothing to index".
+
+    Args:
+        store: The graph store (duck-typed to avoid an import cycle — recall is a
+            leaf module, as in :func:`corpus_provenance`).
+
+    Returns:
+        True when the absence should be surfaced as a degradation.
+    """
+    try:
+        return bool(store.get_active_node_ids())
+    except Exception:
+        return True
+
+
 def provenance_line(config: "object") -> str:
     """Formats ``corpus_provenance`` as the one-line text header."""
     p = corpus_provenance(config)

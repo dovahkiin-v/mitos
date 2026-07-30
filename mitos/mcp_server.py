@@ -13,9 +13,10 @@ from mitos.config import MitosConfig
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.vector_store import QdrantVectorStore
+from mitos.errors import CollectionMissingError
 from mitos.lexical import degraded_reason_from_error, lexical_fallback
 from mitos.recall import (assess_surface_recall, corpus_provenance,
-                          scope_filter_recovery)
+                          missing_index_is_a_gap, scope_filter_recovery)
 
 # Create FastMCP server instance
 mcp = FastMCP("Mitos")
@@ -297,6 +298,18 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
                 )
                 if top_score is None or m["score"] > top_score:
                     top_score = m["score"]
+        except CollectionMissingError as e:
+            # I8 — an absent collection over an EMPTY active set IS the empty index,
+            # and a just-initialized project must not read as broken: leave
+            # `semantic_ran` True so this renders "ran and found nothing" (which is
+            # also what suppresses the degraded-only unranked scope dump below).
+            # Over a populated graph it is a real hole in recall and degrades, with
+            # the header naming the collection and `mitos reconcile`.
+            if missing_index_is_a_gap(store):
+                semantic_ran = False
+                degraded_error = e
+            else:
+                semantic_ran = True
         except Exception as e:
             # Degrade to exact/scope filtering only
             semantic_ran = False
@@ -666,6 +679,21 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             if not output_list and retired:
                 envelope["all_superseded"] = retired
             return dumps_display(envelope, ensure_ascii=False, indent=2)
+        except CollectionMissingError as e:
+            # I8 — see surface_decisions. The healthy-empty envelope is BUILT here
+            # rather than fallen through to: the envelope above (and its `return`)
+            # live inside this `try`, after the query that raised, so there is no
+            # empty path to fall through to at all.
+            if missing_index_is_a_gap(store):
+                return _lexical_degraded_response(
+                    query, reason=degraded_reason_from_error(e), store=store,
+                    brief=brief, limit=clamp_limit(limit),
+                )
+            empty: Dict[str, Any] = {
+                "query": query, "depth_mode": "letter", "matches": [],
+            }
+            empty.update(corpus_provenance(MitosConfig()))
+            return dumps_display(empty, ensure_ascii=False, indent=2)
         except Exception as e:
             # Embedding/Qdrant failure mid-query (e.g. a 429): never the raw
             # provider blob — the deterministic lexical fallback instead.

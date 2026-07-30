@@ -97,6 +97,30 @@ class VectorStoreError(MitosError):
     pass
 
 
+class CollectionMissingError(VectorStoreError):
+    """Qdrant answered: I am up, that collection does not exist (HTTP 404).
+
+    The typed distinction between *missing* and *unreachable*. Absence is a
+    recoverable state with a one-command heal (``mitos reconcile``); an
+    unreachable Qdrant is an infrastructure fault. Reporting the first as the
+    second sends the operator to fix a service that is running.
+
+    A :class:`VectorStoreError` **subclass** on purpose: every shipped
+    ``except VectorStoreError`` net keeps catching it unchanged (``mitos status``'
+    scroll guard, ``cmd_reconcile``'s boundary, ``gather_candidates``' fail-open),
+    so nothing silently changes class and each consumer opts into the narrower
+    catch deliberately.
+
+    Attributes:
+        collection: The absent collection's name, so a surface can name it
+            without re-deriving it from config or scraping the message.
+    """
+
+    def __init__(self, message: str, collection: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.collection = collection
+
+
 class EmbeddingError(MitosError):
     """Raised when embedding provider API calls fail."""
     pass

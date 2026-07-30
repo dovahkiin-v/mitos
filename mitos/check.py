@@ -1363,6 +1363,7 @@ _DEGRADATION_TOKENS: Tuple[str, ...] = (
     "telemetry_write",
     "stale_index",
     "probe_read",
+    "collection_missing",
 )
 
 
@@ -1385,6 +1386,12 @@ def run_degradations(result: CheckRunResult) -> Tuple[str, ...]:
       poison-row escape (KD3).
     * ``"probe_read"`` — the end probe itself was unreadable
       (:class:`ProbeUnavailable`): the run cannot certify completeness.
+    * ``"collection_missing"`` — the sweep went dark because the vector collection
+      does not exist. Emitted **alongside** ``"sweep"``, never instead of it: the
+      effect is unchanged (the sweep degraded) and this names the *cause*, so a
+      trend query on the shipped token stays complete. Derived from the typed
+      reason, not from "any vector fault" — a plain ``VectorStoreError`` still
+      produces ``"sweep"`` alone.
 
     Args:
         result: The typed run outcome.
@@ -1403,6 +1410,11 @@ def run_degradations(result: CheckRunResult) -> Tuple[str, ...]:
             and bool(result.end_probe.transient)
         ),
         "probe_read": isinstance(result.end_probe, ProbeUnavailable),
+        "collection_missing": (
+            result.sweep_degraded is not None
+            and result.sweep_degraded.reason
+            is ConflictUnavailableReason.COLLECTION_MISSING
+        ),
     }
     return tuple(token for token in _DEGRADATION_TOKENS if present[token])
 

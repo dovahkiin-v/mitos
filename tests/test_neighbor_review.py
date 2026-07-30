@@ -942,3 +942,29 @@ def test_cli_record_json_carries_degraded_notice(ws, capsys):
     assert data["status"] == "created"
     assert "vector store unavailable" in data["neighbor_review_unavailable"]
     assert "down" not in data["neighbor_review_unavailable"]
+
+
+def test_cli_record_notice_names_the_missing_collection_and_its_heal(ws, capsys):
+    """A missing collection words itself as itself, with the one command that fixes it.
+
+    The unmapped fallback (``reason.value.replace("_", " ")``) already yields the
+    readable-but-heal-less string "collection missing" — so a test that only greps
+    the noun would pass over an omitted map entry. Assert the ``mitos reconcile``
+    pointer: that is the part the fallback cannot produce.
+    """
+    config, _ = ws
+    unavailable = Unavailable(
+        reason=ConflictUnavailableReason.COLLECTION_MISSING,
+        detail="Qdrant collection 'mitos-x' does not exist",
+    )
+    with patch.object(MitosSyncManager, "_review_neighbors", return_value=unavailable):
+        cmd_record(config, axiom="A new call.", rejected="rej", slug="degcoll",
+                   as_json=True)
+    data = json.loads(capsys.readouterr().out)
+    notice = data["neighbor_review_unavailable"]
+
+    assert data["status"] == "created"          # fail-open: the commit still lands
+    assert "collection is missing" in notice
+    assert "mitos reconcile" in notice
+    assert "vector store unavailable" not in notice
+    assert "mitos-x" not in notice              # detail is logging-only, never rendered

@@ -44,7 +44,7 @@ import anthropic
 from mitos.conflict import ConflictUnavailableReason, Unavailable
 from mitos.conflict_judgment import make_judgment_executor
 from mitos.config import MitosConfig
-from mitos.errors import EmbeddingError, VectorStoreError
+from mitos.errors import CollectionMissingError, EmbeddingError, VectorStoreError
 from mitos.sync import MitosSyncManager
 
 from _conflict_helpers import (
@@ -89,6 +89,20 @@ class _SeveredVector(_FakeVector):
     def query(self, vector: List[float], limit: int = 5) -> List[Dict[str, Any]]:
         self.queries += 1
         raise VectorStoreError("qdrant query severed")
+
+
+class _CollectionlessVector(_FakeVector):
+    """The S2 over-fetch query raises the `CollectionMissingError` SUBCLASS.
+
+    Qdrant is up; the collection is not there. The distinction the whole 1b phase
+    turns on, injected at the same seam as its sibling above.
+    """
+
+    def query(self, vector: List[float], limit: int = 5) -> List[Dict[str, Any]]:
+        self.queries += 1
+        raise CollectionMissingError(
+            "Qdrant collection 'mitos-x' does not exist", collection="mitos-x"
+        )
 
 
 def _req() -> httpx.Request:
@@ -465,3 +479,13 @@ def test_typed_faults_produce_typed_unavailable_reasons() -> None:
     )
     assert isinstance(vector_fault, Unavailable)
     assert vector_fault.reason is ConflictUnavailableReason.VECTOR_STORE
+
+    # The third typed fault: a running Qdrant that simply has no such collection.
+    # It subclasses the one above, so an arm ordered after it would silently make
+    # this leg indistinguishable from an outage.
+    missing_fault = gather_candidates(
+        "Some axiom.", embed_provider=_FakeEmbed(),
+        vector_store=_CollectionlessVector(matches=[_match("x", 0.9)]), store=_Store(),
+    )
+    assert isinstance(missing_fault, Unavailable)
+    assert missing_fault.reason is ConflictUnavailableReason.COLLECTION_MISSING

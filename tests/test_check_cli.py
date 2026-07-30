@@ -87,7 +87,7 @@ def _wire_substrate(
     """Monkeypatches ``cli._build_check_substrate`` to keyed fakes; returns them."""
     embed, vector = _keyed_substrate(neighbourhoods)
     monkeypatch.setattr(cli, "_build_check_substrate",
-                        lambda config: (embed, vector, None, None))
+                        lambda config: (embed, vector, None))
     return embed, vector
 
 

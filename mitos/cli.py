@@ -45,7 +45,7 @@ from mitos.config import (
 )
 from mitos.errors import (
     MitosError, ParseError, ValidationError, DatabaseError, ConfigError,
-    VectorStoreError, EmbeddingError,
+    VectorStoreError, CollectionMissingError, EmbeddingError,
 )
 from mitos.divergence import corpus_graph_divergence, divergence_total
 from mitos.vector_store import scroll_point_ids, hash_to_uuid, QdrantVectorStore
@@ -54,13 +54,15 @@ from mitos.telemetry import TelemetryStore, ConflictCheckRow, JudgmentBatch
 from mitos.identity import compute_node_id
 from mitos.models import get_model_id
 from mitos.parser import ParsedEntry, parse_entry_stream, read_text_or_none
-from mitos.conflict import run_conflict_check, ConflictUnavailableReason
+from mitos.conflict import (run_conflict_check, ConflictUnavailableReason,
+                            SEMANTIC_SUBSTRATE_REASONS)
 from mitos.migrations import is_pre_v1a_schema
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS, open_connection
 from mitos.cutover import default_aside_db_path, perform_swap, rebuild_and_gate
 from mitos.lexical import degraded_reason_from_error, lexical_fallback
 from mitos.recall import (assess_surface_recall, corpus_provenance,
-                          provenance_line, scope_filter_recovery)
+                          missing_index_is_a_gap, provenance_line,
+                          scope_filter_recovery)
 from mitos.sync import (MitosSyncManager, run_ambient_capture, _SLUG_MAX_LEN,
                         _ENTRIES_MARKER, _PAUSE_RESOLVING_RELATIONS)
 from mitos._agent_block import agent_block, agent_block_drift, AGENT_GUIDE_VERSION
@@ -764,6 +766,22 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
             )
             match.update(store.get_modifiers(node["id"]))
             matches.append(match)
+    except CollectionMissingError as e:
+        # I8 — an absent collection over an EMPTY active set IS the empty index, and
+        # a fresh project must not read as broken; over a populated graph it is a
+        # real hole and the degraded header names it plus `mitos reconcile`.
+        # The empty result is constructed HERE, not fallen through to: `matches` and
+        # `retired` are assigned inside the `try`, after the query that raised, so a
+        # bare fall-through would hit an unbound local — on exactly the state (empty
+        # graph + absent collection) nobody reaches by hand.
+        if missing_index_is_a_gap(store):
+            _emit_lexical_degraded(
+                config, query_text, reason=degraded_reason_from_error(e),
+                store=store, as_json=as_json, brief=brief, limit=limit,
+            )
+            return
+        matches = []
+        retired = []
     except Exception as e:
         # Embedding/Qdrant failure mid-query (e.g. a 429): never the raw
         # provider blob — one calm cause line + the deterministic fallback.
@@ -1447,6 +1465,16 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
                 results["active_decisions"].append(_shape(node, m["score"]))
                 if top_score is None or m["score"] > top_score:
                     top_score = m["score"]
+        except CollectionMissingError as e:
+            # I8 — see cmd_query. Over an empty active set the absent collection IS
+            # the empty index, so `semantic_ran` stays True: the read renders "ran
+            # and found nothing", which is also what correctly suppresses the
+            # degraded-only unranked scope dump below.
+            if missing_index_is_a_gap(store):
+                semantic_ran = False
+                degraded_error = e
+            else:
+                semantic_ran = True
         except Exception as e:
             semantic_ran = False
             degraded_error = e
@@ -1917,8 +1945,8 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
     # (superseded vectors that linger, never GC'd) inflates the point total past the
     # active threshold and hides genuinely-missing active vectors (the live-corpus
     # incident: 181 >= 178 read healthy over 12 invisible active nodes). We scroll
-    # Qdrant's actual point ids via the NO-CREATE read path (never constructing a
-    # store that would `_ensure_collection` a missing collection) and diff.
+    # Qdrant's actual point ids and diff. `status` is a read-only sensor and creates
+    # nothing — the module-level scroll keeps it independent of a store entirely.
     #
     # `missing_active` = active nodes with no vector (invisible to semantic search —
     #   the warned state). `orphan_points` = points with no active node — the
@@ -1962,12 +1990,14 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
             pass
 
     initialized = mitos_dir_ok and decisions_ok
-    # A fresh, initialized project has NO Qdrant collection yet — it auto-creates
-    # on the first `record_decision`. So an absent (or empty) collection is a
-    # normal ready state, NOT a blocker: a project with .mitos/, a key, and a
-    # reachable Qdrant is ready to record its first decision. Only an unreachable
-    # Qdrant degrades semantic surface/query. A pre-V1a (prototype) graph is never
-    # ready — it must be routed through the one-time cutover first (§5.2.7).
+    # An absent (or empty) collection is a normal ready state, NOT a blocker: a
+    # project with .mitos/, a key, and a reachable Qdrant is ready to record its
+    # first decision. Absence is not a readiness question because the GRAPH tells
+    # the two cases apart, and the collection row below already does that — over an
+    # empty graph it reads "none recorded yet", over a populated one it warns and
+    # points at `mitos reconcile`. Only an unreachable Qdrant degrades semantic
+    # surface/query. A pre-V1a (prototype) graph is never ready — it must be routed
+    # through the one-time cutover first (§5.2.7).
     ready = initialized and key_ok and q["reachable"] and not pre_v1a
 
     if as_json:
@@ -2005,9 +2035,11 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
 
     verdict = "READY ✓" if ready else ("NEEDS ATTENTION ⚠" if initialized else "NOT SET UP ✗")
     mark = lambda ok: "✓" if ok is True else ("✗" if ok is False else "—")
-    # An absent collection on a reachable Qdrant is normal (auto-creates on the
-    # first record), so show it as a neutral "—" with a note — never a ✗ that
-    # would contradict an otherwise-READY verdict.
+    # An absent collection on a reachable Qdrant is never a readiness ✗ — it is
+    # either the fresh state (nothing recorded yet) or a wipe over a populated
+    # graph, and the two branches below say which. Neutral "—" plus a note, so the
+    # mark can't contradict an otherwise-READY verdict while the note still carries
+    # the heal.
     if not q["reachable"]:
         coll_mark, coll_hint = None, "needs Qdrant up (see above)"
     elif q["collection_exists"]:
@@ -2908,24 +2940,30 @@ def _confirm_spend(n: int, *, assume_yes: bool, as_json: bool) -> Optional[int]:
 
 def _build_check_substrate(
     config: MitosConfig,
-) -> Tuple[Optional[GeminiEmbeddingProvider], Optional[QdrantVectorStore],
-           Optional[str], Optional[str]]:
-    """Constructs the two best-effort external substrate providers (KD2).
+) -> Tuple[Optional[GeminiEmbeddingProvider], QdrantVectorStore, Optional[str]]:
+    """Constructs the two external substrate providers — one of them best-effort (KD2).
 
-    Both providers RAISE at construction — ``GeminiEmbeddingProvider`` when
-    ``GEMINI_API_KEY`` is unset, ``QdrantVectorStore`` when Qdrant is unreachable
-    (its ``__init__`` contacts the network). Each is caught NARROWLY (its own typed
-    error, never a blanket ``except``) and degraded to ``None`` + a kept detail
-    string, so an unexpected error still propagates. The disposition (refuse iff the
-    run has sweep work) is the caller's — this only reports availability. Separated
-    into a module-level helper so tests inject keyed fakes at this seam.
+    ``GeminiEmbeddingProvider`` RAISES at construction when ``GEMINI_API_KEY`` is
+    unset; that is caught NARROWLY (its own typed error, never a blanket
+    ``except``) and degraded to ``None`` + a kept detail string, so an unexpected
+    error still propagates. The disposition (refuse iff the run has sweep work) is
+    the caller's — this only reports availability. Separated into a module-level
+    helper so tests inject keyed fakes at this seam.
+
+    ``QdrantVectorStore`` has **no construction-time failure mode**: its
+    ``__init__`` contacts no network at all, so it is returned unconditionally.
+    Both faults it used to report here — a missing collection and an unreachable
+    Qdrant — now arrive at the *operation*, typed, and reach exit 2 through the
+    sweep's ``Unavailable`` (ADR
+    ``check-precondition-re-keys-from-store-construction-to-operation``). The
+    fail-closed posture is unchanged; only the classification and the wording are.
 
     Args:
         config: The active workspace config (paths + Qdrant coordinates).
 
     Returns:
-        ``(embed, vector, embed_detail, vector_detail)`` — a provider or ``None``,
-        and the failure message string (``None`` on success) for each.
+        ``(embed, vector, embed_detail)`` — the embedding provider or ``None`` with
+        its failure message, and the vector store.
     """
     embed: Optional[GeminiEmbeddingProvider] = None
     embed_detail: Optional[str] = None
@@ -2935,13 +2973,8 @@ def _build_check_substrate(
         )
     except EmbeddingError as exc:
         embed_detail = str(exc)
-    vector: Optional[QdrantVectorStore] = None
-    vector_detail: Optional[str] = None
-    try:
-        vector = QdrantVectorStore(config.qdrant_url, config.qdrant_collection)
-    except VectorStoreError as exc:
-        vector_detail = str(exc)
-    return embed, vector, embed_detail, vector_detail
+    vector = QdrantVectorStore(config.qdrant_url, config.qdrant_collection)
+    return embed, vector, embed_detail
 
 
 def _build_check_telemetry(config: MitosConfig) -> Optional[TelemetryStore]:
@@ -3134,6 +3167,9 @@ def _check_degradation_summary(degradations: Tuple[str, ...]) -> str:
         "telemetry_write": "some per-batch results could not be recorded",
         "stale_index": "the vector index is behind (recall may be thinned)",
         "probe_read": "completeness could not be certified (the index probe was unreadable)",
+        "collection_missing": (
+            "the vector collection does not exist — run `mitos reconcile` to rebuild it"
+        ),
     }
     return "; ".join(words[token] for token in degradations)
 
@@ -3270,20 +3306,19 @@ def cmd_check(
 
     try:
         store = GraphStore(config.db_path)
-        embed, vector, embed_detail, vector_detail = _build_check_substrate(config)
+        embed, vector, embed_detail = _build_check_substrate(config)
         telemetry = _build_check_telemetry(config)
 
         # KD2 — provider-absent disposition keys on whether the run has sweep work.
-        if embed is None or vector is None:
+        # Only the embedding provider can be absent at this point: the vector store
+        # constructs without touching the network, so a missing collection or an
+        # unreachable Qdrant is discovered at the first sweep operation and carried
+        # to the same exit 2 as a typed degradation.
+        if embed is None:
             active = store.get_active_decisions(scope)
             if active:
-                parts: List[str] = []
-                if embed is None:
-                    parts.append(f"embeddings ({embed_detail})")
-                if vector is None:
-                    parts.append(f"vector store ({vector_detail})")
                 msg = (f"check could not run: cannot audit {len(active)} live "
-                       f"decision(s) — {' and '.join(parts)} unavailable.")
+                       f"decision(s) — embeddings ({embed_detail}) unavailable.")
                 if as_json:
                     _emit_json({"error": msg, "code": "substrate_unavailable"})
                 else:
@@ -3513,6 +3548,9 @@ _STAGED_DEGRADATION_WORDS = {
     "sweep": "the semantic substrate went dark mid-run (findings shown are partial)",
     "judgment": "the judge became unavailable mid-run (findings shown are partial)",
     "telemetry_write": "some results could not be recorded",
+    "collection_missing": (
+        "the vector collection does not exist — run `mitos reconcile` to rebuild it"
+    ),
 }
 
 
@@ -3670,16 +3708,14 @@ def _run_staged_check(
                 print("Gate clear — no pending decisions to check.")
             return 0
 
-        embed, vector, embed_detail, vector_detail = _build_check_substrate(config)
-        # Providers absent WITH pending work → fail-closed (the hook precondition), no row.
-        if embed is None or vector is None:
-            parts: List[str] = []
-            if embed is None:
-                parts.append(f"embeddings ({embed_detail})")
-            if vector is None:
-                parts.append(f"vector store ({vector_detail})")
+        embed, vector, embed_detail = _build_check_substrate(config)
+        # The embedding provider absent WITH pending work → fail-closed (the hook
+        # precondition), no row. A missing collection or an unreachable Qdrant is no
+        # longer visible here — it trips the breaker in the entry loop below and
+        # lands on the same exit 2, named rather than blamed on construction.
+        if embed is None:
             msg = (f"check --staged could not gate {len(pending)} pending decision(s) — "
-                   f"{' and '.join(parts)} unavailable.")
+                   f"embeddings ({embed_detail}) unavailable.")
             if as_json:
                 _emit_json({"error": msg, "code": "substrate_unavailable"})
             else:
@@ -3731,14 +3767,18 @@ def _run_staged_check(
             if isinstance(result, check.Unavailable):
                 # Trip the breaker: stop calling the facade for the remaining entries.
                 # The token is faithful to WHICH downstream went dark (aligning with the
-                # corpus P18 vocabulary): the semantic substrate (embedding/vector) reads
-                # as `sweep`, the judge as `judgment`.
-                degraded.add(
-                    "sweep" if result.reason in (
-                        ConflictUnavailableReason.EMBEDDING,
-                        ConflictUnavailableReason.VECTOR_STORE,
-                    ) else "judgment"
-                )
+                # corpus P18 vocabulary): the semantic substrate reads as `sweep`, the
+                # judge as `judgment`. Bound to the shared membership constant, because
+                # an `else` here means "the judge" and would mis-file a new semantic
+                # member silently and confidently.
+                if result.reason in SEMANTIC_SUBSTRATE_REASONS:
+                    degraded.add("sweep")
+                    # Additive, never substitutive — `sweep` is the shipped effect
+                    # token, this names the cause (and the heal, via the word map).
+                    if result.reason is ConflictUnavailableReason.COLLECTION_MISSING:
+                        degraded.add("collection_missing")
+                else:
+                    degraded.add("judgment")
                 break
             nodes_swept += 1
             pairs_judged_fresh += len(result.judged_pairs)
