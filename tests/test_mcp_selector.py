@@ -29,6 +29,7 @@ here is in-process, because the selector's behaviour lives in the function.
 import asyncio
 import json
 import os
+import sys
 from unittest.mock import patch
 
 import pytest
@@ -36,7 +37,7 @@ import pytest
 from mitos import cli, mcp_server, registry, routing
 from mitos.cli import cmd_init, cmd_projects
 from mitos.config import MitosConfig
-from mitos.display import projects_payload
+from mitos.display import projects_payload, resolve_display_ensure_ascii
 from mitos.errors import (
     EXEMPT_EXPLICITLY_GLOBAL,
     TARGETING_DISCRIMINATORS,
@@ -245,6 +246,33 @@ def test_project_is_optional_in_the_schema_and_never_required(tool) -> None:
         "title": "Project",
     }
     assert "project" not in schema.get("required", [])
+
+
+def test_the_targeting_tool_set_is_the_live_one_not_a_hand_copied_list() -> None:
+    """The fence under the four parametrized rows above, and under §4.10's net.
+
+    Those rows are parametrized over a tuple written by hand, so on their own they
+    fence nothing: a seventh tool taking a `project` would simply not be
+    parametrized, and its schema, its documented requirement and its
+    forbidden-syntax sweep would all be unasserted while every row stayed green.
+    This row makes the tuple a claim about the live tool table rather than a list
+    someone remembered to update — computed off `mcp.list_tools()`, the same shape
+    3b used over `subparsers.choices` for the CLI alias set.
+
+    Membership is by the parameter, not by a name list: a tool exposes `project`
+    or it does not, and the one that does not (`list_projects`) has its own row.
+    """
+    exposing = {
+        name for name, tool in _tools().items()
+        if "project" in tool.inputSchema.get("properties", {})
+    }
+
+    assert exposing == set(TARGETING_TOOLS), (
+        "a tool's `project` parameter is not covered by this module's rows — add "
+        "it to TARGETING_TOOLS (which extends the schema, description, "
+        "forbidden-syntax and delivery rows onto it) rather than leaving it "
+        "asserted by nothing"
+    )
 
 
 def test_list_projects_exposes_no_project_parameter() -> None:
@@ -713,17 +741,38 @@ def test_list_projects_is_byte_identical_to_the_cli_json(tmp_path, capsys) -> No
     that actually decides, and a **non-ASCII** name and path, because Lithuanian
     is load-bearing in this project and the encoding seam takes `ensure_ascii` as
     a parameter that the two surfaces set differently.
+
+    Asserted on the emitted **text** as well as on the parsed payloads, because
+    parsed equality is blind to exactly the two things the shared leaf is supposed
+    to fix: key order and indent. `json.loads` would call a compact, differently
+    ordered CLI payload identical to the MCP one, so a row that only compares
+    parsed dicts proves the *values* match and calls it byte parity.
+
+    The text comparison is legitimate here rather than universal, and the
+    difference is worth naming: MCP sets `ensure_ascii=False` unconditionally (the
+    transport has no terminal to sniff) while the CLI resolves it against the live
+    stdout, which under capture is UTF-8 and therefore also non-escaping. On a
+    non-UTF-8 terminal the CLI would emit `\\uXXXX` escapes by design — still the
+    same payload, still parse-equal, which is why both assertions are here rather
+    than only the stricter one.
     """
     root = os.path.realpath(str(tmp_path))
     lithuanian = os.path.join(root, "ąžuolas")
     os.makedirs(lithuanian, exist_ok=True)
     _register_pairs([("zebra", root), ("ąžuolas", lithuanian), ("alpha", root)])
 
-    from_mcp = json.loads(mcp_server.list_projects())
+    mcp_text = mcp_server.list_projects()
     cmd_projects(as_json=True)
-    from_cli = json.loads(capsys.readouterr().out)
+    cli_text = capsys.readouterr().out
+    from_mcp = json.loads(mcp_text)
+    from_cli = json.loads(cli_text)
 
     assert from_mcp == from_cli
+    # `print` adds the newline; everything before it must match exactly.
+    assert not resolve_display_ensure_ascii(sys.stdout), (
+        "the byte assertion below holds only on a non-escaping stdout")
+    assert mcp_text == cli_text.rstrip("\n")
+    assert "ąžuolas" in mcp_text, "no surface escaped the non-ASCII name here"
     assert [p["name"] for p in from_mcp["projects"]] == ["zebra", "ąžuolas", "alpha"]
     assert from_mcp["projects"][1]["path"] == lithuanian
     assert from_mcp["count"] == 3
