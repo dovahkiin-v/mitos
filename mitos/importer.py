@@ -8,22 +8,39 @@ canonical Mitos entries.
 import os
 import json
 import re
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 import anthropic
 
 from mitos.config import MitosConfig
 from mitos.errors import CollectionMissingError, SynthesisError, ValidationError
-from mitos.models import get_model_id
+from mitos.models import get_embedding_model_id, get_model_id
 from mitos.parser import ParsedEntry, parse_header
 from mitos.store import GraphStore, CommitDelta, _utc_now_iso
+from mitos.env import transitional_env_fallback
 from mitos.identity import compute_node_id, embedding_text
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.vector_store import QdrantVectorStore
 from mitos.renderer import MitosRenderer
 
-def run_llm_prose_compression(client: anthropic.Anthropic, title: str, prose_content: str) -> Dict[str, Any]:
-    """Uses Claude Sonnet to faithfully compress a legacy prose ADR into canonical fields."""
+def run_llm_prose_compression(
+    client: anthropic.Anthropic,
+    title: str,
+    prose_content: str,
+    *,
+    model_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """Uses Claude Sonnet to faithfully compress a legacy prose ADR into canonical fields.
+
+    Args:
+        client: The Anthropic client the caller constructed.
+        title: The legacy ADR's heading.
+        prose_content: The legacy ADR's body.
+        model_id: The resolved id for ``SONNET``, taken off the calling
+            workspace's ``config.env``, or ``None`` for the baseline (2c). The
+            same string is stamped as the entry's ``confirmed_by``, so both come
+            from one resolution at the call site.
+    """
     prompt = f"""
 You are the Mitos v0.1 import compression scribe. Your task is to compress a legacy architectural decision record (ADR) into standard, highly precise Mitos fields.
 
@@ -51,10 +68,10 @@ Respond strictly in valid JSON format with the following keys:
 - amends (string or null)
 - resolves (string or null)
 """
-    model_id = get_model_id("SONNET")
+    resolved_model = model_id if model_id is not None else get_model_id("SONNET")
     try:
         message = client.messages.create(
-            model=model_id,
+            model=resolved_model,
             max_tokens=2000,
             temperature=0.3,
             messages=[
@@ -89,7 +106,11 @@ class MitosProseImporter:
         self._collection_absent = False
         try:
             cache_path = os.path.join(self.config.mitos_dir, "embedding_cache.sqlite")
-            self.embed_provider = GeminiEmbeddingProvider(cache_path)
+            self.embed_provider = GeminiEmbeddingProvider(
+                cache_path,
+                api_key=self.config.env.get("GEMINI_API_KEY"),
+                model_id=get_embedding_model_id(self.config.env),
+            )
             self.vector_store = QdrantVectorStore(
                 self.config.qdrant_url,
                 self.config.qdrant_collection
@@ -143,12 +164,18 @@ class MitosProseImporter:
             print("No headings starting with ## or ### found in the import file.")
             return
 
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        api_key = transitional_env_fallback(
+            self.config.env.get("ANTHROPIC_API_KEY"), "ANTHROPIC_API_KEY"
+        )
         if use_llm_extract and not api_key:
             print("ANTHROPIC_API_KEY environment variable is not set. Import --llm-extract requires it.")
             return
 
         client = anthropic.Anthropic(api_key=api_key) if use_llm_extract else None
+        # One resolution for both consumers below — the id the compression call
+        # uses and the id stamped as `confirmed_by` are the same string by
+        # construction, not by two lookups that happen to agree.
+        sonnet_model_id = get_model_id("SONNET", self.config.env)
         renderer = MitosRenderer(self.config.workspace_dir)
 
         imported_count = 0
@@ -174,7 +201,9 @@ class MitosProseImporter:
             if use_llm_extract and client:
                 print(f"Compressing: {slug} ...")
                 try:
-                    compressed = run_llm_prose_compression(client, title or slug, raw_content)
+                    compressed = run_llm_prose_compression(
+                        client, title or slug, raw_content, model_id=sonnet_model_id
+                    )
                 except Exception as e:
                     print(f"[Warning] Failed to compress entry '{slug}': {str(e)}. Skipping.")
                     continue
@@ -211,7 +240,7 @@ class MitosProseImporter:
                 # column (§6.5) — the file:line provenance has no V1a home and is
                 # deferred (a V1b importer concern), not silently crash-on-write.
                 entry.source = "import_llm"
-                entry.confirmed_by = get_model_id("SONNET") if use_llm_extract else "user"
+                entry.confirmed_by = sonnet_model_id if use_llm_extract else "user"
                 entry.confirmed_at = _utc_now_iso()  # MI-10, as in sync's two writers
 
                 # Compute the stable slug-free V1a id (V1-D2) — matches commit_parsed_entry.

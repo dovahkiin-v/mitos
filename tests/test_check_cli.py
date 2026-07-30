@@ -95,7 +95,7 @@ def _wire_judge(monkeypatch: pytest.MonkeyPatch, judge: Any) -> List[bool]:
     """Monkeypatches ``cli._build_check_judge`` to return ``judge``; logs invocation."""
     invoked: List[bool] = []
 
-    def builder() -> Any:
+    def builder(config: MitosConfig) -> Any:
         invoked.append(True)
         return judge
 
@@ -412,7 +412,7 @@ def test_empty_corpus_both_providers_none_exits_0(workspace, monkeypatch, capsys
     config, store, telemetry = workspace
     # Real substrate construction (offline) → (None, None); empty snapshot never
     # touches the providers, so the run stays on the one engine path.
-    monkeypatch.setattr(cli, "_build_check_judge", lambda: None)
+    monkeypatch.setattr(cli, "_build_check_judge", lambda config: None)
 
     code = cli.cmd_check(config, scope=None, fresh=False, assume_yes=False, as_json=False)
 

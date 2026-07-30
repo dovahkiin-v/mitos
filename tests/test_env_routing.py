@@ -1,0 +1,967 @@
+"""Tests for phase 2c: the key and model-override consumers ride `config.env`.
+
+2b built the resolver and hung its answer on ``MitosConfig.env``. This phase
+routes the consumers onto it: every credential and every model override reaches
+its leaf as a value the config-holding orchestrator read off the map for **the
+workspace the call named**, rather than off whatever directory the process
+happened to be launched in.
+
+The discipline every group-2/3/6 row here inverts from 2b's construction rows:
+the sentinel goes in the **workspace's own** ``.env`` (tier 2) with **nothing
+exported**, so a site that resolved from the process environment instead of the
+target cannot pass by accident. 2b's four ``QDRANT_URL`` rows
+(``test_env_resolution.py``, W20) set the value in tier 1 and are cited rather
+than duplicated — they prove the value arrives, these prove it arrives *from the
+target*.
+
+Two shims are pinned live here and both are 5c's to remove. Each such row says
+so in its docstring and names the assertion that replaces it: **invert them, do
+not delete them.** 5c's own I6/I7 suites do not cover this — they catch a call
+site that was never routed (a real key failing to arrive); these catch a
+surviving fallback (the shim outliving its window). Different failures, different
+nets.
+
+Like ``test_env_resolution.py``, this module writes ``os.environ`` in places —
+that is the point — so it carries the same module-autouse ``_keyless`` strip and
+the same ``_unset`` helper. Copied deliberately: a bare
+``monkeypatch.delenv(name, raising=False)`` on an already-absent name records
+nothing, so monkeypatch's undo has nothing to undo and a raw write leaks into
+every module collected afterwards.
+"""
+
+import ast
+import glob
+import json
+import os
+import sys
+from typing import Any, Dict, List, Optional
+from unittest.mock import MagicMock
+
+import pytest
+
+from mitos import cli, embeddings, models
+from mitos.check import execute_corpus_check, plan_corpus_check
+from mitos.config import MitosConfig, RESOLVED_ENV_KEYS
+from mitos.conflict import RenderedPrompt
+from mitos.conflict_judgment import _JUDGMENT_MODEL_ALIAS, make_judgment_executor
+from mitos.env import TIER_ENVIRONMENT, TIER_GLOBAL_ENV, TIER_PROJECT_ENV
+from mitos.errors import EmbeddingError
+from mitos.models import MODEL_IDS, get_embedding_model_id, get_model_id
+from mitos.parser import ParsedEntry
+from mitos.store import GraphStore, open_connection
+from mitos.telemetry import TelemetryStore
+
+from _conflict_helpers import _keyed_substrate, _match
+
+# The one production alias that reaches the three provenance resolves. Pinned as a
+# literal beside the import so a divergence reads as a mismatch, not a rename.
+PRODUCTION_ALIAS = "SONNET"
+
+
+def _unset(monkeypatch, name: str) -> None:
+    """Removes `name` for the test AND guarantees it stays removed at teardown.
+
+    2b's helper verbatim (``test_env_resolution.py``). ``delenv(name,
+    raising=False)`` on an already-absent name records nothing; setting it first
+    forces the absence — or the real prior value — into monkeypatch's record, so
+    a raw ``os.environ`` write later in the row is undone too. Correct in both
+    directions, because the records unwind in reverse.
+    """
+    monkeypatch.setenv(name, "")
+    monkeypatch.delenv(name)
+
+
+@pytest.fixture(autouse=True)
+def _keyless(monkeypatch) -> None:
+    """Strips every name this module routes, so each row builds its own tiers.
+
+    Six test modules pour the repo's real ``.env`` into ``os.environ`` at *import*
+    time, two of them not ``*_live.py``, so in any full-suite run the credentials
+    are present for everything collected afterwards regardless of
+    ``MITOS_NO_LIVE_TESTS``. Every row here opts *in* to the tier it means; a row
+    that assumed absence would pass alone and red in collection order.
+
+    ``QDRANT_URL`` is pointed at a closed port rather than stripped: nothing here
+    touches Qdrant, and a real endpoint inherited from the shell would let a
+    construction row reach the network.
+    """
+    for name in ("GEMINI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY",
+                 "QDRANT_URL", *RESOLVED_ENV_KEYS):
+        _unset(monkeypatch, name)
+    monkeypatch.setenv("QDRANT_URL", "http://localhost:9")
+
+
+def _write(path, text: str) -> str:
+    """Writes a file (creating parents) and returns its path as a string."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return str(path)
+
+
+def _workspace(tmp_path, name: str = "proj", env_text: str = "") -> str:
+    """A real workspace whose own `.env` is the only place a value lives.
+
+    The graph file is materialized so a store construction is a normal open
+    rather than a creation, and ``.env`` is written only when asked — an absent
+    file is the keyless tier-2 this module's degradation rows need.
+    """
+    ws = tmp_path / name
+    (ws / ".mitos").mkdir(parents=True)
+    if env_text:
+        _write(ws / ".env", env_text)
+    GraphStore(str(ws / ".mitos" / "graph.sqlite"))
+    return str(ws)
+
+
+@pytest.fixture
+def genai_keys(monkeypatch) -> List[Optional[str]]:
+    """Records the `api_key` every `GeminiEmbeddingProvider` construction passes.
+
+    The credential is deliberately **not** stored on the provider (P8), so the
+    client constructor is the only seam a routed key can be observed at. Do not
+    "fix" that by adding an ``api_key`` attribute to make a row easier.
+    """
+    seen: List[Optional[str]] = []
+
+    def _client(*, api_key: Optional[str] = None) -> Any:
+        seen.append(api_key)
+        return MagicMock()
+
+    monkeypatch.setattr(embeddings.genai, "Client", _client)
+    return seen
+
+
+@pytest.fixture
+def anthropic_keys(monkeypatch) -> List[Optional[str]]:
+    """Records the `api_key` every judge builder passes to `anthropic.Anthropic`."""
+    import anthropic
+
+    seen: List[Optional[str]] = []
+
+    def _client(*, api_key: Optional[str] = None) -> Any:
+        seen.append(api_key)
+        return MagicMock()
+
+    monkeypatch.setattr(anthropic, "Anthropic", _client)
+    return seen
+
+
+# =========================================================================== #
+# Group 1 — `models.py` is a pure function of the map it is handed
+# =========================================================================== #
+
+def _resolve_alias(alias: str, env: Optional[Dict[str, str]]) -> str:
+    """Dispatches to whichever of the two registry functions owns `alias`."""
+    if alias == "EMBEDDING":
+        return get_embedding_model_id(env)
+    return get_model_id(alias, env)
+
+
+@pytest.mark.parametrize("alias", sorted(MODEL_IDS))
+def test_every_model_override_is_read_from_the_supplied_map(alias):
+    """All four overrides, built from `MODEL_IDS` — never from `MODEL_ALIASES`.
+
+    ``MODEL_ALIASES`` omits ``EMBEDDING``, so a parametrization built from it
+    looks complete while dropping the one override costliest to get wrong: the
+    embedding cache keys on content hash alone, so a mis-routed embedding
+    override reads as working while cached prior-generation vectors flow into a
+    new-generation collection.
+    """
+    env = {f"MITOS_MODEL_OVERRIDE_{alias}": f"override-{alias.lower()}"}
+    assert _resolve_alias(alias, env) == f"override-{alias.lower()}"
+
+
+@pytest.mark.parametrize("alias", sorted(MODEL_IDS))
+def test_an_empty_override_in_the_map_leaves_the_baseline_id_in_force(alias):
+    """The shipped truthiness test, preserved verbatim through the reroute.
+
+    An empty override must not blank the model id — the alternative is a call
+    issued against ``model=""``.
+    """
+    env = {f"MITOS_MODEL_OVERRIDE_{alias}": ""}
+    assert _resolve_alias(alias, env) == MODEL_IDS[alias]
+
+
+@pytest.mark.parametrize("alias", sorted(MODEL_IDS))
+def test_an_absent_map_yields_the_baseline_id(alias):
+    """No map supplied means no override applies — not a lookup somewhere else."""
+    assert _resolve_alias(alias, None) == MODEL_IDS[alias]
+
+
+def test_an_unknown_alias_still_raises_with_the_shipped_message():
+    """The message interpolates `MODEL_ALIASES`, not `MODEL_IDS` — unchanged."""
+    with pytest.raises(ValueError) as exc:
+        get_model_id("GPT", {})
+    assert "Unsupported model alias: GPT" in str(exc.value)
+    assert str(models.MODEL_ALIASES) in str(exc.value)
+
+
+def test_the_model_registry_reads_no_process_environment(monkeypatch):
+    """A process-env override does NOT reach the registry — permanently.
+
+    Not a transitional row: ``models.py`` is a Tier-1 leaf that must not import
+    ``config`` (which imports *it* — an immediate cycle) and must not read the
+    process environment, because an override living in a workspace's ``.env``
+    belongs to *that* workspace. An override reaches a call by being passed;
+    every production reach is routed (see groups 2, 3 and 6). 5c does not touch
+    this row.
+    """
+    for alias in MODEL_IDS:
+        monkeypatch.setenv(f"MITOS_MODEL_OVERRIDE_{alias}", f"from-environ-{alias}")
+
+    for alias in MODEL_IDS:
+        assert _resolve_alias(alias, None) == MODEL_IDS[alias]
+        assert _resolve_alias(alias, {}) == MODEL_IDS[alias]
+
+
+def test_the_model_registry_imports_exactly_typing():
+    """The exact import closure, over the AST — a stronger claim than "no `os`".
+
+    ``import os`` went with the reads: a leaf that no longer touches the process
+    environment should not be *able* to, and a prose mention of ``os.environ``
+    must not satisfy a grep-shaped check. The closure is exact rather than a
+    blacklist because the rule is "stdlib typing only, and nothing from
+    ``mitos``, ever".
+    """
+    tree = ast.parse(open(models.__file__, encoding="utf-8").read())
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+    assert imported == {"typing"}
+
+
+# =========================================================================== #
+# Group 2 — each routed consumer receives the TARGET's value
+# =========================================================================== #
+
+SENTINEL_ENV = "GEMINI_API_KEY=from-the-target\n"
+
+
+def test_the_sync_manager_builds_its_provider_on_the_targets_key(
+    tmp_path, genai_keys
+):
+    """W19 at `sync.py`'s construction site — the workspace's own key arrives.
+
+    The construction sits inside a broad ``except Exception: pass``, so a
+    signature fault here degrades to ``embed_provider = None`` rather than
+    raising. Asserting the *recorded key* (and the provider's presence) is what
+    keeps a swallowed error from reading as a pass.
+    """
+    from mitos.sync import MitosSyncManager
+
+    manager = MitosSyncManager(MitosConfig(_workspace(tmp_path, env_text=SENTINEL_ENV)))
+
+    assert manager.embed_provider is not None
+    assert genai_keys == ["from-the-target"]
+
+
+def test_the_importer_builds_its_provider_on_the_targets_key(tmp_path, genai_keys):
+    """W19 at `importer.py`'s construction site (the same swallow, one worse)."""
+    from mitos.importer import MitosProseImporter
+
+    importer = MitosProseImporter(
+        MitosConfig(_workspace(tmp_path, env_text=SENTINEL_ENV))
+    )
+
+    assert importer.embed_provider is not None
+    assert genai_keys == ["from-the-target"]
+
+
+def test_the_check_substrate_builds_its_provider_on_the_targets_key(
+    tmp_path, genai_keys
+):
+    """W19 at `cli._build_check_substrate` — the seam tests inject keyed fakes at."""
+    embed, _, embed_detail = cli._build_check_substrate(
+        MitosConfig(_workspace(tmp_path, env_text=SENTINEL_ENV))
+    )
+
+    assert embed is not None and embed_detail is None
+    assert genai_keys == ["from-the-target"]
+
+
+def test_the_mcp_server_builds_its_provider_on_the_targets_key(
+    tmp_path, monkeypatch, genai_keys
+):
+    """W19 at `mcp_server.get_workspace_components`.
+
+    It builds a zero-argument ``MitosConfig()``, so the target is the process's
+    working directory — the state 5b replaces with a resolved selector. Driven
+    through ``chdir`` because that is what the site does *today*; the row proves
+    the key arrives, not that the targeting is right.
+    """
+    from mitos import mcp_server
+
+    monkeypatch.chdir(_workspace(tmp_path, env_text=SENTINEL_ENV))
+    _, embed_provider, _ = mcp_server.get_workspace_components()
+
+    assert embed_provider is not None
+    assert genai_keys == ["from-the-target"]
+
+
+def test_the_check_judge_builds_its_client_on_the_targets_key(
+    tmp_path, anthropic_keys
+):
+    """W19 at `cli._build_check_judge` — the ANTHROPIC half, keyed and keyless."""
+    keyed = MitosConfig(
+        _workspace(tmp_path, "keyed", "ANTHROPIC_API_KEY=from-the-target\n")
+    )
+    assert cli._build_check_judge(keyed) is not None
+    assert anthropic_keys == ["from-the-target"]
+
+    assert cli._build_check_judge(MitosConfig(_workspace(tmp_path, "bare"))) is None
+    assert anthropic_keys == ["from-the-target"]  # no second client was built
+
+
+def test_the_sync_conflict_judge_builds_its_client_on_the_targets_key(
+    tmp_path, genai_keys, anthropic_keys
+):
+    """W19 at `sync._build_conflict_judge`.
+
+    Its availability gate reaches the key only when ``embed_provider`` and
+    ``vector_store`` are both live, so the workspace carries the Gemini key too —
+    the row would otherwise return ``None`` for the wrong reason.
+    """
+    from mitos.sync import MitosSyncManager
+
+    ws = _workspace(
+        tmp_path,
+        env_text="GEMINI_API_KEY=from-the-target\nANTHROPIC_API_KEY=anthropic-target\n",
+    )
+    manager = MitosSyncManager(MitosConfig(ws))
+
+    assert manager._build_conflict_judge() is not None
+    assert anthropic_keys == ["anthropic-target"]
+
+
+def test_capture_with_no_key_anywhere_prints_the_shipped_line(tmp_path, capsys):
+    """The keyless disposition at `cmd_capture`, byte-identical after the reroute.
+
+    Four "…is not set" strings share a prefix and a grep returns them as one
+    class; this one and sync's are the two an existing test substring-matches, so
+    the reroute must move neither.
+    """
+    cli.cmd_capture(MitosConfig(_workspace(tmp_path)), "We will use python.")
+
+    out = capsys.readouterr().out
+    assert "GEMINI_API_KEY environment variable is not set" in out
+    assert "Capture requires it" in out
+
+
+def test_sync_with_no_key_anywhere_prints_the_shipped_line(tmp_path, capsys):
+    """The keyless disposition at `perform_sync`'s gate.
+
+    The gate sits below the buffer parse, so a pending entry is required — an
+    empty buffer returns before the key is ever consulted.
+    """
+    config = MitosConfig(_workspace(tmp_path))
+    cli.cmd_init(config)
+    with open(config.decisions_file, "a", encoding="utf-8") as f:
+        f.write(
+            "\n## 2026-06-01 — routed-pending — A pending decision\n"
+            "**Decided:** Some decision.\n"
+            "**Rejected:** None.\n"
+            "**Mechanisms:** python\n"
+            "**Scope:** substrate\n"
+        )
+    capsys.readouterr()
+
+    cli.cmd_sync(config, auto_accept=True)
+
+    out = capsys.readouterr().out
+    assert "GEMINI_API_KEY environment variable is not set" in out
+    assert "Sync requires API keys" in out
+
+
+def test_llm_import_with_no_key_anywhere_prints_the_shipped_line(tmp_path, capsys):
+    """The keyless disposition at `import_from_file`'s ANTHROPIC gate.
+
+    The key is read unconditionally but gated only under ``use_llm_extract``, so a
+    keyless non-LLM import stays a normal path — this drives the gated half.
+    """
+    from mitos.importer import MitosProseImporter
+
+    config = MitosConfig(_workspace(tmp_path))
+    source = _write(tmp_path / "legacy.md", "## A legacy ADR\n\nWe chose python.\n")
+
+    MitosProseImporter(config).import_from_file(source, use_llm_extract=True)
+
+    out = capsys.readouterr().out
+    assert "ANTHROPIC_API_KEY environment variable is not set" in out
+    assert "Import --llm-extract requires it" in out
+
+
+def test_an_exported_empty_key_still_refuses_at_the_provider(tmp_path, genai_keys):
+    """`""` is a supplied answer that must keep masking the file tiers (D4).
+
+    ``env GEMINI_API_KEY= ANTHROPIC_API_KEY= mitos …`` is the shipped idiom for a
+    keyless run on a key-bearing box, and it works by *masking*: the workspace
+    ``.env`` here carries a real key and must lose to the empty export.
+
+    The second half is what makes this a pin rather than a decoration. ``""``
+    and ``None`` behave alike while ``config.env``'s tier 1 *is* ``os.environ``,
+    so the two spellings only diverge once the process environment has moved on
+    from what the config captured — which is precisely the shape ~104 test sites
+    already have. A supplied ``""`` must survive a *real* key appearing beside
+    it: spelling the fallback ``x or os.environ.get(...)`` instead of
+    ``if x is None:`` turns a deliberately keyless run into a keyed, billed one.
+    """
+    os.environ["GEMINI_API_KEY"] = ""  # raw, deliberately — `_unset` undoes it
+    config = MitosConfig(_workspace(tmp_path, env_text=SENTINEL_ENV))
+    cache = os.path.join(config.mitos_dir, "embedding_cache.sqlite")
+
+    assert config.env["GEMINI_API_KEY"] == ""
+    with pytest.raises(EmbeddingError):
+        embeddings.GeminiEmbeddingProvider(
+            cache, api_key=config.env.get("GEMINI_API_KEY")
+        )
+
+    os.environ["GEMINI_API_KEY"] = "a-real-key-that-must-not-win"
+    with pytest.raises(EmbeddingError):
+        embeddings.GeminiEmbeddingProvider(
+            cache, api_key=config.env.get("GEMINI_API_KEY")
+        )
+    assert genai_keys == []
+
+
+# =========================================================================== #
+# Group 3 — the override reaches the call, and the provenance stamp agrees
+# =========================================================================== #
+
+def test_the_embedding_override_from_the_targets_env_reaches_the_provider(
+    tmp_path, genai_keys
+):
+    """The row this phase exists for on the override side.
+
+    ``compute_content_hash`` is ``sha256(text)`` and nothing else — the cache key
+    carries no model id — so a mis-routed embedding override does not fail. It
+    reads as working while cached prior-generation vectors flow into a
+    new-generation collection, and nobody finds out for months.
+    """
+    from mitos.sync import MitosSyncManager
+
+    ws = _workspace(
+        tmp_path,
+        env_text=SENTINEL_ENV + "MITOS_MODEL_OVERRIDE_EMBEDDING=gemini-embedding-next\n",
+    )
+    manager = MitosSyncManager(MitosConfig(ws))
+
+    assert manager.embed_provider is not None
+    assert manager.embed_provider.model_id == "gemini-embedding-next"
+
+
+def _fake_message(text: str) -> MagicMock:
+    """A fake `messages.create` return — `.content[0].text` plus a four-attr usage."""
+    msg = MagicMock()
+    msg.content = [MagicMock(text=text)]
+    msg.usage = MagicMock(
+        input_tokens=120, output_tokens=45,
+        cache_read_input_tokens=0, cache_creation_input_tokens=0,
+    )
+    return msg
+
+
+def _client_returning(message: MagicMock) -> MagicMock:
+    """A fake client whose `with_options(...).messages.create(...)` returns `message`."""
+    client = MagicMock()
+    client.with_options.return_value.messages.create.return_value = message
+    return client
+
+
+def _created_model(client: MagicMock) -> str:
+    """The `model` kwarg the bound judge actually issued."""
+    create = client.with_options.return_value.messages.create
+    create.assert_called_once()
+    return create.call_args.kwargs["model"]
+
+
+def test_the_bound_judge_issues_the_model_id_it_was_built_with():
+    """`make_judgment_executor(client, model_id=…)` binds the id into the call.
+
+    The id rides the closure rather than the facade, so the facade's ``judge``
+    stays a one-arg function of a ``RenderedPrompt`` — the frozen executor
+    boundary is threaded, not widened.
+    """
+    client = _client_returning(_fake_message("[]"))
+    judge = make_judgment_executor(client, model_id="claude-sonnet-from-target")
+
+    judge(RenderedPrompt(system="S", user="U", prompt_version="conflict-tenability-v1"))
+
+    assert _created_model(client) == "claude-sonnet-from-target"
+
+
+def _batches(telemetry: TelemetryStore) -> List[Dict[str, Any]]:
+    """Reads back every ``judgment_batches`` row (read-only; insertion order)."""
+    import sqlite3
+
+    conn = open_connection(telemetry.telemetry_path, read_only=True)
+    try:
+        conn.row_factory = sqlite3.Row
+        return [dict(row) for row in
+                conn.execute("SELECT * FROM judgment_batches ORDER BY rowid")]
+    finally:
+        conn.close()
+
+
+def _commit(store: GraphStore, slug: str, axiom: str) -> str:
+    """Commits a decision and returns its content-hash node id."""
+    entry = ParsedEntry("decision", slug, 1, 5)
+    entry.axiom = axiom
+    entry.rejected_paths = "An alternative."
+    return store.commit_parsed_entry(entry).node_id
+
+
+def test_the_judged_model_id_and_the_persisted_one_are_the_same_string(tmp_path):
+    """The join-key row: what the call used and what provenance records must agree.
+
+    With ``MITOS_MODEL_OVERRIDE_SONNET`` in a workspace ``.env`` **only**, two
+    independent resolutions have to land on it — the judge's, bound at build
+    time from ``config.env``, and ``execute_corpus_check``'s, taken inside the
+    batch loop from the ``env`` map it is handed (``execution.model_alias`` does
+    not exist before then, which is why the map travels rather than an id).
+
+    This is the row that catches a half-threaded phase. The call using the
+    override while the telemetry column records the baseline raises nothing,
+    fails no other assertion, and is a silently wrong provenance column forever.
+    """
+    override = "claude-sonnet-from-target"
+    ws = _workspace(
+        tmp_path, env_text=f"MITOS_MODEL_OVERRIDE_{PRODUCTION_ALIAS}={override}\n"
+    )
+    config = MitosConfig(ws)
+    store = GraphStore(config.db_path)
+    telemetry = TelemetryStore(config.telemetry_path)
+
+    a_id = _commit(store, "routed-a", "The first axiom under judgment.")
+    _commit(store, "routed-b", "The second axiom under judgment.")
+    nodes = {
+        node["core_axiom"]: node
+        for node in store.get_decisions(state="active")
+    }
+    partner = next(n for n in nodes.values() if n["id"] != a_id)
+    neighbourhoods = {axiom: [] for axiom in nodes}
+    neighbourhoods["The first axiom under judgment."] = [_match(partner["slug"], 0.9)]
+    embed, vector = _keyed_substrate(neighbourhoods)
+
+    plan = plan_corpus_check(
+        store=store, embed_provider=embed, vector_store=vector,
+        telemetry=telemetry, model_alias=PRODUCTION_ALIAS,
+    )
+    assert len(plan.fresh_groups) == 1
+
+    # The batch's partner slugs come off the group, never from the fixture's own
+    # idea of which node became the proposal — grouping orients by hash, which is a
+    # DB accident. A guessed slug parses to `Unavailable` and the row would red on
+    # the wrong thing.
+    verdicts = json.dumps([
+        {"slug": pair.partner_node["slug"], "rationale": "They coexist.",
+         "tenable_together": True, "confidence": 0.9}
+        for pair in plan.fresh_groups[0].pairs
+    ])
+    client = _client_returning(_fake_message(verdicts))
+    judge = make_judgment_executor(
+        client, model_id=get_model_id(_JUDGMENT_MODEL_ALIAS, config.env)
+    )
+
+    result = execute_corpus_check(
+        plan, judge=judge, telemetry=telemetry, store=store, env=config.env
+    )
+
+    assert result.judgment_degraded is None
+    batches = _batches(telemetry)
+    assert len(batches) == 1
+    assert _created_model(client) == override
+    assert batches[0]["model_id"] == override
+
+
+# =========================================================================== #
+# Group 4 — `_gemini_key_source` on the resolver's tier report
+# =========================================================================== #
+
+def test_the_key_source_reports_the_project_env_tier(tmp_path):
+    """Tier 2 wins when nothing is exported."""
+    ws = _workspace(tmp_path, env_text="GEMINI_API_KEY=PROJKEY\n")
+    assert cli._gemini_key_source(ws) == TIER_PROJECT_ENV
+
+
+def test_the_key_source_reports_the_global_env_tier(tmp_path, monkeypatch):
+    """Tier 3 wins when the workspace has only the scaffolded empty slot.
+
+    The shape ``mitos init`` produces and its own README recommends: an empty
+    ``GEMINI_API_KEY=`` line under a comment telling the user to set the key once
+    globally. A resolver testing key *presence* at tier 2 would answer
+    ``project .env`` here and every project following the tool's advice would
+    lose its key.
+    """
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    cli.cmd_set_key("GLOBALKEY", is_global=True)
+    ws = _workspace(tmp_path, env_text="GEMINI_API_KEY=\n")
+    assert cli._gemini_key_source(ws) == TIER_GLOBAL_ENV
+
+
+def test_the_key_source_reports_the_environment_tier(tmp_path, monkeypatch):
+    """Tier 1 wins over both files."""
+    monkeypatch.setenv("GEMINI_API_KEY", "ENVKEY")
+    ws = _workspace(tmp_path, env_text="GEMINI_API_KEY=PROJKEY\n")
+    assert cli._gemini_key_source(ws) == TIER_ENVIRONMENT
+
+
+def test_the_key_source_is_none_when_nothing_carries_the_key(tmp_path):
+    """No tier answered — and `_gemini_key_present` (its dead wrapper) agrees."""
+    ws = _workspace(tmp_path)
+    assert cli._gemini_key_source(ws) is None
+    assert cli._gemini_key_present(ws) is False
+
+
+def test_an_exported_empty_key_is_reported_as_no_key(tmp_path, monkeypatch):
+    """The report is keyed on the VALUE, never on the tier being non-None.
+
+    An exported-empty variable resolves to ``ResolvedValue("", "environment")``
+    — a real answer with a real tier — so keying on ``.tier is not None`` would
+    make ``env GEMINI_API_KEY= mitos status`` claim a key is present while every
+    consumer refuses to run.
+    """
+    monkeypatch.setenv("GEMINI_API_KEY", "")
+    ws = _workspace(tmp_path, env_text="GEMINI_API_KEY=PROJKEY\n")
+    assert cli._gemini_key_source(ws) is None
+
+
+def test_status_attributes_a_project_env_key_to_the_environment(
+    tmp_path, monkeypatch, capsys
+):
+    """5c INVERTS THIS ROW — do not delete it.
+
+    Driven through ``cli.main()`` on a workspace whose ``.env`` carries the key
+    with nothing exported. ``main()`` loads that ``.env`` into ``os.environ``
+    before anything resolves, so the env-first resolver truthfully answers
+    ``environment`` for a key whose durable home is the file — less specific than
+    the retired file-first implementation, never false, and bought in exchange
+    for there being only one layering implementation in the tree.
+
+    **5c deletes the entry-time dotenv load (`cli.py`'s two `load_dotenv_file`
+    calls in `main`); this row then asserts `(from project .env)`.** Invert the
+    expectation — the row is the only thing that will make that phase notice the
+    attribution moved.
+    """
+    ws = _workspace(tmp_path, env_text="GEMINI_API_KEY=PROJKEY\n")
+    monkeypatch.chdir(tmp_path)  # restores the cwd `main`'s -C chdir moves
+    monkeypatch.setattr(sys, "argv", ["mitos", "-C", ws, "status"])
+
+    # `status` exits non-zero on this bare workspace (never initialized, no Qdrant)
+    # — irrelevant to the attribution, which prints on every branch.
+    with pytest.raises(SystemExit):
+        cli.main()
+
+    out = capsys.readouterr().out
+    assert f"GEMINI_API_KEY (from {TIER_ENVIRONMENT})" in out
+    assert f"GEMINI_API_KEY (from {TIER_PROJECT_ENV})" not in out
+
+
+# =========================================================================== #
+# Group 5 — the transitional fallback, pinned live
+# =========================================================================== #
+
+class TestTheTransitionalEnvFallback:
+    """`env.transitional_env_fallback` is a compatibility shim with a named death.
+
+    It cannot lie while it lives: tier 1 of the resolution it backs up **is**
+    ``os.environ``, so at every routed production site the supplied value is a
+    strict superset of what the shim would find. It stops being harmless at 5c,
+    which deletes the entry-time dotenv load — ``os.environ`` then no longer
+    holds the workspace's keys and a site that forgot to pass would silently
+    resolve nothing, or the launch directory's residue.
+
+    Every row below is one 5c must **invert**, not delete. 5c's own I6/I7 suites
+    will not catch a surviving shim: behind a routed site the fallback never
+    fires, so they pass with it fully intact. What they detect is an *unrouted*
+    site. These four are the shim's only net.
+    """
+
+    def test_the_provider_without_an_api_key_reads_the_process_environment(
+        self, tmp_path, monkeypatch, genai_keys
+    ):
+        """5c INVERTS: `pytest.raises(EmbeddingError)` with nothing supplied.
+
+        The seven bare ``GeminiEmbeddingProvider(cache_path)`` constructions in
+        ``tests/`` are what this keeps green, and five of them are the live-tier
+        modules CI cannot see.
+        """
+        monkeypatch.setenv("GEMINI_API_KEY", "from-the-process")
+
+        provider = embeddings.GeminiEmbeddingProvider(
+            str(tmp_path / "cache.sqlite")
+        )
+
+        assert provider is not None
+        assert genai_keys == ["from-the-process"]
+
+    def test_sync_without_a_resolved_key_reads_the_process_environment(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """5c INVERTS: the "not set" line prints even with the key in `os.environ`.
+
+        The dominant test shape in this tree is config-first, key-second: a
+        fixture builds ``MitosConfig`` and each row then writes
+        ``os.environ["GEMINI_API_KEY"]`` raw. ``config.env`` is captured at
+        construction, so ~104 sites across 19 files reach their routed consumer
+        through this branch. 5c must migrate that class in the same commit that
+        deletes the shim.
+        """
+        config = MitosConfig(_workspace(tmp_path))
+        cli.cmd_init(config)
+        with open(config.decisions_file, "a", encoding="utf-8") as f:
+            f.write(
+                "\n## 2026-06-01 — fallback-pending — A pending decision\n"
+                "**Decided:** Some decision.\n"
+                "**Rejected:** None.\n"
+                "**Mechanisms:** python\n"
+                "**Scope:** substrate\n"
+            )
+        assert "GEMINI_API_KEY" not in config.env
+        monkeypatch.setenv("GEMINI_API_KEY", "from-the-process")
+        capsys.readouterr()
+
+        cli.cmd_sync(config, auto_accept=True)
+
+        assert "Sync requires API keys" not in capsys.readouterr().out
+
+    def test_the_check_judge_without_a_resolved_key_reads_the_process_environment(
+        self, tmp_path, monkeypatch, anthropic_keys
+    ):
+        """5c INVERTS: `_build_check_judge(config)` returns `None`."""
+        config = MitosConfig(_workspace(tmp_path))
+        assert "ANTHROPIC_API_KEY" not in config.env
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "from-the-process")
+
+        assert cli._build_check_judge(config) is not None
+        assert anthropic_keys == ["from-the-process"]
+
+    def test_capture_without_a_resolved_key_reads_the_process_environment(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """5c INVERTS: the "not set" line prints even with the key in `os.environ`."""
+        config = MitosConfig(_workspace(tmp_path))
+        assert "GEMINI_API_KEY" not in config.env
+        monkeypatch.setenv("GEMINI_API_KEY", "from-the-process")
+
+        cli.cmd_capture(config, "We will use python.")
+
+        assert "Capture requires it" not in capsys.readouterr().out
+
+
+# --- the structural net ----------------------------------------------------
+
+# Every `os.environ` READ that survives this phase, as `(module, function)`.
+# Keyed on the enclosing function rather than a line number: the set is exact
+# either way, and this spelling does not churn when a file above it moves.
+PERMANENT_ENV_READS = {
+    ("env.py", "_resolve"): 2,          # the resolver's own tier 1 — the legitimate one
+    ("config.py", "_hint_cache_path"): 1,   # XDG_CACHE_HOME — genuinely process-scoped
+    ("config.py", "config_home"): 1,        # XDG_CONFIG_HOME — likewise
+    ("_update.py", "_cache_path"): 1,       # XDG
+    ("_update.py", "update_notice"): 1,     # MITOS_NO_UPDATE_CHECK quiet-switch
+    ("cli.py", "_mcp_hint"): 1,             # MITOS_NO_MCP_HINT quiet-switch
+    ("cli.py", "load_dotenv_file"): 2,      # the guard + the write — 5c deletes both
+}
+
+# The shim's own read. One site, one function, one grep string.
+TRANSITIONAL_ENV_READS = {("env.py", "transitional_env_fallback"): 1}
+
+
+def _environ_reads(path: str) -> List[str]:
+    """Every `os.environ` READ in a module, as the name of its enclosing function.
+
+    Four shapes, because the tree uses all four: ``os.environ.get(...)``,
+    ``os.environ.setdefault/pop(...)``, ``name in os.environ``, and a
+    ``os.environ[name]`` subscript in either context. Swept over the AST rather
+    than the text — several of these modules discuss ``os.environ`` in prose, it
+    being the thing this design stopped consulting.
+    """
+    found: List[str] = []
+
+    class Visitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.stack: List[str] = []
+
+        def _scoped(self, node: ast.AST) -> None:
+            self.stack.append(node.name)
+            self.generic_visit(node)
+            self.stack.pop()
+
+        visit_FunctionDef = _scoped
+        visit_AsyncFunctionDef = _scoped
+        visit_ClassDef = _scoped
+
+        def _hit(self) -> None:
+            found.append(".".join(self.stack) or "<module>")
+
+        @staticmethod
+        def _is_environ(node: ast.AST) -> bool:
+            return isinstance(node, ast.Attribute) and node.attr == "environ"
+
+        def visit_Call(self, node: ast.Call) -> None:
+            func = node.func
+            if (isinstance(func, ast.Attribute)
+                    and func.attr in ("get", "setdefault", "pop")
+                    and self._is_environ(func.value)):
+                self._hit()
+            self.generic_visit(node)
+
+        def visit_Compare(self, node: ast.Compare) -> None:
+            if any(self._is_environ(c) for c in node.comparators):
+                self._hit()
+            self.generic_visit(node)
+
+        def visit_Subscript(self, node: ast.Subscript) -> None:
+            if self._is_environ(node.value):
+                self._hit()
+            self.generic_visit(node)
+
+    Visitor().visit(ast.parse(open(path, encoding="utf-8").read()))
+    return found
+
+
+def test_the_process_environment_is_read_only_at_the_declared_sites():
+    """The exact set of `os.environ` reads in `mitos/` — the checklist, not a comment.
+
+    Two declared sets rather than one, because they die on different days.
+    ``PERMANENT_ENV_READS`` is XDG resolution, two quiet-switches, the resolver's
+    own tier 1, and ``load_dotenv_file``'s pair (5c's). ``TRANSITIONAL_ENV_READS``
+    is the shim, and it is deliberately a **single** site so 5c deletes one
+    function rather than hunting: ``grep -rn transitional_env_fallback`` is the
+    whole checklist.
+
+    This is the row that catches a bare read growing back — including the
+    asymmetric case the behavioural rows cannot see: route every credential but
+    leave ``models.py`` reading the process environment, and only this reds.
+    """
+    counted: Dict[Any, int] = {}
+    for path in sorted(glob.glob(os.path.join(os.path.dirname(models.__file__), "*.py"))):
+        module = os.path.basename(path)
+        for func in _environ_reads(path):
+            counted[(module, func)] = counted.get((module, func), 0) + 1
+
+    assert counted == {**PERMANENT_ENV_READS, **TRANSITIONAL_ENV_READS}
+
+
+# Every model-registry call in `mitos/` that resolves WITHOUT a map, as
+# `(module, function)`. All five are the leaf fallbacks a caller supplying
+# nothing lands on; every other call site is routed, and the row below is what
+# keeps that true.
+UNROUTED_MODEL_RESOLVES = {
+    ("embeddings.py", "GeminiEmbeddingProvider.__init__"),
+    ("sync.py", "run_sync_enrichment"),
+    ("sync.py", "run_ambient_capture"),
+    ("importer.py", "run_llm_prose_compression"),
+    ("conflict_judgment.py", "execute_judgment"),
+}
+
+
+def test_every_model_resolve_outside_a_leaf_fallback_is_handed_a_map():
+    """The override half of the routing, swept structurally.
+
+    A dropped ``env`` argument at a provenance resolve raises nothing, fails no
+    other assertion, and writes a model the run never used into a column nobody
+    reads until they need it — group 3's join-key row is the only *behavioural*
+    net, and it covers one of the three resolves. This covers all of them, and
+    catches the same omission at the two model-id resolves that never reach
+    telemetry at all.
+    """
+    unrouted = set()
+    for path in sorted(glob.glob(os.path.join(os.path.dirname(models.__file__), "*.py"))):
+        tree = ast.parse(open(path, encoding="utf-8").read())
+        stack: List[str] = []
+
+        class Visitor(ast.NodeVisitor):
+            def _scoped(self, node: ast.AST) -> None:
+                stack.append(node.name)
+                self.generic_visit(node)
+                stack.pop()
+
+            visit_FunctionDef = _scoped
+            visit_AsyncFunctionDef = _scoped
+            visit_ClassDef = _scoped
+
+            def visit_Call(self, node: ast.Call) -> None:
+                func = node.func
+                name = (func.id if isinstance(func, ast.Name)
+                        else func.attr if isinstance(func, ast.Attribute) else None)
+                needed = {"get_model_id": 2, "get_embedding_model_id": 1}.get(name)
+                if needed is not None and len(node.args) < needed:
+                    unrouted.add((os.path.basename(path), ".".join(stack)))
+                self.generic_visit(node)
+
+        Visitor().visit(tree)
+
+    assert unrouted == UNROUTED_MODEL_RESOLVES
+
+
+def test_the_two_orchestrators_hand_their_map_down():
+    """`cmd_check`'s and `_run_staged_check`'s calls carry `env=`.
+
+    The row above proves each resolve *takes* a map; this proves the two CLI
+    sites that own one actually pass it. A resolve reading ``env=None`` because
+    its caller forgot the keyword is indistinguishable, at every other seam,
+    from a workspace that simply set no override.
+    """
+    tree = ast.parse(open(cli.__file__, encoding="utf-8").read())
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and (getattr(node.func, "attr", None) == "execute_corpus_check"
+             or getattr(node.func, "id", None) == "_persist_staged_batch")
+    ]
+    assert len(calls) == 2, "the two hand-down sites moved — re-read §10 item 16/17"
+    for call in calls:
+        assert "env" in [kw.arg for kw in call.keywords]
+
+
+# =========================================================================== #
+# Group 6 — T10's offline half: a cross-directory call resolves the TARGET's key
+# =========================================================================== #
+
+def test_a_cross_directory_cli_call_resolves_the_targets_key(
+    tmp_path, monkeypatch, genai_keys
+):
+    """I7 on the CLI surface: cwd in A, config for B, B's key arrives.
+
+    Nothing is exported, and A's ``.env`` carries a *different* sentinel — so a
+    site resolving from the working directory fails loudly rather than passing on
+    an empty tier. The ``QDRANT_URL`` companion is already proven by 2b's four
+    construction rows (W20, ``test_env_resolution.py``); it is cited, not
+    duplicated.
+    """
+    a = _workspace(tmp_path, "a", "GEMINI_API_KEY=key-of-a\n")
+    b = _workspace(tmp_path, "b", "GEMINI_API_KEY=key-of-b\n")
+    monkeypatch.chdir(a)
+
+    embed, _, _ = cli._build_check_substrate(MitosConfig(b))
+
+    assert embed is not None
+    assert genai_keys == ["key-of-b"]
+
+
+def test_a_cross_directory_mcp_call_resolves_the_targets_key(
+    tmp_path, monkeypatch, genai_keys
+):
+    """I7 on the MCP surface, in-process.
+
+    ``get_workspace_components`` targets the working directory today, so this
+    drives it through ``chdir(B)`` from A. The **real `mitos serve` subprocess**
+    row is 5c's, on 3a's harness — an in-process approximation cannot observe the
+    entry path or process-owned env, which is exactly where I6's hazards live, so
+    it is deliberately not attempted here.
+    """
+    from mitos import mcp_server
+
+    a = _workspace(tmp_path, "a", "GEMINI_API_KEY=key-of-a\n")
+    b = _workspace(tmp_path, "b", "GEMINI_API_KEY=key-of-b\n")
+    monkeypatch.chdir(a)
+    monkeypatch.chdir(b)
+
+    _, embed_provider, _ = mcp_server.get_workspace_components()
+
+    assert embed_provider is not None
+    assert genai_keys == ["key-of-b"]

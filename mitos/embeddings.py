@@ -11,6 +11,7 @@ import os
 from typing import List, Dict, Optional, Any, Tuple
 from google import genai
 from mitos.models import get_embedding_model_id
+from mitos.env import transitional_env_fallback
 from mitos.errors import EmbeddingError
 
 class EmbeddingCache:
@@ -82,17 +83,40 @@ class EmbeddingCache:
 class GeminiEmbeddingProvider:
     """Gemini-based implementation of the embedding provider."""
 
-    def __init__(self, cache_path: str) -> None:
+    def __init__(
+        self,
+        cache_path: str,
+        *,
+        api_key: Optional[str] = None,
+        model_id: Optional[str] = None,
+    ) -> None:
+        """Builds the provider for one workspace's key and embedding model.
+
+        Args:
+            cache_path: The content-hash embedding cache (its key carries **no**
+                model id, which is why ``model_id`` must arrive resolved for the
+                right target rather than be read here).
+            api_key: The workspace's ``GEMINI_API_KEY``, or ``None`` when the
+                caller supplied nothing (the transitional fallback then reads the
+                process environment — 5c). ``""`` is a supplied answer and still
+                refuses, which is what keeps ``env GEMINI_API_KEY= mitos …`` a
+                keyless run.
+            model_id: The resolved embedding model id, or ``None`` for the
+                baseline. Never stored beyond ``self.model_id``; the key is never
+                stored at all (P8).
+        """
         self.cache = EmbeddingCache(cache_path)
         self.hits = 0
         self.misses = 0
-        
+
         # API Client initialization using the new google-genai SDK
-        api_key = os.environ.get("GEMINI_API_KEY")
-        if not api_key:
+        key = transitional_env_fallback(api_key, "GEMINI_API_KEY")
+        if not key:
             raise EmbeddingError("GEMINI_API_KEY environment variable is not set")
-        self.client = genai.Client(api_key=api_key)
-        self.model_id = get_embedding_model_id()
+        self.client = genai.Client(api_key=key)
+        self.model_id = (
+            model_id if model_id is not None else get_embedding_model_id()
+        )
 
     def get_stats(self) -> Tuple[int, int, float]:
         """Returns cache stats: (hits, misses, hit_rate)."""

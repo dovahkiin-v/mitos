@@ -12,6 +12,7 @@ from mitos.display import blackout_note, clamp_limit, dumps_display, letter_payl
 from mitos.config import MitosConfig
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS
 from mitos.embeddings import GeminiEmbeddingProvider
+from mitos.models import get_embedding_model_id
 from mitos.vector_store import QdrantVectorStore
 from mitos.errors import CollectionMissingError
 from mitos.lexical import degraded_reason_from_error, lexical_fallback
@@ -135,7 +136,11 @@ def get_workspace_components() -> Tuple[GraphStore, Optional[GeminiEmbeddingProv
     vector_store = None
     try:
         cache_path = os.path.join(config.mitos_dir, "embedding_cache.sqlite")
-        embed_provider = GeminiEmbeddingProvider(cache_path)
+        embed_provider = GeminiEmbeddingProvider(
+            cache_path,
+            api_key=config.env.get("GEMINI_API_KEY"),
+            model_id=get_embedding_model_id(config.env),
+        )
         vector_store = QdrantVectorStore(config.qdrant_url, config.qdrant_collection)
     except Exception:
         pass

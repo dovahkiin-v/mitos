@@ -36,13 +36,12 @@ def test_upsert_replaces_empty_slot_no_duplicate(tmp_path):
     assert "OTHER=keep" in content  # other lines preserved
 
 
-def test_env_file_has_key_skips_empty_slot(tmp_path):
-    env = tmp_path / ".env"
-    env.write_text("GEMINI_API_KEY=\n")
-    assert cli._env_file_has_key(str(env), "GEMINI_API_KEY") is False
-    # a real value on a LATER line is still found (past the empty scaffolded slot)
-    env.write_text("GEMINI_API_KEY=\nGEMINI_API_KEY=real\n")
-    assert cli._env_file_has_key(str(env), "GEMINI_API_KEY") is True
+# The empty-slot row that lived here drove `cli`'s own second hand-rolled `.env`
+# parse, which phase 2c retired: `_gemini_key_source` now reads `env.resolve_key`,
+# the tree's one layering implementation. That behaviour (an empty scaffolded slot
+# skipped, a real value on a later line still found) is pinned on
+# `env.parse_env_file` in `tests/test_env_resolution.py`; retargeting the row here
+# would duplicate a shipped one.
 
 
 def test_key_source_global_then_project_override(monkeypatch, tmp_path):

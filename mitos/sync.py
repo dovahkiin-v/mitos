@@ -52,7 +52,8 @@ from mitos.errors import (
     STORE_MISSING_TARGET,
     STORE_SLUG_COLLISION,
 )
-from mitos.models import get_model_id
+from mitos.env import transitional_env_fallback
+from mitos.models import get_embedding_model_id, get_model_id
 from mitos.parser import (ParsedEntry, mask_inline_code, parse_entry_stream,
                           parse_file_reversed)
 from mitos.replay import commit_quarantine_fixpoint
@@ -104,7 +105,9 @@ class _ConflictSyncRun:
 def run_sync_enrichment(
     client: genai.Client,
     entry: ParsedEntry,
-    active_decisions: List[Dict[str, Any]]
+    active_decisions: List[Dict[str, Any]],
+    *,
+    model_id: Optional[str] = None
 ) -> Dict[str, Any]:
     """Calls Gemini to refine a decision, infer scopes, and suggest relationships.
 
@@ -115,6 +118,13 @@ def run_sync_enrichment(
     only as the live test-suite's generative-quota probe target
     (``tests/live_helpers.py``); it is dead in the production path and a candidate for
     removal once that probe is repointed to a still-live generative call.
+
+    Args:
+        client: The Gemini client the caller constructed.
+        entry: The parsed entry to enrich.
+        active_decisions: The active decisions to summarise into the prompt.
+        model_id: The resolved id for ``FLASH_LITE``, taken off the calling
+            workspace's ``config.env``, or ``None`` for the baseline (2c).
     """
     active_summary = ""
     for d in active_decisions[:20]:  # Limit to top 20 active decisions for prompt budget
@@ -146,10 +156,12 @@ Respond strictly in valid JSON format with the following keys:
 - refined_scope (list of strings)
 - suggested_relationships (object with keys: supersedes, amends, narrows, depends_on, resolves)
 """
-    model_id = get_model_id("FLASH_LITE")
+    resolved_model = (
+        model_id if model_id is not None else get_model_id("FLASH_LITE")
+    )
     try:
         response = client.models.generate_content(
-            model=model_id,
+            model=resolved_model,
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
@@ -161,8 +173,17 @@ Respond strictly in valid JSON format with the following keys:
         raise SynthesisError(f"LLM enrichment call failed: {str(e)}")
 
 
-def run_ambient_capture(client: genai.Client, raw_text: str) -> str:
-    """Uses FLASH to convert raw conversational text into a canonical Markdown entry."""
+def run_ambient_capture(
+    client: genai.Client, raw_text: str, *, model_id: Optional[str] = None
+) -> str:
+    """Uses FLASH to convert raw conversational text into a canonical Markdown entry.
+
+    Args:
+        client: The Gemini client the caller constructed.
+        raw_text: The developer's raw conversational input.
+        model_id: The resolved id for ``FLASH``, taken off the calling
+            workspace's ``config.env``, or ``None`` for the baseline (2c).
+    """
     prompt = f"""
 You are the Mitos v0.1 capture scribe. Convert the following developer conversation or thought into a canonical Mitos Decision Entry.
 
@@ -186,10 +207,10 @@ User: {raw_text}
 
 Make sure the slug is a clean, lowercase hyphenated string that matches the decision topic.
 """
-    model_id = get_model_id("FLASH")
+    resolved_model = model_id if model_id is not None else get_model_id("FLASH")
     try:
         response = client.models.generate_content(
-            model=model_id,
+            model=resolved_model,
             contents=prompt,
             config=types.GenerateContentConfig(
                 temperature=0.3
@@ -564,7 +585,11 @@ class MitosSyncManager:
 
         try:
             cache_path = os.path.join(self.config.mitos_dir, "embedding_cache.sqlite")
-            self.embed_provider = GeminiEmbeddingProvider(cache_path)
+            self.embed_provider = GeminiEmbeddingProvider(
+                cache_path,
+                api_key=self.config.env.get("GEMINI_API_KEY"),
+                model_id=get_embedding_model_id(self.config.env),
+            )
             self.vector_store = QdrantVectorStore(
                 self.config.qdrant_url,
                 self.config.qdrant_collection
@@ -748,7 +773,9 @@ class MitosSyncManager:
                 except Exception:
                     pass
 
-        api_key = os.environ.get("GEMINI_API_KEY")
+        api_key = transitional_env_fallback(
+            self.config.env.get("GEMINI_API_KEY"), "GEMINI_API_KEY"
+        )
         if not api_key:
             print("GEMINI_API_KEY environment variable is not set. Sync requires API keys.")
             return
@@ -1220,7 +1247,8 @@ class MitosSyncManager:
         """Builds the bound conflict-judgment executor for this sync run, or None (5a).
 
         The availability gate for the sync-time conflict sensor: the judgment needs an
-        Anthropic client (``ANTHROPIC_API_KEY``, read from env like ``importer.py``) AND
+        Anthropic client (``ANTHROPIC_API_KEY``, resolved for *this workspace* off
+        ``config.env`` — as in ``importer.py``) AND
         the live ``embed_provider`` + ``vector_store`` the facade's candidate gather reads
         (both ``Optional``, ``None`` when Qdrant/Gemini were down at manager init). If any
         is absent the sensor cannot run, so this returns ``None`` and the per-entry hook is
@@ -1242,17 +1270,22 @@ class MitosSyncManager:
         """
         if self.embed_provider is None or self.vector_store is None:
             return None
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        api_key = transitional_env_fallback(
+            self.config.env.get("ANTHROPIC_API_KEY"), "ANTHROPIC_API_KEY"
+        )
         if not api_key:
             return None
         # Lazy import (CONF-D4/§8, load-bearing): `conflict_judgment` is the sole
         # module-scope `import anthropic` in the conflict pipeline. Importing it here keeps
         # the SDK off the `mitos sync` import path whenever the sensor is inactive.
         import anthropic
-        from mitos.conflict_judgment import make_judgment_executor
+        from mitos.conflict_judgment import (_JUDGMENT_MODEL_ALIAS,
+                                             make_judgment_executor)
 
         client = anthropic.Anthropic(api_key=api_key)
-        return make_judgment_executor(client)
+        return make_judgment_executor(
+            client, model_id=get_model_id(_JUDGMENT_MODEL_ALIAS, self.config.env)
+        )
 
     def _run_and_surface_conflict(
         self, entry: ParsedEntry, judge: Callable, run: "_ConflictSyncRun"
@@ -1411,13 +1444,18 @@ class MitosSyncManager:
             return
         try:
             execution = result.execution
-            # CHK-D3: resolve the versioned model id HERE — same process, same env,
-            # moments after the call — without widening the frozen executor boundary.
+            # CHK-D3: resolve the versioned model id HERE — moments after the call,
+            # against the same resolved environment the call itself used
+            # (``self.config.env``, 2c) — without widening the frozen executor
+            # boundary. The map, not a pre-resolved id: ``execution.model_alias``
+            # exists only inside this loop.
             # Deliberately narrower than the batch's best-effort wrap: an unknown
             # alias degrades to NULL (the column is provenance-only), never to a
             # lost batch whose rationale is non-regenerable (M8).
             try:
-                model_id: Optional[str] = get_model_id(execution.model_alias)
+                model_id: Optional[str] = get_model_id(
+                    execution.model_alias, self.config.env
+                )
             except ValueError:
                 model_id = None
             batch = JudgmentBatch(

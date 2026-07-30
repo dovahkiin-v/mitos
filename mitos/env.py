@@ -237,6 +237,46 @@ def resolve_key(name: str, target_dir: str, global_env_path: str) -> ResolvedVal
     return _resolve(name, _file_tiers(target_dir, global_env_path))
 
 
+def transitional_env_fallback(supplied: Optional[str], name: str) -> Optional[str]:
+    """TRANSITIONAL (phase 5c deletes this): the process env, when nothing was supplied.
+
+    A compatibility shim, **not** a second resolution path. Phase 2c routes every
+    credential consumer onto :data:`MitosConfig.env`, and this branch is what lets
+    the callers that supply nothing — ~104 test sites that write ``os.environ``
+    *after* their config was built, plus the bare
+    ``GeminiEmbeddingProvider(cache_path)`` constructions — stay green through a
+    purely additive diff.
+
+    It cannot lie while it lives, because tier 1 of the resolution this shim backs
+    up **is** ``os.environ`` (see :func:`_resolve`): at every routed production
+    site the supplied value is a strict superset of what this would find, so the
+    branch is unreachable-in-effect there. That stops being true at 5c, which
+    deletes the entry-time dotenv load — ``os.environ`` then no longer holds the
+    workspace's keys, and a site that forgot to pass would silently resolve
+    nothing, or the launch directory's residue. Which is the exact defect this
+    vision exists to close.
+
+    Deliberately the tree's **only** remaining process-env read for a credential,
+    so 5c has one function to delete and one grep string
+    (``transitional_env_fallback``) for its checklist rather than a hunt. Its
+    liveness is pinned by inverted rows in ``tests/test_env_routing.py`` that 5c
+    must invert rather than notice.
+
+    Args:
+        supplied: What the caller resolved for its target — ``None`` iff nothing
+            was supplied. ``""`` is a supplied answer (an exported-empty variable)
+            and is returned unchanged, so it keeps masking the file tiers.
+        name: The variable to fall back to.
+
+    Returns:
+        ``supplied`` when it is not ``None``, else the process environment's value
+        or ``None``.
+    """
+    if supplied is not None:
+        return supplied
+    return os.environ.get(name)
+
+
 def resolve_values(
     names: Iterable[str], target_dir: str, global_env_path: str
 ) -> Dict[str, str]:

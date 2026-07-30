@@ -112,8 +112,9 @@ def test_comments_blanks_and_non_assignments_are_skipped(tmp_path):
 def test_whitespace_around_the_key_and_the_equals_is_tolerated(tmp_path):
     """`GEMINI_API_KEY = x` is a shape humans write and must resolve.
 
-    (``_env_file_has_key`` — the tree's third parse, 2c's to retire — does *not*
-    tolerate it. Named here so the divergence is retired rather than ported.)
+    (The ``cli`` reader 2c retired — the tree's third parse — did *not* tolerate
+    it, which is one reason it was folded onto this one. ``cli._upsert_env_var``
+    is the last holdout of the class, a *writer*, and 5c's with ``set-key``.)
     """
     path = _write(tmp_path / ".env", "  GEMINI_API_KEY = x  \n")
     assert parse_env_file(path) == {"GEMINI_API_KEY": "x"}
@@ -304,16 +305,19 @@ def test_the_tier_vocabulary_is_pinned_to_its_literals():
 def test_the_tier_strings_match_the_shipped_key_source_report(tmp_path, monkeypatch):
     """The second net on the same three literals, driven through `cli`.
 
-    ``_gemini_key_source`` is untouched in this phase (2c reroutes it), so its
-    returns are independent evidence that the leaf's vocabulary is the shipped
-    one rather than a plausible re-spelling.
+    Written in 2b against the *pre-routing* ``_gemini_key_source``, as independent
+    evidence that the leaf's vocabulary was the shipped one rather than a
+    plausible re-spelling. 2c routed that function onto ``resolve_key``, so the
+    two are no longer independent — the row survives as the end-to-end pin that
+    the reroute moved no string, and the tier-order rows in
+    ``tests/test_env_routing.py`` are where the new body's precedence is proven.
     """
     proj = tmp_path / "proj"
     proj.mkdir()
-    # The environment rung first, while no file carries the key: the shipped
-    # report checks FILES before the live environment (its own documented
-    # workaround for the entry load's masking), so a global `.env` written first
-    # would shadow this rung rather than lose to it.
+    # The environment rung first, while no file carries the key. The order was
+    # load-bearing against the old file-first body (a global `.env` written first
+    # would have shadowed this rung); under the env-first resolver it is merely
+    # the honest sequence — each rung asserted while the ones above it are empty.
     monkeypatch.setenv("GEMINI_API_KEY", "ENVKEY")
     assert cli._gemini_key_source(str(proj)) == TIER_ENVIRONMENT
 

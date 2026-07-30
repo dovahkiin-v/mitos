@@ -15,7 +15,7 @@ import sqlite3
 import hashlib
 import argparse
 from datetime import datetime, timezone
-from typing import Callable, List, Optional, Dict, Any, Set, Tuple
+from typing import Callable, List, Mapping, Optional, Dict, Any, Set, Tuple
 from google import genai
 
 from mitos import __version__
@@ -48,12 +48,12 @@ from mitos.errors import (
     VectorStoreError, CollectionMissingError, EmbeddingError,
 )
 from mitos.divergence import corpus_graph_divergence, divergence_total
-from mitos.env import parse_env_file
+from mitos.env import parse_env_file, resolve_key, transitional_env_fallback
 from mitos.vector_store import scroll_point_ids, hash_to_uuid, QdrantVectorStore
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.telemetry import TelemetryStore, ConflictCheckRow, JudgmentBatch
 from mitos.identity import compute_node_id
-from mitos.models import get_model_id
+from mitos.models import get_embedding_model_id, get_model_id
 from mitos.parser import ParsedEntry, parse_entry_stream, read_text_or_none
 from mitos.conflict import (run_conflict_check, ConflictUnavailableReason,
                             SEMANTIC_SUBSTRATE_REASONS)
@@ -614,7 +614,9 @@ def cmd_reconcile(config: MitosConfig, as_json: bool = False) -> int:
 
 def cmd_capture(config: MitosConfig, text: str) -> None:
     """Captures a raw architectural thought and appends it to decisions.md."""
-    api_key = os.environ.get("GEMINI_API_KEY")
+    api_key = transitional_env_fallback(
+        config.env.get("GEMINI_API_KEY"), "GEMINI_API_KEY"
+    )
     if not api_key:
         print("GEMINI_API_KEY environment variable is not set. Capture requires it.")
         return
@@ -623,7 +625,9 @@ def cmd_capture(config: MitosConfig, text: str) -> None:
     print("Synthesizing canonical decision entry ...")
     
     try:
-        entry_text = run_ambient_capture(client, text)
+        entry_text = run_ambient_capture(
+            client, text, model_id=get_model_id("FLASH", config.env)
+        )
     except Exception as e:
         print(f"Ambient capture failed: {str(e)}")
         return
@@ -1692,47 +1696,36 @@ def _check_qdrant(qdrant_url: str, collection: str) -> Dict[str, Any]:
     return out
 
 
-def _env_file_has_key(env_path: str, name: str) -> bool:
-    """True if ``env_path`` assigns ``name`` a non-empty value on ANY line.
-
-    Skips empty assignments (the scaffolded ``GEMINI_API_KEY=`` slot) and keeps
-    scanning, so a key added on a later line is still found — matching
-    ``load_dotenv_file``'s "first non-empty value wins" semantics.
-    """
-    if not os.path.exists(env_path):
-        return False
-    try:
-        with open(env_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith(f"{name}="):
-                    if line.split("=", 1)[1].strip().strip('"').strip("'"):
-                        return True
-    except OSError:
-        pass
-    return False
-
-
 def _gemini_key_source(workspace_dir: str) -> Optional[str]:
-    """Reports where GEMINI_API_KEY comes from, in precedence order.
+    """Reports which tier GEMINI_API_KEY came from, for the target workspace.
 
-    Files are checked before the live environment so the report attributes the
-    key to its durable home (``main()`` also loads both files into the
-    environment, which would otherwise mask the distinction).
+    One report shape for the whole tree: this reads the same
+    :func:`~mitos.env.resolve_key` the resolution path itself uses, so the tier
+    the status line names is the tier that actually won. The retired
+    implementation scanned the two files with a second hand-rolled parse before
+    consulting the environment — deliberately, because ``main()`` pours both
+    files into ``os.environ`` and file-first was the only way to keep the
+    distinction visible.
+
+    The cost of dropping that inversion is stated rather than discovered: while
+    the entry-time dotenv load survives (5c deletes it), a real CLI run reports
+    ``"environment"`` for a key whose durable home is a file — less specific,
+    never false, since ``main()`` genuinely did put it there. In exchange there
+    is no second layering implementation to drift.
+
+    The answer is keyed on the **value**, not on the tier: an exported-empty
+    variable resolves to ``ResolvedValue("", "environment")``, and reporting a
+    tier for it would make ``env GEMINI_API_KEY= mitos status`` claim a key is
+    present.
 
     Args:
-        workspace_dir: The project directory to inspect.
+        workspace_dir: The project directory to resolve for.
 
     Returns:
         ``"project .env"``, ``"global .env"``, ``"environment"``, or None.
     """
-    if _env_file_has_key(os.path.join(workspace_dir, ".env"), "GEMINI_API_KEY"):
-        return "project .env"
-    if _env_file_has_key(global_env_path(), "GEMINI_API_KEY"):
-        return "global .env"
-    if os.environ.get("GEMINI_API_KEY"):
-        return "environment"
-    return None
+    resolved = resolve_key("GEMINI_API_KEY", workspace_dir, global_env_path())
+    return resolved.tier if resolved.value else None
 
 
 def _gemini_key_present(workspace_dir: str) -> bool:
@@ -2937,19 +2930,24 @@ def cmd_rebuild(
 def load_dotenv_file(path: str = ".env") -> None:
     """Loads ``KEY=value`` pairs from a ``.env`` file into the environment.
 
-    Mitos reads its credentials (``GEMINI_API_KEY``, ``ANTHROPIC_API_KEY``) and
-    ``QDRANT_URL`` straight from ``os.environ``. This loads them from a workspace
-    ``.env`` so a key dropped in that file takes effect without a manual
-    ``export``. An empty value is skipped, and an existing environment value is
-    never overridden (an explicit ``export`` wins over the file) — including an
+    Since phase 2c every credential (``GEMINI_API_KEY``, ``ANTHROPIC_API_KEY``)
+    and ``QDRANT_URL`` reaches its consumer through the *functional* resolver,
+    computed for the workspace the call named — so this entry-time promotion no
+    longer answers anything. It survives only because the resolver's tier 1 is
+    ``os.environ`` and a handful of callers still supply nothing (the
+    ``transitional_env_fallback`` shim), and phase 5c deletes both together. An
+    empty value is skipped, and an existing environment value is never
+    overridden (an explicit ``export`` wins over the file) — including an
     existing **empty** one, which is what makes ``env GEMINI_API_KEY= mitos …``
     a keyless run on a key-bearing box.
 
     The parse itself lives in ``mitos.env`` (stdlib only, no new dependency —
-    P19), shared with the functional resolver that reads the same two files
-    without touching ``os.environ``. Two hand-rolled parses of one file that must
-    agree is a drift worth not creating: while both mechanisms are live, the
-    resolver's tiers 2–3 read exactly what this writes into tier 1.
+    P19), shared with the resolver that reads the same two files without
+    touching ``os.environ``. Two hand-rolled parses of one file that must agree
+    is a drift worth not creating: while both mechanisms are live, the resolver's
+    tiers 2–3 read exactly what this writes into tier 1, which is why the window
+    cannot produce a wrong answer — only a coarse one (see
+    :func:`_gemini_key_source`).
 
     Args:
         path: Path to the ``.env`` file (default: ``.env`` in the cwd, i.e. the
@@ -3055,7 +3053,9 @@ def _build_check_substrate(
     embed_detail: Optional[str] = None
     try:
         embed = GeminiEmbeddingProvider(
-            os.path.join(config.mitos_dir, "embedding_cache.sqlite")
+            os.path.join(config.mitos_dir, "embedding_cache.sqlite"),
+            api_key=config.env.get("GEMINI_API_KEY"),
+            model_id=get_embedding_model_id(config.env),
         )
     except EmbeddingError as exc:
         embed_detail = str(exc)
@@ -3084,7 +3084,7 @@ def _build_check_telemetry(config: MitosConfig) -> Optional[TelemetryStore]:
         return None
 
 
-def _build_check_judge() -> Optional[Callable]:
+def _build_check_judge(config: MitosConfig) -> Optional[Callable]:
     """Builds the bound conflict-judgment executor, or ``None`` when keyless (KD6).
 
     The ``_build_conflict_judge`` shape with the OPPOSITE disposition: it does NOT
@@ -3095,17 +3095,32 @@ def _build_check_judge() -> Optional[Callable]:
     onto its import path (Tier discipline). Built only after the confirm passes and
     only when fresh groups exist, so a reuse-only/clean run never constructs a client.
 
+    ``config`` is REQUIRED rather than defaulted, and this is the one breaking
+    signature in 2c: the seam is monkeypatched by name in four test modules, so a
+    defaulted parameter would let a stale zero-arg fake keep passing while
+    production resolved its key and its model from somewhere else.
+
+    Args:
+        config: The target workspace's config — the key and the judgment model id
+            both come off its resolved ``env``, never the process environment.
+
     Returns:
         The bound one-arg ``judge`` callable, or ``None`` when ``ANTHROPIC_API_KEY``
         is absent.
     """
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    api_key = transitional_env_fallback(
+        config.env.get("ANTHROPIC_API_KEY"), "ANTHROPIC_API_KEY"
+    )
     if not api_key:
         return None
     import anthropic
-    from mitos.conflict_judgment import make_judgment_executor
+    from mitos.conflict_judgment import (_JUDGMENT_MODEL_ALIAS,
+                                         make_judgment_executor)
 
-    return make_judgment_executor(anthropic.Anthropic(api_key=api_key))
+    return make_judgment_executor(
+        anthropic.Anthropic(api_key=api_key),
+        model_id=get_model_id(_JUDGMENT_MODEL_ALIAS, config.env),
+    )
 
 
 def _check_finding_side(node: Dict[str, Any]) -> Dict[str, Any]:
@@ -3434,9 +3449,9 @@ def cmd_check(
 
         # Build the judge only after the confirm passes and only when there is fresh
         # work (KD6): a reuse-only/clean run never constructs a client.
-        judge = _build_check_judge() if plan.fresh_groups else None
+        judge = _build_check_judge(config) if plan.fresh_groups else None
         result = check.execute_corpus_check(
-            plan, judge=judge, telemetry=telemetry, store=store
+            plan, judge=judge, telemetry=telemetry, store=store, env=config.env
         )
 
         # The full display model — every remaining store read happens HERE, before
@@ -3548,6 +3563,7 @@ def _persist_staged_batch(
     result: "Any",
     *,
     run_id: str,
+    env: Optional[Mapping[str, str]] = None,
 ) -> Optional[str]:
     """Persists one judged staged batch with ``surface='check'`` (KD7), best-effort.
 
@@ -3565,6 +3581,10 @@ def _persist_staged_batch(
             the caller guards ``execution is not None``).
         run_id: This run's id, stamped as ``sync_run_id`` on every row (the one-thread-of-
             truth join to the ``check_runs`` PK).
+        env: The target workspace's resolved environment (``config.env``), against
+            which ``execution.model_alias`` resolves — the same map the judge's own
+            model id came from, so the provenance column records the model the run
+            actually used.
 
     Returns:
         ``None`` on a clean write, or a write-failure detail string (the caller marks the
@@ -3574,10 +3594,11 @@ def _persist_staged_batch(
         return "telemetry store unavailable"
     try:
         execution = result.execution
-        # CHK-D3: resolve the versioned model id here (same process/env, moments after
-        # the call); an unknown alias degrades to NULL (provenance-only), never a lost row.
+        # CHK-D3: resolve the versioned model id here — moments after the call, against
+        # the same resolved environment the call used (2c); an unknown alias degrades to
+        # NULL (provenance-only), never a lost row.
         try:
-            model_id: Optional[str] = get_model_id(execution.model_alias)
+            model_id: Optional[str] = get_model_id(execution.model_alias, env)
         except ValueError:
             model_id = None
         batch = JudgmentBatch(
@@ -3829,7 +3850,7 @@ def _run_staged_check(
         # (unlike corpus, which absorbs `judge=None` as a typed degradation), so a
         # missing key with pending entries is fail-closed exit 2, no row. `--no-verify`
         # is the deliberate human bypass (documented in 4b).
-        judge = _build_check_judge()
+        judge = _build_check_judge(config)
         if judge is None:
             msg = (f"check --staged could not gate {len(pending)} pending decision(s) — "
                    f"ANTHROPIC_API_KEY is not set (the judge is required to gate).")
@@ -3870,7 +3891,9 @@ def _run_staged_check(
             pairs_judged_fresh += len(result.judged_pairs)
             if result.execution is not None:
                 batches_executed += 1
-                detail = _persist_staged_batch(telemetry, result, run_id=run_id)
+                detail = _persist_staged_batch(
+                    telemetry, result, run_id=run_id, env=config.env
+                )
                 if detail is not None:
                     degraded.add("telemetry_write")
             # Map each surfaced finding to its candidate content hash (from judged_pairs).

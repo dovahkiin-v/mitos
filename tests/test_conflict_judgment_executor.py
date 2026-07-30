@@ -368,6 +368,7 @@ def test_t10_check_run_judgment_requests_carry_no_cache_control() -> None:
 
 def test_t10_5a_cli_built_judge_issues_no_cache_control(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
 ) -> None:
     """T10 (CHK-D6, the 5a half): the judge the CLI seam constructs issues no ``cache_control``.
 
@@ -377,14 +378,19 @@ def test_t10_5a_cli_built_judge_issues_no_cache_control(
     judge's ``messages.create`` carries no ``cache_control`` anywhere and a plain-string
     ``system``. A fake key satisfies the keyless guard; the SDK constructor is patched so no
     network is touched — the check surface stays cache-off by decision (the ordering is
-    wired, the flip is a later vision's)."""
+    wired, the flip is a later vision's).
+
+    The seam takes a ``MitosConfig`` since 2c — the key and the judgment model id are
+    resolved for the *target workspace*, not read off the process. The key is exported
+    before the config is built, so it arrives through tier 1 of that resolution."""
     from mitos import cli
+    from mitos.config import MitosConfig
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key-for-construction-only")
     fake_client = _client_returning(_fake_message(text="[]"))
     monkeypatch.setattr(anthropic, "Anthropic", lambda api_key: fake_client)
 
-    judge = cli._build_check_judge()
+    judge = cli._build_check_judge(MitosConfig(str(tmp_path)))
     assert judge is not None                          # the keyed seam built a bound executor
 
     result = judge(_prompt())

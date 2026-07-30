@@ -157,7 +157,7 @@ def _wire_judge(monkeypatch: pytest.MonkeyPatch, judge: Any) -> List[bool]:
     """Monkeypatches ``cli._build_check_judge`` to return ``judge``; logs each build."""
     invoked: List[bool] = []
 
-    def builder() -> Any:
+    def builder(config: MitosConfig) -> Any:
         invoked.append(True)
         return judge
 
