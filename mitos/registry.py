@@ -88,9 +88,9 @@ def load() -> Dict[str, str]:
         error.
 
     Raises:
-        RegistryError: If the file is not readable, is not valid TOML, or carries
-            a value that is not a string (the one shape the flat schema can be
-            violated with).
+        RegistryError: If the file is not readable, is not valid TOML, carries a
+            value that is not a string, or carries a value that is not an
+            absolute path (the two shapes the flat schema can be violated with).
     """
     path = registry_path()
     try:
@@ -130,6 +130,21 @@ def load() -> Dict[str, str]:
                 f"registry is a flat name-to-path map; a name containing dots "
                 f"must be quoted (`\"example.com\" = \"/path/to/it\"`) or TOML "
                 f"reads it as a nested table. Fix or remove {path}."
+            )
+        # The schema is `name → ABSOLUTE path`, and this is where it is enforced —
+        # one gate for every reader, on a pure string test that keeps the leaf's
+        # tier untouched (no filesystem probe here, by design). A hand-edited
+        # relative value would otherwise resolve against whatever directory the
+        # process happens to stand in, which is the cwd-dependence the routing map
+        # exists to remove — defeated *through* the map, silently. `~` is refused
+        # rather than expanded: expanding it here would mint a second
+        # canonicalization spelling beside `canonicalize`, and two spellings split
+        # identity silently.
+        if not os.path.isabs(value):
+            raise RegistryError(
+                f"registry entry {name!r} in {path} holds {value!r}, which is not "
+                f"an absolute path. The registry stores absolute paths — write it "
+                f"out in full (`~` is not expanded). Fix or remove {path}."
             )
     return data
 

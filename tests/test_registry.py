@@ -143,13 +143,16 @@ def test_a_backslash_t_path_is_not_silently_turned_into_a_tab(tmp_path):
         ("[proj]", "dict"),                     # a hand-written table header
     ],
 )
-def test_a_non_string_value_is_the_one_violable_shape(line, found):
+def test_a_non_string_value_is_refused_by_the_flat_schema(line, found):
     """I3's flat ``name → str`` schema fails loud on any other shape, naming the fix.
 
     An old reader must fail *loudly* on a shape it does not understand rather than
     misread a table as a path — which is what makes the version-marker-free flat
     file safe. The message also has to name the dotted-key trap: a perfectly
     ordinary directory name (``example.com``) written bare *becomes* a table.
+
+    The wrong *type* is one of the schema's two violable shapes; the other is a
+    string that is not an absolute path, refused just below.
     """
     path = _write_registry(line + "\n")
 
@@ -161,6 +164,51 @@ def test_a_non_string_value_is_the_one_violable_shape(line, found):
     assert found in message
     assert path in message
     assert "quote" in message.lower()  # the dotted-key recovery
+
+
+@pytest.mark.parametrize("value", ["projects/myproj", "~/work/myproj"])
+def test_a_value_that_is_not_an_absolute_path_is_refused_at_the_read_gate(value):
+    """The schema is ``name → **absolute** path``, and the read gate enforces it.
+
+    The registry is hand-editable by design and most of its guards are guidance —
+    this one is the schema itself. A hand-written ``myproj = "projects/myproj"``
+    would resolve against whatever directory the process happens to stand in, so
+    the cwd-dependence the routing map exists to remove would come back *through*
+    the map, silently, with every test green. ``~/work/x`` is the realistic
+    spelling of the same hazard and is refused rather than expanded: expanding it
+    here would mint a second canonicalization spelling beside ``canonicalize``,
+    and two spellings split identity silently.
+
+    It sits in ``load()`` rather than in the resolver so one gate covers every
+    reader, and *below* the type check, because a table value must be refused as a
+    table. It is pure string work, so the leaf's tier is untouched — no filesystem
+    probe enters the registry.
+    """
+    path = _write_registry(f'"myproj" = "{value}"\n')
+
+    with pytest.raises(RegistryError) as exc:
+        registry.load()
+
+    message = str(exc.value)
+    assert "myproj" in message          # which entry
+    assert path in message              # which file
+    assert "absolute" in message        # the rule that failed
+    assert value in message             # the offending value, echoed back
+
+
+def test_no_writer_can_produce_a_relative_registry_value(tmp_path, monkeypatch):
+    """The gate refuses a shape only a hand-edit can make — ``register`` canonicalizes.
+
+    Worth pinning next to the gate: it is what makes the refusal a *guidance*
+    message for a human editor rather than a fault a mitos code path can trip.
+    """
+    workspace = tmp_path / "proj"
+    workspace.mkdir()
+    monkeypatch.chdir(str(tmp_path))
+
+    registry.register("proj")  # a relative spelling, handed straight to the writer
+
+    assert registry.load() == {"proj": os.path.realpath(str(workspace))}
 
 
 def test_document_order_is_preserved_by_load_and_by_an_unrelated_write(tmp_path):

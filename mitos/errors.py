@@ -92,6 +92,183 @@ class RegistryError(MitosError):
     pass
 
 
+# ---------------------------------------------------------------------------
+# Project-targeting discriminators.
+#
+# The NAMES are the cross-surface contract: the CLI boundary renderer and the MCP
+# boundary renderer both switch on these exact strings to choose their wording,
+# so a typo is a silent break on one surface only. Six classes, none falling
+# through to another, because a wrong class teaches the wrong lesson — answering
+# a relative path with "unknown project — did you mean 'mitos'?" invites a retry
+# with another relative spelling, and answering an uninitialized directory the
+# same way says the *name* is wrong when the *directory* is the problem.
+# ---------------------------------------------------------------------------
+
+TARGET_MISSING = "missing"
+TARGET_UNKNOWN_NAME = "unknown_name"
+TARGET_RELATIVE_PATH = "relative_path"
+TARGET_PATH_NOT_A_WORKSPACE = "path_not_a_workspace"
+TARGET_REGISTERED_UNREACHABLE = "registered_unreachable"
+TARGET_EXEMPT_VERB = "exempt_verb"
+
+TARGETING_DISCRIMINATORS = frozenset(
+    {
+        TARGET_MISSING,
+        TARGET_UNKNOWN_NAME,
+        TARGET_RELATIVE_PATH,
+        TARGET_PATH_NOT_A_WORKSPACE,
+        TARGET_REGISTERED_UNREACHABLE,
+        TARGET_EXEMPT_VERB,
+    }
+)
+
+# Why a verb takes no project selector — a key, never prose, so both surfaces
+# word it themselves. The verb→reason mapping belongs to whichever surface owns
+# its verb table, not here.
+EXEMPT_CREATES_REGISTRATION = "creates_registration"   # `init` — it creates one
+EXEMPT_NO_WORKSPACE = "no_workspace"                   # `serve` — it targets none
+EXEMPT_EXPLICITLY_GLOBAL = "explicitly_global"         # `projects`, the zero-arg
+                                                       # overview, a global key set
+
+EXEMPT_REASONS = frozenset(
+    {
+        EXEMPT_CREATES_REGISTRATION,
+        EXEMPT_NO_WORKSPACE,
+        EXEMPT_EXPLICITLY_GLOBAL,
+    }
+)
+
+# What each class must carry to be renderable. A discriminator whose required
+# data is absent is a half-filled error, which the constructor refuses.
+_TARGETING_REQUIRED_FIELDS: Dict[str, tuple] = {
+    TARGET_MISSING: (),
+    TARGET_UNKNOWN_NAME: ("selector",),
+    TARGET_RELATIVE_PATH: ("selector",),
+    TARGET_PATH_NOT_A_WORKSPACE: ("selector", "path"),
+    TARGET_REGISTERED_UNREACHABLE: ("selector", "name", "path"),
+    TARGET_EXEMPT_VERB: ("verb", "exempt_reason"),
+}
+
+
+class ProjectTargetingError(MitosError):
+    """Raised when a project selector cannot be resolved to a workspace.
+
+    The routing resolver's failure type (``mitos.routing.resolve_project``). It
+    carries **structured data only** — a discriminator, the registered-name
+    vocabulary, close matches, the paths involved — and no finished presentation
+    string: each surface's boundary renderer composes its own example and
+    discovery pointer from these fields, so no CLI wording reaches an MCP caller
+    and no MCP call-form reaches a terminal.
+
+    A ``MitosError`` subclass so the CLI's ``except MitosError`` boundary renders
+    it as one calm ``Error: …`` line even on a path no renderer has reached yet.
+    Deliberately distinct from :class:`RegistryError`: that is a fault of the
+    registry *file*, this is a fault of a *lookup* through it.
+
+    ``str(err)`` is a **terse fallback for an unrendered path** — a
+    discriminator-level statement and nothing more. It is not the teaching-error
+    anatomy, it names no CLI flag and no MCP call form, and every value it echoes
+    goes through ``repr`` (a selector is untrusted text and can carry a newline or
+    an ANSI escape).
+
+    The constructor validates, raising ``ValueError`` — a programming fault in
+    mitos, not a user fault, so deliberately **not** a ``MitosError`` — when the
+    discriminator is unknown, a required field for it is absent, or an
+    ``exempt_reason`` is not one of ``EXEMPT_REASONS``. It exists so a boundary
+    renderer never meets a half-filled error and never has to defend against one.
+
+    Attributes:
+        discriminator: One of ``TARGETING_DISCRIMINATORS`` — the failure class.
+            Renderers switch on this; no class ever falls through to another,
+            because a wrong class teaches the wrong lesson.
+        selector: The selector as the caller supplied it.
+        path: The path involved — the probed workspace root for
+            ``path_not_a_workspace``, the registry's **recorded** path (the value
+            a repoint edits) for ``registered_unreachable``.
+        name: The registered name, for ``registered_unreachable``.
+        registered_names: Every registered name, in document order. The full
+            list; bounding it for display is the renderer's policy
+            (``routing.bounded_registered_names``).
+        close_matches: Did-you-mean suggestions, non-empty only where a *name*
+            was claimed — did-you-mean over registered names is noise for a path.
+        cwd_hint_name: The nearest registered ancestor of the caller's working
+            directory. Always ``None`` here: the resolver has no cwd branch (the
+            invariant's structural leg), and the boundary fills this field.
+        verb: The global verb that was given a selector, for ``exempt_verb``.
+        exempt_reason: Why that verb takes none — a key from ``EXEMPT_REASONS``,
+            never prose.
+    """
+
+    def __init__(
+        self,
+        discriminator: str,
+        *,
+        selector: Optional[str] = None,
+        path: Optional[str] = None,
+        name: Optional[str] = None,
+        registered_names: Optional[List[str]] = None,
+        close_matches: Optional[List[str]] = None,
+        cwd_hint_name: Optional[str] = None,
+        verb: Optional[str] = None,
+        exempt_reason: Optional[str] = None,
+    ) -> None:
+        if discriminator not in TARGETING_DISCRIMINATORS:
+            raise ValueError(
+                f"unknown targeting discriminator {discriminator!r}; expected one "
+                f"of {sorted(TARGETING_DISCRIMINATORS)}"
+            )
+        self.discriminator = discriminator
+        self.selector = selector
+        self.path = path
+        self.name = name
+        # Copied, and spelled without a truthiness coalesce: `x or []` would fold
+        # a deliberately-empty list into the default, which is the shape that
+        # quietly undoes a guard one line below itself elsewhere in this tree.
+        self.registered_names: List[str] = (
+            [] if registered_names is None else list(registered_names)
+        )
+        self.close_matches: List[str] = (
+            [] if close_matches is None else list(close_matches)
+        )
+        self.cwd_hint_name = cwd_hint_name
+        self.verb = verb
+        self.exempt_reason = exempt_reason
+
+        for field in _TARGETING_REQUIRED_FIELDS[discriminator]:
+            if getattr(self, field) is None:
+                raise ValueError(
+                    f"targeting discriminator {discriminator!r} requires {field!r}"
+                )
+        if exempt_reason is not None and exempt_reason not in EXEMPT_REASONS:
+            raise ValueError(
+                f"unknown exempt reason {exempt_reason!r}; expected one of "
+                f"{sorted(EXEMPT_REASONS)}"
+            )
+        super().__init__(self._fallback_message())
+
+    def _fallback_message(self) -> str:
+        """Builds the terse discriminator-level fallback (see the class docstring)."""
+        if self.discriminator == TARGET_MISSING:
+            return "no project selector was supplied"
+        if self.discriminator == TARGET_UNKNOWN_NAME:
+            return f"unknown project {self.selector!r}"
+        if self.discriminator == TARGET_RELATIVE_PATH:
+            return (
+                f"the project selector {self.selector!r} is a relative path; a "
+                f"registered name or an absolute path is required"
+            )
+        if self.discriminator == TARGET_PATH_NOT_A_WORKSPACE:
+            return f"no Mitos workspace at {self.path!r}"
+        if self.discriminator == TARGET_REGISTERED_UNREACHABLE:
+            return (
+                f"the project {self.name!r} is registered at {self.path!r}, which "
+                f"no longer holds a Mitos workspace"
+            )
+        # TARGET_EXEMPT_VERB — the discriminator was whitelisted above, so this is
+        # the remaining class rather than a fall-through default.
+        return f"the {self.verb!r} verb takes no project selector"
+
+
 class VectorStoreError(MitosError):
     """Raised when Qdrant vector store operations fail."""
     pass

@@ -177,6 +177,18 @@ def test_non_editable_install_real_read_path(built_wheel, tmp_path):
         f"missing from the wheel:\n{registry_import.stderr}"
     )
 
+    # The routing leaf ships too, for the same reason and against the same trap.
+    # It is the module every workspace-targeting call routes through once the
+    # boundaries land, so a wheel missing it is a console script that dies on
+    # import while the editable dev install stays perfectly green.
+    routing_import = subprocess.run([str(venv_python), "-c", "import mitos.routing"],
+                                    env=_mitos_env(tmp_path), capture_output=True,
+                                    text=True, timeout=60)
+    assert routing_import.returncode == 0, (
+        f"`import mitos.routing` failed in the installed venv — the module is "
+        f"missing from the wheel:\n{routing_import.stderr}"
+    )
+
     # `mitos init` reads the spec from the installed package dir and scaffolds a workspace.
     workspace = tmp_path / "proj"
     workspace.mkdir()
