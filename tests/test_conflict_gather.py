@@ -401,7 +401,15 @@ def test_collection_missing_is_its_own_typed_unavailable(store: GraphStore) -> N
     Ordering-sensitive: ``CollectionMissingError`` is a ``VectorStoreError``, so an
     arm below the broad one would be dead and the receipt, the sync notice and the
     check token would all report "unreachable" for a running Qdrant.
+
+    **The seeded decision is load-bearing, not scenery.** The ``store`` fixture is an
+    empty graph, and over an empty active set an absent collection is the empty index
+    rather than a gap (I8) — the arm returns ``[]`` and never reaches the reason this
+    row is about. One live decision puts the sweep in the state where absence is a
+    real hole, which is the only state where arm ordering is observable. The
+    empty-graph twin lives in ``test_conflict_faults.py``.
     """
+    _seed_decision(store, "seeded-precedent", "A committed precedent so absence is a gap.")
     embed = _FakeEmbed()
     vector = _FakeVector(
         raises=CollectionMissingError(

@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence,
 from mitos.display import letter_payload
 from mitos.errors import CollectionMissingError, EmbeddingError, VectorStoreError
 from mitos.identity import compute_node_id, embedding_text
+from mitos.recall import missing_index_is_a_gap
 
 if TYPE_CHECKING:
     # Runtime-injected, duck-typed clients — annotated only for the type checker.
@@ -262,6 +263,17 @@ def gather_candidates(
     except CollectionMissingError as exc:
         # Subclass first — an absent collection is a recoverable state with a named
         # heal, not the unreachable-Qdrant fault the broader arm below describes.
+        #
+        # I8, on the same predicate the four read surfaces use: over a graph holding
+        # no active nodes an absent collection IS the empty index, so this is the
+        # "legitimate empty corpus" the contract above already promises returns `[]`.
+        # Degrading here instead would fail a fresh workspace's first
+        # `check --staged` closed and hand it `mitos reconcile` — which enqueues
+        # nothing over an empty active set, so the advice cannot heal what it names.
+        # The gate and the heal agree by construction; an unreadable graph answers
+        # True and still degrades.
+        if not missing_index_is_a_gap(store):
+            return []
         return Unavailable(
             reason=ConflictUnavailableReason.COLLECTION_MISSING, detail=str(exc)
         )

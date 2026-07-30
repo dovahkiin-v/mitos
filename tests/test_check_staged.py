@@ -569,6 +569,51 @@ def test_10d_missing_collection_rides_json_and_the_persisted_trend_row(
     assert rows[0]["degraded_reason"] == "collection_missing,sweep"
 
 
+def test_10e_absent_collection_over_an_empty_graph_gates_clean(
+    workspace, monkeypatch, capsys
+) -> None:
+    """The twin of 10c: no active nodes → the absence is the empty index, exit 0.
+
+    The surface where the gap actually bit. A fresh `mitos init` whose author
+    hand-writes the first decision and commits runs this exact path from the
+    pre-commit hook: the graph is empty, the collection was never created (writes
+    create it, reads no longer do), and 10c's disposition would refuse the commit
+    and hand over `mitos reconcile` — which enqueues nothing over an empty active
+    set, so re-running it changes nothing and the operator is stuck. Before this
+    vision the store's constructor created the collection and this path passed;
+    the fix restores that outcome without restoring the read-creates side effect.
+
+    Deliberately keeps 10c's wiring apart from the one variable under test: same
+    pending entry, same raising substrate, no `_seed_active`. The judge is wired
+    and must never fire — with no candidates there is nothing to judge, so a clean
+    gate here also proves the empty answer costs no LLM spend.
+    """
+    config, store, telemetry = workspace
+    _write_decisions(config, ("pending-y", _PENDING_AXIOM))
+    _wire_substrate(
+        monkeypatch,
+        {_PENDING_AXIOM: [_match("active-q", 0.9)]},
+        vector_raises={_PENDING_AXIOM: CollectionMissingError(
+            "Qdrant collection 'mitos-x' does not exist", collection="mitos-x"
+        )},
+    )
+    judge = _finding_judge()
+    _wire_judge(monkeypatch, judge)
+
+    code = cli.cmd_check(config, staged=True, scope=None, fresh=False,
+                         assume_yes=False, as_json=False)
+
+    out, err = capsys.readouterr()
+    assert code == 0                                     # clean, not fail-closed
+    assert "[partial] This gate could not fully run" not in out
+    assert "the vector collection does not exist" not in out
+    # The dead end specifically: never hand over a heal that cannot heal.
+    assert "mitos reconcile" not in out
+    assert "Traceback" not in out and "Traceback" not in err
+    assert judge.calls == 0                              # no candidates → no spend
+    assert _read_check_runs(config) == []                # no judgment fired → no row
+
+
 def test_10b_judge_degradation_reads_as_judgment_token(workspace, monkeypatch, capsys) -> None:
     """A judge-side ``Unavailable`` (vs substrate) trips the breaker as the ``judgment`` token."""
     config, store, telemetry = workspace

@@ -322,13 +322,15 @@ def corpus_provenance(config: "object") -> Dict[str, str]:
 def missing_index_is_a_gap(store: "object") -> bool:
     """Decides whether an absent vector collection is a gap worth reporting (I8).
 
-    The one predicate behind all four semantic read surfaces (``mitos query`` /
-    ``mitos surface`` and their MCP twins), so the two shapes they take cannot
-    become two behaviours. Over a graph holding **no** active nodes an absent
-    collection *is* the empty index — a just-initialized project is healthy, not
-    broken — and the read renders its ordinary nothing-found result with no
-    diagnostic. Over a populated graph it is a real hole in recall, and the read
-    says so and names the heal.
+    The one predicate behind every consumer of an absent collection: the four
+    semantic read surfaces (``mitos query`` / ``mitos surface`` and their MCP
+    twins) and the conflict sweep behind ``mitos check --staged`` and the
+    sync-time sensor, so the shapes they take cannot become several behaviours.
+    Over a graph holding **no** active nodes an absent collection *is* the empty
+    index — a just-initialized project is healthy, not broken — and the caller
+    renders its ordinary nothing-found result with no diagnostic. Over a
+    populated graph it is a real hole in recall, and the caller says so and names
+    the heal.
 
     Gated on ``get_active_node_ids`` rather than ``get_active_decisions`` for a
     reason stronger than "open questions are embedded too": that set — active

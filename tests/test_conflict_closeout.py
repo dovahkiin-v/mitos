@@ -655,11 +655,20 @@ def test_dod6_discovery_covers_the_check_family_and_respects_the_boundary() -> N
     ``__version__`` edge), and it excludes BOTH ``telemetry.py`` (the sanctioned sink) AND
     everything only reachable through it (``store.py``/``migrations.py`` — the graph
     committer must never enter this lint). The TYPE_CHECKING-guarded ``protocols`` import is
-    skipped, so neither ``protocols.py`` nor its ``parser.py``/``store.py`` pulls appear."""
+    skipped, so neither ``protocols.py`` nor its ``parser.py``/``store.py`` pulls appear.
+
+    ``recall.py`` joined the closure deliberately (the global-MCP-registry vision's
+    Phase 1 checkpoint): ``conflict.py`` imports ``missing_index_is_a_gap`` so the
+    sweep answers an absent collection on the same I8 predicate the four read
+    surfaces use. It is an eighth member, not a boundary breach — a stdlib-only
+    Tier-1 leaf that reads one method off a duck-typed store and writes nothing, so
+    it passes the no-write lint below and widening the fence to cover it is the
+    point of a mechanically-discovered family. This pin did its job: the import was
+    adjudicated here rather than landing unnoticed."""
     names = {os.path.basename(path) for path in _check_family_closure()}
     assert names == {
         "check.py", "conflict.py", "display.py", "errors.py",
-        "identity.py", "models.py", "__init__.py",
+        "identity.py", "models.py", "recall.py", "__init__.py",
     }
     # The boundary + everything only reachable through it stay out (belt-and-suspenders
     # over the exact-set pin: a regression names the offender, not just a set diff).
