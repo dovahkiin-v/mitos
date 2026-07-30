@@ -287,15 +287,17 @@ def test_the_mcp_server_builds_its_provider_on_the_targets_key(
 ):
     """W19 at `mcp_server.get_workspace_components`.
 
-    It builds a zero-argument ``MitosConfig()``, so the target is the process's
-    working directory — the state 5b replaces with a resolved selector. Driven
-    through ``chdir`` because that is what the site does *today*; the row proves
-    the key arrives, not that the targeting is right.
+    It takes the workspace config as an argument (phase 3c), so the cwd read that
+    used to live inside it now lives at the call site — which is what leaves this
+    row proving what it always proved: the key of the workspace *given* is the key
+    the provider is built on. The ``chdir`` stays for exactly that reason; the
+    zero-argument ``MitosConfig()`` is now the caller's choice of target, not the
+    callee's assumption about one.
     """
     from mitos import mcp_server
 
     monkeypatch.chdir(_workspace(tmp_path, env_text=SENTINEL_ENV))
-    _, embed_provider, _ = mcp_server.get_workspace_components()
+    _, embed_provider, _ = mcp_server.get_workspace_components(MitosConfig())
 
     assert embed_provider is not None
     assert genai_keys == ["from-the-target"]
@@ -948,11 +950,15 @@ def test_a_cross_directory_mcp_call_resolves_the_targets_key(
 ):
     """I7 on the MCP surface, in-process.
 
-    ``get_workspace_components`` targets the working directory today, so this
-    drives it through ``chdir(B)`` from A. The **real `mitos serve` subprocess**
-    row is 5c's, on 3a's harness — an in-process approximation cannot observe the
-    entry path or process-owned env, which is exactly where I6's hazards live, so
-    it is deliberately not attempted here.
+    ``get_workspace_components`` takes the workspace config as an argument (phase
+    3c), so the cross-directory move this row makes is now made at the call site:
+    it still walks A → B, and still asserts that B's key — not A's — is the one
+    the provider was built on. Kept on ``chdir`` rather than rewritten to two
+    explicit configs, because the hazard it watches is precisely a *stale* target
+    surviving a move. The **real `mitos serve` subprocess** row is 5c's, on 3a's
+    harness — an in-process approximation cannot observe the entry path or
+    process-owned env, which is exactly where I6's hazards live, so it is
+    deliberately not attempted here.
     """
     from mitos import mcp_server
 
@@ -961,7 +967,7 @@ def test_a_cross_directory_mcp_call_resolves_the_targets_key(
     monkeypatch.chdir(a)
     monkeypatch.chdir(b)
 
-    _, embed_provider, _ = mcp_server.get_workspace_components()
+    _, embed_provider, _ = mcp_server.get_workspace_components(MitosConfig())
 
     assert embed_provider is not None
     assert genai_keys == ["key-of-b"]

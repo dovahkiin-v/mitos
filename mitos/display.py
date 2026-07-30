@@ -343,6 +343,51 @@ def show_payload(
     return payload
 
 
+def projects_payload(reg: Mapping[str, str], registry_path: str) -> Dict[str, Any]:
+    """Shapes the machine-local project listing, shared CLI⇄MCP.
+
+    The one builder behind both ``mitos projects --json`` (``cmd_projects``) and
+    the ``list_projects`` MCP tool, so the discovery shape **cannot drift**
+    between the two surfaces — the twin-parity pattern, lifted here at its second
+    consumer exactly as :func:`show_payload` and :func:`letter_payload` were.
+
+    Registry **document order throughout, never sorted**: that is the order a
+    reverse lookup resolves its first match in, so a listing that re-ordered it
+    would show something other than what actually decides.
+
+    An empty registry is a clean ``count: 0`` envelope — a machine with nothing
+    registered yet is healthy, not broken, and this leaf says nothing about it
+    beyond the count. What a caller should *do* about an empty registry is each
+    surface's wording (the CLI prescribes the setup act; the MCP description
+    names the absolute-path escape hatch), so no such sentence is shaped here.
+
+    Stays a pure dict→dict Tier-1 leaf: it takes the **already-loaded** registry
+    and its path as arguments and does no I/O of its own. Homed here rather than
+    beside ``registry.load`` deliberately — one line from the read, the next
+    maintainer folds the read inside and the leaf re-reads the registry per call;
+    here that is unreachable without an import this module's tier forbids.
+
+    Args:
+        reg: An already-loaded ``name → workspace path`` registry, in document
+            order (``registry.load()``).
+        registry_path: The registry file's path, reported so a caller can find
+            the file whether or not it exists yet.
+
+    Returns:
+        ``{"registry_path": str, "count": int, "projects": [{"name", "path"}, …]}``
+        — JSON-native throughout: ``projects`` is a **list** of dicts, never a
+        list of tuples (a tuple survives in-process and becomes a list across the
+        JSON round trip, so the two surfaces would disagree on shape depending on
+        how each was tested). ``count == len(projects)``.
+    """
+    projects = [{"name": name, "path": path} for name, path in reg.items()]
+    return {
+        "registry_path": registry_path,
+        "count": len(projects),
+        "projects": projects,
+    }
+
+
 def dumps_display(obj: Any, *, ensure_ascii: bool, indent: Optional[int] = 2) -> str:
     """Serializes a display payload to JSON — the single CLI⇄MCP display seam.
 

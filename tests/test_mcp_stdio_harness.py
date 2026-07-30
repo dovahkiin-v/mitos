@@ -32,12 +32,14 @@ from mcp_harness import ServerStartupError, harness_env, mitos_server
 #: declare it and each write path opts in.
 DEAD_QDRANT_URL = "http://127.0.0.1:9"
 
-#: The six tools the MCP surface exposes at this phase. Asserted as an exact set,
-#: against the names as they arrive on the wire — never derived from an import of
-#: `mitos.mcp_server`, which would make the row tautological. **Phase 3c adds a
-#: seventh, `list_projects`**, and must widen this set rather than delete the row.
+#: The seven tools the MCP surface exposes at this phase. Asserted as an exact
+#: set, against the names as they arrive on the wire — never derived from an
+#: import of `mitos.mcp_server`, which would make the row tautological. Phase 3c
+#: widened it by one (`list_projects`, the discovery twin of CLI `projects`); a
+#: later phase that adds a tool widens it again rather than deleting the row.
 EXPECTED_TOOLS = {
     "list_decisions",
+    "list_projects",
     "list_scopes",
     "query_decisions",
     "record_decision",
@@ -207,8 +209,28 @@ async def test_the_session_tears_down_without_leaking_pipes_or_loops(tmp_path, r
     `PytestUnraisableExceptionWarning` at cleanup, after this body returns, so an
     in-body assertion claiming to check for one structurally cannot. pytest's own
     machinery fails the run on its own terms, loudly.
+
+    **The measurement window is drained before it opens, and that is load-bearing
+    rather than tidy** (added in 3c, which is where it first bit). `gc.collect()`
+    finalizes garbage from *anywhere* in the pytest process, and `recwarn` records
+    whatever warns while this test is running — so the collect below attributes
+    every earlier module's unfinalized resource to this session. Phase 3c added the
+    first module that drives the MCP tools for real rather than through a patched
+    `get_workspace_components`, and those tools open a `GraphStore` they never
+    close, so five `ResourceWarning: unclosed database` finalizations landed here
+    and reddened a row about *pipes*. Measured, and it survives isolation: the two
+    modules run together are green, because refcounting frees the connections
+    promptly there; only under a full session do enough of them reach the collector.
+    Draining first keeps the row's claim equal to its subject — the harness imports
+    nothing from mitos and opens no database, so a sqlite finalization is by
+    construction not its leak. 5b and 5c add more in-process rows of the same shape.
     """
     ws = _workspace(tmp_path, "ws_a", env=_scaffold_env(tmp_path))
+
+    # Drain and discard whatever earlier modules left for the collector, so what
+    # this row measures is this session and nothing else.
+    gc.collect()
+    recwarn.clear()
 
     async with mitos_server(cwd=ws, env=harness_env(tmp_path)) as server:
         assert _tool_json(await server.session.call_tool("list_scopes", {})) == {}
@@ -303,6 +325,87 @@ async def test_the_launch_directory_is_what_the_server_binds(tmp_path):
         scopes = _tool_json(await server.session.call_tool("list_scopes", {}))
 
     assert set(scopes) == {"alpha"}
+
+
+@pytest.mark.asyncio
+async def test_a_named_project_retargets_a_server_launched_somewhere_else(tmp_path):
+    """The vision's whole point, over a real server: the call says where.
+
+    The row above pins that the launch directory is still the *default*. This one
+    pins that it is no longer the *answer*: a server launched in A, told
+    `project=B`, answers about B. Only a subprocess can prove it — an in-process
+    call shares pytest's environment and never enters `cli.main()`, so it is
+    structurally blind to the two hazards that live outside the function call.
+
+    The registry is planted at the path the **child** will read, taken from
+    `harness_env`'s own dict. `registry.registry_path()` would resolve the
+    *parent's* conftest redirect instead, and the child would find no registry at
+    all — an absent registry is a healthy empty state, so the row would go green
+    having proven nothing.
+    """
+    env = _scaffold_env(tmp_path)
+    ws_a = _workspace(tmp_path, "ws_a", env=env, scopes=("alpha",))
+    ws_b = _workspace(tmp_path, "ws_b", env=env, scopes=("beta",))
+
+    registry_file = Path(env["XDG_CONFIG_HOME"]) / "mitos" / "registry.toml"
+    registry_file.parent.mkdir(parents=True, exist_ok=True)
+    registry_file.write_text(f'"bee" = "{ws_b}"\n', encoding="utf-8")
+
+    async with mitos_server(cwd=ws_a, env=env) as server:
+        by_name = _tool_json(
+            await server.session.call_tool("list_scopes", {"project": "bee"}))
+        by_path = _tool_json(
+            await server.session.call_tool("list_scopes", {"project": str(ws_b)}))
+        default = _tool_json(await server.session.call_tool("list_scopes", {}))
+        listed = _tool_json(await server.session.call_tool("list_projects", {}))
+
+    assert set(by_name) == {"beta"}
+    assert set(by_path) == {"beta"}
+    assert set(default) == {"alpha"}
+    assert listed["projects"] == [{"name": "bee", "path": str(ws_b)}]
+
+
+@pytest.mark.asyncio
+async def test_a_bad_selector_arrives_error_marked_carrying_the_whole_anatomy(tmp_path):
+    """The delivery mechanism, end to end — measured here rather than reasoned about.
+
+    Three shapes were possible and only one is right, so this row pins which one
+    the tree actually ships: returning the anatomy makes an addressing failure an
+    ordinary success (`isError: False`); letting the typed error propagate marks
+    the result as an error but delivers only its terse discriminator-level
+    fallback, which carries none of the recovery data; raising the *rendered*
+    body delivers both. The middle one is the trap, because it looks entirely
+    correct from the outside.
+
+    `_tool_json` is deliberately not used — it asserts `isError is False`, which
+    is the opposite of the contract here.
+    """
+    env = _scaffold_env(tmp_path)
+    ws_a = _workspace(tmp_path, "ws_a", env=env, scopes=("alpha",))
+
+    registry_file = Path(env["XDG_CONFIG_HOME"]) / "mitos" / "registry.toml"
+    registry_file.parent.mkdir(parents=True, exist_ok=True)
+    registry_file.write_text(f'"alpha-project" = "{ws_a}"\n', encoding="utf-8")
+
+    async with mitos_server(cwd=ws_a, env=env) as server:
+        result = await server.session.call_tool(
+            "surface_decisions", {"query": "anything", "project": "alpha-projekt"})
+
+    assert result.isError is True
+    body = result.content[0].text
+    # FastMCP's own prefix is kept rather than fought: it names the failing tool.
+    assert body.startswith("Error executing tool surface_decisions: ")
+    assert "no project named 'alpha-projekt' is registered" in body
+    assert "Did you mean: alpha-project" in body
+    assert "Registered projects: alpha-project." in body
+    assert "surface_decisions(project='alpha-project', …)" in body
+    assert "`list_projects()`" in body
+    assert "Traceback" not in body
+    # The terse fallback would have been this and nothing else.
+    assert body.strip() != (
+        "Error executing tool surface_decisions: unknown project 'alpha-projekt'")
+    for syntax in ("--project", "mitos init", "mitos projects"):
+        assert syntax not in body
 
 
 @pytest.mark.asyncio

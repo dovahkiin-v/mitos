@@ -572,17 +572,18 @@ def test_the_check_substrate_builds_its_store_on_the_targets_url(tmp_path):
 def test_the_mcp_server_builds_its_store_on_the_targets_url(tmp_path, monkeypatch):
     """W20 at `mcp_server.py`'s construction site.
 
-    It builds a zero-argument ``MitosConfig()``, so the target is the process's
-    working directory — which is precisely the state 3a/3b replace with a
-    resolved selector. Driven through ``chdir`` here (``monkeypatch`` restores
-    it) because that is what the site does *today*; the row proves the URL
-    arrives, not that the targeting is right.
+    It takes the workspace config as an argument (phase 3c), so the cwd read that
+    used to live inside it now lives at the call site — which is what leaves this
+    row proving what it always proved: the URL of the workspace *given* is the URL
+    the vector store is built on. The ``chdir`` stays for exactly that reason, and
+    ``monkeypatch`` restores it; the zero-argument ``MitosConfig()`` here is now
+    the *caller's* choice of target, not the callee's assumption about one.
     """
     monkeypatch.setenv("GEMINI_API_KEY", "testkey")
     from mitos import mcp_server
 
     monkeypatch.chdir(_workspace_with_url(tmp_path))
-    _, _, vector_store = mcp_server.get_workspace_components()
+    _, _, vector_store = mcp_server.get_workspace_components(MitosConfig())
     assert vector_store is not None
     assert vector_store.base_url == "http://from-target:7333"
 

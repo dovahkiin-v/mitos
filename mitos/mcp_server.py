@@ -8,13 +8,22 @@ import os
 from typing import Optional, List, Dict, Any, Tuple
 from mcp.server.fastmcp import FastMCP
 
-from mitos.display import blackout_note, clamp_limit, dumps_display, letter_payload, oneline_payload, order_scope_counts, show_payload, SHOW_NOT_FOUND_HINT
+from mitos import registry, routing
+from mitos.display import blackout_note, clamp_limit, dumps_display, letter_payload, oneline_payload, order_scope_counts, projects_payload, show_payload, SHOW_NOT_FOUND_HINT
 from mitos.config import MitosConfig
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.models import get_embedding_model_id
 from mitos.vector_store import QdrantVectorStore
-from mitos.errors import CollectionMissingError
+from mitos.errors import (
+    CollectionMissingError,
+    ProjectTargetingError,
+    TARGET_EXEMPT_VERB,
+    TARGET_MISSING,
+    TARGET_PATH_NOT_A_WORKSPACE,
+    TARGET_RELATIVE_PATH,
+    TARGET_UNKNOWN_NAME,
+)
 from mitos.lexical import degraded_reason_from_error, lexical_fallback
 from mitos.recall import (assess_surface_recall, corpus_provenance,
                           missing_index_is_a_gap, scope_filter_recovery)
@@ -127,9 +136,341 @@ def _decision_payload(node: Dict[str, Any], score: float, *, brief: bool,
         _attach_modifiers(payload, node, store)
     return payload
 
-def get_workspace_components() -> Tuple[GraphStore, Optional[GeminiEmbeddingProvider], Optional[QdrantVectorStore]]:
-    """Loads and returns the graph store (read-only), embedding provider, and vector store."""
-    config = MitosConfig()
+class _RenderedToolError(Exception):
+    """A targeting failure already rendered for delivery. ``str()`` IS the body.
+
+    Module-private, and it never leaves this file. Its whole purpose is to be the
+    thing a tool **raises** once the anatomy has been composed, because that is
+    the only delivery shape that carries it — measured against this tree's own
+    ``mcp`` over real stdio:
+
+    * ``raise ProjectTargetingError(...)`` → ``isError: True``, and the delivered
+      text is that error's *terse discriminator-level fallback*. The anatomy is
+      gone, and the result looks entirely correct while carrying nothing an agent
+      can act on. This is the trap.
+    * ``raise _RenderedToolError(<anatomy>)`` → ``isError: True`` and the full
+      anatomy.
+    * ``return <anatomy>`` → an ordinary **success**, which an addressing-class
+      failure is not.
+
+    ``Tool.run`` wraps whatever a tool raises as ``ToolError(f"Error executing
+    tool {name}: {e}")``, and the low-level server renders *that* through
+    ``_make_error_result(str(err))`` — so the delivered body is ``str()`` of what
+    was raised. FastMCP's prefix is kept rather than fought: it names the failing
+    tool, which the body would otherwise have to repeat.
+
+    Deliberately **not** a ``MitosError`` and deliberately not a field on
+    ``ProjectTargetingError``: a finished presentation string living on a shared
+    error type is exactly the leak the composition locus forbids — it would put
+    MCP call syntax one attribute away from the CLI boundary.
+    """
+
+
+def _example_project_name(err: ProjectTargetingError) -> Optional[str]:
+    """Picks the project name a rendered example should use, or None for none.
+
+    The closest match first when the caller mistyped a name — an example naming
+    what they probably meant is worth more than an arbitrary one — then the first
+    registered name. **Read from ``err.registered_names``, never from the bounded
+    view**: above the enumeration bound with no close matches, ``BoundedNames``
+    is deliberately empty, and the bound governs *enumeration*, not the existence
+    of one example.
+
+    Args:
+        err: The typed targeting error.
+
+    Returns:
+        A registered name, or ``None`` on a machine with none registered (the
+        caller then renders the absolute-path form, which is the only recovery
+        that exists there).
+    """
+    if err.close_matches:
+        return err.close_matches[0]
+    if err.registered_names:
+        return err.registered_names[0]
+    return None
+
+
+def _example_call(tool: str, err: ProjectTargetingError,
+                  *, prefer_path: bool = False) -> str:
+    """Renders the concrete call form the caller should have made.
+
+    An ellipsis stands in for the tool's other arguments rather than a per-tool
+    argument list: the list would have to be maintained beside six signatures and
+    would drift from them silently, and the caller already holds the arguments —
+    what they are missing is the ``project``.
+
+    Args:
+        tool: The tool the failing call named.
+        err: The typed targeting error.
+        prefer_path: Render the absolute-path form even when a registered name is
+            available. Load-bearing for ``registered_unreachable``, where the
+            registered names *include the one that just failed*: an example
+            naming a project by name there says retry the thing that did not
+            work, which is the dead end the class exists to avoid.
+
+    Returns:
+        One backticked call form.
+    """
+    name = None if prefer_path else _example_project_name(err)
+    target = name if name is not None else "/absolute/path/to/the/workspace"
+    return f"`{tool}(project='{target}', …)`"
+
+
+def _registered_projects_line(bounded: routing.BoundedNames) -> str:
+    """Renders the registered-name vocabulary, respecting the enumeration bound.
+
+    The MCP twin of ``cli._registered_projects_line`` — same policy, different
+    words, and it must stay different: this one may not name ``mitos init``,
+    because registration is a human setup act and an agent handed a
+    state-creating shell command is invited to run it.
+
+    Above ``routing.REGISTERED_NAMES_BOUND`` the enumeration collapses to the
+    close matches plus a count — and when there are no close matches, to the
+    count **alone**. An empty ``names`` with ``collapsed=True`` is the honest
+    answer, so this must never be spelled ``bounded.names or [...]``: that undoes
+    the distinction the policy exists to make, in the one place nobody looks. The
+    discovery pointer is a separate line here (the caller appends it to every
+    body), so this one stays pure vocabulary.
+
+    All four variants open with the same ``Registered projects:`` token — the CLI
+    twin gives each variant its own shape, and this one deliberately does not.
+    Every other line of every body also contains the word *registered*, so a test
+    asserting "no names were enumerated" by scanning the whole body is satisfied
+    by a neighbouring line and goes green against the bug (3b met exactly that
+    trap on the did-you-mean line). One stable token means the vocabulary line can
+    be parsed out and asserted **exactly**, which is the only assertion shape that
+    can see a bound regression.
+
+    Args:
+        bounded: The policy verdict from ``routing.bounded_registered_names``.
+
+    Returns:
+        One indented line for the error body.
+    """
+    if bounded.total == 0:
+        # Empty is first-class. The CLI answers this state by prescribing the
+        # setup act; this surface answers it with the escape hatch, which is the
+        # only recovery an agent is permitted to take.
+        return ("  Registered projects: none on this machine yet — a workspace is "
+                "still reachable by its absolute path.")
+    if not bounded.collapsed:
+        return f"  Registered projects: {', '.join(bounded.names)}."
+    if bounded.names:
+        return (f"  Registered projects: {bounded.total}, closest to what you "
+                f"passed: {', '.join(bounded.names)}.")
+    return f"  Registered projects: {bounded.total} — too many to enumerate here."
+
+
+#: The discovery pointer, on every rendered body. An agent that meets a targeting
+#: failure has, by construction, no project vocabulary — so the one thing every
+#: body must carry is where to go and get it. Worded as a capability statement
+#: rather than an instruction so it reads sanely under an empty registry too.
+_DISCOVERY_POINTER = ("  `list_projects()` returns every registered project name "
+                      "with its workspace path.")
+
+
+def _render_targeting_error(err: ProjectTargetingError, tool: str) -> str:
+    """Composes the MCP surface's teaching anatomy for a targeting failure.
+
+    The §4.5 parts, in this surface's own vocabulary: what is wrong, a concrete
+    **tool call** to copy, the ``list_projects()`` discovery pointer, and the
+    registered-name line in its bound-appropriate form. It is a second renderer,
+    not a shared body — ``cli._render_targeting_error`` says the same things in
+    terms of ``mitos`` commands, and a message that blended the two would hand
+    one surface's syntax to the other's caller.
+
+    Two rules make this renderer's wording different in kind, not merely in
+    phrasing, and both are enforced by tripwire:
+
+    * **It never names a state-creating shell command.** No ``mitos init``, no
+      ``mitos projects``, no CLI flag. An agent that meets an error naming a
+      shell command is invited to run it — an autonomous ``init`` scaffolding a
+      workspace and claiming a registration nobody asked for. Where the CLI's
+      recovery is a setup act, this surface's is the absolute-path escape hatch,
+      or naming a **human** as the next actor. Surfacing a repoint to the
+      operator *is* a terminating action; running one is not.
+    * **It reads nothing.** No ``os.getcwd()``, no second ``registry.load()`` —
+      it is a pure function of the typed error, so it cannot fail. The CLI's
+      renderer needs a ``try/except (RegistryError, OSError)`` guard precisely
+      because it re-reads both *inside* an ``except`` arm; porting that guard
+      here would imply a read that is not there.
+
+    There is deliberately **no cwd line at all**, though §4.5 permits framing one
+    as launch-dir context. On an always-on server ``os.getcwd()`` is fixed for
+    the process's whole life, so a hint derived from it is constant across every
+    call — always noise, or always wrong in the same way. Worse, it would be true
+    for one phase and misleading in the next: today "your launch dir sits inside
+    project X" implies X is the default, which it is; once the fallback is gone,
+    the same line names a project the server will not use.
+
+    It never calls ``str(err)``: that is the terse discriminator-level fallback
+    for an unrendered path, fenced by a tripwire forbidding exactly the strings
+    this function emits.
+
+    Args:
+        err: The typed error, carrying structured data only.
+        tool: The tool whose call failed — it appears in the example, so the
+            caller can copy the fix rather than translate it.
+
+    Returns:
+        The message body. Multi-line; every line after the first is indented as a
+        recovery, not as a new failure. FastMCP prefixes it with
+        ``Error executing tool <tool>: `` on the way out.
+    """
+    if err.discriminator == TARGET_EXEMPT_VERB:
+        # Unreachable from this surface — no MCP tool is exempt, and
+        # `list_projects` takes no `project` parameter, so there is nothing to
+        # refuse. It gets a terse honest branch anyway rather than falling into
+        # a neighbour's `else`, which would render it in `registered_unreachable`'s
+        # words. If you find yourself reaching for `routing.exempt_verb_error`
+        # here, the design has drifted.
+        return (f"the `{err.verb}` tool takes no `project` argument — it answers "
+                f"for the machine, not for one workspace.")
+
+    bounded = routing.bounded_registered_names(err.registered_names, err.close_matches)
+    example = _example_call(tool, err)
+
+    if err.discriminator == TARGET_MISSING:
+        lines = [
+            "no project was named, so there is no workspace to answer for.",
+            f"  Name one on the call — {example} — passing either a registered "
+            f"project name or the absolute path of a workspace directory.",
+            _registered_projects_line(bounded),
+        ]
+    elif err.discriminator == TARGET_UNKNOWN_NAME:
+        lines = [f"no project named {err.selector!r} is registered on this machine."]
+        if err.close_matches:
+            # Never truncated: `close_project_matches` expands each folded match
+            # to every original that folds onto it, so a registry holding several
+            # case variants of one name legitimately returns more than
+            # `PROJECT_DIDYOUMEAN_MAX` — and dropping one would hide the very
+            # distinction the caller needs to see.
+            lines.append(f"  Did you mean: {', '.join(err.close_matches)}")
+        # The recovery leads with whichever option actually exists. On a machine
+        # with an empty registry a name selector still reaches this class — an
+        # agent guessing a plausible project name is the ordinary way in — and
+        # "retry with a registered name" would there be a recovery naming an
+        # option that does not exist, which is the dead end the anatomy removes.
+        lines.append(
+            f"  Retry with "
+            f"{'a registered name, or with ' if err.registered_names else ''}"
+            f"the absolute path of the workspace you mean — {example}.")
+        lines.append(_registered_projects_line(bounded))
+    elif err.discriminator == TARGET_RELATIVE_PATH:
+        # The realistic mistake on this surface: agents reach for relative paths
+        # by habit, from a world where a working directory means something. This
+        # surface canonicalizes nothing, so the habit lands here — and the CLI's
+        # line about shell quoting is wrong here, because there is no shell.
+        lines = [
+            f"the project selector {err.selector!r} is a relative path, and this "
+            f"surface resolves nothing against a working directory.",
+            f"  Pass a registered project name or an absolute path — {example}.",
+        ]
+        if err.selector.startswith("~"):
+            lines.append("  (A leading `~` is not expanded here — pass the "
+                         "absolute path it stands for.)")
+        lines.append(_registered_projects_line(bounded))
+    elif err.discriminator == TARGET_PATH_NOT_A_WORKSPACE:
+        # Naming the triple is a description of what was looked for, which is
+        # fair to say; prescribing the command that creates it is not.
+        lines = [
+            f"there is no Mitos workspace at {err.path!r}.",
+            "  A workspace is a directory holding both .mitos/config.toml and "
+            "decisions.md; that path does not.",
+            f"  Name a registered project, or the absolute path of a workspace "
+            f"that already exists — {example}.",
+            _registered_projects_line(bounded),
+        ]
+    else:
+        # TARGET_REGISTERED_UNREACHABLE — the constructor whitelists the
+        # discriminator and the other five are handled above, so this is the
+        # remaining class rather than a fall-through default (`errors.
+        # _fallback_message` and the CLI renderer are spelled the same way).
+        #
+        # The CLI's recovery for this class is `mitos init --force`, which is
+        # closed to this surface. Left unspecified, the class would hand an agent
+        # a failure with no action it is permitted to take — and an agent with no
+        # named recovery retries or improvises. So the recovery is named as what
+        # it actually is: work for a human, which the agent's job is to surface.
+        lines = [
+            f"the project {err.name!r} is registered at {err.path!r}, which no "
+            f"longer holds a Mitos workspace.",
+            "  The registration points somewhere that has moved or been removed, "
+            "and repointing it needs a human — report that to whoever is "
+            "operating this session.",
+            f"  If you already know where the workspace lives now, name that "
+            f"absolute path instead — {_example_call(tool, err, prefer_path=True)}.",
+            _registered_projects_line(bounded),
+        ]
+
+    lines.append(_DISCOVERY_POINTER)
+    return "\n".join(lines)
+
+
+def _target_config(project: Optional[str], tool: str) -> MitosConfig:
+    """Resolves a tool call's ``project`` to the one config every read below uses.
+
+    The MCP analogue of ``cli.main()``'s single resolution block. It is per-tool
+    rather than per-process because this surface has no shared entry point, but
+    the discipline is identical and is the point of the phase: **one resolution
+    site, one config, and no second construction anywhere in the call.** A tool
+    that resolved project B and then rebuilt a cwd-derived config for its
+    provenance stamp would return B's decisions labelled with A's collection —
+    not a fallback surviving, but a second, disagreeing resolution inside one
+    call.
+
+    The gate is ``is not None`` and never truthiness. ``project=""`` is a
+    *supplied* selector that carries no target: it resolves, fails as the missing
+    class, and renders. Under ``if project:`` it would silently fall back to the
+    working directory — the caller asked for something and got somewhere else.
+
+    Args:
+        project: The selector as the caller passed it, or ``None`` when the
+            argument was omitted.
+        tool: The calling tool's name, for the rendered example.
+
+    Returns:
+        The config for the resolved workspace.
+
+    Raises:
+        _RenderedToolError: On any targeting failure — carrying the finished
+            anatomy, because the typed error's own ``str()`` cannot.
+        RegistryError: If the registry file itself is unusable. Deliberately
+            unwrapped: there is no registered vocabulary to teach when the file
+            holding it cannot be read, so it arrives as one calm line.
+        ConfigError: If the *resolved* workspace's ``config.toml`` is malformed.
+            Resolution proves a workspace's shape, not that its config parses —
+            a malformed config must be resolvable-then-diagnosed. No carve-out
+            here; it is the same pre-existing gap the CLI has.
+    """
+    if project is None:
+        # TRANSITIONAL — the working-directory fallback, and the single line
+        # phase 5b deletes. After this phase it is the ONLY zero-arg
+        # `MitosConfig()` left in this module; the other seven became the one
+        # resolved config threaded through each call. Spelled with the
+        # module-level `MitosConfig` name on purpose: nine test rows retarget
+        # this surface by patching `mitos.mcp_server.MitosConfig`, and they reach
+        # the call only through this name.
+        return MitosConfig()
+    try:
+        target = routing.resolve_project(project)
+    except ProjectTargetingError as err:
+        raise _RenderedToolError(_render_targeting_error(err, tool)) from err
+    return MitosConfig(target.root)
+
+
+def get_workspace_components(config: MitosConfig) -> Tuple[GraphStore, Optional[GeminiEmbeddingProvider], Optional[QdrantVectorStore]]:
+    """Loads and returns the graph store (read-only), embedding provider, and vector store.
+
+    Args:
+        config: The already-resolved workspace config — the caller resolves once
+            at the tool boundary (``_target_config``) and hands the same object
+            to every read in the call. It used to build a zero-argument
+            ``MitosConfig()`` here, which made the target the process's working
+            directory: on an always-on server, the launch directory, fixed for
+            the process's whole life and independent of what any call meant.
+    """
     store = GraphStore(config.db_path, read_only=True)
     
     embed_provider = None
@@ -148,7 +489,7 @@ def get_workspace_components() -> Tuple[GraphStore, Optional[GeminiEmbeddingProv
     return store, embed_provider, vector_store
 
 
-def _lexical_degraded_response(query: str, *, reason: str,
+def _lexical_degraded_response(query: str, *, config: MitosConfig, reason: str,
                                store: Optional[GraphStore], brief: bool,
                                limit: int,
                                open_questions: Optional[List[Dict[str, Any]]] = None) -> str:
@@ -162,6 +503,12 @@ def _lexical_degraded_response(query: str, *, reason: str,
 
     Args:
         query: The claim/topic the caller was trying to recall.
+        config: The call's one resolved workspace config. The degraded envelope
+            must name the workspace the caller *asked* for — it reads that
+            workspace's ``decisions.md`` and stamps its provenance — so this is
+            threaded in rather than rebuilt: a second construction here would
+            answer a targeted call out of whichever directory the server started
+            in, and label it as such.
         reason: One-line cause phrase (see ``degraded_reason_from_error``).
         store: A readable graph store for active-filtering + modifier stamps,
             or None when the graph itself is down (pre-V1a).
@@ -174,11 +521,11 @@ def _lexical_degraded_response(query: str, *, reason: str,
         The degraded envelope as a JSON string.
     """
     envelope = lexical_fallback(
-        query, MitosConfig().decisions_file, reason=reason, store=store,
+        query, config.decisions_file, reason=reason, store=store,
         limit=limit, brief=brief,
     )
     envelope["query"] = query
-    envelope.update(corpus_provenance(MitosConfig()))
+    envelope.update(corpus_provenance(config))
     if open_questions is not None:
         envelope["open_questions"] = open_questions
     return dumps_display(envelope, ensure_ascii=False, indent=2)
@@ -211,7 +558,8 @@ def _oq_payload(oq: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @mcp.tool()
-def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = False, limit: int = 5) -> str:
+def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = False, limit: int = 5,
+                      project: Optional[str] = None) -> str:
     """Surface active precedents for a CLAIM before you decide — the recall loop, use first.
 
     The broad "is there a settled decision near this?" scan: a ranked, capped (top
@@ -235,6 +583,12 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
             "is there anything nearby?" scan). Default False keeps the full reasoning.
         limit: Ranked top-k to retrieve (default 5; clamped to 1–50). Raise it to dig
             deeper, lower it to save context — a context-budget dial, not a cap at 5.
+        project: Which project this call is about — REQUIRED: name it on every
+            call. Either a registered project name (e.g. 'mitos') or the absolute
+            path of a workspace directory. A relative path resolves against
+            nothing here — this server has no meaningful working directory, and
+            one project's precedents are no answer for another's. Call
+            `list_projects()` when you do not know the registered names.
 
     Returns:
         A JSON string with `active_decisions` (ranked, Letter-mode), plus
@@ -255,18 +609,24 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         recoverable "it was settled before, go read the history", not a true miss.
     """
     top_k = clamp_limit(limit)
+    # Resolve BEFORE the `try` below, never inside it. That `except Exception`
+    # exists to degrade a broken *graph* to the lexical fallback; a targeting
+    # failure caught by it would come back as "semantic recall is degraded" with
+    # a nonsense reason and isError: False — the anatomy silently destroyed on
+    # the highest-traffic tool, with every existing row still green.
+    config = _target_config(project, "surface_decisions")
     # A pre-V1a graph raises at store construction — the graph is unusable, so
     # the lexical fallback parses decisions.md directly (no graph access).
     try:
-        store, embed_provider, vector_store = get_workspace_components()
+        store, embed_provider, vector_store = get_workspace_components(config)
     except Exception as e:
         return _lexical_degraded_response(
-            query, reason=degraded_reason_from_error(e), store=None,
+            query, config=config, reason=degraded_reason_from_error(e), store=None,
             brief=brief, limit=top_k,
         )
 
     results: Dict[str, Any] = {"active_decisions": []}
-    results.update(corpus_provenance(MitosConfig()))
+    results.update(corpus_provenance(config))
     semantic_ran = False
     top_score: Optional[float] = None
     retired: List[Dict[str, Any]] = []
@@ -352,7 +712,7 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
     # along on the degraded envelope.
     if not semantic_ran and not results["active_decisions"]:
         return _lexical_degraded_response(
-            query, reason=degraded_reason_from_error(degraded_error),
+            query, config=config, reason=degraded_reason_from_error(degraded_error),
             store=store, brief=brief, limit=top_k,
             open_questions=results.get("open_questions"),
         )
@@ -394,7 +754,7 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
 
 @mcp.tool()
 def list_decisions(scope: Optional[str] = None, state: str = "active", brief: bool = False,
-                   oneline: bool = False) -> str:
+                   oneline: bool = False, project: Optional[str] = None) -> str:
     """Enumerate the COMPLETE set of decisions (optionally scope-filtered) — no ranking, no top-k.
 
     surface_decisions / query_decisions are SEMANTIC and capped at the top few
@@ -423,6 +783,12 @@ def list_decisions(scope: Optional[str] = None, state: str = "active", brief: bo
             scan the map here, then dereference the few that matter with query/show.
             Letter-complete stays the default depth; this is an explicit opt-down,
             never a default. Mutually exclusive with brief.
+        project: Which project this call is about — REQUIRED: name it on every
+            call. Either a registered project name (e.g. 'mitos') or the absolute
+            path of a workspace directory. A relative path resolves against
+            nothing here — this server has no meaningful working directory, and
+            an exhaustive pass over the wrong project reads as a complete answer.
+            Call `list_projects()` when you do not know the registered names.
 
     Returns:
         A JSON string: {decisions, open_questions, total, scope, state}. Each
@@ -432,12 +798,16 @@ def list_decisions(scope: Optional[str] = None, state: str = "active", brief: bo
         `corrected_by` modifier slugs (the stamps survive every thinner tier,
         including oneline). UNBOUNDED.
     """
+    # An argument fault is answered by naming the argument, before any project is
+    # resolved: the caller's mistake is in the depth tier, not in the target, and
+    # resolving first would answer a different question than the one they got wrong.
     if brief and oneline:
         return dumps_display(
             {"error": "brief and oneline are mutually exclusive — pick one depth tier."},
             ensure_ascii=False, indent=None)
 
-    store, _embed, _vec = get_workspace_components()
+    config = _target_config(project, "list_decisions")
+    store, _embed, _vec = get_workspace_components(config)
 
     nodes = store.get_decisions(scope=scope, state=state)
     modifiers = store.get_modifiers_map([n["id"] for n in nodes])
@@ -467,7 +837,7 @@ def list_decisions(scope: Optional[str] = None, state: str = "active", brief: bo
         "total": len(decisions),
         "scope": scope,
         "state": state,
-        **corpus_provenance(MitosConfig()),
+        **corpus_provenance(config),
     }
 
     # On an empty scoped read, distinguish a genuinely-fresh scope from a misspelled one:
@@ -492,7 +862,7 @@ def list_decisions(scope: Optional[str] = None, state: str = "active", brief: bo
 
 
 @mcp.tool()
-def list_scopes(include_archived: bool = False) -> str:
+def list_scopes(include_archived: bool = False, project: Optional[str] = None) -> str:
     """List the project's scope-tag vocabulary with each domain's live-node counts.
 
     The map an agent reads BEFORE recording or recalling: every scope tag that
@@ -516,12 +886,19 @@ def list_scopes(include_archived: bool = False) -> str:
             every other scope tag present in the graph at a `{active_decisions: 0,
             parked_open_questions: 0}` floor — the scope-level parallel of
             list_decisions(state="all").
+        project: Which project this call is about — REQUIRED: name it on every
+            call. Either a registered project name (e.g. 'mitos') or the absolute
+            path of a workspace directory. A relative path resolves against
+            nothing here — this server has no meaningful working directory, and
+            scope vocabularies do not carry between projects. Call
+            `list_projects()` when you do not know the registered names.
 
     Returns:
         A JSON string: an ordered map `{scope: {active_decisions, parked_open_questions}}`,
         busiest domain first. The key order IS the deliverable — iterate it as-is.
     """
-    store, _embed, _vec = get_workspace_components()
+    config = _target_config(project, "list_scopes")
+    store, _embed, _vec = get_workspace_components(config)
     return dumps_display(
         order_scope_counts(store.get_scope_counts(include_archived=include_archived)),
         ensure_ascii=False,
@@ -530,7 +907,7 @@ def list_scopes(include_archived: bool = False) -> str:
 
 
 @mcp.tool()
-def show_node(ident: str) -> str:
+def show_node(ident: str, project: Optional[str] = None) -> str:
     """Dereference ONE decision or open question by exact handle — slug OR content-hash id.
 
     The exact-handle lookup that reaches the graveyard: it resolves a node
@@ -543,6 +920,12 @@ def show_node(ident: str) -> str:
 
     Args:
         ident: A content-hash id or a slug (case-insensitive) — the exact handle.
+        project: Which project this call is about — REQUIRED: name it on every
+            call. Either a registered project name (e.g. 'mitos') or the absolute
+            path of a workspace directory. A relative path resolves against
+            nothing here — this server has no meaningful working directory, and
+            a handle that is exact in one project is absent from the next. Call
+            `list_projects()` when you do not know the registered names.
 
     Returns:
         A JSON string. A found **decision** is a Letter-complete object (`axiom` +
@@ -554,7 +937,8 @@ def show_node(ident: str) -> str:
         returns `{found: false, ident, hint}` (never an error), the hint pointing
         at `mitos sync` for an authored-but-unsynced draft.
     """
-    store, _embed, _vec = get_workspace_components()
+    config = _target_config(project, "show_node")
+    store, _embed, _vec = get_workspace_components(config)
 
     # State-agnostic resolution via the SHARED 5a seam — the identical method
     # cmd_show calls, so the resolution selection cannot drift between surfaces.
@@ -579,7 +963,8 @@ def show_node(ident: str) -> str:
 
 
 @mcp.tool()
-def query_decisions(query: str, depth: str = "letter", brief: bool = False, limit: int = 5) -> str:
+def query_decisions(query: str, depth: str = "letter", brief: bool = False, limit: int = 5,
+                    project: Optional[str] = None) -> str:
     """Look up a SPECIFIC decision by slug or claim — the targeted lookup.
 
     Use this when you know roughly what you're after (a slug you're carrying, or a
@@ -598,6 +983,12 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
         limit: Ranked top-k for the SEMANTIC branch (default 5; clamped to 1–50). Raise
             it to dig deeper, lower it to save context. Ignored by an exact-slug hit
             (that returns the one decision you named).
+        project: Which project this call is about — REQUIRED: name it on every
+            call. Either a registered project name (e.g. 'mitos') or the absolute
+            path of a workspace directory. A relative path resolves against
+            nothing here — this server has no meaningful working directory, and
+            a slug you are carrying belongs to the project you read it from. Call
+            `list_projects()` when you do not know the registered names.
 
     Returns:
         A JSON string containing the ranked results in Letter-mode payload shape.
@@ -610,16 +1001,21 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
         `superseded_by` when known) — settled before, not a true miss; read the history
         with list_decisions(state="all").
     """
+    # The argument fault is answered before any project is resolved — see
+    # list_decisions for why the ordering is deliberate.
     if depth != "letter":
         return dumps_display({"error": f"Depth mode '{depth}' is not yet implemented in v0.1 (Letter-only retrieval)."}, ensure_ascii=False, indent=None)
 
+    # Resolved BEFORE the `try` — see surface_decisions: that `except Exception`
+    # would swallow a targeting failure into the lexical-degraded envelope.
+    config = _target_config(project, "query_decisions")
     # A pre-V1a graph raises at store construction — the graph is unusable, so
     # the lexical fallback parses decisions.md directly (no graph access).
     try:
-        store, embed_provider, vector_store = get_workspace_components()
+        store, embed_provider, vector_store = get_workspace_components(config)
     except Exception as e:
         return _lexical_degraded_response(
-            query, reason=degraded_reason_from_error(e), store=None,
+            query, config=config, reason=degraded_reason_from_error(e), store=None,
             brief=brief, limit=clamp_limit(limit),
         )
 
@@ -680,7 +1076,7 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             # Add the retired handles so the agent gets a pointer, not a false miss
             # (CLI⇄MCP-identical `all_superseded` shape, T5 parity).
             envelope: Dict[str, Any] = {"query": query, "depth_mode": "letter", "matches": output_list}
-            envelope.update(corpus_provenance(MitosConfig()))
+            envelope.update(corpus_provenance(config))
             if not output_list and retired:
                 envelope["all_superseded"] = retired
             return dumps_display(envelope, ensure_ascii=False, indent=2)
@@ -691,25 +1087,25 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             # empty path to fall through to at all.
             if missing_index_is_a_gap(store):
                 return _lexical_degraded_response(
-                    query, reason=degraded_reason_from_error(e), store=store,
-                    brief=brief, limit=clamp_limit(limit),
+                    query, config=config, reason=degraded_reason_from_error(e),
+                    store=store, brief=brief, limit=clamp_limit(limit),
                 )
             empty: Dict[str, Any] = {
                 "query": query, "depth_mode": "letter", "matches": [],
             }
-            empty.update(corpus_provenance(MitosConfig()))
+            empty.update(corpus_provenance(config))
             return dumps_display(empty, ensure_ascii=False, indent=2)
         except Exception as e:
             # Embedding/Qdrant failure mid-query (e.g. a 429): never the raw
             # provider blob — the deterministic lexical fallback instead.
             return _lexical_degraded_response(
-                query, reason=degraded_reason_from_error(e), store=store,
-                brief=brief, limit=clamp_limit(limit),
+                query, config=config, reason=degraded_reason_from_error(e),
+                store=store, brief=brief, limit=clamp_limit(limit),
             )
 
     # No embedding provider / vector store wired at all — degrade lexically.
     return _lexical_degraded_response(
-        query, reason=degraded_reason_from_error(None), store=store,
+        query, config=config, reason=degraded_reason_from_error(None), store=store,
         brief=brief, limit=clamp_limit(limit),
     )
 
@@ -722,7 +1118,8 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
                     narrows: Optional[str] = None, depends_on: Optional[str] = None,
                     resolves: Optional[str] = None, contradicts: Optional[str] = None,
                     derives_from: Optional[str] = None, cites: Optional[str] = None,
-                    acknowledge_neighbors: bool = False) -> str:
+                    acknowledge_neighbors: bool = False,
+                    project: Optional[str] = None) -> str:
     """Record a decision you just made, with the alternatives you rejected and why,
     so future sessions and other agents inherit it instead of relitigating it.
 
@@ -764,6 +1161,13 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
             the flagged neighbours and judging this decision genuinely independent.
             Leave False (default) on the first attempt. Combines with the relation
             args — declared edges are still written.
+        project: Which project this decision belongs to — REQUIRED: name it on
+            every call. Either a registered project name (e.g. 'mitos') or the
+            absolute path of a workspace directory. A relative path resolves
+            against nothing here — this server has no meaningful working
+            directory, and this is the write: a mis-aimed call lands a real entry
+            in another project's corpus. Call `list_projects()` when you do not
+            know the registered names.
 
     Returns:
         A JSON string: {slug, id, state, embedding, status} or {error, code}.
@@ -796,10 +1200,13 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
         health nudge that the generated context files have grown past their size ceiling
         — not an error and not about this decision; run `mitos status` for the breakdown.
     """
+    config = _target_config(project, "record_decision")
     # Build our own writable manager — do NOT reuse get_workspace_components()
-    # (it opens a read_only=True store). Workspace resolves from cwd, like the read tools.
+    # (it opens a read_only=True store). The workspace is the one the call named,
+    # resolved once above like the read tools. The import stays LAZY: mcp_server →
+    # sync → cli → mcp_server is a real cycle, broken only by all three edges
+    # being deferred to call time, and this is one of the three.
     from mitos.sync import MitosSyncManager
-    config = MitosConfig()
     manager = MitosSyncManager(config)
     result = manager.record_decision_entry(
         axiom=axiom,
@@ -820,3 +1227,40 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
         acknowledge_neighbors=acknowledge_neighbors,
     )
     return dumps_display(result, ensure_ascii=False, indent=None)
+
+
+@mcp.tool()
+def list_projects() -> str:
+    """List every Mitos project registered on this machine, with its workspace path.
+
+    The discovery primitive behind every other tool's `project` argument: this is
+    where the vocabulary comes from. Call it when you do not know a project's
+    registered name, when a call came back saying the name you passed is not
+    registered, or once at the start of a session to learn what this machine
+    holds. One round trip, and every later call can name its target.
+
+    It reports registrations, not health — whether a registered path still holds
+    a usable workspace is a question for the tool you actually want to call.
+
+    An empty result is a healthy state, not a failure: nothing is registered on
+    this machine yet. A workspace can still be targeted by passing its absolute
+    path as `project`, which is also the escape hatch for a workspace that exists
+    but was never registered.
+
+    It takes no `project` argument, deliberately: it answers for the machine, not
+    for one workspace.
+
+    Returns:
+        A JSON string: {registry_path, count, projects}, where each entry in
+        `projects` is {name, path} — `name` is what you pass as `project`, `path`
+        is the workspace it reaches. The order is the registry's own document
+        order, never sorted: it is the order a path lookup resolves its first
+        match in, so it is the order that actually decides. `registry_path` names
+        the file the registrations live in, and is reported whether or not that
+        file exists yet.
+    """
+    return dumps_display(
+        projects_payload(registry.load(), registry.registry_path()),
+        ensure_ascii=False,
+        indent=2,
+    )

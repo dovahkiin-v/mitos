@@ -31,6 +31,7 @@ from mitos.display import (
     oneline_axiom,
     oneline_payload,
     order_scope_counts,
+    projects_payload,
     truncate_words,
     resolve_display_ensure_ascii,
     show_payload,
@@ -1250,11 +1251,17 @@ def cmd_projects(as_json: bool = False) -> None:
     Raises:
         RegistryError: If the registry file exists but is unusable.
     """
-    path = registry.registry_path()
-    projects = [{"name": name, "path": p} for name, p in registry.load().items()]
+    # The payload shape is `display.projects_payload`'s, not this function's —
+    # lifted to the shared leaf at its second consumer (the `list_projects` MCP
+    # twin), so the two surfaces cannot drift. Built once and read by BOTH
+    # branches: routing only the `--json` branch through the leaf would fork the
+    # text table off a second, hand-built list.
+    payload = projects_payload(registry.load(), registry.registry_path())
+    path = payload["registry_path"]
+    projects = payload["projects"]
 
     if as_json:
-        _emit_json({"registry_path": path, "count": len(projects), "projects": projects})
+        _emit_json(payload)
         return
 
     if not projects:
