@@ -591,6 +591,10 @@ def test_status_with_a_path_warns_about_that_workspace(tmp_path, monkeypatch, ca
     target = tmp_path / "target"
     (target / ".mitos").mkdir(parents=True)
     (target / ".mitos" / "config.toml").write_text('rotation_mode = "prune"\n', encoding="utf-8")
+    # From phase 3b the positional is a project selector, so the target must carry
+    # the whole validity triple — `.mitos/config.toml` AND `decisions.md` — or the
+    # call lands on the targeting error before any warning can fire.
+    (target / "decisions.md").write_text("# Decisions\n", encoding="utf-8")
 
     clean_cwd = tmp_path / "clean"
     (clean_cwd / ".mitos").mkdir(parents=True)
@@ -615,6 +619,10 @@ def test_status_with_a_path_stays_quiet_about_a_deprecated_cwd(tmp_path, monkeyp
 
     clean_target = tmp_path / "target"
     (clean_target / ".mitos").mkdir(parents=True)
+    # The validity triple, as above — and the config.toml stays CLEAN (no
+    # rotation_mode), which is what this row is about.
+    (clean_target / ".mitos" / "config.toml").write_text("", encoding="utf-8")
+    (clean_target / "decisions.md").write_text("# Decisions\n", encoding="utf-8")
 
     dirty_cwd = tmp_path / "dirty"
     (dirty_cwd / ".mitos").mkdir(parents=True)

@@ -182,19 +182,30 @@ def test_serve_binds_target(tmp_path, monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 def test_status_positional_wins_over_directory(tmp_path, monkeypatch) -> None:
-    """`status /path -C /other` reports on /path — the explicit positional wins."""
+    """`status /path -C /other` reports on /path — the explicit positional wins.
+
+    The positional is a *selector* from phase 3b on, so the target must be a real
+    workspace (``.mitos/config.toml`` + ``decisions.md``) or it lands on the
+    targeting error before the mocked handler is reached — and the argument the
+    handler receives is the canonical root, so it is asserted against
+    ``os.path.realpath`` rather than the raw fixture path (the two agree on this
+    machine's temp root, which is exactly why the raw spelling would be a
+    machine-dependent pin).
+    """
     monkeypatch.chdir(tmp_path)
     other = tmp_path / "other"
     other.mkdir()
     target = tmp_path / "target"
-    target.mkdir()
+    (target / ".mitos").mkdir(parents=True)
+    (target / ".mitos" / "config.toml").write_text("", encoding="utf-8")
+    (target / "decisions.md").write_text("# Decisions\n", encoding="utf-8")
     with patch("mitos.cli.cmd_status", return_value=0) as mock_status:
         with patch.object(sys, "argv",
                           ["mitos", "-C", str(other), "status", str(target)]):
             with pytest.raises(SystemExit) as exc:
                 main()
     assert exc.value.code == 0
-    assert mock_status.call_args.args[0] == str(target)
+    assert mock_status.call_args.args[0] == os.path.realpath(str(target))
 
 
 def test_status_no_positional_uses_directory(tmp_path, monkeypatch) -> None:

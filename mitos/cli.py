@@ -21,6 +21,7 @@ from google import genai
 from mitos import __version__
 from mitos import check
 from mitos import registry
+from mitos import routing
 from mitos.display import (
     apply_stdout_text_safety,
     blackout_note,
@@ -46,6 +47,10 @@ from mitos.config import (
 from mitos.errors import (
     MitosError, ParseError, ValidationError, DatabaseError, ConfigError,
     VectorStoreError, CollectionMissingError, EmbeddingError,
+    ProjectTargetingError, RegistryError,
+    EXEMPT_CREATES_REGISTRATION, EXEMPT_EXPLICITLY_GLOBAL, EXEMPT_NO_WORKSPACE,
+    TARGET_EXEMPT_VERB, TARGET_MISSING, TARGET_PATH_NOT_A_WORKSPACE,
+    TARGET_RELATIVE_PATH, TARGET_UNKNOWN_NAME,
 )
 from mitos.divergence import corpus_graph_divergence, divergence_total
 from mitos.env import parse_env_file, resolve_key, transitional_env_fallback
@@ -1820,24 +1825,35 @@ def _upsert_env_var(env_path: str, name: str, value: str) -> None:
         pass
 
 
-def cmd_set_key(value: str, name: str = "GEMINI_API_KEY", is_global: bool = False) -> None:
+def cmd_set_key(value: str, name: str = "GEMINI_API_KEY", is_global: bool = False,
+                workspace_dir: Optional[str] = None) -> None:
     """Stores an API key in the global or project ``.env``.
 
     Args:
         value: The API key value to store.
         name: The env var name (default ``GEMINI_API_KEY``).
         is_global: If True, write the shared ``~/.config/mitos/.env`` (serves
-            every project); otherwise write ``./.env`` for the current project.
+            every project); otherwise write the project's own ``.env``.
+        workspace_dir: The project to write into. ``None`` — the transitional
+            default — means the process's working directory, exactly as this verb
+            has always behaved. The parameter exists because ``set-key``'s project
+            form *is* the bare invocation: once ``--project`` is accepted on this
+            verb's parser, a selector that did not reach here would silently land a
+            **credential** in the launch directory's ``.env`` while the caller
+            named another project. Phase 5a deletes the default and makes the
+            argument required; ``test_set_key_without_a_selector_still_writes_the
+            _cwd_env`` is the tripwire that has to be inverted for that.
     """
+    base = os.getcwd() if workspace_dir is None else workspace_dir
     if is_global:
         env_path = global_env_path()
     else:
-        env_path = os.path.join(os.getcwd(), ".env")
+        env_path = os.path.join(base, ".env")
     _upsert_env_var(env_path, name, value)
     scope = "globally (all projects)" if is_global else "for this project"
     print(f"Stored {name} {scope} → {env_path}")
     if not is_global:
-        _ensure_gitignore_entry(os.path.join(os.getcwd(), ".gitignore"), ".env")
+        _ensure_gitignore_entry(os.path.join(base, ".gitignore"), ".env")
 
 
 def _fmt_k(n: int) -> str:
@@ -4079,6 +4095,340 @@ def _warn_deprecated_rotation_mode(config: MitosConfig) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# The project selector at the CLI boundary.
+#
+# One resolution site, in `main()`, feeding the single `MitosConfig` every verb
+# already receives — so ~20 verbs retarget with no per-verb edit. A per-verb
+# thread would be twenty chances to miss one, and the one missed would fail
+# *silently*: a call that names a project and writes to the working directory.
+# ---------------------------------------------------------------------------
+
+# Verbs that target no single workspace, and why. The reason keys are the shared
+# vocabulary (`errors.EXEMPT_*`); the wording below is this surface's alone.
+# `status` is deliberately ABSENT: zero-arg `status` is a global overview, but
+# `status <project>` is a supported targeting form, so `-p X status` is the flag
+# spelling of something the tool already does.
+_SELECTOR_EXEMPT_VERBS: Dict[str, str] = {
+    "init": EXEMPT_CREATES_REGISTRATION,
+    "serve": EXEMPT_NO_WORKSPACE,
+    "projects": EXEMPT_EXPLICITLY_GLOBAL,
+}
+
+# Why each of them is global, in this surface's words. Keyed by VERB rather than
+# by reason because two verbs share `explicitly_global` and owe different
+# recoveries — `set-key` only ever lands here through `--global`, which is the
+# form its note names.
+_EXEMPT_VERB_NOTES: Dict[str, str] = {
+    "init": ("`init` creates a registration rather than reaching one — run it in "
+             "the workspace you mean (`mitos -C <dir> init`, or cd there first)."),
+    "serve": ("`serve` starts the MCP server and binds no workspace of its own — "
+              "launch it plainly: `mitos serve`."),
+    "projects": ("`projects` reads the machine-wide registry and targets no single "
+                 "workspace — it works from anywhere."),
+    "set-key": ("`set-key --global` writes the machine-wide .env shared by every "
+                "project — drop `--global` to write one project's own .env."),
+}
+
+# Verbs whose positional argument DENOTES a workspace, so it is a selector source.
+# `import`'s positional is a source markdown *file* and stays cwd-rooted — the
+# discriminator is what the positional denotes, never that it is spelled `path`.
+_POSITIONAL_SELECTOR_VERBS: frozenset = frozenset({"status", "agent-block"})
+
+# The two verbs that answer questions *about* a directory rather than acting on
+# its corpus, so "there is no workspace here" is their ANSWER, not their error.
+# `mitos status /some/dir` must keep printing the NOT SET UP report with its next
+# steps — SETUP.md's agent loop is built on that report — and `agent-block`'s
+# plain form prints a workspace-independent block, so refusing a pre-`init` repo
+# would block a legitimate use.
+_WORKSPACE_OPTIONAL_VERBS: frozenset = frozenset({"status", "agent-block"})
+
+
+def _selector_from_args(args: argparse.Namespace) -> Optional[str]:
+    """Coalesces the three spellings of the project selector into one value.
+
+    ``--project`` is accepted on both sides of the verb, into **two** destinations
+    (``project_pre`` / ``project_post``). That is not redundancy: one shared
+    ``dest`` lets the subparser's ``None`` default overwrite what the top-level
+    parser stored, silently discarding a selector the caller did supply (measured
+    on this parser), and the ``argparse.SUPPRESS`` repair fixes the discard while
+    making the both-positions case indistinguishable from the post-verb one. Two
+    destinations make the trap unconstructible — there is no shared slot to clobber
+    — and the ambiguity stays visible enough to refuse.
+
+    Naming the target twice is refused **even when the two values are identical**:
+    a rule with an equality exception is one nobody can predict at the call site.
+
+    Args:
+        args: The parsed namespace.
+
+    Returns:
+        The selector as the caller typed it, or ``None`` when none was supplied.
+        An empty string is a *supplied* selector carrying no target, and is
+        returned as such — the gate everywhere below is ``is not None``, never
+        truthiness, or `-p ""` would silently fall back to the working directory.
+
+    Raises:
+        MitosError: If the target was named twice. A plain boundary error, not a
+            seventh targeting discriminator: nothing was resolved and nothing is
+            unknown, so it is a CLI-local usage fault.
+    """
+    pre = getattr(args, "project_pre", None)
+    post = getattr(args, "project_post", None)
+    if pre is not None and post is not None:
+        raise MitosError(
+            f"the project was named twice: `--project {pre}` before the verb and "
+            f"`--project {post}` after it. Pass one, on either side."
+        )
+    flag = pre if pre is not None else post
+
+    positional = (getattr(args, "path", None)
+                  if args.command in _POSITIONAL_SELECTOR_VERBS else None)
+    if flag is not None and positional is not None:
+        raise MitosError(
+            f"the project was named twice: `--project {flag}` and the positional "
+            f"{positional!r}. Pass one — `mitos {args.command} {positional}` or "
+            f"`mitos {args.command} --project {flag}`."
+        )
+    return flag if flag is not None else positional
+
+
+def _refuse_selector_on_exempt_verb(args: argparse.Namespace,
+                                    selector: Optional[str]) -> None:
+    """Refuses a selector handed to a verb that targets no project.
+
+    Runs **before** resolution, and the ordering is the point: ``mitos -p nosuch
+    init`` must answer *"`init` takes no project selector"*, not *"unknown
+    project"*. The fault is the verb, and resolving first answers the wrong
+    question — then teaches a recovery (register the name) that would still leave
+    the call malformed.
+
+    Args:
+        args: The parsed namespace.
+        selector: The coalesced selector, or None.
+
+    Raises:
+        ProjectTargetingError: With the ``exempt_verb`` discriminator.
+    """
+    if selector is None:
+        return
+    reason = _SELECTOR_EXEMPT_VERBS.get(args.command)
+    if reason is None and args.command == "set-key" and getattr(args, "is_global", False):
+        # Conditional membership: `set-key`'s *project* form is the bare
+        # invocation, so only `--global` makes the verb global.
+        reason = EXEMPT_EXPLICITLY_GLOBAL
+    if reason is not None:
+        raise routing.exempt_verb_error(args.command, reason)
+
+
+def _resolve_selector(selector: Optional[str],
+                      command: str) -> Optional[routing.ResolvedProject]:
+    """Turns a supplied selector into a validated workspace, or None when absent.
+
+    Absolutizes an explicitly-typed relative path (``.``, ``./x``, ``../x``,
+    ``x/y``) so the resolver only ever receives a name or an absolute path — and
+    runs **after** ``-C``'s process-entry chdir, so ``mitos -C /a -p ./b`` means
+    ``/a/b``. Canonicalizing before the chdir would change what a relative selector
+    means, with every absolute-path test still green.
+
+    ``expanduser`` is deliberately not used: ``os.path.abspath("~/x")`` returns
+    ``<cwd>/~/x``, which **is** absolute, so an unguarded absolutize would send a
+    nonsense path to the resolver and answer with "no workspace at …" naming a
+    directory nobody meant. With the guard, a ``~``-leading selector reaches the
+    resolver path-shaped and non-absolute and lands on the relative-path class,
+    whose message names the actual rule and both valid forms.
+
+    Args:
+        selector: The coalesced selector, or None when none was supplied.
+        command: ``args.command``, for the ``_WORKSPACE_OPTIONAL_VERBS`` carve-out.
+
+    Returns:
+        The resolution, or ``None`` when no selector was supplied (the caller then
+        keeps today's working-directory behaviour; phase 5a removes that fallback).
+
+    Raises:
+        ProjectTargetingError: On every resolution failure the carve-out below
+            does not cover.
+        RegistryError: If the registry file itself is unusable — propagated
+            unwrapped, because there is no registered vocabulary to teach when the
+            file holding it cannot be read.
+    """
+    if selector is None:
+        return None
+    sel = selector
+    if (routing.is_path_shaped(sel) and not sel.startswith("~")
+            and not os.path.isabs(sel)):
+        sel = os.path.abspath(sel)
+    try:
+        return routing.resolve_project(sel)
+    except ProjectTargetingError as err:
+        # The `status`/`agent-block` carve-out (see `_WORKSPACE_OPTIONAL_VERBS`).
+        # Only the PATH form: a *name* is a claim about the registry, so an unknown
+        # name and a registered-but-vanished one both keep their own error — a NOT
+        # SET UP report about a path the caller never typed is a worse answer than
+        # either. `is_path_shaped` is checked here as well as implied by the
+        # discriminator, so a later resolver change cannot widen this to names by
+        # accident. `err.path` is the canonical probed root for this class (as
+        # opposed to the registry's recorded string on `registered_unreachable`),
+        # which is exactly the value `cmd_status` wants.
+        if (command in _WORKSPACE_OPTIONAL_VERBS
+                and err.discriminator == TARGET_PATH_NOT_A_WORKSPACE
+                and routing.is_path_shaped(sel)):
+            # A `ResolvedProject` for a directory that is not (yet) a workspace
+            # stretches the dataclass's "one successful resolution" wording. It is
+            # deliberate: for these two verbs the report IS the successful answer,
+            # and both fields are literally true (a path was named; no registration
+            # covers it). The alternative — a second return shape — would fork
+            # every downstream read for a case that differs only in whether the
+            # directory is populated.
+            return routing.ResolvedProject(root=err.path, name=None, via="path")
+        raise
+
+
+def _registered_projects_line(bounded: routing.BoundedNames) -> str:
+    """Renders the registered-name vocabulary, respecting the enumeration bound.
+
+    Above ``routing.REGISTERED_NAMES_BOUND`` the enumeration collapses to the
+    close matches plus a count plus the discovery pointer — and when there are no
+    close matches, to the count and pointer **alone**. An empty ``names`` with
+    ``collapsed=True`` is the honest answer, so this must never be spelled
+    ``bounded.names or [...]``: that would undo the distinction the policy exists
+    to make, in the one place nobody would look for it.
+
+    Args:
+        bounded: The policy verdict from ``routing.bounded_registered_names``.
+
+    Returns:
+        One indented line for the error body.
+    """
+    if bounded.total == 0:
+        # Empty is first-class, and the CLI is the surface allowed to prescribe
+        # the setup act that fills it.
+        return "  No projects are registered yet — `mitos init` introduces one."
+    if not bounded.collapsed:
+        return (f"  Registered projects: {', '.join(bounded.names)} "
+                f"(list with `mitos projects`).")
+    if bounded.names:
+        return (f"  {bounded.total} projects registered, closest: "
+                f"{', '.join(bounded.names)} (list them all with `mitos projects`).")
+    return (f"  {bounded.total} projects registered — list them with "
+            f"`mitos projects`.")
+
+
+def _render_targeting_error(err: ProjectTargetingError) -> str:
+    """Composes the CLI's teaching anatomy for a targeting failure.
+
+    The vision's §4.5 parts: what is wrong, a concrete example, a discovery
+    pointer, and a did-you-mean or cwd hint where one exists. Wording lives here —
+    at the surface — because it is the difference *between* the surfaces, not
+    shared policy: ``routing`` holds what both must agree on (the bound, the
+    did-you-mean rule, the ancestor predicate), and this renderer is allowed to
+    name ``mitos init`` and ``--project`` precisely because the MCP renderer must
+    never. Homing it in ``display.py`` would put it one import from an agent.
+
+    It never calls ``str(err)``: that is the terse discriminator-level fallback
+    for an unrendered path, and it is fenced by a tripwire forbidding exactly the
+    strings this function emits.
+
+    Args:
+        err: The typed error, carrying structured data only.
+
+    Returns:
+        The message body, without the boundary's own ``Error: `` prefix. Multi-line;
+        every line after the first is indented as a recovery, not a new failure.
+    """
+    if err.discriminator == TARGET_EXEMPT_VERB:
+        note = _EXEMPT_VERB_NOTES.get(
+            err.verb, "it targets no single workspace.")
+        return f"the `{err.verb}` verb takes no project selector.\n  {note}"
+
+    bounded = routing.bounded_registered_names(err.registered_names, err.close_matches)
+
+    if err.discriminator == TARGET_MISSING:
+        lines = [
+            "no project selector was supplied.",
+            "  Pass a registered name or an absolute path — `mitos --project <name> "
+            "<verb>` or `mitos <verb> --project <name>`.",
+            _registered_projects_line(bounded),
+        ]
+    elif err.discriminator == TARGET_UNKNOWN_NAME:
+        lines = [f"unknown project {err.selector!r}."]
+        if err.close_matches:
+            # Never truncated here: `close_project_matches` expands each folded
+            # match to every original that folds onto it, so a registry holding
+            # several case variants of one name legitimately returns more than
+            # `PROJECT_DIDYOUMEAN_MAX` — and dropping one would hide the very
+            # distinction the caller needs to see.
+            lines.append(f"  Did you mean: {', '.join(err.close_matches)}")
+        lines.append(_registered_projects_line(bounded))
+    elif err.discriminator == TARGET_RELATIVE_PATH:
+        lines = [
+            f"the project selector {err.selector!r} is not an absolute path.",
+            "  A selector is a registered name or an absolute path — "
+            "`--project mitos`, or `--project /home/you/code/mitos`.",
+        ]
+        if err.selector.startswith("~"):
+            # Worth one line only for the shape that earns it: `~` looks absolute
+            # to a human and is not, and the reason is almost always a quoted value
+            # the shell therefore did not expand.
+            lines.append("  (A leading `~` is not expanded here — your shell "
+                         "expands it only when the value is unquoted.)")
+        lines.append(_registered_projects_line(bounded))
+    elif err.discriminator == TARGET_PATH_NOT_A_WORKSPACE:
+        lines = [
+            f"no Mitos workspace at {err.path!r}.",
+            "  A workspace is a directory holding .mitos/config.toml and "
+            "decisions.md — run `mitos init` there, or name a registered project.",
+            _registered_projects_line(bounded),
+        ]
+    else:
+        # TARGET_REGISTERED_UNREACHABLE — the constructor whitelists the
+        # discriminator and the other five are handled above, so this is the
+        # remaining class rather than a fall-through default (`errors.
+        # _fallback_message` is spelled the same way, for the same reason).
+        lines = [
+            f"the project {err.name!r} is registered at {err.path!r}, which no "
+            f"longer holds a Mitos workspace.",
+            f"  Repoint it — `mitos init --name {err.name} --force` in the "
+            f"workspace's current location — or edit {registry.registry_path()}.",
+            _registered_projects_line(bounded),
+        ]
+
+    # The cwd hint is a guess about what the caller *meant*, so it renders only
+    # where a name was at stake. On a path-form or exempt failure the caller named
+    # something else entirely and a cwd nudge is noise. `os.getcwd()` is passed
+    # RAW: `nearest_registered_ancestor` canonicalizes its own argument through the
+    # one spelling, and a second canonicalization here would split identity.
+    # This is the one registry re-read the phase permits — the hint needs the
+    # name→path map, which the error does not carry, and it happens only on the
+    # failure path.
+    #
+    # Guarded because this runs INSIDE the boundary's `except` arm, where a raise
+    # escapes `main()` entirely — a sibling `except MitosError` cannot catch what
+    # its neighbour handler throws — and the caller would get a traceback in place
+    # of the diagnosis they need. Both calls can genuinely fail on this path and
+    # only on this path: a targeting failure never constructs a `MitosConfig`, so
+    # the hint may be the first cwd read of the whole run (a deleted working
+    # directory is an `OSError`), and the registry is re-read here after the raise
+    # site already read it (a concurrent edit is a `RegistryError`). Losing an
+    # optional hint is the right degradation; losing the whole rendered error is
+    # not. Deliberately NOT the guard-undoing shape 2a fenced — that one would
+    # swallow a corrupt registry on the *resolution* path, where the fault is the
+    # answer; here resolution already succeeded in reading it.
+    if err.discriminator in (TARGET_MISSING, TARGET_UNKNOWN_NAME):
+        try:
+            err.cwd_hint_name = routing.nearest_registered_ancestor(
+                os.getcwd(), registry.load())
+        except (RegistryError, OSError):
+            err.cwd_hint_name = None
+        if err.cwd_hint_name:
+            lines.append(
+                f"  Your working directory sits inside registered project "
+                f"{err.cwd_hint_name!r} — pass `--project {err.cwd_hint_name}` if "
+                f"that is the target.")
+    return "\n".join(lines)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Builds the CLI argument parser.
 
@@ -4100,6 +4450,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Run as if mitos were started in DIR (git's -C). Retargets the whole "
              "workspace — graph, collection, .env/keys, and relative path args. "
              "Must appear BEFORE the verb: `mitos -C /ws list`.",
+    )
+    # The project selector, pre-verb half. Its twin is registered on every
+    # subparser below, into a DIFFERENT dest — see `_selector_from_args` for why a
+    # shared one silently discards this value. Never argparse-`required`: that
+    # emits argparse's own usage error and exits 2 before mitos code runs, so none
+    # of the teaching anatomy could render.
+    parser.add_argument(
+        "-p", "--project", dest="project_pre", default=None, metavar="SELECTOR",
+        help="Act on this project instead of the working directory: a registered "
+             "name (see `mitos projects`) or an absolute path. Accepted on either "
+             "side of the verb — `mitos -p mitos list` or `mitos list -p mitos`.",
     )
     # metavar collapses the width-doubling {init,sync,query,query_decisions,…}
     # brace-list in the usage banner to a single COMMAND token (R5). This is a
@@ -4346,8 +4707,34 @@ def _build_parser() -> argparse.ArgumentParser:
     # which the next verb added would be one forgotten argument away from missing.
     # argparse reads the attribute at parse time, so assigning it after
     # registration is equivalent to passing it in.
+    #
+    # The post-verb `--project` is registered in the SAME loop, for the same
+    # reason: a per-verb `add_argument` line is one forgotten argument away from
+    # missing on the next verb added, and the miss is not a soft one —
+    # `mitos record -p mitos` would be argparse's own `unrecognized arguments`,
+    # exit 2 before any mitos code runs, carrying none of the anatomy.
+    #
+    # Deduped by `id()` because the five aliased verbs (`query`/`query_decisions`,
+    # `surface`/`surface_decisions`, `list`/`list_decisions`, `scopes`/
+    # `list_scopes`, `record`/`record_decision`) are ONE parser object under two
+    # names: 27 names over 22 objects, and a second `add_argument` on the same
+    # object raises `ArgumentError: conflicting option strings`. The
+    # `allow_abbrev` assignment above needs no such guard — it is idempotent — so
+    # the dedupe guards only the registration. Being one object is also what makes
+    # the aliases free: covering the object once covers both names.
+    _selector_registered: Set[int] = set()
     for _verb_parser in subparsers.choices.values():
         _verb_parser.allow_abbrev = False
+        if id(_verb_parser) in _selector_registered:
+            continue
+        _selector_registered.add(id(_verb_parser))
+        _verb_parser.add_argument(
+            "-p", "--project", dest="project_post", default=None,
+            metavar="SELECTOR",
+            help="Act on this project instead of the working directory: a "
+                 "registered name (see `mitos projects`) or an absolute path. "
+                 "Also accepted before the verb (`mitos -p NAME …`).",
+        )
 
     return parser
 
@@ -4381,17 +4768,23 @@ def main() -> None:
         _enter_target_directory(args.directory)
         load_dotenv_file()
         load_dotenv_file(global_env_path())
-        config = MitosConfig()
-        # Warn about the workspace the VERB will act on, not merely the CWD. `status`
-        # and `agent-block` take a path argument and build their own config for it, so
-        # warning on the CWD config would stay silent about the very workspace the
-        # operator asked to diagnose — and `mitos status` is precisely the command the
-        # deprecation's rationale names as the one that must keep working.
-        _warn_target = getattr(args, "path", None) if args.command in (
-            "status", "agent-block") else None
-        _warn_deprecated_rotation_mode(
-            MitosConfig(_warn_target) if _warn_target else config
-        )
+        # The project selector, resolved ONCE, here. Order is contract: the -C
+        # chdir above runs first (so a relative selector and the cwd hint both read
+        # the post-chdir location), the exempt check runs before resolution (so a
+        # selector on `init` is answered by naming the verb, not by looking the
+        # name up), and only then does a target exist.
+        selector = _selector_from_args(args)
+        _refuse_selector_on_exempt_verb(args, selector)
+        target = _resolve_selector(selector, args.command)
+        # No selector keeps today's behaviour byte for byte — construction is not
+        # migration, and every zero-arg path stays green until 5a removes the
+        # fallback (`test_a_selectorless_call_still_resolves_the_cwd_workspace`).
+        config = MitosConfig(target.root) if target else MitosConfig()
+        # Warn about the workspace the VERB will act on, not merely the CWD. Since
+        # `status`/`agent-block`'s positional is now a selector source feeding the
+        # same `config`, that is simply `config` — there is no second target to
+        # build, and no `args.path` left for a flag-spelled call to fall back from.
+        _warn_deprecated_rotation_mode(config)
         if args.command == "init":
             # `config` stays the first POSITIONAL argument: the suite asserts on
             # `mock_init.call_args.args[0]` to check which workspace a -C run
@@ -4487,15 +4880,16 @@ def main() -> None:
         elif args.command == "serve":
             cmd_serve()
         elif args.command == "status":
-            sys.exit(cmd_status(args.path or os.getcwd(), as_json=args.as_json))
+            sys.exit(cmd_status(config.workspace_dir, as_json=args.as_json))
         elif args.command == "restore-source":
             sys.exit(cmd_restore_source(
                 config, slug=args.slug, all_graph_only=args.all_graph_only,
                 dry_run=args.dry_run, as_json=args.as_json))
         elif args.command == "agent-block":
-            sys.exit(cmd_agent_block(args.path or os.getcwd(), check=args.check))
+            sys.exit(cmd_agent_block(config.workspace_dir, check=args.check))
         elif args.command == "set-key":
-            cmd_set_key(args.value, name=args.name, is_global=args.is_global)
+            cmd_set_key(args.value, name=args.name, is_global=args.is_global,
+                        workspace_dir=target.root if target else None)
         elif args.command == "cutover":
             sys.exit(cmd_cutover(config, allow_drops=args.allow_drops,
                                  assume_yes=args.yes, as_json=args.as_json))
@@ -4506,6 +4900,16 @@ def main() -> None:
             sys.exit(cmd_check(config, staged=args.staged, scope=args.scope,
                                fresh=args.fresh, assume_yes=args.yes,
                                as_json=args.as_json))
+    except ProjectTargetingError as e:
+        # ABOVE `except MitosError`, which it subclasses: without this arm the
+        # fallback `str(e)` would render — a terse discriminator-level sentence
+        # with no example, no vocabulary and no recovery, on exactly the failure an
+        # agent has to act on in one turn. Same stderr channel and same exit
+        # mapping as every other boundary fault, `--json` included: the shipped
+        # boundary answers on stderr regardless, so a JSON envelope for one error
+        # class would be a new asymmetry.
+        print(f"Error: {_render_targeting_error(e)}", file=sys.stderr)
+        sys.exit(2 if args.command == "check" else 1)
     except MitosError as e:
         # KD1: `check` maps every pre-verb/boundary failure (bad -C, ConfigError, an
         # escaped store fault) to exit 2 — for CI, "could not run" is one routing
