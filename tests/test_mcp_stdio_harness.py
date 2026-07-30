@@ -359,10 +359,19 @@ async def test_a_named_project_retargets_a_server_launched_somewhere_else(tmp_pa
         default = _tool_json(await server.session.call_tool("list_scopes", {}))
         listed = _tool_json(await server.session.call_tool("list_projects", {}))
 
+        # An empty registry is a healthy state, and it must arrive as an ordinary
+        # SUCCESS — `_tool_json` asserts `isError is False`, which is the half an
+        # in-process row cannot see. Driven by removing the file mid-session,
+        # which rides the mutation-between-calls topology 3a proved available and
+        # doubles as evidence that the server caches no view of the registry.
+        registry_file.unlink()
+        empty = _tool_json(await server.session.call_tool("list_projects", {}))
+
     assert set(by_name) == {"beta"}
     assert set(by_path) == {"beta"}
     assert set(default) == {"alpha"}
     assert listed["projects"] == [{"name": "bee", "path": str(ws_b)}]
+    assert empty == {"registry_path": str(registry_file), "count": 0, "projects": []}
 
 
 @pytest.mark.asyncio

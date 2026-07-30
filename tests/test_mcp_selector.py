@@ -812,7 +812,7 @@ def test_the_shared_leaf_holds_no_wording_and_stays_a_stdlib_tier_leaf() -> None
         os.path.join(os.path.dirname(cli.__file__), "display.py"), encoding="utf-8"
     ).read())
     docstrings = {
-        id(ast.get_docstring(node, clean=False))
+        ast.get_docstring(node, clean=False)
         for node in ast.walk(tree)
         if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
                              ast.AsyncFunctionDef))
@@ -820,18 +820,12 @@ def test_the_shared_leaf_holds_no_wording_and_stays_a_stdlib_tier_leaf() -> None
     emittable = [
         node.value for node in ast.walk(tree)
         if isinstance(node, ast.Constant) and isinstance(node.value, str)
-        and node.value not in {
-            ast.get_docstring(owner, clean=False)
-            for owner in ast.walk(tree)
-            if isinstance(owner, (ast.Module, ast.ClassDef, ast.FunctionDef,
-                                  ast.AsyncFunctionDef))
-        }
+        and node.value not in docstrings
     ]
-    assert docstrings, "the docstring sweep found nothing — the filter is inert"
-    # Non-inertness, proven against a literal that is really there: the shared
-    # not-found hint carries `mitos sync`, a deliberate workflow pointer. If the
-    # filter ever excluded real strings, this row would sweep an empty set and
-    # pass while proving nothing.
+    # Non-inertness, proven against a literal that is really there rather than by
+    # asserting the set is non-empty: the shared not-found hint carries
+    # `mitos sync`, a deliberate workflow pointer. If the filter ever excluded
+    # real strings, this row would sweep an empty set and pass proving nothing.
     assert any("mitos sync" in literal for literal in emittable)
 
     for literal in emittable:
