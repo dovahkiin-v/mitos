@@ -48,6 +48,7 @@ from mitos.errors import (
     VectorStoreError, CollectionMissingError, EmbeddingError,
 )
 from mitos.divergence import corpus_graph_divergence, divergence_total
+from mitos.env import parse_env_file
 from mitos.vector_store import scroll_point_ids, hash_to_uuid, QdrantVectorStore
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.telemetry import TelemetryStore, ConflictCheckRow, JudgmentBatch
@@ -2939,30 +2940,24 @@ def load_dotenv_file(path: str = ".env") -> None:
     Mitos reads its credentials (``GEMINI_API_KEY``, ``ANTHROPIC_API_KEY``) and
     ``QDRANT_URL`` straight from ``os.environ``. This loads them from a workspace
     ``.env`` so a key dropped in that file takes effect without a manual
-    ``export`` — the same manual parse the live test-suite already uses, with no
-    new dependency (P19 — Dependency Skepticism). An empty value is skipped, and
-    an existing environment value is never overridden (an explicit ``export``
-    wins over the file).
+    ``export``. An empty value is skipped, and an existing environment value is
+    never overridden (an explicit ``export`` wins over the file) — including an
+    existing **empty** one, which is what makes ``env GEMINI_API_KEY= mitos …``
+    a keyless run on a key-bearing box.
+
+    The parse itself lives in ``mitos.env`` (stdlib only, no new dependency —
+    P19), shared with the functional resolver that reads the same two files
+    without touching ``os.environ``. Two hand-rolled parses of one file that must
+    agree is a drift worth not creating: while both mechanisms are live, the
+    resolver's tiers 2–3 read exactly what this writes into tier 1.
 
     Args:
         path: Path to the ``.env`` file (default: ``.env`` in the cwd, i.e. the
             workspace root where ``mitos`` is invoked).
     """
-    if not os.path.exists(path):
-        return
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, val = line.split("=", 1)
-                key = key.strip()
-                val = val.strip().strip('"').strip("'")
-                if key and val and key not in os.environ:
-                    os.environ[key] = val
-    except OSError:
-        pass
+    for key, val in parse_env_file(path).items():
+        if key not in os.environ:
+            os.environ[key] = val
 
 
 # =========================================================================== #

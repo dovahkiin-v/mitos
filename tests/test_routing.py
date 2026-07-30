@@ -546,8 +546,15 @@ def test_importing_the_resolver_pulls_in_no_higher_tier_module():
     # rides in transitively through `registry`, which is tier-legal and is why
     # nothing here imports it directly. A new member here is a tier decision to
     # adjudicate, not a set to widen reflexively.
+    #
+    # `env` and `models` arrived in Phase 2b, one level further down the same
+    # transitive edge: `config` imports both to build its resolved-env carrier.
+    # The adjudication — both are pure stdlib leaves (`env` imports nothing from
+    # `mitos` at all, `models` only `os` and `typing`), so they add no dependency
+    # weight and no cycle.
     assert loaded.split(",") == [
-        "mitos", "mitos.config", "mitos.errors", "mitos.registry", "mitos.routing"
+        "mitos", "mitos.config", "mitos.env", "mitos.errors", "mitos.models",
+        "mitos.registry", "mitos.routing"
     ]
 
 

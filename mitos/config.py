@@ -9,9 +9,31 @@ import os
 import re
 import sys
 import tomllib
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 
+from mitos import env, models
 from mitos.errors import ConfigError
+
+# The variables `MitosConfig` resolves per construction and carries on `.env`.
+# Two groups: the credentials + the Qdrant URL that every substrate consumer
+# reads, and the four model overrides.
+#
+# The override names are DERIVED from `models.MODEL_IDS` rather than re-declared,
+# because `models` is a sibling leaf (stdlib only, no `config` import) — the
+# renderer precedent in `CONFIG_DEFAULTS` below, which re-declares constants with
+# a lockstep cross-check test, exists to avoid a tier INVERSION between `config`
+# and the higher-tier `renderer`, and there is none here. Deriving them is also
+# what keeps `MITOS_MODEL_OVERRIDE_EMBEDDING` in the set: `MODEL_ALIASES` omits
+# `EMBEDDING`, and a set built from it looks correct while dropping the one
+# override that is costliest to lose — the embedding cache keys on content hash
+# alone (`embeddings.py`), so a mis-routed embedding override reads as working
+# while cached prior-generation vectors flow into a new-generation collection.
+# `MODEL_IDS`' keys are already upper-case; no `.upper()` belongs here.
+RESOLVED_ENV_KEYS: Tuple[str, ...] = (
+    "GEMINI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "QDRANT_URL",
+) + tuple(f"MITOS_MODEL_OVERRIDE_{alias}" for alias in models.MODEL_IDS)
 
 # ---------------------------------------------------------------------------
 # v0.1 config schema (§5.2.6) — the SINGLE source of the static defaults.
@@ -448,6 +470,23 @@ class MitosConfig:
         self.workspace_dir = os.path.abspath(workspace_dir)
         self.mitos_dir = os.path.join(self.workspace_dir, ".mitos")
 
+        # The resolved environment for THIS workspace — real env, then the
+        # workspace's own `.env`, then the machine-global one, computed rather
+        # than read off a process `os.environ` some launch directory filled in.
+        # Runtime-only: it holds real API keys, so it is never persisted, never
+        # in `to_dict()`, and never cached across calls (`mcp_server` builds a
+        # fresh config per tool call by design, which is the point).
+        #
+        # Position is load-bearing and belongs HERE rather than beside the
+        # qdrant block: `self.qdrant_url` reads this map below, and a later edit
+        # that drifts the population downward past the post-load re-assert would
+        # break that read. Everything between here and the read is pure
+        # `os.path.join` derivation — no env read, no file read — so this is the
+        # earliest slot that has `self.workspace_dir` to resolve for.
+        self.env: Dict[str, str] = env.resolve_values(
+            RESOLVED_ENV_KEYS, self.workspace_dir, global_env_path()
+        )
+
         # Convention-path attributes — derived from the workspace, NOT file-schema
         # keys in v0.1 (a file occurrence is warn-tolerated). Consumers
         # (store/sync/importer/cli/mcp_server) bind these by name (R12), so they
@@ -486,8 +525,13 @@ class MitosConfig:
         # defaulting there would co-locate Mitos's collections in their instance
         # and share its wipe/contamination risk. :7333 fails safe (semantic just
         # degrades if Mitos's Qdrant isn't up). `docker compose up` starts it.
-        # QDRANT_URL overrides for anyone pointing at a different instance.
-        self.qdrant_url = os.environ.get("QDRANT_URL", "http://localhost:7333")
+        # QDRANT_URL overrides for anyone pointing at a different instance —
+        # resolved through the carrier above, so a URL living in the TARGET
+        # workspace's `.env` reaches every store construction no matter which
+        # directory the process was launched from. `.get(k, default)`, never
+        # `.get(k) or default`: an exported-empty QDRANT_URL resolves to `""`
+        # and must stay `""` (the second spelling silently restores the default).
+        self.qdrant_url = self.env.get("QDRANT_URL", "http://localhost:7333")
         # Per-project so a shared Qdrant never mixes projects' decisions — and
         # per-PATH, not per-name, so a copy of a workspace cannot address the
         # original's vectors. Re-derived on every construction and NEVER persisted;
@@ -524,14 +568,23 @@ class MitosConfig:
 
         self._load_config_file()
 
-        # Env wins over the config file for the Qdrant URL — matching the key
-        # resolution order (env → project .env → global .env) and the documented
-        # contract above ("QDRANT_URL overrides for anyone pointing at a different
-        # instance"). Before this re-assert, a toml-pinned qdrant_url silently
-        # shadowed the env var (AX 2026-07-18): the caller's override did nothing
-        # and nothing said so.
-        if os.environ.get("QDRANT_URL"):
-            self.qdrant_url = os.environ["QDRANT_URL"]
+        # The resolved env wins over the config file for the Qdrant URL — the same
+        # layering as the keys (env → project .env → global .env), now literally
+        # the same mechanism, and the documented contract above ("QDRANT_URL
+        # overrides for anyone pointing at a different instance"). Before this
+        # re-assert, a toml-pinned qdrant_url silently shadowed the env var
+        # (AX 2026-07-18): the caller's override did nothing and nothing said so.
+        #
+        # `QDRANT_URL` is deliberately NOT migrated out of `.env` into
+        # `config.toml`, where the schema key already lives: `mitos init`
+        # force-gitignores `.env` and never `config.toml`, so a project's
+        # `config.toml` is committable by intent and a user who put a
+        # secret-bearing remote URL in the gitignored file did so deliberately.
+        # The global tier is load-bearing for the same variable — a
+        # shared-instance URL is per-machine and naturally lives in the global
+        # `.env`.
+        if self.env.get("QDRANT_URL"):
+            self.qdrant_url = self.env["QDRANT_URL"]
 
     def _load_config_file(self) -> None:
         """Overlays `.mitos/config.toml` onto the defaults under the strict policy.

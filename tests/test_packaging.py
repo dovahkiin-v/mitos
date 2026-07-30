@@ -189,6 +189,17 @@ def test_non_editable_install_real_read_path(built_wheel, tmp_path):
         f"missing from the wheel:\n{routing_import.stderr}"
     )
 
+    # And the env leaf, same trap. It is imported by `mitos.config`, which every
+    # verb constructs, so a wheel missing it is not a degraded feature — it is an
+    # `ImportError` on the very first thing the console script does.
+    env_import = subprocess.run([str(venv_python), "-c", "import mitos.env"],
+                                env=_mitos_env(tmp_path), capture_output=True,
+                                text=True, timeout=60)
+    assert env_import.returncode == 0, (
+        f"`import mitos.env` failed in the installed venv — the module is "
+        f"missing from the wheel:\n{env_import.stderr}"
+    )
+
     # `mitos init` reads the spec from the installed package dir and scaffolds a workspace.
     workspace = tmp_path / "proj"
     workspace.mkdir()
