@@ -4,6 +4,7 @@ This module handles loading and validating Mitos configuration from `.mitos/conf
 and defines system-wide defaults.
 """
 
+import hashlib
 import os
 import re
 import sys
@@ -15,12 +16,14 @@ from mitos.errors import ConfigError
 # ---------------------------------------------------------------------------
 # v0.1 config schema (§5.2.6) — the SINGLE source of the static defaults.
 #
-# `CONFIG_DEFAULTS` holds the seven STATIC-default schema keys: `mitos init` (6b)
+# `CONFIG_DEFAULTS` holds the eight STATIC-default schema keys: `mitos init` (6b)
 # seeds `config.toml` from this exact map, and the loader's missing-key fallback
 # reads it — so a seeded file and a deleted-key fallback can never diverge (P11).
-# The two QDRANT keys are recognized + type-validated (in `CONFIG_SCHEMA`) but NOT
-# here: their defaults are DYNAMIC (env- / workspace-derived) and computed in
-# `__init__` from their existing single-source helpers, then file-overridable.
+# `qdrant_url` is recognized + type-validated (in `CONFIG_SCHEMA`) but NOT here:
+# its default is DYNAMIC (env-derived) and computed in `__init__` from its
+# existing single-source helper, then file-overridable. `qdrant_collection` is
+# dynamic too but no longer file-overridable at all — it is derived from the
+# workspace path on every construction and retired from the file schema below.
 # ---------------------------------------------------------------------------
 CONFIG_DEFAULTS: Dict[str, Any] = {
     "rotation_mode": "archive",
@@ -39,9 +42,9 @@ CONFIG_DEFAULTS: Dict[str, Any] = {
 }
 
 # The recognized file keys → expected (TOML scalar) type, for strict validation.
-# The eight static keys above PLUS the two dynamic-default qdrant keys = the §5.2.6
-# ten-key schema. A file key NOT in this map is tolerated and skipped — split into
-# two buckets by `_load_config_file`: a RECOGNIZED-but-retired key (`RETIRED_CONFIG_KEYS`
+# The eight static keys above PLUS the dynamic-default `qdrant_url` = the nine-key
+# schema. A file key NOT in this map is tolerated and skipped — split into two
+# buckets by `_load_config_file`: a RECOGNIZED-but-retired key (`RETIRED_CONFIG_KEYS`
 # below) is tolerated SILENTLY, while a genuinely unknown key (a typo) earns one
 # calm stderr line.
 CONFIG_SCHEMA: Dict[str, type] = {
@@ -53,7 +56,6 @@ CONFIG_SCHEMA: Dict[str, type] = {
     "render_global_overflow_warn_chars": int,
     "render_scope_overflow_warn_chars": int,
     "qdrant_url": str,
-    "qdrant_collection": str,
     "conflict_check_on_sync": bool,
 }
 
@@ -64,8 +66,25 @@ CONFIG_SCHEMA: Dict[str, type] = {
 # every single call. They are tolerated SILENTLY. The warning is reserved for keys
 # the code does not know at all — where it is the useful signal that a setting will
 # silently not take effect.
+#
+# `qdrant_collection` joins them for a stronger reason than the other four: its
+# file override was a SAFETY hole, not just dead weight. `mitos init` materialized
+# the derived name into the file, so a `cp -r` sandbox or a `git clone` of a repo
+# that committed `.mitos/` carried the ORIGINAL project's collection and every
+# write in the copy overwrote the original's vectors. Retiring it at resolution
+# time (rather than stripping the line at `init` time) is what makes the fix total:
+# a workspace `init` never runs on is exactly the clonable state, so no `init`-time
+# mechanism can reach it. A surviving line of any type is inert wherever it is met,
+# and `_load_config_file` records it in `inert_file_keys` so the two CLI surfaces
+# that print the resolved collection can name it as legacy.
 RETIRED_CONFIG_KEYS: frozenset = frozenset(
-    {"pending_threshold", "db_path", "decisions_file", "archive_dir"}
+    {
+        "pending_threshold",
+        "db_path",
+        "decisions_file",
+        "archive_dir",
+        "qdrant_collection",
+    }
 )
 
 # The `rotation_mode` enum: correct type (str) but a value outside this set is a
@@ -356,20 +375,70 @@ def default_collection_name(workspace_dir: str) -> str:
     would default to the same ``"mitos"`` collection and cross-contaminate
     semantic queries — and, because a point's id is ``hash_to_uuid`` of the
     content hash (M2), two projects recording the same axiom would collide on
-    one Qdrant point. The name is ``mitos-<sanitized-basename>`` of the
-    workspace dir; set ``qdrant_collection`` in ``.mitos/config.toml`` to
-    override explicitly.
+    one Qdrant point.
+
+    The name is ``mitos-<safe basename>-<8 hex of sha256(canonical path)>`` — a
+    pure function of *where the workspace is*, with no opt-out. Nothing persists
+    it (not ``config.toml``, not the registry, not the graph), so a copied or
+    cloned workspace cannot inherit the original's collection; a
+    ``qdrant_collection`` line in ``.mitos/config.toml`` is inert legacy config
+    (see ``RETIRED_CONFIG_KEYS``). The basename alone would not do: two
+    same-named sibling projects, and a ``cp -r`` of one workspace, share it.
+
+    The four steps and their order are **contract** and cannot change after
+    release. The name is the address of live data, so a changed derivation
+    renames every collection in the wild and strands its vectors (P1,
+    interoperability across time):
+
+    1. ``os.path.realpath`` the input — collapses ``.``/``..``/a trailing slash
+       **and** resolves symlinks, so every route to one directory lands on one
+       collection. It never raises and never requires the path to exist, which
+       keeps this function total (and is why no ``exists()`` probe belongs here —
+       whether a path is a workspace is the caller's question).
+    2. ``safe`` = the basename **of that canonical path**, lowercased, each run of
+       non-``[a-z0-9_-]`` collapsed to ``-``, outer ``-`` stripped.
+    3. ``digest`` = the first 8 hex of ``sha256`` over the **full canonical path**
+       — never over the basename and never over ``safe``. Hashing either would
+       give a ``cp -r`` sibling the same digest, which is the entire failure this
+       derivation exists to close.
+    4. Join, omitting an empty ``safe``.
+
+    Two details a reader will otherwise assume wrongly:
+
+    * **The digest's input is ``os.fsencode(canonical)``, not
+      ``canonical.encode("utf-8")``.** A POSIX path is bytes, and ``realpath``
+      hands back a ``str`` carrying ``surrogateescape`` code points for any byte
+      that is not valid UTF-8 — which ``str.encode("utf-8")`` refuses. So the
+      obvious spelling would raise ``UnicodeEncodeError`` from ``MitosConfig``'s
+      constructor for a workspace whose path holds one Latin-1 byte, taking down
+      every verb including the ``mitos status`` you would run to diagnose it.
+      ``fsencode`` agrees with UTF-8 byte-for-byte on every valid path, so it
+      costs nothing and hashes the path's actual bytes — its true identity.
+    * **An empty ``safe`` yields two segments (``mitos-<digest>``), never a bare
+      ``mitos``.** A basename that sanitizes away entirely (``проект``, ``日本語``,
+      ``/``) must not land every such project on one shared collection — P9's own
+      case should not be the one that cross-contaminates. The digest is never
+      omitted, so a directory literally *named* like a digest still derives three
+      segments and cannot collide with the two-segment form.
+
+    Residual, named rather than fixed: ``realpath`` does not case-fold, so on a
+    case-insensitive filesystem two spellings of one directory derive two
+    collections. That degrades benignly (a duplicate empty collection, healed by
+    one ``mitos reconcile``); case-folding would trade it for a genuine
+    cross-project collision on a case-sensitive one.
 
     Args:
         workspace_dir: The workspace directory (the project root holding
-            ``.mitos/``).
+            ``.mitos/``). Need not exist.
 
     Returns:
-        A Qdrant-safe, project-unique collection name.
+        A Qdrant-safe collection name unique to the workspace's canonical path.
     """
-    base = os.path.basename(os.path.normpath(workspace_dir)).lower()
+    canonical = os.path.realpath(workspace_dir)
+    base = os.path.basename(canonical).lower()
     safe = re.sub(r"[^a-z0-9_-]+", "-", base).strip("-")
-    return f"mitos-{safe}" if safe else "mitos"
+    digest = hashlib.sha256(os.fsencode(canonical)).hexdigest()[:8]
+    return f"mitos-{safe}-{digest}" if safe else f"mitos-{digest}"
 
 
 class MitosConfig:
@@ -419,9 +488,22 @@ class MitosConfig:
         # degrades if Mitos's Qdrant isn't up). `docker compose up` starts it.
         # QDRANT_URL overrides for anyone pointing at a different instance.
         self.qdrant_url = os.environ.get("QDRANT_URL", "http://localhost:7333")
-        # Per-project by default so a shared Qdrant never mixes projects' decisions.
-        # An explicit qdrant_collection in .mitos/config.toml overrides this.
+        # Per-project so a shared Qdrant never mixes projects' decisions — and
+        # per-PATH, not per-name, so a copy of a workspace cannot address the
+        # original's vectors. Re-derived on every construction and NEVER persisted;
+        # a `qdrant_collection` line in the file cannot override it (it is retired).
         self.qdrant_collection = default_collection_name(self.workspace_dir)
+
+        # Retired file keys the workspace's config.toml actually carries:
+        # {key: the value found in the file}. Populated by `_load_config_file`,
+        # runtime-only, never persisted and absent from `to_dict()`. It exists so
+        # the CLI surfaces that PRINT a resolved value can name a surviving line as
+        # inert legacy config — the loader itself must stay mute (it runs once per
+        # MCP tool call over a stdio JSON-RPC channel where stdout is protocol, and
+        # `status` builds a second config of its own). General over the whole retired
+        # set rather than `qdrant_collection`-shaped: no key-specific branch in the
+        # loader, and a future retirement gets its data for free.
+        self.inert_file_keys: Dict[str, Any] = {}
 
         # Static-default schema keys — seeded from the single CONFIG_DEFAULTS map
         # (P11), the same map `mitos init` (6b) serializes. The keys are exactly the
@@ -468,7 +550,10 @@ class MitosConfig:
               ``ConfigError`` (the silent-coerce OD1 forbids).
             - A missing known key → keeps the already-seeded default.
             - A recognized-but-retired key (``RETIRED_CONFIG_KEYS``) → tolerated and
-              skipped SILENTLY (not a typo; a per-call warning on it is just noise).
+              skipped SILENTLY (not a typo; a per-call warning on it is just noise),
+              before the type check, so a mistyped retired key is inert rather than
+              fatal. It is recorded in ``inert_file_keys`` for the CLI surfaces that
+              report a surviving line; this loader prints nothing.
             - A genuinely unknown key (a typo) → one calm stderr line, tolerated,
               skipped.
 
@@ -504,7 +589,11 @@ class MitosConfig:
                 # noise. A genuinely unknown key (a typo whose setting silently won't
                 # take effect) still earns one calm, terse, screen-reader-clean line
                 # to stderr (P9, no emoji) — that warning is the useful signal.
-                if key not in RETIRED_CONFIG_KEYS:
+                if key in RETIRED_CONFIG_KEYS:
+                    # Remembered, not applied: a printing surface can name it as
+                    # inert legacy config beside the value it claims to set.
+                    self.inert_file_keys[key] = val
+                else:
                     print(
                         f"Warning: ignoring unrecognized config key "
                         f"'{key}' in {config_path}",
@@ -543,10 +632,15 @@ class MitosConfig:
     def to_dict(self) -> Dict[str, Any]:
         """Converts configuration to dictionary form.
 
-        Includes the convention-path attributes, the two dynamic-default qdrant
-        keys, the kept-but-de-schema'd ``pending_threshold``, and the eight static
-        schema keys (sourced from ``CONFIG_DEFAULTS`` so the set can't drift). No
-        consumer binds this today; it exists for a future ``--json``/debug surface.
+        Includes the convention-path attributes, the two dynamically-defaulted
+        qdrant attributes, the kept-but-de-schema'd ``pending_threshold``, and the
+        eight static schema keys (sourced from ``CONFIG_DEFAULTS`` so the set can't
+        drift). ``qdrant_collection`` stays here even though it left the file
+        schema — that is the retirement pattern's promise: the attribute survives
+        at its computed default and every consumer binding it is unaffected.
+        ``inert_file_keys`` is deliberately absent (runtime-only, never persisted).
+        No consumer binds this today; it exists for a future ``--json``/debug
+        surface.
 
         Returns:
             A dictionary containing every configuration field.

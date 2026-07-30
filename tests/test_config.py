@@ -68,15 +68,10 @@ def test_config_defaults() -> None:
         assert config.archive_dir.endswith(os.path.join("decisions", "archive"))
 
 
-def test_default_collection_name_is_per_project() -> None:
-    """Verifies the per-project Qdrant collection derivation + sanitization."""
-    assert default_collection_name("/home/vinga/Forge/Blacksmith") == "mitos-blacksmith"
-    assert default_collection_name("/x/workshop_mcp") == "mitos-workshop_mcp"
-    assert default_collection_name("/x/My Project!") == "mitos-my-project"
-    # Distinct projects -> distinct collections (the anti-contamination property).
-    assert default_collection_name("/a/proj-one") != default_collection_name("/a/proj-two")
-    # Degenerate path falls back to the bare "mitos" collection.
-    assert default_collection_name("/") == "mitos"
+# The derivation itself — its step order, its digest, its non-injective basename
+# classes, and the retirement of the `qdrant_collection` file override — is pinned by
+# `tests/test_collection_derivation.py`. This module keeps only the attribute-level
+# rows (above): that `MitosConfig` binds whatever the function returns.
 
 
 # ---------------------------------------------------------------------------
@@ -95,12 +90,10 @@ def test_config_file_loading_applies_valid_overrides() -> None:
         _write_config(
             tmpdir,
             'rotation_volume_threshold_entries = 99\n'
-            'qdrant_collection = "custom_collection"\n'
             'qdrant_url = "http://example:7333"\n',
         )
         config = MitosConfig(tmpdir)
         assert config.rotation_volume_threshold_entries == 99
-        assert config.qdrant_collection == "custom_collection"
         assert config.qdrant_url == "http://example:7333"
         # Untouched keys keep their defaults.
         assert config.stale_entry_window_days == CONFIG_DEFAULTS["stale_entry_window_days"]
@@ -276,11 +269,12 @@ def test_retired_keys_silent_unknown_keys_warn(capsys: pytest.CaptureFixture) ->
     """Retired keys are tolerated SILENTLY; only genuinely-unknown keys warn.
 
     A recognized-but-retired key (`RETIRED_CONFIG_KEYS`: `pending_threshold`,
-    `db_path`, `decisions_file`, `archive_dir`) was deliberately dropped from the
-    file schema but is still recognized — its ATTRIBUTE survives at its default
-    (R12) and its file occurrence is skipped with NO warning (it is not a typo, so
-    warning on it every call is noise). A genuinely unknown key (a typo) still earns
-    one calm stderr line — that warning is the signal the setting won't take effect.
+    `db_path`, `decisions_file`, `archive_dir`, `qdrant_collection`) was deliberately
+    dropped from the file schema but is still recognized — its ATTRIBUTE survives at
+    its default (R12) and its file occurrence is skipped with NO warning (it is not a
+    typo, so warning on it every call is noise). A genuinely unknown key (a typo)
+    still earns one calm stderr line — that warning is the signal the setting won't
+    take effect.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         _write_config(
@@ -328,7 +322,7 @@ def test_r12_attribute_surface_preserved() -> None:
             "pending_threshold",
         ):
             assert hasattr(config, attr), attr
-        # ... plus the seven new static schema attributes.
+        # ... plus the eight new static schema attributes.
         for attr in CONFIG_DEFAULTS:
             assert hasattr(config, attr), attr
 
@@ -367,8 +361,10 @@ def test_prototype_shaped_config_loads_clean(capsys: pytest.CaptureFixture) -> N
 
     Mirrors the live `.mitos/config.toml`: `rotation_mode` carries a trailing inline
     comment (which the hand-rolled parser mangled and silently defaulted; tomllib
-    parses it cleanly), `pending_threshold` is now silently tolerated (a recognized
-    retired key), and the `qdrant_*` keys apply.
+    parses it cleanly), `qdrant_url` applies, and BOTH `pending_threshold` and
+    `qdrant_collection` are now silently tolerated retired keys — the second one
+    inert rather than applied, which is the whole point: this file's pin is exactly
+    the shape `mitos init` used to write, and it no longer decides anything.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         _write_config(
@@ -383,7 +379,10 @@ def test_prototype_shaped_config_loads_clean(capsys: pytest.CaptureFixture) -> N
         # Inline comment stripped by tomllib → the clean value applies.
         assert config.rotation_mode == "archive"
         assert config.qdrant_url == "http://localhost:7333"
-        assert config.qdrant_collection == "mitos-mitos-pub"
+        # The pin is INERT: the collection stays the one derived from this path.
+        assert config.qdrant_collection == default_collection_name(tmpdir)
+        assert config.qdrant_collection != "mitos-mitos-pub"
+        assert config.inert_file_keys["qdrant_collection"] == "mitos-mitos-pub"
         # pending_threshold file key silently tolerated; attribute keeps its default.
         assert config.pending_threshold == 30
         # The real seeded file now loads with a CLEAN stderr — no per-invocation
@@ -415,18 +414,20 @@ def test_render_defaults_match_renderer_constants() -> None:
     )
 
 
-def test_schema_covers_ten_keys_and_defaults_are_the_static_eight() -> None:
-    """CONFIG_SCHEMA recognizes ten file keys; CONFIG_DEFAULTS holds the static eight.
+def test_schema_covers_nine_keys_and_defaults_are_the_static_eight() -> None:
+    """CONFIG_SCHEMA recognizes nine file keys; CONFIG_DEFAULTS holds the static eight.
 
-    The two dynamic qdrant keys are recognized + validated but defaulted in
-    __init__, so they are in CONFIG_SCHEMA but not CONFIG_DEFAULTS. v0.2's
-    ``conflict_check_on_sync`` is in BOTH (static default True), so it lifts the
-    counts to ten/eight but leaves the qdrant-only difference unchanged.
+    ``qdrant_url`` is recognized + validated but defaulted in __init__, so it is in
+    CONFIG_SCHEMA and not CONFIG_DEFAULTS — and it is now the ONLY such key.
+    ``qdrant_collection`` was the other one until it was retired from the file schema
+    entirely (its value is derived from the workspace path and not overridable), which
+    is what takes the count from ten to nine. v0.2's ``conflict_check_on_sync`` is in
+    BOTH (static default True).
     """
-    assert len(CONFIG_SCHEMA) == 10
+    assert len(CONFIG_SCHEMA) == 9
     assert len(CONFIG_DEFAULTS) == 8
     assert set(CONFIG_DEFAULTS) < set(CONFIG_SCHEMA)
-    assert set(CONFIG_SCHEMA) - set(CONFIG_DEFAULTS) == {"qdrant_url", "qdrant_collection"}
+    assert set(CONFIG_SCHEMA) - set(CONFIG_DEFAULTS) == {"qdrant_url"}
 
 
 # ---------------------------------------------------------------------------

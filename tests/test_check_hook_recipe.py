@@ -27,6 +27,7 @@ import pytest
 import requests
 
 from live_helpers import live_tests_disabled
+from mitos.config import default_collection_name
 
 # --- The recipe under test (VERBATIM from SETUP.md — keep in lockstep, KD4) ----
 # The shebang is hook scaffolding (implementer's latitude); the load-bearing
@@ -251,11 +252,15 @@ def test_live_hook_blocks_bad_buffer_passes_clean(tmp_path):
     except requests.RequestException:
         pytest.skip(f"Qdrant unreachable at {QDRANT_URL} — environmental.")
 
-    # A workspace dir named so its derived collection (mitos-<basename>) is swept by
-    # conftest's mitos-tmp-* backstop even if teardown misses.
+    # A workspace dir named so its derived collection (mitos-<basename>-<path digest>)
+    # is swept by conftest's mitos-tmp-* backstop even if teardown misses — the prefix
+    # survives the digest suffix, which is why the `tmp` in the basename still buys the
+    # reclaim. Ask the derivation rather than hand-building the name: the shape is
+    # contract, and a second spelling of it here would silently address a collection
+    # nothing writes to.
     ws = tmp_path / f"tmp-golden-hook-{uuid.uuid4().hex[:8]}"
     ws.mkdir()
-    collection = f"mitos-{ws.name}"
+    collection = default_collection_name(str(ws))
     env = _env_with_path(_VENV_BIN)
 
     try:

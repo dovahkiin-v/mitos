@@ -104,7 +104,14 @@ def test_seeded_config_round_trips_clean(tmp_path, capsys):
     config = MitosConfig(str(tmp_path))
     captured = capsys.readouterr()
     assert "unrecognized" not in captured.err
-    assert captured.err == ""  # a clean nine-key file warns about nothing
+    # A clean file warns about nothing. The seed is nine keys — the eight static
+    # CONFIG_DEFAULTS plus `qdrant_url` — which was TEN until `qdrant_collection`
+    # was retired from the schema and stopped being written. The count is pinned
+    # structurally by `test_config_seeds_exactly_the_schema_keys` below; it is
+    # spelled out here only so the next reader need not re-count.
+    assert captured.err == ""
+    # ... and the seed carries no retired key at all, so nothing is inert either.
+    assert config.inert_file_keys == {}
 
     for key, default in CONFIG_DEFAULTS.items():
         assert getattr(config, key) == default
@@ -116,13 +123,18 @@ def test_seeded_config_round_trips_clean(tmp_path, capsys):
 
 
 def test_config_seeds_exactly_the_schema_keys(tmp_path):
-    """The seed writes exactly CONFIG_DEFAULTS' static keys + the two dynamic qdrant keys."""
+    """The seed writes exactly CONFIG_DEFAULTS' static keys + the dynamic `qdrant_url`.
+
+    Note this stays an equality against `CONFIG_SCHEMA` across the `qdrant_collection`
+    retirement: the key left the seeded file AND the schema, so both sides shrank
+    together and the property is unchanged — the seed is exactly the recognized set.
+    """
     _init(tmp_path)
     with open(tmp_path / ".mitos" / "config.toml", "rb") as f:
         data = tomllib.load(f)
 
     assert set(data) == set(CONFIG_SCHEMA)  # every recognized key, nothing else
-    assert set(data) == set(CONFIG_DEFAULTS) | {"qdrant_url", "qdrant_collection"}
+    assert set(data) == set(CONFIG_DEFAULTS) | {"qdrant_url"}
     assert "pending_threshold" not in data
     for key, default in CONFIG_DEFAULTS.items():
         assert data[key] == default
@@ -334,7 +346,13 @@ def test_status_graceful_on_malformed_config(tmp_path, capsys):
 # --- §2 non-regression (inherited setup surface) ---------------------------
 
 def test_init_preserves_env_gitignore_qdrant_scaffolding(tmp_path):
-    """init must not regress the inherited .env + .gitignore + qdrant_* setup surface (§2)."""
+    """init must not regress the inherited .env + .gitignore + qdrant_* setup surface (§2).
+
+    `qdrant_collection` is asserted as an ABSENCE, not a value. Writing the derived name
+    into the file is what let a `cp -r` or a `git clone` of a committed `.mitos/` bind
+    the copy to the original project's vectors, so the line is gone and the name is
+    re-derived from the workspace path on every construction instead.
+    """
     _init(tmp_path)
 
     env_body = _read(tmp_path / ".env")
@@ -347,7 +365,9 @@ def test_init_preserves_env_gitignore_qdrant_scaffolding(tmp_path):
     with open(tmp_path / ".mitos" / "config.toml", "rb") as f:
         data = tomllib.load(f)
     assert data["qdrant_url"] == "http://localhost:7333"
-    assert data["qdrant_collection"] == default_collection_name(str(tmp_path))
+    assert "qdrant_collection" not in data
+    body = _read(tmp_path / ".mitos" / "config.toml")
+    assert "qdrant_collection" not in body  # not even as a commented-out line
 
 
 # --- registration: init introduces the project globally --------------------

@@ -60,7 +60,8 @@ mitos init
 ```
 This creates `.mitos/` (graph + config + skill), `decisions.md`, `format-spec.md`,
 and scaffolds a **gitignored `.env`** with empty key slots. The project gets its
-own collection, `mitos-<project>`.
+own collection, named from the workspace's path so a copied or cloned workspace
+never writes into the original's vectors.
 
 ### 2. Add your key
 Mitos resolves `GEMINI_API_KEY` with this precedence: **shell environment → project

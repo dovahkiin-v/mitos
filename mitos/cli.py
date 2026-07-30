@@ -275,6 +275,58 @@ def _registration_line(outcome: registry.RegistrationOutcome) -> str:
     return f'Registered as "{outcome.name}" → {outcome.path}'
 
 
+def _inert_pin_note(config: MitosConfig, *, offer_deletion: bool = False) -> Optional[str]:
+    """Renders the one-line notice that a retired ``qdrant_collection`` pin survives.
+
+    ``qdrant_collection`` used to be a config-file override, and ``mitos init`` used
+    to materialize the derived name into ``.mitos/config.toml``. Both are gone: the
+    collection is now derived from the workspace path on every construction and the
+    file key is retired, so a surviving line is inert. But it is *visible*, and a
+    reader who finds a name in the config file and a different name on this report
+    deserves to be told which one is real rather than left to guess.
+
+    One renderer, both surfaces (``status``'s collection row and ``init``'s echo), so
+    the two wordings cannot drift. It lives here rather than in ``display.py``
+    because that leaf is the CLI⇄MCP parity seam and the server has no surface for a
+    workspace's config file — putting it there would widen a leaf for a consumer
+    that does not exist.
+
+    Only ``qdrant_collection`` is reported, though ``config.inert_file_keys`` carries
+    every retired key the file holds: a note belongs beside the resolved value it
+    claims to set, and this is the only retired key whose value is printed anywhere.
+    Naming ``pending_threshold`` — which sits in every pre-V1a-seeded file — would
+    re-import exactly the false-alarm-on-every-invocation noise that the retired-key
+    silence exists to prevent.
+
+    Args:
+        config: The workspace config, already loaded (so ``inert_file_keys`` is
+            populated).
+        offer_deletion: Append the recovery clause. ``status`` sets it — a diagnostic
+            surface owes a way forward, and deleting a line nothing reads creates no
+            state. ``init``'s echo stays a bare receipt.
+
+    Returns:
+        The note, or ``None`` when the workspace carries no such line — which is
+        every workspace ``init`` has scaffolded since the key was retired.
+    """
+    if "qdrant_collection" not in config.inert_file_keys:
+        return None
+    pinned = config.inert_file_keys["qdrant_collection"]
+    # `!r`, not `{pinned}`, and not only for type honesty (an `int` pin renders as
+    # `123`, a `str` quoted). The value is UNTRUSTED author-supplied text, and a TOML
+    # basic string can carry ``\n`` and ``\u001b`` escapes — `repr` escapes both, so a
+    # pinned value cannot break this single line or smuggle an ANSI sequence onto the
+    # terminal. Tidying this to a plain interpolation would reopen that.
+    note = (
+        f"config.toml pins qdrant_collection = {pinned!r} — inert legacy config, "
+        f"ignored; this workspace uses '{config.qdrant_collection}', derived from "
+        f"its path"
+    )
+    if offer_deletion:
+        note += ". The line can be deleted; nothing reads it"
+    return note
+
+
 def cmd_init(config: MitosConfig, name: Optional[str] = None, force: bool = False) -> None:
     """Initializes (or idempotently re-initializes) the Mitos workspace.
 
@@ -358,11 +410,16 @@ def cmd_init(config: MitosConfig, name: Optional[str] = None, force: bool = Fals
 
     # 1a. Seed config.toml when absent — from the single-source CONFIG_DEFAULTS map
     #     (P11 / WIRING_LEDGER entry-004), NOT hand-copied literals, so a seeded file
-    #     and the loader's deleted-key fallback can never diverge. The seven static
-    #     keys serialize in CONFIG_DEFAULTS order; the two dynamic qdrant_* lines
-    #     follow (env-/workspace-derived defaults, computed in MitosConfig.__init__).
+    #     and the loader's deleted-key fallback can never diverge. The eight static
+    #     keys serialize in CONFIG_DEFAULTS order; the dynamic qdrant_url line follows
+    #     (an env-derived default, computed in MitosConfig.__init__).
     #     NO pending_threshold line — it left the v0.1 file schema (the loader would
     #     warn-tolerate it on every command).
+    #     NO qdrant_collection line either, and that absence is load-bearing rather
+    #     than tidiness: a materialized collection name travels with a `cp -r` or a
+    #     `git clone` of a committed .mitos/, binding the copy to the ORIGINAL's
+    #     vectors. The name is derived from the workspace path on every construction
+    #     and is not overridable, so there is nothing here to write.
     config_path = os.path.join(config.mitos_dir, "config.toml")
     if not os.path.exists(config_path):
         lines = ["# Mitos Workspace Configuration"]
@@ -373,9 +430,6 @@ def cmd_init(config: MitosConfig, name: Optional[str] = None, force: bool = Fals
             "# standard :6333) so Mitos never co-locates its collections in another",
             "# Qdrant you run. Set QDRANT_URL before `init` or edit this line.",
             f"qdrant_url = {toml_scalar(config.qdrant_url)}",
-            "# Per-project collection: keeps this project's vectors isolated",
-            "# from other Mitos workspaces sharing the same Qdrant instance.",
-            f"qdrant_collection = {toml_scalar(config.qdrant_collection)}",
         ]
         with open(config_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
@@ -476,6 +530,15 @@ def cmd_init(config: MitosConfig, name: Optional[str] = None, force: bool = Fals
     # ladder-advances a prototype into a hybrid.
     GraphStore(config.db_path)
     print(f"Initialized Mitos workspace at {config.workspace_dir} ✓")
+
+    # 4a. If this workspace's config.toml carries a legacy `qdrant_collection` pin,
+    #     name it as inert — `init` is one of the two places a human is already
+    #     asking about this workspace's setup, and `init` never rewrites the file
+    #     (D3: `.mitos/config.toml` is read-only to this vision), so the line stays
+    #     and would otherwise silently disagree with the collection in force.
+    inert_pin = _inert_pin_note(config)
+    if inert_pin:
+        print(inert_pin)
 
     # 5. Introduce the project to Mitos globally — the LAST mutation, after the
     #    scaffold exists and after the line above has already told the operator it
@@ -2073,7 +2136,16 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
          "set it once for all projects: `mitos set-key --global <KEY>`"),
         (f"Qdrant reachable ({config.qdrant_url})", q["reachable"],
          "start it: `docker compose up -d` in the mitos repo"),
-        (f"collection '{config.qdrant_collection}'", coll_mark, coll_hint),
+        # The 4th slot is an ALWAYS-printed follow-up line for this row (see the
+        # print loop). The inert-pin note has to be one: it is a config fact, not a
+        # service fact, so it must render in all four coll_mark branches above —
+        # `coll_hint` renders only when the mark is not ✓, and a pinned workspace
+        # whose collection exists is exactly a case where the two names disagree
+        # visibly. Nesting it in the `collection_exists` arm would drop it from the
+        # unreachable/absent branches, which are the MOST likely to be confused
+        # about which name is in force.
+        (f"collection '{config.qdrant_collection}'", coll_mark, coll_hint,
+         _inert_pin_note(config, offer_deletion=True)),
         # Recommendation, not a requirement — never a ✗. Agents get the best AX
         # (ambient surface/record, structured args, no shell-quoting) via the MCP.
         ("MCP wired (recommended for agents)", True if mcp_wired else None,
@@ -2089,11 +2161,16 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
         # phrasing; it is not an operator-primary surface.)
         checks.insert(1, ("graph schema (V1a)", False, _CUTOVER_GUIDANCE))
     print(f"\nMITOS STATUS for {workspace_dir} — {verdict}\n")
-    for label, ok, hint in checks:
+    # `*rest` tolerates both widths, so the 3-tuple rows (including the pre-V1a row
+    # inserted above) need no change and a future row can add a follow-up without
+    # touching the others. A hint is conditional on the mark; a follow-up note is not.
+    for label, ok, hint, *rest in checks:
         line = f"  {mark(ok)} {label}"
         if ok is not True and hint:
             line += f"   → {hint}"
         print(line)
+        if rest and rest[0]:
+            print(f"      {rest[0]}")
     if q["reachable"] and q["collection_exists"] and q["points"] is not None:
         print(f"      ({q['points']} vector(s) indexed)")
     if graph_nodes is not None:

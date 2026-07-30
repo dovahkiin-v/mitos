@@ -95,7 +95,12 @@ def live_workspace(tmp_path, monkeypatch):
     """
     monkeypatch.setenv("GEMINI_API_KEY", _REAL_KEY)
     monkeypatch.setenv("QDRANT_URL", QDRANT_URL)
-    ws = tmp_path / "proj"
+    # The dir name is load-bearing, at all four sites in this module: the derived
+    # collection now carries a per-path digest, so a crashed run leaks a DIFFERENT
+    # collection every time instead of re-using one stable `mitos-proj`. A `tmp*`
+    # basename keeps the derived name inside conftest's `mitos-tmp*` sweep prefix,
+    # which is the only backstop when teardown never runs.
+    ws = tmp_path / "tmp-proj"
     ws.mkdir()
     cli.cmd_init(MitosConfig(str(ws)))
     collection = default_collection_name(str(ws))
@@ -197,7 +202,7 @@ def test_cli_subprocess_list_decisions_json(tmp_path):
     """Real binary, real argv: the `list_decisions` MCP-name alias + `--json` emit
     the complete structured set after real records (the exhaustive CLI path)."""
     mitos_bin = shutil.which("mitos") or "mitos"
-    ws = tmp_path / "proj"
+    ws = tmp_path / "tmp-proj"
     ws.mkdir()
     env = {
         **os.environ,
@@ -315,7 +320,7 @@ def test_cli_subprocess_relation_flag_links_decisions(tmp_path):
     """Real binary, real argv: --depends-on links two decisions, edge lands in graph."""
     mitos_bin = shutil.which("mitos") or "mitos"
     skip_if_global_mitos_stale(mitos_bin)
-    ws = tmp_path / "proj"
+    ws = tmp_path / "tmp-proj"
     ws.mkdir()
     env = {
         **os.environ,
@@ -372,7 +377,7 @@ def test_cli_subprocess_record_stdin_then_surface(tmp_path):
     """Real binary, real argv, real stdin pipe, real services — the AX fixes
     (MCP-name alias + --rejected-file stdin + surface recall) end-to-end."""
     mitos_bin = shutil.which("mitos") or "mitos"
-    ws = tmp_path / "proj"
+    ws = tmp_path / "tmp-proj"
     ws.mkdir()
     env = {
         **os.environ,

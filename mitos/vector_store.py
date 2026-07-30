@@ -202,7 +202,7 @@ def scroll_point_ids(base_url: str, collection: str, page_size: int = 256) -> Se
 class QdrantVectorStore:
     """REST client for Qdrant vector store managing points and semantic queries."""
 
-    def __init__(self, qdrant_url: str, collection_name: str = "mitos") -> None:
+    def __init__(self, qdrant_url: str, collection_name: str) -> None:
         """Binds the store to a Qdrant endpoint and collection — **no network I/O**.
 
         Construction is pure: it dispatches zero HTTP requests and therefore cannot
@@ -214,7 +214,14 @@ class QdrantVectorStore:
 
         Args:
             qdrant_url: The Qdrant REST endpoint (trailing slash tolerated).
-            collection_name: The project's collection.
+            collection_name: The project's collection. **Required** — it used to
+                default to ``"mitos"``, which is the exact name a basename-less or
+                wholly-non-Latin workspace once derived, i.e. the shared collection
+                the path-hash derivation exists to abolish. Every construction site
+                already passes it, so the default was dead weight; what it could
+                still do is land a *future* site silently in a shared namespace.
+                Declared, not defaulted — the property, not the callers that hold it
+                today.
         """
         self.base_url = qdrant_url.rstrip("/")
         self.collection = collection_name

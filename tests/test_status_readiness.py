@@ -406,3 +406,35 @@ def test_the_marker_line_never_reaches_the_json_payload(tmp_path, monkeypatch, c
     assert "seeded by" not in payload
     # And the readiness mapping is unmoved.
     assert json.loads(payload)["ready"] is True
+
+
+def test_the_inert_pin_note_never_reaches_the_json_payload(tmp_path, monkeypatch, capsys):
+    """The 1d sibling of the row above, and the same reason: 4b owns this payload.
+
+    A workspace carrying a legacy `qdrant_collection` line gets a rendered note beside
+    `status`'s collection row naming the pin as inert. It is deliberately text-only —
+    4b's deep report is what settles the `--json` shape — so this pins the ABSENCE and
+    forces 4b to invert an assertion rather than hope to notice a comment. The
+    behavioural rows for the note itself live in `test_collection_derivation.py`.
+    """
+    mitos_dir = tmp_path / ".mitos"
+    mitos_dir.mkdir()
+    (mitos_dir / "config.toml").write_text(
+        'qdrant_collection = "mitos-mitos-pub"\n', encoding="utf-8"
+    )
+    _init(tmp_path)  # leaves the pre-created config.toml alone
+    capsys.readouterr()
+    monkeypatch.setenv("GEMINI_API_KEY", "testkey")
+    monkeypatch.setattr(cli, "_check_qdrant", _qdrant(True, True, points=0))
+    monkeypatch.setattr(cli, "scroll_point_ids", _scroll(set()))
+
+    assert cli.cmd_status(str(tmp_path), as_json=True) == 0
+    payload = capsys.readouterr().out
+    # The full phrase, not the bare word "inert": the payload echoes the workspace
+    # path, and pytest builds that path from this test's own name.
+    assert "inert legacy config" not in payload
+    assert "mitos-mitos-pub" not in payload
+    # The rendered surface DOES carry it — so the absence above is about the payload,
+    # not about a feature that never shipped.
+    assert cli.cmd_status(str(tmp_path)) == 0
+    assert "inert legacy config" in capsys.readouterr().out
