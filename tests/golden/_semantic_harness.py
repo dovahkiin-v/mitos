@@ -145,7 +145,10 @@ def populate_index(store, provider, vstore: QdrantVectorStore) -> int:
             "embedding_text": text,
         }
         # Pass the RAW 64-hex node id; upsert() converts it to a UUID internally.
-        vstore.upsert(node["id"], vector, payload)
+        # `may_create=True`: this loop seeds the throwaway collection with the WHOLE
+        # live corpus (both kinds, above), so it is a genuinely covering write — the one
+        # class of write that may bring an absent collection into existence.
+        vstore.upsert(node["id"], vector, payload, may_create=True)
     return len(nodes)
 
 

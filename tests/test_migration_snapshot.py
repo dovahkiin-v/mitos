@@ -282,16 +282,17 @@ def test_snapshot_taken_when_populated_db_has_pending_step(tmp_path) -> None:
         conn.close()
 
 
-def test_real_registry_boot_snapshots_migrates_to_v2_and_retains(tmp_path) -> None:
-    """With the LIVE registry, a populated v1 graph snapshots, migrates to v2, retains it.
+def test_real_registry_boot_snapshots_migrates_to_head_and_retains(tmp_path) -> None:
+    """With the LIVE registry, a populated v1 graph snapshots, ladders to head, retains it.
 
-    The flip of 1a's dormancy tripwire: 1b's ``.append((2, _v1b_schema))`` makes the
-    live head 2, so a populated v1 graph now has a pending step. ``_boot_migrations``
-    with the live ``MIGRATION_STEPS`` takes a pre-ladder snapshot, ladders to v2
-    (``mechanisms`` created, ``edges`` widened), every seeded edge survives, a cross-kind
-    shape the v1 CHECK forbade now inserts — and the snapshot is RETAINED on disk (never
-    auto-dropped, the silent-corruption fallback, P5 Ironclad). The head is read
-    dynamically (``_pending_head``), never a literal.
+    The flip of 1a's dormancy tripwire: appending a second rung made the live head > 1,
+    so a populated v1 graph has a pending step. ``_boot_migrations`` with the live
+    ``MIGRATION_STEPS`` takes a pre-ladder snapshot, ladders all the way to the head
+    (``mechanisms`` created, ``edges`` widened, and every later rung applied), every
+    seeded edge survives, a cross-kind shape the v1 CHECK forbade now inserts — and the
+    snapshot is RETAINED on disk (never auto-dropped, the silent-corruption fallback,
+    P5 Ironclad). The head is read dynamically (``_pending_head``), never a literal,
+    which is why this row survives each append rather than needing a new number.
     """
     db_path = str(tmp_path / ".mitos" / "graph.sqlite")
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
@@ -302,11 +303,11 @@ def test_real_registry_boot_snapshots_migrates_to_v2_and_retains(tmp_path) -> No
     conn.close()
     snapshot_path = _snapshot_path(db_path, pre_version)
 
-    _boot_migrations(db_path, MIGRATION_STEPS)  # live head 2 — snapshot fires, ladders up
+    _boot_migrations(db_path, MIGRATION_STEPS)  # live head — snapshot fires, ladders up
 
     conn = open_connection(db_path)
     try:
-        assert _user_version(conn) == _pending_head(MIGRATION_STEPS)  # == 2, dynamic
+        assert _user_version(conn) == _pending_head(MIGRATION_STEPS)  # dynamic, never a literal
         assert _table_exists(conn, "mechanisms")
         # Every seeded edge survived the rebuild (incl. the archived-entry edge).
         assert _edge_count(conn) == 1
@@ -333,6 +334,66 @@ def test_real_registry_boot_snapshots_migrates_to_v2_and_retains(tmp_path) -> No
         assert _user_version(snap) == pre_version  # v1, VACUUM INTO preserved it
         assert not _table_exists(snap, "mechanisms")  # pre-migration content
         assert snap.execute("SELECT COUNT(*) FROM edges;").fetchone()[0] == 1
+    finally:
+        snap.close()
+
+
+def test_real_registry_boot_snapshots_a_populated_v2_graph_before_the_next_rung(
+    tmp_path,
+) -> None:
+    """A populated v2 graph gets its OWN ``.snapshot_v2`` when a later rung lands.
+
+    The harness activates for each append "for free" — the precondition keys off
+    ``_pending_head(steps)``, never a hardcoded version — but *verify it fires* rather
+    than assuming (ADR ``v1b-migration-takes-pre-ladder-db-snapshot-as-binary-reversal``).
+    This is the case a v1-seeded row cannot see: the snapshot path is keyed on the version
+    migrated *from*, so a graph already at v2 must produce ``.snapshot_v2``, distinct from
+    the ``.snapshot_v1`` its own earlier boot left behind.
+
+    The v1c rung itself is a pure ``CREATE TABLE IF NOT EXISTS``, so nothing here can be
+    lossy — which is the point: the reversal image is taken regardless of how safe the
+    step looks, because "safe" is a property of today's step, not of the harness.
+    """
+    db_path = str(tmp_path / ".mitos" / "graph.sqlite")
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    _seed_v1_db(db_path)
+
+    # Ladder to the SECOND rung only, so the graph sits one rung below the live head
+    # with real rows in it. Both steps come from the live registry (never re-authored),
+    # and the stopping point is derived, not a literal.
+    live = sorted(MIGRATION_STEPS, key=lambda s: s[0])
+    assert len(live) >= 3, "this row needs a rung above v2 to migrate into"
+    conn = open_connection(db_path)
+    try:
+        run_migrations(conn, steps=live[:2])
+        mid_version = _user_version(conn)
+    finally:
+        conn.close()
+    assert mid_version < _pending_head(MIGRATION_STEPS)
+
+    mid_snapshot = _snapshot_path(db_path, mid_version)
+    assert not os.path.exists(mid_snapshot)
+
+    _boot_migrations(db_path, MIGRATION_STEPS)
+
+    # It fired, and it is keyed on the version migrated FROM.
+    assert os.path.exists(mid_snapshot)
+
+    conn = open_connection(db_path)
+    try:
+        assert _user_version(conn) == _pending_head(MIGRATION_STEPS)
+        assert _table_exists(conn, "embedding_seed")
+        # The rows the graph already held are untouched by a pure-add rung.
+        assert _edge_count(conn) == 1
+    finally:
+        conn.close()
+
+    # The snapshot is faithful to the pre-rung graph: at the mid version, and without
+    # the table the rung adds.
+    snap = open_connection(mid_snapshot, read_only=True)
+    try:
+        assert _user_version(snap) == mid_version
+        assert not _table_exists(snap, "embedding_seed")
     finally:
         snap.close()
 

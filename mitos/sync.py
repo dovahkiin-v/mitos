@@ -553,7 +553,15 @@ class MitosSyncManager:
         # Lazy initialize vector / embedding dependencies as best-effort (C2/P14)
         self.embed_provider: Optional[GeminiEmbeddingProvider] = None
         self.vector_store: Optional[QdrantVectorStore] = None
-        
+
+        # Set once an inline embed has met an absent collection it may not create, so
+        # a multi-entry sync prints ONE deferral line and skips N−1 wasted Qdrant round
+        # trips (and N−1 embedding calls). Per manager instance — one per command — and
+        # read ONLY by ``_best_effort_embed``: a covering drain later in the same
+        # ``perform_sync`` must not consult it, or a rebuild-then-sync would refuse to
+        # heal because a record earlier in the run found the collection missing.
+        self._collection_absent = False
+
         try:
             cache_path = os.path.join(self.config.mitos_dir, "embedding_cache.sqlite")
             self.embed_provider = GeminiEmbeddingProvider(cache_path)
@@ -1619,7 +1627,21 @@ class MitosSyncManager:
         is retired here, 8a). Returns the document vector it computed and upserted (so
         a caller can reuse it for a neighbour query), or None if embedding was
         deferred/failed.
+
+        This is a **single-node** write, so it may create an absent collection only when
+        that one node *is* the whole active set — the fresh-project carve-out. The
+        declaration comes from the graph gate
+        (:meth:`~mitos.store.GraphStore.has_active_node_other_than`), the same shipped
+        active-view predicate the read-side gate uses; a populated graph defers instead,
+        keeping the collection absent so the honest "couldn't check" notice keeps firing
+        rather than quietly becoming "checked, clean" over a one-point index.
         """
+        if self._collection_absent:
+            # Already reported once for this command: say nothing, spend nothing, and
+            # skip the round trip. The outbox row the commit wrote is the durable
+            # record of the deferral either way.
+            return None
+
         embed_text = _embedding_input_text(
             kind=entry.kind, axiom=entry.axiom,
             topic=entry.topic, questions_raised=entry.questions_raised,
@@ -1643,15 +1665,37 @@ class MitosSyncManager:
         }
 
         try:
+            # Declared intent, from the graph gate: this write covers the active set iff
+            # there is no other active node. Cheap enough to run unconditionally (an
+            # EXISTS … LIMIT 1), and it must be computed before the write because only
+            # the 404 reveals whether it matters. Deliberately INSIDE this try: the
+            # helper's contract is that it swallows its own faults and leaves the outbox
+            # row (that is what makes deferral cheap), and a graph read added outside it
+            # would let a store fault escape a path that has never raised.
+            may_create = not self.store.has_active_node_other_than(delta.node_id)
             # Check embedding provider and generate vector
             vector = self.embed_provider.get_embedding(payload["embedding_text"], is_query=False)
-            self.vector_store.upsert(delta.node_id, vector, payload)
+            self.vector_store.upsert(delta.node_id, vector, payload, may_create=may_create)
             # Indexed now — drop the Outbox row the commit enqueued.
             try:
                 self.store.remove_pending_embedding(delta.node_id)
             except Exception as dbe:
                 print(f"[Warning] Failed to clear outbox row: {str(dbe)}", file=sys.stderr)
             return vector
+        except CollectionMissingError:
+            # Named as itself, not as an outage: Qdrant is up, the index is not there,
+            # and this write is not the one that may build it. One line per command
+            # (the latch), and the outbox row the commit wrote stays put — so the work
+            # is queued and `mitos reconcile` completes it in one pass. stderr, for the
+            # same JSON-RPC reason as the provider-down twin above.
+            self._collection_absent = True
+            print(
+                f"[Warning] Embedding upsert deferred for '{entry.slug}': the Qdrant "
+                f"collection is missing and this write does not cover the active set. "
+                f"Queued — run `mitos reconcile` to rebuild the index.",
+                file=sys.stderr,
+            )
+            return None
         except Exception as e:
             # The commit already enqueued this node (C2); leave the row for the next
             # drain. stderr — shared with the MCP write tool's JSON-RPC stdout channel.
@@ -1663,6 +1707,27 @@ class MitosSyncManager:
 
         Claims a batch of pending embeddings atomically to prevent concurrent
         drainers from double-processing rows, processes them, and removes resolved entries.
+
+        **Whether this drain may create an absent collection is not a property of the
+        running call site.** The drain has three callers (``mitos sync --embed-only``,
+        the sync commit path, and ``reconcile_embeddings``), and ``--embed-only`` is a
+        drain with no buffer at all — its covering-ness is entirely a property of outbox
+        state that a *prior* command deliberately established, which a call-site flag
+        structurally cannot express. So the knowledge travels to the substrate: the
+        ``embedding_seed`` marker, written by ``rebuild``/``cutover``'s prune (the act
+        that makes the outbox equal the active set) and by ``reconcile``'s enqueue pass.
+        This is the marker's only consumer. It is read **once at entry** — not per
+        claim-batch, so a concurrent second drainer cannot flip it mid-run — and cleared
+        the moment the outbox empties, because that is the moment coverage has been
+        delivered and the claim stops being true. A drain that stops early (the
+        zero-progress guard, or a refusal) **keeps** the marker: rows remain, so the next
+        drain is still covering.
+
+        It is emphatically *not* an inferred comparison of outbox size against the active
+        set — that is not a completeness measure (the outbox holds rows for
+        no-longer-active nodes), it is more expensive than the signals it would replace,
+        and it decays silently once a migration hands every project a clean collection
+        holding only active points.
         """
         if not self.embed_provider or not self.vector_store:
             print("Cannot drain outbox: Embedding provider or vector store down.")
@@ -1671,8 +1736,15 @@ class MitosSyncManager:
         import uuid
         drainer_id = f"drainer-{uuid.uuid4()}"
 
+        # Declared intent, from the state a prior command established (read once).
+        may_create = self.store.embedding_seed() is not None
+
         printed_header = False
         total_drained = 0
+        # Set by the refusal arm below; the refusal must escape BOTH loops (the per-item
+        # `for` and the enclosing claim-batch `while`), and a bare `break` leaves only
+        # the inner one.
+        refused = False
         try:
             # Drain the outbox in claim-batches until it is EMPTY. A single call must
             # not stop after one `limit`-sized batch: a corpus with more than `limit`
@@ -1696,6 +1768,11 @@ class MitosSyncManager:
                     return
 
                 if not pending:
+                    # The outbox is empty: any coverage the marker claimed has been
+                    # delivered (or there was nothing to deliver), so the claim is spent
+                    # and must stop authorizing creation. Clearing here covers both the
+                    # drained-to-empty exit and an already-empty outbox on entry.
+                    self._clear_embedding_seed_best_effort()
                     break
 
                 if not printed_header:
@@ -1737,12 +1814,29 @@ class MitosSyncManager:
                         # 1. Fetch embedding vector
                         vector = self.embed_provider.get_embedding(embed_text, is_query=False)
                         # 2. Upsert to Qdrant
-                        self.vector_store.upsert(node_id, vector, payload)
+                        self.vector_store.upsert(
+                            node_id, vector, payload, may_create=may_create
+                        )
                         # 3. Clean up queue row on success
                         self.store.remove_pending_embedding(node_id)
                         batch_resolved += 1
                         total_drained += 1
                         print(f"Successfully drained embedding for '{node['slug']}' ✓")
+                    except CollectionMissingError:
+                        # Ahead of the generic arm below, and deliberately quiet: a
+                        # refusal is a property of the whole drain, not of this row, so
+                        # it costs ONE calm line and stops immediately rather than
+                        # repeating per node. And NO `increment_pending_attempts` — the
+                        # row was not rejected, the drain declined; inflating a counter
+                        # that exists to describe genuine failure would poison it.
+                        print(
+                            "Stopping the drain: the Qdrant collection is missing and no "
+                            "covering re-embed has been requested, so writing now would "
+                            "index only part of the corpus. Run `mitos reconcile` to "
+                            "rebuild it in one pass."
+                        )
+                        refused = True
+                        break
                     except Exception as e:
                         # Increment retry count on failure (which also releases this row)
                         try:
@@ -1750,6 +1844,13 @@ class MitosSyncManager:
                         except Exception:
                             pass
                         print(f"[Warning] Failed to drain embedding for '{node['slug']}': {str(e)}")
+
+                # The refusal escapes the claim-batch loop too — the inner `break` only
+                # left the per-item one, and re-claiming would meet the same absent
+                # collection. The marker (if any) is deliberately RETAINED: rows remain,
+                # so the coverage claim still holds for the next drain.
+                if refused:
+                    break
 
                 # Nothing left the outbox this batch — every claimed row errored (a
                 # dead/erroring provider). Stop; re-claiming would return the same rows.
@@ -1761,6 +1862,20 @@ class MitosSyncManager:
                 self.store.release_pending_embeddings(drainer_id)
             except Exception:
                 pass
+
+    def _clear_embedding_seed_best_effort(self) -> None:
+        """Clears the coverage marker, reporting rather than raising on failure.
+
+        The clear is bookkeeping on a delivered claim, not part of the drain's product,
+        so a graph fault here must not turn a fully-drained outbox into a failed
+        ``sync``. Failing to clear is also the *safe* direction — the marker only ever
+        authorizes a covering drain, and the next one re-reads the (now empty) outbox
+        and clears it again.
+        """
+        try:
+            self.store.clear_embedding_seed()
+        except Exception as e:
+            print(f"[Warning] Failed to clear the embedding seed marker: {str(e)}")
 
     def reconcile_embeddings(self) -> Dict[str, int]:
         """Re-embeds active nodes missing from Qdrant, then drains the outbox.
@@ -1812,6 +1927,14 @@ class MitosSyncManager:
             self.store.add_pending_embedding(node_id)
 
         if missing:
+            # The enqueue above is the act that makes the outbox cover the active set,
+            # so record it before draining: the drain reads the marker, not a flag, and
+            # stamping it durably buys crash-safety for free — a reconcile that dies
+            # mid-drain leaves the marker standing, and the operator's next `sync`
+            # completes the heal instead of refusing it. This is one of only three
+            # producers, all operator-invoked: nothing implicit ever stamps it, which is
+            # what keeps the heal operator-invoked rather than automatic.
+            self.store.stamp_embedding_seed("reconcile")
             self.drain_pending_embeddings()
 
         return {

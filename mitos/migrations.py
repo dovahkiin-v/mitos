@@ -570,6 +570,78 @@ def _v1b_schema(conn: sqlite3.Connection) -> None:
     _rebuild_edges_widened(conn)
 
 
+# --- V1c schema (Phase 1c): migration ladder step 3 ----------------------------
+#
+# ``embedding_seed`` — the durable record that ``pending_embeddings`` covers the
+# graph's active set. A row present means exactly one thing, and nothing else may
+# read it into meaning: **the outbox covers the active set**, because a command that
+# bounds it that way said so. It is written by the two operator-invoked verbs that
+# actually deliver that property (``rebuild``/``cutover``'s prune, and
+# ``reconcile``'s enqueue pass) and read by exactly one consumer,
+# ``MitosSyncManager.drain_pending_embeddings``, which clears it the moment the
+# outbox empties and the claim stops being true.
+#
+# Why a graph table rather than a file in ``.mitos/``: the fact being recorded is
+# *about* ``pending_embeddings``, a graph table, and the graph is the exact artifact
+# ``cutover.perform_swap`` replaces — so the marker rides the swap atomically and a
+# refused rebuild discards it with the aside DB. Persisting derived vector-binding
+# state inside the workspace is what retiring the ``qdrant_collection`` override
+# exists to stop (it travels with ``cp -r`` and a git clone; ADR
+# ``absent-collection-creation-requires-a-write-covering-the-active-set``, rejected
+# path 3). A copied workspace carries the outbox along with the marker, so the claim
+# stays true in the copy.
+#
+# Single-purpose on purpose: NOT a general ``graph_meta(key, value)`` kv table
+# (P20's Retrofit Test does not fire — nothing in the ROADMAP commits to further
+# graph-level metadata — and a kv table invites junk; P19, the 50-year test).
+
+# The three verbs that may establish coverage. Single-sourced here so the DDL CHECK
+# and every producer bind ONE set: a literal retyped at a call site passes every
+# unit test that stamps through the same constant and only reds at runtime against
+# the CHECK. Interpolated into the DDL (the P8 carve-out — a code-internal constant,
+# never a user value), the same idiom ``store._KILL_EDGE_TYPES_SQL`` uses;
+# ``tests/test_embedding_seed.py`` pins the constant against the constraint text
+# SQLite actually stored.
+EMBEDDING_SEED_ESTABLISHED_BY: Tuple[str, ...] = ("rebuild", "cutover", "reconcile")
+
+_V1C_ESTABLISHED_BY_SQL: str = (
+    "(" + ", ".join(f"'{verb}'" for verb in EMBEDDING_SEED_ESTABLISHED_BY) + ")"
+)
+
+# One row, or none. ``CHECK (id = 1)`` makes single-row-ness structural rather than
+# conventional, and absence of the row is the false state — there is no
+# ``covers = 0`` row, because a two-valued column would let a stale ``0`` and a
+# missing row mean the same thing two ways. ``established_at`` is an
+# application-supplied UTC ISO-8601 string; no ``CURRENT_TIMESTAMP`` default (MI-10,
+# mirroring ``_v1_schema`` and ``mechanisms``). No FK — it references no node.
+_V1C_EMBEDDING_SEED_STATEMENT: str = f"""
+    CREATE TABLE IF NOT EXISTS embedding_seed (
+        id             INTEGER NOT NULL,
+        established_by TEXT NOT NULL,
+        established_at TEXT NOT NULL,
+        PRIMARY KEY (id),
+        CHECK (id = 1),
+        CHECK (established_by IN {_V1C_ESTABLISHED_BY_SQL})
+    ) STRICT;
+"""
+
+
+def _v1c_schema(conn: sqlite3.Connection) -> None:
+    """Migration step 3 (V1c): create the ``embedding_seed`` coverage marker.
+
+    A pure add — one ``CREATE TABLE IF NOT EXISTS``, no rebuild, no data movement,
+    so it is idempotent for MI-3 replay by construction. Runs inside
+    ``run_migrations``' transaction; does NOT touch ``user_version`` or
+    ``BEGIN``/``COMMIT`` (the runner owns both), and issues one statement per
+    ``conn.execute`` — never ``executescript`` (it force-commits and would split the
+    DDL out of the atomic version bump).
+
+    Args:
+        conn: An open, writable SQLite connection inside the runner's transaction.
+    """
+    conn.execute(_V1C_EMBEDDING_SEED_STATEMENT)
+
+
 # --- Pre-ladder DB snapshot harness (Phase 1a): binary migration reversal ------
 #
 # The first populated-schema migration (Phase 1b) rewrites a graph that already
@@ -769,3 +841,15 @@ MIGRATION_STEPS.append((1, _v1_schema))
 # at def-time, so an in-place append is seen by the live boot while a rebind would be
 # invisible to it (PATTERNS; §7 gotcha).
 MIGRATION_STEPS.append((2, _v1b_schema))
+
+
+# --- V1c live registration (Phase 1c) ------------------------------------------
+#
+# Append step 3 — the ``embedding_seed`` coverage marker. The ladder head becomes 3,
+# so a populated v2 graph now has a pending step and Phase 1a's pre-ladder snapshot
+# fires on its real ``v2→v3`` boot, again with ZERO change to that harness (it keys
+# off ``_pending_head(steps)``, never a hardcoded version). Use ``.append`` — NEVER
+# rebind ``MIGRATION_STEPS = [...]``: ``run_migrations``'s default arg binds the list
+# *object* at def-time, so an in-place append is seen by the live boot while a rebind
+# would be invisible to it (PATTERNS; §7 gotcha).
+MIGRATION_STEPS.append((3, _v1c_schema))

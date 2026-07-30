@@ -66,7 +66,7 @@ from mitos.identity import compute_node_id
 from mitos.migrations import is_pre_v1a_schema
 from mitos.parser import ParsedEntry, parse_file_reversed
 from mitos.replay import commit_quarantine_fixpoint
-from mitos.store import GraphStore, open_connection
+from mitos.store import GraphStore, open_connection, write_embedding_seed
 
 logger = logging.getLogger(__name__)
 
@@ -433,9 +433,15 @@ def rebuild_and_gate(
     # 4. Bound the embedding seed to the active set. Every commit self-enqueued one
     #    pending_embeddings row (5c), so the queue holds the whole corpus incl. dead
     #    nodes; prune it to the store's own active set (G5 — never a re-encoded
-    #    predicate).
+    #    predicate). The prune also stamps the coverage marker in its own transaction,
+    #    naming the verb that asked for it — which is what makes the next `sync`'s drain
+    #    a covering write and so makes both verbs' printed next-step true.
     reconstructed_active_ids = _reconstructed_active_ids(store)
-    _prune_embedding_queue_to_active(aside_db_path, reconstructed_active_ids)
+    _prune_embedding_queue_to_active(
+        aside_db_path,
+        reconstructed_active_ids,
+        established_by="cutover" if strict else "rebuild",
+    )
 
     # 5. Completeness gate against the still-live OLD graph (read-only). The gate
     #    baselines on PRESENCE (every node id in the rebuild, active OR superseded) —
@@ -870,9 +876,9 @@ def _reconstructed_all_ids(store: GraphStore) -> Set[str]:
 
 
 def _prune_embedding_queue_to_active(
-    aside_db_path: str, active_ids: Set[str]
+    aside_db_path: str, active_ids: Set[str], *, established_by: str
 ) -> None:
-    """Prunes ``pending_embeddings`` to exactly the active id set (both kinds).
+    """Prunes ``pending_embeddings`` to exactly the active id set, and records it.
 
     Every commit self-enqueued one ``pending_embeddings`` row unconditionally
     (5c), so the queue holds the whole corpus including dead/superseded nodes; the
@@ -888,9 +894,24 @@ def _prune_embedding_queue_to_active(
     empties the whole queue (``NOT IN`` over an empty subquery matches every row,
     never the ``NOT IN ()`` syntax error).
 
+    This prune **is** the act that makes the outbox equal the active set, so it is also
+    where that fact is recorded: the ``embedding_seed`` marker is stamped in the same
+    connection and the same commit as the ``DELETE``. Stamping anywhere else would let
+    the marker claim coverage the prune had not delivered — and the marker is what makes
+    ``rebuild``'s own printed next step (*"Re-embed …: ``mitos sync``"*) true, since
+    neither ``rebuild`` nor ``cutover`` upserts anything itself; the covering write is
+    the **next** command's drain.
+
+    It writes into the **aside** DB, which is what makes the guarantee cheap in both
+    directions: the marker rides ``perform_swap``'s whole-file rename atomically, and a
+    refused rebuild (casualties, a shortfall, a declined confirmation) discards the aside
+    file and leaves no marker behind.
+
     Args:
         aside_db_path: The build-aside graph (writable).
         active_ids: The active node ids to keep.
+        established_by: The verb doing the bounding — ``"cutover"`` or ``"rebuild"``
+            (one of ``migrations.EMBEDDING_SEED_ESTABLISHED_BY``).
     """
     conn = open_connection(aside_db_path)
     try:
@@ -905,6 +926,9 @@ def _prune_embedding_queue_to_active(
             "DELETE FROM pending_embeddings "
             "WHERE node_id NOT IN (SELECT id FROM _active_ids)"
         )
+        # Same connection, same commit as the DELETE above: the claim and the act that
+        # makes it true land together or not at all.
+        write_embedding_seed(conn, established_by)
         conn.commit()
     finally:
         conn.close()

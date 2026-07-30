@@ -322,3 +322,87 @@ def test_status_json_null_missing_when_scroll_fails(tmp_path, monkeypatch, capsy
     assert checks["missing_active_vectors"] is None
     assert checks["missing_active_slugs"] is None
     assert checks["orphan_points"] is None
+
+
+# --- the coverage marker in the deep report (phase 1c stretch) -----------------
+
+
+def test_status_names_the_seeding_verb_when_a_coverage_marker_stands(
+    tmp_path, monkeypatch, capsys
+):
+    """A seeded queue means `mitos sync` restores search, and the report says which.
+
+    The shipped warning offers both heals conditioned on prose the operator cannot check
+    ("or `mitos sync` if the outbox is non-empty"). With a marker standing that condition
+    is decided, so naming the verb that seeded the queue turns a guess into an instruction.
+
+    Informational only: the exit code stays 0 and no readiness mark moves. This must not
+    become a gate — an *unseeded* queue is an ordinary state, not a fault.
+    """
+    _init(tmp_path)
+    capsys.readouterr()
+    monkeypatch.setenv("GEMINI_API_KEY", "testkey")
+    ids = _commit_n(tmp_path, 2)
+
+    from mitos.store import GraphStore
+
+    GraphStore(MitosConfig(str(tmp_path)).db_path).stamp_embedding_seed("rebuild")
+
+    # Both active nodes are missing from a collection that exists but holds nothing.
+    monkeypatch.setattr(cli, "_check_qdrant", _qdrant(True, True, points=0))
+    monkeypatch.setattr(cli, "scroll_point_ids", _scroll(set()))
+
+    assert cli.cmd_status(str(tmp_path)) == 0
+    out = capsys.readouterr().out
+    assert "vector index incomplete" in out
+    assert "seeded by `rebuild`" in out
+    assert "`mitos sync` restores search" in out
+    assert len(ids) == 2
+
+
+def test_status_says_nothing_about_a_marker_that_does_not_stand(
+    tmp_path, monkeypatch, capsys
+):
+    """No marker, no line — and the shipped `reconcile` guidance is untouched.
+
+    The twin fixture: without it the row above would pass whether the line were
+    conditional or unconditional.
+    """
+    _init(tmp_path)
+    capsys.readouterr()
+    monkeypatch.setenv("GEMINI_API_KEY", "testkey")
+    _commit_n(tmp_path, 2)
+    monkeypatch.setattr(cli, "_check_qdrant", _qdrant(True, True, points=0))
+    monkeypatch.setattr(cli, "scroll_point_ids", _scroll(set()))
+
+    assert cli.cmd_status(str(tmp_path)) == 0
+    out = capsys.readouterr().out
+    assert "vector index incomplete" in out
+    assert "seeded by" not in out
+    assert "mitos reconcile" in out
+
+
+def test_the_marker_line_never_reaches_the_json_payload(tmp_path, monkeypatch, capsys):
+    """Deliberately rendered-text-only: the `--json` shape is 4b's to settle.
+
+    4b owns the deep report's payload (the registered project name, the inert-legacy
+    `qdrant_collection` line). Adding a field here would hand it a shape to revise for a
+    consumer that does not exist yet, so the stretch stops at the rendered surface.
+    """
+    _init(tmp_path)
+    capsys.readouterr()
+    monkeypatch.setenv("GEMINI_API_KEY", "testkey")
+    _commit_n(tmp_path, 1)
+
+    from mitos.store import GraphStore
+
+    GraphStore(MitosConfig(str(tmp_path)).db_path).stamp_embedding_seed("reconcile")
+    monkeypatch.setattr(cli, "_check_qdrant", _qdrant(True, True, points=0))
+    monkeypatch.setattr(cli, "scroll_point_ids", _scroll(set()))
+
+    assert cli.cmd_status(str(tmp_path), as_json=True) == 0
+    payload = capsys.readouterr().out
+    assert "embedding_seed" not in payload
+    assert "seeded by" not in payload
+    # And the readiness mapping is unmoved.
+    assert json.loads(payload)["ready"] is True

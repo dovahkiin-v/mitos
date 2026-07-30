@@ -77,13 +77,22 @@ class _FakeVector:
     def __init__(self, matches: Optional[List[Dict[str, Any]]] = None) -> None:
         self._matches = matches if matches is not None else []
         self.queries = 0
+        #: Every `may_create` this fake was handed, in call order — so a row can assert
+        #: WHICH intent the write path declared, not merely that it declared something.
+        self.may_create_calls: List[bool] = []
 
     def query(self, vector: List[float], limit: int = 5) -> List[Dict[str, Any]]:
         self.queries += 1
         return list(self._matches)
 
-    def upsert(self, node_id: str, vector: List[float], payload: Dict[str, Any]) -> None:
-        pass
+    def upsert(self, node_id: str, vector: List[float], payload: Dict[str, Any],
+               *, may_create: bool) -> None:
+        # `may_create` is spelled out rather than absorbed by `**k` on purpose: this
+        # fake reaches ~70 exercised upserts across the suite, and the handlers around
+        # every one of them swallow a TypeError into a warning line, so an un-migrated
+        # signature here would silently convert all of them into no-ops while the suite
+        # stayed green. Naming the parameter makes the arity a pinned contract.
+        self.may_create_calls.append(may_create)
 
 
 class _KeyedEmbed:
@@ -141,7 +150,9 @@ class _KeyedVector:
             raise self._raises[key]
         return list(self._matches[key])
 
-    def upsert(self, node_id: str, vector: List[float], payload: Dict[str, Any]) -> None:
+    def upsert(self, node_id: str, vector: List[float], payload: Dict[str, Any],
+               *, may_create: bool) -> None:
+        # Same explicit-arity discipline as `_FakeVector` above.
         pass
 
 

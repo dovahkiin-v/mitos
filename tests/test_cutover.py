@@ -176,6 +176,27 @@ def _pending_slugs(aside_db_path):
         conn.close()
 
 
+def _embedding_seed(db_path):
+    """Returns the graph's ``embedding_seed`` verb, or ``None`` when no marker stands.
+
+    The ``_pending_slugs`` twin. Vocabulary note, not a collision: ``embedding seed`` is
+    the shipped term for the outbox *contents* after the prune, and the ``embedding_seed``
+    table records exactly that fact — consistent by design.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT established_by FROM embedding_seed WHERE id = 1"
+        ).fetchone()
+        return row[0] if row else None
+    except sqlite3.OperationalError:
+        # A pre-V1a prototype graph has no such table — which is also the honest answer
+        # to "does a marker stand here?": no.
+        return None
+    finally:
+        conn.close()
+
+
 # --- SC1: happy path -----------------------------------------------------------
 
 
@@ -435,6 +456,88 @@ def test_sc9_embedding_seed_bounded_to_active(tmp_path):
     decs, oqs = _active_slugs(result.aside_db_path)
     assert decs == {"d3"}
     assert oqs == {"q1"}
+    # And the prune RECORDS the bounding it just performed, in the same transaction —
+    # which is what makes the next `sync`'s drain a covering write and so makes both
+    # verbs' printed next-step ("Re-embed …: mitos sync") true.
+    assert _embedding_seed(result.aside_db_path) == "cutover"
+
+
+# --- the coverage marker: written by the prune, riding the swap -----------------
+
+
+def test_the_prune_names_the_verb_that_asked_for_it(tmp_path):
+    """``cutover`` (strict) and ``rebuild`` (resilient) stamp their own names.
+
+    Three producers, one ``CHECK``, and they must agree exactly — a typo would pass every
+    unit test that stamps through the shared constant and only red at runtime against the
+    constraint, mid-heal on an operator's machine.
+    """
+    config = _config(tmp_path)
+    _write(config.decisions_file, _stream(_decision("alpha", "Alpha axiom.")))
+
+    strict = rebuild_and_gate(config, aside_db_path=_aside(config), strict=True)
+    assert _embedding_seed(strict.aside_db_path) == "cutover"
+
+    resilient = rebuild_and_gate(config, aside_db_path=_aside(config), strict=False)
+    assert _embedding_seed(resilient.aside_db_path) == "rebuild"
+
+
+def test_an_empty_active_set_still_stamps_over_an_emptied_queue(tmp_path):
+    """The marker's claim is about coverage, and covering nothing is still covering.
+
+    A corpus whose every entry is superseded prunes the queue to empty. The claim
+    ("the outbox covers the active set") is then trivially true, and the next drain finds
+    nothing and clears it — which is why the empty case needs no special arm.
+    """
+    config = _config(tmp_path)
+    _write(
+        config.decisions_file,
+        _stream(
+            _decision("d2", "Axiom two.", supersedes="d1"),
+            _decision("d1", "Axiom one."),
+        ),
+    )
+    result = rebuild_and_gate(config, aside_db_path=_aside(config))
+
+    assert _pending_slugs(result.aside_db_path) == {"d2"}
+    assert _embedding_seed(result.aside_db_path) == "cutover"
+
+
+def test_the_marker_rides_the_swap_and_a_refusal_leaves_none(tmp_path, capsys):
+    """It is written into the ASIDE graph, and that is the whole safety argument.
+
+    ``perform_swap`` is a whole-file ``os.rename``, so the marker arrives in the live
+    graph atomically with the rebuild it describes — a swap can never land a graph whose
+    outbox and marker disagree. And a refused rebuild (a casualty, a shortfall, a declined
+    confirmation) discards the aside file, so the live graph is left with no marker and no
+    creation licence: the refusal costs nothing and grants nothing.
+    """
+    config = _config(tmp_path)
+    _plant_prototype(
+        config.db_path,
+        [{"slug": "alpha", "kind": "decision", "core_axiom": "Alpha axiom."}],
+    )
+    # A dangling citation makes this entry a casualty, so the rebuild refuses.
+    _write(
+        config.decisions_file,
+        _stream(
+            _decision("beta", "Beta axiom.", supersedes="ghost"),
+            _decision("alpha", "Alpha axiom."),
+        ),
+    )
+    result = rebuild_and_gate(config, aside_db_path=_aside(config), strict=False)
+    assert result.residual_casualties
+
+    # The aside file carries the marker, the still-live graph does not.
+    assert _embedding_seed(result.aside_db_path) == "rebuild"
+    assert _embedding_seed(config.db_path) is None
+
+    # Now let a clean rebuild swap, and the marker arrives with it.
+    _write(config.decisions_file, _stream(_decision("alpha", "Alpha axiom.")))
+    clean = rebuild_and_gate(config, aside_db_path=_aside(config), strict=False)
+    perform_swap(config, clean.aside_db_path, timestamp="20260730-000000")
+
+    assert _embedding_seed(config.db_path) == "rebuild"
 
 
 # --- SC10: idempotent retry discards a stale/garbage aside ---------------------

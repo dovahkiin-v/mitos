@@ -1926,6 +1926,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
     # (which files, which decisions to re-scope) lives here, not on every `record`.
     overflows: List[Dict[str, Any]] = []
     graph_behind = False
+    embedding_seed: Optional[Dict[str, str]] = None
     if os.path.exists(config.db_path) and not pre_v1a:
         try:
             ro_store = GraphStore(config.db_path, read_only=True)
@@ -1935,6 +1936,12 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
             active_ids = ro_store.get_active_node_ids()
             active_nodes = len(active_ids)
             overflows = overflow_report(ro_store)
+            # The coverage marker, if one stands: a `rebuild`/`cutover`/`reconcile`
+            # bounded the outbox to the active set and has not drained yet. Purely
+            # informational — it tells the operator that a plain `mitos sync` restores
+            # search, which is otherwise a fact only the drain knows. Never a readiness
+            # gate: an unseeded queue is an ordinary state, not a fault.
+            embedding_seed = ro_store.embedding_seed()
         except Exception:
             pass  # both reads are best-effort; a failure leaves the safe defaults
         graph_behind = _graph_behind_buffer(config.db_path)
@@ -2117,6 +2124,13 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
             f"to re-embed them (or `mitos sync` if the outbox is non-empty) — "
             f"informational, not a readiness blocker."
         )
+        if embedding_seed:
+            # Which of the two heals applies is knowable here, so say it rather than
+            # leaving the operator to infer it from "if the outbox is non-empty".
+            print(
+                f"      the embedding queue was seeded by `{embedding_seed['established_by']}` "
+                f"at {embedding_seed['established_at']} — `mitos sync` restores search"
+            )
         if n <= 5:
             for slug in missing_active_slugs:
                 print(f"      • {slug}")

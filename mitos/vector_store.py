@@ -3,12 +3,16 @@
 This module implements the vector store pipeline (D) using the Qdrant REST API
 directly, reducing dependency bloat and ensuring maximum interoperability.
 
-Two contracts hold across every member here. **Reading never writes:** neither
+Three contracts hold across every member here. **Reading never writes:** neither
 constructing a store nor querying/scrolling one can bring a collection into
 existence — creation attaches to :meth:`QdrantVectorStore.upsert`, lazily, on a
-404. And **missing is not unreachable:** an absent collection raises the typed
+404. **Missing is not unreachable:** an absent collection raises the typed
 :class:`~mitos.errors.CollectionMissingError`, which every surface words as the
-recoverable state it is (``mitos reconcile``) rather than as an outage.
+recoverable state it is (``mitos reconcile``) rather than as an outage. And **not
+every write may create:** the upsert takes a required ``may_create`` declaration, so
+a write covering only itself leaves an absent collection absent rather than minting a
+one-point index over a populated corpus. Absence is a signal several nets key on; a
+single write must not be able to spend it.
 """
 
 import requests
@@ -254,24 +258,40 @@ class QdrantVectorStore:
         except requests.RequestException as e:
             raise VectorStoreError(f"Qdrant connection refused: {str(e)}")
 
-    def upsert(self, point_id: str, vector: List[float], payload: Dict[str, Any]) -> None:
+    def upsert(self, point_id: str, vector: List[float], payload: Dict[str, Any],
+               *, may_create: bool) -> None:
         """Upserts a single point into Qdrant using the deterministic UUID mapping.
 
         Creation lives here, lazily: the write is attempted first, and only a 404 —
-        the collection does not exist — triggers ``_ensure_collection`` and **one**
-        retry. The healthy case pays zero extra round trips, and a 404 that turns
-        out to mean something else (a renamed endpoint in a future Qdrant) costs one
-        wasted create and then raises on the second 404 — never a loop, never a
-        silent success.
+        the collection does not exist — reaches the creation decision. When the caller
+        declared ``may_create``, that is ``_ensure_collection`` and **one** retry; when
+        it did not, the absent collection is left absent and reported. The healthy case
+        pays zero extra round trips either way, and a 404 that turns out to mean
+        something else (a renamed endpoint in a future Qdrant) costs one wasted create
+        and then raises on the second 404 — never a loop, never a silent success.
+
+        ``may_create`` is **required and keyword-only** on purpose. A default of False
+        would be safe today and would silently lose the contract tomorrow: a future
+        call site that omits it defers forever and reads as working, because the outbox
+        merely grows. A default of True re-arms the hazard the parameter exists to
+        close. Required makes every write site declare, and turns an un-migrated one
+        into a ``TypeError`` rather than a behaviour change nobody sees. The declaration
+        is read **only on a 404**, so a healthy project's every write may pass False
+        forever with nothing changing.
 
         Args:
             point_id: The SHA-256 node ID.
             vector: The embedding vector values.
             payload: Node metadata {slug, scope, state, kind, embedding_text}.
+            may_create: Whether this write covers the workspace's active set and may
+                therefore bring an absent collection into existence. Callers derive it
+                from declared intent — the graph gate for a single-node write, the
+                ``embedding_seed`` marker for a drain — never from an inferred
+                comparison.
 
         Raises:
-            CollectionMissingError: If the collection is still absent after the
-                create-and-retry.
+            CollectionMissingError: If the collection is absent and this write may not
+                create it, or if it is still absent after the create-and-retry.
             VectorStoreError: If Qdrant is unreachable or rejects the write.
         """
         uuid_id = hash_to_uuid(point_id)
@@ -299,9 +319,20 @@ class QdrantVectorStore:
             resp = _put()
             if _collection_is_missing(resp):
                 # ── The one place an absent collection is created. ──────────────
-                # Phase 1c narrows WHICH writes may take this branch (a write that
-                # covers the workspace's active set); keep it a single, clearly
-                # marked seam so that predicate has one place to go.
+                # Narrowed to writes that COVER the workspace's active set. A write
+                # covering only itself defers here: creating would leave a collection
+                # holding one point out of N, and from the next write on every net
+                # keyed on absence would report "checked, clean" over an index that
+                # was never checked. Deferral is cheap — the commit already wrote the
+                # outbox row, so the work is queued, not lost.
+                if not may_create:
+                    raise CollectionMissingError(
+                        f"Qdrant collection '{self.collection}' does not exist, and "
+                        f"this write does not cover the workspace's active set — "
+                        f"deferring rather than creating an index holding only part "
+                        f"of the corpus. Run `mitos reconcile` to build it in one pass.",
+                        collection=self.collection,
+                    )
                 self._ensure_collection()
                 resp = _put()
             if resp.status_code != 200:

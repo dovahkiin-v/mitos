@@ -13,7 +13,7 @@ from datetime import datetime
 import anthropic
 
 from mitos.config import MitosConfig
-from mitos.errors import SynthesisError, ValidationError
+from mitos.errors import CollectionMissingError, SynthesisError, ValidationError
 from mitos.models import get_model_id
 from mitos.parser import ParsedEntry, parse_header
 from mitos.store import GraphStore, CommitDelta, _utc_now_iso
@@ -82,6 +82,11 @@ class MitosProseImporter:
         # Lazy load embeddings/vectors
         self.embed_provider = None
         self.vector_store = None
+
+        # Set once an entry's embed has met an absent collection it may not create, so
+        # an N-entry import prints ONE line instead of N and skips N−1 wasted round
+        # trips. Per importer instance — one per `mitos import` invocation.
+        self._collection_absent = False
         try:
             cache_path = os.path.join(self.config.mitos_dir, "embedding_cache.sqlite")
             self.embed_provider = GeminiEmbeddingProvider(cache_path)
@@ -249,8 +254,23 @@ class MitosProseImporter:
             pass
 
     def _best_effort_embed(self, delta: CommitDelta, entry: ParsedEntry) -> None:
-        """Best-effort embedding upsert pipeline for imported nodes."""
+        """Best-effort embedding upsert pipeline for imported nodes.
+
+        Each call covers exactly one node, so it may create an absent collection only
+        on a genuinely fresh project — the same graph gate the ``sync`` write path uses.
+        Importing into a populated graph whose collection is absent would otherwise mint
+        precisely the partial index the gate exists to prevent, one entry deep.
+
+        The commit already enqueued every node and this method never dequeues, so the
+        durability of a deferral is free here; what the arm below adds is the **notice**
+        — the surrounding ``except Exception: pass`` would otherwise swallow the refusal
+        into complete silence.
+        """
         if not self.embed_provider or not self.vector_store:
+            return
+
+        if self._collection_absent:
+            # Reported once for this import; say nothing and spend nothing further.
             return
 
         payload = {
@@ -264,7 +284,23 @@ class MitosProseImporter:
         }
 
         try:
+            # Inside the try for the same reason as the sync twin: the graph read must
+            # not be able to escape a helper whose whole contract is best-effort.
+            may_create = not self.store.has_active_node_other_than(delta.node_id)
             vector = self.embed_provider.get_embedding(payload["embedding_text"], is_query=False)
-            self.vector_store.upsert(delta.node_id, vector, payload)
+            self.vector_store.upsert(
+                delta.node_id, vector, payload, may_create=may_create
+            )
+        except CollectionMissingError:
+            # Ahead of the bare swallow below — CollectionMissingError is a
+            # VectorStoreError subclass, so `except Exception: pass` would catch it and
+            # the import would report N nodes committed with no hint that none of them
+            # reached the index.
+            self._collection_absent = True
+            print(
+                "[Warning] Embeddings deferred for this import: the Qdrant collection "
+                "is missing and these writes do not cover the active set. Every node is "
+                "queued — run `mitos reconcile` to build the index in one pass."
+            )
         except Exception:
             pass

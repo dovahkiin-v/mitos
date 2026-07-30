@@ -115,7 +115,7 @@ def test_upsert_creates_the_absent_collection_and_retries_once(
     ]
 
     store = QdrantVectorStore(_URL, collection_name=_COLLECTION)
-    store.upsert("a" * 64, [0.1] * EMBEDDING_DIM, {"slug": "s"})
+    store.upsert("a" * 64, [0.1] * EMBEDDING_DIM, {"slug": "s"}, may_create=True)
 
     creates = [c for c in mock_put.call_args_list if _is_create_shaped(c)]
     assert len(creates) == 1
@@ -142,10 +142,87 @@ def test_upsert_retries_exactly_once_then_raises(
 
     store = QdrantVectorStore(_URL, collection_name=_COLLECTION)
     with pytest.raises(CollectionMissingError):
-        store.upsert("a" * 64, [0.1] * EMBEDDING_DIM, {"slug": "s"})
+        store.upsert("a" * 64, [0.1] * EMBEDDING_DIM, {"slug": "s"}, may_create=True)
 
     # upsert → create → upsert, and then it stops.
     assert len(mock_put.call_args_list) == 3
+
+
+# --------------------------------------------------------------------------- #
+# I10 write half — a non-covering write leaves an absent collection absent
+# --------------------------------------------------------------------------- #
+
+@patch("mitos.vector_store.requests.put")
+@patch("mitos.vector_store.requests.get")
+def test_a_non_covering_upsert_dispatches_no_create_and_raises(
+    mock_get: MagicMock, mock_put: MagicMock
+) -> None:
+    """Success criterion 12, the offline regression twin.
+
+    What this proves is precisely *"mitos dispatched no create"* — it never observes a
+    server, so it cannot speak to the collection listing (F2's split; the live twin in
+    ``tests/test_collection_absence_live.py`` asserts that). It is the net that runs in
+    bare CI, and it catches the change that would actually happen: someone widening the
+    creation branch back out.
+
+    Assert the absence of a **create-shaped** request rather than "no PUT" — the upsert
+    is itself a PUT, so the weaker claim would be vacuous.
+    """
+    mock_put.return_value = _resp(404)
+
+    store = QdrantVectorStore(_URL, collection_name=_COLLECTION)
+    with pytest.raises(CollectionMissingError) as excinfo:
+        store.upsert("a" * 64, [0.1] * EMBEDDING_DIM, {"slug": "s"}, may_create=False)
+
+    assert not any(_is_create_shaped(c) for c in mock_put.call_args_list)
+    # And no existence probe either — the refusal is decided before any recovery.
+    assert mock_get.call_args_list == []
+    # Exactly one PUT: the attempted upsert. No create, no retry.
+    assert len(mock_put.call_args_list) == 1
+    # Worded as the recoverable state it is, never as an outage, and it carries the heal.
+    assert excinfo.value.collection == _COLLECTION
+    assert "reconcile" in str(excinfo.value)
+    # Catchable by every shipped `except VectorStoreError` net, unchanged.
+    assert isinstance(excinfo.value, VectorStoreError)
+
+
+@patch("mitos.vector_store.requests.put")
+@patch("mitos.vector_store.requests.get")
+def test_may_create_is_read_only_on_a_404(
+    mock_get: MagicMock, mock_put: MagicMock
+) -> None:
+    """A healthy collection ignores the declaration entirely — the blast radius pin.
+
+    Every write on a healthy project declares ``may_create=False`` forever after the
+    first, and nothing about it changes: the parameter is consulted at exactly one place,
+    the 404 recovery branch. Without this row a reader would reasonably assume the
+    narrowing is a behaviour change on the healthy path.
+    """
+    mock_put.return_value = _resp(200)
+
+    store = QdrantVectorStore(_URL, collection_name=_COLLECTION)
+    store.upsert("a" * 64, [0.1] * EMBEDDING_DIM, {"slug": "s"}, may_create=False)
+
+    assert len(mock_put.call_args_list) == 1
+    assert mock_get.call_args_list == []
+
+
+def test_may_create_is_required_and_keyword_only() -> None:
+    """D1's contract, asserted rather than commented.
+
+    A default would be the quiet failure: ``False`` loses the covering case for any
+    future call site that forgets to declare (it defers forever and reads as working,
+    because the outbox merely grows), ``True`` re-arms the hazard. Positional passing is
+    refused for the same reason — a fourth positional argument is easy to add by accident
+    and impossible to read at the call site.
+    """
+    store = QdrantVectorStore(_URL, collection_name=_COLLECTION)
+
+    with pytest.raises(TypeError):
+        store.upsert("a" * 64, [0.1] * EMBEDDING_DIM, {"slug": "s"})  # type: ignore[call-arg]
+
+    with pytest.raises(TypeError):
+        store.upsert("a" * 64, [0.1] * EMBEDDING_DIM, {"slug": "s"}, True)  # type: ignore[misc]
 
 
 # --------------------------------------------------------------------------- #
