@@ -385,6 +385,16 @@ def test_cli_mcp_record_pause_parity(ws, capsys):
     assert cli_payload["code"] == mcp_payload["code"] == "similar_decision_exists"
     assert cli_payload["message"] == mcp_payload["message"]
 
+    # The `needs_review` receipt is stamped too — the fourth outcome shape, whose
+    # other three live in `tests/test_corpus_provenance.py`. It is asserted here
+    # because this is where the armed review machinery lives. Both surfaces get
+    # the same config (the CLI's directly, the MCP's through the patched
+    # `MitosConfig`), so the two stamps must agree as well as be present.
+    for payload in (cli_payload, mcp_payload):
+        assert payload["project"] == config.project
+        assert payload["collection"] == config.qdrant_collection
+        assert payload["workspace"] == config.workspace_dir
+
     # The enriched shape in its contractual key order, the stamp riding last.
     n = cli_payload["neighbors"][0]
     assert list(n.keys()) == ["slug", "axiom", "scope", "score", "rejected_paths",

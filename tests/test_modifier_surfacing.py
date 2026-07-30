@@ -16,6 +16,7 @@ never depends on running services.
 """
 
 import json
+import os
 import shutil
 import tempfile
 from typing import Iterator, Tuple
@@ -23,6 +24,7 @@ from typing import Iterator, Tuple
 import pytest
 from unittest.mock import patch
 
+from mitos import routing
 from mitos.config import MitosConfig
 from mitos.cli import cmd_init, cmd_list, cmd_open_questions, cmd_query, cmd_show, cmd_surface
 from mitos.parser import ParsedEntry
@@ -41,12 +43,32 @@ def offline(monkeypatch):
 
 @pytest.fixture
 def ws(offline) -> Iterator[Tuple[MitosConfig, MitosSyncManager]]:
-    """An initialised temp workspace + a manager, in offline graph-only mode."""
-    tmp = tempfile.mkdtemp()
+    """An initialised temp workspace + a manager, in offline graph-only mode.
+
+    `realpath` rather than the raw mkdtemp path: the `show_node` parity row names
+    this workspace in path form, and resolution canonicalizes — so on a platform
+    whose temp root is a symlink the two surfaces would stamp different
+    `workspace` strings and parity would red on the environment.
+    """
+    tmp = os.path.realpath(tempfile.mkdtemp())
     config = MitosConfig(tmp)
     cmd_init(config)
+    config = _resolve_like_main(tmp)
     yield config, MitosSyncManager(config)
     shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _resolve_like_main(root: str) -> MitosConfig:
+    """The config ``cli.main()`` builds for a path-form selector.
+
+    A CLI verb never receives a hand-built config in production — ``main()``
+    resolves the selector and passes what it got, so the config carries the
+    resolved *name*. ``mitos init`` registers the workspace, so the same path
+    reverse-looks-up to that name on the MCP side too; hand-building here would
+    make the show-parity row red on the test's shortcut rather than on a drift.
+    """
+    target = routing.resolve_project(root)
+    return MitosConfig(target.root, project=target.name)
 
 
 def _rec(m: MitosSyncManager, slug: str, scope=None, **relations) -> dict:
@@ -501,7 +523,16 @@ def test_show_node_parity_with_cli_show_json(ws, capsys) -> None:
     """CLI⇄MCP parity (the vision's load-bearing invariant): for the SAME ident over a
     real store, `json.loads(show_node(ident))` == `json.loads(mitos show --json ident)`
     — for a found decision, a found OQ, AND the not-found case. Structural via the shared
-    resolve_handle seam + the shared show_payload builder; pinned here too."""
+    resolve_handle seam + the shared show_payload builder; pinned here too.
+
+    Since both shapes now carry the corpus provenance, the MCP side must NAME this
+    workspace: the fixture never chdirs, so a `project`-less call would resolve
+    pytest's cwd (the mitos-pub repo — itself a valid workspace) and stamp a
+    different collection than the CLI side, reading as a broken stamp when the
+    truth is that the call never named a target. The path form needs no registry.
+    Resolution is left to run — only `get_workspace_components` is patched — because
+    a row that mocked the resolution could not observe the stamp at all.
+    """
     from mitos import mcp_server
     config, m = ws
     store = GraphStore(config.db_path)
@@ -518,8 +549,15 @@ def test_show_node_parity_with_cli_show_json(ws, capsys) -> None:
         cmd_show(config, ident, as_json=True)
         cli_out = json.loads(capsys.readouterr().out)
         with patch.object(mcp_server, "get_workspace_components", return_value=(ro, None, None)):
-            mcp_out = json.loads(mcp_server.show_node(ident))
+            mcp_out = json.loads(mcp_server.show_node(ident, project=config.workspace_dir))
         assert cli_out == mcp_out, f"CLI⇄MCP show parity drift on {ident!r}"
+        # Both shapes stamped, including the not-found one — the half that is
+        # ambiguous between "no such handle" and "wrong project", and the half a
+        # found-branch-only stamp would leave bare (dict equality alone would red
+        # on `nope-not-here`, but say nothing about what was missing).
+        assert cli_out["project"] == config.project
+        assert cli_out["collection"] == config.qdrant_collection
+        assert cli_out["workspace"] == config.workspace_dir
 
 
 def test_cli_list_text_marks_modified(ws, capsys) -> None:
@@ -673,6 +711,7 @@ def test_cli_query_true_miss_keeps_plain_message(ws, capsys) -> None:
     resp = json.loads(capsys.readouterr().out)
     assert resp == {"query": "a claim that is not any slug", "depth_mode": "letter",
                     "matches": [],
+                    "project": config.project,
                     "collection": config.qdrant_collection,
                     "workspace": config.workspace_dir}
     assert "all_superseded" not in resp

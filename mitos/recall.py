@@ -306,14 +306,28 @@ def corpus_provenance(config: "object") -> Dict[str, str]:
     workspace" — the reviewing cwd and a vision's decision store can diverge).
     Shared by the CLI verbs and their MCP twins so the field names can't drift.
 
+    ``project`` answers that ambiguity in the *caller's own* vocabulary: a call
+    that named a registered project gets that name back, so an agent holding
+    several projects can see at a glance that the answer came from the one it
+    asked for. The value is read straight off the config the resolution site
+    built and is **never re-derived here** — a reverse lookup against the
+    registry would break this module's leaf status, read the registry on every
+    stamped answer (including the degraded path, where the filesystem may be the
+    fault), and miss on a symlinked route, quietly echoing a path for a
+    registered project.
+
     Args:
         config: The active ``MitosConfig`` (duck-typed to avoid an import cycle
             — recall is a leaf module).
 
     Returns:
-        ``{"collection": <qdrant collection>, "workspace": <workspace dir>}``.
+        ``{"project": <registered name or absolute path>,
+        "collection": <qdrant collection>, "workspace": <workspace dir>}``.
+        Field order is contractual — the identity a reader scans for first, then
+        the derived collection, then the location.
     """
     return {
+        "project": getattr(config, "project", ""),
         "collection": getattr(config, "qdrant_collection", ""),
         "workspace": getattr(config, "workspace_dir", ""),
     }
@@ -356,6 +370,11 @@ def missing_index_is_a_gap(store: "object") -> bool:
 
 
 def provenance_line(config: "object") -> str:
-    """Formats ``corpus_provenance`` as the one-line text header."""
+    """Formats ``corpus_provenance`` as the one-line text header.
+
+    Same field order as the dict, for the same reason: the project the call
+    resolved reads first. The ``·`` separator is used at every site, including
+    the bracketed inline forms.
+    """
     p = corpus_provenance(config)
-    return f"corpus: {p['collection']} · {p['workspace']}"
+    return f"corpus: {p['project']} · {p['collection']} · {p['workspace']}"

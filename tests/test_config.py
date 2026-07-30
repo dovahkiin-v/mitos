@@ -353,6 +353,73 @@ def test_to_dict_carries_full_surface() -> None:
 
 
 # ---------------------------------------------------------------------------
+# `config.project` — the echo carrier (runtime-only, never empty)
+# ---------------------------------------------------------------------------
+
+def test_project_is_never_empty_across_every_construction_form() -> None:
+    """The echo's never-empty rule is a property of CONSTRUCTION, not of call sites.
+
+    Four forms, because each is a real caller: the zero-arg fallback (5b's line),
+    a bare workspace root, an explicit ``project=None`` (what the two resolution
+    sites pass for an *unregistered* path — `ResolvedProject.name` is `None`
+    there), and a registered name. Only the last carries a name; the other three
+    fall back to the canonical workspace path, which is what makes an echo defined
+    for every selector form without a branch at any consumer.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        forms = {
+            "zero-arg": MitosConfig(),
+            "path only": MitosConfig(tmpdir),
+            "explicit None": MitosConfig(tmpdir, project=None),
+            "named": MitosConfig(tmpdir, project="a-registered-name"),
+        }
+        for label, config in forms.items():
+            assert config.project, f"empty project on the {label} form"
+
+        assert forms["path only"].project == forms["path only"].workspace_dir
+        assert forms["explicit None"].project == forms["explicit None"].workspace_dir
+        assert forms["zero-arg"].project == os.path.abspath(os.getcwd())
+        assert forms["named"].project == "a-registered-name"
+
+
+def test_project_is_runtime_only_and_absent_from_to_dict() -> None:
+    """Like ``env`` and ``inert_file_keys``: carried per call, never persisted.
+
+    ``to_dict`` feeds the ``status`` surfaces and anything that writes config
+    back; the caller's selector is a property of ONE invocation, so persisting it
+    would turn a per-call routing fact into workspace state.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        assert "project" not in MitosConfig(tmpdir, project="named").to_dict()
+
+
+def test_a_project_key_in_config_toml_is_inert_and_cannot_become_the_echo(
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """ADR ``no-implicit-project-targeting-channel-including-process-env``, extended
+    to the config file.
+
+    ``MitosConfig`` applies file-schema keys by ``setattr``, so a new attribute name
+    on the class is worth an adversarial row rather than an assumption: ``project``
+    is in neither ``CONFIG_SCHEMA`` nor ``RETIRED_CONFIG_KEYS``, so a
+    ``project = "…"`` line takes the unknown-key branch — one calm warning, no
+    ``setattr`` — and the echo still names the workspace the CALL resolved.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _write_config(tmpdir, 'project = "spoofed"\n')
+
+        default = MitosConfig(tmpdir)
+        assert default.project == default.workspace_dir != "spoofed"
+
+        named = MitosConfig(tmpdir, project="real-name")
+        assert named.project == "real-name"
+
+        err = capsys.readouterr().err
+        assert "project" in err  # the unrecognized-key line, so it is not silent
+        assert "Traceback" not in err
+
+
+# ---------------------------------------------------------------------------
 # Existing-file coherence (§5.2.7) — the live prototype-shaped file
 # ---------------------------------------------------------------------------
 

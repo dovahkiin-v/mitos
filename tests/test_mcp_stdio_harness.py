@@ -24,6 +24,11 @@ from pathlib import Path
 import pytest
 
 from mcp_harness import ServerStartupError, harness_env, mitos_server
+#: The collection derivation itself, so an expected collection is never a
+#: hand-built `f"mitos-{name}"` literal (1d's W11). A pure path→name function:
+#: importing it into the *parent* opens no store and reads no environment, and the
+#: no-mitos-import rule below binds `tests/mcp_harness.py`, not this module.
+from mitos.config import default_collection_name
 
 #: A port nothing listens on. `mitos record` writes, and an absent `QDRANT_URL`
 #: would send it at this box's live default instance, where it could leave behind a
@@ -146,8 +151,9 @@ async def test_list_scopes_answers_over_a_real_serve_subprocess(tmp_path):
     """A real server, launched from a real workspace, answers a real tool call.
 
     The first test in this codebase to watch mitos from the outside as a process.
-    A fresh workspace answering `{}` is also I8's healthy-and-empty shape at this
-    surface — a valid empty vocabulary, not an error.
+    A fresh workspace answering an empty `scopes` map is also I8's healthy-and-empty
+    shape at this surface — a valid empty vocabulary, not an error, now inside the
+    provenance envelope that says which project was empty.
     """
     ws = _workspace(tmp_path, "ws_a", env=_scaffold_env(tmp_path))
 
@@ -157,7 +163,7 @@ async def test_list_scopes_answers_over_a_real_serve_subprocess(tmp_path):
 
         result = await server.session.call_tool("list_scopes", {})
         assert result.isError is False
-        assert _tool_json(result) == {}
+        assert _tool_json(result)["scopes"] == {}
 
 
 @pytest.mark.asyncio
@@ -186,7 +192,7 @@ async def test_the_smoke_needs_neither_a_key_nor_a_reachable_qdrant(tmp_path):
     assert not (Path(env["XDG_CONFIG_HOME"]) / "mitos" / ".env").exists()
 
     async with mitos_server(cwd=ws, env=env) as server:
-        assert _tool_json(await server.session.call_tool("list_scopes", {})) == {}
+        assert _tool_json(await server.session.call_tool("list_scopes", {}))["scopes"] == {}
 
 
 # --------------------------------------------------------------------------- #
@@ -233,7 +239,7 @@ async def test_the_session_tears_down_without_leaking_pipes_or_loops(tmp_path, r
     recwarn.clear()
 
     async with mitos_server(cwd=ws, env=harness_env(tmp_path)) as server:
-        assert _tool_json(await server.session.call_tool("list_scopes", {})) == {}
+        assert _tool_json(await server.session.call_tool("list_scopes", {}))["scopes"] == {}
 
     # A handle that dies with a helper's frame reds this row by refcount alone; the
     # collect is what makes it hold for a leak that lands in a reference cycle
@@ -322,9 +328,12 @@ async def test_the_launch_directory_is_what_the_server_binds(tmp_path):
     _workspace(tmp_path, "ws_b", env=env, scopes=("beta",))
 
     async with mitos_server(cwd=ws_a, env=env) as server:
-        scopes = _tool_json(await server.session.call_tool("list_scopes", {}))
+        payload = _tool_json(await server.session.call_tool("list_scopes", {}))
 
-    assert set(scopes) == {"alpha"}
+    assert set(payload["scopes"]) == {"alpha"}
+    # Transitional echo rule: a selector-less call attributes itself to the
+    # resolved workspace's path. 5b removes the fallback and this line with it.
+    assert payload["project"] == str(ws_a)
 
 
 @pytest.mark.asyncio
@@ -367,11 +376,77 @@ async def test_a_named_project_retargets_a_server_launched_somewhere_else(tmp_pa
         registry_file.unlink()
         empty = _tool_json(await server.session.call_tool("list_projects", {}))
 
-    assert set(by_name) == {"beta"}
-    assert set(by_path) == {"beta"}
-    assert set(default) == {"alpha"}
+    assert set(by_name["scopes"]) == {"beta"}
+    assert set(by_path["scopes"]) == {"beta"}
+    assert set(default["scopes"]) == {"alpha"}
     assert listed["projects"] == [{"name": "bee", "path": str(ws_b)}]
     assert empty == {"registry_path": str(registry_file), "count": 0, "projects": []}
+
+    # Criterion 5, over the same real server: the answer names the project back.
+    # A registered NAME echoes the name; the same workspace reached by its
+    # registered PATH echoes that same name via the reverse lookup; and the
+    # selector-less call echoes the launch directory's path. The collection is
+    # read from the derivation, never hand-built as f"mitos-{name}".
+    assert by_name["project"] == "bee"
+    assert by_path["project"] == "bee"
+    assert default["project"] == str(ws_a)
+    assert by_name["workspace"] == by_path["workspace"] == str(ws_b)
+    assert by_name["collection"] == default_collection_name(str(ws_b))
+    assert default["collection"] == default_collection_name(str(ws_a))
+    # Echo and discovery speak ONE vocabulary: the name planted in the registry,
+    # the name `list_projects` reports, and the name the envelope echoes are the
+    # same string.
+    assert listed["projects"][0]["name"] == by_name["project"] == "bee"
+
+
+@pytest.mark.asyncio
+async def test_two_registered_projects_each_echo_their_own_name_in_one_session(tmp_path):
+    """The echo is per-CALL, not per-process — the sharpest form of the claim.
+
+    One long-lived server, launched from neither workspace, alternating between
+    two registered projects across two different tools. A per-process echo (a
+    name cached at startup, or a config built once and reused) answers both calls
+    with one name and reds here, while every single-project row stays green.
+
+    Asserted across two tools because the stamp is applied per tool: `list_scopes`
+    builds its envelope, `show_node` updates a payload from the shared display
+    leaf, and a phase that wired only one of them would look complete from either
+    row alone.
+    """
+    env = _scaffold_env(tmp_path)
+    ws_a = _workspace(tmp_path, "ws_a", env=env, scopes=("alpha",))
+    ws_b = _workspace(tmp_path, "ws_b", env=env, scopes=("beta",))
+    launch = tmp_path / "elsewhere"
+    launch.mkdir()
+
+    registry_file = Path(env["XDG_CONFIG_HOME"]) / "mitos" / "registry.toml"
+    registry_file.parent.mkdir(parents=True, exist_ok=True)
+    registry_file.write_text(f'"ay" = "{ws_a}"\n"bee" = "{ws_b}"\n', encoding="utf-8")
+
+    async with mitos_server(cwd=launch, env=env) as server:
+        scopes = {}
+        shows = {}
+        # Interleaved on purpose: A, B, A. A cached first-call config survives an
+        # A→B→B ordering and dies on the return to A.
+        for name in ("ay", "bee", "ay"):
+            scopes[name] = _tool_json(
+                await server.session.call_tool("list_scopes", {"project": name}))
+            shows[name] = _tool_json(await server.session.call_tool(
+                "show_node", {"ident": f"{'alpha' if name == 'ay' else 'beta'}-probe",
+                              "project": name}))
+
+    for name, ws, scope in (("ay", ws_a, "alpha"), ("bee", ws_b, "beta")):
+        assert scopes[name]["project"] == name
+        assert scopes[name]["workspace"] == str(ws)
+        assert scopes[name]["collection"] == default_collection_name(str(ws))
+        # The dereference reached that project's own graph, and says so.
+        assert shows[name]["slug"] == f"{scope}-probe"
+        assert shows[name]["project"] == name
+        assert shows[name]["workspace"] == str(ws)
+
+    assert set(scopes["ay"]["scopes"]) == {"alpha"}
+    assert set(scopes["bee"]["scopes"]) == {"beta"}
+    assert scopes["ay"]["collection"] != scopes["bee"]["collection"]
 
 
 @pytest.mark.asyncio
@@ -484,7 +559,7 @@ async def test_the_harness_never_relabels_a_failure_that_is_not_its_own(tmp_path
 
     with pytest.raises(AssertionError, match="the caller's own assertion") as excinfo:
         async with mitos_server(cwd=ws, env=harness_env(tmp_path)) as server:
-            assert _tool_json(await server.session.call_tool("list_scopes", {})) == {}
+            assert _tool_json(await server.session.call_tool("list_scopes", {}))["scopes"] == {}
             raise AssertionError("the caller's own assertion")
 
     # Not merely matchable — the group must be gone from the chain, or it renders
@@ -622,10 +697,12 @@ async def test_one_long_lived_session_spans_calls_and_a_filesystem_mutation(tmp_
 
     async with mitos_server(cwd=ws, env=env) as server:
         before = _tool_json(await server.session.call_tool("list_scopes", {}))
-        assert before == {}
+        assert before["scopes"] == {}
 
         _record(ws, "alpha", env=env)
 
         after = _tool_json(await server.session.call_tool("list_scopes", {}))
-        assert set(after) == {"alpha"}
-        assert after["alpha"]["active_decisions"] == 1
+        assert set(after["scopes"]) == {"alpha"}
+        assert after["scopes"]["alpha"]["active_decisions"] == 1
+        # The provenance is per-call, not cached with the graph view.
+        assert before["project"] == after["project"] == str(ws)

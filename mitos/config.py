@@ -466,9 +466,32 @@ def default_collection_name(workspace_dir: str) -> str:
 class MitosConfig:
     """Represents the configuration state for the active Mitos workspace."""
 
-    def __init__(self, workspace_dir: str = ".") -> None:
+    def __init__(self, workspace_dir: str = ".", *, project: Optional[str] = None) -> None:
         self.workspace_dir = os.path.abspath(workspace_dir)
         self.mitos_dir = os.path.join(self.workspace_dir, ".mitos")
+
+        # The name the CALLER used for this workspace, carried so every answer
+        # can echo the target back in the caller's own vocabulary. Filled at the
+        # two resolution sites (`cli.main`, `mcp_server._target_config`) from
+        # `ResolvedProject.name`, which is already the registered name for both
+        # selector forms — a name-form selector by construction, a path-form one
+        # via the registry's reverse lookup — and `None` for an unregistered
+        # path. So the fallback below covers the escape hatch and the
+        # transitional selector-less call in one expression, and "never empty"
+        # is a property of construction rather than of every call site
+        # remembering.
+        #
+        # `or` rather than `if project is None` (2c's rule elsewhere) precisely
+        # here: `registry.validate_name` forbids an empty name, so `""` is not a
+        # supplied answer on this field the way it is for an env value — the two
+        # spellings are behaviourally identical and `or` also absorbs a future
+        # caller passing `""`. Do not "fix" it into the other form.
+        #
+        # Runtime-only, like `self.env` below and `inert_file_keys`: absent from
+        # `to_dict()`, never persisted, and not a `CONFIG_SCHEMA` key — a
+        # `project = "…"` line in `config.toml` takes the unknown-key branch
+        # (one calm warning, no `setattr`) and cannot become the echo.
+        self.project = project or self.workspace_dir
 
         # The resolved environment for THIS workspace — real env, then the
         # workspace's own `.env`, then the machine-global one, computed rather
@@ -482,7 +505,9 @@ class MitosConfig:
         # that drifts the population downward past the post-load re-assert would
         # break that read. Everything between here and the read is pure
         # `os.path.join` derivation — no env read, no file read — so this is the
-        # earliest slot that has `self.workspace_dir` to resolve for.
+        # earliest slot that has `self.workspace_dir` to resolve for. (The
+        # `self.project` line above is a plain assignment that reads neither, so
+        # it does not move this boundary.)
         self.env: Dict[str, str] = env.resolve_values(
             RESOLVED_ENV_KEYS, self.workspace_dir, global_env_path()
         )

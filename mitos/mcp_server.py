@@ -431,7 +431,10 @@ def _target_config(project: Optional[str], tool: str) -> MitosConfig:
         tool: The calling tool's name, for the rendered example.
 
     Returns:
-        The config for the resolved workspace.
+        The config for the resolved workspace, carrying the resolved
+        ``project`` name for the provenance echo. A targeting failure raises
+        *before* any config exists, which is why an error response carries the
+        teaching anatomy in the echo's place rather than a stamp.
 
     Raises:
         _RenderedToolError: On any targeting failure — carrying the finished
@@ -457,7 +460,12 @@ def _target_config(project: Optional[str], tool: str) -> MitosConfig:
         target = routing.resolve_project(project)
     except ProjectTargetingError as err:
         raise _RenderedToolError(_render_targeting_error(err, tool)) from err
-    return MitosConfig(target.root)
+    # `project=` carries the caller's own vocabulary onto the config so every
+    # answer below can echo the target back. `target.name` is already the
+    # registered name for both selector forms and `None` for an unregistered
+    # path, which the constructor resolves to the canonical path — so the echo
+    # is defined for every form without a branch here.
+    return MitosConfig(target.root, project=target.name)
 
 
 def get_workspace_components(config: MitosConfig) -> Tuple[GraphStore, Optional[GeminiEmbeddingProvider], Optional[QdrantVectorStore]]:
@@ -877,8 +885,8 @@ def list_scopes(include_archived: bool = False, project: Optional[str] = None) -
     This returns a tag→counts AGGREGATE, not decision payloads: there is no node id
     to stamp, so — unlike surface/query/list_decisions — it carries no
     `superseded_by`/`amended_by`/… modifier keys (that is correct, not a missing
-    stamp). An empty/fresh project returns `{}` — a valid empty vocabulary, never an
-    error.
+    stamp). An empty/fresh project returns `{"scopes": {}, …}` — a valid empty
+    vocabulary, never an error, and the provenance says which project was empty.
 
     Args:
         include_archived: When False (default), returns only live domains (≥1 active
@@ -894,16 +902,23 @@ def list_scopes(include_archived: bool = False, project: Optional[str] = None) -
             `list_projects()` when you do not know the registered names.
 
     Returns:
-        A JSON string: an ordered map `{scope: {active_decisions, parked_open_questions}}`,
-        busiest domain first. The key order IS the deliverable — iterate it as-is.
+        A JSON string: `{scopes, project, collection, workspace}`. `scopes` is an
+        ordered map `{scope: {active_decisions, parked_open_questions}}`, busiest
+        domain first — the key order of THAT map IS the deliverable, so iterate it
+        as-is. The other three name the corpus the vocabulary came from: the
+        project as you addressed it, its derived collection, and its path.
     """
     config = _target_config(project, "list_scopes")
     store, _embed, _vec = get_workspace_components(config)
-    return dumps_display(
-        order_scope_counts(store.get_scope_counts(include_archived=include_archived)),
-        ensure_ascii=False,
-        indent=2,
-    )
+    # The vocabulary nests under `scopes` rather than sharing the top level with
+    # the stamp: scope tags are user-authored strings, and a project holding a
+    # tag literally named `project`/`collection`/`workspace` would otherwise have
+    # its own vocabulary silently overwritten by the provenance.
+    envelope = {
+        "scopes": order_scope_counts(store.get_scope_counts(include_archived=include_archived)),
+    }
+    envelope.update(corpus_provenance(config))
+    return dumps_display(envelope, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
@@ -935,7 +950,10 @@ def show_node(ident: str, project: Optional[str] = None) -> str:
         `superseded_by`, an amended one its `amended_by`/`narrowed_by` — so a
         moved-on node never reads as the final word. A genuinely-absent handle
         returns `{found: false, ident, hint}` (never an error), the hint pointing
-        at `mitos sync` for an authored-but-unsynced draft.
+        at `mitos sync` for an authored-but-unsynced draft. Both shapes carry the
+        trailing `project`/`collection`/`workspace` provenance — most valuable on
+        the absent one, which is otherwise ambiguous between "no such handle
+        here" and "you are asking the wrong project".
     """
     config = _target_config(project, "show_node")
     store, _embed, _vec = get_workspace_components(config)
@@ -946,11 +964,13 @@ def show_node(ident: str, project: Optional[str] = None) -> str:
     # NOT swallow it into not-found (a breach is not "not found").
     node = store.resolve_handle(ident)
     if not node:
-        return dumps_display(
-            {"found": False, "ident": ident, "hint": SHOW_NOT_FOUND_HINT},
-            ensure_ascii=False,
-            indent=2,
-        )
+        # Stamped too, and it is the more valuable half: "not found" is exactly
+        # the answer that is ambiguous between a missing handle and a mis-aimed
+        # call. Provenance last, on both branches, so the CLI twin's dict stays
+        # equal key-for-key.
+        missing = {"found": False, "ident": ident, "hint": SHOW_NOT_FOUND_HINT}
+        missing.update(corpus_provenance(config))
+        return dumps_display(missing, ensure_ascii=False, indent=2)
 
     # state from the separate computed-state read (never node.get("state") —
     # absent on the resolved dict); modifiers are the one kind-agnostic stamp
@@ -959,6 +979,7 @@ def show_node(ident: str, project: Optional[str] = None) -> str:
     state = store.get_node_state(node["id"])
     modifiers = store.get_modifiers(node["id"])
     payload = show_payload(node, state=state, modifiers=modifiers)
+    payload.update(corpus_provenance(config))
     return dumps_display(payload, ensure_ascii=False, indent=2)
 
 
@@ -1170,7 +1191,10 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
             know the registered names.
 
     Returns:
-        A JSON string: {slug, id, state, embedding, status} or {error, code}.
+        A JSON string: {slug, id, state, embedding, status} or {error, code},
+        every outcome additionally carrying the trailing {project, collection,
+        workspace} naming the corpus this write landed in — check it, since a
+        mis-aimed write is the one mistake here that is unpleasant to unwind.
         status="created" means newly recorded; status="exists" is a SUCCESS — the
         identical decision was already recorded and is now confirmed present, not an
         error and not something to retry. Only a top-level {error, code} is a failure.
@@ -1226,6 +1250,16 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
         slug=slug,
         acknowledge_neighbors=acknowledge_neighbors,
     )
+    # The receipt names the corpus it just wrote to — the highest-value stamp in
+    # the set precisely because it is the write: a mis-aimed read wastes a turn,
+    # a mis-aimed write lands a real entry in another project's gold source.
+    # Stamped HERE, at the boundary that serializes it, never inside
+    # `record_decision_entry`: the buffer-first + rollback contract is not the
+    # place for a routing concern, and the receipt keys it emits (slug/id/state/
+    # embedding/status/code/neighbors/message/error/edges_created/scope/
+    # mechanisms/…) contain none of these three, so the update adds and never
+    # overwrites.
+    result.update(corpus_provenance(config))
     return dumps_display(result, ensure_ascii=False, indent=None)
 
 

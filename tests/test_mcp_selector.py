@@ -344,6 +344,7 @@ def test_a_registered_name_answers_about_that_workspace_from_another_cwd(
     payload = json.loads(mcp_server.list_decisions(project="target"))
 
     assert [d["slug"] for d in payload["decisions"]] == ["alpha-probe"]
+    assert payload["project"] == "target"  # the name the CALL used, echoed back
     assert payload["workspace"] == target
     assert payload["collection"] == MitosConfig(target).qdrant_collection
     assert payload["collection"] != MitosConfig(decoy).qdrant_collection
@@ -362,9 +363,12 @@ def test_an_absolute_path_reaches_a_valid_but_unregistered_workspace(
     _register(decoy=decoy)
     monkeypatch.chdir(decoy)
 
-    scopes = json.loads(mcp_server.list_scopes(project=target))
+    payload = json.loads(mcp_server.list_scopes(project=target))
 
-    assert set(scopes) == {"alpha"}
+    assert set(payload["scopes"]) == {"alpha"}
+    # An unregistered path echoes the path itself — the §4.7 escape-hatch rule,
+    # cross-checked here on the tool that exercises it.
+    assert payload["project"] == target
 
 
 def test_the_write_tool_records_into_the_project_the_call_named(
@@ -966,6 +970,10 @@ def test_a_project_less_call_still_resolves_the_cwd_workspace(
 
     assert [d["slug"] for d in payload["decisions"]] == ["alpha-probe"]
     assert payload["workspace"] == cwd
+    # Transitional echo rule: no selector → the resolved workspace's absolute
+    # path, so no mid-vision answer is ever unattributed. 5b removes the branch
+    # that produces it along with the fallback itself.
+    assert payload["project"] == cwd
 
 
 def test_an_empty_project_renders_the_missing_anatomy_rather_than_falling_back(

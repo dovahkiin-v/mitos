@@ -13,6 +13,7 @@ read and never depend on the machine's running services.
 """
 
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -21,6 +22,7 @@ from typing import Iterator, Tuple
 import pytest
 from unittest.mock import patch
 
+from mitos import routing
 from mitos.config import MitosConfig
 from mitos.cli import cmd_init, cmd_list, cmd_open_questions, cmd_scopes, main
 from mitos.display import order_scope_counts
@@ -39,12 +41,35 @@ def offline(monkeypatch):
 
 @pytest.fixture
 def ws(offline) -> Iterator[Tuple[MitosConfig, MitosSyncManager]]:
-    """An initialised temp workspace + a manager, in offline graph-only mode."""
-    tmp = tempfile.mkdtemp()
+    """An initialised temp workspace + a manager, in offline graph-only mode.
+
+    `realpath` rather than the raw mkdtemp path: the MCP twin resolves its
+    path-form selector through `registry.canonicalize` (= realpath), so on a
+    platform whose temp root is a symlink the two surfaces would stamp different
+    `workspace` strings and the parity rows would red on the environment rather
+    than on a regression.
+    """
+    tmp = os.path.realpath(tempfile.mkdtemp())
     config = MitosConfig(tmp)
     cmd_init(config)
+    config = _resolve_like_main(tmp)
     yield config, MitosSyncManager(config)
     shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _resolve_like_main(root: str) -> MitosConfig:
+    """The config ``cli.main()`` builds for a path-form selector.
+
+    A CLI verb never receives a hand-built config in production — ``main()``
+    resolves the selector and passes what it got, so the config carries the
+    resolved *name*. The echo is exactly the field where that matters: ``mitos
+    init`` registers the workspace, so a path-form selector reverse-looks-up to
+    the registered name on both surfaces. Hand-building the config here would
+    have the CLI echo a path while the MCP twin echoed the name, and the parity
+    rows would red on the test's shortcut rather than on a drift.
+    """
+    target = routing.resolve_project(root)
+    return MitosConfig(target.root, project=target.name)
 
 
 def _record(m: MitosSyncManager, slug: str, scope, supersedes=None, resolves=None) -> None:
@@ -104,11 +129,24 @@ def _seed(config) -> None:
 
 
 def _mcp_scopes(config, **kwargs) -> str:
-    """Calls the MCP `list_scopes` tool against a read-only store on this workspace."""
+    """Calls the MCP `list_scopes` tool against a read-only store on this workspace.
+
+    The workspace is named in **path form**, and that is load-bearing rather than
+    tidy. The `ws` fixture never chdirs, so a `project`-less call would resolve
+    pytest's cwd — the mitos-pub repo, which is itself a valid workspace — and the
+    tool would stamp the repo's collection while the CLI twin stamped the temp
+    workspace's. Every parity row below would red, reading as a broken stamp when
+    the truth is that the helper never named a target. The path form needs no
+    registry and resolves to exactly this config's root.
+
+    `_target_config` is deliberately left to run (only `get_workspace_components`
+    is patched): a row that mocked the resolution could not observe the echo at
+    all.
+    """
     from mitos import mcp_server
     store = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
-        return mcp_server.list_scopes(**kwargs)
+        return mcp_server.list_scopes(project=config.workspace_dir, **kwargs)
 
 
 # --------------------------------------------------------------------------- #
@@ -136,15 +174,24 @@ def test_order_scope_counts_empty() -> None:
 # --------------------------------------------------------------------------- #
 
 def test_cmd_scopes_json_ordering(ws, capsys) -> None:
-    """`mitos scopes --json` emits the ordered map, busiest domain first, ties alpha."""
+    """`mitos scopes --json` emits the ordered map, busiest domain first, ties alpha.
+
+    The map now sits under `scopes` inside the provenance envelope; the ordering
+    contract moved down with it and is asserted where it now lives.
+    """
     config, _ = ws
     _seed(config)
     capsys.readouterr()  # drain the init banner
     cmd_scopes(config, as_json=True)
-    out = json.loads(capsys.readouterr().out)
+    envelope = json.loads(capsys.readouterr().out)
+    out = envelope["scopes"]
     assert list(out) == ["substrate", "store", "auth", "schema"]
     assert out["substrate"] == {"active_decisions": 3, "parked_open_questions": 0}
     assert out["auth"] == {"active_decisions": 0, "parked_open_questions": 1}
+    # The envelope names the corpus the vocabulary came from.
+    assert envelope["project"] == config.project
+    assert envelope["collection"] == config.qdrant_collection
+    assert envelope["workspace"] == config.workspace_dir
 
 
 def test_cmd_scopes_archived_adds_dead_domain(ws, capsys) -> None:
@@ -154,11 +201,11 @@ def test_cmd_scopes_archived_adds_dead_domain(ws, capsys) -> None:
     capsys.readouterr()
 
     cmd_scopes(config, as_json=True)
-    live = json.loads(capsys.readouterr().out)
+    live = json.loads(capsys.readouterr().out)["scopes"]
     assert "dead" not in live
 
     cmd_scopes(config, as_json=True, archived=True)
-    archived = json.loads(capsys.readouterr().out)
+    archived = json.loads(capsys.readouterr().out)["scopes"]
     assert archived["dead"] == {"active_decisions": 0, "parked_open_questions": 0}
     # The dead 0/0 domain sorts to the tail (lowest total).
     assert list(archived)[-1] == "dead"
@@ -177,11 +224,21 @@ def test_cmd_scopes_text_table(ws, capsys) -> None:
 
 
 def test_cmd_scopes_empty_is_healthy(ws, capsys) -> None:
-    """A just-init'd workspace: `{}` under --json, a calm message in text, exit 0."""
+    """A just-init'd workspace: an empty vocabulary under --json, a calm message in
+    text, exit 0 — and the empty answer now says WHICH project was empty.
+
+    That attribution is the feature, not a dilution of the empty-is-healthy rule:
+    `{}` from a fresh project and `{}` from the wrong project used to be the same
+    answer.
+    """
     config, _ = ws
     capsys.readouterr()
     cmd_scopes(config, as_json=True)
-    assert json.loads(capsys.readouterr().out) == {}
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["scopes"] == {}
+    assert envelope["project"] == config.project
+    assert envelope["collection"] == config.qdrant_collection
+    assert envelope["workspace"] == config.workspace_dir
 
     cmd_scopes(config)
     text = capsys.readouterr().out
@@ -195,7 +252,9 @@ def test_cmd_scopes_casefold_key(ws, capsys) -> None:
     _record(m, "cap-one", scope=["Auth"])
     capsys.readouterr()
     cmd_scopes(config, as_json=True)
-    out = json.loads(capsys.readouterr().out)
+    # Read the nested map, not the envelope: against the top level `"Auth" not in`
+    # would be trivially true and would stop testing the casefold.
+    out = json.loads(capsys.readouterr().out)["scopes"]
     assert "auth" in out
     assert "Auth" not in out
 
@@ -208,23 +267,53 @@ def test_mcp_list_scopes_ordering(ws) -> None:
     """`list_scopes` returns the same ordered map JSON, busiest first."""
     config, _ = ws
     _seed(config)
-    out = json.loads(_mcp_scopes(config))
-    assert list(out) == ["substrate", "store", "auth", "schema"]
+    envelope = json.loads(_mcp_scopes(config))
+    assert list(envelope["scopes"]) == ["substrate", "store", "auth", "schema"]
+    assert envelope["project"] == config.project
+    assert envelope["collection"] == config.qdrant_collection
+    assert envelope["workspace"] == config.workspace_dir
 
 
 def test_mcp_list_scopes_archived(ws) -> None:
     """`include_archived=True` adds the dead 0/0 domain on the MCP surface too."""
     config, _ = ws
     _seed(config)
-    assert "dead" not in json.loads(_mcp_scopes(config))
-    archived = json.loads(_mcp_scopes(config, include_archived=True))
+    assert "dead" not in json.loads(_mcp_scopes(config))["scopes"]
+    archived = json.loads(_mcp_scopes(config, include_archived=True))["scopes"]
     assert archived["dead"] == {"active_decisions": 0, "parked_open_questions": 0}
 
 
 def test_mcp_list_scopes_empty_is_healthy(ws) -> None:
-    """An empty/fresh project returns `{}` — a valid empty vocabulary, never an error."""
+    """An empty/fresh project returns an empty vocabulary — never an error — and
+    names the project it was empty for."""
     config, _ = ws
-    assert json.loads(_mcp_scopes(config)) == {}
+    envelope = json.loads(_mcp_scopes(config))
+    assert envelope["scopes"] == {}
+    assert envelope["project"] == config.project
+    assert envelope["collection"] == config.qdrant_collection
+    assert envelope["workspace"] == config.workspace_dir
+
+
+def test_mcp_list_scopes_envelope_nests_the_ordering_contract(ws) -> None:
+    """The ordering contract lives on the nested map, and the stamp cannot reach it.
+
+    The nesting is not cosmetic: scope tags are user-authored strings, so a project
+    whose vocabulary literally holds `project`/`collection`/`workspace` must keep
+    those tags — and their counts — rather than have them overwritten by the
+    provenance. A merged-into-one-map build reds here.
+    """
+    config, m = ws
+    for tag in ("project", "collection", "workspace"):
+        _record(m, f"{tag}-probe", scope=[tag])
+
+    envelope = json.loads(_mcp_scopes(config))
+
+    assert list(envelope) == ["scopes", "project", "collection", "workspace"]
+    assert list(envelope["scopes"]) == ["collection", "project", "workspace"]  # ties alpha
+    for tag in ("project", "collection", "workspace"):
+        assert envelope["scopes"][tag] == {"active_decisions": 1,
+                                           "parked_open_questions": 0}
+    assert envelope["workspace"] == config.workspace_dir  # the path, not the count
 
 
 def test_mcp_list_scopes_registered() -> None:
@@ -251,7 +340,9 @@ def test_cli_mcp_map_parity(ws, capsys) -> None:
     mcp_out = _mcp_scopes(config)
 
     assert json.loads(cli_out) == json.loads(mcp_out)
-    assert list(json.loads(cli_out)) == list(json.loads(mcp_out))  # key order IS the deliverable
+    # key order IS the deliverable — at both levels of the envelope
+    assert list(json.loads(cli_out)) == list(json.loads(mcp_out))
+    assert list(json.loads(cli_out)["scopes"]) == list(json.loads(mcp_out)["scopes"])
     assert cli_out.rstrip("\n") == mcp_out  # only the CLI print newline differs
 
 
@@ -264,7 +355,7 @@ def test_cli_mcp_parity_with_archived(ws, capsys) -> None:
     cli_out = capsys.readouterr().out
     mcp_out = _mcp_scopes(config, include_archived=True)
     assert json.loads(cli_out) == json.loads(mcp_out)
-    assert list(json.loads(cli_out)) == list(json.loads(mcp_out))
+    assert list(json.loads(cli_out)["scopes"]) == list(json.loads(mcp_out)["scopes"])
 
 
 # --------------------------------------------------------------------------- #
@@ -278,7 +369,7 @@ def test_counts_match_read_verbs_through_surface(ws, capsys) -> None:
     _seed(config)
     capsys.readouterr()
     cmd_scopes(config, as_json=True)
-    scopes = json.loads(capsys.readouterr().out)
+    scopes = json.loads(capsys.readouterr().out)["scopes"]
 
     # active_decisions for `substrate` == len(list --scope substrate --json decisions)
     cmd_list(config, scope="substrate", as_json=True)

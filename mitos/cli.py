@@ -918,7 +918,9 @@ def cmd_show(config: MitosConfig, ident: str, as_json: bool = False) -> None:
     branch, whose static, hedged ``mitos sync`` pointer reads no buffer (truthful for
     both a typo and an authored-but-unsynced draft). With ``as_json`` it emits a
     Letter-complete, modifier-stamped JSON object (the not-found case a JSON object
-    too, never a bare text print).
+    too, never a bare text print) — both shapes carrying the trailing
+    ``project``/``collection``/``workspace`` provenance, as does the ``show_node``
+    MCP twin, key for key.
 
     Args:
         config: The active workspace config (supplies the graph db path).
@@ -941,7 +943,12 @@ def cmd_show(config: MitosConfig, ident: str, as_json: bool = False) -> None:
         # not-found object byte-for-byte (parity is structural).
         hint = SHOW_NOT_FOUND_HINT
         if as_json:
-            _emit_json({"found": False, "ident": ident, "hint": hint})
+            # Provenance last, exactly as the `show_node` twin stamps it: the
+            # absent-handle answer is the one most in need of naming its corpus
+            # ("no such handle here" vs "you asked the wrong project").
+            missing = {"found": False, "ident": ident, "hint": hint}
+            missing.update(corpus_provenance(config))
+            _emit_json(missing)
             return
         print(f"Node with ID or Slug '{ident}' not found — {hint}.")
         return
@@ -961,6 +968,7 @@ def cmd_show(config: MitosConfig, ident: str, as_json: bool = False) -> None:
         # structural, not test-enforced). The 5a --json regression pins prove this
         # extraction is byte-identical to the prior inline builder.
         payload = show_payload(node, state=state, modifiers=modifiers)
+        payload.update(corpus_provenance(config))
         _emit_json(payload)
         return
 
@@ -1196,8 +1204,11 @@ def cmd_scopes(config: MitosConfig, as_json: bool = False, archived: bool = Fals
 
     Args:
         config: The active workspace configuration.
-        as_json: Emit the machine-readable ordered ``{scope: {active_decisions,
-            parked_open_questions}}`` map (for agents) instead of the text table.
+        as_json: Emit the machine-readable ``{scopes, project, collection,
+            workspace}`` envelope (for agents) instead of the text table —
+            ``scopes`` being the ordered ``{scope: {active_decisions,
+            parked_open_questions}}`` map, the rest naming the corpus it came
+            from. The byte-identical twin of the MCP ``list_scopes`` payload.
         archived: Include fully-dead domains (every scope present in the graph at a
             ``0/0`` floor) — the scope-level parallel of ``list --state all``.
             Omit for the live vocabulary only.
@@ -1209,7 +1220,13 @@ def cmd_scopes(config: MitosConfig, as_json: bool = False, archived: bool = Fals
     counts = order_scope_counts(store.get_scope_counts(include_archived=archived))
 
     if as_json:
-        _emit_json(counts)
+        # Same construction as the `list_scopes` twin, provenance last, so the
+        # serialized bodies match byte for byte. The vocabulary nests under
+        # `scopes` because scope tags are user-authored: a tag literally named
+        # `project`/`collection`/`workspace` must not be overwritten by the stamp.
+        envelope = {"scopes": counts}
+        envelope.update(corpus_provenance(config))
+        _emit_json(envelope)
         return
 
     if not counts:
@@ -1324,9 +1341,10 @@ def cmd_record(
     """Records a decision directly to the write-buffer and graph (thin wrapper).
 
     Under ``as_json``, every outcome — created/exists, the ``needs_review`` pause, and
-    error — is emitted as the raw ``record_decision_entry`` receipt dict (the same shape
-    the MCP ``record_decision`` tool serializes) on **stdout**, never a stderr wall a
-    ``--json`` consumer would miss. The existing exit codes are preserved (0
+    error — is emitted as the ``record_decision_entry`` receipt dict plus the trailing
+    ``project``/``collection``/``workspace`` provenance naming the corpus written to
+    (the same shape the MCP ``record_decision`` tool serializes) on **stdout**, never a
+    stderr wall a ``--json`` consumer would miss. The existing exit codes are preserved (0
     created/exists, 2 needs_review, 1 error): exit code is the shell's signal, the JSON
     object is the agent's.
     """
@@ -1356,7 +1374,11 @@ def cmd_record(
         # (the pause's `neighbors` is a stamped decision-read surface: each entry is
         # the enriched candidate_payload, modifier stamps included; the created
         # receipt's write-facts stay unstamped write results). scope_overflow, when
-        # present, is already inside `result`.
+        # present, is already inside `result`. The one addition is the trailing
+        # provenance, naming the corpus the write landed in — stamped here at the
+        # boundary, never inside `record_decision_entry`, so the buffer-first +
+        # rollback contract carries no routing concern.
+        result.update(corpus_provenance(config))
         _emit_json(result)
         if "error" in result:
             sys.exit(1)
@@ -4786,7 +4808,13 @@ def main() -> None:
         # No selector keeps today's behaviour byte for byte — construction is not
         # migration, and every zero-arg path stays green until 5a removes the
         # fallback (`test_a_selectorless_call_still_resolves_the_cwd_workspace`).
-        config = MitosConfig(target.root) if target else MitosConfig()
+        # `project=` carries the caller's own vocabulary onto the config so every
+        # echo below names the target the way the caller addressed it.
+        # `target.name` is already the registered name for both selector forms
+        # and `None` for an unregistered path, which the constructor resolves to
+        # the canonical path.
+        config = (MitosConfig(target.root, project=target.name) if target
+                  else MitosConfig())
         # Warn about the workspace the VERB will act on, not merely the CWD. Since
         # `status`/`agent-block`'s positional is now a selector source feeding the
         # same `config`, that is simply `config` — there is no second target to
