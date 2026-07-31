@@ -693,6 +693,146 @@ def test_the_status_project_payload_announces_which_report_it_is(tmp_path, capsy
     assert json.loads(capsys.readouterr().out)["report"] == "project"
 
 
+# --- the dispatch flip (5a) -------------------------------------------------
+
+def _run(argv: List[str]) -> Any:
+    """Drives `cli.main()` through argv, returning the exit code."""
+    with patch.object(sys, "argv", ["mitos"] + list(argv)):
+        try:
+            cli.main()
+        except SystemExit as exc:
+            return exc.code
+    return 0
+
+
+def test_the_zero_arg_status_routes_to_the_overview_and_the_named_form_does_not(
+        tmp_path, qdrant, capsys):
+    """W29's named consumer: the report 4a built is what a selectorless `status` is.
+
+    Both halves in one row on purpose — the flip is a *fork*, and a row that only
+    proved the new branch would stay green under a build that routed **every**
+    `status` to the overview, which would silently delete the deep report.
+    """
+    project = _workspace(tmp_path / "project")
+    _register(project=project)
+    capsys.readouterr()
+
+    assert _run(["status", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["report"] == "overview"
+
+    assert _run(["status", "project", "--json"]) in (0, 1)
+    assert json.loads(capsys.readouterr().out)["report"] == "project"
+
+
+def test_the_overview_is_built_before_any_workspace_config_is(tmp_path, qdrant,
+                                                              monkeypatch, capsys):
+    """Ordering is contract: a broken workspace underfoot is not a global failure.
+
+    The caller stands in a directory whose `.mitos/config.toml` is malformed. Build
+    the boundary config first and 4b's `ConfigError` carve-out catches it and routes
+    to `_answer_workspace_optional_verb` → the **deep** report about that directory:
+    exit 1, the wrong answer, and nothing red anywhere. Fault injection: move the
+    branch below the config construction and this row reds while every other row in
+    the module stays green.
+    """
+    broken = tmp_path / "broken"
+    os.makedirs(str(broken / ".mitos"))
+    with open(str(broken / ".mitos" / "config.toml"), "w") as f:
+        f.write("not = = toml")
+    with open(str(broken / "decisions.md"), "w") as f:
+        f.write("")
+    _register(elsewhere=_workspace(tmp_path / "elsewhere"))
+    monkeypatch.chdir(str(broken))
+    capsys.readouterr()
+
+    assert _run(["status", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["report"] == "overview"
+
+
+# --- the collection flag's corpus gate (entry-010) --------------------------
+
+def _populate(workspace: str) -> None:
+    """Writes a corpus holding one entry BELOW the sentinel.
+
+    By hand rather than through `record`/`sync`: the flag under test is about the
+    *corpus*, and both of those would also build a graph this module never opens.
+    """
+    with open(os.path.join(workspace, "decisions.md"), "w", encoding="utf-8") as f:
+        f.write("# Decisions\n\n<!-- BEGIN ENTRIES -->\n\n### an-entry\n\n"
+                "**Decided:** Something was decided here.\n"
+                "**Rejected:** Deciding nothing.\n")
+
+
+def test_a_fresh_project_with_no_collection_yet_is_not_flagged(tmp_path, qdrant):
+    """I8 at the overview: healthy-and-empty is first-class, so it wears no ⚠.
+
+    Post-1c `may_create` binds creation to the upsert, so **every** project between
+    `mitos init` and its first `record` has no collection — the single most common
+    state on a machine with a fresh registration. The deep report calls that state
+    READY ✓ and its collection row reads *"auto-created on first record"*; an
+    unconditional flag here made the two halves of one command contradict each other
+    on the healthiest state there is.
+    """
+    project = _workspace(tmp_path / "project")     # `_workspace` leaves the corpus empty
+    _register(project=project)
+
+    payload = overview.build_overview()
+
+    assert _by_name(payload)["project"]["collection_present"] is False
+    assert cli._overview_notes(_by_name(payload)["project"], payload) == []
+
+
+def test_a_populated_project_with_no_collection_is_flagged_and_names_no_heal(
+        tmp_path, qdrant):
+    """The other side of the gate — and the flag prescribes a *report*, not a command.
+
+    The overview reads no graph, so it cannot tell the clone whose graph was never
+    built (heal: `mitos sync`) from the project whose collection was swept (heal:
+    `mitos reconcile`) — and for the clone `reconcile` is the heal 4b calls *"one
+    word away and worse than silence"*: it diffs an empty active set against an
+    absent collection, enqueues nothing, and reports success on a workspace it did
+    not touch. So the note hands the reader to `mitos status <name>`, which reads the
+    graph and names the right one.
+    """
+    project = _workspace(tmp_path / "project")
+    _populate(project)
+    _register(project=project)
+
+    payload = overview.build_overview()
+    notes = "\n".join(cli._overview_notes(_by_name(payload)["project"], payload))
+
+    assert "no vector collection" in notes
+    assert default_collection_name(project) in notes
+    assert "mitos status project" in notes
+    assert "reconcile" not in notes
+    assert "sync" not in notes
+
+
+def test_the_corpus_gate_is_injected_and_not_re_derived(tmp_path, qdrant):
+    """The scan is a parameter, so a row can drive both verdicts without a filesystem.
+
+    It also pins *which* file is scanned: `decisions.md` beside `.mitos/` — the
+    shipped validity triple `is_workspace` just proved — rather than anything a
+    second config construction might derive.
+    """
+    project = _workspace(tmp_path / "project")
+    _register(project=project)
+    payload = overview.build_overview()
+    entry = _by_name(payload)["project"]
+
+    scanned: List[str] = []
+
+    def _scan(path: str) -> bool:
+        scanned.append(path)
+        return True
+
+    notes = cli._overview_notes(entry, payload, corpus_scan=_scan)
+
+    assert scanned == [os.path.join(project, "decisions.md")]
+    assert any("no vector collection" in note for note in notes)
+    assert cli._overview_notes(entry, payload, corpus_scan=lambda _: False) == []
+
+
 # --- tier ------------------------------------------------------------------
 
 def test_importing_the_overview_pulls_in_no_higher_tier_module():

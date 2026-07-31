@@ -12,9 +12,11 @@ instance can answer is here, and it is the half the vision leans on hardest:
   still completes** with the live project fully reported;
 * one shared URL across two projects issues exactly **one** request, and no request
   is ever addressed to ``/collections/<name>``;
-* a project whose derived collection is genuinely absent is flagged with the
-  ``mitos reconcile`` pointer — with its twin, a project whose collection the fixture
-  created, which is not;
+* a project whose derived collection is genuinely absent is flagged — with its twin,
+  a project whose collection the fixture created, which is not. Both halves of that
+  pair carry a **populated corpus**, because 5a gated the flag on one: a project
+  between ``mitos init`` and its first ``record`` legitimately has no collection and
+  must wear no ⚠;
 * a raising local probe on the same run as a healthy project renders its own state
   while everything else is fully reported.
 
@@ -102,19 +104,28 @@ def _register(**projects: str) -> str:
         "".join(f'"{name}" = "{path}"\n' for name, path in projects.items()))
 
 
-def _workspace(root, *, qdrant_url: str = None) -> str:
+_POPULATED_CORPUS = ("# Decisions\n\n<!-- BEGIN ENTRIES -->\n\n### an-entry\n\n"
+                     "**Decided:** Something was decided here.\n"
+                     "**Rejected:** Deciding nothing.\n")
+
+
+def _workspace(root, *, qdrant_url: str = None, populated: bool = False) -> str:
     """Builds a sweepable workspace and returns its canonical path.
 
     The caller passes a ``tmp-``-prefixed directory; this asserts the derived
     collection name is reclaimable by the conftest sweep, so a future rename of the
     fixture cannot start leaking collections silently.
+
+    ``populated`` writes one entry below the sentinel — by hand, since the corpus is
+    all the collection flag's gate reads and neither ``record`` nor ``sync`` belongs
+    in a fixture this module never opens a graph for.
     """
     root = str(root)
     os.makedirs(os.path.join(root, ".mitos"), exist_ok=True)
     with open(os.path.join(root, ".mitos", "config.toml"), "w") as f:
         f.write("")
     with open(os.path.join(root, "decisions.md"), "w") as f:
-        f.write("")
+        f.write(_POPULATED_CORPUS if populated else "")
     if qdrant_url is not None:
         with open(os.path.join(root, ".env"), "w") as f:
             f.write(f"QDRANT_URL={qdrant_url}\n")
@@ -283,13 +294,19 @@ def test_an_absent_collection_is_flagged_and_its_present_twin_is_not(
     """T15 + W30: the post-migration net, with the fixture pair that makes it bite.
 
     The two workspaces differ **only** in whether their collection exists — a fixture
-    that varied along a second axis would pass under either behaviour. The flagged
-    one carries the ``mitos reconcile`` pointer; the twin carries nothing at all.
+    that varied along a second axis would pass under either behaviour. Both are
+    **populated**, which is the axis 5a added: the flag is gated on the corpus, so an
+    empty-corpus pair would leave both unflagged and the row would prove nothing.
+
+    The pointer inverted with that gate. It used to name ``mitos reconcile``, which
+    is wrong for a clone whose graph was never built; it now hands the reader to
+    ``mitos status <name>``, the surface that reads the graph and can tell the two
+    heals apart.
     """
     from mitos import cli
 
-    swept = _workspace(tmp_path / "tmp-swept")
-    reconciled = _workspace(tmp_path / "tmp-reconciled")
+    swept = _workspace(tmp_path / "tmp-swept", populated=True)
+    reconciled = _workspace(tmp_path / "tmp-reconciled", populated=True)
     created_collection(default_collection_name(reconciled))
     _register(swept=swept, reconciled=reconciled)
 
@@ -300,9 +317,29 @@ def test_an_absent_collection_is_flagged_and_its_present_twin_is_not(
     assert projects["reconciled"]["collection_present"] is True
 
     notes = "\n".join(cli._overview_notes(projects["swept"], payload))
-    assert "mitos reconcile" in notes
+    assert "mitos status swept" in notes
+    assert "reconcile" not in notes
     assert default_collection_name(swept) in notes
     assert cli._overview_notes(projects["reconciled"], payload) == []
+
+
+def test_a_fresh_projects_absent_collection_is_not_a_finding(tmp_path):
+    """Entry-010's headline state, proven against the real instance.
+
+    Same shape as the swept project above and the same genuinely-absent collection —
+    the corpus is the only difference. A machine full of freshly-registered projects
+    must render a calm table, not a column of ⚠.
+    """
+    from mitos import cli
+
+    fresh = _workspace(tmp_path / "tmp-fresh")           # empty corpus
+    _register(fresh=fresh)
+
+    payload = overview.build_overview()
+    projects = _by_name(payload)
+
+    assert projects["fresh"]["collection_present"] is False
+    assert cli._overview_notes(projects["fresh"], payload) == []
 
 
 def test_a_raising_entry_renders_its_own_state_while_the_sweep_completes(

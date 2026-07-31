@@ -16,6 +16,7 @@ import sys
 import pytest
 from unittest.mock import MagicMock, patch
 
+from conftest import make_workspace
 from mitos.cli import main, _enter_target_directory
 from mitos.config import MitosConfig, default_collection_name
 from mitos.errors import MitosError
@@ -208,16 +209,43 @@ def test_status_positional_wins_over_directory(tmp_path, monkeypatch) -> None:
     assert mock_status.call_args.args[0] == os.path.realpath(str(target))
 
 
-def test_status_no_positional_uses_directory(tmp_path, monkeypatch) -> None:
-    """`status` with no positional under `-C /ws` reports on /ws (os.getcwd() = /ws)."""
+def test_status_no_positional_is_the_global_overview_not_the_directory(
+        tmp_path, monkeypatch) -> None:
+    """Inverted at 5a: `-C /ws status` no longer reports on /ws.
+
+    It used to — the chdir landed and `status` resolved the working directory. The
+    zero-arg form is now the machine-wide overview, so `-C` has nothing to aim: the
+    deep report is never reached at all. Its recovery is the `-p` form below, where
+    `-C` still decides what `.` means.
+    """
     monkeypatch.chdir(tmp_path)
     ws = tmp_path / "ws"
     ws.mkdir()
     with patch("mitos.cli.cmd_status", return_value=0) as mock_status:
-        with patch.object(sys, "argv", ["mitos", "-C", str(ws), "status"]):
+        with patch("mitos.cli.cmd_status_overview", return_value=0) as mock_overview:
+            with patch.object(sys, "argv", ["mitos", "-C", str(ws), "status"]):
+                with pytest.raises(SystemExit) as exc:
+                    main()
+    assert exc.value.code == 0
+    mock_status.assert_not_called()
+    mock_overview.assert_called_once()
+
+
+def test_status_under_a_directory_still_targets_it_through_a_relative_selector(
+        tmp_path, monkeypatch) -> None:
+    """`-C /ws -p . status` — the recovery, and the ordering contract for free.
+
+    `.` is absolutized **after** the chdir, so it means /ws rather than the launch
+    directory. Canonicalizing before the chdir would change what a relative selector
+    means with every absolute-path row still green.
+    """
+    monkeypatch.chdir(tmp_path)
+    ws = make_workspace(tmp_path / "ws")
+    with patch("mitos.cli.cmd_status", return_value=0) as mock_status:
+        with patch.object(sys, "argv", ["mitos", "-C", ws, "-p", ".", "status"]):
             with pytest.raises(SystemExit):
                 main()
-    assert mock_status.call_args.args[0] == os.path.realpath(str(ws))
+    assert mock_status.call_args.args[0] == os.path.realpath(ws)
 
 
 # ---------------------------------------------------------------------------

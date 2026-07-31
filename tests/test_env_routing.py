@@ -649,7 +649,9 @@ def test_status_attributes_a_project_env_key_to_the_environment(
     """
     ws = _workspace(tmp_path, env_text="GEMINI_API_KEY=PROJKEY\n")
     monkeypatch.chdir(tmp_path)  # restores the cwd `main`'s -C chdir moves
-    monkeypatch.setattr(sys, "argv", ["mitos", "-C", ws, "status"])
+    # `-p .` after the `-C` chdir: post-5a a selectorless `status` is the machine-wide
+    # overview, which reports no key attribution for anyone.
+    monkeypatch.setattr(sys, "argv", ["mitos", "-C", ws, "-p", ".", "status"])
 
     # `status` exits non-zero on this bare workspace (never initialized, no Qdrant)
     # — irrelevant to the attribution, which prints on every branch.

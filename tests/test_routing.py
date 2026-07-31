@@ -32,6 +32,7 @@ import sys
 
 import pytest
 
+from conftest import make_workspace
 from mitos import cli, registry, routing
 from mitos.config import MitosConfig
 from mitos.errors import (
@@ -70,19 +71,11 @@ def _register(**entries) -> None:
     )
 
 
-def _make_workspace(root) -> str:
-    """Builds the minimal valid workspace shape and returns its canonical path.
-
-    The shipped validity triple and nothing more: ``.mitos/`` holding a
-    ``config.toml``, plus ``decisions.md``. Deliberately no graph — a workspace is
-    valid without one (the cloned-but-unbuilt state the escape hatch exists for).
-    """
-    os.makedirs(os.path.join(str(root), ".mitos"), exist_ok=True)
-    with open(os.path.join(str(root), ".mitos", "config.toml"), "w") as f:
-        f.write("# a mitos workspace\n")
-    with open(os.path.join(str(root), "decisions.md"), "w") as f:
-        f.write("# Decisions\n")
-    return os.path.realpath(str(root))
+#: The shared workspace builder, lifted to `conftest` at 5a — the flip gave it a
+#: dozen more consumers and thirteen private re-spellings would be thirteen chances
+#: to write the half-workspace one. Kept under the module-local name so the rows
+#: below read unchanged.
+_make_workspace = make_workspace
 
 
 # --- group 1: shape discrimination -----------------------------------------

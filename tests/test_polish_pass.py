@@ -57,14 +57,16 @@ class TestGuardCodeSpanExemption:
                                   capture_output=True, text=True,
                                   cwd=str(tmp_path), env=env)
 
+        # `init` is selector-exempt and runs against `cwd`; every verb after it names
+        # the workspace, since 5a removed the working-directory fallback.
         run("init")
-        rec = run("record",
+        rec = run("-p", str(tmp_path), "record",
                   "The parser anchors on the `BEGIN ENTRIES` sentinel comment.",
                   "--rejected", "scanning for `[NOTE: markers]` naively",
                   "--slug", "quoted-marker-prose")
         assert rec.returncode == 0, rec.stderr
         # And the entry round-trips through a sync-driven reparse.
-        sync = run("sync", "--yes")
+        sync = run("-p", str(tmp_path), "sync", "--yes")
         assert sync.returncode == 0, sync.stderr
 
 
@@ -80,7 +82,10 @@ class TestStatusGlyph:
 
         run("init")
         os.remove(os.path.join(str(tmp_path), "format-spec.md"))
-        out = run("status").stdout
+        # NAMED, not zero-arg: post-5a a selectorless `status` answers the global
+        # overview, which carries no per-project `format-spec.md` row at all — this
+        # row's `next(...)` would raise `StopIteration`, not fail an assertion.
+        out = run("status", str(tmp_path)).stdout
         spec_line = next(l for l in out.splitlines() if "format-spec.md" in l)
         assert "✗" not in spec_line
         assert "—" in spec_line and "non-destructive" in spec_line

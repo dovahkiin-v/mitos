@@ -612,7 +612,9 @@ def test_deprecated_rotation_mode_warns_once_at_dispatch(tmp_path, monkeypatch, 
     mitos_dir.mkdir()
     (mitos_dir / "config.toml").write_text('rotation_mode = "mark"\n', encoding="utf-8")
 
-    monkeypatch.setattr(_sys, "argv", ["mitos", "-C", str(tmp_path), "status"])
+    # `-p .` after the `-C` chdir: post-5a a selectorless `status` answers the
+    # global overview, which builds no workspace config and so fires no warning.
+    monkeypatch.setattr(_sys, "argv", ["mitos", "-C", str(tmp_path), "-p", ".", "status"])
     try:
         main()
     except SystemExit:
@@ -634,7 +636,9 @@ def test_clean_rotation_mode_warns_nothing_at_dispatch(tmp_path, monkeypatch, ca
     mitos_dir.mkdir()
     (mitos_dir / "config.toml").write_text('rotation_mode = "archive"\n', encoding="utf-8")
 
-    monkeypatch.setattr(_sys, "argv", ["mitos", "-C", str(tmp_path), "status"])
+    # `-p .` after the `-C` chdir: post-5a a selectorless `status` answers the
+    # global overview, which builds no workspace config and so fires no warning.
+    monkeypatch.setattr(_sys, "argv", ["mitos", "-C", str(tmp_path), "-p", ".", "status"])
     try:
         main()
     except SystemExit:

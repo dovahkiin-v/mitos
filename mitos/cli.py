@@ -2188,7 +2188,8 @@ _OVERVIEW_MARKS = {
 }
 
 
-def _overview_notes(project: Dict[str, Any], payload: Dict[str, Any]) -> List[str]:
+def _overview_notes(project: Dict[str, Any], payload: Dict[str, Any], *,
+                    corpus_scan: Callable[[str], bool] = corpus_has_entries) -> List[str]:
     """Words one project's findings — the sentences the leaf deliberately does not carry.
 
     Order is by what the reader most needs: where they are standing, then why the
@@ -2196,10 +2197,45 @@ def _overview_notes(project: Dict[str, Any], payload: Dict[str, Any]) -> List[st
     A fully healthy project on a healthy instance produces **no** lines at all, so a
     calm machine reads as a calm table (P9).
 
+    **The collection flag is gated on the corpus, and it prescribes nothing.** I8
+    says the missing-collection message must be gated — *"a brand-new project with
+    zero decisions also has no collection, and sending that user to `mitos
+    reconcile` would be a wall on the healthy-and-empty state this project treats as
+    first-class"* — and until the zero-arg dispatch flip this surface was reachable
+    by nobody, so its ungated flag was false about a state no user could read. Two
+    changes make it true in all three states it meets:
+
+    * **Gated on the corpus** (the injected scan), not on the graph the way 1b's
+      read surfaces and 4b's deep report are. A graph gate is the sharper predicate
+      and this sweep may not have it: ``mitos/overview.py``'s cost contract is three
+      stats plus a config read and its docstring forbids opening SQLite,
+      permanently. The corpus is the honest proxy this surface can afford, and it
+      separates the fresh project (flagged before, healthy now) from a populated one.
+    * **No prescription.** The corpus gate cannot separate the clone whose graph was
+      never built (heal: ``mitos sync``) from the project whose collection was swept
+      (heal: ``mitos reconcile``), and for the clone ``reconcile`` is the heal 4b
+      calls *"one word away and worse than silence"* — it diffs an empty active set
+      against an absent collection, enqueues nothing, and reports success on a
+      workspace it did not touch. So the note points at ``mitos status <name>``,
+      which reads the graph and names the right heal. That is the *"projects
+      discovers, status diagnoses"* division the vision already states.
+
+    The scan arrives as a keyword with a default rather than as an import inside the
+    leaf: ``mitos/overview.py`` stays Tier 2 with its import closure untouched, and
+    the predicate is injectable for a row that must not touch a filesystem. It runs
+    only on an ``ok`` entry — every other state carries ``collection: None`` — so the
+    probe has already reached that workspace within its wall-clock budget. The read
+    itself is not inside that budget, which is the residual cost of answering this
+    at the surface rather than in the sweep; it is one short-circuiting stream over a
+    file the probe just stat'd.
+
     Args:
         project: One entry of the payload's ``projects`` list.
         payload: The whole payload — read only for ``cwd_project`` and for the
             document order that decides a shared path's resolving name.
+        corpus_scan: The corpus-population predicate, ``parser.corpus_has_entries``
+            by default. Takes the corpus path; a missing or unreadable file is
+            ``False``.
 
     Returns:
         Zero or more note lines, already indented.
@@ -2230,14 +2266,19 @@ def _overview_notes(project: Dict[str, Any], payload: Dict[str, Any]) -> List[st
         notes.append(f"the check failed: {project['error']}")
 
     if project["collection"] is not None:
-        if project["collection_present"] is False:
-            # A pointer plus the named heal, never a diagnosis: the overview reads no
-            # graph, so it cannot price what re-embedding would cost (that belongs to
-            # the deep report and to `reconcile` itself). Presence would not imply
-            # population anyway.
+        # `decisions.md` beside `.mitos/` is the shipped validity triple `is_workspace`
+        # just proved for this entry and `MitosConfig` derives without a setting, so the
+        # join is a literal here rather than a config construction the sweep refuses to
+        # repeat.
+        if (project["collection_present"] is False
+                and corpus_scan(os.path.join(project["path"], "decisions.md"))):
+            # A pointer, never a diagnosis and never a heal: the overview reads no
+            # graph, so it can neither price what re-embedding would cost nor tell a
+            # swept collection from an unbuilt one — and those two want opposite
+            # commands. Presence would not imply population anyway.
             notes.append(
                 f"⚠ no vector collection {project['collection']} on "
-                f"{project['qdrant_url']} — run `mitos reconcile` in that project")
+                f"{project['qdrant_url']} — `mitos status {name}` for the heal")
         elif project["collection_present"] is None:
             notes.append(
                 f"vector collection unknown — {project['qdrant_url']} did not answer "
@@ -2328,9 +2369,11 @@ def cmd_status_overview(as_json: bool = False) -> int:
     """Reports what this machine has: every registered project and its health.
 
     The **global** half of ``status`` — explicitly global, so no silent cwd
-    resolution exists to mis-aim it. Nothing routes here yet; the zero-arg dispatch
-    flip is a later phase's, which keeps that phase a routing change rather than a
-    routing-change-plus-a-new-report.
+    resolution exists to mis-aim it. It is what a **selectorless** ``mitos status``
+    renders; ``mitos status <project>`` keeps the per-project deep report. The
+    dispatch decides between them in ``main()``, before any ``MitosConfig`` is
+    built, so a broken workspace underfoot cannot take down a report about the
+    whole machine.
 
     **The exit contract, stated where the report is built.** It returns **0 whenever
     it can render, and non-zero only when it cannot**. An empty registry is the
@@ -5317,7 +5360,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # status — is Mitos set up for this project? (human- and LLM-friendly check)
     status_p = subparsers.add_parser("status", help="Check whether Mitos is set up for a project.")
-    status_p.add_argument("path", nargs="?", default=None, help="Project directory to check (default: current directory).")
+    status_p.add_argument("path", nargs="?", default=None,
+                          help="Project to report on: a registered name (see `mitos "
+                               "projects`) or an absolute path. Omit it for the "
+                               "machine-wide overview of every registered project.")
     status_p.add_argument("--json", action="store_true", dest="as_json", help="Emit a machine-readable JSON report.")
 
     # set-key — store an API key globally (all projects) or for this project
@@ -5475,6 +5521,25 @@ def main() -> None:
         # name up), and only then does a target exist.
         selector = _selector_from_args(args)
         _refuse_selector_on_exempt_verb(args, selector)
+        if args.command == "status" and selector is None:
+            # `status` is the one selector-OPTIONAL verb: a selector is legal and
+            # routes to the deep report, its absence routes to the global overview.
+            # A plain condition, deliberately NOT folded into `_exempt_reason` — a
+            # selector on `status` is not refused, and merging the two rules would
+            # make `mitos -p mitos status` refusable by accident.
+            #
+            # Placed BEFORE the `MitosConfig` construction, and the ordering is
+            # contract: the overview is global by definition, so a malformed
+            # `.mitos/config.toml` in whatever directory the caller happens to be
+            # standing in must not take down a report about the whole machine. (4b's
+            # `ConfigError` carve-out would catch it and route to
+            # `_answer_workspace_optional_verb` → the *deep* report: silently the
+            # wrong answer, exit 1 either way, nothing red.) The early `sys.exit` is
+            # safe past the `finally` because `status` is not in
+            # `_DECISION_LOOP_COMMANDS`, so the only post-exit `config` read never
+            # fires on this path and no unbound local can become a swallowed
+            # `NameError`.
+            sys.exit(cmd_status_overview(as_json=args.as_json))
         target = _resolve_selector(selector, args.command)
         # No selector keeps today's behaviour byte for byte — construction is not
         # migration, and every zero-arg path stays green until 5a removes the

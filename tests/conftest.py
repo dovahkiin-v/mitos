@@ -77,6 +77,53 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip_marker)
 
 
+def make_workspace(root) -> str:
+    """Builds the minimal valid workspace shape and returns its canonical path.
+
+    The shipped validity triple and nothing more: ``.mitos/`` holding a
+    ``config.toml``, plus ``decisions.md``. A half-workspace is not a workspace,
+    and building only the first two parts is the fixture mistake made from habit —
+    it costs nothing before 5a (the handler is mocked and never sees the directory)
+    and refuses to resolve after it. Deliberately no graph: a workspace is valid
+    without one, which is the cloned-but-unbuilt state the escape hatch exists for.
+
+    Lifted here at 5a from ``test_cli_selector``/``test_routing``'s byte-identical
+    twins, because the flip gave it a dozen more consumers: every row that used to
+    hand a mocked handler a bare ``tmp_path`` now needs a real workspace, and
+    thirteen private re-spellings would be thirteen chances to write the
+    half-workspace one.
+
+    **Absolute-path form, always.** The canonical path is what a migrated row passes
+    to ``-p``; ``-p .`` would resolve *pytest's* working directory — the mitos-pub
+    repo, which is itself a valid workspace — so a row written that way is green
+    both here and under a build that still resolved the cwd, which is the exact
+    defect 5a removes.
+
+    Args:
+        root: The directory to build the workspace at (created if absent).
+
+    Returns:
+        The workspace root's canonical (``realpath``) absolute path.
+    """
+    os.makedirs(os.path.join(str(root), ".mitos"), exist_ok=True)
+    with open(os.path.join(str(root), ".mitos", "config.toml"), "w") as f:
+        f.write("# a mitos workspace\n")
+    with open(os.path.join(str(root), "decisions.md"), "w") as f:
+        f.write("# Decisions\n")
+    return os.path.realpath(str(root))
+
+
+@pytest.fixture
+def workspace(tmp_path) -> str:
+    """One ready-made workspace under ``tmp_path``, canonical path.
+
+    The fixture form of :func:`make_workspace`, for the common row that needs
+    exactly one. Rows needing two (or needing the directory named) call the
+    function.
+    """
+    return make_workspace(tmp_path / "ws")
+
+
 @pytest.fixture(autouse=True)
 def hermetic_mitos_env(monkeypatch, tmp_path):
     """Isolates per-test config/cache and silences the CLI's network/nag side-effects."""

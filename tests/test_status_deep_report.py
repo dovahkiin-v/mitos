@@ -970,12 +970,16 @@ def test_the_named_form_keeps_the_shipped_zero_one_readiness_mapping(
     assert "NEEDS ATTENTION ⚠" in capsys.readouterr().out
 
 
-def test_a_selectorless_status_is_unchanged_in_every_respect(
+def test_a_selectorless_status_renders_the_global_overview(
     tmp_path, monkeypatch, capsys
 ) -> None:
-    """Transitional, and 5a's to invert: the zero-arg form still resolves the working
-    directory, renders the path-only header, and returns the same code. It gains the
-    new keys like every other call and nothing else.
+    """Inverted at 5a (entry-007): the zero-arg form is no longer a project report.
+
+    It used to resolve the working directory and answer the deep report about it.
+    Now it answers the *other* question — what does this machine have — so the whole
+    payload changes shape, not merely a value: `report` flips to `"overview"` and
+    every per-project readiness key is gone. Standing in a healthy workspace does not
+    bring the old answer back; that is the point of the flip.
     """
     ws = _fresh(tmp_path)
     monkeypatch.chdir(str(ws))
@@ -986,7 +990,14 @@ def test_a_selectorless_status_is_unchanged_in_every_respect(
 
     payload = json.loads(capsys.readouterr().out)
     assert rc == 0
-    assert payload["report"] == "project"
-    assert payload["ready"] is True
-    assert payload["checks"]["graph_unbuilt"] is False
-    assert payload["project"] == os.path.realpath(str(ws))
+    assert payload["report"] == "overview"
+    assert "ready" not in payload and "checks" not in payload
+    # The registration `cmd_init` made is what the overview reports on, and the cwd
+    # marker names it — the recovery the flip owes a caller who wanted the old answer.
+    assert [p["name"] for p in payload["projects"]] == ["fresh"]
+    assert payload["cwd_project"] == "fresh"
+
+    # …and the named form still gives the report this row used to assert.
+    rc = _run(["status", "fresh"])
+    assert rc == 0
+    assert "READY ✓" in capsys.readouterr().out
