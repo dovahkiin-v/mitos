@@ -35,7 +35,8 @@ import pytest
 from mitos import __version__, check, cli
 from mitos.config import MitosConfig
 from mitos.conflict import ConflictUnavailableReason, Unavailable
-from mitos.errors import DatabaseError, VectorStoreError
+from mitos.errors import (CollectionMissingError, DatabaseError,
+                          VectorStoreError)
 from mitos.parser import ParsedEntry, parse_entry_stream
 from mitos.store import GraphStore, open_connection
 from mitos.telemetry import TelemetryStore
@@ -107,7 +108,7 @@ def _wire_substrate(
     """Monkeypatches ``cli._build_check_substrate`` to keyed fakes; returns them."""
     embed, vector = _keyed_substrate(neighbourhoods, vector_raises=vector_raises)
     monkeypatch.setattr(cli, "_build_check_substrate",
-                        lambda config: (embed, vector, None, None))
+                        lambda config: (embed, vector, None))
     return embed, vector
 
 
@@ -115,7 +116,7 @@ def _wire_judge(monkeypatch: pytest.MonkeyPatch, judge: Any) -> List[bool]:
     """Monkeypatches ``cli._build_check_judge`` to return ``judge``; logs invocation."""
     invoked: List[bool] = []
 
-    def builder() -> Any:
+    def builder(config: MitosConfig) -> Any:
         invoked.append(True)
         return judge
     monkeypatch.setattr(cli, "_build_check_judge", builder)
@@ -305,7 +306,7 @@ def test_4_no_pending_exits_0_zero_contact_no_probe_no_row(workspace, monkeypatc
                         lambda store: probe_calls.append(True))
     sub_calls: List[bool] = []
     monkeypatch.setattr(cli, "_build_check_substrate",
-                        lambda config: sub_calls.append(True) or (None, None, "x", "x"))
+                        lambda config: sub_calls.append(True) or (None, object(), "x"))
     judge_calls = _wire_judge(monkeypatch, None)
 
     code = cli.cmd_check(config, staged=True, scope=None, fresh=False,
@@ -315,6 +316,111 @@ def test_4_no_pending_exits_0_zero_contact_no_probe_no_row(workspace, monkeypatc
     assert "no pending decisions" in capsys.readouterr().out.lower()
     assert probe_calls == [] and sub_calls == [] and judge_calls == []
     assert _read_check_runs(config) == []
+
+
+class TestTheFreePathCarveOut:
+    """§4.7's obligation carve-out: the echo rides output the surface already emits.
+
+    Every other verb on the require-list names the corpus it answered from. This
+    one path does not, and the reason is specific: it is a pre-commit hook's
+    dominant path, sold in SETUP.md as effectively free — free in *noise* as much
+    as in spend — and its target is a literal in a committed hook (`-p .`), so it
+    is the one target in the set that cannot drift. Spending a shipped near-silence
+    to name a target that cannot be wrong is the trade this branch declines.
+
+    Not to be confused with `agent-block`'s carve-out, which is about the CHANNEL
+    (its stdout is a travelling artifact) and leaves the obligation intact.
+    """
+
+    def test_the_free_short_circuit_prints_exactly_its_gate_clear_line(
+        self, workspace, monkeypatch, capsys
+    ) -> None:
+        """Exact equality, not membership.
+
+        `"Gate clear"` appears on BOTH the free short-circuit and the report path
+        (`cli.py`'s `_print_staged_report`), so a membership assertion here is green
+        whichever line printed — and would stay green if the echo were added. The
+        whole line, and nothing else, is the claim.
+        """
+        config, store, telemetry = workspace
+        _commit(store, "committed-x", "A committed axiom already in the graph.")
+        _drain_outbox(store)
+        _write_decisions(config, ("committed-x", "A committed axiom already in the graph."))
+        capsys.readouterr()
+
+        code = cli.cmd_check(config, staged=True, scope=None, fresh=False,
+                             assume_yes=False, as_json=False)
+
+        captured = capsys.readouterr()
+        assert code == 0
+        assert captured.out == "Gate clear — no pending decisions to check.\n"
+        assert captured.err == ""
+
+    def test_the_free_paths_json_branch_is_not_carved_out(
+        self, workspace, monkeypatch, capsys
+    ) -> None:
+        """`--json` on the same path DOES carry it — it already emits a full object.
+
+        The carve-out is about not converting a silence into output, and a payload
+        is not a silence. Stated as its own row so a later reader does not
+        "harmonize" the two branches into one rule.
+        """
+        config, store, telemetry = workspace
+        _commit(store, "committed-x", "A committed axiom already in the graph.")
+        _drain_outbox(store)
+        _write_decisions(config, ("committed-x", "A committed axiom already in the graph."))
+        capsys.readouterr()
+
+        cli.cmd_check(config, staged=True, scope=None, fresh=False,
+                      assume_yes=False, as_json=True)
+
+        obj = json.loads(capsys.readouterr().out)
+        assert obj["project"] == config.project
+        assert obj["collection"] == config.qdrant_collection
+        assert obj["workspace"] == config.workspace_dir
+
+    def test_the_report_path_carries_the_echo(self, workspace, monkeypatch, capsys) -> None:
+        """With pending work the gate reports — and a report names its corpus."""
+        config, store, telemetry = workspace
+        _seed_active(store)
+        _write_decisions(config, ("pending-y", _PENDING_AXIOM))
+        _wire_substrate(monkeypatch, {_PENDING_AXIOM: []})
+        _wire_judge(monkeypatch, _SequenceJudge([]))
+        capsys.readouterr()
+
+        code = cli.cmd_check(config, staged=True, scope=None, fresh=False,
+                             assume_yes=False, as_json=False)
+
+        out = capsys.readouterr().out
+        assert code == 0
+        assert f"corpus: {config.project}" in out
+        assert config.qdrant_collection in out
+        assert "Gate clear" in out          # the REPORT's line, this time
+
+    def test_the_fail_closed_refusal_carries_it_on_stderr(
+        self, workspace, monkeypatch, capsys
+    ) -> None:
+        """The gate could not run — and that answer rides stderr, so the echo does.
+
+        Fail-closed with pending work is the shape a hook actually meets on a
+        machine with no key, and it is precisely when "which corpus?" is worth
+        knowing.
+        """
+        config, store, telemetry = workspace
+        _seed_active(store)
+        _write_decisions(config, ("pending-y", _PENDING_AXIOM))
+        monkeypatch.setattr(cli, "_build_check_substrate",
+                            lambda config: (None, object(), "no key"))
+        capsys.readouterr()
+
+        code = cli.cmd_check(config, staged=True, scope=None, fresh=False,
+                             assume_yes=False, as_json=False)
+
+        captured = capsys.readouterr()
+        assert code == 2
+        assert f"corpus: {config.project}" in captured.err
+        assert "could not gate" in captured.err
+        assert captured.out == ""
 
 
 def test_4b_absent_decisions_file_exits_0(workspace, monkeypatch) -> None:
@@ -382,12 +488,19 @@ def test_7_no_anthropic_key_with_pending_exits_2_no_row(workspace, monkeypatch, 
 
 
 def test_8_providers_absent_with_pending_exits_2_no_row(workspace, monkeypatch, capsys) -> None:
-    """Embed/vector absent with pending entries → fail-closed exit 2, names the component."""
+    """The embed provider absent with pending entries → fail-closed exit 2, names it.
+
+    The vector store has no construction-time absence to test any more (1b): it
+    builds without touching the network, and a missing collection or an unreachable
+    Qdrant reaches the gate at the operation instead — covered by
+    ``test_10_breaker_trips_on_first_unavailable_partial_exit_2`` and the
+    collection-missing rows below.
+    """
     config, store, telemetry = workspace
     _seed_active(store)
     _write_decisions(config, ("pending-y", _PENDING_AXIOM))
     monkeypatch.setattr(cli, "_build_check_substrate",
-                        lambda config: (None, object(), "no GEMINI key", None))
+                        lambda config: (None, object(), "no GEMINI key"))
     judge_calls = _wire_judge(monkeypatch, _finding_judge())
 
     code = cli.cmd_check(config, staged=True, scope=None, fresh=False,
@@ -481,6 +594,129 @@ def test_10_breaker_trips_on_first_unavailable_partial_exit_2(workspace, monkeyp
     assert rows[0]["nodes_swept"] == 1
     # A VECTOR_STORE Unavailable reads as the semantic-substrate `sweep` token.
     assert "sweep" in rows[0]["degraded_reason"]
+
+
+def test_10c_missing_collection_names_itself_and_its_heal_exit_2(
+    workspace, monkeypatch, capsys
+) -> None:
+    """T6 (staged): an absent collection over pending work → exit 2, named, with the heal.
+
+    Both halves matter. The **classification**: without binding
+    ``SEMANTIC_SUBSTRATE_REASONS`` the ``else`` here means "the judge", so the gate
+    would persist ``degraded_reason="judgment"`` — wrong in the confusing direction,
+    and silently. The **wording**: ``_STAGED_DEGRADATION_WORDS`` is read with
+    ``if t in …``, so an unmapped token is dropped from the report while still
+    riding ``--json`` and the persisted row — a silent failure that needs a positive
+    assertion to be provable.
+    """
+    config, store, telemetry = workspace
+    _seed_active(store)
+    _write_decisions(config, ("pending-y", _PENDING_AXIOM))
+    _wire_substrate(
+        monkeypatch,
+        {_PENDING_AXIOM: [_match("active-q", 0.9)]},
+        vector_raises={_PENDING_AXIOM: CollectionMissingError(
+            "Qdrant collection 'mitos-x' does not exist", collection="mitos-x"
+        )},
+    )
+    _wire_judge(monkeypatch, _finding_judge())
+
+    code = cli.cmd_check(config, staged=True, scope=None, fresh=False,
+                         assume_yes=False, as_json=False)
+
+    out, err = capsys.readouterr()
+    assert code == 2                                    # fail-closed, unchanged
+    assert "[partial] This gate could not fully run" in out
+    assert "the vector collection does not exist" in out
+    assert "mitos reconcile" in out
+    assert "Traceback" not in out and "Traceback" not in err
+
+
+def test_10d_missing_collection_rides_json_and_the_persisted_trend_row(
+    workspace, monkeypatch, capsys
+) -> None:
+    """The cause token is additive on both machine surfaces, never a replacement.
+
+    Two pending entries so a batch actually fires and the summary row gets written —
+    ``check_runs.degraded_reason`` is the P18 trend surface the token has to reach,
+    and a single-entry run trips the breaker before any batch and writes no row at
+    all. ``sweep`` must still be there beside the new token, or a trend query on the
+    shipped token silently under-counts.
+
+    Staged emits ``sorted(degraded)``, so the order here is not corpus mode's
+    declaration order — each surface's assertion is written to its own order.
+    """
+    config, store, telemetry = workspace
+    _seed_active(store)
+    p1_axiom = "First pending axiom that finds the active corpus decision."
+    p2_axiom = "Second pending axiom whose collection has gone missing."
+    _write_decisions(config, ("pending-1", p1_axiom), ("pending-2", p2_axiom))
+    _wire_substrate(
+        monkeypatch,
+        {p1_axiom: [_match("active-q", 0.9)], p2_axiom: []},
+        vector_raises={p2_axiom: CollectionMissingError(
+            "Qdrant collection 'mitos-x' does not exist", collection="mitos-x"
+        )},
+    )
+    _wire_judge(monkeypatch, _SequenceJudge([
+        _execution([("active-q", False, 0.9, "They cannot both stand.")], batch_id="b0"),
+    ]))
+
+    code = cli.cmd_check(config, staged=True, scope=None, fresh=False,
+                         assume_yes=False, as_json=True)
+
+    assert code == 2
+    obj = json.loads(capsys.readouterr().out)
+    assert obj["degradations"] == ["collection_missing", "sweep"]
+
+    rows = _read_check_runs(config)
+    assert len(rows) == 1
+    assert rows[0]["degraded_reason"] == "collection_missing,sweep"
+
+
+def test_10e_absent_collection_over_an_empty_graph_gates_clean(
+    workspace, monkeypatch, capsys
+) -> None:
+    """The twin of 10c: no active nodes → the absence is the empty index, exit 0.
+
+    The surface where the gap actually bit. A fresh `mitos init` whose author
+    hand-writes the first decision and commits runs this exact path from the
+    pre-commit hook: the graph is empty, the collection was never created (writes
+    create it, reads no longer do), and 10c's disposition would refuse the commit
+    and hand over `mitos reconcile` — which enqueues nothing over an empty active
+    set, so re-running it changes nothing and the operator is stuck. Before this
+    vision the store's constructor created the collection and this path passed;
+    the fix restores that outcome without restoring the read-creates side effect.
+
+    Deliberately keeps 10c's wiring apart from the one variable under test: same
+    pending entry, same raising substrate, no `_seed_active`. The judge is wired
+    and must never fire — with no candidates there is nothing to judge, so a clean
+    gate here also proves the empty answer costs no LLM spend.
+    """
+    config, store, telemetry = workspace
+    _write_decisions(config, ("pending-y", _PENDING_AXIOM))
+    _wire_substrate(
+        monkeypatch,
+        {_PENDING_AXIOM: [_match("active-q", 0.9)]},
+        vector_raises={_PENDING_AXIOM: CollectionMissingError(
+            "Qdrant collection 'mitos-x' does not exist", collection="mitos-x"
+        )},
+    )
+    judge = _finding_judge()
+    _wire_judge(monkeypatch, judge)
+
+    code = cli.cmd_check(config, staged=True, scope=None, fresh=False,
+                         assume_yes=False, as_json=False)
+
+    out, err = capsys.readouterr()
+    assert code == 0                                     # clean, not fail-closed
+    assert "[partial] This gate could not fully run" not in out
+    assert "the vector collection does not exist" not in out
+    # The dead end specifically: never hand over a heal that cannot heal.
+    assert "mitos reconcile" not in out
+    assert "Traceback" not in out and "Traceback" not in err
+    assert judge.calls == 0                              # no candidates → no spend
+    assert _read_check_runs(config) == []                # no judgment fired → no row
 
 
 def test_10b_judge_degradation_reads_as_judgment_token(workspace, monkeypatch, capsys) -> None:

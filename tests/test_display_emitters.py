@@ -104,7 +104,7 @@ def test_mcp_list_decisions_emits_raw_glyphs(ws) -> None:
     store = GraphStore(config.db_path, read_only=True)
 
     with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
-        out = mcp_server.list_decisions(scope="enc")
+        out = mcp_server.list_decisions(scope="enc", project=config.workspace_dir)
 
     assert "—" in out and "§" in out and "ąčęėįšųūž" in out
     assert "\\u" not in out
@@ -133,7 +133,7 @@ def test_cli_mcp_glyph_parity(ws, capsys) -> None:
     cli_payload = json.loads(capsys.readouterr().out)
 
     with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
-        mcp_out = mcp_server.list_decisions(scope="enc")
+        mcp_out = mcp_server.list_decisions(scope="enc", project=config.workspace_dir)
     mcp_payload = json.loads(mcp_out)
 
     # Same glyph treatment: both unescaped, and the same decision content.
@@ -174,6 +174,11 @@ def test_cli_list_json_ascii_fallback(ws, monkeypatch) -> None:
 def test_mcp_error_return_stays_single_line() -> None:
     """A non-letter depth error return is single-line JSON (indent=None kept)."""
     from mitos.mcp_server import query_decisions
+    # Deliberately selector-less, and it survives 5b's flip: the `depth` argument
+    # fault is answered *before* `_target_config` runs, which is the ordering §3
+    # pins and `test_an_argument_fault_is_answered_before_the_project_is_resolved`
+    # asserts on purpose. Naming a project here would resolve nothing (the call
+    # never reaches resolution) and would read as if it did.
     out = query_decisions(query="anything", depth="trace")
     assert "\n" not in out  # single-line — widening to indent=2 would be a text change
     assert "error" in json.loads(out)
@@ -200,30 +205,3 @@ def test_cli_list_text_path_unperturbed(ws, capsys) -> None:
     assert "enc-one" in out  # the human listing
     assert not out.lstrip().startswith("{")  # not the JSON document
     assert '"decisions"' not in out  # the JSON wrapper key never leaks into text
-
-
-# --------------------------------------------------------------------------- #
-# §3-(1) nudge — own stderr line, absent from stdout (stale-premise pin)
-# --------------------------------------------------------------------------- #
-
-def test_mcp_nudge_on_stderr_absent_from_stdout(ws, capsys, monkeypatch) -> None:
-    """The 💡 MCP nudge fires on its own stderr line and never touches stdout.
-
-    Pins the already-satisfied state (the nudge has gone to a separate stderr
-    line since commit 8b3c90f, 2026-06-12 — the vision's "concatenates onto the
-    axiom" premise was stale at authoring). A regression that re-routes it onto
-    the stdout JSON/text body is caught here.
-    """
-    config, _ = ws
-    # Enable the nudge: it is suppressed by the autouse hermetic fixture.
-    monkeypatch.delenv("MITOS_NO_MCP_HINT", raising=False)
-    monkeypatch.chdir(config.workspace_dir)  # main() builds MitosConfig(".")
-    capsys.readouterr()
-
-    with patch.object(sys, "argv", ["mitos", "list", "--json"]):
-        main()
-
-    captured = capsys.readouterr()
-    assert "💡" in captured.err  # the nudge fired on stderr
-    assert "💡" not in captured.out  # never on the stdout JSON body
-    json.loads(captured.out)  # stdout is clean JSON (the nudge didn't corrupt it)

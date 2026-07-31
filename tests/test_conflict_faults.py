@@ -44,7 +44,7 @@ import anthropic
 from mitos.conflict import ConflictUnavailableReason, Unavailable
 from mitos.conflict_judgment import make_judgment_executor
 from mitos.config import MitosConfig
-from mitos.errors import EmbeddingError, VectorStoreError
+from mitos.errors import CollectionMissingError, EmbeddingError, VectorStoreError
 from mitos.sync import MitosSyncManager
 
 from _conflict_helpers import (
@@ -89,6 +89,20 @@ class _SeveredVector(_FakeVector):
     def query(self, vector: List[float], limit: int = 5) -> List[Dict[str, Any]]:
         self.queries += 1
         raise VectorStoreError("qdrant query severed")
+
+
+class _CollectionlessVector(_FakeVector):
+    """The S2 over-fetch query raises the `CollectionMissingError` SUBCLASS.
+
+    Qdrant is up; the collection is not there. The distinction the whole 1b phase
+    turns on, injected at the same seam as its sibling above.
+    """
+
+    def query(self, vector: List[float], limit: int = 5) -> List[Dict[str, Any]]:
+        self.queries += 1
+        raise CollectionMissingError(
+            "Qdrant collection 'mitos-x' does not exist", collection="mitos-x"
+        )
 
 
 def _req() -> httpx.Request:
@@ -452,6 +466,13 @@ def test_typed_faults_produce_typed_unavailable_reasons() -> None:
         def get_node_by_slug(self, slug: str) -> Any:  # never reached on these legs
             raise AssertionError("graph read must not run when the substrate is severed")
 
+        def get_active_node_ids(self) -> set:
+            # Declared explicitly, not left to the I8 gate's unreadable-graph
+            # fallback: a stub missing this method degrades via `except Exception`
+            # and the COLLECTION_MISSING leg below would then pass for the wrong
+            # reason. A populated graph is what makes an absent collection a gap.
+            return {"some-node-id"}
+
     embed_fault = gather_candidates(
         "Some axiom.", embed_provider=_SeveredEmbed(),
         vector_store=_FakeVector(matches=[_match("x", 0.9)]), store=_Store(),
@@ -465,3 +486,86 @@ def test_typed_faults_produce_typed_unavailable_reasons() -> None:
     )
     assert isinstance(vector_fault, Unavailable)
     assert vector_fault.reason is ConflictUnavailableReason.VECTOR_STORE
+
+    # The third typed fault: a running Qdrant that simply has no such collection.
+    # It subclasses the one above, so an arm ordered after it would silently make
+    # this leg indistinguishable from an outage.
+    missing_fault = gather_candidates(
+        "Some axiom.", embed_provider=_FakeEmbed(),
+        vector_store=_CollectionlessVector(matches=[_match("x", 0.9)]), store=_Store(),
+    )
+    assert isinstance(missing_fault, Unavailable)
+    assert missing_fault.reason is ConflictUnavailableReason.COLLECTION_MISSING
+
+
+@pytest.mark.parametrize(
+    "active_ids, expect_degraded",
+    [
+        pytest.param({"a-committed-node"}, True, id="populated-graph-is-a-gap"),
+        pytest.param(set(), False, id="empty-graph-is-the-empty-index"),
+    ],
+)
+def test_absent_collection_degrades_only_when_the_graph_has_something_to_index(
+    active_ids: set, expect_degraded: bool,
+) -> None:
+    """I8 at the sweep: absence is a gap iff `mitos reconcile` would index something.
+
+    The predicate has two opposite outcomes, so it needs a fixture for each — a
+    one-sided row passes under either behaviour. The empty-graph half is the one
+    that was missing: `gather_candidates`' own contract already promises `[]` for
+    "a legitimate empty: an empty corpus", and re-keying `check`'s precondition
+    onto the operation broke that promise for the state where the collection has
+    never been created. It bites hardest on a fresh workspace whose first commit
+    runs `mitos check --staged` from a pre-commit hook: exit 2, advised to run
+    `mitos reconcile`, which enqueues nothing over an empty active set and so
+    cannot heal what it names — a dead end, not a vector.
+
+    Gated on the same `get_active_node_ids` the four read surfaces use, and the
+    same set `reconcile_embeddings` enqueues, so the gate and the heal agree by
+    construction.
+    """
+    from mitos.conflict import gather_candidates
+
+    class _Store:
+        def get_active_node_ids(self) -> set:
+            return active_ids
+
+        def get_node_by_slug(self, slug: str) -> Any:  # no match survives to S3
+            raise AssertionError("the query raised — S3 must never run")
+
+    result = gather_candidates(
+        "Some axiom.", embed_provider=_FakeEmbed(),
+        vector_store=_CollectionlessVector(matches=[_match("x", 0.9)]), store=_Store(),
+    )
+
+    if expect_degraded:
+        assert isinstance(result, Unavailable)
+        assert result.reason is ConflictUnavailableReason.COLLECTION_MISSING
+    else:
+        assert result == []
+
+
+def test_an_unreadable_graph_still_degrades_on_an_absent_collection() -> None:
+    """The I8 gate's loud branch: "I could not check" is never the healthy empty.
+
+    The carve-out above turns on a graph read, so the read's own failure must not
+    inherit the quiet answer — a store that raises has not told us the corpus is
+    empty, it has told us nothing.
+    """
+    from mitos.conflict import gather_candidates
+
+    class _UnreadableStore:
+        def get_active_node_ids(self) -> set:
+            raise RuntimeError("graph unreadable")
+
+        def get_node_by_slug(self, slug: str) -> Any:
+            raise AssertionError("the query raised — S3 must never run")
+
+    result = gather_candidates(
+        "Some axiom.", embed_provider=_FakeEmbed(),
+        vector_store=_CollectionlessVector(matches=[_match("x", 0.9)]),
+        store=_UnreadableStore(),
+    )
+
+    assert isinstance(result, Unavailable)
+    assert result.reason is ConflictUnavailableReason.COLLECTION_MISSING

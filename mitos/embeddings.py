@@ -82,17 +82,47 @@ class EmbeddingCache:
 class GeminiEmbeddingProvider:
     """Gemini-based implementation of the embedding provider."""
 
-    def __init__(self, cache_path: str) -> None:
+    def __init__(
+        self,
+        cache_path: str,
+        *,
+        api_key: Optional[str],
+        model_id: Optional[str] = None,
+    ) -> None:
+        """Builds the provider for one workspace's key and embedding model.
+
+        Args:
+            cache_path: The content-hash embedding cache (its key carries **no**
+                model id, which is why ``model_id`` must arrive resolved for the
+                right target rather than be read here).
+            api_key: The workspace's ``GEMINI_API_KEY``. ``None`` means the caller
+                supplied nothing and the provider refuses — it consults no
+                environment of its own (5c). ``""`` is a supplied answer and
+                refuses the same way, which is what keeps
+                ``env GEMINI_API_KEY= mitos …`` a keyless run.
+            model_id: The resolved embedding model id, or ``None`` for the
+                baseline. Never stored beyond ``self.model_id``; the key is never
+                stored at all (P8).
+        """
         self.cache = EmbeddingCache(cache_path)
         self.hits = 0
         self.misses = 0
-        
+
         # API Client initialization using the new google-genai SDK
-        api_key = os.environ.get("GEMINI_API_KEY")
         if not api_key:
-            raise EmbeddingError("GEMINI_API_KEY environment variable is not set")
+            # A vector, not a wall (P3): the old wording named the process
+            # environment, which is now one of three places the key can live and
+            # the least likely of them. Name the search order and the verb that
+            # writes one. The provider itself reads no environment.
+            raise EmbeddingError(
+                "GEMINI_API_KEY is not set for this workspace — mitos reads it "
+                "from the process environment, then the workspace's .env, then "
+                "the global .env (`mitos set-key <key>` writes one)"
+            )
         self.client = genai.Client(api_key=api_key)
-        self.model_id = get_embedding_model_id()
+        self.model_id = (
+            model_id if model_id is not None else get_embedding_model_id()
+        )
 
     def get_stats(self) -> Tuple[int, int, float]:
         """Returns cache stats: (hits, misses, hit_rate)."""

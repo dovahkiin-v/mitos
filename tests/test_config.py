@@ -68,15 +68,10 @@ def test_config_defaults() -> None:
         assert config.archive_dir.endswith(os.path.join("decisions", "archive"))
 
 
-def test_default_collection_name_is_per_project() -> None:
-    """Verifies the per-project Qdrant collection derivation + sanitization."""
-    assert default_collection_name("/home/vinga/Forge/Blacksmith") == "mitos-blacksmith"
-    assert default_collection_name("/x/workshop_mcp") == "mitos-workshop_mcp"
-    assert default_collection_name("/x/My Project!") == "mitos-my-project"
-    # Distinct projects -> distinct collections (the anti-contamination property).
-    assert default_collection_name("/a/proj-one") != default_collection_name("/a/proj-two")
-    # Degenerate path falls back to the bare "mitos" collection.
-    assert default_collection_name("/") == "mitos"
+# The derivation itself — its step order, its digest, its non-injective basename
+# classes, and the retirement of the `qdrant_collection` file override — is pinned by
+# `tests/test_collection_derivation.py`. This module keeps only the attribute-level
+# rows (above): that `MitosConfig` binds whatever the function returns.
 
 
 # ---------------------------------------------------------------------------
@@ -95,12 +90,10 @@ def test_config_file_loading_applies_valid_overrides() -> None:
         _write_config(
             tmpdir,
             'rotation_volume_threshold_entries = 99\n'
-            'qdrant_collection = "custom_collection"\n'
             'qdrant_url = "http://example:7333"\n',
         )
         config = MitosConfig(tmpdir)
         assert config.rotation_volume_threshold_entries == 99
-        assert config.qdrant_collection == "custom_collection"
         assert config.qdrant_url == "http://example:7333"
         # Untouched keys keep their defaults.
         assert config.stale_entry_window_days == CONFIG_DEFAULTS["stale_entry_window_days"]
@@ -276,11 +269,12 @@ def test_retired_keys_silent_unknown_keys_warn(capsys: pytest.CaptureFixture) ->
     """Retired keys are tolerated SILENTLY; only genuinely-unknown keys warn.
 
     A recognized-but-retired key (`RETIRED_CONFIG_KEYS`: `pending_threshold`,
-    `db_path`, `decisions_file`, `archive_dir`) was deliberately dropped from the
-    file schema but is still recognized — its ATTRIBUTE survives at its default
-    (R12) and its file occurrence is skipped with NO warning (it is not a typo, so
-    warning on it every call is noise). A genuinely unknown key (a typo) still earns
-    one calm stderr line — that warning is the signal the setting won't take effect.
+    `db_path`, `decisions_file`, `archive_dir`, `qdrant_collection`) was deliberately
+    dropped from the file schema but is still recognized — its ATTRIBUTE survives at
+    its default (R12) and its file occurrence is skipped with NO warning (it is not a
+    typo, so warning on it every call is noise). A genuinely unknown key (a typo)
+    still earns one calm stderr line — that warning is the signal the setting won't
+    take effect.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         _write_config(
@@ -328,7 +322,7 @@ def test_r12_attribute_surface_preserved() -> None:
             "pending_threshold",
         ):
             assert hasattr(config, attr), attr
-        # ... plus the seven new static schema attributes.
+        # ... plus the eight new static schema attributes.
         for attr in CONFIG_DEFAULTS:
             assert hasattr(config, attr), attr
 
@@ -359,6 +353,77 @@ def test_to_dict_carries_full_surface() -> None:
 
 
 # ---------------------------------------------------------------------------
+# `config.project` — the echo carrier (runtime-only, never empty)
+# ---------------------------------------------------------------------------
+
+def test_project_is_never_empty_across_every_construction_form() -> None:
+    """The echo's never-empty rule is a property of CONSTRUCTION, not of call sites.
+
+    Three forms, because each is a construction the code can still perform: a bare
+    workspace root, an explicit ``project=None`` (what the two resolution sites
+    pass for an *unregistered* path — `ResolvedProject.name` is `None` there),
+    and a registered name. Only the last carries a name; the other two
+    fall back to the canonical workspace path, which is what makes an echo defined
+    for every selector form without a branch at any consumer.
+
+    There were four until 5d, when removing the constructor's ``"."`` default made
+    the zero-argument form unconstructible. Its claim was not dropped: it is
+    inverted into a ``TypeError`` row in
+    ``tests/test_workspace_root_discipline.py``, which is where the whole
+    no-cwd-default property now lives.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        forms = {
+            "path only": MitosConfig(tmpdir),
+            "explicit None": MitosConfig(tmpdir, project=None),
+            "named": MitosConfig(tmpdir, project="a-registered-name"),
+        }
+        for label, config in forms.items():
+            assert config.project, f"empty project on the {label} form"
+
+        assert forms["path only"].project == forms["path only"].workspace_dir
+        assert forms["explicit None"].project == forms["explicit None"].workspace_dir
+        assert forms["named"].project == "a-registered-name"
+
+
+def test_project_is_runtime_only_and_absent_from_to_dict() -> None:
+    """Like ``env`` and ``inert_file_keys``: carried per call, never persisted.
+
+    ``to_dict`` feeds the ``status`` surfaces and anything that writes config
+    back; the caller's selector is a property of ONE invocation, so persisting it
+    would turn a per-call routing fact into workspace state.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        assert "project" not in MitosConfig(tmpdir, project="named").to_dict()
+
+
+def test_a_project_key_in_config_toml_is_inert_and_cannot_become_the_echo(
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """ADR ``no-implicit-project-targeting-channel-including-process-env``, extended
+    to the config file.
+
+    ``MitosConfig`` applies file-schema keys by ``setattr``, so a new attribute name
+    on the class is worth an adversarial row rather than an assumption: ``project``
+    is in neither ``CONFIG_SCHEMA`` nor ``RETIRED_CONFIG_KEYS``, so a
+    ``project = "…"`` line takes the unknown-key branch — one calm warning, no
+    ``setattr`` — and the echo still names the workspace the CALL resolved.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _write_config(tmpdir, 'project = "spoofed"\n')
+
+        default = MitosConfig(tmpdir)
+        assert default.project == default.workspace_dir != "spoofed"
+
+        named = MitosConfig(tmpdir, project="real-name")
+        assert named.project == "real-name"
+
+        err = capsys.readouterr().err
+        assert "project" in err  # the unrecognized-key line, so it is not silent
+        assert "Traceback" not in err
+
+
+# ---------------------------------------------------------------------------
 # Existing-file coherence (§5.2.7) — the live prototype-shaped file
 # ---------------------------------------------------------------------------
 
@@ -367,8 +432,10 @@ def test_prototype_shaped_config_loads_clean(capsys: pytest.CaptureFixture) -> N
 
     Mirrors the live `.mitos/config.toml`: `rotation_mode` carries a trailing inline
     comment (which the hand-rolled parser mangled and silently defaulted; tomllib
-    parses it cleanly), `pending_threshold` is now silently tolerated (a recognized
-    retired key), and the `qdrant_*` keys apply.
+    parses it cleanly), `qdrant_url` applies, and BOTH `pending_threshold` and
+    `qdrant_collection` are now silently tolerated retired keys — the second one
+    inert rather than applied, which is the whole point: this file's pin is exactly
+    the shape `mitos init` used to write, and it no longer decides anything.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         _write_config(
@@ -383,7 +450,10 @@ def test_prototype_shaped_config_loads_clean(capsys: pytest.CaptureFixture) -> N
         # Inline comment stripped by tomllib → the clean value applies.
         assert config.rotation_mode == "archive"
         assert config.qdrant_url == "http://localhost:7333"
-        assert config.qdrant_collection == "mitos-mitos-pub"
+        # The pin is INERT: the collection stays the one derived from this path.
+        assert config.qdrant_collection == default_collection_name(tmpdir)
+        assert config.qdrant_collection != "mitos-mitos-pub"
+        assert config.inert_file_keys["qdrant_collection"] == "mitos-mitos-pub"
         # pending_threshold file key silently tolerated; attribute keeps its default.
         assert config.pending_threshold == 30
         # The real seeded file now loads with a CLEAN stderr — no per-invocation
@@ -415,18 +485,20 @@ def test_render_defaults_match_renderer_constants() -> None:
     )
 
 
-def test_schema_covers_ten_keys_and_defaults_are_the_static_eight() -> None:
-    """CONFIG_SCHEMA recognizes ten file keys; CONFIG_DEFAULTS holds the static eight.
+def test_schema_covers_nine_keys_and_defaults_are_the_static_eight() -> None:
+    """CONFIG_SCHEMA recognizes nine file keys; CONFIG_DEFAULTS holds the static eight.
 
-    The two dynamic qdrant keys are recognized + validated but defaulted in
-    __init__, so they are in CONFIG_SCHEMA but not CONFIG_DEFAULTS. v0.2's
-    ``conflict_check_on_sync`` is in BOTH (static default True), so it lifts the
-    counts to ten/eight but leaves the qdrant-only difference unchanged.
+    ``qdrant_url`` is recognized + validated but defaulted in __init__, so it is in
+    CONFIG_SCHEMA and not CONFIG_DEFAULTS — and it is now the ONLY such key.
+    ``qdrant_collection`` was the other one until it was retired from the file schema
+    entirely (its value is derived from the workspace path and not overridable), which
+    is what takes the count from ten to nine. v0.2's ``conflict_check_on_sync`` is in
+    BOTH (static default True).
     """
-    assert len(CONFIG_SCHEMA) == 10
+    assert len(CONFIG_SCHEMA) == 9
     assert len(CONFIG_DEFAULTS) == 8
     assert set(CONFIG_DEFAULTS) < set(CONFIG_SCHEMA)
-    assert set(CONFIG_SCHEMA) - set(CONFIG_DEFAULTS) == {"qdrant_url", "qdrant_collection"}
+    assert set(CONFIG_SCHEMA) - set(CONFIG_DEFAULTS) == {"qdrant_url"}
 
 
 # ---------------------------------------------------------------------------
@@ -514,9 +586,10 @@ def test_unknown_rotation_mode_still_hard_fails() -> None:
 def test_config_loading_never_writes_to_stdout(capsys) -> None:
     """A deprecated mode must not print to stdout — it would corrupt MCP's JSON-RPC.
 
-    ``mcp_server.py`` constructs ``MitosConfig()`` per tool call over a stdio
+    ``mcp_server.py`` constructs a ``MitosConfig`` per tool call over a stdio
     JSON-RPC channel, so anything on stdout there is protocol corruption rather than
-    noise. The warning is the CLI dispatcher's job, on stderr; the loader stays mute.
+    noise. (Per-call construction is the substance and is unchanged; since 5b the
+    construction takes a resolved root rather than none.) The warning is the CLI dispatcher's job, on stderr; the loader stays mute.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         _write_config(tmpdir, 'rotation_mode = "mark"\n')
@@ -544,7 +617,9 @@ def test_deprecated_rotation_mode_warns_once_at_dispatch(tmp_path, monkeypatch, 
     mitos_dir.mkdir()
     (mitos_dir / "config.toml").write_text('rotation_mode = "mark"\n', encoding="utf-8")
 
-    monkeypatch.setattr(_sys, "argv", ["mitos", "-C", str(tmp_path), "status"])
+    # `-p .` after the `-C` chdir: post-5a a selectorless `status` answers the
+    # global overview, which builds no workspace config and so fires no warning.
+    monkeypatch.setattr(_sys, "argv", ["mitos", "-C", str(tmp_path), "-p", ".", "status"])
     try:
         main()
     except SystemExit:
@@ -566,7 +641,9 @@ def test_clean_rotation_mode_warns_nothing_at_dispatch(tmp_path, monkeypatch, ca
     mitos_dir.mkdir()
     (mitos_dir / "config.toml").write_text('rotation_mode = "archive"\n', encoding="utf-8")
 
-    monkeypatch.setattr(_sys, "argv", ["mitos", "-C", str(tmp_path), "status"])
+    # `-p .` after the `-C` chdir: post-5a a selectorless `status` answers the
+    # global overview, which builds no workspace config and so fires no warning.
+    monkeypatch.setattr(_sys, "argv", ["mitos", "-C", str(tmp_path), "-p", ".", "status"])
     try:
         main()
     except SystemExit:
@@ -590,6 +667,10 @@ def test_status_with_a_path_warns_about_that_workspace(tmp_path, monkeypatch, ca
     target = tmp_path / "target"
     (target / ".mitos").mkdir(parents=True)
     (target / ".mitos" / "config.toml").write_text('rotation_mode = "prune"\n', encoding="utf-8")
+    # From phase 3b the positional is a project selector, so the target must carry
+    # the whole validity triple — `.mitos/config.toml` AND `decisions.md` — or the
+    # call lands on the targeting error before any warning can fire.
+    (target / "decisions.md").write_text("# Decisions\n", encoding="utf-8")
 
     clean_cwd = tmp_path / "clean"
     (clean_cwd / ".mitos").mkdir(parents=True)
@@ -614,6 +695,10 @@ def test_status_with_a_path_stays_quiet_about_a_deprecated_cwd(tmp_path, monkeyp
 
     clean_target = tmp_path / "target"
     (clean_target / ".mitos").mkdir(parents=True)
+    # The validity triple, as above — and the config.toml stays CLEAN (no
+    # rotation_mode), which is what this row is about.
+    (clean_target / ".mitos" / "config.toml").write_text("", encoding="utf-8")
+    (clean_target / "decisions.md").write_text("# Decisions\n", encoding="utf-8")
 
     dirty_cwd = tmp_path / "dirty"
     (dirty_cwd / ".mitos").mkdir(parents=True)

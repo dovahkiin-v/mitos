@@ -4,23 +4,48 @@ This module handles loading and validating Mitos configuration from `.mitos/conf
 and defines system-wide defaults.
 """
 
+import hashlib
 import os
 import re
 import sys
 import tomllib
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 
+from mitos import env, models
 from mitos.errors import ConfigError
+
+# The variables `MitosConfig` resolves per construction and carries on `.env`.
+# Two groups: the credentials + the Qdrant URL that every substrate consumer
+# reads, and the four model overrides.
+#
+# The override names are DERIVED from `models.MODEL_IDS` rather than re-declared,
+# because `models` is a sibling leaf (stdlib only, no `config` import) — the
+# renderer precedent in `CONFIG_DEFAULTS` below, which re-declares constants with
+# a lockstep cross-check test, exists to avoid a tier INVERSION between `config`
+# and the higher-tier `renderer`, and there is none here. Deriving them is also
+# what keeps `MITOS_MODEL_OVERRIDE_EMBEDDING` in the set: `MODEL_ALIASES` omits
+# `EMBEDDING`, and a set built from it looks correct while dropping the one
+# override that is costliest to lose — the embedding cache keys on content hash
+# alone (`embeddings.py`), so a mis-routed embedding override reads as working
+# while cached prior-generation vectors flow into a new-generation collection.
+# `MODEL_IDS`' keys are already upper-case; no `.upper()` belongs here.
+RESOLVED_ENV_KEYS: Tuple[str, ...] = (
+    "GEMINI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "QDRANT_URL",
+) + tuple(f"MITOS_MODEL_OVERRIDE_{alias}" for alias in models.MODEL_IDS)
 
 # ---------------------------------------------------------------------------
 # v0.1 config schema (§5.2.6) — the SINGLE source of the static defaults.
 #
-# `CONFIG_DEFAULTS` holds the seven STATIC-default schema keys: `mitos init` (6b)
+# `CONFIG_DEFAULTS` holds the eight STATIC-default schema keys: `mitos init` (6b)
 # seeds `config.toml` from this exact map, and the loader's missing-key fallback
 # reads it — so a seeded file and a deleted-key fallback can never diverge (P11).
-# The two QDRANT keys are recognized + type-validated (in `CONFIG_SCHEMA`) but NOT
-# here: their defaults are DYNAMIC (env- / workspace-derived) and computed in
-# `__init__` from their existing single-source helpers, then file-overridable.
+# `qdrant_url` is recognized + type-validated (in `CONFIG_SCHEMA`) but NOT here:
+# its default is DYNAMIC (env-derived) and computed in `__init__` from its
+# existing single-source helper, then file-overridable. `qdrant_collection` is
+# dynamic too but no longer file-overridable at all — it is derived from the
+# workspace path on every construction and retired from the file schema below.
 # ---------------------------------------------------------------------------
 CONFIG_DEFAULTS: Dict[str, Any] = {
     "rotation_mode": "archive",
@@ -39,9 +64,9 @@ CONFIG_DEFAULTS: Dict[str, Any] = {
 }
 
 # The recognized file keys → expected (TOML scalar) type, for strict validation.
-# The eight static keys above PLUS the two dynamic-default qdrant keys = the §5.2.6
-# ten-key schema. A file key NOT in this map is tolerated and skipped — split into
-# two buckets by `_load_config_file`: a RECOGNIZED-but-retired key (`RETIRED_CONFIG_KEYS`
+# The eight static keys above PLUS the dynamic-default `qdrant_url` = the nine-key
+# schema. A file key NOT in this map is tolerated and skipped — split into two
+# buckets by `_load_config_file`: a RECOGNIZED-but-retired key (`RETIRED_CONFIG_KEYS`
 # below) is tolerated SILENTLY, while a genuinely unknown key (a typo) earns one
 # calm stderr line.
 CONFIG_SCHEMA: Dict[str, type] = {
@@ -53,7 +78,6 @@ CONFIG_SCHEMA: Dict[str, type] = {
     "render_global_overflow_warn_chars": int,
     "render_scope_overflow_warn_chars": int,
     "qdrant_url": str,
-    "qdrant_collection": str,
     "conflict_check_on_sync": bool,
 }
 
@@ -64,8 +88,25 @@ CONFIG_SCHEMA: Dict[str, type] = {
 # every single call. They are tolerated SILENTLY. The warning is reserved for keys
 # the code does not know at all — where it is the useful signal that a setting will
 # silently not take effect.
+#
+# `qdrant_collection` joins them for a stronger reason than the other four: its
+# file override was a SAFETY hole, not just dead weight. `mitos init` materialized
+# the derived name into the file, so a `cp -r` sandbox or a `git clone` of a repo
+# that committed `.mitos/` carried the ORIGINAL project's collection and every
+# write in the copy overwrote the original's vectors. Retiring it at resolution
+# time (rather than stripping the line at `init` time) is what makes the fix total:
+# a workspace `init` never runs on is exactly the clonable state, so no `init`-time
+# mechanism can reach it. A surviving line of any type is inert wherever it is met,
+# and `_load_config_file` records it in `inert_file_keys` so the two CLI surfaces
+# that print the resolved collection can name it as legacy.
 RETIRED_CONFIG_KEYS: frozenset = frozenset(
-    {"pending_threshold", "db_path", "decisions_file", "archive_dir"}
+    {
+        "pending_threshold",
+        "db_path",
+        "decisions_file",
+        "archive_dir",
+        "qdrant_collection",
+    }
 )
 
 # The `rotation_mode` enum: correct type (str) but a value outside this set is a
@@ -137,7 +178,8 @@ def _hint_cache_path(cache_name: str) -> str:
     to ``~/.cache``. The file need not exist.
 
     Args:
-        cache_name: The cache file's basename (e.g. ``"mcp_hint.json"``).
+        cache_name: The cache file's basename (e.g.
+            ``"scope_overflow_hint.json"``).
 
     Returns:
         Absolute path to ``<cache>/mitos/<cache_name>``.
@@ -151,9 +193,10 @@ def _hint_cache_path(cache_name: str) -> str:
 def hint_due(cache_name: str, key: str, window_seconds: float) -> bool:
     """Fail-silent once-per-window gate for a debounced nudge.
 
-    Backs the recurring-nudge surfaces (the MCP-server hint, the render-overflow
-    summary) so they fire at most once per ``window_seconds`` per ``key`` instead of
-    on every call. Reads a small JSON cache keyed by ``key``; if that key has not
+    Backs the render-overflow summary — currently the only such surface, since
+    mitos became machine-global and the per-project MCP-wiring nudge retired — so
+    it fires at most once per ``window_seconds`` per ``key`` instead of on every
+    call. Reads a small JSON cache keyed by ``key``; if that key has not
     fired within the window it stamps the current time and returns True, otherwise
     returns False. Never raises — a missing/corrupt cache or an unwritable cache dir
     degrades to "due" (the nudge shows) rather than crashing the caller.
@@ -191,6 +234,24 @@ def hint_due(cache_name: str, key: str, window_seconds: float) -> bool:
     return True
 
 
+def config_home() -> str:
+    """Returns the machine-local config root Mitos keeps its global state under.
+
+    The single XDG resolution for every global (non-workspace) Mitos file — the
+    shared ``.env`` and the project registry both hang off it. It is one mechanism
+    on purpose: the test suite redirects ``XDG_CONFIG_HOME`` per test, so a second
+    hand-rolled ``expanduser("~/.config")`` anywhere would slip that isolation and
+    write into the real user config.
+
+    Returns:
+        Absolute path to the config root (``$XDG_CONFIG_HOME``, else
+        ``~/.config``). The directory need not exist.
+    """
+    return os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+        os.path.expanduser("~"), ".config"
+    )
+
+
 def global_env_path() -> str:
     """Returns the path to Mitos's global ``.env`` (shared across all projects).
 
@@ -204,10 +265,130 @@ def global_env_path() -> str:
         Absolute path to ``<config>/mitos/.env`` (``~/.config/mitos/.env`` by
         default). The file need not exist.
     """
-    config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
-        os.path.expanduser("~"), ".config"
+    return os.path.join(config_home(), "mitos", ".env")
+
+
+def global_registry_path() -> str:
+    """Returns the path to Mitos's global project registry.
+
+    The registry is the machine-local ``name → absolute workspace path`` routing
+    map: ``mitos init`` registers the workspace it scaffolds, and name-targeted
+    commands resolve a selector through it instead of inferring a workspace from
+    the process's working directory. It lives beside the global ``.env`` (one
+    config root, one XDG mechanism) and deliberately **outside** every workspace —
+    it routes between projects, so no project owns it.
+
+    It stores routing only. Nothing about a project's identity (its collection,
+    its graph, its corpus) is derived from this file, so editing, removing, or
+    repointing an entry can never change what a workspace *is*.
+
+    Returns:
+        Absolute path to ``<config>/mitos/registry.toml``
+        (``~/.config/mitos/registry.toml`` by default). The file need not exist —
+        an absent registry is the healthy "no projects registered yet" state.
+    """
+    return os.path.join(config_home(), "mitos", "registry.toml")
+
+
+def toml_scalar(value: Any) -> str:
+    """Serializes a scalar to its TOML right-hand-side literal (or a quoted key).
+
+    A deliberately tiny serializer — NOT a general TOML writer. The stdlib
+    ``tomllib`` is read-only and P19 forbids pulling ``tomli-w`` for a handful of
+    flat scalars, so both hand-rolled writers use this one: ``mitos init`` seeds
+    ``.mitos/config.toml`` through it, and the registry writes both its keys
+    (project names) and its values (workspace paths) through it.
+
+    The string form is chosen by *value shape*, because the registry's real domain
+    includes paths and names a config value never carries:
+
+    * clean (no ``"``, no ``\\``, no control character) → today's **basic**
+      string, byte-identical to what the config seeder has always emitted;
+    * carrying a ``\\`` or a ``"`` but no ``'`` or control character → a TOML
+      **literal** string, which processes no escapes at all. This is the
+      load-bearing case: a path written into a *basic* string has its escapes
+      interpreted on the next read (``"/x/a\\tb"`` comes back with a TAB), which
+      would silently register a path that does not exist;
+    * anything left (both quote kinds, or a newline/control character) → a basic
+      string with ``\\\\`` / ``\\"`` / ``\\n`` / ``\\uXXXX`` escapes.
+
+    The ``bool`` branch MUST stay above the ``int`` branch: ``bool`` subclasses
+    ``int``, so an int-first order would emit ``True`` as ``1`` instead of ``true``.
+
+    Args:
+        value: The value to serialize (``str``, ``int``, or ``bool``).
+
+    Returns:
+        The TOML literal — e.g. ``'"archive"'`` for a string, ``'50'`` for an int,
+        ``'true'``/``'false'`` for a bool. Every string form round-trips back to
+        the original value through ``tomllib``.
+
+    Raises:
+        TypeError: If the value is not a plain ``str``/``int``/``bool``. Callers
+            at a user-facing boundary convert this to their own calm error rather
+            than letting it surface (I5).
+    """
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str):
+        return _toml_string(value)
+    raise TypeError(
+        f"toml_scalar cannot serialize {type(value).__name__}: {value!r}"
     )
-    return os.path.join(config_home, "mitos", ".env")
+
+
+def _is_toml_control(char: str) -> bool:
+    """Reports whether a character may not appear raw inside a TOML string.
+
+    TOML forbids raw control characters in both string kinds, with the single
+    exception of a tab. Anything this returns True for has to be escaped, which
+    also rules the value out of the literal-string form (literal strings have no
+    escape mechanism at all).
+    """
+    return (char < "\x20" and char != "\t") or char == "\x7f"
+
+
+#: Control characters TOML gives a short escape to; everything else goes \uXXXX.
+_TOML_SHORT_ESCAPES = {
+    "\b": "\\b",
+    "\t": "\\t",
+    "\n": "\\n",
+    "\f": "\\f",
+    "\r": "\\r",
+}
+
+
+def _toml_string(value: str) -> str:
+    """Serializes a string to the TOML form that round-trips it byte-identically.
+
+    See :func:`toml_scalar` for the three-way choice and why it is value-driven.
+    The same function serves keys and values: a basic- or literal-quoted key is
+    legal TOML, and the registry always quotes its keys — a bare key would parse a
+    dotted name (``example.com``) as a nested table and a non-ASCII name (P9:
+    ``ąžuolas``) not at all.
+    """
+    has_control = any(_is_toml_control(c) for c in value)
+    needs_escaping = '"' in value or "\\" in value
+
+    if not needs_escaping and not has_control:
+        # The shipped form. Every existing config.toml line keeps these bytes.
+        return f'"{value}"'
+    if "'" not in value and not has_control:
+        # A literal string processes no escapes — the faithful form for a path.
+        return f"'{value}'"
+
+    # Both quote kinds, or a control character: a fully escaped basic string.
+    # `\\` MUST be escaped before `"`, or the backslash just added is doubled.
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    out = []
+    for char in escaped:
+        if _is_toml_control(char) or char == "\t":
+            out.append(_TOML_SHORT_ESCAPES.get(char) or f"\\u{ord(char):04X}")
+        else:
+            out.append(char)
+    return '"' + "".join(out) + '"'
 
 
 def default_collection_name(workspace_dir: str) -> str:
@@ -218,28 +399,120 @@ def default_collection_name(workspace_dir: str) -> str:
     would default to the same ``"mitos"`` collection and cross-contaminate
     semantic queries — and, because a point's id is ``hash_to_uuid`` of the
     content hash (M2), two projects recording the same axiom would collide on
-    one Qdrant point. The name is ``mitos-<sanitized-basename>`` of the
-    workspace dir; set ``qdrant_collection`` in ``.mitos/config.toml`` to
-    override explicitly.
+    one Qdrant point.
+
+    The name is ``mitos-<safe basename>-<8 hex of sha256(canonical path)>`` — a
+    pure function of *where the workspace is*, with no opt-out. Nothing persists
+    it (not ``config.toml``, not the registry, not the graph), so a copied or
+    cloned workspace cannot inherit the original's collection; a
+    ``qdrant_collection`` line in ``.mitos/config.toml`` is inert legacy config
+    (see ``RETIRED_CONFIG_KEYS``). The basename alone would not do: two
+    same-named sibling projects, and a ``cp -r`` of one workspace, share it.
+
+    The four steps and their order are **contract** and cannot change after
+    release. The name is the address of live data, so a changed derivation
+    renames every collection in the wild and strands its vectors (P1,
+    interoperability across time):
+
+    1. ``os.path.realpath`` the input — collapses ``.``/``..``/a trailing slash
+       **and** resolves symlinks, so every route to one directory lands on one
+       collection. It never raises and never requires the path to exist, which
+       keeps this function total (and is why no ``exists()`` probe belongs here —
+       whether a path is a workspace is the caller's question).
+    2. ``safe`` = the basename **of that canonical path**, lowercased, each run of
+       non-``[a-z0-9_-]`` collapsed to ``-``, outer ``-`` stripped.
+    3. ``digest`` = the first 8 hex of ``sha256`` over the **full canonical path**
+       — never over the basename and never over ``safe``. Hashing either would
+       give a ``cp -r`` sibling the same digest, which is the entire failure this
+       derivation exists to close.
+    4. Join, omitting an empty ``safe``.
+
+    Two details a reader will otherwise assume wrongly:
+
+    * **The digest's input is ``os.fsencode(canonical)``, not
+      ``canonical.encode("utf-8")``.** A POSIX path is bytes, and ``realpath``
+      hands back a ``str`` carrying ``surrogateescape`` code points for any byte
+      that is not valid UTF-8 — which ``str.encode("utf-8")`` refuses. So the
+      obvious spelling would raise ``UnicodeEncodeError`` from ``MitosConfig``'s
+      constructor for a workspace whose path holds one Latin-1 byte, taking down
+      every verb including the ``mitos status`` you would run to diagnose it.
+      ``fsencode`` agrees with UTF-8 byte-for-byte on every valid path, so it
+      costs nothing and hashes the path's actual bytes — its true identity.
+    * **An empty ``safe`` yields two segments (``mitos-<digest>``), never a bare
+      ``mitos``.** A basename that sanitizes away entirely (``проект``, ``日本語``,
+      ``/``) must not land every such project on one shared collection — P9's own
+      case should not be the one that cross-contaminates. The digest is never
+      omitted, so a directory literally *named* like a digest still derives three
+      segments and cannot collide with the two-segment form.
+
+    Residual, named rather than fixed: ``realpath`` does not case-fold, so on a
+    case-insensitive filesystem two spellings of one directory derive two
+    collections. That degrades benignly (a duplicate empty collection, healed by
+    one ``mitos reconcile``); case-folding would trade it for a genuine
+    cross-project collision on a case-sensitive one.
 
     Args:
         workspace_dir: The workspace directory (the project root holding
-            ``.mitos/``).
+            ``.mitos/``). Need not exist.
 
     Returns:
-        A Qdrant-safe, project-unique collection name.
+        A Qdrant-safe collection name unique to the workspace's canonical path.
     """
-    base = os.path.basename(os.path.normpath(workspace_dir)).lower()
+    canonical = os.path.realpath(workspace_dir)
+    base = os.path.basename(canonical).lower()
     safe = re.sub(r"[^a-z0-9_-]+", "-", base).strip("-")
-    return f"mitos-{safe}" if safe else "mitos"
+    digest = hashlib.sha256(os.fsencode(canonical)).hexdigest()[:8]
+    return f"mitos-{safe}-{digest}" if safe else f"mitos-{digest}"
 
 
 class MitosConfig:
     """Represents the configuration state for the active Mitos workspace."""
 
-    def __init__(self, workspace_dir: str = ".") -> None:
+    def __init__(self, workspace_dir: str, *, project: Optional[str] = None) -> None:
         self.workspace_dir = os.path.abspath(workspace_dir)
         self.mitos_dir = os.path.join(self.workspace_dir, ".mitos")
+
+        # The name the CALLER used for this workspace, carried so every answer
+        # can echo the target back in the caller's own vocabulary. Filled at the
+        # two resolution sites (`cli.main`, `mcp_server._target_config`) from
+        # `ResolvedProject.name`, which is already the registered name for both
+        # selector forms — a name-form selector by construction, a path-form one
+        # via the registry's reverse lookup — and `None` for an unregistered
+        # path. So the fallback below covers the escape hatch and the
+        # transitional selector-less call in one expression, and "never empty"
+        # is a property of construction rather than of every call site
+        # remembering.
+        #
+        # `or` rather than `if project is None` (2c's rule elsewhere) precisely
+        # here: `registry.validate_name` forbids an empty name, so `""` is not a
+        # supplied answer on this field the way it is for an env value — the two
+        # spellings are behaviourally identical and `or` also absorbs a future
+        # caller passing `""`. Do not "fix" it into the other form.
+        #
+        # Runtime-only, like `self.env` below and `inert_file_keys`: absent from
+        # `to_dict()`, never persisted, and not a `CONFIG_SCHEMA` key — a
+        # `project = "…"` line in `config.toml` takes the unknown-key branch
+        # (one calm warning, no `setattr`) and cannot become the echo.
+        self.project = project or self.workspace_dir
+
+        # The resolved environment for THIS workspace — real env, then the
+        # workspace's own `.env`, then the machine-global one, computed rather
+        # than read off a process `os.environ` some launch directory filled in.
+        # Runtime-only: it holds real API keys, so it is never persisted, never
+        # in `to_dict()`, and never cached across calls (`mcp_server` builds a
+        # fresh config per tool call by design, which is the point).
+        #
+        # Position is load-bearing and belongs HERE rather than beside the
+        # qdrant block: `self.qdrant_url` reads this map below, and a later edit
+        # that drifts the population downward past the post-load re-assert would
+        # break that read. Everything between here and the read is pure
+        # `os.path.join` derivation — no env read, no file read — so this is the
+        # earliest slot that has `self.workspace_dir` to resolve for. (The
+        # `self.project` line above is a plain assignment that reads neither, so
+        # it does not move this boundary.)
+        self.env: Dict[str, str] = env.resolve_values(
+            RESOLVED_ENV_KEYS, self.workspace_dir, global_env_path()
+        )
 
         # Convention-path attributes — derived from the workspace, NOT file-schema
         # keys in v0.1 (a file occurrence is warn-tolerated). Consumers
@@ -279,11 +552,29 @@ class MitosConfig:
         # defaulting there would co-locate Mitos's collections in their instance
         # and share its wipe/contamination risk. :7333 fails safe (semantic just
         # degrades if Mitos's Qdrant isn't up). `docker compose up` starts it.
-        # QDRANT_URL overrides for anyone pointing at a different instance.
-        self.qdrant_url = os.environ.get("QDRANT_URL", "http://localhost:7333")
-        # Per-project by default so a shared Qdrant never mixes projects' decisions.
-        # An explicit qdrant_collection in .mitos/config.toml overrides this.
+        # QDRANT_URL overrides for anyone pointing at a different instance —
+        # resolved through the carrier above, so a URL living in the TARGET
+        # workspace's `.env` reaches every store construction no matter which
+        # directory the process was launched from. `.get(k, default)`, never
+        # `.get(k) or default`: an exported-empty QDRANT_URL resolves to `""`
+        # and must stay `""` (the second spelling silently restores the default).
+        self.qdrant_url = self.env.get("QDRANT_URL", "http://localhost:7333")
+        # Per-project so a shared Qdrant never mixes projects' decisions — and
+        # per-PATH, not per-name, so a copy of a workspace cannot address the
+        # original's vectors. Re-derived on every construction and NEVER persisted;
+        # a `qdrant_collection` line in the file cannot override it (it is retired).
         self.qdrant_collection = default_collection_name(self.workspace_dir)
+
+        # Retired file keys the workspace's config.toml actually carries:
+        # {key: the value found in the file}. Populated by `_load_config_file`,
+        # runtime-only, never persisted and absent from `to_dict()`. It exists so
+        # the CLI surfaces that PRINT a resolved value can name a surviving line as
+        # inert legacy config — the loader itself must stay mute (it runs once per
+        # MCP tool call over a stdio JSON-RPC channel where stdout is protocol, and
+        # `status` builds a second config of its own). General over the whole retired
+        # set rather than `qdrant_collection`-shaped: no key-specific branch in the
+        # loader, and a future retirement gets its data for free.
+        self.inert_file_keys: Dict[str, Any] = {}
 
         # Static-default schema keys — seeded from the single CONFIG_DEFAULTS map
         # (P11), the same map `mitos init` (6b) serializes. The keys are exactly the
@@ -304,14 +595,23 @@ class MitosConfig:
 
         self._load_config_file()
 
-        # Env wins over the config file for the Qdrant URL — matching the key
-        # resolution order (env → project .env → global .env) and the documented
-        # contract above ("QDRANT_URL overrides for anyone pointing at a different
-        # instance"). Before this re-assert, a toml-pinned qdrant_url silently
-        # shadowed the env var (AX 2026-07-18): the caller's override did nothing
-        # and nothing said so.
-        if os.environ.get("QDRANT_URL"):
-            self.qdrant_url = os.environ["QDRANT_URL"]
+        # The resolved env wins over the config file for the Qdrant URL — the same
+        # layering as the keys (env → project .env → global .env), now literally
+        # the same mechanism, and the documented contract above ("QDRANT_URL
+        # overrides for anyone pointing at a different instance"). Before this
+        # re-assert, a toml-pinned qdrant_url silently shadowed the env var
+        # (AX 2026-07-18): the caller's override did nothing and nothing said so.
+        #
+        # `QDRANT_URL` is deliberately NOT migrated out of `.env` into
+        # `config.toml`, where the schema key already lives: `mitos init`
+        # force-gitignores `.env` and never `config.toml`, so a project's
+        # `config.toml` is committable by intent and a user who put a
+        # secret-bearing remote URL in the gitignored file did so deliberately.
+        # The global tier is load-bearing for the same variable — a
+        # shared-instance URL is per-machine and naturally lives in the global
+        # `.env`.
+        if self.env.get("QDRANT_URL"):
+            self.qdrant_url = self.env["QDRANT_URL"]
 
     def _load_config_file(self) -> None:
         """Overlays `.mitos/config.toml` onto the defaults under the strict policy.
@@ -330,7 +630,10 @@ class MitosConfig:
               ``ConfigError`` (the silent-coerce OD1 forbids).
             - A missing known key → keeps the already-seeded default.
             - A recognized-but-retired key (``RETIRED_CONFIG_KEYS``) → tolerated and
-              skipped SILENTLY (not a typo; a per-call warning on it is just noise).
+              skipped SILENTLY (not a typo; a per-call warning on it is just noise),
+              before the type check, so a mistyped retired key is inert rather than
+              fatal. It is recorded in ``inert_file_keys`` for the CLI surfaces that
+              report a surviving line; this loader prints nothing.
             - A genuinely unknown key (a typo) → one calm stderr line, tolerated,
               skipped.
 
@@ -366,7 +669,11 @@ class MitosConfig:
                 # noise. A genuinely unknown key (a typo whose setting silently won't
                 # take effect) still earns one calm, terse, screen-reader-clean line
                 # to stderr (P9, no emoji) — that warning is the useful signal.
-                if key not in RETIRED_CONFIG_KEYS:
+                if key in RETIRED_CONFIG_KEYS:
+                    # Remembered, not applied: a printing surface can name it as
+                    # inert legacy config beside the value it claims to set.
+                    self.inert_file_keys[key] = val
+                else:
                     print(
                         f"Warning: ignoring unrecognized config key "
                         f"'{key}' in {config_path}",
@@ -405,10 +712,15 @@ class MitosConfig:
     def to_dict(self) -> Dict[str, Any]:
         """Converts configuration to dictionary form.
 
-        Includes the convention-path attributes, the two dynamic-default qdrant
-        keys, the kept-but-de-schema'd ``pending_threshold``, and the eight static
-        schema keys (sourced from ``CONFIG_DEFAULTS`` so the set can't drift). No
-        consumer binds this today; it exists for a future ``--json``/debug surface.
+        Includes the convention-path attributes, the two dynamically-defaulted
+        qdrant attributes, the kept-but-de-schema'd ``pending_threshold``, and the
+        eight static schema keys (sourced from ``CONFIG_DEFAULTS`` so the set can't
+        drift). ``qdrant_collection`` stays here even though it left the file
+        schema — that is the retirement pattern's promise: the attribute survives
+        at its computed default and every consumer binding it is unaffected.
+        ``inert_file_keys`` is deliberately absent (runtime-only, never persisted).
+        No consumer binds this today; it exists for a future ``--json``/debug
+        surface.
 
         Returns:
             A dictionary containing every configuration field.

@@ -11,6 +11,7 @@ Maintains strict compliance with the Mitos Framework (FRAMEWORK.md) and the 1:1
 test-to-code byte ratio constraint.
 """
 
+import json
 import os
 import shutil
 import tempfile
@@ -18,6 +19,7 @@ import pytest
 from typing import Tuple, List, Dict, Any
 from unittest.mock import MagicMock, patch
 
+from conftest import make_workspace
 from mitos.config import MitosConfig
 from mitos.store import GraphStore, ParsedEntry
 from mitos.mcp_server import query_decisions, surface_decisions
@@ -25,8 +27,15 @@ from mitos.mcp_server import query_decisions, surface_decisions
 
 @pytest.fixture
 def isolated_workspace() -> Tuple[MitosConfig, str]:
-    """Fixture that provisions a fully isolated temporary workspace for MCP tests."""
-    tmpdir = tempfile.mkdtemp()
+    """Fixture that provisions a fully isolated temporary workspace for MCP tests.
+
+    ``make_workspace`` first, and it is load-bearing rather than tidy: since 5b
+    every tool call resolves its ``project``, and resolution *validates* — a
+    directory holding only ``.mitos/`` is a half-workspace and would refuse with
+    ``target_path_not_a_workspace``, turning all seven rows below into an
+    unintended fault injection.
+    """
+    tmpdir = make_workspace(tempfile.mkdtemp())
     config = MitosConfig(tmpdir)
     config.db_path = os.path.join(tmpdir, ".mitos", "graph.sqlite")
     config.decisions_file = os.path.join(tmpdir, "decisions.md")
@@ -72,10 +81,20 @@ def test_mcp_unconfigured_vector_store_fallback(isolated_workspace) -> None:
     with patch("mitos.mcp_server.get_workspace_components", return_value=(store, None, mock_vector)):
         results = query_decisions(
             query="SQLite",
-            depth="letter"
+            depth="letter",
+            project=config.workspace_dir
         )
-        # Results should gracefully report that lookup failed or fall back safely
-        assert "error" in results or "failed" in results or len(results) >= 0
+        # The row's claim, stated so it can fail: a refused vector store comes
+        # back as the shared degraded envelope, never an `{error}` object and
+        # never a crash. Its third disjunct used to be `len(results) >= 0`,
+        # which is vacuously true — the assertion proved nothing about any
+        # output. Strengthened here rather than left, because 5b makes this call
+        # cross the targeting boundary and a row that cannot fail cannot report
+        # what the crossing did.
+        payload = json.loads(results)
+        assert payload["degraded"] == "lexical"
+        assert payload["degraded_reason"]
+        assert "error" not in payload
 
 
 # ==============================================================================
@@ -97,7 +116,8 @@ def test_mcp_query_extreme_inputs(isolated_workspace) -> None:
         # 1. Test empty query search
         res_empty = query_decisions(
             query="",
-            depth="letter"
+            depth="letter",
+            project=config.workspace_dir
         )
         assert len(res_empty) >= 0
         
@@ -105,7 +125,8 @@ def test_mcp_query_extreme_inputs(isolated_workspace) -> None:
         massive_query = "SQLite WAL " * 200
         res_massive = query_decisions(
             query=massive_query,
-            depth="letter"
+            depth="letter",
+            project=config.workspace_dir
         )
         assert len(res_massive) >= 0
         
@@ -113,7 +134,8 @@ def test_mcp_query_extreme_inputs(isolated_workspace) -> None:
         sql_injection = "' OR 1=1; DROP TABLE nodes; --"
         res_sql = query_decisions(
             query=sql_injection,
-            depth="letter"
+            depth="letter",
+            project=config.workspace_dir
         )
         assert len(res_sql) >= 0
 
@@ -144,20 +166,23 @@ def test_mcp_surface_invalid_scopes(isolated_workspace) -> None:
         # 1. Surface nonexistent scope
         res_nonexistent = surface_decisions(
             query="SQLite",
-            scope="nonexistent_scope"
+            scope="nonexistent_scope",
+            project=config.workspace_dir
         )
         assert "0 active decisions" in res_nonexistent or len(res_nonexistent) >= 0
         
         # 2. Surface empty scope
         res_empty = surface_decisions(
             query="SQLite",
-            scope=""
+            scope="",
+            project=config.workspace_dir
         )
         assert len(res_empty) >= 0
         
         # 3. Surface with special characters in scope name
         res_special = surface_decisions(
             query="SQLite",
-            scope="substrate' OR 1=1 --"
+            scope="substrate' OR 1=1 --",
+            project=config.workspace_dir
         )
         assert len(res_special) >= 0

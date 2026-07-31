@@ -8,13 +8,13 @@ canonical Mitos entries.
 import os
 import json
 import re
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 import anthropic
 
 from mitos.config import MitosConfig
-from mitos.errors import SynthesisError, ValidationError
-from mitos.models import get_model_id
+from mitos.errors import CollectionMissingError, SynthesisError, ValidationError
+from mitos.models import get_embedding_model_id, get_model_id
 from mitos.parser import ParsedEntry, parse_header
 from mitos.store import GraphStore, CommitDelta, _utc_now_iso
 from mitos.identity import compute_node_id, embedding_text
@@ -22,8 +22,24 @@ from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.vector_store import QdrantVectorStore
 from mitos.renderer import MitosRenderer
 
-def run_llm_prose_compression(client: anthropic.Anthropic, title: str, prose_content: str) -> Dict[str, Any]:
-    """Uses Claude Sonnet to faithfully compress a legacy prose ADR into canonical fields."""
+def run_llm_prose_compression(
+    client: anthropic.Anthropic,
+    title: str,
+    prose_content: str,
+    *,
+    model_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """Uses Claude Sonnet to faithfully compress a legacy prose ADR into canonical fields.
+
+    Args:
+        client: The Anthropic client the caller constructed.
+        title: The legacy ADR's heading.
+        prose_content: The legacy ADR's body.
+        model_id: The resolved id for ``SONNET``, taken off the calling
+            workspace's ``config.env``, or ``None`` for the baseline (2c). The
+            same string is stamped as the entry's ``confirmed_by``, so both come
+            from one resolution at the call site.
+    """
     prompt = f"""
 You are the Mitos v0.1 import compression scribe. Your task is to compress a legacy architectural decision record (ADR) into standard, highly precise Mitos fields.
 
@@ -51,10 +67,10 @@ Respond strictly in valid JSON format with the following keys:
 - amends (string or null)
 - resolves (string or null)
 """
-    model_id = get_model_id("SONNET")
+    resolved_model = model_id if model_id is not None else get_model_id("SONNET")
     try:
         message = client.messages.create(
-            model=model_id,
+            model=resolved_model,
             max_tokens=2000,
             temperature=0.3,
             messages=[
@@ -82,9 +98,18 @@ class MitosProseImporter:
         # Lazy load embeddings/vectors
         self.embed_provider = None
         self.vector_store = None
+
+        # Set once an entry's embed has met an absent collection it may not create, so
+        # an N-entry import prints ONE line instead of N and skips N−1 wasted round
+        # trips. Per importer instance — one per `mitos import` invocation.
+        self._collection_absent = False
         try:
             cache_path = os.path.join(self.config.mitos_dir, "embedding_cache.sqlite")
-            self.embed_provider = GeminiEmbeddingProvider(cache_path)
+            self.embed_provider = GeminiEmbeddingProvider(
+                cache_path,
+                api_key=self.config.env.get("GEMINI_API_KEY"),
+                model_id=get_embedding_model_id(self.config.env),
+            )
             self.vector_store = QdrantVectorStore(
                 self.config.qdrant_url,
                 self.config.qdrant_collection
@@ -138,12 +163,16 @@ class MitosProseImporter:
             print("No headings starting with ## or ### found in the import file.")
             return
 
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        api_key = self.config.env.get("ANTHROPIC_API_KEY")
         if use_llm_extract and not api_key:
             print("ANTHROPIC_API_KEY environment variable is not set. Import --llm-extract requires it.")
             return
 
         client = anthropic.Anthropic(api_key=api_key) if use_llm_extract else None
+        # One resolution for both consumers below — the id the compression call
+        # uses and the id stamped as `confirmed_by` are the same string by
+        # construction, not by two lookups that happen to agree.
+        sonnet_model_id = get_model_id("SONNET", self.config.env)
         renderer = MitosRenderer(self.config.workspace_dir)
 
         imported_count = 0
@@ -169,7 +198,9 @@ class MitosProseImporter:
             if use_llm_extract and client:
                 print(f"Compressing: {slug} ...")
                 try:
-                    compressed = run_llm_prose_compression(client, title or slug, raw_content)
+                    compressed = run_llm_prose_compression(
+                        client, title or slug, raw_content, model_id=sonnet_model_id
+                    )
                 except Exception as e:
                     print(f"[Warning] Failed to compress entry '{slug}': {str(e)}. Skipping.")
                     continue
@@ -206,7 +237,7 @@ class MitosProseImporter:
                 # column (§6.5) — the file:line provenance has no V1a home and is
                 # deferred (a V1b importer concern), not silently crash-on-write.
                 entry.source = "import_llm"
-                entry.confirmed_by = get_model_id("SONNET") if use_llm_extract else "user"
+                entry.confirmed_by = sonnet_model_id if use_llm_extract else "user"
                 entry.confirmed_at = _utc_now_iso()  # MI-10, as in sync's two writers
 
                 # Compute the stable slug-free V1a id (V1-D2) — matches commit_parsed_entry.
@@ -249,8 +280,23 @@ class MitosProseImporter:
             pass
 
     def _best_effort_embed(self, delta: CommitDelta, entry: ParsedEntry) -> None:
-        """Best-effort embedding upsert pipeline for imported nodes."""
+        """Best-effort embedding upsert pipeline for imported nodes.
+
+        Each call covers exactly one node, so it may create an absent collection only
+        on a genuinely fresh project — the same graph gate the ``sync`` write path uses.
+        Importing into a populated graph whose collection is absent would otherwise mint
+        precisely the partial index the gate exists to prevent, one entry deep.
+
+        The commit already enqueued every node and this method never dequeues, so the
+        durability of a deferral is free here; what the arm below adds is the **notice**
+        — the surrounding ``except Exception: pass`` would otherwise swallow the refusal
+        into complete silence.
+        """
         if not self.embed_provider or not self.vector_store:
+            return
+
+        if self._collection_absent:
+            # Reported once for this import; say nothing and spend nothing further.
             return
 
         payload = {
@@ -264,7 +310,23 @@ class MitosProseImporter:
         }
 
         try:
+            # Inside the try for the same reason as the sync twin: the graph read must
+            # not be able to escape a helper whose whole contract is best-effort.
+            may_create = not self.store.has_active_node_other_than(delta.node_id)
             vector = self.embed_provider.get_embedding(payload["embedding_text"], is_query=False)
-            self.vector_store.upsert(delta.node_id, vector, payload)
+            self.vector_store.upsert(
+                delta.node_id, vector, payload, may_create=may_create
+            )
+        except CollectionMissingError:
+            # Ahead of the bare swallow below — CollectionMissingError is a
+            # VectorStoreError subclass, so `except Exception: pass` would catch it and
+            # the import would report N nodes committed with no hint that none of them
+            # reached the index.
+            self._collection_absent = True
+            print(
+                "[Warning] Embeddings deferred for this import: the Qdrant collection "
+                "is missing and these writes do not cover the active set. Every node is "
+                "queued — run `mitos reconcile` to build the index in one pass."
+            )
         except Exception:
             pass

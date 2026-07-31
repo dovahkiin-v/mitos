@@ -277,7 +277,7 @@ def test_mcp_record_decision_pauses(ws):
     config, _ = ws
     with patch("mitos.mcp_server.MitosConfig", return_value=config), \
          patch.object(MitosSyncManager, "_review_neighbors", return_value=_FLAGGED):
-        res = json.loads(mcp_server.record_decision("A new call.", "rej", ["s"], slug="newcall"))
+        res = json.loads(mcp_server.record_decision("A new call.", "rej", ["s"], slug="newcall", project=config.workspace_dir))
     assert res["status"] == "needs_review" and res["neighbors"] == _FLAGGED
     assert GraphStore(config.db_path).get_node_by_slug("newcall") is None
 
@@ -289,7 +289,7 @@ def test_mcp_record_decision_acknowledge_commits(ws):
     with patch("mitos.mcp_server.MitosConfig", return_value=config), \
          patch.object(MitosSyncManager, "_review_neighbors", return_value=_FLAGGED):
         res = json.loads(mcp_server.record_decision("A new call.", "rej", ["s"],
-                                                    slug="newcall", acknowledge_neighbors=True))
+                                                    slug="newcall", acknowledge_neighbors=True, project=config.workspace_dir))
     assert res["status"] == "created"
     assert GraphStore(config.db_path).get_node_by_slug("newcall") is not None
 
@@ -379,11 +379,21 @@ def test_cli_mcp_record_pause_parity(ws, capsys):
         cli_payload = json.loads(capsys.readouterr().out)
         mcp_payload = json.loads(mcp_server.record_decision(
             "Adopt SQLite as the storage engine.", "rej", ["db"],
-            slug="adopt-sqlite"))
+            slug="adopt-sqlite", project=config.workspace_dir))
 
     assert cli_payload["neighbors"] == mcp_payload["neighbors"]
     assert cli_payload["code"] == mcp_payload["code"] == "similar_decision_exists"
     assert cli_payload["message"] == mcp_payload["message"]
+
+    # The `needs_review` receipt is stamped too — the fourth outcome shape, whose
+    # other three live in `tests/test_corpus_provenance.py`. It is asserted here
+    # because this is where the armed review machinery lives. Both surfaces get
+    # the same config (the CLI's directly, the MCP's through the patched
+    # `MitosConfig`), so the two stamps must agree as well as be present.
+    for payload in (cli_payload, mcp_payload):
+        assert payload["project"] == config.project
+        assert payload["collection"] == config.qdrant_collection
+        assert payload["workspace"] == config.workspace_dir
 
     # The enriched shape in its contractual key order, the stamp riding last.
     n = cli_payload["neighbors"][0]
@@ -421,12 +431,20 @@ def test_cli_record_pause_renders_enrichment_and_stamp(ws, capsys):
             cmd_record(config, axiom="Adopt SQLite as the storage engine.",
                        rejected="rej", scope=["db"], slug="adopt-sqlite")
     assert exc.value.code == 2
-    err = capsys.readouterr().err
+    captured = capsys.readouterr()
+    err = captured.err
     assert "use-sqlite" in err
     assert "Rejected Postgres" in err
     assert "scope: db" in err
     assert "amended by: use-sqlite-wal" in err
     assert "possible tension" not in err
+    # The pause answers on STDERR, so its corpus echo does too (§4.7 rides the
+    # response's own channel). This is the sharpest case for that rule: nothing
+    # was written, and the agent reading the refusal is reading stderr — an echo
+    # pinned to stdout would be missing from exactly the response that needs it.
+    assert f"corpus: {config.project}" in err
+    assert config.qdrant_collection in err and config.workspace_dir in err
+    assert "corpus: " not in captured.out
 
 
 def test_mcp_record_docstring_pins_enriched_protocol():
@@ -942,3 +960,29 @@ def test_cli_record_json_carries_degraded_notice(ws, capsys):
     assert data["status"] == "created"
     assert "vector store unavailable" in data["neighbor_review_unavailable"]
     assert "down" not in data["neighbor_review_unavailable"]
+
+
+def test_cli_record_notice_names_the_missing_collection_and_its_heal(ws, capsys):
+    """A missing collection words itself as itself, with the one command that fixes it.
+
+    The unmapped fallback (``reason.value.replace("_", " ")``) already yields the
+    readable-but-heal-less string "collection missing" — so a test that only greps
+    the noun would pass over an omitted map entry. Assert the ``mitos reconcile``
+    pointer: that is the part the fallback cannot produce.
+    """
+    config, _ = ws
+    unavailable = Unavailable(
+        reason=ConflictUnavailableReason.COLLECTION_MISSING,
+        detail="Qdrant collection 'mitos-x' does not exist",
+    )
+    with patch.object(MitosSyncManager, "_review_neighbors", return_value=unavailable):
+        cmd_record(config, axiom="A new call.", rejected="rej", slug="degcoll",
+                   as_json=True)
+    data = json.loads(capsys.readouterr().out)
+    notice = data["neighbor_review_unavailable"]
+
+    assert data["status"] == "created"          # fail-open: the commit still lands
+    assert "collection is missing" in notice
+    assert "mitos reconcile" in notice
+    assert "vector store unavailable" not in notice
+    assert "mitos-x" not in notice              # detail is logging-only, never rendered

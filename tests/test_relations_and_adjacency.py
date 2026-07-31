@@ -418,10 +418,11 @@ def test_cli_cmd_record_corrects_kill_edge(ws):
 
 
 @patch("mitos.cli.cmd_record")
-def test_cli_relation_flags_route(mock_record, monkeypatch):
+def test_cli_relation_flags_route(mock_record, monkeypatch, workspace):
     """The --corrects/--depends-on/--amends/--cites/etc. flags reach cmd_record."""
     monkeypatch.setattr(sys, "argv", [
-        "mitos", "record", "ax", "--rejected", "r", "--slug", "the-slug",
+        "mitos", "-p", workspace, "record", "ax", "--rejected", "r",
+        "--slug", "the-slug",
         "--corrects", "korrekt",
         "--depends-on", "foo", "--amends", "bar", "--cites", "baz",
         "--derives-from", "qux", "--contradicts", "quux", "--narrows", "corge",
@@ -445,9 +446,9 @@ def test_mcp_record_decision_with_relation(ws):
     config, _ = ws
     with patch("mitos.mcp_server.MitosConfig", return_value=config):
         from mitos.mcp_server import record_decision
-        json.loads(record_decision("Target.", "rej", ["s"], slug="mcp-target"))
+        json.loads(record_decision("Target.", "rej", ["s"], slug="mcp-target", project=config.workspace_dir))
         res = json.loads(record_decision("Linker.", "rej", ["s"], slug="mcp-linker",
-                                         depends_on="mcp-target"))
+                                         depends_on="mcp-target", project=config.workspace_dir))
     assert res["status"] == "created"
     assert "**Depends-On:** mcp-target" in _read(config)
     assert _edge(GraphStore(config.db_path), "mcp-linker", "mcp-target", "depends_on")
@@ -470,10 +471,10 @@ def test_mcp_record_decision_supersedes_comma_separated(ws):
     config, _ = ws
     with patch("mitos.mcp_server.MitosConfig", return_value=config):
         from mitos.mcp_server import record_decision
-        json.loads(record_decision("A.", "rej", ["s"], slug="m-a"))
-        json.loads(record_decision("B.", "rej", ["s"], slug="m-b"))
+        json.loads(record_decision("A.", "rej", ["s"], slug="m-a", project=config.workspace_dir))
+        json.loads(record_decision("B.", "rej", ["s"], slug="m-b", project=config.workspace_dir))
         res = json.loads(record_decision("Unifier.", "rej", ["s"], slug="m-unifier",
-                                         supersedes="m-a, m-b"))
+                                         supersedes="m-a, m-b", project=config.workspace_dir))
     assert res["status"] == "created", res
     store = GraphStore(config.db_path)
     assert _edge(store, "m-unifier", "m-a", "supersedes")
@@ -485,8 +486,8 @@ def test_mcp_record_decision_corrects_kill_edge(ws):
     config, _ = ws
     with patch("mitos.mcp_server.MitosConfig", return_value=config):
         from mitos.mcp_server import record_decision
-        json.loads(record_decision("Target.", "rej", ["s"], slug="mcp-ktarget"))
+        json.loads(record_decision("Target.", "rej", ["s"], slug="mcp-ktarget", project=config.workspace_dir))
         res = json.loads(record_decision("Corrector.", "rej", ["s"], slug="mcp-kcorrector",
-                                         corrects="mcp-ktarget"))
+                                         corrects="mcp-ktarget", project=config.workspace_dir))
     assert res["status"] == "created"
     assert _edge(GraphStore(config.db_path), "mcp-kcorrector", "mcp-ktarget", "corrects")

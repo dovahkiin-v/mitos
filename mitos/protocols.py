@@ -50,13 +50,18 @@ class EmbeddingProvider(Protocol):
 class VectorStore(Protocol):
     """Protocol for point-management and semantic similarity query interfaces."""
 
-    def upsert(self, point_id: str, vector: List[float], payload: Dict[str, Any]) -> None:
+    def upsert(self, point_id: str, vector: List[float], payload: Dict[str, Any],
+               *, may_create: bool) -> None:
         """Upserts a single vector and payload into the vector index.
 
         Args:
             point_id: The SHA-256 node ID.
             vector: The embedding vector values.
             payload: Node metadata.
+            may_create: Whether this write covers the workspace's active set and may
+                therefore bring an absent index into existence. Required and
+                keyword-only — every write site declares (see
+                :meth:`~mitos.vector_store.QdrantVectorStore.upsert`).
         """
         ...
 

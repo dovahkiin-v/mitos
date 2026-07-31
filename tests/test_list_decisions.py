@@ -109,7 +109,7 @@ def test_mcp_list_decisions_complete_set(ws) -> None:
 
     store = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
-        resp = json.loads(mcp_server.list_decisions(scope="zone"))
+        resp = json.loads(mcp_server.list_decisions(scope="zone", project=config.workspace_dir))
 
     assert resp["total"] == 6
     assert len(resp["decisions"]) == 6
@@ -138,8 +138,8 @@ def test_mcp_list_decisions_state_all_includes_superseded(ws) -> None:
     store = GraphStore(config.db_path, read_only=True)
 
     with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
-        active = json.loads(mcp_server.list_decisions(scope="api"))
-        every = json.loads(mcp_server.list_decisions(scope="api", state="all"))
+        active = json.loads(mcp_server.list_decisions(scope="api", project=config.workspace_dir))
+        every = json.loads(mcp_server.list_decisions(scope="api", state="all", project=config.workspace_dir))
 
     assert {d["slug"] for d in active["decisions"]} == {"v2"}
     assert {d["slug"] for d in every["decisions"]} == {"v1", "v2"}
@@ -171,9 +171,9 @@ def test_cmd_list_empty_graph_message(ws, capsys) -> None:
 
 
 @patch("mitos.cli.cmd_list")
-def test_list_decisions_alias_routes(mock_list, monkeypatch) -> None:
+def test_list_decisions_alias_routes(mock_list, monkeypatch, workspace) -> None:
     """The MCP-name alias `list_decisions` routes to cmd_list with --json plumbed."""
-    monkeypatch.setattr(sys, "argv", ["mitos", "list_decisions", "--scope", "api", "--json"])
+    monkeypatch.setattr(sys, "argv", ["mitos", "-p", workspace, "list_decisions", "--scope", "api", "--json"])
     main()
     mock_list.assert_called_once()
     _, kwargs = mock_list.call_args
@@ -189,7 +189,7 @@ def test_surface_note_points_to_exhaustive_path(ws) -> None:
     store = GraphStore(config.db_path, read_only=True)
     # No embed/vector → falls back to scope pre-filter, which populates results.
     with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
-        resp = json.loads(mcp_server.surface_decisions(query="anything", scope="db"))
+        resp = json.loads(mcp_server.surface_decisions(query="anything", scope="db", project=config.workspace_dir))
     assert resp["active_decisions"]
     assert "note" in resp and "list_decisions" in resp["note"]
 
@@ -266,7 +266,7 @@ def test_mcp_list_decisions_absent_scope_in_band_signal(ws) -> None:
     _record(m, "d", scope=["db"])
     store = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
-        resp = json.loads(mcp_server.list_decisions(scope="ath"))
+        resp = json.loads(mcp_server.list_decisions(scope="ath", project=config.workspace_dir))
     assert resp["decisions"] == [] and resp["open_questions"] == []
     assert resp["scope_known"] is False
     rec = resp["scope_recovery"]
@@ -283,7 +283,7 @@ def test_mcp_list_decisions_live_scope_envelope_unchanged(ws) -> None:
     _record(m, "a", scope=["auth"])
     store = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
-        resp = json.loads(mcp_server.list_decisions(scope="auth"))
+        resp = json.loads(mcp_server.list_decisions(scope="auth", project=config.workspace_dir))
     assert resp["decisions"]
     assert "scope_known" not in resp and "scope_recovery" not in resp
 
@@ -298,7 +298,7 @@ def test_cli_mcp_fire_same_signal(ws, capsys) -> None:
     cli = json.loads(capsys.readouterr().out)
     store = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
-        mcp = json.loads(mcp_server.list_decisions(scope="ath"))
+        mcp = json.loads(mcp_server.list_decisions(scope="ath", project=config.workspace_dir))
     assert cli["scope_known"] is False and mcp["scope_known"] is False
     # Both name the same did-you-mean; the call-form differs by surface.
     assert "'auth'" in cli["scope_recovery"] and "'auth'" in mcp["scope_recovery"]

@@ -56,7 +56,7 @@ from mitos.conflict import (
     ConflictUnavailableReason,
     Unavailable,
 )
-from mitos.errors import DatabaseError, VectorStoreError
+from mitos.errors import CollectionMissingError, DatabaseError, VectorStoreError
 from mitos.parser import ParsedEntry
 from mitos.store import GraphStore
 from mitos.telemetry import ConflictCheckRow, JudgmentBatch, TelemetryStore
@@ -732,6 +732,45 @@ def test_sweep_trip_alone_exits_2(
     )
 
     assert run_degradations(result) == ("sweep",)
+    assert exit_code_for(result) == 2
+
+
+def test_collection_missing_adds_its_cause_token_alongside_sweep(
+    temp_store: GraphStore, temp_telemetry: TelemetryStore
+) -> None:
+    """1b: a missing collection emits ``collection_missing`` IN ADDITION to ``sweep``.
+
+    Additive, never substitutive. ``sweep`` is a shipped P18 trend token whose rule
+    is additive-evolution-only; replacing it for this case would silently narrow its
+    meaning and make a trend query on ``sweep`` under-count. The effect is unchanged
+    (the sweep degraded) — this names the cause, and the word maps hang the heal off
+    it. Declaration order puts the new token last.
+
+    The narrowness is the other half of the claim, and
+    ``test_sweep_trip_alone_exits_2`` above is its tripwire: a plain
+    ``VectorStoreError`` must keep producing ``("sweep",)`` alone, because the token
+    derives from the typed reason and not from "any vector fault".
+    """
+    a_axiom = "Collection-missing axiom alpha."
+    b_axiom = "Collection-missing axiom beta."
+    _commit(temp_store, "coll-a", a_axiom)
+    _commit(temp_store, "coll-b", b_axiom)
+    _drain_outbox(temp_store)
+    neighbourhoods = {a_axiom: [], b_axiom: []}
+
+    plan = _plan(
+        temp_store,
+        neighbourhoods,
+        temp_telemetry,
+        vector_raises={a_axiom: CollectionMissingError(
+            "Qdrant collection 'mitos-x' does not exist", collection="mitos-x"
+        )},
+    )
+    result = execute_corpus_check(
+        plan, judge=_canned_judge(plan), telemetry=temp_telemetry, store=temp_store
+    )
+
+    assert run_degradations(result) == ("sweep", "collection_missing")
     assert exit_code_for(result) == 2
 
 

@@ -270,17 +270,17 @@ def letter_payload(
     return payload
 
 
-# The single not-found hint for the state-agnostic dereference (`mitos show` /
-# the `show_node` MCP twin). Static and hedged — it reads no buffer, so it is
-# truthful for both a typo and an authored-but-unsynced draft (it never asserts
-# presence). Single-sourced here so the not-found JSON object (`{found, ident,
-# hint}`) is byte-equal CLI⇄MCP — the one string the genuine-absence parity
-# assertion reads. Must keep the `mitos sync` + `decisions.md/questions.md`
-# substrings (the CLI not-found test pins them).
-SHOW_NOT_FOUND_HINT = (
-    "not in graph — if you just authored it in decisions.md/questions.md, "
-    "run `mitos sync`"
-)
+# The not-found hint for the state-agnostic dereference used to live here, single-
+# sourced so the `{found, ident, hint}` object was byte-equal CLI⇄MCP. 6c removed
+# that single-sourcing, and the reason is the one this leaf cannot host: the
+# correct recovery genuinely DIFFERS per surface. The CLI wants a `mitos sync`
+# naming the selector the caller used; the MCP surface may name no shell command
+# at all (`agent-error-surface-never-prescribes-state-creating-setup`), and a
+# selectored CLI string parked here would red `display.py`'s own FORBIDDEN_SYNTAX
+# literal sweep. So each boundary composes its own: `cli._show_not_found_hint`
+# and `mcp_server.SHOW_NOT_FOUND_HINT`. What stays shared is the *shape* —
+# `show_payload` below, and the not-found object's key set, which the parity row
+# still pins.
 
 
 def show_payload(
@@ -341,6 +341,51 @@ def show_payload(
         }
     payload.update(modifiers)
     return payload
+
+
+def projects_payload(reg: Mapping[str, str], registry_path: str) -> Dict[str, Any]:
+    """Shapes the machine-local project listing, shared CLI⇄MCP.
+
+    The one builder behind both ``mitos projects --json`` (``cmd_projects``) and
+    the ``list_projects`` MCP tool, so the discovery shape **cannot drift**
+    between the two surfaces — the twin-parity pattern, lifted here at its second
+    consumer exactly as :func:`show_payload` and :func:`letter_payload` were.
+
+    Registry **document order throughout, never sorted**: that is the order a
+    reverse lookup resolves its first match in, so a listing that re-ordered it
+    would show something other than what actually decides.
+
+    An empty registry is a clean ``count: 0`` envelope — a machine with nothing
+    registered yet is healthy, not broken, and this leaf says nothing about it
+    beyond the count. What a caller should *do* about an empty registry is each
+    surface's wording (the CLI prescribes the setup act; the MCP description
+    names the absolute-path escape hatch), so no such sentence is shaped here.
+
+    Stays a pure dict→dict Tier-1 leaf: it takes the **already-loaded** registry
+    and its path as arguments and does no I/O of its own. Homed here rather than
+    beside ``registry.load`` deliberately — one line from the read, the next
+    maintainer folds the read inside and the leaf re-reads the registry per call;
+    here that is unreachable without an import this module's tier forbids.
+
+    Args:
+        reg: An already-loaded ``name → workspace path`` registry, in document
+            order (``registry.load()``).
+        registry_path: The registry file's path, reported so a caller can find
+            the file whether or not it exists yet.
+
+    Returns:
+        ``{"registry_path": str, "count": int, "projects": [{"name", "path"}, …]}``
+        — JSON-native throughout: ``projects`` is a **list** of dicts, never a
+        list of tuples (a tuple survives in-process and becomes a list across the
+        JSON round trip, so the two surfaces would disagree on shape depending on
+        how each was tested). ``count == len(projects)``.
+    """
+    projects = [{"name": name, "path": path} for name, path in reg.items()]
+    return {
+        "registry_path": registry_path,
+        "count": len(projects),
+        "projects": projects,
+    }
 
 
 def dumps_display(obj: Any, *, ensure_ascii: bool, indent: Optional[int] = 2) -> str:

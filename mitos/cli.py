@@ -15,11 +15,14 @@ import sqlite3
 import hashlib
 import argparse
 from datetime import datetime, timezone
-from typing import Callable, List, Optional, Dict, Any, Set, Tuple
+from typing import Callable, List, Mapping, Optional, Dict, Any, Set, Tuple
 from google import genai
 
 from mitos import __version__
 from mitos import check
+from mitos import overview
+from mitos import registry
+from mitos import routing
 from mitos.display import (
     apply_stdout_text_safety,
     blackout_note,
@@ -29,36 +32,45 @@ from mitos.display import (
     oneline_axiom,
     oneline_payload,
     order_scope_counts,
+    projects_payload,
     truncate_words,
     resolve_display_ensure_ascii,
     show_payload,
-    SHOW_NOT_FOUND_HINT,
 )
 from mitos.config import (
     MitosConfig,
     CONFIG_DEFAULTS,
     default_collection_name,
     global_env_path,
-    hint_due,
+    toml_scalar,
 )
 from mitos.errors import (
     MitosError, ParseError, ValidationError, DatabaseError, ConfigError,
-    VectorStoreError, EmbeddingError,
+    VectorStoreError, CollectionMissingError, EmbeddingError,
+    ProjectTargetingError, RegistryError,
+    EXEMPT_CREATES_REGISTRATION, EXEMPT_EXPLICITLY_GLOBAL, EXEMPT_NO_WORKSPACE,
+    TARGET_EXEMPT_VERB, TARGET_MISSING, TARGET_PATH_NOT_A_WORKSPACE,
+    TARGET_RELATIVE_PATH, TARGET_UNKNOWN_NAME,
 )
 from mitos.divergence import corpus_graph_divergence, divergence_total
+from mitos.env import resolve_key
 from mitos.vector_store import scroll_point_ids, hash_to_uuid, QdrantVectorStore
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.telemetry import TelemetryStore, ConflictCheckRow, JudgmentBatch
 from mitos.identity import compute_node_id
-from mitos.models import get_model_id
-from mitos.parser import ParsedEntry, parse_entry_stream, read_text_or_none
-from mitos.conflict import run_conflict_check, ConflictUnavailableReason
+from mitos.models import get_embedding_model_id, get_model_id
+from mitos.parser import (ParsedEntry, corpus_has_entries, parse_entry_stream,
+                          read_text_or_none)
+from mitos.conflict import (run_conflict_check, ConflictUnavailableReason,
+                            SEMANTIC_SUBSTRATE_REASONS)
 from mitos.migrations import is_pre_v1a_schema
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS, open_connection
 from mitos.cutover import default_aside_db_path, perform_swap, rebuild_and_gate
 from mitos.lexical import degraded_reason_from_error, lexical_fallback
 from mitos.recall import (assess_surface_recall, corpus_provenance,
-                          provenance_line, scope_filter_recovery)
+                          missing_graph_is_a_gap, missing_graph_note,
+                          missing_index_is_a_gap, provenance_line,
+                          scope_filter_recovery)
 from mitos.sync import (MitosSyncManager, run_ambient_capture, _SLUG_MAX_LEN,
                         _ENTRIES_MARKER, _PAUSE_RESOLVING_RELATIONS)
 from mitos._agent_block import agent_block, agent_block_drift, AGENT_GUIDE_VERSION
@@ -70,21 +82,30 @@ from mitos.importer import MitosProseImporter
 # Lazy by design (§6 description economy): zero context cost until --help is
 # invoked, so it can afford the expansive examples the eager MCP descriptions
 # can't. Teaches the surface→record reflex, the scope vocabulary, workspace
-# targeting (-C), and the relation-edge guidance. Every flag/verb shown here is
+# targeting (-p), and the relation-edge guidance. Every flag/verb shown here is
 # real CLI surface — keep it runnable, never invent a flag (there is no
 # --retired edge). Rendered verbatim via RawDescriptionHelpFormatter.
+#
+# EVERY worked example names its project, because since 5a every verb below
+# requires one. This block is 5,000 lines from the parser that renders it, so an
+# audit scoped to "help text" misses it — grep the string, not the parser.
 _EPILOG = """\
 Examples:
   # Before deciding: surface precedent, then record the outcome you chose
-  mitos surface "cache invalidation strategy"
-  mitos record "Write-through cache for session data" \\
+  # (`-p` names the project: a registered name — see `mitos projects` — or an
+  #  absolute path. It is accepted on either side of the verb.)
+  mitos -p myproject surface "cache invalidation strategy"
+  mitos -p myproject record "Write-through cache for session data" \\
     --rejected "write-back: data loss on crash" --scope cache --slug write-through-sessions
 
   # Discover the scope vocabulary before you invent a near-duplicate tag
-  mitos scopes
+  mitos -p myproject scopes
 
-  # Operate on another workspace without cd (git's -C; must precede the verb)
-  mitos -C /path/to/repo list --scope auth
+  # What does this machine have? (the only workspace-free report)
+  mitos status
+
+  # Operate on a workspace by path, from anywhere
+  mitos -p /path/to/repo list --scope auth
 
 Relating a decision to a prior (pass the prior's EXACT slug):
   --supersedes a,b   priors you've outgrown / evolved past (comma-separated for several)
@@ -110,6 +131,44 @@ def _emit_json(obj: Any, *, indent: Optional[int] = 2) -> None:
         None.
     """
     print(dumps_display(obj, ensure_ascii=resolve_display_ensure_ascii(sys.stdout), indent=indent))
+
+
+def _echo_corpus(config: MitosConfig, *, file=None) -> None:
+    """Prints the standard corpus echo, leading a response on its own channel (§4.7).
+
+    One spelling for every text site: ``recall.provenance_line`` renders the three
+    fields the ``--json`` payloads carry as keys, so the two channels can never
+    disagree about which corpus answered. The value is read off the config the
+    caller's selector resolved — never re-derived here (``recall``'s docstrings
+    state why: a stamp-time reverse lookup silently echoes a path for a registered
+    project on a symlinked route).
+
+    ``file`` exists because several handlers answer on stderr in some branches and
+    stdout in others: an echo pinned to stdout is invisible to a caller reading the
+    stderr answer, which is exactly the agent-facing path on ``record``'s pause. The
+    echo leads the response *on the response's own channel*.
+
+    **It flushes, and that is load-bearing rather than tidy.** Several handlers take
+    this echo at the top, *before* the store construction that can raise — and a
+    raise there is rendered by ``main()``'s boundary on stderr, which is unbuffered
+    while a piped stdout is not. Measured without the flush:
+    ``mitos scopes | cat`` on an unopenable graph printed ``Error: …`` *above* the
+    echo, so the reader's opening line was a refusal for a command that had already
+    named its corpus. Flushing here fixes the whole class in one place instead of at
+    every leading site; a handler that then prints more before a stderr write still
+    owes its own flush (``cmd_restore_source`` does).
+
+    Args:
+        config: The resolved workspace config (carries ``project`` /
+            ``qdrant_collection`` / ``workspace_dir``).
+        file: The stream the response rides; ``None`` ⇒ stdout.
+
+    Returns:
+        None.
+    """
+    stream = file or sys.stdout
+    print(provenance_line(config), file=stream)
+    stream.flush()
 
 
 # Shared route-to-cutover guidance. `mitos init` raises it (DatabaseError),
@@ -255,46 +314,170 @@ def _extract_sample_block(spec: str, header: str) -> str:
     return match.group(1).strip() if match else ""
 
 
-def _toml_scalar(value: Any) -> str:
-    """Serializes a v0.1 config scalar to its TOML right-hand-side literal.
+def _registration_line(outcome: registry.RegistrationOutcome) -> str:
+    """Renders ``init``'s one-line registration confirmation.
 
-    A deliberately tiny serializer for exactly the value set the schema uses —
-    plain strings (no embedded ``"`` or newline), integers, and booleans — NOT a
-    general TOML writer. The stdlib ``tomllib`` is read-only and P19 forbids pulling
-    ``tomli-w`` for a handful of flat scalars, so ``mitos init`` seeds ``config.toml``
-    through this (mirrors the project's hand-rolled ``.env``/config readers).
+    Names the registered name and the resolved path — the whole truth available at
+    registration time, and the pair a later name-targeted command resolves through.
+    """
+    if outcome.action == "reasserted":
+        return f'Already registered as "{outcome.name}" → {outcome.path}'
+    if outcome.action == "repointed":
+        return (
+            f'Repointed "{outcome.name}" → {outcome.path} '
+            f"(was {outcome.previous_path})"
+        )
+    return f'Registered as "{outcome.name}" → {outcome.path}'
 
-    The ``bool`` branch MUST stay above the ``int`` branch: ``bool`` subclasses
-    ``int``, so an int-first order would emit ``True`` as ``1`` instead of ``true``.
+
+def _status_subject(workspace_dir: str, project: Optional[str]) -> str:
+    """Names the project a `mitos status` report is about, in the caller's vocabulary.
+
+    An operator who addressed a project by its registered name should read that
+    name back — a report headed by a path alone leaves them matching directories by
+    eye to confirm the tool heard them. The directory stays present regardless:
+    which directory answered is the other half of the question, and 5a's flip makes
+    the named form the ordinary one.
+
+    The name is rendered through ``repr`` (1d's ``_inert_pin_note`` idiom). It is
+    the one registry field ``registry.load`` validates nothing about — the read gate
+    checks the *value* is a string and absolute, never the *key* — so a hand-edited
+    name can carry a newline or an ESC and reach a terminal intact. It was rendered
+    raw until 6c and deliberately so, because ``mitos projects`` and the 4a overview
+    table also rendered it raw and a unilateral divergence would give one listing
+    several spellings; the closed set was **three** surfaces, and 6c fixed all three
+    in one edit rather than leaving the audit closable with one still raw.
+
+    The **directory** stays raw, which is not an oversight either: it keeps this
+    branch byte-identical to the shipped path-only form below, and a path is rendered
+    raw by every other report surface in the tree, so escaping it here alone would
+    re-create exactly the several-spellings drift the name fix removes.
 
     Args:
-        value: The config value to serialize (``str``, ``int``, or ``bool``).
+        workspace_dir: The absolute directory the report is about.
+        project: The registered name the caller used, or ``None`` when they named
+            a path (or nothing).
 
     Returns:
-        The TOML literal — e.g. ``'"archive"'`` for a string, ``'50'`` for an int,
-        ``'true'``/``'false'`` for a bool.
-
-    Raises:
-        TypeError: If the value is not a plain ``str``/``int``/``bool``, or is a
-            ``str`` containing a ``"`` or newline (beyond this serializer's scope).
+        The header subject — byte-identical to the shipped path-only form when no
+        name was supplied.
     """
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, str):
-        if '"' in value or "\n" in value:
-            raise TypeError(
-                f"_toml_scalar only handles simple strings without quotes or "
-                f"newlines (got {value!r})"
-            )
-        return f'"{value}"'
-    raise TypeError(
-        f"_toml_scalar cannot serialize {type(value).__name__}: {value!r}"
+    if project is None:
+        return workspace_dir
+    return f"{project!r} ({workspace_dir})"
+
+
+def _inert_pin_note(config: MitosConfig, *, offer_deletion: bool = False) -> Optional[str]:
+    """Renders the one-line notice that a retired ``qdrant_collection`` pin survives.
+
+    ``qdrant_collection`` used to be a config-file override, and ``mitos init`` used
+    to materialize the derived name into ``.mitos/config.toml``. Both are gone: the
+    collection is now derived from the workspace path on every construction and the
+    file key is retired, so a surviving line is inert. But it is *visible*, and a
+    reader who finds a name in the config file and a different name on this report
+    deserves to be told which one is real rather than left to guess.
+
+    One renderer, both surfaces (``status``'s collection row and ``init``'s echo), so
+    the two wordings cannot drift. It lives here rather than in ``display.py``
+    because that leaf is the CLI⇄MCP parity seam and the server has no surface for a
+    workspace's config file — putting it there would widen a leaf for a consumer
+    that does not exist.
+
+    Only ``qdrant_collection`` is reported, though ``config.inert_file_keys`` carries
+    every retired key the file holds: a note belongs beside the resolved value it
+    claims to set, and this is the only retired key whose value is printed anywhere.
+    Naming ``pending_threshold`` — which sits in every pre-V1a-seeded file — would
+    re-import exactly the false-alarm-on-every-invocation noise that the retired-key
+    silence exists to prevent.
+
+    Args:
+        config: The workspace config, already loaded (so ``inert_file_keys`` is
+            populated).
+        offer_deletion: Append the recovery clause. ``status`` sets it — a diagnostic
+            surface owes a way forward, and deleting a line nothing reads creates no
+            state. ``init``'s echo stays a bare receipt.
+
+    Returns:
+        The note, or ``None`` when the workspace carries no such line — which is
+        every workspace ``init`` has scaffolded since the key was retired.
+    """
+    if "qdrant_collection" not in config.inert_file_keys:
+        return None
+    pinned = config.inert_file_keys["qdrant_collection"]
+    # `!r`, not `{pinned}`, and not only for type honesty (an `int` pin renders as
+    # `123`, a `str` quoted). The value is UNTRUSTED author-supplied text, and a TOML
+    # basic string can carry ``\n`` and ``\u001b`` escapes — `repr` escapes both, so a
+    # pinned value cannot break this single line or smuggle an ANSI sequence onto the
+    # terminal. Tidying this to a plain interpolation would reopen that.
+    note = (
+        f"config.toml pins qdrant_collection = {pinned!r} — inert legacy config, "
+        f"ignored; this workspace uses '{config.qdrant_collection}', derived from "
+        f"its path"
     )
+    if offer_deletion:
+        note += ". The line can be deleted; nothing reads it"
+    return note
 
 
-def cmd_init(config: MitosConfig) -> None:
+#: The one wording for "your vectors may be under a different name" — rendered on
+#: both carry-over triggers, so the two cannot drift into two half-truths. It is a
+#: statement of fact plus the named heal, never a diagnosis: `init` must work on a
+#: fresh, service-less machine, so it makes NO network call and therefore cannot
+#: know whether the new collection is actually empty. `mitos reconcile` ships today
+#: (it re-embeds the active set against whatever collection is in force), so the
+#: pointer names a capability this release has, not one a later phase brings.
+_COLLECTION_CARRY_OVER_POINTER = (
+    "If this workspace's vectors were built under the old name, "
+    "`mitos reconcile` rebuilds them here."
+)
+
+
+def _collection_echo_lines(config: MitosConfig,
+                           outcome: registry.RegistrationOutcome) -> List[str]:
+    """Renders ``init``'s collection line, plus the carry-over pointer when it applies.
+
+    ``init`` is the moment a project *becomes* resolvable, and the only place a
+    human meets its registered name, its path and its derived collection together —
+    which matters more since the collection name became a path hash, deliberately
+    less legible than the old basename. This is the line that pays that cost down.
+
+    Composed from the **registration outcome**, never from
+    :func:`~mitos.recall.provenance_line`: ``init`` is selector-exempt, so ``main()``
+    resolves no target and ``config.project`` is the workspace *path*. The standard
+    echo would therefore print a path at the one surface whose whole point is the
+    *name*, and every existing row would stay green.
+
+    Two triggers, both computable with no network probe:
+
+    * a ``--force`` repoint — the previous path derived a different collection;
+    * a surviving legacy ``qdrant_collection`` pin — ``_inert_pin_note`` has already
+      printed the pinned and derived values, so only the pointer is added here (one
+      renderer for the old → new information; saying it twice is how the two drift).
+
+    Args:
+        config: The workspace config (supplies the derived collection and the
+            retired-key set).
+        outcome: What ``registry.register`` did, and to which path.
+
+    Returns:
+        The lines to print, in order, beneath the registration line.
+    """
+    collection = f"collection: {config.qdrant_collection}"
+    repointed = (outcome.action == "repointed" and outcome.previous_path is not None)
+    previous = (default_collection_name(outcome.previous_path)
+                if repointed else None)
+    # `default_collection_name` realpaths its own input, and `outcome.path` is
+    # already canonical, so this agrees with `config.qdrant_collection` by
+    # construction — even on a symlinked route. No canonicalization needed here.
+    if previous and previous != config.qdrant_collection:
+        collection += f"  (was {previous})"
+    lines = [collection]
+    if previous or "qdrant_collection" in config.inert_file_keys:
+        lines.append(_COLLECTION_CARRY_OVER_POINTER)
+    return lines
+
+
+def cmd_init(config: MitosConfig, name: Optional[str] = None, force: bool = False) -> None:
     """Initializes (or idempotently re-initializes) the Mitos workspace.
 
     Scaffolds the V1a ``.mitos/`` layout: the graph boots at the migration-ladder
@@ -306,12 +489,30 @@ def cmd_init(config: MitosConfig) -> None:
     (prototype) graph is refused **before any file mutation** with route-to-cutover
     guidance, never ladder-advanced into a hybrid.
 
+    ``init`` is also how a project introduces itself to Mitos *globally*: its final
+    step registers the workspace's name and absolute path in the machine-local
+    registry, so later commands can target it by name instead of inferring it from
+    a working directory. An existing workspace joins by re-running ``init`` — that
+    is the sole registration path, and it is idempotent.
+
+    Registration is deliberately **last**, and its failure does not unwind the
+    scaffold: an unwritable or malformed registry leaves a fully valid workspace
+    that is merely unregistered (still reachable by its path, registrable by a
+    later re-run). Rolling working files back to undo a routing entry would destroy
+    user-visible state to fix a bookkeeping one.
+
     Args:
         config: The workspace configuration to initialize.
+        name: Register under this name instead of the workspace directory's name.
+        force: Repoint an existing registration of ``name`` at this workspace. It
+            waives only the name collision, never the path-uniqueness guard.
 
     Raises:
         DatabaseError: If a pre-V1a (prototype) graph is detected — the workspace
             is left in its pre-init state; route the operator to the cutover.
+        RegistryError: If registration fails (illegal name, either guard, or an
+            unusable registry file). The workspace is fully scaffolded and valid,
+            and simply not registered.
     """
     # 0. Refuse a pre-V1a (prototype) graph BEFORE any file mutation. The RW
     #    GraphStore boot guard would also refuse it, but only at the very end —
@@ -359,24 +560,26 @@ def cmd_init(config: MitosConfig) -> None:
 
     # 1a. Seed config.toml when absent — from the single-source CONFIG_DEFAULTS map
     #     (P11 / WIRING_LEDGER entry-004), NOT hand-copied literals, so a seeded file
-    #     and the loader's deleted-key fallback can never diverge. The seven static
-    #     keys serialize in CONFIG_DEFAULTS order; the two dynamic qdrant_* lines
-    #     follow (env-/workspace-derived defaults, computed in MitosConfig.__init__).
+    #     and the loader's deleted-key fallback can never diverge. The eight static
+    #     keys serialize in CONFIG_DEFAULTS order; the dynamic qdrant_url line follows
+    #     (an env-derived default, computed in MitosConfig.__init__).
     #     NO pending_threshold line — it left the v0.1 file schema (the loader would
     #     warn-tolerate it on every command).
+    #     NO qdrant_collection line either, and that absence is load-bearing rather
+    #     than tidiness: a materialized collection name travels with a `cp -r` or a
+    #     `git clone` of a committed .mitos/, binding the copy to the ORIGINAL's
+    #     vectors. The name is derived from the workspace path on every construction
+    #     and is not overridable, so there is nothing here to write.
     config_path = os.path.join(config.mitos_dir, "config.toml")
     if not os.path.exists(config_path):
         lines = ["# Mitos Workspace Configuration"]
         for key, default in CONFIG_DEFAULTS.items():
-            lines.append(f"{key} = {_toml_scalar(default)}")
+            lines.append(f"{key} = {toml_scalar(default)}")
         lines += [
             "# Qdrant REST endpoint. Defaults to Mitos's dedicated :7333 (not the",
             "# standard :6333) so Mitos never co-locates its collections in another",
             "# Qdrant you run. Set QDRANT_URL before `init` or edit this line.",
-            f"qdrant_url = {_toml_scalar(config.qdrant_url)}",
-            "# Per-project collection: keeps this project's vectors isolated",
-            "# from other Mitos workspaces sharing the same Qdrant instance.",
-            f"qdrant_collection = {_toml_scalar(config.qdrant_collection)}",
+            f"qdrant_url = {toml_scalar(config.qdrant_url)}",
         ]
         with open(config_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
@@ -420,17 +623,22 @@ def cmd_init(config: MitosConfig) -> None:
             f"{format_spec_content}\n\n"
             "## Setup — API Keys\n"
             "Mitos reads keys from a `.env` file at the workspace root (`mitos init` scaffolds it with empty slots; it is gitignored). Set exactly one required key:\n"
-            "- **`GEMINI_API_KEY`** (Google Gemini) — REQUIRED for semantic `surface_decisions`/`query_decisions` and for `mitos sync`. One key covers both embeddings and synthesis.\n"
-            "- `ANTHROPIC_API_KEY` — strongly recommended: it powers the LLM-judged layer (the `mitos check` conflict audit, the sync-time conflict notice, `mitos import --llm-extract`). Mitos runs without it, but only as a basic record-and-search store; with it, the corpus is audited for decisions that silently contradict each other. Degrades calmly when absent.\n"
-            "Without `GEMINI_API_KEY`, `record_decision` still works (it commits to the local graph; the embedding is queued and drains on the next `mitos sync` once the key is set), but semantic surface/query are unavailable. If a tool reports a missing key, tell the human to put it in `.env`.\n\n"
+            "- **`GEMINI_API_KEY`** (Google Gemini) — REQUIRED for semantic `surface_decisions`/`query_decisions` and for `mitos sync -p .`. One key covers both embeddings and synthesis.\n"
+            "- `ANTHROPIC_API_KEY` — strongly recommended: it powers the LLM-judged layer (the `mitos check -p .` conflict audit, the sync-time conflict notice, `mitos import -p . --llm-extract`). Mitos runs without it, but only as a basic record-and-search store; with it, the corpus is audited for decisions that silently contradict each other. Degrades calmly when absent.\n"
+            "Without `GEMINI_API_KEY`, `record_decision` still works (it commits to the local graph; the embedding is queued and drains on the next `mitos sync -p .` once the key is set), but semantic surface/query are unavailable. If a tool reports a missing key, tell the human to put it in `.env`.\n\n"
             "Mitos uses its own Qdrant on **:7333** (not the standard :6333), started with `docker compose up -d`. If semantic tools report Qdrant unreachable, tell the human to start it; `record_decision` still works meanwhile (embeddings queue and drain once it's up).\n\n"
+            "## Addressing — every call names the project it is for\n"
+            "One mitos install serves every project on this machine, so **every call must name its target**; a call that names none is refused rather than aimed at a guess. Your entries still land in THIS project's own decision graph and its own Qdrant collection — the separation is by naming, not by inability, which is exactly why the naming is worth getting right.\n"
+            "- **MCP tools:** pass `project` on every call, as the **absolute path of the workspace directory this file's `.mitos/` sits in** — you know that path, because you just read this file from it. (A registered project name works too when the human gives you one. A relative path is refused: the server has no working directory to resolve it against.)\n"
+            "- **CLI:** `-p .` on either side of the verb — `mitos surface -p . \"…\"` — when your shell is at the workspace root, or `-p <that absolute path>` from anywhere. `mitos status` and `mitos agent-block` take the same selector as a positional (`mitos status .`).\n"
+            "Do not paste a project *name* into any file this repo commits, this one included: names are machine-local, and a name that means this project here can name a different real project on someone else's machine — which is a write into the wrong corpus rather than an error you would notice.\n"
+            "Every answer echoes the corpus it acted on: `project · collection · workspace`. Read that line. Now that a call *can* reach another project, the echo is what makes a mis-aimed one visible instead of silently plausible.\n\n"
             "## Recording & recall — MCP tools (preferred) or CLI fallback\n"
-            "All decisions you record, surface, and query are scoped to THIS project's decision graph and its own Qdrant collection — you will not see, and cannot contaminate, other projects' decisions.\n"
-            "If the Mitos MCP server is wired into your agent, call these tools directly — best experience: structured args, no shell-quoting. If it is NOT wired, each maps to a CLI verb (and the CLI also accepts the long names as aliases, e.g. `mitos record_decision`):\n"
-            "- `record_decision`  (CLI: `mitos record`) — the moment you commit to a foundational choice (a schema, a library, a pattern, a path you're abandoning), persist it WITH the alternatives you rejected and why, so future sessions inherit it instead of relitigating. Recording rich prose via the CLI? Use `--axiom-file -` / `--rejected-file -` / `--context-file -` to read from stdin and avoid shell-quoting.\n"
-            "- `surface_decisions` (CLI: `mitos surface`) — surface active precedents for a claim/scope BEFORE you decide, so you don't relitigate a settled call. This is the recall loop — use it first. Every hit carries its full `rejected_paths`; pass `brief=True` (CLI `--brief`) for an axiom-only scan.\n"
-            "- `query_decisions`   (CLI: `mitos query`) — semantic or slug lookup when unsure whether a precedent exists.\n"
-            "- `list_decisions`    (CLI: `mitos list`) — the EXHAUSTIVE recall path. surface/query are semantic and capped at the top few matches; this returns EVERY decision in a scope, deterministically, so a completeness pass or audit doesn't miss anything below the relevance cliff. Needs no key or Qdrant.\n\n"
+            "If the Mitos MCP server is wired into your agent, call these tools directly — best experience: structured args, no shell-quoting. If it is NOT wired, each maps to a CLI verb (and the CLI also accepts the long names as aliases, e.g. `mitos record_decision -p .`):\n"
+            "- `record_decision`  (CLI: `mitos record -p .`) — the moment you commit to a foundational choice (a schema, a library, a pattern, a path you're abandoning), persist it WITH the alternatives you rejected and why, so future sessions inherit it instead of relitigating. Recording rich prose via the CLI? Use `--axiom-file -` / `--rejected-file -` / `--context-file -` to read from stdin and avoid shell-quoting.\n"
+            "- `surface_decisions` (CLI: `mitos surface -p .`) — surface active precedents for a claim/scope BEFORE you decide, so you don't relitigate a settled call. This is the recall loop — use it first. Every hit carries its full `rejected_paths`; pass `brief=True` (CLI `--brief`) for an axiom-only scan.\n"
+            "- `query_decisions`   (CLI: `mitos query -p .`) — semantic or slug lookup when unsure whether a precedent exists.\n"
+            "- `list_decisions`    (CLI: `mitos list -p .`) — the EXHAUSTIVE recall path. surface/query are semantic and capped at the top few matches; this returns EVERY decision in a scope, deterministically, so a completeness pass or audit doesn't miss anything below the relevance cliff. Needs no key or Qdrant.\n\n"
             "## When to record — the capture trigger (YOUR judgement; Mitos stores, it does not decide what is worth storing)\n"
             "Recall is easy to ask for; knowing WHAT is worth recording is the real call, and it falls to you. Record a decision when it:\n"
             "- sets a pattern future work must follow, or\n"
@@ -478,9 +686,50 @@ def cmd_init(config: MitosConfig) -> None:
     GraphStore(config.db_path)
     print(f"Initialized Mitos workspace at {config.workspace_dir} ✓")
 
+    # 4a. If this workspace's config.toml carries a legacy `qdrant_collection` pin,
+    #     name it as inert — `init` is one of the two places a human is already
+    #     asking about this workspace's setup, and `init` never rewrites the file
+    #     (D3: `.mitos/config.toml` is read-only to this vision), so the line stays
+    #     and would otherwise silently disagree with the collection in force.
+    inert_pin = _inert_pin_note(config)
+    if inert_pin:
+        print(inert_pin)
+
+    # 5. Introduce the project to Mitos globally — the LAST mutation, after the
+    #    scaffold exists and after the line above has already told the operator it
+    #    does. A registry fault raises RegistryError from here, which main()'s
+    #    `except MitosError` boundary renders as one calm `Error: …` line: the
+    #    workspace stays valid and unregistered, and nothing is rolled back.
+    #    The path registered is the CANONICAL (symlink-resolved) one, which is not
+    #    necessarily `config.workspace_dir`'s abspath spelling.
+    #    Flush stdout first — the same shape as the post-receipt nudges in
+    #    `cmd_record`: a refusal here goes to stderr (unbuffered) while the success
+    #    line above sits in a block-buffered pipe, so without this the `Error:` line
+    #    overtakes it and the reader's opening line is a refusal for a job that in
+    #    fact finished. The no-unwind posture is only legible in the right order.
+    sys.stdout.flush()
+    outcome = registry.register(config.workspace_dir, name=name, force=force)
+    print(_registration_line(outcome))
+    # 6. Name → path → collection, the trio a human only ever meets together here
+    #    (§4.7). Composed from the outcome, not from `provenance_line` — see
+    #    `_collection_echo_lines`. Placed AFTER the register call, never between
+    #    the flush and it: a line in that gap re-opens the stdout/stderr inversion
+    #    the flush exists to close. Flushed again for the same reason, because the
+    #    entry-point notices (`update_notice`, the MCP hint) write stderr after
+    #    every verb returns.
+    for line in _collection_echo_lines(config, outcome):
+        print(line)
+    sys.stdout.flush()
+
 
 def cmd_sync(config: MitosConfig, auto_accept: bool = False, embed_only: bool = False, verbose: bool = False) -> None:
-    """Synchronizes the decisions write buffer with the graph store."""
+    """Synchronizes the decisions write buffer with the graph store.
+
+    The handler prints nothing itself — ``perform_sync`` does — so the corpus echo
+    leads its stdout report from here, and the two abort branches carry their own on
+    stderr (an echo pinned to stdout is invisible to a caller reading the refusal).
+    """
+    _echo_corpus(config)
     manager = MitosSyncManager(config)
     if embed_only:
         manager.drain_pending_embeddings()
@@ -488,9 +737,13 @@ def cmd_sync(config: MitosConfig, auto_accept: bool = False, embed_only: bool = 
         try:
             manager.perform_sync(auto_accept=auto_accept, verbose=verbose)
         except ParseError as e:
+            sys.stdout.flush()
+            _echo_corpus(config, file=sys.stderr)
             print(f"Sync Aborted: Parse error in write-buffer.\n{str(e)}", file=sys.stderr)
             sys.exit(1)
         except ValidationError as e:
+            sys.stdout.flush()
+            _echo_corpus(config, file=sys.stderr)
             print(f"Sync Aborted: Validation error.\n{str(e)}", file=sys.stderr)
             sys.exit(1)
 
@@ -512,18 +765,25 @@ def cmd_reconcile(config: MitosConfig, as_json: bool = False) -> int:
         Process exit code (0 on success, 1 if Qdrant/embedding provider is down).
     """
     manager = MitosSyncManager(config)
+    # Ahead of the call, not ahead of the report: `reconcile_embeddings` writes its
+    # own provider-down line (to stderr, since 5c) before returning, so an echo
+    # placed beside the report below would not be the leading line the reader sees.
+    if not as_json:
+        _echo_corpus(config)
     try:
         result = manager.reconcile_embeddings()
     except VectorStoreError as e:
         msg = f"Reconcile unavailable — Qdrant or embedding provider down: {str(e)}"
         if as_json:
-            print(json.dumps({"error": msg}))
+            print(json.dumps({"error": msg, **corpus_provenance(config)}))
         else:
+            sys.stdout.flush()
+            _echo_corpus(config, file=sys.stderr)
             print(msg, file=sys.stderr)
         return 1
 
     if as_json:
-        print(json.dumps(result))
+        print(json.dumps({**result, **corpus_provenance(config)}))
     else:
         print(
             f"Reconciled: {result['active']} active node(s), "
@@ -534,8 +794,13 @@ def cmd_reconcile(config: MitosConfig, as_json: bool = False) -> int:
 
 
 def cmd_capture(config: MitosConfig, text: str) -> None:
-    """Captures a raw architectural thought and appends it to decisions.md."""
-    api_key = os.environ.get("GEMINI_API_KEY")
+    """Captures a raw architectural thought and appends it to decisions.md.
+
+    Every branch — the keyless refusal included — answers on stdout, so one leading
+    echo covers the whole verb.
+    """
+    _echo_corpus(config)
+    api_key = config.env.get("GEMINI_API_KEY")
     if not api_key:
         print("GEMINI_API_KEY environment variable is not set. Capture requires it.")
         return
@@ -544,7 +809,9 @@ def cmd_capture(config: MitosConfig, text: str) -> None:
     print("Synthesizing canonical decision entry ...")
     
     try:
-        entry_text = run_ambient_capture(client, text)
+        entry_text = run_ambient_capture(
+            client, text, model_id=get_model_id("FLASH", config.env)
+        )
     except Exception as e:
         print(f"Ambient capture failed: {str(e)}")
         return
@@ -696,7 +963,11 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
     if depth != "letter":
         msg = f"Depth mode '{depth}' is not yet implemented in v0.1 (Letter-only retrieval)."
         if as_json:
-            _emit_json({"error": msg}, indent=None)
+            # Inside the handler, so it stamps (the locus rule). Its text twin one
+            # line below deliberately does not: `raise` renders through `main()`'s
+            # generic boundary, i.e. outside any handler, where no resolved config
+            # is in scope and the response is not this verb's to shape.
+            _emit_json({"error": msg, **corpus_provenance(config)}, indent=None)
             return
         raise ValueError(msg)
 
@@ -751,6 +1022,22 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
             )
             match.update(store.get_modifiers(node["id"]))
             matches.append(match)
+    except CollectionMissingError as e:
+        # I8 — an absent collection over an EMPTY active set IS the empty index, and
+        # a fresh project must not read as broken; over a populated graph it is a
+        # real hole and the degraded header names it plus `mitos reconcile`.
+        # The empty result is constructed HERE, not fallen through to: `matches` and
+        # `retired` are assigned inside the `try`, after the query that raised, so a
+        # bare fall-through would hit an unbound local — on exactly the state (empty
+        # graph + absent collection) nobody reaches by hand.
+        if missing_index_is_a_gap(store):
+            _emit_lexical_degraded(
+                config, query_text, reason=degraded_reason_from_error(e),
+                store=store, as_json=as_json, brief=brief, limit=limit,
+            )
+            return
+        matches = []
+        retired = []
     except Exception as e:
         # Embedding/Qdrant failure mid-query (e.g. a 429): never the raw
         # provider blob — one calm cause line + the deterministic fallback.
@@ -767,16 +1054,34 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
     # filter dropped something, so `not matches and retired` is exactly the blackout.
     blackout = not matches and bool(retired)
 
+    # W31 — the unbuilt graph. Unlike its I8 sibling this one is consulted on the
+    # ORDINARY empty path rather than inside an `except`: an empty graph raises
+    # nothing, it simply answers empty, which is precisely why the answer is
+    # indistinguishable from "no precedent" without it. Mutually exclusive with
+    # `blackout` by construction (a retired handle is a node, and this fires only
+    # over a graph with none), so the two can never contradict each other.
+    unbuilt = not matches and missing_graph_is_a_gap(
+        store, config, corpus_has_entries=corpus_has_entries
+    )
+
     # Build the per-match list once, then branch the two renderings over it.
     if as_json:
         envelope: Dict[str, Any] = {"query": query_text, "depth_mode": "letter", "matches": matches}
         envelope.update(corpus_provenance(config))
         if blackout:
             envelope["all_superseded"] = retired
+        if unbuilt:
+            envelope["note"] = missing_graph_note("cli")
         _emit_json(envelope)
         return
 
     if blackout:
+        # Stamped for the same reason as the miss below: "everything here is
+        # superseded" and "you asked the wrong project" are the two readings this
+        # line separates. `cmd_surface`'s blackout already names its corpus (it
+        # falls through the stamped empty header); this branch returns early and
+        # was the one text exit of the read verbs that named none.
+        _echo_corpus(config)
         print(blackout_note(retired))
         return
 
@@ -786,6 +1091,8 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
     if not matches:
         print(provenance_line(config))
         print("No matching decisions found.")
+        if unbuilt:
+            print(f"→ {missing_graph_note('cli')}")
         return
 
     print(f"\nQuery matches for: '{query_text}'  [{provenance_line(config)}]")
@@ -803,6 +1110,37 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         print()
 
 
+def _show_not_found_hint(config: MitosConfig) -> str:
+    """Composes the CLI's ``show`` not-found hint — the recovery, naming a selector.
+
+    Static and hedged in the sense that matters: it reads **no buffer**, so it is
+    truthful for a typo and for an authored-but-unsynced draft alike and never
+    asserts presence (``show-not-found-hint-static-hedged-not-buffer-read``). Only
+    the *recovery clause* is composed, and only from the config already in hand.
+
+    It names the selector because the recipe is otherwise a hard failure: since the
+    flip, a bare ``mitos sync`` has no target and errors out, so a hint that printed
+    one would hand a stuck reader a second wall. The value is the caller's own
+    vocabulary (``config.project`` — the registered name, or the workspace path when
+    the target was not registered), rendered through ``repr`` for the same reason
+    every other registry name on this surface is: a name is hand-editable text, and
+    the quoted form is what a shell would want around a path with a space anyway.
+
+    It lives here rather than in ``display.py`` because the MCP twin's hint may name
+    no shell command at all, so the two cannot share a body — and because a
+    selectored string in that leaf reds its own FORBIDDEN_SYNTAX literal sweep.
+
+    Args:
+        config: The resolved workspace config, carrying ``project``.
+
+    Returns:
+        The hint clause, without a trailing period — both call sites supply their
+        own punctuation.
+    """
+    return (f"not in graph — if you just authored it in decisions.md/questions.md, "
+            f"run `mitos sync -p {config.project!r}`")
+
+
 def cmd_show(config: MitosConfig, ident: str, as_json: bool = False) -> None:
     """Shows full details of a specific node by ID or slug.
 
@@ -810,10 +1148,14 @@ def cmd_show(config: MitosConfig, ident: str, as_json: bool = False) -> None:
     — active-first, else the most-recent superseded node in the casefolded-slug
     lineage (marked superseded) — so a moved-on node still answers to its own slug
     instead of 404-ing. Only a genuinely-absent identifier reaches the not-found
-    branch, whose static, hedged ``mitos sync`` pointer reads no buffer (truthful for
-    both a typo and an authored-but-unsynced draft). With ``as_json`` it emits a
+    branch, whose hedged ``mitos sync`` pointer reads no buffer (truthful for both a
+    typo and an authored-but-unsynced draft) and names the caller's own selector, so
+    the recipe it prints is one a post-flip shell will actually run.
+    With ``as_json`` it emits a
     Letter-complete, modifier-stamped JSON object (the not-found case a JSON object
-    too, never a bare text print).
+    too, never a bare text print) — both shapes carrying the trailing
+    ``project``/``collection``/``workspace`` provenance, as does the ``show_node``
+    MCP twin, key for key.
 
     Args:
         config: The active workspace config (supplies the graph db path).
@@ -823,6 +1165,11 @@ def cmd_show(config: MitosConfig, ident: str, as_json: bool = False) -> None:
     Returns:
         None.
     """
+    # Both text exits (the dereferenced node and the not-found pointer) answer on
+    # stdout, so one gated leading echo covers them; the two `--json` branches
+    # carry the same three fields as keys and must not also carry a text line.
+    if not as_json:
+        _echo_corpus(config)
     store = GraphStore(config.db_path)
 
     # State-agnostic resolution: id → active slug → most-recent in lineage → None.
@@ -831,12 +1178,17 @@ def cmd_show(config: MitosConfig, ident: str, as_json: bool = False) -> None:
 
     if not node:
         # Genuine absence: a typo, or an authored-but-unsynced draft. The hint is
-        # static and hedged — it reads no buffer, never asserts presence to a typo.
-        # Single-sourced in display.py so the `show_node` MCP twin emits the same
-        # not-found object byte-for-byte (parity is structural).
-        hint = SHOW_NOT_FOUND_HINT
+        # hedged and reads no buffer, so it never asserts presence to a typo. Its
+        # WORDING is this surface's own since 6c — the MCP twin's carries no shell
+        # command — while the not-found object's SHAPE stays shared and pinned.
+        hint = _show_not_found_hint(config)
         if as_json:
-            _emit_json({"found": False, "ident": ident, "hint": hint})
+            # Provenance last, exactly as the `show_node` twin stamps it: the
+            # absent-handle answer is the one most in need of naming its corpus
+            # ("no such handle here" vs "you asked the wrong project").
+            missing = {"found": False, "ident": ident, "hint": hint}
+            missing.update(corpus_provenance(config))
+            _emit_json(missing)
             return
         print(f"Node with ID or Slug '{ident}' not found — {hint}.")
         return
@@ -856,6 +1208,7 @@ def cmd_show(config: MitosConfig, ident: str, as_json: bool = False) -> None:
         # structural, not test-enforced). The 5a --json regression pins prove this
         # extraction is byte-identical to the prior inline builder.
         payload = show_payload(node, state=state, modifiers=modifiers)
+        payload.update(corpus_provenance(config))
         _emit_json(payload)
         return
 
@@ -1017,6 +1370,10 @@ def cmd_open_questions(config: MitosConfig, scope: Optional[str] = None,
         as_json: Emit a machine-readable JSON map (the parked OQ set, each carrying
             its ``amended_by``/``narrowed_by`` modifier subset) instead of text.
     """
+    # All three text branches (the listing, the empty line, the scope-recovery
+    # vector) answer on stdout — one leading echo, gated off the `--json` path.
+    if not as_json:
+        _echo_corpus(config)
     store = GraphStore(config.db_path)
     oqs = store.get_open_questions(scope=scope)
 
@@ -1046,6 +1403,7 @@ def cmd_open_questions(config: MitosConfig, scope: Optional[str] = None,
             "open_questions": [_oq_payload(q) for q in parked],
             "total": len(parked),
             "scope": scope,
+            **corpus_provenance(config),
         }
         if recovery:
             payload["scope_known"] = False
@@ -1091,8 +1449,11 @@ def cmd_scopes(config: MitosConfig, as_json: bool = False, archived: bool = Fals
 
     Args:
         config: The active workspace configuration.
-        as_json: Emit the machine-readable ordered ``{scope: {active_decisions,
-            parked_open_questions}}`` map (for agents) instead of the text table.
+        as_json: Emit the machine-readable ``{scopes, project, collection,
+            workspace}`` envelope (for agents) instead of the text table —
+            ``scopes`` being the ordered ``{scope: {active_decisions,
+            parked_open_questions}}`` map, the rest naming the corpus it came
+            from. The byte-identical twin of the MCP ``list_scopes`` payload.
         archived: Include fully-dead domains (every scope present in the graph at a
             ``0/0`` floor) — the scope-level parallel of ``list --state all``.
             Omit for the live vocabulary only.
@@ -1100,11 +1461,21 @@ def cmd_scopes(config: MitosConfig, as_json: bool = False, archived: bool = Fals
     Returns:
         None.
     """
+    # Both text branches (the table and the empty-vocabulary line) are stdout; the
+    # `--json` envelope already carries the same three fields as keys.
+    if not as_json:
+        _echo_corpus(config)
     store = GraphStore(config.db_path)
     counts = order_scope_counts(store.get_scope_counts(include_archived=archived))
 
     if as_json:
-        _emit_json(counts)
+        # Same construction as the `list_scopes` twin, provenance last, so the
+        # serialized bodies match byte for byte. The vocabulary nests under
+        # `scopes` because scope tags are user-authored: a tag literally named
+        # `project`/`collection`/`workspace` must not be overwritten by the stamp.
+        envelope = {"scopes": counts}
+        envelope.update(corpus_provenance(config))
+        _emit_json(envelope)
         return
 
     if not counts:
@@ -1124,14 +1495,82 @@ def cmd_scopes(config: MitosConfig, as_json: bool = False, archived: bool = Fals
     print()
 
 
+def cmd_projects(as_json: bool = False) -> None:
+    """Lists the Mitos projects registered on this machine.
+
+    The discovery read over the global registry: which project names exist and
+    which workspace each one reaches. A **global** verb — it takes no workspace
+    config and works from anywhere, including a machine with no Mitos workspace at
+    all, which is the state it is most likely to be met in.
+
+    It reports registrations, not health. Whether a registered path still holds a
+    valid workspace is ``mitos status``'s question; answering it here too would be
+    a second source that drifts from the first.
+
+    Args:
+        as_json: Emit the machine-readable payload (``registry_path``, ``count``,
+            ``projects``) instead of the text table.
+
+    Returns:
+        None.
+
+    Raises:
+        RegistryError: If the registry file exists but is unusable.
+    """
+    # The payload shape is `display.projects_payload`'s, not this function's —
+    # lifted to the shared leaf at its second consumer (the `list_projects` MCP
+    # twin), so the two surfaces cannot drift. Built once and read by BOTH
+    # branches: routing only the `--json` branch through the leaf would fork the
+    # text table off a second, hand-built list.
+    payload = projects_payload(registry.load(), registry.registry_path())
+    path = payload["registry_path"]
+    projects = payload["projects"]
+
+    if as_json:
+        _emit_json(payload)
+        return
+
+    if not projects:
+        # Empty/fresh is first-class: a machine with nothing registered yet is
+        # healthy, and an absent registry file is the same healthy state.
+        print(f"No projects registered yet — `mitos init` introduces one ({path}).")
+        return
+
+    # File order throughout, never sorted: it is the order a reverse lookup
+    # resolves its first match in, so the listing must show what actually decides.
+    #
+    # The name goes through `repr` (1d's `_inert_pin_note` idiom): `registry.load`
+    # validates the VALUE (a string, absolute) and never the KEY, so a hand-edited
+    # name is the one registry field that reaches a terminal unchecked and can carry
+    # a newline that breaks this table or an ESC that paints it. The column width is
+    # therefore computed off the repr'd length — measuring the raw name here and
+    # printing the escaped one misaligns every row.
+    name_w = max(len("project"), max(len(repr(p["name"])) for p in projects))
+    print(f"\nProjects ({len(projects)} registered, in registry order):")
+    print(f"Registry: {path}")
+    print("-" * (name_w + 30))
+    print(f"{'project':{name_w}}   workspace")
+    for project in projects:
+        print(f"{project['name']!r:{name_w}}   {project['path']}")
+    print()
+
+
 def cmd_import(config: MitosConfig, filepath: str, use_llm_extract: bool = False) -> None:
-    """Imports legacy prose ADR file."""
+    """Imports legacy prose ADR file.
+
+    The handler prints nothing itself (``MitosProseImporter`` does), so the echo
+    leads its report from here — and it is the one verb whose positional is a
+    cwd-rooted *file* while its target is a selector, which is exactly the pair a
+    reader needs named.
+    """
+    _echo_corpus(config)
     importer = MitosProseImporter(config)
     importer.import_from_file(filepath, use_llm_extract)
 
 
 def cmd_render(config: MitosConfig, scope: Optional[str] = None, render_format: str = "live-axioms") -> None:
     """Statelessly regenerates live_axioms.md and scope axioms."""
+    _echo_corpus(config)
     if render_format != "live-axioms":
         print(f"Warning: format '{render_format}' is not supported in v0.1. Falling back to live-axioms.")
     store = GraphStore(config.db_path)
@@ -1166,9 +1605,10 @@ def cmd_record(
     """Records a decision directly to the write-buffer and graph (thin wrapper).
 
     Under ``as_json``, every outcome — created/exists, the ``needs_review`` pause, and
-    error — is emitted as the raw ``record_decision_entry`` receipt dict (the same shape
-    the MCP ``record_decision`` tool serializes) on **stdout**, never a stderr wall a
-    ``--json`` consumer would miss. The existing exit codes are preserved (0
+    error — is emitted as the ``record_decision_entry`` receipt dict plus the trailing
+    ``project``/``collection``/``workspace`` provenance naming the corpus written to
+    (the same shape the MCP ``record_decision`` tool serializes) on **stdout**, never a
+    stderr wall a ``--json`` consumer would miss. The existing exit codes are preserved (0
     created/exists, 2 needs_review, 1 error): exit code is the shell's signal, the JSON
     object is the agent's.
     """
@@ -1198,7 +1638,11 @@ def cmd_record(
         # (the pause's `neighbors` is a stamped decision-read surface: each entry is
         # the enriched candidate_payload, modifier stamps included; the created
         # receipt's write-facts stay unstamped write results). scope_overflow, when
-        # present, is already inside `result`.
+        # present, is already inside `result`. The one addition is the trailing
+        # provenance, naming the corpus the write landed in — stamped here at the
+        # boundary, never inside `record_decision_entry`, so the buffer-first +
+        # rollback contract carries no routing concern.
+        result.update(corpus_provenance(config))
         _emit_json(result)
         if "error" in result:
             sys.exit(1)
@@ -1206,7 +1650,12 @@ def cmd_record(
             sys.exit(2)
         return
 
+    # Three text outcomes on two channels — D3's sharpest case. The pause and the
+    # error answer on stderr, and that is the agent-facing path: an echo pinned to
+    # stdout would be missing from exactly the response a caller reads when the
+    # write did NOT land.
     if "error" in result:
+        _echo_corpus(config, file=sys.stderr)
         print(f"Record failed [{result['code']}]: {result['error']}", file=sys.stderr)
         sys.exit(1)
 
@@ -1216,6 +1665,7 @@ def cmd_record(
         # without a dereference round-trip. Enrichment keys via .get(): production
         # always sends the full candidate_payload shape, but leaner dicts reach this
         # render from canned fixtures.
+        _echo_corpus(config, file=sys.stderr)
         print(f"⚠ Paused — '{result['slug']}' looks like an existing decision. Nothing written.",
               file=sys.stderr)
         for n in result.get("neighbors", []):
@@ -1245,6 +1695,7 @@ def cmd_record(
     # success headline — a no-op reported as "Recorded ✓" is the same
     # couldn't-do-it-reads-as-done inversion the degraded-check notice below
     # exists to prevent, on the write itself rather than on the review.
+    _echo_corpus(config)
     no_op = result.get("no_op_reason")
     if no_op:
         print(f"Decision '{result['slug']}' {no_op}")
@@ -1387,6 +1838,16 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
                 results["active_decisions"].append(_shape(node, m["score"]))
                 if top_score is None or m["score"] > top_score:
                     top_score = m["score"]
+        except CollectionMissingError as e:
+            # I8 — see cmd_query. Over an empty active set the absent collection IS
+            # the empty index, so `semantic_ran` stays True: the read renders "ran
+            # and found nothing", which is also what correctly suppresses the
+            # degraded-only unranked scope dump below.
+            if missing_index_is_a_gap(store):
+                semantic_ran = False
+                degraded_error = e
+            else:
+                semantic_ran = True
         except Exception as e:
             semantic_ran = False
             degraded_error = e
@@ -1458,6 +1919,17 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     if blackout:
         results["note"] = blackout_note(retired)
         results["all_superseded"] = retired
+        note = results["note"]
+
+    # W31 — the unbuilt graph, consulted on the ordinary empty path (see cmd_query).
+    # Placed after the blackout override so the graph note wins if both ever applied:
+    # with no graph, a pointer at the collection or the graveyard names the wrong
+    # heal. They cannot both apply in fact — a retired handle is a node — but the
+    # precedence is written down rather than left to that coincidence.
+    if not results["active_decisions"] and missing_graph_is_a_gap(
+        store, config, corpus_has_entries=corpus_has_entries
+    ):
+        results["note"] = missing_graph_note("cli")
         note = results["note"]
 
     if as_json:
@@ -1540,47 +2012,36 @@ def _check_qdrant(qdrant_url: str, collection: str) -> Dict[str, Any]:
     return out
 
 
-def _env_file_has_key(env_path: str, name: str) -> bool:
-    """True if ``env_path`` assigns ``name`` a non-empty value on ANY line.
-
-    Skips empty assignments (the scaffolded ``GEMINI_API_KEY=`` slot) and keeps
-    scanning, so a key added on a later line is still found — matching
-    ``load_dotenv_file``'s "first non-empty value wins" semantics.
-    """
-    if not os.path.exists(env_path):
-        return False
-    try:
-        with open(env_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith(f"{name}="):
-                    if line.split("=", 1)[1].strip().strip('"').strip("'"):
-                        return True
-    except OSError:
-        pass
-    return False
-
-
 def _gemini_key_source(workspace_dir: str) -> Optional[str]:
-    """Reports where GEMINI_API_KEY comes from, in precedence order.
+    """Reports which tier GEMINI_API_KEY came from, for the target workspace.
 
-    Files are checked before the live environment so the report attributes the
-    key to its durable home (``main()`` also loads both files into the
-    environment, which would otherwise mask the distinction).
+    One report shape for the whole tree: this reads the same
+    :func:`~mitos.env.resolve_key` the resolution path itself uses, so the tier
+    the status line names is the tier that actually won. The retired
+    implementation scanned the two files with a second hand-rolled parse before
+    consulting the environment — deliberately, because ``main()`` used to pour
+    both files into ``os.environ``, and file-first was the only way to keep the
+    distinction visible through that.
+
+    That inversion is no longer needed, and the coarseness it was compensating
+    for is gone with it: since 5c deleted the entry-time dotenv load, nothing
+    promotes a file's key into the process environment, so a key living in a
+    ``.env`` now reports the file it lives in. ``"environment"`` means someone
+    exported it.
+
+    The answer is keyed on the **value**, not on the tier: an exported-empty
+    variable resolves to ``ResolvedValue("", "environment")``, and reporting a
+    tier for it would make ``env GEMINI_API_KEY= mitos status`` claim a key is
+    present.
 
     Args:
-        workspace_dir: The project directory to inspect.
+        workspace_dir: The project directory to resolve for.
 
     Returns:
         ``"project .env"``, ``"global .env"``, ``"environment"``, or None.
     """
-    if _env_file_has_key(os.path.join(workspace_dir, ".env"), "GEMINI_API_KEY"):
-        return "project .env"
-    if _env_file_has_key(global_env_path(), "GEMINI_API_KEY"):
-        return "global .env"
-    if os.environ.get("GEMINI_API_KEY"):
-        return "environment"
-    return None
+    resolved = resolve_key("GEMINI_API_KEY", workspace_dir, global_env_path())
+    return resolved.tier if resolved.value else None
 
 
 def _gemini_key_present(workspace_dir: str) -> bool:
@@ -1588,12 +2049,35 @@ def _gemini_key_present(workspace_dir: str) -> bool:
     return _gemini_key_source(workspace_dir) is not None
 
 
-def _mcp_wired(workspace_dir: str) -> bool:
-    """True if a project-scoped ``.mcp.json`` wires the mitos MCP server.
+def _mcp_project_entry(workspace_dir: str) -> bool:
+    """True if a project-scoped ``.mcp.json`` here declares a ``mitos`` MCP server.
 
-    This is the Claude Code convention (a ``mitos`` entry under ``mcpServers``).
-    It's a *recommendation* signal for agents, never a readiness blocker — other
-    harnesses wire the MCP elsewhere, and humans don't need it at all.
+    Since mitos became machine-global, this is a **finding, not a readiness
+    signal** — which is why the name says what it found rather than what it
+    approves of. One user-scope registration serves every project; a project-scope
+    entry under the same server name does not coexist with it and does not degrade
+    to it — it *wins by name and erases it*, so a broken project entry leaves the
+    session with no mitos tools at all and no diagnostic saying why.
+
+    The predicate is keyed on the literal server name ``mitos`` because that is
+    what the precedence is keyed on. A project registering the same server under a
+    different key (``mitos-local``, say) genuinely does not shadow, and must not be
+    flagged — do not widen this to "any entry whose command mentions mitos".
+
+    **Known limit, deliberate:** this reads ``<workspace>/.mcp.json`` only, while a
+    client may ancestor-walk to a parent launch root. An entry above the workspace
+    shadows the same way and is invisible here. Widening the read means walking to
+    ``/`` and flagging a whole tree from one file, which is a different design; a
+    clean report says "nothing here", not "nothing anywhere".
+
+    Args:
+        workspace_dir: The project directory to inspect.
+
+    Returns:
+        True when the file exists, parses, and names ``mitos`` under
+        ``mcpServers``. Fully fail-silent: an unreadable or malformed file reports
+        no finding rather than an error, since this is one row on a report the
+        caller asked about something else.
     """
     import json as _json
     path = os.path.join(workspace_dir, ".mcp.json")
@@ -1607,45 +2091,29 @@ def _mcp_wired(workspace_dir: str) -> bool:
         return False
 
 
-# The decision-loop verbs (+ their MCP-name aliases). Only these get the
-# "consider wiring the MCP" nudge — setup/ops/inspection verbs are CLI-native,
-# and `serve` IS the MCP, so nudging there would be nonsense.
-_DECISION_LOOP_COMMANDS = frozenset({
-    "record", "record_decision", "surface", "surface_decisions", "query", "query_decisions",
-    "list", "list_decisions",
-})
-
-
-def _mcp_hint(workspace_dir: str) -> Optional[str]:
-    """Returns a gentle 'wire the MCP for the best experience' nudge, or None.
-
-    Fires only when this project has no MCP wired, at most once per 24h per
-    workspace (so it's a nudge, not a nag), and never when ``MITOS_NO_MCP_HINT``
-    is set or the MCP is already wired. Fully fail-silent.
-
-    Args:
-        workspace_dir: The project directory the CLI command acted on.
-
-    Returns:
-        A one-line stderr-ready nudge, or None.
-    """
-    if os.environ.get("MITOS_NO_MCP_HINT") or _mcp_wired(workspace_dir):
-        return None
-    if not hint_due("mcp_hint.json", workspace_dir, 24 * 60 * 60):
-        return None
-    return (
-        "💡 You're using the mitos CLI directly. For the best experience — ambient "
-        "recall and structured recording (no shell-quoting) — wire the MCP server: "
-        "see SETUP.md §3.\n   (Silence with MITOS_NO_MCP_HINT=1.)"
-    )
-
-
 def _upsert_env_var(env_path: str, name: str, value: str) -> None:
     """Inserts or replaces ``name=value`` in a ``.env`` file, preserving the rest.
 
     Replaces an existing (possibly empty) ``name=`` line in place; otherwise
     appends one. Creates the file (and parent dirs) if absent, and tightens the
     file to ``0600`` since it holds secrets.
+
+    **The tree's one hand-rolled** ``.env`` **write, and it matches the way
+    ``env.parse_env_file`` reads** — split on the first ``=``, strip, compare. A
+    ``startswith(f"{name}=")`` test (what this did until 5c) cannot see a
+    hand-spaced ``GEMINI_API_KEY = x``, so ``set-key`` appended a *second*
+    assignment and left a file whose writer and reader disagreed about which line
+    was the key. Two deliberate agreements with the reader: a line carrying no
+    ``=`` is not an assignment and is left alone (the reader skips it too, so no
+    duplicate is created from its point of view), and a commented-out line does
+    not match (its key parses as ``#NAME``). One deliberate asymmetry: the reader
+    ignores an *empty* assignment while this replaces it — that is the scaffolded
+    ``GEMINI_API_KEY=`` slot, and after the write it is non-empty anyway.
+
+    Every matching line is rewritten, not only the first. The reader is
+    first-non-empty-wins, so a file carrying the key twice would otherwise keep a
+    stale second copy that a later hand-edit could promote; rewriting all matches
+    makes them the same string and the two orders agree.
 
     Args:
         env_path: Path to the ``.env`` file to write.
@@ -1658,7 +2126,7 @@ def _upsert_env_var(env_path: str, name: str, value: str) -> None:
     if os.path.exists(env_path):
         with open(env_path, "r", encoding="utf-8") as f:
             for line in f:
-                if line.strip().startswith(f"{name}="):
+                if "=" in line and line.split("=", 1)[0].strip() == name:
                     lines.append(f"{name}={value}\n")
                     found = True
                 else:
@@ -1675,24 +2143,48 @@ def _upsert_env_var(env_path: str, name: str, value: str) -> None:
         pass
 
 
-def cmd_set_key(value: str, name: str = "GEMINI_API_KEY", is_global: bool = False) -> None:
+def cmd_set_key(value: str, *, workspace_dir: Optional[str],
+                name: str = "GEMINI_API_KEY", is_global: bool = False) -> None:
     """Stores an API key in the global or project ``.env``.
+
+    **This function cannot resolve a working directory, and that is the point.**
+    ``set-key``'s project form *is* the bare invocation, so a selector that failed
+    to reach here would have landed a **credential** in the launch directory's
+    ``.env`` while the caller named another project — the vision's §1 hazard on the
+    one payload where it is worst. ``workspace_dir`` is therefore required and
+    ``None`` means *"there is no project"*, not *"use cwd"*: it stays ``Optional``
+    only because ``--global`` legitimately has no workspace, and the guard for the
+    mismatch is a **raise**, never a default.
 
     Args:
         value: The API key value to store.
+        workspace_dir: The project to write into, or ``None`` for the ``--global``
+            form. Required — an unnamed project form is unconstructible rather than
+            silently cwd-rooted.
         name: The env var name (default ``GEMINI_API_KEY``).
         is_global: If True, write the shared ``~/.config/mitos/.env`` (serves
-            every project); otherwise write ``./.env`` for the current project.
+            every project); otherwise write the project's own ``.env``.
+
+    Raises:
+        MitosError: If the project form was called with no workspace. A programming
+            fault rather than a user one — ``main()`` refuses a selectorless
+            ``set-key`` at the boundary with the teaching anatomy — so it is a plain
+            boundary error, not a seventh targeting discriminator.
     """
+    if not is_global and workspace_dir is None:
+        raise MitosError(
+            "set-key needs the project to write into. Name it with `--project` "
+            "(a registered name or an absolute path), or pass `--global` to write "
+            "the machine-wide .env shared by every project.")
     if is_global:
         env_path = global_env_path()
     else:
-        env_path = os.path.join(os.getcwd(), ".env")
+        env_path = os.path.join(workspace_dir, ".env")
     _upsert_env_var(env_path, name, value)
     scope = "globally (all projects)" if is_global else "for this project"
     print(f"Stored {name} {scope} → {env_path}")
     if not is_global:
-        _ensure_gitignore_entry(os.path.join(os.getcwd(), ".gitignore"), ".env")
+        _ensure_gitignore_entry(os.path.join(workspace_dir, ".gitignore"), ".env")
 
 
 def _fmt_k(n: int) -> str:
@@ -1761,7 +2253,256 @@ def _graph_behind_buffer(db_path: str) -> bool:
         conn.close()
 
 
-def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
+#: The state column's mark. ``✓`` healthy, ``✗`` a finding, ``—`` **unknown** —
+#: `status`'s own vocabulary, and the third mark is the load-bearing one: an
+#: unresponsive entry is not a missing one, so it must not be rendered as a finding.
+_OVERVIEW_MARKS = {
+    overview.STATE_OK: "✓",
+    overview.STATE_MISSING: "✗",
+    overview.STATE_NOT_A_WORKSPACE: "✗",
+    overview.STATE_ERROR: "✗",
+    overview.STATE_UNRESPONSIVE: "—",
+}
+
+
+def _overview_notes(project: Dict[str, Any], payload: Dict[str, Any], *,
+                    corpus_scan: Callable[[str], bool] = corpus_has_entries) -> List[str]:
+    """Words one project's findings — the sentences the leaf deliberately does not carry.
+
+    Order is by what the reader most needs: where they are standing, then why the
+    row is not ``ok``, then the vector cross-reference, then the registry finding.
+    A fully healthy project on a healthy instance produces **no** lines at all, so a
+    calm machine reads as a calm table (P9).
+
+    **The collection flag is gated on the corpus, and it prescribes nothing.** I8
+    says the missing-collection message must be gated — *"a brand-new project with
+    zero decisions also has no collection, and sending that user to `mitos
+    reconcile` would be a wall on the healthy-and-empty state this project treats as
+    first-class"* — and until the zero-arg dispatch flip this surface was reachable
+    by nobody, so its ungated flag was false about a state no user could read. Two
+    changes make it true in all three states it meets:
+
+    * **Gated on the corpus** (the injected scan), not on the graph the way 1b's
+      read surfaces and 4b's deep report are. A graph gate is the sharper predicate
+      and this sweep may not have it: ``mitos/overview.py``'s cost contract is three
+      stats plus a config read and its docstring forbids opening SQLite,
+      permanently. The corpus is the honest proxy this surface can afford, and it
+      separates the fresh project (flagged before, healthy now) from a populated one.
+    * **No prescription.** The corpus gate cannot separate the clone whose graph was
+      never built (heal: ``mitos sync``) from the project whose collection was swept
+      (heal: ``mitos reconcile``), and for the clone ``reconcile`` is the heal 4b
+      calls *"one word away and worse than silence"* — it diffs an empty active set
+      against an absent collection, enqueues nothing, and reports success on a
+      workspace it did not touch. So the note points at ``mitos status <name>``,
+      which reads the graph and names the right heal. That is the *"projects
+      discovers, status diagnoses"* division the vision already states.
+
+    The scan arrives as a keyword with a default rather than as an import inside the
+    leaf: ``mitos/overview.py`` stays Tier 2 with its import closure untouched, and
+    the predicate is injectable for a row that must not touch a filesystem. It runs
+    only on an ``ok`` entry — every other state carries ``collection: None`` — so the
+    probe has already reached that workspace within its wall-clock budget. The read
+    itself is not inside that budget, which is the residual cost of answering this
+    at the surface rather than in the sweep; it is one short-circuiting stream over a
+    file the probe just stat'd.
+
+    Args:
+        project: One entry of the payload's ``projects`` list.
+        payload: The whole payload — read only for ``cwd_project`` and for the
+            document order that decides a shared path's resolving name.
+        corpus_scan: The corpus-population predicate, ``parser.corpus_has_entries``
+            by default. Takes the corpus path; a missing or unreadable file is
+            ``False``.
+
+    Returns:
+        Zero or more note lines, already indented.
+    """
+    notes: List[str] = []
+    # Every registry NAME on this surface renders through `repr`, matching the table
+    # one screen down and `mitos projects`. The read gate validates the registry's
+    # values and never its keys, so a name is unchecked hand-edited text; here it also
+    # lands inside printed `mitos status <name>` recipes, where the quoted form is the
+    # one a shell would accept anyway. `name` is bound to the escaped spelling once so
+    # a later note cannot reintroduce the raw one.
+    name = repr(project["name"])
+    if payload["cwd_project"] == project["name"]:
+        # The overview closes its own discovery loop: a human standing in their
+        # project who expected a project report learns the form at a glance.
+        notes.append(
+            f"→ you are here — `mitos status {name}` for this project's full report")
+
+    state = project["state"]
+    if state == overview.STATE_MISSING:
+        notes.append(
+            f"nothing at {project['path']} — the project moved or was deleted; "
+            f"re-run `mitos init` there, or edit {payload['registry_path']}")
+    elif state == overview.STATE_NOT_A_WORKSPACE:
+        notes.append(
+            f"{project['path']} exists but holds no Mitos workspace (.mitos/config.toml "
+            f"+ decisions.md) — run `mitos init` there, or edit "
+            f"{payload['registry_path']}")
+    elif state == overview.STATE_UNRESPONSIVE:
+        notes.append(
+            f"the check did not answer within {overview.LOCAL_PROBE_BUDGET:g}s — an "
+            f"unresponsive mount, not a missing project; nothing was concluded about it")
+    elif state == overview.STATE_ERROR:
+        notes.append(f"the check failed: {project['error']}")
+
+    if project["collection"] is not None:
+        # `decisions.md` beside `.mitos/` is the shipped validity triple `is_workspace`
+        # just proved for this entry and `MitosConfig` derives without a setting, so the
+        # join is a literal here rather than a config construction the sweep refuses to
+        # repeat.
+        if (project["collection_present"] is False
+                and corpus_scan(os.path.join(project["path"], "decisions.md"))):
+            # A pointer, never a diagnosis and never a heal: the overview reads no
+            # graph, so it can neither price what re-embedding would cost nor tell a
+            # swept collection from an unbuilt one — and those two want opposite
+            # commands. Presence would not imply population anyway.
+            notes.append(
+                f"⚠ no vector collection {project['collection']} on "
+                f"{project['qdrant_url']} — `mitos status {name}` for the heal")
+        elif project["collection_present"] is None:
+            notes.append(
+                f"vector collection unknown — {project['qdrant_url']} did not answer "
+                f"with a usable listing (see below)")
+
+    if project["shares_path_with"]:
+        # A finding, never a fault — both names reach the same workspace, so nothing
+        # can be corrupted. The actionable half is which one decides: a reverse
+        # lookup answers with the first in document order, which is the first of them
+        # in the listing above.
+        others = ", ".join(repr(other) for other in project["shares_path_with"])
+        deciding = repr(next(
+            other["name"] for other in payload["projects"]
+            if other["path"] == project["path"]))
+        notes.append(
+            f"also registered as {others} — every echo names {deciding} for this "
+            f"workspace (first in registry order wins)")
+    return [f"   {note}" for note in notes]
+
+
+def _render_overview(payload: Dict[str, Any]) -> None:
+    """Prints the global overview as a text table.
+
+    The wording half of the sweep — every user-facing sentence lives here, following
+    ``_render_targeting_error``'s precedent, while ``mitos/overview.py`` carries only
+    typed data.
+
+    **It flushes, and that is load-bearing.** ``main()``'s ``except MitosError``
+    boundary writes unbuffered stderr while a piped stdout is not, so without the
+    flush an error raised after this table can land *above* the output it annotates,
+    with the whole suite green (``capsys`` keeps the streams apart and cannot see the
+    inversion).
+
+    Args:
+        payload: ``overview.build_overview``'s payload.
+
+    Returns:
+        None.
+    """
+    projects = payload["projects"]
+    if not projects:
+        # Empty/fresh is first-class: a machine with nothing registered yet is
+        # healthy, and an absent registry file is the same healthy state.
+        print(f"No projects registered yet — `mitos init` introduces one "
+              f"({payload['registry_path']}).")
+        sys.stdout.flush()
+        return
+
+    # File order throughout, never sorted — the order a reverse lookup resolves its
+    # first match in, matching `mitos projects`.
+    #
+    # `repr` on the name, and the width measured off the repr'd length, for the same
+    # reason as `cmd_projects`' table: the registry's read gate validates values and
+    # never keys, so the name is hand-editable text arriving unchecked. The two
+    # tables move together — that lockstep is why 6c fixed all three surfaces at once.
+    name_w = max(len("project"), max(len(repr(p["name"])) for p in projects))
+    state_w = max(len("state"), max(len(p["state"]) for p in projects) + 2)
+    print(f"\nMITOS PROJECTS ({payload['count']} registered, in registry order)")
+    print(f"Registry: {payload['registry_path']}")
+    print("-" * (name_w + state_w + 20))
+    print(f"{'project':{name_w}}   {'state':{state_w}}   workspace")
+    for project in projects:
+        # `.get` rather than `[...]` on purpose, and safe only because the table is
+        # fenced against the leaf's vocabulary by a key-set row: a renderer fallback
+        # over an unfenced map is this vision's most-repeated defect shape, and a
+        # KeyError here would take the whole table down over one unknown state, which
+        # is the opposite of what every other line in this phase is for.
+        mark = _OVERVIEW_MARKS.get(project["state"], "—")
+        state = f"{mark} {project['state']}"
+        print(f"{project['name']!r:{name_w}}   {state:{state_w}}   {project['path']}")
+        for note in _overview_notes(project, payload):
+            print(note)
+
+    instances = payload["instances"]
+    if instances:
+        print("\nQdrant:")
+        for instance in instances:
+            if instance["listing_available"]:
+                detail = f"up · {instance['collection_count']} collection(s)"
+            elif instance["reachable"]:
+                detail = ("up, but its collection listing is unavailable · vector "
+                          "checks unknown")
+            else:
+                detail = "no answer · vector checks unknown"
+            print(f"  {instance['url']}   {detail}")
+            if instance["error"]:
+                print(f"     {instance['error']}")
+    print()
+    sys.stdout.flush()
+
+
+def cmd_status_overview(as_json: bool = False) -> int:
+    """Reports what this machine has: every registered project and its health.
+
+    The **global** half of ``status`` — explicitly global, so no silent cwd
+    resolution exists to mis-aim it. It is what a **selectorless** ``mitos status``
+    renders; ``mitos status <project>`` keeps the per-project deep report. The
+    dispatch decides between them in ``main()``, before any ``MitosConfig`` is
+    built, so a broken workspace underfoot cannot take down a report about the
+    whole machine.
+
+    **The exit contract, stated where the report is built.** It returns **0 whenever
+    it can render, and non-zero only when it cannot**. An empty registry is the
+    healthy fresh state, a stale entry is flagged-not-fatal, and an unreachable
+    Qdrant is a timed-out cell — none of the three is an error. Only a registry that
+    cannot be parsed fails, through the calm ``RegistryError`` the boundary renders.
+    The readiness *gate* keeps its shipped ``0``/``1`` mapping and stays with the
+    per-project report, where a readiness verdict still means something: ``ready`` is
+    undefined for a report about N projects.
+
+    Args:
+        as_json: Emit the machine-readable payload instead of the text table.
+
+    Returns:
+        ``0``.
+
+    Raises:
+        RegistryError: If the registry file exists and is unusable.
+    """
+    # The vision's ONE display-only cwd read, and it lives here rather than in the
+    # leaf so the sweep structurally has no cwd branch. Guarded on `_render_targeting_error`'s
+    # precedent (a deleted working directory raises `OSError`): losing an optional
+    # marker is the right degradation, losing the whole table is not. Narrower than
+    # that precedent's `(RegistryError, OSError)` on purpose — the registry read
+    # happens inside `build_overview`, where its failure IS the answer and must not
+    # be swallowed into a table that pretends nothing is registered.
+    try:
+        cwd: Optional[str] = os.getcwd()
+    except OSError:
+        cwd = None
+
+    payload = overview.build_overview(cwd=cwd)
+    if as_json:
+        _emit_json(payload)
+        return 0
+    _render_overview(payload)
+    return 0
+
+
+def cmd_status(workspace_dir: str, as_json: bool = False, *,
+               project: Optional[str] = None) -> int:
     """Reports whether Mitos is set up for a project, and what (if anything) is missing.
 
     Designed to be run by a human OR an LLM in a new project: it answers "is Mitos
@@ -1769,9 +2510,27 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
     (0 = fully ready, 1 = needs attention / not set up). When not ready it prints
     concise next steps and points at the full SETUP walkthrough.
 
+    **Exit contract for ``mitos status <project>``: 0 = fully ready, 1 = needs
+    attention / not set up, on every branch including the malformed-config one.**
+    SETUP.md's agent loop is built on that mapping, so it is stated here rather
+    than left to be read off the returns.
+
+    ``project`` arrives as an argument because it cannot be recovered here.
+    ``config.project`` on the config this function rebuilds is a *path* (the
+    constructor's ``project or self.workspace_dir``), and the alternative —
+    reverse-looking-up the path against the registry — is the build 3d rejected by
+    name: it misses on a symlinked route whose registry entry is hand-written
+    non-canonically, quietly printing a path for a registered project with every
+    test green. ``main()`` already resolved the name; it passes it in, so this
+    function structurally cannot re-derive it wrong.
+
     Args:
         workspace_dir: The project directory to inspect.
         as_json: Emit a machine-readable JSON report instead of the text report.
+        project: The registered name the caller addressed this workspace by, or
+            ``None`` for an unregistered path / no selector. Keyword-only and
+            defaulted, so the direct call sites (the suite's, and any future one)
+            keep passing a bare path.
 
     Returns:
         ``0`` if fully ready, ``1`` otherwise.
@@ -1783,17 +2542,32 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
     # boundary would render only a generic `Error: …`; status owes its caller the
     # contextual "config malformed → not ready" report (Lesson 45 / entry-004).
     try:
-        config = MitosConfig(workspace_dir)
+        config = MitosConfig(workspace_dir, project=project)
     except ConfigError as e:
         if as_json:
             _emit_json({
+                # Which payload this is. `status --json` returns the project report
+                # today and will return the global overview too once zero-arg
+                # `status` is flipped, so it announces itself rather than leaving a
+                # consumer to sniff a shape — and it does so on BOTH emission sites,
+                # because a discriminator present on one is detectable only by
+                # absence, which is sniffing wearing a discriminator's clothes.
+                "report": "project",
+                # Same value the constructor would have computed had it succeeded
+                # (`project or self.workspace_dir`), so a consumer never has to
+                # branch on which arm produced the payload. Note this key is the
+                # *targeting* identity and is unrelated to the three-field corpus
+                # echo `corpus_provenance` emits elsewhere — `status` carries no
+                # echo (3e's in-body carve-out), so the two never share a payload.
+                "project": project or workspace_dir,
                 "workspace": workspace_dir,
                 "ready": False,
                 "initialized": False,
                 "config_error": str(e),
             })
         else:
-            print(f"\nMITOS STATUS for {workspace_dir} — NOT SET UP ✗\n")
+            print(f"\nMITOS STATUS for {_status_subject(workspace_dir, project)} "
+                  f"— NOT SET UP ✗\n")
             print(f"  ✗ config.toml malformed: {e}")
             print("      → fix it or re-run `mitos init`")
             print()
@@ -1824,9 +2598,9 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
     key_source = _gemini_key_source(workspace_dir)
     key_ok = key_source is not None
     q = _check_qdrant(config.qdrant_url, config.qdrant_collection)
-    mcp_wired = _mcp_wired(workspace_dir)
+    mcp_project_entry = _mcp_project_entry(workspace_dir)
     # Best-effort: is the pasted agent-file mitos note out of date? A recommendation,
-    # never a readiness blocker — like the MCP-wired check.
+    # never a readiness blocker — like the shadowing-entry finding.
     agent_drift = agent_block_drift(workspace_dir)
 
     graph_nodes = None
@@ -1838,15 +2612,28 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
     # (which files, which decisions to re-scope) lives here, not on every `record`.
     overflows: List[Dict[str, Any]] = []
     graph_behind = False
+    embedding_seed: Optional[Dict[str, str]] = None
+    # The store the unbuilt-graph predicate answers on, or None when there is no
+    # graph file at all (the clone). Bound immediately after construction so a
+    # later read failure still hands the predicate a store — it then answers on its
+    # "could not check" arm, the loud direction, rather than on the absent-file one.
+    gap_store: Optional[GraphStore] = None
     if os.path.exists(config.db_path) and not pre_v1a:
         try:
             ro_store = GraphStore(config.db_path, read_only=True)
+            gap_store = ro_store
             all_nodes = ro_store.get_all_nodes()
             graph_nodes = len(all_nodes)
             id_to_slug = {n["id"]: n["slug"] for n in all_nodes}
             active_ids = ro_store.get_active_node_ids()
             active_nodes = len(active_ids)
             overflows = overflow_report(ro_store)
+            # The coverage marker, if one stands: a `rebuild`/`cutover`/`reconcile`
+            # bounded the outbox to the active set and has not drained yet. Purely
+            # informational — it tells the operator that a plain `mitos sync` restores
+            # search, which is otherwise a fact only the drain knows. Never a readiness
+            # gate: an unseeded queue is an ordinary state, not a fault.
+            embedding_seed = ro_store.embedding_seed()
         except Exception:
             pass  # both reads are best-effort; a failure leaves the safe defaults
         graph_behind = _graph_behind_buffer(config.db_path)
@@ -1857,8 +2644,8 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
     # (superseded vectors that linger, never GC'd) inflates the point total past the
     # active threshold and hides genuinely-missing active vectors (the live-corpus
     # incident: 181 >= 178 read healthy over 12 invisible active nodes). We scroll
-    # Qdrant's actual point ids via the NO-CREATE read path (never constructing a
-    # store that would `_ensure_collection` a missing collection) and diff.
+    # Qdrant's actual point ids and diff. `status` is a read-only sensor and creates
+    # nothing — the module-level scroll keeps it independent of a store entirely.
     #
     # `missing_active` = active nodes with no vector (invisible to semantic search —
     #   the warned state). `orphan_points` = points with no active node — the
@@ -1902,16 +2689,54 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
             pass
 
     initialized = mitos_dir_ok and decisions_ok
-    # A fresh, initialized project has NO Qdrant collection yet — it auto-creates
-    # on the first `record_decision`. So an absent (or empty) collection is a
-    # normal ready state, NOT a blocker: a project with .mitos/, a key, and a
-    # reachable Qdrant is ready to record its first decision. Only an unreachable
-    # Qdrant degrades semantic surface/query. A pre-V1a (prototype) graph is never
-    # ready — it must be routed through the one-time cutover first (§5.2.7).
-    ready = initialized and key_ok and q["reachable"] and not pre_v1a
+    # The unbuilt graph (W31): a corpus holding entries over a graph holding no
+    # nodes — the clone that carries the committed `.mitos/config.toml` and
+    # `decisions.md` but not the gitignored `*.sqlite`. The same predicate the four
+    # semantic read surfaces consult, so this report and those answers cannot drift
+    # into two opinions about one state.
+    #
+    # TWO guards, and each removes a heal that would be wrong on a report that is
+    # already not-ready. `pre_v1a`: a prototype graph leaves `gap_store` None (the
+    # two reads above skip it) while being, by definition, POPULATED — unguarded it
+    # would be told "run `mitos sync`" beside the `mitos cutover` line it already
+    # gets. `initialized`: a directory holding a `decisions.md` and no `.mitos/`
+    # cannot be synced at all, and its report already leads with `mitos init` — the
+    # rung there would be a second, unreachable instruction (measured by hand on a
+    # real directory, not reasoned about). Neither guard touches the target state:
+    # a clone carries the committed `.mitos/config.toml`, so it is `initialized`.
+    graph_unbuilt = False
+    if initialized and not pre_v1a:
+        graph_unbuilt = missing_graph_is_a_gap(
+            gap_store, config, corpus_has_entries=corpus_has_entries
+        )
+
+    # An absent (or empty) collection is a normal ready state, NOT a blocker: a
+    # project with .mitos/, a key, and a reachable Qdrant is ready to record its
+    # first decision. Absence is not a readiness question because the GRAPH tells
+    # the two cases apart, and the collection row below already does that — over an
+    # empty graph it reads "none recorded yet", over a populated one it warns and
+    # points at `mitos reconcile`. Only an unreachable Qdrant degrades semantic
+    # surface/query. A pre-V1a (prototype) graph is never ready — it must be routed
+    # through the one-time cutover first (§5.2.7).
+    #
+    # An unbuilt graph over a populated corpus is likewise never ready, and unlike
+    # the informational rungs (vector completeness, divergence) this one is a gate:
+    # those report PARTIAL degradation over a working graph — the lexical fallback
+    # still answers, `list`/`show` still serve — while this state has no working
+    # graph at all, does not self-heal (nothing builds it but an explicit `mitos
+    # sync`, unlike an absent collection, which the first covering write creates),
+    # and is read by an agent setup loop whose next move on a `0` is to trust an
+    # empty answer. A gate that cannot stop that is not a gate. The 0/1 mapping is
+    # unchanged and no new verdict appears: `initialized` is still True on a clone,
+    # so the shipped middle value (NEEDS ATTENTION ⚠) already fits.
+    ready = (initialized and key_ok and q["reachable"]
+             and not pre_v1a and not graph_unbuilt)
 
     if as_json:
         _emit_json({
+            # The payload discriminator — see the early ConfigError branch above.
+            "report": "project",
+            "project": config.project,
             "workspace": workspace_dir,
             "ready": ready,
             "initialized": initialized,
@@ -1933,8 +2758,27 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
                 ),
                 "missing_active_slugs": missing_active_slugs,
                 "orphan_points": orphan_points,
-                "mcp_wired": mcp_wired,
+                "graph_unbuilt": graph_unbuilt,
+                # Renamed from `mcp_wired` in 6a, and the rename is the point: the
+                # same file read now means the opposite thing. A consumer reading
+                # `mcp_wired: true` for "good" would read a hazard as an
+                # endorsement, and no test can catch a lie of that shape — a
+                # missing key reds loudly on the first read.
+                "mcp_project_entry": mcp_project_entry,
             },
+            # The RAW pinned value, never the rendered note: prose belongs to the
+            # text surface and typed data to the payload, or the two channels drift
+            # into two claims. It may be a `str`, an `int`, or a list — the loader
+            # records whatever the file held (1d's retirement rows parametrize all
+            # three) and `_emit_json` serializes each fine. No `repr()`: that
+            # escaping is `_inert_pin_note`'s, and it is a terminal concern. The
+            # gate is spelled as the membership test `_inert_pin_note` uses, not as
+            # a `.get()`: one condition, two channels, or the phase has shipped two
+            # predicates that can disagree.
+            "inert_collection_pin": (
+                config.inert_file_keys["qdrant_collection"]
+                if "qdrant_collection" in config.inert_file_keys else None
+            ),
             "graph_behind_buffer": graph_behind,
             "corpus_divergence": divergence_report,
             "scope_overflow": overflows,
@@ -1945,9 +2789,11 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
 
     verdict = "READY ✓" if ready else ("NEEDS ATTENTION ⚠" if initialized else "NOT SET UP ✗")
     mark = lambda ok: "✓" if ok is True else ("✗" if ok is False else "—")
-    # An absent collection on a reachable Qdrant is normal (auto-creates on the
-    # first record), so show it as a neutral "—" with a note — never a ✗ that
-    # would contradict an otherwise-READY verdict.
+    # An absent collection on a reachable Qdrant is never a readiness ✗ — it is
+    # either the fresh state (nothing recorded yet) or a wipe over a populated
+    # graph, and the two branches below say which. Neutral "—" plus a note, so the
+    # mark can't contradict an otherwise-READY verdict while the note still carries
+    # the heal.
     if not q["reachable"]:
         coll_mark, coll_hint = None, "needs Qdrant up (see above)"
     elif q["collection_exists"]:
@@ -1960,6 +2806,13 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
             None,
             f"missing — {len(active_ids)} active node(s) have no vectors; run `mitos reconcile`",
         )
+    elif graph_unbuilt:
+        # The calm fresh-project sentence below is FALSE over a corpus of hundreds,
+        # and it is part of the same lie the rung exists to stop: an absent
+        # collection here means nothing has been indexed because nothing has been
+        # BUILT, not because nothing has been decided. Defer to the graph rung
+        # rather than contradict it — with no graph, the collection is downstream.
+        coll_mark, coll_hint = None, "nothing indexed yet — the graph is unbuilt (see below)"
     else:
         coll_mark, coll_hint = None, "auto-created on first record — none recorded yet"
     checks = [
@@ -1974,11 +2827,21 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
          "set it once for all projects: `mitos set-key --global <KEY>`"),
         (f"Qdrant reachable ({config.qdrant_url})", q["reachable"],
          "start it: `docker compose up -d` in the mitos repo"),
-        (f"collection '{config.qdrant_collection}'", coll_mark, coll_hint),
-        # Recommendation, not a requirement — never a ✗. Agents get the best AX
-        # (ambient surface/record, structured args, no shell-quoting) via the MCP.
-        ("MCP wired (recommended for agents)", True if mcp_wired else None,
-         "agents: wire `mitos serve` — see SETUP.md §3 (CLI works without it)"),
+        # The 4th slot is an ALWAYS-printed follow-up line for this row (see the
+        # print loop). The inert-pin note has to be one: it is a config fact, not a
+        # service fact, so it must render in all four coll_mark branches above —
+        # `coll_hint` renders only when the mark is not ✓, and a pinned workspace
+        # whose collection exists is exactly a case where the two names disagree
+        # visibly. Nesting it in the `collection_exists` arm would drop it from the
+        # unreachable/absent branches, which are the MOST likely to be confused
+        # about which name is in force.
+        (f"collection '{config.qdrant_collection}'", coll_mark, coll_hint,
+         _inert_pin_note(config, offer_deletion=True)),
+        # No MCP-wiring row lives here any more. Wiring is a one-time machine-global
+        # act since the registry landed, so it is not a per-project readiness rung
+        # in either direction — and its replacement is a *finding* that must be
+        # ABSENT on a healthy project, while every `checks` row renders
+        # unconditionally. It prints below, beside the agent-file drift note.
     ]
     # A pre-V1a (prototype) graph is the dominant blocker — surface it prominently,
     # right after the workspace line, with the same route-to-cutover guidance `init`
@@ -1989,16 +2852,38 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
         # cutover`. (The store.py boot-guard message stays its own deeper-internal
         # phrasing; it is not an operator-primary surface.)
         checks.insert(1, ("graph schema (V1a)", False, _CUTOVER_GUIDANCE))
-    print(f"\nMITOS STATUS for {workspace_dir} — {verdict}\n")
-    for label, ok, hint in checks:
+    print(f"\nMITOS STATUS for {_status_subject(workspace_dir, project)} — {verdict}\n")
+    # `*rest` tolerates both widths, so the 3-tuple rows (including the pre-V1a row
+    # inserted above) need no change and a future row can add a follow-up without
+    # touching the others. A hint is conditional on the mark; a follow-up note is not.
+    for label, ok, hint, *rest in checks:
         line = f"  {mark(ok)} {label}"
         if ok is not True and hint:
             line += f"   → {hint}"
         print(line)
+        if rest and rest[0]:
+            print(f"      {rest[0]}")
     if q["reachable"] and q["collection_exists"] and q["points"] is not None:
         print(f"      ({q['points']} vector(s) indexed)")
     if graph_nodes is not None:
         print(f"  • graph holds {graph_nodes} node(s)")
+    # The unbuilt graph (W31). A blocker, not a rung readers learn to skip: every
+    # semantic read over this workspace answers cleanly empty while the corpus holds
+    # entries, so the caller is told "no precedent" for a project that has them.
+    #
+    # The heal is `mitos sync` and EMPHATICALLY not `mitos reconcile`: reconcile
+    # diffs an empty active set against an absent collection, finds nothing to
+    # enqueue, and reports success on a workspace it did not touch — converting a
+    # recoverable state into one the operator believes they already fixed. That is
+    # one word away from being the wrong answer, which is why a row asserts the
+    # word's absence from this rung.
+    if graph_unbuilt:
+        print(
+            "\n  ⚠ the graph is unbuilt — decisions.md holds entries but the graph "
+            "holds no nodes, so every read answers empty and reads as 'no precedent'. "
+            "Run `mitos sync` to build it (usually a clone: the graph is gitignored, "
+            "the corpus is not)."
+        )
     # Vector-completeness verdict from the exact id-diff computed above (not a
     # count). Three outcomes:
     #   • scroll failed (missing_active_slugs is None) → we could not verify; say so
@@ -2025,6 +2910,13 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
             f"to re-embed them (or `mitos sync` if the outbox is non-empty) — "
             f"informational, not a readiness blocker."
         )
+        if embedding_seed:
+            # Which of the two heals applies is knowable here, so say it rather than
+            # leaving the operator to infer it from "if the outbox is non-empty".
+            print(
+                f"      the embedding queue was seeded by `{embedding_seed['established_by']}` "
+                f"at {embedding_seed['established_at']} — `mitos sync` restores search"
+            )
         if n <= 5:
             for slug in missing_active_slugs:
                 print(f"      • {slug}")
@@ -2044,6 +2936,22 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
             "registry were never committed for this corpus (a schema upgrade widens "
             "the DDL but does not re-commit). Run `mitos rebuild` to populate them "
             "(informational — not a readiness blocker; no decisions are at risk)."
+        )
+    if mcp_project_entry:
+        # A finding, not a check — so it prints only when there is something to
+        # say, and a project with no `.mcp.json` reads clean. The wording states
+        # the fact rather than prescribing a fix, because mitos cannot tell a
+        # STALE entry from one deliberately kept identical to the machine-wide
+        # registration, and both are legitimate: "delete it" would be wrong advice
+        # half the time. Note also that this reads THIS directory only — an entry
+        # at a parent launch root shadows the same way and is not visible here.
+        print(
+            "\n  ⚠ this project declares its own `mitos` MCP server in `.mcp.json`. "
+            "A project-scope entry takes precedence over the machine-wide one by "
+            "name — it does not fall back to it — so this file is what your "
+            "sessions here get, and a broken entry leaves them with no mitos tools "
+            "at all. Keep it in sync with your machine-wide registration, or remove "
+            "it and let that one serve this project."
         )
     if agent_drift["stale"]:
         stale_files = ", ".join(
@@ -2065,6 +2973,9 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
                   f"`mitos set-key --global <KEY>` (or per-project: `mitos set-key <KEY>`)"); n += 1
         if not q["reachable"]:
             print(f"  {n}. Start Mitos's Qdrant: `docker compose up -d` from the mitos repo"); n += 1
+        if graph_unbuilt:
+            print(f"  {n}. Build the graph from your corpus: `mitos sync` "
+                  f"(the graph is derivative — decisions.md is the source)"); n += 1
         print("  Full walkthrough → SETUP.md "
               "(https://github.com/dovahkiin-v/mitos/blob/main/SETUP.md)")
         print()
@@ -2204,19 +3115,27 @@ def cmd_restore_source(
         verify_whole_buffer,
     )
 
+    # Every refusal below answers on stderr and every report on stdout, so the echo
+    # rides each branch rather than leading the handler. This verb writes
+    # `config.decisions_file` — the user-authored gold source P6 makes immutable —
+    # so naming the corpus is not decoration here: a mis-aimed
+    # `--all-graph-only` rewrites *another* project's input in bulk.
     if bool(slug) == bool(all_graph_only):
         msg = "restore-source needs exactly one of --slug or --all-graph-only."
         if as_json:
-            _emit_json({"error": msg, "code": "ambiguous_target"})
+            _emit_json({"error": msg, "code": "ambiguous_target",
+                        **corpus_provenance(config)})
         else:
+            _echo_corpus(config, file=sys.stderr)
             print(msg, file=sys.stderr)
         return 1
 
     if not os.path.exists(config.db_path):
         msg = "No graph found — nothing to restore from."
         if as_json:
-            _emit_json({"error": msg, "code": "no_graph"})
+            _emit_json({"error": msg, "code": "no_graph", **corpus_provenance(config)})
         else:
+            _echo_corpus(config, file=sys.stderr)
             print(msg, file=sys.stderr)
         return 1
 
@@ -2225,8 +3144,9 @@ def cmd_restore_source(
     if report.get("skipped"):
         msg = f"Cannot restore — {report['skipped']}."
         if as_json:
-            _emit_json({"error": msg, "code": "unavailable"})
+            _emit_json({"error": msg, "code": "unavailable", **corpus_provenance(config)})
         else:
+            _echo_corpus(config, file=sys.stderr)
             print(msg, file=sys.stderr)
         return 1
 
@@ -2236,8 +3156,10 @@ def cmd_restore_source(
             msg = (f"'{slug}' is not a graph-only node — it already has a `### ` block "
                    f"in the corpus, or no such node exists.")
             if as_json:
-                _emit_json({"error": msg, "code": "not_graph_only"})
+                _emit_json({"error": msg, "code": "not_graph_only",
+                            **corpus_provenance(config)})
             else:
+                _echo_corpus(config, file=sys.stderr)
                 print(msg, file=sys.stderr)
             return 1
         targets = [slug]
@@ -2262,8 +3184,9 @@ def cmd_restore_source(
     if not targets:
         if as_json:
             _emit_json({"restored": [], "refused": [], "dry_run": dry_run,
-                        "written": False})
+                        "written": False, **corpus_provenance(config)})
         else:
+            _echo_corpus(config)
             print("No graph-only nodes — every node has a source block. ✓")
         return 0
 
@@ -2337,8 +3260,15 @@ def cmd_restore_source(
             "dry_run": dry_run,
             "written": written,
             "path": config.decisions_file,
+            **corpus_provenance(config),
         })
         return 1 if refused else 0
+
+    # One run can answer on BOTH channels (a partial write reports on stdout and
+    # refuses on stderr), so the echo leads each channel that carries an answer
+    # rather than picking one — the same shape `cmd_sync` and `cmd_reconcile` take.
+    if dry_run or written:
+        _echo_corpus(config)
 
     if dry_run:
         print(f"\nWould restore {len(blocks)} source block(s) to "
@@ -2352,6 +3282,13 @@ def cmd_restore_source(
             print(f"  • {target}")
         print("\nReview the entries, then `mitos rebuild --json` to confirm the "
               "completeness gate passes.")
+    if refused:
+        # Flush first: stderr is unbuffered while a piped stdout is not, so without
+        # this the refusals overtake the report they annotate (the inversion
+        # `cmd_init` and `cmd_record` already guard against — this branch had no
+        # such flush before, and the leading echo above makes the order load-bearing).
+        sys.stdout.flush()
+        _echo_corpus(config, file=sys.stderr)
     for row in refused:
         print(f"  ✗ refused: {row['slug']} — {row['reason']}", file=sys.stderr)
     if refused and not written and not dry_run:
@@ -2436,13 +3373,25 @@ def cmd_cutover(
         CutoverError: On a corpus defect during the rebuild (caught at the
             ``main()`` boundary).
     """
+    # 0. The echo leads every text branch — including the two early returns below
+    #    and `rebuild_and_gate`'s own stdout — so one call covers all 28 sites. All
+    #    of them are stdout; this verb has no stderr answer.
+    if not as_json:
+        _echo_corpus(config)
+
     # 1. Up-front prototype probe (G7) — mirrors the cmd_init / cmd_status RO-probe
     #    shape. An absent / already-V1a / empty graph is a cheap no-op: no rebuild,
     #    no swap, no Qdrant churn (and a post-success re-run is idempotent).
     if not os.path.exists(config.db_path):
         if as_json:
+            # The stamp overwrites the hand-built `workspace` key with the same
+            # value (`corpus_provenance` reads `config.workspace_dir` too), so it
+            # is additive in effect on these four early returns. The `to_dict()`
+            # shapes below carry no `workspace` key at all — `aside_db_path` is a
+            # *different* directory and nothing here touches it.
             _emit_json({"workspace": config.workspace_dir,
-                        "swapped": False, "reason": "no_graph"})
+                        "swapped": False, "reason": "no_graph",
+                        **corpus_provenance(config)})
         else:
             print("No graph found at this workspace — run `mitos init` for a fresh "
                   "V1a workspace (nothing to cut over).")
@@ -2455,7 +3404,8 @@ def cmd_cutover(
     if not is_prototype:
         if as_json:
             _emit_json({"workspace": config.workspace_dir,
-                        "swapped": False, "reason": "not_a_prototype"})
+                        "swapped": False, "reason": "not_a_prototype",
+                        **corpus_provenance(config)})
         else:
             print("Graph is already on the V1a schema (or empty) — nothing to "
                   "cut over.")
@@ -2490,7 +3440,8 @@ def cmd_cutover(
             if as_json:
                 _emit_json({**result.to_dict(), "swapped": False,
                             "reason": "shortfall_refused",
-                            "qdrant_wipe_cmd": qdrant_wipe_cmd})
+                            "qdrant_wipe_cmd": qdrant_wipe_cmd,
+                            **corpus_provenance(config)})
             else:
                 print(f"\nRefusing to swap: {n} active core(s) would be dropped. "
                       f"Review the offenders above. If this purge is intentional "
@@ -2508,7 +3459,8 @@ def cmd_cutover(
             # JSON mode is for automation: never prompt; require an explicit --yes.
             _emit_json({**result.to_dict(), "swapped": False,
                         "reason": "confirmation_required",
-                        "qdrant_wipe_cmd": qdrant_wipe_cmd})
+                        "qdrant_wipe_cmd": qdrant_wipe_cmd,
+                        **corpus_provenance(config)})
             return 1
         if sys.stdin.isatty():
             answer = input("\nProceed with the cutover swap? This replaces the "
@@ -2531,7 +3483,8 @@ def cmd_cutover(
     if as_json:
         _emit_json({**result.to_dict(), "swapped": True,
                     "bak_path": bak_path,
-                    "qdrant_wipe_cmd": qdrant_wipe_cmd})
+                    "qdrant_wipe_cmd": qdrant_wipe_cmd,
+                    **corpus_provenance(config)})
         return 0
 
     print(f"\n✓ Cutover complete — the V1a graph is live at {config.db_path}.")
@@ -2640,12 +3593,18 @@ def cmd_rebuild(
         CutoverError: On a corpus format defect during the rebuild (caught at the
             ``main()`` boundary).
     """
+    # 0. One leading echo for all 21 text sites — every one of them is stdout,
+    #    including the two early returns and `rebuild_and_gate`'s own output.
+    if not as_json:
+        _echo_corpus(config)
+
     # 1. Probe: rebuild runs on a CURRENT graph. Absent → init; prototype → the
     #    one-time cutover owns it (don't double-handle).
     if not os.path.exists(config.db_path):
         if as_json:
             _emit_json({"workspace": config.workspace_dir,
-                        "swapped": False, "reason": "no_graph"})
+                        "swapped": False, "reason": "no_graph",
+                        **corpus_provenance(config)})
         else:
             print("No graph found at this workspace — run `mitos init` first "
                   "(nothing to rebuild).")
@@ -2658,7 +3617,8 @@ def cmd_rebuild(
     if is_prototype:
         if as_json:
             _emit_json({"workspace": config.workspace_dir,
-                        "swapped": False, "reason": "prototype_graph"})
+                        "swapped": False, "reason": "prototype_graph",
+                        **corpus_provenance(config)})
         else:
             print("Graph is a pre-V1a prototype — run `mitos cutover` (the one-time "
                   "migration) instead of `mitos rebuild`.")
@@ -2699,7 +3659,8 @@ def cmd_rebuild(
     if blocked and not allow_drops:
         if as_json:
             _emit_json({**result.to_dict(), "swapped": False,
-                        "reason": "casualties_or_shortfall_refused"})
+                        "reason": "casualties_or_shortfall_refused",
+                        **corpus_provenance(config)})
         else:
             _print_rebuild_remediation(
                 casualties, result.missing_cores, os.path.basename(config.decisions_file)
@@ -2713,7 +3674,8 @@ def cmd_rebuild(
     if not assume_yes:
         if as_json:
             _emit_json({**result.to_dict(), "swapped": False,
-                        "reason": "confirmation_required"})
+                        "reason": "confirmation_required",
+                        **corpus_provenance(config)})
             return 1
         if sys.stdin.isatty():
             answer = input("\nProceed with the rebuild swap? This replaces the live "
@@ -2734,7 +3696,8 @@ def cmd_rebuild(
     # 6. Post-swap guidance.
     if as_json:
         _emit_json({**result.to_dict(), "swapped": True,
-                    "bak_path": bak_path})
+                    "bak_path": bak_path,
+                    **corpus_provenance(config)})
         return 0
 
     print(f"\n✓ Rebuild complete — the graph at {config.db_path} now reflects the "
@@ -2748,38 +3711,6 @@ def cmd_rebuild(
     if bak_path:
         print(f"  - Once satisfied, remove the backup:  rm {bak_path}")
     return 0
-
-
-def load_dotenv_file(path: str = ".env") -> None:
-    """Loads ``KEY=value`` pairs from a ``.env`` file into the environment.
-
-    Mitos reads its credentials (``GEMINI_API_KEY``, ``ANTHROPIC_API_KEY``) and
-    ``QDRANT_URL`` straight from ``os.environ``. This loads them from a workspace
-    ``.env`` so a key dropped in that file takes effect without a manual
-    ``export`` — the same manual parse the live test-suite already uses, with no
-    new dependency (P19 — Dependency Skepticism). An empty value is skipped, and
-    an existing environment value is never overridden (an explicit ``export``
-    wins over the file).
-
-    Args:
-        path: Path to the ``.env`` file (default: ``.env`` in the cwd, i.e. the
-            workspace root where ``mitos`` is invoked).
-    """
-    if not os.path.exists(path):
-        return
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, val = line.split("=", 1)
-                key = key.strip()
-                val = val.strip().strip('"').strip("'")
-                if key and val and key not in os.environ:
-                    os.environ[key] = val
-    except OSError:
-        pass
 
 
 # =========================================================================== #
@@ -2848,40 +3779,43 @@ def _confirm_spend(n: int, *, assume_yes: bool, as_json: bool) -> Optional[int]:
 
 def _build_check_substrate(
     config: MitosConfig,
-) -> Tuple[Optional[GeminiEmbeddingProvider], Optional[QdrantVectorStore],
-           Optional[str], Optional[str]]:
-    """Constructs the two best-effort external substrate providers (KD2).
+) -> Tuple[Optional[GeminiEmbeddingProvider], QdrantVectorStore, Optional[str]]:
+    """Constructs the two external substrate providers — one of them best-effort (KD2).
 
-    Both providers RAISE at construction — ``GeminiEmbeddingProvider`` when
-    ``GEMINI_API_KEY`` is unset, ``QdrantVectorStore`` when Qdrant is unreachable
-    (its ``__init__`` contacts the network). Each is caught NARROWLY (its own typed
-    error, never a blanket ``except``) and degraded to ``None`` + a kept detail
-    string, so an unexpected error still propagates. The disposition (refuse iff the
-    run has sweep work) is the caller's — this only reports availability. Separated
-    into a module-level helper so tests inject keyed fakes at this seam.
+    ``GeminiEmbeddingProvider`` RAISES at construction when ``GEMINI_API_KEY`` is
+    unset; that is caught NARROWLY (its own typed error, never a blanket
+    ``except``) and degraded to ``None`` + a kept detail string, so an unexpected
+    error still propagates. The disposition (refuse iff the run has sweep work) is
+    the caller's — this only reports availability. Separated into a module-level
+    helper so tests inject keyed fakes at this seam.
+
+    ``QdrantVectorStore`` has **no construction-time failure mode**: its
+    ``__init__`` contacts no network at all, so it is returned unconditionally.
+    Both faults it used to report here — a missing collection and an unreachable
+    Qdrant — now arrive at the *operation*, typed, and reach exit 2 through the
+    sweep's ``Unavailable`` (ADR
+    ``check-precondition-re-keys-from-store-construction-to-operation``). The
+    fail-closed posture is unchanged; only the classification and the wording are.
 
     Args:
         config: The active workspace config (paths + Qdrant coordinates).
 
     Returns:
-        ``(embed, vector, embed_detail, vector_detail)`` — a provider or ``None``,
-        and the failure message string (``None`` on success) for each.
+        ``(embed, vector, embed_detail)`` — the embedding provider or ``None`` with
+        its failure message, and the vector store.
     """
     embed: Optional[GeminiEmbeddingProvider] = None
     embed_detail: Optional[str] = None
     try:
         embed = GeminiEmbeddingProvider(
-            os.path.join(config.mitos_dir, "embedding_cache.sqlite")
+            os.path.join(config.mitos_dir, "embedding_cache.sqlite"),
+            api_key=config.env.get("GEMINI_API_KEY"),
+            model_id=get_embedding_model_id(config.env),
         )
     except EmbeddingError as exc:
         embed_detail = str(exc)
-    vector: Optional[QdrantVectorStore] = None
-    vector_detail: Optional[str] = None
-    try:
-        vector = QdrantVectorStore(config.qdrant_url, config.qdrant_collection)
-    except VectorStoreError as exc:
-        vector_detail = str(exc)
-    return embed, vector, embed_detail, vector_detail
+    vector = QdrantVectorStore(config.qdrant_url, config.qdrant_collection)
+    return embed, vector, embed_detail
 
 
 def _build_check_telemetry(config: MitosConfig) -> Optional[TelemetryStore]:
@@ -2905,7 +3839,7 @@ def _build_check_telemetry(config: MitosConfig) -> Optional[TelemetryStore]:
         return None
 
 
-def _build_check_judge() -> Optional[Callable]:
+def _build_check_judge(config: MitosConfig) -> Optional[Callable]:
     """Builds the bound conflict-judgment executor, or ``None`` when keyless (KD6).
 
     The ``_build_conflict_judge`` shape with the OPPOSITE disposition: it does NOT
@@ -2916,17 +3850,30 @@ def _build_check_judge() -> Optional[Callable]:
     onto its import path (Tier discipline). Built only after the confirm passes and
     only when fresh groups exist, so a reuse-only/clean run never constructs a client.
 
+    ``config`` is REQUIRED rather than defaulted, and this is the one breaking
+    signature in 2c: the seam is monkeypatched by name in four test modules, so a
+    defaulted parameter would let a stale zero-arg fake keep passing while
+    production resolved its key and its model from somewhere else.
+
+    Args:
+        config: The target workspace's config — the key and the judgment model id
+            both come off its resolved ``env``, never the process environment.
+
     Returns:
         The bound one-arg ``judge`` callable, or ``None`` when ``ANTHROPIC_API_KEY``
         is absent.
     """
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    api_key = config.env.get("ANTHROPIC_API_KEY")
     if not api_key:
         return None
     import anthropic
-    from mitos.conflict_judgment import make_judgment_executor
+    from mitos.conflict_judgment import (_JUDGMENT_MODEL_ALIAS,
+                                         make_judgment_executor)
 
-    return make_judgment_executor(anthropic.Anthropic(api_key=api_key))
+    return make_judgment_executor(
+        anthropic.Anthropic(api_key=api_key),
+        model_id=get_model_id(_JUDGMENT_MODEL_ALIAS, config.env),
+    )
 
 
 def _check_finding_side(node: Dict[str, Any]) -> Dict[str, Any]:
@@ -3074,6 +4021,9 @@ def _check_degradation_summary(degradations: Tuple[str, ...]) -> str:
         "telemetry_write": "some per-batch results could not be recorded",
         "stale_index": "the vector index is behind (recall may be thinned)",
         "probe_read": "completeness could not be certified (the index probe was unreadable)",
+        "collection_missing": (
+            "the vector collection does not exist — run `mitos reconcile` to rebuild it"
+        ),
     }
     return "; ".join(words[token] for token in degradations)
 
@@ -3195,8 +4145,13 @@ def cmd_check(
         msg = ("check --staged cannot combine with --scope or --fresh — the gate always "
                "checks the whole pending buffer and never reuses verdicts.")
         if as_json:
-            _emit_json({"error": msg, "code": "invalid_flags"})
+            _emit_json({"error": msg, "code": "invalid_flags",
+                        **corpus_provenance(config)})
         else:
+            # Inside the handler, so it echoes (D5's locus rule). An argument-shape
+            # refusal that `main()` renders would not — but this one has a reader
+            # and a resolved config, and the two are what the rule turns on.
+            _echo_corpus(config, file=sys.stderr)
             print(msg, file=sys.stderr)
         return 2
     # The gate is a self-contained sequence (its own error boundary); 3a's corpus body
@@ -3210,23 +4165,24 @@ def cmd_check(
 
     try:
         store = GraphStore(config.db_path)
-        embed, vector, embed_detail, vector_detail = _build_check_substrate(config)
+        embed, vector, embed_detail = _build_check_substrate(config)
         telemetry = _build_check_telemetry(config)
 
         # KD2 — provider-absent disposition keys on whether the run has sweep work.
-        if embed is None or vector is None:
+        # Only the embedding provider can be absent at this point: the vector store
+        # constructs without touching the network, so a missing collection or an
+        # unreachable Qdrant is discovered at the first sweep operation and carried
+        # to the same exit 2 as a typed degradation.
+        if embed is None:
             active = store.get_active_decisions(scope)
             if active:
-                parts: List[str] = []
-                if embed is None:
-                    parts.append(f"embeddings ({embed_detail})")
-                if vector is None:
-                    parts.append(f"vector store ({vector_detail})")
                 msg = (f"check could not run: cannot audit {len(active)} live "
-                       f"decision(s) — {' and '.join(parts)} unavailable.")
+                       f"decision(s) — embeddings ({embed_detail}) unavailable.")
                 if as_json:
-                    _emit_json({"error": msg, "code": "substrate_unavailable"})
+                    _emit_json({"error": msg, "code": "substrate_unavailable",
+                                **corpus_provenance(config)})
                 else:
+                    _echo_corpus(config, file=sys.stderr)
                     print(msg, file=sys.stderr)
                 return 2
             # Empty snapshot → the providers are never touched (iter_sweep is lazy
@@ -3253,9 +4209,9 @@ def cmd_check(
 
         # Build the judge only after the confirm passes and only when there is fresh
         # work (KD6): a reuse-only/clean run never constructs a client.
-        judge = _build_check_judge() if plan.fresh_groups else None
+        judge = _build_check_judge(config) if plan.fresh_groups else None
         result = check.execute_corpus_check(
-            plan, judge=judge, telemetry=telemetry, store=store
+            plan, judge=judge, telemetry=telemetry, store=store, env=config.env
         )
 
         # The full display model — every remaining store read happens HERE, before
@@ -3292,19 +4248,26 @@ def cmd_check(
         # vector message, never a traceback CI would read as "new findings".
         msg = f"check could not run: {exc}"
         if as_json:
-            _emit_json({"error": msg, "code": "check_faulted"})
+            _emit_json({"error": msg, "code": "check_faulted",
+                        **corpus_provenance(config)})
         else:
+            _echo_corpus(config, file=sys.stderr)
             print(msg, file=sys.stderr)
         return 2
 
     # Emission is pure (out of the write contract): one JSON object or the report.
     if as_json:
-        _emit_json(_check_json_object(
+        # Stamped at the CALL SITE, never by threading `config` into
+        # `_check_json_object`: that assembler is a shipped API whose signature has
+        # no business gaining a routing parameter (the same argument D1 makes
+        # against stamping inside `_emit_json`).
+        _emit_json({**_check_json_object(
             result, row, exclusions=exclusions, exit_code=exit_code,
             row_written=row_written, scope=scope, fresh=fresh,
             transient_count=transient_count,
-        ))
+        ), **corpus_provenance(config)})
     else:
+        _echo_corpus(config)
         _print_check_report(
             result, exclusions=exclusions, denominator=denominator, scope=scope,
             row_written=row_written, transient_count=transient_count,
@@ -3367,6 +4330,7 @@ def _persist_staged_batch(
     result: "Any",
     *,
     run_id: str,
+    env: Optional[Mapping[str, str]] = None,
 ) -> Optional[str]:
     """Persists one judged staged batch with ``surface='check'`` (KD7), best-effort.
 
@@ -3384,6 +4348,10 @@ def _persist_staged_batch(
             the caller guards ``execution is not None``).
         run_id: This run's id, stamped as ``sync_run_id`` on every row (the one-thread-of-
             truth join to the ``check_runs`` PK).
+        env: The target workspace's resolved environment (``config.env``), against
+            which ``execution.model_alias`` resolves — the same map the judge's own
+            model id came from, so the provenance column records the model the run
+            actually used.
 
     Returns:
         ``None`` on a clean write, or a write-failure detail string (the caller marks the
@@ -3393,10 +4361,11 @@ def _persist_staged_batch(
         return "telemetry store unavailable"
     try:
         execution = result.execution
-        # CHK-D3: resolve the versioned model id here (same process/env, moments after
-        # the call); an unknown alias degrades to NULL (provenance-only), never a lost row.
+        # CHK-D3: resolve the versioned model id here — moments after the call, against
+        # the same resolved environment the call used (2c); an unknown alias degrades to
+        # NULL (provenance-only), never a lost row.
         try:
-            model_id: Optional[str] = get_model_id(execution.model_alias)
+            model_id: Optional[str] = get_model_id(execution.model_alias, env)
         except ValueError:
             model_id = None
         batch = JudgmentBatch(
@@ -3453,6 +4422,9 @@ _STAGED_DEGRADATION_WORDS = {
     "sweep": "the semantic substrate went dark mid-run (findings shown are partial)",
     "judgment": "the judge became unavailable mid-run (findings shown are partial)",
     "telemetry_write": "some results could not be recorded",
+    "collection_missing": (
+        "the vector collection does not exist — run `mitos reconcile` to rebuild it"
+    ),
 }
 
 
@@ -3600,29 +4572,46 @@ def _run_staged_check(
         if not pending:
             ended_at = datetime.now(timezone.utc).isoformat()
             if as_json:
-                _emit_json(_staged_json_object(
+                # The `--json` branch of the free path is NOT carved out: it already
+                # emits a full object, so a key costs no shipped silence. Only the
+                # one-line text branch below is the carve-out, and the two must not
+                # be "harmonized" into one rule later.
+                _emit_json({**_staged_json_object(
                     run_id=run_id, started_at=started_at, ended_at=ended_at,
                     exit_code=0, nodes_total=0, nodes_swept=0, batches_executed=0,
                     pairs_judged_fresh=0, finding_objs=[], degradations=[],
                     exclusions=[], transient_count=0, row_written=False,
-                ))
+                ), **corpus_provenance(config)})
             else:
+                # THE OBLIGATION CARVE-OUT (§4.7): the echo rides output the surface
+                # already emits and never converts a near-silent success into
+                # output. This is a pre-commit hook's dominant path — SETUP.md sells
+                # it as effectively free, in noise as much as in spend — and its
+                # target is a literal in a committed hook (`-p .`), so it cannot
+                # drift. Measured at 8523259: this prints exactly ONE line (the
+                # vision's "printed nothing at all" is false; the conclusion is
+                # not). Tripling it to name a target that cannot drift is the trade
+                # this branch declines. Distinct from `agent-block`'s carve-out,
+                # which is about the CHANNEL, not the obligation — collapsing the
+                # two into "check and agent-block are special" loses both arguments.
                 print("Gate clear — no pending decisions to check.")
             return 0
 
-        embed, vector, embed_detail, vector_detail = _build_check_substrate(config)
-        # Providers absent WITH pending work → fail-closed (the hook precondition), no row.
-        if embed is None or vector is None:
-            parts: List[str] = []
-            if embed is None:
-                parts.append(f"embeddings ({embed_detail})")
-            if vector is None:
-                parts.append(f"vector store ({vector_detail})")
+        embed, vector, embed_detail = _build_check_substrate(config)
+        # The embedding provider absent WITH pending work → fail-closed (the hook
+        # precondition), no row. A missing collection or an unreachable Qdrant is no
+        # longer visible here — it trips the breaker in the entry loop below and
+        # lands on the same exit 2, named rather than blamed on construction.
+        if embed is None:
             msg = (f"check --staged could not gate {len(pending)} pending decision(s) — "
-                   f"{' and '.join(parts)} unavailable.")
+                   f"embeddings ({embed_detail}) unavailable.")
             if as_json:
-                _emit_json({"error": msg, "code": "substrate_unavailable"})
+                _emit_json({"error": msg, "code": "substrate_unavailable",
+                            **corpus_provenance(config)})
             else:
+                # The fail-closed refusal DOES echo — the carve-out below is the
+                # free short-circuit alone, and this branch is already speaking.
+                _echo_corpus(config, file=sys.stderr)
                 print(msg, file=sys.stderr)
             return 2
 
@@ -3647,13 +4636,15 @@ def _run_staged_check(
         # (unlike corpus, which absorbs `judge=None` as a typed degradation), so a
         # missing key with pending entries is fail-closed exit 2, no row. `--no-verify`
         # is the deliberate human bypass (documented in 4b).
-        judge = _build_check_judge()
+        judge = _build_check_judge(config)
         if judge is None:
             msg = (f"check --staged could not gate {len(pending)} pending decision(s) — "
                    f"ANTHROPIC_API_KEY is not set (the judge is required to gate).")
             if as_json:
-                _emit_json({"error": msg, "code": "judge_unavailable"})
+                _emit_json({"error": msg, "code": "judge_unavailable",
+                            **corpus_provenance(config)})
             else:
+                _echo_corpus(config, file=sys.stderr)
                 print(msg, file=sys.stderr)
             return 2
 
@@ -3671,20 +4662,26 @@ def _run_staged_check(
             if isinstance(result, check.Unavailable):
                 # Trip the breaker: stop calling the facade for the remaining entries.
                 # The token is faithful to WHICH downstream went dark (aligning with the
-                # corpus P18 vocabulary): the semantic substrate (embedding/vector) reads
-                # as `sweep`, the judge as `judgment`.
-                degraded.add(
-                    "sweep" if result.reason in (
-                        ConflictUnavailableReason.EMBEDDING,
-                        ConflictUnavailableReason.VECTOR_STORE,
-                    ) else "judgment"
-                )
+                # corpus P18 vocabulary): the semantic substrate reads as `sweep`, the
+                # judge as `judgment`. Bound to the shared membership constant, because
+                # an `else` here means "the judge" and would mis-file a new semantic
+                # member silently and confidently.
+                if result.reason in SEMANTIC_SUBSTRATE_REASONS:
+                    degraded.add("sweep")
+                    # Additive, never substitutive — `sweep` is the shipped effect
+                    # token, this names the cause (and the heal, via the word map).
+                    if result.reason is ConflictUnavailableReason.COLLECTION_MISSING:
+                        degraded.add("collection_missing")
+                else:
+                    degraded.add("judgment")
                 break
             nodes_swept += 1
             pairs_judged_fresh += len(result.judged_pairs)
             if result.execution is not None:
                 batches_executed += 1
-                detail = _persist_staged_batch(telemetry, result, run_id=run_id)
+                detail = _persist_staged_batch(
+                    telemetry, result, run_id=run_id, env=config.env
+                )
                 if detail is not None:
                     degraded.add("telemetry_write")
             # Map each surfaced finding to its candidate content hash (from judged_pairs).
@@ -3740,22 +4737,27 @@ def _run_staged_check(
         # exit 2 with a calm vector message, never a traceback CI reads as "new findings".
         msg = f"check --staged could not run: {exc}"
         if as_json:
-            _emit_json({"error": msg, "code": "check_faulted"})
+            _emit_json({"error": msg, "code": "check_faulted",
+                        **corpus_provenance(config)})
         else:
+            _echo_corpus(config, file=sys.stderr)
             print(msg, file=sys.stderr)
         return 2
 
     # Emission is pure (out of the write contract): one JSON object or the report.
     if as_json:
-        _emit_json(_staged_json_object(
+        # Stamped at the call site, like the corpus twin — `_staged_json_object` is
+        # a shipped assembler and stays signature-stable.
+        _emit_json({**_staged_json_object(
             run_id=run_id, started_at=started_at, ended_at=ended_at,
             exit_code=exit_code, nodes_total=len(pending), nodes_swept=nodes_swept,
             batches_executed=batches_executed, pairs_judged_fresh=pairs_judged_fresh,
             finding_objs=[_staged_finding_json(e, h, f, p) for e, h, f, p in findings],
             degradations=sorted(degraded), exclusions=exclusions,
             transient_count=transient_count, row_written=row_written,
-        ))
+        ), **corpus_provenance(config)})
     else:
+        _echo_corpus(config)
         _print_staged_report(
             findings, nodes_swept=nodes_swept, nodes_total=len(pending),
             degraded=degraded, exclusions=exclusions, transient_count=transient_count,
@@ -3870,6 +4872,430 @@ def _warn_deprecated_rotation_mode(config: MitosConfig) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# The project selector at the CLI boundary.
+#
+# One resolution site, in `main()`, feeding the single `MitosConfig` every verb
+# already receives — so ~20 verbs retarget with no per-verb edit. A per-verb
+# thread would be twenty chances to miss one, and the one missed would fail
+# *silently*: a call that names a project and writes to the working directory.
+# ---------------------------------------------------------------------------
+
+# Verbs that target no single workspace, and why. The reason keys are the shared
+# vocabulary (`errors.EXEMPT_*`); the wording below is this surface's alone.
+# `status` is deliberately ABSENT: zero-arg `status` is a global overview, but
+# `status <project>` is a supported targeting form, so `-p X status` is the flag
+# spelling of something the tool already does.
+_SELECTOR_EXEMPT_VERBS: Dict[str, str] = {
+    "init": EXEMPT_CREATES_REGISTRATION,
+    "serve": EXEMPT_NO_WORKSPACE,
+    "projects": EXEMPT_EXPLICITLY_GLOBAL,
+}
+
+# Why each of them is global, in this surface's words. Keyed by VERB rather than
+# by reason because two verbs share `explicitly_global` and owe different
+# recoveries — `set-key` only ever lands here through `--global`, which is the
+# form its note names.
+_EXEMPT_VERB_NOTES: Dict[str, str] = {
+    "init": ("`init` creates a registration rather than reaching one — run it in "
+             "the workspace you mean (`mitos -C <dir> init`, or cd there first)."),
+    "serve": ("`serve` starts the MCP server and binds no workspace of its own — "
+              "launch it plainly: `mitos serve`."),
+    "projects": ("`projects` reads the machine-wide registry and targets no single "
+                 "workspace — it works from anywhere."),
+    "set-key": ("`set-key --global` writes the machine-wide .env shared by every "
+                "project — drop `--global` to write one project's own .env."),
+}
+
+# Verbs whose positional argument DENOTES a workspace, so it is a selector source.
+# `import`'s positional is a source markdown *file* and stays cwd-rooted — the
+# discriminator is what the positional denotes, never that it is spelled `path`.
+_POSITIONAL_SELECTOR_VERBS: frozenset = frozenset({"status", "agent-block"})
+
+# The two verbs that answer questions *about* a directory rather than acting on
+# its corpus, so "there is no workspace here" is their ANSWER, not their error.
+# `mitos status /some/dir` must keep printing the NOT SET UP report with its next
+# steps — SETUP.md's agent loop is built on that report — and `agent-block`'s
+# plain form prints a workspace-independent block, so refusing a pre-`init` repo
+# would block a legitimate use.
+_WORKSPACE_OPTIONAL_VERBS: frozenset = frozenset({"status", "agent-block"})
+
+
+def _answer_workspace_optional_verb(args: argparse.Namespace,
+                                    target: Optional[routing.ResolvedProject]) -> int:
+    """Runs a ``_WORKSPACE_OPTIONAL_VERBS`` verb when its config could not be built.
+
+    These two verbs answer questions *about* a directory rather than acting on its
+    corpus, so a malformed ``.mitos/config.toml`` is their **answer**, not their
+    error — the same argument that put them in ``_WORKSPACE_OPTIONAL_VERBS`` in the
+    first place (3b's D8), extended from "there is no workspace here" to "the
+    workspace here is broken". Measured before this was written: ``mitos status
+    --json <malformed-workspace>`` printed a one-line ``Error:`` and **not one byte
+    of JSON**, because the boundary's ``MitosConfig`` construction raised before
+    dispatch and ``cmd_status``'s own contextual report never ran. On ``main`` the
+    path form still worked — ``main()`` built its config from cwd while
+    ``cmd_status`` got ``args.path`` — and 3b collapsed the two onto one
+    boundary-resolved config with the exit code unchanged either way, so nothing
+    went red.
+
+    Both members are covered, not just ``status``: ``cmd_agent_block`` reads no
+    config at all (verified against its body), so refusing it over a config it
+    never opens is the same defect. The cost is stated rather than hidden — the
+    ``agent-block`` dispatch's stderr corpus echo is **absent** on this path, since
+    there is no config to name a corpus from, and inventing a fallback would make
+    the echo claim a collection nobody resolved.
+
+    Since 5a ``target`` is always a real resolution on this path: neither verb is
+    exempt, a selectorless ``status`` routed to the global overview one statement
+    earlier, and a selectorless ``agent-block`` raised. The parameter keeps its
+    ``Optional`` type because that is ``_resolve_selector``'s declared return on the
+    exempt path, not because ``None`` is reachable here.
+
+    Args:
+        args: The parsed namespace.
+        target: The resolved project.
+
+    Returns:
+        The verb's exit code.
+    """
+    # `abspath` rather than a working-directory read — the canonical root is already
+    # in hand, and the tree keeps exactly the two display-only reads entry-005
+    # enumerates (this comment is worded to keep that standing grep honest, 2a's
+    # precedent).
+    root = os.path.abspath(target.root)
+    if args.command == "status":
+        return cmd_status(root, as_json=args.as_json, project=target.name)
+    return cmd_agent_block(root, check=args.check)
+
+
+def _selector_from_args(args: argparse.Namespace) -> Optional[str]:
+    """Coalesces the three spellings of the project selector into one value.
+
+    ``--project`` is accepted on both sides of the verb, into **two** destinations
+    (``project_pre`` / ``project_post``). That is not redundancy: one shared
+    ``dest`` lets the subparser's ``None`` default overwrite what the top-level
+    parser stored, silently discarding a selector the caller did supply (measured
+    on this parser), and the ``argparse.SUPPRESS`` repair fixes the discard while
+    making the both-positions case indistinguishable from the post-verb one. Two
+    destinations make the trap unconstructible — there is no shared slot to clobber
+    — and the ambiguity stays visible enough to refuse.
+
+    Naming the target twice is refused **even when the two values are identical**:
+    a rule with an equality exception is one nobody can predict at the call site.
+
+    Args:
+        args: The parsed namespace.
+
+    Returns:
+        The selector as the caller typed it, or ``None`` when none was supplied.
+        An empty string is a *supplied* selector carrying no target, and is
+        returned as such — the gate everywhere below is ``is not None``, never
+        truthiness, or `-p ""` would silently fall back to the working directory.
+
+    Raises:
+        MitosError: If the target was named twice. A plain boundary error, not a
+            seventh targeting discriminator: nothing was resolved and nothing is
+            unknown, so it is a CLI-local usage fault.
+    """
+    pre = getattr(args, "project_pre", None)
+    post = getattr(args, "project_post", None)
+    if pre is not None and post is not None:
+        raise MitosError(
+            f"the project was named twice: `--project {pre}` before the verb and "
+            f"`--project {post}` after it. Pass one, on either side."
+        )
+    flag = pre if pre is not None else post
+
+    positional = (getattr(args, "path", None)
+                  if args.command in _POSITIONAL_SELECTOR_VERBS else None)
+    if flag is not None and positional is not None:
+        raise MitosError(
+            f"the project was named twice: `--project {flag}` and the positional "
+            f"{positional!r}. Pass one — `mitos {args.command} {positional}` or "
+            f"`mitos {args.command} --project {flag}`."
+        )
+    return flag if flag is not None else positional
+
+
+def _exempt_reason(args: argparse.Namespace) -> Optional[str]:
+    """Answers "does this call target no single workspace?", once, for both readers.
+
+    Two sides of the boundary need the same rule and would otherwise spell it
+    twice: the refusal below (*a selector on this verb is a fault*) and the flip in
+    ``main()`` (*the absence of a selector on this verb is fine*). A second
+    hand-written ``args.command in _SELECTOR_EXEMPT_VERBS or (args.command ==
+    "set-key" and args.is_global)`` is the drift seam — ``set-key --global`` would
+    keep working while ``mitos -p x set-key --global`` answered a different
+    question, or vice versa, and no row would see it.
+
+    ``status`` is deliberately **not** here. Its optionality is a different rule — a
+    selector is *legal* on ``status`` and merely routes elsewhere when absent — and
+    folding the two together would make ``mitos -p mitos status`` refusable by
+    accident.
+
+    Args:
+        args: The parsed namespace.
+
+    Returns:
+        One of ``errors.EXEMPT_*`` — the shared vocabulary that also keys
+        ``routing.exempt_verb_error`` and ``_EXEMPT_VERB_NOTES`` — or ``None`` when
+        the call targets a workspace. Never a boolean: a fourth spelling of the
+        reason is what forks the renderer's vocabulary.
+    """
+    reason = _SELECTOR_EXEMPT_VERBS.get(args.command)
+    if reason is None and args.command == "set-key" and getattr(args, "is_global", False):
+        # Conditional membership: `set-key`'s *project* form is the bare
+        # invocation, so only `--global` makes the verb global. `getattr` with a
+        # default because `is_global` exists only on the `set-key` namespace.
+        reason = EXEMPT_EXPLICITLY_GLOBAL
+    return reason
+
+
+def _refuse_selector_on_exempt_verb(args: argparse.Namespace,
+                                    selector: Optional[str]) -> None:
+    """Refuses a selector handed to a verb that targets no project.
+
+    Runs **before** resolution, and the ordering is the point: ``mitos -p nosuch
+    init`` must answer *"`init` takes no project selector"*, not *"unknown
+    project"*. The fault is the verb, and resolving first answers the wrong
+    question — then teaches a recovery (register the name) that would still leave
+    the call malformed.
+
+    Args:
+        args: The parsed namespace.
+        selector: The coalesced selector, or None.
+
+    Raises:
+        ProjectTargetingError: With the ``exempt_verb`` discriminator.
+    """
+    if selector is None:
+        return
+    reason = _exempt_reason(args)
+    if reason is not None:
+        raise routing.exempt_verb_error(args.command, reason)
+
+
+def _resolve_selector(selector: Optional[str],
+                      command: str) -> routing.ResolvedProject:
+    """Turns a selector into a validated workspace — or raises. There is no absence.
+
+    Absolutizes an explicitly-typed relative path (``.``, ``./x``, ``../x``,
+    ``x/y``) so the resolver only ever receives a name or an absolute path — and
+    runs **after** ``-C``'s process-entry chdir, so ``mitos -C /a -p ./b`` means
+    ``/a/b``. Canonicalizing before the chdir would change what a relative selector
+    means, with every absolute-path test still green.
+
+    ``expanduser`` is deliberately not used: ``os.path.abspath("~/x")`` returns
+    ``<cwd>/~/x``, which **is** absolute, so an unguarded absolutize would send a
+    nonsense path to the resolver and answer with "no workspace at …" naming a
+    directory nobody meant. With the guard, a ``~``-leading selector reaches the
+    resolver path-shaped and non-absolute and lands on the relative-path class,
+    whose message names the actual rule and both valid forms.
+
+    **An absent selector is carried straight through to
+    ``routing.resolve_project``, which raises the missing-class error.** That is
+    5a's flip: this function used to return ``None`` for it and the caller used to
+    read that as *"resolve the working directory"*. A boundary-local ``if selector
+    is None: raise ProjectTargetingError(missing, …)`` would have worked and would
+    have duplicated the constructor's required-field bookkeeping at the one place
+    2a deliberately kept free of it — one raise site, one wording, no fifth
+    spelling invented here. ``resolve_project``'s own ``not selector`` guard runs
+    before any shape test, so ``None`` never reaches ``is_path_shaped``.
+
+    The caller reaches this function **only** for a verb that targets a workspace:
+    ``_exempt_reason`` short-circuits ``init``/``serve``/``projects``/``set-key
+    --global`` (whose ``target`` is ``None``, and it is ``None`` exactly then), and
+    the ``status`` fork routes a selectorless call to the global overview one
+    statement earlier.
+
+    Args:
+        selector: The coalesced selector, or None when none was supplied.
+        command: ``args.command``, for the ``_WORKSPACE_OPTIONAL_VERBS`` carve-out.
+
+    Returns:
+        The resolution. Never ``None``.
+
+    Raises:
+        ProjectTargetingError: On every resolution failure the carve-out below
+            does not cover — including a wholly absent selector.
+        RegistryError: If the registry file itself is unusable — propagated
+            unwrapped, because there is no registered vocabulary to teach when the
+            file holding it cannot be read.
+    """
+    sel = selector
+    if (sel is not None and routing.is_path_shaped(sel) and not sel.startswith("~")
+            and not os.path.isabs(sel)):
+        sel = os.path.abspath(sel)
+    try:
+        return routing.resolve_project(sel)
+    except ProjectTargetingError as err:
+        # The `status`/`agent-block` carve-out (see `_WORKSPACE_OPTIONAL_VERBS`).
+        # Only the PATH form: a *name* is a claim about the registry, so an unknown
+        # name and a registered-but-vanished one both keep their own error — a NOT
+        # SET UP report about a path the caller never typed is a worse answer than
+        # either. `is_path_shaped` is checked here as well as implied by the
+        # discriminator, so a later resolver change cannot widen this to names by
+        # accident. `err.path` is the canonical probed root for this class (as
+        # opposed to the registry's recorded string on `registered_unreachable`),
+        # which is exactly the value `cmd_status` wants.
+        if (command in _WORKSPACE_OPTIONAL_VERBS
+                and err.discriminator == TARGET_PATH_NOT_A_WORKSPACE
+                and routing.is_path_shaped(sel)):
+            # A `ResolvedProject` for a directory that is not (yet) a workspace
+            # stretches the dataclass's "one successful resolution" wording. It is
+            # deliberate: for these two verbs the report IS the successful answer,
+            # and both fields are literally true (a path was named; no registration
+            # covers it). The alternative — a second return shape — would fork
+            # every downstream read for a case that differs only in whether the
+            # directory is populated.
+            return routing.ResolvedProject(root=err.path, name=None, via="path")
+        raise
+
+
+def _registered_projects_line(bounded: routing.BoundedNames) -> str:
+    """Renders the registered-name vocabulary, respecting the enumeration bound.
+
+    Above ``routing.REGISTERED_NAMES_BOUND`` the enumeration collapses to the
+    close matches plus a count plus the discovery pointer — and when there are no
+    close matches, to the count and pointer **alone**. An empty ``names`` with
+    ``collapsed=True`` is the honest answer, so this must never be spelled
+    ``bounded.names or [...]``: that would undo the distinction the policy exists
+    to make, in the one place nobody would look for it.
+
+    Args:
+        bounded: The policy verdict from ``routing.bounded_registered_names``.
+
+    Returns:
+        One indented line for the error body.
+    """
+    if bounded.total == 0:
+        # Empty is first-class, and the CLI is the surface allowed to prescribe
+        # the setup act that fills it.
+        return "  No projects are registered yet — `mitos init` introduces one."
+    if not bounded.collapsed:
+        return (f"  Registered projects: {', '.join(bounded.names)} "
+                f"(list with `mitos projects`).")
+    if bounded.names:
+        return (f"  {bounded.total} projects registered, closest: "
+                f"{', '.join(bounded.names)} (list them all with `mitos projects`).")
+    return (f"  {bounded.total} projects registered — list them with "
+            f"`mitos projects`.")
+
+
+def _render_targeting_error(err: ProjectTargetingError) -> str:
+    """Composes the CLI's teaching anatomy for a targeting failure.
+
+    The vision's §4.5 parts: what is wrong, a concrete example, a discovery
+    pointer, and a did-you-mean or cwd hint where one exists. Wording lives here —
+    at the surface — because it is the difference *between* the surfaces, not
+    shared policy: ``routing`` holds what both must agree on (the bound, the
+    did-you-mean rule, the ancestor predicate), and this renderer is allowed to
+    name ``mitos init`` and ``--project`` precisely because the MCP renderer must
+    never. Homing it in ``display.py`` would put it one import from an agent.
+
+    It never calls ``str(err)``: that is the terse discriminator-level fallback
+    for an unrendered path, and it is fenced by a tripwire forbidding exactly the
+    strings this function emits.
+
+    Args:
+        err: The typed error, carrying structured data only.
+
+    Returns:
+        The message body, without the boundary's own ``Error: `` prefix. Multi-line;
+        every line after the first is indented as a recovery, not a new failure.
+    """
+    if err.discriminator == TARGET_EXEMPT_VERB:
+        note = _EXEMPT_VERB_NOTES.get(
+            err.verb, "it targets no single workspace.")
+        return f"the `{err.verb}` verb takes no project selector.\n  {note}"
+
+    bounded = routing.bounded_registered_names(err.registered_names, err.close_matches)
+
+    if err.discriminator == TARGET_MISSING:
+        lines = [
+            "no project selector was supplied.",
+            "  Pass a registered name or an absolute path — `mitos --project <name> "
+            "<verb>` or `mitos <verb> --project <name>`.",
+            _registered_projects_line(bounded),
+        ]
+    elif err.discriminator == TARGET_UNKNOWN_NAME:
+        lines = [f"unknown project {err.selector!r}."]
+        if err.close_matches:
+            # Never truncated here: `close_project_matches` expands each folded
+            # match to every original that folds onto it, so a registry holding
+            # several case variants of one name legitimately returns more than
+            # `PROJECT_DIDYOUMEAN_MAX` — and dropping one would hide the very
+            # distinction the caller needs to see.
+            lines.append(f"  Did you mean: {', '.join(err.close_matches)}")
+        lines.append(_registered_projects_line(bounded))
+    elif err.discriminator == TARGET_RELATIVE_PATH:
+        lines = [
+            f"the project selector {err.selector!r} is not an absolute path.",
+            "  A selector is a registered name or an absolute path — "
+            "`--project mitos`, or `--project /home/you/code/mitos`.",
+        ]
+        if err.selector.startswith("~"):
+            # Worth one line only for the shape that earns it: `~` looks absolute
+            # to a human and is not, and the reason is almost always a quoted value
+            # the shell therefore did not expand.
+            lines.append("  (A leading `~` is not expanded here — your shell "
+                         "expands it only when the value is unquoted.)")
+        lines.append(_registered_projects_line(bounded))
+    elif err.discriminator == TARGET_PATH_NOT_A_WORKSPACE:
+        lines = [
+            f"no Mitos workspace at {err.path!r}.",
+            "  A workspace is a directory holding .mitos/config.toml and "
+            "decisions.md — run `mitos init` there, or name a registered project.",
+            _registered_projects_line(bounded),
+        ]
+    else:
+        # TARGET_REGISTERED_UNREACHABLE — the constructor whitelists the
+        # discriminator and the other five are handled above, so this is the
+        # remaining class rather than a fall-through default (`errors.
+        # _fallback_message` is spelled the same way, for the same reason).
+        lines = [
+            f"the project {err.name!r} is registered at {err.path!r}, which no "
+            f"longer holds a Mitos workspace.",
+            f"  Repoint it — `mitos init --name {err.name} --force` in the "
+            f"workspace's current location — or edit {registry.registry_path()}.",
+            _registered_projects_line(bounded),
+        ]
+
+    # The cwd hint is a guess about what the caller *meant*, so it renders only
+    # where a name was at stake. On a path-form or exempt failure the caller named
+    # something else entirely and a cwd nudge is noise. `os.getcwd()` is passed
+    # RAW: `nearest_registered_ancestor` canonicalizes its own argument through the
+    # one spelling, and a second canonicalization here would split identity.
+    # This is the one registry re-read the phase permits — the hint needs the
+    # name→path map, which the error does not carry, and it happens only on the
+    # failure path.
+    #
+    # Guarded because this runs INSIDE the boundary's `except` arm, where a raise
+    # escapes `main()` entirely — a sibling `except MitosError` cannot catch what
+    # its neighbour handler throws — and the caller would get a traceback in place
+    # of the diagnosis they need. Both calls can genuinely fail on this path and
+    # only on this path: a targeting failure never constructs a `MitosConfig`, so
+    # the hint may be the first cwd read of the whole run (a deleted working
+    # directory is an `OSError`), and the registry is re-read here after the raise
+    # site already read it (a concurrent edit is a `RegistryError`). Losing an
+    # optional hint is the right degradation; losing the whole rendered error is
+    # not. Deliberately NOT the guard-undoing shape 2a fenced — that one would
+    # swallow a corrupt registry on the *resolution* path, where the fault is the
+    # answer; here resolution already succeeded in reading it.
+    if err.discriminator in (TARGET_MISSING, TARGET_UNKNOWN_NAME):
+        try:
+            err.cwd_hint_name = routing.nearest_registered_ancestor(
+                os.getcwd(), registry.load())
+        except (RegistryError, OSError):
+            err.cwd_hint_name = None
+        if err.cwd_hint_name:
+            lines.append(
+                f"  Your working directory sits inside registered project "
+                f"{err.cwd_hint_name!r} — pass `--project {err.cwd_hint_name}` if "
+                f"that is the target.")
+    return "\n".join(lines)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Builds the CLI argument parser.
 
@@ -3888,9 +5314,22 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"mitos {__version__}")
     parser.add_argument(
         "-C", "--directory", dest="directory", default=None, metavar="DIR",
-        help="Run as if mitos were started in DIR (git's -C). Retargets the whole "
-             "workspace — graph, collection, .env/keys, and relative path args. "
-             "Must appear BEFORE the verb: `mitos -C /ws list`.",
+        help="Run as if mitos were started in DIR (git's -C). Retargets relative "
+             "path ARGUMENTS only — it does not name a project, so a verb still "
+             "needs `--project`. Must appear BEFORE the verb: "
+             "`mitos -C /ws -p /ws record … --rejected-file ./r.txt`.",
+    )
+    # The project selector, pre-verb half. Its twin is registered on every
+    # subparser below, into a DIFFERENT dest — see `_selector_from_args` for why a
+    # shared one silently discards this value. Never argparse-`required`: that
+    # emits argparse's own usage error and exits 2 before mitos code runs, so none
+    # of the teaching anatomy could render.
+    parser.add_argument(
+        "-p", "--project", dest="project_pre", default=None, metavar="SELECTOR",
+        help="The project to act on — REQUIRED on every verb but `init`, `serve`, "
+             "`projects` and `set-key --global`: a registered name (see `mitos "
+             "projects`) or an absolute path. Accepted on either side of the verb "
+             "— `mitos -p mitos list` or `mitos list -p mitos`.",
     )
     # metavar collapses the width-doubling {init,sync,query,query_decisions,…}
     # brace-list in the usage banner to a single COMMAND token (R5). This is a
@@ -3899,7 +5338,19 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
     # init
-    subparsers.add_parser("init", help="Initialize Mitos in current workspace.")
+    init_p = subparsers.add_parser("init", help="Initialize Mitos in current workspace.")
+    init_p.add_argument(
+        "--name", default=None, metavar="NAME",
+        help="Register the workspace under NAME (default: this directory's name).")
+    init_p.add_argument(
+        "--force", action="store_true",
+        help="Repoint an existing registration of NAME at this workspace.")
+
+    # projects — the global registry read (needs no workspace; works anywhere).
+    proj_p = subparsers.add_parser(
+        "projects", help="List the Mitos projects registered on this machine.")
+    proj_p.add_argument("--json", action="store_true", dest="as_json",
+                        help="Emit machine-readable JSON.")
 
     # sync
     sync_p = subparsers.add_parser("sync", help="Sync buffer decisions to graph database.")
@@ -4035,15 +5486,22 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # status — is Mitos set up for this project? (human- and LLM-friendly check)
     status_p = subparsers.add_parser("status", help="Check whether Mitos is set up for a project.")
-    status_p.add_argument("path", nargs="?", default=None, help="Project directory to check (default: current directory).")
+    status_p.add_argument("path", nargs="?", default=None,
+                          help="Project to report on: a registered name (see `mitos "
+                               "projects`) or an absolute path. Omit it for the "
+                               "machine-wide overview of every registered project.")
     status_p.add_argument("--json", action="store_true", dest="as_json", help="Emit a machine-readable JSON report.")
 
     # set-key — store an API key globally (all projects) or for this project
-    sk_p = subparsers.add_parser("set-key", help="Store an API key globally (all projects) or for this project.")
+    sk_p = subparsers.add_parser(
+        "set-key",
+        help="Store an API key globally (all projects) or for one named project.")
     sk_p.add_argument("value", help="The API key value.")
     sk_p.add_argument("--name", default="GEMINI_API_KEY", help="Env var name to store (default: GEMINI_API_KEY).")
     sk_p.add_argument("--global", action="store_true", dest="is_global",
-                      help="Write the global ~/.config/mitos/.env (shared by ALL projects) instead of this project's .env.")
+                      help="Write the global ~/.config/mitos/.env (shared by ALL "
+                           "projects). Without it, `--project` is required and the "
+                           "key lands in that project's own .env.")
 
     # cutover — the one-time prototype→V1a migration (destructive; operator-run).
     cut_p = subparsers.add_parser(
@@ -4111,7 +5569,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "agent-block",
         help="Print the agent-file block to paste into AGENTS.md/CLAUDE.md/…, or --check for drift.")
     ab_p.add_argument("path", nargs="?", default=None,
-                      help="Project directory (default: current directory) — used by --check.")
+                      help="The project — a registered name or an absolute path. "
+                           "Required (the flag spelling `-p` works too); `--check` "
+                           "scans this project's agent files.")
     ab_p.add_argument("--check", action="store_true",
                       help="Scan the project's agent files and report stale/unversioned mitos notes.")
 
@@ -4125,8 +5585,35 @@ def _build_parser() -> argparse.ArgumentParser:
     # which the next verb added would be one forgotten argument away from missing.
     # argparse reads the attribute at parse time, so assigning it after
     # registration is equivalent to passing it in.
+    #
+    # The post-verb `--project` is registered in the SAME loop, for the same
+    # reason: a per-verb `add_argument` line is one forgotten argument away from
+    # missing on the next verb added, and the miss is not a soft one —
+    # `mitos record -p mitos` would be argparse's own `unrecognized arguments`,
+    # exit 2 before any mitos code runs, carrying none of the anatomy.
+    #
+    # Deduped by `id()` because the five aliased verbs (`query`/`query_decisions`,
+    # `surface`/`surface_decisions`, `list`/`list_decisions`, `scopes`/
+    # `list_scopes`, `record`/`record_decision`) are ONE parser object under two
+    # names: 27 names over 22 objects, and a second `add_argument` on the same
+    # object raises `ArgumentError: conflicting option strings`. The
+    # `allow_abbrev` assignment above needs no such guard — it is idempotent — so
+    # the dedupe guards only the registration. Being one object is also what makes
+    # the aliases free: covering the object once covers both names.
+    _selector_registered: Set[int] = set()
     for _verb_parser in subparsers.choices.values():
         _verb_parser.allow_abbrev = False
+        if id(_verb_parser) in _selector_registered:
+            continue
+        _selector_registered.add(id(_verb_parser))
+        _verb_parser.add_argument(
+            "-p", "--project", dest="project_post", default=None,
+            metavar="SELECTOR",
+            help="The project to act on — REQUIRED on every verb but `init`, "
+                 "`serve`, `projects` and `set-key --global`: a registered name "
+                 "(see `mitos projects`) or an absolute path. Also accepted "
+                 "before the verb (`mitos -p NAME …`).",
+        )
 
     return parser
 
@@ -4148,31 +5635,90 @@ def main() -> None:
         # the MCP hint) is already wrapped in its own `except Exception: pass`, so an
         # unbound `config` after a construction failure stays silent.
         #
-        # -C/--directory runs FIRST (before the project .env load + config) so the
-        # whole workspace retargets together: chdir into the target, THEN load the
-        # CWD-relative project .env, THEN the fixed-path global .env (CWD-independent
-        # — it stays global). An absent -C target raises MitosError here and renders
-        # through the `except MitosError` boundary as a clean one-line error. The
-        # project .env load also sits inside the try now (strictly safer — a .env
-        # read failure is caught, not a bare traceback). Precedence is unchanged:
-        # load_dotenv_file never overwrites an already-set key, so env > project >
-        # global still holds.
+        # -C/--directory runs FIRST (before the selector and the config) so the
+        # whole workspace retargets together: chdir into the target, and every
+        # relative path arg, the cwd hint and an argless convenience default all
+        # read the post-chdir location. An absent -C target raises MitosError here
+        # and renders through the `except MitosError` boundary as a clean one-line
+        # error.
+        #
+        # No `.env` is loaded here, and that absence is the paradigm (phase 5c):
+        # keys are never promoted into `os.environ`, they are resolved per call by
+        # `env.resolve_values` for the workspace the call named, and hung on
+        # `MitosConfig.env` (config.py). Precedence is unchanged — real env >
+        # project `.env` > global `.env` — but it is now computed for the *target*
+        # rather than baked in from the *launch* directory.
         _enter_target_directory(args.directory)
-        load_dotenv_file()
-        load_dotenv_file(global_env_path())
-        config = MitosConfig()
-        # Warn about the workspace the VERB will act on, not merely the CWD. `status`
-        # and `agent-block` take a path argument and build their own config for it, so
-        # warning on the CWD config would stay silent about the very workspace the
-        # operator asked to diagnose — and `mitos status` is precisely the command the
-        # deprecation's rationale names as the one that must keep working.
-        _warn_target = getattr(args, "path", None) if args.command in (
-            "status", "agent-block") else None
-        _warn_deprecated_rotation_mode(
-            MitosConfig(_warn_target) if _warn_target else config
-        )
+        # The project selector, resolved ONCE, here. Order is contract: the -C
+        # chdir above runs first (so a relative selector and the cwd hint both read
+        # the post-chdir location), the exempt check runs before resolution (so a
+        # selector on `init` is answered by naming the verb, not by looking the
+        # name up), and only then does a target exist.
+        selector = _selector_from_args(args)
+        _refuse_selector_on_exempt_verb(args, selector)
+        if args.command == "status" and selector is None:
+            # `status` is the one selector-OPTIONAL verb: a selector is legal and
+            # routes to the deep report, its absence routes to the global overview.
+            # A plain condition, deliberately NOT folded into `_exempt_reason` — a
+            # selector on `status` is not refused, and merging the two rules would
+            # make `mitos -p mitos status` refusable by accident.
+            #
+            # Placed BEFORE the `MitosConfig` construction, and the ordering is
+            # contract: the overview is global by definition, so a malformed
+            # `.mitos/config.toml` in whatever directory the caller happens to be
+            # standing in must not take down a report about the whole machine. (4b's
+            # `ConfigError` carve-out would catch it and route to
+            # `_answer_workspace_optional_verb` → the *deep* report: silently the
+            # wrong answer, exit 1 either way, nothing red.) The early `sys.exit` is
+            # safe past the `finally` unconditionally: since 6a retired the MCP
+            # nudge, the `finally` reads no `config` at all (its one surviving arm,
+            # the update notice, binds only module-level names), so no unbound local
+            # on this path can become a swallowed `NameError`. It used to be safe
+            # only *conditionally* — because `status` was not in the frozenset
+            # gating the nudge — and that weaker argument went with the nudge.
+            sys.exit(cmd_status_overview(as_json=args.as_json))
+        # `target` is `None` EXACTLY when the verb targets no workspace — the same
+        # predicate the refusal above used, called once more rather than
+        # hand-spelled a second time. For every other verb `_resolve_selector`
+        # either returns a validated workspace or raises the §4.5 teaching error:
+        # since 5a there is no third outcome, and in particular no working-directory
+        # fallback. A caller who omits the selector gets a calm error naming the
+        # recovery, not a silent write into whatever directory the process started
+        # in.
+        target = (None if _exempt_reason(args) is not None
+                  else _resolve_selector(selector, args.command))
+        # `project=` carries the caller's own vocabulary onto the config so every
+        # echo below names the target the way the caller addressed it.
+        # `target.name` is already the registered name for both selector forms
+        # and `None` for an unregistered path, which the constructor resolves to
+        # the canonical path. The exempt arm builds an explicit `MitosConfig(".")`
+        # — same resolution as the zero-arg default it replaced, but an argument
+        # rather than a default, which is what 5d removed the default behind
+        # (`os.path.abspath` inside the constructor, never a working-directory read,
+        # so entry-005's standing grep stays honest).
+        try:
+            config = (MitosConfig(target.root, project=target.name) if target
+                      else MitosConfig("."))
+        except ConfigError:
+            # The existing carve-out, extended by one error class rather than a new
+            # mechanism: for the two verbs that answer ABOUT a directory, a broken
+            # config.toml is the answer they exist to give. Every other verb keeps
+            # today's calm one-line boundary error.
+            if args.command not in _WORKSPACE_OPTIONAL_VERBS:
+                raise
+            sys.exit(_answer_workspace_optional_verb(args, target))
+        # Warn about the workspace the VERB will act on, not merely the CWD. Since
+        # `status`/`agent-block`'s positional is now a selector source feeding the
+        # same `config`, that is simply `config` — there is no second target to
+        # build, and no `args.path` left for a flag-spelled call to fall back from.
+        _warn_deprecated_rotation_mode(config)
         if args.command == "init":
-            cmd_init(config)
+            # `config` stays the first POSITIONAL argument: the suite asserts on
+            # `mock_init.call_args.args[0]` to check which workspace a -C run
+            # targeted, and a keyword here would empty that tuple.
+            cmd_init(config, name=args.name, force=args.force)
+        elif args.command == "projects":
+            cmd_projects(as_json=args.as_json)
         elif args.command == "sync":
             cmd_sync(config, auto_accept=args.yes, embed_only=args.embed_only, verbose=args.verbose)
         elif args.command == "reconcile":
@@ -4261,15 +5807,42 @@ def main() -> None:
         elif args.command == "serve":
             cmd_serve()
         elif args.command == "status":
-            sys.exit(cmd_status(args.path or os.getcwd(), as_json=args.as_json))
+            # `target.name` — the registered name, already resolved once above —
+            # rather than anything `cmd_status` could recover from a path. Read at
+            # the boundary, passed into the callee (2a's `cwd_hint_name`, 4a's D5),
+            # so the report cannot name the project wrong on a symlinked route.
+            sys.exit(cmd_status(config.workspace_dir, as_json=args.as_json,
+                                project=target.name))
         elif args.command == "restore-source":
             sys.exit(cmd_restore_source(
                 config, slug=args.slug, all_graph_only=args.all_graph_only,
                 dry_run=args.dry_run, as_json=args.as_json))
         elif args.command == "agent-block":
-            sys.exit(cmd_agent_block(args.path or os.getcwd(), check=args.check))
+            # THE CHANNEL CARVE-OUT (§4.7) — not an obligation carve-out; the two
+            # are different arguments and must stay distinct. `agent-block`'s plain
+            # form prints a paste-ready block whose own text tells the reader to
+            # paste it into AGENTS.md / CLAUDE.md, so an echo on stdout would land a
+            # resolved name and a path-hashed collection INSIDE a committed,
+            # travelling artifact — the persisted machine-specific identity §4.3
+            # forbids. So it answers out of band, on stderr, for BOTH forms: the
+            # `--check` report is a diagnostic and could safely take stdout, but two
+            # channels for one verb is a drift seam for no gain.
+            #
+            # Emitted here rather than in the handler on purpose: `cmd_agent_block`
+            # gains no echo code at all, so "the block is byte-identical across
+            # machines" stays a structural fact rather than a discipline someone
+            # could later tidy onto stdout.
+            _echo_corpus(config, file=sys.stderr)
+            sys.exit(cmd_agent_block(config.workspace_dir, check=args.check))
         elif args.command == "set-key":
-            cmd_set_key(args.value, name=args.name, is_global=args.is_global)
+            # The other dispatch-site echo, for the same reason: `cmd_set_key` takes
+            # a bare path, not a config, and `main()` is the only place that holds
+            # both. Project form only — `--global` is selector-exempt and writes the
+            # machine-wide .env, which names no corpus.
+            if not args.is_global:
+                _echo_corpus(config)
+            cmd_set_key(args.value, name=args.name, is_global=args.is_global,
+                        workspace_dir=target.root if target else None)
         elif args.command == "cutover":
             sys.exit(cmd_cutover(config, allow_drops=args.allow_drops,
                                  assume_yes=args.yes, as_json=args.as_json))
@@ -4280,6 +5853,42 @@ def main() -> None:
             sys.exit(cmd_check(config, staged=args.staged, scope=args.scope,
                                fresh=args.fresh, assume_yes=args.yes,
                                as_json=args.as_json))
+    except ProjectTargetingError as e:
+        # ABOVE `except MitosError`, which it subclasses: without this arm the
+        # fallback `str(e)` would render — a terse discriminator-level sentence
+        # with no example, no vocabulary and no recovery, on exactly the failure an
+        # agent has to act on in one turn. Same stderr channel and same exit
+        # mapping as every other boundary fault, `--json` included: the shipped
+        # boundary answers on stderr regardless, so a JSON envelope for one error
+        # class would be a new asymmetry.
+        print(f"Error: {_render_targeting_error(e)}", file=sys.stderr)
+        sys.exit(2 if args.command == "check" else 1)
+    except RegistryError as e:
+        # Also above `except MitosError`, and for the mirror of the reason above:
+        # `registry.load()`'s body is the located cause only — it names no `mitos`
+        # command, because since 5b every MCP tool call reaches it and that surface
+        # may not be handed a state-creating one. The recovery clause is each
+        # boundary's own, and THIS boundary is the one a human reads, so it is the
+        # one allowed to name the setup act (`mcp_server._render_registry_error`
+        # names the absolute-path escape hatch instead). Appended here rather than
+        # folded back into the leaf so the two wordings cannot re-merge by accident.
+        #
+        # Gated on `file_unusable` because this arm catches the whole class: a
+        # *registration refusal* (`--name` already taken, path already registered)
+        # is not repaired by re-running the thing that just refused, and it already
+        # carries its own `--name`/`--force` recovery. Widening the nudge to it
+        # would trade one wrong prescription for another.
+        detail = str(e)
+        if e.file_unusable:
+            # "fixed or removed", not "readable": only one of the five refusals is a
+            # readability fault. The other four are a file that opens perfectly and
+            # says something illegal, and each located cause above already ends in
+            # `Fix or remove …` — so this clause completes that sentence rather than
+            # renaming the fault. The flag is `file_unusable` for the same reason.
+            detail += ("\n  `mitos init` in a project re-registers it once the "
+                       "file is fixed or removed.")
+        print(f"Error: {detail}", file=sys.stderr)
+        sys.exit(2 if args.command == "check" else 1)
     except MitosError as e:
         # KD1: `check` maps every pre-verb/boundary failure (bad -C, ConfigError, an
         # escaped store fault) to exit 2 — for CI, "could not run" is one routing
@@ -4303,15 +5912,6 @@ def main() -> None:
                     print(_notice, file=sys.stderr)
             except Exception:
                 pass
-            # Nudge CLI-only agents toward the MCP, but only on the decision-loop
-            # verbs where it actually helps (and rate-limited inside _mcp_hint).
-            if args.command in _DECISION_LOOP_COMMANDS:
-                try:
-                    _hint = _mcp_hint(config.workspace_dir)
-                    if _hint:
-                        print(_hint, file=sys.stderr)
-                except Exception:
-                    pass
 
 
 if __name__ == "__main__":

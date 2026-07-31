@@ -55,8 +55,9 @@ from mitos.conflict import (
     ConflictUnavailableReason,
     Unavailable,
 )
-from mitos.errors import DatabaseError, VectorStoreError
+from mitos.errors import CollectionMissingError, DatabaseError, VectorStoreError
 from mitos.store import GraphStore, open_connection
+from mitos.vector_store import QdrantVectorStore
 from mitos.telemetry import ConflictCheckRow, JudgmentBatch, TelemetryStore
 
 from _conflict_helpers import (
@@ -72,15 +73,25 @@ from test_check_probe import _canned_judge, _commit, _seed_verdict
 
 PRODUCTION_ALIAS = "SONNET"
 
-# The machine contract a CI consumer parses — the full §8 corpus ``--json`` key set
-# (test_check_cli.py:297). 5a proves it stays byte-stable when the run goes RED: a
-# degraded run discloses its degradation without dropping or renaming a key.
+# The machine contract a CI consumer parses — the full §8 corpus ``--json`` key set.
+# 5a proves it stays byte-stable when the run goes RED: a degraded run discloses its
+# degradation without dropping or renaming a key.
+#
+# `test_check_cli.py::test_7_json_shape_snapshot` now IMPORTS this rather than
+# re-listing it: the duplicate copy is what let a radius analysis miss five of the
+# six rows here when the corpus echo added three keys. One constant, one edit.
+#
+# The three provenance keys are the corpus echo (§4.7): every response that resolves
+# a project names it. They are asserted as MEMBERS of the exact-equality set, never
+# by relaxing the comparison to a subset — the whole point of these rows is that the
+# key set is machine-stable under degradation, and `>=` would gut that.
 _CORPUS_JSON_KEYS = {
     "run_id", "mode", "exit_code", "started_at", "ended_at", "fresh",
     "nodes_total", "nodes_swept", "pairs_judged_fresh", "pairs_reused",
     "batches_planned", "batches_executed", "batches_skipped", "findings",
     "findings_new", "findings_known", "degradations", "coverage_exclusions",
     "index_backlog_transient", "summary_row_written",
+    "project", "collection", "workspace",
 }
 
 
@@ -115,6 +126,20 @@ def workspace() -> Tuple[MitosConfig, GraphStore, TelemetryStore]:
 # Helpers — seam wiring + telemetry readback (the 3a/3b idiom, verbatim)
 # --------------------------------------------------------------------------- #
 
+class _FakeResponse:
+    """A minimal ``requests`` response — status plus a body (or a decode failure)."""
+
+    def __init__(self, status_code: int, body: Any) -> None:
+        self.status_code = status_code
+        self.text = "hostile body"
+        self._body = body
+
+    def json(self) -> Any:
+        if isinstance(self._body, Exception):
+            raise self._body
+        return self._body
+
+
 def _pair(store: GraphStore) -> Tuple[str, str, Dict[str, List[Dict[str, Any]]]]:
     """Commits an (a, b) pair whose a-side sweep discovers b; returns ids + neighbourhoods."""
     a_axiom = "Hardening axiom alpha for the check verb."
@@ -134,7 +159,7 @@ def _wire_substrate(
     """Monkeypatches ``cli._build_check_substrate`` to keyed fakes; returns them."""
     embed, vector = _keyed_substrate(neighbourhoods, vector_raises=vector_raises)
     monkeypatch.setattr(cli, "_build_check_substrate",
-                        lambda config: (embed, vector, None, None))
+                        lambda config: (embed, vector, None))
     return embed, vector
 
 
@@ -142,7 +167,7 @@ def _wire_judge(monkeypatch: pytest.MonkeyPatch, judge: Any) -> List[bool]:
     """Monkeypatches ``cli._build_check_judge`` to return ``judge``; logs each build."""
     invoked: List[bool] = []
 
-    def builder() -> Any:
+    def builder(config: MitosConfig) -> Any:
         invoked.append(True)
         return judge
 
@@ -347,6 +372,141 @@ def test_t5_qdrant_severed_midsweep_partial_exit_2_breaker_trips_once(
     # Breaker trips ONCE: the vector was queried for the finder and the severed node only —
     # the three tail nodes beyond the trip were never gathered.
     assert len(vector.queried) == 2
+
+
+def test_t6_missing_collection_names_itself_and_its_heal_exit_2(
+    workspace, monkeypatch, capsys,
+) -> None:
+    """T6 (corpus): an absent collection over a populated graph → exit 2, named, healed.
+
+    The posture is unchanged from the severed-Qdrant row above — that is the point
+    of re-keying the precondition onto the operation rather than rewriting it. What
+    changes is that the operator is no longer told the infrastructure is down when
+    it is running; they are told the collection is gone and handed the one command
+    that rebuilds it.
+    """
+    config, store, telemetry = workspace
+    axiom = "Collection-missing axiom for the corpus check."
+    _commit(store, "coll-missing", axiom)
+    _drain_outbox(store)
+    _wire_substrate(
+        monkeypatch, {axiom: []},
+        vector_raises={axiom: CollectionMissingError(
+            "Qdrant collection 'mitos-x' does not exist", collection="mitos-x"
+        )},
+    )
+
+    code = cli.cmd_check(config, scope=None, fresh=False, assume_yes=False, as_json=False)
+
+    out, err = capsys.readouterr()
+    assert code == 2                                    # fail-closed, unchanged
+    assert "[partial] This check could not fully run" in out
+    assert "the vector collection does not exist" in out
+    assert "mitos reconcile" in out
+    assert "unreachable" not in out and "Qdrant" not in err
+    assert "Traceback" not in out and "Traceback" not in err
+
+
+def test_t6_missing_collection_json_carries_both_tokens(
+    workspace, monkeypatch, capsys,
+) -> None:
+    """The machine surface gets the cause beside the effect, in declaration order.
+
+    Corpus mode emits ``run_degradations``' declaration order; ``--staged`` sorts.
+    Two surfaces, two orders — assert each to its own.
+    """
+    config, store, telemetry = workspace
+    axiom = "Collection-missing axiom for the corpus JSON."
+    _commit(store, "coll-json", axiom)
+    _drain_outbox(store)
+    _wire_substrate(
+        monkeypatch, {axiom: []},
+        vector_raises={axiom: CollectionMissingError(
+            "Qdrant collection 'mitos-x' does not exist", collection="mitos-x"
+        )},
+    )
+
+    code = cli.cmd_check(config, scope=None, fresh=False, assume_yes=False, as_json=True)
+
+    assert code == 2
+    obj = json.loads(capsys.readouterr().out)
+    assert obj["degradations"] == ["sweep", "collection_missing"]
+    assert obj.keys() == _CORPUS_JSON_KEYS          # no key dropped or renamed
+
+
+# --------------------------------------------------------------------------- #
+# §10 — the layer-removal adversarial row: the operation-time gate is now SOLE
+# --------------------------------------------------------------------------- #
+
+_HOSTILE_READS = [
+    pytest.param("missing", id="404-collection-missing"),
+    pytest.param("malformed-json", id="200-non-json-body"),
+    pytest.param("malformed-shape", id="200-result-not-a-list"),
+    pytest.param("no-result-key", id="200-without-a-result-key"),
+    pytest.param("null-result", id="200-with-a-null-result"),
+    pytest.param("server-error", id="500"),
+    pytest.param("refused", id="connection-refused"),
+]
+
+
+@pytest.mark.parametrize("fault", _HOSTILE_READS)
+def test_t6_hostile_read_boundary_still_fails_closed(
+    workspace, monkeypatch, capsys, fault: str,
+) -> None:
+    """Every hostile shape at the REAL read boundary still exits 2, calmly.
+
+    Deleting ``_build_check_substrate``'s construction-time guard makes the
+    operation-time typed degradation the **only** thing standing between a missing
+    collection and a ``check`` that reports clean. A latent weakness there was
+    cosmetic while the guard backstopped it; it is a real defect now. So this row
+    drives a genuine ``QdrantVectorStore`` with a faked ``requests`` — not an
+    injected exception — so the classifier itself is under test end to end.
+
+    The malformed 200 is the one that matters most: it is the only shape that could
+    slip past a status-code-keyed classifier and reach the report as a healthy empty
+    sweep, i.e. an unauditable corpus reading as clean — exactly what CHK-D5's
+    fail-closed contract forbids.
+    """
+    import requests as _requests
+
+    config, store, telemetry = workspace
+    axiom = "Hostile-boundary axiom for the sole-gate row."
+    _commit(store, "hostile", axiom)
+    _drain_outbox(store)
+    embed, _discard = _keyed_substrate({axiom: []})
+    # A REAL store: only the transport is faked, so the 404/shape classification and
+    # the typed-error plumbing are exercised rather than assumed.
+    real_vector = QdrantVectorStore("http://localhost:9", "mitos-tmp-hostile")
+    monkeypatch.setattr(cli, "_build_check_substrate",
+                        lambda config: (embed, real_vector, None))
+
+    if fault == "refused":
+        def _post(*args: Any, **kwargs: Any) -> Any:
+            raise _requests.RequestException("connection refused")
+    else:
+        resp = _FakeResponse(*{
+            "missing": (404, {}),
+            "malformed-json": (200, ValueError("Expecting value")),
+            "malformed-shape": (200, {"result": "not-a-list"}),
+            "no-result-key": (200, {"status": "ok"}),
+            "null-result": (200, {"result": None}),
+            "server-error": (500, {}),
+        }[fault])
+
+        def _post(*args: Any, **kwargs: Any) -> Any:
+            return resp
+
+    monkeypatch.setattr("mitos.vector_store.requests.post", _post)
+
+    code = cli.cmd_check(config, scope=None, fresh=False, assume_yes=False, as_json=False)
+
+    out, err = capsys.readouterr()
+    assert code == 2                                       # fail-closed, every shape
+    assert "[partial] This check could not fully run" in out
+    assert "Swept 0 of 1 decisions" in out                 # never certified as clean
+    assert "Traceback" not in out and "Traceback" not in err
+    if fault == "missing":
+        assert "mitos reconcile" in out                    # only absence gets the heal
 
 
 def test_t5_judgment_fails_at_batch_k_persists_k_minus_one(

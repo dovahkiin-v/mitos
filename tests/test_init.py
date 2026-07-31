@@ -9,11 +9,15 @@ filesystem + idempotency + pre-V1a-refusal outcomes (no external services; the
 
 import os
 import sqlite3
+import subprocess
+import sys
 import tomllib
+from unittest.mock import patch
 
 import pytest
 
 from mitos import cli
+from mitos import registry
 from mitos.config import (
     MitosConfig,
     CONFIG_DEFAULTS,
@@ -22,7 +26,7 @@ from mitos.config import (
 )
 from mitos.migrations import MIGRATION_STEPS, _pending_head
 from mitos.store import GraphStore
-from mitos.errors import DatabaseError
+from mitos.errors import DatabaseError, RegistryError
 
 
 # --- helpers ---------------------------------------------------------------
@@ -100,7 +104,14 @@ def test_seeded_config_round_trips_clean(tmp_path, capsys):
     config = MitosConfig(str(tmp_path))
     captured = capsys.readouterr()
     assert "unrecognized" not in captured.err
-    assert captured.err == ""  # a clean nine-key file warns about nothing
+    # A clean file warns about nothing. The seed is nine keys — the eight static
+    # CONFIG_DEFAULTS plus `qdrant_url` — which was TEN until `qdrant_collection`
+    # was retired from the schema and stopped being written. The count is pinned
+    # structurally by `test_config_seeds_exactly_the_schema_keys` below; it is
+    # spelled out here only so the next reader need not re-count.
+    assert captured.err == ""
+    # ... and the seed carries no retired key at all, so nothing is inert either.
+    assert config.inert_file_keys == {}
 
     for key, default in CONFIG_DEFAULTS.items():
         assert getattr(config, key) == default
@@ -112,13 +123,18 @@ def test_seeded_config_round_trips_clean(tmp_path, capsys):
 
 
 def test_config_seeds_exactly_the_schema_keys(tmp_path):
-    """The seed writes exactly CONFIG_DEFAULTS' static keys + the two dynamic qdrant keys."""
+    """The seed writes exactly CONFIG_DEFAULTS' static keys + the dynamic `qdrant_url`.
+
+    Note this stays an equality against `CONFIG_SCHEMA` across the `qdrant_collection`
+    retirement: the key left the seeded file AND the schema, so both sides shrank
+    together and the property is unchanged — the seed is exactly the recognized set.
+    """
     _init(tmp_path)
     with open(tmp_path / ".mitos" / "config.toml", "rb") as f:
         data = tomllib.load(f)
 
     assert set(data) == set(CONFIG_SCHEMA)  # every recognized key, nothing else
-    assert set(data) == set(CONFIG_DEFAULTS) | {"qdrant_url", "qdrant_collection"}
+    assert set(data) == set(CONFIG_DEFAULTS) | {"qdrant_url"}
     assert "pending_threshold" not in data
     for key, default in CONFIG_DEFAULTS.items():
         assert data[key] == default
@@ -128,7 +144,7 @@ def test_config_seeds_conflict_check_as_native_bool(tmp_path):
     """A fresh init seeds ``conflict_check_on_sync = true`` (lowercase, unquoted).
 
     The v0.2 toggle is the first bool-typed key; ``mitos init`` must NOT crash on
-    it (the ``_toml_scalar`` bool-serializer trap) and must emit a native TOML
+    it (the ``toml_scalar`` bool-serializer trap) and must emit a native TOML
     boolean that ``tomllib`` parses straight back to Python ``True``.
     """
     _init(tmp_path)  # must not raise — the central 1a gotcha
@@ -330,7 +346,13 @@ def test_status_graceful_on_malformed_config(tmp_path, capsys):
 # --- §2 non-regression (inherited setup surface) ---------------------------
 
 def test_init_preserves_env_gitignore_qdrant_scaffolding(tmp_path):
-    """init must not regress the inherited .env + .gitignore + qdrant_* setup surface (§2)."""
+    """init must not regress the inherited .env + .gitignore + qdrant_* setup surface (§2).
+
+    `qdrant_collection` is asserted as an ABSENCE, not a value. Writing the derived name
+    into the file is what let a `cp -r` or a `git clone` of a committed `.mitos/` bind
+    the copy to the original project's vectors, so the line is gone and the name is
+    re-derived from the workspace path on every construction instead.
+    """
     _init(tmp_path)
 
     env_body = _read(tmp_path / ".env")
@@ -343,4 +365,275 @@ def test_init_preserves_env_gitignore_qdrant_scaffolding(tmp_path):
     with open(tmp_path / ".mitos" / "config.toml", "rb") as f:
         data = tomllib.load(f)
     assert data["qdrant_url"] == "http://localhost:7333"
-    assert data["qdrant_collection"] == default_collection_name(str(tmp_path))
+    assert "qdrant_collection" not in data
+    body = _read(tmp_path / ".mitos" / "config.toml")
+    assert "qdrant_collection" not in body  # not even as a commented-out line
+
+
+# --- registration: init introduces the project globally --------------------
+#
+# `init` is the registry's SOLE writer, and registration is its LAST step. Paths
+# are asserted against `os.path.realpath(tmp_path)`, never the raw fixture path:
+# the registry canonicalizes with `realpath` while `MitosConfig` uses `abspath`,
+# so on a machine whose `/tmp` is a symlink the two legitimately differ.
+
+def test_fresh_init_registers_the_workspace_under_its_directory_name(tmp_path, capsys):
+    """A fresh init registers the workspace and says so, naming name + resolved path."""
+    workspace = tmp_path / "proj"
+    workspace.mkdir()
+
+    _init(workspace)
+
+    assert registry.load() == {"proj": os.path.realpath(str(workspace))}
+    out = capsys.readouterr().out
+    assert "proj" in out
+    assert os.path.realpath(str(workspace)) in out
+
+
+def test_init_registers_the_canonical_path_not_the_abspath_spelling(tmp_path):
+    """A workspace reached through a symlink registers its REAL directory and name.
+
+    The registry's canonical form (``realpath``) is what a later collection
+    derivation and a resolver both consume, so ``init`` must not record the
+    ``abspath`` spelling ``MitosConfig`` happens to hold. Registering the link path
+    would give one workspace two identities depending on how it was entered.
+    """
+    real = tmp_path / "real-project"
+    real.mkdir()
+    link = tmp_path / "linked"
+    link.symlink_to(real, target_is_directory=True)
+
+    _init(link)
+
+    assert registry.load() == {"real-project": os.path.realpath(str(real))}
+
+
+def test_init_name_flag_overrides_the_derived_name(tmp_path):
+    """``--name`` registers under the given name instead of the directory's."""
+    workspace = tmp_path / "proj"
+    workspace.mkdir()
+
+    cli.cmd_init(MitosConfig(str(workspace)), name="chosen")
+
+    assert registry.load() == {"chosen": os.path.realpath(str(workspace))}
+
+
+def test_reinit_is_an_idempotent_reassert(tmp_path, capsys):
+    """A second init re-asserts the same pair without erroring or duplicating it."""
+    workspace = tmp_path / "proj"
+    workspace.mkdir()
+    _init(workspace)
+    capsys.readouterr()
+
+    _init(workspace)  # must not raise — re-init is how a project joins/stays joined
+
+    assert registry.load() == {"proj": os.path.realpath(str(workspace))}
+    assert "Already registered" in capsys.readouterr().out
+
+
+def test_a_dot_directory_basename_refuses_but_leaves_a_complete_workspace(tmp_path, capsys):
+    """An illegal DEFAULT name refuses registration — and scaffolds the workspace fully.
+
+    ``mitos init`` inside a dot-directory derives ``.config``-shaped name, which no
+    selector can reach. The refusal must not unwind the scaffold: the workspace
+    itself is legitimate and unregistered workspaces are an ordinary supported
+    state, so withholding a valid workspace to prevent a routing entry would be the
+    Ironclad Invariant inverted. The recovery is a re-run with ``--name``.
+    """
+    workspace = tmp_path / ".hidden"
+    workspace.mkdir()
+
+    with pytest.raises(RegistryError) as exc:
+        _init(workspace)
+
+    assert "--name" in str(exc.value)
+    assert registry.load() == {}
+    # The scaffold is complete despite the failed registration.
+    for rel in (".mitos/config.toml", ".mitos/graph.sqlite", ".mitos/skill.md",
+                "format-spec.md", "decisions.md", "questions.md", ".env"):
+        assert (workspace / rel).exists(), f"missing {rel} after a refused registration"
+    assert "Initialized Mitos workspace" in capsys.readouterr().out
+
+    # And the named recovery really is one: the same directory, one flag on.
+    cli.cmd_init(MitosConfig(str(workspace)), name="hidden")
+    assert registry.load() == {"hidden": os.path.realpath(str(workspace))}
+
+
+def test_registration_is_the_last_mutation_and_never_unwinds_the_scaffold(tmp_path, capsys):
+    """With registration forced to fail, the graph is booted and the scaffold intact.
+
+    Pins the ORDER, not just the no-unwind posture: the "Initialized …" line has
+    already printed and ``graph.sqlite`` already exists when registration runs, so
+    a registry fault can only ever add an error line to a finished job.
+    """
+    workspace = tmp_path / "proj"
+    workspace.mkdir()
+
+    with patch.object(registry, "register",
+                      side_effect=RegistryError("registry is on fire")):
+        with pytest.raises(RegistryError):
+            _init(workspace)
+
+    assert (workspace / ".mitos" / "graph.sqlite").exists()
+    assert (workspace / "decisions.md").exists()
+    assert "Initialized Mitos workspace" in capsys.readouterr().out
+
+
+def test_init_force_repoints_a_name_to_this_workspace(tmp_path, capsys):
+    """``--force`` moves an existing registration here and reports what it displaced."""
+    first = tmp_path / "a" / "proj"
+    second = tmp_path / "b" / "proj"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    _init(first)
+
+    with pytest.raises(RegistryError) as exc:
+        _init(second)              # same derived name, different path
+    assert "--force" in str(exc.value)
+    capsys.readouterr()
+
+    cli.cmd_init(MitosConfig(str(second)), force=True)
+
+    assert registry.load() == {"proj": os.path.realpath(str(second))}
+    out = capsys.readouterr().out
+    assert "Repointed" in out
+    assert os.path.realpath(str(first)) in out   # names what it displaced
+
+
+def test_a_clean_init_prints_name_then_path_then_collection(tmp_path, capsys):
+    """The trio a human only ever meets together here (§4.7).
+
+    ``init`` is selector-exempt, so ``main()`` resolves no target and the standard
+    corpus echo would print the workspace PATH where the whole point is the NAME —
+    which is why this line is composed from the registration outcome instead. The
+    ordering assertion is what makes that observable: name and path come from
+    ``_registration_line``, the collection from the config's derivation.
+
+    On a clean workspace it is a bare receipt: no carry-over pointer (nothing was
+    displaced and no legacy pin survives), and no ``mitos reconcile`` nudge for a
+    collection that was never anywhere else.
+    """
+    workspace = tmp_path / "proj"
+    workspace.mkdir()
+
+    # `--name` is load-bearing for this row, not decoration: on a default
+    # registration the name IS the directory basename, so the path CONTAINS the
+    # name and a `provenance_line(config)` build — which prints the path, because
+    # `init` is selector-exempt and resolves no target — satisfies a naive "the
+    # name appears" check. A name that is not the basename is the only fixture that
+    # tells the two builds apart.
+    cli.cmd_init(MitosConfig(str(workspace)), name="a-name-that-is-not-the-dir")
+
+    out = capsys.readouterr().out
+    collection = MitosConfig(str(workspace)).qdrant_collection
+    assert 'Registered as "a-name-that-is-not-the-dir"' in out
+    assert collection in out
+    assert out.index("a-name-that-is-not-the-dir") < out.index(collection)
+    # The tell of the wrong build: the standard corpus echo, which names a path
+    # where §4.7 says a human meets the registered NAME.
+    assert "corpus: " not in out
+    # `qdrant_collection` is the RETIRED config key, and a workspace carrying one
+    # gets `_inert_pin_note` instead — this line must not borrow its spelling.
+    assert "qdrant_collection" not in out
+    assert "reconcile" not in out.lower()
+    assert "(was " not in out
+
+
+def test_the_collection_echo_makes_no_network_call(tmp_path, capsys):
+    """Both carry-over triggers are computed locally — `init` never probes Qdrant.
+
+    The tempting version of the pointer is a diagnosis ("the new collection is
+    empty"), and answering that honestly needs a round trip. `init` is the one verb
+    that must work on a fresh, service-less machine, so the pointer is a statement
+    of fact plus the named heal instead, and this row is what keeps the difference
+    from being re-litigated by a future "wouldn't it be nicer if…".
+
+    Driven on the `--force` repoint, the trigger that computes the *old* name from
+    a path the caller never named — the branch most likely to reach for a probe.
+    """
+    first = tmp_path / "a" / "proj"
+    second = tmp_path / "b" / "proj"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    _init(first)
+
+    with patch.object(cli, "QdrantVectorStore") as vector_store, \
+         patch.object(cli, "scroll_point_ids") as scroll:
+        cli.cmd_init(MitosConfig(str(second)), force=True)
+
+    assert vector_store.call_count == 0
+    assert scroll.call_count == 0
+    assert "reconcile" in capsys.readouterr().out.lower()   # the pointer did render
+
+
+def test_a_repoint_names_both_collections_and_points_at_reconcile(tmp_path, capsys):
+    """``init``'s echo states name → path → collection, and carries the repoint over.
+
+    **The inversion of a planted tripwire.** Until this phase the assertions below
+    were their own negatives: a repoint changed no collection *that anything
+    printed*, so naming one would have been false when read, and the absence was
+    pinned so that whoever landed the echo had to invert it consciously rather than
+    hope to notice a comment. This is that inversion.
+
+    A ``--force`` repoint is one of the two carry-over triggers (the other is a
+    surviving legacy ``qdrant_collection`` pin, pinned in
+    ``test_collection_derivation.py``). Both the displaced path's collection and the
+    new one are named, and the ``mitos reconcile`` pointer follows — a statement of
+    fact plus the named heal, never a diagnosis: ``init`` makes no network call and
+    so cannot know whether the new collection is empty.
+    """
+    first = tmp_path / "a" / "proj"
+    second = tmp_path / "b" / "proj"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    _init(first)
+    capsys.readouterr()
+
+    cli.cmd_init(MitosConfig(str(second)), force=True)
+
+    out = capsys.readouterr().out
+    assert "Repointed" in out
+    assert "reconcile" in out.lower()
+    assert "collection" in out.lower()
+    # Both sides of the old → new mapping, read dynamically off the derivation —
+    # never a hardcoded `mitos-…` literal.
+    assert default_collection_name(str(second)) in out
+    assert default_collection_name(str(first)) in out
+    # Ordering is the claim: the registration line first, then the collection it
+    # derives, so a reader meets name → path → collection in that order.
+    assert out.index("Repointed") < out.index(default_collection_name(str(second)))
+
+
+def test_the_success_line_reaches_a_captured_stream_before_the_refusal(tmp_path):
+    """On a refused registration the "Initialized ✓" line still prints FIRST.
+
+    Driven as a subprocess with **one combined pipe**, because that is the only
+    stream shape where the ordering can break and the only one `capsys` cannot
+    model: stdout is block-buffered when it is not a terminal while stderr never
+    is, so without an explicit flush the `Error:` line overtakes the success line
+    it is supposed to follow. The whole no-unwind posture is a *message* — the
+    workspace is fine, only the routing entry is missing — and a reader (an agent,
+    a CI log) whose first line is a refusal reads a failed `init`.
+    """
+    workspace = tmp_path / ".hidden"          # an illegal DEFAULT name (leading dot)
+    workspace.mkdir()
+    env = {
+        **os.environ,
+        "MITOS_NO_UPDATE_CHECK": "1",
+        "XDG_CONFIG_HOME": str(tmp_path / "xdg_config"),
+    }
+
+    done = subprocess.run(
+        [sys.executable, "-m", "mitos.cli", "init"],
+        cwd=str(workspace), env=env, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+
+    assert done.returncode == 1
+    combined = done.stdout
+    assert "Traceback" not in combined
+    assert "Initialized Mitos workspace" in combined
+    assert "Error:" in combined
+    assert combined.index("Initialized Mitos workspace") < combined.index("Error:"), (
+        f"the refusal overtook the success line it follows:\n{combined}"
+    )

@@ -37,6 +37,7 @@ from mitos.store import GraphStore, open_connection
 from mitos.telemetry import TelemetryStore
 
 from _conflict_helpers import _drain_outbox, _keyed_substrate, _match
+from test_check_hardening import _CORPUS_JSON_KEYS
 from test_check_probe import _canned_judge, _commit, _poison, _seed_verdict
 
 PRODUCTION_ALIAS = "SONNET"
@@ -87,7 +88,7 @@ def _wire_substrate(
     """Monkeypatches ``cli._build_check_substrate`` to keyed fakes; returns them."""
     embed, vector = _keyed_substrate(neighbourhoods)
     monkeypatch.setattr(cli, "_build_check_substrate",
-                        lambda config: (embed, vector, None, None))
+                        lambda config: (embed, vector, None))
     return embed, vector
 
 
@@ -95,7 +96,7 @@ def _wire_judge(monkeypatch: pytest.MonkeyPatch, judge: Any) -> List[bool]:
     """Monkeypatches ``cli._build_check_judge`` to return ``judge``; logs invocation."""
     invoked: List[bool] = []
 
-    def builder() -> Any:
+    def builder(config: MitosConfig) -> Any:
         invoked.append(True)
         return judge
 
@@ -294,13 +295,11 @@ def test_7_json_shape_snapshot(workspace, monkeypatch, capsys):
 
     assert code == 1
     obj = json.loads(capsys.readouterr().out)
-    assert set(obj.keys()) == {
-        "run_id", "mode", "exit_code", "started_at", "ended_at", "fresh",
-        "nodes_total", "nodes_swept", "pairs_judged_fresh", "pairs_reused",
-        "batches_planned", "batches_executed", "batches_skipped", "findings",
-        "findings_new", "findings_known", "degradations", "coverage_exclusions",
-        "index_backlog_transient", "summary_row_written",
-    }
+    # Imported rather than re-listed: this set lived here AND in
+    # `test_check_hardening.py`, and the duplicate is why a key added to the
+    # contract reds seven rows across two modules that a single-module audit sees
+    # as one. The set is the contract; there is one copy of it now.
+    assert set(obj.keys()) == _CORPUS_JSON_KEYS
     assert "scope" not in obj  # MI-9 — absent, never ""
     assert obj["mode"] == "corpus" and obj["exit_code"] == 1
     finding = obj["findings"][0]
@@ -412,7 +411,7 @@ def test_empty_corpus_both_providers_none_exits_0(workspace, monkeypatch, capsys
     config, store, telemetry = workspace
     # Real substrate construction (offline) → (None, None); empty snapshot never
     # touches the providers, so the run stays on the one engine path.
-    monkeypatch.setattr(cli, "_build_check_judge", lambda: None)
+    monkeypatch.setattr(cli, "_build_check_judge", lambda config: None)
 
     code = cli.cmd_check(config, scope=None, fresh=False, assume_yes=False, as_json=False)
 

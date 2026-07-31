@@ -76,7 +76,7 @@ def test_not_ready_when_key_missing(tmp_path, monkeypatch):
     assert cli.cmd_status(str(tmp_path)) == 1
 
 
-def test_json_report_ready_and_has_mcp_field(tmp_path, monkeypatch, capsys):
+def test_json_report_ready_and_has_mcp_project_entry_field(tmp_path, monkeypatch, capsys):
     _init(tmp_path)
     capsys.readouterr()  # discard cmd_init's "Initialized..." message
     monkeypatch.setenv("GEMINI_API_KEY", "testkey")
@@ -85,8 +85,13 @@ def test_json_report_ready_and_has_mcp_field(tmp_path, monkeypatch, capsys):
     data = json.loads(capsys.readouterr().out)
     assert code == 0
     assert data["ready"] is True
-    assert "mcp_wired" in data["checks"]
-    assert data["checks"]["mcp_wired"] is False  # no .mcp.json in a fresh init
+    # Renamed from `mcp_wired` in 6a along with its meaning: `True` is now a
+    # shadowing FINDING, not a satisfied recommendation. A fresh init declares no
+    # project-scope server, which is the correct machine-global state — and the
+    # `ready is True` above is the half that says so: the finding is not a rung.
+    assert "mcp_wired" not in data["checks"]
+    assert "mcp_project_entry" in data["checks"]
+    assert data["checks"]["mcp_project_entry"] is False  # no .mcp.json in a fresh init
     # A clean (within-budget) project reports an empty size-ceiling list.
     assert data["scope_overflow"] == []
 
@@ -322,3 +327,122 @@ def test_status_json_null_missing_when_scroll_fails(tmp_path, monkeypatch, capsy
     assert checks["missing_active_vectors"] is None
     assert checks["missing_active_slugs"] is None
     assert checks["orphan_points"] is None
+
+
+# --- the coverage marker in the deep report (phase 1c stretch) -----------------
+
+
+def test_status_names_the_seeding_verb_when_a_coverage_marker_stands(
+    tmp_path, monkeypatch, capsys
+):
+    """A seeded queue means `mitos sync` restores search, and the report says which.
+
+    The shipped warning offers both heals conditioned on prose the operator cannot check
+    ("or `mitos sync` if the outbox is non-empty"). With a marker standing that condition
+    is decided, so naming the verb that seeded the queue turns a guess into an instruction.
+
+    Informational only: the exit code stays 0 and no readiness mark moves. This must not
+    become a gate — an *unseeded* queue is an ordinary state, not a fault.
+    """
+    _init(tmp_path)
+    capsys.readouterr()
+    monkeypatch.setenv("GEMINI_API_KEY", "testkey")
+    ids = _commit_n(tmp_path, 2)
+
+    from mitos.store import GraphStore
+
+    GraphStore(MitosConfig(str(tmp_path)).db_path).stamp_embedding_seed("rebuild")
+
+    # Both active nodes are missing from a collection that exists but holds nothing.
+    monkeypatch.setattr(cli, "_check_qdrant", _qdrant(True, True, points=0))
+    monkeypatch.setattr(cli, "scroll_point_ids", _scroll(set()))
+
+    assert cli.cmd_status(str(tmp_path)) == 0
+    out = capsys.readouterr().out
+    assert "vector index incomplete" in out
+    assert "seeded by `rebuild`" in out
+    assert "`mitos sync` restores search" in out
+    assert len(ids) == 2
+
+
+def test_status_says_nothing_about_a_marker_that_does_not_stand(
+    tmp_path, monkeypatch, capsys
+):
+    """No marker, no line — and the shipped `reconcile` guidance is untouched.
+
+    The twin fixture: without it the row above would pass whether the line were
+    conditional or unconditional.
+    """
+    _init(tmp_path)
+    capsys.readouterr()
+    monkeypatch.setenv("GEMINI_API_KEY", "testkey")
+    _commit_n(tmp_path, 2)
+    monkeypatch.setattr(cli, "_check_qdrant", _qdrant(True, True, points=0))
+    monkeypatch.setattr(cli, "scroll_point_ids", _scroll(set()))
+
+    assert cli.cmd_status(str(tmp_path)) == 0
+    out = capsys.readouterr().out
+    assert "vector index incomplete" in out
+    assert "seeded by" not in out
+    assert "mitos reconcile" in out
+
+
+def test_the_marker_line_never_reaches_the_json_payload(tmp_path, monkeypatch, capsys):
+    """Deliberately rendered-text-only: the `--json` shape is 4b's to settle.
+
+    4b owns the deep report's payload (the registered project name, the inert-legacy
+    `qdrant_collection` line). Adding a field here would hand it a shape to revise for a
+    consumer that does not exist yet, so the stretch stops at the rendered surface.
+    """
+    _init(tmp_path)
+    capsys.readouterr()
+    monkeypatch.setenv("GEMINI_API_KEY", "testkey")
+    _commit_n(tmp_path, 1)
+
+    from mitos.store import GraphStore
+
+    GraphStore(MitosConfig(str(tmp_path)).db_path).stamp_embedding_seed("reconcile")
+    monkeypatch.setattr(cli, "_check_qdrant", _qdrant(True, True, points=0))
+    monkeypatch.setattr(cli, "scroll_point_ids", _scroll(set()))
+
+    assert cli.cmd_status(str(tmp_path), as_json=True) == 0
+    payload = capsys.readouterr().out
+    assert "embedding_seed" not in payload
+    assert "seeded by" not in payload
+    # And the readiness mapping is unmoved.
+    assert json.loads(payload)["ready"] is True
+
+
+def test_the_inert_pin_reaches_the_json_payload_as_a_value_not_a_sentence(
+    tmp_path, monkeypatch, capsys
+):
+    """The 4b inversion of 1d's second tripwire (its twin lives in
+    `test_collection_derivation.py`, and both had to be inverted together — a phase
+    that inverted one and deleted the other would have lost a real pin).
+
+    The split is the point and it is not a formality: the payload carries the pinned
+    **value**, the rendered surface carries the **sentence**, and neither crosses.
+    The row above (`embedding_seed`) is deliberately NOT a sibling — it is about a
+    different marker line and stays text-only.
+    """
+    mitos_dir = tmp_path / ".mitos"
+    mitos_dir.mkdir()
+    (mitos_dir / "config.toml").write_text(
+        'qdrant_collection = "mitos-mitos-pub"\n', encoding="utf-8"
+    )
+    _init(tmp_path)  # leaves the pre-created config.toml alone
+    capsys.readouterr()
+    monkeypatch.setenv("GEMINI_API_KEY", "testkey")
+    monkeypatch.setattr(cli, "_check_qdrant", _qdrant(True, True, points=0))
+    monkeypatch.setattr(cli, "scroll_point_ids", _scroll(set()))
+
+    assert cli.cmd_status(str(tmp_path), as_json=True) == 0
+    payload = capsys.readouterr().out
+    # The full phrase, not the bare word "inert": the payload echoes the workspace
+    # path, and pytest builds that path from this test's own name.
+    assert "inert legacy config" not in payload
+    assert json.loads(payload)["inert_collection_pin"] == "mitos-mitos-pub"
+    # The rendered surface carries the sentence — so the absence above is about
+    # prose in a machine payload, not about a feature that never shipped.
+    assert cli.cmd_status(str(tmp_path)) == 0
+    assert "inert legacy config" in capsys.readouterr().out

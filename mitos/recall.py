@@ -21,11 +21,18 @@ did-you-mean + a top-K busiest-first candidate slice + an overflow pointer to th
 dedicated scope-discovery surface — never the full tag vocabulary on the hot path
 (P11).
 
-Pure stdlib — no graph or network access (``difflib`` for the did-you-mean).
+Pure stdlib — no graph or network access, and **zero ``mitos`` imports**
+(``difflib`` for the did-you-mean). Where a policy here needs a fact only another
+module can compute, the fact is *injected* rather than imported:
+:func:`missing_graph_is_a_gap` takes the corpus scan as a required keyword. That
+is not ceremony — ``conflict.py`` imports this module, so an import added here
+lands inside the check family's discovered no-write fence
+(``test_conflict_closeout.py``), and a predicate the sweep never calls has no
+business widening it.
 """
 
 import difflib
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 # Top semantic score at/above which a match is treated as a real precedent rather than
 # a loose neighbour. Calibrated to observed Gemini-embedding scores: settled precedents
@@ -64,6 +71,31 @@ _SURFACE_POINTERS: Dict[str, Dict[str, str]] = {
         "discovery": "list_scopes",
         "state_all": "list_decisions(scope='{scope}', state='all')",
         "sync": "mitos sync",
+    },
+}
+
+
+# Per-surface wording for the unbuilt-graph signal, on the ``_SURFACE_POINTERS``
+# idiom: the policy emits the signal and composes the shared sentence, each surface
+# supplies its own closing clause. The verb is ``mitos sync`` on *both* — there is no
+# MCP sync tool, so the shell command is the only truthful pointer (a shell command is
+# not the MCP-tool leak the T7 gate forbids). What differs is the register: a CLI
+# caller can run it where they stand; an agent on the MCP surface cannot, and telling
+# it so beats letting it hunt for a tool that does not exist.
+#
+# `mitos reconcile` is NOT a pointer here and must never become one: over an unbuilt
+# graph it diffs an empty active set against an absent collection, finds nothing to
+# enqueue, and reports success on a workspace it did not touch — converting a
+# recoverable state into one the operator believes they already fixed.
+MISSING_GRAPH_POINTERS: Dict[str, Dict[str, str]] = {
+    "cli": {
+        "build": "run `mitos sync` here to build it",
+    },
+    "mcp": {
+        "build": (
+            "`mitos sync` has to be run in that project to build it (there is no "
+            "tool for it on this surface)"
+        ),
     },
 }
 
@@ -306,20 +338,174 @@ def corpus_provenance(config: "object") -> Dict[str, str]:
     workspace" — the reviewing cwd and a vision's decision store can diverge).
     Shared by the CLI verbs and their MCP twins so the field names can't drift.
 
+    ``project`` answers that ambiguity in the *caller's own* vocabulary: a call
+    that named a registered project gets that name back, so an agent holding
+    several projects can see at a glance that the answer came from the one it
+    asked for. The value is read straight off the config the resolution site
+    built and is **never re-derived here** — a reverse lookup against the
+    registry would break this module's leaf status, read the registry on every
+    stamped answer (including the degraded path, where the filesystem may be the
+    fault), and miss on a symlinked route, quietly echoing a path for a
+    registered project.
+
     Args:
         config: The active ``MitosConfig`` (duck-typed to avoid an import cycle
             — recall is a leaf module).
 
     Returns:
-        ``{"collection": <qdrant collection>, "workspace": <workspace dir>}``.
+        ``{"project": <registered name or absolute path>,
+        "collection": <qdrant collection>, "workspace": <workspace dir>}``.
+        Field order is contractual — the identity a reader scans for first, then
+        the derived collection, then the location.
     """
     return {
+        "project": getattr(config, "project", ""),
         "collection": getattr(config, "qdrant_collection", ""),
         "workspace": getattr(config, "workspace_dir", ""),
     }
 
 
+def missing_index_is_a_gap(store: "object") -> bool:
+    """Decides whether an absent vector collection is a gap worth reporting (I8).
+
+    The one predicate behind every consumer of an absent collection: the four
+    semantic read surfaces (``mitos query`` / ``mitos surface`` and their MCP
+    twins) and the conflict sweep behind ``mitos check --staged`` and the
+    sync-time sensor, so the shapes they take cannot become several behaviours.
+    Over a graph holding **no** active nodes an absent collection *is* the empty
+    index — a just-initialized project is healthy, not broken — and the caller
+    renders its ordinary nothing-found result with no diagnostic. Over a
+    populated graph it is a real hole in recall, and the caller says so and names
+    the heal.
+
+    Gated on ``get_active_node_ids`` rather than ``get_active_decisions`` for a
+    reason stronger than "open questions are embedded too": that set — active
+    decisions ∪ surviving open questions — is exactly what
+    ``reconcile_embeddings`` enqueues, so the diagnostic fires if and only if the
+    ``mitos reconcile`` it points at would actually have something to index. The
+    gate and the heal agree by construction.
+
+    An unreadable graph answers **True**, the loud branch: "I could not check"
+    must never render as the healthy-empty "I checked, there is nothing to index".
+
+    Args:
+        store: The graph store (duck-typed to avoid an import cycle — recall is a
+            leaf module, as in :func:`corpus_provenance`).
+
+    Returns:
+        True when the absence should be surfaced as a degradation.
+    """
+    try:
+        return bool(store.get_active_node_ids())
+    except Exception:
+        return True
+
+
+def missing_graph_is_a_gap(
+    store: Optional["object"],
+    config: "object",
+    *,
+    corpus_has_entries: Callable[[str], bool],
+) -> bool:
+    """Decides whether an unbuilt graph is a gap worth reporting (I8, W31).
+
+    The mirror of :func:`missing_index_is_a_gap`, and it is meant to be read
+    beside it: that predicate asks *"is an absent collection a gap?"* and answers
+    on the graph; this one asks *"is an empty graph a gap?"* and answers on the
+    corpus. Both exist so the surfaces that consult them cannot become several
+    behaviours.
+
+    The state it names was made routine by the absolute-path escape hatch: a clone
+    carries the committed ``.mitos/config.toml`` and a ``decisions.md`` holding
+    hundreds of decisions, but not the gitignored ``*.sqlite`` — nobody commits a
+    binary graph on purpose. Every semantic read over that workspace answers
+    cleanly empty, and the agent reads *no precedents* for a project that has
+    hundreds. That is the *"could not check"* → *"checked, it's clean"* inversion,
+    arriving through the **graph** door instead of the collection one.
+
+    **The gate is the TOTAL node count, never the active set**, and the reasoning
+    is the sibling's own applied to a different heal: that predicate gates on
+    ``get_active_node_ids`` because that set is exactly what ``mitos reconcile``
+    enqueues, while this one gates on the node count because ``mitos sync`` commits
+    *entries* to nodes regardless of computed state. Gate and heal agree by
+    construction, and they are different heals — asking a **computed-state view**
+    whether the graph was ever *built* is asking the wrong question, however the
+    answer happens to come out.
+
+    Worth knowing, because it is the thing that makes the wrong build hard to
+    catch: today the two gates never actually disagree. Kill edges are acyclic by
+    write-path guard, so a non-empty graph always retains at least one node with no
+    incoming kill edge (measured — a supersession chain always leaves a live tip,
+    and a self-supersede raises). "Every decision superseded, active set empty" is
+    therefore **unconstructible** end to end, which means an active-set build ships
+    green and stays green until something — a corrupted graph, a future kill-edge
+    type, a rebuild — makes the two diverge, at which point it renders "the graph is
+    missing, run ``mitos sync``" over a populated one. The difference lives in the
+    contract, so that is where the tests pin it.
+
+    ``store`` is ``Optional`` because ``status`` genuinely has none — it guards
+    every graph read with ``os.path.exists(config.db_path)``, and a clone's
+    ``db_path`` does not exist. The four read surfaces always hold a store (their
+    ``GraphStore`` construction creates the file), so they pass one and it answers
+    ``(0, "")``.
+
+    Args:
+        store: The graph store, or ``None`` when there is no graph file at all
+            (duck-typed to avoid an import cycle — recall is a leaf module, as in
+            :func:`corpus_provenance`).
+        config: The active ``MitosConfig`` (duck-typed; ``decisions_file`` is the
+            only attribute read).
+        corpus_has_entries: The corpus scan — ``parser.corpus_has_entries`` at
+            every call site. **Required**, never defaulted: this module keeps zero
+            ``mitos`` imports (see the module docstring for why the import is not
+            free), and a defaulted no-op would let a forgotten call site answer a
+            silent ``False`` instead of raising.
+
+    Returns:
+        True when an unbuilt graph should be surfaced as a degradation — which is
+        exactly when the corpus has something for ``mitos sync`` to commit. An
+        unreadable graph answers on the corpus too, the loud branch: "I could not
+        check" must never render as the healthy "I checked, it is empty".
+    """
+    try:
+        node_count = store.graph_fingerprint()[0] if store is not None else 0
+    except Exception:
+        node_count = 0
+    if node_count:
+        return False
+    return bool(corpus_has_entries(getattr(config, "decisions_file", "")))
+
+
+def missing_graph_note(surface: str) -> str:
+    """Words the unbuilt-graph signal for one surface.
+
+    Composed here rather than at each call site for the reason the whole module
+    exists: four read surfaces spelling one diagnosis is four diagnoses waiting to
+    diverge. The shared sentence says what the emptiness *means* — the distinction
+    the reader is about to get wrong — and the per-surface clause names the heal in
+    that surface's register (:data:`MISSING_GRAPH_POINTERS`).
+
+    Args:
+        surface: ``"cli"`` or ``"mcp"``. Required and unkeyed by design, as in
+            :func:`assess_surface_recall`: no call site may silently emit the other
+            surface's register.
+
+    Returns:
+        The one-line note.
+    """
+    return (
+        "The graph is unbuilt: decisions.md holds entries but the graph has no "
+        "nodes, so this empty answer means 'nothing is indexed yet', not 'no "
+        f"precedent exists' — {MISSING_GRAPH_POINTERS[surface]['build']}."
+    )
+
+
 def provenance_line(config: "object") -> str:
-    """Formats ``corpus_provenance`` as the one-line text header."""
+    """Formats ``corpus_provenance`` as the one-line text header.
+
+    Same field order as the dict, for the same reason: the project the call
+    resolved reads first. The ``·`` separator is used at every site, including
+    the bracketed inline forms.
+    """
     p = corpus_provenance(config)
-    return f"corpus: {p['collection']} · {p['workspace']}"
+    return f"corpus: {p['project']} · {p['collection']} · {p['workspace']}"

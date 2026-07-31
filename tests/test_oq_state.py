@@ -333,7 +333,13 @@ def test_cmd_open_questions_json_empty_is_honest_envelope(ws, capsys) -> None:
     capsys.readouterr()
     cmd_open_questions(config, as_json=True)  # must not raise
     out = json.loads(capsys.readouterr().out)
-    assert out == {"open_questions": [], "total": 0, "scope": None}
+    # Whole-dict equality, kept whole: the envelope gained the three corpus-echo
+    # fields (§4.7), so they are named here rather than the comparison being
+    # loosened to a subset — "honest-empty" is a claim about the WHOLE envelope.
+    assert out == {"open_questions": [], "total": 0, "scope": None,
+                   "project": config.workspace_dir,
+                   "collection": config.qdrant_collection,
+                   "workspace": config.workspace_dir}
 
 
 def test_cmd_open_questions_json_matches_list_json_oq_shape(ws, capsys) -> None:
@@ -410,7 +416,7 @@ def test_mcp_surface_decisions_oq_present_absent_amended(ws) -> None:
 
     ro = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components", return_value=(ro, None, None)):
-        resp = json.loads(mcp_server.surface_decisions(query="anything", scope="auth"))
+        resp = json.loads(mcp_server.surface_decisions(query="anything", scope="auth", project=config.workspace_dir))
     by_topic = {oq["topic"]: oq for oq in resp["open_questions"]}
     assert "q-open" in by_topic
     assert "q-answered" not in by_topic
@@ -427,7 +433,7 @@ def test_mcp_list_decisions_oq_present_absent(ws) -> None:
 
     ro = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components", return_value=(ro, None, None)):
-        resp = json.loads(mcp_server.list_decisions(scope="auth"))
+        resp = json.loads(mcp_server.list_decisions(scope="auth", project=config.workspace_dir))
     topics = {oq["topic"] for oq in resp["open_questions"]}
     assert "q-open" in topics
     assert "q-answered" not in topics
@@ -438,7 +444,7 @@ def _surface_oq(config, scope):
     from mitos import mcp_server
     ro = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components", return_value=(ro, None, None)):
-        resp = json.loads(mcp_server.surface_decisions(query="anything", scope=scope))
+        resp = json.loads(mcp_server.surface_decisions(query="anything", scope=scope, project=config.workspace_dir))
     return {oq["topic"]: oq for oq in resp["open_questions"]}
 
 

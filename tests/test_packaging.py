@@ -70,7 +70,6 @@ def _mitos_env(tmp_path) -> dict:
     return {
         **os.environ,
         "MITOS_NO_UPDATE_CHECK": "1",
-        "MITOS_NO_MCP_HINT": "1",
         "XDG_CONFIG_HOME": str(tmp_path / "xdg_config"),
         "XDG_CACHE_HOME": str(tmp_path / "xdg_cache"),
     }
@@ -164,6 +163,73 @@ def test_non_editable_install_real_read_path(built_wheel, tmp_path):
         "installed format-spec.md differs from the package source"
     )
 
+    # The registry leaf ships. `pyproject.toml` declares `packages = ["mitos"]` — an
+    # explicit list, not `find_packages()` — so a *subpackage* would be silently
+    # excluded from the wheel while the editable dev install resolved it happily.
+    # `registry.py` is flat in `mitos/`, on the right side of that trap; this is the
+    # net that catches a future move to the wrong side.
+    registry_import = subprocess.run([str(venv_python), "-c", "import mitos.registry"],
+                                     env=_mitos_env(tmp_path), capture_output=True,
+                                     text=True, timeout=60)
+    assert registry_import.returncode == 0, (
+        f"`import mitos.registry` failed in the installed venv — the module is "
+        f"missing from the wheel:\n{registry_import.stderr}"
+    )
+
+    # The routing leaf ships too, for the same reason and against the same trap.
+    # It is the module every workspace-targeting call routes through once the
+    # boundaries land, so a wheel missing it is a console script that dies on
+    # import while the editable dev install stays perfectly green.
+    routing_import = subprocess.run([str(venv_python), "-c", "import mitos.routing"],
+                                    env=_mitos_env(tmp_path), capture_output=True,
+                                    text=True, timeout=60)
+    assert routing_import.returncode == 0, (
+        f"`import mitos.routing` failed in the installed venv — the module is "
+        f"missing from the wheel:\n{routing_import.stderr}"
+    )
+
+    # And the env leaf, same trap. It is imported by `mitos.config`, which every
+    # verb constructs, so a wheel missing it is not a degraded feature — it is an
+    # `ImportError` on the very first thing the console script does.
+    env_import = subprocess.run([str(venv_python), "-c", "import mitos.env"],
+                                env=_mitos_env(tmp_path), capture_output=True,
+                                text=True, timeout=60)
+    assert env_import.returncode == 0, (
+        f"`import mitos.env` failed in the installed venv — the module is "
+        f"missing from the wheel:\n{env_import.stderr}"
+    )
+
+    # And the overview leaf, same trap. A flat module is on the right side of it, so
+    # this is cheap insurance rather than a known gap — but it is the module the
+    # zero-arg `mitos status` will route to, i.e. the first thing a human runs when
+    # something feels wrong, on a machine where nothing else has told them yet.
+    overview_import = subprocess.run([str(venv_python), "-c", "import mitos.overview"],
+                                     env=_mitos_env(tmp_path), capture_output=True,
+                                     text=True, timeout=60)
+    assert overview_import.returncode == 0, (
+        f"`import mitos.overview` failed in the installed venv — the module is "
+        f"missing from the wheel:\n{overview_import.stderr}"
+    )
+
+    # And the MCP server module — a DIFFERENT trap from the four above. It is not
+    # about what the wheel contains but about what a fresh dependency resolve
+    # *installs beside it*: `mcp` 2.0.0 renamed `mcp.server.fastmcp` (the surface
+    # `mcp_server.py:9` imports at module scope) to `mcp.server.mcpserver`, so an
+    # unceilinged `mcp>=…` floor resolves 2.x and `mitos serve` — the recommended
+    # agent interface — dies with `No module named 'mcp.server.fastmcp'` on a real
+    # install while the whole editable dev tree stays green. This row is the only
+    # place in the suite where deps resolve from PyPI rather than from the venv
+    # someone pinned by age, which is why the ceiling is gated here.
+    mcp_server_import = subprocess.run([str(venv_python), "-c", "import mitos.mcp_server"],
+                                       env=_mitos_env(tmp_path), capture_output=True,
+                                       text=True, timeout=60)
+    assert mcp_server_import.returncode == 0, (
+        f"`import mitos.mcp_server` failed in the installed venv — `mitos serve` "
+        f"is unstartable from a fresh install. Check the `mcp` version this "
+        f"resolve picked against the ceiling in pyproject.toml:\n"
+        f"{mcp_server_import.stderr}"
+    )
+
     # `mitos init` reads the spec from the installed package dir and scaffolds a workspace.
     workspace = tmp_path / "proj"
     workspace.mkdir()
@@ -171,3 +237,11 @@ def test_non_editable_install_real_read_path(built_wheel, tmp_path):
                           capture_output=True, text=True, timeout=120)
     assert init.returncode == 0, f"`mitos init` failed:\n{init.stdout}\n{init.stderr}"
     assert (workspace / "format-spec.md").is_file(), "`mitos init` did not seed format-spec.md"
+
+    # …and registers the project it just scaffolded, into the redirected config root
+    # (`_mitos_env` carries XDG_CONFIG_HOME explicitly — the autouse parent-process
+    # fixture does not reach a subprocess). The real-install path is the only place
+    # the whole chain runs against a non-editable package.
+    registry_file = tmp_path / "xdg_config" / "mitos" / "registry.toml"
+    assert registry_file.is_file(), "`mitos init` did not write the project registry"
+    assert str(workspace.resolve()) in registry_file.read_text(encoding="utf-8")

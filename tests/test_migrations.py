@@ -19,6 +19,7 @@ from mitos.migrations import (
     _pending_head,
     _v1_schema,
     _v1b_schema,
+    _v1c_schema,
     is_pre_v1a_schema,
     run_migrations,
 )
@@ -57,18 +58,23 @@ def _create_step(table: str):
     return step
 
 
-def test_registry_has_v1a_and_v1b_schema_steps() -> None:
-    """The live registry carries both ladder rungs: V1a step 1 and V1b step 2.
+def test_registry_has_v1a_v1b_and_v1c_schema_steps() -> None:
+    """The live registry carries three ladder rungs: V1a, V1b and V1c.
 
-    Phase 5a appended ``(1, _v1_schema)`` (entry-001 flip); Phase 1b appends
-    ``(2, _v1b_schema)`` (the ``mechanisms`` DDL + widened ``edges`` CHECK) via
-    ``.append`` — never a rebind, so ``run_migrations``'s def-time-bound default arg
-    sees both on the live boot. This retires the ``len == 1`` dormancy tripwire 1a
-    left for 1b.
+    Phase 5a appended ``(1, _v1_schema)`` (entry-001 flip); the collection-absence
+    phase 1b appended ``(2, _v1b_schema)`` (the ``mechanisms`` DDL + widened ``edges``
+    CHECK); phase 1c appends ``(3, _v1c_schema)`` (the ``embedding_seed`` coverage
+    marker) — each via ``.append``, never a rebind, so ``run_migrations``'s
+    def-time-bound default arg sees all three on the live boot.
+
+    The count assertion is the deliberate hand-off tripwire each phase inherits: it
+    reds on the next append, which is how the appending phase is forced to notice the
+    ladder shape rather than grow it by accident.
     """
     assert (1, _v1_schema) in MIGRATION_STEPS
     assert (2, _v1b_schema) in MIGRATION_STEPS
-    assert len(MIGRATION_STEPS) == 2  # the V1a rung + the V1b rung
+    assert (3, _v1c_schema) in MIGRATION_STEPS
+    assert len(MIGRATION_STEPS) == 3  # the V1a rung + the V1b rung + the V1c rung
 
 
 def test_empty_ladder_is_noop() -> None:
@@ -779,27 +785,31 @@ def _v1b_conn(tmp_path, name: str = "v1b.sqlite") -> sqlite3.Connection:
     return conn
 
 
-def test_full_ladder_boots_fresh_db_to_head_2_via_live_registry(tmp_path) -> None:
-    """A fresh DB run through the LIVE registry ladders to head 2 with both schemas.
+def test_full_ladder_boots_fresh_db_to_head_via_live_registry(tmp_path) -> None:
+    """A fresh DB run through the LIVE registry ladders to the head with every schema.
 
-    PLANNING_NOTES:57 — the from-scratch boot (not just step-2-on-a-seeded-v1) is what
-    catches a "step 2 assumes ``edges`` exists but nothing created it" bug: the live
-    ``MIGRATION_STEPS`` applies step 1 then step 2 from ``user_version`` 0. The head is
-    read dynamically (``_pending_head``), never a literal.
+    PLANNING_NOTES:57 — the from-scratch boot (not just step-N-on-a-seeded-predecessor)
+    is what catches a "step 2 assumes ``edges`` exists but nothing created it" bug: the
+    live ``MIGRATION_STEPS`` applies every rung in order from ``user_version`` 0. The
+    head is read dynamically (``_pending_head``), never a literal — which is why this row
+    survives each append and only its table-set assertion grows.
     """
     conn = open_connection(str(tmp_path / "fresh.sqlite"))
     try:
         head = run_migrations(conn, MIGRATION_STEPS)
         assert head == _pending_head(MIGRATION_STEPS)
         assert _user_version(conn) == _pending_head(MIGRATION_STEPS)
-        # All six V1a tables + the new mechanisms registry are present.
+        # All six V1a tables + the mechanisms registry + the coverage marker.
         tables = {
             row[0]
             for row in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table';"
             )
         }
-        assert tables == set(_V1A_TABLES) | {"mechanisms"}
+        assert tables == set(_V1A_TABLES) | {"mechanisms", "embedding_seed"}
+        # The marker table ships PRESENT and EMPTY: a fresh project has no covering act
+        # standing, and "healthy and empty" must not read as "coverage established".
+        assert conn.execute("SELECT COUNT(*) FROM embedding_seed;").fetchone()[0] == 0
         # mechanisms laddered in STRICT with its canonical_name PK (full shape +
         # prototype-negative assertions live in the dedicated mechanisms tests below).
         assert _is_strict(conn, "mechanisms")

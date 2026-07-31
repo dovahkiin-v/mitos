@@ -23,7 +23,7 @@ not here, so ``candidate_slugs`` — the parse's realignment key — stays facad
 from __future__ import annotations
 
 import time
-from typing import Callable
+from typing import Callable, Optional
 from uuid import uuid4
 
 import anthropic
@@ -58,6 +58,7 @@ def execute_judgment(
     *,
     client: "anthropic.Anthropic",
     timeout_s: float = CONFLICT_LLM_TIMEOUT_S,
+    model_id: Optional[str] = None,
 ) -> "JudgmentExecution | Unavailable":
     """Runs one batched SONNET tenability call; returns raw text + metrics, or a typed failure.
 
@@ -84,6 +85,11 @@ def execute_judgment(
         client: The injected Anthropic client (5a constructs the real one). Keyword-only.
         timeout_s: The hard per-call wall-clock cap in seconds (default
             ``CONFLICT_LLM_TIMEOUT_S``). Keyword-only.
+        model_id: The resolved versioned id for ``_JUDGMENT_MODEL_ALIAS``, taken
+            off the calling workspace's ``config.env`` by whichever orchestrator
+            bound the client (2c). ``None`` falls back to the baseline for the
+            alias — an override reaches this call only by being passed, because
+            the model registry reads no process environment. Keyword-only.
 
     Returns:
         A :class:`~mitos.conflict.JudgmentExecution` (raw text + batch_id + usage + elapsed)
@@ -99,7 +105,10 @@ def execute_judgment(
         message = client.with_options(
             max_retries=0, timeout=timeout_s
         ).messages.create(
-            model=get_model_id(_JUDGMENT_MODEL_ALIAS),
+            model=(
+                model_id if model_id is not None
+                else get_model_id(_JUDGMENT_MODEL_ALIAS)
+            ),
             max_tokens=_JUDGMENT_MAX_TOKENS,
             temperature=CONFLICT_JUDGMENT_TEMPERATURE,
             system=prompt.system,  # static cache-anchored prefix; cache_control OFF (RF-3).
@@ -142,6 +151,8 @@ def execute_judgment(
 
 def make_judgment_executor(
     client: "anthropic.Anthropic",
+    *,
+    model_id: Optional[str] = None,
 ) -> "Callable[[RenderedPrompt], JudgmentExecution | Unavailable]":
     """Binds a client into the one-arg ``judge`` callable the facade expects (the 5a seam).
 
@@ -153,6 +164,11 @@ def make_judgment_executor(
 
     Args:
         client: The Anthropic client to bind (5a constructs it, e.g. with ``max_retries=0``).
+        model_id: The resolved versioned model id to bind alongside it (2c) — the
+            id the calling workspace's ``config.env`` resolved for
+            ``_JUDGMENT_MODEL_ALIAS``, or ``None`` for the baseline. It rides the
+            closure rather than the facade, so the facade's ``judge`` stays a
+            one-arg function of a ``RenderedPrompt``.
 
     Returns:
         A one-arg callable ``(RenderedPrompt) -> JudgmentExecution | Unavailable`` that drives
@@ -160,6 +176,6 @@ def make_judgment_executor(
     """
 
     def judge(prompt: "RenderedPrompt") -> "JudgmentExecution | Unavailable":
-        return execute_judgment(prompt, client=client)
+        return execute_judgment(prompt, client=client, model_id=model_id)
 
     return judge

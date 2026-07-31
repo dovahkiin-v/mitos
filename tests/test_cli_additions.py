@@ -14,15 +14,15 @@ from mitos.cli import main
 # --- aliases + surface routing -------------------------------------------------
 
 @patch("mitos.cli.cmd_record")
-def test_record_decision_alias_routes(mock_record, monkeypatch):
-    monkeypatch.setattr(sys, "argv", ["mitos", "record_decision", "ax", "--rejected", "r", "--slug", "s"])
+def test_record_decision_alias_routes(mock_record, monkeypatch, workspace):
+    monkeypatch.setattr(sys, "argv", ["mitos", "-p", workspace, "record_decision", "ax", "--rejected", "r", "--slug", "s"])
     main()
     assert mock_record.called
 
 
 @patch("mitos.cli.cmd_surface")
-def test_surface_verb_routes_with_scope(mock_surface, monkeypatch):
-    monkeypatch.setattr(sys, "argv", ["mitos", "surface", "a claim", "--scope", "db"])
+def test_surface_verb_routes_with_scope(mock_surface, monkeypatch, workspace):
+    monkeypatch.setattr(sys, "argv", ["mitos", "-p", workspace, "surface", "a claim", "--scope", "db"])
     main()
     mock_surface.assert_called_once()
     args, kwargs = mock_surface.call_args
@@ -31,23 +31,23 @@ def test_surface_verb_routes_with_scope(mock_surface, monkeypatch):
 
 
 @patch("mitos.cli.cmd_surface")
-def test_surface_decisions_alias_routes(mock_surface, monkeypatch):
-    monkeypatch.setattr(sys, "argv", ["mitos", "surface_decisions", "claim"])
+def test_surface_decisions_alias_routes(mock_surface, monkeypatch, workspace):
+    monkeypatch.setattr(sys, "argv", ["mitos", "-p", workspace, "surface_decisions", "claim"])
     main()
     assert mock_surface.called
 
 
 @patch("mitos.cli.cmd_query")
-def test_query_decisions_alias_routes(mock_query, monkeypatch):
-    monkeypatch.setattr(sys, "argv", ["mitos", "query_decisions", "claim"])
+def test_query_decisions_alias_routes(mock_query, monkeypatch, workspace):
+    monkeypatch.setattr(sys, "argv", ["mitos", "-p", workspace, "query_decisions", "claim"])
     main()
     assert mock_query.called
 
 
 @patch("mitos.cli.cmd_query")
-def test_query_json_brief_routes(mock_query, monkeypatch):
+def test_query_json_brief_routes(mock_query, monkeypatch, workspace):
     """`query c --json --brief` threads as_json=True, brief=True (non-exhaustive)."""
-    monkeypatch.setattr(sys, "argv", ["mitos", "query", "claim", "--json", "--brief"])
+    monkeypatch.setattr(sys, "argv", ["mitos", "-p", workspace, "query", "claim", "--json", "--brief"])
     main()
     assert mock_query.called
     _, kwargs = mock_query.call_args
@@ -55,9 +55,9 @@ def test_query_json_brief_routes(mock_query, monkeypatch):
 
 
 @patch("mitos.cli.cmd_query")
-def test_query_limit_routes(mock_query, monkeypatch):
+def test_query_limit_routes(mock_query, monkeypatch, workspace):
     """`query c --limit 7` threads limit=7 through the parser + dispatch."""
-    monkeypatch.setattr(sys, "argv", ["mitos", "query", "claim", "--limit", "7"])
+    monkeypatch.setattr(sys, "argv", ["mitos", "-p", workspace, "query", "claim", "--limit", "7"])
     main()
     assert mock_query.called
     _, kwargs = mock_query.call_args
@@ -65,9 +65,9 @@ def test_query_limit_routes(mock_query, monkeypatch):
 
 
 @patch("mitos.cli.cmd_surface")
-def test_surface_limit_routes(mock_surface, monkeypatch):
+def test_surface_limit_routes(mock_surface, monkeypatch, workspace):
     """`surface c --limit 7` threads limit=7 through the parser + dispatch."""
-    monkeypatch.setattr(sys, "argv", ["mitos", "surface", "claim", "--limit", "7"])
+    monkeypatch.setattr(sys, "argv", ["mitos", "-p", workspace, "surface", "claim", "--limit", "7"])
     main()
     assert mock_surface.called
     _, kwargs = mock_surface.call_args
@@ -75,9 +75,9 @@ def test_surface_limit_routes(mock_surface, monkeypatch):
 
 
 @patch("mitos.cli.cmd_open_questions")
-def test_open_questions_json_routes(mock_oq, monkeypatch):
+def test_open_questions_json_routes(mock_oq, monkeypatch, workspace):
     """`open-questions --json` threads as_json=True through to the handler."""
-    monkeypatch.setattr(sys, "argv", ["mitos", "open-questions", "--json"])
+    monkeypatch.setattr(sys, "argv", ["mitos", "-p", workspace, "open-questions", "--json"])
     main()
     assert mock_oq.called
     _, kwargs = mock_oq.call_args
@@ -85,10 +85,10 @@ def test_open_questions_json_routes(mock_oq, monkeypatch):
 
 
 @patch("mitos.cli.cmd_record")
-def test_record_json_routes(mock_record, monkeypatch):
+def test_record_json_routes(mock_record, monkeypatch, workspace):
     """`record … --json` threads as_json=True through to the handler."""
     monkeypatch.setattr(sys, "argv",
-                        ["mitos", "record", "ax", "--rejected", "r", "--slug", "s", "--json"])
+                        ["mitos", "-p", workspace, "record", "ax", "--rejected", "r", "--slug", "s", "--json"])
     main()
     assert mock_record.called
     _, kwargs = mock_record.call_args
@@ -113,17 +113,17 @@ def test_read_text_arg_from_stdin(monkeypatch):
 
 
 @patch("mitos.cli.cmd_record")
-def test_record_reads_rejected_from_file(mock_record, tmp_path, monkeypatch):
+def test_record_reads_rejected_from_file(mock_record, tmp_path, monkeypatch, workspace):
     rf = tmp_path / "rej.txt"
     rf.write_text("rejected prose, apostrophe-safe: Camila's", encoding="utf-8")
-    monkeypatch.setattr(sys, "argv", ["mitos", "record", "ax", "--rejected-file", str(rf), "--slug", "s"])
+    monkeypatch.setattr(sys, "argv", ["mitos", "-p", workspace, "record", "ax", "--rejected-file", str(rf), "--slug", "s"])
     main()
     _, kwargs = mock_record.call_args
     assert kwargs["rejected"] == "rejected prose, apostrophe-safe: Camila's"
 
 
-def test_record_requires_rejected(monkeypatch):
-    monkeypatch.setattr(sys, "argv", ["mitos", "record", "ax", "--slug", "s"])  # neither --rejected nor --rejected-file
+def test_record_requires_rejected(monkeypatch, workspace):
+    monkeypatch.setattr(sys, "argv", ["mitos", "-p", workspace, "record", "ax", "--slug", "s"])  # neither --rejected nor --rejected-file
     with pytest.raises(SystemExit) as exc:
         main()
     assert exc.value.code == 2
@@ -140,40 +140,55 @@ def test_version_flag_prints_and_exits_zero(monkeypatch, capsys):
     assert __version__ in capsys.readouterr().out
 
 
-# --- MCP wiring detection + hint ----------------------------------------------
+# --- MCP project-entry (shadowing) detection ----------------------------------
 
-def test_mcp_wired_detection(tmp_path):
-    assert cli._mcp_wired(str(tmp_path)) is False
+def test_mcp_project_entry_detection(tmp_path):
+    """The same `.mcp.json` read as the retired `_mcp_wired`, meaning the opposite.
+
+    `True` is now a FINDING — a project-scope entry under the server name `mitos`
+    wins by name over the machine-wide registration and erases it, so this is the
+    state worth reporting, not the state worth congratulating.
+    """
+    assert cli._mcp_project_entry(str(tmp_path)) is False
     (tmp_path / ".mcp.json").write_text('{"mcpServers": {"mitos": {"command": "mitos"}}}')
-    assert cli._mcp_wired(str(tmp_path)) is True
+    assert cli._mcp_project_entry(str(tmp_path)) is True
     (tmp_path / ".mcp.json").write_text('{"mcpServers": {"other": {}}}')
-    assert cli._mcp_wired(str(tmp_path)) is False
+    assert cli._mcp_project_entry(str(tmp_path)) is False
 
 
-def test_mcp_hint_fires_then_rate_limits(tmp_path, monkeypatch):
-    monkeypatch.delenv("MITOS_NO_MCP_HINT", raising=False)
-    first = cli._mcp_hint(str(tmp_path))
-    assert first is not None and "wire the MCP" in first
-    assert cli._mcp_hint(str(tmp_path)) is None  # within 24h → silent
+def test_mcp_project_entry_keys_on_the_server_name_not_the_command(tmp_path):
+    """A server registered under a DIFFERENT key does not shadow, so it is not flagged.
+
+    Precedence is keyed on the entry's name, so `mitos-local` coexists with the
+    machine-wide `mitos` entry rather than erasing it. Widening the predicate to
+    "any entry whose command mentions mitos" would flag a harmless registration —
+    the cries-wolf failure the note exists to avoid.
+    """
+    (tmp_path / ".mcp.json").write_text(
+        '{"mcpServers": {"mitos-local": {"command": "mitos", "args": ["serve"]}}}'
+    )
+    assert cli._mcp_project_entry(str(tmp_path)) is False
 
 
-def test_mcp_hint_silent_when_wired(tmp_path, monkeypatch):
-    monkeypatch.delenv("MITOS_NO_MCP_HINT", raising=False)
-    (tmp_path / ".mcp.json").write_text('{"mcpServers": {"mitos": {"command": "mitos"}}}')
-    assert cli._mcp_hint(str(tmp_path)) is None
+def test_mcp_project_entry_fails_silent_on_a_malformed_file(tmp_path):
+    """Unreadable/malformed input reports no finding — it is one row on someone else's report."""
+    (tmp_path / ".mcp.json").write_text("{not json at all")
+    assert cli._mcp_project_entry(str(tmp_path)) is False
+    (tmp_path / ".mcp.json").write_text('["a list, not an object"]')
+    assert cli._mcp_project_entry(str(tmp_path)) is False
 
 
-def test_mcp_hint_opt_out(tmp_path, monkeypatch):
-    monkeypatch.setenv("MITOS_NO_MCP_HINT", "1")
-    assert cli._mcp_hint(str(tmp_path)) is None
+def test_the_mcp_wiring_nudge_and_its_quiet_switch_are_gone():
+    """The retired nudge leaves no symbol behind for a later reader to re-wire.
 
-
-def test_decision_loop_commands_cover_aliases():
-    for verb in ("record", "record_decision", "surface", "surface_decisions",
-                 "query", "query_decisions", "list", "list_decisions"):
-        assert verb in cli._DECISION_LOOP_COMMANDS
-    for non_verb in ("init", "status", "sync", "serve", "set-key"):
-        assert non_verb not in cli._DECISION_LOOP_COMMANDS
+    Its premise inverted: wiring is a one-time machine-global act now, so a nudge
+    that cannot tell whether its advice was already taken would fire in every
+    project forever. `MITOS_NO_MCP_HINT` existing at all was evidence it already
+    read as a nag; `tests/test_env_routing.py`'s declared read set pins its
+    absence from the environment side.
+    """
+    for symbol in ("_mcp_hint", "_mcp_wired", "_DECISION_LOOP_COMMANDS"):
+        assert not hasattr(cli, symbol), f"cli.{symbol} survived its retirement"
 
 
 # --- Phase 6a: help-as-API-doc (gate T12) -------------------------------------
@@ -183,7 +198,11 @@ _ALIASES = ("query_decisions", "surface_decisions", "list_decisions", "record_de
 
 def test_help_renders_epilog_worked_examples(monkeypatch, capsys):
     """Criterion 1: `mitos --help` exits 0 and renders the worked-examples epilog,
-    the surface→record compose, and the relation-edge guidance."""
+    the surface→record compose, and the relation-edge guidance.
+
+    Every worked example names its project since 5a — the epilog's own comment
+    promises the block stays runnable, and a selectorless `mitos surface …` is now
+    a teaching error rather than a lesson."""
     monkeypatch.setattr(sys, "argv", ["mitos", "--help"])
     with pytest.raises(SystemExit) as exc:
         main()
@@ -191,8 +210,8 @@ def test_help_renders_epilog_worked_examples(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Examples:" in out
     # the surface→record compose appears as runnable example commands
-    assert "mitos surface" in out
-    assert "mitos record" in out
+    assert "mitos -p myproject surface" in out
+    assert "mitos -p myproject record" in out
     # relation-edge guidance — and the recurring "retired" misuse fenced off
     assert "--supersedes" in out and "--corrects" in out
     assert "retired" in out
@@ -214,17 +233,17 @@ def test_help_usage_banner_collapsed_no_alias_brace_list(monkeypatch, capsys):
 
 
 @patch("mitos.cli.cmd_list")
-def test_list_decisions_alias_routes(mock_list, monkeypatch):
+def test_list_decisions_alias_routes(mock_list, monkeypatch, workspace):
     """Criterion 3 (gap fill): the `list_decisions` alias still routes."""
-    monkeypatch.setattr(sys, "argv", ["mitos", "list_decisions"])
+    monkeypatch.setattr(sys, "argv", ["mitos", "-p", workspace, "list_decisions"])
     main()
     assert mock_list.called
 
 
 @patch("mitos.cli.cmd_scopes")
-def test_list_scopes_alias_routes(mock_scopes, monkeypatch):
+def test_list_scopes_alias_routes(mock_scopes, monkeypatch, workspace):
     """Criterion 3 (gap fill): the `list_scopes` alias still routes."""
-    monkeypatch.setattr(sys, "argv", ["mitos", "list_scopes"])
+    monkeypatch.setattr(sys, "argv", ["mitos", "-p", workspace, "list_scopes"])
     main()
     assert mock_scopes.called
 
@@ -240,11 +259,11 @@ def test_surface_decisions_mcp_description_names_compose():
 # --- --axiom-file (quoting-safe axiom, symmetric with --rejected-file) ----------
 
 @patch("mitos.cli.cmd_record")
-def test_record_reads_axiom_from_file(mock_record, tmp_path, monkeypatch):
+def test_record_reads_axiom_from_file(mock_record, tmp_path, monkeypatch, workspace):
     af = tmp_path / "axiom.txt"
     af.write_text("Camila's axiom, apostrophe-safe\n", encoding="utf-8")
     monkeypatch.setattr(sys, "argv",
-                        ["mitos", "record", "--axiom-file", str(af),
+                        ["mitos", "-p", workspace, "record", "--axiom-file", str(af),
                          "--rejected", "r", "--slug", "s"])
     main()
     _, kwargs = mock_record.call_args
@@ -253,21 +272,21 @@ def test_record_reads_axiom_from_file(mock_record, tmp_path, monkeypatch):
 
 
 @patch("mitos.cli.cmd_record")
-def test_record_reads_axiom_from_stdin(mock_record, monkeypatch):
+def test_record_reads_axiom_from_stdin(mock_record, monkeypatch, workspace):
     monkeypatch.setattr(sys, "stdin", io.StringIO("axiom from stdin\n"))
     monkeypatch.setattr(sys, "argv",
-                        ["mitos", "record", "--axiom-file", "-",
+                        ["mitos", "-p", workspace, "record", "--axiom-file", "-",
                          "--rejected", "r", "--slug", "s"])
     main()
     _, kwargs = mock_record.call_args
     assert kwargs["axiom"] == "axiom from stdin"
 
 
-def test_record_rejects_both_axiom_sources(tmp_path, monkeypatch, capsys):
+def test_record_rejects_both_axiom_sources(tmp_path, monkeypatch, capsys, workspace):
     af = tmp_path / "axiom.txt"
     af.write_text("file axiom", encoding="utf-8")
     monkeypatch.setattr(sys, "argv",
-                        ["mitos", "record", "inline axiom", "--axiom-file", str(af),
+                        ["mitos", "-p", workspace, "record", "inline axiom", "--axiom-file", str(af),
                          "--rejected", "r", "--slug", "s"])
     with pytest.raises(SystemExit) as exc:
         main()
@@ -275,19 +294,19 @@ def test_record_rejects_both_axiom_sources(tmp_path, monkeypatch, capsys):
     assert "exactly one axiom source" in capsys.readouterr().err
 
 
-def test_record_rejects_neither_axiom_source(monkeypatch, capsys):
-    monkeypatch.setattr(sys, "argv", ["mitos", "record", "--rejected", "r", "--slug", "s"])
+def test_record_rejects_neither_axiom_source(monkeypatch, capsys, workspace):
+    monkeypatch.setattr(sys, "argv", ["mitos", "-p", workspace, "record", "--rejected", "r", "--slug", "s"])
     with pytest.raises(SystemExit) as exc:
         main()
     assert exc.value.code == 2
     assert "exactly one axiom source" in capsys.readouterr().err
 
 
-def test_record_neither_axiom_source_json_speaks_json(monkeypatch, capsys):
+def test_record_neither_axiom_source_json_speaks_json(monkeypatch, capsys, workspace):
     """Under --json the dead-end is a structured object on stdout, exit 2 preserved."""
     import json
     monkeypatch.setattr(sys, "argv",
-                        ["mitos", "record", "--rejected", "r", "--slug", "s", "--json"])
+                        ["mitos", "-p", workspace, "record", "--rejected", "r", "--slug", "s", "--json"])
     with pytest.raises(SystemExit) as exc:
         main()
     assert exc.value.code == 2
@@ -302,7 +321,7 @@ def test_record_neither_axiom_source_json_speaks_json(monkeypatch, capsys):
     (["--axiom-file", "-", "--rejected-file", "-", "--context-file", "-"], "--context-file"),
 ])
 def test_multiple_stdin_file_args_fail_with_their_own_error(
-    argv_extra, expected_in_msg, monkeypatch, capsys
+    argv_extra, expected_in_msg, monkeypatch, capsys, workspace
 ):
     """Only one argument can read stdin; asking twice names that, not a missing flag.
 
@@ -310,7 +329,7 @@ def test_multiple_stdin_file_args_fail_with_their_own_error(
     failure surfaced downstream as "record requires --rejected or --rejected-file" —
     a wall naming a flag the caller had already passed.
     """
-    monkeypatch.setattr(sys, "argv", ["mitos", "record", "--slug", "s"] + argv_extra)
+    monkeypatch.setattr(sys, "argv", ["mitos", "-p", workspace, "record", "--slug", "s"] + argv_extra)
     monkeypatch.setattr(sys, "stdin", io.StringIO("some prose"))
     with pytest.raises(SystemExit) as exc:
         main()
@@ -321,10 +340,10 @@ def test_multiple_stdin_file_args_fail_with_their_own_error(
     assert "requires --rejected" not in err, "must not send the caller after a flag they passed"
 
 
-def test_single_stdin_file_arg_still_works(monkeypatch):
+def test_single_stdin_file_arg_still_works(monkeypatch, workspace):
     """The guard must not break the ordinary one-arg-from-stdin case."""
     monkeypatch.setattr(sys, "argv",
-                        ["mitos", "record", "--slug", "s", "--axiom-file", "-", "--rejected", "r"])
+                        ["mitos", "-p", workspace, "record", "--slug", "s", "--axiom-file", "-", "--rejected", "r"])
     monkeypatch.setattr(sys, "stdin", io.StringIO("An axiom from stdin.\n"))
     with patch("mitos.cli.cmd_record") as mock_record:
         main()
@@ -338,7 +357,7 @@ def test_single_stdin_file_arg_still_works(monkeypatch):
 # consecutive AX_FEEDBACK rounds (10 and 11, 2026-07-25). They are the *source* of
 # the scope divergence the corpus↔graph detector reports, so they close first.
 
-def test_repeated_scope_flags_accumulate(monkeypatch):
+def test_repeated_scope_flags_accumulate(monkeypatch, workspace):
     """`--scope a --scope b` keeps BOTH — it used to silently keep only the last.
 
     ``nargs="*"`` alone overwrites the destination on each occurrence, and the
@@ -346,27 +365,27 @@ def test_repeated_scope_flags_accumulate(monkeypatch):
     measured scope divergences on the live corpus trace to exactly this.
     """
     monkeypatch.setattr(sys, "argv",
-                        ["mitos", "record", "ax", "--rejected", "r", "--slug", "s",
+                        ["mitos", "-p", workspace, "record", "ax", "--rejected", "r", "--slug", "s",
                          "--scope", "config", "--scope", "sync", "--scope", "substrate"])
     with patch("mitos.cli.cmd_record") as mock_record:
         main()
     assert mock_record.call_args.kwargs["scope"] == ["config", "sync", "substrate"]
 
 
-def test_space_separated_scope_still_works(monkeypatch):
+def test_space_separated_scope_still_works(monkeypatch, workspace):
     """The documented spelling keeps working — `extend` must not cost the old form."""
     monkeypatch.setattr(sys, "argv",
-                        ["mitos", "record", "ax", "--rejected", "r", "--slug", "s",
+                        ["mitos", "-p", workspace, "record", "ax", "--rejected", "r", "--slug", "s",
                          "--scope", "config", "sync"])
     with patch("mitos.cli.cmd_record") as mock_record:
         main()
     assert mock_record.call_args.kwargs["scope"] == ["config", "sync"]
 
 
-def test_mixed_scope_spellings_accumulate(monkeypatch):
+def test_mixed_scope_spellings_accumulate(monkeypatch, workspace):
     """Repeated and space-separated forms compose rather than fight."""
     monkeypatch.setattr(sys, "argv",
-                        ["mitos", "record", "ax", "--rejected", "r", "--slug", "s",
+                        ["mitos", "-p", workspace, "record", "ax", "--rejected", "r", "--slug", "s",
                          "--scope", "config", "sync", "--scope", "substrate"])
     with patch("mitos.cli.cmd_record") as mock_record:
         main()
@@ -395,7 +414,7 @@ def test_extend_does_not_mutate_the_default_list_in_place():
     assert third.mechanisms is None
 
 
-def test_axiom_flag_is_not_swallowed_by_axiom_file(monkeypatch, capsys):
+def test_axiom_flag_is_not_swallowed_by_axiom_file(monkeypatch, capsys, workspace):
     """`--axiom "prose"` dies as an argparse error, never as `File name too long`.
 
     ``allow_abbrev`` defaults to True on every subparser, so ``--axiom`` was an
@@ -405,7 +424,7 @@ def test_axiom_flag_is_not_swallowed_by_axiom_file(monkeypatch, capsys):
     nothing the caller could act on.
     """
     monkeypatch.setattr(sys, "argv",
-                        ["mitos", "record", "--axiom", "A decision stated as prose.",
+                        ["mitos", "-p", workspace, "record", "--axiom", "A decision stated as prose.",
                          "--rejected", "r", "--slug", "s"])
     with pytest.raises(SystemExit) as exc:
         main()
@@ -446,7 +465,7 @@ def test_abbreviated_option_is_rejected_by_the_grammar():
         assert exc.value.code == 2, argv
 
 
-def test_repeated_mechanisms_flags_accumulate(monkeypatch):
+def test_repeated_mechanisms_flags_accumulate(monkeypatch, workspace):
     """`--mechanisms a --mechanisms b` keeps BOTH — and this one is canonical core.
 
     The same silent-truncation shape as `--scope`, registered on the very next line
@@ -457,24 +476,24 @@ def test_repeated_mechanisms_flags_accumulate(monkeypatch):
     is immutable by construction (M1).
     """
     monkeypatch.setattr(sys, "argv",
-                        ["mitos", "record", "ax", "--rejected", "r", "--slug", "s",
+                        ["mitos", "-p", workspace, "record", "ax", "--rejected", "r", "--slug", "s",
                          "--mechanisms", "sqlite", "--mechanisms", "wal-mode"])
     with patch("mitos.cli.cmd_record") as mock_record:
         main()
     assert mock_record.call_args.kwargs["mechanisms"] == ["sqlite", "wal-mode"]
 
 
-def test_space_separated_mechanisms_still_works(monkeypatch):
+def test_space_separated_mechanisms_still_works(monkeypatch, workspace):
     """The documented spelling keeps working, and an absent flag still yields None."""
     monkeypatch.setattr(sys, "argv",
-                        ["mitos", "record", "ax", "--rejected", "r", "--slug", "s",
+                        ["mitos", "-p", workspace, "record", "ax", "--rejected", "r", "--slug", "s",
                          "--mechanisms", "sqlite", "wal-mode"])
     with patch("mitos.cli.cmd_record") as mock_record:
         main()
     assert mock_record.call_args.kwargs["mechanisms"] == ["sqlite", "wal-mode"]
 
     monkeypatch.setattr(sys, "argv",
-                        ["mitos", "record", "ax", "--rejected", "r", "--slug", "s"])
+                        ["mitos", "-p", workspace, "record", "ax", "--rejected", "r", "--slug", "s"])
     with patch("mitos.cli.cmd_record") as mock_record:
         main()
     assert mock_record.call_args.kwargs["mechanisms"] is None, (

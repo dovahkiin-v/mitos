@@ -6,8 +6,8 @@ project knows mitos is set up here and how to use it.
 
 It is a **copy**, and copies drift. Two design choices keep that manageable:
 
-- **The block is deliberately thin** — durable pointers only (run ``mitos status``,
-  read SETUP.md, the tools are self-describing). The volatile detail (required
+- **The block is deliberately thin** — durable pointers only (name the project, run
+  ``mitos status .``, read SETUP.md, the tools are self-describing). The volatile detail (required
   fields, the slug rule and its length cap, when-to-record) lives in the always-fresh
   surfaces: the MCP tool schemas (which ship with the code and *enforce* the
   required args) and SETUP.md-on-GitHub. If the copy holds no detail that can change,
@@ -29,9 +29,10 @@ from typing import Dict, List, Optional
 # copies to refresh. The marker embeds this number; `mitos status` compares a project's
 # pasted marker against it. (Not tied to the package __version__ — most releases don't
 # touch the block.)
-AGENT_GUIDE_VERSION = 2
+AGENT_GUIDE_VERSION = 3
 
-# The agent-instruction filenames mitos knows about (the SETUP.md §6 list), checked at
+# The agent-instruction filenames mitos knows about (SETUP.md's list — named without
+# a section number on purpose; that file is renumbered by its own edits), checked at
 # the project root only — these are where the block is pasted.
 AGENT_FILENAMES = ("AGENTS.md", "CLAUDE.md", "GEMINI.md", ".cursorrules")
 
@@ -63,14 +64,24 @@ def agent_block(version: int = AGENT_GUIDE_VERSION) -> str:
     """
     return (
         f"<!-- mitos-agent-guide: v{version} — managed block, refresh with "
-        f"`mitos agent-block`. -->\n"
+        f"`mitos agent-block .`. -->\n"
         "## Architectural Decisions — Mitos (per-project)\n"
         "This project uses **mitos** for architectural decision memory — markdown for "
         "humans, a graph for the agents. It is **per-project** (its own `.mitos/` "
-        "workspace + Qdrant collection).\n"
+        "workspace + Qdrant collection), and one install serves every project on the "
+        "machine.\n"
         "\n"
-        "- **Check it's ready:** run `mitos status`. If it isn't `READY ✓`, follow the "
-        "setup guide — https://github.com/dovahkiin-v/mitos/blob/main/SETUP.md (or the "
+        "- **Name this project on every call.** There is no default target: a call "
+        "that names none is refused, not guessed at. Use the **absolute path of the "
+        "directory this file is in** — as `project` on an MCP tool, or as `-p .` from "
+        "that directory (`-p <path>` from anywhere) on the CLI. Do not put a "
+        "registered *name* in this file: names are machine-local, so the same one can "
+        "mean a different real project on someone else's machine. Every answer echoes "
+        "`project · collection · workspace` — read it, that echo is what makes a "
+        "mis-aimed call visible.\n"
+        "- **Check it's ready:** run `mitos status .` from this directory. If it isn't "
+        "`READY ✓`, follow the setup guide — "
+        "https://github.com/dovahkiin-v/mitos/blob/main/SETUP.md (or the "
         "`mitos-setup` skill). If `mitos` is `command not found`, it was uninstalled "
         "after setup — reinstall it (pipx); don't silently drop decision-recording.\n"
         "- **Record** ADR-worthy decisions with `record_decision`; **check precedents** "
@@ -79,7 +90,7 @@ def agent_block(version: int = AGENT_GUIDE_VERSION) -> str:
         "(including the slug handle) — and SETUP.md is the full guide: what's worth "
         "recording, how to choose a slug, and how to link related decisions.\n"
         "- **Keep the graph honest:** after a burst of `record_decision` writes — or "
-        "when starting a session — run `mitos check` to audit the live corpus for "
+        "when starting a session — run `mitos check -p .` to audit the live corpus for "
         "undeclared contradictions (read-only; it never edits anything). Resolve any "
         "finding the normal way: declare the relationship in `decisions.md`.\n"
         "<!-- /mitos-agent-guide -->"

@@ -93,6 +93,10 @@ HAS_LIVE_KEYS = (not live_tests_disabled()) and bool(
     os.environ.get("GEMINI_API_KEY") and os.environ.get("ANTHROPIC_API_KEY")
 )
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:7333")
+# 5c: `GeminiEmbeddingProvider` reads no process environment — the key is
+# supplied explicitly. Read here, beside the gate that already reads it, in
+# the same module-constant idiom as `QDRANT_URL` above.
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 pytestmark = pytest.mark.skipif(
     not HAS_LIVE_KEYS,
@@ -153,7 +157,7 @@ def conflict_index():
     cache_dir = os.path.join(H.GOLDEN_DIR, ".cache")
     os.makedirs(cache_dir, exist_ok=True)
     cache_path = os.path.join(cache_dir, f"embeddings-{get_embedding_model_id()}.sqlite")
-    provider = GeminiEmbeddingProvider(cache_path)
+    provider = GeminiEmbeddingProvider(cache_path, api_key=GEMINI_API_KEY)
     vstore = QdrantVectorStore(QDRANT_URL, collection)
 
     try:

@@ -44,9 +44,13 @@ def test_agent_block_carries_current_marker_and_pointers():
     assert marker_version(block) == AGENT_GUIDE_VERSION      # round-trips through the parser
     # Durable pointers, not volatile detail: it points at the self-describing tools and
     # the guide rather than inlining the field list / slug cap (which can change).
-    assert "mitos status" in block
+    # Both habit lines name a TARGET. Post-flip a bare `mitos check` hard-fails and
+    # a bare `mitos status` succeeds while answering about the whole machine — the
+    # quieter and worse of the two — so the substring `"mitos status"` alone no
+    # longer distinguishes a working recipe from a broken one.
+    assert "mitos status ." in block
     assert "record_decision" in block
-    assert "mitos check" in block  # the habit line pointing at the conflict sweep (4a)
+    assert "mitos check -p ." in block  # the habit line pointing at the conflict sweep (4a)
     assert "SETUP.md" in block.replace("setup.md", "SETUP.md") or "github.com/dovahkiin-v/mitos" in block
     assert "≤100" not in block and "100 characters" not in block  # volatile detail stays out
 
@@ -90,6 +94,28 @@ def test_scan_v1_paste_without_habit_line_is_outdated(tmp_path, capsys):
     files = scan_agent_files(str(tmp_path))
     assert files[0]["status"] == "outdated"
     assert files[0]["marker_version"] == 1
+    assert agent_block_drift(str(tmp_path))["stale"] is True
+    assert cli.cmd_agent_block(str(tmp_path), check=True) == 1
+
+
+def test_scan_v2_paste_is_outdated(tmp_path, capsys):
+    """The v2 paste that exists on real projects' disks TODAY reads `outdated`.
+
+    Spelled as a literal `2`, not `AGENT_GUIDE_VERSION - 1`. The whole module is
+    parametrized on the running constant, so it stays green through any bump —
+    including one that never happened — and a self-adjusting spelling here would
+    restate that tautology instead of the claim, which is about a specific number
+    sitting in specific files right now. The marker's integer is also the ONLY
+    migration channel these copies have: `scan_agent_files` classifies a paste by
+    that integer and never by comparing block text, so a v3 rewrite that skipped
+    the bump would leave every stale copy reported `current`.
+    """
+    (tmp_path / "AGENTS.md").write_text(
+        "<!-- mitos-agent-guide: v2 -->\n## Architectural Decisions — Mitos\n"
+        "Run `mitos status`. record_decision etc.", encoding="utf-8")
+    files = scan_agent_files(str(tmp_path))
+    assert files[0]["status"] == "outdated"
+    assert files[0]["marker_version"] == 2
     assert agent_block_drift(str(tmp_path))["stale"] is True
     assert cli.cmd_agent_block(str(tmp_path), check=True) == 1
 

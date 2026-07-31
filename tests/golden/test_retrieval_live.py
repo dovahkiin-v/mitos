@@ -72,6 +72,10 @@ def _load_live_env() -> None:
 _load_live_env()
 HAS_LIVE_KEYS = (not live_tests_disabled()) and bool(os.environ.get("GEMINI_API_KEY"))  # retrieval needs embeddings only
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:7333")
+# 5c: `GeminiEmbeddingProvider` reads no process environment — the key is
+# supplied explicitly. Read here, beside the gate that already reads it, in
+# the same module-constant idiom as `QDRANT_URL` above.
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 pytestmark = pytest.mark.skipif(
     not HAS_LIVE_KEYS,
@@ -104,7 +108,7 @@ def populated_index():
     # column), so a model swap must land on a different file or it returns stale
     # vectors and masks embedding drift (Fable #11).
     cache_path = os.path.join(cache_dir, f"embeddings-{get_embedding_model_id()}.sqlite")
-    provider = GeminiEmbeddingProvider(cache_path)
+    provider = GeminiEmbeddingProvider(cache_path, api_key=GEMINI_API_KEY)
     vstore = QdrantVectorStore(QDRANT_URL, collection)
 
     try:
@@ -168,20 +172,28 @@ def test_baseline_diff_soft_gate(populated_index):
         )
 
 
-def test_mcp_surface_smoke(populated_index):
+def test_mcp_surface_smoke(populated_index, tmp_path):
     """One realism pass through the MCP surface against the test index (Fable #2).
 
     Patches `get_workspace_components` to inject the test (store, provider, vstore)
     so `surface_decisions` resolves the golden corpus, not the repo's real .mitos.
+
+    `tmp_path` builds a bare workspace purely so the call has a target to name:
+    since 5b every tool call resolves its `project`, and `populated_index` yields
+    no config and no workspace root. Nothing *golden* is added — no oracle row, no
+    corpus edit, the baseline unmoved — which is what the no-fixture-additions
+    rule is about; the store the row reads is still the injected one.
     """
     from unittest.mock import patch
+    from conftest import make_workspace
 
     store, provider, vstore, _ = populated_index
     with patch("mitos.mcp_server.get_workspace_components") as mock_get:
         mock_get.return_value = (store, provider, vstore)
         with skip_on_embed_quota():
             res = surface_decisions(
-                "How do we resolve two people editing the same file at the same time?"
+                "How do we resolve two people editing the same file at the same time?",
+                project=make_workspace(tmp_path / "ws"),
             )
     # The concurrent-edit precedent should surface through the real MCP path.
     assert "harbor-sync" in res, f"expected a sync decision in MCP surface output; got: {res[:400]}"

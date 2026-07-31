@@ -24,7 +24,7 @@ from mitos.store import GraphStore
 from mitos.sync import MitosSyncManager
 from mitos.parser import ParsedEntry
 from mitos.vector_store import QdrantVectorStore, hash_to_uuid
-from mitos.errors import VectorStoreError
+from mitos.errors import CollectionMissingError, VectorStoreError
 
 
 @pytest.fixture
@@ -156,7 +156,10 @@ def test_reconcile_degrades_cleanly_when_providers_down(sync_env: Tuple[MitosCon
     _commit(store, "node-a", "Axiom A")
     _clear_outbox(store)
 
-    # A degraded manager (Qdrant/Gemini down) has None providers.
+    # A degraded manager has None providers. Since 1b the vector store constructs
+    # without touching the network, so this state comes from a MISSING KEY (or a
+    # provider that raised), never from Qdrant being down — a down Qdrant now
+    # surfaces at the scroll instead, and its row is the cmd_reconcile one below.
     manager.embed_provider = None
     manager.vector_store = None
 
@@ -166,6 +169,62 @@ def test_reconcile_degrades_cleanly_when_providers_down(sync_env: Tuple[MitosCon
     # Graph and outbox are untouched — no crash, no partial write.
     assert len(store.get_all_nodes()) == 1
     assert store.get_pending_embeddings() == []
+
+
+def test_cmd_reconcile_heals_an_absent_collection_and_exits_0(
+    sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """T5: the verb heals rather than blaming Qdrant for a state Qdrant is fine with."""
+    from mitos import cli
+
+    config, manager, tmpdir = sync_env
+    store = GraphStore(config.db_path)
+    _commit(store, "node-a", "Axiom A")
+    _clear_outbox(store)
+
+    _mock_embed_stack(manager, present_uuids=set())
+    manager.vector_store.list_point_ids = MagicMock(
+        side_effect=CollectionMissingError(
+            "Qdrant collection 'mitos-x' does not exist", collection="mitos-x"
+        )
+    )
+
+    with patch("mitos.cli.MitosSyncManager", return_value=manager):
+        rc = cli.cmd_reconcile(config, as_json=True)
+
+    assert rc == 0
+    assert manager.vector_store.upsert.call_count == 1
+
+
+def test_cmd_reconcile_now_actually_reaches_its_qdrant_down_arm(
+    sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """T5's twin, and it is NEWLY satisfied rather than merely preserved.
+
+    Before 1b an unreachable Qdrant made the store's constructor raise, so
+    ``MitosSyncManager`` left ``vector_store = None``, ``reconcile_embeddings``
+    returned zeros, and the verb exited **0** with a confusing double message. Now
+    the store constructs, the scroll raises a connection ``VectorStoreError``, and
+    the verb exits **1** with an accurate line. A reviewer meeting the changed exit
+    code without this row would read a behaviour improvement as a regression.
+
+    Driven through a REAL ``QdrantVectorStore`` against a dead port — a fake would
+    not prove the path is reachable, which is the entire claim.
+    """
+    from mitos import cli
+
+    config, manager, tmpdir = sync_env
+    store = GraphStore(config.db_path)
+    _commit(store, "node-a", "Axiom A")
+    _clear_outbox(store)
+
+    manager.embed_provider = MagicMock()
+    manager.vector_store = QdrantVectorStore("http://localhost:9", "mitos-tmp-dead")
+
+    with patch("mitos.cli.MitosSyncManager", return_value=manager):
+        rc = cli.cmd_reconcile(config, as_json=False)
+
+    assert rc == 1
 
 
 def test_cmd_reconcile_returns_error_on_qdrant_unreachable(
@@ -186,14 +245,82 @@ def test_cmd_reconcile_returns_error_on_qdrant_unreachable(
     assert rc == 1
 
 
+def test_reconcile_reads_an_absent_collection_as_empty(
+    sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """An absent collection is the state reconcile exists FOR — it heals, never errors.
+
+    W9. Before 1b the pre-write diff's 404 raised and ``cmd_reconcile`` rendered
+    "Qdrant or embedding provider down", so the heal this vision prescribes failed
+    on the very state the collection migration creates, and blamed infrastructure
+    for it. The absent collection now reads as an empty point set: every active
+    node is missing, every one is enqueued, and the drain's first upsert creates
+    the collection.
+    """
+    config, manager, tmpdir = sync_env
+    store = GraphStore(config.db_path)
+    ids = [_commit(store, f"node-{i}", f"Axiom {i}") for i in range(3)]
+    _clear_outbox(store)
+
+    _mock_embed_stack(manager, present_uuids=set())
+    manager.vector_store.list_point_ids = MagicMock(
+        side_effect=CollectionMissingError(
+            "Qdrant collection 'mitos-x' does not exist", collection="mitos-x"
+        )
+    )
+
+    result = manager.reconcile_embeddings()
+
+    assert result == {"active": 3, "present": 0, "enqueued": 3}
+    upserted = {call.args[0] for call in manager.vector_store.upsert.call_args_list}
+    assert upserted == set(ids)
+    assert store.get_pending_embeddings() == []
+
+
+def test_reconcile_still_raises_when_qdrant_is_unreachable(
+    sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """The refused-connection twin: only ABSENCE reads as empty, an outage propagates.
+
+    The narrow catch is the whole point — widened to ``VectorStoreError`` it would
+    swallow a genuine outage and re-embed the entire corpus against a dead Qdrant.
+    """
+    config, manager, tmpdir = sync_env
+    store = GraphStore(config.db_path)
+    _commit(store, "node-a", "Axiom A")
+    _clear_outbox(store)
+
+    _mock_embed_stack(manager, present_uuids=set())
+    manager.vector_store.list_point_ids = MagicMock(
+        side_effect=VectorStoreError("Qdrant scroll connection error: refused")
+    )
+
+    with pytest.raises(VectorStoreError):
+        manager.reconcile_embeddings()
+
+
+@patch("mitos.vector_store.requests.post")
+@patch("mitos.vector_store.requests.get")
+def test_list_point_ids_404_is_a_collection_missing_error(
+    mock_get: MagicMock, mock_post: MagicMock
+) -> None:
+    """The typed 404 arrives through the real store, not only through a fake."""
+    mock_get.return_value = MagicMock(status_code=200)
+    mock_post.return_value = MagicMock(status_code=404, text="doesn't exist")
+
+    vs = QdrantVectorStore("http://localhost:7333", "coll")
+    with pytest.raises(CollectionMissingError) as excinfo:
+        vs.list_point_ids()
+    assert excinfo.value.collection == "coll"
+
+
 @patch("mitos.vector_store.requests.post")
 @patch("mitos.vector_store.requests.get")
 def test_list_point_ids_pagination(mock_get: MagicMock, mock_post: MagicMock) -> None:
     """list_point_ids walks every scroll page until next_page_offset is null."""
-    # _ensure_collection (called from __init__) sees an existing collection.
-    ensure_resp = MagicMock()
-    ensure_resp.status_code = 200
-    mock_get.return_value = ensure_resp
+    # Construction contacts nothing since 1b; `requests.get` is patched only so a
+    # stray call would be visible rather than hitting a real localhost.
+    mock_get.return_value = MagicMock(status_code=200)
 
     page1 = MagicMock()
     page1.status_code = 200
@@ -220,9 +347,7 @@ def test_list_point_ids_pagination(mock_get: MagicMock, mock_post: MagicMock) ->
 @patch("mitos.vector_store.requests.get")
 def test_list_point_ids_raises_on_qdrant_error(mock_get: MagicMock, mock_post: MagicMock) -> None:
     """A Qdrant connection failure during scroll surfaces as VectorStoreError."""
-    ensure_resp = MagicMock()
-    ensure_resp.status_code = 200
-    mock_get.return_value = ensure_resp
+    mock_get.return_value = MagicMock(status_code=200)
     mock_post.side_effect = requests.RequestException("connection refused")
 
     vs = QdrantVectorStore("http://localhost:7333", "coll")

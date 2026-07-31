@@ -424,7 +424,7 @@ def summarize_overflows(overflows: List[Dict[str, Any]]) -> Optional[str]:
 class MitosRenderer:
     """Renderer creating active-axiom markdown assets for LLM context ingestion."""
 
-    def __init__(self, workspace_dir: str = ".") -> None:
+    def __init__(self, workspace_dir: str) -> None:
         self.workspace_dir = os.path.abspath(workspace_dir)
         self.mitos_dir = os.path.join(self.workspace_dir, ".mitos")
         self.axioms_dir = os.path.join(self.mitos_dir, "axioms")

@@ -65,10 +65,16 @@ def degraded_reason_from_error(exc: Optional[BaseException]) -> str:
         return "embedding provider rate-limited (429)"
     # Late import avoided — errors.py is a leaf, safe at module level, but the
     # string checks above must win first (an EmbeddingError often wraps a 429).
-    from mitos.errors import EmbeddingError, VectorStoreError
+    from mitos.errors import CollectionMissingError, EmbeddingError, VectorStoreError
 
     if isinstance(exc, EmbeddingError):
         return "embedding provider error"
+    # Before the VectorStoreError arm, which it subclasses — otherwise the most-used
+    # read verb answers a missing collection with "Qdrant unavailable", the exact
+    # blame-the-infrastructure phrase the typed error exists to replace.
+    if isinstance(exc, CollectionMissingError):
+        named = f" '{exc.collection}'" if exc.collection else ""
+        return f"vector collection{named} missing — run `mitos reconcile`"
     if isinstance(exc, VectorStoreError):
         return "Qdrant unavailable"
     lowered = text.lower()

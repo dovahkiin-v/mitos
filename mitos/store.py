@@ -25,6 +25,7 @@ from mitos.errors import (
 )
 from mitos.identity import SLUG_MAX_LEN, compute_node_id, mechanism_canonical_norm
 from mitos.migrations import (
+    EMBEDDING_SEED_ESTABLISHED_BY,
     MIGRATION_STEPS,
     MigrationStep,
     run_migrations,
@@ -377,6 +378,46 @@ def _utc_now_iso() -> str:
         The current time, e.g. ``"2026-06-18T05:54:31.532538+00:00"``.
     """
     return datetime.now(timezone.utc).isoformat()
+
+
+# The one spelling of the ``embedding_seed`` upsert. Two callers need it on two
+# different connections — ``GraphStore.stamp_embedding_seed`` on its own, and
+# ``cutover._prune_embedding_queue_to_active`` inside the transaction that makes the
+# claim true — so the SQL is single-sourced here rather than retyped at the second
+# site. The same in-transaction-twin shape ``_enqueue_outbox`` / ``add_pending_embedding``
+# already established for the outbox. ``ON CONFLICT(id) DO UPDATE`` so a re-stamp
+# replaces the row rather than raising (the marker records the LATEST covering act).
+_EMBEDDING_SEED_UPSERT_SQL: str = """
+    INSERT INTO embedding_seed (id, established_by, established_at)
+    VALUES (1, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+        established_by = excluded.established_by,
+        established_at = excluded.established_at
+"""
+
+
+def write_embedding_seed(
+    conn: sqlite3.Connection, established_by: str, *, now: Optional[str] = None
+) -> None:
+    """Stamps the coverage marker on ``conn``, without committing (MI-10 timestamp).
+
+    The in-transaction twin of :meth:`GraphStore.stamp_embedding_seed`: it issues the
+    statement and leaves the transaction to the caller, so the act that *makes* the
+    outbox cover the active set and the record *claiming* it can land together. The
+    ``established_by`` vocabulary is enforced by the table's own ``CHECK`` (see
+    ``migrations.EMBEDDING_SEED_ESTABLISHED_BY``) — an unknown verb is refused at
+    write time, not filtered here.
+
+    Args:
+        conn: An open, writable connection whose transaction the caller owns.
+        established_by: The verb that established coverage — one of
+            ``migrations.EMBEDDING_SEED_ESTABLISHED_BY``.
+        now: The UTC ISO-8601 stamp to record; defaults to :func:`_utc_now_iso`
+            (MI-10 — application-supplied, never ``CURRENT_TIMESTAMP``).
+    """
+    conn.execute(
+        _EMBEDDING_SEED_UPSERT_SQL, (established_by, now or _utc_now_iso())
+    )
 
 
 def _strip_citation(raw: str) -> str:
@@ -2358,6 +2399,137 @@ class GraphStore:
         active: Set[str] = {node["id"] for node in self.get_active_decisions()}
         active.update(node["id"] for node in self.get_open_questions())
         return active
+
+    def has_active_node_other_than(self, node_id: str) -> bool:
+        """Reports whether the active set holds any node besides ``node_id``.
+
+        The cheap complement of :meth:`get_active_node_ids` for the one question a
+        single-node write needs answered: *does this write cover the live surface, or
+        is there live architecture it leaves unindexed?* An empty graph, or a graph
+        holding only this node, answers ``False`` — the fresh-project carve-out, where
+        one point genuinely **is** the whole active set.
+
+        Deliberately not ``len(get_active_node_ids() - {node_id}) > 0``: that is two
+        full active-view fetches, each running ``_hydrate_rows`` (the bulk scope fetch,
+        the modifier stamp, the reader-facing alias re-key), i.e. a hydrated read of
+        the entire live corpus — on **every** record, not only when it matters. This is
+        an ``EXISTS … LIMIT 1`` over the same predicate: an index seek (P11/P17).
+
+        The two must never disagree, so this binds the shipped ``_ACTIVE_VIEW_PREDICATE``
+        rather than re-encoding it ("Active-view liveness is ONE SQL atom", PATTERNS),
+        and over exactly the kinds ``get_active_node_ids`` unions — active decisions
+        **plus** ``get_open_questions``' Stage-1 survivors. Note what is *not* here: no
+        ``_OQ_RESOLVED_PREDICATE`` clause. ``resolves`` is not a kill edge, so a
+        *resolved* open question is still returned by ``get_open_questions`` and is
+        still in the active id set (its docstring says so outright) — it genuinely needs
+        an embedding, and excluding it here would make this gate claim coverage the
+        write does not deliver. ``tests/test_embedding_seed.py`` pins the agreement over
+        a fixture matrix rather than trusting it.
+
+        ``nodes`` stays UNALIASED so the correlated liveness predicate binds (the alias
+        trap the constant's own comment warns about).
+
+        Args:
+            node_id: The node the calling write covers.
+
+        Returns:
+            True iff at least one active node other than ``node_id`` exists.
+        """
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM nodes "
+                "WHERE nodes.kind IN ('decision', 'open_question') "
+                f"AND {_ACTIVE_VIEW_PREDICATE} "
+                "AND nodes.id != ? LIMIT 1",
+                (node_id,),
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+
+    def stamp_embedding_seed(self, established_by: str) -> None:
+        """Records that ``pending_embeddings`` covers the graph's active set.
+
+        The standalone-connection twin of :func:`write_embedding_seed`, for the
+        producer that is not already inside the transaction it describes
+        (``reconcile_embeddings``). Re-stamping replaces the existing row rather than
+        raising — the marker records the latest covering act, not a history.
+
+        Args:
+            established_by: The verb that established coverage — one of
+                ``migrations.EMBEDDING_SEED_ESTABLISHED_BY``.
+
+        Raises:
+            DatabaseError: If the write fails, including the ``CHECK`` refusing an
+                ``established_by`` outside the declared vocabulary.
+        """
+        conn = self._get_connection()
+        try:
+            with conn:
+                write_embedding_seed(conn, established_by)
+        except sqlite3.Error as e:
+            raise DatabaseError(
+                f"Failed to stamp the embedding seed marker "
+                f"(established_by must be one of "
+                f"{', '.join(EMBEDDING_SEED_ESTABLISHED_BY)}): {str(e)}"
+            )
+        finally:
+            conn.close()
+
+    def embedding_seed(self) -> Optional[Dict[str, str]]:
+        """Returns the coverage marker, or None when no covering act stands.
+
+        Absence of the row is the false state — there is no ``covers = 0`` row to
+        interpret. Read by exactly one consumer,
+        ``MitosSyncManager.drain_pending_embeddings``, at its entry.
+
+        An unreadable marker (a hand-truncated graph missing the table entirely) reads
+        as **absent**, not as a fault: the only consumer's safe answer to "may this
+        write create the collection?" is *no*, and deferral costs an outbox row that
+        was already written. Failing loud here would turn a recoverable graph into a
+        failed ``sync`` while still not creating anything.
+
+        Returns:
+            ``{"established_by": …, "established_at": …}`` — plain strings, no
+            datetime objects crossing the boundary — or ``None``.
+        """
+        try:
+            conn = self._get_connection()
+        except DatabaseError:
+            return None
+        try:
+            row = conn.execute(
+                "SELECT established_by, established_at FROM embedding_seed WHERE id = 1"
+            ).fetchone()
+            if row is None:
+                return None
+            return {
+                "established_by": row["established_by"],
+                "established_at": row["established_at"],
+            }
+        except sqlite3.Error:
+            return None
+        finally:
+            conn.close()
+
+    def clear_embedding_seed(self) -> None:
+        """Drops the coverage marker — the claim has been delivered or has expired.
+
+        Called by the drain the moment the outbox empties: coverage is no longer
+        pending, so the marker must stop authorizing creation.
+
+        Raises:
+            DatabaseError: If the delete fails.
+        """
+        conn = self._get_connection()
+        try:
+            with conn:
+                conn.execute("DELETE FROM embedding_seed WHERE id = 1")
+        except sqlite3.Error as e:
+            raise DatabaseError(f"Failed to clear the embedding seed marker: {str(e)}")
+        finally:
+            conn.close()
 
     def node_ids_in_commit_order(self) -> List[str]:
         """Returns every node id in the order it was committed into THIS graph file.

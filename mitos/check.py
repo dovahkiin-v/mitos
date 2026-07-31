@@ -82,6 +82,7 @@ from typing import (
     Iterable,
     Iterator,
     List,
+    Mapping,
     Optional,
     Set,
     Tuple,
@@ -1107,6 +1108,7 @@ def execute_corpus_check(
     judge: Optional[Callable[[RenderedPrompt], "JudgmentExecution | Unavailable"]],
     telemetry: Optional[TelemetryStore],
     store: "GraphStoreProtocol",
+    env: Optional[Mapping[str, str]] = None,
 ) -> CheckRunResult:
     """Executes a planned corpus check — the only spend site, persisting per batch.
 
@@ -1155,6 +1157,13 @@ def execute_corpus_check(
             incomplete).
         store: The graph store the end probe reads (REQUIRED — certification is
             not opt-in). Only ``get_pending_embeddings`` is touched here.
+        env: The calling workspace's resolved environment (``config.env``), used
+            for the one thing this leaf cannot pre-resolve: ``execution
+            .model_alias`` exists only inside the batch loop, so the *map*
+            travels here rather than a resolved id. Its join to the id the judge
+            actually called with is the KD5 paragraph's data-level sibling — both
+            sides must resolve against the same map or the provenance column
+            records a model the run never used, silently.
 
     Returns:
         The typed :class:`CheckRunResult` — findings pair-key-ordered, every
@@ -1243,7 +1252,7 @@ def execute_corpus_check(
         # rows and by its fresh findings' provenance.
         created_at = _utc_now_iso()
         try:
-            model_id: Optional[str] = get_model_id(execution.model_alias)
+            model_id: Optional[str] = get_model_id(execution.model_alias, env)
         except ValueError:
             model_id = None  # provenance-only column — degrade, never lose the batch
         batch = JudgmentBatch(
@@ -1363,6 +1372,7 @@ _DEGRADATION_TOKENS: Tuple[str, ...] = (
     "telemetry_write",
     "stale_index",
     "probe_read",
+    "collection_missing",
 )
 
 
@@ -1385,6 +1395,12 @@ def run_degradations(result: CheckRunResult) -> Tuple[str, ...]:
       poison-row escape (KD3).
     * ``"probe_read"`` — the end probe itself was unreadable
       (:class:`ProbeUnavailable`): the run cannot certify completeness.
+    * ``"collection_missing"`` — the sweep went dark because the vector collection
+      does not exist. Emitted **alongside** ``"sweep"``, never instead of it: the
+      effect is unchanged (the sweep degraded) and this names the *cause*, so a
+      trend query on the shipped token stays complete. Derived from the typed
+      reason, not from "any vector fault" — a plain ``VectorStoreError`` still
+      produces ``"sweep"`` alone.
 
     Args:
         result: The typed run outcome.
@@ -1403,6 +1419,11 @@ def run_degradations(result: CheckRunResult) -> Tuple[str, ...]:
             and bool(result.end_probe.transient)
         ),
         "probe_read": isinstance(result.end_probe, ProbeUnavailable),
+        "collection_missing": (
+            result.sweep_degraded is not None
+            and result.sweep_degraded.reason
+            is ConflictUnavailableReason.COLLECTION_MISSING
+        ),
     }
     return tuple(token for token in _DEGRADATION_TOKENS if present[token])
 

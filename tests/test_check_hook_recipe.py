@@ -16,10 +16,18 @@ reproduced VERBATIM here (KD4 — a reword in either place diverges the test; th
   decision → the hook blocks the commit; a clean (no-pending) buffer → the commit
   passes.
 
-The divergence message's em-dash is U+2014 (byte-confirmed against SETUP.md:204).
+The divergence message's em-dash is U+2014 (byte-confirmed against SETUP.md; no
+line number here — the recipe moves, and a stale anchor is worse than none).
+
+Since 6b this module also carries the **doc-shape** rows for SETUP.md's other
+recipes: the scheduled sweep, the secretless-CI prose that points at it, the
+corpus↔graph repair, and the `SETUP.md → <Heading>` pointers `mitos/` prints.
+They live here because this is already the module that reads SETUP.md from disk.
 """
 
 import os
+import pathlib
+import re
 import subprocess
 import uuid
 
@@ -27,6 +35,7 @@ import pytest
 import requests
 
 from live_helpers import live_tests_disabled
+from mitos.config import default_collection_name
 
 # --- The recipe under test (VERBATIM from SETUP.md — keep in lockstep, KD4) ----
 # The shebang is hook scaffolding (implementer's latitude); the load-bearing
@@ -39,7 +48,7 @@ if ! git diff --quiet -- decisions.md; then
     echo "decisions.md has unstaged changes — stage or stash them before committing" >&2
     exit 1
 fi
-mitos check --staged
+mitos check --staged -p .
 """
 
 # The verbatim divergence message the guard emits (em-dash U+2014).
@@ -48,6 +57,13 @@ DIVERGENCE_MESSAGE = (
 )
 # The verbatim guard command (the recipe's git plumbing).
 GUARD_COMMAND = "git diff --quiet -- decisions.md"
+# The verbatim gate command. `-p .` is correct **specifically** because git runs
+# hooks from the worktree top level, so `.` IS the workspace root at run time — the
+# discriminator is *is cwd the workspace root when this runs*, never *does the
+# artifact travel*. Added to the lockstep set at 5a: the two constants above name
+# the guard and the message, so an edit to this line alone would have left the
+# lockstep row green while `RECIPE` and SETUP.md silently diverged.
+GATE_COMMAND = "mitos check --staged -p ."
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SETUP_PATH = os.path.join(_REPO_ROOT, "SETUP.md")
@@ -153,8 +169,162 @@ def test_setup_recipe_is_in_lockstep():
         "the divergence message drifted from SETUP.md — update in lockstep "
         "(check the em-dash is U+2014)"
     )
+    assert GATE_COMMAND in setup, (
+        "the gate command drifted from SETUP.md — update in lockstep"
+    )
+    assert GATE_COMMAND in RECIPE
     # The em-dash is U+2014, not a hyphen or U+2013 (byte-confirmed).
     assert "—" in DIVERGENCE_MESSAGE
+
+
+# --------------------------------------------------------------------------- #
+# 6b — doc-shape rows over SETUP.md's other recipes
+# --------------------------------------------------------------------------- #
+
+_MITOS_PKG = pathlib.Path(_REPO_ROOT) / "mitos"
+
+
+def _setup_text():
+    return pathlib.Path(_SETUP_PATH).read_text(encoding="utf-8")
+
+
+def _extract_section(text, heading):
+    """Returns the body under ``heading``, up to the next markdown heading.
+
+    Boundaries are matched on ``^#{2,}\\s`` deliberately, **never** on a bare
+    ``^#``: SETUP.md carries ``#``-prefixed *shell comments inside fenced blocks*,
+    and the scheduled-sweep block opens with two of them. A ``^#`` splitter cuts
+    that section off one line above its only two recipe lines, which would leave
+    the presence row below red after a correct fix and the absence row passing
+    vacuously — the exact pair of wrong answers these rows exist to prevent.
+    """
+    lines = text.splitlines()
+    start = next(
+        (i for i, ln in enumerate(lines)
+         if re.match(r"^#{2,}\s", ln) and ln.split(" ", 1)[1].strip() == heading),
+        None,
+    )
+    assert start is not None, f"SETUP.md has no heading {heading!r} — it was renamed or lost"
+    body = []
+    for ln in lines[start + 1:]:
+        if re.match(r"^#{2,}\s", ln):
+            break
+        body.append(ln)
+    return "\n".join(body)
+
+
+def _fenced_blocks(section, lang):
+    """Returns the ``lang``-tagged fenced code blocks in a section body, joined.
+
+    Two reasons the language tag is required rather than optional. The absence rows
+    below belong on the **recipe**, not on the section — the prose around the cron
+    recipe explains *why* ``-p .`` is wrong there, so a whole-section absence claim
+    reds on the sentence that teaches the rule (found by running it). And the
+    corpus↔graph section carries an *untagged* fence holding a verbatim sample of
+    `mitos status` output, whose ``mitos rebuild`` is quoted shipped text this phase
+    must not edit; matching every fence would red on the tool's own words.
+    """
+    return "\n".join(
+        re.findall(r"^```" + lang + r"\n(.*?)^```", section, re.S | re.M)
+    )
+
+
+def test_scheduled_sweep_recipe_names_a_registered_project():
+    """cron starts in ``$HOME``, so the nightly sweep must name a project, not ``.``.
+
+    Measured: ``mitos check -p .`` from ``/home/vinga`` exits **2** — the
+    fail-closed code — so a mis-aimed scheduled job is indistinguishable from a
+    real substrate outage in an exit-code branch, on the one surface whose stderr
+    goes to a mailbox nobody reads. The registered-name form is safe *here*
+    specifically because a crontab is machine-local state that never travels; the
+    same literal in a committed file would name a different project on another
+    machine.
+
+    Presence and absence are asserted together over the SAME extracted block. An
+    absence claim alone is satisfied by a block that says nothing at all — which
+    is exactly the state this file was in before 6b (no selector *and* no ``-p .``,
+    so the absence half passed vacuously against a broken recipe).
+    """
+    recipe = _fenced_blocks(
+        _extract_section(_setup_text(), "Scheduled corpus sweep (cron)"), "sh"
+    )
+    assert "mitos check" in recipe, "the scheduled-sweep block lost its recipe"
+    assert re.search(r"mitos check[^\n]*-p \w", recipe), (
+        "the scheduled-sweep recipe names no project — cron runs from $HOME, so "
+        "it must carry `-p <registered-name>`"
+    )
+    assert "-p ." not in recipe, (
+        "the scheduled-sweep recipe uses `-p .`, which resolves to $HOME under cron"
+    )
+
+
+def test_secretless_ci_prose_does_not_re_teach_a_bare_sweep():
+    """The third bare `check` site sat in *prose*, where a fenced-block reader misses it.
+
+    The secretless-CI bullet advises running the corpus sweep on a keyed schedule
+    — i.e. the cron form — in the one paragraph a reader consults precisely when
+    wiring an unattended job. Paired presence/absence again: the section must
+    still send the reader to the scheduled recipe, and must not spell a bare
+    ``mitos check`` beside that advice.
+    """
+    block = _extract_section(
+        _setup_text(), "Keys, Qdrant, and the secretless-CI consequence"
+    )
+    assert "corpus sweep" in block, "the secretless-CI bullet lost its subject"
+    assert "`mitos check`" not in block, (
+        "the secretless-CI bullet spells a bare `mitos check`; it takes the "
+        "scheduled (registered-name) form, not the CI one"
+    )
+
+
+def test_corpus_graph_repair_recipe_names_its_project_on_every_line():
+    """The one recipe in the file whose mis-aim *writes* another project's gold source.
+
+    ``restore-source --all-graph-only`` splices blocks into ``decisions.md``, so a
+    wrong target here is not a failed read — it is a mutation of the file P6 makes
+    authoritative. Presence over the section (all three lines, both
+    ``restore-source`` forms) plus an absence over the executable fence only — the
+    surrounding prose legitimately names ``mitos rebuild`` as a subject, and the
+    untagged fence beside it quotes shipped `mitos status` output verbatim.
+    """
+    section = _extract_section(_setup_text(), "When the corpus and the graph disagree")
+    recipe = _fenced_blocks(section, "bash")
+    for verb in ("restore-source", "rebuild"):
+        assert f"mitos {verb} -p ." in recipe, f"`mitos {verb}` lost its selector"
+    assert recipe.count("mitos restore-source -p .") == 2, (
+        "both restore-source lines (--dry-run and the real splice) must name the project"
+    )
+    bare = re.findall(r"mitos (?:restore-source|rebuild)(?! -p\b)", recipe)
+    assert not bare, f"selector-less repair recipe in the executable block: {bare}"
+
+
+def test_every_setup_md_pointer_in_mitos_names_a_heading_that_exists():
+    """`SETUP.md → <Heading>` is printed by production code the `.md` sweep cannot see.
+
+    Two `cli.py` strings route a reader to a SETUP.md section **by title**, and
+    nothing else in the tree would notice a rename — 6a cleared out both `§`-number
+    references, so numbers are free and titles are not. Matching is by prefix after
+    stripping trailing punctuation, because the pointers say `Cutover` while the
+    heading is `Cutover (migrating a prototype graph to V1a)`.
+    """
+    headings = [
+        ln.split(" ", 1)[1].strip()
+        for ln in _setup_text().splitlines()
+        if re.match(r"^#{2,6}\s", ln)
+    ]
+    pointers = set()
+    for path in _MITOS_PKG.rglob("*.py"):
+        for target in re.findall(
+            r"SETUP\.md\s*→\s*(\S+)", path.read_text(encoding="utf-8")
+        ):
+            pointers.add(target.rstrip('.)",\\'))
+
+    assert pointers, "no `SETUP.md → <Heading>` pointer found — did the regex rot?"
+    for target in sorted(pointers):
+        assert any(h.startswith(target) for h in headings), (
+            f"`mitos/` points at SETUP.md → {target!r}, which no heading matches. "
+            f"Headings: {headings}"
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -251,11 +421,15 @@ def test_live_hook_blocks_bad_buffer_passes_clean(tmp_path):
     except requests.RequestException:
         pytest.skip(f"Qdrant unreachable at {QDRANT_URL} — environmental.")
 
-    # A workspace dir named so its derived collection (mitos-<basename>) is swept by
-    # conftest's mitos-tmp-* backstop even if teardown misses.
+    # A workspace dir named so its derived collection (mitos-<basename>-<path digest>)
+    # is swept by conftest's mitos-tmp-* backstop even if teardown misses — the prefix
+    # survives the digest suffix, which is why the `tmp` in the basename still buys the
+    # reclaim. Ask the derivation rather than hand-building the name: the shape is
+    # contract, and a second spelling of it here would silently address a collection
+    # nothing writes to.
     ws = tmp_path / f"tmp-golden-hook-{uuid.uuid4().hex[:8]}"
     ws.mkdir()
-    collection = f"mitos-{ws.name}"
+    collection = default_collection_name(str(ws))
     env = _env_with_path(_VENV_BIN)
 
     try:
@@ -269,7 +443,10 @@ def test_live_hook_blocks_bad_buffer_passes_clean(tmp_path):
 
         # Seed + index the hard-delete decision (non-interactive).
         (ws / "decisions.md").write_text(_HARD_DELETE, encoding="utf-8")
-        sync = _run(["mitos", "sync", "--yes"], ws, env=env)
+        # `init` above stays bare — it is selector-exempt and a supplied selector is
+        # REFUSED, so `-p .` there would exit non-zero on "`init` takes no project
+        # selector". Only the workspace-targeting verbs gain one.
+        sync = _run(["mitos", "sync", "--yes", "-p", "."], ws, env=env)
         if sync.returncode != 0:
             # A quota/service outage during seeding is environmental, not a defect.
             pytest.skip(

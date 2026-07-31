@@ -16,6 +16,7 @@ never depends on running services.
 """
 
 import json
+import os
 import shutil
 import tempfile
 from typing import Iterator, Tuple
@@ -23,6 +24,7 @@ from typing import Iterator, Tuple
 import pytest
 from unittest.mock import patch
 
+from conftest import resolve_like_main
 from mitos.config import MitosConfig
 from mitos.cli import cmd_init, cmd_list, cmd_open_questions, cmd_query, cmd_show, cmd_surface
 from mitos.parser import ParsedEntry
@@ -41,10 +43,17 @@ def offline(monkeypatch):
 
 @pytest.fixture
 def ws(offline) -> Iterator[Tuple[MitosConfig, MitosSyncManager]]:
-    """An initialised temp workspace + a manager, in offline graph-only mode."""
-    tmp = tempfile.mkdtemp()
+    """An initialised temp workspace + a manager, in offline graph-only mode.
+
+    `realpath` rather than the raw mkdtemp path: the `show_node` parity row names
+    this workspace in path form, and resolution canonicalizes — so on a platform
+    whose temp root is a symlink the two surfaces would stamp different
+    `workspace` strings and parity would red on the environment.
+    """
+    tmp = os.path.realpath(tempfile.mkdtemp())
     config = MitosConfig(tmp)
     cmd_init(config)
+    config = resolve_like_main(tmp)
     yield config, MitosSyncManager(config)
     shutil.rmtree(tmp, ignore_errors=True)
 
@@ -181,7 +190,7 @@ def test_mcp_query_exact_slug_surfaces_amended_by(ws) -> None:
     _rec(m, "boundary-rule-v2", amends="boundary-rule")
     store = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
-        resp = json.loads(mcp_server.query_decisions("boundary-rule"))
+        resp = json.loads(mcp_server.query_decisions("boundary-rule", project=config.workspace_dir))
     assert resp["state"] == "active"           # amends does NOT retire the parent
     assert resp["amended_by"] == ["boundary-rule-v2"]
 
@@ -193,7 +202,7 @@ def test_mcp_query_exact_slug_unmodified_has_no_modifier_keys(ws) -> None:
     _rec(m, "clean")
     store = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
-        resp = json.loads(mcp_server.query_decisions("clean"))
+        resp = json.loads(mcp_server.query_decisions("clean", project=config.workspace_dir))
     assert not any(k in resp for k in MODIFIER_EDGE_KEYS.values())
 
 
@@ -206,7 +215,7 @@ def test_mcp_list_decisions_surfaces_modifiers(ws) -> None:
     _rec(m, "untouched", scope=["z"])
     store = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
-        resp = json.loads(mcp_server.list_decisions(scope="z"))
+        resp = json.loads(mcp_server.list_decisions(scope="z", project=config.workspace_dir))
     by_slug = {d["slug"]: d for d in resp["decisions"]}
     assert by_slug["amended-one"]["amended_by"] == ["amender"]
     assert not any(k in by_slug["untouched"] for k in MODIFIER_EDGE_KEYS.values())
@@ -220,7 +229,8 @@ def test_mcp_surface_scope_fallback_surfaces_modifiers(ws) -> None:
     _rec(m, "fb-amender", scope=["db"], amends="fb-target")
     store = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
-        resp = json.loads(mcp_server.surface_decisions(query="anything", scope="db"))
+        resp = json.loads(mcp_server.surface_decisions(query="anything", scope="db",
+            project=config.workspace_dir))
     target = next(d for d in resp["active_decisions"] if d["slug"] == "fb-target")
     assert target["amended_by"] == ["fb-amender"]
 
@@ -260,7 +270,8 @@ def test_mcp_surface_semantic_path_surfaces_modifiers(ws) -> None:
     fake_vec = _FakeVector([{"slug": "sem-target", "score": 0.91}])
     with patch.object(mcp_server, "get_workspace_components",
                       return_value=(store, _FakeEmbed(), fake_vec)):
-        resp = json.loads(mcp_server.surface_decisions(query="how do we normalize rows"))
+        resp = json.loads(mcp_server.surface_decisions(query="how do we normalize rows",
+            project=config.workspace_dir))
     target = next(d for d in resp["active_decisions"] if d["slug"] == "sem-target")
     assert target["amended_by"] == ["sem-amender"]
 
@@ -276,7 +287,8 @@ def test_mcp_query_semantic_path_surfaces_modifiers(ws) -> None:
     with patch.object(mcp_server, "get_workspace_components",
                       return_value=(store, _FakeEmbed(), fake_vec)):
         # A spaced claim resolves to no exact slug → falls through to semantic search.
-        resp = json.loads(mcp_server.query_decisions("a claim that is not any slug"))
+        resp = json.loads(mcp_server.query_decisions("a claim that is not any slug",
+            project=config.workspace_dir))
     match = next(mt for mt in resp["matches"] if mt["slug"] == "q-target")
     assert match["amended_by"] == ["q-amender"]
 
@@ -295,7 +307,7 @@ def test_mcp_query_exact_slug_superseded_carries_superseded_by(ws) -> None:
     _rec(m, "v2", supersedes="v1")
     store = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
-        resp = json.loads(mcp_server.query_decisions("v1"))
+        resp = json.loads(mcp_server.query_decisions("v1", project=config.workspace_dir))
     assert resp["state"] == "superseded"
     assert resp["superseded_by"] == ["v2"]
 
@@ -399,7 +411,13 @@ def test_cli_show_json_oq_body_and_modifier_subset(ws, capsys) -> None:
 
 def test_cli_show_json_not_found_is_object_with_hint(ws, capsys) -> None:
     """`show --json` on a genuinely-absent slug emits a JSON object (falsy found-flag +
-    `mitos sync` hint), not a bare text line."""
+    `mitos sync` hint), not a bare text line.
+
+    6c gave the hint a **selector**: since the flip a bare `mitos sync` has no target
+    and hard-fails, so printing one would hand a stuck reader a second wall. The
+    value is the caller's own vocabulary (`config.project`), which is why this is
+    asserted against the config rather than against a literal recipe.
+    """
     config, m = ws
     capsys.readouterr()
     cmd_show(config, "no-such-slug", as_json=True)
@@ -407,6 +425,7 @@ def test_cli_show_json_not_found_is_object_with_hint(ws, capsys) -> None:
     assert out["found"] is False
     assert out["ident"] == "no-such-slug"
     assert "mitos sync" in out["hint"].lower()
+    assert f"-p {config.project!r}" in out["hint"]
 
 
 # --------------------------------------------------------------------------- #
@@ -427,7 +446,7 @@ def test_mcp_show_node_resolves_superseded_not_reused_slug(ws) -> None:
     _rec(m, "dead-v2", supersedes="dead-v1")  # distinct slug → "dead-v1" has no active bearer
     store = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
-        resp = json.loads(mcp_server.show_node("dead-v1"))
+        resp = json.loads(mcp_server.show_node("dead-v1", project=config.workspace_dir))
     assert resp.get("found") is not False           # not the not-found object
     assert resp["kind"] == "decision"
     assert resp["slug"] == "dead-v1"
@@ -445,7 +464,7 @@ def test_mcp_show_node_active_slug_resolves_active(ws) -> None:
     _rec(m, "alive-node")
     store = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
-        resp = json.loads(mcp_server.show_node("alive-node"))
+        resp = json.loads(mcp_server.show_node("alive-node", project=config.workspace_dir))
     assert resp["state"] == "active"
     assert resp["slug"] == "alive-node"
     assert "superseded_by" not in resp
@@ -460,7 +479,7 @@ def test_mcp_show_node_by_id_resolves(ws) -> None:
     node_id = res["id"]
     store = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
-        resp = json.loads(mcp_server.show_node(node_id))
+        resp = json.loads(mcp_server.show_node(node_id, project=config.workspace_dir))
     assert resp["id"] == node_id
     assert resp["slug"] == "by-id"
 
@@ -475,7 +494,7 @@ def test_mcp_show_node_oq_body_and_modifier_subset(ws) -> None:
     _commit_oq(store, "oq-policy-v2", amends="oq-policy")
     ro = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components", return_value=(ro, None, None)):
-        resp = json.loads(mcp_server.show_node("oq-policy"))
+        resp = json.loads(mcp_server.show_node("oq-policy", project=config.workspace_dir))
     assert resp["kind"] == "open_question"
     assert resp["topic"] == "oq-policy"
     assert resp["questions_raised"]
@@ -486,22 +505,55 @@ def test_mcp_show_node_oq_body_and_modifier_subset(ws) -> None:
 
 def test_mcp_show_node_not_found_is_object_with_hint(ws) -> None:
     """T10 genuine-absence: an absent handle returns the JSON not-found object
-    (`found: false` + the `mitos sync` hint), never an error/exception."""
+    (`found: false` + a hint), never an error/exception.
+
+    The hint carried `mitos sync` until 6c and now carries **no shell command at
+    all** — `agent-error-surface-never-prescribes-state-creating-setup`, widened
+    past its original targeting-only scope. It is not merely emptied: a dead end is
+    what PATTERNS forbids, so the recovery is expressed in this surface's own
+    vocabulary (two read tools) and the unsynced-draft case is stated as a fact
+    rather than as a command to fix it with.
+    """
     from mitos import mcp_server
     config, m = ws
     store = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
-        resp = json.loads(mcp_server.show_node("ghost-slug"))
+        resp = json.loads(mcp_server.show_node("ghost-slug", project=config.workspace_dir))
     assert resp["found"] is False
     assert resp["ident"] == "ghost-slug"
-    assert "mitos sync" in resp["hint"].lower()
+    assert "mitos " not in resp["hint"]
+    assert "list_decisions" in resp["hint"] and "query_decisions" in resp["hint"]
+    # Still hedged and still buffer-free: truthful for a typo AND for a draft.
+    assert "decisions.md" in resp["hint"]
 
 
 def test_show_node_parity_with_cli_show_json(ws, capsys) -> None:
     """CLI⇄MCP parity (the vision's load-bearing invariant): for the SAME ident over a
     real store, `json.loads(show_node(ident))` == `json.loads(mitos show --json ident)`
-    — for a found decision, a found OQ, AND the not-found case. Structural via the shared
-    resolve_handle seam + the shared show_payload builder; pinned here too."""
+    — for a found decision and a found OQ. Structural via the shared resolve_handle
+    seam + the shared show_payload builder; pinned here too.
+
+    **The not-found case is checked one notch differently since 6c, deliberately.**
+    It used to ride the same dict-equality, which made this row the structural
+    enforcer of the hint's byte-equality across the two surfaces. 6c removed that
+    single-sourcing on purpose — the CLI's hint names a selector, the MCP's may name
+    no shell command at all — so keeping dict-equality here would red on exactly the
+    change the phase exists to make. Scoping the row down to the found cases and
+    stopping there is the move that would have quietly weakened it: the *shape*
+    parity is what the invariant is about, and it still holds. So the not-found half
+    asserts the **key set** is identical and **every value except `hint`** is equal —
+    strictly stronger than the old row about the shape, and honest about the one
+    field that must differ — plus one rule per surface, so neither hint can drift
+    into the other's.
+
+    Since both shapes now carry the corpus provenance, the MCP side must NAME this
+    workspace: the fixture never chdirs, so a `project`-less call would resolve
+    pytest's cwd (the mitos-pub repo — itself a valid workspace) and stamp a
+    different collection than the CLI side, reading as a broken stamp when the
+    truth is that the call never named a target. The path form needs no registry.
+    Resolution is left to run — only `get_workspace_components` is patched — because
+    a row that mocked the resolution could not observe the stamp at all.
+    """
     from mitos import mcp_server
     config, m = ws
     store = GraphStore(config.db_path)
@@ -518,8 +570,23 @@ def test_show_node_parity_with_cli_show_json(ws, capsys) -> None:
         cmd_show(config, ident, as_json=True)
         cli_out = json.loads(capsys.readouterr().out)
         with patch.object(mcp_server, "get_workspace_components", return_value=(ro, None, None)):
-            mcp_out = json.loads(mcp_server.show_node(ident))
-        assert cli_out == mcp_out, f"CLI⇄MCP show parity drift on {ident!r}"
+            mcp_out = json.loads(mcp_server.show_node(ident, project=config.workspace_dir))
+        if ident == "nope-not-here":
+            assert cli_out.keys() == mcp_out.keys(), "not-found SHAPE drifted"
+            assert ({k: v for k, v in cli_out.items() if k != "hint"}
+                    == {k: v for k, v in mcp_out.items() if k != "hint"})
+            # The one field that must differ, and the rule each side owes.
+            assert cli_out["hint"] != mcp_out["hint"]
+            assert f"-p {config.project!r}" in cli_out["hint"]   # names its selector
+            assert "mitos " not in mcp_out["hint"]               # no shell command
+        else:
+            assert cli_out == mcp_out, f"CLI⇄MCP show parity drift on {ident!r}"
+        # Both shapes stamped, including the not-found one — the half that is
+        # ambiguous between "no such handle" and "wrong project", and the half a
+        # found-branch-only stamp would leave bare.
+        assert cli_out["project"] == config.project
+        assert cli_out["collection"] == config.qdrant_collection
+        assert cli_out["workspace"] == config.workspace_dir
 
 
 def test_cli_list_text_marks_modified(ws, capsys) -> None:
@@ -634,7 +701,7 @@ def test_cli_query_json_parity_with_mcp(ws) -> None:
     store_mcp = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components",
                       return_value=(store_mcp, _FakeEmbed(), _FakeVector(list(matches)))):
-        mcp_resp = json.loads(mcp_server.query_decisions(claim))
+        mcp_resp = json.loads(mcp_server.query_decisions(claim, project=config.workspace_dir))
 
     assert cli_resp["matches"] == mcp_resp["matches"]
 
@@ -673,6 +740,7 @@ def test_cli_query_true_miss_keeps_plain_message(ws, capsys) -> None:
     resp = json.loads(capsys.readouterr().out)
     assert resp == {"query": "a claim that is not any slug", "depth_mode": "letter",
                     "matches": [],
+                    "project": config.project,
                     "collection": config.qdrant_collection,
                     "workspace": config.workspace_dir}
     assert "all_superseded" not in resp
@@ -775,7 +843,8 @@ def test_mcp_query_blackout_vector(ws) -> None:
     fake_vec = _FakeVector([{"slug": "dead-v1", "score": 0.9}])
     with patch.object(mcp_server, "get_workspace_components",
                       return_value=(store, _FakeEmbed(), fake_vec)):
-        resp = json.loads(mcp_server.query_decisions("a claim that is not any slug"))
+        resp = json.loads(mcp_server.query_decisions("a claim that is not any slug",
+            project=config.workspace_dir))
     assert resp["matches"] == []
     assert resp["all_superseded"] == [{"slug": "dead-v1", "state": "superseded", "superseded_by": ["dead-v2"]}]
 
@@ -790,7 +859,8 @@ def test_mcp_surface_blackout_vector(ws) -> None:
     fake_vec = _FakeVector([{"slug": "dead-v1", "score": 0.9}])
     with patch.object(mcp_server, "get_workspace_components",
                       return_value=(store, _FakeEmbed(), fake_vec)):
-        resp = json.loads(mcp_server.surface_decisions(query="a claim that is not any slug"))
+        resp = json.loads(mcp_server.surface_decisions(query="a claim that is not any slug",
+            project=config.workspace_dir))
     assert resp["active_decisions"] == []
     assert resp["all_superseded"] == [{"slug": "dead-v1", "state": "superseded", "superseded_by": ["dead-v2"]}]
 
@@ -807,12 +877,14 @@ def test_mcp_limit_threads_through(ws) -> None:
         fake_vec = _FakeVector([{"slug": "q-target", "score": 0.8}])
         with patch.object(mcp_server, "get_workspace_components",
                           return_value=(store, _FakeEmbed(), fake_vec)):
-            mcp_server.query_decisions("a claim that is not any slug", limit=requested)
+            mcp_server.query_decisions("a claim that is not any slug", limit=requested,
+                project=config.workspace_dir)
         assert fake_vec.last_limit == expected
         fake_vec2 = _FakeVector([{"slug": "q-target", "score": 0.8}])
         with patch.object(mcp_server, "get_workspace_components",
                           return_value=(store, _FakeEmbed(), fake_vec2)):
-            mcp_server.surface_decisions(query="a claim that is not any slug", limit=requested)
+            mcp_server.surface_decisions(query="a claim that is not any slug", limit=requested,
+                project=config.workspace_dir)
         assert fake_vec2.last_limit == expected
 
 
@@ -837,7 +909,7 @@ def test_cli_mcp_blackout_parity(ws) -> None:
     store_mcp = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components",
                       return_value=(store_mcp, _FakeEmbed(), _FakeVector(list(matches)))):
-        mcp_q = json.loads(mcp_server.query_decisions(claim))
+        mcp_q = json.loads(mcp_server.query_decisions(claim, project=config.workspace_dir))
     assert cli_q["all_superseded"] == mcp_q["all_superseded"]
 
     # surface parity
@@ -849,7 +921,7 @@ def test_cli_mcp_blackout_parity(ws) -> None:
     cli_s = json.loads(buf2.getvalue())
     with patch.object(mcp_server, "get_workspace_components",
                       return_value=(GraphStore(config.db_path, read_only=True), _FakeEmbed(), _FakeVector(list(matches)))):
-        mcp_s = json.loads(mcp_server.surface_decisions(query=claim))
+        mcp_s = json.loads(mcp_server.surface_decisions(query=claim, project=config.workspace_dir))
     assert cli_s["all_superseded"] == mcp_s["all_superseded"]
 
 

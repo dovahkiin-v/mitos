@@ -1335,6 +1335,87 @@ def read_text_or_none(path: str) -> Optional[str]:
         return fh.read()
 
 
+def corpus_has_entries(path: str) -> bool:
+    """Tests whether a corpus file holds at least one entry, without parsing it.
+
+    The cheap complement to :func:`parse_entry_stream` for callers that need the
+    boolean and nothing else — "is this corpus populated?" — on a path where a
+    parse-and-validate would be the wrong price (a read surface, a status rung).
+    It **streams** and short-circuits on the first entry heading it meets, so a
+    50,000-entry corpus genuinely costs what a one-entry one does — the file is
+    never materialized. Reading it whole would have made that claim false in
+    exactly the case P11 asks about, on a predicate that rides every empty answer
+    four read surfaces can give.
+
+    It lives here because the boundary it applies is defined here and must not
+    acquire a second spelling: entries begin the line **after** the first line
+    containing ``BEGIN ENTRIES`` (the same substring-over-``mask_inline_code``
+    match ``parse_entry_stream`` makes, and deliberately transcript-*un*aware,
+    exactly like that scan), and a ``##``/``### slug`` line starts an entry while
+    ``####``, a single ``#``, an indented heading, and any heading inside a
+    ``[DECISION_TRANSCRIPT]…[/DECISION_TRANSCRIPT]`` block do not (the
+    :func:`_split_entry_sections` predicate). A freshly-``init``ed workspace ships
+    a ``### example-slug`` sample block *above* the sentinel, so neither "the file
+    is non-empty" nor "the file contains a ``###`` heading" is this question — the
+    sentinel is the whole predicate.
+
+    Args:
+        path: The corpus file to scan.
+
+    Returns:
+        True iff at least one entry heading sits in the entry stream. A missing or
+        unreadable file is ``False``: absence is not a populated corpus, and this
+        is a signal a caller pairs with a louder one, never a fault of its own.
+    """
+    # One streaming pass, and the bookkeeping is what makes it equivalent to the
+    # parser's two-step (find the sentinel, then split from there). A heading seen
+    # BEFORE the sentinel cannot short-circuit — a later sentinel would demote it
+    # to preamble — so it is remembered provisionally and discarded the moment one
+    # appears. After the sentinel a heading is final and returns immediately, which
+    # is where the short-circuit actually lives: entries are authored newest-first
+    # directly below the sentinel, so a populated corpus answers within a few lines
+    # of it and the rest of the file is never read.
+    found_above_sentinel = False
+    seen_sentinel = False
+    in_transcript = False
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                if not seen_sentinel and "BEGIN ENTRIES" in mask_inline_code(line):
+                    # The first sentinel wins (`parse_entry_stream` breaks on it),
+                    # and this scan is transcript-blind here for exactly the same
+                    # reason that one is: a *quoted* sentinel still cuts the stream,
+                    # so the cheap scan and the real parse never disagree about
+                    # which side of the cut an entry falls on. Transcript state
+                    # restarts at the cut, as `_split_entry_sections` does.
+                    seen_sentinel = True
+                    found_above_sentinel = False
+                    in_transcript = False
+                    continue
+                stripped = line.strip()
+                if not in_transcript and stripped == "[DECISION_TRANSCRIPT]":
+                    in_transcript = True
+                    continue
+                if in_transcript and stripped == "[/DECISION_TRANSCRIPT]":
+                    in_transcript = False
+                    continue
+                if (not in_transcript and line.startswith("##")
+                        and not line.startswith("####")):
+                    if seen_sentinel:
+                        return True
+                    found_above_sentinel = True
+    except OSError:
+        return False
+    except UnicodeDecodeError:
+        # A corpus in a legacy encoding is a real defect, but it is `mitos sync`'s
+        # to report with a line number. Here it is one more "cannot read it", and
+        # the callers of this predicate all have a louder signal for that state.
+        return False
+    # Only reachable with no sentinel in the file, where `parse_entry_stream` treats
+    # the whole file as the entry stream — so a heading anywhere counts.
+    return found_above_sentinel
+
+
 def parse_file_reversed(
     path: str, kind: str, failures: List[EntryFailure]
 ) -> List[ParsedEntry]:

@@ -382,7 +382,7 @@ def test_cmd_rebuild_no_graph_returns_error(tmp_path):
 # --- CLI routing ---------------------------------------------------------------
 
 
-def test_cli_routes_rebuild_to_cmd_rebuild(tmp_path, monkeypatch):
+def test_cli_routes_rebuild_to_cmd_rebuild(tmp_path, monkeypatch, workspace):
     """`mitos rebuild` dispatches to cmd_rebuild with its flags bound."""
     captured = {}
 
@@ -391,7 +391,7 @@ def test_cli_routes_rebuild_to_cmd_rebuild(tmp_path, monkeypatch):
         return 0
 
     monkeypatch.setattr(cli, "cmd_rebuild", _fake_rebuild)
-    monkeypatch.setattr(sys, "argv", ["mitos", "rebuild", "--allow-drops", "--yes", "--json"])
+    monkeypatch.setattr(sys, "argv", ["mitos", "-p", workspace, "rebuild", "--allow-drops", "--yes", "--json"])
     with pytest.raises(SystemExit) as exc:
         cli_main()
     assert exc.value.code == 0
