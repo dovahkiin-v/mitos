@@ -5,8 +5,13 @@ a graph, a parser, a resolver — and structurally blind for two hazards, becaus
 both live outside the function call:
 
 1. An in-process tool call never enters ``cli.main()``, so it cannot observe what
-   the **entry path** does to the process (the two ``load_dotenv_file`` calls that
-   put a project's keys into ``os.environ``).
+   the **entry path** does to the process. Phase 5c deleted the thing it was built
+   to watch — two ``load_dotenv_file`` calls that put the launch directory's keys
+   into ``os.environ`` for the process's whole life — and this harness is what
+   proved the deletion landed, from outside, as a process. The hazard is past
+   tense; the blindness that made it invisible from in-process is not, which is
+   why every row that asserts the *absence* of an entry-time promotion still
+   belongs here.
 2. An in-process tool call shares pytest's ``os.environ``, so it cannot observe
    **process-owned environment** at all.
 

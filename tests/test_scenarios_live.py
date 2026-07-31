@@ -125,7 +125,11 @@ def test_scenario_s1_cold_start_happy_path(live_workspace) -> None:
     
     # Verify embedding is upserted to Qdrant (C2)
     cache_path = os.path.join(config.mitos_dir, "embedding_cache.sqlite")
-    provider = GeminiEmbeddingProvider(cache_path)
+    # 5c: the provider consults no environment of its own — the key rides the
+    # config's resolved map, for the workspace this scenario built.
+    provider = GeminiEmbeddingProvider(
+        cache_path, api_key=config.env.get("GEMINI_API_KEY")
+    )
     qdrant = QdrantVectorStore(config.qdrant_url, config.qdrant_collection)
     
     # Verify we can retrieve it by semantic similarity
@@ -586,7 +590,11 @@ def test_scenario_x1_decision_lifecycle(live_workspace) -> None:
     
     # Step 4: Embed (Verify Qdrant contains the verbatim committed axiom)
     cache_path = os.path.join(config.mitos_dir, "embedding_cache.sqlite")
-    provider = GeminiEmbeddingProvider(cache_path)
+    # 5c: the provider consults no environment of its own — the key rides the
+    # config's resolved map, for the workspace this scenario built.
+    provider = GeminiEmbeddingProvider(
+        cache_path, api_key=config.env.get("GEMINI_API_KEY")
+    )
     qdrant = QdrantVectorStore(config.qdrant_url, config.qdrant_collection)
     
     with skip_on_embed_quota():

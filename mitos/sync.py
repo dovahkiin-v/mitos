@@ -52,7 +52,6 @@ from mitos.errors import (
     STORE_MISSING_TARGET,
     STORE_SLUG_COLLISION,
 )
-from mitos.env import transitional_env_fallback
 from mitos.models import get_embedding_model_id, get_model_id
 from mitos.parser import (ParsedEntry, mask_inline_code, parse_entry_stream,
                           parse_file_reversed)
@@ -773,9 +772,7 @@ class MitosSyncManager:
                 except Exception:
                     pass
 
-        api_key = transitional_env_fallback(
-            self.config.env.get("GEMINI_API_KEY"), "GEMINI_API_KEY"
-        )
+        api_key = self.config.env.get("GEMINI_API_KEY")
         if not api_key:
             print("GEMINI_API_KEY environment variable is not set. Sync requires API keys.")
             return
@@ -1270,9 +1267,7 @@ class MitosSyncManager:
         """
         if self.embed_provider is None or self.vector_store is None:
             return None
-        api_key = transitional_env_fallback(
-            self.config.env.get("ANTHROPIC_API_KEY"), "ANTHROPIC_API_KEY"
-        )
+        api_key = self.config.env.get("ANTHROPIC_API_KEY")
         if not api_key:
             return None
         # Lazy import (CONF-D4/§8, load-bearing): `conflict_judgment` is the sole
@@ -1949,7 +1944,16 @@ class MitosSyncManager:
                 A *missing collection* does not raise (see above).
         """
         if not self.embed_provider or not self.vector_store:
-            print("Cannot reconcile: Embedding provider or vector store down.")
+            # stderr, not stdout: `mitos reconcile --json` promises stdout carries
+            # exactly one JSON object, and this line is `as_json`-blind — it broke
+            # `json.loads(stdout)` on every provider-down workspace. Threading a
+            # presentation flag down into the manager was the alternative; a
+            # diagnostic on the diagnostic channel keeps the routing decision at
+            # the boundary, where the rest of it already lives.
+            print(
+                "Cannot reconcile: Embedding provider or vector store down.",
+                file=sys.stderr,
+            )
             return {"active": 0, "present": 0, "enqueued": 0}
 
         active_ids = self.store.get_active_node_ids()

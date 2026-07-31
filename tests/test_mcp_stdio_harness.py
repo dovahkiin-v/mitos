@@ -767,3 +767,201 @@ async def test_one_long_lived_session_spans_calls_and_a_filesystem_mutation(tmp_
         registered = {entry["path"]: entry["name"] for entry in _tool_json(
             await server.session.call_tool("list_projects", {}))["projects"]}
         assert before["project"] == after["project"] == registered[str(ws)]
+
+
+# --------------------------------------------------------------------------- #
+# Phase 5c — I6/I7: the credential follows the TARGET, not the launch directory
+#
+# The vision's founding hazard, one layer down from the addressing one phases 3-5b
+# closed. Until 5c, `cli.main()` poured the *launch* directory's `.env` and the
+# global `.env` into `os.environ`, and a shim read `os.environ` whenever a caller
+# supplied nothing — so a server launched inside `cartolina/` because that is where
+# its client happened to start it answered every mitos call for the rest of its life
+# with `cartolina`'s key. Not a wrong answer: a wrong credential, spent against
+# someone else's quota, resolving from a file nobody named.
+#
+# Both hazards live outside the function call, so every row here is a real process.
+# The observation splits deliberately across the two surfaces, because each has
+# exactly one keyless, network-free signal and they are different signals:
+#
+#   * the MCP surface has no tool that reports key state, so the *negative* claim
+#     rides `degraded_reason` — "embeddings/Qdrant unavailable" is returned only
+#     when no provider was ever constructed, i.e. the target resolved no key from
+#     any tier;
+#   * the CLI surface reports the winning TIER by name (`mitos status`), which is
+#     the *positive* claim and the sharper one — `global .env` in particular is
+#     reachable only if the resolution genuinely ran for the named target and
+#     nothing was promoted into tier 1.
+#
+# The direct "os.environ gained nothing" assertion is in-process and lives in
+# `tests/test_directory_global.py::test_no_env_file_is_promoted_into_the_process_
+# environment`, which drives `main()` with a launch `.env`, a target `.env` and a
+# global `.env` all carrying one name. These rows are its process-level half.
+# --------------------------------------------------------------------------- #
+
+#: Sentinel key values. Syntactically plausible, deliberately worthless. A row
+#: that reaches a provider with one of these is a row that has already failed.
+A_SENTINEL = "AIza-sentinel-belongs-to-A"
+B_SENTINEL = "AIza-sentinel-belongs-to-B"
+GLOBAL_SENTINEL = "AIza-sentinel-belongs-to-the-machine"
+
+
+def _write_env(path, text):
+    """Writes a `.env`, creating parents. Returns the path."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _global_env(root):
+    """The path a harness child resolves as its global `.env`.
+
+    Read off `harness_env`'s own declared `XDG_CONFIG_HOME` rather than re-deriving
+    the `<root>/home/.config` shape, and never from `mitos.config.global_env_path()`,
+    which would answer for the *parent* process. `config_home() ==
+    XDG_CONFIG_HOME` for the child is pinned by
+    `test_the_child_environment_is_declared_not_inherited`; the `mitos/.env` tail
+    is `global_env_path`'s shape, and it is self-checking here — the `global .env`
+    case below only resolves if the file this writes is the one the child reads.
+
+    It does not exist by default (asserted by that same row), so a test wanting a
+    global tier creates it.
+    """
+    return Path(harness_env(root)["XDG_CONFIG_HOME"]) / "mitos" / ".env"
+
+
+@pytest.mark.asyncio
+async def test_a_session_launched_inside_A_resolves_no_key_for_a_keyless_B(tmp_path):
+    """I6(b)/I7 server half: A's key does not become the whole process's key.
+
+    One long-lived session **launched from inside project A**, where `A/.env`
+    carries a real-shaped key. A neutral launch directory would pass while the
+    hazard shipped, which is why `cwd=ws_a` is the load-bearing half of the setup.
+    B is keyless — no `.env`, and no global `.env` exists — so the correct answer
+    is that B's call finds no key anywhere.
+
+    The observable is `degraded_reason`. `lexical.degraded_reason_from_error(None)`
+    returns "embeddings/Qdrant unavailable" and `None` is reached **only** when
+    `embed_provider` was never built, i.e. `config.env` carried no `GEMINI_API_KEY`
+    for B. With the entry load alive, A's sentinel sits in this child's `os.environ`,
+    tier 1 answers for B, the provider *is* built, and the reason becomes
+    "embedding provider error" or a connection phrase instead. So the row reds on
+    the hazard and passes on the fix.
+
+    Cost: the green path constructs no provider and makes no network call, which is
+    what keeps this module serviceless. Under **fault injection** (the shim or the
+    entry load restored) it does attempt one call with a worthless key — that is the
+    injection run, not the gate run.
+
+    The provenance assertions are not decoration: they state that the answer came
+    from B's corpus while B's credential was the one not found, so a row that
+    silently answered for A could not pass by resolving nothing.
+    """
+    env = _scaffold_env(tmp_path)
+    ws_a = _workspace(tmp_path, "ws_a", env=env, scopes=("alpha",))
+    ws_b = _workspace(tmp_path, "ws_b", env=env, scopes=("beta",))
+    _write_env(ws_a / ".env", f"GEMINI_API_KEY={A_SENTINEL}\n")
+    assert not _global_env(tmp_path).exists()
+
+    async with mitos_server(cwd=ws_a, env=env) as server:
+        payload = _tool_json(await server.session.call_tool(
+            "surface_decisions", {"query": "beta workspace", "project": str(ws_b)}))
+
+    assert payload["degraded"] == "lexical"
+    assert payload["degraded_reason"] == "embeddings/Qdrant unavailable"
+    assert payload["workspace"] == str(ws_b)
+
+
+@pytest.mark.asyncio
+async def test_one_session_answers_from_the_graph_file_on_disk_at_each_call(tmp_path):
+    """I6(a): swapping the target's graph between two calls changes the answer.
+
+    3a's `…spans_calls_and_a_filesystem_mutation` proves the *corpus* is re-read;
+    this is the sharper claim the index asks for — a simulated rebuild. Nothing is
+    cached across calls, **including a SQLite handle**: a server that opened the
+    graph once at startup would keep answering from the swapped-away file, and a
+    `mitos rebuild` under a live session would be invisible to every later call.
+
+    Added beside 3a's row rather than folded into it: the two claims fail
+    differently and a merged row would report the wrong one.
+    """
+    env = _scaffold_env(tmp_path)
+    ws = _workspace(tmp_path, "ws_a", env=env, scopes=("alpha",))
+    donor = _workspace(tmp_path, "ws_donor", env=env, scopes=("gamma",))
+
+    async with mitos_server(cwd=ws, env=env) as server:
+        before = _tool_json(await server.session.call_tool(
+            "list_scopes", {"project": str(ws)}))
+        assert set(before["scopes"]) == {"alpha"}
+
+        # The rebuild, simulated: a different graph file lands at the same path.
+        (ws / ".mitos" / "graph.sqlite").unlink()
+        (ws / ".mitos" / "graph.sqlite").write_bytes(
+            (donor / ".mitos" / "graph.sqlite").read_bytes())
+
+        after = _tool_json(await server.session.call_tool(
+            "list_scopes", {"project": str(ws)}))
+
+    assert set(after["scopes"]) == {"gamma"}
+    assert before["project"] == after["project"]
+
+
+def _status_key_line(root, target, *, cwd, env):
+    """Runs `mitos -p <target> status` as a subprocess and returns its key row.
+
+    Not `_run_mitos`: `status` exits non-zero on these workspaces (Qdrant is a dead
+    port by design), and the exit code is not what the caller is asking about. The
+    attribution prints on every branch.
+    """
+    done = subprocess.run(
+        [sys.executable, "-m", "mitos.cli", "-p", str(target), "status"],
+        cwd=str(cwd), env=env, capture_output=True, text=True, timeout=120,
+    )
+    lines = [ln for ln in done.stdout.splitlines() if "GEMINI_API_KEY" in ln]
+    assert len(lines) == 1, f"expected one key line, got {lines}\n{done.stdout}"
+    return lines[0]
+
+
+def test_the_cli_invoked_from_inside_A_reports_Bs_own_tier(tmp_path):
+    """I7 CLI half: the winning tier is named for the TARGET, from inside another project.
+
+    The positive claim, and the one the MCP surface cannot make keylessly. `mitos
+    status` names the tier that actually won (`env.resolve_key`, one call, no
+    provider), so a sentinel plus a tier string is a complete statement about which
+    file answered.
+
+    Two cases, and the second is the discriminator:
+
+    * **B has its own key** → `project .env`. A's key is present in the launch
+      directory and must lose.
+    * **B has none, the machine has one** → `global .env`. This is the case no
+      wrong implementation can reach: the entry load would have promoted A's key
+      into tier 1 and reported `environment`, and a resolution that ran for A
+      rather than B would have reported `project .env`. It is also D2's argument
+      asserted rather than reasoned — deleting the *global* load with the project
+      one had to leave the global **tier** intact, which is exactly the setup
+      SETUP.md recommends (an empty project slot plus one global key).
+
+    Bound to `env`'s tier constants, imported here for the same reason
+    `test_env_routing.py` binds to them: a rename lands as a failing import, not as
+    a green row asserting a dead string.
+    """
+    from mitos.env import TIER_ENVIRONMENT, TIER_GLOBAL_ENV, TIER_PROJECT_ENV
+
+    env = _scaffold_env(tmp_path)
+    ws_a = _workspace(tmp_path, "ws_a", env=env)
+    ws_b = _workspace(tmp_path, "ws_b", env=env)
+    _write_env(ws_a / ".env", f"GEMINI_API_KEY={A_SENTINEL}\n")
+    _write_env(_global_env(tmp_path), f"GEMINI_API_KEY={GLOBAL_SENTINEL}\n")
+
+    _write_env(ws_b / ".env", f"GEMINI_API_KEY={B_SENTINEL}\n")
+    line = _status_key_line(tmp_path, ws_b, cwd=ws_a, env=env)
+    assert f"(from {TIER_PROJECT_ENV})" in line
+    assert TIER_ENVIRONMENT not in line
+    # P8: the attribution names the tier, never the value.
+    assert B_SENTINEL not in line and A_SENTINEL not in line
+
+    (ws_b / ".env").unlink()
+    line = _status_key_line(tmp_path, ws_b, cwd=ws_a, env=env)
+    assert f"(from {TIER_GLOBAL_ENV})" in line
+    assert TIER_PROJECT_ENV not in line

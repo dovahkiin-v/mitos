@@ -1,8 +1,10 @@
 """T9 gate: the `-C`/`--directory` process-entry chdir (Phase 4a).
 
 `-C`/`--directory` performs a single `os.chdir(args.directory)` at process entry,
-before any env load, config construction, or arg-driven file open — git's `-C`
-semantics, a *total* workspace retarget. These tests drive the real entry point
+before config construction or any arg-driven file open — git's `-C` semantics, a
+*total* workspace retarget. (It used to run before an env load too; 5c deleted
+that load, so there is no longer a second thing for the chdir to be ordered
+against.) These tests drive the real entry point
 (`main()` with a monkeypatched `sys.argv`) so the chdir + the `main()` reorder are
 exercised end-to-end, not via a unit shortcut.
 
@@ -18,7 +20,8 @@ from unittest.mock import MagicMock, patch
 
 from conftest import make_workspace
 from mitos.cli import main, _enter_target_directory
-from mitos.config import default_collection_name
+from mitos.config import default_collection_name, global_env_path
+from mitos.env import resolve_key
 from mitos.errors import MitosError
 
 
@@ -108,8 +111,9 @@ def test_init_under_directory_creates_mitos_in_target(tmp_path, monkeypatch) -> 
 
 
 # ---------------------------------------------------------------------------
-# The R3 partial-retarget pins: set-key writes /ws/.env, and the project .env
-# LOAD moved after the chdir (read from /ws/.env).
+# The R3 partial-retarget pins: set-key writes /ws/.env. Its sibling — the
+# project `.env` LOAD moving after the chdir — inverted at 5c into a pin that no
+# `.env` reaches `os.environ` at all.
 # ---------------------------------------------------------------------------
 
 def test_set_key_under_directory_writes_target_env(tmp_path, monkeypatch, capsys) -> None:
@@ -126,25 +130,42 @@ def test_set_key_under_directory_writes_target_env(tmp_path, monkeypatch, capsys
     assert not (tmp_path / ".env").exists()
 
 
-def test_project_env_loaded_from_target_under_directory(tmp_path, monkeypatch) -> None:
-    """The project `.env` LOAD moved after the chdir: keys come from /ws/.env (R3).
+def test_no_env_file_is_promoted_into_the_process_environment(tmp_path, monkeypatch) -> None:
+    """R3's pin, inverted at 5c: the entry load is gone, so NOTHING is promoted.
 
-    If `load_dotenv_file()` had stayed at its pre-parse position, `-C` would
-    retarget the graph/collection but read keys from the launch CWD — the
-    partial-retarget trap. A custom key name (loaded only from the target `.env`)
-    pins that the load now retargets.
+    This row used to prove that the project `.env` load moved *after* the `-C`
+    chdir — because a load at its old pre-parse position would retarget the
+    graph and the collection while still reading keys from the launch CWD, the
+    partial-retarget trap. 5c deleted the load itself: keys are resolved per call
+    for the workspace the call named (`env.resolve_values`, hung on
+    `MitosConfig.env`), and `os.environ` is written nowhere.
+
+    So the claim inverts rather than disappears, and it is now the stronger one.
+    The fixture is unchanged — a launch `.env`, a target `.env`, and a global
+    `.env` all carrying the same custom name — and **none** of the three may
+    appear in the process environment afterwards. It is this module's only row
+    that would notice the writer coming back, and it is I6's CLI-side pin.
     """
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("MITOS_TEST_DIRKEY", raising=False)
+    monkeypatch.setenv("MITOS_TEST_DIRKEY", "")   # force the absence into the record
+    monkeypatch.delenv("MITOS_TEST_DIRKEY")
     ws = tmp_path / "ws"
     ws.mkdir()
     (ws / ".env").write_text("MITOS_TEST_DIRKEY=from-target\n", encoding="utf-8")
-    # A same-named key in the LAUNCH CWD's .env must lose — proving which dir is read.
     (tmp_path / ".env").write_text("MITOS_TEST_DIRKEY=from-launch\n", encoding="utf-8")
-    with patch("mitos.cli.cmd_init"):  # keep it light; the env load runs before dispatch
+    global_env = global_env_path()
+    os.makedirs(os.path.dirname(global_env), exist_ok=True)
+    with open(global_env, "w", encoding="utf-8") as f:
+        f.write("MITOS_TEST_DIRKEY=from-global\n")
+
+    with patch("mitos.cli.cmd_init"):  # keep it light; nothing before dispatch loads keys
         with patch.object(sys, "argv", ["mitos", "-C", str(ws), "init"]):
             main()
-    assert os.environ.get("MITOS_TEST_DIRKEY") == "from-target"
+
+    assert "MITOS_TEST_DIRKEY" not in os.environ
+    # And the resolver still finds the target's value — the delivery changed, not
+    # the layering (the launch CWD's `.env` is not a tier for anyone).
+    assert resolve_key("MITOS_TEST_DIRKEY", str(ws), global_env).value == "from-target"
 
 
 def test_relative_rejected_file_retargets(tmp_path, monkeypatch) -> None:

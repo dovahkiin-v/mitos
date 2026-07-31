@@ -72,6 +72,10 @@ def _load_live_env() -> None:
 _load_live_env()
 HAS_LIVE_KEYS = (not live_tests_disabled()) and bool(os.environ.get("GEMINI_API_KEY"))  # retrieval needs embeddings only
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:7333")
+# 5c: `GeminiEmbeddingProvider` reads no process environment — the key is
+# supplied explicitly. Read here, beside the gate that already reads it, in
+# the same module-constant idiom as `QDRANT_URL` above.
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 pytestmark = pytest.mark.skipif(
     not HAS_LIVE_KEYS,
@@ -104,7 +108,7 @@ def populated_index():
     # column), so a model swap must land on a different file or it returns stale
     # vectors and masks embedding drift (Fable #11).
     cache_path = os.path.join(cache_dir, f"embeddings-{get_embedding_model_id()}.sqlite")
-    provider = GeminiEmbeddingProvider(cache_path)
+    provider = GeminiEmbeddingProvider(cache_path, api_key=GEMINI_API_KEY)
     vstore = QdrantVectorStore(QDRANT_URL, collection)
 
     try:

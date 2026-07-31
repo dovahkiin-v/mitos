@@ -863,18 +863,19 @@ class TestTheTwoCarveOuts:
 #: `--json` verbs whose payload is knowingly NOT parseable at this commit, with the
 #: owner of the fix. One row across every JSON verb catches "a text line leaked above
 #: the object" for all of them at once — but a silent exclusion would read as "all
-#: payloads parse clean", which is false, so the exclusion is named here and logged
+#: payloads parse clean", which is false, so an exclusion is named here and logged
 #: by the row itself.
 #:
-#: `reconcile`: `MitosSyncManager.reconcile_embeddings` (`sync.py`) prints its
-#: provider-down line to stdout unconditionally, `as_json`-blind, so
-#: `mitos reconcile --json` has emitted a stray text line above its object since
-#: before this vision. The fix is a one-line `as_json` thread in `sync.py`, whose
-#: diff this phase's structural gate requires to be EMPTY (T8b) — so it is recorded
-#: as a named deferral rather than smuggled in here.
-JSON_PARSE_EXCLUSIONS = {
-    "reconcile": "pre-existing stray stdout line from sync.py — deferred, T8b fences the fix",
-}
+#: **Empty since 5c**, and the emptiness is the gate. Its one member was
+#: `reconcile`: `MitosSyncManager.reconcile_embeddings` printed its provider-down
+#: line to stdout unconditionally and `as_json`-blind, so `mitos reconcile --json`
+#: had emitted a stray text line above its object since before this vision. 3e
+#: found it and was fenced out by its own empty-`sync.py`-diff proof (T8b); 5c is
+#: the next phase T8b lists as touching `sync.py`, and it moved the line to stderr.
+#: Removing the member IS the regression gate — the row below asserts
+#: `skipped == sorted(JSON_PARSE_EXCLUSIONS)`, so a stale member reds rather than
+#: rots, and a re-broken verb reds on the `json.loads`.
+JSON_PARSE_EXCLUSIONS = {}
 
 
 def test_no_json_payload_carries_a_stray_text_line(tmp_path, offline, monkeypatch,
@@ -911,7 +912,7 @@ def test_no_json_payload_carries_a_stray_text_line(tmp_path, offline, monkeypatc
         checked.append(verb)
 
     # No silent caps: the row states what it covered and what it did not.
-    assert len(checked) >= 15, checked
+    assert len(checked) >= 16, checked
     assert skipped == sorted(JSON_PARSE_EXCLUSIONS), (
         f"checked {checked}; excluded {skipped} — see JSON_PARSE_EXCLUSIONS")
 

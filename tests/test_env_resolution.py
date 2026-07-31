@@ -57,10 +57,11 @@ def _unset(monkeypatch, name: str) -> None:
     """Removes `name` for the test AND guarantees it stays removed at teardown.
 
     ``monkeypatch.delenv(name, raising=False)`` on an **already-absent** name
-    records nothing, so monkeypatch's undo has nothing to undo — and this module
-    is the one place in the tree that writes ``os.environ`` **raw**, because
-    ``load_dotenv_file`` does (that is the behaviour group 5 exists to pin). The
-    two failure shapes, both measured: a raw write with no later ``delenv``
+    records nothing, so monkeypatch's undo has nothing to undo — and a raw
+    ``os.environ`` write is unavoidable wherever a row means to exercise a leak
+    (group 5's two fixture-net rows do exactly that; until 5c the whole of group
+    5 did, because the entry-time load it pinned wrote the environment itself).
+    The two failure shapes, both measured: a raw write with no later ``delenv``
     survives teardown outright, and a raw write followed by ``monkeypatch.delenv``
     is *worse* — the delete records the leaked value and undo faithfully **puts it
     back**. Either way ``GEMINI_API_KEY`` escapes into every module collected
@@ -85,11 +86,11 @@ def _keyless(monkeypatch) -> None:
     default — but it deliberately leaves the credential names alone, and this box
     has both a repo ``.env`` and a global one.
 
-    ``NEW`` is not a mitos name; it is the third key group 5's entry-load row
-    writes, and it rides here for the same teardown reason (see :func:`_unset`).
+    (``NEW`` used to ride here too — the third key group 5's entry-load row
+    wrote. That row went with the mechanism in 5c; no row writes the name now.)
     """
     for name in ("GEMINI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY",
-                 "QDRANT_URL", "NEW", *RESOLVED_ENV_KEYS):
+                 "QDRANT_URL", *RESOLVED_ENV_KEYS):
         _unset(monkeypatch, name)
 
 
@@ -114,7 +115,8 @@ def test_whitespace_around_the_key_and_the_equals_is_tolerated(tmp_path):
 
     (The ``cli`` reader 2c retired — the tree's third parse — did *not* tolerate
     it, which is one reason it was folded onto this one. ``cli._upsert_env_var``
-    is the last holdout of the class, a *writer*, and 5c's with ``set-key``.)
+    was the last holdout of the class, a *writer*; 5c brought its key match onto
+    the same shape — see group 5.)
     """
     path = _write(tmp_path / ".env", "  GEMINI_API_KEY = x  \n")
     assert parse_env_file(path) == {"GEMINI_API_KEY": "x"}
@@ -151,7 +153,7 @@ def test_an_empty_assignment_is_skipped(tmp_path):
 
 
 def test_the_first_non_empty_assignment_wins_within_a_file(tmp_path):
-    """First-wins, not last — the shipped entry load's `key not in os.environ`.
+    """First-wins, not last — the retired entry load's `key not in os.environ`.
 
     A plain ``dict[key] = value`` loop is last-wins and inverts this silently. The
     scaffolded-empty-slot-then-real-value shape agrees either way; two real values
@@ -195,8 +197,9 @@ def test_a_non_utf8_file_parses_to_empty_instead_of_raising(tmp_path):
     """The one row here that is NEW coverage rather than an inherited pin.
 
     Before this leaf, a non-UTF-8 `.env` raised ``UnicodeDecodeError`` out of
-    ``load_dotenv_file`` — which is **not** an ``OSError``, so its ``except``
-    missed it and ``main()``'s generic arm rendered ``Fatal Unexpected Error``
+    the entry-time load 5c deleted — which is **not** an ``OSError``, so its
+    ``except`` missed it and ``main()``'s generic arm rendered ``Fatal
+    Unexpected Error``
     for *every verb*, ``mitos status`` included. Whole-file, not partial: the
     first line parses cleanly and is still discarded, because a file that failed
     mid-decode is not a source of truth for the bytes before the bad one.
@@ -607,10 +610,10 @@ def test_importing_the_env_leaf_pulls_in_no_other_mitos_module():
     assert out.stdout.strip().split(",") == ["mitos", "mitos.env"]
 
 
-# --- group 5: the re-spelled load_dotenv_file -------------------------------
+# --- group 5: the fixture's own net, and the last hand-rolled `.env` writer --
 
 def test_a_raw_environ_write_does_not_survive_the_key_strip():
-    """The fixture's own net: group 5 writes `os.environ` raw, and it must not leak.
+    """The fixture's own net: this module writes `os.environ` raw, and it must not leak.
 
     Verified to red against the plain ``monkeypatch.delenv(name, raising=False)``
     this replaced — on an already-absent name that records nothing, so the raw
@@ -637,58 +640,55 @@ def test_the_key_strip_still_restores_a_genuinely_exported_value(monkeypatch):
         os.environ["MITOS_TEST_EXPORTED"] = "leaked"
     assert os.environ["MITOS_TEST_EXPORTED"] == "REAL"
 
-def test_the_entry_load_still_never_overrides_an_existing_key(tmp_path, monkeypatch):
-    """Including an existing EMPTY one — the keyless-run idiom depends on it."""
-    monkeypatch.setenv("GEMINI_API_KEY", "")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "EXPORTED")
-    path = _write(tmp_path / ".env",
-                  "GEMINI_API_KEY=FROMFILE\nANTHROPIC_API_KEY=FROMFILE\nNEW=fromfile\n")
-    cli.load_dotenv_file(path)
-    assert os.environ["GEMINI_API_KEY"] == ""
-    assert os.environ["ANTHROPIC_API_KEY"] == "EXPORTED"
-    assert os.environ["NEW"] == "fromfile"
-    # No cleanup line here on purpose: `_keyless` registers `NEW` with monkeypatch
-    # so the raw write is undone at teardown. A `monkeypatch.delenv` here would
-    # record the leaked value and undo would put it back — see `_unset`.
+def test_the_writer_and_the_reader_agree_on_a_hand_spaced_key(tmp_path):
+    """D6/entry-004a: `set-key` must REPLACE `GEMINI_API_KEY = old`, not shadow it.
 
+    The row this replaces pinned the entry load and the resolver reading one
+    parse; the entry load is gone, and the surviving half of its subject is the
+    clause it named in passing — *"the tree's third parse still gets this
+    wrong"*. That third parse is ``cli._upsert_env_var``, the last hand-rolled
+    ``.env`` handler and the only one that **writes**. Until 5c it matched
+    ``line.strip().startswith(f"{name}=")``, so a hand-spaced assignment was
+    invisible to it and ``set-key`` appended a *second* line — leaving a file
+    whose writer and reader disagreed about which line was the key, with
+    ``parse_env_file``'s first-wins rule handing the reader the stale one.
 
-def test_the_entry_load_still_applies_first_non_empty_per_file(tmp_path, monkeypatch):
-    """The scaffolded empty slot does not shadow a real value below it."""
-    path = _write(tmp_path / ".env", "GEMINI_API_KEY=\nGEMINI_API_KEY=real\n")
-    cli.load_dotenv_file(path)
-    assert os.environ["GEMINI_API_KEY"] == "real"
-
-
-def test_the_entry_load_survives_a_non_utf8_env_file(tmp_path):
-    """It used to raise `UnicodeDecodeError` past `main()`'s `except OSError`.
-
-    Every verb — ``mitos status`` included — rendered ``Fatal Unexpected Error``
-    on a workspace whose ``.env`` carried one bad byte. Fixed for free by routing
-    onto the leaf's fail-silent parse.
-    """
-    path = tmp_path / ".env"
-    path.write_bytes(b"K=v\n\xff\xfe\n")
-    cli.load_dotenv_file(str(path))  # must not raise
-    assert "K" not in os.environ
-
-
-def test_the_entry_load_and_the_resolver_read_one_parse(tmp_path, monkeypatch):
-    """Agreement is structural, not test-enforced — but pinned at the seam.
-
-    Between this phase and 5c both mechanisms are live: the entry load bakes the
-    files into tier 1 while the resolver reads the same files as tiers 2–3. Two
-    hand-rolled parses that must agree is the drift this avoids by not creating
-    it — asserted here on the shape most likely to diverge (whitespace around the
-    key, which the tree's *third* parse still gets wrong).
+    Asserted end to end rather than on the writer alone: the write lands on the
+    existing line (no duplicate), and the resolver then reads the **new** value.
     """
     target = tmp_path / "proj"
-    path = _write(target / ".env", "  GEMINI_API_KEY = spaced  \n")
-    assert parse_env_file(path) == {"GEMINI_API_KEY": "spaced"}
-    cli.load_dotenv_file(path)
-    assert os.environ["GEMINI_API_KEY"] == "spaced"
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    path = _write(target / ".env",
+                  "# scaffold\n  GEMINI_API_KEY = old  \nOTHER=keep\n")
+
+    cli._upsert_env_var(path, "GEMINI_API_KEY", "new")
+
+    lines = open(path, encoding="utf-8").read().splitlines()
+    assert [ln for ln in lines if "GEMINI_API_KEY" in ln] == ["GEMINI_API_KEY=new"]
+    assert "# scaffold" in lines and "OTHER=keep" in lines
+    assert parse_env_file(path) == {"GEMINI_API_KEY": "new", "OTHER": "keep"}
     assert resolve_key("GEMINI_API_KEY", str(target),
-                       global_env_path()).value == "spaced"
+                       global_env_path()).value == "new"
+
+
+def test_the_writer_leaves_a_line_the_reader_does_not_see_as_an_assignment(tmp_path):
+    """The other half of the agreement, and the edge the fix introduces.
+
+    ``line.split("=", 1)[0]`` on a line carrying no ``=`` returns the whole line,
+    so a bare ``GEMINI_API_KEY`` would match the name and be rewritten — while
+    ``parse_env_file`` skips it. The writer therefore tests for an ``=`` first,
+    which is the reader's own predicate: a non-assignment is not the key line for
+    either of them, and a commented-out assignment parses its key as ``#NAME``
+    and matches neither.
+    """
+    path = _write(tmp_path / ".env",
+                  "GEMINI_API_KEY\n#GEMINI_API_KEY=commented\n")
+
+    cli._upsert_env_var(path, "GEMINI_API_KEY", "new")
+
+    lines = open(path, encoding="utf-8").read().splitlines()
+    assert lines == ["GEMINI_API_KEY", "#GEMINI_API_KEY=commented",
+                     "GEMINI_API_KEY=new"]
+    assert parse_env_file(path) == {"GEMINI_API_KEY": "new"}
 
 
 def test_the_env_module_writes_to_the_process_environment_nowhere(tmp_path):

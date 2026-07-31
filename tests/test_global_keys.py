@@ -3,9 +3,18 @@
 import os
 
 import pytest
+from unittest.mock import MagicMock
 
-from mitos import cli
+from mitos import cli, embeddings
 from mitos import config as mitos_config
+from mitos.config import MitosConfig
+from mitos.env import (
+    TIER_GLOBAL_ENV,
+    TIER_PROJECT_ENV,
+    ResolvedValue,
+    parse_env_file,
+    resolve_key,
+)
 from mitos.errors import MitosError
 
 
@@ -27,6 +36,24 @@ def test_set_key_custom_name(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     cli.cmd_set_key("SECRET", workspace_dir=None, name="ANTHROPIC_API_KEY", is_global=True)
     assert "ANTHROPIC_API_KEY=SECRET" in open(mitos_config.global_env_path(), encoding="utf-8").read()
+
+
+def test_upsert_replaces_a_hand_spaced_slot_no_duplicate(tmp_path):
+    """D6/entry-004a: the shape the pre-5c `startswith(f"{name}=")` match could not see.
+
+    Extends the shipped row below rather than replacing it. A hand-edited
+    ``GEMINI_API_KEY = old`` was invisible to the writer, so ``set-key`` appended a
+    *second* assignment and ``env.parse_env_file``'s first-non-empty-wins rule then
+    handed the reader the stale one — writer and reader disagreeing about which
+    line is the key, in a file holding a credential.
+    """
+    env = tmp_path / ".env"
+    env.write_text("# header\n  GEMINI_API_KEY = old  \nOTHER=keep\n")
+    cli._upsert_env_var(str(env), "GEMINI_API_KEY", "NEWKEY")
+    content = env.read_text()
+    assert content.count("GEMINI_API_KEY") == 1
+    assert "GEMINI_API_KEY=NEWKEY" in content
+    assert "# header" in content and "OTHER=keep" in content
 
 
 def test_upsert_replaces_empty_slot_no_duplicate(tmp_path):
@@ -90,3 +117,62 @@ def test_the_project_form_is_unconstructible_without_a_workspace(tmp_path, monke
 
     assert not os.path.exists(os.path.join(str(tmp_path), ".env"))
     assert not os.path.exists(mitos_config.global_env_path())
+
+
+def test_a_key_dropped_into_the_scaffolded_env_still_just_works(tmp_path, monkeypatch):
+    """5c criterion 4: only the DELIVERY changed — auto-discovery is intact.
+
+    The ADR ``init-scaffolds-gitignored-env`` promises that a key dropped into the
+    ``.env`` ``mitos init`` scaffolds is found with no further configuration. 5c
+    deleted the mechanism that used to *deliver* it (the entry-time load into
+    ``os.environ``), so the promise has to be re-asserted against the replacement
+    rather than assumed to have survived it — the scaffolded file is read by
+    ``env.resolve_values`` for the workspace the call named, at the same tier, in
+    the same precedence order.
+
+    Driven end to end through the real verbs: `init` writes the scaffold with its
+    empty slot, `set-key` fills it, the resolver reads it back, and a consumer
+    (`cmd_capture`) is handed it. The global half is the setup SETUP.md actually
+    recommends — one key for the machine, an untouched empty slot per project —
+    and it is the half a surviving *global* load would have made resolve from the
+    wrong tier.
+    """
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    monkeypatch.setenv("GEMINI_API_KEY", "")   # force the absence into the record
+    monkeypatch.delenv("GEMINI_API_KEY")
+    ws = tmp_path / "proj"
+    ws.mkdir()
+    cli.cmd_init(MitosConfig(str(ws)))
+
+    scaffold = (ws / ".env").read_text(encoding="utf-8")
+    assert "GEMINI_API_KEY=" in scaffold
+    assert parse_env_file(str(ws / ".env")) == {}   # the slot is empty, not a value
+
+    # 1. A global key, project slot untouched → the global tier answers.
+    cli.cmd_set_key("GLOBALKEY", workspace_dir=None, is_global=True)
+    assert resolve_key("GEMINI_API_KEY", str(ws),
+                       mitos_config.global_env_path()) == ResolvedValue(
+        "GLOBALKEY", TIER_GLOBAL_ENV)
+
+    # 2. The project's own slot filled by `set-key` → it wins, in place.
+    cli.cmd_set_key("PROJKEY", workspace_dir=str(ws))
+    assert (ws / ".env").read_text(encoding="utf-8").count("GEMINI_API_KEY") == 1
+    assert resolve_key("GEMINI_API_KEY", str(ws),
+                       mitos_config.global_env_path()) == ResolvedValue(
+        "PROJKEY", TIER_PROJECT_ENV)
+
+    # 3. And a consumer is handed it — the whole point of the delivery change.
+    seen = []
+
+    def _client(*, api_key=None):
+        seen.append(api_key)
+        return MagicMock()
+
+    monkeypatch.setattr(embeddings.genai, "Client", _client)
+    config = MitosConfig(str(ws))
+    assert config.env["GEMINI_API_KEY"] == "PROJKEY"
+    cli.cmd_capture(config, "We will use python.")
+    # A set, not a list: `capture` builds a client for synthesis and another on
+    # the way to the buffer, and the claim is about *which key* every one of them
+    # was handed, not how many there are.
+    assert seen and set(seen) == {"PROJKEY"}

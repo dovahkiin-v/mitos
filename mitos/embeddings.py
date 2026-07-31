@@ -11,7 +11,6 @@ import os
 from typing import List, Dict, Optional, Any, Tuple
 from google import genai
 from mitos.models import get_embedding_model_id
-from mitos.env import transitional_env_fallback
 from mitos.errors import EmbeddingError
 
 class EmbeddingCache:
@@ -96,11 +95,11 @@ class GeminiEmbeddingProvider:
             cache_path: The content-hash embedding cache (its key carries **no**
                 model id, which is why ``model_id`` must arrive resolved for the
                 right target rather than be read here).
-            api_key: The workspace's ``GEMINI_API_KEY``, or ``None`` when the
-                caller supplied nothing (the transitional fallback then reads the
-                process environment — 5c). ``""`` is a supplied answer and still
-                refuses, which is what keeps ``env GEMINI_API_KEY= mitos …`` a
-                keyless run.
+            api_key: The workspace's ``GEMINI_API_KEY``. ``None`` means the caller
+                supplied nothing and the provider refuses — it consults no
+                environment of its own (5c). ``""`` is a supplied answer and
+                refuses the same way, which is what keeps
+                ``env GEMINI_API_KEY= mitos …`` a keyless run.
             model_id: The resolved embedding model id, or ``None`` for the
                 baseline. Never stored beyond ``self.model_id``; the key is never
                 stored at all (P8).
@@ -110,10 +109,17 @@ class GeminiEmbeddingProvider:
         self.misses = 0
 
         # API Client initialization using the new google-genai SDK
-        key = transitional_env_fallback(api_key, "GEMINI_API_KEY")
-        if not key:
-            raise EmbeddingError("GEMINI_API_KEY environment variable is not set")
-        self.client = genai.Client(api_key=key)
+        if not api_key:
+            # A vector, not a wall (P3): the old wording named the process
+            # environment, which is now one of three places the key can live and
+            # the least likely of them. Name the search order and the verb that
+            # writes one. The provider itself reads no environment.
+            raise EmbeddingError(
+                "GEMINI_API_KEY is not set for this workspace — mitos reads it "
+                "from the process environment, then the workspace's .env, then "
+                "the global .env (`mitos set-key <key>` writes one)"
+            )
+        self.client = genai.Client(api_key=api_key)
         self.model_id = (
             model_id if model_id is not None else get_embedding_model_id()
         )

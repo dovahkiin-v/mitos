@@ -1,22 +1,23 @@
 """Layered ``.env`` resolution: the thing that answers *with which keys?*
 
-Mitos learns its secrets today by **mutating the process it lives in** —
-``cli.main()`` pours a project ``.env`` and the global ``.env`` into
-``os.environ`` at startup, and from then on every question about "which key?" is
-answered by the environment the process happens to be standing in. For a CLI
-whose working directory *is* its project that is a defensible guess. For an
+Mitos used to learn its secrets by **mutating the process it lived in** —
+``cli.main()`` poured a project ``.env`` and the global ``.env`` into
+``os.environ`` at startup, and from then on every question about "which key?"
+was answered by the environment the process happened to be standing in. For a
+CLI whose working directory *is* its project that was a defensible guess. For an
 always-on server that serves every project on the machine from one launch
-directory it is not a guess at all: the launch dir's ``.env`` is baked in for
-the process's whole life, so a call meaning project B resolves A's key — and the
-thing that leaks is the user's credential.
+directory it was not a guess at all: the launch dir's ``.env`` was baked in for
+the process's whole life, so a call meaning project B resolved A's key — and the
+thing that leaked was the user's credential.
 
-This module replaces the mutation with a function. :func:`resolve_key` and
-:func:`resolve_values` compute a value **for a named target**, reading real env
-first, then ``<target_dir>/.env``, then the injected global ``.env``, and they
-**never write to** ``os.environ``. That is what finally makes per-call
-statelessness a property that can be stated and tested rather than hoped for: a
-program that never writes to its own environment can be asked the same question
-twice, about two different projects, and answer honestly both times.
+This module replaced that mutation with a function, and since phase 5c the
+mutation is gone: **mitos writes to** ``os.environ`` **nowhere.**
+:func:`resolve_key` and :func:`resolve_values` compute a value **for a named
+target**, reading real env first, then ``<target_dir>/.env``, then the injected
+global ``.env``. That is what makes per-call statelessness a property that can be
+stated and tested rather than hoped for: a program that never writes to its own
+environment can be asked the same question twice, about two different projects,
+and answer honestly both times.
 
 **The resolution matrix.** The two file tiers and the process environment do not
 test the same thing, and the asymmetry is load-bearing rather than cosmetic
@@ -115,18 +116,21 @@ class ResolvedValue:
 def parse_env_file(path: str) -> Dict[str, str]:
     """Parses a ``.env`` file into its ``KEY=value`` pairs.
 
-    The single ``.env`` parse for the whole tree (``cli.load_dotenv_file`` routes
-    through it): two hand-rolled parses of one file that must agree is a drift
-    this module can simply not create. Comments, blank lines and lines carrying
-    no ``=`` are skipped; whitespace around the key and the value is stripped; a
-    value keeps everything right of its first ``=``, so a query string survives.
+    The single ``.env`` **read** for the whole tree: two hand-rolled parses of
+    one file that must agree is a drift this module can simply not create. (The
+    one remaining hand-rolled sibling is ``cli._upsert_env_var``, a *writer*,
+    which matches on the parsed key so writer and reader agree about which line
+    is which.) Comments, blank lines and lines carrying no ``=`` are skipped;
+    whitespace around the key and the value is stripped; a value keeps everything
+    right of its first ``=``, so a query string survives.
 
-    **First non-empty assignment wins within a file**, not last. The shipped
-    entry load guards on ``key not in os.environ``, so once a key has been set
-    later lines for it are skipped — and a plain ``dict[key] = value`` loop is
-    last-wins and would invert that silently on any file carrying a key twice.
-    The common shape (a scaffolded empty slot followed by a real value) happens
-    to agree either way; two real values do not.
+    **First non-empty assignment wins within a file**, not last. It is the
+    behaviour the deleted entry-time load had — it guarded on ``key not in
+    os.environ``, so once a key was set later lines for it were skipped — and a
+    plain ``dict[key] = value`` loop is last-wins and would have inverted it
+    silently on any file carrying a key twice. The common shape (a scaffolded
+    empty slot followed by a real value) happens to agree either way; two real
+    values do not.
 
     Quote stripping is ``.strip('"').strip("'")`` — double quotes first — copied
     from the shipped parse character for character, which makes it deliberately
@@ -235,46 +239,6 @@ def resolve_key(name: str, target_dir: str, global_env_path: str) -> ResolvedVal
         answered.
     """
     return _resolve(name, _file_tiers(target_dir, global_env_path))
-
-
-def transitional_env_fallback(supplied: Optional[str], name: str) -> Optional[str]:
-    """TRANSITIONAL (phase 5c deletes this): the process env, when nothing was supplied.
-
-    A compatibility shim, **not** a second resolution path. Phase 2c routes every
-    credential consumer onto :data:`MitosConfig.env`, and this branch is what lets
-    the callers that supply nothing — ~104 test sites that write ``os.environ``
-    *after* their config was built, plus the bare
-    ``GeminiEmbeddingProvider(cache_path)`` constructions — stay green through a
-    purely additive diff.
-
-    It cannot lie while it lives, because tier 1 of the resolution this shim backs
-    up **is** ``os.environ`` (see :func:`_resolve`): at every routed production
-    site the supplied value is a strict superset of what this would find, so the
-    branch is unreachable-in-effect there. That stops being true at 5c, which
-    deletes the entry-time dotenv load — ``os.environ`` then no longer holds the
-    workspace's keys, and a site that forgot to pass would silently resolve
-    nothing, or the launch directory's residue. Which is the exact defect this
-    vision exists to close.
-
-    Deliberately the tree's **only** remaining process-env read for a credential,
-    so 5c has one function to delete and one grep string
-    (``transitional_env_fallback``) for its checklist rather than a hunt. Its
-    liveness is pinned by inverted rows in ``tests/test_env_routing.py`` that 5c
-    must invert rather than notice.
-
-    Args:
-        supplied: What the caller resolved for its target — ``None`` iff nothing
-            was supplied. ``""`` is a supplied answer (an exported-empty variable)
-            and is returned unchanged, so it keeps masking the file tiers.
-        name: The variable to fall back to.
-
-    Returns:
-        ``supplied`` when it is not ``None``, else the process environment's value
-        or ``None``.
-    """
-    if supplied is not None:
-        return supplied
-    return os.environ.get(name)
 
 
 def resolve_values(

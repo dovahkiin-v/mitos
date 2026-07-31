@@ -14,12 +14,13 @@ target cannot pass by accident. 2b's four ``QDRANT_URL`` rows
 than duplicated — they prove the value arrives, these prove it arrives *from the
 target*.
 
-Two shims are pinned live here and both are 5c's to remove. Each such row says
-so in its docstring and names the assertion that replaces it: **invert them, do
-not delete them.** 5c's own I6/I7 suites do not cover this — they catch a call
-site that was never routed (a real key failing to arrive); these catch a
-surviving fallback (the shim outliving its window). Different failures, different
-nets.
+Group 5 was 2c's live pin on the transitional fallback and is now its inversion:
+5c deleted the shim and the entry-time dotenv load together, and each row there
+asserts the keyless posture where it used to assert the process environment
+answering. That group plus the AST sweep below are the shim's only net — 5c's own
+I6/I7 suites do not cover it, because behind a routed site the fallback never
+fires; what they catch is a call site that was never routed (a real key failing
+to arrive). Different failures, different nets.
 
 Like ``test_env_resolution.py``, this module writes ``os.environ`` in places —
 that is the point — so it carries the same module-autouse ``_keyless`` strip and
@@ -630,22 +631,28 @@ def test_an_exported_empty_key_is_reported_as_no_key(tmp_path, monkeypatch):
     assert cli._gemini_key_source(ws) is None
 
 
-def test_status_attributes_a_project_env_key_to_the_environment(
+def test_status_attributes_a_project_env_key_to_its_own_file(
     tmp_path, monkeypatch, capsys
 ):
-    """5c INVERTS THIS ROW — do not delete it.
+    """The inversion 2c wrote this row for: `project .env`, never `environment`.
 
     Driven through ``cli.main()`` on a workspace whose ``.env`` carries the key
-    with nothing exported. ``main()`` loads that ``.env`` into ``os.environ``
-    before anything resolves, so the env-first resolver truthfully answers
-    ``environment`` for a key whose durable home is the file — less specific than
-    the retired file-first implementation, never false, and bought in exchange
-    for there being only one layering implementation in the tree.
+    with nothing exported. Until 5c, ``main()`` poured that ``.env`` into
+    ``os.environ`` before anything resolved, so the env-first resolver answered
+    ``environment`` for a key whose durable home was the file — less specific,
+    never false, since ``main()`` genuinely had put it there. 5c deleted the
+    entry-time load, and with nothing promoting a file's key into tier 1 the
+    attribution names the file.
 
-    **5c deletes the entry-time dotenv load (`cli.py`'s two `load_dotenv_file`
-    calls in `main`); this row then asserts `(from project .env)`.** Invert the
-    expectation — the row is the only thing that will make that phase notice the
-    attribution moved.
+    That is 2c's stated cost paid off (ADR
+    ``key-source-attribution-reports-the-tier-that-won-not-the-durable-home``),
+    and it is also this module's cheapest net against the entry load coming
+    back: restore either ``load_dotenv_file`` call and this row reds.
+
+    Bound to the tier **constants**, never to literals: the three strings are the
+    join key between ``env.resolve_key`` and ``status``'s attribution line, so a
+    rename lands as one failing import rather than as a green test asserting a
+    dead string.
     """
     ws = _workspace(tmp_path, env_text="GEMINI_API_KEY=PROJKEY\n")
     monkeypatch.chdir(tmp_path)  # restores the cwd `main`'s -C chdir moves
@@ -659,59 +666,69 @@ def test_status_attributes_a_project_env_key_to_the_environment(
         cli.main()
 
     out = capsys.readouterr().out
-    assert f"GEMINI_API_KEY (from {TIER_ENVIRONMENT})" in out
-    assert f"GEMINI_API_KEY (from {TIER_PROJECT_ENV})" not in out
+    assert f"GEMINI_API_KEY (from {TIER_PROJECT_ENV})" in out
+    assert f"GEMINI_API_KEY (from {TIER_ENVIRONMENT})" not in out
 
 
 # =========================================================================== #
-# Group 5 — the transitional fallback, pinned live
+# Group 5 — the keyless posture, where the fallback used to answer
 # =========================================================================== #
 
-class TestTheTransitionalEnvFallback:
-    """`env.transitional_env_fallback` is a compatibility shim with a named death.
+class TestTheKeylessPostureWhereTheFallbackUsedToAnswer:
+    """The shim is gone (5c): a key the config did not resolve reaches nobody.
 
-    It cannot lie while it lives: tier 1 of the resolution it backs up **is**
-    ``os.environ``, so at every routed production site the supplied value is a
-    strict superset of what the shim would find. It stops being harmless at 5c,
-    which deletes the entry-time dotenv load — ``os.environ`` then no longer
-    holds the workspace's keys and a site that forgot to pass would silently
-    resolve nothing, or the launch directory's residue.
+    Until 5c, ``env.transitional_env_fallback`` answered from ``os.environ``
+    whenever a caller supplied nothing — a compatibility shim that let 2c's
+    routing diff be purely additive. It could not lie while it lived, because
+    tier 1 of the resolution it backed up **is** ``os.environ``. It stopped being
+    harmless the moment 5c deleted the entry-time dotenv load: nothing promotes a
+    workspace's keys into the process environment any more, so a site that forgot
+    to pass would silently resolve nothing — or the launch directory's residue,
+    which is the defect this whole vision exists to close.
 
-    Every row below is one 5c must **invert**, not delete. 5c's own I6/I7 suites
-    will not catch a surviving shim: behind a routed site the fallback never
-    fires, so they pass with it fully intact. What they detect is an *unrouted*
-    site. These four are the shim's only net.
+    Every row below is the *inversion* of a row 2c wrote as a live pin, and the
+    shape is deliberate: a real key sits in ``os.environ``, the config resolved
+    **nothing**, and the consumer must take its keyless branch anyway. 5c's own
+    I6/I7 suites cannot catch a surviving fallback — behind a routed site it
+    never fires, so they pass with it fully intact; what they detect is an
+    *unrouted* site. These rows plus the AST sweep below are what would notice
+    the shim growing back.
+
+    Five of the six key-consumption families the index names had a row of this
+    class at 2c. The sixth — importer extraction — did not, and is the last row
+    here, so the set is now complete rather than nearly so.
     """
 
-    def test_the_provider_without_an_api_key_reads_the_process_environment(
+    def test_the_provider_without_an_api_key_refuses_instead_of_reading_env(
         self, tmp_path, monkeypatch, genai_keys
     ):
-        """5c INVERTS: `pytest.raises(EmbeddingError)` with nothing supplied.
+        """2c's row inverted: `EmbeddingError`, with a real key in the environment.
 
-        The seven bare ``GeminiEmbeddingProvider(cache_path)`` constructions in
-        ``tests/`` are what this keeps green, and five of them are the live-tier
-        modules CI cannot see.
+        The seven bare ``GeminiEmbeddingProvider(cache_path)`` constructions the
+        shim kept green were migrated to an explicit ``api_key=`` in the same
+        commit — five of them in live-tier modules CI cannot see.
+
+        ``genai_keys`` is asserted **empty** rather than merely unused: the
+        refusal has to happen before a client is constructed, so an edit that
+        built the client first and validated after cannot pass this row.
         """
         monkeypatch.setenv("GEMINI_API_KEY", "from-the-process")
 
-        provider = embeddings.GeminiEmbeddingProvider(
-            str(tmp_path / "cache.sqlite")
-        )
+        with pytest.raises(EmbeddingError):
+            embeddings.GeminiEmbeddingProvider(str(tmp_path / "cache.sqlite"))
 
-        assert provider is not None
-        assert genai_keys == ["from-the-process"]
+        assert genai_keys == []
 
-    def test_sync_without_a_resolved_key_reads_the_process_environment(
+    def test_sync_without_a_resolved_key_refuses_instead_of_reading_env(
         self, tmp_path, monkeypatch, capsys
     ):
-        """5c INVERTS: the "not set" line prints even with the key in `os.environ`.
+        """2c's row inverted: the "not set" line prints WITH the key in `os.environ`.
 
         The dominant test shape in this tree is config-first, key-second: a
         fixture builds ``MitosConfig`` and each row then writes
         ``os.environ["GEMINI_API_KEY"]`` raw. ``config.env`` is captured at
-        construction, so ~104 sites across 19 files reach their routed consumer
-        through this branch. 5c must migrate that class in the same commit that
-        deletes the shim.
+        construction, so ~113 sites across 21 files used to reach their routed
+        consumer through the shim. This is that shape, and it now refuses.
         """
         config = MitosConfig(_workspace(tmp_path))
         cli.cmd_init(config)
@@ -729,37 +746,64 @@ class TestTheTransitionalEnvFallback:
 
         cli.cmd_sync(config, auto_accept=True)
 
-        assert "Sync requires API keys" not in capsys.readouterr().out
+        assert "Sync requires API keys" in capsys.readouterr().out
 
-    def test_the_check_judge_without_a_resolved_key_reads_the_process_environment(
+    def test_the_check_judge_without_a_resolved_key_refuses_instead_of_reading_env(
         self, tmp_path, monkeypatch, anthropic_keys
     ):
-        """5c INVERTS: `_build_check_judge(config)` returns `None`."""
+        """2c's row inverted: `_build_check_judge(config)` returns `None`."""
         config = MitosConfig(_workspace(tmp_path))
         assert "ANTHROPIC_API_KEY" not in config.env
         monkeypatch.setenv("ANTHROPIC_API_KEY", "from-the-process")
 
-        assert cli._build_check_judge(config) is not None
-        assert anthropic_keys == ["from-the-process"]
+        assert cli._build_check_judge(config) is None
+        assert anthropic_keys == []
 
-    def test_capture_without_a_resolved_key_reads_the_process_environment(
+    def test_capture_without_a_resolved_key_refuses_instead_of_reading_env(
         self, tmp_path, monkeypatch, capsys
     ):
-        """5c INVERTS: the "not set" line prints even with the key in `os.environ`."""
+        """2c's row inverted: the "not set" line prints WITH the key in `os.environ`."""
         config = MitosConfig(_workspace(tmp_path))
         assert "GEMINI_API_KEY" not in config.env
         monkeypatch.setenv("GEMINI_API_KEY", "from-the-process")
 
         cli.cmd_capture(config, "We will use python.")
 
-        assert "Capture requires it" not in capsys.readouterr().out
+        assert "Capture requires it" in capsys.readouterr().out
 
+    def test_the_importer_without_a_resolved_key_refuses_instead_of_reading_env(
+        self, tmp_path, monkeypatch, anthropic_keys, capsys
+    ):
+        """The sixth family, which had no row of this class before 5c.
+
+        ``import_from_file`` reads ``ANTHROPIC_API_KEY`` unconditionally and gates
+        it under ``use_llm_extract``, so the LLM-extract form is the one that can
+        observe an unrouted key. ``anthropic_keys`` empty is the sharp half: the
+        SDK client is constructed one line below the gate, so a key arriving from
+        anywhere other than ``config.env`` would show up there.
+        """
+        from mitos.importer import MitosProseImporter
+
+        config = MitosConfig(_workspace(tmp_path))
+        source = _write(tmp_path / "legacy.md",
+                        "## A legacy ADR\n\nWe chose python.\n")
+        assert "ANTHROPIC_API_KEY" not in config.env
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "from-the-process")
+        capsys.readouterr()
+
+        MitosProseImporter(config).import_from_file(source, use_llm_extract=True)
+
+        assert "Import --llm-extract requires it" in capsys.readouterr().out
+        assert anthropic_keys == []
 
 # --- the structural net ----------------------------------------------------
 
-# Every `os.environ` READ that survives this phase, as `(module, function)`.
-# Keyed on the enclosing function rather than a line number: the set is exact
-# either way, and this spelling does not churn when a file above it moves.
+# EVERY `os.environ` read in `mitos/`, as `(module, function)`. Six keys, seven
+# reads, and after 5c there is no second dict beside this one: the transitional
+# shim's single read is gone, and so is `cli.load_dotenv_file`'s pair — which
+# were also the tree's only `os.environ` WRITE. Keyed on the enclosing function
+# rather than a line number: the set is exact either way, and this spelling does
+# not churn when a file above it moves.
 PERMANENT_ENV_READS = {
     ("env.py", "_resolve"): 2,          # the resolver's own tier 1 — the legitimate one
     ("config.py", "_hint_cache_path"): 1,   # XDG_CACHE_HOME — genuinely process-scoped
@@ -767,11 +811,7 @@ PERMANENT_ENV_READS = {
     ("_update.py", "_cache_path"): 1,       # XDG
     ("_update.py", "update_notice"): 1,     # MITOS_NO_UPDATE_CHECK quiet-switch
     ("cli.py", "_mcp_hint"): 1,             # MITOS_NO_MCP_HINT quiet-switch
-    ("cli.py", "load_dotenv_file"): 2,      # the guard + the write — 5c deletes both
 }
-
-# The shim's own read. One site, one function, one grep string.
-TRANSITIONAL_ENV_READS = {("env.py", "transitional_env_fallback"): 1}
 
 
 def _environ_reads(path: str) -> List[str]:
@@ -830,12 +870,18 @@ def _environ_reads(path: str) -> List[str]:
 def test_the_process_environment_is_read_only_at_the_declared_sites():
     """The exact set of `os.environ` reads in `mitos/` — the checklist, not a comment.
 
-    Two declared sets rather than one, because they die on different days.
-    ``PERMANENT_ENV_READS`` is XDG resolution, two quiet-switches, the resolver's
-    own tier 1, and ``load_dotenv_file``'s pair (5c's). ``TRANSITIONAL_ENV_READS``
-    is the shim, and it is deliberately a **single** site so 5c deletes one
-    function rather than hunting: ``grep -rn transitional_env_fallback`` is the
-    whole checklist.
+    **One** declared set since 5c. It was two, because they died on different
+    days: ``PERMANENT_ENV_READS`` (XDG resolution, two quiet-switches, the
+    resolver's own tier 1 — and, until 5c, ``load_dotenv_file``'s guard-plus-
+    write pair) beside ``TRANSITIONAL_ENV_READS``, the compatibility shim's one
+    site. Both of 5c's members were deleted outright and the second dict went
+    with its only member — an empty dict left behind is a hook for the next
+    shim.
+
+    Six keys, seven reads. The count is pinned independently outside this file:
+    the ADR recorded at 2b says *"nine permanent … and exactly one transitional …
+    5c shrinks the first to seven and the second to zero"* — reads, not keys. Two
+    sources agreeing is the check; any other number means one of them is wrong.
 
     This is the row that catches a bare read growing back — including the
     asymmetric case the behavioural rows cannot see: route every credential but
@@ -847,7 +893,94 @@ def test_the_process_environment_is_read_only_at_the_declared_sites():
         for func in _environ_reads(path):
             counted[(module, func)] = counted.get((module, func), 0) + 1
 
-    assert counted == {**PERMANENT_ENV_READS, **TRANSITIONAL_ENV_READS}
+    assert counted == PERMANENT_ENV_READS
+    assert sum(counted.values()) == 7
+
+
+def test_the_process_environment_is_written_nowhere_in_mitos():
+    """The other half, and the one 5c makes absolute: `mitos` mutates no environment.
+
+    The read set above tolerates six legitimate consultations. There is no
+    legitimate **write**: a program that writes its own environment cannot answer
+    the same question twice about two different projects, which is the property
+    this vision exists to establish. Until 5c the tree had exactly one writer,
+    ``cli.load_dotenv_file``'s two statements; it was deleted rather than merely
+    unhooked, so the claim is structural rather than policed.
+
+    Swept over the parsed code for every mutating shape — a subscript **store**
+    (plain and augmented), a rebind of the attribute itself, a ``del``, and the
+    four mutating dict methods — because the read sweep above counts an
+    ``os.environ[name]`` subscript without caring which side of an assignment it
+    sits on, so it would pass a write as a read.
+    """
+    class WriteVisitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.hits: List[str] = []
+
+        @staticmethod
+        def _is_environ_sub(node: ast.AST) -> bool:
+            return (isinstance(node, ast.Subscript)
+                    and isinstance(node.value, ast.Attribute)
+                    and node.value.attr == "environ")
+
+        @staticmethod
+        def _is_environ_itself(node: ast.AST) -> bool:
+            # `os.environ = {...}` — a rebind rather than a mutation, and it would
+            # be invisible to a subscript-only sweep while doing strictly more.
+            return isinstance(node, ast.Attribute) and node.attr == "environ"
+
+        def _targets(self, node, targets) -> None:
+            for t in targets:
+                if self._is_environ_sub(t) or self._is_environ_itself(t):
+                    self.hits.append(ast.dump(t))
+            self.generic_visit(node)
+
+        def visit_Assign(self, node: ast.Assign) -> None:
+            self._targets(node, node.targets)
+
+        def visit_AugAssign(self, node: ast.AugAssign) -> None:
+            self._targets(node, [node.target])
+
+        def visit_Delete(self, node: ast.Delete) -> None:
+            self._targets(node, node.targets)
+
+        def visit_Call(self, node: ast.Call) -> None:
+            func = node.func
+            if (isinstance(func, ast.Attribute)
+                    and func.attr in ("setdefault", "pop", "update", "clear")
+                    and isinstance(func.value, ast.Attribute)
+                    and func.value.attr == "environ"):
+                self.hits.append(func.attr)
+            self.generic_visit(node)
+
+    offenders: Dict[str, List[str]] = {}
+    for path in sorted(glob.glob(os.path.join(os.path.dirname(models.__file__), "*.py"))):
+        v = WriteVisitor()
+        v.visit(ast.parse(open(path, encoding="utf-8").read()))
+        if v.hits:
+            offenders[os.path.basename(path)] = v.hits
+
+    assert offenders == {}
+
+
+def test_the_entry_dotenv_loader_does_not_exist():
+    """A name-absence claim, not a call-site grep — D1's structural form.
+
+    The index asks for *"no entry path calls ``load_dotenv_file``"*. Asserting
+    that as a call-site sweep leaves a live, tested, importable ``os.environ``
+    writer one line away from any future verb, and invites someone to satisfy the
+    claim by adding a "just for ``init``" call somewhere the sweep does not look.
+    So the function was deleted, and this asserts the *symbol* is gone: there is
+    no writer to call.
+
+    Named ``mitos.cli`` explicitly rather than swept, because the failure message
+    should say which symbol came back.
+    """
+    import mitos.cli
+    import mitos.env
+
+    assert not hasattr(mitos.cli, "load_dotenv_file")
+    assert not hasattr(mitos.env, "transitional_env_fallback")
 
 
 # Every model-registry call in `mitos/` that resolves WITHOUT a map, as

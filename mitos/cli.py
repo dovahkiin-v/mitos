@@ -55,7 +55,7 @@ from mitos.errors import (
     TARGET_RELATIVE_PATH, TARGET_UNKNOWN_NAME,
 )
 from mitos.divergence import corpus_graph_divergence, divergence_total
-from mitos.env import parse_env_file, resolve_key, transitional_env_fallback
+from mitos.env import resolve_key
 from mitos.vector_store import scroll_point_ids, hash_to_uuid, QdrantVectorStore
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.telemetry import TelemetryStore, ConflictCheckRow, JudgmentBatch
@@ -755,9 +755,9 @@ def cmd_reconcile(config: MitosConfig, as_json: bool = False) -> int:
         Process exit code (0 on success, 1 if Qdrant/embedding provider is down).
     """
     manager = MitosSyncManager(config)
-    # Ahead of the call, not ahead of the report: `reconcile_embeddings` prints its
-    # own provider-down line to stdout before returning, so an echo placed beside
-    # the report below would not be the leading line the reader sees.
+    # Ahead of the call, not ahead of the report: `reconcile_embeddings` writes its
+    # own provider-down line (to stderr, since 5c) before returning, so an echo
+    # placed beside the report below would not be the leading line the reader sees.
     if not as_json:
         _echo_corpus(config)
     try:
@@ -790,9 +790,7 @@ def cmd_capture(config: MitosConfig, text: str) -> None:
     echo covers the whole verb.
     """
     _echo_corpus(config)
-    api_key = transitional_env_fallback(
-        config.env.get("GEMINI_API_KEY"), "GEMINI_API_KEY"
-    )
+    api_key = config.env.get("GEMINI_API_KEY")
     if not api_key:
         print("GEMINI_API_KEY environment variable is not set. Capture requires it.")
         return
@@ -1971,15 +1969,15 @@ def _gemini_key_source(workspace_dir: str) -> Optional[str]:
     :func:`~mitos.env.resolve_key` the resolution path itself uses, so the tier
     the status line names is the tier that actually won. The retired
     implementation scanned the two files with a second hand-rolled parse before
-    consulting the environment — deliberately, because ``main()`` pours both
-    files into ``os.environ`` and file-first was the only way to keep the
-    distinction visible.
+    consulting the environment — deliberately, because ``main()`` used to pour
+    both files into ``os.environ``, and file-first was the only way to keep the
+    distinction visible through that.
 
-    The cost of dropping that inversion is stated rather than discovered: while
-    the entry-time dotenv load survives (5c deletes it), a real CLI run reports
-    ``"environment"`` for a key whose durable home is a file — less specific,
-    never false, since ``main()`` genuinely did put it there. In exchange there
-    is no second layering implementation to drift.
+    That inversion is no longer needed, and the coarseness it was compensating
+    for is gone with it: since 5c deleted the entry-time dotenv load, nothing
+    promotes a file's key into the process environment, so a key living in a
+    ``.env`` now reports the file it lives in. ``"environment"`` means someone
+    exported it.
 
     The answer is keyed on the **value**, not on the tier: an exported-empty
     variable resolves to ``ResolvedValue("", "environment")``, and reporting a
@@ -2060,6 +2058,23 @@ def _upsert_env_var(env_path: str, name: str, value: str) -> None:
     appends one. Creates the file (and parent dirs) if absent, and tightens the
     file to ``0600`` since it holds secrets.
 
+    **The tree's one hand-rolled** ``.env`` **write, and it matches the way
+    ``env.parse_env_file`` reads** — split on the first ``=``, strip, compare. A
+    ``startswith(f"{name}=")`` test (what this did until 5c) cannot see a
+    hand-spaced ``GEMINI_API_KEY = x``, so ``set-key`` appended a *second*
+    assignment and left a file whose writer and reader disagreed about which line
+    was the key. Two deliberate agreements with the reader: a line carrying no
+    ``=`` is not an assignment and is left alone (the reader skips it too, so no
+    duplicate is created from its point of view), and a commented-out line does
+    not match (its key parses as ``#NAME``). One deliberate asymmetry: the reader
+    ignores an *empty* assignment while this replaces it — that is the scaffolded
+    ``GEMINI_API_KEY=`` slot, and after the write it is non-empty anyway.
+
+    Every matching line is rewritten, not only the first. The reader is
+    first-non-empty-wins, so a file carrying the key twice would otherwise keep a
+    stale second copy that a later hand-edit could promote; rewriting all matches
+    makes them the same string and the two orders agree.
+
     Args:
         env_path: Path to the ``.env`` file to write.
         name: The variable name (e.g. ``GEMINI_API_KEY``).
@@ -2071,7 +2086,7 @@ def _upsert_env_var(env_path: str, name: str, value: str) -> None:
     if os.path.exists(env_path):
         with open(env_path, "r", encoding="utf-8") as f:
             for line in f:
-                if line.strip().startswith(f"{name}="):
+                if "=" in line and line.split("=", 1)[0].strip() == name:
                     lines.append(f"{name}={value}\n")
                     found = True
                 else:
@@ -3625,37 +3640,6 @@ def cmd_rebuild(
     return 0
 
 
-def load_dotenv_file(path: str = ".env") -> None:
-    """Loads ``KEY=value`` pairs from a ``.env`` file into the environment.
-
-    Since phase 2c every credential (``GEMINI_API_KEY``, ``ANTHROPIC_API_KEY``)
-    and ``QDRANT_URL`` reaches its consumer through the *functional* resolver,
-    computed for the workspace the call named — so this entry-time promotion no
-    longer answers anything. It survives only because the resolver's tier 1 is
-    ``os.environ`` and a handful of callers still supply nothing (the
-    ``transitional_env_fallback`` shim), and phase 5c deletes both together. An
-    empty value is skipped, and an existing environment value is never
-    overridden (an explicit ``export`` wins over the file) — including an
-    existing **empty** one, which is what makes ``env GEMINI_API_KEY= mitos …``
-    a keyless run on a key-bearing box.
-
-    The parse itself lives in ``mitos.env`` (stdlib only, no new dependency —
-    P19), shared with the resolver that reads the same two files without
-    touching ``os.environ``. Two hand-rolled parses of one file that must agree
-    is a drift worth not creating: while both mechanisms are live, the resolver's
-    tiers 2–3 read exactly what this writes into tier 1, which is why the window
-    cannot produce a wrong answer — only a coarse one (see
-    :func:`_gemini_key_source`).
-
-    Args:
-        path: Path to the ``.env`` file (default: ``.env`` in the cwd, i.e. the
-            workspace root where ``mitos`` is invoked).
-    """
-    for key, val in parse_env_file(path).items():
-        if key not in os.environ:
-            os.environ[key] = val
-
-
 # =========================================================================== #
 # Phase 3a — `mitos check`: the read-only corpus conflict audit / CI gate.
 #
@@ -3806,9 +3790,7 @@ def _build_check_judge(config: MitosConfig) -> Optional[Callable]:
         The bound one-arg ``judge`` callable, or ``None`` when ``ANTHROPIC_API_KEY``
         is absent.
     """
-    api_key = transitional_env_fallback(
-        config.env.get("ANTHROPIC_API_KEY"), "ANTHROPIC_API_KEY"
-    )
+    api_key = config.env.get("ANTHROPIC_API_KEY")
     if not api_key:
         return None
     import anthropic
@@ -5580,18 +5562,20 @@ def main() -> None:
         # the MCP hint) is already wrapped in its own `except Exception: pass`, so an
         # unbound `config` after a construction failure stays silent.
         #
-        # -C/--directory runs FIRST (before the project .env load + config) so the
-        # whole workspace retargets together: chdir into the target, THEN load the
-        # CWD-relative project .env, THEN the fixed-path global .env (CWD-independent
-        # — it stays global). An absent -C target raises MitosError here and renders
-        # through the `except MitosError` boundary as a clean one-line error. The
-        # project .env load also sits inside the try now (strictly safer — a .env
-        # read failure is caught, not a bare traceback). Precedence is unchanged:
-        # load_dotenv_file never overwrites an already-set key, so env > project >
-        # global still holds.
+        # -C/--directory runs FIRST (before the selector and the config) so the
+        # whole workspace retargets together: chdir into the target, and every
+        # relative path arg, the cwd hint and an argless convenience default all
+        # read the post-chdir location. An absent -C target raises MitosError here
+        # and renders through the `except MitosError` boundary as a clean one-line
+        # error.
+        #
+        # No `.env` is loaded here, and that absence is the paradigm (phase 5c):
+        # keys are never promoted into `os.environ`, they are resolved per call by
+        # `env.resolve_values` for the workspace the call named, and hung on
+        # `MitosConfig.env` (config.py). Precedence is unchanged — real env >
+        # project `.env` > global `.env` — but it is now computed for the *target*
+        # rather than baked in from the *launch* directory.
         _enter_target_directory(args.directory)
-        load_dotenv_file()
-        load_dotenv_file(global_env_path())
         # The project selector, resolved ONCE, here. Order is contract: the -C
         # chdir above runs first (so a relative selector and the cwd hint both read
         # the post-chdir location), the exempt check runs before resolution (so a

@@ -33,7 +33,9 @@ close alone, because they only exist at the whole-substrate level):
    assertion keys on **graph state**, never on the ``embedding`` field.
 2. **``perform_sync`` ingestion** (DoD #4, the one gate that exercises the 4a/4b
    ``questions.md`` ingestion + fixpoint): ``perform_sync`` early-returns without
-   ``GEMINI_API_KEY`` (4a), so the gate sets a *mock* key + patches
+   ``GEMINI_API_KEY`` (4a), so the gate sets a *mock* key on the config's own
+   resolved ``env`` map — never ``os.environ``, which since 5c reaches no
+   consumer and which the fixture's config was built before anyway — + patches
    ``google.genai.Client`` (the ``tests/test_sync.py`` idiom), forces the manager
    into graph-only mode (no embedding/Qdrant network — the P14 degraded fallback),
    and patches ``run_sync_enrichment`` to an **identity passthrough** so each
@@ -206,7 +208,7 @@ def _edge_triples(store: GraphStore) -> set:
 @patch("mitos.sync.run_sync_enrichment", side_effect=_identity_enrichment)
 @patch("google.genai.Client")
 def test_dod4_dogfood_corpus_syncs_in_one_pass(
-    _mock_client, _mock_enrich, sync_ws, monkeypatch
+    _mock_client, _mock_enrich, sync_ws
 ) -> None:
     """A dogfood corpus syncs cleanly in ONE ``perform_sync`` — every edge family lands.
 
@@ -227,7 +229,11 @@ def test_dod4_dogfood_corpus_syncs_in_one_pass(
     ``resolved``, the parked ones ``parked``).
     """
     config, manager = sync_ws
-    monkeypatch.setenv("GEMINI_API_KEY", "mock_key")  # clear the 4a sync key gate
+    # On the CARRIER, not `os.environ`: `config.env` is captured when the fixture
+    # builds the config, so a key exported afterwards is a key this run never had.
+    # Since 5c there is no process-env fallback behind it (the fixture already
+    # mutates the config post-construction, so this is its own idiom).
+    config.env["GEMINI_API_KEY"] = "mock_key"  # clear the 4a sync key gate
 
     # Entries newest-first in the file; parse_file_reversed commits oldest-first, so
     # host-d (bottom) lands before its same-file referrers. The cross-file
@@ -308,7 +314,7 @@ def test_dod4_dogfood_corpus_syncs_in_one_pass(
 @patch("mitos.sync.run_sync_enrichment", side_effect=_identity_enrichment)
 @patch("google.genai.Client")
 def test_dod4_malformed_oq_quarantines_loudly_batch_proceeds(
-    _mock_client, _mock_enrich, sync_ws, monkeypatch, capsys
+    _mock_client, _mock_enrich, sync_ws, capsys
 ) -> None:
     """OD1 branch (b): a bad OQ quarantines as a LOUD vector while the batch commits.
 
@@ -319,7 +325,7 @@ def test_dod4_malformed_oq_quarantines_loudly_batch_proceeds(
     dead-letter / P7) isolating the one poison record, never amputating the batch.
     """
     config, manager = sync_ws
-    monkeypatch.setenv("GEMINI_API_KEY", "mock_key")
+    config.env["GEMINI_API_KEY"] = "mock_key"  # on the carrier — see the row above
 
     _write(
         config.decisions_file,

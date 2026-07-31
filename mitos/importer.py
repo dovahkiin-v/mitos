@@ -17,7 +17,6 @@ from mitos.errors import CollectionMissingError, SynthesisError, ValidationError
 from mitos.models import get_embedding_model_id, get_model_id
 from mitos.parser import ParsedEntry, parse_header
 from mitos.store import GraphStore, CommitDelta, _utc_now_iso
-from mitos.env import transitional_env_fallback
 from mitos.identity import compute_node_id, embedding_text
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.vector_store import QdrantVectorStore
@@ -164,9 +163,7 @@ class MitosProseImporter:
             print("No headings starting with ## or ### found in the import file.")
             return
 
-        api_key = transitional_env_fallback(
-            self.config.env.get("ANTHROPIC_API_KEY"), "ANTHROPIC_API_KEY"
-        )
+        api_key = self.config.env.get("ANTHROPIC_API_KEY")
         if use_llm_extract and not api_key:
             print("ANTHROPIC_API_KEY environment variable is not set. Import --llm-extract requires it.")
             return
