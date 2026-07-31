@@ -333,10 +333,21 @@ def resolve_project(selector: Optional[str]) -> ResolvedProject:
     structural half of "no call resolves its workspace from the process's working
     directory": the function cannot express a cwd fallback. It is ``Optional``-
     typed so an *absent* selector goes through the same single raise site as every
-    other failure — both boundaries call ``resolve_project(args.project)``
-    unconditionally and cannot invent a fifth wording between them. An empty
-    string is the missing class too, not an unknown project named ``''``: it
-    carries no target.
+    other failure, rather than letting either boundary invent a fifth wording. An
+    empty string is the missing class too, not an unknown project named ``''``: it
+    carries no target — and both boundaries gate on ``is not None``, never on
+    truthiness, so ``-p ""`` / ``project=""`` reach that raise site rather than
+    falling back.
+
+    **Mid-vision, the absent case does not reach here at all.** Each boundary
+    coalesces its own spelling first — ``cli._selector_from_args`` over
+    ``project_pre``/``project_post`` plus the ``status``/``agent-block``
+    positional, ``mcp_server._target_config`` over the tool's ``project``
+    argument — and a *selector-less* call still keeps today's working-directory
+    behaviour instead of calling this function, which is why the ``Optional``
+    branch is currently reachable only through an empty string. Phases 5a and 5b
+    remove those fallbacks and route the absent case here too; until then the
+    branch is built, tested, and deliberately not yet the only path.
 
     The registry read is **not** optional and its faults propagate unwrapped —
     including on the path form, which needs routing for nothing but the echo name.

@@ -35,6 +35,7 @@ import pytest
 from mitos import registry, routing
 from mitos.errors import RegistryError
 from mitos.cli import (
+    _EXEMPT_VERB_NOTES,
     _POSITIONAL_SELECTOR_VERBS,
     _SELECTOR_EXEMPT_VERBS,
     _WORKSPACE_OPTIONAL_VERBS,
@@ -423,6 +424,28 @@ def test_status_is_not_an_exempt_verb() -> None:
     """`status <project>` is a supported targeting form, so `-p X status` is its twin."""
     assert "status" not in _SELECTOR_EXEMPT_VERBS
     assert set(_SELECTOR_EXEMPT_VERBS) == {"init", "serve", "projects"}
+
+
+def test_every_exempt_verb_owns_its_own_recovery_sentence() -> None:
+    """The two exempt maps are hand-written, and only one of them is fenced.
+
+    ``_SELECTOR_EXEMPT_VERBS`` (verb → reason) is what the boundary raises on;
+    ``_EXEMPT_VERB_NOTES`` (verb → this surface's wording) is what the renderer
+    prints, and its lookup carries a ``.get`` fallback. So a verb added to the
+    first without the second does not fail — it silently renders the generic
+    *"it targets no single workspace"* line, which is honest and useless: the
+    whole point of the class is that each exempt verb is meaningless in a
+    *different* way. The class of defect is this vision's recurring one — a
+    hand-written set proves only what someone remembered to put in it — so the
+    two maps are compared rather than each asserted alone.
+
+    ``set-key`` is in the notes and not in the reason map on purpose: its
+    membership is conditional (only ``--global`` makes it global), decided at the
+    boundary rather than by a table.
+    """
+    assert set(_EXEMPT_VERB_NOTES) == set(_SELECTOR_EXEMPT_VERBS) | {"set-key"}
+    for verb, note in _EXEMPT_VERB_NOTES.items():
+        assert f"`{verb}" in note, f"{verb}'s note must name the verb it refuses"
 
 
 @pytest.mark.parametrize("verb", ["init", "serve", "projects"])
