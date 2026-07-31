@@ -200,6 +200,18 @@ def test_non_editable_install_real_read_path(built_wheel, tmp_path):
         f"missing from the wheel:\n{env_import.stderr}"
     )
 
+    # And the overview leaf, same trap. A flat module is on the right side of it, so
+    # this is cheap insurance rather than a known gap — but it is the module the
+    # zero-arg `mitos status` will route to, i.e. the first thing a human runs when
+    # something feels wrong, on a machine where nothing else has told them yet.
+    overview_import = subprocess.run([str(venv_python), "-c", "import mitos.overview"],
+                                     env=_mitos_env(tmp_path), capture_output=True,
+                                     text=True, timeout=60)
+    assert overview_import.returncode == 0, (
+        f"`import mitos.overview` failed in the installed venv — the module is "
+        f"missing from the wheel:\n{overview_import.stderr}"
+    )
+
     # `mitos init` reads the spec from the installed package dir and scaffolds a workspace.
     workspace = tmp_path / "proj"
     workspace.mkdir()

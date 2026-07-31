@@ -298,6 +298,31 @@ class CollectionMissingError(VectorStoreError):
         self.collection = collection
 
 
+class VectorStoreUnreachableError(VectorStoreError):
+    """Qdrant did not answer at all — the transport failed before any status code.
+
+    :class:`CollectionMissingError`'s sibling from the other direction, and the
+    reason it lives here beside it rather than in the module that raises it: that
+    class is documented as *"the typed distinction between missing and
+    unreachable"*, and the unreachable half was, until now, indistinguishable from
+    every other fault. A refused connection, a DNS failure and a socket timeout say
+    **nothing about the service's state**; a 500, an auth wall or a malformed body
+    say the service is up and answering something unusable. Both raise
+    ``VectorStoreError`` today, so a caller that must report the two apart — the
+    ``mitos status`` overview's per-instance tri-state — could otherwise only sniff
+    the message text.
+
+    A :class:`VectorStoreError` **subclass**, on the same reasoning as its sibling:
+    every shipped ``except VectorStoreError`` net keeps catching it unchanged, and a
+    consumer opts into the narrower catch deliberately.
+
+    Raised today only by :func:`mitos.vector_store.list_collection_names`.
+    ``scroll_point_ids``' identical transport arm is deliberately left alone — its
+    consumers collapse the two states and narrowing that error's class is a change
+    to a shipped read path, not this one's work.
+    """
+
+
 class EmbeddingError(MitosError):
     """Raised when embedding provider API calls fail."""
     pass

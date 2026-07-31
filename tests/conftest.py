@@ -152,6 +152,7 @@ LIVE_MODULES: tuple[str, ...] = (
     "test_pathologies_live.py",
     "test_scenarios_live.py",
     "test_collection_absence_live.py",
+    "test_status_overview_live.py",
 )
 
 

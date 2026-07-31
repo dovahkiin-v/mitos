@@ -20,6 +20,7 @@ from google import genai
 
 from mitos import __version__
 from mitos import check
+from mitos import overview
 from mitos import registry
 from mitos import routing
 from mitos.display import (
@@ -2118,6 +2119,200 @@ def _graph_behind_buffer(db_path: str) -> bool:
         conn.close()
 
 
+#: The state column's mark. ``✓`` healthy, ``✗`` a finding, ``—`` **unknown** —
+#: `status`'s own vocabulary, and the third mark is the load-bearing one: an
+#: unresponsive entry is not a missing one, so it must not be rendered as a finding.
+_OVERVIEW_MARKS = {
+    overview.STATE_OK: "✓",
+    overview.STATE_MISSING: "✗",
+    overview.STATE_NOT_A_WORKSPACE: "✗",
+    overview.STATE_ERROR: "✗",
+    overview.STATE_UNRESPONSIVE: "—",
+}
+
+
+def _overview_notes(project: Dict[str, Any], payload: Dict[str, Any]) -> List[str]:
+    """Words one project's findings — the sentences the leaf deliberately does not carry.
+
+    Order is by what the reader most needs: where they are standing, then why the
+    row is not ``ok``, then the vector cross-reference, then the registry finding.
+    A fully healthy project on a healthy instance produces **no** lines at all, so a
+    calm machine reads as a calm table (P9).
+
+    Args:
+        project: One entry of the payload's ``projects`` list.
+        payload: The whole payload — read only for ``cwd_project`` and for the
+            document order that decides a shared path's resolving name.
+
+    Returns:
+        Zero or more note lines, already indented.
+    """
+    notes: List[str] = []
+    name = project["name"]
+    if payload["cwd_project"] == name:
+        # The overview closes its own discovery loop: a human standing in their
+        # project who expected a project report learns the form at a glance.
+        notes.append(
+            f"→ you are here — `mitos status {name}` for this project's full report")
+
+    state = project["state"]
+    if state == overview.STATE_MISSING:
+        notes.append(
+            f"nothing at {project['path']} — the project moved or was deleted; "
+            f"re-run `mitos init` there, or edit {payload['registry_path']}")
+    elif state == overview.STATE_NOT_A_WORKSPACE:
+        notes.append(
+            f"{project['path']} exists but holds no Mitos workspace (.mitos/config.toml "
+            f"+ decisions.md) — run `mitos init` there, or edit "
+            f"{payload['registry_path']}")
+    elif state == overview.STATE_UNRESPONSIVE:
+        notes.append(
+            f"the check did not answer within {overview.LOCAL_PROBE_BUDGET:g}s — an "
+            f"unresponsive mount, not a missing project; nothing was concluded about it")
+    elif state == overview.STATE_ERROR:
+        notes.append(f"the check failed: {project['error']}")
+
+    if project["collection"] is not None:
+        if project["collection_present"] is False:
+            # A pointer plus the named heal, never a diagnosis: the overview reads no
+            # graph, so it cannot price what re-embedding would cost (that belongs to
+            # the deep report and to `reconcile` itself). Presence would not imply
+            # population anyway.
+            notes.append(
+                f"⚠ no vector collection {project['collection']} on "
+                f"{project['qdrant_url']} — run `mitos reconcile` in that project")
+        elif project["collection_present"] is None:
+            notes.append(
+                f"vector collection unknown — {project['qdrant_url']} did not answer "
+                f"with a usable listing (see below)")
+
+    if project["shares_path_with"]:
+        # A finding, never a fault — both names reach the same workspace, so nothing
+        # can be corrupted. The actionable half is which one decides: a reverse
+        # lookup answers with the first in document order, which is the first of them
+        # in the listing above.
+        others = ", ".join(project["shares_path_with"])
+        deciding = next(
+            other["name"] for other in payload["projects"]
+            if other["path"] == project["path"])
+        notes.append(
+            f"also registered as {others} — every echo names {deciding} for this "
+            f"workspace (first in registry order wins)")
+    return [f"   {note}" for note in notes]
+
+
+def _render_overview(payload: Dict[str, Any]) -> None:
+    """Prints the global overview as a text table.
+
+    The wording half of the sweep — every user-facing sentence lives here, following
+    ``_render_targeting_error``'s precedent, while ``mitos/overview.py`` carries only
+    typed data.
+
+    **It flushes, and that is load-bearing.** ``main()``'s ``except MitosError``
+    boundary writes unbuffered stderr while a piped stdout is not, so without the
+    flush an error raised after this table can land *above* the output it annotates,
+    with the whole suite green (``capsys`` keeps the streams apart and cannot see the
+    inversion).
+
+    Args:
+        payload: ``overview.build_overview``'s payload.
+
+    Returns:
+        None.
+    """
+    projects = payload["projects"]
+    if not projects:
+        # Empty/fresh is first-class: a machine with nothing registered yet is
+        # healthy, and an absent registry file is the same healthy state.
+        print(f"No projects registered yet — `mitos init` introduces one "
+              f"({payload['registry_path']}).")
+        sys.stdout.flush()
+        return
+
+    # File order throughout, never sorted — the order a reverse lookup resolves its
+    # first match in, matching `mitos projects`.
+    name_w = max(len("project"), max(len(p["name"]) for p in projects))
+    state_w = max(len("state"), max(len(p["state"]) for p in projects) + 2)
+    print(f"\nMITOS PROJECTS ({payload['count']} registered, in registry order)")
+    print(f"Registry: {payload['registry_path']}")
+    print("-" * (name_w + state_w + 20))
+    print(f"{'project':{name_w}}   {'state':{state_w}}   workspace")
+    for project in projects:
+        # `.get` rather than `[...]` on purpose, and safe only because the table is
+        # fenced against the leaf's vocabulary by a key-set row: a renderer fallback
+        # over an unfenced map is this vision's most-repeated defect shape, and a
+        # KeyError here would take the whole table down over one unknown state, which
+        # is the opposite of what every other line in this phase is for.
+        mark = _OVERVIEW_MARKS.get(project["state"], "—")
+        state = f"{mark} {project['state']}"
+        print(f"{project['name']:{name_w}}   {state:{state_w}}   {project['path']}")
+        for note in _overview_notes(project, payload):
+            print(note)
+
+    instances = payload["instances"]
+    if instances:
+        print("\nQdrant:")
+        for instance in instances:
+            if instance["listing_available"]:
+                detail = f"up · {instance['collection_count']} collection(s)"
+            elif instance["reachable"]:
+                detail = ("up, but its collection listing is unavailable · vector "
+                          "checks unknown")
+            else:
+                detail = "no answer · vector checks unknown"
+            print(f"  {instance['url']}   {detail}")
+            if instance["error"]:
+                print(f"     {instance['error']}")
+    print()
+    sys.stdout.flush()
+
+
+def cmd_status_overview(as_json: bool = False) -> int:
+    """Reports what this machine has: every registered project and its health.
+
+    The **global** half of ``status`` — explicitly global, so no silent cwd
+    resolution exists to mis-aim it. Nothing routes here yet; the zero-arg dispatch
+    flip is a later phase's, which keeps that phase a routing change rather than a
+    routing-change-plus-a-new-report.
+
+    **The exit contract, stated where the report is built.** It returns **0 whenever
+    it can render, and non-zero only when it cannot**. An empty registry is the
+    healthy fresh state, a stale entry is flagged-not-fatal, and an unreachable
+    Qdrant is a timed-out cell — none of the three is an error. Only a registry that
+    cannot be parsed fails, through the calm ``RegistryError`` the boundary renders.
+    The readiness *gate* keeps its shipped ``0``/``1`` mapping and stays with the
+    per-project report, where a readiness verdict still means something: ``ready`` is
+    undefined for a report about N projects.
+
+    Args:
+        as_json: Emit the machine-readable payload instead of the text table.
+
+    Returns:
+        ``0``.
+
+    Raises:
+        RegistryError: If the registry file exists and is unusable.
+    """
+    # The vision's ONE display-only cwd read, and it lives here rather than in the
+    # leaf so the sweep structurally has no cwd branch. Guarded on `_render_targeting_error`'s
+    # precedent (a deleted working directory raises `OSError`): losing an optional
+    # marker is the right degradation, losing the whole table is not. Narrower than
+    # that precedent's `(RegistryError, OSError)` on purpose — the registry read
+    # happens inside `build_overview`, where its failure IS the answer and must not
+    # be swallowed into a table that pretends nothing is registered.
+    try:
+        cwd: Optional[str] = os.getcwd()
+    except OSError:
+        cwd = None
+
+    payload = overview.build_overview(cwd=cwd)
+    if as_json:
+        _emit_json(payload)
+        return 0
+    _render_overview(payload)
+    return 0
+
+
 def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
     """Reports whether Mitos is set up for a project, and what (if anything) is missing.
 
@@ -2144,6 +2339,13 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
     except ConfigError as e:
         if as_json:
             _emit_json({
+                # Which payload this is. `status --json` returns the project report
+                # today and will return the global overview too once zero-arg
+                # `status` is flipped, so it announces itself rather than leaving a
+                # consumer to sniff a shape — and it does so on BOTH emission sites,
+                # because a discriminator present on one is detectable only by
+                # absence, which is sniffing wearing a discriminator's clothes.
+                "report": "project",
                 "workspace": workspace_dir,
                 "ready": False,
                 "initialized": False,
@@ -2278,6 +2480,8 @@ def cmd_status(workspace_dir: str, as_json: bool = False) -> int:
 
     if as_json:
         _emit_json({
+            # The payload discriminator — see the early ConfigError branch above.
+            "report": "project",
             "workspace": workspace_dir,
             "ready": ready,
             "initialized": initialized,

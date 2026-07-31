@@ -18,7 +18,11 @@ single write must not be able to spend it.
 import requests
 import json
 from typing import List, Dict, Any, Set
-from mitos.errors import CollectionMissingError, VectorStoreError
+from mitos.errors import (
+    CollectionMissingError,
+    VectorStoreError,
+    VectorStoreUnreachableError,
+)
 from mitos.models import EMBEDDING_DIM
 
 
@@ -197,6 +201,75 @@ def scroll_point_ids(base_url: str, collection: str, page_size: int = 256) -> Se
         return ids
     except requests.RequestException as e:
         raise VectorStoreError(f"Qdrant scroll connection error: {str(e)}")
+
+
+def list_collection_names(base_url: str, *, timeout: float) -> Set[str]:
+    """Names every collection on a Qdrant instance — one call, instance-scoped.
+
+    The bulk shape the global overview needs: whether N projects' collections
+    exist is answered by **one** request to the instance plus a local set
+    membership test, never by N per-collection probes (``mitos status``'
+    ``_check_qdrant`` is the per-collection shape, and it stays the deep report's).
+    So the call budget scales with distinct instances and never with project count.
+
+    This endpoint addresses the **instance**, not a collection, which is why a
+    non-200 is never routed through :func:`_raise_response_error`: that helper maps
+    404 → :class:`CollectionMissingError`, and a 404 *here* means a wrong base URL
+    or a proxy in the way — an instance fault mis-filed as a missing collection at
+    exactly the boundary a consumer's tri-state depends on.
+
+    The two failure directions are typed apart, because a caller reporting instance
+    health must not read "answered with something unusable" as "did not answer":
+    a transport fault raises :class:`VectorStoreUnreachableError`, everything else
+    raises plain :class:`VectorStoreError`.
+
+    Args:
+        base_url: The Qdrant base URL (trailing slash tolerated).
+        timeout: Per-request socket timeout in seconds.
+
+    Returns:
+        The set of collection names on the instance. Empty is a legitimate answer
+        (a fresh instance) and is never confused with an unavailable listing — that
+        one raises.
+
+    Raises:
+        VectorStoreUnreachableError: If the instance did not answer at all.
+        VectorStoreError: If it answered with a non-200, a non-JSON or wrongly
+            shaped body, or a listing that is not a list of named objects.
+    """
+    url = f"{base_url.rstrip('/')}/collections"
+    try:
+        resp = requests.get(url, timeout=timeout)
+    except requests.RequestException as e:
+        raise VectorStoreUnreachableError(
+            f"Qdrant collection listing connection error: {str(e)}"
+        ) from e
+    if resp.status_code != 200:
+        raise VectorStoreError(
+            f"Qdrant collection listing failed (HTTP {resp.status_code}): {resp.text}"
+        )
+
+    result = _decode_result(resp, operation="collection listing")
+    if not isinstance(result, dict):
+        raise VectorStoreError(
+            "Qdrant collection listing returned an unexpected result shape "
+            f"({type(result).__name__}, expected an object)."
+        )
+    # No `or []` — deliberately unlike `scroll_point_ids`' `points` line one module
+    # over. An unusable listing and an empty instance are the two states this
+    # function's whole contract keeps apart, and coalescing a `null` into an empty
+    # list collapses them into "your collection is missing" for every project on
+    # the instance.
+    collections = result.get("collections")
+    if not isinstance(collections, list) or any(
+        not isinstance(item, dict) or not isinstance(item.get("name"), str)
+        for item in collections
+    ):
+        raise VectorStoreError(
+            "Qdrant collection listing returned an unexpected collections shape "
+            "(expected a list of objects carrying a `name`)."
+        )
+    return {item["name"] for item in collections}
 
 
 class QdrantVectorStore:

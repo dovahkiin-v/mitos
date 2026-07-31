@@ -7,8 +7,10 @@ initialization handling, and filtered semantic queries.
 import pytest
 from unittest.mock import MagicMock, patch
 from mitos.models import EMBEDDING_DIM
-from mitos.vector_store import QdrantVectorStore, hash_to_uuid, scroll_point_ids
-from mitos.errors import CollectionMissingError, VectorStoreError
+from mitos.vector_store import (QdrantVectorStore, hash_to_uuid, list_collection_names,
+                                scroll_point_ids)
+from mitos.errors import (CollectionMissingError, VectorStoreError,
+                          VectorStoreUnreachableError)
 
 _URL = "http://localhost:6333"
 _COLLECTION = "test_collection"
@@ -355,3 +357,102 @@ def test_vector_store_query_handling(mock_post: MagicMock) -> None:
     body = kwargs["json"]
     assert body["limit"] == 1
     assert "filter" not in body
+
+
+# --- the instance-scoped collection listing ---------------------------------
+
+@patch("mitos.vector_store.requests.get")
+def test_list_collection_names_reads_the_instance_endpoint_once(mock_get: MagicMock) -> None:
+    """One call, addressed to the INSTANCE — never to a collection.
+
+    The bulk shape the global overview needs: whether N projects' collections exist
+    is one request plus local set membership, so the call budget scales with distinct
+    instances and never with project count.
+    """
+    mock_get.return_value = _resp(200, {"result": {"collections": [
+        {"name": "mitos-a-1234abcd"}, {"name": "mitos-b-5678efgh"}]}})
+
+    names = list_collection_names(_URL, timeout=3.0)
+
+    assert names == {"mitos-a-1234abcd", "mitos-b-5678efgh"}
+    assert mock_get.call_count == 1
+    assert mock_get.call_args[0][0] == f"{_URL}/collections"
+    assert mock_get.call_args[1]["timeout"] == 3.0
+
+
+@patch("mitos.vector_store.requests.get")
+def test_list_collection_names_reads_an_empty_instance_as_empty(mock_get: MagicMock) -> None:
+    """Zero collections is a legitimate answer, not a fault — a fresh instance."""
+    mock_get.return_value = _resp(200, {"result": {"collections": []}})
+
+    assert list_collection_names(_URL, timeout=3.0) == set()
+
+
+@pytest.mark.parametrize("status", [404, 401, 500])
+@patch("mitos.vector_store.requests.get")
+def test_list_collection_names_never_classifies_a_non_200_as_a_missing_collection(
+        mock_get: MagicMock, status: int) -> None:
+    """404 included, and 404 is the point.
+
+    This endpoint addresses the instance, not a collection, so routing it through
+    ``_raise_response_error`` (which maps 404 → ``CollectionMissingError``) would
+    file a wrong base URL or a proxy in the way as *your collection is missing* — at
+    exactly the boundary a consumer's reachable/listing tri-state depends on.
+    """
+    mock_get.return_value = _resp(status)
+
+    with pytest.raises(VectorStoreError) as excinfo:
+        list_collection_names(_URL, timeout=3.0)
+    assert not isinstance(excinfo.value, CollectionMissingError)
+    assert not isinstance(excinfo.value, VectorStoreUnreachableError)
+
+
+@patch("mitos.vector_store.requests.get")
+def test_list_collection_names_types_an_unreachable_instance_apart(
+        mock_get: MagicMock) -> None:
+    """The distinction a caller reporting instance health cannot do without.
+
+    *Answered with something unusable* must not read as *did not answer*, and the
+    two are one class today, so a consumer could otherwise only sniff message text.
+    A subclass, so every shipped ``except VectorStoreError`` net keeps catching it.
+    """
+    import requests as _requests
+    mock_get.side_effect = _requests.exceptions.ConnectionError("refused")
+
+    with pytest.raises(VectorStoreUnreachableError) as excinfo:
+        list_collection_names(_URL, timeout=3.0)
+    assert isinstance(excinfo.value, VectorStoreError)
+
+
+@pytest.mark.parametrize("body", [
+    pytest.param(ValueError("Expecting value"), id="non-json"),
+    pytest.param("just a string", id="not-an-object"),
+    pytest.param({"status": "ok"}, id="no-result-key"),
+    pytest.param({"result": "not-an-object"}, id="result-not-an-object"),
+    pytest.param({"result": {}}, id="no-collections-key"),
+    pytest.param({"result": {"collections": "not-a-list"}}, id="collections-not-a-list"),
+    pytest.param({"result": {"collections": ["bare-string"]}}, id="items-not-objects"),
+    pytest.param({"result": {"collections": [{"id": 1}]}}, id="item-without-name"),
+    pytest.param({"result": {"collections": [{"name": 7}]}}, id="name-not-a-string"),
+    # The sharpest of the set, and the reason there is no `or []` here: coerced, a
+    # null listing reads as an empty instance, which tells every project on it that
+    # its vectors are gone. An empty listing and an unusable one are exactly the two
+    # states this function exists to keep apart.
+    pytest.param({"result": {"collections": None}}, id="collections-null"),
+])
+@patch("mitos.vector_store.requests.get")
+def test_list_collection_names_malformed_200_raises_typed(
+        mock_get: MagicMock, body: object) -> None:
+    """A 200 of the wrong shape is a substrate fault, not an empty answer.
+
+    And it is emphatically **not** the unreachable class: the instance answered, so
+    a consumer's tri-state must read *up, but its listing is unusable*. Routing a
+    shape guard through :class:`VectorStoreUnreachableError` would flip every
+    malformed listing to *no answer* with the whole suite green — the same silent
+    mis-filing the 404 row above fences from the other side.
+    """
+    mock_get.return_value = _resp(200, body)
+
+    with pytest.raises(VectorStoreError) as excinfo:
+        list_collection_names(_URL, timeout=3.0)
+    assert not isinstance(excinfo.value, VectorStoreUnreachableError)
