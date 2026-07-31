@@ -724,6 +724,36 @@ def test_the_zero_arg_status_routes_to_the_overview_and_the_named_form_does_not(
     assert json.loads(capsys.readouterr().out)["report"] == "project"
 
 
+def test_the_one_non_zero_path_reaches_the_user_as_a_calm_line(tmp_path, capsys):
+    """The exit contract's failure half, asserted where a user now meets it.
+
+    `test_a_malformed_registry_is_the_only_non_zero_path` pins the raise at the
+    direct call — the only reach 4a had. The flip gave that raise a route through
+    `main()`, and `RegistryError` subclasses `MitosError`, so it lands on the
+    boundary's generic arm *below* the `ProjectTargetingError` one: a one-line
+    `Error:` on stderr and exit 1. Nothing asserted that until the route existed,
+    and an uncaught class here would surface as a raw traceback on the report a
+    caller reaches for when their machine is already confusing them.
+
+    `--json` too, deliberately: the shipped boundary answers on stderr for every
+    fault regardless of the flag, so this emits **no** JSON — the same asymmetry
+    3b signed for the targeting errors, restated on the one report that has a
+    machine-readable twin.
+    """
+    _write_registry("this is not [ valid toml")
+
+    for argv in (["status"], ["status", "--json"]):
+        assert _run(argv) == 1, argv
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.startswith("Error: ")
+        # Named by the fault it actually is, not merely "something failed": only
+        # `RegistryError` speaks this, so a build that answered exit 1 for some
+        # other reason (a targeting error, say) cannot satisfy the row.
+        assert "not valid TOML" in captured.err
+        assert "Traceback" not in captured.err
+
+
 def test_the_overview_is_built_before_any_workspace_config_is(tmp_path, qdrant,
                                                               monkeypatch, capsys):
     """Ordering is contract: a broken workspace underfoot is not a global failure.

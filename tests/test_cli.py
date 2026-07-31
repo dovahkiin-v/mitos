@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch, ANY
 from mitos.cli import main
 from mitos.config import toml_scalar
 
-def test_cli_help_menu(workspace) -> None:
+def test_cli_help_menu() -> None:
     """Verifies that the help menu is printed and exits cleanly with 0."""
     with patch.object(sys, "argv", ["mitos", "--help"]):
         with pytest.raises(SystemExit) as exc:
@@ -19,7 +19,7 @@ def test_cli_help_menu(workspace) -> None:
 
 
 @patch("mitos.cli.cmd_init")
-def test_cli_init_routing(mock_init: MagicMock, workspace) -> None:
+def test_cli_init_routing(mock_init: MagicMock) -> None:
     """Verifies that the 'init' command routes to the initialization controller."""
     with patch.object(sys, "argv", ["mitos", "init"]):
         main()
@@ -114,14 +114,14 @@ def test_cli_render_format_routing(mock_render: MagicMock, workspace) -> None:
 
 
 @patch("mitos.cli.cmd_serve")
-def test_cli_serve_routing(mock_serve: MagicMock, workspace) -> None:
+def test_cli_serve_routing(mock_serve: MagicMock) -> None:
     """Verifies that 'serve' sub-command routes to cmd_serve."""
     with patch.object(sys, "argv", ["mitos", "serve"]):
         main()
     assert mock_serve.called
 
 
-def test_cli_unexpected_error_exits_1(workspace) -> None:
+def test_cli_unexpected_error_exits_1() -> None:
     """Verifies that unexpected exceptions crash cleanly with exit code 1."""
     with patch("mitos.cli.cmd_init", side_effect=Exception("Unexpected boom!")):
         with patch.object(sys, "argv", ["mitos", "init"]):
@@ -174,7 +174,7 @@ def test_cli_malformed_config_exits_clean_no_traceback(
 # — they are the byte-compatibility gate for every config.toml line ever seeded.
 # ---------------------------------------------------------------------------
 
-def test_toml_scalar_serializes_bool_as_lowercase_literal(workspace) -> None:
+def test_toml_scalar_serializes_bool_as_lowercase_literal() -> None:
     """A bool serializes to native TOML ``true``/``false`` (not ``1``/``0``, not raise).
 
     ``bool`` subclasses ``int``, so the bool branch must precede the int branch;
@@ -184,7 +184,7 @@ def test_toml_scalar_serializes_bool_as_lowercase_literal(workspace) -> None:
     assert toml_scalar(False) == "false"
 
 
-def test_toml_scalar_still_serializes_int_and_str(workspace) -> None:
+def test_toml_scalar_still_serializes_int_and_str() -> None:
     """The bool branch doesn't disturb the existing int/str scalars."""
     assert toml_scalar(50) == "50"
     assert toml_scalar("archive") == '"archive"'
@@ -202,7 +202,7 @@ def test_toml_scalar_still_serializes_int_and_str(workspace) -> None:
         ("plain", "the clean case still takes the shipped basic form"),
     ],
 )
-def test_toml_scalar_round_trips_the_widened_domain(value, why, workspace) -> None:
+def test_toml_scalar_round_trips_the_widened_domain(value, why) -> None:
     """Every value shape the registry can carry survives a serialize→parse cycle.
 
     The registry's domain is wider than the config schema's: project names can hold
@@ -218,7 +218,7 @@ def test_toml_scalar_round_trips_the_widened_domain(value, why, workspace) -> No
     "key",
     ["plain", "dotted.name", "ąžuolas", 'quote"bearing', "back\\slash"],
 )
-def test_toml_scalar_also_serves_as_a_quoted_key(key, workspace) -> None:
+def test_toml_scalar_also_serves_as_a_quoted_key(key) -> None:
     """The same serializer quotes registry KEYS, which is why names are never bare.
 
     A bare dotted key parses as a nested table (``example.com`` — an ordinary
@@ -228,7 +228,7 @@ def test_toml_scalar_also_serves_as_a_quoted_key(key, workspace) -> None:
     assert list(tomllib.loads(f'{toml_scalar(key)} = "v"')) == [key]
 
 
-def test_toml_scalar_refuses_a_non_scalar_loudly(workspace) -> None:
+def test_toml_scalar_refuses_a_non_scalar_loudly() -> None:
     """A value with no TOML scalar form raises ``TypeError``, never emits a guess.
 
     Callers at a user-facing boundary convert this into their own calm error; the

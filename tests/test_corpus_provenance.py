@@ -32,7 +32,7 @@ from mitos.recall import corpus_provenance, provenance_line
 # re-derived: `_run` calls the real `main()` (which is where the CLI's single
 # resolution site and the two dispatch-site echoes live), and `_subparsers` is
 # already the tree's one spelling of "every verb the parser accepts".
-from test_cli_selector import _make_workspace, _run, _subparsers
+from test_cli_selector import _run, _subparsers
 
 
 class TestHelpers:

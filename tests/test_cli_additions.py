@@ -97,17 +97,17 @@ def test_record_json_routes(mock_record, monkeypatch, workspace):
 
 # --- file / stdin prose input --------------------------------------------------
 
-def test_read_text_arg_inline(workspace):
+def test_read_text_arg_inline():
     assert cli._read_text_arg("inline", None) == "inline"
 
 
-def test_read_text_arg_from_file(tmp_path, workspace):
+def test_read_text_arg_from_file(tmp_path):
     f = tmp_path / "r.txt"
     f.write_text("prose with Camila's apostrophe", encoding="utf-8")
     assert "Camila's" in cli._read_text_arg(None, str(f))
 
 
-def test_read_text_arg_from_stdin(monkeypatch, workspace):
+def test_read_text_arg_from_stdin(monkeypatch):
     monkeypatch.setattr(sys, "stdin", io.StringIO("from stdin"))
     assert cli._read_text_arg(None, "-") == "from stdin"
 
@@ -142,7 +142,7 @@ def test_version_flag_prints_and_exits_zero(monkeypatch, capsys):
 
 # --- MCP wiring detection + hint ----------------------------------------------
 
-def test_mcp_wired_detection(tmp_path, workspace):
+def test_mcp_wired_detection(tmp_path):
     assert cli._mcp_wired(str(tmp_path)) is False
     (tmp_path / ".mcp.json").write_text('{"mcpServers": {"mitos": {"command": "mitos"}}}')
     assert cli._mcp_wired(str(tmp_path)) is True
@@ -150,25 +150,25 @@ def test_mcp_wired_detection(tmp_path, workspace):
     assert cli._mcp_wired(str(tmp_path)) is False
 
 
-def test_mcp_hint_fires_then_rate_limits(tmp_path, monkeypatch, workspace):
+def test_mcp_hint_fires_then_rate_limits(tmp_path, monkeypatch):
     monkeypatch.delenv("MITOS_NO_MCP_HINT", raising=False)
     first = cli._mcp_hint(str(tmp_path))
     assert first is not None and "wire the MCP" in first
     assert cli._mcp_hint(str(tmp_path)) is None  # within 24h → silent
 
 
-def test_mcp_hint_silent_when_wired(tmp_path, monkeypatch, workspace):
+def test_mcp_hint_silent_when_wired(tmp_path, monkeypatch):
     monkeypatch.delenv("MITOS_NO_MCP_HINT", raising=False)
     (tmp_path / ".mcp.json").write_text('{"mcpServers": {"mitos": {"command": "mitos"}}}')
     assert cli._mcp_hint(str(tmp_path)) is None
 
 
-def test_mcp_hint_opt_out(tmp_path, monkeypatch, workspace):
+def test_mcp_hint_opt_out(tmp_path, monkeypatch):
     monkeypatch.setenv("MITOS_NO_MCP_HINT", "1")
     assert cli._mcp_hint(str(tmp_path)) is None
 
 
-def test_decision_loop_commands_cover_aliases(workspace):
+def test_decision_loop_commands_cover_aliases():
     for verb in ("record", "record_decision", "surface", "surface_decisions",
                  "query", "query_decisions", "list", "list_decisions"):
         assert verb in cli._DECISION_LOOP_COMMANDS
@@ -233,7 +233,7 @@ def test_list_scopes_alias_routes(mock_scopes, monkeypatch, workspace):
     assert mock_scopes.called
 
 
-def test_surface_decisions_mcp_description_names_compose(workspace):
+def test_surface_decisions_mcp_description_names_compose():
     """Criterion 4 (W15): the surfacing tools' descriptions name the
     surface→record compose so an MCP agent discovers the write-back step."""
     from mitos.mcp_server import surface_decisions, query_decisions
@@ -306,8 +306,8 @@ def test_record_neither_axiom_source_json_speaks_json(monkeypatch, capsys, works
     (["--axiom-file", "-", "--rejected-file", "-", "--context-file", "-"], "--context-file"),
 ])
 def test_multiple_stdin_file_args_fail_with_their_own_error(
-    argv_extra, expected_in_msg, monkeypatch, capsys
-, workspace):
+    argv_extra, expected_in_msg, monkeypatch, capsys, workspace
+):
     """Only one argument can read stdin; asking twice names that, not a missing flag.
 
     Regression: the first reader drained stdin and the rest came back empty, so the
@@ -377,7 +377,7 @@ def test_mixed_scope_spellings_accumulate(monkeypatch, workspace):
     assert mock_record.call_args.kwargs["scope"] == ["config", "sync", "substrate"]
 
 
-def test_extend_does_not_mutate_the_default_list_in_place(workspace):
+def test_extend_does_not_mutate_the_default_list_in_place():
     """`action="extend"` + `default=[]` must not accumulate across parses.
 
     The classic mutable-default gotcha: an action that extends the default list in
@@ -421,7 +421,7 @@ def test_axiom_flag_is_not_swallowed_by_axiom_file(monkeypatch, capsys, workspac
     assert "--axiom" in combined, "the error must name the flag the caller actually typed"
 
 
-def test_abbreviation_is_off_on_every_subparser(workspace):
+def test_abbreviation_is_off_on_every_subparser():
     """No verb abbreviates — a per-parser flag is one forgotten kwarg from regressing.
 
     Setting ``allow_abbrev=False`` on the top-level parser does NOT propagate to
@@ -438,7 +438,7 @@ def test_abbreviation_is_off_on_every_subparser(workspace):
     assert abbreviating == [], f"these verbs still abbreviate options: {abbreviating}"
 
 
-def test_abbreviated_option_is_rejected_by_the_grammar(workspace):
+def test_abbreviated_option_is_rejected_by_the_grammar():
     """`--jso` no longer resolves to `--json`; `--axiom` no longer reaches --axiom-file."""
     from mitos.cli import _build_parser
 
