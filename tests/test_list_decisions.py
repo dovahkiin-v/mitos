@@ -171,9 +171,9 @@ def test_cmd_list_empty_graph_message(ws, capsys) -> None:
 
 
 @patch("mitos.cli.cmd_list")
-def test_list_decisions_alias_routes(mock_list, monkeypatch) -> None:
+def test_list_decisions_alias_routes(mock_list, monkeypatch, workspace) -> None:
     """The MCP-name alias `list_decisions` routes to cmd_list with --json plumbed."""
-    monkeypatch.setattr(sys, "argv", ["mitos", "list_decisions", "--scope", "api", "--json"])
+    monkeypatch.setattr(sys, "argv", ["mitos", "-p", workspace, "list_decisions", "--scope", "api", "--json"])
     main()
     mock_list.assert_called_once()
     _, kwargs = mock_list.call_args

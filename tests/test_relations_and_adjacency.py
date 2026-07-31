@@ -418,10 +418,11 @@ def test_cli_cmd_record_corrects_kill_edge(ws):
 
 
 @patch("mitos.cli.cmd_record")
-def test_cli_relation_flags_route(mock_record, monkeypatch):
+def test_cli_relation_flags_route(mock_record, monkeypatch, workspace):
     """The --corrects/--depends-on/--amends/--cites/etc. flags reach cmd_record."""
     monkeypatch.setattr(sys, "argv", [
-        "mitos", "record", "ax", "--rejected", "r", "--slug", "the-slug",
+        "mitos", "-p", workspace, "record", "ax", "--rejected", "r",
+        "--slug", "the-slug",
         "--corrects", "korrekt",
         "--depends-on", "foo", "--amends", "bar", "--cites", "baz",
         "--derives-from", "qux", "--contradicts", "quux", "--narrows", "corge",

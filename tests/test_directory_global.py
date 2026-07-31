@@ -81,11 +81,16 @@ def test_directory_retargets_config_collection(mock_init, tmp_path, monkeypatch)
 
 @patch("mitos.cli.cmd_list")
 def test_directory_reaches_dispatch_and_chdirs(mock_list, tmp_path, monkeypatch) -> None:
-    """`-C` is consumed by the parent parser (not the subparser) and the chdir lands."""
+    """`-C` is consumed by the parent parser (not the subparser) and the chdir lands.
+
+    `-p .` rather than an absolute path, deliberately and only here: the row's whole
+    claim is that the chdir happened before resolution, so a selector that resolves
+    *through* the new cwd is the assertion, not a shortcut.
+    """
     monkeypatch.chdir(tmp_path)
     ws = tmp_path / "ws"
-    ws.mkdir()
-    with patch.object(sys, "argv", ["mitos", "-C", str(ws), "list"]):
+    make_workspace(ws)
+    with patch.object(sys, "argv", ["mitos", "-C", str(ws), "-p", ".", "list"]):
         main()
     mock_list.assert_called_once()
     assert os.getcwd() == os.path.realpath(str(ws))
@@ -110,13 +115,14 @@ def test_init_under_directory_creates_mitos_in_target(tmp_path, monkeypatch) -> 
 def test_set_key_under_directory_writes_target_env(tmp_path, monkeypatch, capsys) -> None:
     """`mitos -C /ws set-key …` writes /ws/.env — NOT the launch CWD's .env (R3 canary)."""
     monkeypatch.chdir(tmp_path)
-    ws = tmp_path / "ws"
-    ws.mkdir()
+    ws = make_workspace(tmp_path / "ws")
     with patch.object(sys, "argv",
-                      ["mitos", "-C", str(ws), "set-key", "SECRET123", "--name", "GEMINI_API_KEY"]):
+                      ["mitos", "-C", ws, "-p", ".", "set-key", "SECRET123",
+                       "--name", "GEMINI_API_KEY"]):
         main()
-    assert (ws / ".env").exists()
-    assert "SECRET123" in (ws / ".env").read_text(encoding="utf-8")
+    assert os.path.exists(os.path.join(ws, ".env"))
+    with open(os.path.join(ws, ".env"), encoding="utf-8") as f:
+        assert "SECRET123" in f.read()
     assert not (tmp_path / ".env").exists()
 
 
@@ -142,18 +148,46 @@ def test_project_env_loaded_from_target_under_directory(tmp_path, monkeypatch) -
 
 
 def test_relative_rejected_file_retargets(tmp_path, monkeypatch) -> None:
-    """A relative `--rejected-file ./r.txt` opens against the post-chdir CWD (/ws)."""
+    """A relative `--rejected-file ./r.txt` opens against the post-chdir CWD (/ws).
+
+    This is `-C`'s surviving role, and the pair `-C /ws -p .` is what the migration
+    had to become: **a selector moves the workspace, it does not move where a file
+    argument opens.** Rewriting the row as `-p /ws record … --rejected-file ./r.txt`
+    would retarget the corpus and still open `./r.txt` against the launch directory
+    — a missing file, or worse, a different one.
+    """
     monkeypatch.chdir(tmp_path)
-    ws = tmp_path / "ws"
-    ws.mkdir()
-    (ws / "r.txt").write_text("the rejected alternative prose", encoding="utf-8")
+    ws = make_workspace(tmp_path / "ws")
+    (tmp_path / "ws" / "r.txt").write_text("the rejected alternative prose",
+                                           encoding="utf-8")
     with patch("mitos.cli.cmd_record") as mock_record:
         with patch.object(sys, "argv",
-                          ["mitos", "-C", str(ws), "record", "my axiom",
+                          ["mitos", "-C", ws, "-p", ".", "record", "my axiom",
                            "--rejected-file", "./r.txt", "--slug", "x"]):
             main()
     mock_record.assert_called_once()
     assert mock_record.call_args.kwargs["rejected"] == "the rejected alternative prose"
+
+
+def test_a_selector_does_not_move_where_a_file_argument_opens(tmp_path, monkeypatch) -> None:
+    """G2b's other half, stated as its own row rather than left in a comment.
+
+    Same workspace, no `-C`: `-p /ws` retargets the corpus while `./r.txt` still
+    opens against the launch directory. The two files carry different prose, so a
+    build that resolved the file against the selector would read the wrong one and
+    the assertion would name which.
+    """
+    monkeypatch.chdir(tmp_path)
+    ws = make_workspace(tmp_path / "ws")
+    (tmp_path / "ws" / "r.txt").write_text("the workspace copy", encoding="utf-8")
+    (tmp_path / "r.txt").write_text("the launch-directory copy", encoding="utf-8")
+    with patch("mitos.cli.cmd_record") as mock_record:
+        with patch.object(sys, "argv",
+                          ["mitos", "-p", ws, "record", "my axiom",
+                           "--rejected-file", "./r.txt", "--slug", "x"]):
+            main()
+    assert mock_record.call_args.args[0].workspace_dir == ws
+    assert mock_record.call_args.kwargs["rejected"] == "the launch-directory copy"
 
 
 # ---------------------------------------------------------------------------
@@ -288,7 +322,8 @@ def test_directory_target_is_a_file_clean_error(tmp_path, monkeypatch, capsys) -
 def test_no_directory_flag_does_not_chdir(mock_list, tmp_path, monkeypatch) -> None:
     """A flagless invocation never chdirs — the added code is gated on args.directory."""
     monkeypatch.chdir(tmp_path)
-    with patch.object(sys, "argv", ["mitos", "list"]):
+    ws = make_workspace(tmp_path / "ws")
+    with patch.object(sys, "argv", ["mitos", "-p", ws, "list"]):
         main()
     mock_list.assert_called_once()
     assert os.getcwd() == str(tmp_path)  # launch CWD unchanged

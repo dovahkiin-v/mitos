@@ -387,9 +387,9 @@ def test_counts_match_read_verbs_through_surface(ws, capsys) -> None:
 # --------------------------------------------------------------------------- #
 
 @patch("mitos.cli.cmd_scopes")
-def test_list_scopes_alias_routes(mock_scopes, monkeypatch) -> None:
+def test_list_scopes_alias_routes(mock_scopes, monkeypatch, workspace) -> None:
     """The MCP-name alias `list_scopes` routes to cmd_scopes with the flags plumbed."""
-    monkeypatch.setattr(sys, "argv", ["mitos", "list_scopes", "--json", "--archived"])
+    monkeypatch.setattr(sys, "argv", ["mitos", "-p", workspace, "list_scopes", "--json", "--archived"])
     main()
     mock_scopes.assert_called_once()
     _, kwargs = mock_scopes.call_args

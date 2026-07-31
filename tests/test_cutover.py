@@ -1048,9 +1048,15 @@ def test_cmd_cutover_corpus_defect_one_line_error_via_main(tmp_path, monkeypatch
         config.decisions_file,
         _stream(_decision("orphan", "Orphan axiom.", supersedes="ghost")),
     )
-    monkeypatch.chdir(tmp_path)
+    # A full validity triple, and the selector names it: the row asserts exit 1 +
+    # `Error:` + no traceback, and a 5a targeting error satisfies all three — so a
+    # selectorless spelling here would stay green while proving nothing about
+    # `cutover`. (`.mitos/config.toml` is what `_config` never wrote.)
+    os.makedirs(str(tmp_path / ".mitos"), exist_ok=True)
+    with open(str(tmp_path / ".mitos" / "config.toml"), "w") as f:
+        f.write("# a mitos workspace\n")
     monkeypatch.setenv("MITOS_NO_UPDATE_CHECK", "1")
-    monkeypatch.setattr(sys, "argv", ["mitos", "cutover", "--yes"])
+    monkeypatch.setattr(sys, "argv", ["mitos", "-p", str(tmp_path), "cutover", "--yes"])
 
     with pytest.raises(SystemExit) as exc:
         cli_main()

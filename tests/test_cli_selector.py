@@ -33,7 +33,7 @@ from unittest.mock import patch
 import pytest
 
 from conftest import make_workspace
-from mitos import registry, routing
+from mitos import config, registry, routing
 from mitos.errors import RegistryError
 from mitos.cli import (
     _EXEMPT_VERB_NOTES,
@@ -1106,20 +1106,25 @@ def test_a_malformed_registry_is_not_dressed_in_the_targeting_anatomy(
 
 
 # ---------------------------------------------------------------------------
-# Group 6 — the transitional tripwires. INVERT these at 5a, never delete them.
+# Group 6 — the two transitional tripwires, INVERTED at 5a (entry-007).
+#
+# They were written to make the flip a decision someone makes rather than an
+# omission someone notices. Both were kept and turned around; neither was deleted,
+# because the assertion is the only statement that the fallback is gone rather than
+# merely untested.
 # ---------------------------------------------------------------------------
 
-def test_a_selectorless_call_still_resolves_the_cwd_workspace(
+def test_a_selectorless_call_is_refused_from_inside_a_workspace(
     tmp_path, monkeypatch
 ) -> None:
-    """TRANSITIONAL (phase 5a inverts this row).
+    """INVERTED at 5a: standing in the workspace is no longer an answer.
 
-    Construction is not migration: this phase makes the selector *sayable*, not
-    *required*, so a bare `mitos list` from inside a workspace behaves exactly as
-    it did before. Phase 5a removes the working-directory fallback, at which point
-    this must become an assertion that the same invocation renders the missing
-    anatomy and exits 1. The row exists so that flip is a decision someone makes
-    rather than an omission someone notices.
+    Before the flip this exact invocation resolved the working directory and ran.
+    Now it renders the §4.5 teaching anatomy on stderr and exits 1 — and the mock
+    proves the point that matters: no verb ran at all, so there is no write to
+    unwind. Standing in the *right* directory is deliberately not a special case;
+    a default that is usually right is exactly the kind that fails silently and
+    late.
     """
     root = _make_workspace(tmp_path / "ws")
     monkeypatch.chdir(root)
@@ -1127,24 +1132,290 @@ def test_a_selectorless_call_still_resolves_the_cwd_workspace(
     with patch("mitos.cli.cmd_list", return_value=0) as mock:
         code = _run(["list"])
 
-    assert code == 0
-    assert mock.call_args.args[0].workspace_dir == root
+    assert code == 1
+    mock.assert_not_called()
 
 
-def test_set_key_without_a_selector_still_writes_the_cwd_env(
+def test_the_refusal_teaches_the_recovery_and_names_where_you_are(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """The anatomy on the failure the flip makes routine — including the cwd hint.
+
+    The hint is the one working-directory read 5a **keeps** (entry-005): it is the
+    recovery line on the most common post-flip failure, and it sits in the error
+    renderer rather than on the resolution path precisely so removing the fallback
+    could not take it with it. A sweep reading its inherited `os.getcwd()` list as
+    "delete them all" leaves every other row here green.
+    """
+    root = _make_workspace(tmp_path / "ws")
+    monkeypatch.chdir(root)
+    _register(here=root)
+
+    code = _run(["list"])
+
+    err = capsys.readouterr().err
+    assert code == 1
+    assert "--project" in err                    # the flag that recovers it
+    assert "mitos projects" in err                # where the vocabulary lives
+    # The hint asserted by its DISTINCTIVE phrase, never by the bare name: the
+    # `Registered projects:` line one row up already carries every registered name,
+    # so `assert "here" in err` is green whatever the hint line actually says (this
+    # module's own did-you-mean lesson, applied one line over).
+    assert "working directory sits inside" in err
+    assert "here" in err
+    assert "Traceback" not in err
+
+
+def test_set_key_without_a_selector_writes_no_env_anywhere(
     tmp_path, monkeypatch
 ) -> None:
-    """TRANSITIONAL (phase 5a inverts this row).
+    """INVERTED at 5a — and the sharpest of the three, because the payload is a key.
 
-    Pins ``cmd_set_key``'s ``workspace_dir=None`` default. 5a deletes the default
-    and the two ``os.getcwd()`` calls behind it, making the argument required —
-    and this row then asserts the selectorless call is refused instead.
+    ``cmd_set_key``'s ``workspace_dir`` is now required with no default, so the
+    project form is unconstructible without a named project rather than silently
+    cwd-rooted. Criterion 3: **no file anywhere** — not the launch directory's
+    ``.env``, not the global one.
     """
     cwd = tmp_path / "here"
     cwd.mkdir()
     monkeypatch.chdir(cwd)
 
-    _run(["set-key", "a-value"])
+    code = _run(["set-key", "a-value"])
 
-    assert "GEMINI_API_KEY=a-value" in (
-        open(os.path.join(str(cwd), ".env"), encoding="utf-8").read())
+    assert code == 1
+    assert not os.path.exists(os.path.join(str(cwd), ".env"))
+    assert not os.path.exists(config.global_env_path())
+
+
+def test_set_key_global_is_exempt_and_still_writes_the_machine_wide_env(
+    tmp_path, monkeypatch
+) -> None:
+    """The one form that must SURVIVE the flip, and the proof `_exempt_reason` is right.
+
+    ``set-key --global`` names no project because it *has* none, so it is exempt in
+    that form. Fault injection: make the exempt predicate unconditional on
+    ``set-key`` and the bare form above goes green for the wrong reason while this
+    row reds.
+    """
+    cwd = tmp_path / "here"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+
+    code = _run(["set-key", "--global", "a-value"])
+
+    assert code == 0
+    with open(config.global_env_path(), encoding="utf-8") as f:
+        assert "GEMINI_API_KEY=a-value" in f.read()
+    assert not os.path.exists(os.path.join(str(cwd), ".env"))
+
+
+# ---------------------------------------------------------------------------
+# Group 7 — the flip itself (5a). Every require-list verb, the three classes,
+# and the fail-closed direction the removed fallback used to backstop.
+# ---------------------------------------------------------------------------
+
+#: The minimum extra argv each verb needs to get PAST argparse — required
+#: positionals and required/mutually-exclusive flags. Argparse exits 2 before any
+#: mitos code runs, so a verb missing one would look like a `check`-shaped exit-2
+#: refusal while never reaching the targeting boundary at all.
+_MINIMAL_ARGS = {
+    "capture": ["some prose"],
+    "record": ["an axiom", "--slug", "a-slug"],
+    "record_decision": ["an axiom", "--slug", "a-slug"],
+    "restore-source": ["--all-graph-only"],
+    "import": ["notes.md"],
+    "query": ["a claim"],
+    "query_decisions": ["a claim"],
+    "set-key": ["a-value"],
+    "show": ["a-slug"],
+    "surface": ["a claim"],
+    "surface_decisions": ["a claim"],
+}
+
+#: The five MCP-name aliases, pinned by name beside the computed list below. A
+#: canonical-names-only parametrization would leave five invocable verbs unpinned on
+#: exactly the agent-facing path `skill.md` teaches.
+_ALIASES = ("query_decisions", "surface_decisions", "list_decisions",
+            "list_scopes", "record_decision")
+
+
+def _require_list():
+    """The §4.4 require-list, computed off the live parser rather than hand-listed."""
+    return sorted(set(_subparsers(_build_parser()))
+                  - set(_SELECTOR_EXEMPT_VERBS) - {"status"})
+
+
+def test_the_require_list_is_the_parser_minus_the_two_other_classes() -> None:
+    """23 verbs, measured — and the five aliases are among them, named.
+
+    The three classes of §3 partition the parser exactly: exempt (a selector is
+    refused), optional (`status`, whose absence routes elsewhere), and required
+    (everything else). A verb added later lands in `required` by construction, which
+    is the safe default — but this row makes the count a decision rather than a
+    drift.
+    """
+    verbs = _require_list()
+    assert len(verbs) == 23
+    for alias in _ALIASES:
+        assert alias in verbs
+    assert set(_subparsers(_build_parser())) == (
+        set(verbs) | set(_SELECTOR_EXEMPT_VERBS) | {"status"})
+
+
+@pytest.mark.parametrize("verb", _require_list())
+def test_every_require_list_verb_refuses_a_selectorless_call(
+    verb, tmp_path, monkeypatch, capsys
+) -> None:
+    """I1's CLI half: no verb on the require-list resolves the working directory.
+
+    Run from **inside a valid workspace**, deliberately — that is the invocation
+    that used to work, and the one whose silent success is the vision's §1 hazard.
+    Nothing about standing in the right place is a special case any more.
+
+    `check` keeps its own exit-2 mapping (CI reads "could not run" as one routing
+    class with the verb's own refusals); every other verb exits 1. No third exit
+    code is invented for the flip.
+    """
+    root = _make_workspace(tmp_path / "ws")
+    monkeypatch.chdir(root)
+    # One registration, so the anatomy renders its full vocabulary line rather than
+    # the empty-registry variant — the state a real caller meets.
+    _register(theproject=root)
+
+    code = _run([verb] + _MINIMAL_ARGS.get(verb, []))
+
+    err = capsys.readouterr().err
+    assert code == (2 if verb == "check" else 1), err
+    assert "Traceback" not in err
+    assert "--project" in err          # the recovery, in one round trip
+    assert "theproject" in err          # the registered vocabulary
+
+
+def test_agent_blocks_bare_form_is_on_the_require_list_too(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """Surfaced rather than buried, because it reads like a defect.
+
+    `mitos agent-block`'s plain output is a workspace-*independent* block, so
+    requiring a selector for it looks arbitrary. It is the vision's call, not an
+    oversight: `--check` genuinely scans a workspace's agent files, and a per-form
+    carve-out would be exactly the §4.8 grace the vision refuses — on the verb whose
+    output gets committed. The recovery is `mitos agent-block -p .`.
+    """
+    root = _make_workspace(tmp_path / "ws")
+    monkeypatch.chdir(root)
+
+    assert _run(["agent-block"]) == 1
+    assert "--project" in capsys.readouterr().err
+
+    assert _run(["agent-block", "-p", root]) == 0
+    out = capsys.readouterr().out
+    assert "mitos-agent-guide" in out and "/mitos-agent-guide" in out
+
+
+def test_import_keeps_its_positional_as_a_FILE_and_takes_the_selector_by_flag(
+    tmp_path, monkeypatch
+) -> None:
+    """`import`'s positional is a source markdown file, never a workspace.
+
+    So it is deliberately absent from `_POSITIONAL_SELECTOR_VERBS`: post-flip
+    `mitos import notes.md` hard-fails and the fix is `mitos -p <name> import
+    notes.md` — the file argument unchanged, still opening against cwd. A migrator
+    who reads "positional on a require-list verb" as "that's the selector" either
+    deletes the path or passes the workspace twice.
+    """
+    root = _make_workspace(tmp_path / "ws")
+    launch = tmp_path / "launch"
+    launch.mkdir()
+    (launch / "notes.md").write_text("# notes\n", encoding="utf-8")
+    monkeypatch.chdir(launch)
+
+    assert _run(["import", "notes.md"]) == 1
+
+    with patch("mitos.cli.cmd_import", return_value=None) as mock:
+        assert _run(["-p", root, "import", "notes.md"]) == 0
+    assert mock.call_args.args[0].workspace_dir == root
+    assert mock.call_args.args[1] == "notes.md"
+
+
+# --- the fail-closed direction the removed fallback used to backstop --------
+
+def test_a_write_verb_pointed_at_a_non_workspace_writes_nothing(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """The adversarial row this layer-removal owes.
+
+    Removing the working-directory fallback makes `resolve_project` the SOLE gate on
+    which workspace any CLI verb touches. Until now the fallback backstopped a bad
+    selector — a call that failed to resolve still had somewhere to land. After this
+    phase nothing does, so the fail-closed direction needs its own assertion: a
+    selector naming a real, writable directory that is simply not a workspace must
+    refuse **before** anything is created in it.
+    """
+    not_a_workspace = tmp_path / "plain-dir"
+    not_a_workspace.mkdir()
+    monkeypatch.chdir(_make_workspace(tmp_path / "ws"))
+    before = sorted(os.listdir(str(not_a_workspace)))
+
+    code = _run(["-p", str(not_a_workspace), "record", "an axiom",
+                 "--rejected", "the alternative", "--slug", "s"])
+
+    assert code == 1
+    assert "no Mitos workspace" in capsys.readouterr().err
+    assert sorted(os.listdir(str(not_a_workspace))) == before == []
+
+
+def test_restore_source_refuses_before_opening_any_graph(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """Criterion 4: the refusal precedes the store, not merely the write.
+
+    `restore-source --all-graph-only` is the widest-blast-radius read in the tree
+    (it walks every graph-only node and rewrites `decisions.md`). The row patches
+    `GraphStore` so a construction anywhere on the path is visible: the selectorless
+    call must not reach it at all.
+    """
+    monkeypatch.chdir(_make_workspace(tmp_path / "ws"))
+
+    with patch("mitos.cli.GraphStore") as store:
+        code = _run(["restore-source", "--all-graph-only"])
+
+    assert code == 1
+    store.assert_not_called()
+    assert "--project" in capsys.readouterr().err
+
+
+# --- the help surface's own truth (T20b) -----------------------------------
+
+def test_the_help_surface_no_longer_teaches_the_working_directory_model() -> None:
+    """Criterion 8, asserted against `_build_parser()` — no workspace needed.
+
+    Six texts taught a model this phase deletes, and they sit far apart: two `-p`
+    help strings that are the same sentence in two places (an audit that fixes the
+    pre-verb one and stops leaves the post-verb spelling teaching the dead model),
+    the `-C` string that claimed to retarget graph + collection + `.env`, two
+    positional helps promising a current-directory default, and `_EPILOG` — a module
+    constant five thousand lines from the parser that renders it.
+    """
+    parser = _build_parser()
+    top = parser.format_help()
+
+    assert "instead of the working directory" not in top
+    assert "-C /path/to/repo list" not in top          # the dead headline example
+    for claim in ("graph, collection, .env/keys", "default: current directory"):
+        assert claim not in top
+
+    subs = _subparsers(parser)
+    assert "instead of the working directory" not in subs["record"].format_help()
+    assert "default: current directory" not in subs["status"].format_help()
+    assert "default: current directory" not in subs["agent-block"].format_help()
+
+    # And every worked example in the epilog names its project, because every verb
+    # it shows now requires one. `mitos status` is the single exception and is
+    # shown as such.
+    epilog = top.split("Examples:", 1)[1]
+    for line in epilog.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("mitos ") or stripped == "mitos status":
+            continue
+        assert stripped.startswith("mitos -p "), f"selectorless example: {stripped!r}"

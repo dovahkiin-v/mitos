@@ -322,7 +322,7 @@ def test_the_tier_strings_match_the_shipped_key_source_report(tmp_path, monkeypa
     assert cli._gemini_key_source(str(proj)) == TIER_ENVIRONMENT
 
     monkeypatch.delenv("GEMINI_API_KEY")
-    cli.cmd_set_key("GLOBALKEY", is_global=True)
+    cli.cmd_set_key("GLOBALKEY", workspace_dir=None, is_global=True)
     assert cli._gemini_key_source(str(proj)) == TIER_GLOBAL_ENV
     (proj / ".env").write_text("GEMINI_API_KEY=PROJKEY\n", encoding="utf-8")
     assert cli._gemini_key_source(str(proj)) == TIER_PROJECT_ENV

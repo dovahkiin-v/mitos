@@ -311,9 +311,9 @@ class TestCliFailureModes:
     def test_exit_code_zero_via_main(self, ws, monkeypatch):
         config, m = ws
         _rec(m, "cache-strategy", "Use a write-through cache.")
-        monkeypatch.chdir(config.workspace_dir)
         from mitos.cli import main
-        with patch("sys.argv", ["mitos", "surface", "zebra quantum"]):
+        with patch("sys.argv", ["mitos", "-p", config.workspace_dir,
+                                "surface", "zebra quantum"]):
             rc = main()
         assert rc in (0, None)
 

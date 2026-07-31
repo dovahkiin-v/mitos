@@ -160,7 +160,8 @@ def test_cmd_list_oneline_text_keeps_modifier_marker(ws, capsys) -> None:
 
 def test_cli_brief_and_oneline_mutually_exclusive(ws, monkeypatch, capsys) -> None:
     """`mitos list --brief --oneline` is an argparse error (exit 2)."""
-    monkeypatch.setattr(sys, "argv", ["mitos", "list", "--brief", "--oneline"])
+    monkeypatch.setattr(sys, "argv", ["mitos", "-p", ws[0].workspace_dir,
+                                      "list", "--brief", "--oneline"])
     with pytest.raises(SystemExit) as exc:
         main()
     assert exc.value.code == 2

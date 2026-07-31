@@ -10,6 +10,15 @@ Skipped unless a real ``GEMINI_API_KEY`` is resolvable (env → the global
 ``~/.config/mitos/.env`` → the dev clone's ``.env``) AND Qdrant ``:7333`` is up.
 Each test uses an isolated workspace and DELETES its Qdrant collection on teardown,
 so the shared instance is never polluted.
+
+**The three subprocess rows resolve ``shutil.which("mitos")`` — the pipx build, not
+this checkout.** The branch carries no version bump, so the installed binary reports
+the same version as the source and the version-gated skip (which fires only when the
+installed binary is *strictly behind*) cannot help. They therefore run against the
+**pre-flip** binary and go green whether or not the source still resolves a working
+directory. They are written on the **source's** contract — every workspace-targeting
+verb names its project — which is forward-compatible either way, and they are
+genuinely unproven until the post-merge ``pipx install --force``.
 """
 
 import json
@@ -28,7 +37,9 @@ from mitos.config import MitosConfig, default_collection_name
 from mitos.store import GraphStore
 from mitos.sync import MitosSyncManager
 
-from live_helpers import skip_if_embed_quota_exhausted, skip_if_global_mitos_stale
+from live_helpers import (skip_if_embed_quota_exhausted,
+                          skip_if_global_mitos_lacks_project_selector,
+                          skip_if_global_mitos_stale)
 
 
 def _read_key_from_env_file(path: str, name: str = "GEMINI_API_KEY"):
@@ -202,6 +213,7 @@ def test_cli_subprocess_list_decisions_json(tmp_path):
     """Real binary, real argv: the `list_decisions` MCP-name alias + `--json` emit
     the complete structured set after real records (the exhaustive CLI path)."""
     mitos_bin = shutil.which("mitos") or "mitos"
+    skip_if_global_mitos_lacks_project_selector(mitos_bin)
     ws = tmp_path / "tmp-proj"
     ws.mkdir()
     env = {
@@ -234,14 +246,14 @@ def test_cli_subprocess_list_decisions_json(tmp_path):
             # deliberately independent decisions, so take the sanctioned bypass —
             # the pause itself is pinned by test_neighbor_review.py.
             rec = subprocess.run(
-                [mitos_bin, "record", axiom, "--rejected", rejected, "--scope", "infra",
-                 "--slug", f"slug-{i}", "--acknowledge-neighbors"],
+                [mitos_bin, "-p", str(ws), "record", axiom, "--rejected", rejected,
+                 "--scope", "infra", "--slug", f"slug-{i}", "--acknowledge-neighbors"],
                 cwd=ws, env=env, capture_output=True, text=True,
             )
             assert rec.returncode == 0, rec.stderr
 
         listed = subprocess.run(
-            [mitos_bin, "list_decisions", "--scope", "infra", "--json"],
+            [mitos_bin, "-p", str(ws), "list_decisions", "--scope", "infra", "--json"],
             cwd=ws, env=env, capture_output=True, text=True,
         )
         assert listed.returncode == 0, listed.stderr
@@ -320,6 +332,7 @@ def test_cli_subprocess_relation_flag_links_decisions(tmp_path):
     """Real binary, real argv: --depends-on links two decisions, edge lands in graph."""
     mitos_bin = shutil.which("mitos") or "mitos"
     skip_if_global_mitos_stale(mitos_bin)
+    skip_if_global_mitos_lacks_project_selector(mitos_bin)
     ws = tmp_path / "tmp-proj"
     ws.mkdir()
     env = {
@@ -336,13 +349,13 @@ def test_cli_subprocess_relation_flag_links_decisions(tmp_path):
         assert subprocess.run([mitos_bin, "init"], cwd=ws, env=env,
                               capture_output=True, text=True).returncode == 0
         a = subprocess.run(
-            [mitos_bin, "record", "Adopt hexagonal architecture",
+            [mitos_bin, "-p", str(ws), "record", "Adopt hexagonal architecture",
              "--rejected", "Layered rejected: leaks IO into the core", "--scope", "arch",
              "--slug", "hexagonal-arch"],
             cwd=ws, env=env, capture_output=True, text=True)
         assert a.returncode == 0, a.stderr
         b = subprocess.run(
-            [mitos_bin, "record", "Adapters live at the edges",
+            [mitos_bin, "-p", str(ws), "record", "Adapters live at the edges",
              "--rejected", "Core importing IO rejected: violates the dependency rule",
              "--scope", "arch", "--slug", "adapters-at-edges", "--depends-on", "hexagonal-arch"],
             cwd=ws, env=env, capture_output=True, text=True)
@@ -377,6 +390,7 @@ def test_cli_subprocess_record_stdin_then_surface(tmp_path):
     """Real binary, real argv, real stdin pipe, real services — the AX fixes
     (MCP-name alias + --rejected-file stdin + surface recall) end-to-end."""
     mitos_bin = shutil.which("mitos") or "mitos"
+    skip_if_global_mitos_lacks_project_selector(mitos_bin)
     ws = tmp_path / "tmp-proj"
     ws.mkdir()
     env = {
@@ -396,7 +410,7 @@ def test_cli_subprocess_record_stdin_then_surface(tmp_path):
 
         # MCP-name alias + prose via stdin (apostrophes must survive)
         rec = subprocess.run(
-            [mitos_bin, "record_decision",
+            [mitos_bin, "-p", str(ws), "record_decision",
              "Camila's tutor fails fast on missing data", "--rejected-file", "-",
              "--slug", "camilas-tutor", "--scope", "personas"],
             cwd=ws, env=env, text=True, capture_output=True,
@@ -406,7 +420,8 @@ def test_cli_subprocess_record_stdin_then_surface(tmp_path):
         assert "Recorded decision" in rec.stdout
 
         surf = subprocess.run(
-            [mitos_bin, "surface", "how should the tutor handle missing data",
+            [mitos_bin, "-p", str(ws), "surface",
+             "how should the tutor handle missing data",
              "--scope", "personas"],
             cwd=ws, env=env, capture_output=True, text=True,
         )

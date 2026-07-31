@@ -111,9 +111,15 @@ def _run_mitos(*args, cwd, env):
 
 
 def _record(ws, scope, *, env):
-    """Commits one decision carrying `scope`, keylessly, into an initialized workspace."""
+    """Commits one decision carrying `scope`, keylessly, into an initialized workspace.
+
+    The workspace is named by absolute path: `init` registers it under the
+    directory's basename, but these fixtures build several workspaces per run and
+    the path form is the one that cannot collide. (`init` itself stays bare — it is
+    selector-exempt.)
+    """
     _run_mitos(
-        "record", f"The {scope} workspace answers for itself.",
+        "-p", str(ws), "record", f"The {scope} workspace answers for itself.",
         "--rejected", "A workspace that reports another workspace's graph.",
         "--scope", scope, "--slug", f"{scope}-probe",
         cwd=ws, env=env,

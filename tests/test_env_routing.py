@@ -598,7 +598,7 @@ def test_the_key_source_reports_the_global_env_tier(tmp_path, monkeypatch):
     lose its key.
     """
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
-    cli.cmd_set_key("GLOBALKEY", is_global=True)
+    cli.cmd_set_key("GLOBALKEY", workspace_dir=None, is_global=True)
     ws = _workspace(tmp_path, env_text="GEMINI_API_KEY=\n")
     assert cli._gemini_key_source(ws) == TIER_GLOBAL_ENV
 

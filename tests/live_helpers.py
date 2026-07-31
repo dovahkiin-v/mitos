@@ -343,3 +343,47 @@ def skip_if_global_mitos_stale(mitos_bin: str) -> None:
             f"`pipx install --force git+https://github.com/dovahkiin-v/mitos`. "
             f"Environmental install-lag, not a code defect."
         )
+
+
+def skip_if_global_mitos_lacks_project_selector(mitos_bin: str) -> None:
+    """Skip loudly if the resolved global ``mitos`` predates the project selector.
+
+    CAPABILITY-gated, not version-gated, and the distinction is measured rather
+    than stylistic: this vision's branch carries **no version bump** (standing
+    constraint 12), so the pipx build and the source report the same string and
+    :func:`skip_if_global_mitos_stale` — which fires only when the installed binary
+    is *strictly behind* — cannot see the gap at all. The installed binary here
+    predates phase 3b: it has no ``--project`` option, so every row written on the
+    post-5a contract dies at argparse with ``invalid choice`` naming the path it was
+    handed.
+
+    The reason deliberately omits ``conftest``'s ``_ENV_SKIP_MARKER``. This is not
+    an environmental degradation of a service — it is a known, phase-scoped install
+    lag with a named closer (the post-merge ``pipx install --force``), the same
+    class as the live-floor docstring's *"baseline seeding is explicit-only"*
+    always-skip. Counting it would put a ``[live-floor]`` line on every run until
+    that refresh lands, and a warning that fires every time is a warning nobody
+    reads.
+
+    Args:
+        mitos_bin: Path or name of the ``mitos`` binary to probe.
+
+    Returns:
+        None.
+
+    Raises:
+        Skipped: When the installed binary does not accept ``--project``.
+    """
+    try:
+        out = subprocess.run(
+            [mitos_bin, "--help"], capture_output=True, text=True, timeout=10
+        )
+    except Exception:
+        return  # can't probe → run the test (uncertainty must not mask it)
+    if "--project" not in (out.stdout or ""):
+        pytest.skip(
+            f"the installed `mitos` ({mitos_bin}) predates the project selector, so "
+            f"it cannot run a post-5a invocation. Refresh it with `pipx install "
+            f"--force git+https://github.com/dovahkiin-v/mitos` once this vision "
+            f"merges. Known install lag with a named closer."
+        )

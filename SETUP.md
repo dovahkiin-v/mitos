@@ -240,7 +240,7 @@ if ! git diff --quiet -- decisions.md; then
     echo "decisions.md has unstaged changes — stage or stash them before committing" >&2
     exit 1
 fi
-mitos check --staged
+mitos check --staged -p .
 ```
 
 A commit that touches no pending decision entries short-circuits to exit `0` with

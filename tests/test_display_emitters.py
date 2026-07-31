@@ -217,10 +217,10 @@ def test_mcp_nudge_on_stderr_absent_from_stdout(ws, capsys, monkeypatch) -> None
     config, _ = ws
     # Enable the nudge: it is suppressed by the autouse hermetic fixture.
     monkeypatch.delenv("MITOS_NO_MCP_HINT", raising=False)
-    monkeypatch.chdir(config.workspace_dir)  # main() builds MitosConfig(".")
     capsys.readouterr()
 
-    with patch.object(sys, "argv", ["mitos", "list", "--json"]):
+    with patch.object(sys, "argv", ["mitos", "-p", config.workspace_dir,
+                                    "list", "--json"]):
         main()
 
     captured = capsys.readouterr()

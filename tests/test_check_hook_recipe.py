@@ -40,7 +40,7 @@ if ! git diff --quiet -- decisions.md; then
     echo "decisions.md has unstaged changes — stage or stash them before committing" >&2
     exit 1
 fi
-mitos check --staged
+mitos check --staged -p .
 """
 
 # The verbatim divergence message the guard emits (em-dash U+2014).
@@ -49,6 +49,13 @@ DIVERGENCE_MESSAGE = (
 )
 # The verbatim guard command (the recipe's git plumbing).
 GUARD_COMMAND = "git diff --quiet -- decisions.md"
+# The verbatim gate command. `-p .` is correct **specifically** because git runs
+# hooks from the worktree top level, so `.` IS the workspace root at run time — the
+# discriminator is *is cwd the workspace root when this runs*, never *does the
+# artifact travel*. Added to the lockstep set at 5a: the two constants above name
+# the guard and the message, so an edit to this line alone would have left the
+# lockstep row green while `RECIPE` and SETUP.md silently diverged.
+GATE_COMMAND = "mitos check --staged -p ."
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SETUP_PATH = os.path.join(_REPO_ROOT, "SETUP.md")
@@ -154,6 +161,10 @@ def test_setup_recipe_is_in_lockstep():
         "the divergence message drifted from SETUP.md — update in lockstep "
         "(check the em-dash is U+2014)"
     )
+    assert GATE_COMMAND in setup, (
+        "the gate command drifted from SETUP.md — update in lockstep"
+    )
+    assert GATE_COMMAND in RECIPE
     # The em-dash is U+2014, not a hyphen or U+2013 (byte-confirmed).
     assert "—" in DIVERGENCE_MESSAGE
 
@@ -274,7 +285,10 @@ def test_live_hook_blocks_bad_buffer_passes_clean(tmp_path):
 
         # Seed + index the hard-delete decision (non-interactive).
         (ws / "decisions.md").write_text(_HARD_DELETE, encoding="utf-8")
-        sync = _run(["mitos", "sync", "--yes"], ws, env=env)
+        # `init` above stays bare — it is selector-exempt and a supplied selector is
+        # REFUSED, so `-p .` there would exit non-zero on "`init` takes no project
+        # selector". Only the workspace-targeting verbs gain one.
+        sync = _run(["mitos", "sync", "--yes", "-p", "."], ws, env=env)
         if sync.returncode != 0:
             # A quota/service outage during seeding is environmental, not a defect.
             pytest.skip(

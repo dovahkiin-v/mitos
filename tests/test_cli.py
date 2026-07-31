@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch, ANY
 from mitos.cli import main
 from mitos.config import toml_scalar
 
-def test_cli_help_menu() -> None:
+def test_cli_help_menu(workspace) -> None:
     """Verifies that the help menu is printed and exits cleanly with 0."""
     with patch.object(sys, "argv", ["mitos", "--help"]):
         with pytest.raises(SystemExit) as exc:
@@ -19,7 +19,7 @@ def test_cli_help_menu() -> None:
 
 
 @patch("mitos.cli.cmd_init")
-def test_cli_init_routing(mock_init: MagicMock) -> None:
+def test_cli_init_routing(mock_init: MagicMock, workspace) -> None:
     """Verifies that the 'init' command routes to the initialization controller."""
     with patch.object(sys, "argv", ["mitos", "init"]):
         main()
@@ -27,9 +27,9 @@ def test_cli_init_routing(mock_init: MagicMock) -> None:
 
 
 @patch("mitos.cli.cmd_sync")
-def test_cli_sync_routing(mock_sync: MagicMock) -> None:
+def test_cli_sync_routing(mock_sync: MagicMock, workspace) -> None:
     """Verifies that 'sync' command parses flags and routes correctly."""
-    with patch.object(sys, "argv", ["mitos", "sync", "--yes"]):
+    with patch.object(sys, "argv", ["mitos", "-p", workspace, "sync", "--yes"]):
         main()
     mock_sync.assert_called_once()
     # Check that auto_accept is True
@@ -38,9 +38,9 @@ def test_cli_sync_routing(mock_sync: MagicMock) -> None:
 
 
 @patch("mitos.cli.cmd_capture")
-def test_cli_capture_routing(mock_capture: MagicMock) -> None:
+def test_cli_capture_routing(mock_capture: MagicMock, workspace) -> None:
     """Verifies that 'capture' routes successfully with text argument."""
-    with patch.object(sys, "argv", ["mitos", "capture", "Use SQLite WAL"]):
+    with patch.object(sys, "argv", ["mitos", "-p", workspace, "capture", "Use SQLite WAL"]):
         main()
     mock_capture.assert_called_once()
     args, kwargs = mock_capture.call_args
@@ -48,9 +48,9 @@ def test_cli_capture_routing(mock_capture: MagicMock) -> None:
 
 
 @patch("mitos.cli.cmd_query")
-def test_cli_query_routing(mock_query: MagicMock) -> None:
+def test_cli_query_routing(mock_query: MagicMock, workspace) -> None:
     """Verifies that semantic 'query' command routes successfully."""
-    with patch.object(sys, "argv", ["mitos", "query", "cache strategy"]):
+    with patch.object(sys, "argv", ["mitos", "-p", workspace, "query", "cache strategy"]):
         main()
     mock_query.assert_called_once()
     args, kwargs = mock_query.call_args
@@ -58,9 +58,9 @@ def test_cli_query_routing(mock_query: MagicMock) -> None:
 
 
 @patch("mitos.cli.cmd_show")
-def test_cli_show_routing(mock_show: MagicMock) -> None:
+def test_cli_show_routing(mock_show: MagicMock, workspace) -> None:
     """Verifies 'show' command queries slugs correctly."""
-    with patch.object(sys, "argv", ["mitos", "show", "my-slug"]):
+    with patch.object(sys, "argv", ["mitos", "-p", workspace, "show", "my-slug"]):
         main()
     mock_show.assert_called_once()
     args, kwargs = mock_show.call_args
@@ -68,9 +68,9 @@ def test_cli_show_routing(mock_show: MagicMock) -> None:
 
 
 @patch("mitos.cli.cmd_list")
-def test_cli_list_routing(mock_list: MagicMock) -> None:
+def test_cli_list_routing(mock_list: MagicMock, workspace) -> None:
     """Verifies 'list' routes with optional scope and state filters."""
-    with patch.object(sys, "argv", ["mitos", "list", "--scope", "backend", "--state", "active"]):
+    with patch.object(sys, "argv", ["mitos", "-p", workspace, "list", "--scope", "backend", "--state", "active"]):
         main()
     mock_list.assert_called_once_with(
         ANY,
@@ -83,9 +83,9 @@ def test_cli_list_routing(mock_list: MagicMock) -> None:
 
 
 @patch("mitos.cli.cmd_sync")
-def test_cli_sync_embed_only_routing(mock_sync: MagicMock) -> None:
+def test_cli_sync_embed_only_routing(mock_sync: MagicMock, workspace) -> None:
     """Verifies that 'sync --embed-only' routes correctly with embed_only=True."""
-    with patch.object(sys, "argv", ["mitos", "sync", "--embed-only"]):
+    with patch.object(sys, "argv", ["mitos", "-p", workspace, "sync", "--embed-only"]):
         main()
     mock_sync.assert_called_once()
     args, kwargs = mock_sync.call_args
@@ -93,9 +93,9 @@ def test_cli_sync_embed_only_routing(mock_sync: MagicMock) -> None:
 
 
 @patch("mitos.cli.cmd_query")
-def test_cli_query_depth_routing(mock_query: MagicMock) -> None:
+def test_cli_query_depth_routing(mock_query: MagicMock, workspace) -> None:
     """Verifies that 'query --depth' routes with the depth parameter."""
-    with patch.object(sys, "argv", ["mitos", "query", "my claim", "--depth", "trace"]):
+    with patch.object(sys, "argv", ["mitos", "-p", workspace, "query", "my claim", "--depth", "trace"]):
         main()
     mock_query.assert_called_once()
     args, kwargs = mock_query.call_args
@@ -104,9 +104,9 @@ def test_cli_query_depth_routing(mock_query: MagicMock) -> None:
 
 
 @patch("mitos.cli.cmd_render")
-def test_cli_render_format_routing(mock_render: MagicMock) -> None:
+def test_cli_render_format_routing(mock_render: MagicMock, workspace) -> None:
     """Verifies 'render --format' routes format to cmd_render."""
-    with patch.object(sys, "argv", ["mitos", "render", "--format", "nygard"]):
+    with patch.object(sys, "argv", ["mitos", "-p", workspace, "render", "--format", "nygard"]):
         main()
     mock_render.assert_called_once()
     args, kwargs = mock_render.call_args
@@ -114,14 +114,14 @@ def test_cli_render_format_routing(mock_render: MagicMock) -> None:
 
 
 @patch("mitos.cli.cmd_serve")
-def test_cli_serve_routing(mock_serve: MagicMock) -> None:
+def test_cli_serve_routing(mock_serve: MagicMock, workspace) -> None:
     """Verifies that 'serve' sub-command routes to cmd_serve."""
     with patch.object(sys, "argv", ["mitos", "serve"]):
         main()
     assert mock_serve.called
 
 
-def test_cli_unexpected_error_exits_1() -> None:
+def test_cli_unexpected_error_exits_1(workspace) -> None:
     """Verifies that unexpected exceptions crash cleanly with exit code 1."""
     with patch("mitos.cli.cmd_init", side_effect=Exception("Unexpected boom!")):
         with patch.object(sys, "argv", ["mitos", "init"]):
@@ -131,7 +131,7 @@ def test_cli_unexpected_error_exits_1() -> None:
 
 
 def test_cli_malformed_config_exits_clean_no_traceback(
-    tmp_path, monkeypatch, capsys
+    tmp_path, capsys
 ) -> None:
     """A malformed `.mitos/config.toml` exits 1 with a one-line error, no traceback.
 
@@ -139,8 +139,13 @@ def test_cli_malformed_config_exits_clean_no_traceback(
     construction. Because `main()` now builds the config INSIDE its `try:`, the
     `except MitosError` boundary renders it as a clean `Error: …` line rather than
     dumping a raw Python traceback for every command (PLANNING_NOTES Lesson 45 —
-    the Letterbox `ConfigError`→traceback trap). `main()` builds `MitosConfig()`
-    from cwd, so we chdir into a workspace whose config is malformed.
+    the Letterbox `ConfigError`→traceback trap). Since 5a the config is built from
+    the **named** project, so the row names the malformed workspace rather than
+    standing in it — the boundary is the same one either way.
+
+    The workspace is a full validity triple: `resolve_project` runs first and
+    refuses a directory with no `decisions.md` for its own reason, which would
+    prove the wrong thing.
     """
     mitos_dir = tmp_path / ".mitos"
     mitos_dir.mkdir()
@@ -148,9 +153,9 @@ def test_cli_malformed_config_exits_clean_no_traceback(
     (mitos_dir / "config.toml").write_text(
         'rotation_mode = "archive\nqdrant_url = "x"\n', encoding="utf-8"
     )
-    monkeypatch.chdir(tmp_path)
+    (tmp_path / "decisions.md").write_text("# Decisions\n", encoding="utf-8")
 
-    with patch.object(sys, "argv", ["mitos", "list"]):
+    with patch.object(sys, "argv", ["mitos", "-p", str(tmp_path), "list"]):
         with pytest.raises(SystemExit) as exc:
             main()
     assert exc.value.code == 1
@@ -169,7 +174,7 @@ def test_cli_malformed_config_exits_clean_no_traceback(
 # — they are the byte-compatibility gate for every config.toml line ever seeded.
 # ---------------------------------------------------------------------------
 
-def test_toml_scalar_serializes_bool_as_lowercase_literal() -> None:
+def test_toml_scalar_serializes_bool_as_lowercase_literal(workspace) -> None:
     """A bool serializes to native TOML ``true``/``false`` (not ``1``/``0``, not raise).
 
     ``bool`` subclasses ``int``, so the bool branch must precede the int branch;
@@ -179,7 +184,7 @@ def test_toml_scalar_serializes_bool_as_lowercase_literal() -> None:
     assert toml_scalar(False) == "false"
 
 
-def test_toml_scalar_still_serializes_int_and_str() -> None:
+def test_toml_scalar_still_serializes_int_and_str(workspace) -> None:
     """The bool branch doesn't disturb the existing int/str scalars."""
     assert toml_scalar(50) == "50"
     assert toml_scalar("archive") == '"archive"'
@@ -197,7 +202,7 @@ def test_toml_scalar_still_serializes_int_and_str() -> None:
         ("plain", "the clean case still takes the shipped basic form"),
     ],
 )
-def test_toml_scalar_round_trips_the_widened_domain(value, why) -> None:
+def test_toml_scalar_round_trips_the_widened_domain(value, why, workspace) -> None:
     """Every value shape the registry can carry survives a serialize→parse cycle.
 
     The registry's domain is wider than the config schema's: project names can hold
@@ -213,7 +218,7 @@ def test_toml_scalar_round_trips_the_widened_domain(value, why) -> None:
     "key",
     ["plain", "dotted.name", "ąžuolas", 'quote"bearing', "back\\slash"],
 )
-def test_toml_scalar_also_serves_as_a_quoted_key(key) -> None:
+def test_toml_scalar_also_serves_as_a_quoted_key(key, workspace) -> None:
     """The same serializer quotes registry KEYS, which is why names are never bare.
 
     A bare dotted key parses as a nested table (``example.com`` — an ordinary
@@ -223,7 +228,7 @@ def test_toml_scalar_also_serves_as_a_quoted_key(key) -> None:
     assert list(tomllib.loads(f'{toml_scalar(key)} = "v"')) == [key]
 
 
-def test_toml_scalar_refuses_a_non_scalar_loudly() -> None:
+def test_toml_scalar_refuses_a_non_scalar_loudly(workspace) -> None:
     """A value with no TOML scalar form raises ``TypeError``, never emits a guess.
 
     Callers at a user-facing boundary convert this into their own calm error; the

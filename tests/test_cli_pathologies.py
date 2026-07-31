@@ -66,6 +66,14 @@ def isolated_workspace(monkeypatch) -> Tuple[MitosConfig, str]:
     config.archive_dir = os.path.join(tmpdir, "decisions", "archive")
     
     os.makedirs(config.mitos_dir, exist_ok=True)
+    # The full shipped validity triple since 5a: rows that drive `main()` name this
+    # workspace with `--project`, and resolution refuses a half-workspace before the
+    # handler (or the dispatch guard) is reached.
+    with open(os.path.join(config.mitos_dir, "config.toml"), "w") as f:
+        f.write("# a mitos workspace\n")
+    if not os.path.exists(config.decisions_file):
+        with open(config.decisions_file, "w") as f:
+            f.write("# Decisions\n")
     yield config, tmpdir
     
     # Clean up workspace
@@ -418,10 +426,13 @@ def test_record_json_needs_review_receipt(isolated_workspace, capsys) -> None:
 def test_record_json_missing_rejected_guard(isolated_workspace, capsys, monkeypatch) -> None:
     """The dispatch-level missing-`--rejected` guard speaks JSON on stdout under --json
     (`code: "missing_rejected"`) and still exits 2 — no stderr wall."""
-    # Route through `main()` so the dispatch-level guard runs (it fires before any
-    # store access, so the cwd workspace is irrelevant — mirrors test_record_requires_rejected).
+    # Route through `main()` so the dispatch-level guard runs. It fires before any
+    # store access — but AFTER targeting, so the call still names its project or it
+    # never reaches the guard (mirrors test_record_requires_rejected).
+    config, _ = isolated_workspace
     monkeypatch.setattr(sys, "argv",
-                        ["mitos", "record", "ax", "--slug", "s", "--json"])
+                        ["mitos", "-p", config.workspace_dir, "record", "ax",
+                         "--slug", "s", "--json"])
     capsys.readouterr()
     with pytest.raises(SystemExit) as exc:
         main()

@@ -76,20 +76,37 @@ class TestHelpers:
                 < line.index(config.workspace_dir))
 
 
+#: The name the `workspace` fixture registers itself under. A FIXED name rather than
+#: `init`'s basename default, because since 5a every row below addresses the
+#: workspace by selector and the echo answers with the *registered name* — so the
+#: assertions read as the §4.7 value rule they exercise instead of as an incidental
+#: `tmp_path` basename.
+WORKSPACE_NAME = "provenance-ws"
+
+
 @pytest.fixture
 def workspace(tmp_path):
-    """A minimal initialized workspace with one synced decision."""
+    """A minimal initialized workspace with one synced decision.
+
+    Its runner supplies `-p WORKSPACE_NAME` on every non-exempt verb: 5a removed
+    the working-directory fallback, so `cwd=ws` alone no longer targets anything.
+    `init` keeps running bare — it is selector-exempt and a supplied selector is
+    refused.
+    """
     ws = str(tmp_path)
     env = {**os.environ, "GEMINI_API_KEY": "", "GOOGLE_API_KEY": "",
            "QDRANT_URL": "http://localhost:1"}
 
-    def run(*args):
+    def _raw(*args):
         return subprocess.run(
             [sys.executable, "-m", "mitos.cli", *args],
             capture_output=True, text=True, cwd=ws, env=env,
         )
 
-    run("init")
+    def run(*args):
+        return _raw("-p", WORKSPACE_NAME, *args)
+
+    _raw("init", "--name", WORKSPACE_NAME)
     with open(os.path.join(ws, "decisions.md"), "a", encoding="utf-8") as f:
         f.write(
             "\n### provenance-test-decision\n"
@@ -134,11 +151,21 @@ def _both_tokens(stdout: str, config: MitosConfig) -> bool:
 
 
 class TestCliJson:
+    """Entry-007's four CLI-side members, INVERTED at 5a — not deleted.
+
+    Each used to assert `project == abspath(ws)`, the transitional rule for a
+    selector-less call. There is no selector-less call left on these verbs, so the
+    rule they exercise moved one row down §4.7's table: a **registered path**
+    reverse-looks-up, so the echo names the registered name. The assertion is the
+    only statement that no response is unattributed; turning it around is what
+    keeps that statement true rather than merely absent.
+    """
+
     def test_list_json_carries_provenance(self, workspace):
         ws, run = workspace
         out = run("list", "--json")
         payload = json.loads(out.stdout)
-        assert payload["project"] == os.path.abspath(ws)  # selector-less → the path
+        assert payload["project"] == WORKSPACE_NAME   # registered name → the name
         assert payload["collection"] == MitosConfig(workspace_dir=ws).qdrant_collection
         assert payload["workspace"] == os.path.abspath(ws)
 
@@ -149,19 +176,21 @@ class TestCliJson:
         out = run("surface", "provenance headers", "--json")
         payload = json.loads(out.stdout)
         assert payload.get("degraded") == "lexical"
-        assert payload["project"] == os.path.abspath(ws)
+        assert payload["project"] == WORKSPACE_NAME
         assert payload["collection"] == MitosConfig(workspace_dir=ws).qdrant_collection
         assert payload["workspace"] == os.path.abspath(ws)
 
     def test_degraded_surface_text_has_provenance_line(self, workspace):
         ws, run = workspace
         out = run("surface", "provenance headers")
-        assert _both_tokens(out.stdout, MitosConfig(workspace_dir=ws))
+        assert _both_tokens(out.stdout,
+                            MitosConfig(workspace_dir=ws, project=WORKSPACE_NAME))
 
     def test_list_text_header_has_provenance(self, workspace):
         ws, run = workspace
         out = run("list")
-        assert _both_tokens(out.stdout, MitosConfig(workspace_dir=ws))
+        assert _both_tokens(out.stdout,
+                            MitosConfig(workspace_dir=ws, project=WORKSPACE_NAME))
 
 
 class TestMcpTwins:
@@ -911,7 +940,7 @@ def test_a_leading_echo_reaches_a_combined_pipe_before_a_boundary_error(tmp_path
     graph.unlink()
     graph.mkdir()
 
-    done = run("scopes")
+    done = run("-p", str(workspace), "scopes")
 
     combined = done.stdout
     assert "Error:" in combined
@@ -955,7 +984,8 @@ def test_the_report_reaches_a_combined_pipe_before_the_refusals(tmp_path):
     run("init")
     for slug, axiom in (("alpha-block", "The alpha decision restores cleanly."),
                         ("beta-block", "The beta decision cannot be rendered.")):
-        run("record", axiom, "--slug", slug, "--rejected", f"Losing {slug}.")
+        run("-p", str(workspace), "record", axiom, "--slug", slug,
+            "--rejected", f"Losing {slug}.")
 
     # Make both nodes graph-only (drop their `### ` blocks), then blank one node's
     # axiom so `render_source_block` refuses it while the other still renders.
@@ -974,7 +1004,8 @@ def test_the_report_reaches_a_combined_pipe_before_the_refusals(tmp_path):
     graph.commit()
     graph.close()
 
-    done = run("restore-source", "--all-graph-only", "--dry-run")
+    done = run("-p", str(workspace), "restore-source", "--all-graph-only",
+               "--dry-run")
 
     combined = done.stdout
     assert "Would restore 1 source block(s)" in combined

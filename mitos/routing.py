@@ -339,15 +339,18 @@ def resolve_project(selector: Optional[str]) -> ResolvedProject:
     truthiness, so ``-p ""`` / ``project=""`` reach that raise site rather than
     falling back.
 
-    **Mid-vision, the absent case does not reach here at all.** Each boundary
-    coalesces its own spelling first — ``cli._selector_from_args`` over
-    ``project_pre``/``project_post`` plus the ``status``/``agent-block``
+    **The CLI now routes the absent case here; the MCP surface does not yet.**
+    Each boundary coalesces its own spelling first — ``cli._selector_from_args``
+    over ``project_pre``/``project_post`` plus the ``status``/``agent-block``
     positional, ``mcp_server._target_config`` over the tool's ``project``
-    argument — and a *selector-less* call still keeps today's working-directory
-    behaviour instead of calling this function, which is why the ``Optional``
-    branch is currently reachable only through an empty string. Phases 5a and 5b
-    remove those fallbacks and route the absent case here too; until then the
-    branch is built, tested, and deliberately not yet the only path.
+    argument. Since phase 5a a selector-less CLI call reaches this function with
+    ``None`` and gets the missing-class error, with two deliberate exceptions that
+    never call it at all: a verb that targets no workspace
+    (``init``/``serve``/``projects``/``set-key --global``) and a zero-arg ``mitos
+    status``, which answers the machine-wide overview. On the MCP side a
+    ``project``-less tool call still keeps today's working-directory behaviour, so
+    for *that* boundary the ``Optional`` branch remains reachable only through an
+    empty string until phase 5b.
 
     The registry read is **not** optional and its faults propagate unwrapped —
     including on the path form, which needs routing for nothing but the echo name.

@@ -84,21 +84,30 @@ from mitos.importer import MitosProseImporter
 # Lazy by design (§6 description economy): zero context cost until --help is
 # invoked, so it can afford the expansive examples the eager MCP descriptions
 # can't. Teaches the surface→record reflex, the scope vocabulary, workspace
-# targeting (-C), and the relation-edge guidance. Every flag/verb shown here is
+# targeting (-p), and the relation-edge guidance. Every flag/verb shown here is
 # real CLI surface — keep it runnable, never invent a flag (there is no
 # --retired edge). Rendered verbatim via RawDescriptionHelpFormatter.
+#
+# EVERY worked example names its project, because since 5a every verb below
+# requires one. This block is 5,000 lines from the parser that renders it, so an
+# audit scoped to "help text" misses it — grep the string, not the parser.
 _EPILOG = """\
 Examples:
   # Before deciding: surface precedent, then record the outcome you chose
-  mitos surface "cache invalidation strategy"
-  mitos record "Write-through cache for session data" \\
+  # (`-p` names the project: a registered name — see `mitos projects` — or an
+  #  absolute path. It is accepted on either side of the verb.)
+  mitos -p myproject surface "cache invalidation strategy"
+  mitos -p myproject record "Write-through cache for session data" \\
     --rejected "write-back: data loss on crash" --scope cache --slug write-through-sessions
 
   # Discover the scope vocabulary before you invent a near-duplicate tag
-  mitos scopes
+  mitos -p myproject scopes
 
-  # Operate on another workspace without cd (git's -C; must precede the verb)
-  mitos -C /path/to/repo list --scope auth
+  # What does this machine have? (the only workspace-free report)
+  mitos status
+
+  # Operate on a workspace by path, from anywhere
+  mitos -p /path/to/repo list --scope auth
 
 Relating a decision to a prior (pass the prior's EXACT slug):
   --supersedes a,b   priors you've outgrown / evolved past (comma-separated for several)
@@ -2079,35 +2088,48 @@ def _upsert_env_var(env_path: str, name: str, value: str) -> None:
         pass
 
 
-def cmd_set_key(value: str, name: str = "GEMINI_API_KEY", is_global: bool = False,
-                workspace_dir: Optional[str] = None) -> None:
+def cmd_set_key(value: str, *, workspace_dir: Optional[str],
+                name: str = "GEMINI_API_KEY", is_global: bool = False) -> None:
     """Stores an API key in the global or project ``.env``.
+
+    **This function cannot resolve a working directory, and that is the point.**
+    ``set-key``'s project form *is* the bare invocation, so a selector that failed
+    to reach here would have landed a **credential** in the launch directory's
+    ``.env`` while the caller named another project — the vision's §1 hazard on the
+    one payload where it is worst. ``workspace_dir`` is therefore required and
+    ``None`` means *"there is no project"*, not *"use cwd"*: it stays ``Optional``
+    only because ``--global`` legitimately has no workspace, and the guard for the
+    mismatch is a **raise**, never a default.
 
     Args:
         value: The API key value to store.
+        workspace_dir: The project to write into, or ``None`` for the ``--global``
+            form. Required — an unnamed project form is unconstructible rather than
+            silently cwd-rooted.
         name: The env var name (default ``GEMINI_API_KEY``).
         is_global: If True, write the shared ``~/.config/mitos/.env`` (serves
             every project); otherwise write the project's own ``.env``.
-        workspace_dir: The project to write into. ``None`` — the transitional
-            default — means the process's working directory, exactly as this verb
-            has always behaved. The parameter exists because ``set-key``'s project
-            form *is* the bare invocation: once ``--project`` is accepted on this
-            verb's parser, a selector that did not reach here would silently land a
-            **credential** in the launch directory's ``.env`` while the caller
-            named another project. Phase 5a deletes the default and makes the
-            argument required; ``test_set_key_without_a_selector_still_writes_the
-            _cwd_env`` is the tripwire that has to be inverted for that.
+
+    Raises:
+        MitosError: If the project form was called with no workspace. A programming
+            fault rather than a user one — ``main()`` refuses a selectorless
+            ``set-key`` at the boundary with the teaching anatomy — so it is a plain
+            boundary error, not a seventh targeting discriminator.
     """
-    base = os.getcwd() if workspace_dir is None else workspace_dir
+    if not is_global and workspace_dir is None:
+        raise MitosError(
+            "set-key needs the project to write into. Name it with `--project` "
+            "(a registered name or an absolute path), or pass `--global` to write "
+            "the machine-wide .env shared by every project.")
     if is_global:
         env_path = global_env_path()
     else:
-        env_path = os.path.join(base, ".env")
+        env_path = os.path.join(workspace_dir, ".env")
     _upsert_env_var(env_path, name, value)
     scope = "globally (all projects)" if is_global else "for this project"
     print(f"Stored {name} {scope} → {env_path}")
     if not is_global:
-        _ensure_gitignore_entry(os.path.join(base, ".gitignore"), ".env")
+        _ensure_gitignore_entry(os.path.join(workspace_dir, ".gitignore"), ".env")
 
 
 def _fmt_k(n: int) -> str:
@@ -4868,22 +4890,26 @@ def _answer_workspace_optional_verb(args: argparse.Namespace,
     there is no config to name a corpus from, and inventing a fallback would make
     the echo claim a collection nobody resolved.
 
+    Since 5a ``target`` is always a real resolution on this path: neither verb is
+    exempt, a selectorless ``status`` routed to the global overview one statement
+    earlier, and a selectorless ``agent-block`` raised. The parameter keeps its
+    ``Optional`` type because that is ``_resolve_selector``'s declared return on the
+    exempt path, not because ``None`` is reachable here.
+
     Args:
         args: The parsed namespace.
-        target: The resolved project, or ``None`` when no selector was supplied.
+        target: The resolved project.
 
     Returns:
         The verb's exit code.
     """
-    # `abspath` rather than a direct working-directory read: `MitosConfig()`'s own
-    # default is `"."` absolutized, so this is the same resolution the failed
-    # construction would have made, and the tree keeps exactly the three
-    # working-directory reads entry-005 enumerates (this comment is worded to keep
-    # that standing grep honest — 2a's precedent).
-    root = os.path.abspath(target.root if target else ".")
+    # `abspath` rather than a working-directory read — the canonical root is already
+    # in hand, and the tree keeps exactly the two display-only reads entry-005
+    # enumerates (this comment is worded to keep that standing grep honest, 2a's
+    # precedent).
+    root = os.path.abspath(target.root)
     if args.command == "status":
-        return cmd_status(root, as_json=args.as_json,
-                          project=target.name if target else None)
+        return cmd_status(root, as_json=args.as_json, project=target.name)
     return cmd_agent_block(root, check=args.check)
 
 
@@ -4936,6 +4962,40 @@ def _selector_from_args(args: argparse.Namespace) -> Optional[str]:
     return flag if flag is not None else positional
 
 
+def _exempt_reason(args: argparse.Namespace) -> Optional[str]:
+    """Answers "does this call target no single workspace?", once, for both readers.
+
+    Two sides of the boundary need the same rule and would otherwise spell it
+    twice: the refusal below (*a selector on this verb is a fault*) and the flip in
+    ``main()`` (*the absence of a selector on this verb is fine*). A second
+    hand-written ``args.command in _SELECTOR_EXEMPT_VERBS or (args.command ==
+    "set-key" and args.is_global)`` is the drift seam — ``set-key --global`` would
+    keep working while ``mitos -p x set-key --global`` answered a different
+    question, or vice versa, and no row would see it.
+
+    ``status`` is deliberately **not** here. Its optionality is a different rule — a
+    selector is *legal* on ``status`` and merely routes elsewhere when absent — and
+    folding the two together would make ``mitos -p mitos status`` refusable by
+    accident.
+
+    Args:
+        args: The parsed namespace.
+
+    Returns:
+        One of ``errors.EXEMPT_*`` — the shared vocabulary that also keys
+        ``routing.exempt_verb_error`` and ``_EXEMPT_VERB_NOTES`` — or ``None`` when
+        the call targets a workspace. Never a boolean: a fourth spelling of the
+        reason is what forks the renderer's vocabulary.
+    """
+    reason = _SELECTOR_EXEMPT_VERBS.get(args.command)
+    if reason is None and args.command == "set-key" and getattr(args, "is_global", False):
+        # Conditional membership: `set-key`'s *project* form is the bare
+        # invocation, so only `--global` makes the verb global. `getattr` with a
+        # default because `is_global` exists only on the `set-key` namespace.
+        reason = EXEMPT_EXPLICITLY_GLOBAL
+    return reason
+
+
 def _refuse_selector_on_exempt_verb(args: argparse.Namespace,
                                     selector: Optional[str]) -> None:
     """Refuses a selector handed to a verb that targets no project.
@@ -4955,18 +5015,14 @@ def _refuse_selector_on_exempt_verb(args: argparse.Namespace,
     """
     if selector is None:
         return
-    reason = _SELECTOR_EXEMPT_VERBS.get(args.command)
-    if reason is None and args.command == "set-key" and getattr(args, "is_global", False):
-        # Conditional membership: `set-key`'s *project* form is the bare
-        # invocation, so only `--global` makes the verb global.
-        reason = EXEMPT_EXPLICITLY_GLOBAL
+    reason = _exempt_reason(args)
     if reason is not None:
         raise routing.exempt_verb_error(args.command, reason)
 
 
 def _resolve_selector(selector: Optional[str],
-                      command: str) -> Optional[routing.ResolvedProject]:
-    """Turns a supplied selector into a validated workspace, or None when absent.
+                      command: str) -> routing.ResolvedProject:
+    """Turns a selector into a validated workspace — or raises. There is no absence.
 
     Absolutizes an explicitly-typed relative path (``.``, ``./x``, ``../x``,
     ``x/y``) so the resolver only ever receives a name or an absolute path — and
@@ -4981,25 +5037,38 @@ def _resolve_selector(selector: Optional[str],
     resolver path-shaped and non-absolute and lands on the relative-path class,
     whose message names the actual rule and both valid forms.
 
+    **An absent selector is carried straight through to
+    ``routing.resolve_project``, which raises the missing-class error.** That is
+    5a's flip: this function used to return ``None`` for it and the caller used to
+    read that as *"resolve the working directory"*. A boundary-local ``if selector
+    is None: raise ProjectTargetingError(missing, …)`` would have worked and would
+    have duplicated the constructor's required-field bookkeeping at the one place
+    2a deliberately kept free of it — one raise site, one wording, no fifth
+    spelling invented here. ``resolve_project``'s own ``not selector`` guard runs
+    before any shape test, so ``None`` never reaches ``is_path_shaped``.
+
+    The caller reaches this function **only** for a verb that targets a workspace:
+    ``_exempt_reason`` short-circuits ``init``/``serve``/``projects``/``set-key
+    --global`` (whose ``target`` is ``None``, and it is ``None`` exactly then), and
+    the ``status`` fork routes a selectorless call to the global overview one
+    statement earlier.
+
     Args:
         selector: The coalesced selector, or None when none was supplied.
         command: ``args.command``, for the ``_WORKSPACE_OPTIONAL_VERBS`` carve-out.
 
     Returns:
-        The resolution, or ``None`` when no selector was supplied (the caller then
-        keeps today's working-directory behaviour; phase 5a removes that fallback).
+        The resolution. Never ``None``.
 
     Raises:
         ProjectTargetingError: On every resolution failure the carve-out below
-            does not cover.
+            does not cover — including a wholly absent selector.
         RegistryError: If the registry file itself is unusable — propagated
             unwrapped, because there is no registered vocabulary to teach when the
             file holding it cannot be read.
     """
-    if selector is None:
-        return None
     sel = selector
-    if (routing.is_path_shaped(sel) and not sel.startswith("~")
+    if (sel is not None and routing.is_path_shaped(sel) and not sel.startswith("~")
             and not os.path.isabs(sel)):
         sel = os.path.abspath(sel)
     try:
@@ -5190,9 +5259,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"mitos {__version__}")
     parser.add_argument(
         "-C", "--directory", dest="directory", default=None, metavar="DIR",
-        help="Run as if mitos were started in DIR (git's -C). Retargets the whole "
-             "workspace — graph, collection, .env/keys, and relative path args. "
-             "Must appear BEFORE the verb: `mitos -C /ws list`.",
+        help="Run as if mitos were started in DIR (git's -C). Retargets relative "
+             "path ARGUMENTS only — it does not name a project, so a verb still "
+             "needs `--project`. Must appear BEFORE the verb: "
+             "`mitos -C /ws -p /ws record … --rejected-file ./r.txt`.",
     )
     # The project selector, pre-verb half. Its twin is registered on every
     # subparser below, into a DIFFERENT dest — see `_selector_from_args` for why a
@@ -5201,9 +5271,10 @@ def _build_parser() -> argparse.ArgumentParser:
     # of the teaching anatomy could render.
     parser.add_argument(
         "-p", "--project", dest="project_pre", default=None, metavar="SELECTOR",
-        help="Act on this project instead of the working directory: a registered "
-             "name (see `mitos projects`) or an absolute path. Accepted on either "
-             "side of the verb — `mitos -p mitos list` or `mitos list -p mitos`.",
+        help="The project to act on — REQUIRED on every verb but `init`, `serve`, "
+             "`projects` and `set-key --global`: a registered name (see `mitos "
+             "projects`) or an absolute path. Accepted on either side of the verb "
+             "— `mitos -p mitos list` or `mitos list -p mitos`.",
     )
     # metavar collapses the width-doubling {init,sync,query,query_decisions,…}
     # brace-list in the usage banner to a single COMMAND token (R5). This is a
@@ -5367,11 +5438,15 @@ def _build_parser() -> argparse.ArgumentParser:
     status_p.add_argument("--json", action="store_true", dest="as_json", help="Emit a machine-readable JSON report.")
 
     # set-key — store an API key globally (all projects) or for this project
-    sk_p = subparsers.add_parser("set-key", help="Store an API key globally (all projects) or for this project.")
+    sk_p = subparsers.add_parser(
+        "set-key",
+        help="Store an API key globally (all projects) or for one named project.")
     sk_p.add_argument("value", help="The API key value.")
     sk_p.add_argument("--name", default="GEMINI_API_KEY", help="Env var name to store (default: GEMINI_API_KEY).")
     sk_p.add_argument("--global", action="store_true", dest="is_global",
-                      help="Write the global ~/.config/mitos/.env (shared by ALL projects) instead of this project's .env.")
+                      help="Write the global ~/.config/mitos/.env (shared by ALL "
+                           "projects). Without it, `--project` is required and the "
+                           "key lands in that project's own .env.")
 
     # cutover — the one-time prototype→V1a migration (destructive; operator-run).
     cut_p = subparsers.add_parser(
@@ -5439,7 +5514,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "agent-block",
         help="Print the agent-file block to paste into AGENTS.md/CLAUDE.md/…, or --check for drift.")
     ab_p.add_argument("path", nargs="?", default=None,
-                      help="Project directory (default: current directory) — used by --check.")
+                      help="The project — a registered name or an absolute path. "
+                           "Required (the flag spelling `-p` works too); `--check` "
+                           "scans this project's agent files.")
     ab_p.add_argument("--check", action="store_true",
                       help="Scan the project's agent files and report stale/unversioned mitos notes.")
 
@@ -5477,9 +5554,10 @@ def _build_parser() -> argparse.ArgumentParser:
         _verb_parser.add_argument(
             "-p", "--project", dest="project_post", default=None,
             metavar="SELECTOR",
-            help="Act on this project instead of the working directory: a "
-                 "registered name (see `mitos projects`) or an absolute path. "
-                 "Also accepted before the verb (`mitos -p NAME …`).",
+            help="The project to act on — REQUIRED on every verb but `init`, "
+                 "`serve`, `projects` and `set-key --global`: a registered name "
+                 "(see `mitos projects`) or an absolute path. Also accepted "
+                 "before the verb (`mitos -p NAME …`).",
         )
 
     return parser
@@ -5540,18 +5618,28 @@ def main() -> None:
             # fires on this path and no unbound local can become a swallowed
             # `NameError`.
             sys.exit(cmd_status_overview(as_json=args.as_json))
-        target = _resolve_selector(selector, args.command)
-        # No selector keeps today's behaviour byte for byte — construction is not
-        # migration, and every zero-arg path stays green until 5a removes the
-        # fallback (`test_a_selectorless_call_still_resolves_the_cwd_workspace`).
+        # `target` is `None` EXACTLY when the verb targets no workspace — the same
+        # predicate the refusal above used, called once more rather than
+        # hand-spelled a second time. For every other verb `_resolve_selector`
+        # either returns a validated workspace or raises the §4.5 teaching error:
+        # since 5a there is no third outcome, and in particular no working-directory
+        # fallback. A caller who omits the selector gets a calm error naming the
+        # recovery, not a silent write into whatever directory the process started
+        # in.
+        target = (None if _exempt_reason(args) is not None
+                  else _resolve_selector(selector, args.command))
         # `project=` carries the caller's own vocabulary onto the config so every
         # echo below names the target the way the caller addressed it.
         # `target.name` is already the registered name for both selector forms
         # and `None` for an unregistered path, which the constructor resolves to
-        # the canonical path.
+        # the canonical path. The exempt arm builds an explicit `MitosConfig(".")`
+        # — same resolution as the zero-arg default it replaced, but an argument
+        # rather than a default, which is what 5d then removes the default behind
+        # (`os.path.abspath` inside the constructor, never a working-directory read,
+        # so entry-005's standing grep stays honest).
         try:
             config = (MitosConfig(target.root, project=target.name) if target
-                      else MitosConfig())
+                      else MitosConfig("."))
         except ConfigError:
             # The existing carve-out, extended by one error class rather than a new
             # mechanism: for the two verbs that answer ABOUT a directory, a broken
@@ -5665,7 +5753,7 @@ def main() -> None:
             # the boundary, passed into the callee (2a's `cwd_hint_name`, 4a's D5),
             # so the report cannot name the project wrong on a symlinked route.
             sys.exit(cmd_status(config.workspace_dir, as_json=args.as_json,
-                                project=target.name if target else None))
+                                project=target.name))
         elif args.command == "restore-source":
             sys.exit(cmd_restore_source(
                 config, slug=args.slug, all_graph_only=args.all_graph_only,

@@ -330,13 +330,14 @@ def test_a_clean_corpus_is_a_quiet_success(tmp_path, capsys):
     assert payload["restored"] == [] and payload["written"] is False
 
 
-def test_the_verb_routes_through_the_cli(monkeypatch, tmp_path):
+def test_the_verb_routes_through_the_cli(monkeypatch, tmp_path, workspace):
     """`mitos restore-source` is registered and threads its flags."""
     from unittest.mock import patch
     from mitos.cli import main
 
     monkeypatch.setattr(sys, "argv",
-                        ["mitos", "restore-source", "--all-graph-only", "--dry-run", "--json"])
+                        ["mitos", "-p", workspace, "restore-source",
+                         "--all-graph-only", "--dry-run", "--json"])
     with patch("mitos.cli.cmd_restore_source", return_value=0) as mock:
         with pytest.raises(SystemExit):
             main()
