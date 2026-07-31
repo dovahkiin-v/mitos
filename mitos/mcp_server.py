@@ -25,7 +25,9 @@ from mitos.errors import (
     TARGET_UNKNOWN_NAME,
 )
 from mitos.lexical import degraded_reason_from_error, lexical_fallback
+from mitos.parser import corpus_has_entries
 from mitos.recall import (assess_surface_recall, corpus_provenance,
+                          missing_graph_is_a_gap, missing_graph_note,
                           missing_index_is_a_gap, scope_filter_recovery)
 
 # Create FastMCP server instance
@@ -757,6 +759,19 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         results["note"] = blackout_note(retired)
         results["all_superseded"] = retired
 
+    # W31 — the unbuilt graph (a clone carrying the corpus but not the gitignored
+    # *.sqlite). Consulted on the ORDINARY empty path, not in an `except` arm: an
+    # empty graph raises nothing, it answers empty, and that answer is what an agent
+    # reads as "no precedent" for a project holding hundreds. After the blackout
+    # override so the graph note wins if both applied — with no graph, a pointer at
+    # the graveyard names the wrong heal; in fact they exclude each other, since a
+    # retired handle is a node. CLI⇄MCP parity is structural: one predicate, one
+    # composer, each surface's own register.
+    if not results["active_decisions"] and missing_graph_is_a_gap(
+        store, config, corpus_has_entries=corpus_has_entries
+    ):
+        results["note"] = missing_graph_note("mcp")
+
     return dumps_display(results, ensure_ascii=False, indent=2)
 
 
@@ -1100,6 +1115,17 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             envelope.update(corpus_provenance(config))
             if not output_list and retired:
                 envelope["all_superseded"] = retired
+            # W31 — see surface_decisions. Both of this tool's empty envelopes carry
+            # it: this one (semantic ran and matched nothing) and the healthy-empty
+            # one built in the CollectionMissingError arm below. An unbuilt clone
+            # typically reaches the second — its collection is absent too — but the
+            # first is reachable whenever the collection exists and the graph does
+            # not, and a diagnosis present on one exit only is a verb that reads as
+            # done (3e's per-EXIT lesson).
+            elif not output_list and missing_graph_is_a_gap(
+                store, config, corpus_has_entries=corpus_has_entries
+            ):
+                envelope["note"] = missing_graph_note("mcp")
             return dumps_display(envelope, ensure_ascii=False, indent=2)
         except CollectionMissingError as e:
             # I8 — see surface_decisions. The healthy-empty envelope is BUILT here
@@ -1115,6 +1141,16 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
                 "query": query, "depth_mode": "letter", "matches": [],
             }
             empty.update(corpus_provenance(config))
+            # W31 — the state this envelope was built for and the unbuilt graph are
+            # the SAME workspace on a clone: no *.sqlite, so no collection was ever
+            # created either. `missing_index_is_a_gap` said the absence is healthy
+            # (an empty active set has nothing to index); this says why the active
+            # set is empty, and names the heal that fixes both. Without it the clone
+            # gets the cleanest possible empty answer over hundreds of decisions.
+            if missing_graph_is_a_gap(
+                store, config, corpus_has_entries=corpus_has_entries
+            ):
+                empty["note"] = missing_graph_note("mcp")
             return dumps_display(empty, ensure_ascii=False, indent=2)
         except Exception as e:
             # Embedding/Qdrant failure mid-query (e.g. a 429): never the raw

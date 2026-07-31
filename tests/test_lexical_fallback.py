@@ -547,3 +547,212 @@ class TestAbsentCollectionOnTheReadSurfaces:
 
         assert "Semantic recall unavailable" in out
         assert "mitos reconcile" in out
+
+
+# ---------------------------------------------------------------------------
+# W31 — the UNBUILT graph on the same four semantic read surfaces
+#
+# The sibling above answers "is an absent COLLECTION a gap?" on the graph. This
+# one answers "is an empty GRAPH a gap?" on the corpus, and it is the state the
+# absolute-path escape hatch made routine: a clone carries the committed
+# `.mitos/config.toml` and a `decisions.md` holding real entries, but not the
+# gitignored `*.sqlite`. Every read over it returns the clean empty envelope, and
+# the agent that asked reads *no precedents* for a project that has hundreds.
+#
+# The pair is the fixture, again and for the same reason: the clone AND a fresh
+# workspace whose sample-only corpus sits above the `BEGIN ENTRIES` sentinel,
+# which must keep answering exactly as it does today. The fresh half is already
+# covered by `TestAbsentCollectionOnTheReadSurfaces`' empty-graph rows above —
+# they run on the shipped `ws` fixture, which is a bare `cmd_init` — so this class
+# adds the clone half and re-asserts the twin only where the composition differs.
+# ---------------------------------------------------------------------------
+
+_CLONE_ENTRY = """
+### clone-entry-one
+
+**Decided:** A clone carries the corpus but never the graph.
+**Rejected:** Committing the binary graph — it is derivative.
+**Scope:** clone
+"""
+
+
+@pytest.fixture
+def cloned(offline):
+    """A workspace with entries below the sentinel and a graph holding no nodes.
+
+    The corpus is seeded BY HAND: `mitos sync` commits nothing without a
+    `GEMINI_API_KEY` (it parses, then refuses) and `record` commits to the graph,
+    which is the one thing this fixture must not have. The graph file is deleted
+    after `init` and then re-created empty — because that is the reachable steady
+    state on this surface: `MitosSyncManager` opens the store read-write, so the
+    first read over a clone leaves a 0-node `graph.sqlite` behind and every read
+    after it sees exactly this shape.
+    """
+    tmp = tempfile.mkdtemp()
+    config = MitosConfig(tmp)
+    cmd_init(config)
+    with open(config.decisions_file, "a", encoding="utf-8") as f:
+        f.write(_CLONE_ENTRY)
+    import os as _os
+    _os.remove(config.db_path)
+    from mitos.store import GraphStore
+    assert GraphStore(config.db_path).graph_fingerprint()[0] == 0
+    yield config
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestUnbuiltGraphOnTheReadSurfaces:
+    def _cli(self, config, verb, **kwargs):
+        """The seam from the class above: a healthy embedder, an absent collection.
+
+        Reused deliberately — an unbuilt clone with a key and a reachable Qdrant
+        raises `CollectionMissingError`, `missing_index_is_a_gap` calls the absence
+        healthy (the active set IS empty), and the read lands on the ordinary
+        empty-result path. That is the exact composition this class is about.
+        """
+        with patch("mitos.cli.MitosSyncManager") as MM:
+            mgr = MitosSyncManager(config)
+            mgr.embed_provider = _Embeds()
+            mgr.vector_store = _MissingCollection()
+            MM.return_value = mgr
+            return _capture(verb, config, "cache strategy", **kwargs)
+
+    def _mcp(self, config, monkeypatch, tool):
+        from mitos.store import GraphStore
+        monkeypatch.chdir(config.workspace_dir)
+        from mitos import mcp_server
+        comps = (GraphStore(config.db_path, read_only=True),
+                 _Embeds(), _MissingCollection())
+        with patch.object(mcp_server, "get_workspace_components",
+                          return_value=comps):
+            return json.loads(getattr(mcp_server, tool)("cache strategy"))
+
+    # -- the clone: the empty answer says why it is empty ---------------------
+
+    def test_cli_query_text_names_the_unbuilt_graph_and_sync(self, cloned):
+        out = self._cli(cloned, cmd_query)
+
+        assert "No matching decisions found." in out
+        assert "graph is unbuilt" in out
+        assert "mitos sync" in out
+        assert "reconcile" not in out
+
+    def test_cli_query_json_carries_the_note(self, cloned):
+        data = json.loads(self._cli(cloned, cmd_query, as_json=True))
+
+        assert data["matches"] == []
+        assert "graph is unbuilt" in data["note"]
+        assert "mitos sync" in data["note"]
+        assert data["collection"]              # the provenance stamp still rides
+
+    def test_cli_surface_names_the_unbuilt_graph_and_sync(self, cloned):
+        out = self._cli(cloned, cmd_surface)
+
+        assert "No active precedents found" in out
+        assert "graph is unbuilt" in out
+        assert "mitos sync" in out
+
+    @pytest.mark.parametrize("tool", ["query_decisions", "surface_decisions"])
+    def test_mcp_tools_carry_the_note_in_their_own_register(
+        self, cloned, monkeypatch, tool
+    ):
+        """Same predicate, same composer, a different closing clause: an agent on
+        this surface cannot run a shell command where it stands, and saying so beats
+        letting it hunt for a `sync` tool that does not exist.
+        """
+        out = self._mcp(cloned, monkeypatch, tool)
+
+        assert out.get("matches", out.get("active_decisions")) == []
+        assert "graph is unbuilt" in out["note"]
+        assert "mitos sync" in out["note"]
+        assert "no tool for it on this surface" in out["note"]
+        assert "reconcile" not in out["note"]
+
+    def test_the_note_is_not_a_degradation_the_envelope_stays_clean(
+        self, cloned, monkeypatch
+    ):
+        """It annotates a successful read; it does not claim the read failed.
+
+        `degraded: "lexical"` means "I could not run semantic recall". Here recall
+        ran and there was genuinely nothing indexed — a different fact, and blurring
+        the two would put a diagnosis on the wrong axis.
+        """
+        out = self._mcp(cloned, monkeypatch, "surface_decisions")
+
+        assert "degraded" not in out
+        assert "degraded_reason" not in out
+
+    # -- the twin: a fresh workspace is unchanged in every respect ------------
+
+    def test_the_fresh_twin_says_nothing_about_a_graph(self, ws):
+        config, _m = ws
+        out = self._cli(config, cmd_query)
+
+        assert "No matching decisions found." in out
+        assert "unbuilt" not in out
+
+    @pytest.mark.parametrize("tool", ["query_decisions", "surface_decisions"])
+    def test_the_fresh_twin_mcp_envelope_carries_no_graph_note(
+        self, ws, monkeypatch, tool
+    ):
+        config, _m = ws
+        out = self._mcp(config, monkeypatch, tool)
+
+        assert "unbuilt" not in json.dumps(out)
+
+    def test_a_populated_graph_over_a_populated_corpus_says_nothing_either(self, ws):
+        """The control that keeps the gate honest end to end: once anything is
+        committed, the note must go away even though the corpus is non-empty.
+        """
+        config, m = ws
+        with open(config.decisions_file, "a", encoding="utf-8") as f:
+            f.write(_CLONE_ENTRY)
+        _rec(m, "some-other-decision", "An unrelated axiom.")
+
+        out = self._cli(config, cmd_query)
+
+        assert "unbuilt" not in out
+
+
+class _NoMatches:
+    """A vector store that is present and simply returns nothing.
+
+    The other way an empty answer arrives: the collection EXISTS (so nothing
+    raises) and the query matched no points — which is what an unbuilt clone looks
+    like the moment anything has created its collection. `query_decisions` builds
+    two different empty envelopes for the two shapes, so both need a row or the
+    verb reads as done while one exit says nothing (3e's per-EXIT lesson).
+    """
+
+    def query(self, vector, limit=5):
+        return []
+
+
+class TestUnbuiltGraphOnTheOrdinaryEmptyEnvelope:
+    def _mcp(self, config, monkeypatch, tool, vector_store):
+        from mitos.store import GraphStore
+        monkeypatch.chdir(config.workspace_dir)
+        from mitos import mcp_server
+        comps = (GraphStore(config.db_path, read_only=True), _Embeds(), vector_store)
+        with patch.object(mcp_server, "get_workspace_components",
+                          return_value=comps):
+            return json.loads(getattr(mcp_server, tool)("cache strategy"))
+
+    @pytest.mark.parametrize("tool", ["query_decisions", "surface_decisions"])
+    def test_a_present_but_empty_collection_still_names_the_unbuilt_graph(
+        self, cloned, monkeypatch, tool
+    ):
+        out = self._mcp(cloned, monkeypatch, tool, _NoMatches())
+
+        assert out.get("matches", out.get("active_decisions")) == []
+        assert "graph is unbuilt" in out["note"]
+        assert "mitos sync" in out["note"]
+
+    @pytest.mark.parametrize("tool", ["query_decisions", "surface_decisions"])
+    def test_the_fresh_twin_on_the_same_envelope_says_nothing(
+        self, ws, monkeypatch, tool
+    ):
+        config, _m = ws
+        out = self._mcp(config, monkeypatch, tool, _NoMatches())
+
+        assert "unbuilt" not in json.dumps(out)

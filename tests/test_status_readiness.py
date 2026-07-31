@@ -408,14 +408,17 @@ def test_the_marker_line_never_reaches_the_json_payload(tmp_path, monkeypatch, c
     assert json.loads(payload)["ready"] is True
 
 
-def test_the_inert_pin_note_never_reaches_the_json_payload(tmp_path, monkeypatch, capsys):
-    """The 1d sibling of the row above, and the same reason: 4b owns this payload.
+def test_the_inert_pin_reaches_the_json_payload_as_a_value_not_a_sentence(
+    tmp_path, monkeypatch, capsys
+):
+    """The 4b inversion of 1d's second tripwire (its twin lives in
+    `test_collection_derivation.py`, and both had to be inverted together — a phase
+    that inverted one and deleted the other would have lost a real pin).
 
-    A workspace carrying a legacy `qdrant_collection` line gets a rendered note beside
-    `status`'s collection row naming the pin as inert. It is deliberately text-only —
-    4b's deep report is what settles the `--json` shape — so this pins the ABSENCE and
-    forces 4b to invert an assertion rather than hope to notice a comment. The
-    behavioural rows for the note itself live in `test_collection_derivation.py`.
+    The split is the point and it is not a formality: the payload carries the pinned
+    **value**, the rendered surface carries the **sentence**, and neither crosses.
+    The row above (`embedding_seed`) is deliberately NOT a sibling — it is about a
+    different marker line and stays text-only.
     """
     mitos_dir = tmp_path / ".mitos"
     mitos_dir.mkdir()
@@ -433,8 +436,8 @@ def test_the_inert_pin_note_never_reaches_the_json_payload(tmp_path, monkeypatch
     # The full phrase, not the bare word "inert": the payload echoes the workspace
     # path, and pytest builds that path from this test's own name.
     assert "inert legacy config" not in payload
-    assert "mitos-mitos-pub" not in payload
-    # The rendered surface DOES carry it — so the absence above is about the payload,
-    # not about a feature that never shipped.
+    assert json.loads(payload)["inert_collection_pin"] == "mitos-mitos-pub"
+    # The rendered surface carries the sentence — so the absence above is about
+    # prose in a machine payload, not about a feature that never shipped.
     assert cli.cmd_status(str(tmp_path)) == 0
     assert "inert legacy config" in capsys.readouterr().out

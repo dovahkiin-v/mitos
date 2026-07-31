@@ -525,13 +525,22 @@ class TestInertPinReporting:
         assert "qdrant_collection" not in out
         assert "inert legacy config" not in out
 
-    def test_the_note_never_reaches_the_json_payload(self, tmp_path, monkeypatch, capsys) -> None:
-        """Rendered text only — the `--json` shape for this is 4b's to settle.
+    def test_the_json_payload_carries_the_pinned_value_and_none_of_its_prose(
+        self, tmp_path, monkeypatch, capsys
+    ) -> None:
+        """The 4b inversion of 1d's tripwire — and it is narrower than it looks.
 
-        4b owns the deep report's payload, including whatever field names an inert
-        legacy pin there. Adding one now would hand it a shape to revise for a consumer
-        that does not exist, so the addition stops at the rendered surface and this row
-        forces 4b to invert an assertion rather than notice a comment.
+        1d shipped the note to the rendered surface only and left this row asserting
+        the whole thing absent from `--json`, addressed to 4b by name. Two of its
+        three assertions survive the inversion and one flips, which IS the decision:
+
+        * the rendered *phrase* stays absent — a finished sentence in a machine
+          payload is the CLI/MCP composition drift the rule exists to stop (typed
+          data in the payload, prose at the surface);
+        * the pinned *value* is now present, because it is data and its absence was
+          the gap 1d flagged;
+        * the resolved collection and readiness stay exactly as they were — the pin
+          is inert, and nothing about it moves either.
         """
         ws = tmp_path / "project"
         ws.mkdir()
@@ -548,9 +557,10 @@ class TestInertPinReporting:
         # The full phrase, not the bare word: pytest builds the workspace path from
         # the test's own name and `status` echoes that path back.
         assert "inert legacy config" not in payload
-        assert "mitos-mitos-pub" not in payload
-        # The collection key still carries the RESOLVED name, and readiness is unmoved.
         parsed = json.loads(payload)
+        # The value, raw and un-`repr`d — `repr` is the terminal's escaping concern.
+        assert parsed["inert_collection_pin"] == "mitos-mitos-pub"
+        # The collection key still carries the RESOLVED name, and readiness is unmoved.
         assert parsed["collection"] == MitosConfig(str(ws)).qdrant_collection
         assert parsed["ready"] is True
 
