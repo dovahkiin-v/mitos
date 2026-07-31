@@ -18,14 +18,16 @@ If you work with an AI coding agent (Claude Code, Cursor, Gemini CLI, …), the 
 
 ```text
 Read https://github.com/dovahkiin-v/mitos/blob/main/SETUP.md and set up mitos
-for this project. When done, run `mitos status` and report the result.
+for this project. When done, run `mitos status .` from the project directory
+and report the result.
 ```
 
 What your agent will end up doing — the same steps a human follows, all in [SETUP.md](SETUP.md) where you can read them first:
 
 - install the `mitos` CLI via pipx, from this repository;
 - start a local Qdrant container (`qdrant/qdrant` on port `7333`, isolated from any Qdrant you already run);
-- initialize the project workspace and wire the MCP server;
+- register the MCP server once for the whole machine, if it isn't registered already;
+- initialize the project workspace, which also registers the project by name;
 - ask you to set your API keys yourself (`mitos set-key`) — a Gemini key (required), and an Anthropic key for the conflict-audit layer (strongly recommended); the setup guide tells agents not to handle key values.
 
 How much your agent asks along the way is governed by your own agent's settings, not by this prompt.
@@ -36,11 +38,13 @@ The same steps by hand — full detail in **[SETUP.md](SETUP.md)**:
 
 1. **Install** (once per machine): `pipx install git+https://github.com/dovahkiin-v/mitos`
 2. **Start Qdrant** (once per machine, shared by all projects): `docker compose up -d` from this repo — mitos runs its own instance on `:7333`, so it never touches a Qdrant you use for other work.
-3. **Per project**: `mitos init` from the project root, then `mitos set-key --global <your-Gemini-key>` (one key covers everything; get it at <https://aistudio.google.com/app/apikey>). Gemini is the tested embedding provider today; a multi-provider abstraction is on the roadmap.
-4. **Wire the MCP server** for your agent (recommended) — see [SETUP.md](SETUP.md) for `.mcp.json` and other harnesses.
-5. **Verify**: `mitos status` → `READY ✓`.
+3. **Register the MCP server** (once per machine, recommended for agents): `claude mcp add --scope user mitos -- mitos serve`. One registration serves every project — see [SETUP.md](SETUP.md) for what it costs, for other harnesses, and for why a leftover per-project `.mcp.json` entry has to go.
+4. **Per project**: `mitos init` from the project root, then `mitos set-key --global <your-Gemini-key>` (one key covers everything; get it at <https://aistudio.google.com/app/apikey>). Gemini is the tested embedding provider today; a multi-provider abstraction is on the roadmap.
+5. **Verify**: `mitos status .` → `READY ✓`.
 
-`mitos status` is the compass throughout: it says exactly what's done, what's missing, and what to do next.
+`mitos status .` is the compass throughout: it says exactly what's done, what's missing, and what to do next for that project. With no project named, `mitos status` answers the other question — what does this machine have — listing every registered project and checking Qdrant.
+
+**Every command names its project.** There is no default target: `mitos init` registers the project by name, and from then on each verb takes `-p <name>`, `-p <absolute path>`, or `-p .` from the project root (agents pass the same thing as a `project` argument). `mitos projects` lists what's registered. That is what lets one install and one MCP server serve every project on the machine without a call ever landing in the wrong corpus.
 
 ## How it runs
 
@@ -57,7 +61,7 @@ A few properties worth knowing:
 - **The markdown is the source of truth.** Every decision lands in `decisions.md`, human-readable and greppable; the graph and the search index are derived from it and can always be rebuilt (`mitos rebuild`).
 - **Decisions are never edited or deleted — they're superseded.** State (active / superseded / amended) is computed from typed relations between decisions, so the history of *why* always survives.
 - **It fails safe.** If the search index or the embedding API is down, recording still works and search degrades to an honest text-match over the markdown — nothing blocks, nothing is lost, and degraded output says it's degraded.
-- **It audits itself.** `mitos check` sweeps the corpus for decisions that silently contradict each other, and `mitos check --staged` gates new entries as a pre-commit or CI step (see [SETUP.md](SETUP.md) for recipes).
+- **It audits itself.** The corpus sweep (`mitos check -p .`) finds decisions that silently contradict each other, and `--staged` gates new entries as a pre-commit or CI step — see [SETUP.md](SETUP.md) for the hook, CI and cron recipes, which name their project three different ways.
 
 Explore the rest with `mitos --help` — the help text doubles as the API reference.
 
