@@ -18,7 +18,7 @@ from unittest.mock import MagicMock, patch
 
 from conftest import make_workspace
 from mitos.cli import main, _enter_target_directory
-from mitos.config import MitosConfig, default_collection_name
+from mitos.config import default_collection_name
 from mitos.errors import MitosError
 
 
@@ -191,11 +191,26 @@ def test_a_selector_does_not_move_where_a_file_argument_opens(tmp_path, monkeypa
 
 
 # ---------------------------------------------------------------------------
-# serve binds the launch CWD to /ws.
+# serve still honours -C — and since 5b that is all -C does for it.
 # ---------------------------------------------------------------------------
 
 def test_serve_binds_target(tmp_path, monkeypatch) -> None:
-    """`mitos -C /ws serve` binds the server's per-call config to /ws (no real mcp.run)."""
+    """`mitos -C /ws serve` moves the process to /ws (no real mcp.run).
+
+    The half this row keeps is the ADR
+    `serve-honors-dash-c-via-entry-chdir-not-scoped-out`: `-C` reaches `serve`
+    through the process-entry chdir like every other verb, and something must
+    still pin that.
+
+    The half it drops is the claim that the launch directory *binds* anything.
+    It used to read `MitosConfig().qdrant_collection` inside the fake handler and
+    assert the collection derived from the launch dir — true while `_target_config`
+    fell back to the cwd, and exactly what 5b removes. A server launched here now
+    answers for whichever project each call names, which
+    `test_the_launch_directory_binds_nothing` states over a real process. Dropping
+    the assertion also drops the zero-arg `MitosConfig()` it needed — one of the
+    five 5d must remove, gone here for free.
+    """
     monkeypatch.chdir(tmp_path)
     ws = tmp_path / "ws"
     ws.mkdir()
@@ -203,13 +218,11 @@ def test_serve_binds_target(tmp_path, monkeypatch) -> None:
 
     def _fake_serve() -> None:
         captured["cwd"] = os.getcwd()
-        captured["collection"] = MitosConfig().qdrant_collection
 
     with patch("mitos.cli.cmd_serve", side_effect=_fake_serve):
         with patch.object(sys, "argv", ["mitos", "-C", str(ws), "serve"]):
             main()
     assert captured["cwd"] == os.path.realpath(str(ws))
-    assert captured["collection"] == default_collection_name(captured["cwd"])
 
 
 # ---------------------------------------------------------------------------

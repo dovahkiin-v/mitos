@@ -187,7 +187,7 @@ def test_mcp_oneline_matches_cli_json(ws, capsys) -> None:
     store = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components",
                       return_value=(store, None, None)):
-        mcp_out = json.loads(mcp_server.list_decisions(scope="tier", oneline=True))
+        mcp_out = json.loads(mcp_server.list_decisions(scope="tier", oneline=True, project=config.workspace_dir))
 
     assert mcp_out["decisions"] == cli_out["decisions"]
     assert mcp_out["total"] == cli_out["total"] == 2
@@ -200,7 +200,7 @@ def test_mcp_brief_and_oneline_error(ws) -> None:
     store = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components",
                       return_value=(store, None, None)):
-        resp = json.loads(mcp_server.list_decisions(brief=True, oneline=True))
+        resp = json.loads(mcp_server.list_decisions(brief=True, oneline=True, project=config.workspace_dir))
     assert "error" in resp and "mutually exclusive" in resp["error"]
 
 

@@ -63,6 +63,21 @@ TARGETING_TOOLS = (
     "record_decision",
 )
 
+#: What each targeting tool needs beyond its selector, so a row can drive all six.
+#: Keyed on the same names as `TARGETING_TOOLS`, which the live-set fence below
+#: pins — a seventh tool lands here as a `KeyError` rather than as silent
+#: non-coverage.
+REQUIRED_ARGS = {
+    "surface_decisions": {"query": "anything"},
+    "list_decisions": {},
+    "list_scopes": {},
+    "show_node": {"ident": "anything"},
+    "query_decisions": {"query": "anything"},
+    "record_decision": {"axiom": "a", "rejected_paths": "b",
+                        "scope": ["c"], "slug": "d"},
+}
+
+
 #: Targeting vocabulary that belongs to the *other* surface. `mitos init` is the
 #: sharp one: registration is a human setup act, and an agent handed a
 #: state-creating shell command is invited to run it.
@@ -270,7 +285,8 @@ def test_the_targeting_tool_set_is_the_live_one_not_a_hand_copied_list() -> None
     assert exposing == set(TARGETING_TOOLS), (
         "a tool's `project` parameter is not covered by this module's rows — add "
         "it to TARGETING_TOOLS (which extends the schema, description, "
-        "forbidden-syntax and delivery rows onto it) rather than leaving it "
+        "forbidden-syntax, selector-less refusal and delivery rows onto it) "
+        "rather than leaving it "
         "asserted by nothing"
     )
 
@@ -419,17 +435,8 @@ def test_a_targeting_failure_reaches_the_caller_from_every_tool(
     """
     _register(known=_workspace(tmp_path / "known"))
     monkeypatch.chdir(tmp_path)
-    required = {
-        "surface_decisions": {"query": "anything"},
-        "list_decisions": {},
-        "list_scopes": {},
-        "show_node": {"ident": "anything"},
-        "query_decisions": {"query": "anything"},
-        "record_decision": {"axiom": "a", "rejected_paths": "b",
-                            "scope": ["c"], "slug": "d"},
-    }[tool]
 
-    body = _body(tool, project="nosuchproject", **required)
+    body = _body(tool, project="nosuchproject", **REQUIRED_ARGS[tool])
 
     assert body.startswith("no project named 'nosuchproject' is registered")
     assert f"{tool}(project=" in body, "the example must name the failing tool"
@@ -903,6 +910,23 @@ def test_a_malformed_registry_reaches_the_caller_as_one_calm_line(
     read, so dressing it in the anatomy would be a wall built out of data we do
     not have. Over the transport it becomes `Error executing tool X: <this line>`
     with `isError: True` and no traceback.
+
+    Calm is not the same as empty, which is why I5 asks for both halves and 5b
+    adds the second: the line must still carry the **parse detail** (which key,
+    which line — the only thing that lets anyone fix the file) and the **recovery**
+    (`Fix or remove …`, plus the fact that an absent registry is healthy). A row
+    asserting only the absence of the anatomy is green against a message that says
+    nothing at all.
+
+    Its CLI twin is `test_a_malformed_registry_is_not_dressed_in_the_targeting_
+    anatomy`; the two are one claim over one shared line in `registry.py`.
+
+    **Deliberately no `mitos init` tripwire here** (D7). That line names
+    `mitos init` as the re-registration act, and the no-state-creating-command
+    rule is scoped to the six discriminators `_render_targeting_error` composes,
+    not to every string that can reach an MCP caller — exactly as the CLI-syntax
+    tripwire is scoped to the `project:` doc entry rather than to whole
+    descriptions. Widening either would red a shipped, deliberate message.
     """
     from mitos.errors import RegistryError
 
@@ -917,6 +941,58 @@ def test_a_malformed_registry_reaches_the_caller_as_one_calm_line(
     assert "\n" not in message.strip()
     assert "Did you mean" not in message
     assert "Registered projects" not in message
+    assert "Traceback" not in message
+    # The two clauses I5 names, neither of which the shape above can see.
+    assert "not valid TOML" in message           # the parse detail
+    assert f"Fix or remove {path}" in message    # the recovery
+    assert "an absent registry is healthy" in message
+
+
+def test_a_malformed_registry_now_reaches_the_SELECTORLESS_call_too(
+    tmp_path, monkeypatch
+) -> None:
+    """G8, stated rather than only named: the registry is a hard dependency of
+    **every** MCP call since 5b, not only of selector-bearing ones.
+
+    Before the flip a `project`-less call returned `MitosConfig()` without ever
+    opening the routing table, so a corrupt `registry.toml` cost a machine only
+    its name-form calls. With the fallback gone every call reaches
+    `routing.resolve_project`, which loads the registry **before** its
+    `if not selector:` test — so this call raises `RegistryError` rather than
+    rendering the missing anatomy, and a corrupt routing table on the dominant
+    agent path is loud instead of partial. That is the correct posture and it is
+    a *frequency* change rather than a new class, which is exactly the kind of
+    thing that gets rediscovered as a regression when no row says it.
+
+    It also fences the D1 alternative: a boundary-local
+    `if project is None: raise ProjectTargetingError(TARGET_MISSING, …)` placed
+    ahead of the resolver would still render a correct-looking anatomy, and
+    nothing else in the suite would notice that a broken registry had gone quiet
+    again. The sibling row above pins the selector-bearing half; the two are one
+    claim about one load site.
+
+    An **absent** registry stays healthy (I8) and is pinned by its own rows — the
+    fault here is a file that exists and cannot be parsed.
+    """
+    from mitos.errors import RegistryError
+
+    # The workspace first: `_workspace` runs a real `mitos init`, which registers
+    # and so needs a readable registry. Corrupting the file afterwards is what
+    # leaves the process standing in a perfectly good workspace it can no longer
+    # be routed to.
+    monkeypatch.chdir(_workspace(tmp_path / "cwd"))
+    path = _write_registry('"broken" = \n')
+
+    with pytest.raises(RegistryError) as excinfo:
+        mcp_server.list_scopes()
+
+    message = str(excinfo.value)
+    assert path in message
+    assert "not valid TOML" in message
+    # Not dressed as a targeting failure: there is no vocabulary to teach.
+    assert "no project was named" not in message
+    assert "Registered projects" not in message
+    assert "Traceback" not in message
 
 
 def test_a_resolved_target_with_a_malformed_config_stays_a_calm_line(
@@ -946,50 +1022,60 @@ def test_a_resolved_target_with_a_malformed_config_stays_a_calm_line(
 
 
 # ---------------------------------------------------------------------------
-# Group 7 — the transitional tripwires. INVERT these at 5b, never delete them.
+# Group 7 — the pair 5b turned over. The first was a transitional tripwire and is
+# now inverted; the second was written to survive the flip unedited and did.
 # ---------------------------------------------------------------------------
 
-def test_a_project_less_call_still_resolves_the_cwd_workspace(
+def test_a_project_less_call_is_refused_from_inside_a_workspace(
     tmp_path, monkeypatch
 ) -> None:
-    """TRANSITIONAL (phase 5b inverts this row). Criterion 5.
+    """Entry-007's first MCP tripwire, INVERTED at 5b. Criterion 5.
 
-    Construction is not migration: this phase makes the selector *sayable* on the
-    MCP surface, not *required*, so a call that names no project behaves exactly
-    as it did before. 5b removes the working-directory fallback — the single
-    `else: MitosConfig()` branch inside `_target_config` — at which point this
-    must become an assertion that the same call renders the **missing** anatomy
-    and arrives error-marked. The row exists so that flip is a decision someone
-    makes rather than an omission someone notices.
+    3c made the selector *sayable* and left the working-directory fallback live,
+    so this row asserted that a call naming no project answered out of the cwd.
+    5b deletes the fallback — the `if project is None: return MitosConfig()`
+    branch inside `_target_config` — so the row turns over rather than lapsing:
+    the same call now renders the **missing** anatomy and arrives error-marked.
+
+    The arrangement is chosen to bite. The process sits *inside* a real workspace
+    holding a decision this row could name, and a second project is registered —
+    so a surviving fallback would answer with `alpha-probe` and read as a pass.
+    What must be true instead is that nothing about the process's location reaches
+    the answer, and that the refusal teaches the recovery in one round trip.
     """
     cwd = _workspace(tmp_path / "cwd", scope="alpha")
     _register(other=_workspace(tmp_path / "other", scope="beta"))
     monkeypatch.chdir(cwd)
 
-    payload = json.loads(mcp_server.list_decisions())
+    body = _body("list_decisions")
 
-    assert [d["slug"] for d in payload["decisions"]] == ["alpha-probe"]
-    assert payload["workspace"] == cwd
-    # Transitional echo rule: no selector → the resolved workspace's absolute
-    # path, so no mid-vision answer is ever unattributed. 5b removes the branch
-    # that produces it along with the fallback itself.
-    assert payload["project"] == cwd
+    assert body.startswith("no project was named")
+    # The cwd workspace reaches the answer neither as data nor as a suggestion.
+    assert "alpha" not in body
+    assert cwd not in body
+    # The registered vocabulary and the discovery pointer both ride, so the
+    # caller who omitted the selector can supply it on the next call.
+    assert _vocabulary(body) == "other."
+    assert "list_projects()" in body
+    assert "Traceback" not in body
 
 
 def test_an_empty_project_renders_the_missing_anatomy_rather_than_falling_back(
     tmp_path, monkeypatch
 ) -> None:
-    """TRANSITIONAL (phase 5b inverts this row's twin). Criterion 6.
+    """The unedited half of the pair — it was written to survive 5b, and did.
 
-    The gate is `is not None`, never truthiness. `project=""` is a **supplied**
-    selector that carries no target — under `if project:` it would silently fall
-    back to the working directory, and the caller who asked for something would
-    get somewhere else. This is also what makes the `missing` class reachable and
-    testable while the fallback is still live.
+    3c's gate was `is not None`, never truthiness: `project=""` is a **supplied**
+    selector carrying no target, and under `if project:` it would have fallen
+    back to the working directory, giving the caller who asked for something
+    somewhere else. 5b removes the gate entirely with the branch it guarded, so
+    the empty case now reaches `resolve_project`'s own falsy test — same class,
+    same wording, one fewer gate.
 
-    At 5b the omitted case joins this one, and the row above becomes its
-    duplicate; keep them both then — one pins the gate, the other pins the
-    absence of a default.
+    That is exactly why this row must NOT be rewritten: it is the statement that
+    the collapse did not quietly turn `""` into a fallback. It is a near-duplicate
+    of the row above by design — that one pins the absence of a default, this one
+    pins that an empty answer is not one.
     """
     cwd = _workspace(tmp_path / "cwd", scope="alpha")
     _register(other=_workspace(tmp_path / "other", scope="beta"))
@@ -1000,3 +1086,98 @@ def test_an_empty_project_renders_the_missing_anatomy_rather_than_falling_back(
     assert body.startswith("no project was named")
     assert "alpha" not in body, "an empty selector must not resolve the cwd workspace"
     assert _vocabulary(body) == "other."
+
+
+# ---------------------------------------------------------------------------
+# Group 8 — T17/T18: the class the flip creates, and the two-surface pair.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("tool", TARGETING_TOOLS)
+def test_a_selectorless_call_is_refused_by_every_targeting_tool(
+    tmp_path, monkeypatch, tool
+) -> None:
+    """T17, MCP half: the missing class over a real call, on every tool.
+
+    3c could only reach the missing class through `project=""`, because an
+    omitted selector fell back to the working directory. 5b makes the omission
+    itself reach it, which is the class the flip creates and the one an agent will
+    actually meet — so it is asserted per tool rather than on a representative.
+
+    The set is fenced by `test_the_targeting_tool_set_is_the_live_one_…`, so a
+    seventh targeting tool lands as a failing set comparison there rather than as
+    a tool nobody checked here.
+
+    Written on a **clean** registry deliberately. `resolve_project` calls
+    `registry.load()` *before* its `if not selector:` test, so on a malformed
+    registry this same call raises `RegistryError` instead — the wrong class, and
+    a row built that way would look like it caught something.
+    """
+    _register(known=_workspace(tmp_path / "known"))
+    monkeypatch.chdir(tmp_path / "known")   # standing in a workspace changes nothing
+
+    body = _body(tool, **REQUIRED_ARGS[tool])
+
+    assert body.startswith("no project was named")
+    assert f"{tool}(project=" in body, "the example must name the failing tool"
+    assert _vocabulary(body) == "known."
+    assert "`list_projects()`" in body
+    assert "degraded" not in body, (
+        "a targeting failure must not arrive as the degraded lexical envelope"
+    )
+
+
+@pytest.mark.parametrize("tool", TARGETING_TOOLS)
+def test_no_rendered_body_carries_a_traceback(tmp_path, monkeypatch, tool) -> None:
+    """I5: what reaches an agent is a message, never a stack.
+
+    Cheap, and it is the assertion that separates "rendered" from "propagated":
+    a body carrying a traceback is a raised exception someone forgot to compose,
+    and it reads to an agent as a mitos crash rather than as its own mistake.
+    Asserted on the class (every tool, both reachable-by-call classes) rather than
+    on the one row that happened to carry it.
+    """
+    _register(known=_workspace(tmp_path / "known"))
+    monkeypatch.chdir(tmp_path)
+
+    for kwargs in ({}, {"project": "nosuchproject"}):
+        body = _body(tool, **kwargs, **REQUIRED_ARGS[tool])
+        assert "Traceback" not in body, (kwargs, tool)
+        assert "  File \"" not in body, (kwargs, tool)
+
+
+def test_each_surface_teaches_its_own_call_form_for_the_same_typed_error(
+    tmp_path, monkeypatch
+) -> None:
+    """I5's composition-locus drift guard, stated as one row over one error.
+
+    Both surfaces already have their *negative* tripwires — neither body carries
+    the other's vocabulary. Those catch a leak; they cannot catch a renderer that
+    teaches nothing at all, or one that drifts into a third syntax belonging to
+    neither. The positive claim is what this asserts: the same
+    `ProjectTargetingError`, rendered twice, produces a CLI body carrying
+    `--project`-shaped syntax and an MCP body carrying `tool(project='…')`-shaped
+    syntax.
+
+    One typed error, two renderers, on purpose: the row would be satisfiable by
+    two unrelated fixtures, and then it would be testing two coincidences rather
+    than one composition locus. The class is `missing` because that is the one
+    5b creates — the pair is at its most load-bearing on the failure a caller now
+    actually meets.
+    """
+    _register(known=_workspace(tmp_path / "known"))
+    monkeypatch.chdir(tmp_path)          # outside `known`, so no cwd hint rides
+    err = _raises(None)
+
+    cli_body = cli._render_targeting_error(err)
+    mcp_body = mcp_server._render_targeting_error(err, "surface_decisions")
+
+    assert err.discriminator == TARGET_MISSING
+
+    # Each says the thing its own caller can act on...
+    assert "`mitos --project <name> <verb>`" in cli_body
+    assert "`surface_decisions(project='known', …)`" in mcp_body
+    # ...and neither says the other's, which is the half already fenced and is
+    # asserted here so the pair reads as one claim rather than two halves.
+    assert "surface_decisions(" not in cli_body
+    assert "list_projects()" not in cli_body
+    assert not any(token in mcp_body for token in FORBIDDEN_SYNTAX)

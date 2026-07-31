@@ -464,6 +464,40 @@ def test_a_selector_on_an_exempt_verb_names_the_verb(
     assert "Traceback" not in err
 
 
+@pytest.mark.parametrize("verb", ["init", "serve", "projects"])
+def test_a_post_verb_selector_on_an_exempt_verb_reaches_mitos_code(
+    tmp_path, monkeypatch, capsys, verb
+) -> None:
+    """I5's post-verb half: `mitos init -p <name>` refuses like `mitos -p <name> init`.
+
+    The row above covers the **pre-verb** spelling only, and the difference is not
+    cosmetic. `--project` is registered on both the top-level parser and every
+    subparser into two separate destinations (`project_pre`/`project_post`), so
+    the post-verb spelling on an exempt verb is the one place where a missing
+    registration would surface as argparse's `unrecognized arguments` banner —
+    a parser-level rejection that never enters mitos code, carries no note naming
+    the verb, and exits 2 instead of 1. That is the failure this asserts against:
+    the call must reach `_exempt_reason` and render the exempt-class refusal.
+
+    `init` is the sharp member — it is the one exempt verb an agent or a script is
+    likely to reach for with a name in hand, since `mitos init --name X` exists and
+    `-p X` looks like its sibling.
+    """
+    monkeypatch.chdir(tmp_path)
+    handler = {"init": "cmd_init", "serve": "cmd_serve", "projects": "cmd_projects"}[verb]
+    with patch(f"mitos.cli.{handler}", return_value=0) as mock:
+        code = _run([verb, "-p", "nosuch"])
+
+    err = capsys.readouterr().err
+    assert not mock.called
+    assert code == 1, "argparse's own rejection would be 2, and would say usage:"
+    assert "usage:" not in err
+    assert "unrecognized arguments" not in err
+    assert verb in err
+    assert "unknown project" not in err
+    assert "Traceback" not in err
+
+
 def test_set_key_is_exempt_only_under_the_global_flag(
     tmp_path, monkeypatch, capsys
 ) -> None:
@@ -1091,6 +1125,14 @@ def test_a_malformed_registry_is_not_dressed_in_the_targeting_anatomy(
     There is no registered vocabulary to enumerate when the file holding it cannot
     be read, so the anatomy would be a lie — and the caller needs the parse detail,
     not a did-you-mean.
+
+    5b adds the positive half, which the absence assertions above cannot see: the
+    line must carry the **parse detail** and the **`Fix or remove …` recovery**, or
+    a message saying nothing at all would satisfy this row. Its MCP twin is
+    `test_a_malformed_registry_reaches_the_caller_as_one_calm_line`; the two are
+    one claim over one shared line in `registry.py`, and only the CLI half may
+    name `mitos init` — which here it does, in a message 1a deliberately kept
+    single-sourced (D7).
     """
     path = _write_registry('"broken" = \n')
     monkeypatch.chdir(tmp_path)
@@ -1103,6 +1145,10 @@ def test_a_malformed_registry_is_not_dressed_in_the_targeting_anatomy(
     assert "Did you mean" not in err
     assert "Registered projects" not in err
     assert "Traceback" not in err
+    # The two clauses I5 names, on this surface too.
+    assert "not valid TOML" in err               # the parse detail
+    assert f"Fix or remove {path}" in err        # the recovery
+    assert "an absent registry is healthy" in err
 
 
 # ---------------------------------------------------------------------------

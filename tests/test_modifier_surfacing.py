@@ -24,7 +24,7 @@ from typing import Iterator, Tuple
 import pytest
 from unittest.mock import patch
 
-from mitos import routing
+from conftest import resolve_like_main
 from mitos.config import MitosConfig
 from mitos.cli import cmd_init, cmd_list, cmd_open_questions, cmd_query, cmd_show, cmd_surface
 from mitos.parser import ParsedEntry
@@ -53,22 +53,9 @@ def ws(offline) -> Iterator[Tuple[MitosConfig, MitosSyncManager]]:
     tmp = os.path.realpath(tempfile.mkdtemp())
     config = MitosConfig(tmp)
     cmd_init(config)
-    config = _resolve_like_main(tmp)
+    config = resolve_like_main(tmp)
     yield config, MitosSyncManager(config)
     shutil.rmtree(tmp, ignore_errors=True)
-
-
-def _resolve_like_main(root: str) -> MitosConfig:
-    """The config ``cli.main()`` builds for a path-form selector.
-
-    A CLI verb never receives a hand-built config in production — ``main()``
-    resolves the selector and passes what it got, so the config carries the
-    resolved *name*. ``mitos init`` registers the workspace, so the same path
-    reverse-looks-up to that name on the MCP side too; hand-building here would
-    make the show-parity row red on the test's shortcut rather than on a drift.
-    """
-    target = routing.resolve_project(root)
-    return MitosConfig(target.root, project=target.name)
 
 
 def _rec(m: MitosSyncManager, slug: str, scope=None, **relations) -> dict:
@@ -203,7 +190,7 @@ def test_mcp_query_exact_slug_surfaces_amended_by(ws) -> None:
     _rec(m, "boundary-rule-v2", amends="boundary-rule")
     store = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
-        resp = json.loads(mcp_server.query_decisions("boundary-rule"))
+        resp = json.loads(mcp_server.query_decisions("boundary-rule", project=config.workspace_dir))
     assert resp["state"] == "active"           # amends does NOT retire the parent
     assert resp["amended_by"] == ["boundary-rule-v2"]
 
@@ -215,7 +202,7 @@ def test_mcp_query_exact_slug_unmodified_has_no_modifier_keys(ws) -> None:
     _rec(m, "clean")
     store = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
-        resp = json.loads(mcp_server.query_decisions("clean"))
+        resp = json.loads(mcp_server.query_decisions("clean", project=config.workspace_dir))
     assert not any(k in resp for k in MODIFIER_EDGE_KEYS.values())
 
 
@@ -228,7 +215,7 @@ def test_mcp_list_decisions_surfaces_modifiers(ws) -> None:
     _rec(m, "untouched", scope=["z"])
     store = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
-        resp = json.loads(mcp_server.list_decisions(scope="z"))
+        resp = json.loads(mcp_server.list_decisions(scope="z", project=config.workspace_dir))
     by_slug = {d["slug"]: d for d in resp["decisions"]}
     assert by_slug["amended-one"]["amended_by"] == ["amender"]
     assert not any(k in by_slug["untouched"] for k in MODIFIER_EDGE_KEYS.values())
@@ -242,7 +229,8 @@ def test_mcp_surface_scope_fallback_surfaces_modifiers(ws) -> None:
     _rec(m, "fb-amender", scope=["db"], amends="fb-target")
     store = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
-        resp = json.loads(mcp_server.surface_decisions(query="anything", scope="db"))
+        resp = json.loads(mcp_server.surface_decisions(query="anything", scope="db",
+            project=config.workspace_dir))
     target = next(d for d in resp["active_decisions"] if d["slug"] == "fb-target")
     assert target["amended_by"] == ["fb-amender"]
 
@@ -282,7 +270,8 @@ def test_mcp_surface_semantic_path_surfaces_modifiers(ws) -> None:
     fake_vec = _FakeVector([{"slug": "sem-target", "score": 0.91}])
     with patch.object(mcp_server, "get_workspace_components",
                       return_value=(store, _FakeEmbed(), fake_vec)):
-        resp = json.loads(mcp_server.surface_decisions(query="how do we normalize rows"))
+        resp = json.loads(mcp_server.surface_decisions(query="how do we normalize rows",
+            project=config.workspace_dir))
     target = next(d for d in resp["active_decisions"] if d["slug"] == "sem-target")
     assert target["amended_by"] == ["sem-amender"]
 
@@ -298,7 +287,8 @@ def test_mcp_query_semantic_path_surfaces_modifiers(ws) -> None:
     with patch.object(mcp_server, "get_workspace_components",
                       return_value=(store, _FakeEmbed(), fake_vec)):
         # A spaced claim resolves to no exact slug → falls through to semantic search.
-        resp = json.loads(mcp_server.query_decisions("a claim that is not any slug"))
+        resp = json.loads(mcp_server.query_decisions("a claim that is not any slug",
+            project=config.workspace_dir))
     match = next(mt for mt in resp["matches"] if mt["slug"] == "q-target")
     assert match["amended_by"] == ["q-amender"]
 
@@ -317,7 +307,7 @@ def test_mcp_query_exact_slug_superseded_carries_superseded_by(ws) -> None:
     _rec(m, "v2", supersedes="v1")
     store = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
-        resp = json.loads(mcp_server.query_decisions("v1"))
+        resp = json.loads(mcp_server.query_decisions("v1", project=config.workspace_dir))
     assert resp["state"] == "superseded"
     assert resp["superseded_by"] == ["v2"]
 
@@ -449,7 +439,7 @@ def test_mcp_show_node_resolves_superseded_not_reused_slug(ws) -> None:
     _rec(m, "dead-v2", supersedes="dead-v1")  # distinct slug → "dead-v1" has no active bearer
     store = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
-        resp = json.loads(mcp_server.show_node("dead-v1"))
+        resp = json.loads(mcp_server.show_node("dead-v1", project=config.workspace_dir))
     assert resp.get("found") is not False           # not the not-found object
     assert resp["kind"] == "decision"
     assert resp["slug"] == "dead-v1"
@@ -467,7 +457,7 @@ def test_mcp_show_node_active_slug_resolves_active(ws) -> None:
     _rec(m, "alive-node")
     store = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
-        resp = json.loads(mcp_server.show_node("alive-node"))
+        resp = json.loads(mcp_server.show_node("alive-node", project=config.workspace_dir))
     assert resp["state"] == "active"
     assert resp["slug"] == "alive-node"
     assert "superseded_by" not in resp
@@ -482,7 +472,7 @@ def test_mcp_show_node_by_id_resolves(ws) -> None:
     node_id = res["id"]
     store = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
-        resp = json.loads(mcp_server.show_node(node_id))
+        resp = json.loads(mcp_server.show_node(node_id, project=config.workspace_dir))
     assert resp["id"] == node_id
     assert resp["slug"] == "by-id"
 
@@ -497,7 +487,7 @@ def test_mcp_show_node_oq_body_and_modifier_subset(ws) -> None:
     _commit_oq(store, "oq-policy-v2", amends="oq-policy")
     ro = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components", return_value=(ro, None, None)):
-        resp = json.loads(mcp_server.show_node("oq-policy"))
+        resp = json.loads(mcp_server.show_node("oq-policy", project=config.workspace_dir))
     assert resp["kind"] == "open_question"
     assert resp["topic"] == "oq-policy"
     assert resp["questions_raised"]
@@ -513,7 +503,7 @@ def test_mcp_show_node_not_found_is_object_with_hint(ws) -> None:
     config, m = ws
     store = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
-        resp = json.loads(mcp_server.show_node("ghost-slug"))
+        resp = json.loads(mcp_server.show_node("ghost-slug", project=config.workspace_dir))
     assert resp["found"] is False
     assert resp["ident"] == "ghost-slug"
     assert "mitos sync" in resp["hint"].lower()
@@ -672,7 +662,7 @@ def test_cli_query_json_parity_with_mcp(ws) -> None:
     store_mcp = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components",
                       return_value=(store_mcp, _FakeEmbed(), _FakeVector(list(matches)))):
-        mcp_resp = json.loads(mcp_server.query_decisions(claim))
+        mcp_resp = json.loads(mcp_server.query_decisions(claim, project=config.workspace_dir))
 
     assert cli_resp["matches"] == mcp_resp["matches"]
 
@@ -814,7 +804,8 @@ def test_mcp_query_blackout_vector(ws) -> None:
     fake_vec = _FakeVector([{"slug": "dead-v1", "score": 0.9}])
     with patch.object(mcp_server, "get_workspace_components",
                       return_value=(store, _FakeEmbed(), fake_vec)):
-        resp = json.loads(mcp_server.query_decisions("a claim that is not any slug"))
+        resp = json.loads(mcp_server.query_decisions("a claim that is not any slug",
+            project=config.workspace_dir))
     assert resp["matches"] == []
     assert resp["all_superseded"] == [{"slug": "dead-v1", "state": "superseded", "superseded_by": ["dead-v2"]}]
 
@@ -829,7 +820,8 @@ def test_mcp_surface_blackout_vector(ws) -> None:
     fake_vec = _FakeVector([{"slug": "dead-v1", "score": 0.9}])
     with patch.object(mcp_server, "get_workspace_components",
                       return_value=(store, _FakeEmbed(), fake_vec)):
-        resp = json.loads(mcp_server.surface_decisions(query="a claim that is not any slug"))
+        resp = json.loads(mcp_server.surface_decisions(query="a claim that is not any slug",
+            project=config.workspace_dir))
     assert resp["active_decisions"] == []
     assert resp["all_superseded"] == [{"slug": "dead-v1", "state": "superseded", "superseded_by": ["dead-v2"]}]
 
@@ -846,12 +838,14 @@ def test_mcp_limit_threads_through(ws) -> None:
         fake_vec = _FakeVector([{"slug": "q-target", "score": 0.8}])
         with patch.object(mcp_server, "get_workspace_components",
                           return_value=(store, _FakeEmbed(), fake_vec)):
-            mcp_server.query_decisions("a claim that is not any slug", limit=requested)
+            mcp_server.query_decisions("a claim that is not any slug", limit=requested,
+                project=config.workspace_dir)
         assert fake_vec.last_limit == expected
         fake_vec2 = _FakeVector([{"slug": "q-target", "score": 0.8}])
         with patch.object(mcp_server, "get_workspace_components",
                           return_value=(store, _FakeEmbed(), fake_vec2)):
-            mcp_server.surface_decisions(query="a claim that is not any slug", limit=requested)
+            mcp_server.surface_decisions(query="a claim that is not any slug", limit=requested,
+                project=config.workspace_dir)
         assert fake_vec2.last_limit == expected
 
 
@@ -876,7 +870,7 @@ def test_cli_mcp_blackout_parity(ws) -> None:
     store_mcp = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components",
                       return_value=(store_mcp, _FakeEmbed(), _FakeVector(list(matches)))):
-        mcp_q = json.loads(mcp_server.query_decisions(claim))
+        mcp_q = json.loads(mcp_server.query_decisions(claim, project=config.workspace_dir))
     assert cli_q["all_superseded"] == mcp_q["all_superseded"]
 
     # surface parity
@@ -888,7 +882,7 @@ def test_cli_mcp_blackout_parity(ws) -> None:
     cli_s = json.loads(buf2.getvalue())
     with patch.object(mcp_server, "get_workspace_components",
                       return_value=(GraphStore(config.db_path, read_only=True), _FakeEmbed(), _FakeVector(list(matches)))):
-        mcp_s = json.loads(mcp_server.surface_decisions(query=claim))
+        mcp_s = json.loads(mcp_server.surface_decisions(query=claim, project=config.workspace_dir))
     assert cli_s["all_superseded"] == mcp_s["all_superseded"]
 
 

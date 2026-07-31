@@ -335,22 +335,25 @@ def resolve_project(selector: Optional[str]) -> ResolvedProject:
     typed so an *absent* selector goes through the same single raise site as every
     other failure, rather than letting either boundary invent a fifth wording. An
     empty string is the missing class too, not an unknown project named ``''``: it
-    carries no target — and both boundaries gate on ``is not None``, never on
-    truthiness, so ``-p ""`` / ``project=""`` reach that raise site rather than
-    falling back.
+    carries no target — and neither boundary can turn it into a fallback. The
+    CLI's coalescer gates on ``is not None``, never on truthiness, so ``-p ""``
+    survives as a supplied value; the MCP boundary gates on nothing at all since
+    phase 5b, so ``project=""`` arrives here untouched. Both reach the raise site
+    below rather than falling back.
 
-    **The CLI now routes the absent case here; the MCP surface does not yet.**
-    Each boundary coalesces its own spelling first — ``cli._selector_from_args``
-    over ``project_pre``/``project_post`` plus the ``status``/``agent-block``
-    positional, ``mcp_server._target_config`` over the tool's ``project``
-    argument. Since phase 5a a selector-less CLI call reaches this function with
-    ``None`` and gets the missing-class error, with two deliberate exceptions that
-    never call it at all: a verb that targets no workspace
+    **Both boundaries route the absent case here.** Each coalesces its own
+    spelling first — ``cli._selector_from_args`` over ``project_pre``/
+    ``project_post`` plus the ``status``/``agent-block`` positional,
+    ``mcp_server._target_config`` over the tool's ``project`` argument — and then
+    hands what it found, ``None`` included, straight to this function. A
+    selector-less CLI call (since phase 5a) and a ``project``-less MCP tool call
+    (since phase 5b) both get the missing-class error from the one raise site
+    below. Two deliberate exceptions never call it at all, and both are the
+    CLI's: a verb that targets no workspace
     (``init``/``serve``/``projects``/``set-key --global``) and a zero-arg ``mitos
-    status``, which answers the machine-wide overview. On the MCP side a
-    ``project``-less tool call still keeps today's working-directory behaviour, so
-    for *that* boundary the ``Optional`` branch remains reachable only through an
-    empty string until phase 5b.
+    status``, which answers the machine-wide overview. The MCP surface has no
+    exempt tool — ``list_projects`` answers for the machine and takes no selector,
+    so it never reaches a resolution at all.
 
     The registry read is **not** optional and its faults propagate unwrapped —
     including on the path form, which needs routing for nothing but the echo name.

@@ -301,10 +301,10 @@ def _render_targeting_error(err: ProjectTargetingError, tool: str) -> str:
     There is deliberately **no cwd line at all**, though §4.5 permits framing one
     as launch-dir context. On an always-on server ``os.getcwd()`` is fixed for
     the process's whole life, so a hint derived from it is constant across every
-    call — always noise, or always wrong in the same way. Worse, it would be true
-    for one phase and misleading in the next: today "your launch dir sits inside
-    project X" implies X is the default, which it is; once the fallback is gone,
-    the same line names a project the server will not use.
+    call — always noise, or always wrong in the same way. And since the
+    working-directory fallback was deleted there is nothing true left for such a
+    line to say: "your launch dir sits inside project X" would name a project this
+    surface will not use for anything, which is worse than silence.
 
     It never calls ``str(err)``: that is the terse discriminator-level fallback
     for an unrendered path, fenced by a tripwire forbidding exactly the strings
@@ -422,14 +422,17 @@ def _target_config(project: Optional[str], tool: str) -> MitosConfig:
     not a fallback surviving, but a second, disagreeing resolution inside one
     call.
 
-    The gate is ``is not None`` and never truthiness. ``project=""`` is a
-    *supplied* selector that carries no target: it resolves, fails as the missing
-    class, and renders. Under ``if project:`` it would silently fall back to the
-    working directory — the caller asked for something and got somewhere else.
+    There is no gate on ``project`` at all, and that is the finished shape rather
+    than a simplification: an omitted selector and an empty one are the *same*
+    class, so both go straight to ``routing.resolve_project``'s single raise site
+    and come back as the missing anatomy. The parameter stays ``Optional`` because
+    ``None`` is what an omitted argument delivers — the type describes the call,
+    not a default this function supplies.
 
     Args:
         project: The selector as the caller passed it, or ``None`` when the
-            argument was omitted.
+            argument was omitted. Both reach the resolver; neither resolves a
+            working directory.
         tool: The calling tool's name, for the rendered example.
 
     Returns:
@@ -449,15 +452,6 @@ def _target_config(project: Optional[str], tool: str) -> MitosConfig:
             a malformed config must be resolvable-then-diagnosed. No carve-out
             here; it is the same pre-existing gap the CLI has.
     """
-    if project is None:
-        # TRANSITIONAL — the working-directory fallback, and the single line
-        # phase 5b deletes. After this phase it is the ONLY zero-arg
-        # `MitosConfig()` left in this module; the other seven became the one
-        # resolved config threaded through each call. Spelled with the
-        # module-level `MitosConfig` name on purpose: nine test rows retarget
-        # this surface by patching `mitos.mcp_server.MitosConfig`, and they reach
-        # the call only through this name.
-        return MitosConfig()
     try:
         target = routing.resolve_project(project)
     except ProjectTargetingError as err:

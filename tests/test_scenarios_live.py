@@ -15,6 +15,7 @@ import json
 from typing import Tuple, List, Dict, Optional, Any
 from unittest.mock import MagicMock, patch
 
+from conftest import make_workspace
 from mitos.config import MitosConfig
 from mitos.store import GraphStore, ValidationError
 from mitos.parser import ParsedEntry, parse_decisions_file
@@ -50,7 +51,17 @@ def force_live_env() -> None:
 
 @pytest.fixture
 def live_workspace() -> Tuple[MitosConfig, str]:
-    """Fixture that provisions a fully isolated temporary workspace."""
+    """Fixture that provisions a fully isolated temporary workspace.
+
+    Deliberately NOT `conftest.make_workspace`, even though since 5b an MCP call
+    must resolve a valid workspace. Measured: `cmd_init` seeds `decisions.md`
+    only `if not os.path.exists(...)`, so pre-writing the validity triple here
+    leaves every `cmd_init` row in this module with a 12-byte corpus carrying
+    neither the `BEGIN ENTRIES` sentinel nor the sample block — a shape the tool
+    never produces, which `sync` would then silently *repair* rather than fail on.
+    Most rows here run `cmd_init` themselves and get the real thing; the one MCP
+    row that does not builds the triple in its own body and says why.
+    """
     tmpdir = tempfile.mkdtemp()
     config = MitosConfig(tmpdir)
     config.db_path = os.path.join(tmpdir, ".mitos", "graph.sqlite")
@@ -177,6 +188,12 @@ def test_scenario_s2_dense_prose_migration(live_workspace) -> None:
 # ==============================================================================
 def test_scenario_s3_pre_write_surfacing(live_workspace) -> None:
     config, tmpdir = live_workspace
+    # The only MCP row in this module that never runs `cmd_init`, so it is the
+    # only one that has to build the validity triple itself: since 5b the tool
+    # call resolves its `project`, and resolution refuses a directory holding
+    # only `.mitos/`. The store below is still the injected one — this exists so
+    # the call has a real target to name.
+    make_workspace(tmpdir)
     store = GraphStore(config.db_path)
     
     # Seed prior decision
@@ -189,7 +206,8 @@ def test_scenario_s3_pre_write_surfacing(live_workspace) -> None:
     # Call FastMCP surface tool directly using mock workspace components
     with patch("mitos.mcp_server.get_workspace_components") as mock_get:
         mock_get.return_value = (store, None, None)
-        res = surface_decisions("cache write concurrency strategy", "cache")
+        res = surface_decisions("cache write concurrency strategy", "cache",
+                                project=config.workspace_dir)
         assert "cache-concurrency" in res
         assert "In-process asyncio.Lock" in res
         assert "advisory locks" in res
@@ -587,5 +605,6 @@ def test_scenario_x1_decision_lifecycle(live_workspace) -> None:
     # Step 6 & 7: MCP payload contains verbatim committed axiom
     with patch("mitos.mcp_server.get_workspace_components") as mock_get:
         mock_get.return_value = (store, provider, qdrant)
-        mcp_res = surface_decisions("spec dynamic retrieval", "substrate")
+        mcp_res = surface_decisions("spec dynamic retrieval", "substrate",
+                                    project=config.workspace_dir)
         assert committed_axiom in mcp_res

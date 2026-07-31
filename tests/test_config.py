@@ -359,10 +359,12 @@ def test_to_dict_carries_full_surface() -> None:
 def test_project_is_never_empty_across_every_construction_form() -> None:
     """The echo's never-empty rule is a property of CONSTRUCTION, not of call sites.
 
-    Four forms, because each is a real caller: the zero-arg fallback (5b's line),
-    a bare workspace root, an explicit ``project=None`` (what the two resolution
-    sites pass for an *unregistered* path — `ResolvedProject.name` is `None`
-    there), and a registered name. Only the last carries a name; the other three
+    Four forms, because each is a construction the code can perform: the zero-arg
+    form (no *surface* reaches it since 5b removed the last fallback, but the
+    constructor still defines it and 5d is what removes the default), a bare
+    workspace root, an explicit ``project=None`` (what the two resolution sites
+    pass for an *unregistered* path — `ResolvedProject.name` is `None` there),
+    and a registered name. Only the last carries a name; the other three
     fall back to the canonical workspace path, which is what makes an echo defined
     for every selector form without a branch at any consumer.
     """
@@ -582,9 +584,10 @@ def test_unknown_rotation_mode_still_hard_fails() -> None:
 def test_config_loading_never_writes_to_stdout(capsys) -> None:
     """A deprecated mode must not print to stdout — it would corrupt MCP's JSON-RPC.
 
-    ``mcp_server.py`` constructs ``MitosConfig()`` per tool call over a stdio
+    ``mcp_server.py`` constructs a ``MitosConfig`` per tool call over a stdio
     JSON-RPC channel, so anything on stdout there is protocol corruption rather than
-    noise. The warning is the CLI dispatcher's job, on stderr; the loader stays mute.
+    noise. (Per-call construction is the substance and is unchanged; since 5b the
+    construction takes a resolved root rather than none.) The warning is the CLI dispatcher's job, on stderr; the loader stays mute.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         _write_config(tmpdir, 'rotation_mode = "mark"\n')

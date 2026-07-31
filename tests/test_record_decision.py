@@ -207,7 +207,7 @@ def test_full_read_write_loop(ws) -> None:
     # query_decisions resolves the exact slug without needing embeddings.
     with patch("mitos.mcp_server.MitosConfig", return_value=config):
         from mitos.mcp_server import query_decisions
-        out = json.loads(query_decisions("event-sourcing"))
+        out = json.loads(query_decisions("event-sourcing", project=config.workspace_dir))
     assert out["slug"] == "event-sourcing"
     assert out["rejected_paths"] == "CRUD loses history."  # anti-knowledge flows end-to-end
 
@@ -394,9 +394,9 @@ def test_mcp_tool_returns_well_formed_json(ws) -> None:
     config, _ = ws
     with patch("mitos.mcp_server.MitosConfig", return_value=config):
         from mitos.mcp_server import record_decision
-        ok = json.loads(record_decision("A decision.", "A rejection.", ["s"], slug="mcp-ok"))
+        ok = json.loads(record_decision("A decision.", "A rejection.", ["s"], slug="mcp-ok", project=config.workspace_dir))
         assert ok["status"] == "created" and ok["slug"] == "mcp-ok"
-        err = json.loads(record_decision("Another.", "", ["s"], slug="mcp-err"))  # missing rejected_paths
+        err = json.loads(record_decision("Another.", "", ["s"], slug="mcp-err", project=config.workspace_dir))  # missing rejected_paths
         assert err["code"] == "missing_rejected_paths"
     # The write actually landed through the MCP entry point (writable store).
     assert GraphStore(config.db_path).get_node_by_slug("mcp-ok") is not None
@@ -677,7 +677,7 @@ def test_mcp_receipt_carries_edges_and_fields(ws) -> None:
     with patch("mitos.mcp_server.MitosConfig", return_value=config):
         res = json.loads(mcp_server.record_decision(
             "Follow-up axiom.", "rej", ["db"], slug="follow-up",
-            mechanisms=["sqlite"], amends="prior"))
+            mechanisms=["sqlite"], amends="prior", project=config.workspace_dir))
     assert res["status"] == "created"
     assert res["edges_created"] == [{"kind": "amends", "target": "prior"}]
     assert res["scope"] == ["db"] and res["mechanisms"] == ["sqlite"]

@@ -59,8 +59,8 @@ def test_mcp_surface_brief_omits_rejected_paths(ws):
     m.record_decision_entry("Use SQLite WAL.", "Postgres too heavy.", ["db"], slug="sqlite-wal")
     store = _ro_store(config)
     with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
-        full = json.loads(mcp_server.surface_decisions("storage", scope="db"))
-        brief = json.loads(mcp_server.surface_decisions("storage", scope="db", brief=True))
+        full = json.loads(mcp_server.surface_decisions("storage", scope="db", project=config.workspace_dir))
+        brief = json.loads(mcp_server.surface_decisions("storage", scope="db", brief=True, project=config.workspace_dir))
     assert "rejected_paths" in full["active_decisions"][0]
     assert "rejected_paths" not in brief["active_decisions"][0]
     assert brief["active_decisions"][0]["axiom"] == "Use SQLite WAL."  # axiom stays
@@ -73,7 +73,7 @@ def test_mcp_list_brief_omits_rejected_paths(ws):
         m.record_decision_entry(f"Axiom {i}.", "rej", ["z"], slug=f"z-{i}")
     store = _ro_store(config)
     with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
-        brief = json.loads(mcp_server.list_decisions(scope="z", brief=True))
+        brief = json.loads(mcp_server.list_decisions(scope="z", brief=True, project=config.workspace_dir))
     assert brief["total"] == 3
     assert all("rejected_paths" not in d for d in brief["decisions"])
     assert all(d["axiom"] for d in brief["decisions"])
@@ -113,8 +113,8 @@ def test_mcp_surface_repeat_keeps_full_rejected_paths(ws):
     m.record_decision_entry("Single PSP is Stripe.", "Adyen heavier.", ["pay"], slug="stripe-psp")
     store = _ro_store(config)
     with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
-        first = json.loads(mcp_server.surface_decisions("payments", scope="pay"))
-        second = json.loads(mcp_server.surface_decisions("payments", scope="pay"))
+        first = json.loads(mcp_server.surface_decisions("payments", scope="pay", project=config.workspace_dir))
+        second = json.loads(mcp_server.surface_decisions("payments", scope="pay", project=config.workspace_dir))
     d1 = first["active_decisions"][0]
     d2 = second["active_decisions"][0]
     assert "rejected_paths" in d1 and "seen" not in d1
@@ -186,7 +186,7 @@ def test_surface_omits_open_questions_without_scope(ws):
     m.record_decision_entry("Decision.", "rej", ["s"], slug="d")
     store = _ro_store(config)
     with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
-        resp = json.loads(mcp_server.surface_decisions("anything"))
+        resp = json.loads(mcp_server.surface_decisions("anything", project=config.workspace_dir))
     assert "open_questions" not in resp
 
 
@@ -196,7 +196,7 @@ def test_surface_includes_open_questions_with_scope(ws):
     m.record_decision_entry("Decision.", "rej", ["scoped"], slug="d")
     store = _ro_store(config)
     with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
-        resp = json.loads(mcp_server.surface_decisions("anything", scope="scoped"))
+        resp = json.loads(mcp_server.surface_decisions("anything", scope="scoped", project=config.workspace_dir))
     assert "open_questions" in resp and resp["open_questions"] == []
 
 

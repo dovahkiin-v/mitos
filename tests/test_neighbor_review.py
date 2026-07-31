@@ -277,7 +277,7 @@ def test_mcp_record_decision_pauses(ws):
     config, _ = ws
     with patch("mitos.mcp_server.MitosConfig", return_value=config), \
          patch.object(MitosSyncManager, "_review_neighbors", return_value=_FLAGGED):
-        res = json.loads(mcp_server.record_decision("A new call.", "rej", ["s"], slug="newcall"))
+        res = json.loads(mcp_server.record_decision("A new call.", "rej", ["s"], slug="newcall", project=config.workspace_dir))
     assert res["status"] == "needs_review" and res["neighbors"] == _FLAGGED
     assert GraphStore(config.db_path).get_node_by_slug("newcall") is None
 
@@ -289,7 +289,7 @@ def test_mcp_record_decision_acknowledge_commits(ws):
     with patch("mitos.mcp_server.MitosConfig", return_value=config), \
          patch.object(MitosSyncManager, "_review_neighbors", return_value=_FLAGGED):
         res = json.loads(mcp_server.record_decision("A new call.", "rej", ["s"],
-                                                    slug="newcall", acknowledge_neighbors=True))
+                                                    slug="newcall", acknowledge_neighbors=True, project=config.workspace_dir))
     assert res["status"] == "created"
     assert GraphStore(config.db_path).get_node_by_slug("newcall") is not None
 
@@ -379,7 +379,7 @@ def test_cli_mcp_record_pause_parity(ws, capsys):
         cli_payload = json.loads(capsys.readouterr().out)
         mcp_payload = json.loads(mcp_server.record_decision(
             "Adopt SQLite as the storage engine.", "rej", ["db"],
-            slug="adopt-sqlite"))
+            slug="adopt-sqlite", project=config.workspace_dir))
 
     assert cli_payload["neighbors"] == mcp_payload["neighbors"]
     assert cli_payload["code"] == mcp_payload["code"] == "similar_decision_exists"

@@ -18,7 +18,8 @@ the way a real agent's MCP client does. Import it by bare name — ``tests/`` is
 Usage — one session, many calls, a filesystem mutation permitted between them::
 
     async with mitos_server(cwd=workspace, env=harness_env(tmp_path)) as server:
-        result = await server.session.call_tool("list_scopes", {})
+        result = await server.session.call_tool(
+            "list_scopes", {"project": str(workspace)})
         payload = json.loads(result.content[0].text)
 
 Two properties are not negotiable, and each exists because a measurement said so:

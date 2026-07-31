@@ -329,72 +329,67 @@ class TestMcpParity:
         store = GraphStore(config.db_path, read_only=True)
         return store, embed, vec
 
-    def test_mcp_surface_embed_error(self, ws, monkeypatch):
+    def test_mcp_surface_embed_error(self, ws):
         config, m = ws
         _rec(m, "cache-strategy", "Use a write-through cache.")
-        monkeypatch.chdir(config.workspace_dir)
         from mitos import mcp_server
         exc = EmbeddingError('429 {"status": "RESOURCE_EXHAUSTED"}')
         comps = self._components(config, embed=_Boom(exc), vec=object())
         with patch.object(mcp_server, "get_workspace_components",
                           return_value=comps):
-            out = json.loads(mcp_server.surface_decisions("cache strategy"))
+            out = json.loads(mcp_server.surface_decisions("cache strategy", project=config.workspace_dir))
         assert out["degraded"] == "lexical"
         assert "429" in out["degraded_reason"]
         assert "RESOURCE_EXHAUSTED" not in out["degraded_reason"]
         assert out["matches"][0]["slug"] == "cache-strategy"
         assert "confidence" not in out
 
-    def test_mcp_surface_pre_v1a(self, ws, monkeypatch):
+    def test_mcp_surface_pre_v1a(self, ws):
         config, m = ws
         _rec(m, "cache-strategy", "Use a write-through cache.")
-        monkeypatch.chdir(config.workspace_dir)
         from mitos import mcp_server
         exc = DatabaseError("This graph predates the V1a schema.")
         with patch.object(mcp_server, "get_workspace_components",
                           side_effect=exc):
-            out = json.loads(mcp_server.surface_decisions("cache"))
+            out = json.loads(mcp_server.surface_decisions("cache", project=config.workspace_dir))
         assert out["degraded"] == "lexical"
         assert out["stamps_unavailable"] is True
 
-    def test_mcp_query_no_providers(self, ws, monkeypatch):
+    def test_mcp_query_no_providers(self, ws):
         config, m = ws
         _rec(m, "cache-strategy", "Use a write-through cache.")
-        monkeypatch.chdir(config.workspace_dir)
         from mitos import mcp_server
         comps = self._components(config)
         with patch.object(mcp_server, "get_workspace_components",
                           return_value=comps):
-            out = json.loads(mcp_server.query_decisions("cache strategy"))
+            out = json.loads(mcp_server.query_decisions("cache strategy", project=config.workspace_dir))
         assert out["degraded"] == "lexical"
         assert out["matches"][0]["slug"] == "cache-strategy"
         assert "error" not in out
 
-    def test_mcp_query_embed_error(self, ws, monkeypatch):
+    def test_mcp_query_embed_error(self, ws):
         config, m = ws
         _rec(m, "cache-strategy", "Use a write-through cache.")
-        monkeypatch.chdir(config.workspace_dir)
         from mitos import mcp_server
         exc = EmbeddingError("boom connection refused")
         comps = self._components(config, embed=_Boom(exc), vec=object())
         with patch.object(mcp_server, "get_workspace_components",
                           return_value=comps):
-            out = json.loads(mcp_server.query_decisions("cache strategy"))
+            out = json.loads(mcp_server.query_decisions("cache strategy", project=config.workspace_dir))
         assert out["degraded"] == "lexical"
         assert "error" not in out
         assert out["matches"][0]["slug"] == "cache-strategy"
 
-    def test_mcp_stamps_when_graph_readable(self, ws, monkeypatch):
+    def test_mcp_stamps_when_graph_readable(self, ws):
         config, m = ws
         _rec(m, "cache-strategy", "Use a write-through cache.")
         _rec(m, "cache-strategy-amendment", "Amend the cache strategy.",
              amends="cache-strategy")
-        monkeypatch.chdir(config.workspace_dir)
         from mitos import mcp_server
         comps = self._components(config)
         with patch.object(mcp_server, "get_workspace_components",
                           return_value=comps):
-            out = json.loads(mcp_server.surface_decisions("cache"))
+            out = json.loads(mcp_server.surface_decisions("cache", project=config.workspace_dir))
         by_slug = {mm["slug"]: mm for mm in out["matches"]}
         assert by_slug["cache-strategy"]["amended_by"] == [
             "cache-strategy-amendment"
@@ -446,15 +441,14 @@ class TestAbsentCollectionOnTheReadSurfaces:
             MM.return_value = mgr
             return _capture(verb, config, "cache strategy", **kwargs)
 
-    def _mcp(self, config, monkeypatch, tool):
+    def _mcp(self, config, tool):
         from mitos.store import GraphStore
-        monkeypatch.chdir(config.workspace_dir)
         from mitos import mcp_server
         comps = (GraphStore(config.db_path, read_only=True),
                  _Embeds(), _MissingCollection())
         with patch.object(mcp_server, "get_workspace_components",
                           return_value=comps):
-            return json.loads(getattr(mcp_server, tool)("cache strategy"))
+            return json.loads(getattr(mcp_server, tool)("cache strategy", project=config.workspace_dir))
 
     # -- populated graph: absence announces itself, by name, with the heal ----
 
@@ -476,12 +470,12 @@ class TestAbsentCollectionOnTheReadSurfaces:
 
     @pytest.mark.parametrize("tool", ["query_decisions", "surface_decisions"])
     def test_mcp_populated_graph_names_the_collection_and_the_heal(
-        self, ws, monkeypatch, tool
+        self, ws, tool
     ):
         config, m = ws
         _rec(m, "cache-strategy", "Use a write-through cache.")
 
-        out = self._mcp(config, monkeypatch, tool)
+        out = self._mcp(config, tool)
 
         assert out["degraded"] == "lexical"
         assert _ABSENT in out["degraded_reason"]
@@ -516,9 +510,9 @@ class TestAbsentCollectionOnTheReadSurfaces:
         assert "Semantic recall unavailable" not in out
 
     @pytest.mark.parametrize("tool", ["query_decisions", "surface_decisions"])
-    def test_mcp_empty_graph_is_the_clean_envelope(self, ws, monkeypatch, tool):
+    def test_mcp_empty_graph_is_the_clean_envelope(self, ws, tool):
         config, _m = ws
-        out = self._mcp(config, monkeypatch, tool)
+        out = self._mcp(config, tool)
 
         assert "degraded" not in out
         assert "degraded_reason" not in out
@@ -617,15 +611,14 @@ class TestUnbuiltGraphOnTheReadSurfaces:
             MM.return_value = mgr
             return _capture(verb, config, "cache strategy", **kwargs)
 
-    def _mcp(self, config, monkeypatch, tool):
+    def _mcp(self, config, tool):
         from mitos.store import GraphStore
-        monkeypatch.chdir(config.workspace_dir)
         from mitos import mcp_server
         comps = (GraphStore(config.db_path, read_only=True),
                  _Embeds(), _MissingCollection())
         with patch.object(mcp_server, "get_workspace_components",
                           return_value=comps):
-            return json.loads(getattr(mcp_server, tool)("cache strategy"))
+            return json.loads(getattr(mcp_server, tool)("cache strategy", project=config.workspace_dir))
 
     # -- the clone: the empty answer says why it is empty ---------------------
 
@@ -654,13 +647,13 @@ class TestUnbuiltGraphOnTheReadSurfaces:
 
     @pytest.mark.parametrize("tool", ["query_decisions", "surface_decisions"])
     def test_mcp_tools_carry_the_note_in_their_own_register(
-        self, cloned, monkeypatch, tool
+        self, cloned, tool
     ):
         """Same predicate, same composer, a different closing clause: an agent on
         this surface cannot run a shell command where it stands, and saying so beats
         letting it hunt for a `sync` tool that does not exist.
         """
-        out = self._mcp(cloned, monkeypatch, tool)
+        out = self._mcp(cloned, tool)
 
         assert out.get("matches", out.get("active_decisions")) == []
         assert "graph is unbuilt" in out["note"]
@@ -669,7 +662,7 @@ class TestUnbuiltGraphOnTheReadSurfaces:
         assert "reconcile" not in out["note"]
 
     def test_the_note_is_not_a_degradation_the_envelope_stays_clean(
-        self, cloned, monkeypatch
+        self, cloned
     ):
         """It annotates a successful read; it does not claim the read failed.
 
@@ -677,7 +670,7 @@ class TestUnbuiltGraphOnTheReadSurfaces:
         ran and there was genuinely nothing indexed — a different fact, and blurring
         the two would put a diagnosis on the wrong axis.
         """
-        out = self._mcp(cloned, monkeypatch, "surface_decisions")
+        out = self._mcp(cloned, "surface_decisions")
 
         assert "degraded" not in out
         assert "degraded_reason" not in out
@@ -693,10 +686,10 @@ class TestUnbuiltGraphOnTheReadSurfaces:
 
     @pytest.mark.parametrize("tool", ["query_decisions", "surface_decisions"])
     def test_the_fresh_twin_mcp_envelope_carries_no_graph_note(
-        self, ws, monkeypatch, tool
+        self, ws, tool
     ):
         config, _m = ws
-        out = self._mcp(config, monkeypatch, tool)
+        out = self._mcp(config, tool)
 
         assert "unbuilt" not in json.dumps(out)
 
@@ -729,20 +722,19 @@ class _NoMatches:
 
 
 class TestUnbuiltGraphOnTheOrdinaryEmptyEnvelope:
-    def _mcp(self, config, monkeypatch, tool, vector_store):
+    def _mcp(self, config, tool, vector_store):
         from mitos.store import GraphStore
-        monkeypatch.chdir(config.workspace_dir)
         from mitos import mcp_server
         comps = (GraphStore(config.db_path, read_only=True), _Embeds(), vector_store)
         with patch.object(mcp_server, "get_workspace_components",
                           return_value=comps):
-            return json.loads(getattr(mcp_server, tool)("cache strategy"))
+            return json.loads(getattr(mcp_server, tool)("cache strategy", project=config.workspace_dir))
 
     @pytest.mark.parametrize("tool", ["query_decisions", "surface_decisions"])
     def test_a_present_but_empty_collection_still_names_the_unbuilt_graph(
-        self, cloned, monkeypatch, tool
+        self, cloned, tool
     ):
-        out = self._mcp(cloned, monkeypatch, tool, _NoMatches())
+        out = self._mcp(cloned, tool, _NoMatches())
 
         assert out.get("matches", out.get("active_decisions")) == []
         assert "graph is unbuilt" in out["note"]
@@ -750,9 +742,9 @@ class TestUnbuiltGraphOnTheOrdinaryEmptyEnvelope:
 
     @pytest.mark.parametrize("tool", ["query_decisions", "surface_decisions"])
     def test_the_fresh_twin_on_the_same_envelope_says_nothing(
-        self, ws, monkeypatch, tool
+        self, ws, tool
     ):
         config, _m = ws
-        out = self._mcp(config, monkeypatch, tool, _NoMatches())
+        out = self._mcp(config, tool, _NoMatches())
 
         assert "unbuilt" not in json.dumps(out)

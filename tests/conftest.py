@@ -113,6 +113,43 @@ def make_workspace(root) -> str:
     return os.path.realpath(str(root))
 
 
+def resolve_like_main(root: str):
+    """The config ``cli.main()`` builds for a path-form selector.
+
+    A verb never receives a hand-built config in production — ``main()`` resolves
+    the selector and passes what it got, so the config carries the resolved
+    *name*. The echo is exactly the field where that matters: ``mitos init``
+    registers the workspace under its directory basename, so a path-form selector
+    reverse-looks-up to that registered name on both surfaces. Hand-building the
+    config instead has the CLI echo a path while its MCP twin echoes the name, and
+    a parity row then reds on the test's shortcut rather than on a drift.
+
+    The name is a **random per-run temp basename** for the usual
+    ``mkdtemp``-then-``cmd_init`` fixture, so a row asserting the echo must
+    compare against this config's ``project``, never against a literal.
+
+    Lifted here at 5b from ``test_scopes``/``test_modifier_surfacing``'s
+    byte-identical twins, for the same reason 5a lifted :func:`make_workspace`:
+    the MCP flip gave it eleven more candidate consumers, and eleven private
+    re-spellings would be eleven chances to hand-build the config instead.
+
+    Args:
+        root: A workspace root — the path form of a selector.
+
+    Returns:
+        The :class:`~mitos.config.MitosConfig` for the resolved workspace,
+        carrying the resolved project name.
+    """
+    # Imported in-body: conftest is loaded before every session, and the mitos
+    # import graph has no business riding that for a helper most modules never
+    # call.
+    from mitos import routing
+    from mitos.config import MitosConfig
+
+    target = routing.resolve_project(root)
+    return MitosConfig(target.root, project=target.name)
+
+
 @pytest.fixture
 def workspace(tmp_path) -> str:
     """One ready-made workspace under ``tmp_path``, canonical path.

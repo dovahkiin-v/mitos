@@ -22,7 +22,7 @@ from typing import Iterator, Tuple
 import pytest
 from unittest.mock import patch
 
-from mitos import routing
+from conftest import resolve_like_main
 from mitos.config import MitosConfig
 from mitos.cli import cmd_init, cmd_list, cmd_open_questions, cmd_scopes, main
 from mitos.display import order_scope_counts
@@ -52,24 +52,9 @@ def ws(offline) -> Iterator[Tuple[MitosConfig, MitosSyncManager]]:
     tmp = os.path.realpath(tempfile.mkdtemp())
     config = MitosConfig(tmp)
     cmd_init(config)
-    config = _resolve_like_main(tmp)
+    config = resolve_like_main(tmp)
     yield config, MitosSyncManager(config)
     shutil.rmtree(tmp, ignore_errors=True)
-
-
-def _resolve_like_main(root: str) -> MitosConfig:
-    """The config ``cli.main()`` builds for a path-form selector.
-
-    A CLI verb never receives a hand-built config in production — ``main()``
-    resolves the selector and passes what it got, so the config carries the
-    resolved *name*. The echo is exactly the field where that matters: ``mitos
-    init`` registers the workspace, so a path-form selector reverse-looks-up to
-    the registered name on both surfaces. Hand-building the config here would
-    have the CLI echo a path while the MCP twin echoed the name, and the parity
-    rows would red on the test's shortcut rather than on a drift.
-    """
-    target = routing.resolve_project(root)
-    return MitosConfig(target.root, project=target.name)
 
 
 def _record(m: MitosSyncManager, slug: str, scope, supersedes=None, resolves=None) -> None:

@@ -9,8 +9,9 @@ it addressed, not only the path the tool resolved — so an agent holding severa
 projects sees a mis-aim immediately.
 
 Pins the fields on the CLI JSON envelopes, the MCP twins, and the degraded
-lexical fallback, plus the text-mode provenance line; and pins the four value
-rules the ``project`` field follows, one per selector form.
+lexical fallback, plus the text-mode provenance line; and pins the value rules
+the ``project`` field follows, one per selector form — three that answer, and the
+selector-less form, which since 5b is a refusal rather than a fourth value.
 """
 
 import asyncio
@@ -194,31 +195,40 @@ class TestCliJson:
 
 
 class TestMcpTwins:
+    # Both rows name the workspace in PATH form and assert the echo comes back as
+    # the registered NAME: the fixture's `mitos init --name provenance-ws`
+    # registered it, so `resolve_project` reverse-looks-up and §4.7's second value
+    # rule applies. Before 5b these called selectorless from a `chdir(ws)`, and the
+    # path form was what a cwd-resolved config echoed — the chdir is gone with the
+    # fallback, which is also what makes these the CLI twins two screens up rather
+    # than a differently-worded sibling.
+
     def test_list_decisions_payload_carries_provenance(self, workspace, monkeypatch):
         ws, _ = workspace
-        monkeypatch.chdir(ws)
         monkeypatch.setenv("QDRANT_URL", "http://localhost:1")
         monkeypatch.setenv("GEMINI_API_KEY", "")
         monkeypatch.setenv("GOOGLE_API_KEY", "")
-        payload = json.loads(mcp_server.list_decisions())
-        assert payload["project"] == os.path.abspath(ws)
+        payload = json.loads(mcp_server.list_decisions(project=ws))
+        assert payload["project"] == WORKSPACE_NAME
         assert payload["collection"] == MitosConfig(workspace_dir=ws).qdrant_collection
         assert payload["workspace"] == os.path.abspath(ws)
 
     def test_surface_decisions_degraded_carries_provenance(self, workspace, monkeypatch):
         ws, _ = workspace
-        monkeypatch.chdir(ws)
         monkeypatch.setenv("QDRANT_URL", "http://localhost:1")
         monkeypatch.setenv("GEMINI_API_KEY", "")
         monkeypatch.setenv("GOOGLE_API_KEY", "")
-        payload = json.loads(mcp_server.surface_decisions("provenance headers"))
+        payload = json.loads(
+            mcp_server.surface_decisions("provenance headers", project=ws))
         assert payload.get("degraded") == "lexical"
-        assert payload["project"] == os.path.abspath(ws)
+        assert payload["project"] == WORKSPACE_NAME
         assert payload["collection"] == MitosConfig(workspace_dir=ws).qdrant_collection
 
 
 # --------------------------------------------------------------------------- #
-# The four value rules — one per selector form, all four on the same tool.
+# The value rules — one per selector form, all of them on the same tool. Three
+# forms answer since 5b; the fourth (no selector) is a refusal, and has its own
+# row here rather than being dropped.
 # --------------------------------------------------------------------------- #
 
 @pytest.fixture(autouse=False)
@@ -262,7 +272,10 @@ class TestEchoValueRules:
 
     All four rules collapse to one expression in `MitosConfig.__init__` because
     `resolve_project` already did the reverse lookup — so these rows are what keep
-    that collapse honest, one per form, on a single tool.
+    that collapse honest, one per form, on a single tool. The fourth rule (no
+    selector → the workspace path) is the constructor's alone since 5b: no call on
+    this surface reaches it, and the row that used to exercise it now asserts the
+    refusal in its place.
     """
 
     def test_a_registered_name_echoes_that_name(self, tmp_path, offline, monkeypatch):
@@ -301,19 +314,31 @@ class TestEchoValueRules:
         assert _echo(project=target) == target
         assert os.path.isabs(_echo(project=target))
 
-    def test_a_selectorless_call_echoes_the_resolved_workspace_path(
+    def test_a_selectorless_call_is_refused_from_inside_a_workspace(
         self, tmp_path, offline, monkeypatch
     ):
-        """TRANSITIONAL (phase 3 only, inverted by 5b): no selector still resolves the
-        cwd, and even that answer carries a defined echo — the unregistered-path rule.
+        """Entry-007's third tripwire, inverted at 5b: there is no fourth form here.
 
-        When 5b removes the fallback this row inverts to assert the refusal; it is
-        here so that no response is ever unattributed mid-vision.
+        Phase 3 asserted that a selector-less call still resolved the cwd and that
+        even *that* answer carried a defined echo, so no response was unattributed
+        mid-vision. 5b deletes the fallback, so the rule turns over rather than
+        lapsing: a call naming no project has no workspace to answer for, and the
+        §4.5 anatomy stands where the echo would have been.
+
+        The cwd is deliberately the workspace itself — the one arrangement under
+        which a surviving fallback would look like a pass. Nothing about the
+        directory the process sits in reaches the answer.
         """
         target = _init_workspace(tmp_path / "target")
         monkeypatch.chdir(target)
 
-        assert _echo() == target
+        with pytest.raises(mcp_server._RenderedToolError) as raised:
+            _echo()
+
+        body = str(raised.value)
+        assert "no project was named" in body
+        assert target not in body          # the cwd is not offered as a default
+        assert "list_projects()" in body   # the recovery an agent can actually take
 
     def test_a_registered_project_reached_through_a_symlink_echoes_its_name(
         self, tmp_path, offline, monkeypatch
@@ -352,6 +377,13 @@ class TestEchoValueRules:
         The constructor pins never-empty at the source (`tests/test_config.py`);
         this is the surface-level restatement — a `""` reaching an agent is the
         failure the whole envelope exists to prevent.
+
+        Three forms, not four: §4.7's fourth value rule (no selector → the
+        workspace path) is a *constructor* rule and still holds there, but since
+        5b no call on this surface can reach it — a selector-less call has no
+        answer to stamp. That case is asserted one row up as a refusal rather than
+        dropped from the loop, which is why this docstring says the number out
+        loud.
         """
         target = _init_workspace(tmp_path / "target")
         unregistered = _init_workspace(tmp_path / "loose")
@@ -359,7 +391,7 @@ class TestEchoValueRules:
         monkeypatch.chdir(target)
 
         for selector in ({"project": "reg"}, {"project": target},
-                         {"project": unregistered}, {}):
+                         {"project": unregistered}):
             assert _echo(**selector), f"empty echo for {selector}"
 
 

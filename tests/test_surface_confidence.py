@@ -284,7 +284,7 @@ def _surface_with(matches, ws, query="some claim", scope=None):
     store = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components",
                       return_value=(store, _FakeEmbed(), _FakeVector(matches))):
-        return json.loads(mcp_server.surface_decisions(query, scope=scope))
+        return json.loads(mcp_server.surface_decisions(query, scope=scope, project=config.workspace_dir))
 
 
 def _cli_surface_json(matches, ws, query="some claim", scope=None):
@@ -354,7 +354,7 @@ def test_mcp_surface_degraded_has_no_confidence(ws):
     _rec(m, "settled", scope=["db"])
     store = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
-        resp = json.loads(mcp_server.surface_decisions("anything", scope="db"))
+        resp = json.loads(mcp_server.surface_decisions("anything", scope="db", project=config.workspace_dir))
     assert "confidence" not in resp
     assert resp["active_decisions"]                       # degraded fallback fired
     assert "unavailable" in resp["note"] and "list_decisions" in resp["note"]

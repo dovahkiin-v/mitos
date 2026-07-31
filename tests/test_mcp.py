@@ -7,6 +7,7 @@ to the C4 Letter-mode JSON return format.
 import json
 import pytest
 from unittest.mock import MagicMock, patch
+from conftest import make_workspace
 from mitos.store import GraphStore
 from mitos.parser import ParsedEntry
 from mitos.mcp_server import mcp, surface_decisions, query_decisions
@@ -22,8 +23,14 @@ async def test_mcp_tool_registration() -> None:
 
 
 @patch("mitos.mcp_server.get_workspace_components")
-def test_query_decisions_tool(mock_get_components: MagicMock) -> None:
-    """Verifies query_decisions formats data strictly in Letter-mode shape."""
+def test_query_decisions_tool(mock_get_components: MagicMock, tmp_path) -> None:
+    """Verifies query_decisions formats data strictly in Letter-mode shape.
+
+    The workspace is built only so the call has a target to name. Everything the
+    row asserts comes off the mocked store; before 5b the call resolved pytest's
+    own cwd — the mitos-pub checkout, which happens to be a valid workspace —
+    which is precisely the accident this phase removes.
+    """
     # Mock GraphStore
     mock_store = MagicMock()
     mock_store.get_node_by_slug.return_value = {
@@ -40,7 +47,8 @@ def test_query_decisions_tool(mock_get_components: MagicMock) -> None:
     mock_get_components.return_value = (mock_store, None, None)
 
     # Call query_decisions
-    resp_text = query_decisions(query="auth-decision")
+    resp_text = query_decisions(query="auth-decision",
+                                project=make_workspace(tmp_path / "ws"))
     resp = json.loads(resp_text)
     
     # Assert Letter-mode keys are present and clean
@@ -56,7 +64,8 @@ def test_query_decisions_tool(mock_get_components: MagicMock) -> None:
 
 
 @patch("mitos.mcp_server.get_workspace_components")
-def test_surface_decisions_fallback_filtering(mock_get_components: MagicMock) -> None:
+def test_surface_decisions_fallback_filtering(mock_get_components: MagicMock,
+                                              tmp_path) -> None:
     """Verifies surface_decisions fallback pre-filtering and open questions insertion."""
     mock_store = MagicMock()
     
@@ -90,7 +99,8 @@ def test_surface_decisions_fallback_filtering(mock_get_components: MagicMock) ->
     mock_get_components.return_value = (mock_store, None, None)
 
     # Call surface_decisions
-    resp_text = surface_decisions(query="database strategy", scope="db")
+    resp_text = surface_decisions(query="database strategy", scope="db",
+                                  project=make_workspace(tmp_path / "ws"))
     resp = json.loads(resp_text)
     
     assert len(resp["active_decisions"]) == 1

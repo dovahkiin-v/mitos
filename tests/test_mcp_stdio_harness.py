@@ -167,7 +167,7 @@ async def test_list_scopes_answers_over_a_real_serve_subprocess(tmp_path):
         tools = await server.session.list_tools()
         assert {tool.name for tool in tools.tools} == EXPECTED_TOOLS
 
-        result = await server.session.call_tool("list_scopes", {})
+        result = await server.session.call_tool("list_scopes", {"project": str(ws)})
         assert result.isError is False
         assert _tool_json(result)["scopes"] == {}
 
@@ -198,7 +198,8 @@ async def test_the_smoke_needs_neither_a_key_nor_a_reachable_qdrant(tmp_path):
     assert not (Path(env["XDG_CONFIG_HOME"]) / "mitos" / ".env").exists()
 
     async with mitos_server(cwd=ws, env=env) as server:
-        assert _tool_json(await server.session.call_tool("list_scopes", {}))["scopes"] == {}
+        assert _tool_json(await server.session.call_tool(
+            "list_scopes", {"project": str(ws)}))["scopes"] == {}
 
 
 # --------------------------------------------------------------------------- #
@@ -245,7 +246,8 @@ async def test_the_session_tears_down_without_leaking_pipes_or_loops(tmp_path, r
     recwarn.clear()
 
     async with mitos_server(cwd=ws, env=harness_env(tmp_path)) as server:
-        assert _tool_json(await server.session.call_tool("list_scopes", {}))["scopes"] == {}
+        assert _tool_json(await server.session.call_tool(
+            "list_scopes", {"project": str(ws)}))["scopes"] == {}
 
     # A handle that dies with a helper's frame reds this row by refcount alone; the
     # collect is what makes it hold for a leak that lands in a reference cycle
@@ -319,38 +321,54 @@ async def test_the_declared_environment_is_what_the_child_receives(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_the_launch_directory_is_what_the_server_binds(tmp_path):
-    """A server answers for the directory it was launched from — today.
+async def test_the_launch_directory_binds_nothing(tmp_path):
+    """Entry-007's second MCP tripwire, INVERTED at 5b — over a real process.
 
-    `mcp_server`'s zero-arg `MitosConfig()` reads the process CWD, so the launch
-    directory *is* the bound workspace. **Phase 5b flips exactly this**: once each
-    tool takes a `project` selector, a server launched in A must be able to answer
-    for B. When that lands, this row is the one to re-point — invert it to assert
-    the selector wins over the launch directory. It is not to be deleted: the
-    launch directory remains the default, and something must still pin it.
+    3a asserted the opposite, and said so: `mcp_server`'s zero-arg `MitosConfig()`
+    read the process CWD, so the launch directory *was* the bound workspace, and
+    this row was written to be re-pointed rather than deleted. 5b deletes the
+    fallback, so the claim turns over: the launch directory binds nothing at all,
+    and a call that names no project is refused even when the process is standing
+    in a perfectly good workspace holding the very scope the row could name.
+
+    Only a subprocess can state it. In-process, pytest's cwd is the mitos-pub
+    checkout — itself a valid workspace — so a surviving fallback would resolve
+    *something* and the distinction would be invisible. Here `cwd=ws_a` is a real
+    workspace carrying `alpha`, and the assertion is that `alpha` reaches nothing.
+
+    `-C`'s surviving role is unaffected and is pinned elsewhere
+    (`test_serve_binds_target`): the flag still moves the process, it just no
+    longer decides whose corpus a call touches.
     """
     env = _scaffold_env(tmp_path)
     ws_a = _workspace(tmp_path, "ws_a", env=env, scopes=("alpha",))
     _workspace(tmp_path, "ws_b", env=env, scopes=("beta",))
 
     async with mitos_server(cwd=ws_a, env=env) as server:
-        payload = _tool_json(await server.session.call_tool("list_scopes", {}))
+        result = await server.session.call_tool("list_scopes", {})
 
-    assert set(payload["scopes"]) == {"alpha"}
-    # Transitional echo rule: a selector-less call attributes itself to the
-    # resolved workspace's path. 5b removes the fallback and this line with it.
-    assert payload["project"] == str(ws_a)
+    # Read the body directly: `_tool_json` asserts `isError is False` and would
+    # fail before the anatomy could be looked at.
+    assert result.isError is True
+    body = result.content[0].text
+    assert body.startswith("Error executing tool list_scopes: ")
+    assert "no project was named" in body
+    assert "alpha" not in body and str(ws_a) not in body
+    assert "list_projects()" in body
+    assert "Traceback" not in body
 
 
 @pytest.mark.asyncio
 async def test_a_named_project_retargets_a_server_launched_somewhere_else(tmp_path):
     """The vision's whole point, over a real server: the call says where.
 
-    The row above pins that the launch directory is still the *default*. This one
-    pins that it is no longer the *answer*: a server launched in A, told
-    `project=B`, answers about B. Only a subprocess can prove it — an in-process
-    call shares pytest's environment and never enters `cli.main()`, so it is
-    structurally blind to the two hazards that live outside the function call.
+    The row above pins that the launch directory binds nothing. This one pins the
+    other half in the same long-lived session — success criterion 4 entire: a
+    server launched in A answers a `project=B` call about **B**, in both selector
+    forms, and refuses the selector-less one. Only a subprocess can prove it — an
+    in-process call shares pytest's environment and never enters `cli.main()`, so
+    it is structurally blind to the two hazards that live outside the function
+    call.
 
     The registry is planted at the path the **child** will read, taken from
     `harness_env`'s own dict. `registry.registry_path()` would resolve the
@@ -371,7 +389,11 @@ async def test_a_named_project_retargets_a_server_launched_somewhere_else(tmp_pa
             await server.session.call_tool("list_scopes", {"project": "bee"}))
         by_path = _tool_json(
             await server.session.call_tool("list_scopes", {"project": str(ws_b)}))
-        default = _tool_json(await server.session.call_tool("list_scopes", {}))
+        # The third form, and since 5b it is a refusal rather than a default.
+        # `ws_a` is unregistered in this row (the registry was overwritten with
+        # `bee` alone) and the process is standing in it — the one arrangement
+        # where a surviving fallback would answer `alpha` and read as a pass.
+        refused = await server.session.call_tool("list_scopes", {})
         listed = _tool_json(await server.session.call_tool("list_projects", {}))
 
         # An empty registry is a healthy state, and it must arrive as an ordinary
@@ -384,21 +406,24 @@ async def test_a_named_project_retargets_a_server_launched_somewhere_else(tmp_pa
 
     assert set(by_name["scopes"]) == {"beta"}
     assert set(by_path["scopes"]) == {"beta"}
-    assert set(default["scopes"]) == {"alpha"}
+    assert refused.isError is True
+    assert "no project was named" in refused.content[0].text
+    assert "alpha" not in refused.content[0].text
     assert listed["projects"] == [{"name": "bee", "path": str(ws_b)}]
     assert empty == {"registry_path": str(registry_file), "count": 0, "projects": []}
 
     # Criterion 5, over the same real server: the answer names the project back.
     # A registered NAME echoes the name; the same workspace reached by its
-    # registered PATH echoes that same name via the reverse lookup; and the
-    # selector-less call echoes the launch directory's path. The collection is
-    # read from the derivation, never hand-built as f"mitos-{name}".
+    # registered PATH echoes that same name via the reverse lookup. There is no
+    # third value to assert since 5b — the selector-less call carries no echo at
+    # all, because it resolves nothing and the anatomy stands in the stamp's
+    # place. The collection is read from the derivation, never hand-built as
+    # f"mitos-{name}".
     assert by_name["project"] == "bee"
     assert by_path["project"] == "bee"
-    assert default["project"] == str(ws_a)
     assert by_name["workspace"] == by_path["workspace"] == str(ws_b)
     assert by_name["collection"] == default_collection_name(str(ws_b))
-    assert default["collection"] == default_collection_name(str(ws_a))
+    assert "collection" not in refused.content[0].text
     # Echo and discovery speak ONE vocabulary: the name planted in the registry,
     # the name `list_projects` reports, and the name the envelope echoes are the
     # same string.
@@ -565,7 +590,8 @@ async def test_the_harness_never_relabels_a_failure_that_is_not_its_own(tmp_path
 
     with pytest.raises(AssertionError, match="the caller's own assertion") as excinfo:
         async with mitos_server(cwd=ws, env=harness_env(tmp_path)) as server:
-            assert _tool_json(await server.session.call_tool("list_scopes", {}))["scopes"] == {}
+            assert _tool_json(await server.session.call_tool(
+                "list_scopes", {"project": str(ws)}))["scopes"] == {}
             raise AssertionError("the caller's own assertion")
 
     # Not merely matchable — the group must be gone from the chain, or it renders
@@ -622,8 +648,28 @@ def test_only_json_rpc_reaches_the_transport(tmp_path):
         },
         {"jsonrpc": "2.0", "method": "notifications/initialized"},
         {
+            # A SUCCEEDING call, and the selector is what makes it one. Two
+            # reasons, and the second was measured rather than assumed.
+            #
+            # (1) Since 5b a selector-less call is refused, and this row's whole
+            #     point is reaching a tool *handler* with a response on the wire.
+            # (2) A tool that RAISES loses its response on this row's shape often
+            #     enough to matter. Measured 2026-07-31, 40 runs each, stdin
+            #     closed immediately after the exchange: refusals dropped the
+            #     tool-result line 3/40 (missing class), 4/40 (unknown name),
+            #     1/40 (relative path); the success path dropped 0/40. It is a
+            #     race between the response write and the teardown that EOF
+            #     starts, it belongs to `mcp.server.stdio`'s shutdown rather than
+            #     to mitos (`mitos/` carries no diff here), and it predates this
+            #     phase — the two refusal classes above it are reachable today.
+            #     Every rendered-refusal row therefore lives on the harness, where
+            #     the session stays open and no EOF races the write.
+            #
+            # So: do not "simplify" this back to `{}`. It would restore a ~7%
+            # flake on a row whose failure message points at stdout hygiene.
             "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-            "params": {"name": "list_scopes", "arguments": {}},
+            "params": {"name": "list_scopes",
+                       "arguments": {"project": str(ws)}},
         },
     ))
 
@@ -702,13 +748,22 @@ async def test_one_long_lived_session_spans_calls_and_a_filesystem_mutation(tmp_
     ws = _workspace(tmp_path, "ws_a", env=env)
 
     async with mitos_server(cwd=ws, env=env) as server:
-        before = _tool_json(await server.session.call_tool("list_scopes", {}))
+        before = _tool_json(await server.session.call_tool(
+            "list_scopes", {"project": str(ws)}))
         assert before["scopes"] == {}
 
         _record(ws, "alpha", env=env)
 
-        after = _tool_json(await server.session.call_tool("list_scopes", {}))
+        after = _tool_json(await server.session.call_tool(
+            "list_scopes", {"project": str(ws)}))
         assert set(after["scopes"]) == {"alpha"}
         assert after["scopes"]["alpha"]["active_decisions"] == 1
-        # The provenance is per-call, not cached with the graph view.
-        assert before["project"] == after["project"] == str(ws)
+        # The provenance is per-call, not cached with the graph view. The value is
+        # the REGISTERED NAME, not the path this row passes: `_workspace` runs a
+        # real `mitos init`, `harness_env` derives the child's `XDG_CONFIG_HOME`
+        # from the same root, so init and server share one registry and the path
+        # form reverse-looks-up. Read it off the listing rather than hard-coding
+        # "ws_a", so the row states the join instead of a coincidence.
+        registered = {entry["path"]: entry["name"] for entry in _tool_json(
+            await server.session.call_tool("list_projects", {}))["projects"]}
+        assert before["project"] == after["project"] == registered[str(ws)]
