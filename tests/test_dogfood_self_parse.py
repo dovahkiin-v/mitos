@@ -35,7 +35,7 @@ import pytest
 
 from mitos.cli import _extract_sample_block, load_format_spec
 from mitos.errors import EntryFailure
-from mitos.parser import parse_entry_stream
+from mitos.parser import corpus_has_entries, parse_entry_stream
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -158,15 +158,28 @@ def test_working_tree_decisions_self_parse_clean() -> None:
 def test_open_questions_self_parse_clean_or_absent() -> None:
     """The OQ self-parse pass is attempted even when ``questions.md`` is absent (G10).
 
-    ``questions.md`` is absent/empty today (zero OQs in the corpus), so this is a
-    no-op pass now — but the closeout MUST still *attempt* it (parse as
-    ``open_question`` when present and non-empty) so a future OQ corpus is never
-    silently skipped (§2.1 "names both files so it never silently skips"). Guard:
-    file-absent / empty-stream → skip-with-reason, never an error.
+    The corpus holds zero OQs today, so this is a no-op pass now — but the closeout
+    MUST still *attempt* it (parse as ``open_question`` when the file holds entries)
+    so a future OQ corpus is never silently skipped (§2.1 "names both files so it
+    never silently skips"). Guard: no entries → skip-with-reason, never an error.
+
+    **The guard is ``corpus_has_entries``, not ``.strip()``, and that is the whole
+    point of it.** A freshly-``init``ed workspace ships a ``### example-slug`` sample
+    block *above* the ``BEGIN ENTRIES`` sentinel, so a scaffolded-but-empty
+    ``questions.md`` is neither absent nor blank while still parsing to zero entries —
+    exactly the state ``corpus_has_entries``' own docstring says neither "the file is
+    non-empty" nor "it has a ``###`` heading" can tell apart. The naive guard made
+    this row pass only for as long as the file did not exist: running ``mitos init``
+    in this checkout (which SETUP.md and the mitos-setup skill both instruct, and
+    which the 0.15.0 migration did) created it and turned a skip into a red
+    ``assert 0 >= 1``. CI never saw it — ``questions.md`` is gitignored, so a fresh
+    checkout has none and the row skips there forever. Found on a dev box during the
+    0.15.0 release sweep; the sibling ``decisions`` row already reasons this way
+    ("cleanliness is the property under guard, not corpus size").
     """
     path = os.path.join(REPO_ROOT, "questions.md")
-    if not os.path.exists(path) or not _read(path).strip():
-        pytest.skip("questions.md absent/empty — no-op OQ pass (G10), attempted not skipped")
+    if not os.path.exists(path) or not corpus_has_entries(path):
+        pytest.skip("questions.md holds no entries — no-op OQ pass (G10), attempted not skipped")
     entries, failures = _parse_collect(_read(path), "open_question", path)
     assert failures == [], _describe(failures)
     assert len(entries) >= 1
