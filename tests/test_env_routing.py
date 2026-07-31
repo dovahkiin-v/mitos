@@ -810,19 +810,20 @@ class TestTheKeylessPostureWhereTheFallbackUsedToAnswer:
 
 # --- the structural net ----------------------------------------------------
 
-# EVERY `os.environ` read in `mitos/`, as `(module, function)`. Six keys, seven
-# reads, and after 5c there is no second dict beside this one: the transitional
-# shim's single read is gone, and so is `cli.load_dotenv_file`'s pair — which
-# were also the tree's only `os.environ` WRITE. Keyed on the enclosing function
-# rather than a line number: the set is exact either way, and this spelling does
-# not churn when a file above it moves.
+# EVERY `os.environ` read in `mitos/`, as `(module, function)`. **Five keys, six
+# reads** since 6a — `MITOS_NO_MCP_HINT` retired with the per-project MCP-wiring
+# nudge, so `cli.py` now reads the process environment nowhere at all. After 5c
+# there is no second dict beside this one either: the transitional shim's single
+# read is gone, and so is `cli.load_dotenv_file`'s pair — which were also the
+# tree's only `os.environ` WRITE. Keyed on the enclosing function rather than a
+# line number: the set is exact either way, and this spelling does not churn when
+# a file above it moves.
 PERMANENT_ENV_READS = {
     ("env.py", "_resolve"): 2,          # the resolver's own tier 1 — the legitimate one
     ("config.py", "_hint_cache_path"): 1,   # XDG_CACHE_HOME — genuinely process-scoped
     ("config.py", "config_home"): 1,        # XDG_CONFIG_HOME — likewise
     ("_update.py", "_cache_path"): 1,       # XDG
     ("_update.py", "update_notice"): 1,     # MITOS_NO_UPDATE_CHECK quiet-switch
-    ("cli.py", "_mcp_hint"): 1,             # MITOS_NO_MCP_HINT quiet-switch
 }
 
 
@@ -890,10 +891,14 @@ def test_the_process_environment_is_read_only_at_the_declared_sites():
     with its only member — an empty dict left behind is a hook for the next
     shim.
 
-    Six keys, seven reads. The count is pinned independently outside this file:
-    the ADR recorded at 2b says *"nine permanent … and exactly one transitional …
-    5c shrinks the first to seven and the second to zero"* — reads, not keys. Two
-    sources agreeing is the check; any other number means one of them is wrong.
+    **Five keys, six reads** since 6a, which retired ``MITOS_NO_MCP_HINT`` along
+    with the nudge it silenced — leaving ``cli.py`` reading the process
+    environment nowhere. The prior count is pinned independently outside this
+    file: the ADR recorded at 2b says *"nine permanent … and exactly one
+    transitional … 5c shrinks the first to seven and the second to zero"* —
+    reads, not keys — and 6a takes that seven to six by deleting a reader, not by
+    re-routing one. Two sources agreeing is the check; any other number means one
+    of them is wrong.
 
     This is the row that catches a bare read growing back — including the
     asymmetric case the behavioural rows cannot see: route every credential but
@@ -906,13 +911,13 @@ def test_the_process_environment_is_read_only_at_the_declared_sites():
             counted[(module, func)] = counted.get((module, func), 0) + 1
 
     assert counted == PERMANENT_ENV_READS
-    assert sum(counted.values()) == 7
+    assert sum(counted.values()) == 6
 
 
 def test_the_process_environment_is_written_nowhere_in_mitos():
     """The other half, and the one 5c makes absolute: `mitos` mutates no environment.
 
-    The read set above tolerates six legitimate consultations. There is no
+    The read set above tolerates six legitimate consultations (five keys). There is no
     legitimate **write**: a program that writes its own environment cannot answer
     the same question twice about two different projects, which is the property
     this vision exists to establish. Until 5c the tree had exactly one writer,

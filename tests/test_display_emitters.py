@@ -205,30 +205,3 @@ def test_cli_list_text_path_unperturbed(ws, capsys) -> None:
     assert "enc-one" in out  # the human listing
     assert not out.lstrip().startswith("{")  # not the JSON document
     assert '"decisions"' not in out  # the JSON wrapper key never leaks into text
-
-
-# --------------------------------------------------------------------------- #
-# §3-(1) nudge — own stderr line, absent from stdout (stale-premise pin)
-# --------------------------------------------------------------------------- #
-
-def test_mcp_nudge_on_stderr_absent_from_stdout(ws, capsys, monkeypatch) -> None:
-    """The 💡 MCP nudge fires on its own stderr line and never touches stdout.
-
-    Pins the already-satisfied state (the nudge has gone to a separate stderr
-    line since commit 8b3c90f, 2026-06-12 — the vision's "concatenates onto the
-    axiom" premise was stale at authoring). A regression that re-routes it onto
-    the stdout JSON/text body is caught here.
-    """
-    config, _ = ws
-    # Enable the nudge: it is suppressed by the autouse hermetic fixture.
-    monkeypatch.delenv("MITOS_NO_MCP_HINT", raising=False)
-    capsys.readouterr()
-
-    with patch.object(sys, "argv", ["mitos", "-p", config.workspace_dir,
-                                    "list", "--json"]):
-        main()
-
-    captured = capsys.readouterr()
-    assert "💡" in captured.err  # the nudge fired on stderr
-    assert "💡" not in captured.out  # never on the stdout JSON body
-    json.loads(captured.out)  # stdout is clean JSON (the nudge didn't corrupt it)

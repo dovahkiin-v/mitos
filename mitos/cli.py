@@ -43,7 +43,6 @@ from mitos.config import (
     CONFIG_DEFAULTS,
     default_collection_name,
     global_env_path,
-    hint_due,
     toml_scalar,
 )
 from mitos.errors import (
@@ -618,17 +617,22 @@ def cmd_init(config: MitosConfig, name: Optional[str] = None, force: bool = Fals
             f"{format_spec_content}\n\n"
             "## Setup — API Keys\n"
             "Mitos reads keys from a `.env` file at the workspace root (`mitos init` scaffolds it with empty slots; it is gitignored). Set exactly one required key:\n"
-            "- **`GEMINI_API_KEY`** (Google Gemini) — REQUIRED for semantic `surface_decisions`/`query_decisions` and for `mitos sync`. One key covers both embeddings and synthesis.\n"
-            "- `ANTHROPIC_API_KEY` — strongly recommended: it powers the LLM-judged layer (the `mitos check` conflict audit, the sync-time conflict notice, `mitos import --llm-extract`). Mitos runs without it, but only as a basic record-and-search store; with it, the corpus is audited for decisions that silently contradict each other. Degrades calmly when absent.\n"
-            "Without `GEMINI_API_KEY`, `record_decision` still works (it commits to the local graph; the embedding is queued and drains on the next `mitos sync` once the key is set), but semantic surface/query are unavailable. If a tool reports a missing key, tell the human to put it in `.env`.\n\n"
+            "- **`GEMINI_API_KEY`** (Google Gemini) — REQUIRED for semantic `surface_decisions`/`query_decisions` and for `mitos sync -p .`. One key covers both embeddings and synthesis.\n"
+            "- `ANTHROPIC_API_KEY` — strongly recommended: it powers the LLM-judged layer (the `mitos check -p .` conflict audit, the sync-time conflict notice, `mitos import -p . --llm-extract`). Mitos runs without it, but only as a basic record-and-search store; with it, the corpus is audited for decisions that silently contradict each other. Degrades calmly when absent.\n"
+            "Without `GEMINI_API_KEY`, `record_decision` still works (it commits to the local graph; the embedding is queued and drains on the next `mitos sync -p .` once the key is set), but semantic surface/query are unavailable. If a tool reports a missing key, tell the human to put it in `.env`.\n\n"
             "Mitos uses its own Qdrant on **:7333** (not the standard :6333), started with `docker compose up -d`. If semantic tools report Qdrant unreachable, tell the human to start it; `record_decision` still works meanwhile (embeddings queue and drain once it's up).\n\n"
+            "## Addressing — every call names the project it is for\n"
+            "One mitos install serves every project on this machine, so **every call must name its target**; a call that names none is refused rather than aimed at a guess. Your entries still land in THIS project's own decision graph and its own Qdrant collection — the separation is by naming, not by inability, which is exactly why the naming is worth getting right.\n"
+            "- **MCP tools:** pass `project` on every call, as the **absolute path of the workspace directory this file's `.mitos/` sits in** — you know that path, because you just read this file from it. (A registered project name works too when the human gives you one. A relative path is refused: the server has no working directory to resolve it against.)\n"
+            "- **CLI:** `-p .` on either side of the verb — `mitos surface -p . \"…\"` — when your shell is at the workspace root, or `-p <that absolute path>` from anywhere. `mitos status` and `mitos agent-block` take the same selector as a positional (`mitos status .`).\n"
+            "Do not paste a project *name* into any file this repo commits, this one included: names are machine-local, and a name that means this project here can name a different real project on someone else's machine — which is a write into the wrong corpus rather than an error you would notice.\n"
+            "Every answer echoes the corpus it acted on: `project · collection · workspace`. Read that line. Now that a call *can* reach another project, the echo is what makes a mis-aimed one visible instead of silently plausible.\n\n"
             "## Recording & recall — MCP tools (preferred) or CLI fallback\n"
-            "All decisions you record, surface, and query are scoped to THIS project's decision graph and its own Qdrant collection — you will not see, and cannot contaminate, other projects' decisions.\n"
-            "If the Mitos MCP server is wired into your agent, call these tools directly — best experience: structured args, no shell-quoting. If it is NOT wired, each maps to a CLI verb (and the CLI also accepts the long names as aliases, e.g. `mitos record_decision`):\n"
-            "- `record_decision`  (CLI: `mitos record`) — the moment you commit to a foundational choice (a schema, a library, a pattern, a path you're abandoning), persist it WITH the alternatives you rejected and why, so future sessions inherit it instead of relitigating. Recording rich prose via the CLI? Use `--axiom-file -` / `--rejected-file -` / `--context-file -` to read from stdin and avoid shell-quoting.\n"
-            "- `surface_decisions` (CLI: `mitos surface`) — surface active precedents for a claim/scope BEFORE you decide, so you don't relitigate a settled call. This is the recall loop — use it first. Every hit carries its full `rejected_paths`; pass `brief=True` (CLI `--brief`) for an axiom-only scan.\n"
-            "- `query_decisions`   (CLI: `mitos query`) — semantic or slug lookup when unsure whether a precedent exists.\n"
-            "- `list_decisions`    (CLI: `mitos list`) — the EXHAUSTIVE recall path. surface/query are semantic and capped at the top few matches; this returns EVERY decision in a scope, deterministically, so a completeness pass or audit doesn't miss anything below the relevance cliff. Needs no key or Qdrant.\n\n"
+            "If the Mitos MCP server is wired into your agent, call these tools directly — best experience: structured args, no shell-quoting. If it is NOT wired, each maps to a CLI verb (and the CLI also accepts the long names as aliases, e.g. `mitos record_decision -p .`):\n"
+            "- `record_decision`  (CLI: `mitos record -p .`) — the moment you commit to a foundational choice (a schema, a library, a pattern, a path you're abandoning), persist it WITH the alternatives you rejected and why, so future sessions inherit it instead of relitigating. Recording rich prose via the CLI? Use `--axiom-file -` / `--rejected-file -` / `--context-file -` to read from stdin and avoid shell-quoting.\n"
+            "- `surface_decisions` (CLI: `mitos surface -p .`) — surface active precedents for a claim/scope BEFORE you decide, so you don't relitigate a settled call. This is the recall loop — use it first. Every hit carries its full `rejected_paths`; pass `brief=True` (CLI `--brief`) for an axiom-only scan.\n"
+            "- `query_decisions`   (CLI: `mitos query -p .`) — semantic or slug lookup when unsure whether a precedent exists.\n"
+            "- `list_decisions`    (CLI: `mitos list -p .`) — the EXHAUSTIVE recall path. surface/query are semantic and capped at the top few matches; this returns EVERY decision in a scope, deterministically, so a completeness pass or audit doesn't miss anything below the relevance cliff. Needs no key or Qdrant.\n\n"
             "## When to record — the capture trigger (YOUR judgement; Mitos stores, it does not decide what is worth storing)\n"
             "Recall is easy to ask for; knowing WHAT is worth recording is the real call, and it falls to you. Record a decision when it:\n"
             "- sets a pattern future work must follow, or\n"
@@ -1999,12 +2003,35 @@ def _gemini_key_present(workspace_dir: str) -> bool:
     return _gemini_key_source(workspace_dir) is not None
 
 
-def _mcp_wired(workspace_dir: str) -> bool:
-    """True if a project-scoped ``.mcp.json`` wires the mitos MCP server.
+def _mcp_project_entry(workspace_dir: str) -> bool:
+    """True if a project-scoped ``.mcp.json`` here declares a ``mitos`` MCP server.
 
-    This is the Claude Code convention (a ``mitos`` entry under ``mcpServers``).
-    It's a *recommendation* signal for agents, never a readiness blocker — other
-    harnesses wire the MCP elsewhere, and humans don't need it at all.
+    Since mitos became machine-global, this is a **finding, not a readiness
+    signal** — which is why the name says what it found rather than what it
+    approves of. One user-scope registration serves every project; a project-scope
+    entry under the same server name does not coexist with it and does not degrade
+    to it — it *wins by name and erases it*, so a broken project entry leaves the
+    session with no mitos tools at all and no diagnostic saying why.
+
+    The predicate is keyed on the literal server name ``mitos`` because that is
+    what the precedence is keyed on. A project registering the same server under a
+    different key (``mitos-local``, say) genuinely does not shadow, and must not be
+    flagged — do not widen this to "any entry whose command mentions mitos".
+
+    **Known limit, deliberate:** this reads ``<workspace>/.mcp.json`` only, while a
+    client may ancestor-walk to a parent launch root. An entry above the workspace
+    shadows the same way and is invisible here. Widening the read means walking to
+    ``/`` and flagging a whole tree from one file, which is a different design; a
+    clean report says "nothing here", not "nothing anywhere".
+
+    Args:
+        workspace_dir: The project directory to inspect.
+
+    Returns:
+        True when the file exists, parses, and names ``mitos`` under
+        ``mcpServers``. Fully fail-silent: an unreadable or malformed file reports
+        no finding rather than an error, since this is one row on a report the
+        caller asked about something else.
     """
     import json as _json
     path = os.path.join(workspace_dir, ".mcp.json")
@@ -2016,39 +2043,6 @@ def _mcp_wired(workspace_dir: str) -> bool:
         return "mitos" in (data.get("mcpServers") or {})
     except (OSError, ValueError, AttributeError):
         return False
-
-
-# The decision-loop verbs (+ their MCP-name aliases). Only these get the
-# "consider wiring the MCP" nudge — setup/ops/inspection verbs are CLI-native,
-# and `serve` IS the MCP, so nudging there would be nonsense.
-_DECISION_LOOP_COMMANDS = frozenset({
-    "record", "record_decision", "surface", "surface_decisions", "query", "query_decisions",
-    "list", "list_decisions",
-})
-
-
-def _mcp_hint(workspace_dir: str) -> Optional[str]:
-    """Returns a gentle 'wire the MCP for the best experience' nudge, or None.
-
-    Fires only when this project has no MCP wired, at most once per 24h per
-    workspace (so it's a nudge, not a nag), and never when ``MITOS_NO_MCP_HINT``
-    is set or the MCP is already wired. Fully fail-silent.
-
-    Args:
-        workspace_dir: The project directory the CLI command acted on.
-
-    Returns:
-        A one-line stderr-ready nudge, or None.
-    """
-    if os.environ.get("MITOS_NO_MCP_HINT") or _mcp_wired(workspace_dir):
-        return None
-    if not hint_due("mcp_hint.json", workspace_dir, 24 * 60 * 60):
-        return None
-    return (
-        "💡 You're using the mitos CLI directly. For the best experience — ambient "
-        "recall and structured recording (no shell-quoting) — wire the MCP server: "
-        "see SETUP.md §3.\n   (Silence with MITOS_NO_MCP_HINT=1.)"
-    )
 
 
 def _upsert_env_var(env_path: str, name: str, value: str) -> None:
@@ -2547,9 +2541,9 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
     key_source = _gemini_key_source(workspace_dir)
     key_ok = key_source is not None
     q = _check_qdrant(config.qdrant_url, config.qdrant_collection)
-    mcp_wired = _mcp_wired(workspace_dir)
+    mcp_project_entry = _mcp_project_entry(workspace_dir)
     # Best-effort: is the pasted agent-file mitos note out of date? A recommendation,
-    # never a readiness blocker — like the MCP-wired check.
+    # never a readiness blocker — like the shadowing-entry finding.
     agent_drift = agent_block_drift(workspace_dir)
 
     graph_nodes = None
@@ -2708,7 +2702,12 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
                 "missing_active_slugs": missing_active_slugs,
                 "orphan_points": orphan_points,
                 "graph_unbuilt": graph_unbuilt,
-                "mcp_wired": mcp_wired,
+                # Renamed from `mcp_wired` in 6a, and the rename is the point: the
+                # same file read now means the opposite thing. A consumer reading
+                # `mcp_wired: true` for "good" would read a hazard as an
+                # endorsement, and no test can catch a lie of that shape — a
+                # missing key reds loudly on the first read.
+                "mcp_project_entry": mcp_project_entry,
             },
             # The RAW pinned value, never the rendered note: prose belongs to the
             # text surface and typed data to the payload, or the two channels drift
@@ -2781,10 +2780,11 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
         # about which name is in force.
         (f"collection '{config.qdrant_collection}'", coll_mark, coll_hint,
          _inert_pin_note(config, offer_deletion=True)),
-        # Recommendation, not a requirement — never a ✗. Agents get the best AX
-        # (ambient surface/record, structured args, no shell-quoting) via the MCP.
-        ("MCP wired (recommended for agents)", True if mcp_wired else None,
-         "agents: wire `mitos serve` — see SETUP.md §3 (CLI works without it)"),
+        # No MCP-wiring row lives here any more. Wiring is a one-time machine-global
+        # act since the registry landed, so it is not a per-project readiness rung
+        # in either direction — and its replacement is a *finding* that must be
+        # ABSENT on a healthy project, while every `checks` row renders
+        # unconditionally. It prints below, beside the agent-file drift note.
     ]
     # A pre-V1a (prototype) graph is the dominant blocker — surface it prominently,
     # right after the workspace line, with the same route-to-cutover guidance `init`
@@ -2879,6 +2879,22 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
             "registry were never committed for this corpus (a schema upgrade widens "
             "the DDL but does not re-commit). Run `mitos rebuild` to populate them "
             "(informational — not a readiness blocker; no decisions are at risk)."
+        )
+    if mcp_project_entry:
+        # A finding, not a check — so it prints only when there is something to
+        # say, and a project with no `.mcp.json` reads clean. The wording states
+        # the fact rather than prescribing a fix, because mitos cannot tell a
+        # STALE entry from one deliberately kept identical to the machine-wide
+        # registration, and both are legitimate: "delete it" would be wrong advice
+        # half the time. Note also that this reads THIS directory only — an entry
+        # at a parent launch root shadows the same way and is not visible here.
+        print(
+            "\n  ⚠ this project declares its own `mitos` MCP server in `.mcp.json`. "
+            "A project-scope entry takes precedence over the machine-wide one by "
+            "name — it does not fall back to it — so this file is what your "
+            "sessions here get, and a broken entry leaves them with no mitos tools "
+            "at all. Keep it in sync with your machine-wide registration, or remove "
+            "it and let that one serve this project."
         )
     if agent_drift["stale"]:
         stale_files = ", ".join(
@@ -5597,10 +5613,12 @@ def main() -> None:
             # `ConfigError` carve-out would catch it and route to
             # `_answer_workspace_optional_verb` → the *deep* report: silently the
             # wrong answer, exit 1 either way, nothing red.) The early `sys.exit` is
-            # safe past the `finally` because `status` is not in
-            # `_DECISION_LOOP_COMMANDS`, so the only post-exit `config` read never
-            # fires on this path and no unbound local can become a swallowed
-            # `NameError`.
+            # safe past the `finally` unconditionally: since 6a retired the MCP
+            # nudge, the `finally` reads no `config` at all (its one surviving arm,
+            # the update notice, binds only module-level names), so no unbound local
+            # on this path can become a swallowed `NameError`. It used to be safe
+            # only *conditionally* — because `status` was not in the frozenset
+            # gating the nudge — and that weaker argument went with the nudge.
             sys.exit(cmd_status_overview(as_json=args.as_json))
         # `target` is `None` EXACTLY when the verb targets no workspace — the same
         # predicate the refusal above used, called once more rather than
@@ -5811,15 +5829,6 @@ def main() -> None:
                     print(_notice, file=sys.stderr)
             except Exception:
                 pass
-            # Nudge CLI-only agents toward the MCP, but only on the decision-loop
-            # verbs where it actually helps (and rate-limited inside _mcp_hint).
-            if args.command in _DECISION_LOOP_COMMANDS:
-                try:
-                    _hint = _mcp_hint(config.workspace_dir)
-                    if _hint:
-                        print(_hint, file=sys.stderr)
-                except Exception:
-                    pass
 
 
 if __name__ == "__main__":

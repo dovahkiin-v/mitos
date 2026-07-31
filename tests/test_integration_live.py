@@ -221,7 +221,6 @@ def test_cli_subprocess_list_decisions_json(tmp_path):
         "GEMINI_API_KEY": _REAL_KEY,
         "QDRANT_URL": QDRANT_URL,
         "MITOS_NO_UPDATE_CHECK": "1",
-        "MITOS_NO_MCP_HINT": "1",
         "XDG_CONFIG_HOME": str(tmp_path / "cfg"),
         "XDG_CACHE_HOME": str(tmp_path / "cache"),
     }
@@ -340,7 +339,6 @@ def test_cli_subprocess_relation_flag_links_decisions(tmp_path):
         "GEMINI_API_KEY": _REAL_KEY,
         "QDRANT_URL": QDRANT_URL,
         "MITOS_NO_UPDATE_CHECK": "1",
-        "MITOS_NO_MCP_HINT": "1",
         "XDG_CONFIG_HOME": str(tmp_path / "cfg"),
         "XDG_CACHE_HOME": str(tmp_path / "cache"),
     }
@@ -398,7 +396,6 @@ def test_cli_subprocess_record_stdin_then_surface(tmp_path):
         "GEMINI_API_KEY": _REAL_KEY,
         "QDRANT_URL": QDRANT_URL,
         "MITOS_NO_UPDATE_CHECK": "1",
-        "MITOS_NO_MCP_HINT": "1",
         "XDG_CONFIG_HOME": str(tmp_path / "cfg"),
         "XDG_CACHE_HOME": str(tmp_path / "cache"),
     }

@@ -70,7 +70,6 @@ def _mitos_env(tmp_path) -> dict:
     return {
         **os.environ,
         "MITOS_NO_UPDATE_CHECK": "1",
-        "MITOS_NO_MCP_HINT": "1",
         "XDG_CONFIG_HOME": str(tmp_path / "xdg_config"),
         "XDG_CACHE_HOME": str(tmp_path / "xdg_cache"),
     }
@@ -210,6 +209,25 @@ def test_non_editable_install_real_read_path(built_wheel, tmp_path):
     assert overview_import.returncode == 0, (
         f"`import mitos.overview` failed in the installed venv — the module is "
         f"missing from the wheel:\n{overview_import.stderr}"
+    )
+
+    # And the MCP server module — a DIFFERENT trap from the four above. It is not
+    # about what the wheel contains but about what a fresh dependency resolve
+    # *installs beside it*: `mcp` 2.0.0 renamed `mcp.server.fastmcp` (the surface
+    # `mcp_server.py:9` imports at module scope) to `mcp.server.mcpserver`, so an
+    # unceilinged `mcp>=…` floor resolves 2.x and `mitos serve` — the recommended
+    # agent interface — dies with `No module named 'mcp.server.fastmcp'` on a real
+    # install while the whole editable dev tree stays green. This row is the only
+    # place in the suite where deps resolve from PyPI rather than from the venv
+    # someone pinned by age, which is why the ceiling is gated here.
+    mcp_server_import = subprocess.run([str(venv_python), "-c", "import mitos.mcp_server"],
+                                       env=_mitos_env(tmp_path), capture_output=True,
+                                       text=True, timeout=60)
+    assert mcp_server_import.returncode == 0, (
+        f"`import mitos.mcp_server` failed in the installed venv — `mitos serve` "
+        f"is unstartable from a fresh install. Check the `mcp` version this "
+        f"resolve picked against the ceiling in pyproject.toml:\n"
+        f"{mcp_server_import.stderr}"
     )
 
     # `mitos init` reads the spec from the installed package dir and scaffolds a workspace.

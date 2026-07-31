@@ -144,7 +144,6 @@ def harness_env(
         "XDG_CONFIG_HOME": str(home / ".config"),
         "XDG_CACHE_HOME": str(home / ".cache"),
         "MITOS_NO_UPDATE_CHECK": "1",
-        "MITOS_NO_MCP_HINT": "1",
     }
     if extra:
         env.update(extra)

@@ -954,7 +954,6 @@ def test_a_leading_echo_reaches_a_combined_pipe_before_a_boundary_error(tmp_path
     env = {
         **os.environ,
         "MITOS_NO_UPDATE_CHECK": "1",
-        "MITOS_NO_MCP_HINT": "1",
         "XDG_CONFIG_HOME": str(tmp_path / "xdg_config"),
         "GEMINI_API_KEY": "", "GOOGLE_API_KEY": "",
         "QDRANT_URL": "http://localhost:1",
@@ -1002,7 +1001,6 @@ def test_the_report_reaches_a_combined_pipe_before_the_refusals(tmp_path):
     env = {
         **os.environ,
         "MITOS_NO_UPDATE_CHECK": "1",
-        "MITOS_NO_MCP_HINT": "1",
         "XDG_CONFIG_HOME": str(tmp_path / "xdg_config"),
         "GEMINI_API_KEY": "", "GOOGLE_API_KEY": "",
         "QDRANT_URL": "http://localhost:1",

@@ -76,7 +76,7 @@ def test_not_ready_when_key_missing(tmp_path, monkeypatch):
     assert cli.cmd_status(str(tmp_path)) == 1
 
 
-def test_json_report_ready_and_has_mcp_field(tmp_path, monkeypatch, capsys):
+def test_json_report_ready_and_has_mcp_project_entry_field(tmp_path, monkeypatch, capsys):
     _init(tmp_path)
     capsys.readouterr()  # discard cmd_init's "Initialized..." message
     monkeypatch.setenv("GEMINI_API_KEY", "testkey")
@@ -85,8 +85,13 @@ def test_json_report_ready_and_has_mcp_field(tmp_path, monkeypatch, capsys):
     data = json.loads(capsys.readouterr().out)
     assert code == 0
     assert data["ready"] is True
-    assert "mcp_wired" in data["checks"]
-    assert data["checks"]["mcp_wired"] is False  # no .mcp.json in a fresh init
+    # Renamed from `mcp_wired` in 6a along with its meaning: `True` is now a
+    # shadowing FINDING, not a satisfied recommendation. A fresh init declares no
+    # project-scope server, which is the correct machine-global state — and the
+    # `ready is True` above is the half that says so: the finding is not a rung.
+    assert "mcp_wired" not in data["checks"]
+    assert "mcp_project_entry" in data["checks"]
+    assert data["checks"]["mcp_project_entry"] is False  # no .mcp.json in a fresh init
     # A clean (within-budget) project reports an empty size-ceiling list.
     assert data["scope_overflow"] == []
 

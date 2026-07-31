@@ -587,12 +587,11 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
             "is there anything nearby?" scan). Default False keeps the full reasoning.
         limit: Ranked top-k to retrieve (default 5; clamped to 1–50). Raise it to dig
             deeper, lower it to save context — a context-budget dial, not a cap at 5.
-        project: Which project this call is about — REQUIRED: name it on every
-            call. Either a registered project name (e.g. 'mitos') or the absolute
-            path of a workspace directory. A relative path resolves against
-            nothing here — this server has no meaningful working directory, and
-            one project's precedents are no answer for another's. Call
-            `list_projects()` when you do not know the registered names.
+        project: Which project this call is about — REQUIRED on every call: a
+            registered project name (e.g. 'mitos') or the absolute path of a
+            workspace. Call `list_projects()` if you do not know the names.
+            Distinct from `scope`: `project` picks the corpus, `scope` filters
+            within it.
 
     Returns:
         A JSON string with `active_decisions` (ranked, Letter-mode), plus
@@ -800,12 +799,11 @@ def list_decisions(scope: Optional[str] = None, state: str = "active", brief: bo
             scan the map here, then dereference the few that matter with query/show.
             Letter-complete stays the default depth; this is an explicit opt-down,
             never a default. Mutually exclusive with brief.
-        project: Which project this call is about — REQUIRED: name it on every
-            call. Either a registered project name (e.g. 'mitos') or the absolute
-            path of a workspace directory. A relative path resolves against
-            nothing here — this server has no meaningful working directory, and
-            an exhaustive pass over the wrong project reads as a complete answer.
-            Call `list_projects()` when you do not know the registered names.
+        project: Which project this call is about — REQUIRED on every call: a
+            registered project name (e.g. 'mitos') or the absolute path of a
+            workspace. Call `list_projects()` if you do not know the names.
+            Distinct from `scope`: `project` picks the corpus, `scope` filters
+            within it.
 
     Returns:
         A JSON string: {decisions, open_questions, total, scope, state}. Each
@@ -903,12 +901,9 @@ def list_scopes(include_archived: bool = False, project: Optional[str] = None) -
             every other scope tag present in the graph at a `{active_decisions: 0,
             parked_open_questions: 0}` floor — the scope-level parallel of
             list_decisions(state="all").
-        project: Which project this call is about — REQUIRED: name it on every
-            call. Either a registered project name (e.g. 'mitos') or the absolute
-            path of a workspace directory. A relative path resolves against
-            nothing here — this server has no meaningful working directory, and
-            scope vocabularies do not carry between projects. Call
-            `list_projects()` when you do not know the registered names.
+        project: Which project this call is about — REQUIRED on every call: a
+            registered project name (e.g. 'mitos') or the absolute path of a
+            workspace. Call `list_projects()` if you do not know the names.
 
     Returns:
         A JSON string: `{scopes, project, collection, workspace}`. `scopes` is an
@@ -944,12 +939,9 @@ def show_node(ident: str, project: Optional[str] = None) -> str:
 
     Args:
         ident: A content-hash id or a slug (case-insensitive) — the exact handle.
-        project: Which project this call is about — REQUIRED: name it on every
-            call. Either a registered project name (e.g. 'mitos') or the absolute
-            path of a workspace directory. A relative path resolves against
-            nothing here — this server has no meaningful working directory, and
-            a handle that is exact in one project is absent from the next. Call
-            `list_projects()` when you do not know the registered names.
+        project: Which project this call is about — REQUIRED on every call: a
+            registered project name (e.g. 'mitos') or the absolute path of a
+            workspace. Call `list_projects()` if you do not know the names.
 
     Returns:
         A JSON string. A found **decision** is a Letter-complete object (`axiom` +
@@ -1013,12 +1005,9 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
         limit: Ranked top-k for the SEMANTIC branch (default 5; clamped to 1–50). Raise
             it to dig deeper, lower it to save context. Ignored by an exact-slug hit
             (that returns the one decision you named).
-        project: Which project this call is about — REQUIRED: name it on every
-            call. Either a registered project name (e.g. 'mitos') or the absolute
-            path of a workspace directory. A relative path resolves against
-            nothing here — this server has no meaningful working directory, and
-            a slug you are carrying belongs to the project you read it from. Call
-            `list_projects()` when you do not know the registered names.
+        project: Which project this call is about — REQUIRED on every call: a
+            registered project name (e.g. 'mitos') or the absolute path of a
+            workspace. Call `list_projects()` if you do not know the names.
 
     Returns:
         A JSON string containing the ranked results in Letter-mode payload shape.
@@ -1212,13 +1201,12 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
             the flagged neighbours and judging this decision genuinely independent.
             Leave False (default) on the first attempt. Combines with the relation
             args — declared edges are still written.
-        project: Which project this decision belongs to — REQUIRED: name it on
-            every call. Either a registered project name (e.g. 'mitos') or the
-            absolute path of a workspace directory. A relative path resolves
-            against nothing here — this server has no meaningful working
-            directory, and this is the write: a mis-aimed call lands a real entry
-            in another project's corpus. Call `list_projects()` when you do not
-            know the registered names.
+        project: Which project this decision belongs to — REQUIRED on every
+            call: a registered project name (e.g. 'mitos') or the absolute path of
+            a workspace. Call `list_projects()` if you do not know the names.
+            Distinct from `scope`: `project` picks the corpus, `scope` filters
+            within it. This is the write — a mis-aimed call lands a real entry in
+            another project's corpus.
 
     Returns:
         A JSON string: {slug, id, state, embedding, status} or {error, code},
@@ -1249,10 +1237,12 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
         relationship, make a NEW decision (a distinct axiom), don't resubmit the old one.
         A "created" result MAY carry `neighbor_review_unavailable`: the commit
         succeeded but the near-duplicate review could not run — absent neighbours are
-        not checked-clean; `mitos check` covers the gap retroactively.
+        not checked-clean; a later `check` pass over this project covers the gap
+        retroactively.
         The result MAY also carry `scope_overflow`: a one-line, debounced (≤once/24h)
         health nudge that the generated context files have grown past their size ceiling
-        — not an error and not about this decision; run `mitos status` for the breakdown.
+        — not an error and not about this decision; a status report on this project
+        has the breakdown.
     """
     config = _target_config(project, "record_decision")
     # Build our own writable manager — do NOT reuse get_workspace_components()

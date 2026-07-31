@@ -178,7 +178,8 @@ def _hint_cache_path(cache_name: str) -> str:
     to ``~/.cache``. The file need not exist.
 
     Args:
-        cache_name: The cache file's basename (e.g. ``"mcp_hint.json"``).
+        cache_name: The cache file's basename (e.g.
+            ``"scope_overflow_hint.json"``).
 
     Returns:
         Absolute path to ``<cache>/mitos/<cache_name>``.
@@ -192,9 +193,10 @@ def _hint_cache_path(cache_name: str) -> str:
 def hint_due(cache_name: str, key: str, window_seconds: float) -> bool:
     """Fail-silent once-per-window gate for a debounced nudge.
 
-    Backs the recurring-nudge surfaces (the MCP-server hint, the render-overflow
-    summary) so they fire at most once per ``window_seconds`` per ``key`` instead of
-    on every call. Reads a small JSON cache keyed by ``key``; if that key has not
+    Backs the render-overflow summary — currently the only such surface, since
+    mitos became machine-global and the per-project MCP-wiring nudge retired — so
+    it fires at most once per ``window_seconds`` per ``key`` instead of on every
+    call. Reads a small JSON cache keyed by ``key``; if that key has not
     fired within the window it stamps the current time and returns True, otherwise
     returns False. Never raises — a missing/corrupt cache or an unwritable cache dir
     degrades to "due" (the nudge shows) rather than crashing the caller.

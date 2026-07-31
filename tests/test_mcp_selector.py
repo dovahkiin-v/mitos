@@ -322,11 +322,18 @@ def test_no_cli_targeting_syntax_reaches_a_project_argument_entry(tool) -> None:
     """Criterion 8, half one: the descriptions.
 
     Scoped to the `project:` entry rather than the whole description on purpose.
-    A blanket "no CLI command form in MCP text" rule would red three pre-existing,
-    deliberate, shipped strings — `show_node`'s `mitos sync` (via the shared
-    `display.SHOW_NOT_FOUND_HINT` leaf) and `record_decision`'s `mitos check` /
-    `mitos status` — which are workflow pointers, where naming a CLI command is
-    the correct answer. The rule is about *targeting* recoveries.
+    A blanket "no CLI command form in MCP text" rule would red `show_node`'s
+    `mitos sync` — a workflow pointer reaching this surface through the shared
+    `display.SHOW_NOT_FOUND_HINT` leaf, whose byte-equality across CLI and MCP is
+    itself asserted elsewhere, so it cannot be reworded on one side alone. The
+    rule is about *targeting* recoveries.
+
+    It used to name two more: `record_decision`'s `mitos check` and `mitos status`
+    pointers. Both were rewritten in 6a and neither spells a CLI recipe now — a
+    bare `check` hard-fails post-flip, and a bare `status` silently answers about
+    the whole machine instead of this project, which is worse. So the surviving
+    exemption is one string, not three, and it is one that survives on a *shared
+    leaf* argument rather than on a workflow-pointer argument.
     """
     entry = _project_arg_doc(_tools()[tool].description)
     for syntax in FORBIDDEN_SYNTAX:

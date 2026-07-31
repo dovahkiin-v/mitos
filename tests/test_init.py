@@ -620,7 +620,6 @@ def test_the_success_line_reaches_a_captured_stream_before_the_refusal(tmp_path)
     env = {
         **os.environ,
         "MITOS_NO_UPDATE_CHECK": "1",
-        "MITOS_NO_MCP_HINT": "1",
         "XDG_CONFIG_HOME": str(tmp_path / "xdg_config"),
     }
 

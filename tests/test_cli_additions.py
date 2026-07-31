@@ -140,40 +140,55 @@ def test_version_flag_prints_and_exits_zero(monkeypatch, capsys):
     assert __version__ in capsys.readouterr().out
 
 
-# --- MCP wiring detection + hint ----------------------------------------------
+# --- MCP project-entry (shadowing) detection ----------------------------------
 
-def test_mcp_wired_detection(tmp_path):
-    assert cli._mcp_wired(str(tmp_path)) is False
+def test_mcp_project_entry_detection(tmp_path):
+    """The same `.mcp.json` read as the retired `_mcp_wired`, meaning the opposite.
+
+    `True` is now a FINDING — a project-scope entry under the server name `mitos`
+    wins by name over the machine-wide registration and erases it, so this is the
+    state worth reporting, not the state worth congratulating.
+    """
+    assert cli._mcp_project_entry(str(tmp_path)) is False
     (tmp_path / ".mcp.json").write_text('{"mcpServers": {"mitos": {"command": "mitos"}}}')
-    assert cli._mcp_wired(str(tmp_path)) is True
+    assert cli._mcp_project_entry(str(tmp_path)) is True
     (tmp_path / ".mcp.json").write_text('{"mcpServers": {"other": {}}}')
-    assert cli._mcp_wired(str(tmp_path)) is False
+    assert cli._mcp_project_entry(str(tmp_path)) is False
 
 
-def test_mcp_hint_fires_then_rate_limits(tmp_path, monkeypatch):
-    monkeypatch.delenv("MITOS_NO_MCP_HINT", raising=False)
-    first = cli._mcp_hint(str(tmp_path))
-    assert first is not None and "wire the MCP" in first
-    assert cli._mcp_hint(str(tmp_path)) is None  # within 24h → silent
+def test_mcp_project_entry_keys_on_the_server_name_not_the_command(tmp_path):
+    """A server registered under a DIFFERENT key does not shadow, so it is not flagged.
+
+    Precedence is keyed on the entry's name, so `mitos-local` coexists with the
+    machine-wide `mitos` entry rather than erasing it. Widening the predicate to
+    "any entry whose command mentions mitos" would flag a harmless registration —
+    the cries-wolf failure the note exists to avoid.
+    """
+    (tmp_path / ".mcp.json").write_text(
+        '{"mcpServers": {"mitos-local": {"command": "mitos", "args": ["serve"]}}}'
+    )
+    assert cli._mcp_project_entry(str(tmp_path)) is False
 
 
-def test_mcp_hint_silent_when_wired(tmp_path, monkeypatch):
-    monkeypatch.delenv("MITOS_NO_MCP_HINT", raising=False)
-    (tmp_path / ".mcp.json").write_text('{"mcpServers": {"mitos": {"command": "mitos"}}}')
-    assert cli._mcp_hint(str(tmp_path)) is None
+def test_mcp_project_entry_fails_silent_on_a_malformed_file(tmp_path):
+    """Unreadable/malformed input reports no finding — it is one row on someone else's report."""
+    (tmp_path / ".mcp.json").write_text("{not json at all")
+    assert cli._mcp_project_entry(str(tmp_path)) is False
+    (tmp_path / ".mcp.json").write_text('["a list, not an object"]')
+    assert cli._mcp_project_entry(str(tmp_path)) is False
 
 
-def test_mcp_hint_opt_out(tmp_path, monkeypatch):
-    monkeypatch.setenv("MITOS_NO_MCP_HINT", "1")
-    assert cli._mcp_hint(str(tmp_path)) is None
+def test_the_mcp_wiring_nudge_and_its_quiet_switch_are_gone():
+    """The retired nudge leaves no symbol behind for a later reader to re-wire.
 
-
-def test_decision_loop_commands_cover_aliases():
-    for verb in ("record", "record_decision", "surface", "surface_decisions",
-                 "query", "query_decisions", "list", "list_decisions"):
-        assert verb in cli._DECISION_LOOP_COMMANDS
-    for non_verb in ("init", "status", "sync", "serve", "set-key"):
-        assert non_verb not in cli._DECISION_LOOP_COMMANDS
+    Its premise inverted: wiring is a one-time machine-global act now, so a nudge
+    that cannot tell whether its advice was already taken would fire in every
+    project forever. `MITOS_NO_MCP_HINT` existing at all was evidence it already
+    read as a nag; `tests/test_env_routing.py`'s declared read set pins its
+    absence from the environment side.
+    """
+    for symbol in ("_mcp_hint", "_mcp_wired", "_DECISION_LOOP_COMMANDS"):
+        assert not hasattr(cli, symbol), f"cli.{symbol} survived its retirement"
 
 
 # --- Phase 6a: help-as-API-doc (gate T12) -------------------------------------

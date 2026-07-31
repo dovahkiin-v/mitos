@@ -163,9 +163,15 @@ def workspace(tmp_path) -> str:
 
 @pytest.fixture(autouse=True)
 def hermetic_mitos_env(monkeypatch, tmp_path):
-    """Isolates per-test config/cache and silences the CLI's network/nag side-effects."""
+    """Isolates per-test config/cache and silences the CLI's network side-effects.
+
+    Only one quiet-switch is left: the update check. ``MITOS_NO_MCP_HINT`` was the
+    second, and it retired with the per-project MCP-wiring nudge it silenced — that
+    nudge advised toward a project-scope ``.mcp.json`` entry, which now *shadows*
+    the machine-wide registration rather than complementing it. There is no
+    remaining stderr nag for a test to suppress.
+    """
     monkeypatch.setenv("MITOS_NO_UPDATE_CHECK", "1")
-    monkeypatch.setenv("MITOS_NO_MCP_HINT", "1")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg_config"))
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg_cache"))
 
