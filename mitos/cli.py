@@ -5618,7 +5618,7 @@ def main() -> None:
         # and `None` for an unregistered path, which the constructor resolves to
         # the canonical path. The exempt arm builds an explicit `MitosConfig(".")`
         # — same resolution as the zero-arg default it replaced, but an argument
-        # rather than a default, which is what 5d then removes the default behind
+        # rather than a default, which is what 5d removed the default behind
         # (`os.path.abspath` inside the constructor, never a working-directory read,
         # so entry-005's standing grep stays honest).
         try:
