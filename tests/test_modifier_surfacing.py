@@ -411,7 +411,13 @@ def test_cli_show_json_oq_body_and_modifier_subset(ws, capsys) -> None:
 
 def test_cli_show_json_not_found_is_object_with_hint(ws, capsys) -> None:
     """`show --json` on a genuinely-absent slug emits a JSON object (falsy found-flag +
-    `mitos sync` hint), not a bare text line."""
+    `mitos sync` hint), not a bare text line.
+
+    6c gave the hint a **selector**: since the flip a bare `mitos sync` has no target
+    and hard-fails, so printing one would hand a stuck reader a second wall. The
+    value is the caller's own vocabulary (`config.project`), which is why this is
+    asserted against the config rather than against a literal recipe.
+    """
     config, m = ws
     capsys.readouterr()
     cmd_show(config, "no-such-slug", as_json=True)
@@ -419,6 +425,7 @@ def test_cli_show_json_not_found_is_object_with_hint(ws, capsys) -> None:
     assert out["found"] is False
     assert out["ident"] == "no-such-slug"
     assert "mitos sync" in out["hint"].lower()
+    assert f"-p {config.project!r}" in out["hint"]
 
 
 # --------------------------------------------------------------------------- #
@@ -498,7 +505,15 @@ def test_mcp_show_node_oq_body_and_modifier_subset(ws) -> None:
 
 def test_mcp_show_node_not_found_is_object_with_hint(ws) -> None:
     """T10 genuine-absence: an absent handle returns the JSON not-found object
-    (`found: false` + the `mitos sync` hint), never an error/exception."""
+    (`found: false` + a hint), never an error/exception.
+
+    The hint carried `mitos sync` until 6c and now carries **no shell command at
+    all** — `agent-error-surface-never-prescribes-state-creating-setup`, widened
+    past its original targeting-only scope. It is not merely emptied: a dead end is
+    what PATTERNS forbids, so the recovery is expressed in this surface's own
+    vocabulary (two read tools) and the unsynced-draft case is stated as a fact
+    rather than as a command to fix it with.
+    """
     from mitos import mcp_server
     config, m = ws
     store = GraphStore(config.db_path, read_only=True)
@@ -506,14 +521,30 @@ def test_mcp_show_node_not_found_is_object_with_hint(ws) -> None:
         resp = json.loads(mcp_server.show_node("ghost-slug", project=config.workspace_dir))
     assert resp["found"] is False
     assert resp["ident"] == "ghost-slug"
-    assert "mitos sync" in resp["hint"].lower()
+    assert "mitos " not in resp["hint"]
+    assert "list_decisions" in resp["hint"] and "query_decisions" in resp["hint"]
+    # Still hedged and still buffer-free: truthful for a typo AND for a draft.
+    assert "decisions.md" in resp["hint"]
 
 
 def test_show_node_parity_with_cli_show_json(ws, capsys) -> None:
     """CLI⇄MCP parity (the vision's load-bearing invariant): for the SAME ident over a
     real store, `json.loads(show_node(ident))` == `json.loads(mitos show --json ident)`
-    — for a found decision, a found OQ, AND the not-found case. Structural via the shared
-    resolve_handle seam + the shared show_payload builder; pinned here too.
+    — for a found decision and a found OQ. Structural via the shared resolve_handle
+    seam + the shared show_payload builder; pinned here too.
+
+    **The not-found case is checked one notch differently since 6c, deliberately.**
+    It used to ride the same dict-equality, which made this row the structural
+    enforcer of the hint's byte-equality across the two surfaces. 6c removed that
+    single-sourcing on purpose — the CLI's hint names a selector, the MCP's may name
+    no shell command at all — so keeping dict-equality here would red on exactly the
+    change the phase exists to make. Scoping the row down to the found cases and
+    stopping there is the move that would have quietly weakened it: the *shape*
+    parity is what the invariant is about, and it still holds. So the not-found half
+    asserts the **key set** is identical and **every value except `hint`** is equal —
+    strictly stronger than the old row about the shape, and honest about the one
+    field that must differ — plus one rule per surface, so neither hint can drift
+    into the other's.
 
     Since both shapes now carry the corpus provenance, the MCP side must NAME this
     workspace: the fixture never chdirs, so a `project`-less call would resolve
@@ -540,11 +571,19 @@ def test_show_node_parity_with_cli_show_json(ws, capsys) -> None:
         cli_out = json.loads(capsys.readouterr().out)
         with patch.object(mcp_server, "get_workspace_components", return_value=(ro, None, None)):
             mcp_out = json.loads(mcp_server.show_node(ident, project=config.workspace_dir))
-        assert cli_out == mcp_out, f"CLI⇄MCP show parity drift on {ident!r}"
+        if ident == "nope-not-here":
+            assert cli_out.keys() == mcp_out.keys(), "not-found SHAPE drifted"
+            assert ({k: v for k, v in cli_out.items() if k != "hint"}
+                    == {k: v for k, v in mcp_out.items() if k != "hint"})
+            # The one field that must differ, and the rule each side owes.
+            assert cli_out["hint"] != mcp_out["hint"]
+            assert f"-p {config.project!r}" in cli_out["hint"]   # names its selector
+            assert "mitos " not in mcp_out["hint"]               # no shell command
+        else:
+            assert cli_out == mcp_out, f"CLI⇄MCP show parity drift on {ident!r}"
         # Both shapes stamped, including the not-found one — the half that is
         # ambiguous between "no such handle" and "wrong project", and the half a
-        # found-branch-only stamp would leave bare (dict equality alone would red
-        # on `nope-not-here`, but say nothing about what was missing).
+        # found-branch-only stamp would leave bare.
         assert cli_out["project"] == config.project
         assert cli_out["collection"] == config.qdrant_collection
         assert cli_out["workspace"] == config.workspace_dir

@@ -103,6 +103,21 @@ def _write_registry(text: str) -> str:
     return path
 
 
+def _write_registry_bytes(raw: bytes) -> str:
+    """Hand-writes the registry as raw bytes.
+
+    The text helper above cannot express one of the five states ``registry.load``
+    refuses — a file saved in a legacy encoding, which is an ordinary way to meet a
+    file that invites hand-editing. Written in binary so the encoding fault is the
+    file's rather than the test's.
+    """
+    path = registry.registry_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(raw)
+    return path
+
+
 def _register_pairs(pairs) -> str:
     """Writes a registry from ``(name, path)`` pairs, preserving document order."""
     return _write_registry("".join(f'"{name}" = "{path}"\n' for name, path in pairs))
@@ -321,19 +336,25 @@ def test_every_project_argument_is_documented_as_required(tool) -> None:
 def test_no_cli_targeting_syntax_reaches_a_project_argument_entry(tool) -> None:
     """Criterion 8, half one: the descriptions.
 
-    Scoped to the `project:` entry rather than the whole description on purpose.
-    A blanket "no CLI command form in MCP text" rule would red `show_node`'s
-    `mitos sync` — a workflow pointer reaching this surface through the shared
-    `display.SHOW_NOT_FOUND_HINT` leaf, whose byte-equality across CLI and MCP is
-    itself asserted elsewhere, so it cannot be reworded on one side alone. The
-    rule is about *targeting* recoveries.
+    Scoped to the `project:` entry rather than the whole description, and the
+    scoping now buys less than it used to — which is the right direction. It used
+    to carry a standing carve-out for `show_node`'s `mitos sync`, on the argument
+    that the string arrived through the shared `display.SHOW_NOT_FOUND_HINT` leaf
+    whose CLI⇄MCP byte-equality was itself asserted elsewhere, "so it cannot be
+    reworded on one side alone." **6c destroyed that premise**: the leaf's
+    single-sourcing is gone, each surface composes its own hint, and this
+    surface's names no shell command at all. The exemption is retired rather than
+    narrowed — there is nothing left for it to exempt.
 
-    It used to name two more: `record_decision`'s `mitos check` and `mitos status`
-    pointers. Both were rewritten in 6a and neither spells a CLI recipe now — a
-    bare `check` hard-fails post-flip, and a bare `status` silently answers about
-    the whole machine instead of this project, which is worse. So the surviving
-    exemption is one string, not three, and it is one that survives on a *shared
-    leaf* argument rather than on a workflow-pointer argument.
+    It had already lost two others in 6a: `record_decision`'s `mitos check` and
+    `mitos status` pointers, both rewritten because a bare `check` hard-fails
+    post-flip and a bare `status` silently answers about the whole machine.
+
+    What the entry-scoping still buys is narrowness of *subject*: the rule here is
+    about **targeting** recoveries specifically. The wider claim — that no MCP
+    error body prescribes a state-creating command, on the registry-load class as
+    well — is pinned by `test_no_state_creating_command_reaches_the_registry_
+    error_body` below, which this row deliberately does not try to cover.
     """
     entry = _project_arg_doc(_tools()[tool].description)
     for syntax in FORBIDDEN_SYNTAX:
@@ -890,10 +911,17 @@ def test_the_shared_leaf_holds_no_wording_and_stays_a_stdlib_tier_leaf() -> None
         and node.value not in docstrings
     ]
     # Non-inertness, proven against a literal that is really there rather than by
-    # asserting the set is non-empty: the shared not-found hint carries
-    # `mitos sync`, a deliberate workflow pointer. If the filter ever excluded
-    # real strings, this row would sweep an empty set and pass proving nothing.
-    assert any("mitos sync" in literal for literal in emittable)
+    # asserting the set is non-empty: if the filter ever excluded real strings,
+    # this row would sweep an empty set and pass proving nothing.
+    #
+    # The anchor was `mitos sync`, carried by the shared not-found hint. 6c split
+    # that hint per surface and deleted it from this leaf, so the anchor moved to
+    # `blackout_note`'s retired-history pointer — still a deliberate workflow
+    # string, and still one that survives here precisely because it spells BOTH
+    # surfaces' form side by side, which is the property that lets a recipe live
+    # on a shared leaf at all. Re-anchored rather than deleted: dropping it would
+    # leave the sweep below able to pass over an empty set forever.
+    assert any("mitos list --state all" in literal for literal in emittable)
 
     for literal in emittable:
         for syntax in FORBIDDEN_SYNTAX:
@@ -911,48 +939,46 @@ def test_the_shared_leaf_holds_no_wording_and_stays_a_stdlib_tier_leaf() -> None
 def test_a_malformed_registry_reaches_the_caller_as_one_calm_line(
     tmp_path, monkeypatch
 ) -> None:
-    """Criterion 15 / G11: `RegistryError` propagates unwrapped, deliberately.
+    """Criterion 15 / G11, **inverted at 6c**: the registry class is rendered here.
 
-    There is no registered vocabulary to teach when the file holding it cannot be
-    read, so dressing it in the anatomy would be a wall built out of data we do
-    not have. Over the transport it becomes `Error executing tool X: <this line>`
+    It used to propagate unwrapped, on the reasoning that there is no registered
+    vocabulary to teach when the file holding it cannot be read. Two things were
+    wrong with that. The vocabulary is gone but the **escape hatch is not** — an
+    absolute-path selector resolves without touching the registry, so there is a
+    real recovery to teach. And the unwrapped body named `mitos init`, handing an
+    agent a state-creating shell command on a surface whose whole rule is that it
+    may not (entry-013). So the class is caught in `_target_config` and re-rendered
+    in the same shape as the targeting one: a `_RenderedToolError` whose `str()`
+    IS the body, which over the transport becomes `Error executing tool X: <body>`
     with `isError: True` and no traceback.
 
-    Calm is not the same as empty, which is why I5 asks for both halves and 5b
-    adds the second: the line must still carry the **parse detail** (which key,
-    which line — the only thing that lets anyone fix the file) and the **recovery**
-    (`Fix or remove …`, plus the fact that an absent registry is healthy). A row
-    asserting only the absence of the anatomy is green against a message that says
-    nothing at all.
+    Calm is still not the same as empty, and the located-cause half is unchanged:
+    the body must carry the **parse detail** (which file, which line — the only
+    thing that lets anyone fix it) and a **recovery**. A row asserting only the
+    absence of the anatomy is green against a message that says nothing at all.
 
     Its CLI twin is `test_a_malformed_registry_is_not_dressed_in_the_targeting_
-    anatomy`; the two are one claim over one shared line in `registry.py`.
-
-    **Deliberately no `mitos init` tripwire here** (D7). That line names
-    `mitos init` as the re-registration act, and the no-state-creating-command
-    rule is scoped to the six discriminators `_render_targeting_error` composes,
-    not to every string that can reach an MCP caller — exactly as the CLI-syntax
-    tripwire is scoped to the `project:` doc entry rather than to whole
-    descriptions. Widening either would red a shipped, deliberate message.
+    anatomy`; the two are one claim over one shared *cause* in `registry.py` —
+    and, since 6c, over two deliberately different recovery clauses.
     """
-    from mitos.errors import RegistryError
-
     path = _write_registry('"broken" = \n')
     monkeypatch.chdir(tmp_path)
 
-    with pytest.raises(RegistryError) as excinfo:
+    with pytest.raises(mcp_server._RenderedToolError) as excinfo:
         mcp_server.list_scopes(project="anything")
 
     message = str(excinfo.value)
     assert path in message
-    assert "\n" not in message.strip()
     assert "Did you mean" not in message
     assert "Registered projects" not in message
     assert "Traceback" not in message
-    # The two clauses I5 names, neither of which the shape above can see.
+    # The located cause, unchanged and still shared with the CLI.
     assert "not valid TOML" in message           # the parse detail
-    assert f"Fix or remove {path}" in message    # the recovery
+    assert f"Fix or remove {path}" in message
     assert "an absent registry is healthy" in message
+    # This surface's own recovery: the escape hatch, and no shell command.
+    assert "absolute path" in message
+    assert "project='/absolute/path/to/the/workspace'" in message
 
 
 def test_a_malformed_registry_now_reaches_the_SELECTORLESS_call_too(
@@ -980,9 +1006,12 @@ def test_a_malformed_registry_now_reaches_the_SELECTORLESS_call_too(
 
     An **absent** registry stays healthy (I8) and is pinned by its own rows — the
     fault here is a file that exists and cannot be parsed.
-    """
-    from mitos.errors import RegistryError
 
+    6c changed the *carrier* and not the claim: the fault now arrives as the
+    rendered `_RenderedToolError` rather than a bare `RegistryError`, because the
+    body it used to propagate named `mitos init` to an agent. Loud on the dominant
+    path is still the property under test.
+    """
     # The workspace first: `_workspace` runs a real `mitos init`, which registers
     # and so needs a readable registry. Corrupting the file afterwards is what
     # leaves the process standing in a perfectly good workspace it can no longer
@@ -990,7 +1019,7 @@ def test_a_malformed_registry_now_reaches_the_SELECTORLESS_call_too(
     monkeypatch.chdir(_workspace(tmp_path / "cwd"))
     path = _write_registry('"broken" = \n')
 
-    with pytest.raises(RegistryError) as excinfo:
+    with pytest.raises(mcp_server._RenderedToolError) as excinfo:
         mcp_server.list_scopes()
 
     message = str(excinfo.value)
@@ -1000,6 +1029,142 @@ def test_a_malformed_registry_now_reaches_the_SELECTORLESS_call_too(
     assert "no project was named" not in message
     assert "Registered projects" not in message
     assert "Traceback" not in message
+
+
+#: The four `load()` refusals a hand-written file can express, one per raise site
+#: except the unreadable-file arm — that one needs a mode change and gets its own
+#: root-guarded row below, so between them the five are covered.
+_REGISTRY_REFUSALS = [
+    b'"broken" = \n',                       # invalid TOML
+    b'"a" = "/abs" \n"a" = "/other"\n',     # duplicate name → arrives as invalid TOML
+    b'"caf\xe9" = "/ws/cafe"\n',            # latin-1, not UTF-8
+    b'"a" = 7\n',                           # value is not a string
+    b'"a" = "relative/path"\n',             # value is not absolute
+]
+
+#: Both ways an MCP call reaches `registry.load()`. `list_projects` is the one that
+#: does NOT go through `_target_config` — it takes no `project` and resolves none —
+#: which is exactly why it has to be swept by name rather than assumed covered.
+_REGISTRY_READING_CALLS = [
+    ("list_scopes", lambda: mcp_server.list_scopes(project="anything")),
+    ("list_projects", lambda: mcp_server.list_projects()),
+]
+
+
+@pytest.mark.parametrize("registry_bytes", _REGISTRY_REFUSALS)
+@pytest.mark.parametrize("tool, call", _REGISTRY_READING_CALLS,
+                         ids=[name for name, _ in _REGISTRY_READING_CALLS])
+def test_no_state_creating_command_reaches_the_registry_error_body(
+    tmp_path, monkeypatch, registry_bytes, tool, call
+) -> None:
+    """Criterion 8's second half — the class `FORBIDDEN_SYNTAX` was blind to.
+
+    `agent-error-surface-never-prescribes-state-creating-setup` was recorded with a
+    `Decided:` clause scoped to *"the MCP renderer's targeting errors"*, and the
+    four assertion sites above all drive `_render_targeting_error`. A
+    `RegistryError` never passes through it, so the constant was **structurally**
+    unable to see the registry-load class — which is exactly why that class shipped
+    naming `mitos init` to an agent for three phases (entry-013). Rewording the
+    message alone would have left the same blindness; the point of this row is that
+    the next such body reds a test rather than needing to be noticed.
+
+    Swept over every shape `registry.load()` can refuse, not one, because the defect
+    was two of five raises and the ledger's own lesson from entry-009 is that an
+    enumeration believed closed is usually a floor. Four of the five are hand-written
+    files here; the fifth (an unreadable file) needs a mode change and has its own row
+    below.
+
+    **And swept over both calls, which is the other axis the enumeration hid.**
+    `_target_config` reaches `registry.load()` on every *targeting* call, but
+    `list_projects` takes no selector and reads the registry directly — so a sweep
+    driving only a targeting tool proves nothing about the one tool whose entire
+    subject is the registry. Each shape drives the real file through a real tool
+    call, so it is the delivered body under test and not a renderer called directly.
+
+    Scoped to the **message body**, never to the module: `registry.py`'s docstring
+    legitimately says *"re-running `mitos init` in each project"*, and 6b's lesson
+    is that an absence assertion belongs on the executable fence rather than on the
+    prose that explains it.
+    """
+    _write_registry_bytes(registry_bytes)
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(mcp_server._RenderedToolError) as excinfo:
+        call()
+    message = str(excinfo.value)
+
+    for syntax in FORBIDDEN_SYNTAX:
+        assert syntax not in message, f"{tool}'s registry error body leaked {syntax!r}"
+    # Non-inertness: a body that said nothing would pass the sweep above. The
+    # located cause plus a recovery is what makes it a vector rather than a wall.
+    assert registry.registry_path() in message
+    assert "absolute path" in message
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root ignores file mode bits, so an unreadable registry stays readable",
+)
+@pytest.mark.parametrize("tool, call", _REGISTRY_READING_CALLS,
+                         ids=[name for name, _ in _REGISTRY_READING_CALLS])
+def test_an_unreadable_registry_is_the_fifth_refusal_and_carries_no_command(
+    tmp_path, monkeypatch, tool, call
+) -> None:
+    """The one `load()` refusal a hand-written file cannot express.
+
+    Split out rather than folded into the sweep above because it is the only shape
+    needing a mode change, and a mode change is a no-op under root — so folding it in
+    would have made four honest rows carry one that silently passes on some machines.
+    It is worth having as its own row anyway: this is the raise whose body named
+    `mitos init` before 6c, and the only one of the five whose *cause* is not
+    something a reader can see by opening the file.
+    """
+    path = _write_registry('"a" = "/ws/a"\n')
+    os.chmod(path, 0o000)
+    monkeypatch.chdir(tmp_path)
+    try:
+        with pytest.raises(mcp_server._RenderedToolError) as excinfo:
+            call()
+    finally:
+        os.chmod(path, 0o600)
+    message = str(excinfo.value)
+
+    for syntax in FORBIDDEN_SYNTAX:
+        assert syntax not in message, f"{tool}'s registry error body leaked {syntax!r}"
+    assert path in message
+    assert "permissions" in message      # the located cause
+    assert "absolute path" in message    # this surface's recovery
+
+
+def test_the_cli_registry_error_keeps_the_init_nudge_the_mcp_one_may_not(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """The other half of the split: one cause, two deliberately different recoveries.
+
+    A rule enforced only by an absence sweep degrades into "say less on both
+    surfaces", which is not the decision — the CLI is read by a human for whom
+    re-registering IS the repair, and the vision's two-renderer shape exists so
+    that surface keeps its own words. So this row asserts the CLI still says the
+    thing the MCP body may not, over the same corrupt file.
+
+    It also pins the gate: the nudge rides `RegistryError.file_unusable`, so a
+    *registration refusal* — which already carries `--name`/`--force` and which no
+    MCP tool can reach — does not collect advice to re-run the act that refused.
+    """
+    from mitos.errors import RegistryError
+
+    path = _write_registry('"broken" = \n')
+    monkeypatch.chdir(tmp_path)
+
+    with patch.object(sys, "argv", ["mitos", "projects"]), pytest.raises(SystemExit):
+        cli.main()
+    err = capsys.readouterr().err
+    assert path in err
+    assert "not valid TOML" in err
+    assert "mitos init" in err              # the human's recovery, still here
+
+    # And the gate, not merely the happy path: a refusal is not re-run-able.
+    assert RegistryError("name taken").file_unusable is False
 
 
 def test_a_resolved_target_with_a_malformed_config_stays_a_calm_line(

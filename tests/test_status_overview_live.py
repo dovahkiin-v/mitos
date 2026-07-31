@@ -317,7 +317,12 @@ def test_an_absent_collection_is_flagged_and_its_present_twin_is_not(
     assert projects["reconciled"]["collection_present"] is True
 
     notes = "\n".join(cli._overview_notes(projects["swept"], payload))
-    assert "mitos status swept" in notes
+    # The name renders through `repr` since 6c (entry-009) — here as elsewhere on
+    # this surface, and inside a printed recipe the quoted form is what a shell
+    # would want anyway. This is the service-backed twin of
+    # `test_status_overview.py`'s row, and it is the one only a local run with
+    # Qdrant up can see (standing constraint 6: CI alone is not a gate).
+    assert "mitos status 'swept'" in notes
     assert "reconcile" not in notes
     assert default_collection_name(swept) in notes
     assert cli._overview_notes(projects["reconciled"], payload) == []

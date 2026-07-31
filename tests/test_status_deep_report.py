@@ -762,7 +762,7 @@ class TestTheHeaderNamesTheProject:
         _run(["status", "alpha"])
 
         out = capsys.readouterr().out
-        assert "MITOS STATUS for alpha (" in out
+        assert "MITOS STATUS for 'alpha' (" in out
         # The directory that answered stays present: an operator addressing a
         # project by name still needs to see which one it resolved to.
         assert os.path.realpath(str(ws)) in out
@@ -797,7 +797,7 @@ class TestTheHeaderNamesTheProject:
 
         _run(["status", "linked"])
 
-        assert "MITOS STATUS for linked (" in capsys.readouterr().out
+        assert "MITOS STATUS for 'linked' (" in capsys.readouterr().out
 
     def test_an_unregistered_path_keeps_the_shipped_path_only_header(
         self, tmp_path, monkeypatch, capsys
@@ -821,25 +821,25 @@ class TestTheHeaderNamesTheProject:
         assert f"MITOS STATUS for {os.path.realpath(str(ws))} — " in out
         assert "(" not in out.splitlines()[1]      # no name-and-parens form
 
-    def test_a_registered_name_carrying_a_control_character_renders_raw(
+    def test_a_registered_name_carrying_a_control_character_renders_escaped(
         self, tmp_path, monkeypatch, capsys
     ) -> None:
-        """Pins the CURRENT disposition so 6c's audit inverts a row, not a comment.
+        """**Inverted at 6c** — this row used to pin the raw render, on purpose.
 
         The sibling of `test_status_overview.py::
-        test_a_registry_name_carrying_a_control_character_renders_raw`, and the
+        test_a_registry_name_carrying_a_control_character_renders_escaped`, and the
         reason is the same one, one surface further on: `registry.load()` validates
-        only *is a string* on the value, so a hand edit can leave a name holding a
-        newline. The disposition is deliberate and is **not** that this is fine —
-        `mitos projects` and 4a's overview table both render this data raw, and a
-        unilateral divergence here would give one listing **three** spellings. The
-        closed set is now three surfaces; fixing it means fixing all three in one
-        edit, and this row is one of the three that must then be inverted.
+        the *value* (a string, absolute) and never the *key*, so a hand edit can
+        leave a name holding a newline. It was rendered raw until the audit because
+        `mitos projects` and 4a's overview table both did, and a unilateral
+        divergence would have given one listing **three** spellings. 6c fixed all
+        three surfaces in one edit, so the lockstep survives and `repr` is now the
+        shared spelling on all of them.
 
-        (Note the contrast with the pin *value* one row over: that goes through
-        `repr` because it has no sibling surface to stay in lockstep with — the
-        rule is untrusted-values-get-escaped, and the exception is a shipped set of
-        surfaces that must agree with each other until they are fixed together.)
+        (The pin *value* one row over already went through `repr`, for the reason
+        that now covers the name too — it simply had no sibling surface to wait for.
+        The rule was always untrusted-values-get-escaped; the exception was a
+        shipped set of surfaces that had to be fixed together, and they were.)
         """
         ws = tmp_path / "wsdir"
         ws.mkdir()
@@ -852,7 +852,9 @@ class TestTheHeaderNamesTheProject:
 
         _run(["status", "line\nbreak"])
 
-        assert "line\nbreak (" in capsys.readouterr().out   # raw, like `projects`
+        out = capsys.readouterr().out
+        assert "line\nbreak (" not in out                    # cannot break the header
+        assert f"{'line' + chr(10) + 'break'!r} (" in out    # escaped, like `projects`
 
     def test_a_direct_call_without_a_name_is_unchanged(
         self, tmp_path, monkeypatch, capsys

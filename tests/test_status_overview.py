@@ -490,8 +490,11 @@ def test_two_names_for_one_path_are_a_finding_and_never_a_fault(tmp_path, qdrant
     assert registry.reverse_lookup(shared) == "first"
 
     rendered = _render_to_text(payload)
-    assert "also registered as second" in rendered
-    assert "every echo names first" in rendered
+    # Names render through `repr` here since 6c, same spelling as the table above
+    # and as `mitos projects` — the registry's read gate validates values, never
+    # keys, so a name is unchecked hand-edited text wherever it is printed.
+    assert "also registered as 'second'" in rendered
+    assert "every echo names 'first'" in rendered
 
 
 def test_an_empty_registry_and_an_absent_one_both_render_the_healthy_overview(
@@ -550,24 +553,28 @@ def test_a_flagged_entry_and_a_dead_instance_both_still_exit_zero(
     assert "reconcile" not in notes
 
 
-def test_a_registry_name_carrying_a_control_character_renders_raw(tmp_path, qdrant):
-    """Pins the CURRENT disposition so a later audit inverts a row, not a comment.
+def test_a_registry_name_carrying_a_control_character_renders_escaped(tmp_path, qdrant):
+    """**Inverted at 6c** — this row used to pin the raw render, on purpose.
 
     ``registry.load()`` validates only *is a string* and *is absolute*, and only on
-    the **value** — so a hand edit can leave a name holding a newline, which breaks
-    the table's line structure. The disposition here is deliberate and is **not**
-    that this is fine: the shipped ``mitos projects`` table renders the same data
-    raw, and a unilateral divergence would give the machine two spellings of one
-    listing. Fixing it means fixing **both** surfaces in one edit — recorded for the
-    later ADR-edge audit. If that audit lands ``{value!r}``, this row is the one that
-    must be inverted.
+    the **value**, so a hand edit can leave a *name* holding a newline. Until the
+    audit that was rendered raw and the row said so, because the shipped ``mitos
+    projects`` table did the same and a unilateral divergence would have given the
+    machine two spellings of one listing. 6c fixed all three surfaces in one edit —
+    this table, ``mitos projects``, and 4b's ``status`` header — so the deliberate
+    lockstep is preserved and the escaping is the new shared spelling.
+
+    The **payload** is unchanged and still carries the raw name: escaping is a
+    render concern, and ``--json`` crosses a serializer boundary that owns its own.
     """
     _write_registry(f'"line\\nbreak" = "{_workspace(tmp_path / "ws")}"\n')
 
     payload = overview.build_overview()
 
-    assert payload["projects"][0]["name"] == "line\nbreak"
-    assert "line\nbreak" in _render_to_text(payload)   # raw, exactly like `projects`
+    assert payload["projects"][0]["name"] == "line\nbreak"     # data, untouched
+    text = _render_to_text(payload)
+    assert "line\nbreak" not in text                           # cannot break the table
+    assert repr("line\nbreak") in text                         # exactly like `projects`
 
 
 def test_a_malformed_registry_is_the_only_non_zero_path(tmp_path):
@@ -599,7 +606,7 @@ def test_the_overview_marks_the_project_containing_cwd_and_teaches_the_form(
 
     cli._render_overview(payload)
     text = capsys.readouterr().out
-    assert "`mitos status project` for this project's full report" in text
+    assert "`mitos status 'project'` for this project's full report" in text
     # …and exactly one row is marked.
     assert text.count("you are here") == 1
 
@@ -833,7 +840,7 @@ def test_a_populated_project_with_no_collection_is_flagged_and_names_no_heal(
 
     assert "no vector collection" in notes
     assert default_collection_name(project) in notes
-    assert "mitos status project" in notes
+    assert "mitos status 'project'" in notes
     assert "reconcile" not in notes
     assert "sync" not in notes
 

@@ -270,17 +270,17 @@ def letter_payload(
     return payload
 
 
-# The single not-found hint for the state-agnostic dereference (`mitos show` /
-# the `show_node` MCP twin). Static and hedged — it reads no buffer, so it is
-# truthful for both a typo and an authored-but-unsynced draft (it never asserts
-# presence). Single-sourced here so the not-found JSON object (`{found, ident,
-# hint}`) is byte-equal CLI⇄MCP — the one string the genuine-absence parity
-# assertion reads. Must keep the `mitos sync` + `decisions.md/questions.md`
-# substrings (the CLI not-found test pins them).
-SHOW_NOT_FOUND_HINT = (
-    "not in graph — if you just authored it in decisions.md/questions.md, "
-    "run `mitos sync`"
-)
+# The not-found hint for the state-agnostic dereference used to live here, single-
+# sourced so the `{found, ident, hint}` object was byte-equal CLI⇄MCP. 6c removed
+# that single-sourcing, and the reason is the one this leaf cannot host: the
+# correct recovery genuinely DIFFERS per surface. The CLI wants a `mitos sync`
+# naming the selector the caller used; the MCP surface may name no shell command
+# at all (`agent-error-surface-never-prescribes-state-creating-setup`), and a
+# selectored CLI string parked here would red `display.py`'s own FORBIDDEN_SYNTAX
+# literal sweep. So each boundary composes its own: `cli._show_not_found_hint`
+# and `mcp_server.SHOW_NOT_FOUND_HINT`. What stays shared is the *shape* —
+# `show_payload` below, and the not-found object's key set, which the parity row
+# still pins.
 
 
 def show_payload(

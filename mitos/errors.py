@@ -88,8 +88,23 @@ class RegistryError(MitosError):
     Deliberately distinct from the *targeting* errors a later phase's resolver
     raises when a selector cannot be resolved: those are faults of a lookup, these
     are faults of the file and of a write to it.
+
+    Attributes:
+        file_unusable: True for the **read-gate** class only — the faults
+            :func:`mitos.registry.load` raises, which every surface can meet on any
+            call. It exists so each boundary can add its **own** recovery clause
+            without the message body carrying either surface's syntax: the CLI
+            names ``mitos init``, the MCP renderer names the absolute-path escape
+            hatch, and a *registration refusal* (which the MCP surface never
+            reaches, and which already carries ``--name``/``--force``) gets
+            neither. A plain bool rather than a discriminator vocabulary because
+            there are exactly two classes and the docstring above already names
+            them; nothing branches finer.
     """
-    pass
+
+    def __init__(self, message: str, *, file_unusable: bool = False) -> None:
+        super().__init__(message)
+        self.file_unusable = file_unusable
 
 
 # ---------------------------------------------------------------------------

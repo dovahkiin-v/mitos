@@ -107,6 +107,51 @@ def test_json_form_round_trips_a_non_ascii_name(capsys):
     assert payload["projects"] == [{"name": "ąžuolas", "path": "/ws/oak"}]
 
 
+def test_a_registry_name_carrying_a_control_character_renders_escaped(capsys):
+    """entry-009's third surface — the shipped verb, which had no pin at all.
+
+    `registry.load()` validates the *value* (a string, absolute) and never the
+    *key*, so a hand edit can leave a name holding a newline or an ESC and it
+    reaches a terminal unchecked: the newline breaks this table's line structure
+    and the ESC paints it. 4a's overview table and 4b's `status` header each
+    carried a row pinning the raw render; **this one carried none**, which is why
+    the audit could have been closed with two surfaces fixed and the shipped verb
+    still raw. All three moved together in 6c and all three now have a row.
+
+    The **column width** is asserted too, not only the escaping: the width is
+    computed off the name, so escaping the render without escaping the measurement
+    misaligns every row while every substring assertion above stays green.
+    """
+    _write_registry('"line\\nbreak" = "/ws/one"\n"b" = "/ws/two"\n')
+
+    _run_projects()
+
+    out = capsys.readouterr().out
+    assert "line\nbreak" not in out                 # cannot break the table
+    assert repr("line\nbreak") in out
+    # One row per registration still, despite the newline in the data.
+    rows = [line for line in out.splitlines() if "/ws/" in line]
+    assert len(rows) == 2
+    # Width measured off the escaped spelling: both paths start at one column.
+    assert rows[0].index("/ws/one") == rows[1].index("/ws/two")
+
+
+def test_the_json_payload_keeps_the_raw_name_escaping_is_a_render_concern(capsys):
+    """The escaping above stops at the text surface, deliberately.
+
+    `--json` crosses a serializer boundary that owns its own escaping, and a
+    consumer needs the value the registry actually holds — `display.projects_payload`
+    is a data leaf, so putting `repr` in it would corrupt the payload to tidy a
+    table.
+    """
+    _write_registry('"line\\nbreak" = "/ws/one"\n')
+
+    _run_projects("--json")
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["projects"] == [{"name": "line\nbreak", "path": "/ws/one"}]
+
+
 # --- healthy and empty -----------------------------------------------------
 
 @pytest.mark.parametrize(
@@ -184,9 +229,16 @@ def test_a_hand_broken_registry_renders_one_calm_line_at_exit_1(capsys, broken, 
     """Every unusable-registry shape exits 1 with one ``Error:`` line and no traceback.
 
     The file is hand-editable, so a broken one is an ordinary state to be met in —
-    and the operator needs the path, the cause, and the fix, not a stack dump. No
-    new boundary carries this: ``RegistryError`` is a ``MitosError``, so the
-    shipped ``except MitosError`` arm renders it.
+    and the operator needs the path, the cause, and the fix, not a stack dump.
+
+    Since 6c the class **does** have its own boundary arm (``main()``'s
+    ``except RegistryError``, above the ``MitosError`` one), because the shared body
+    had to stop naming ``mitos init`` — every MCP tool call reaches ``registry.load()``
+    and that surface may not be handed a state-creating shell command. The arm appends
+    the human's recovery here and the MCP renderer appends its own there. What this row
+    asserts is unchanged and is the reason it still bites: **one** ``Error:``, the path,
+    no traceback, and no half-rendered table before the refusal — the recovery rides as
+    an indented continuation, not as a second failure.
     """
     path = _write_registry(broken)
 

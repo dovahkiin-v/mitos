@@ -36,7 +36,6 @@ from mitos.display import (
     truncate_words,
     resolve_display_ensure_ascii,
     show_payload,
-    SHOW_NOT_FOUND_HINT,
 )
 from mitos.config import (
     MitosConfig,
@@ -340,12 +339,19 @@ def _status_subject(workspace_dir: str, project: Optional[str]) -> str:
     which directory answered is the other half of the question, and 5a's flip makes
     the named form the ordinary one.
 
-    Rendered **raw**, not through ``repr``. That is deliberate rather than an
-    oversight of the untrusted-value rule: a registry name is hand-editable and
-    ``registry.load`` validates only that it is a string, but ``mitos projects``
-    and the 4a overview table already render it raw, and a unilateral divergence
-    here would give one listing three spellings. The closed set is now **three**
-    surfaces, and fixing it means fixing all three in one edit (4a's note for 6c).
+    The name is rendered through ``repr`` (1d's ``_inert_pin_note`` idiom). It is
+    the one registry field ``registry.load`` validates nothing about — the read gate
+    checks the *value* is a string and absolute, never the *key* — so a hand-edited
+    name can carry a newline or an ESC and reach a terminal intact. It was rendered
+    raw until 6c and deliberately so, because ``mitos projects`` and the 4a overview
+    table also rendered it raw and a unilateral divergence would give one listing
+    several spellings; the closed set was **three** surfaces, and 6c fixed all three
+    in one edit rather than leaving the audit closable with one still raw.
+
+    The **directory** stays raw, which is not an oversight either: it keeps this
+    branch byte-identical to the shipped path-only form below, and a path is rendered
+    raw by every other report surface in the tree, so escaping it here alone would
+    re-create exactly the several-spellings drift the name fix removes.
 
     Args:
         workspace_dir: The absolute directory the report is about.
@@ -358,7 +364,7 @@ def _status_subject(workspace_dir: str, project: Optional[str]) -> str:
     """
     if project is None:
         return workspace_dir
-    return f"{project} ({workspace_dir})"
+    return f"{project!r} ({workspace_dir})"
 
 
 def _inert_pin_note(config: MitosConfig, *, offer_deletion: bool = False) -> Optional[str]:
@@ -1104,6 +1110,37 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         print()
 
 
+def _show_not_found_hint(config: MitosConfig) -> str:
+    """Composes the CLI's ``show`` not-found hint — the recovery, naming a selector.
+
+    Static and hedged in the sense that matters: it reads **no buffer**, so it is
+    truthful for a typo and for an authored-but-unsynced draft alike and never
+    asserts presence (``show-not-found-hint-static-hedged-not-buffer-read``). Only
+    the *recovery clause* is composed, and only from the config already in hand.
+
+    It names the selector because the recipe is otherwise a hard failure: since the
+    flip, a bare ``mitos sync`` has no target and errors out, so a hint that printed
+    one would hand a stuck reader a second wall. The value is the caller's own
+    vocabulary (``config.project`` — the registered name, or the workspace path when
+    the target was not registered), rendered through ``repr`` for the same reason
+    every other registry name on this surface is: a name is hand-editable text, and
+    the quoted form is what a shell would want around a path with a space anyway.
+
+    It lives here rather than in ``display.py`` because the MCP twin's hint may name
+    no shell command at all, so the two cannot share a body — and because a
+    selectored string in that leaf reds its own FORBIDDEN_SYNTAX literal sweep.
+
+    Args:
+        config: The resolved workspace config, carrying ``project``.
+
+    Returns:
+        The hint clause, without a trailing period — both call sites supply their
+        own punctuation.
+    """
+    return (f"not in graph — if you just authored it in decisions.md/questions.md, "
+            f"run `mitos sync -p {config.project!r}`")
+
+
 def cmd_show(config: MitosConfig, ident: str, as_json: bool = False) -> None:
     """Shows full details of a specific node by ID or slug.
 
@@ -1111,8 +1148,10 @@ def cmd_show(config: MitosConfig, ident: str, as_json: bool = False) -> None:
     — active-first, else the most-recent superseded node in the casefolded-slug
     lineage (marked superseded) — so a moved-on node still answers to its own slug
     instead of 404-ing. Only a genuinely-absent identifier reaches the not-found
-    branch, whose static, hedged ``mitos sync`` pointer reads no buffer (truthful for
-    both a typo and an authored-but-unsynced draft). With ``as_json`` it emits a
+    branch, whose hedged ``mitos sync`` pointer reads no buffer (truthful for both a
+    typo and an authored-but-unsynced draft) and names the caller's own selector, so
+    the recipe it prints is one a post-flip shell will actually run.
+    With ``as_json`` it emits a
     Letter-complete, modifier-stamped JSON object (the not-found case a JSON object
     too, never a bare text print) — both shapes carrying the trailing
     ``project``/``collection``/``workspace`` provenance, as does the ``show_node``
@@ -1139,10 +1178,10 @@ def cmd_show(config: MitosConfig, ident: str, as_json: bool = False) -> None:
 
     if not node:
         # Genuine absence: a typo, or an authored-but-unsynced draft. The hint is
-        # static and hedged — it reads no buffer, never asserts presence to a typo.
-        # Single-sourced in display.py so the `show_node` MCP twin emits the same
-        # not-found object byte-for-byte (parity is structural).
-        hint = SHOW_NOT_FOUND_HINT
+        # hedged and reads no buffer, so it never asserts presence to a typo. Its
+        # WORDING is this surface's own since 6c — the MCP twin's carries no shell
+        # command — while the not-found object's SHAPE stays shared and pinned.
+        hint = _show_not_found_hint(config)
         if as_json:
             # Provenance last, exactly as the `show_node` twin stamps it: the
             # absent-handle answer is the one most in need of naming its corpus
@@ -1499,13 +1538,20 @@ def cmd_projects(as_json: bool = False) -> None:
 
     # File order throughout, never sorted: it is the order a reverse lookup
     # resolves its first match in, so the listing must show what actually decides.
-    name_w = max(len("project"), max(len(p["name"]) for p in projects))
+    #
+    # The name goes through `repr` (1d's `_inert_pin_note` idiom): `registry.load`
+    # validates the VALUE (a string, absolute) and never the KEY, so a hand-edited
+    # name is the one registry field that reaches a terminal unchecked and can carry
+    # a newline that breaks this table or an ESC that paints it. The column width is
+    # therefore computed off the repr'd length — measuring the raw name here and
+    # printing the escaped one misaligns every row.
+    name_w = max(len("project"), max(len(repr(p["name"])) for p in projects))
     print(f"\nProjects ({len(projects)} registered, in registry order):")
     print(f"Registry: {path}")
     print("-" * (name_w + 30))
     print(f"{'project':{name_w}}   workspace")
     for project in projects:
-        print(f"{project['name']:{name_w}}   {project['path']}")
+        print(f"{project['name']!r:{name_w}}   {project['path']}")
     print()
 
 
@@ -2272,8 +2318,14 @@ def _overview_notes(project: Dict[str, Any], payload: Dict[str, Any], *,
         Zero or more note lines, already indented.
     """
     notes: List[str] = []
-    name = project["name"]
-    if payload["cwd_project"] == name:
+    # Every registry NAME on this surface renders through `repr`, matching the table
+    # one screen down and `mitos projects`. The read gate validates the registry's
+    # values and never its keys, so a name is unchecked hand-edited text; here it also
+    # lands inside printed `mitos status <name>` recipes, where the quoted form is the
+    # one a shell would accept anyway. `name` is bound to the escaped spelling once so
+    # a later note cannot reintroduce the raw one.
+    name = repr(project["name"])
+    if payload["cwd_project"] == project["name"]:
         # The overview closes its own discovery loop: a human standing in their
         # project who expected a project report learns the form at a glance.
         notes.append(
@@ -2320,10 +2372,10 @@ def _overview_notes(project: Dict[str, Any], payload: Dict[str, Any], *,
         # can be corrupted. The actionable half is which one decides: a reverse
         # lookup answers with the first in document order, which is the first of them
         # in the listing above.
-        others = ", ".join(project["shares_path_with"])
-        deciding = next(
+        others = ", ".join(repr(other) for other in project["shares_path_with"])
+        deciding = repr(next(
             other["name"] for other in payload["projects"]
-            if other["path"] == project["path"])
+            if other["path"] == project["path"]))
         notes.append(
             f"also registered as {others} — every echo names {deciding} for this "
             f"workspace (first in registry order wins)")
@@ -2360,7 +2412,12 @@ def _render_overview(payload: Dict[str, Any]) -> None:
 
     # File order throughout, never sorted — the order a reverse lookup resolves its
     # first match in, matching `mitos projects`.
-    name_w = max(len("project"), max(len(p["name"]) for p in projects))
+    #
+    # `repr` on the name, and the width measured off the repr'd length, for the same
+    # reason as `cmd_projects`' table: the registry's read gate validates values and
+    # never keys, so the name is hand-editable text arriving unchecked. The two
+    # tables move together — that lockstep is why 6c fixed all three surfaces at once.
+    name_w = max(len("project"), max(len(repr(p["name"])) for p in projects))
     state_w = max(len("state"), max(len(p["state"]) for p in projects) + 2)
     print(f"\nMITOS PROJECTS ({payload['count']} registered, in registry order)")
     print(f"Registry: {payload['registry_path']}")
@@ -2374,7 +2431,7 @@ def _render_overview(payload: Dict[str, Any]) -> None:
         # is the opposite of what every other line in this phase is for.
         mark = _OVERVIEW_MARKS.get(project["state"], "—")
         state = f"{mark} {project['state']}"
-        print(f"{project['name']:{name_w}}   {state:{state_w}}   {project['path']}")
+        print(f"{project['name']!r:{name_w}}   {state:{state_w}}   {project['path']}")
         for note in _overview_notes(project, payload):
             print(note)
 
@@ -5805,6 +5862,32 @@ def main() -> None:
         # boundary answers on stderr regardless, so a JSON envelope for one error
         # class would be a new asymmetry.
         print(f"Error: {_render_targeting_error(e)}", file=sys.stderr)
+        sys.exit(2 if args.command == "check" else 1)
+    except RegistryError as e:
+        # Also above `except MitosError`, and for the mirror of the reason above:
+        # `registry.load()`'s body is the located cause only — it names no `mitos`
+        # command, because since 5b every MCP tool call reaches it and that surface
+        # may not be handed a state-creating one. The recovery clause is each
+        # boundary's own, and THIS boundary is the one a human reads, so it is the
+        # one allowed to name the setup act (`mcp_server._render_registry_error`
+        # names the absolute-path escape hatch instead). Appended here rather than
+        # folded back into the leaf so the two wordings cannot re-merge by accident.
+        #
+        # Gated on `file_unusable` because this arm catches the whole class: a
+        # *registration refusal* (`--name` already taken, path already registered)
+        # is not repaired by re-running the thing that just refused, and it already
+        # carries its own `--name`/`--force` recovery. Widening the nudge to it
+        # would trade one wrong prescription for another.
+        detail = str(e)
+        if e.file_unusable:
+            # "fixed or removed", not "readable": only one of the five refusals is a
+            # readability fault. The other four are a file that opens perfectly and
+            # says something illegal, and each located cause above already ends in
+            # `Fix or remove …` — so this clause completes that sentence rather than
+            # renaming the fault. The flag is `file_unusable` for the same reason.
+            detail += ("\n  `mitos init` in a project re-registers it once the "
+                       "file is fixed or removed.")
+        print(f"Error: {detail}", file=sys.stderr)
         sys.exit(2 if args.command == "check" else 1)
     except MitosError as e:
         # KD1: `check` maps every pre-verb/boundary failure (bad -C, ConfigError, an

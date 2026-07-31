@@ -9,7 +9,7 @@ from typing import Optional, List, Dict, Any, Tuple
 from mcp.server.fastmcp import FastMCP
 
 from mitos import registry, routing
-from mitos.display import blackout_note, clamp_limit, dumps_display, letter_payload, oneline_payload, order_scope_counts, projects_payload, show_payload, SHOW_NOT_FOUND_HINT
+from mitos.display import blackout_note, clamp_limit, dumps_display, letter_payload, oneline_payload, order_scope_counts, projects_payload, show_payload
 from mitos.config import MitosConfig
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS
 from mitos.embeddings import GeminiEmbeddingProvider
@@ -18,6 +18,7 @@ from mitos.vector_store import QdrantVectorStore
 from mitos.errors import (
     CollectionMissingError,
     ProjectTargetingError,
+    RegistryError,
     TARGET_EXEMPT_VERB,
     TARGET_MISSING,
     TARGET_PATH_NOT_A_WORKSPACE,
@@ -139,10 +140,15 @@ def _decision_payload(node: Dict[str, Any], score: float, *, brief: bool,
     return payload
 
 class _RenderedToolError(Exception):
-    """A targeting failure already rendered for delivery. ``str()`` IS the body.
+    """An addressing failure already rendered for delivery. ``str()`` IS the body.
+
+    Two classes ride it since 6c — the **targeting** anatomy and the **registry**
+    class's located cause plus escape hatch — and the shape is the same for both
+    because the delivery constraint below is a property of the transport, not of
+    either message.
 
     Module-private, and it never leaves this file. Its whole purpose is to be the
-    thing a tool **raises** once the anatomy has been composed, because that is
+    thing a tool **raises** once the body has been composed, because that is
     the only delivery shape that carries it — measured against this tree's own
     ``mcp`` over real stdio:
 
@@ -270,6 +276,61 @@ def _registered_projects_line(bounded: routing.BoundedNames) -> str:
 #: rather than an instruction so it reads sanely under an empty registry too.
 _DISCOVERY_POINTER = ("  `list_projects()` returns every registered project name "
                       "with its workspace path.")
+
+#: This surface's ``show_node`` not-found hint. The CLI twin
+#: (``cli._show_not_found_hint``) names a `mitos sync` carrying the caller's
+#: selector; **this one names no shell command at all**, per
+#: `agent-error-surface-never-prescribes-state-creating-setup` — an agent handed
+#: one is invited to run it, and a sync is a write over the corpus.
+#:
+#: It stays hedged and reads no buffer, so it is truthful for a typo and for an
+#: authored-but-unsynced draft alike (`show-not-found-hint-static-hedged-not-
+#: buffer-read`). The recovery is expressed in this surface's own vocabulary —
+#: two READ tools that answer both cases — so the dead-end PATTERNS forbids does
+#: not open: a mistyped handle is discoverable, and an uncommitted draft is named
+#: as a fact rather than as a command to fix it with.
+SHOW_NOT_FOUND_HINT = (
+    "not in graph — check the handle with `list_decisions` or `query_decisions`; "
+    "an entry only hand-authored in decisions.md/questions.md is not in the graph "
+    "until it is synced"
+)
+
+
+def _render_registry_error(err: RegistryError) -> str:
+    """Composes this surface's recovery for an unusable registry file.
+
+    ``registry.load()``'s own message is the **located cause** and is shared: which
+    file, what is wrong with it. Only the *recovery clause* is per-surface, and it
+    has to be, because the two surfaces have genuinely different ones. The CLI
+    boundary may name ``mitos init`` — a human reads it, and re-registering is the
+    repair. This renderer may not (`agent-error-surface-never-prescribes-state-
+    creating-setup`), and it does not merely omit the nudge: there is a recovery
+    that is honestly better here, because **the absolute-path selector needs no
+    registry at all**. An agent whose routing map is corrupt can keep working by
+    naming the workspace directly, which is the escape hatch's whole point.
+
+    Like ``_render_targeting_error`` it reads nothing — no registry (the file is
+    what failed), no filesystem — so it needs no guard.
+
+    The escape-hatch clause is gated on ``file_unusable``: it is the answer to a
+    broken routing *file*, and offering it for a registration refusal would be
+    advice about a fault this surface cannot even reach (no MCP tool writes the
+    registry). The gate is here rather than assumed, so the renderer stays correct
+    if a future tool does.
+
+    Args:
+        err: The typed error, carrying the located cause as its message.
+
+    Returns:
+        The rendered body. Multi-line when a recovery applies; the recovery is
+        indented.
+    """
+    if not err.file_unusable:
+        return str(err)
+    return (f"{err}\n"
+            f"  Until it is repaired, name the workspace by its absolute path — "
+            f"`project='/absolute/path/to/the/workspace'` — which resolves without "
+            f"reading the registry.")
 
 
 def _render_targeting_error(err: ProjectTargetingError, tool: str) -> str:
@@ -443,10 +504,14 @@ def _target_config(project: Optional[str], tool: str) -> MitosConfig:
 
     Raises:
         _RenderedToolError: On any targeting failure — carrying the finished
-            anatomy, because the typed error's own ``str()`` cannot.
-        RegistryError: If the registry file itself is unusable. Deliberately
-            unwrapped: there is no registered vocabulary to teach when the file
-            holding it cannot be read, so it arrives as one calm line.
+            anatomy — and on an unusable registry file. The registry class used to
+            propagate unwrapped, on the reasoning that there is no registered
+            vocabulary to teach when the file holding it cannot be read. 6c
+            inverted that: the vocabulary is gone, but the **escape hatch is not**
+            — an absolute-path selector resolves without touching the registry —
+            and the shared body was naming ``mitos init`` to an agent, which is
+            the one thing this surface may not do. So it is caught and re-rendered
+            here, in the same shape as the targeting class.
         ConfigError: If the *resolved* workspace's ``config.toml`` is malformed.
             Resolution proves a workspace's shape, not that its config parses —
             a malformed config must be resolvable-then-diagnosed. No carve-out
@@ -456,6 +521,13 @@ def _target_config(project: Optional[str], tool: str) -> MitosConfig:
         target = routing.resolve_project(project)
     except ProjectTargetingError as err:
         raise _RenderedToolError(_render_targeting_error(err, tool)) from err
+    except RegistryError as err:
+        # Caught for its WORDING, not for its severity: the fault is real and the
+        # call still fails. `resolve_project` reads the registry on every call
+        # since the fallback went, so this is the whole MCP surface's answer to a
+        # corrupt routing map — and the one place the shared body's `mitos init`
+        # reached an agent.
+        raise _RenderedToolError(_render_registry_error(err)) from err
     # `project=` carries the caller's own vocabulary onto the config so every
     # answer below can echo the target back. `target.name` is already the
     # registered name for both selector forms and `None` for an unregistered
@@ -951,7 +1023,8 @@ def show_node(ident: str, project: Optional[str] = None) -> str:
         `superseded_by`, an amended one its `amended_by`/`narrowed_by` — so a
         moved-on node never reads as the final word. A genuinely-absent handle
         returns `{found: false, ident, hint}` (never an error), the hint pointing
-        at `mitos sync` for an authored-but-unsynced draft. Both shapes carry the
+        at `list_decisions`/`query_decisions` for a mistyped handle and naming an
+        unsynced draft as the other possibility. Both shapes carry the
         trailing `project`/`collection`/`workspace` provenance — most valuable on
         the absent one, which is otherwise ambiguous between "no such handle
         here" and "you are asking the wrong project".
@@ -968,7 +1041,8 @@ def show_node(ident: str, project: Optional[str] = None) -> str:
         # Stamped too, and it is the more valuable half: "not found" is exactly
         # the answer that is ambiguous between a missing handle and a mis-aimed
         # call. Provenance last, on both branches, so the CLI twin's dict stays
-        # equal key-for-key.
+        # equal KEY for key — the shape is still shared; since 6c only the `hint`
+        # VALUE differs, because this surface may name no shell command.
         missing = {"found": False, "ident": ident, "hint": SHOW_NOT_FOUND_HINT}
         missing.update(corpus_provenance(config))
         return dumps_display(missing, ensure_ascii=False, indent=2)
@@ -1313,8 +1387,18 @@ def list_projects() -> str:
         the file the registrations live in, and is reported whether or not that
         file exists yet.
     """
+    # The one tool that reads the registry OUTSIDE `_target_config` — it takes no
+    # `project`, so it never resolves one. Rendered through the same renderer as
+    # every other tool rather than propagating raw: a second wording for one cause
+    # is the drift the two-renderer split exists to prevent, and the escape hatch is
+    # this tool's most useful answer of all — a caller who came here for vocabulary
+    # learns it can keep working without any.
+    try:
+        registered = registry.load()
+    except RegistryError as err:
+        raise _RenderedToolError(_render_registry_error(err)) from err
     return dumps_display(
-        projects_payload(registry.load(), registry.registry_path()),
+        projects_payload(registered, registry.registry_path()),
         ensure_ascii=False,
         indent=2,
     )

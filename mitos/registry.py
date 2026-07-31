@@ -81,6 +81,19 @@ def load() -> Dict[str, str]:
     resolves its first match in, so a human reading the list sees the order that
     actually decides.
 
+    Every message here is the **located cause and nothing more** — which file,
+    what is wrong with it, and the hand-edit the file's own design invites. It
+    names no ``mitos`` command, and that is a rule rather than a wording taste:
+    since the working-directory fallback went, ``mcp_server._target_config``
+    reaches this function on **every** MCP tool call, so a body naming ``mitos
+    init`` would hand an autonomous agent a state-creating shell command as the
+    advertised fix (``agent-error-surface-never-prescribes-state-creating-setup``,
+    widened past its original targeting-only scope in 6c). The recovery *clause*
+    is each boundary's — ``cli.main()`` composes the human's, which may name
+    ``mitos init``; ``mcp_server._render_registry_error`` composes the agent's,
+    which names the absolute-path escape hatch instead. This leaf stays Tier 1 and
+    carries no surface syntax, exactly as ``ProjectTargetingError`` does.
+
     Returns:
         The registered ``name → absolute path`` pairs, in the order they appear in
         the file. An **absent** registry (or an absent config directory) returns
@@ -101,13 +114,15 @@ def load() -> Dict[str, str]:
     except OSError as e:
         raise RegistryError(
             f"cannot read the Mitos project registry at {path}: {e}. "
-            f"Fix its permissions or remove the file — `mitos init` re-registers "
-            f"a project."
+            f"Fix its permissions, or remove the file — an absent registry is "
+            f"healthy.",
+            file_unusable=True,
         ) from e
     except UnicodeDecodeError as e:
         raise RegistryError(
             f"the Mitos project registry at {path} is not valid UTF-8 text: {e}. "
-            f"Fix or remove {path}."
+            f"Fix or remove {path}.",
+            file_unusable=True,
         ) from e
 
     try:
@@ -118,8 +133,8 @@ def load() -> Dict[str, str]:
         # silently keeping one of the two.
         raise RegistryError(
             f"the Mitos project registry at {path} is not valid TOML: {e}. "
-            f"Fix or remove {path} — an absent registry is healthy, and "
-            f"`mitos init` re-registers a project."
+            f"Fix or remove {path} — an absent registry is healthy.",
+            file_unusable=True,
         ) from e
 
     for name, value in data.items():
@@ -129,7 +144,8 @@ def load() -> Dict[str, str]:
                 f"{type(value).__name__}, not a workspace path string. The "
                 f"registry is a flat name-to-path map; a name containing dots "
                 f"must be quoted (`\"example.com\" = \"/path/to/it\"`) or TOML "
-                f"reads it as a nested table. Fix or remove {path}."
+                f"reads it as a nested table. Fix or remove {path}.",
+                file_unusable=True,
             )
         # The schema is `name → ABSOLUTE path`, and this is where it is enforced —
         # one gate for every reader, on a pure string test that keeps the leaf's
@@ -144,7 +160,8 @@ def load() -> Dict[str, str]:
             raise RegistryError(
                 f"registry entry {name!r} in {path} holds {value!r}, which is not "
                 f"an absolute path. The registry stores absolute paths — write it "
-                f"out in full (`~` is not expanded). Fix or remove {path}."
+                f"out in full (`~` is not expanded). Fix or remove {path}.",
+                file_unusable=True,
             )
     return data
 

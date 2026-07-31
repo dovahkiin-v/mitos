@@ -90,3 +90,7 @@ tests/golden/.cache/
 decisions.md
 decisions/
 live_axioms.md
+# questions.md is decisions.md's twin gold-source buffer and belongs to the same
+# corpus. It is absent today only because this workspace has authored no open
+# question; without this line the first one would land in a public repo.
+questions.md
