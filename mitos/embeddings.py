@@ -86,7 +86,7 @@ class GeminiEmbeddingProvider:
         self,
         cache_path: str,
         *,
-        api_key: Optional[str] = None,
+        api_key: Optional[str],
         model_id: Optional[str] = None,
     ) -> None:
         """Builds the provider for one workspace's key and embedding model.

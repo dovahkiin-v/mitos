@@ -359,18 +359,21 @@ def test_to_dict_carries_full_surface() -> None:
 def test_project_is_never_empty_across_every_construction_form() -> None:
     """The echo's never-empty rule is a property of CONSTRUCTION, not of call sites.
 
-    Four forms, because each is a construction the code can perform: the zero-arg
-    form (no *surface* reaches it since 5b removed the last fallback, but the
-    constructor still defines it and 5d is what removes the default), a bare
+    Three forms, because each is a construction the code can still perform: a bare
     workspace root, an explicit ``project=None`` (what the two resolution sites
     pass for an *unregistered* path — `ResolvedProject.name` is `None` there),
-    and a registered name. Only the last carries a name; the other three
+    and a registered name. Only the last carries a name; the other two
     fall back to the canonical workspace path, which is what makes an echo defined
     for every selector form without a branch at any consumer.
+
+    There were four until 5d, when removing the constructor's ``"."`` default made
+    the zero-argument form unconstructible. Its claim was not dropped: it is
+    inverted into a ``TypeError`` row in
+    ``tests/test_workspace_root_discipline.py``, which is where the whole
+    no-cwd-default property now lives.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         forms = {
-            "zero-arg": MitosConfig(),
             "path only": MitosConfig(tmpdir),
             "explicit None": MitosConfig(tmpdir, project=None),
             "named": MitosConfig(tmpdir, project="a-registered-name"),
@@ -380,7 +383,6 @@ def test_project_is_never_empty_across_every_construction_form() -> None:
 
         assert forms["path only"].project == forms["path only"].workspace_dir
         assert forms["explicit None"].project == forms["explicit None"].workspace_dir
-        assert forms["zero-arg"].project == os.path.abspath(os.getcwd())
         assert forms["named"].project == "a-registered-name"
 
 

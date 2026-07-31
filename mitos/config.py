@@ -466,7 +466,7 @@ def default_collection_name(workspace_dir: str) -> str:
 class MitosConfig:
     """Represents the configuration state for the active Mitos workspace."""
 
-    def __init__(self, workspace_dir: str = ".", *, project: Optional[str] = None) -> None:
+    def __init__(self, workspace_dir: str, *, project: Optional[str] = None) -> None:
         self.workspace_dir = os.path.abspath(workspace_dir)
         self.mitos_dir = os.path.join(self.workspace_dir, ".mitos")
 

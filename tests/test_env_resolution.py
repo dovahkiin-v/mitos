@@ -578,15 +578,17 @@ def test_the_mcp_server_builds_its_store_on_the_targets_url(tmp_path, monkeypatc
     It takes the workspace config as an argument (phase 3c), so the cwd read that
     used to live inside it now lives at the call site — which is what leaves this
     row proving what it always proved: the URL of the workspace *given* is the URL
-    the vector store is built on. The ``chdir`` stays for exactly that reason, and
-    ``monkeypatch`` restores it; the zero-argument ``MitosConfig()`` here is now
-    the *caller's* choice of target, not the callee's assumption about one.
+    the vector store is built on. Phase 5d removed the constructor's ``"."``
+    default, so the target is named outright and the ``chdir`` that used to supply
+    it is gone; a callee reading the working directory instead of the config would
+    resolve pytest's cwd (the repo — a real workspace) and this assertion would
+    still red.
     """
     monkeypatch.setenv("GEMINI_API_KEY", "testkey")
     from mitos import mcp_server
 
-    monkeypatch.chdir(_workspace_with_url(tmp_path))
-    _, _, vector_store = mcp_server.get_workspace_components(MitosConfig())
+    ws = _workspace_with_url(tmp_path)
+    _, _, vector_store = mcp_server.get_workspace_components(MitosConfig(ws))
     assert vector_store is not None
     assert vector_store.base_url == "http://from-target:7333"
 

@@ -284,21 +284,24 @@ def test_the_check_substrate_builds_its_provider_on_the_targets_key(
 
 
 def test_the_mcp_server_builds_its_provider_on_the_targets_key(
-    tmp_path, monkeypatch, genai_keys
+    tmp_path, genai_keys
 ):
     """W19 at `mcp_server.get_workspace_components`.
 
     It takes the workspace config as an argument (phase 3c), so the cwd read that
     used to live inside it now lives at the call site — which is what leaves this
     row proving what it always proved: the key of the workspace *given* is the key
-    the provider is built on. The ``chdir`` stays for exactly that reason; the
-    zero-argument ``MitosConfig()`` is now the caller's choice of target, not the
-    callee's assumption about one.
+    the provider is built on. Phase 5d removed the constructor's ``"."`` default,
+    so the target is named outright and the ``chdir`` that used to supply it is
+    gone. The row keeps its bite: pytest's cwd is the repo, itself a valid
+    workspace carrying a real ``GEMINI_API_KEY``, so a callee that read the working
+    directory instead of the config would resolve *that* key and this assertion
+    would still red.
     """
     from mitos import mcp_server
 
-    monkeypatch.chdir(_workspace(tmp_path, env_text=SENTINEL_ENV))
-    _, embed_provider, _ = mcp_server.get_workspace_components(MitosConfig())
+    ws = _workspace(tmp_path, env_text=SENTINEL_ENV)
+    _, embed_provider, _ = mcp_server.get_workspace_components(MitosConfig(ws))
 
     assert embed_provider is not None
     assert genai_keys == ["from-the-target"]
@@ -711,11 +714,20 @@ class TestTheKeylessPostureWhereTheFallbackUsedToAnswer:
         ``genai_keys`` is asserted **empty** rather than merely unused: the
         refusal has to happen before a client is constructed, so an edit that
         built the client first and validated after cannot pass this row.
+
+        ``api_key=None`` is spelled out because 5d made the keyword required; the
+        claim is unchanged, because ``None`` was always a *supplied* answer and
+        takes the same refusal branch the absent default used to. What 5d closed
+        is the neighbouring case — a call site that forgot the keyword entirely —
+        and that one is a ``TypeError``, pinned in
+        ``tests/test_workspace_root_discipline.py``.
         """
         monkeypatch.setenv("GEMINI_API_KEY", "from-the-process")
 
         with pytest.raises(EmbeddingError):
-            embeddings.GeminiEmbeddingProvider(str(tmp_path / "cache.sqlite"))
+            embeddings.GeminiEmbeddingProvider(
+                str(tmp_path / "cache.sqlite"), api_key=None
+            )
 
         assert genai_keys == []
 
@@ -1086,23 +1098,27 @@ def test_a_cross_directory_mcp_call_resolves_the_targets_key(
     """I7 on the MCP surface, in-process.
 
     ``get_workspace_components`` takes the workspace config as an argument (phase
-    3c), so the cross-directory move this row makes is now made at the call site:
-    it still walks A → B, and still asserts that B's key — not A's — is the one
-    the provider was built on. Kept on ``chdir`` rather than rewritten to two
-    explicit configs, because the hazard it watches is precisely a *stale* target
-    surviving a move. The **real `mitos serve` subprocess** row is 5c's, on 3a's
-    harness — an in-process approximation cannot observe the entry path or
-    process-owned env, which is exactly where I6's hazards live, so it is
-    deliberately not attempted here.
+    3c), so the cross-directory claim this row makes is made at the call site: the
+    process sits in A, the config names B, and B's key — not A's — is the one the
+    provider was built on. The ``chdir`` stays because *this* row's subject is the
+    directory move itself, unlike W19's above, whose subject is the config given
+    and which dropped its ``chdir`` with 5d's constructor default. What a *stale*
+    target surviving a move looks like at the process level is no longer askable
+    here at all — there is no cwd-derived target left to go stale — and the
+    process-level version of that hazard is 5c's **real `mitos serve` subprocess**
+    row on 3a's harness
+    (``test_one_session_answers_from_the_graph_file_on_disk_at_each_call``); an
+    in-process approximation cannot observe the entry path or process-owned env,
+    which is exactly where I6's hazards live, so it is deliberately not attempted
+    here.
     """
     from mitos import mcp_server
 
     a = _workspace(tmp_path, "a", "GEMINI_API_KEY=key-of-a\n")
     b = _workspace(tmp_path, "b", "GEMINI_API_KEY=key-of-b\n")
     monkeypatch.chdir(a)
-    monkeypatch.chdir(b)
 
-    _, embed_provider, _ = mcp_server.get_workspace_components(MitosConfig())
+    _, embed_provider, _ = mcp_server.get_workspace_components(MitosConfig(b))
 
     assert embed_provider is not None
     assert genai_keys == ["key-of-b"]
