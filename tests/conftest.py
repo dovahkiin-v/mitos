@@ -161,8 +161,18 @@ def workspace(tmp_path) -> str:
     return make_workspace(tmp_path / "ws")
 
 
+#: The credential names ``hermetic_mitos_env`` strips from every non-live test.
+#: Deliberately the three LLM keys and nothing wider: ``QDRANT_URL`` stays,
+#: because tests target the local instance through it, and the modules that need
+#: a broader strip (``RESOLVED_ENV_KEYS``, ``QDRANT_URL``) keep their own
+#: ``_keyless`` fixtures on top of this baseline.
+_CREDENTIAL_NAMES: tuple[str, ...] = (
+    "GEMINI_API_KEY", "GOOGLE_API_KEY", "ANTHROPIC_API_KEY",
+)
+
+
 @pytest.fixture(autouse=True)
-def hermetic_mitos_env(monkeypatch, tmp_path):
+def hermetic_mitos_env(request, monkeypatch, tmp_path):
     """Isolates per-test config/cache and silences the CLI's network side-effects.
 
     Only one quiet-switch is left: the update check. ``MITOS_NO_MCP_HINT`` was the
@@ -170,10 +180,28 @@ def hermetic_mitos_env(monkeypatch, tmp_path):
     nudge advised toward a project-scope ``.mcp.json`` entry, which now *shadows*
     the machine-wide registration rather than complementing it. There is no
     remaining stderr nag for a test to suppress.
+
+    Non-live tests also start with the three LLM credential names stripped, so a
+    keyed dev box proves what keyless CI proves. The fixture used to leave the
+    credentials alone, and that gap held CI red for four days (2026-07-31→08-04):
+    ``test_importer``'s LLM tests read the key off ``config.env`` after 5c, the
+    dev box's real key leaked in through tier 1 and kept them green locally, and
+    only the keyless CI runner saw the failure. The strip is per-test and
+    reversible (monkeypatch), so the import-time ``.env`` loaders in the live-ish
+    modules and any row that ``setenv``s its own value are unaffected — each test
+    simply starts from the CI posture instead of the box's.
+
+    ``LIVE_MODULES`` (below) are exempt: real calls with real keys are their
+    entire point, and their floor machinery already accounts for the keyless
+    state honestly. ``test_adversarial_invariants.py`` needs no exemption — its
+    workspace fixture re-loads the repo ``.env`` into ``os.environ`` per test.
     """
     monkeypatch.setenv("MITOS_NO_UPDATE_CHECK", "1")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg_config"))
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg_cache"))
+    if request.node.path.name not in LIVE_MODULES:
+        for name in _CREDENTIAL_NAMES:
+            monkeypatch.delenv(name, raising=False)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -232,7 +260,9 @@ _ENV_SKIP_MARKER = "not a code defect"
 #: Test modules that make real Anthropic/Gemini calls. Held in sync with the set
 #: consulting ``live_helpers.live_tests_disabled`` by the meta-test in
 #: tests/test_live_floor.py — a new live module that skips registration fails there,
-#: rather than quietly falling outside the floor.
+#: rather than quietly falling outside the floor. Second consumer:
+#: ``hermetic_mitos_env`` exempts these modules from its credential strip, so a
+#: module missing from here also runs keyless — loudly, via its own env-skips.
 LIVE_MODULES: tuple[str, ...] = (
     "test_conflict_eval_live.py",
     "test_retrieval_live.py",

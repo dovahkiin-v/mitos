@@ -15,13 +15,14 @@ lookup, and a mocked one proves nothing about either.
 **The module-autouse key strip is load-bearing, not hygiene.** Six test modules
 write the repo's real ``.env`` into ``os.environ`` at *import* time — and two of
 them are not ``*_live.py`` (``test_check_hook_recipe.py``,
-``test_adversarial_invariants.py``, the second an unconditional overwrite). So in
-any full-suite run ``GEMINI_API_KEY``/``ANTHROPIC_API_KEY`` are present for every
-test collected after them, regardless of the shell and regardless of
-``MITOS_NO_LIVE_TESTS``. A tier-2/tier-3 row that assumed the key was absent
-would pass alone and red in collection order — the order-dependent mock-seam-leak
-class. ``_keyless`` below is ``test_v1a_closeout.py``'s shipped shape; each row
-opts *in* to the tier it means.
+``test_adversarial_invariants.py``, the second an unconditional overwrite).
+Conftest's ``hermetic_mitos_env`` now strips the three LLM credential names from
+every non-live test (the importer CI-red incident, 2026-08), so those import-time
+writes no longer reach a test body — but it strips only the credentials.
+``_keyless`` below stays for the wider set this module resolves (``QDRANT_URL``
+plus every ``RESOLVED_ENV_KEYS`` name) and for ``_unset``'s guaranteed-teardown
+semantics, which the rows that raw-write a name depend on. Each row still opts
+*in* to the tier it means.
 
 Consequently: assert on **specific keys**, never on a whole-dict equality that
 could print a live credential into a pytest report (and, on a ``vision/**`` push,
@@ -83,8 +84,10 @@ def _keyless(monkeypatch) -> None:
 
     ``hermetic_mitos_env`` (conftest, autouse) redirects the XDG dirs — so
     ``global_env_path()`` already lands inside ``tmp_path`` and tier 3 is empty by
-    default — but it deliberately leaves the credential names alone, and this box
-    has both a repo ``.env`` and a global one.
+    default — and since the importer CI-red incident it also strips the three LLM
+    credential names. This module resolves more names than that (``QDRANT_URL``,
+    the whole of ``RESOLVED_ENV_KEYS``), and its rows raw-write names that need
+    ``_unset``'s guaranteed teardown, so the module-level strip stays.
 
     (``NEW`` used to ride here too — the third key group 5's entry-load row
     wrote. That row went with the mechanism in 5c; no row writes the name now.)

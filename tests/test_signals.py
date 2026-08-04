@@ -237,13 +237,12 @@ def _seed_reenc(manager: MitosSyncManager, source: str) -> str:
 def test_sync_cross_source_reencounter_emits_one_signal(
     mock_client: MagicMock,
     sync_env: Tuple[MitosConfig, MitosSyncManager, str],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """DoD #1 primary: re-sync the identical entry from a DIFFERENT source → exactly
     one ``source_reencounter`` row carrying the new source; node source stays first-seen."""
     config, manager, _ = sync_env
     _set_enrichment_passthrough(mock_client)
-    monkeypatch.setenv("GEMINI_API_KEY", "mock_key")
+    config.env["GEMINI_API_KEY"] = "mock_key"
 
     nid = _seed_reenc(manager, source="user")
     _append(config, _reenc_entry("import_llm"))
@@ -259,13 +258,12 @@ def test_sync_cross_source_reencounter_emits_one_signal(
 def test_sync_same_source_reencounter_is_clean_noop(
     mock_client: MagicMock,
     sync_env: Tuple[MitosConfig, MitosSyncManager, str],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """DoD #1 second half: re-sync the identical entry with the SAME source (omitted
     ``**Source:**`` defaults to ``user``) → zero rows."""
     config, manager, _ = sync_env
     _set_enrichment_passthrough(mock_client)
-    monkeypatch.setenv("GEMINI_API_KEY", "mock_key")
+    config.env["GEMINI_API_KEY"] = "mock_key"
 
     nid = _seed_reenc(manager, source="user")
     _append(config, _reenc_entry(None))  # no Source line → "user"
@@ -278,13 +276,12 @@ def test_sync_same_source_reencounter_is_clean_noop(
 def test_sync_reencounter_is_pk_idempotent_across_resyncs(
     mock_client: MagicMock,
     sync_env: Tuple[MitosConfig, MitosSyncManager, str],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Re-syncing the differing-source entry TWICE (re-appended after the first
     rotates it out) still yields exactly one row (composite-PK INSERT OR IGNORE)."""
     config, manager, _ = sync_env
     _set_enrichment_passthrough(mock_client)
-    monkeypatch.setenv("GEMINI_API_KEY", "mock_key")
+    config.env["GEMINI_API_KEY"] = "mock_key"
 
     nid = _seed_reenc(manager, source="user")
     _append(config, _reenc_entry("import_llm"))

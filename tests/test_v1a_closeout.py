@@ -14,9 +14,12 @@ proof of one acceptance scenario against V1a's surface, mapped to a contract row
 **Keyless is non-negotiable (G1).** The DoD CI gate (``ci.yml``) runs with no
 secrets and no Qdrant — so every test here must run green *without*
 ``GEMINI_API_KEY``/``ANTHROPIC_API_KEY`` or the gate silently proves nothing
-(the OD1 silent-skip the vision forbids). This dev box carries a global ``.env``
-(``hermetic_mitos_env`` does NOT unset the keys — scout W1), so the ``_keyless``
-autouse fixture below strips them: with no Gemini key the
+(the OD1 silent-skip the vision forbids). This dev box carries a global ``.env``;
+``hermetic_mitos_env`` strips the LLM credential names for every non-live test
+(since the importer CI-red incident — it did not at scout W1, which is why this
+module grew its own strip), and the ``_keyless`` autouse fixture below keeps the
+local statement AND adds ``QDRANT_URL``, which conftest leaves alone: with no
+Gemini key the
 ``GeminiEmbeddingProvider`` raises at construction, the manager degrades to
 graph-only, and ``record_decision_entry`` commits the graph with a best-effort
 embed that is a pure no-op — byte-for-byte the CI posture, deterministic
@@ -58,10 +61,10 @@ from mitos.sync import MitosSyncManager
 def _keyless(monkeypatch) -> None:
     """Strips live API keys so the dev box matches the keyless CI gate (G1/W1).
 
-    ``hermetic_mitos_env`` (conftest, autouse) redirects the XDG dirs but leaves
-    ``GEMINI_API_KEY``/``QDRANT_URL`` alone, and this box has a global ``.env`` —
-    so without this the "keyless" DoD tests would make real embedding calls
-    (slow, quota-flaky, non-deterministic). Unsetting the keys makes
+    ``hermetic_mitos_env`` (conftest, autouse) now strips the LLM credential
+    names too, but it leaves ``QDRANT_URL`` alone — and a keyless-but-Qdrant-
+    reachable run is not the CI posture, so this fixture keeps the full local
+    statement rather than relying on the baseline minus one name. Unsetting makes
     ``GeminiEmbeddingProvider`` raise at construction → the manager boots in
     graph-only mode → the best-effort embed is a no-op and ``_review_neighbors``
     returns ``[]`` (offline-safe, no pause). The CI posture, deterministically.

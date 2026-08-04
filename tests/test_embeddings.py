@@ -39,13 +39,10 @@ def test_embedding_cache_get_set(temp_cache_path: str) -> None:
 @patch("google.genai.Client")
 def test_embedding_provider_observability(mock_client: MagicMock, temp_cache_path: str) -> None:
     """Tests asymmetric prefixing, cache hits/misses, and API client fallback."""
-    # The raw `os.environ` write is deliberately LEFT: it holds ~113 rows in
-    # other modules green through collection order (5c §7.2), and removing it
-    # would convert a documented standing fragility into this phase's
-    # regression. The key the provider uses is the explicit one below — since 5c
-    # the provider consults no environment at all.
-    os.environ["GEMINI_API_KEY"] = "mock_key"
-
+    # No env write: conftest's credential strip retired the collection-order
+    # leak this row once fed (the ~113-row crutch of 5c §7.2) — since 5c the
+    # provider consults no environment at all, the explicit key below is the one
+    # it uses.
     provider = GeminiEmbeddingProvider(temp_cache_path, api_key="mock_key")
     # No `model_id=`: this asserts the leaf's own baseline fallback, which is the
     # `model_id is None` branch and stays live (UNROUTED_MODEL_RESOLVES).
@@ -86,7 +83,6 @@ def test_embedding_provider_observability(mock_client: MagicMock, temp_cache_pat
 @patch("google.genai.Client")
 def test_embeddings_batch_token_aware(mock_client: MagicMock, temp_cache_path: str) -> None:
     """Tests that get_embeddings_batch executes bulk requests and utilizes cache correctly."""
-    os.environ["GEMINI_API_KEY"] = "mock_key"  # left in place — see the row above
     provider = GeminiEmbeddingProvider(temp_cache_path, api_key="mock_key")
 
     # Mock embed API response for batch of 2

@@ -67,7 +67,7 @@ def test_sync_happy_path(mock_client: MagicMock, sync_env: Tuple[MitosConfig, Mi
     #    (The google.genai.Client patch + mock key below only satisfy the key/embed gate.)
 
     # Set up environment variables to satisfy provider check
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
 
     # 3. Perform sync in auto-accept mode
     manager.perform_sync(auto_accept=True)
@@ -130,7 +130,7 @@ def test_sync_stale_entry_detection(mock_client: MagicMock, sync_env: Tuple[Mito
         "suggested_relationships": {}
     })
     mock_client.return_value.models.generate_content.return_value = mock_gen_resp
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
 
     manager.perform_sync(auto_accept=True)
 
@@ -150,7 +150,7 @@ def test_sync_slug_collision_correction(mock_input: MagicMock, mock_client: Magi
     """
     config, manager, tmpdir = sync_env
     store = GraphStore(config.db_path)
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
 
     # 1. Seed an existing active decision in the graph
     entry1 = ParsedEntry("decision", "database", 1, 10)
@@ -223,7 +223,7 @@ def test_sync_undeclared_slug_collision_is_skipped_under_auto_accept(
     """
     config, manager, tmpdir = sync_env
     store = GraphStore(config.db_path)
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
 
     _seed_active_decision(store, "database", "We use PostgreSQL.")
 
@@ -261,7 +261,7 @@ def test_sync_declared_same_slug_supersession_commits_under_auto_accept(
     """
     config, manager, tmpdir = sync_env
     store = GraphStore(config.db_path)
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
 
     original_id = _seed_active_decision(store, "database", "We use PostgreSQL.")
 
@@ -293,7 +293,7 @@ def test_sync_outbox_queue_and_drain(mock_client: MagicMock, sync_env: Tuple[Mit
     """Verifies that failed embeddings enter pending_embeddings queue and drain on recovery (C2)."""
     config, manager, tmpdir = sync_env
     store = GraphStore(config.db_path)
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
 
     # Inject mock embedding deps so the test is hermetic: the manager is built by the
     # fixture before any mocking, so without a reachable Qdrant/GEMINI key (e.g. in CI)
@@ -560,7 +560,7 @@ def test_sync_ingests_questions_md_and_commits_derives_from(
     from it.
     """
     config, manager, tmpdir = sync_env
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
     _set_enrichment_passthrough(mock_client)
 
     _append_decision(config, _HOST_DECISION)
@@ -597,7 +597,7 @@ def test_sync_missing_questions_md_is_healthy(
 ) -> None:
     """An absent questions.md is healthy-empty: no FileNotFoundError, decisions commit."""
     config, manager, tmpdir = sync_env
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
     _set_enrichment_passthrough(mock_client)
 
     assert not os.path.exists(os.path.join(tmpdir, "questions.md"))
@@ -624,7 +624,7 @@ def test_sync_questions_md_file_level_error_bulkheads_from_decisions(
     (an OSError) — a deterministic file-level failure that is isolated to OQ ingestion.
     """
     config, manager, tmpdir = sync_env
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
     _set_enrichment_passthrough(mock_client)
 
     # A directory at the questions.md path: exists() is True, but shutil.copy raises.
@@ -656,7 +656,7 @@ def test_sync_questions_md_undecodable_bytes_bulkheads_from_decisions(
     WHOLE sync (decisions included) — the exact cross-buffer contamination D4 forbids.
     """
     config, manager, tmpdir = sync_env
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
     _set_enrichment_passthrough(mock_client)
 
     # Invalid UTF-8 bytes in questions.md (copies fine as binary, fails utf-8 parse).
@@ -683,7 +683,7 @@ def test_sync_malformed_decision_entry_does_not_strand_oq(
     """Symmetric bulkhead: a malformed DECISION entry is per-entry isolated, and OQ
     ingestion still proceeds (a defect in one buffer never strands the other)."""
     config, manager, tmpdir = sync_env
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
     _set_enrichment_passthrough(mock_client)
 
     # A decision missing the required **Rejected:** field (M5) → collector-isolated.
@@ -725,7 +725,7 @@ def test_sync_single_forward_ref_converges_in_one_sync(
     guiding-vector coverage moved to test_sync_unauthored_target_residual_guiding_vector.)
     """
     config, manager, tmpdir = sync_env
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
     _set_enrichment_passthrough(mock_client)
 
     _append_decision(
@@ -779,7 +779,7 @@ def test_sync_deep_acyclic_chain_converges_in_one_sync(
     retry passes. All four nodes and all three edges land in a single sync.
     """
     config, manager, tmpdir = sync_env
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
     _set_enrichment_passthrough(mock_client)
 
     # Decisions, authored newest-first (the buffer convention): d1 (newer) on top.
@@ -839,7 +839,7 @@ def test_sync_fixpoint_is_load_bearing_for_deep_chain(
     a second sync. This is the RED-without-4b proof the floor-only behaviour leaves.
     """
     config, manager, tmpdir = sync_env
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
     _set_enrichment_passthrough(mock_client)
 
     _append_decision(
@@ -895,7 +895,7 @@ def test_sync_true_cycle_surfaces_loud_and_returns(
     return); P7 holds — no exception escapes perform_sync.
     """
     config, manager, tmpdir = sync_env
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
     _set_enrichment_passthrough(mock_client)
 
     _append_decision(
@@ -946,7 +946,7 @@ def test_sync_unauthored_target_residual_guiding_vector(
     next-sync commit.
     """
     config, manager, tmpdir = sync_env
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
     _set_enrichment_passthrough(mock_client)
 
     _append_decision(
@@ -991,7 +991,7 @@ def test_sync_quarantine_isolates_whole_commit_error_class(
     survivor-OQ does, the code string still prints).
     """
     config, manager, tmpdir = sync_env
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
     _set_enrichment_passthrough(mock_client)
 
     # Seed an existing DECISION target so the offending edge is a kind violation
@@ -1036,7 +1036,7 @@ def test_sync_open_questions_never_rotate(
     """OQ does not rotate (D5): questions.md is byte-unchanged after sync, no archive
     carries the OQ, while the decision rotates normally."""
     config, manager, tmpdir = sync_env
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
     _set_enrichment_passthrough(mock_client)
 
     _append_decision(config, _HOST_DECISION)
@@ -1075,7 +1075,7 @@ def test_sync_decisions_oldest_first_amend_commits_in_one_sync(
     older in-buffer entry commits in ONE sync — the reversal lands the older entry
     first, so the amend resolves its target on the first pass."""
     config, manager, tmpdir = sync_env
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
     _set_enrichment_passthrough(mock_client)
 
     # Authored newest-first (the buffer convention): newer on top, older below.
@@ -1128,7 +1128,7 @@ def test_sync_confirmed_at_is_utc_with_offset(
     the live corpus was a naive local-time string sitting beside an offset-aware one.
     """
     config, manager, tmpdir = sync_env
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
 
     with open(config.decisions_file, "a", encoding="utf-8") as f:
         f.write(
@@ -1190,7 +1190,7 @@ def test_undeclared_collision_is_skipped_interactively_too(
     """
     config, manager, tmpdir = sync_env
     store = GraphStore(config.db_path)
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
 
     original_id = _seed_active_decision(store, "database", "We use PostgreSQL.")
 
@@ -1229,7 +1229,7 @@ def test_collision_resyncs_cleanly_once_the_author_declares_the_relation(
     """
     config, manager, tmpdir = sync_env
     store = GraphStore(config.db_path)
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
 
     original_id = _seed_active_decision(store, "database", "We use PostgreSQL.")
 
@@ -1279,7 +1279,7 @@ def test_collision_never_discards_a_kill_edge_authored_at_another_slug(
     """
     config, manager, tmpdir = sync_env
     store = GraphStore(config.db_path)
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
 
     _seed_active_decision(store, "database", "We use PostgreSQL.")
     legacy_id = _seed_active_decision(store, "legacy-store", "We use a flat file.")
@@ -1366,7 +1366,7 @@ def test_a_clean_corpus_resync_is_byte_identical_behaviour(
     re-commit, which MI-3 requires.
     """
     config, manager, tmpdir = sync_env
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
     store = _seed_committed_buffer(config, manager)
     before = store.get_all_nodes()[0]
 
@@ -1383,7 +1383,7 @@ def test_a_commentary_edit_is_reconciled_under_auto_accept(
 ) -> None:
     """The brief's flagship case: a corrected `rejected_paths` reaches the graph."""
     config, manager, tmpdir = sync_env
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
     store = _seed_committed_buffer(config, manager)
     node_before = store.get_all_nodes()[0]
 
@@ -1402,7 +1402,7 @@ def test_a_scope_edit_is_reconciled(
 ) -> None:
     """Scope is the species with real-use evidence — a findability defect, now repairable."""
     config, manager, tmpdir = sync_env
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
     _seed_committed_buffer(config, manager)
 
     _edit_buffer(config, "**Scope:** alpha", "**Scope:** alpha, beta")
@@ -1424,7 +1424,7 @@ def test_the_reconcile_carries_stored_confirmation_provenance_forward(
     113 `agent` plus one model — on a change that touched only prose.
     """
     config, manager, tmpdir = sync_env
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
     store = _seed_committed_buffer(config, manager)
     node_id = store.get_all_nodes()[0]["id"]
     with store._get_connection() as conn:
@@ -1453,7 +1453,7 @@ def test_the_reconcile_does_not_rotate_the_entry(
     reconcile that rotated would quietly re-create the disease it cures.
     """
     config, manager, tmpdir = sync_env
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
     manager.config.pending_threshold = 1
     _seed_committed_buffer(config, manager)
 
@@ -1478,7 +1478,7 @@ def test_an_edge_deletion_is_skipped_under_auto_accept_and_reported(
     right call and it must be stated, not discovered.
     """
     config, manager, tmpdir = sync_env
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
     store = GraphStore(config.db_path)
     _seed_active_decision(store, "predecessor", "The earlier axiom.")
 
@@ -1506,7 +1506,7 @@ def test_an_edge_addition_applies_under_auto_accept(
 ) -> None:
     """Additions apply, deletions do not — an asymmetry, matching `record --yes`."""
     config, manager, tmpdir = sync_env
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
     store = GraphStore(config.db_path)
     _seed_active_decision(store, "predecessor", "The earlier axiom.")
     _seed_committed_buffer(config, manager)
@@ -1528,7 +1528,7 @@ def test_an_interactive_skip_leaves_the_graph_untouched(
 ) -> None:
     """The reconcile has its OWN prompt verb, so answering `[s]kip` changes nothing."""
     config, manager, tmpdir = sync_env
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
     _seed_committed_buffer(config, manager)
 
     _edit_buffer(config, "The original rejected reasoning.", "The CORRECTED reasoning.")
@@ -1547,7 +1547,7 @@ def test_an_interactive_reconcile_deletes_exactly_the_dropped_edge(
 ) -> None:
     """Interactively, a deletion IS applied — the author saw it named and said yes."""
     config, manager, tmpdir = sync_env
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
     store = GraphStore(config.db_path)
     _seed_active_decision(store, "predecessor", "The earlier axiom.")
     _seed_committed_buffer(config, manager, amends="predecessor")
@@ -1571,7 +1571,7 @@ def test_the_reconcile_writes_a_write_ahead_audit_row(
     from mitos.telemetry import TelemetryStore
 
     config, manager, tmpdir = sync_env
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
     _seed_committed_buffer(config, manager)
 
     _edit_buffer(config, "The original rejected reasoning.", "The CORRECTED reasoning.")
@@ -1600,7 +1600,7 @@ def test_an_unavailable_audit_store_refuses_the_reconcile(
     cooperates. This is the sharpest way the design fails in practice if left unstated.
     """
     config, manager, tmpdir = sync_env
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
     _seed_committed_buffer(config, manager)
     _edit_buffer(config, "The original rejected reasoning.", "The CORRECTED reasoning.")
 
@@ -1639,7 +1639,7 @@ def test_a_reconcile_never_carries_a_transcript_rewrite_along(
     from mitos.telemetry import TelemetryStore
 
     config, manager, tmpdir = sync_env
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
     _seed_committed_buffer(config, manager)
 
     _edit_buffer(config, "**Scope:** alpha",
@@ -1680,7 +1680,7 @@ def test_sync_without_a_tty_and_without_yes_skips_instead_of_dying(
     explicit authorization to mutate, and the absence of a terminal is not it.
     """
     config, manager, tmpdir = sync_env
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
     _seed_committed_buffer(config, manager)
     _edit_buffer(config, "The original rejected reasoning.", "The CORRECTED reasoning.")
 
@@ -1708,7 +1708,7 @@ def test_an_open_question_divergence_does_not_reconcile_forever(
     from mitos.telemetry import TelemetryStore
 
     config, manager, tmpdir = sync_env
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
     with open(config.questions_file, "w", encoding="utf-8") as f:
         f.write("# Questions\n<!-- BEGIN ENTRIES -->\n\n### embedding-choice\n\n"
                 "**Topic:** which embedding model\n**Questions:**\n- Which dimension?\n")
@@ -1741,7 +1741,7 @@ def test_an_unresolvable_citation_is_reported_once_not_audited_forever(
     from mitos.telemetry import TelemetryStore
 
     config, manager, tmpdir = sync_env
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
     _seed_committed_buffer(config, manager)
 
     _edit_buffer(config, "**Scope:** alpha", "**Scope:** alpha\n**Cites:** ghost-slug")
@@ -1772,7 +1772,7 @@ def test_a_kind_illegal_edge_is_reported_once_not_audited_forever(
     from mitos.telemetry import TelemetryStore
 
     config, manager, tmpdir = sync_env
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
     store = GraphStore(config.db_path)
     _seed_active_decision(store, "a-real-decision", "A perfectly resolvable axiom.")
     _seed_committed_buffer(config, manager)
@@ -1823,7 +1823,7 @@ def test_a_legal_edge_to_a_lineage_slug_still_reconciles(
     from mitos.telemetry import TelemetryStore
 
     config, manager, tmpdir = sync_env
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
     store = GraphStore(config.db_path)
     _seed_active_decision(store, "cited-decision", "A cited axiom.")
     _seed_committed_buffer(config, manager)
@@ -1852,7 +1852,7 @@ def test_the_audit_row_records_full_edge_state_not_a_delta(
     from mitos.telemetry import TelemetryStore
 
     config, manager, tmpdir = sync_env
-    os.environ["GEMINI_API_KEY"] = "mock_key"
+    config.env["GEMINI_API_KEY"] = "mock_key"
     store = GraphStore(config.db_path)
     _seed_active_decision(store, "kept-target", "The retained axiom.")
     _seed_active_decision(store, "added-target", "The newly cited axiom.")
