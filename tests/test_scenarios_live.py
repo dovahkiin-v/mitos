@@ -404,6 +404,13 @@ def test_scenario_f1_synthesis_llm_down(live_workspace) -> None:
         
     # Mock LLM provider to throw 429 mid-sync, then succeed on retry (F1)
     manager = MitosSyncManager(config)
+
+    # The genai client is mocked, but perform_sync's key gate is not: on a
+    # keyless runner (CI checks out no .env for this module's loader) the sync
+    # refuses before the retry path is reached. This row used to inherit a
+    # mock key from earlier modules' os.environ leaks, retired with conftest's
+    # credential strip.
+    config.env["GEMINI_API_KEY"] = "mock_key"
     
     mock_responses = [
         Exception("Resource Exhausted (429)"),
