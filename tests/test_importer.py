@@ -76,7 +76,9 @@ def test_import_with_llm_extract(mock_anthropic: MagicMock, import_env: Tuple[Mi
         }))
     ]
     mock_anthropic.return_value.messages.create.return_value = mock_msg
-    os.environ["ANTHROPIC_API_KEY"] = "mock_anthropic_key"
+    # Post-5c the importer reads the key off `config.env` (resolved at config
+    # construction), never `os.environ` — inject where it actually looks.
+    config.env["ANTHROPIC_API_KEY"] = "mock_anthropic_key"
 
     # 3. Perform import
     importer.import_from_file(legacy_file, use_llm_extract=True)
@@ -133,7 +135,7 @@ def test_import_confirmed_at_is_utc_with_offset(
         }))
     ]
     mock_anthropic.return_value.messages.create.return_value = mock_msg
-    os.environ["ANTHROPIC_API_KEY"] = "mock_anthropic_key"
+    config.env["ANTHROPIC_API_KEY"] = "mock_anthropic_key"
 
     importer.import_from_file(legacy_file, use_llm_extract=True)
 
