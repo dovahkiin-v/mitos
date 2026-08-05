@@ -1065,20 +1065,20 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
 
     Use this when you know roughly what you're after (a slug you're carrying, or a
     pointed claim). For the broad "is there precedent near this?" scan before
-    deciding, use surface_decisions; for the EXHAUSTIVE set in a scope, list_decisions.
-    If query matches a unique slug exactly, returns that one decision (full); otherwise
-    a ranked semantic search for the claim. Its slug branch is active-view-only — to
-    dereference an EXACT handle including a superseded node it can't reach, use show_node.
-    Once you decide, `record_decision` the outcome so the next agent inherits it.
+    deciding, use surface_decisions; for the EXHAUSTIVE set in a scope,
+    list_decisions. If query matches a unique slug exactly, returns that one
+    decision in full (active view only — to dereference an EXACT handle including
+    a superseded node, use show_node); otherwise a ranked semantic search for the
+    claim. Once you decide, `record_decision` the outcome so the next agent
+    inherits it.
 
     Args:
         query: Unique decision slug identifier OR a semantic claim search query.
-        depth: The retrieval depth (e.g. 'letter', 'trace', 'vibe'). v0.1 enforces Letter mode.
-        brief: If True, omit `rejected_paths` from ranked semantic matches (axiom-only).
-            An exact-slug hit is always returned in full (you asked for that one).
-        limit: Ranked top-k for the SEMANTIC branch (default 5; clamped to 1–50). Raise
-            it to dig deeper, lower it to save context. Ignored by an exact-slug hit
-            (that returns the one decision you named).
+        depth: The retrieval depth (e.g. 'letter'). v0.1 enforces Letter mode.
+        brief: If True, omit `rejected_paths` from ranked semantic matches
+            (an exact-slug hit is always returned in full — you asked for that one).
+        limit: Ranked top-k for the SEMANTIC branch (default 5; clamped to 1–50).
+            Ignored by an exact-slug hit.
         project: Which project this call is about — REQUIRED on every call: a
             registered project name (e.g. 'mitos') or the absolute path of a
             workspace. Call `list_projects()` if you do not know the names.
@@ -1086,13 +1086,12 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
     Returns:
         A JSON string containing the ranked results in Letter-mode payload shape.
         A decision a later one has moved on from also carries `superseded_by`/
-        `amended_by`/`narrowed_by`/`corrected_by` (the modifying slugs) — an exact-slug
-        hit on an amended decision still reads `state: "active"`, so chase these before
-        trusting its axiom's mechanism. When the semantic branch retrieved precedents but
-        every one is superseded (a blackout), `matches` stays empty and a sibling
-        `all_superseded` list carries the retired handles (`slug`, `state`, live
-        `superseded_by` when known) — settled before, not a true miss; read the history
-        with list_decisions(state="all").
+        `amended_by`/`narrowed_by`/`corrected_by` (the modifying slugs) — an
+        exact-slug hit on an amended decision still reads `state: "active"`, so
+        chase these before trusting its axiom's mechanism. When every retrieved
+        precedent is superseded (a blackout), `matches` stays empty and a sibling
+        `all_superseded` list carries the retired handles — settled before, not a
+        true miss; read the history with list_decisions(state="all").
     """
     # The argument fault is answered before any project is resolved — see
     # list_decisions for why the ordering is deliberate.
@@ -1237,40 +1236,38 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
     """Record a decision you just made, with the alternatives you rejected and why,
     so future sessions and other agents inherit it instead of relitigating it.
 
+    Relation args — pass the EXACT slug of an existing decision (look it up first
+    with surface_decisions/query_decisions; each is validated to point at a real
+    decision, and each accepts a comma-separated list, e.g. supersedes="a, b"):
+      supersedes:   that decision is REPLACED — outgrown; it leaves the active view.
+      corrects:     that decision was WRONG — also retires it (wrong, not outgrown).
+      amends:       that decision still stands; this modifies part of it
+                    (e.g. adds an accepted cost, or updates a mechanism detail).
+      narrows:      that decision still stands; this carves a case out of its scope
+                    (e.g. parent "all endpoints authenticated" + this one
+                    "the health endpoint is public").
+      contradicts:  both stand, in acknowledged tension.
+      depends_on:   this decision relies on that one staying true.
+      cites:        this builds on that one; no state change.
+      resolves:     closes an open question (the edge is decision→open_question only).
+      derives_from: NOT valid when recording a decision — that edge originates from
+                    an open question; use cites for a decision this one builds on.
+
     Call this the moment you commit to a foundational choice — a schema, a library,
-    a pattern, or a path you've decided to abandon. `rejected_paths` is required:
+    a pattern, or a path you've decided to abandon. `rejected_paths` is REQUIRED:
     recording WHY you ruled options out is what stops you (or the next agent) from
-    re-proposing them. If this decision relates to an earlier one, look the earlier
-    one up first with query_decisions/surface_decisions and pass its EXACT slug to the
-    matching relation arg below (each is validated to point at a real decision). Each
-    relation arg also accepts a comma-separated list to link several at once
-    (e.g. supersedes="a, b").
-    Returns the decision's slug; look it up afterwards with query_decisions.
+    re-proposing them.
 
     Args:
         axiom: The decision as a single clear sentence true going forward.
         rejected_paths: The alternatives considered and rejected, and why. REQUIRED.
+            One "(N) <option>: REJECTED — <reason>" per line scans best.
         scope: Area tags, e.g. ["database", "auth"].
         mechanisms: Concrete technologies/entities involved, e.g. ["sqlite", "wal-mode"].
         context: Optional background on why this was decided.
-        supersedes: Exact slug of a prior decision this one REPLACES (the old one
-            becomes superseded). Use this for decision evolution.
-        corrects: Exact slug of a prior decision this one CORRECTS (an in-buffer
-            correction — the old one leaves the active view, like supersedes; use
-            this when the earlier decision was wrong rather than outgrown).
-        amends: Exact slug of a decision this one amends (modifies without replacing).
-        narrows: Exact slug of a decision this one narrows the scope of.
-        depends_on: Exact slug of a decision this one depends on.
-        resolves: Exact slug of an open question this one resolves (the resolves edge is decision→open_question only).
-        contradicts: Exact slug of a decision this one is in tension with.
-        derives_from: Not valid when recording a decision — a derives_from edge
-            originates from an open question (open_question -> decision), so a
-            decision cannot be its source. Use cites to link a decision this one
-            builds on.
-        cites: Exact slug of a decision this one cites.
         slug: The short, descriptive handle for the decision (e.g. 'sqlite-wal-mode').
-            Keep it to at most 100 characters — the slug is the permanent citation
-            handle, so an over-length one is rejected (not silently truncated).
+            At most 100 characters — it is the permanent citation handle, so an
+            over-length one is rejected (not silently truncated).
         acknowledge_neighbors: Record past the near-duplicate review after inspecting
             the flagged neighbours and judging this decision genuinely independent.
             Leave False (default) on the first attempt. Combines with the relation
@@ -1283,40 +1280,27 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
             another project's corpus.
 
     Returns:
-        A JSON string: {slug, id, state, embedding, status} or {error, code},
-        every outcome additionally carrying the trailing {project, collection,
-        workspace} naming the corpus this write landed in — check it, since a
-        mis-aimed write is the one mistake here that is unpleasant to unwind.
-        status="created" means newly recorded; status="exists" is a SUCCESS — the
-        identical decision was already recorded and is now confirmed present, not an
-        error and not something to retry. Only a top-level {error, code} is a failure.
-        status="needs_review" (code "similar_decision_exists") is a PAUSE, not a failure
-        and not a write: this decision is ≥0.80 similar to existing `neighbors` it does
-        not reference. Each neighbour carries its axiom, rejected_paths, scope, score,
-        and an amended_by/narrowed_by stamp when a later decision has moved it on
-        (dereference that slug before linking). Judge each neighbour, then re-record
-        with that judgment: a relation arg
+        A JSON string: {slug, id, state, embedding, status} or {error, code}, every
+        outcome carrying a trailing {project, collection, workspace} echo naming
+        the corpus this write landed in — check it. Only a top-level {error, code}
+        is a failure. status="created": newly recorded, with `edges_created` write
+        facts (each {kind, target}, read back from the committed graph — empty
+        means no edge landed) and the committed scope/mechanisms. status="exists":
+        a SUCCESS no-op, not an error — the identical decision (identity = slug +
+        axiom + mechanisms) is already recorded; changed commentary/relations are
+        NOT saved and are listed under `differs`; record a NEW decision (a distinct
+        axiom) for new reasoning. status="needs_review" (code
+        "similar_decision_exists"): a PAUSE, not a failure — nothing was written;
+        the response lists ≥0.80-similar unlinked `neighbors`, each with its axiom,
+        rejected_paths, scope, score and modifier stamps (an amended_by/narrowed_by
+        stamp means that neighbour has moved on — dereference before linking).
+        Judge each, then re-record with that judgment: a relation arg
         (amends/narrows/supersedes/corrects/contradicts/cites) pointing at any
-        neighbour this decision genuinely relates to, acknowledge_neighbors=True for
-        neighbours that stand independently alongside it — or both at once for a
-        mixed set. Nothing was written,
-        so a re-record is the right move (unlike an "exists" no-op).
-        The "created" result also carries `edges_created` — the relation edges this
-        record actually wired, each `{kind, target}` (write facts read back from the
-        committed graph, so an empty list means no edge landed) — and the resolved
-        `scope`/`mechanisms` as committed.
-        NOTE: identity is (slug + axiom + mechanisms). Re-recording an
-        existing decision is a no-op — a changed `context`/`rejected_paths`/`scope` or
-        relation on a re-record is NOT saved. To record different reasoning or a new
-        relationship, make a NEW decision (a distinct axiom), don't resubmit the old one.
-        A "created" result MAY carry `neighbor_review_unavailable`: the commit
-        succeeded but the near-duplicate review could not run — absent neighbours are
-        not checked-clean; a later `check` pass over this project covers the gap
-        retroactively.
-        The result MAY also carry `scope_overflow`: a one-line, debounced (≤once/24h)
-        health nudge that the generated context files have grown past their size ceiling
-        — not an error and not about this decision; a status report on this project
-        has the breakdown.
+        neighbour this decision genuinely relates to, acknowledge_neighbors=True
+        for neighbours that stand independently — or both at once for a mixed set. A "created"
+        result MAY carry `neighbor_review_unavailable` (the near-dup review could
+        not run; absent neighbours are not checked-clean) or a debounced
+        `scope_overflow` health nudge (not about this decision).
     """
     config = _target_config(project, "record_decision")
     # Build our own writable manager — do NOT reuse get_workspace_components()
