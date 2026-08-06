@@ -83,9 +83,13 @@ workspace at all.
 Two things to know before you run it:
 
 - **It costs context in every session on the machine, whether or not you use
-  mitos.** Measured on this build: seven tools carrying 3,296 characters of JSON
-  schema and 18,574 characters of description. That is the price of loading
-  everywhere, and it is the trade this recipe makes deliberately.
+  mitos.** Measured on `0.15.1` (2026-08-06): seven tools carrying 3,296
+  characters of JSON schema and 17,291 characters of description. That is the
+  price of loading everywhere, and it is the trade this recipe makes
+  deliberately. The figure is pinned to a version because the description half
+  moves whenever a tool's prose is rewritten — `0.15.1` cut it by ~1,300
+  characters — so read it as a measurement of that release, not of whatever
+  build you are running.
 - **`claude mcp add` has no `alwaysLoad` flag**, and whether that field does
   anything at user scope is unmeasured — so don't count on the tools being
   exempt from an MCP tool-search step.
