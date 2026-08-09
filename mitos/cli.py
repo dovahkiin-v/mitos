@@ -1767,6 +1767,31 @@ def _read_text_arg(inline: Optional[str], file_path: Optional[str]) -> Optional[
     return inline
 
 
+def _join_relation_flag(values: Optional[List[str]]) -> Optional[str]:
+    """Comma-joins a repeatable relation flag back into the shared string form.
+
+    The nine ``record`` relation flags accumulate their repeats (``action="append"``),
+    while ``cmd_record``, ``record_decision_entry`` and the MCP ``record_decision``
+    tool all take one comma-separated string — the form the markdown relationship
+    fields already use. Joining here, at main()'s single call site, keeps those three
+    signatures identical (so CLI⇄MCP parity is structural rather than policed) and
+    sits above every consumer of the declared set, all of which read it through
+    ``_split_relation_slugs``.
+
+    The separator is ``", "``, not ``","``: the raw string is serialized straight into
+    ``decisions.md`` as ``**Cites:** a, b, c``, and that file is the gold source a
+    human reads. Both spellings parse identically downstream.
+
+    Args:
+        values: The accumulated occurrences, or None when the flag was not supplied.
+
+    Returns:
+        The comma-joined string, or None when the flag was absent (absent and empty
+        are distinguished downstream).
+    """
+    return None if values is None else ", ".join(values)
+
+
 def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
                 as_json: bool = False, brief: bool = False,
                 limit: Optional[int] = None) -> None:
@@ -5463,15 +5488,53 @@ def _build_parser() -> argparse.ArgumentParser:
     rec_p.add_argument("--context", default=None, help="Optional background on why this was decided.")
     rec_p.add_argument("--context-file", default=None, dest="context_file",
                        help="Read --context from a file ('-' = stdin).")
-    rec_p.add_argument("--supersedes", default=None, help="Exact slug(s) of prior decision(s) this one replaces — comma-separated for several (e.g. 'a, b').")
-    rec_p.add_argument("--corrects", default=None, help="Exact slug(s) of prior decision(s) this one corrects (kill-edge twin of --supersedes) — comma-separated for several.")
-    rec_p.add_argument("--amends", default=None, help="Exact slug(s) of decision(s) this one amends — comma-separated for several.")
-    rec_p.add_argument("--narrows", default=None, help="Exact slug(s) of decision(s) this one narrows — comma-separated for several.")
-    rec_p.add_argument("--depends-on", default=None, dest="depends_on", help="Exact slug(s) of decision(s) this one depends on — comma-separated for several.")
-    rec_p.add_argument("--resolves", default=None, help="Exact slug(s) of open question(s) this one resolves (resolves is decision→open-question only) — comma-separated for several.")
-    rec_p.add_argument("--contradicts", default=None, help="Exact slug(s) of decision(s) this one contradicts — comma-separated for several.")
-    rec_p.add_argument("--derives-from", default=None, dest="derives_from", help="Not valid when recording a decision — a derives_from edge originates from an open question (open_question -> decision), so a decision cannot be its source. Use --cites to link a decision this one builds on.")
-    rec_p.add_argument("--cites", default=None, help="Exact slug(s) of decision(s) this one cites — comma-separated for several.")
+    # The nine relation flags accumulate repeats, so `--cites a --cites b` means
+    # what `--cites "a, b"` has always meant. As plain last-wins strings they kept
+    # only the final occurrence and said nothing — and on the two kill-edge flags
+    # that is not a lost link but a false claim about present truth, since state is
+    # computed from edges: the prior the author declared superseded stayed in the
+    # active view and every read reported it as current.
+    #
+    # `action="append"` rather than `--scope`/`--mechanisms`' `nargs="*"` + `extend`
+    # above, for two measured reasons. A bare `extend` (no `nargs`) iterates each
+    # string into CHARACTERS. And `nargs="*"` would make the space form parse, which
+    # here is worse than refusing it: `--cites a "My axiom"` swallows record's axiom
+    # positional, so the caller supplies an axiom and is refused for missing one.
+    # `append` keeps each occurrence one whole value, so neither shape is
+    # constructible. `default=None` is kept on all nine — absent and empty are
+    # distinguished downstream, and `append` only runs when the flag is present.
+    # main() comma-joins the accumulated values back into the single string every
+    # consumer already splits (`_split_relation_slugs`); see `_join_relation_flag`.
+    rec_p.add_argument("--supersedes", default=None, action="append",
+                       help="Exact slug(s) of prior decision(s) this one replaces. "
+                            "Repeatable and comma-separated both accumulate: "
+                            "`--supersedes a --supersedes b` == `--supersedes 'a, b'`.")
+    rec_p.add_argument("--corrects", default=None, action="append",
+                       help="Exact slug(s) of prior decision(s) this one corrects "
+                            "(kill-edge twin of --supersedes). Repeatable and "
+                            "comma-separated both accumulate.")
+    rec_p.add_argument("--amends", default=None, action="append",
+                       help="Exact slug(s) of decision(s) this one amends. Repeatable "
+                            "and comma-separated both accumulate.")
+    rec_p.add_argument("--narrows", default=None, action="append",
+                       help="Exact slug(s) of decision(s) this one narrows. Repeatable "
+                            "and comma-separated both accumulate.")
+    rec_p.add_argument("--depends-on", default=None, action="append", dest="depends_on",
+                       help="Exact slug(s) of decision(s) this one depends on. Repeatable "
+                            "and comma-separated both accumulate.")
+    rec_p.add_argument("--resolves", default=None, action="append",
+                       help="Exact slug(s) of open question(s) this one resolves (resolves "
+                            "is decision→open-question only). Repeatable and "
+                            "comma-separated both accumulate.")
+    rec_p.add_argument("--contradicts", default=None, action="append",
+                       help="Exact slug(s) of decision(s) this one contradicts. Repeatable "
+                            "and comma-separated both accumulate.")
+    # Accumulates like its siblings — its refusal fires downstream, in the validate
+    # phase — but its help stays a refusal explanation, teaching no spelling at all.
+    rec_p.add_argument("--derives-from", default=None, action="append", dest="derives_from", help="Not valid when recording a decision — a derives_from edge originates from an open question (open_question -> decision), so a decision cannot be its source. Use --cites to link a decision this one builds on.")
+    rec_p.add_argument("--cites", default=None, action="append",
+                       help="Exact slug(s) of decision(s) this one cites. Repeatable and "
+                            "comma-separated both accumulate.")
     rec_p.add_argument("--slug", required=True,
                        help=f"Explicit slug (handle) for the decision, required "
                             f"(≤{_SLUG_MAX_LEN} chars; an over-length slug is rejected, not truncated).")
@@ -5791,15 +5854,15 @@ def main() -> None:
                 scope=args.scope,
                 mechanisms=args.mechanisms,
                 context=context,
-                supersedes=args.supersedes,
-                corrects=args.corrects,
-                amends=args.amends,
-                narrows=args.narrows,
-                depends_on=args.depends_on,
-                resolves=args.resolves,
-                contradicts=args.contradicts,
-                derives_from=args.derives_from,
-                cites=args.cites,
+                supersedes=_join_relation_flag(args.supersedes),
+                corrects=_join_relation_flag(args.corrects),
+                amends=_join_relation_flag(args.amends),
+                narrows=_join_relation_flag(args.narrows),
+                depends_on=_join_relation_flag(args.depends_on),
+                resolves=_join_relation_flag(args.resolves),
+                contradicts=_join_relation_flag(args.contradicts),
+                derives_from=_join_relation_flag(args.derives_from),
+                cites=_join_relation_flag(args.cites),
                 slug=args.slug,
                 acknowledge_neighbors=args.acknowledge_neighbors,
                 as_json=args.as_json,
