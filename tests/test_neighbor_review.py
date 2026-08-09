@@ -15,6 +15,7 @@ drive it deterministically offline.
 import json
 import logging
 import shutil
+import sys
 import tempfile
 from typing import Iterator, Tuple
 
@@ -354,6 +355,13 @@ def test_cli_mcp_record_pause_parity(ws, capsys):
     return (the two emissions differ in indentation by design), and pins the
     protocol semantics riding the shared message: both exits named, no
     tension/judged wording.
+
+    The paused call also declares one target (A2), so the declared-edge echo rides
+    this comparison. What the row states rather than polices is the parity MECHANISM:
+    the two encodings are ONE object — `record_decision_entry` builds the pause dict,
+    `cmd_record --json` emits it verbatim and MCP `record_decision` returns it after a
+    single provenance update — so a divergence here means a surface started reshaping,
+    not that two spellings drifted apart.
     """
     from mitos import mcp_server
     config, m = ws
@@ -365,6 +373,11 @@ def test_cli_mcp_record_pause_parity(ws, capsys):
                             slug="use-sqlite")
     m.record_decision_entry("Use SQLite with WAL mode.", "rej", ["db"],
                             slug="use-sqlite-wal", amends="use-sqlite")
+    # Declared, and deliberately OUTSIDE the armed sweep — group two's scoreless
+    # shape, so the echo is non-empty on both surfaces without suppressing the
+    # neighbour that makes them pause at all.
+    m.record_decision_entry("The renderer emits MADR markdown files per decision.",
+                            "rej", ["render"], slug="madr-render")
     factory = _armed_real_manager_factory([{"slug": "use-sqlite", "score": 0.9}])
 
     with patch("mitos.cli.MitosSyncManager", side_effect=factory), \
@@ -374,16 +387,23 @@ def test_cli_mcp_record_pause_parity(ws, capsys):
         with pytest.raises(SystemExit) as exc:
             cmd_record(config, axiom="Adopt SQLite as the storage engine.",
                        rejected="rej", scope=["db"], slug="adopt-sqlite",
-                       as_json=True)
+                       cites="madr-render", as_json=True)
         assert exc.value.code == 2
         cli_payload = json.loads(capsys.readouterr().out)
         mcp_payload = json.loads(mcp_server.record_decision(
             "Adopt SQLite as the storage engine.", "rej", ["db"],
-            slug="adopt-sqlite", project=config.workspace_dir))
+            slug="adopt-sqlite", cites="madr-render",
+            project=config.workspace_dir))
 
     assert cli_payload["neighbors"] == mcp_payload["neighbors"]
     assert cli_payload["code"] == mcp_payload["code"] == "similar_decision_exists"
     assert cli_payload["message"] == mcp_payload["message"]
+
+    # The declared-edge echo, both fields, across both machine encodings.
+    assert cli_payload["declared_no_near_match"] == [{"slug": "madr-render"}]
+    assert (cli_payload["declared_no_near_match"]
+            == mcp_payload["declared_no_near_match"])
+    assert "declared" not in cli_payload and "declared" not in mcp_payload
 
     # The `needs_review` receipt is stamped too — the fourth outcome shape, whose
     # other three live in `tests/test_corpus_provenance.py`. It is asserted here
@@ -1005,3 +1025,598 @@ def test_cli_record_notice_names_the_missing_collection_and_its_heal(ws, capsys)
     assert "mitos reconcile" in notice
     assert "vector store unavailable" not in notice
     assert "mitos-x" not in notice              # detail is logging-only, never rendered
+
+
+# --------------------------------------------------------------------------- #
+# The declared-edge pause echo (A2 / T4)
+#
+# The pause computes exactly which edges the call declared, uses that set to decide
+# what NOT to flag — and, before this, said nothing about it. mitos is stateless
+# across calls and can never say "since your last attempt", so an agent reading a
+# pause on a DIFFERENT node could not tell a fresh pause from a shrinking one, and
+# the cheapest reading of "my edge didn't take" is to mint a second, false edge into
+# `decisions.md` — the one artifact that is not derivative.
+#
+# The echo is a PARTITION, complete over what the caller typed:
+#   `declared`               — every target it typed, all nine relations, canonical
+#                              spellings.
+#   `declared_no_near_match` — the pause-resolving subset that moved nothing here,
+#                              `{slug}` when the sweep never saw it and
+#                              `{slug, score}` when it did and fell below the floor.
+# An empty group is an ABSENT key, never `[]`. Both groups derive from the primary
+# sets (declarations, gathered candidates, floor — M8), never from
+# `screen_candidates`' return, in which a declared 0.91 neighbour and a declared 0.62
+# one are both absent for unrelated reasons.
+# --------------------------------------------------------------------------- #
+
+#: One gathered sweep the rows below share: `echo-c` is the UNDECLARED survivor every
+#: pause needs to fire on at all, `echo-b` is strong, `echo-d` is below the floor.
+_ECHO_GATHERED = [{"slug": "echo-b", "score": 0.91},
+                  {"slug": "echo-c", "score": 0.84},
+                  {"slug": "echo-d", "score": 0.62}]
+
+#: The axiom every echo row records — near enough to `echo-b` to be plausible, though
+#: the fake embedder makes the score fixture-supplied rather than semantic.
+_ECHO_AXIOM = "The store uses SQLite with WAL journaling and a busy timeout."
+
+
+def _seed_echo_corpus(m):
+    """The live nodes the echo rows declare against.
+
+    Every declared target resolves in Phase A, so a target named in a fixture but not
+    seeded fails at `relation_target_not_found` BEFORE the pause can compose — and a
+    never-gathered target (`echo-x`) still has to be a live node, it is only absent
+    from the armed matches.
+    """
+    _seed(m, "echo-b", "The store uses SQLite for persistence.")
+    _seed(m, "echo-c", "Scope discovery lists the live subset, not the full spine.")
+    _seed(m, "echo-d", "The renderer emits MADR markdown files per decision.")
+    _seed(m, "echo-x", "Retries use exponential backoff with jitter.")
+
+
+def _echo_pause(m, matches, **rels):
+    """Arm the sweep, record, and assert the call actually paused."""
+    _arm(m, matches)
+    res = m.record_decision_entry(_ECHO_AXIOM, "rej", ["s"], slug="echo-new", **rels)
+    assert res["status"] == "needs_review", res
+    return res
+
+
+def test_pause_that_declared_nothing_is_byte_identical(ws, capsys):
+    """No declarations at all → no echo anywhere, and the pause body is unchanged.
+
+    The majority path pays nothing for the echo: neither key, and sync's `message`
+    still closes `…before linking. Nothing was written.` with no sentence between. The
+    exact-substring assertion is the point — an empty-group render (`Declared: none`,
+    or a bare stem) would slip past a key-absence check while shipping a wall on the
+    quiet path.
+    """
+    config, m = ws
+    _seed_echo_corpus(m)
+    res = _echo_pause(m, _ECHO_GATHERED)
+    assert "declared" not in res and "declared_no_near_match" not in res
+    assert res["message"].endswith(
+        "dereference that slug before linking. Nothing was written.")
+    assert "Declared" not in res["message"]
+
+    factory = _armed_real_manager_factory(_ECHO_GATHERED)
+    capsys.readouterr()
+    with patch("mitos.cli.MitosSyncManager", side_effect=factory):
+        with pytest.raises(SystemExit):
+            cmd_record(config, axiom=_ECHO_AXIOM, rejected="rej", scope=["s"],
+                       slug="echo-quiet")
+    err = capsys.readouterr().err
+    assert _cli_echo_lines(err) == []
+    assert "Declared" not in err
+
+
+def test_declared_strong_neighbour_lands_in_group_one(ws):
+    """R1 / trace row 2 — the M8 row: a declared target gathered at 0.91.
+
+    S4 drops it from the screened survivors BECAUSE it was declared, so a build that
+    derived the groups from `screen_candidates`' return puts it in NEITHER — the
+    caller checks the echo against its own command line and reads a target it typed
+    and does not see back as "it did not parse", which is the second-false-edge mint
+    arriving as an omission.
+    """
+    config, m = ws
+    _seed_echo_corpus(m)
+    res = _echo_pause(m, _ECHO_GATHERED, cites="echo-b")
+    assert [n["slug"] for n in res["neighbors"]] == ["echo-c"]
+    assert res["declared"] == ["echo-b"]
+    assert "declared_no_near_match" not in res
+
+
+def test_declared_below_floor_target_reports_its_score(ws):
+    """R2 / trace row 3 — gathered and below the floor: group two, SCORED."""
+    config, m = ws
+    _seed_echo_corpus(m)
+    res = _echo_pause(m, _ECHO_GATHERED, cites="echo-b, echo-d")
+    assert res["declared"] == ["echo-b"]
+    assert res["declared_no_near_match"] == [{"slug": "echo-d", "score": 0.62}]
+
+
+def test_lineage_ancestor_the_caller_never_typed_is_in_neither_group(ws):
+    """R3 / trace row 4 — the discriminator is *did the caller type it*.
+
+    `declared_targets` unions the caller's declarations with the transitive mutation
+    ancestors of its mutation targets, and the echo may show only the caller's half.
+    Here `chain-a` is suppressed from the neighbour payload (it IS an ancestor of the
+    declared `chain-b`) and gathered ABOVE the floor — so a build echoing the whole
+    suppression set would report it as declared, telling the caller it typed
+    something it did not.
+    """
+    config, m = ws
+    _seed(m, "chain-a", "The store uses SQLite for persistence.")
+    _seed(m, "chain-b", "The store uses SQLite with a single connection.",
+          amends="chain-a")
+    _seed(m, "echo-c", "Scope discovery lists the live subset, not the full spine.")
+    res = _echo_pause(m, [{"slug": "chain-b", "score": 0.91},
+                          {"slug": "echo-c", "score": 0.84},
+                          {"slug": "chain-a", "score": 0.88}],
+                      amends="chain-b")
+    assert [n["slug"] for n in res["neighbors"]] == ["echo-c"]
+    assert res["declared"] == ["chain-b"]
+    assert "declared_no_near_match" not in res
+
+
+def test_non_resolving_relation_is_acknowledged_never_flagged(ws):
+    """R4 / trace row 5 — an ordinary cross-domain `--depends-on`, below the floor.
+
+    `depends_on` is outside `_PAUSE_RESOLVING_RELATIONS`, so it is acknowledged in
+    group one and can never reach group two. Keying group two on all nine relations
+    is the likelier wrong build precisely because it is the cheaper one: it reports
+    the DESIGNED case under a heading meaning "declared, and it moved nothing".
+    """
+    config, m = ws
+    _seed_echo_corpus(m)
+    res = _echo_pause(m, _ECHO_GATHERED, amends="echo-b", depends_on="echo-d")
+    # Fixed relation order: supersedes, corrects, then _EXTRA_RELATIONS' own order —
+    # so `amends` precedes `depends_on` regardless of how the caller typed them.
+    assert res["declared"] == ["echo-b", "echo-d"]
+    assert "declared_no_near_match" not in res
+
+
+def test_never_gathered_declaration_renders_scoreless(ws):
+    """R5 / trace row 6 — the COMMON group-two shape, and the one that has no score.
+
+    The sweep is a bounded nearest-neighbour window, so `--cites some-distant-decision`
+    — the ordinary shape of *builds on* — is simply not in it. There is no candidate
+    to read a score off, so the key is ABSENT rather than null. A phase implementing
+    only the scored shape either faults here or drops the declaration into group one,
+    which is the exact silence the partition exists to break.
+    """
+    config, m = ws
+    _seed_echo_corpus(m)
+    res = _echo_pause(m, [{"slug": "echo-b", "score": 0.91},
+                          {"slug": "echo-c", "score": 0.84}],
+                      amends="echo-b", cites="echo-x")
+    assert res["declared"] == ["echo-b"]
+    assert res["declared_no_near_match"] == [{"slug": "echo-x"}]
+    assert "score" not in res["declared_no_near_match"][0]
+
+
+def test_echo_prints_the_stored_slug_not_the_caller_spelling(ws):
+    """R6 — canonical-handle retention, on BOTH halves of the partition.
+
+    The caller's two spellings (its verbatim string and the casefold membership uses)
+    are both wrong to print: `_normalize_slug` runs on the record path alone while the
+    parser keeps a hand-authored header slug's case, so the stored handle genuinely
+    differs from both. Retention is therefore an obligation over every declared
+    target, not a lookup keyed on group membership — a below-floor declaration has a
+    candidate to read one off and an ungathered one does not.
+
+    The plan's fixture is inverted here and the inversion is load-bearing: `record`
+    cannot produce a mixed-case STORED slug (`_normalize_slug` lowercases every one),
+    so the caller types the mixed case instead. `_validate_relation_target` compares
+    casefolded, so the declaration still resolves and reaches the pause.
+    """
+    config, m = ws
+    _seed_echo_corpus(m)
+    res = _echo_pause(m, [{"slug": "echo-b", "score": 0.91},
+                          {"slug": "echo-c", "score": 0.84}],
+                      amends="ECHO-B", cites="Echo-X")
+    assert res["declared"] == ["echo-b"]                          # the gathered half
+    assert res["declared_no_near_match"] == [{"slug": "echo-x"}]  # the ungathered half
+    assert "ECHO-B" not in res["message"] and "Echo-X" not in res["message"]
+
+
+def test_one_target_two_relations_appears_once(ws):
+    """R7 — the partition is over TARGETS, not flag occurrences.
+
+    Declared through `depends_on` (outside the set) and `cites` (inside it): one
+    entry, in group two, because ANY pause-resolving relation puts it there. A
+    partition over occurrences renders the same target in both groups.
+    """
+    config, m = ws
+    _seed_echo_corpus(m)
+    res = _echo_pause(m, [{"slug": "echo-c", "score": 0.84}],
+                      depends_on="echo-x", cites="echo-x")
+    assert res["declared_no_near_match"] == [{"slug": "echo-x"}]
+    assert "declared" not in res
+
+
+def test_repeated_identical_target_is_echoed_once(ws):
+    """1a's `--cites a --cites a` joins to "a, a" and commits one edge — echo once."""
+    config, m = ws
+    _seed_echo_corpus(m)
+    res = _echo_pause(m, [{"slug": "echo-b", "score": 0.91},
+                          {"slug": "echo-c", "score": 0.84}],
+                      cites="echo-b, echo-b")
+    assert res["declared"] == ["echo-b"]
+
+
+def test_empty_group_one_renders_no_key_and_no_none(ws, capsys):
+    """R8 — a lone distant `--cites` leaves group one empty, and empty renders NOTHING.
+
+    `Declared: none` beside a populated group two denies a declaration the call did
+    receive — the same false-edge invitation as an omission, wearing a label. Asserted
+    on both prose renderers, scoped to the echo's own sentences: the shipped pause body
+    and each neighbour's free-prose `rejected_paths` are allowed to say anything.
+    """
+    config, m = ws
+    _seed_echo_corpus(m)
+    factory = _armed_real_manager_factory([{"slug": "echo-c", "score": 0.84}])
+
+    with patch("mitos.cli.MitosSyncManager", side_effect=factory):
+        with pytest.raises(SystemExit) as exc:
+            cmd_record(config, axiom=_ECHO_AXIOM, rejected="rej", scope=["s"],
+                       slug="echo-new", cites="echo-x", as_json=True)
+    assert exc.value.code == 2
+    res = json.loads(capsys.readouterr().out)
+
+    assert "declared" not in res
+    assert res["declared_no_near_match"] == [{"slug": "echo-x"}]
+
+    sentences = _echo_sentences(res["message"])
+    assert len(sentences) == 1, res["message"]      # the lift is not vacuous
+    for line in sentences:
+        assert "none" not in line.casefold(), line
+
+    capsys.readouterr()
+    with patch("mitos.cli.MitosSyncManager", side_effect=factory):
+        with pytest.raises(SystemExit):
+            cmd_record(config, axiom=_ECHO_AXIOM, rejected="rej", scope=["s"],
+                       slug="echo-new", cites="echo-x")
+    rendered = _cli_echo_lines(capsys.readouterr().err)
+    assert rendered == ["Declared, not a near neighbour here: echo-x"]
+
+
+def test_echo_sits_after_the_neighbours_and_before_the_closing_sentence(ws, capsys):
+    """D5's two positions — the only contract of this phase nothing else pins.
+
+    On the CLI body the echo renders AFTER the neighbour blocks and BEFORE the
+    recovery menu. In front of the payload it is the wall R8 names: the author meets a
+    list of its own slugs before the `rejected_paths` it judges tenability from, which
+    is trading the pause's purpose for its decoration.
+
+    In sync's `message` the echo goes ahead of `Nothing was written.`, so the
+    commitment retraction still CLOSES the body — the register floor's second axis
+    leans on that sentence being last, and an echo appended after it silently moves
+    the retraction into the middle of a paragraph.
+
+    Both are orderings, so both are invisible to every key- and line-scoped row above:
+    each one stays green with the echo rendered in exactly the wrong place.
+    """
+    config, m = ws
+    _seed_echo_corpus(m)
+    factory = _armed_real_manager_factory(_ECHO_GATHERED)
+
+    with patch("mitos.cli.MitosSyncManager", side_effect=factory):
+        with pytest.raises(SystemExit):
+            cmd_record(config, axiom=_ECHO_AXIOM, rejected="rej", scope=["s"],
+                       slug="echo-new", cites="echo-b, echo-d")
+    err = capsys.readouterr().err
+    lines = [line.strip() for line in err.splitlines()]
+
+    neighbour = max(i for i, line in enumerate(lines) if line.startswith("↔ "))
+    menu = next(i for i, line in enumerate(lines) if line.startswith("→ "))
+    echo = [i for i, line in enumerate(lines) if line.startswith(_ECHO_STEMS)]
+    assert len(echo) == 2, lines
+    assert neighbour < min(echo) and max(echo) < menu, lines
+
+    message = _echo_pause(m, _ECHO_GATHERED, cites="echo-b, echo-d")["message"]
+    assert message.endswith("Nothing was written.")
+    sentences = _echo_sentences(message)
+    assert len(sentences) == 2, message
+    for sentence in sentences:
+        assert message.index(sentence) < message.index("Nothing was written.")
+
+
+# --------------------------------------------------------------------------- #
+# Scoping the prose guards to the echo's OWN sentences
+#
+# The pause body legitimately carries the shapes these rows forbid: sync's `message`
+# already counts neighbours ("similar to 1 existing decision(s)"), names
+# `acknowledge_neighbors=True` and the six recovery relations, the CLI prints each
+# neighbour's `(0.84)` and a `⚠ Paused` headline, and every neighbour's
+# `rejected_paths` is free author prose. A guard swept over the whole response would
+# red on shipped text, and one relaxed until it stopped doing so would pin nothing.
+# --------------------------------------------------------------------------- #
+
+#: The echo's two sentence stems — the only prose this phase authored.
+_ECHO_STEMS = ("Declared: ", "Declared, not a near neighbour here: ")
+
+
+def _echo_sentences(message: str):
+    """The echo's own sentences, lifted out of sync's composed `message`."""
+    import re
+    return [s.strip() for s in re.split(r"(?<=[.]) ", message)
+            if s.strip().startswith(_ECHO_STEMS)]
+
+
+def _cli_echo_lines(err: str):
+    """The echo's own lines, lifted out of the CLI's composed stderr body."""
+    return [line.strip() for line in err.splitlines()
+            if line.strip().startswith(_ECHO_STEMS)]
+
+
+def test_uncollapsed_echo_carries_no_count_anywhere(ws, capsys):
+    """R10 — no aggregate on the common path, on any encoding. Injection-verified.
+
+    "N of your declared edges resolved a neighbour" is the one line an agent reads to
+    decide it is FINISHED, and mitos already deleted that family from this exact
+    payload once. The collapse marker is the only place a number may appear, so on an
+    uncollapsed pause there must be none — including a `*_total` key silently carried
+    the way `routing.BoundedNames` carries its `total` unconditionally (correct for an
+    in-process struct, and the designed-out aggregate the moment it is serialized).
+    """
+    config, m = ws
+    _seed_echo_corpus(m)
+    factory = _armed_real_manager_factory(_ECHO_GATHERED)
+
+    with patch("mitos.cli.MitosSyncManager", side_effect=factory):
+        with pytest.raises(SystemExit):
+            cmd_record(config, axiom=_ECHO_AXIOM, rejected="rej", scope=["s"],
+                       slug="echo-new", cites="echo-b, echo-d", as_json=True)
+    res = json.loads(capsys.readouterr().out)
+
+    assert res["declared"] and res["declared_no_near_match"]      # both groups present
+    assert "declared_total" not in res
+    assert "declared_no_near_match_total" not in res
+
+    sentences = _echo_sentences(res["message"])
+    assert len(sentences) == 2, res["message"]
+    for line in sentences:
+        assert _count_markers(line) == [], line
+
+    capsys.readouterr()
+    with patch("mitos.cli.MitosSyncManager", side_effect=factory):
+        with pytest.raises(SystemExit):
+            cmd_record(config, axiom=_ECHO_AXIOM, rejected="rej", scope=["s"],
+                       slug="echo-new", cites="echo-b, echo-d")
+    rendered = _cli_echo_lines(capsys.readouterr().err)
+    assert len(rendered) == 2, rendered
+    for line in rendered:
+        assert _count_markers(line) == [], line
+
+    # Non-vacuity: the checker must catch a planted collapse marker.
+    assert _count_markers("Declared: alpha, beta, gamma (3 total)") == ["(3 total)"]
+
+
+def _count_markers(text: str):
+    """Every collapse-count marker in one echo sentence (empty == uncollapsed).
+
+    Matches the marker's own SHAPE, not "any digit": group two legitimately renders
+    each below-floor score, and the shipped pause body counts neighbours.
+    """
+    import re
+    return re.findall(r"\(\d+ total\)", text)
+
+
+#: Register violations planted into the checker below to prove it is not vacuous.
+#: Each is a label or key name that asserts or denies a commitment the pause cannot
+#: make — it returns ABOVE Phase B, so nothing was written in either direction.
+_PLANTED_ECHO_VIOLATIONS = (
+    "Edges registered: echo-b",                       # a registration receipt
+    "Committed: echo-b",                              # the same claim, shorter
+    "Declared but unresolved: echo-x",                # a failure reading
+    "Declared, missing from the sweep: echo-x",        # a not-valid reading
+    "edges_created_no_near_match",                    # the claim in a key name
+)
+
+#: Forbidden anywhere in a group label, a key name or an echo sentence (§3.5).
+_ECHO_FORBIDDEN = ("registered", "committed", "created", "saved", "applied",
+                   "landed", "failed", "invalid", "unresolved", "warning",
+                   "error", "missing", "skipped", "rejected", "orphan")
+
+
+def _echo_register_violations(text: str):
+    from test_record_decision import register_violations
+    return register_violations(text, substrings=_ECHO_FORBIDDEN)
+
+
+def test_echo_labels_and_key_names_claim_no_commitment(ws, capsys):
+    """R11 — the register floor, on both encodings and on the KEY NAMES.
+
+    Three axes, none of which the wording may imply: that a declaration was invalid
+    (the screen never gates one), that it was committed or NOT committed in either
+    direction (a group-one line reading as a receipt of landed edges invites dropping
+    exactly those flags from the re-record the pause exists to force — on
+    `--supersedes` that leaves a superseded decision in the active view for every
+    read), or that it is an exception (group two's likelier member is an ordinary
+    distant `--cites`).
+
+    The key names are inside the floor, not beside it: on the machine surface a crisp
+    `edges_registered` is a WORSE carrier of a false commitment claim than the prose
+    retraction one field away.
+    """
+    config, m = ws
+    _seed_echo_corpus(m)
+    factory = _armed_real_manager_factory(_ECHO_GATHERED)
+
+    with patch("mitos.cli.MitosSyncManager", side_effect=factory):
+        with pytest.raises(SystemExit):
+            cmd_record(config, axiom=_ECHO_AXIOM, rejected="rej", scope=["s"],
+                       slug="echo-new", cites="echo-b, echo-d", as_json=True)
+    res = json.loads(capsys.readouterr().out)
+
+    echo_keys = [k for k in res if k.startswith("declared")]
+    assert sorted(echo_keys) == ["declared", "declared_no_near_match"]
+    for key in echo_keys:
+        assert _echo_register_violations(key) == [], key
+
+    sentences = _echo_sentences(res["message"])
+    assert len(sentences) == 2, res["message"]      # the lift is not vacuous
+    for line in sentences:
+        assert _echo_register_violations(line) == [], line
+
+    capsys.readouterr()
+    with patch("mitos.cli.MitosSyncManager", side_effect=factory):
+        with pytest.raises(SystemExit):
+            cmd_record(config, axiom=_ECHO_AXIOM, rejected="rej", scope=["s"],
+                       slug="echo-new", cites="echo-b, echo-d")
+    rendered = _cli_echo_lines(capsys.readouterr().err)
+    assert len(rendered) == 2, rendered
+    for line in rendered:
+        assert _echo_register_violations(line) == [], line
+
+    # Non-vacuity: every planted shape must be caught by the same checker.
+    for planted in _PLANTED_ECHO_VIOLATIONS:
+        assert _echo_register_violations(planted), (
+            f"the register checker is vacuous — it passed: {planted!r}")
+
+
+def test_acknowledge_bypass_carries_no_echo_and_still_writes_the_edge(ws):
+    """R12 — `acknowledge_neighbors=True` short-circuits the whole block.
+
+    No pause, so no echo — and the declared edge must still COMMIT. The store read is
+    the load-bearing line: this composition works only because the guarded block is
+    skipped entirely while Phase B writes edges from the raw relation args, so a
+    refactor that moved the echo's inputs INTO the block would drop the edge exactly
+    when both flags travel together, with every other row green.
+    """
+    config, m = ws
+    _seed_echo_corpus(m)
+    _arm(m, _ECHO_GATHERED)
+    res = m.record_decision_entry(_ECHO_AXIOM, "rej", ["s"], slug="echo-ack",
+                                  cites="echo-b", acknowledge_neighbors=True)
+    assert res["status"] == "created", res
+    assert "declared" not in res
+    assert "declared_no_near_match" not in res
+    store = GraphStore(config.db_path)
+    node = store.get_node_by_slug("echo-ack")
+    assert node is not None
+    assert {"kind": "cites", "target": "echo-b"} in store.get_outgoing_edges(node["id"])
+
+
+def test_degraded_review_falls_through_to_created_with_no_echo(ws):
+    """R13 — a degraded sweep leaves `neighbors` empty and falls through to `created`.
+
+    Written as the echo's ABSENCE beside `coherence_audit`'s presence rather than as
+    "the receipt is unchanged": 1b put a new unconditional key on this same exit, so a
+    row phrased the second way reads as a regression the first time someone diffs the
+    payload.
+    """
+    config, m = ws
+    _seed_echo_corpus(m)
+    unavailable = Unavailable(reason=ConflictUnavailableReason.VECTOR_STORE,
+                              detail="down")
+    with patch.object(MitosSyncManager, "_review_neighbors", return_value=unavailable):
+        res = m.record_decision_entry(_ECHO_AXIOM, "rej", ["s"], slug="echo-degraded",
+                                      cites="echo-b")
+    assert res["status"] == "created", res
+    assert "declared" not in res
+    assert "declared_no_near_match" not in res
+    assert res["coherence_audit"].strip()
+    assert "vector store unavailable" in res["neighbor_review_unavailable"]
+
+
+def test_record_decision_entry_docstring_names_both_echo_keys(ws):
+    """R15 / constraint 3 — the `Returns:` docstring enumerates the pause dict's keys.
+
+    It named `{status, code, neighbors, message}` before this phase — already short by
+    `slug`, which the dict has carried since before this vision, and now short by two
+    more. A stale enumeration reads as completeness.
+    """
+    doc = MitosSyncManager.record_decision_entry.__doc__
+    for key in ("slug", "neighbors", "message",
+                "declared", "declared_no_near_match", "_total"):
+        assert key in doc, key
+
+
+# --------------------------------------------------------------------------- #
+# The bound (R9)
+#
+# 1a made the declared set unboundedly growable by repetition — `--cites` × 40 is
+# newly legal where it previously collapsed to one — so the pause body needs a
+# ceiling that scales with the caller's own command line, never with corpus size.
+# The row drives `main()` with the REPEATED flag spelling deliberately: that form
+# exists only at the argparse layer (`action="append"` plus main()'s comma-join),
+# while `record_decision_entry`'s relation parameters are plain comma-strings, so a
+# sync-layer fixture pins the bound and leaves the B1 × A2 coupling unexercised in
+# its shipped shape.
+# --------------------------------------------------------------------------- #
+
+def _record_argv(workspace_dir, *tail):
+    return ["mitos", "-p", workspace_dir, "record", *tail]
+
+
+def test_both_groups_collapse_independently_at_the_bound(ws, capsys, monkeypatch):
+    """R9 — 25 declarations per group against a bound of 20, on both encodings.
+
+    Both groups are bounded, independently, and the fixture has to make each one
+    collapse on its own: 25 never-gathered `--cites` targets all land in group two
+    (row 6's scoreless shape) and would leave group one EMPTY, which is R8's shape
+    rather than a group-one collapse. 25 `--depends-on` targets can never reach group
+    two whatever their score, so they collapse group one.
+
+    Every declared target resolves in Phase A, so all fifty are seeded live first — a
+    fixture naming un-seeded slugs fails at `relation_target_not_found` before the
+    pause composes.
+
+    Asserted: the list truncates to 20, the elision takes the TAIL, the count is a
+    SIBLING key rather than a mixed-type array member, and caller order is preserved
+    within each relation.
+    """
+    from mitos.cli import main
+
+    config, m = ws
+    _seed(m, "echo-c", "Scope discovery lists the live subset, not the full spine.")
+    dep = [f"dep-{i:02d}" for i in range(25)]
+    cite = [f"cit-{i:02d}" for i in range(25)]
+    for i, slug in enumerate(dep + cite):
+        _seed(m, slug, f"Bounded declaration fixture number {i} of fifty.")
+
+    tail = []
+    for slug in dep:
+        tail += ["--depends-on", slug]
+    for slug in cite:
+        tail += ["--cites", slug]
+    # `echo-c` is the undeclared survivor: without it the sweep screens everything and
+    # the pause never composes at all.
+    factory = _armed_real_manager_factory([{"slug": "echo-c", "score": 0.84}])
+
+    with patch("mitos.cli.MitosSyncManager", side_effect=factory):
+        monkeypatch.setattr(sys, "argv", _record_argv(
+            config.workspace_dir, _ECHO_AXIOM, "--rejected", "rej",
+            "--slug", "echo-bound", "--json", *tail))
+        with pytest.raises(SystemExit) as exc:
+            main()
+    assert exc.value.code == 2
+    res = json.loads(capsys.readouterr().out)
+
+    assert res["declared"] == dep[:20]                       # tail elided, order kept
+    assert res["declared_total"] == 25
+    assert [i["slug"] for i in res["declared_no_near_match"]] == cite[:20]
+    assert res["declared_no_near_match_total"] == 25
+    # The count is a sibling key, never appended into the array (P1: an array of
+    # reference IDs must not retype into a mixed-type one).
+    assert all(isinstance(s, str) for s in res["declared"])
+
+    # And the text encoding: items AND the count beside them — a bare count would
+    # destroy the completeness cross-check group one exists to enable.
+    capsys.readouterr()
+    with patch("mitos.cli.MitosSyncManager", side_effect=factory):
+        monkeypatch.setattr(sys, "argv", _record_argv(
+            config.workspace_dir, _ECHO_AXIOM, "--rejected", "rej",
+            "--slug", "echo-bound", *tail))
+        with pytest.raises(SystemExit):
+            main()
+    rendered = _cli_echo_lines(capsys.readouterr().err)
+    assert len(rendered) == 2, rendered
+    assert rendered[0].startswith("Declared: dep-00, dep-01,")
+    assert rendered[0].endswith("dep-19 (25 total)")
+    assert "dep-20" not in rendered[0]
+    assert rendered[1].endswith("cit-19 (25 total)")
+    assert "cit-20" not in rendered[1]

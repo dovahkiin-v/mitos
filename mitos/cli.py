@@ -72,7 +72,8 @@ from mitos.recall import (assess_surface_recall, corpus_provenance,
                           missing_index_is_a_gap, provenance_line,
                           scope_filter_recovery)
 from mitos.sync import (MitosSyncManager, run_ambient_capture, _SLUG_MAX_LEN,
-                        _ENTRIES_MARKER, _PAUSE_RESOLVING_RELATIONS)
+                        _ENTRIES_MARKER, _PAUSE_RESOLVING_RELATIONS,
+                        _declared_echo_lines)
 from mitos._agent_block import agent_block, agent_block_drift, AGENT_GUIDE_VERSION
 from mitos.renderer import MitosRenderer, overflow_report
 from mitos.importer import MitosProseImporter
@@ -1697,6 +1698,12 @@ def cmd_record(
         # without a dereference round-trip. Enrichment keys via .get(): production
         # always sends the full candidate_payload shape, but leaner dicts reach this
         # render from canned fixtures.
+        #
+        # Then the caller's own declared targets, partitioned (A2) — after the
+        # neighbour blocks and before the recovery menu. In front of the payload it
+        # would be a wall between the author and the anti-knowledge it judges
+        # tenability from; the sentences are `_declared_echo_lines` over this same
+        # dict's keys, so this render and the two machine encodings cannot disagree.
         _echo_corpus(config, file=sys.stderr)
         print(f"⚠ Paused — '{result['slug']}' looks like an existing decision. Nothing written.",
               file=sys.stderr)
@@ -1714,6 +1721,8 @@ def cmd_record(
                       file=sys.stderr)
             if n.get("scope"):
                 print(f"      scope: {', '.join(n['scope'])}", file=sys.stderr)
+        for line in _declared_echo_lines(result):
+            print(f"  {line}", file=sys.stderr)
         # Same co-equal framing as the shared needs_review message (one constant,
         # two spellings — the CLI renders flags, the message bare names).
         menu = "/".join(f"--{r}" for r in _PAUSE_RESOLVING_RELATIONS)

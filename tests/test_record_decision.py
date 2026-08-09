@@ -813,14 +813,42 @@ _NOTE_FORBIDDEN_SUBSTRINGS = ("mitos ", "this decision", "this entry",
 _NOTE_FORBIDDEN_WORDS = ("run", "now")
 
 
-def _coherence_note_violations(note: str):
-    """Every register rule the note breaks, as a sorted list (empty == compliant)."""
+def register_violations(text: str, *, substrings=(), words=()):
+    """Every forbidden shape ``text`` carries, as a sorted list (empty == compliant).
+
+    The shared half of a register contract: a checker the test feeds BOTH the shipped
+    string and a set of planted violations, so a regex that silently stopped matching
+    reds its own row instead of passing forever. 1b built this inline for the
+    coherence note and left it un-lifted; 2a's pause echo is the second real consumer,
+    which is when a helper is extracted rather than speculatively.
+
+    Two traps live here rather than in each caller. ``substrings`` match anywhere
+    (casefolded), which is right for a phrase; ``words`` match on **word boundaries**
+    only, because a bare ``"now" in text`` reds on *"known"*. And the caller must scope
+    what it hands in to its **own** field or sentence — the same response legitimately
+    carries forbidden tokens elsewhere (free-prose ``rejected_paths``, a shipped
+    ``acknowledge_neighbors=True``), so a whole-payload sweep reds on shipped text.
+
+    Args:
+        text: The one string under contract.
+        substrings: Phrases forbidden anywhere in it.
+        words: Tokens forbidden as whole words.
+
+    Returns:
+        The sorted forbidden shapes found; empty means compliant.
+    """
     import re
-    folded = note.casefold()
-    found = [s for s in _NOTE_FORBIDDEN_SUBSTRINGS if s in folded]
-    found += [w for w in _NOTE_FORBIDDEN_WORDS
+    folded = text.casefold()
+    found = [s for s in substrings if s in folded]
+    found += [w for w in words
               if re.search(rf"\b{re.escape(w)}\b", folded)]
     return sorted(found)
+
+
+def _coherence_note_violations(note: str):
+    """Every register rule the note breaks, as a sorted list (empty == compliant)."""
+    return register_violations(note, substrings=_NOTE_FORBIDDEN_SUBSTRINGS,
+                               words=_NOTE_FORBIDDEN_WORDS)
 
 
 def _created(m, axiom: str, slug: str) -> dict:

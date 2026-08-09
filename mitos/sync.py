@@ -466,6 +466,21 @@ _PAUSE_RESOLVING_RELATIONS = (
     "amends", "narrows", "supersedes", "corrects", "contradicts", "cites",
 )
 
+# How many declared targets each pause-echo group renders before it collapses to a
+# slice plus a sibling count (A2). Applied per group, independently.
+#
+# The bound's FIRST job is safety, not readability. The count is an exception marker,
+# so a bound low enough to fire on an ordinary declaration would reconstruct the
+# aggregate claim the echo is designed NOT to make ("N of your edges resolved a
+# neighbour") on exactly the path meant to stay quiet. Set it where a collapse is
+# pathological: the largest real declaration measured in this corpus is four, an
+# ordinary six-slug declaration must not collapse, and forty repeated `--cites` still
+# does. `routing.REGISTERED_NAMES_BOUND = 10` and `recall.SURFACE_TOP_SCOPES = 5`
+# transfer their SHAPE (count beside slice, shown only on collapse) and deliberately
+# not their magnitude — both are small because for those surfaces a collapse is the
+# designed common case, which is the opposite of this one.
+_DECLARED_ECHO_BOUND = 20
+
 # Surface wording for the record receipt's degraded-check causes. The record surface
 # owns this text (the core returns only the typed reason — the same core/surface split
 # as _notice_conflict_unavailable, the sync-surface sibling). ``Unavailable.detail`` is
@@ -544,6 +559,157 @@ def _review_unavailable_notice(cause: str) -> str:
         f"Near-duplicate review could not run ({cause}); this decision committed "
         "without a neighbour check."
     )
+
+
+def _declared_echo(
+    declared_by_relation: Dict[str, Optional[str]],
+    canonical_slugs: Dict[str, str],
+    gathered_index: Dict[str, Tuple[str, float]],
+    floor: float,
+) -> Dict[str, Any]:
+    """Partitions the caller's own declared targets for the pause body (A2).
+
+    The predicate, stated once here so no reader re-derives it from three call sites.
+    Let ``V`` be the targets the caller typed across all nine relation flags, ``G``
+    the slugs this call's KNN sweep gathered, and ``PR``
+    :data:`_PAUSE_RESOLVING_RELATIONS`:
+
+    * **Group two** (``declared_no_near_match``) — targets in ``V`` declared through at
+      least one ``PR`` relation that fall outside ``V ∩ G ∩ (score >= floor)``.
+    * **Group one** (``declared``) — the complement over ``V``, keyed on all nine
+      relations.
+
+    Four properties are contract, not implementation taste:
+
+    * The partition is over **targets**, not flag occurrences — a target declared
+      through several relations appears once, and lands in group two if *any* of those
+      relations is pause-resolving. So an ordinary cross-domain ``depends_on`` is
+      acknowledged in group one and can never be reported as having moved nothing.
+    * The inputs are the **primary sets** — the declarations, the gathered candidates
+      and the floor (M8). Never ``screen_candidates``' filtered return: its S4 stage
+      drops a declared target *before* the floor, so a declaration that resolved a
+      strong neighbour and one that did nothing are both absent from the survivors,
+      for unrelated reasons.
+    * Only the caller's own half of ``declared_targets`` is echoed. The transitive
+      lineage ancestors merged in for suppression are in **neither** group — the
+      discriminator is *did the caller type it*, never *is it also an ancestor*.
+    * An empty group renders **no key at all**, never an empty list: group one is
+      genuinely reachable-empty (a lone distant ``cites``), and a ``declared: []``
+      beside a populated group two would deny a declaration the call did receive.
+
+    Group two carries ``score`` only when the target *was* gathered and fell below the
+    floor; a target the sweep never saw has no candidate to read one off and renders
+    scoreless. The absent key — rather than a ``null`` — is what carries that shape.
+
+    Args:
+        declared_by_relation: Relation name -> the caller's raw, unsplit argument, in
+            the fixed render order (``supersedes``, ``corrects``, then
+            ``_EXTRA_RELATIONS``' own order). Values may be ``None``.
+        canonical_slugs: Casefolded declared target -> its stored slug, retained by the
+            Phase-A validation loops. The echo prints the stored spelling for every
+            target, gathered or not (a caller spelling and the casefold are both wrong
+            here — ``_normalize_slug`` runs on the record path alone, so the stored
+            handle genuinely differs from both).
+        gathered_index: Casefolded gathered slug -> ``(stored slug, score)`` for every
+            candidate this call's sweep returned, pre-screen.
+        floor: The similarity floor the screen applied (``_NEIGHBOR_REVIEW_THRESHOLD``).
+
+    Returns:
+        The echo's keys, ready to merge into the pause dict — any of ``declared``,
+        ``declared_total``, ``declared_no_near_match``,
+        ``declared_no_near_match_total``. Empty when the caller declared nothing.
+    """
+    order: List[Tuple[str, str]] = []       # (casefolded, verbatim), first-seen order
+    seen: set = set()
+    resolving: set = set()
+    for relation, raw in declared_by_relation.items():
+        for target in _split_relation_slugs(raw):
+            folded = target.casefold()
+            if folded not in seen:
+                seen.add(folded)
+                order.append((folded, target))
+            if relation in _PAUSE_RESOLVING_RELATIONS:
+                resolving.add(folded)
+
+    group_one: List[str] = []
+    group_two: List[Dict[str, Any]] = []
+    for folded, verbatim in order:
+        # The stored spelling, from the validation loops. Every declared target
+        # resolved there before the pause could compose, so the fallback is
+        # unreachable — it exists so a future edit cannot turn the echo into a crash
+        # on the write path.
+        handle = canonical_slugs.get(folded, verbatim)
+        gathered = gathered_index.get(folded)
+        if folded in resolving and not (gathered is not None and gathered[1] >= floor):
+            item: Dict[str, Any] = {"slug": handle}
+            if gathered is not None:
+                item["score"] = gathered[1]
+            group_two.append(item)
+        else:
+            group_one.append(handle)
+
+    echo: Dict[str, Any] = {}
+    for key, items in (("declared", group_one),
+                       ("declared_no_near_match", group_two)):
+        if not items:
+            continue
+        if len(items) > _DECLARED_ECHO_BOUND:
+            # The elision takes the TAIL: a score-keyed truncation is undefined over
+            # group two's common member (the scoreless one) and, defaulted to zero,
+            # would elide exactly the declarations carrying no other signal.
+            echo[key] = items[:_DECLARED_ECHO_BOUND]
+            echo[f"{key}_total"] = len(items)
+        else:
+            echo[key] = items
+    return echo
+
+
+def _declared_echo_lines(payload: Dict[str, Any]) -> List[str]:
+    """The echo's prose, composed from the pause payload's own keys.
+
+    Both prose renderers read this — sync's ``message`` and ``cmd_record``'s composed
+    body — so what a human reads and what the two machine encodings carry cannot
+    drift: the sentences are a render of the keys, not a second computation beside
+    them. Returns ``[]`` when the payload carries no echo, which is the whole render
+    for a call that declared nothing.
+
+    Both lines report in the **declared** register and say nothing about whether an
+    edge committed, in either direction. The pause returns above Phase B, so nothing
+    was written; a first group reading as a receipt of landed edges would invite
+    dropping exactly those flags from the re-record the pause exists to force. The
+    count renders only on a collapse — rendered unconditionally it is the aggregate
+    claim this surface is designed not to make.
+
+    Args:
+        payload: The pause dict (or the echo keys alone).
+
+    Returns:
+        Zero, one or two sentences without trailing punctuation, group one first.
+    """
+    lines: List[str] = []
+
+    declared = payload.get("declared")
+    if declared:
+        line = "Declared: " + ", ".join(declared)
+        total = payload.get("declared_total")
+        if total is not None:
+            line += f" ({total} total)"
+        lines.append(line)
+
+    no_match = payload.get("declared_no_near_match")
+    if no_match:
+        rendered = []
+        for item in no_match:
+            score = item.get("score")
+            rendered.append(item["slug"] if score is None
+                            else f"{item['slug']} ({score:.2f}, below floor)")
+        line = "Declared, not a near neighbour here: " + ", ".join(rendered)
+        total = payload.get("declared_no_near_match_total")
+        if total is not None:
+            line += f" ({total} total)"
+        lines.append(line)
+
+    return lines
 
 
 def _normalize_slug(text: str) -> str:
@@ -2037,7 +2203,10 @@ class MitosSyncManager:
                 return node_id, node
         return None, None
 
-    def _validate_relation_target(self, relation: str, target: str) -> Optional[Dict[str, str]]:
+    def _validate_relation_target(
+        self, relation: str, target: str, *,
+        canonical_slugs: Optional[Dict[str, str]] = None,
+    ) -> Optional[Dict[str, str]]:
         """Validates a typed relation's target is a unique, EXACT-match decision.
 
         Mirrors the supersedes check (``resolve_slug`` is casefold-exact; the re-filter
@@ -2047,6 +2216,12 @@ class MitosSyncManager:
         Args:
             relation: The relation kwarg name (for the error message), e.g. "amends".
             target: The slug the agent passed as that relation's target.
+            canonical_slugs: Optional casefolded-target -> stored-slug map to record the
+                resolved node's own spelling into. This is the ONLY place an
+                *ungathered* declared target's canonical handle is ever computed — the
+                node is already fetched here and its slug discarded — and the pause echo
+                prints stored spellings, never caller ones. Absent on the callers that
+                do not compose an echo.
 
         Returns:
             None if valid, else a structured ``{error, code}`` dict.
@@ -2059,10 +2234,13 @@ class MitosSyncManager:
         node = self.store.get_node(ids[0])
         if not node or node.get("slug", "").casefold() != target.casefold():
             return _record_error("relation_target_not_found", relation=relation, target=target)
+        if canonical_slugs is not None:
+            canonical_slugs[target.casefold()] = node["slug"]
         return None
 
-    def _review_neighbors(self, entry: ParsedEntry,
-                          declared_targets: set) -> "List[Dict[str, Any]] | Unavailable":
+    def _review_neighbors(self, entry: ParsedEntry, declared_targets: set, *,
+                          gathered_index: Optional[Dict[str, Tuple[str, float]]] = None,
+                          ) -> "List[Dict[str, Any]] | Unavailable":
         """Pre-commit: existing live decisions too similar to ``entry`` to ignore (P4).
 
         Composes the Conflict sensor's candidate stages (the same discovery `mitos
@@ -2086,6 +2264,15 @@ class MitosSyncManager:
             declared_targets: Casefolded slugs the entry already links to — its declared
                 relation targets plus their transitive mutation lineage — excluded so a
                 linked neighbour is not re-flagged.
+            gathered_index: Optional sink the caller passes to keep this call's *raw*
+                gathered set, ``{casefolded slug: (stored slug, score)}``. The pause
+                echo partitions the caller's declarations against the gathered
+                candidates and the floor — the primary sets (M8) — and the screened
+                return cannot answer for them: S4 drops a declared target *before* the
+                floor, so a declaration that resolved a strong neighbour and one that
+                fell short are indistinguishable there. A sink rather than a widened
+                return type, so the eight ``patch.object`` sites binding this method by
+                string stay green.
 
         Returns:
             A list of :func:`~mitos.conflict.candidate_payload` dicts for
@@ -2107,6 +2294,13 @@ class MitosSyncManager:
         )
         if isinstance(gathered, Unavailable):
             return gathered
+        if gathered_index is not None:
+            # Read the handle off the hydrated node, not off ``Candidate.slug``: the
+            # latter is the vector-store payload's spelling (they agree in production
+            # because the payload was written from the node, but they are two sources).
+            gathered_index.update(
+                {c.node["slug"].casefold(): (c.node["slug"], c.score) for c in gathered}
+            )
         screened = screen_candidates(
             gathered,
             declared_targets=declared_targets,
@@ -2650,11 +2844,19 @@ class MitosSyncManager:
             ``coherence_audit`` statement of the corpus's standing, cumulative
             contradiction-check debt; OR, when a highly-similar unreferenced decision exists and
             ``acknowledge_neighbors`` is False, a ``{status: "needs_review", code:
-            "similar_decision_exists", neighbors, message}`` pause that wrote NOTHING —
+            "similar_decision_exists", slug, neighbors, message}`` pause that wrote
+            NOTHING —
             each ``neighbors`` element is an enriched, modifier-stamped decision-read
             payload (:func:`~mitos.conflict.candidate_payload`: ``slug`` / ``axiom`` /
             ``scope`` / ``score`` / ``rejected_paths`` plus any ``amended_by``/
-            ``narrowed_by`` stamps) the authoring agent judges tenability from;
+            ``narrowed_by`` stamps) the authoring agent judges tenability from. That
+            pause also echoes the caller's own declared relation targets, partitioned
+            by :func:`_declared_echo` and present only when non-empty: ``declared``
+            (every target it typed, canonical spellings) and
+            ``declared_no_near_match`` (``{slug[, score]}`` for the pause-resolving
+            declarations that moved nothing on this call), each with a
+            ``*_total`` sibling count when the group collapsed at
+            :data:`_DECLARED_ECHO_BOUND`;
             OR a structured ``{error, code}`` failure (see spec §5).
         """
         # === Phase A — validate everything in memory (no writes) ===
@@ -2768,6 +2970,12 @@ class MitosSyncManager:
         # multi-target supersede (each slug resolved independently; a lone slug is the
         # 1-element common case). Phase A read-only fast-fail: a miss on ANY target
         # returns an error naming that slug and writes nothing.
+        # Each loop below also retains the resolved node's OWN slug spelling, keyed on
+        # the casefolded caller spelling. That is the pause echo's canonical handle for
+        # every declared target — including the ones the neighbour sweep never gathers,
+        # whose stored spelling is computed nowhere else — and it costs a dict write on
+        # a node already fetched.
+        canonical_slugs: Dict[str, str] = {}
         supersedes_slugs = _split_relation_slugs(supersedes)
         for _sup in supersedes_slugs:
             ids = self.store.resolve_slug(_sup)
@@ -2778,6 +2986,7 @@ class MitosSyncManager:
             target = self.store.get_node(ids[0])
             if not target or target.get("slug", "").casefold() != _sup.casefold():
                 return _record_error("supersedes_not_found", supersedes=_sup)
+            canonical_slugs[_sup.casefold()] = target["slug"]
         if supersedes_slugs:
             entry.supersedes = supersedes_slugs  # List[str] shape (V1b multi-valued)
 
@@ -2794,6 +3003,7 @@ class MitosSyncManager:
             target = self.store.get_node(ids[0])
             if not target or target.get("slug", "").casefold() != _cor.casefold():
                 return _record_error("corrects_not_found", corrects=_cor)
+            canonical_slugs[_cor.casefold()] = target["slug"]
         if corrects_slugs:
             entry.corrects = corrects_slugs  # List[str] shape (V1b multi-valued)
 
@@ -2804,7 +3014,8 @@ class MitosSyncManager:
         for _name, _raw in extra_relations.items():
             _targets = _split_relation_slugs(_raw)
             for _t in _targets:
-                err = self._validate_relation_target(_name, _t)
+                err = self._validate_relation_target(
+                    _name, _t, canonical_slugs=canonical_slugs)
                 if err:
                     return err
             if _targets:
@@ -2867,6 +3078,20 @@ class MitosSyncManager:
         review_unavailable: Optional[str] = None
         if not acknowledge_neighbors:
             neighbors: List[Dict[str, Any]] = []
+            # The caller's own declarations, per relation, for the pause echo — built
+            # BESIDE the declared_targets comprehension below, which folds the relation
+            # name away. Purely additive: nothing that Phase B reads moves in here.
+            # `test_mixed_neighbors_declared_edge_survives_acknowledge_bypass` documents
+            # why that matters — this whole block is skipped under acknowledge_neighbors
+            # while Phase B still writes edges from the raw relation args, so relocating
+            # any normalization into it drops declared edges when both flags travel
+            # together, with every other row green.
+            declared_by_relation: Dict[str, Optional[str]] = {
+                "supersedes": supersedes, "corrects": corrects, **extra_relations,
+            }
+            # This call's raw gathered set, filled by _review_neighbors. Primary-set
+            # input to the partition (M8); empty when the sweep never ran.
+            gathered_index: Dict[str, Tuple[str, float]] = {}
             try:
                 declared_targets = {
                     t.casefold()
@@ -2889,7 +3114,8 @@ class MitosSyncManager:
                         + _split_relation_slugs(extra_relations.get("amends"))
                         + _split_relation_slugs(extra_relations.get("narrows"))
                     )
-                reviewed = self._review_neighbors(entry, declared_targets)
+                reviewed = self._review_neighbors(entry, declared_targets,
+                                                  gathered_index=gathered_index)
             except (DatabaseError, ValidationError) as exc:
                 # A graph-store fault during the pause read (gather's node reads or the
                 # lineage walk). Fail open — a fault this severe fails Phase B anyway,
@@ -2911,6 +3137,16 @@ class MitosSyncManager:
                 else:
                     neighbors = reviewed
             if neighbors:
+                # The declared-edge echo (A2). mitos is stateless across calls, so a
+                # pause on a different node cannot say "since your last attempt" — and
+                # a caller that cannot tell whether its declaration registered mints a
+                # second, false edge into the gold source. The one thing that answers
+                # it is what this call already computed and threw away.
+                echo = _declared_echo(declared_by_relation, canonical_slugs,
+                                      gathered_index, _NEIGHBOR_REVIEW_THRESHOLD)
+                # Ahead of the closing sentence, so the commitment retraction still
+                # closes the body.
+                echo_prose = "".join(f"{line}. " for line in _declared_echo_lines(echo))
                 return {
                     "status": "needs_review",
                     "code": "similar_decision_exists",
@@ -2927,9 +3163,10 @@ class MitosSyncManager:
                         "acknowledge_neighbors=True for neighbours that stand "
                         "independently alongside it — or both at once for a mixed "
                         "set. An amended_by/narrowed_by stamp means the neighbour "
-                        "has moved on — dereference that slug before linking. "
+                        f"has moved on — dereference that slug before linking. {echo_prose}"
                         "Nothing was written."
                     ),
+                    **echo,
                 }
 
         # === Phase B — the only writes, fully serialised under one lock ===
