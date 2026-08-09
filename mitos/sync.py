@@ -410,6 +410,24 @@ _EXISTS_NO_OP_NOTE = (
     "pointing at this slug."
 )
 
+# The standing coherence debt a successful write incurs, stated on every `created`
+# receipt. The REGISTER is the mechanism, not the presence: `mitos check` reuses
+# prior verdicts (a reused pair never enters a batch), so one deferred run after N
+# writes covers the same ground as N runs for less — and `_confirm_spend` only fires
+# above CHECK_CONFIRM_BATCHES fresh groups, so a caller auditing per write presents
+# ~1 fresh group forever and the tree's only spend ring never fires. A line reading
+# "audit this write" therefore converts one owed run into N and fragments the
+# amortization (ADR `record-receipt-states-cumulative-audit-debt-not-per-write-work`).
+# So: cumulative and corpus-wide, no imperative, no per-entry referent — and no
+# command, because this string is an MCP-visible payload field, not a CLI line (ADR
+# `receipt-dict-strings-are-mcp-boundary-so-recovery-splits-per-renderer`). The
+# recovery clause is each renderer's own; `cli._coherence_audit_hint` composes the
+# CLI's. Enforced by test rather than by emphasis (tests/test_record_decision.py).
+_COHERENCE_AUDIT_NOTE = (
+    "Coherence audit is cumulative and corpus-wide: this corpus holds recorded "
+    "decisions that no contradiction check has covered yet."
+)
+
 # A new decision at/above this document-document similarity to an existing one the
 # author did NOT reference is paused for review (AX P4): the neighbour must surface
 # BEFORE commit, while the author can still point an amends/supersedes/contradicts
@@ -497,9 +515,24 @@ _PREFLIGHT_DISPOSITIONS: Dict[str, str] = {
 def _review_unavailable_notice(cause: str) -> str:
     """One calm receipt sentence for a near-dup check that could not run (fail-open).
 
-    Structure fixed by the vision: name the cause, state that the decision committed
-    without the check, point at the retroactive net. "Couldn't check" must never read
-    as "checked, clean".
+    Structure: name the cause and state that the decision committed without the
+    check. "Couldn't check" must never read as "checked, clean".
+
+    It names **no command**, and that is the boundary rule rather than a stylistic
+    trim: this sentence is returned into ``result["neighbor_review_unavailable"]``,
+    which ``record --json`` emits verbatim and MCP ``record_decision`` returns — so
+    a selectored ``mitos check`` here would put a shell command carrying a CLI flag
+    onto an agent's response. The recovery is composed per renderer instead, and on
+    the CLI it rides the *unconditional* coherence line one paragraph below (which
+    lands on this same ``created`` exit by construction), so the receipt names the
+    verb exactly once rather than twice in two registers. ADRs
+    ``receipt-dict-strings-are-mcp-boundary-so-recovery-splits-per-renderer`` and
+    ``created-receipt-names-its-recovery-once-on-the-unconditional-line``.
+
+    One cause spelling is the deliberate exception: ``COLLECTION_MISSING`` keeps its
+    ``mitos reconcile`` pointer in :data:`_REVIEW_UNAVAILABLE_CAUSES`, a separate
+    string this function does not compose — a local re-embed rather than a judged
+    audit, and test-pinned because the unmapped fallback cannot produce it.
 
     Args:
         cause: Short prose naming what failed (e.g. "embedding service unavailable").
@@ -509,7 +542,7 @@ def _review_unavailable_notice(cause: str) -> str:
     """
     return (
         f"Near-duplicate review could not run ({cause}); this decision committed "
-        "without a neighbour check — `mitos check` covers it retroactively."
+        "without a neighbour check."
     )
 
 
@@ -2612,7 +2645,10 @@ class MitosSyncManager:
             as committed, plus an optional
             ``neighbor_review_unavailable`` notice when the pre-commit near-dup
             check could not run (the record fails open — the commit proceeds
-            unchecked and `mitos check` covers it retroactively); OR, when a highly-similar unreferenced decision exists and
+            unchecked; the notice names the cause and no command, each surface
+            composing its own recovery), plus an always-present
+            ``coherence_audit`` statement of the corpus's standing, cumulative
+            contradiction-check debt; OR, when a highly-similar unreferenced decision exists and
             ``acknowledge_neighbors`` is False, a ``{status: "needs_review", code:
             "similar_decision_exists", neighbors, message}`` pause that wrote NOTHING —
             each ``neighbors`` element is an enriched, modifier-stamped decision-read
@@ -3025,6 +3061,12 @@ class MitosSyncManager:
             "edges_created": self.store.get_outgoing_edges(node_id),
             "scope": entry.scope,
             "mechanisms": entry.mechanisms,
+            # Unconditional, and only here: a write that landed incurred coherence
+            # debt, while `exists`/`needs_review`/every error wrote nothing and owe
+            # nothing. Carrying the FACT on the field (rather than leaving the CLI
+            # renderer to decide) is what keeps the shared text tail from leaking
+            # the line onto a no-op — the renderer gates on the key's presence.
+            "coherence_audit": _COHERENCE_AUDIT_NOTE,
         }
         # Honest degradation (KDD-4): when the pre-commit near-dup check could not run,
         # say so on the receipt — one calm sentence, only on a genuinely failed check

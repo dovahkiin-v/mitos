@@ -798,7 +798,15 @@ def test_degraded_embedding_commits_with_notice(ws):
     assert res["status"] == "created"
     notice = res["neighbor_review_unavailable"]
     assert "embedding service unavailable" in notice
-    assert "mitos check" in notice
+    # The notice names the CAUSE and no command: it rides the shared receipt dict
+    # to MCP verbatim, and a shell command carrying a CLI flag may not go there.
+    # The recovery is composed per renderer (the CLI's on the coherence line).
+    # Scoped to the composed sentence, not to the whole class: COLLECTION_MISSING's
+    # CAUSE string keeps its bare `mitos reconcile` — a separate line this function
+    # does not compose, deliberately kept and pinned by
+    # `test_cli_record_notice_names_the_missing_collection_and_its_heal` below, so
+    # the two rows are not in conflict.
+    assert "mitos" not in notice
     # Unavailable.detail is logging-only — never rendered into the receipt.
     assert "quota exhausted" not in notice
     assert GraphStore(config.db_path).get_node_by_slug("deg-embed") is not None
@@ -814,7 +822,7 @@ def test_degraded_vector_store_commits_with_notice(ws):
     assert res["status"] == "created"
     notice = res["neighbor_review_unavailable"]
     assert "vector store unavailable" in notice
-    assert "mitos check" in notice
+    assert "mitos" not in notice  # cause only; recovery is each renderer's own
     assert "connection refused" not in notice
     assert GraphStore(config.db_path).get_node_by_slug("deg-vector") is not None
 
@@ -838,7 +846,7 @@ def test_graph_fault_during_pause_read_commits_with_notice(ws):
     assert res["status"] == "created"
     notice = res["neighbor_review_unavailable"]
     assert "graph read failed" in notice
-    assert "mitos check" in notice
+    assert "mitos" not in notice  # cause only; recovery is each renderer's own
     assert "disk I/O error" not in notice
     assert GraphStore(config.db_path).get_node_by_slug("gf-new") is not None
 
@@ -937,15 +945,26 @@ def test_created_receipt_carries_no_related_echo(ws):
 
 
 def test_cli_record_renders_degraded_notice(ws, capsys):
-    """The human surface: receipt on stdout, one calm notice line after it on stderr."""
+    """The human surface: receipt on stdout, then the notice and the pointer on stderr.
+
+    Tightened rather than left alone: a row spelled ``"mitos check" in err`` keeps
+    passing after the split — the coherence line one paragraph below now supplies
+    the string the notice used to — so it would pin nothing while reading as a gate.
+    The two halves are asserted separately, and the count is the load-bearing line:
+    zero means the split's easy half was done and the recovery never composed (worse
+    than the bare command it replaced), two means the notice kept its clause.
+    """
     config, _ = ws
     unavailable = Unavailable(reason=ConflictUnavailableReason.EMBEDDING, detail="quota")
     with patch.object(MitosSyncManager, "_review_neighbors", return_value=unavailable):
         cmd_record(config, axiom="A new call.", rejected="rej", slug="degcall")
     out, err = capsys.readouterr()
     assert "Recorded decision 'degcall'" in out
-    assert "Near-duplicate review could not run" in err
-    assert "mitos check" in err
+    notice_line = next(line for line in err.splitlines()
+                       if "Near-duplicate review could not run" in line)
+    assert "mitos" not in notice_line, notice_line
+    assert (out + err).count("mitos check") == 1, err
+    assert f"-p {config.project!r}" in err, err
     assert "quota" not in err  # detail is logging-only, never rendered
 
 

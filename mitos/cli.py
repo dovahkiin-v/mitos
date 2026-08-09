@@ -1141,6 +1141,38 @@ def _show_not_found_hint(config: MitosConfig) -> str:
             f"run `mitos sync -p {config.project!r}`")
 
 
+def _coherence_audit_hint(config: MitosConfig) -> str:
+    """Composes the CLI's coherence-audit recovery clause — this boundary's alone.
+
+    The *fact* (a standing, corpus-wide contradiction-check debt) lives once, on
+    ``sync._COHERENCE_AUDIT_NOTE``, and reaches all three encodings on the shared
+    receipt dict. Only the *recovery* is composed here, for the same reason
+    :func:`_show_not_found_hint` is: MCP may name no shell command (an agent handed
+    one runs it), the CLI reader's actual repair *is* ``mitos check``, and a shared
+    body could only be the intersection — which is empty of recovery.
+
+    It names the selector because a bare ``mitos check`` has had no target since the
+    0.15.0 flip, and it renders ``config.project`` through ``repr`` for the reason
+    every other registry name on this surface does: a name is hand-editable text,
+    and the quoted form is what a shell wants around a path with a space anyway.
+
+    Unlike its sibling this returns a **complete sentence with its own terminal
+    punctuation** — it has exactly one call site, where it is appended to a shared
+    note that is itself a full sentence, so caller-supplied punctuation would only
+    split one string across two files.
+
+    The register stays the note's: this states what the audit *is*, one pass over
+    the whole corpus, and never frames it as work owed on the entry just written.
+
+    Args:
+        config: The resolved workspace config, carrying ``project``.
+
+    Returns:
+        The recovery sentence, naming ``mitos check`` exactly once.
+    """
+    return f"The audit is `mitos check -p {config.project!r}` — one pass, whole corpus."
+
+
 def cmd_show(config: MitosConfig, ident: str, as_json: bool = False) -> None:
     """Shows full details of a specific node by ID or slug.
 
@@ -1743,6 +1775,19 @@ def cmd_record(
     if review_notice:
         sys.stdout.flush()
         print(f"\n{review_notice}", file=sys.stderr)
+    # The standing coherence debt, last — so it reads as the answer to the notice
+    # above it, which after the split carries no recovery of its own. Gated on the
+    # FIELD, which sync sets on the `created` return alone: this text tail is shared
+    # with the `exists` exit (it branches only on the headline and the path label),
+    # and a no-op incurs no audit debt — an unconditional print would also put a
+    # second recipe on a receipt that already carries the `mitos sync` one. Same
+    # flush-first shape as the two riders above; the `--json` branch returned long
+    # ago, which is why the recovery clause is text-only by construction rather than
+    # by a condition.
+    coherence = result.get("coherence_audit")
+    if coherence:
+        sys.stdout.flush()
+        print(f"\n{coherence} {_coherence_audit_hint(config)}", file=sys.stderr)
 
 
 def _read_text_arg(inline: Optional[str], file_path: Optional[str]) -> Optional[str]:
@@ -5457,10 +5502,22 @@ def _build_parser() -> argparse.ArgumentParser:
     rec_p = subparsers.add_parser("record", aliases=["record_decision"], help="Record a decision directly to buffer and graph.")
     rec_p.add_argument("axiom", nargs="?", default=None,
                        help="The decision as a single clear sentence true going forward "
-                            "(or use --axiom-file; exactly one of the two).")
+                            "(or use --axiom / --axiom-file; exactly one of the three).")
+    # `--axiom` gets its OWN dest. Sharing the positional's is the cheaper-looking
+    # trick and is dead on arrival: without SUPPRESS the flag form parses to None
+    # (the positional's default overwrites it), and with SUPPRESS argument ORDER
+    # decides which value survives, so supplying both becomes undetectable and one
+    # is silently kept — the silently-keep-last defect on the field that
+    # CONSTITUTES identity (a dropped axiom is a different node id, M1/M2). Plain
+    # `store`, never `append`: an axiom is one sentence, not a set, so the arity the
+    # nine relation flags took has no meaning here. `metavar` or the usage banner
+    # leaks the internal dest as `[--axiom AXIOM_FLAG]`.
+    rec_p.add_argument("--axiom", default=None, dest="axiom_flag", metavar="AXIOM",
+                       help="The axiom as a flag, for callers who reach for one — "
+                            "the same value as the positional (exactly one of the three).")
     rec_p.add_argument("--axiom-file", default=None, dest="axiom_file",
                        help="Read the axiom from a file ('-' = stdin) to avoid shell-quoting; "
-                            "replaces the positional axiom (supply one, not both).")
+                            "replaces the inline axiom (exactly one of the three).")
     rec_p.add_argument("--rejected", default=None, help="Alternatives considered and rejected, and why (REQUIRED — or use --rejected-file).")
     rec_p.add_argument("--rejected-file", default=None, dest="rejected_file",
                        help="Read --rejected from a file ('-' = stdin) to avoid shell-quoting long prose.")
@@ -5642,7 +5699,11 @@ def _build_parser() -> argparse.ArgumentParser:
     # `--axiom` an unambiguous prefix of `--axiom-file`: a 470-character axiom went
     # to the file reader and the command died as `[Errno 36] File name too long`
     # through the outermost boundary, as a "Fatal Unexpected Error" naming nothing
-    # the caller could act on. Setting `allow_abbrev=False` on the top-level parser
+    # the caller could act on. That founding example is now HISTORICAL — `--axiom`
+    # is a declared option, so it resolves exactly and no longer abbreviates
+    # anything; a reader reproducing it will find it does not reproduce. The rule
+    # still holds for every other flag (`--axiom-fil` is the probe that still
+    # bites). Setting `allow_abbrev=False` on the top-level parser
     # does NOT propagate — an `add_parser()` child keeps its own True — so it is
     # pinned here over the whole registered set rather than as a kwarg on `record`,
     # which the next verb added would be one forgotten argument away from missing.
@@ -5806,15 +5867,29 @@ def main() -> None:
         elif args.command == "render":
             cmd_render(config, scope=args.scope, render_format=args.format)
         elif args.command in ("record", "record_decision"):
-            # Exactly one axiom source: the positional or --axiom-file (the
-            # quoting-safe twin of --rejected-file). Same JSON-aware dead-end
+            # Exactly one axiom source: the positional, --axiom, or --axiom-file
+            # (the quoting-safe twin of --rejected-file). Same JSON-aware dead-end
             # shape as the missing-rejected check below.
-            if (args.axiom is None) == (args.axiom_file is None):
+            #
+            # The COUNT feeds both the guard and the --json code, deliberately. The
+            # previous chooser read one dest — `"ambiguous" if args.axiom is not
+            # None else "missing"` — an exact discriminator at arity two and wrong
+            # at three: `--axiom X --axiom-file f` leaves the positional None and
+            # reported `missing_axiom` to a caller who had supplied two. One value,
+            # so the two cannot drift apart again. Gates are `is not None`, never
+            # truthiness: an empty axiom is a SUPPLIED source that the write path
+            # then refuses on its own terms.
+            _axiom_sources = [source for source
+                              in (args.axiom, args.axiom_flag, args.axiom_file)
+                              if source is not None]
+            if len(_axiom_sources) != 1:
                 msg = ("record requires exactly one axiom source: the positional "
-                       "axiom OR --axiom-file ('-' = stdin), not both and not neither.")
+                       "axiom, --axiom, or --axiom-file ('-' = stdin) — one of the "
+                       f"three, and {len(_axiom_sources)} were supplied.")
                 if args.as_json:
-                    _emit_json({"error": msg, "code": "ambiguous_axiom_source"
-                                if args.axiom is not None else "missing_axiom"})
+                    _emit_json({"error": msg,
+                                "code": ("ambiguous_axiom_source" if _axiom_sources
+                                         else "missing_axiom")})
                 else:
                     print(msg, file=sys.stderr)
                 sys.exit(2)
@@ -5832,7 +5907,11 @@ def main() -> None:
                 else:
                     print(msg, file=sys.stderr)
                 sys.exit(2)
-            axiom = _read_text_arg(args.axiom, args.axiom_file)
+            # The guard above proved at most one inline source is set, so coalescing
+            # them is safe and `_read_text_arg`'s file-wins precedence never fires on
+            # a caller who supplied both.
+            _inline_axiom = args.axiom if args.axiom is not None else args.axiom_flag
+            axiom = _read_text_arg(_inline_axiom, args.axiom_file)
             if args.axiom_file is not None and axiom.endswith("\n"):
                 axiom = axiom[:-1]  # strip the single trailing newline files/heredocs add
             rejected = _read_text_arg(args.rejected, args.rejected_file)

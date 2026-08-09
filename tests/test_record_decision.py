@@ -11,6 +11,7 @@ every error path leaves decisions.md byte-for-byte unchanged.
 import os
 import json
 import shutil
+import sys
 import tempfile
 import threading
 from typing import Tuple, Iterator
@@ -779,3 +780,242 @@ def test_exists_no_op_leaves_a_missing_source_block_missing(ws) -> None:
     # re-record cannot, and until `restore-source` shipped there was nothing that could.
     assert "restore-source" in res["no_op_reason"]
     assert "no `### ` block" in res["no_op_reason"]
+
+
+# --------------------------------------------------------------------------- #
+# The coherence-audit pointer (B2 / T2)
+# --------------------------------------------------------------------------- #
+#
+# The field's WORDING is the guard, not a matter of taste: `mitos check` is the
+# tree's sole Anthropic spend and reuses verdicts, so one deferred run covers N
+# writes for less, while `_confirm_spend` only fires above ten fresh groups — an
+# agent auditing per write presents ~1 forever and the only spend ring in the tree
+# never fires. A line reading "audit this write" therefore converts one owed run
+# into N (ADR `record-receipt-states-cumulative-audit-debt-not-per-write-work`).
+# So the register is a tested contract here rather than the author's ear.
+
+#: Shapes the note must never take. Each is planted into the checker below to prove
+#: it is not vacuous — a negative row that cannot red is worse than no row.
+#: Recorded verbatim so a later reader re-runs the proof instead of trusting it.
+_PLANTED_NOTE_VIOLATIONS = (
+    "Coherence debt is standing — run `mitos check -p '.'` to clear it.",  # a command
+    "Coherence debt is standing; run the audit before the next write.",   # imperative
+    "This decision committed without a contradiction check.",             # per-entry
+    "Contradiction coverage is stale — audit this corpus now.",           # "now"
+    "You should check the corpus for contradictions.",                    # "you should"
+)
+
+#: Substrings forbidden anywhere in the shared field, casefolded.
+_NOTE_FORBIDDEN_SUBSTRINGS = ("mitos ", "this decision", "this entry",
+                              "audit this", "you should")
+#: Forbidden as WORDS — a bare `"now" in text` reds on "known" (1a's casefold lesson,
+#: one class over), so these match on word boundaries only.
+_NOTE_FORBIDDEN_WORDS = ("run", "now")
+
+
+def _coherence_note_violations(note: str):
+    """Every register rule the note breaks, as a sorted list (empty == compliant)."""
+    import re
+    folded = note.casefold()
+    found = [s for s in _NOTE_FORBIDDEN_SUBSTRINGS if s in folded]
+    found += [w for w in _NOTE_FORBIDDEN_WORDS
+              if re.search(rf"\b{re.escape(w)}\b", folded)]
+    return sorted(found)
+
+
+def _created(m, axiom: str, slug: str) -> dict:
+    """One created receipt, past the 0.80 pause floor (seeds are near-twins)."""
+    res = m.record_decision_entry(axiom, "rej", ["s"], slug=slug,
+                                  acknowledge_neighbors=True)
+    assert res["status"] == "created", res
+    return res
+
+
+def test_created_receipt_carries_a_non_empty_coherence_audit_string(ws) -> None:
+    """Every `created` return carries `coherence_audit`, and it is a non-empty str.
+
+    The type row exists on its own because it is the only thing that reds a later
+    "simplification" of the field into the boolean the ADR rejected — a flag would
+    be per-entry by position and would assert a coverage fact the receipt cannot
+    know. Reasoning in a rejected-alternative cannot survive a rewrite unaided.
+    """
+    config, m = ws
+    res = _created(m, "The receipt states its standing coherence debt.", "coh-created")
+    assert isinstance(res["coherence_audit"], str)
+    assert res["coherence_audit"].strip()
+
+
+def test_coherence_note_states_a_standing_corpus_wide_debt(ws) -> None:
+    """The register, asserted: no command, no imperative, no per-entry referent.
+
+    Non-vacuity is proved in-row — every shape in ``_PLANTED_NOTE_VIOLATIONS`` is
+    fed to the same checker and must be caught. Without that, a checker whose regex
+    silently stopped matching would pass this row forever.
+    """
+    config, m = ws
+    note = _created(m, "The register is enforced by a row.", "coh-register")["coherence_audit"]
+
+    assert _coherence_note_violations(note) == [], note
+    # Wider than the entry it rides — the debt is the corpus's, not this write's.
+    assert "corpus" in note.casefold(), note
+
+    # The injection proof: each planted shape must be caught by the same checker.
+    for planted in _PLANTED_NOTE_VIOLATIONS:
+        assert _coherence_note_violations(planted), (
+            f"the register checker is vacuous — it passed: {planted!r}")
+
+
+def test_exists_receipt_carries_neither_the_field_nor_the_line(ws, capsys) -> None:
+    """A re-record wrote nothing, so it incurs no audit debt and says nothing.
+
+    The exit that bites: `cmd_record`'s text tail is SHARED between `created` and
+    `exists` (it branches only on the headline and the path label), so an
+    unconditional print would put the pointer — and a second recipe — on a no-op.
+    The `exists` short-circuit returns above the embedding step, which is why this
+    is also the one record exit whose stderr can honestly be asserted empty.
+    """
+    from mitos.cli import cmd_record
+    config, m = ws
+    _created(m, "A decision recorded once.", "coh-exists")
+
+    res = m.record_decision_entry("A decision recorded once.", "rej", ["s"],
+                                  slug="coh-exists", acknowledge_neighbors=True)
+    assert res["status"] == "exists"
+    assert "coherence_audit" not in res
+
+    capsys.readouterr()
+    cmd_record(config, axiom="A decision recorded once.", rejected="rej",
+               slug="coh-exists", acknowledge_neighbors=True)
+    out, err = capsys.readouterr()
+    assert "already recorded" in out
+    assert "mitos check" not in out + err
+    assert "coherence" not in (out + err).casefold()
+    assert err == "", err
+
+
+def test_pause_and_error_exits_carry_no_coherence_audit(ws) -> None:
+    """`needs_review` wrote nothing and an error exit wrote nothing — neither owes it."""
+    config, m = ws
+    _created(m, "The sync lock is held during commit.", "coh-prior")
+    with patch.object(MitosSyncManager, "_review_neighbors",
+                      return_value=[{"slug": "coh-prior", "score": 0.9,
+                                     "axiom": "The sync lock is held during commit."}]):
+        paused = m.record_decision_entry("The sync lock is held for the commit duration.",
+                                         "rej", ["s"], slug="coh-paused")
+    assert paused["status"] == "needs_review"
+    assert "coherence_audit" not in paused
+
+    failed = m.record_decision_entry("An axiom pointing nowhere.", "rej", ["s"],
+                                     slug="coh-dangling", supersedes="no-such-slug")
+    assert "error" in failed
+    assert "coherence_audit" not in failed
+
+
+def test_both_machine_encodings_carry_the_identical_coherence_audit(ws, capsys) -> None:
+    """`record --json` and MCP `record_decision` return the same object's field.
+
+    Distinct slugs deliberately: the CLI call COMMITS, so an MCP call replaying the
+    same axiom would return `exists` (which carries no field at all) and the row
+    would compare a string against nothing.
+    """
+    from mitos import mcp_server
+    from mitos.cli import cmd_record
+    config, m = ws
+
+    cmd_record(config, axiom="The CLI encoding of the receipt.", rejected="rej",
+               slug="coh-cli", acknowledge_neighbors=True, as_json=True)
+    cli_payload = json.loads(capsys.readouterr().out)
+
+    with patch("mitos.mcp_server.MitosConfig", return_value=config):
+        mcp_payload = json.loads(mcp_server.record_decision(
+            "The MCP encoding of the receipt.", "rej", ["s"], slug="coh-mcp",
+            acknowledge_neighbors=True, project=config.workspace_dir))
+
+    assert cli_payload["status"] == "created" and mcp_payload["status"] == "created"
+    assert cli_payload["coherence_audit"] == mcp_payload["coherence_audit"]
+    # And identical because they are ONE source rendered twice, not two strings that
+    # happen to agree — the single-sourcing is the parity mechanism, and a row that
+    # only compared the two payloads would stay green through a hand-copied second
+    # spelling on either surface.
+    from mitos.sync import _COHERENCE_AUDIT_NOTE
+    assert cli_payload["coherence_audit"] == _COHERENCE_AUDIT_NOTE
+    # And neither machine surface carries the recovery — the command is the CLI text
+    # renderer's alone, because an agent handed a shell command runs it.
+    assert "mitos" not in cli_payload["coherence_audit"]
+    assert "mitos" not in mcp_payload["coherence_audit"]
+
+
+def test_json_created_exit_keeps_b2s_text_off_stderr(ws, capsys) -> None:
+    """Under `--json` the pointer speaks on stdout only — nothing of B2 on stderr.
+
+    Scoped to B2's own text rather than to stderr as a whole: an offline created
+    record legitimately writes ``[Warning] Embedding upsert deferred …`` there
+    (measured), so a row spelled ``err == ""`` would red on shipped behaviour.
+    """
+    from mitos.cli import cmd_record
+    config, _ = ws
+    cmd_record(config, axiom="The JSON surface stays on stdout.", rejected="rej",
+               slug="coh-json", acknowledge_neighbors=True, as_json=True)
+    out, err = capsys.readouterr()
+    payload = json.loads(out)
+    assert payload["coherence_audit"]
+    assert payload["coherence_audit"] not in err
+    assert "mitos check" not in err
+
+
+def test_cli_created_receipt_names_the_audit_exactly_once_selectored(ws, capsys) -> None:
+    """The recovery clause: `mitos check`, once, carrying the caller's own selector.
+
+    Reds in BOTH directions by construction. Zero mentions is the split's easy half
+    done and the recovery never composed — worse than the bare command it replaced.
+    Two is the degraded notice having kept its clause.
+    """
+    from mitos.cli import cmd_record
+    config, _ = ws
+    cmd_record(config, axiom="The human surface carries the recovery.", rejected="rej",
+               slug="coh-text", acknowledge_neighbors=True)
+    out, err = capsys.readouterr()
+    combined = out + err
+    assert combined.count("mitos check") == 1, combined
+    # The selector is the caller's own vocabulary, repr-rendered — never a literal
+    # (a hand-built config echoes the workspace path; through main() it is the name).
+    assert f"-p {config.project!r}" in err, err
+    assert "Recorded decision 'coh-text'" in out
+
+
+def test_the_coherence_line_reaches_a_combined_pipe_after_the_receipt(tmp_path) -> None:
+    """Ordering, proved where it can break: ONE pipe, a real subprocess.
+
+    ``capsys`` keeps the streams apart and is structurally blind to this — off a TTY
+    stdout is block-buffered while stderr never is, so without the flush the pointer
+    overtakes the receipt it annotates. The anchor is ``Handle:`` (the receipt's last
+    stdout line) rather than "all of stdout": an offline record already writes
+    ``[Warning] Embedding upsert deferred …`` to stderr from inside the write path,
+    and measured, that warning lands FIRST in the combined pipe — so an assertion
+    shaped "stderr follows stdout" is false before this change too.
+    """
+    import subprocess
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    env = {
+        **os.environ,
+        "MITOS_NO_UPDATE_CHECK": "1",
+        "XDG_CONFIG_HOME": str(tmp_path / "xdg_config"),
+        "GEMINI_API_KEY": "", "GOOGLE_API_KEY": "",
+        "QDRANT_URL": "http://localhost:1",
+    }
+
+    def run(*argv):
+        return subprocess.run(
+            [sys.executable, "-m", "mitos.cli", *argv], cwd=str(workspace), env=env,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+
+    run("init")
+    done = run("-p", str(workspace), "record", "A decision recorded through a pipe.",
+               "--rejected", "rej", "--slug", "piped-record")
+
+    combined = done.stdout
+    assert "Recorded decision 'piped-record'" in combined, combined
+    assert "mitos check" in combined, combined
+    assert combined.index("mitos check") > combined.index("Handle:"), combined

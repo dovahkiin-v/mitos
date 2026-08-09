@@ -2,6 +2,7 @@
 prose input, `--version`, and the MCP-wiring hint."""
 
 import io
+import re
 import sys
 
 import pytest
@@ -351,7 +352,7 @@ def test_single_stdin_file_arg_still_works(monkeypatch, workspace):
     assert mock_record.call_args.kwargs["axiom"] == "An axiom from stdin."
 
 
-# --- the intake leak: repeated --scope, and --axiom's prefix swallow -------------
+# --- the intake leak: repeated --scope, and the retired --axiom prefix swallow ---
 #
 # Both bugs were found from the write side by two different loop Claudes in
 # consecutive AX_FEEDBACK rounds (10 and 11, 2026-07-25). They are the *source* of
@@ -415,25 +416,29 @@ def test_extend_does_not_mutate_the_default_list_in_place():
 
 
 def test_axiom_flag_is_not_swallowed_by_axiom_file(monkeypatch, capsys, workspace):
-    """`--axiom "prose"` dies as an argparse error, never as `File name too long`.
+    """`--axiom "prose"` RECORDS the prose — it never reaches the file reader.
 
-    ``allow_abbrev`` defaults to True on every subparser, so ``--axiom`` was an
-    unambiguous prefix of ``--axiom-file`` and argparse handed a whole axiom to the
-    file reader. The command then died through the outermost boundary as an
-    ``[Errno 36] File name too long`` "Fatal Unexpected Error" — a wall pointing at
-    nothing the caller could act on.
+    Inverted deliberately, from the stronger direction. ``allow_abbrev`` defaults to
+    True on every subparser, so ``--axiom`` was an unambiguous prefix of
+    ``--axiom-file`` and argparse handed a whole axiom to the file reader; the
+    command then died through the outermost boundary as an ``[Errno 36] File name
+    too long`` "Fatal Unexpected Error". Turning abbreviation off fixed the crash
+    and left a wall — a bare usage banner and exit 2 — where every sibling flag had
+    taught callers to look. This row asserted that wall; it now asserts the vector.
+
+    The two original negatives are KEPT: they are the founding defect, and neither
+    may reappear now that the flag parses for real.
     """
     monkeypatch.setattr(sys, "argv",
                         ["mitos", "-p", workspace, "record", "--axiom", "A decision stated as prose.",
                          "--rejected", "r", "--slug", "s"])
-    with pytest.raises(SystemExit) as exc:
+    with patch("mitos.cli.cmd_record") as mock_record:
         main()
-    assert exc.value.code == 2
+    assert mock_record.call_args.kwargs["axiom"] == "A decision stated as prose."
     captured = capsys.readouterr()
     combined = captured.out + captured.err
     assert "File name too long" not in combined
     assert "Traceback" not in combined
-    assert "--axiom" in combined, "the error must name the flag the caller actually typed"
 
 
 def test_abbreviation_is_off_on_every_subparser():
@@ -454,12 +459,19 @@ def test_abbreviation_is_off_on_every_subparser():
 
 
 def test_abbreviated_option_is_rejected_by_the_grammar():
-    """`--jso` no longer resolves to `--json`; `--axiom` no longer reaches --axiom-file."""
+    """`--jso` no longer resolves to `--json`; `--axiom-fil` no longer reaches --axiom-file.
+
+    The `record` probe was `--axiom`, which is now a declared option resolving
+    exactly — so it had to be swapped rather than deleted, or the row would go green
+    while testing nothing. `--axiom-fil` is an unambiguous prefix of `--axiom-file`
+    and NOT a prefix of `--axiom`: measured, it is accepted under
+    ``allow_abbrev=True`` and exits 2 under ``False``, so the row still bites.
+    """
     from mitos.cli import _build_parser
 
     parser = _build_parser()
     for argv in (["list", "--jso"],
-                 ["record", "--axiom", "prose", "--rejected", "r", "--slug", "s"]):
+                 ["record", "--axiom-fil", "x", "--rejected", "r", "--slug", "s"]):
         with pytest.raises(SystemExit) as exc:
             parser.parse_args(argv)
         assert exc.value.code == 2, argv
@@ -499,3 +511,204 @@ def test_space_separated_mechanisms_still_works(monkeypatch, workspace):
     assert mock_record.call_args.kwargs["mechanisms"] is None, (
         "absent must stay None — `[]` and None are distinguished downstream"
     )
+
+
+# --- --axiom: three sources, one predicate (B4) ---------------------------------
+#
+# `--axiom` is where every sibling flag has taught callers to look, and until this
+# phase it was a bare usage banner and exit 2 — a wall where a vector belongs. It
+# takes its OWN dest (`axiom_flag`): a shared dest with the positional makes
+# "supplied both" undetectable (argument order silently decides the winner), which
+# is the silently-keep-last defect 1a just fixed, reintroduced on the field that
+# CONSTITUTES identity — a dropped axiom is a different node id, not a lost link.
+
+def _record_actions_by_dest():
+    """The `record` subparser's argparse actions keyed by dest — positional included.
+
+    Keyed by dest rather than by option string so the POSITIONAL is reachable (it
+    has none). Asserts run against ``action.help``, never ``format_help()``: the
+    rendered help wraps at a terminal width pytest and the shell do not share, so a
+    phrase assertion reds wherever the wrap lands inside it.
+    """
+    from test_cli_selector import _subparsers
+    from mitos.cli import _build_parser
+
+    return {a.dest: a for a in _subparsers(_build_parser())["record"]._actions}
+
+
+_POSITIONAL_AXIOM = "An axiom typed as a positional."
+_FLAG_AXIOM = "An axiom typed as a flag."
+_FILE_AXIOM = "An axiom read from a file."
+
+#: The eight axiom-source states. `("flag", "file")` is the invocation the shipped
+#: chooser misclassified: it leaves the positional None, so a code picked off that
+#: one dest answered `missing_axiom` to a caller who had supplied two.
+_AXIOM_MATRIX = [
+    ((), "missing_axiom"),
+    (("positional",), _POSITIONAL_AXIOM),
+    (("flag",), _FLAG_AXIOM),
+    (("file",), _FILE_AXIOM),
+    (("positional", "flag"), "ambiguous_axiom_source"),
+    (("positional", "file"), "ambiguous_axiom_source"),
+    (("flag", "file"), "ambiguous_axiom_source"),
+    (("positional", "flag", "file"), "ambiguous_axiom_source"),
+]
+
+
+def _axiom_argv(sources, workspace, axiom_file):
+    argv = ["mitos", "-p", workspace, "record"]
+    if "positional" in sources:
+        argv.append(_POSITIONAL_AXIOM)
+    if "flag" in sources:
+        argv += ["--axiom", _FLAG_AXIOM]
+    if "file" in sources:
+        argv += ["--axiom-file", str(axiom_file)]
+    return argv + ["--rejected", "r", "--slug", "s"]
+
+
+@pytest.fixture
+def axiom_file(tmp_path):
+    path = tmp_path / "axiom.txt"
+    path.write_text(_FILE_AXIOM + "\n", encoding="utf-8")
+    return path
+
+
+@pytest.mark.parametrize("sources, expected", _AXIOM_MATRIX,
+                         ids=[".".join(s) or "none" for s, _ in _AXIOM_MATRIX])
+def test_axiom_source_matrix_text_surface(sources, expected, monkeypatch, capsys,
+                                          workspace, axiom_file):
+    """All eight states: exactly one source records, none or several refuse with exit 2."""
+    monkeypatch.setattr(sys, "argv", _axiom_argv(sources, workspace, axiom_file))
+    refuses = expected in ("missing_axiom", "ambiguous_axiom_source")
+
+    if refuses:
+        with pytest.raises(SystemExit) as exc:
+            main()
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "exactly one axiom source" in err
+        # The message names all THREE sources — a refusal that still says "two"
+        # sends a caller who typed --axiom looking for a flag it does not mention.
+        # `--axiom` is matched with a negative lookahead: the shipped two-source
+        # message contains it as a PREFIX of `--axiom-file`, so a bare substring
+        # test passes over exactly the omission this asserts against.
+        assert re.search(r"--axiom(?!-)", err), err
+        assert "--axiom-file" in err, err
+        assert "positional" in err, err
+    else:
+        with patch("mitos.cli.cmd_record") as mock_record:
+            main()
+        assert mock_record.call_args.kwargs["axiom"] == expected
+
+
+@pytest.mark.parametrize("sources, expected", [(s, e) for s, e in _AXIOM_MATRIX
+                                               if e.endswith("axiom_source")
+                                               or e == "missing_axiom"],
+                         ids=lambda v: ".".join(v) if isinstance(v, tuple) else str(v))
+def test_axiom_source_refusals_carry_their_json_code(sources, expected, monkeypatch,
+                                                     capsys, workspace, axiom_file):
+    """Every refusal names its code on `--json`, chosen from the COUNT of sources.
+
+    The shipped chooser was an exact discriminator at arity two and wrong at three:
+    keyed on one dest, `--axiom X --axiom-file f` reported `missing_axiom` to a
+    caller who had supplied two. One count now feeds the guard and the code alike,
+    so a single expression cannot drift from the other.
+    """
+    import json
+    monkeypatch.setattr(sys, "argv",
+                        _axiom_argv(sources, workspace, axiom_file) + ["--json"])
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 2
+    assert json.loads(capsys.readouterr().out)["code"] == expected
+
+
+def test_axiom_flag_reaches_the_record_decision_alias(monkeypatch, workspace):
+    """`record` and `record_decision` are ONE parser object — one declaration covers both."""
+    monkeypatch.setattr(sys, "argv",
+                        ["mitos", "-p", workspace, "record_decision",
+                         "--axiom", _FLAG_AXIOM, "--rejected", "r", "--slug", "s"])
+    with patch("mitos.cli.cmd_record") as mock_record:
+        main()
+    assert mock_record.call_args.kwargs["axiom"] == _FLAG_AXIOM
+
+
+def test_axiom_flag_is_a_plain_store_and_does_not_accumulate():
+    """`--axiom` is plain `store` — asserted off the parser, so B1's pattern reds here.
+
+    1a converted nine relation flags in this same block to ``action="append"``, and
+    a later pass reaching for that pattern would find `--axiom` one flag over. It is
+    forbidden on this one: an accumulating spelling on the identity-constituting
+    field mints a joined string into the canonical core, where set semantics have no
+    meaning (an axiom is one sentence, not a set) and a merged value is a different
+    node id.
+    """
+    action = _record_actions_by_dest()["axiom_flag"]
+    assert type(action).__name__ == "_StoreAction", type(action).__name__
+    assert action.nargs is None
+    assert action.default is None
+    # `metavar` or the usage banner leaks the internal dest as `[--axiom AXIOM_FLAG]`.
+    assert action.metavar == "AXIOM"
+
+
+def test_repeated_axiom_flag_is_last_wins_shipped_class_semantics(monkeypatch, workspace):
+    """`--axiom a --axiom b` keeps `b`, silently — pinned, not endorsed.
+
+    The whole single-value class behaves this way (`--rejected`, `--context`,
+    `--slug`, `--axiom-file`), so singling `--axiom` out would ship an
+    inconsistency; fixing the class is a different item with its own review. The
+    three-source check counts SOURCES, not occurrences, so a repeated single flag
+    is one source and still records.
+    """
+    monkeypatch.setattr(sys, "argv",
+                        ["mitos", "-p", workspace, "record", "--axiom", "first",
+                         "--axiom", "second", "--rejected", "r", "--slug", "s"])
+    with patch("mitos.cli.cmd_record") as mock_record:
+        main()
+    assert mock_record.call_args.kwargs["axiom"] == "second"
+
+
+def test_the_three_axiom_help_strings_say_three(monkeypatch, capsys, workspace):
+    """The positional's help, `--axiom-file`'s help and the refusal all say THREE.
+
+    A sentence that ships saying "exactly one of the two" describes a grammar that
+    no longer exists, on the surface a caller reads to find the third.
+    """
+    actions = _record_actions_by_dest()
+    assert "three" in actions["axiom"].help
+    assert "three" in actions["axiom_file"].help
+    assert actions["axiom_flag"].help
+
+    monkeypatch.setattr(sys, "argv",
+                        ["mitos", "-p", workspace, "record", "--rejected", "r", "--slug", "s"])
+    with pytest.raises(SystemExit):
+        main()
+    assert "three" in capsys.readouterr().err
+
+
+def test_the_flag_and_the_positional_mint_the_same_node_id(monkeypatch, capsys, workspace):
+    """MI-4/M2: `--axiom` is a parse-time alias into the canonical core, nothing more.
+
+    Recorded through the positional, then through the flag under a DIFFERENT slug —
+    identity is the content, so the second call resolves to the same node id and
+    returns `exists`. That is the cheapest demonstration that the new declaration
+    reaches the identity-constituting field byte-identically and mutates no existing
+    node's core: a flag that mangled the sentence would mint a second node instead.
+    """
+    import json
+    sentence = "Identity is the canonical core, and the flag is only a spelling."
+
+    monkeypatch.setattr(sys, "argv",
+                        ["mitos", "-p", workspace, "record", sentence,
+                         "--rejected", "r", "--slug", "via-positional", "--json"])
+    main()
+    first = json.loads(capsys.readouterr().out)
+    assert first["status"] == "created", first
+
+    monkeypatch.setattr(sys, "argv",
+                        ["mitos", "-p", workspace, "record", "--axiom", sentence,
+                         "--rejected", "r", "--slug", "via-flag", "--json"])
+    main()
+    second = json.loads(capsys.readouterr().out)
+    assert second["status"] == "exists", second
+    assert second["id"] == first["id"]
