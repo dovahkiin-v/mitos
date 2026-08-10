@@ -66,6 +66,7 @@ from _conflict_helpers import (
     _seed_active,
     _wire_fakes,
     env,
+    interactive_stdin,
     offline,
 )
 

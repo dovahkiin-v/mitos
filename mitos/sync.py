@@ -1150,6 +1150,27 @@ class MitosSyncManager:
                     )
                     continue
 
+            # No terminal and no `--yes`: report this pending entry and skip it, never
+            # prompt. Position is the contract, not a placement detail. ABOVE the kind
+            # split below, so ONE refusal dominates BOTH accept prompts — a guard
+            # written inside either branch is one chance in two to ship a door still
+            # dead on the other kind. Above the split also puts it above the per-entry
+            # conflict sensor by construction, which is a spend contract: the crash
+            # this replaces bounded the sensor's loop at one entry, so a guard placed
+            # at the `input()` would let a run that can accept *nothing* sweep a paid
+            # judgment across the whole pending buffer. And BELOW the collision block,
+            # so every shipped per-entry diagnostic above it still prints.
+            #
+            # Report-and-skip, exit unchanged at 0: the entry stays in decisions.md
+            # (sync never deletes from it), so `--yes` commits it next run — a skip
+            # costs a turn, not an entry. It replaces an unguarded `input()` that died
+            # with `EOF when reading a line` → `Fatal Unexpected Error`, exit 1, naming
+            # nothing; the refusal names the entry it skipped.
+            if not auto_accept and not sys.stdin.isatty():
+                print(f"\n[Pending] '{entry.slug}' — skipped, stdin is not a terminal. "
+                      "Re-run with `--yes` to accept pending entries non-interactively.")
+                continue
+
             if entry.kind == "decision":
                 # Strict-deterministic sync (A): the decision commits EXACTLY as
                 # authored — no LLM enrichment in the sync runtime path. Refining a
@@ -1167,8 +1188,9 @@ class MitosSyncManager:
                 # Conflict sensor (5a): judge this decision against its undeclared close
                 # neighbours and surface any high-confidence contradiction BEFORE the
                 # accept prompt (CONF-D7), so the tension is named while the author can
-                # still choose. `conflict_judge is not None` already implies the full gate
-                # (decision-kind here, not auto_accept, toggle on, judge available). RF-1:
+                # still choose. `conflict_judge is not None` plus the guard above imply the
+                # full gate (decision-kind here, not auto_accept, a terminal on stdin,
+                # toggle on, judge available). RF-1:
                 # `entry` holds the parsed declarations and nothing else — the slug-collision
                 # override that used to rewrite them below is retired, so the property RF-1
                 # relied on is now structural. Advisory — it prints, never blocks; the accept
@@ -1487,10 +1509,13 @@ class MitosSyncManager:
         """Runs the conflict check for one decision entry, surfaces + persists it (5a/5b).
 
         The sync-time surface of the Conflict sensor. Called under the caller's gates
-        (decision-kind, ``not auto_accept``, toggle on, judge available) immediately before
-        the accept prompt, so a high-confidence contradiction is named at the moment the
-        author can still choose (CONF-D7). Advisory only: it prints, applies no verb, writes
-        nothing to the graph, and **never blocks the commit**.
+        (decision-kind, ``not auto_accept``, a terminal on stdin, toggle on, judge
+        available) immediately before the accept prompt, so a high-confidence contradiction
+        is named at the moment the author can still choose (CONF-D7). The TTY gate is the
+        loop's own report-and-skip refusal, which sits above the kind split and therefore
+        above this call: a run with no terminal can accept nothing, so it judges nothing.
+        Advisory only: it prints, applies no verb, writes nothing to the graph, and
+        **never blocks the commit**.
 
         Contract (load-bearing, §8): no conflict-path outcome may abort a real decision
         commit. 5b gives the surface its memory and its failure manners:

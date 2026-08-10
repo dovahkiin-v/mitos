@@ -140,13 +140,18 @@ def test_sync_stale_entry_detection(mock_client: MagicMock, sync_env: Tuple[Mito
 
 @patch("google.genai.Client")
 @patch("builtins.input", side_effect=["a"])
-def test_sync_slug_collision_correction(mock_input: MagicMock, mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]) -> None:
+@patch("sys.stdin.isatty", return_value=True)
+def test_sync_slug_collision_correction(mock_isatty: MagicMock, mock_input: MagicMock, mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]) -> None:
     """A DECLARED correction at the colliding slug commits as declared, interactively.
 
     Retargeted: this pinned the ``[c]orrection / [s]upersession`` prompt, which is
     retired — its answer was applied in memory only and never reached the markdown, so
     it minted kill-edges the gold source did not declare. The relation now comes from
     the entry, and the only prompt left on this path is the ordinary accept prompt.
+
+    The TTY patch states what "interactively" has always meant here: this row answers an
+    accept prompt, and the loop's report-and-skip guard skips a pending entry when stdin
+    is not a terminal — which under pytest it is not.
     """
     config, manager, tmpdir = sync_env
     store = GraphStore(config.db_path)
@@ -1678,6 +1683,14 @@ def test_sync_without_a_tty_and_without_yes_skips_instead_of_dying(
     turned every agent, CI job, cron and piped invocation into a fatal
     `EOF when reading a line`. Skipping is the fail-closed choice: `--yes` is an
     explicit authorization to mutate, and the absence of a terminal is not it.
+
+    The `[Divergence]` assertion is the structural half, and it is what makes the
+    `"no terminal"` one mean something. There is a second non-TTY refusal in the loop
+    now — the pending-entry guard, which sits BELOW this branch's `continue`s — and a
+    guard hoisted above the reconcile would satisfy a bare wording assertion while
+    skipping the reconcile entirely. The header only prints from inside
+    `_apply_commentary_reconcile`, so asserting it pins that this run reached the
+    reconcile at all, whatever either refusal happens to say.
     """
     config, manager, tmpdir = sync_env
     config.env["GEMINI_API_KEY"] = "mock_key"
@@ -1691,7 +1704,14 @@ def test_sync_without_a_tty_and_without_yes_skips_instead_of_dying(
 
     node = GraphStore(config.db_path).get_all_nodes()[0]
     assert node["rejected_paths"] == "The original rejected reasoning.", "fail closed"
-    assert "no terminal" in capsys.readouterr().out
+    # ONE readouterr call — it drains the buffer, so a second returns "" and would
+    # silently reduce this to a single-fact assertion.
+    out = capsys.readouterr().out
+    assert "[Divergence] 'reconcile-me'" in out, (
+        "the reconcile must have been reached — a guard hoisted above it would skip "
+        "this entry before the divergence is ever reported"
+    )
+    assert "no terminal" in out
 
 
 @patch("google.genai.Client")

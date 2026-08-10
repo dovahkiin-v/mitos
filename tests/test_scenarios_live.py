@@ -430,12 +430,14 @@ def test_scenario_f1_synthesis_llm_down(live_workspace) -> None:
             raise resp
         return resp
         
-    # The F1 retry-on-input path is INTERACTIVE by definition. As of V1b 4a, a
-    # non-interactive sync (auto_accept, or a non-TTY stdin) no longer blocks on
-    # input() — it auto-skips the degraded entry (see the deterministic skip gate
-    # in test_sync.py). So this retry scenario runs in interactive mode: stdin is a
-    # TTY (mocked) and auto_accept is False, so the user is prompted and chooses
-    # [r]etry.
+    # This scenario runs in INTERACTIVE mode: stdin is a TTY (mocked) and auto_accept is
+    # False, so the entry reaches the per-entry accept prompt and the patched `input`
+    # answers it. Neither non-interactive posture reaches that prompt, and the two halves
+    # have different origins: under `--yes` the prompt is not run at all (its own
+    # `if not auto_accept:` gate), while a non-TTY run is reported and skipped one
+    # statement earlier, by the loop's report-and-skip guard above the kind split
+    # (tests/test_repair_door.py) — which is what made the second half true. Before that
+    # guard a non-TTY sync did not "no longer block on input()": it died there.
     mock_stdin = MagicMock()
     mock_stdin.isatty.return_value = True
     with patch("google.genai.Client") as mock_client, \
