@@ -820,6 +820,11 @@ def test_a_pending_named_target_is_guard_skipped_and_exits_non_zero(
     The refusal 3a wrote names `--yes` and no command, and stays true: this flag
     satisfies the *reconcile* gate, not the accept prompt. The exit is non-zero
     because the caller asked for a state the corpus did not reach.
+
+    "Non-zero" is this row's *claim* and not its measurement — it observes the
+    returned shortfall, one frame below the `sys.exit`.
+    `::test_a_shortfall_becomes_the_processs_own_exit_code` drives the same corpus
+    through `cli.main()` and is where the exit code itself is pinned.
     """
     config, manager, _ = env
     assert not sys.stdin.isatty()
@@ -942,6 +947,84 @@ def test_reconcile_entry_naming_nothing_is_refused_rather_than_ignored(
     captured = capsys.readouterr()
     assert code == 1, f"exit {code!r}; stderr was:\n{captured.err}"
     assert "named no entry" in captured.err, captured.err
+
+
+# --------------------------------------------------------------------------- #
+# R8b — the shortfall reaches the caller as an exit code (added at the Phase 3
+# integration checkpoint: the 3a → 3b → `cmd_sync` seam was wired and unpinned)
+# --------------------------------------------------------------------------- #
+
+def test_a_shortfall_becomes_the_processs_own_exit_code(
+    tmp_path, capsys: pytest.CaptureFixture
+) -> None:
+    """The seam 3a and 3b meet at, driven end to end: guard → ledger → exit code.
+
+    Every other shortfall row in this module asserts `perform_sync`'s RETURN VALUE
+    and stops there, so the four lines in `cmd_sync` that turn that list into
+    `sys.exit(1)` were pinned by nothing — deleting them left the whole suite green
+    while the flag's headline property (*a named target that does not end in the
+    state your markdown describes exits 1*) silently became exit 0, which is the
+    silent no-op the door exists to remove. Measured at the integration checkpoint
+    after Phase 3, not reasoned about.
+
+    The fixture is deliberately the PENDING one, so the row crosses the sub-phase
+    boundary rather than testing 3b alone: 3a's guard produces the outcome, 3b's
+    ledger classifies it, and `cli.py` is what a caller finally reads. Its
+    manager-level twin is `::test_a_pending_named_target_is_guard_skipped_and_exits_non_zero`,
+    whose name claims the exit it cannot observe.
+
+    Workspace shape and key injection follow
+    `::test_the_verb_exits_zero_instead_of_dying_on_the_prompt` — see that row's
+    docstring for why `make_workspace` rather than the `env` fixture's tmpdir. No
+    entry commits on this path, so no network seam is owed.
+    """
+    workspace = make_workspace(tmp_path / "ws")
+    with open(os.path.join(workspace, "decisions.md"), "a", encoding="utf-8") as f:
+        f.write(
+            "\n## 2026-06-01 — door-shortfall — Door Shortfall\n"
+            "**Decided:** The axiom nobody accepted, named by the flag anyway.\n"
+            "**Rejected:** Rejected the obvious alternative.\n"
+            "**Mechanisms:** python\n"
+            "**Scope:** api\n\n"
+        )
+    assert not sys.stdin.isatty()
+
+    code = _run(["sync", "-p", workspace, "--reconcile-entry", "door-shortfall"])
+
+    captured = capsys.readouterr()
+    assert code == 1, f"exit {code!r}; stderr was:\n{captured.err}"
+    assert "Fatal Unexpected Error" not in captured.err
+    assert len(_refusal_lines(captured.out)) == 1, "3a's guard fired, unchanged"
+    lines = _repair_lines(captured.err)
+    assert len(lines) == 1 and "door-shortfall" in lines[0], lines
+
+
+def test_the_exit_code_follows_the_shortfall_in_both_directions(
+    tmp_path, capsys: pytest.CaptureFixture
+) -> None:
+    """And the exit is the SHORTFALL's, not the flag's presence.
+
+    The row above is end-to-end and therefore only ever exercises one direction at
+    a time; a build reading `if repair_targets:` instead of `if shortfall:` passes
+    it, and passes every manager-level row too, while exiting 1 on a repair that
+    landed perfectly. Both directions over one seam is what makes the mapping a
+    contract rather than a coincidence, so this row drives the boundary with
+    `perform_sync` stubbed — the branch under test is `cmd_sync`'s, and a real
+    satisfied target through `main()` would owe a commit, a network seam and a
+    second fixture to prove the same two-line claim.
+    """
+    workspace = make_workspace(tmp_path / "ws")
+
+    with patch("mitos.cli.MitosSyncManager") as mock_manager:
+        perform = mock_manager.return_value.perform_sync
+        perform.return_value = []
+        satisfied = _run(["sync", "-p", workspace, "--reconcile-entry", "landed"])
+        perform.return_value = ["missed"]
+        unsatisfied = _run(["sync", "-p", workspace, "--reconcile-entry", "missed"])
+
+    capsys.readouterr()
+    assert satisfied in (0, None), f"a satisfied target exits 0, got {satisfied!r}"
+    assert unsatisfied == 1, f"a shortfall exits 1, got {unsatisfied!r}"
 
 
 def test_the_repeat_and_comma_spellings_accumulate_to_the_same_handles(
