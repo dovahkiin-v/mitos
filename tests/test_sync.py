@@ -1479,8 +1479,11 @@ def test_an_edge_deletion_is_skipped_under_auto_accept_and_reported(
     `commit_parsed_entry` mirrors edges declaratively, so a removed markdown line
     DELETES that edge. You cannot apply an entry's commentary while withholding its
     edge state, so an entry carrying BOTH is wholly skipped — which means its
-    commentary divergence stays unreconciled on every non-interactive run. That is the
-    right call and it must be stated, not discovered.
+    commentary divergence stays unreconciled on every non-interactive run the caller
+    did not authorize FOR THAT ENTRY. That is the right call and it must be stated,
+    not discovered. (Since 3b there is one such authorization: naming the entry with
+    `--reconcile-entry`, which this row deliberately does not pass — the `--yes`-only
+    behaviour is what it pins, and `tests/test_repair_door.py` owns the other half.)
     """
     config, manager, tmpdir = sync_env
     config.env["GEMINI_API_KEY"] = "mock_key"
@@ -1681,8 +1684,10 @@ def test_sync_without_a_tty_and_without_yes_skips_instead_of_dying(
 
     This gate fires on a corpus state that used to produce ZERO prompts, so prompting
     turned every agent, CI job, cron and piped invocation into a fatal
-    `EOF when reading a line`. Skipping is the fail-closed choice: `--yes` is an
-    explicit authorization to mutate, and the absence of a terminal is not it.
+    `EOF when reading a line`. Skipping is the fail-closed choice: the absence of a
+    terminal is not an authorization to mutate. What IS one is `--yes` (for an entry
+    carrying no edge deletion) or, since 3b, naming the entry with
+    `--reconcile-entry` — neither of which this row passes, which is the point.
 
     The `[Divergence]` assertion is the structural half, and it is what makes the
     `"no terminal"` one mean something. There is a second non-TTY refusal in the loop

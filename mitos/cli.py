@@ -73,7 +73,7 @@ from mitos.recall import (assess_surface_recall, corpus_provenance,
                           scope_filter_recovery)
 from mitos.sync import (MitosSyncManager, run_ambient_capture, _SLUG_MAX_LEN,
                         _ENTRIES_MARKER, _PAUSE_RESOLVING_RELATIONS,
-                        _declared_echo_lines)
+                        _declared_echo_lines, _split_relation_slugs)
 from mitos._agent_block import agent_block, agent_block_drift, AGENT_GUIDE_VERSION
 from mitos.renderer import MitosRenderer, overflow_report
 from mitos.importer import MitosProseImporter
@@ -723,20 +723,63 @@ def cmd_init(config: MitosConfig, name: Optional[str] = None, force: bool = Fals
     sys.stdout.flush()
 
 
-def cmd_sync(config: MitosConfig, auto_accept: bool = False, embed_only: bool = False, verbose: bool = False) -> None:
+def cmd_sync(config: MitosConfig, auto_accept: bool = False, embed_only: bool = False,
+             verbose: bool = False, repair_targets: Optional[List[str]] = None) -> None:
     """Synchronizes the decisions write buffer with the graph store.
 
-    The handler prints nothing itself — ``perform_sync`` does — so the corpus echo
-    leads its stdout report from here, and the two abort branches carry their own on
-    stderr (an echo pinned to stdout is invisible to a caller reading the refusal).
+    The report itself is ``perform_sync``'s, so the corpus echo leads its stdout
+    report from here. What the handler prints on its own is refusals — the two
+    aborts and the two ``--reconcile-entry`` compositions below — and each carries
+    its own echo on stderr, because an echo pinned to stdout is invisible to a
+    caller reading the refusal.
+
+    The shortfall exit is the handler's too: exiting from inside the loop would
+    truncate the run before ``render_all`` and the outbox drain, so ``perform_sync``
+    returns the unsatisfied targets and this is where they become an exit code.
+
+    Args:
+        config: The resolved workspace config.
+        auto_accept: ``--yes``.
+        embed_only: ``--embed-only`` — drains the outbox and runs no sync.
+        verbose: ``--verbose``.
+        repair_targets: ``--reconcile-entry`` handles, already split. ``None``
+            means the flag was absent; ``[]`` means it was supplied and named
+            nothing, which is a refusal rather than a fallback — the same rule the
+            selector follows (``-p ""`` renders, it does not fall back to cwd).
     """
     _echo_corpus(config)
+    # Refused here rather than at the parser. `add_mutually_exclusive_group` would
+    # answer with argparse's terse `not allowed with argument` at exit 2, and would
+    # be the only place in the tree where a `mitos sync` flag COMBINATION is judged;
+    # a handler-side refusal keeps every door refusal in one register, one channel
+    # and one exit code. Above the `if embed_only:` branch, because that branch
+    # short-circuits to the outbox drain and never calls `perform_sync` — so the
+    # flag would otherwise be discarded silently and the run would exit 0, which is
+    # the silent no-op the fail-loud property forbids.
+    if repair_targets is not None:
+        if embed_only:
+            sys.stdout.flush()
+            _echo_corpus(config, file=sys.stderr)
+            print("--reconcile-entry needs a full sync: --embed-only drains the "
+                  "pending embeddings queue and reads no buffer entries. Re-run "
+                  "without --embed-only.", file=sys.stderr)
+            sys.exit(1)
+        if not repair_targets:
+            sys.stdout.flush()
+            _echo_corpus(config, file=sys.stderr)
+            print("--reconcile-entry named no entry. Give it the `### ` slug of a "
+                  "diverged buffer entry, as `mitos status` reports it.",
+                  file=sys.stderr)
+            sys.exit(1)
     manager = MitosSyncManager(config)
     if embed_only:
         manager.drain_pending_embeddings()
     else:
         try:
-            manager.perform_sync(auto_accept=auto_accept, verbose=verbose)
+            shortfall = manager.perform_sync(
+                auto_accept=auto_accept, verbose=verbose,
+                repair_targets=repair_targets,
+            )
         except ParseError as e:
             sys.stdout.flush()
             _echo_corpus(config, file=sys.stderr)
@@ -746,6 +789,12 @@ def cmd_sync(config: MitosConfig, auto_accept: bool = False, embed_only: bool = 
             sys.stdout.flush()
             _echo_corpus(config, file=sys.stderr)
             print(f"Sync Aborted: Validation error.\n{str(e)}", file=sys.stderr)
+            sys.exit(1)
+        if shortfall:
+            # 1, matching the verb's two aborts — no new code vocabulary. The
+            # contract binds only the caller who typed the flag; a bare `mitos sync`
+            # returns an empty list and is untouched. This exit prints nothing
+            # itself (the report's lines came from `sync.py`), so it owes no echo.
             sys.exit(1)
 
 
@@ -3008,7 +3057,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
     if overflows:
         _print_overflow_detail(overflows)
     if divergence_report is not None:
-        _print_divergence_rung(divergence_report)
+        _print_divergence_rung(divergence_report, project=config.project)
     if graph_behind:
         print(
             "\n  ⚠ graph is behind your buffer — the V1b edge catalog + mechanism "
@@ -3061,7 +3110,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
     return 0 if ready else 1
 
 
-def _print_divergence_rung(report: Dict[str, Any]) -> None:
+def _print_divergence_rung(report: Dict[str, Any], *, project: str) -> None:
     """Prints the corpus↔graph divergence rung — informational, never a blocker.
 
     A corpus mid-edit is a normal state, so gating readiness here would make an
@@ -3080,6 +3129,16 @@ def _print_divergence_rung(report: Dict[str, Any]) -> None:
 
     Args:
         report: A ``corpus_graph_divergence`` result.
+        project: The caller's own vocabulary for this workspace — ``config.project``,
+            i.e. the registered name for a registered target and the workspace path
+            otherwise. Required and keyword-only, matching ``cmd_status``'s own
+            idiom: the one recipe this function composes for a repair the reader can
+            run NOW has to carry a selector (since the selector flip a bare
+            ``mitos sync`` has no target), and it is passed in rather than
+            re-derived here for the reason 3d rejected by name — a reverse lookup
+            misses on a symlinked route whose registry entry is hand-written
+            non-canonically, printing a path for a registered project with every
+            other row green.
     """
     if report.get("skipped"):
         # Never a verdict from a read we could not take. "corpus busy" is the normal
@@ -3146,10 +3205,11 @@ def _print_divergence_rung(report: Dict[str, Any]) -> None:
 
     reconcilable = report.get("reconcilable") or 0
     if reconcilable:
-        print(f"      → {reconcilable} of these can be repaired now: `mitos sync` "
-              f"reconciles a diverged buffer entry, printing the field diff first "
-              f"(add `--yes` to apply without prompting; an edge DELETION is always "
-              f"skipped under `--yes`).")
+        print(f"      → {reconcilable} of these can be repaired now: `mitos sync -p "
+              f"{project!r}` reconciles a diverged buffer entry, printing the field "
+              f"diff first (add `--yes` to apply without prompting, or "
+              f"`--reconcile-entry <slug>` to apply one named entry's whole "
+              f"reconcile — the only way to apply an edge DELETION unattended).")
     if report.get("archived_drift"):
         print(f"      ({report['archived_drift']} of these sit in an ARCHIVE file — "
               f"`sync` reads only the buffer, so their reconciler is `mitos rebuild`.)")
@@ -5436,6 +5496,23 @@ def _build_parser() -> argparse.ArgumentParser:
     sync_p.add_argument("--yes", action="store_true", help="Auto-accept all parsed changes.")
     sync_p.add_argument("--embed-only", action="store_true", help="Drain the pending embeddings outbox queue only.")
     sync_p.add_argument("--verbose", action="store_true", help="Show verbose cache statistics.")
+    # The repair door. Same arity as the nine relation flags below: `action="append"`
+    # with no `nargs`, so each occurrence stays one whole value (a bare `extend`
+    # iterates the string into characters; `nargs="*"` would make the space form
+    # parse and swallow the next token). `default=None` distinguishes an absent flag
+    # from one supplied naming nothing, which is a refusal rather than a fallback.
+    # main() splits the comma form through `_split_relation_slugs`, the tree's single
+    # comma-split semantics.
+    sync_p.add_argument(
+        "--reconcile-entry", default=None, action="append", dest="reconcile_entry",
+        metavar="SLUG",
+        help="Apply the whole reconcile for the named diverged buffer entry, "
+             "including an edge deletion, with no terminal and no --yes. Names the "
+             "entry's `### ` slug as `mitos status` reports it (a renamed entry is "
+             "named by its NEW slug — the loop reads the markdown). Repeatable and "
+             "comma-separated both accumulate: `--reconcile-entry a "
+             "--reconcile-entry b` == `--reconcile-entry 'a, b'`. A named target "
+             "that does not end in the state your markdown describes exits 1.")
 
     # reconcile
     rec_p = subparsers.add_parser(
@@ -5853,7 +5930,18 @@ def main() -> None:
         elif args.command == "projects":
             cmd_projects(as_json=args.as_json)
         elif args.command == "sync":
-            cmd_sync(config, auto_accept=args.yes, embed_only=args.embed_only, verbose=args.verbose)
+            # The split lives here, at the call site, exactly as 1a's join does:
+            # `None` (flag absent) survives as `None` so the handler can tell it
+            # from a flag supplied naming nothing. Handles reach `cmd_sync` in the
+            # caller's VERBATIM spelling — never `_normalize_slug`'d, which runs on
+            # the `record` path alone while the parser keeps a header slug verbatim.
+            cmd_sync(config, auto_accept=args.yes, embed_only=args.embed_only,
+                     verbose=args.verbose,
+                     repair_targets=(
+                         None if args.reconcile_entry is None
+                         else [h for v in args.reconcile_entry
+                               for h in _split_relation_slugs(v)]
+                     ))
         elif args.command == "reconcile":
             sys.exit(cmd_reconcile(config, as_json=args.as_json))
         elif args.command == "capture":

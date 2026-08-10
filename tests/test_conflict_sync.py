@@ -315,13 +315,24 @@ def test_open_question_entry_is_never_checked(
         f.write(
             "# Open Questions\n"
             "<!-- BEGIN ENTRIES -->\n"
-            "## 2026-06-01 — auth-scope — Auth scope open question\n"
-            "**Questions:** Should health checks bypass auth?\n\n"
+            "### auth-scope\n\n"
+            "**Topic:** Auth scope open question\n"
+            "**Questions:**\n- Should health checks bypass auth?\n\n"
         )
+    # Non-vacuity, and it is not decoration: until 3b this fixture used the
+    # DECISION header shape with an inline `**Questions:**`, so the parser dropped
+    # it (`Missing required field **Topic:**`) above the loop and the row asserted
+    # an absence over a run holding ZERO entries. It had never exercised the branch
+    # it names, on any build. Assert the entry actually committed before asserting
+    # what did not happen to it.
 
     with patch("builtins.input", side_effect=["a"]):
         manager.perform_sync(auto_accept=False)
 
+    assert manager.store.get_node_by_slug("auth-scope") is not None, (
+        "the open question must PARSE and COMMIT — otherwise the assertion below "
+        "is satisfied by an empty run rather than by the kind branch"
+    )
     assert spy.call_count == 0  # the OQ branch has no conflict check by design
 
 

@@ -13,7 +13,7 @@ import json
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Dict, Optional, Any, Tuple, Callable
+from typing import List, Dict, Optional, Any, Set, Tuple, Callable
 from filelock import FileLock, Timeout
 from google import genai
 from google.genai import types
@@ -760,6 +760,234 @@ def _slugify(text: str) -> str:
     return s
 
 
+# The three outcomes that SATISFY a `--reconcile-entry` target. Every other
+# end-state the per-entry loop can reach is a shortfall by default, and that
+# direction is the decision rather than the spelling: the loop ends an entry in
+# more states than any table names, and the two directions are not symmetric. A
+# failure state left unstamped exits 0 on a repair that never landed — the silent
+# no-op this whole flag exists to remove — while a satisfied state left unstamped
+# exits non-zero, loudly, and is caught by the re-run row. Enumerating the closed
+# set is also the only direction that survives a control-flow change in a later
+# vision.
+_REPAIR_SATISFIED = frozenset({"reconciled", "committed", "clean"})
+
+# The located cause each shortfall outcome renders as. Keys are the outcome tokens
+# `_perform_sync_internal` stamps at its own `continue`s; an entry that reached
+# none of them (a site added later and not stamped) falls through to the generic
+# line below, which is a shortfall too.
+_REPAIR_CAUSES = {
+    "open_question": (
+        "this entry is an open question, and the commentary reconcile is "
+        "decisions-only — a hand-edit to it can never be applied by `sync`"
+    ),
+    "source_only": (
+        "its only divergence is the `**Source:**` line, which a reconcile "
+        "provably cannot change — restore the line to match the graph"
+    ),
+    "reconcile_refused": (
+        "the commentary reconcile refused it; its reason is printed above"
+    ),
+    "collision": (
+        "its slug already names another node and the entry declares no relation "
+        "at it, so it was skipped before any reconcile — the collision report "
+        "above says what to author"
+    ),
+    "pending_skipped": (
+        "it is still pending, and a run with no terminal and no `--yes` skips a "
+        "pending entry before it can be committed. This flag authorizes the "
+        "reconcile, not the accept prompt"
+    ),
+    "operator_skipped": "it was skipped at the accept prompt",
+    "operator_quit": "the run was stopped at its accept prompt",
+    "quarantined": (
+        "its commit was refused and the retry never drained it; the report above "
+        "names why"
+    ),
+    "store_error": (
+        "an unexpected store error stopped its commit; the report above names it"
+    ),
+}
+
+#: The two causes that stand in for the never-seen class's absence claim when the
+#: run stopped reading the buffer. Neither is a new state: the target is still a
+#: shortfall and the exit is still non-zero — what changes is that a run holding no
+#: evidence of absence does not assert one, and does not name `mitos rebuild` as the
+#: heal for an entry that may be sitting in the buffer it stopped reading.
+_REPAIR_UNREAD_LOCKED = (
+    "another Mitos process holds the corpus lock, so this run never read the "
+    "buffer — re-run once it is free"
+)
+_REPAIR_UNREAD_QUIT = (
+    "the run was stopped at its accept prompt before this entry was reached, so "
+    "nothing was ruled on it — re-run to reach it"
+)
+
+_REPAIR_GENERIC_CAUSE = (
+    "it did not end in any of the states this flag can satisfy; the run's own "
+    "report above says what happened to it"
+)
+
+
+class _RepairLedger:
+    """Observes what the sync loop did with each entry `--reconcile-entry` named.
+
+    Constructed once per run and inert when no targets were named, so every `note`
+    is a no-op on the ordinary path. It holds no policy of its own: the loop stamps
+    what it did, and the ledger renders the shortfall afterwards. Deliberately
+    module-private and un-generalized — nothing else consumes it, and there is no
+    second consumer to extract a shared refusal renderer for.
+
+    Attributes:
+        _handles: casefold handle → the caller's verbatim spelling. Verbatim is
+            what the report renders, because the caller has to recognise what they
+            typed; casefold is what matches, because every other slug lookup in
+            the tree folds on both sides.
+    """
+
+    def __init__(self, targets: Optional[List[str]] = None) -> None:
+        self._handles: Dict[str, str] = {}
+        for raw in targets or []:
+            self._handles.setdefault(raw.casefold(), raw)
+        self._outcomes: Dict[str, str] = {}
+        self._order: List[str] = []
+        self._failure_slugs: Set[str] = set()
+        self._unattributable_failures = False
+        self._unread_reason: Optional[str] = None
+        self._inert = False
+
+    def authorizes(self, entry: ParsedEntry) -> bool:
+        """Whether this entry was named, casefold-exactly, by the caller.
+
+        One tier, no alias/prefix/did-you-mean resolution — the discipline every
+        other slug lookup uses. Neither side is ``_normalize_slug``'d: that helper
+        runs on the ``record`` path alone, and the parser keeps a header slug
+        verbatim.
+        """
+        slug = getattr(entry, "slug", None)
+        return bool(slug) and slug.casefold() in self._handles
+
+    def note(self, entry: ParsedEntry, outcome: str) -> None:
+        """Records the loop's own verdict for a named entry. A no-op otherwise.
+
+        Later notes win, deliberately: the quarantine stamps a shortfall at the
+        commit and the fixpoint upgrades the entries it drains, so the pessimistic
+        stamp is the one that survives a missed correction.
+        """
+        if not self.authorizes(entry):
+            return
+        key = entry.slug.casefold()
+        if key not in self._outcomes:
+            self._order.append(key)
+        self._outcomes[key] = outcome
+
+    def note_parse_failures(self, failures: List[EntryFailure]) -> None:
+        """Records this run's parse failures, for the never-seen classification."""
+        if not self._handles:
+            return
+        for fail in failures:
+            if fail.slug:
+                self._failure_slugs.add(fail.slug.casefold())
+            else:
+                # A pre-header failure carries no slug, so it can be reported but
+                # not attributed to a handle.
+                self._unattributable_failures = True
+
+    def mark_buffer_unread(self, reason: str) -> None:
+        """Records that the run did not read the whole buffer, and why.
+
+        Two sites reach it: a lock held by another process (nothing was read at
+        all) and ``[q]uit`` at an accept prompt (everything below that entry went
+        unread). It changes no verdict and no exit — an unreached handle is still a
+        shortfall — but it changes what the report may CLAIM about one. "absent
+        from the buffer, or already rotated into an archive" is an absence claim
+        whose heal is `mitos rebuild`, and a run that stopped reading has no
+        evidence for either half.
+
+        Args:
+            reason: The located cause, rendered in place of the absence claim.
+        """
+        self._unread_reason = reason
+
+    def mark_keyless(self) -> None:
+        """Marks the run as below the key floor — the report's one carve-out.
+
+        ``mitos sync``'s ``GEMINI_API_KEY`` refusal returns above the per-entry
+        loop, so on a keyless workspace the flag is inert: nothing was reconciled
+        and nothing was looked for. Fail-loud is scoped to runs that clear the
+        floor, and flipping that exit code is a separate contract break owned by
+        a pass that deprecates it.
+        """
+        self._inert = True
+
+    def report(self) -> List[str]:
+        """Prints one line per named target that needs one; returns the shortfall.
+
+        The channel is stderr and is not overridable: the block accompanies a
+        non-zero exit on its common path, and the tree's non-zero-exit refusals
+        answer there. One channel for the whole report, exit-0 line included.
+
+        Returns:
+            The caller's verbatim spellings for every target that did NOT end in
+            the state its markdown describes. Empty means nothing was named, the
+            run was below the key floor, or every named target is satisfied.
+        """
+        if self._inert or not self._handles:
+            return []
+
+        # Document order — the loop's, which is `decisions.md`'s, never the order
+        # the caller named them. Handles the loop never reached have no position of
+        # their own, so they follow in naming order.
+        ordered = self._order + [k for k in self._handles if k not in self._outcomes]
+
+        lines: List[str] = []
+        shortfall: List[str] = []
+        for key in ordered:
+            handle = self._handles[key]
+            outcome = self._outcomes.get(key)
+            if outcome in _REPAIR_SATISFIED:
+                if outcome == "clean":
+                    # The one satisfied state that owes a line: nothing else in the
+                    # run said anything about this entry, so without it a caller
+                    # reads silence as "not applied".
+                    lines.append(
+                        f"[Repair] {handle!r} — nothing to reconcile: the corpus "
+                        f"and graph already agree for this entry."
+                    )
+                continue
+            shortfall.append(handle)
+            lines.append(f"[Repair] {handle!r} — {self._cause(key, outcome)}.")
+
+        if lines:
+            # stdout is block-buffered under a pipe while stderr is not, so without
+            # this flush the block lands above the run's own report and inverts the
+            # reading. One channel and one flush for the whole block, so it stays
+            # together and accompanies the non-zero exit on its common path.
+            sys.stdout.flush()
+            for line in lines:
+                print(line, file=sys.stderr)
+        return shortfall
+
+    def _cause(self, key: str, outcome: Optional[str]) -> str:
+        """Renders the located cause for one unsatisfied handle."""
+        if outcome is not None:
+            return _REPAIR_CAUSES.get(outcome, _REPAIR_GENERIC_CAUSE)
+        # The never-seen class — stated as a property, never as a two-member list.
+        if key in self._failure_slugs:
+            return ("the buffer holds this entry but it failed to parse, so the "
+                    "loop never reached it — fix the parse error reported above")
+        if self._unread_reason is not None:
+            # The run stopped reading the buffer, so it holds no evidence for the
+            # absence claim below and may not make it.
+            return self._unread_reason
+        line = ("no entry with this slug was reached this run: it is absent from "
+                "the buffer, or already rotated into an archive (`sync` reads the "
+                "buffer alone, so an archived entry's reconciler is `mitos rebuild`)")
+        if self._unattributable_failures:
+            line += (". The buffer also holds unparsed entries this run could not "
+                     "attribute to a slug")
+        return line
+
+
 class MitosSyncManager:
     """Manages the full parse-enrich-commit sync flow and side effects."""
 
@@ -852,8 +1080,30 @@ class MitosSyncManager:
                 print("Auto-restored missing sample format header and BEGIN ENTRIES "
                       "marker ✓", file=sys.stderr)
 
-    def perform_sync(self, auto_accept: bool = False, verbose: bool = False) -> None:
-        """Executes the complete transactional sync flow."""
+    def perform_sync(self, auto_accept: bool = False, verbose: bool = False,
+                     repair_targets: Optional[List[str]] = None) -> List[str]:
+        """Executes the complete transactional sync flow.
+
+        The repair ledger is built and reported HERE rather than inside
+        ``_perform_sync_internal``, which has four returns plus a fall-through and
+        two of them pull in opposite directions: the no-parseable-entries return
+        carries two of the exit table's own rows (an unparseable target and one
+        absent from the buffer), while the key-floor return must stay silent. One
+        report site after every path, and one explicit carve-out marked at the
+        floor, beats four call sites and four chances to miss the one that matters.
+
+        Args:
+            auto_accept: Whether ``--yes`` is in force.
+            verbose: Emit cache statistics at the end of the run.
+            repair_targets: Handles named by ``--reconcile-entry``, in the caller's
+                verbatim spelling. ``None`` (no flag) and ``[]`` mean the same
+                thing here — nothing was named, so the ledger is inert.
+
+        Returns:
+            The named targets that did NOT end in the state their markdown
+            describes, for the caller to exit on. Empty on every ordinary run.
+        """
+        ledger = _RepairLedger(repair_targets)
         snapshot_path = os.path.join(self.config.mitos_dir, "sync_snapshot.md")
         # Second snapshot for steady-state questions.md ingestion (Phase 4a): taken
         # under the same lock as the decisions snapshot for read-consistency, and
@@ -861,7 +1111,7 @@ class MitosSyncManager:
         questions_snapshot_path = os.path.join(self.config.mitos_dir, "questions_snapshot.md")
         try:
             self._perform_sync_internal(
-                snapshot_path, questions_snapshot_path, auto_accept, verbose
+                snapshot_path, questions_snapshot_path, auto_accept, verbose, ledger
             )
         finally:
             for path in (snapshot_path, questions_snapshot_path):
@@ -870,9 +1120,19 @@ class MitosSyncManager:
                         os.remove(path)
                     except Exception:
                         pass
+        return ledger.report()
 
-    def _perform_sync_internal(self, snapshot_path: str, questions_snapshot_path: str, auto_accept: bool = False, verbose: bool = False) -> None:
-        """Executes the internal transactional sync flow."""
+    def _perform_sync_internal(self, snapshot_path: str, questions_snapshot_path: str, auto_accept: bool = False, verbose: bool = False, ledger: Optional["_RepairLedger"] = None) -> None:
+        """Executes the internal transactional sync flow.
+
+        ``ledger`` is defaulted so the sole production caller stays the only site
+        that has to know about it and a direct call keeps working; an inert ledger
+        makes every ``note`` below a no-op. ``is None`` rather than a truthiness
+        coalesce, because an inert ledger is a real object with a real contract.
+        """
+        if ledger is None:
+            ledger = _RepairLedger()
+
         # 1. Snapshot-at-sync-start under brief file lock
         questions_snapshotted = False
         try:
@@ -899,6 +1159,8 @@ class MitosSyncManager:
                         )
         except Timeout:
             print("Another Mitos process holds the lock; check for stuck 'mitos sync'.")
+            # Nothing was read, so a named target's line may not say it is absent.
+            ledger.mark_buffer_unread(_REPAIR_UNREAD_LOCKED)
             return
 
         # 2. Parse from the snapshots, oldest-first within each file. Steady-state
@@ -936,6 +1198,10 @@ class MitosSyncManager:
                 )
 
         all_failures = dec_failures + oq_failures
+        # Recorded before the `if not entries:` return below, because that return
+        # carries two of the exit table's own rows: a named target whose block
+        # failed to parse, and one genuinely absent from the buffer.
+        ledger.note_parse_failures(all_failures)
         for fail in all_failures:
             msgs = "; ".join(item.message for item in fail.items) or "malformed entry"
             print(
@@ -974,6 +1240,14 @@ class MitosSyncManager:
         api_key = self.config.env.get("GEMINI_API_KEY")
         if not api_key:
             print("GEMINI_API_KEY environment variable is not set. Sync requires API keys.")
+            # The report's ONE carve-out. This refusal returns above the per-entry
+            # loop, so a named target was neither reconciled nor looked for — there
+            # is nothing to be loud about, and the run's exit stays 0 because
+            # flipping it is a contract break under every CI job that reads it.
+            # A floor on loudness, never a ceiling: a keyless workspace whose buffer
+            # is empty reaches the return above this one and DOES report, correctly,
+            # because on that corpus the named target genuinely is absent.
+            ledger.mark_keyless()
             return
             
         renderer = MitosRenderer(self.config.workspace_dir)
@@ -1061,6 +1335,7 @@ class MitosSyncManager:
                     # an open question, so a reconcile of one can never converge: it
                     # would print "Reconciled ✓" and append a fresh attribution row on
                     # every single sync, for a mutation that provably cannot land.
+                    ledger.note(entry, "open_question")
                     continue
 
                 divergence = entry_divergence(
@@ -1073,11 +1348,25 @@ class MitosSyncManager:
                     # `source` divergence is reported by `status` but is NOT
                     # reconcilable — MI-4 fences it out of the commentary UPDATE, so
                     # re-committing provably cannot change it.
+                    #
+                    # So this ONE branch covers TWO states for a named target, and
+                    # the repair flag has to tell them apart: a genuinely clean
+                    # entry is satisfied (the corpus and graph agree — exit 0),
+                    # while one diverging ONLY in `source` is permanently
+                    # unreconcilable and must not read as "not diverged". Exit 0
+                    # there is the silent no-op the fail-loud property forbids, and
+                    # `status`'s own rung already names the heal for it.
+                    ledger.note(
+                        entry,
+                        "source_only" if divergence.get("source") else "clean",
+                    )
                     continue
 
                 if not self._apply_commentary_reconcile(
-                    entry, existing, node_id, divergence, auto_accept
+                    entry, existing, node_id, divergence, auto_accept,
+                    authorized=ledger.authorizes(entry),
                 ):
+                    ledger.note(entry, "reconcile_refused")
                     continue
                 # Reconciled. Deliberately falls through to `continue` rather than the
                 # commit path below: no conflict judge (the canonical core is unchanged,
@@ -1085,6 +1374,7 @@ class MitosSyncManager:
                 # re-stamp, and above all NO ROTATION — rotation stays tied to a FIRST
                 # commit, because an entry that leaves the buffer leaves sync's read-set
                 # and its future divergence becomes invisible again.
+                ledger.note(entry, "reconciled")
                 continue
 
             # Slug collision check
@@ -1148,6 +1438,7 @@ class MitosSyncManager:
                         f"entry; to correct it, add `**Corrects:** [{entry.slug}]`. "
                         "Then re-run sync."
                     )
+                    ledger.note(entry, "collision")
                     continue
 
             # No terminal and no `--yes`: report this pending entry and skip it, never
@@ -1169,6 +1460,10 @@ class MitosSyncManager:
             if not auto_accept and not sys.stdin.isatty():
                 print(f"\n[Pending] '{entry.slug}' — skipped, stdin is not a terminal. "
                       "Re-run with `--yes` to accept pending entries non-interactively.")
+                # A named target still pending is NOT satisfied: the repair flag
+                # authorizes the reconcile gate, not this accept prompt, so the
+                # refusal above stays true and stays unchanged.
+                ledger.note(entry, "pending_skipped")
                 continue
 
             if entry.kind == "decision":
@@ -1201,9 +1496,15 @@ class MitosSyncManager:
                 if not auto_accept:
                     u_choice = input("Accept this decision? [a]ccept / [s]kip / [q]uit: ").strip().lower()
                     if u_choice == 's':
+                        ledger.note(entry, "operator_skipped")
                         continue
                     elif u_choice == 'q':
                         print("Sync paused by user.")
+                        ledger.note(entry, "operator_quit")
+                        # The loop ends here, so every entry BELOW this one in the
+                        # document went unread. A named target among them is still a
+                        # shortfall, but the report may not call it absent.
+                        ledger.mark_buffer_unread(_REPAIR_UNREAD_QUIT)
                         break
 
             else:
@@ -1213,9 +1514,12 @@ class MitosSyncManager:
                 if not auto_accept:
                     u_choice = input("Accept this open question? [a]ccept / [s]kip / [q]uit: ").strip().lower()
                     if u_choice == 's':
+                        ledger.note(entry, "operator_skipped")
                         continue
                     elif u_choice == 'q':
                         print("Sync paused by user.")
+                        ledger.note(entry, "operator_quit")
+                        ledger.mark_buffer_unread(_REPAIR_UNREAD_QUIT)  # as above
                         break
 
             # Populate OD3 confirmation metadata
@@ -1249,6 +1553,10 @@ class MitosSyncManager:
                 # and its in-corpus target may yet commit in this same sync. Carry
                 # entry_raw_text so a decision committed in the fixpoint still rotates.
                 quarantined.append((entry, entry_raw_text, exc))
+                # Pessimistic stamp: the fixpoint below upgrades whichever of these
+                # it drains, so a missed correction leaves a shortfall rather than a
+                # false satisfaction.
+                ledger.note(entry, "quarantined")
                 continue
             except (ValidationError, DatabaseError) as exc:
                 # Defensive secondary bulkhead (Gotcha): a bypassed-parser empty core
@@ -1262,8 +1570,10 @@ class MitosSyncManager:
                     f"{entry.line_end}): unexpected store error — {exc}. Entry left in "
                     f"its buffer; fix and re-sync."
                 )
+                ledger.note(entry, "store_error")
                 continue
             print(f"Committed node: {entry.slug} ✓")
+            ledger.note(entry, "committed")
 
             # best-effort embedding upsert (C2) — applies to OQ nodes too.
             self._best_effort_embed(delta, entry)
@@ -1287,6 +1597,15 @@ class MitosSyncManager:
         # never a hang, never a whole-sync abort. The fixpoint sits BEFORE rotation so
         # a decision it commits is appended to synced_blocks and rotates with the rest.
         residual = self._commit_quarantine_fixpoint(quarantined, synced_blocks)
+        # The satisfied "committed" state is TWO sites, not one. A stamp placed only
+        # after the main pass's `Committed node:` misses every entry the fixpoint
+        # drains, so a named forward-ref target would exit non-zero on a run that
+        # committed it. Keyed on identity because the residual tuples are the
+        # quarantined ones.
+        residual_ids = {id(entry) for entry, _raw, _exc in residual}
+        for entry, _raw, _exc in quarantined:
+            if id(entry) not in residual_ids:
+                ledger.note(entry, "committed")
         for entry, _raw, exc in residual:
             self._report_commit_quarantine(entry, exc)
 
@@ -2526,6 +2845,8 @@ class MitosSyncManager:
         node_id: str,
         divergence: Dict[str, Any],
         auto_accept: bool,
+        *,
+        authorized: bool = False,
     ) -> bool:
         """Applies one commentary reconcile, or reports why it was skipped.
 
@@ -2540,6 +2861,15 @@ class MitosSyncManager:
             node_id: The node's id.
             divergence: The ``entry_divergence`` report.
             auto_accept: Whether ``--yes`` is in force.
+            authorized: Whether the caller named THIS entry with
+                ``--reconcile-entry``. It is an additional way to satisfy the gate
+                below, never a second apply path: an authorized entry skips both
+                authorization branches and falls through to the same foreclosure
+                check, the same write-ahead attribution row and the same
+                ``commit_parsed_entry`` a TTY ``[r]`` already reaches, so a fault
+                mid-reconcile leaves exactly the state a confirmed reconcile leaves
+                today. The named-target test lives at the call site, so this
+                function stays ignorant of the flag's vocabulary.
 
         Returns:
             True if the reconcile was applied.
@@ -2562,37 +2892,56 @@ class MitosSyncManager:
             # edges declaratively: a line removed from the markdown DELETES that edge.
             print(f"  edge DELETED: {removed}")
 
-        if auto_accept and removals:
-            # `--yes` widens sync from append-only to mutate, but never to delete an
-            # edge unattended. And because `commit_parsed_entry` mirrors edges
-            # declaratively, an entry's commentary cannot be applied while withholding
-            # its edge state — so a MIXED entry is wholly skipped, and its commentary
-            # divergence stays unreconciled on every non-interactive run. Stated here
-            # rather than left to be discovered.
-            print("  Skipped — an edge DELETION cannot be applied under --yes, and an "
-                  "entry's commentary cannot be applied while withholding its edge "
-                  "state. Restore the relation line in decisions.md to reconcile the "
-                  "commentary alone, or re-run `mitos sync` from a terminal to confirm "
-                  "the deletion.")
-            return False
+        # `authorized` satisfies BOTH branches below for the entry the caller named,
+        # and nothing else: the fall-through is the shipped one, not a second route.
+        if not authorized:
+            if auto_accept and removals:
+                # `--yes` widens sync from append-only to mutate, but never to delete
+                # an edge unattended. And because `commit_parsed_entry` mirrors edges
+                # declaratively, an entry's commentary cannot be applied while
+                # withholding its edge state — so a MIXED entry is skipped whole. That
+                # holds for every entry a run was NOT authorized for; naming the entry
+                # is the other way to satisfy this gate, and it applies the whole
+                # reconcile rather than the deletion alone.
+                print("  Skipped — this run authorized no repair for this entry, and "
+                      "an edge DELETION cannot be applied under --yes alone (an "
+                      "entry's commentary cannot be applied while withholding its "
+                      "edge state, so a mixed entry is skipped whole). To apply it, "
+                      "name the entry:")
+                # `entry.slug`, never `existing['slug']`: the door matches the handle
+                # against the MARKDOWN slug the loop is iterating, so on a hand-edited
+                # RENAME the graph's slug is the one string this recipe must not carry
+                # — a caller copying it would name an entry no parsed block matches and
+                # get the never-seen refusal on a target sitting in front of them.
+                print(f"    mitos sync -p {self.config.project!r} "
+                      f"--reconcile-entry {entry.slug!r}")
+                print("  Or restore the relation line in decisions.md to reconcile "
+                      "the commentary alone.")
+                return False
 
-        if not auto_accept:
-            if not sys.stdin.isatty():
-                # No TTY and no `--yes`: report and skip, never prompt. This gate fires
-                # on a corpus state that used to produce ZERO prompts (the old code
-                # `continue`d unconditionally), so prompting here turned every
-                # non-interactive `mitos sync` — an agent, a CI job, a cron, a piped
-                # invocation — into a fatal `EOF when reading a line`. Skipping is the
-                # fail-closed choice: `--yes` is an explicit authorization to mutate,
-                # and the absence of a terminal is not that authorization.
-                print("  Skipped — no terminal to confirm on. Re-run with `--yes` to "
-                      "apply commentary reconciles non-interactively.")
-                return False
-            choice = input("Reconcile the graph to the markdown? "
-                           "[r]econcile / [s]kip: ").strip().lower()
-            if choice != "r":
-                print("  Skipped.")
-                return False
+            if not auto_accept:
+                if not sys.stdin.isatty():
+                    # No TTY, no `--yes` and no authorization for this entry: report
+                    # and skip, never prompt. This gate fires on a corpus state that
+                    # used to produce ZERO prompts (the old code `continue`d
+                    # unconditionally), so prompting here turned every non-interactive
+                    # `mitos sync` — an agent, a CI job, a cron, a piped invocation —
+                    # into a fatal `EOF when reading a line`. Skipping is the
+                    # fail-closed choice: the absence of a terminal is not an
+                    # authorization to mutate. What IS one is `--yes` (for an entry
+                    # carrying no edge deletion) or naming this entry.
+                    print("  Skipped — no terminal to confirm on, and this run "
+                          "authorized no repair for this entry. To apply it "
+                          "non-interactively, name it:")
+                    # The markdown slug, for the reason the sibling refusal states.
+                    print(f"    mitos sync -p {self.config.project!r} "
+                          f"--reconcile-entry {entry.slug!r}")
+                    return False
+                choice = input("Reconcile the graph to the markdown? "
+                               "[r]econcile / [s]kip: ").strip().lower()
+                if choice != "r":
+                    print("  Skipped.")
+                    return False
 
         uncommittable = self._uncommittable_edges(entry, divergence)
         if uncommittable:
