@@ -447,6 +447,73 @@ def test_every_targeting_tool_carries_the_envelope(tmp_path, offline, monkeypatc
         assert payload["workspace"] == target, name
 
 
+def test_the_exact_slug_exit_carries_the_envelope(tmp_path, offline, monkeypatch):
+    """A verb is stamped per EXIT, not per verb — `query_decisions`' second one.
+
+    Lives BESIDE the require-list above rather than inside `TOOL_ARGS`, and that
+    placement is the whole lesson. `TOOL_ARGS` is per-verb by construction — one
+    entry per tool, fenced by a set-equality against `mcp.list_tools()` — so a
+    second call-form for one tool reds the completeness assertion instead of
+    landing. Its `query_decisions` entry passes a string matching no slug, which
+    never reaches the dereference branch, so the branch shipped unstamped under a
+    green per-verb fixture (ADR
+    `per-exit-coverage-rows-live-beside-the-per-verb-require-list-not-in-it`).
+
+    The dereference exit is the one an agent acts on MOST directly: it named a
+    handle and got the decision in full, with no ranking to second-guess and no
+    empty result to interpret — which is why an answer from the wrong corpus is
+    the one that never looks wrong.
+    """
+    name, target = _register_workspace(tmp_path, monkeypatch)
+
+    payload = json.loads(mcp_server.query_decisions(
+        query="the-cli-echo-names-its-corpus", project=name))
+
+    # Non-vacuity FIRST: prove the call entered the dereference branch. A row
+    # asserting only the stamp is green against the semantic branch — which is
+    # exactly how the defect survived — so pin the shape that tells them apart:
+    # the dereference exit returns a top-level `state` and no `matches`, while
+    # both the ranked envelope and the lexical-degraded one carry `matches`.
+    assert payload["slug"] == "the-cli-echo-names-its-corpus"
+    assert "state" in payload
+    assert "matches" not in payload
+
+    assert payload["project"] == name
+    assert payload["collection"] == MitosConfig(target).qdrant_collection
+    assert payload["workspace"] == target
+
+
+@pytest.mark.parametrize("tool,kwargs", [
+    ("query_decisions", {"query": "q", "depth": "trace"}),
+    ("list_decisions", {"brief": True, "oneline": True}),
+])
+def test_an_argument_fault_carries_no_envelope(tool, kwargs, tmp_path, offline, monkeypatch):
+    """The two deliberate non-stamps, asserted as rows rather than left as silences.
+
+    `query_decisions`' depth-mode refusal and `list_decisions`' `brief and oneline`
+    refusal are ARGUMENT faults, answered before `_target_config` runs — *"the
+    caller's mistake is in the depth tier, not in the target, and resolving first
+    would answer a different question than the one they got wrong"*, in the shipped
+    comment's own words. No config exists at those exits, so there is nothing to
+    stamp from: they are carve-outs, not gaps, and the absence is stated here so
+    review does not read it as two missed exits.
+
+    Their CLI twins diverge legitimately for the same resolution-order reason —
+    `cmd_query`'s depth-error `--json` arm DOES stamp, because `main()` resolved
+    before dispatch.
+
+    The ordering half is owned by
+    `tests/test_mcp_selector.py::test_an_argument_fault_is_answered_before_the_project_is_resolved`
+    and is cited, not duplicated: a second copy is an enumeration waiting to drift.
+    """
+    name, _target = _register_workspace(tmp_path, monkeypatch, decisions=False)
+
+    payload = json.loads(getattr(mcp_server, tool)(project=name, **kwargs))
+
+    assert "error" in payload
+    assert not {"project", "collection", "workspace"} & set(payload)
+
+
 class TestTheRecordReceipt:
     """The write's receipt names the corpus it landed in — every outcome shape.
 

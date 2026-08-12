@@ -1126,6 +1126,11 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
                 "depth_mode": "letter"
             }
             output.update(store.get_modifiers(node["id"]))
+            # Provenance last, after the payload's own content fields — show_node's
+            # rule, one screen up, applied to the other dereference exit. Most
+            # valuable here: this is the answer an agent acts on directly, so a hit
+            # from the wrong corpus is the one that never looks wrong.
+            output.update(corpus_provenance(config))
             return dumps_display(output, ensure_ascii=False, indent=2)
     except Exception:
         # Not a slug collision or lookup failed; proceed to semantic claim lookup
