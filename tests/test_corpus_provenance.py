@@ -482,6 +482,17 @@ def test_the_exact_slug_exit_carries_the_envelope(tmp_path, offline, monkeypatch
     assert payload["collection"] == MitosConfig(target).qdrant_collection
     assert payload["workspace"] == target
 
+    # Provenance, and deliberately NOT confidence — the two answer different
+    # questions and only one of them is asked here. Provenance answers *which
+    # corpus replied*, which is ambiguous on every exit; a band answers *how well
+    # the semantic ranking did*, which on a named handle is not a question, so a
+    # band here reads as "this decision is doubtful". Pinned rather than left to
+    # the prose: the band lands on this verb's OTHER exits next, in this same
+    # function, and a phase wiring it envelope-by-envelope meets an assertion it
+    # has to invert on purpose instead of a paragraph it has to remember.
+    assert "confidence" not in payload
+    assert "note" not in payload
+
 
 @pytest.mark.parametrize("tool,kwargs", [
     ("query_decisions", {"query": "q", "depth": "trace"}),
