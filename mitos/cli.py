@@ -67,12 +67,13 @@ from mitos.migrations import is_pre_v1a_schema
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS, open_connection
 from mitos.cutover import default_aside_db_path, perform_swap, rebuild_and_gate
 from mitos.lexical import degraded_reason_from_error, lexical_fallback
-from mitos.recall import (assess_surface_recall, corpus_provenance,
-                          missing_graph_is_a_gap, missing_graph_note,
-                          missing_index_is_a_gap, provenance_line,
-                          scope_filter_recovery)
+from mitos.recall import (assess_query_recall, assess_surface_recall,
+                          corpus_provenance, missing_graph_is_a_gap,
+                          missing_graph_note, missing_index_is_a_gap,
+                          provenance_line, scope_filter_recovery)
 from mitos.sync import (MitosSyncManager, run_ambient_capture, _SLUG_MAX_LEN,
-                        _ENTRIES_MARKER, _PAUSE_RESOLVING_RELATIONS)
+                        _ENTRIES_MARKER, _PAUSE_RESOLVING_RELATIONS,
+                        _declared_echo_lines, _split_relation_slugs)
 from mitos._agent_block import agent_block, agent_block_drift, AGENT_GUIDE_VERSION
 from mitos.renderer import MitosRenderer, overflow_report
 from mitos.importer import MitosProseImporter
@@ -637,7 +638,7 @@ def cmd_init(config: MitosConfig, name: Optional[str] = None, force: bool = Fals
             "If the Mitos MCP server is wired into your agent, call these tools directly — best experience: structured args, no shell-quoting. If it is NOT wired, each maps to a CLI verb (and the CLI also accepts the long names as aliases, e.g. `mitos record_decision -p .`):\n"
             "- `record_decision`  (CLI: `mitos record -p .`) — the moment you commit to a foundational choice (a schema, a library, a pattern, a path you're abandoning), persist it WITH the alternatives you rejected and why, so future sessions inherit it instead of relitigating. Recording rich prose via the CLI? Use `--axiom-file -` / `--rejected-file -` / `--context-file -` to read from stdin and avoid shell-quoting.\n"
             "- `surface_decisions` (CLI: `mitos surface -p .`) — surface active precedents for a claim/scope BEFORE you decide, so you don't relitigate a settled call. This is the recall loop — use it first. Every hit carries its full `rejected_paths`; pass `brief=True` (CLI `--brief`) for an axiom-only scan.\n"
-            "- `query_decisions`   (CLI: `mitos query -p .`) — semantic or slug lookup when unsure whether a precedent exists.\n"
+            "- `query_decisions`   (CLI: `mitos query -p .`) — the TARGETED lookup: a slug you are carrying, or a pointed claim. Its confidence band rates how well the ranking matched what you named, not whether precedent exists — `surface_decisions` answers that one.\n"
             "- `list_decisions`    (CLI: `mitos list -p .`) — the EXHAUSTIVE recall path. surface/query are semantic and capped at the top few matches; this returns EVERY decision in a scope, deterministically, so a completeness pass or audit doesn't miss anything below the relevance cliff. Needs no key or Qdrant.\n\n"
             "## When to record — the capture trigger (YOUR judgement; Mitos stores, it does not decide what is worth storing)\n"
             "Recall is easy to ask for; knowing WHAT is worth recording is the real call, and it falls to you. Record a decision when it:\n"
@@ -722,20 +723,63 @@ def cmd_init(config: MitosConfig, name: Optional[str] = None, force: bool = Fals
     sys.stdout.flush()
 
 
-def cmd_sync(config: MitosConfig, auto_accept: bool = False, embed_only: bool = False, verbose: bool = False) -> None:
+def cmd_sync(config: MitosConfig, auto_accept: bool = False, embed_only: bool = False,
+             verbose: bool = False, repair_targets: Optional[List[str]] = None) -> None:
     """Synchronizes the decisions write buffer with the graph store.
 
-    The handler prints nothing itself — ``perform_sync`` does — so the corpus echo
-    leads its stdout report from here, and the two abort branches carry their own on
-    stderr (an echo pinned to stdout is invisible to a caller reading the refusal).
+    The report itself is ``perform_sync``'s, so the corpus echo leads its stdout
+    report from here. What the handler prints on its own is refusals — the two
+    aborts and the two ``--reconcile-entry`` compositions below — and each carries
+    its own echo on stderr, because an echo pinned to stdout is invisible to a
+    caller reading the refusal.
+
+    The shortfall exit is the handler's too: exiting from inside the loop would
+    truncate the run before ``render_all`` and the outbox drain, so ``perform_sync``
+    returns the unsatisfied targets and this is where they become an exit code.
+
+    Args:
+        config: The resolved workspace config.
+        auto_accept: ``--yes``.
+        embed_only: ``--embed-only`` — drains the outbox and runs no sync.
+        verbose: ``--verbose``.
+        repair_targets: ``--reconcile-entry`` handles, already split. ``None``
+            means the flag was absent; ``[]`` means it was supplied and named
+            nothing, which is a refusal rather than a fallback — the same rule the
+            selector follows (``-p ""`` renders, it does not fall back to cwd).
     """
     _echo_corpus(config)
+    # Refused here rather than at the parser. `add_mutually_exclusive_group` would
+    # answer with argparse's terse `not allowed with argument` at exit 2, and would
+    # be the only place in the tree where a `mitos sync` flag COMBINATION is judged;
+    # a handler-side refusal keeps every door refusal in one register, one channel
+    # and one exit code. Above the `if embed_only:` branch, because that branch
+    # short-circuits to the outbox drain and never calls `perform_sync` — so the
+    # flag would otherwise be discarded silently and the run would exit 0, which is
+    # the silent no-op the fail-loud property forbids.
+    if repair_targets is not None:
+        if embed_only:
+            sys.stdout.flush()
+            _echo_corpus(config, file=sys.stderr)
+            print("--reconcile-entry needs a full sync: --embed-only drains the "
+                  "pending embeddings queue and reads no buffer entries. Re-run "
+                  "without --embed-only.", file=sys.stderr)
+            sys.exit(1)
+        if not repair_targets:
+            sys.stdout.flush()
+            _echo_corpus(config, file=sys.stderr)
+            print("--reconcile-entry named no entry. Give it the `### ` slug of a "
+                  "diverged buffer entry, as `mitos status` reports it.",
+                  file=sys.stderr)
+            sys.exit(1)
     manager = MitosSyncManager(config)
     if embed_only:
         manager.drain_pending_embeddings()
     else:
         try:
-            manager.perform_sync(auto_accept=auto_accept, verbose=verbose)
+            shortfall = manager.perform_sync(
+                auto_accept=auto_accept, verbose=verbose,
+                repair_targets=repair_targets,
+            )
         except ParseError as e:
             sys.stdout.flush()
             _echo_corpus(config, file=sys.stderr)
@@ -745,6 +789,12 @@ def cmd_sync(config: MitosConfig, auto_accept: bool = False, embed_only: bool = 
             sys.stdout.flush()
             _echo_corpus(config, file=sys.stderr)
             print(f"Sync Aborted: Validation error.\n{str(e)}", file=sys.stderr)
+            sys.exit(1)
+        if shortfall:
+            # 1, matching the verb's two aborts — no new code vocabulary. The
+            # contract binds only the caller who typed the flag; a bare `mitos sync`
+            # returns an empty list and is untouched. This exit prints nothing
+            # itself (the report's lines came from `sync.py`), so it owes no echo.
             sys.exit(1)
 
 
@@ -991,6 +1041,11 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
 
     store = manager.store
     top_k = clamp_limit(limit)
+    # Initialized BEFORE the `try` for the reason the CollectionMissingError arm's own
+    # comment gives below: that arm constructs the empty result rather than falling
+    # through, so a `top_score` bound inside the loop would be an unbound local on
+    # exactly the state (empty graph + absent collection) nobody reaches by hand.
+    top_score: Optional[float] = None
     try:
         q_vector = manager.embed_provider.get_embedding(query_text, is_query=True)
         raw_matches = manager.vector_store.query(q_vector, limit=top_k)
@@ -1022,6 +1077,12 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
             )
             match.update(store.get_modifiers(node["id"]))
             matches.append(match)
+            # Off the SURFACED list, after the append — never off `raw_matches`,
+            # which still holds the superseded and unresolvable nodes this loop
+            # just dropped. A band read off the raw return rates a match the
+            # caller never saw.
+            if top_score is None or m["score"] > top_score:
+                top_score = m["score"]
     except CollectionMissingError as e:
         # I8 — an absent collection over an EMPTY active set IS the empty index, and
         # a fresh project must not read as broken; over a populated graph it is a
@@ -1064,12 +1125,32 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         store, config, corpus_has_entries=corpus_has_entries
     )
 
+    # The confidence band, in the `query` register: it describes how this lookup's
+    # ranking did, never what the corpus holds. One call serves both encodings.
+    # `assess_query_recall` never returns None, so there is no `is not None` guard
+    # here — copying `cmd_surface`'s would be a branch that can never be False.
+    confidence, note = assess_query_recall(
+        top_score=top_score,
+        result_count=len(matches),
+        config=config,
+        surface="cli",
+    )
+
     # Build the per-match list once, then branch the two renderings over it.
     if as_json:
         envelope: Dict[str, Any] = {"query": query_text, "depth_mode": "letter", "matches": matches}
         envelope.update(corpus_provenance(config))
+        # Band note FIRST, then the overrides reassign it — the precedence is
+        # confidence note < blackout < unbuilt, and it is the NOTE that yields:
+        # `confidence` stands on every one of these exits (it is a fact about the
+        # ranking that an override about the graph does not contradict).
+        envelope["confidence"] = confidence
+        envelope["note"] = note
         if blackout:
             envelope["all_superseded"] = retired
+            # Closes the text/JSON divergence: the text branch below has printed
+            # this note since 2d while `--json` carried the handles alone.
+            envelope["note"] = blackout_note(retired)
         if unbuilt:
             envelope["note"] = missing_graph_note("cli")
         _emit_json(envelope)
@@ -1091,11 +1172,24 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
     if not matches:
         print(provenance_line(config))
         print("No matching decisions found.")
+        # This branch APPENDS where the envelope above assigns, so the override is
+        # written rather than inherited: left to the copy, a miss over an unbuilt
+        # graph would print the band note *and* the pointer, and the band note's
+        # redirect sends the caller to `surface`, which answers just as empty over
+        # that same unbuilt graph — a turn spent one line above the correct heal.
         if unbuilt:
             print(f"→ {missing_graph_note('cli')}")
+        else:
+            band_line = _query_band_line(confidence)
+            if band_line:
+                print(band_line)
+            print(f"→ {note}")
         return
 
     print(f"\nQuery matches for: '{query_text}'  [{provenance_line(config)}]")
+    band_line = _query_band_line(confidence)
+    if band_line:
+        print(band_line)
     print("-" * 60)
     for i, d in enumerate(matches, start=1):
         print(f"{i}. {d['slug']}  (score {d['score']:.3f})")
@@ -1108,6 +1202,38 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         if d["scope"]:
             print(f"   Scope:    {', '.join(d['scope'])}")
         print()
+    print(f"→ {note}")
+
+
+def _query_band_line(confidence: str) -> Optional[str]:
+    """The one-line band label for ``mitos query``'s text renderings, or None.
+
+    Two branches, not three: ``strong`` prints nothing, exactly as on ``surface``.
+    A label-axis reading of "the band renders" would compose a ``strong`` line
+    carrying ``⚠`` over a good result, which reads as a warning about an answer
+    that is fine. The ``⚠`` glyph is the shipped status legend (``✓``/``⚠``/``✗``),
+    not emphasis — a status line without it reads as a defect, not as calm.
+
+    The line carries the **label**; the note carries the legend and the register,
+    and stays legend-complete on its own (on MCP the label arrives as the typed
+    ``confidence`` field and there is no line at all).
+
+    The ``none`` line is one sentence true of **both** of that band's states —
+    matches that all ranked off-axis, and nothing ranked at all. ``surface``'s
+    shipped twin ("the scope is populated, but nothing matches your query") is
+    false twice over here, which is why it is not copied.
+
+    Args:
+        confidence: The band from ``assess_query_recall``.
+
+    Returns:
+        The line to print, or None when the band prints none.
+    """
+    if confidence == "weak":
+        return "⚠ confidence: weak — top matches are close but may not be this lookup's handle."
+    if confidence == "none":
+        return "⚠ confidence: none — nothing ranked as a real match for this lookup."
+    return None
 
 
 def _show_not_found_hint(config: MitosConfig) -> str:
@@ -1139,6 +1265,38 @@ def _show_not_found_hint(config: MitosConfig) -> str:
     """
     return (f"not in graph — if you just authored it in decisions.md/questions.md, "
             f"run `mitos sync -p {config.project!r}`")
+
+
+def _coherence_audit_hint(config: MitosConfig) -> str:
+    """Composes the CLI's coherence-audit recovery clause — this boundary's alone.
+
+    The *fact* (a standing, corpus-wide contradiction-check debt) lives once, on
+    ``sync._COHERENCE_AUDIT_NOTE``, and reaches all three encodings on the shared
+    receipt dict. Only the *recovery* is composed here, for the same reason
+    :func:`_show_not_found_hint` is: MCP may name no shell command (an agent handed
+    one runs it), the CLI reader's actual repair *is* ``mitos check``, and a shared
+    body could only be the intersection — which is empty of recovery.
+
+    It names the selector because a bare ``mitos check`` has had no target since the
+    0.15.0 flip, and it renders ``config.project`` through ``repr`` for the reason
+    every other registry name on this surface does: a name is hand-editable text,
+    and the quoted form is what a shell wants around a path with a space anyway.
+
+    Unlike its sibling this returns a **complete sentence with its own terminal
+    punctuation** — it has exactly one call site, where it is appended to a shared
+    note that is itself a full sentence, so caller-supplied punctuation would only
+    split one string across two files.
+
+    The register stays the note's: this states what the audit *is*, one pass over
+    the whole corpus, and never frames it as work owed on the entry just written.
+
+    Args:
+        config: The resolved workspace config, carrying ``project``.
+
+    Returns:
+        The recovery sentence, naming ``mitos check`` exactly once.
+    """
+    return f"The audit is `mitos check -p {config.project!r}` — one pass, whole corpus."
 
 
 def cmd_show(config: MitosConfig, ident: str, as_json: bool = False) -> None:
@@ -1665,6 +1823,12 @@ def cmd_record(
         # without a dereference round-trip. Enrichment keys via .get(): production
         # always sends the full candidate_payload shape, but leaner dicts reach this
         # render from canned fixtures.
+        #
+        # Then the caller's own declared targets, partitioned (A2) — after the
+        # neighbour blocks and before the recovery menu. In front of the payload it
+        # would be a wall between the author and the anti-knowledge it judges
+        # tenability from; the sentences are `_declared_echo_lines` over this same
+        # dict's keys, so this render and the two machine encodings cannot disagree.
         _echo_corpus(config, file=sys.stderr)
         print(f"⚠ Paused — '{result['slug']}' looks like an existing decision. Nothing written.",
               file=sys.stderr)
@@ -1682,6 +1846,8 @@ def cmd_record(
                       file=sys.stderr)
             if n.get("scope"):
                 print(f"      scope: {', '.join(n['scope'])}", file=sys.stderr)
+        for line in _declared_echo_lines(result):
+            print(f"  {line}", file=sys.stderr)
         # Same co-equal framing as the shared needs_review message (one constant,
         # two spellings — the CLI renders flags, the message bare names).
         menu = "/".join(f"--{r}" for r in _PAUSE_RESOLVING_RELATIONS)
@@ -1743,6 +1909,19 @@ def cmd_record(
     if review_notice:
         sys.stdout.flush()
         print(f"\n{review_notice}", file=sys.stderr)
+    # The standing coherence debt, last — so it reads as the answer to the notice
+    # above it, which after the split carries no recovery of its own. Gated on the
+    # FIELD, which sync sets on the `created` return alone: this text tail is shared
+    # with the `exists` exit (it branches only on the headline and the path label),
+    # and a no-op incurs no audit debt — an unconditional print would also put a
+    # second recipe on a receipt that already carries the `mitos sync` one. Same
+    # flush-first shape as the two riders above; the `--json` branch returned long
+    # ago, which is why the recovery clause is text-only by construction rather than
+    # by a condition.
+    coherence = result.get("coherence_audit")
+    if coherence:
+        sys.stdout.flush()
+        print(f"\n{coherence} {_coherence_audit_hint(config)}", file=sys.stderr)
 
 
 def _read_text_arg(inline: Optional[str], file_path: Optional[str]) -> Optional[str]:
@@ -1765,6 +1944,31 @@ def _read_text_arg(inline: Optional[str], file_path: Optional[str]) -> Optional[
         with open(file_path, "r", encoding="utf-8") as f:
             return f.read()
     return inline
+
+
+def _join_relation_flag(values: Optional[List[str]]) -> Optional[str]:
+    """Comma-joins a repeatable relation flag back into the shared string form.
+
+    The nine ``record`` relation flags accumulate their repeats (``action="append"``),
+    while ``cmd_record``, ``record_decision_entry`` and the MCP ``record_decision``
+    tool all take one comma-separated string — the form the markdown relationship
+    fields already use. Joining here, at main()'s single call site, keeps those three
+    signatures identical (so CLI⇄MCP parity is structural rather than policed) and
+    sits above every consumer of the declared set, all of which read it through
+    ``_split_relation_slugs``.
+
+    The separator is ``", "``, not ``","``: the raw string is serialized straight into
+    ``decisions.md`` as ``**Cites:** a, b, c``, and that file is the gold source a
+    human reads. Both spellings parse identically downstream.
+
+    Args:
+        values: The accumulated occurrences, or None when the flag was not supplied.
+
+    Returns:
+        The comma-joined string, or None when the flag was absent (absent and empty
+        are distinguished downstream).
+    """
+    return None if values is None else ", ".join(values)
 
 
 def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
@@ -2743,6 +2947,20 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
             "pre_v1a": pre_v1a,
             "qdrant_url": config.qdrant_url,
             "collection": config.qdrant_collection,
+            # The four resolved corpus locations, flat beside the other
+            # resolved-identity values rather than in a `paths` sub-map: `checks` is
+            # the payload's only nested map and it is a homogeneous verdict map,
+            # which these explicitly are not (a path passes and fails nothing). The
+            # key names mirror `MitosConfig.to_dict()`'s spellings so a consumer
+            # reading both finds the same words — a naming convention, deliberately
+            # NOT a code coupling: bound as attributes, so a future rename inside a
+            # debug mapping cannot propagate into a shipped payload contract
+            # (additive-only, data in the wild). Absolute by construction
+            # (`__init__` abspath's the workspace), so nothing here re-`abspath`s.
+            "decisions_file": config.decisions_file,
+            "questions_file": config.questions_file,
+            "archive_dir": config.archive_dir,
+            "db_path": config.db_path,
             "checks": {
                 "mitos_workspace": mitos_dir_ok,
                 "decisions_buffer": decisions_ok,
@@ -2817,7 +3035,14 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
         coll_mark, coll_hint = None, "auto-created on first record — none recorded yet"
     checks = [
         ("workspace (.mitos/ + config.toml)", mitos_dir_ok, "run `mitos init`"),
-        ("decisions.md buffer", decisions_ok, "created by `mitos init`"),
+        # The path rides INLINE in the label, not on a line elsewhere: the row's
+        # own job is to say which file it is about, and a reader must never have to
+        # correlate a `✗` row with a path listed further down to learn that. The
+        # parenthetical is the report's shipped idiom (`Qdrant reachable (…)`,
+        # `GEMINI_API_KEY (from …)`). The `mitos init` hint stays bare because
+        # `init` is selector-exempt — a bare `mitos init` is runnable, not a wall.
+        (f"decisions.md buffer ({config.decisions_file})", decisions_ok,
+         "created by `mitos init`"),
         # Reference copy for humans/agents — the parser reads the spec from the
         # installed package, so a missing workspace copy never gates readiness:
         # neutral "—", never a ✗ under a READY ✓ verdict (✗ is for real blockers).
@@ -2865,6 +3090,24 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
             print(f"      {rest[0]}")
     if q["reachable"] and q["collection_exists"] and q["points"] is not None:
         print(f"      ({q['points']} vector(s) indexed)")
+    # The three corpus locations that have no check row to hang off, as neutral `•`
+    # facts in the idiom the report already speaks (`• graph holds …`, `• {n}
+    # graveyard point(s)`) — a resolved path passes and fails nothing, so it is not
+    # a rung in any glyph and never joins `checks`. Unconditional by design: the two
+    # sessions that grepped `.mitos/decisions.md` and got confident zero-hit answers
+    # were working in HEALTHY workspaces where every row read ✓, so a path shown
+    # only on failure is absent from exactly the state that produced this item. The
+    # archive is the load-bearing member — `<root>/decisions/archive` follows
+    # neither the root convention `decisions.md` teaches nor the `.mitos/` one
+    # everything else does, so a reader told the other three still cannot derive it.
+    # Rendered, never inspected: no `stat`, no glob, no entry count. The archive
+    # listing is one import away and already on this verb's path
+    # (`corpus_graph_divergence`), and a count beside a path would be a second,
+    # weaker report of what the divergence rung already covers — drifting from it by
+    # construction, and the only thing here that is not O(1) in corpus size.
+    print(f"  • questions.md buffer: {config.questions_file}")
+    print(f"  • decisions archive: {config.archive_dir}")
+    print(f"  • graph: {config.db_path}")
     if graph_nodes is not None:
         print(f"  • graph holds {graph_nodes} node(s)")
     # The unbuilt graph (W31). A blocker, not a rung readers learn to skip: every
@@ -2929,7 +3172,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
     if overflows:
         _print_overflow_detail(overflows)
     if divergence_report is not None:
-        _print_divergence_rung(divergence_report)
+        _print_divergence_rung(divergence_report, project=config.project)
     if graph_behind:
         print(
             "\n  ⚠ graph is behind your buffer — the V1b edge catalog + mechanism "
@@ -2982,7 +3225,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
     return 0 if ready else 1
 
 
-def _print_divergence_rung(report: Dict[str, Any]) -> None:
+def _print_divergence_rung(report: Dict[str, Any], *, project: str) -> None:
     """Prints the corpus↔graph divergence rung — informational, never a blocker.
 
     A corpus mid-edit is a normal state, so gating readiness here would make an
@@ -3001,6 +3244,16 @@ def _print_divergence_rung(report: Dict[str, Any]) -> None:
 
     Args:
         report: A ``corpus_graph_divergence`` result.
+        project: The caller's own vocabulary for this workspace — ``config.project``,
+            i.e. the registered name for a registered target and the workspace path
+            otherwise. Required and keyword-only, matching ``cmd_status``'s own
+            idiom: the one recipe this function composes for a repair the reader can
+            run NOW has to carry a selector (since the selector flip a bare
+            ``mitos sync`` has no target), and it is passed in rather than
+            re-derived here for the reason 3d rejected by name — a reverse lookup
+            misses on a symlinked route whose registry entry is hand-written
+            non-canonically, printing a path for a registered project with every
+            other row green.
     """
     if report.get("skipped"):
         # Never a verdict from a read we could not take. "corpus busy" is the normal
@@ -3067,10 +3320,11 @@ def _print_divergence_rung(report: Dict[str, Any]) -> None:
 
     reconcilable = report.get("reconcilable") or 0
     if reconcilable:
-        print(f"      → {reconcilable} of these can be repaired now: `mitos sync` "
-              f"reconciles a diverged buffer entry, printing the field diff first "
-              f"(add `--yes` to apply without prompting; an edge DELETION is always "
-              f"skipped under `--yes`).")
+        print(f"      → {reconcilable} of these can be repaired now: `mitos sync -p "
+              f"{project!r}` reconciles a diverged buffer entry, printing the field "
+              f"diff first (add `--yes` to apply without prompting, or "
+              f"`--reconcile-entry <slug>` to apply one named entry's whole "
+              f"reconcile — the only way to apply an edge DELETION unattended).")
     if report.get("archived_drift"):
         print(f"      ({report['archived_drift']} of these sit in an ARCHIVE file — "
               f"`sync` reads only the buffer, so their reconciler is `mitos rebuild`.)")
@@ -5357,6 +5611,23 @@ def _build_parser() -> argparse.ArgumentParser:
     sync_p.add_argument("--yes", action="store_true", help="Auto-accept all parsed changes.")
     sync_p.add_argument("--embed-only", action="store_true", help="Drain the pending embeddings outbox queue only.")
     sync_p.add_argument("--verbose", action="store_true", help="Show verbose cache statistics.")
+    # The repair door. Same arity as the nine relation flags below: `action="append"`
+    # with no `nargs`, so each occurrence stays one whole value (a bare `extend`
+    # iterates the string into characters; `nargs="*"` would make the space form
+    # parse and swallow the next token). `default=None` distinguishes an absent flag
+    # from one supplied naming nothing, which is a refusal rather than a fallback.
+    # main() splits the comma form through `_split_relation_slugs`, the tree's single
+    # comma-split semantics.
+    sync_p.add_argument(
+        "--reconcile-entry", default=None, action="append", dest="reconcile_entry",
+        metavar="SLUG",
+        help="Apply the whole reconcile for the named diverged buffer entry, "
+             "including an edge deletion, with no terminal and no --yes. Names the "
+             "entry's `### ` slug as `mitos status` reports it (a renamed entry is "
+             "named by its NEW slug — the loop reads the markdown). Repeatable and "
+             "comma-separated both accumulate: `--reconcile-entry a "
+             "--reconcile-entry b` == `--reconcile-entry 'a, b'`. A named target "
+             "that does not end in the state your markdown describes exits 1.")
 
     # reconcile
     rec_p = subparsers.add_parser(
@@ -5370,7 +5641,8 @@ def _build_parser() -> argparse.ArgumentParser:
     cap_p.add_argument("text", help="Raw decision description.")
 
     # query (alias: query_decisions — MCP tool name)
-    q_p = subparsers.add_parser("query", aliases=["query_decisions"], help="Semantic lookup for precedents.")
+    q_p = subparsers.add_parser("query", aliases=["query_decisions"],
+                                help="Targeted lookup by slug or pointed claim (its confidence rates the ranking, not the corpus).")
     q_p.add_argument("claim", help="Assertion or subsystem query.")
     q_p.add_argument("--depth", default="letter", help="Depth (default: letter).")
     q_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON.")
@@ -5380,7 +5652,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # surface (alias: surface_decisions — MCP tool name) — the precedent-recall loop
     surf_p = subparsers.add_parser("surface", aliases=["surface_decisions"],
-                                   help="Surface active decisions relevant to a query (precedent check before deciding).")
+                                   help="Surface active decisions relevant to a query (precedent check before deciding — its confidence rates whether precedent exists).")
     surf_p.add_argument("query", help="The claim or topic to find precedents for.")
     surf_p.add_argument("--scope", default=None, help="Optional scope hint (does NOT filter semantic recall — scopes open-questions + note only). Use `list --scope` to hard-filter by scope.")
     surf_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON.")
@@ -5432,10 +5704,22 @@ def _build_parser() -> argparse.ArgumentParser:
     rec_p = subparsers.add_parser("record", aliases=["record_decision"], help="Record a decision directly to buffer and graph.")
     rec_p.add_argument("axiom", nargs="?", default=None,
                        help="The decision as a single clear sentence true going forward "
-                            "(or use --axiom-file; exactly one of the two).")
+                            "(or use --axiom / --axiom-file; exactly one of the three).")
+    # `--axiom` gets its OWN dest. Sharing the positional's is the cheaper-looking
+    # trick and is dead on arrival: without SUPPRESS the flag form parses to None
+    # (the positional's default overwrites it), and with SUPPRESS argument ORDER
+    # decides which value survives, so supplying both becomes undetectable and one
+    # is silently kept — the silently-keep-last defect on the field that
+    # CONSTITUTES identity (a dropped axiom is a different node id, M1/M2). Plain
+    # `store`, never `append`: an axiom is one sentence, not a set, so the arity the
+    # nine relation flags took has no meaning here. `metavar` or the usage banner
+    # leaks the internal dest as `[--axiom AXIOM_FLAG]`.
+    rec_p.add_argument("--axiom", default=None, dest="axiom_flag", metavar="AXIOM",
+                       help="The axiom as a flag, for callers who reach for one — "
+                            "the same value as the positional (exactly one of the three).")
     rec_p.add_argument("--axiom-file", default=None, dest="axiom_file",
                        help="Read the axiom from a file ('-' = stdin) to avoid shell-quoting; "
-                            "replaces the positional axiom (supply one, not both).")
+                            "replaces the inline axiom (exactly one of the three).")
     rec_p.add_argument("--rejected", default=None, help="Alternatives considered and rejected, and why (REQUIRED — or use --rejected-file).")
     rec_p.add_argument("--rejected-file", default=None, dest="rejected_file",
                        help="Read --rejected from a file ('-' = stdin) to avoid shell-quoting long prose.")
@@ -5463,15 +5747,53 @@ def _build_parser() -> argparse.ArgumentParser:
     rec_p.add_argument("--context", default=None, help="Optional background on why this was decided.")
     rec_p.add_argument("--context-file", default=None, dest="context_file",
                        help="Read --context from a file ('-' = stdin).")
-    rec_p.add_argument("--supersedes", default=None, help="Exact slug(s) of prior decision(s) this one replaces — comma-separated for several (e.g. 'a, b').")
-    rec_p.add_argument("--corrects", default=None, help="Exact slug(s) of prior decision(s) this one corrects (kill-edge twin of --supersedes) — comma-separated for several.")
-    rec_p.add_argument("--amends", default=None, help="Exact slug(s) of decision(s) this one amends — comma-separated for several.")
-    rec_p.add_argument("--narrows", default=None, help="Exact slug(s) of decision(s) this one narrows — comma-separated for several.")
-    rec_p.add_argument("--depends-on", default=None, dest="depends_on", help="Exact slug(s) of decision(s) this one depends on — comma-separated for several.")
-    rec_p.add_argument("--resolves", default=None, help="Exact slug(s) of open question(s) this one resolves (resolves is decision→open-question only) — comma-separated for several.")
-    rec_p.add_argument("--contradicts", default=None, help="Exact slug(s) of decision(s) this one contradicts — comma-separated for several.")
-    rec_p.add_argument("--derives-from", default=None, dest="derives_from", help="Not valid when recording a decision — a derives_from edge originates from an open question (open_question -> decision), so a decision cannot be its source. Use --cites to link a decision this one builds on.")
-    rec_p.add_argument("--cites", default=None, help="Exact slug(s) of decision(s) this one cites — comma-separated for several.")
+    # The nine relation flags accumulate repeats, so `--cites a --cites b` means
+    # what `--cites "a, b"` has always meant. As plain last-wins strings they kept
+    # only the final occurrence and said nothing — and on the two kill-edge flags
+    # that is not a lost link but a false claim about present truth, since state is
+    # computed from edges: the prior the author declared superseded stayed in the
+    # active view and every read reported it as current.
+    #
+    # `action="append"` rather than `--scope`/`--mechanisms`' `nargs="*"` + `extend`
+    # above, for two measured reasons. A bare `extend` (no `nargs`) iterates each
+    # string into CHARACTERS. And `nargs="*"` would make the space form parse, which
+    # here is worse than refusing it: `--cites a "My axiom"` swallows record's axiom
+    # positional, so the caller supplies an axiom and is refused for missing one.
+    # `append` keeps each occurrence one whole value, so neither shape is
+    # constructible. `default=None` is kept on all nine — absent and empty are
+    # distinguished downstream, and `append` only runs when the flag is present.
+    # main() comma-joins the accumulated values back into the single string every
+    # consumer already splits (`_split_relation_slugs`); see `_join_relation_flag`.
+    rec_p.add_argument("--supersedes", default=None, action="append",
+                       help="Exact slug(s) of prior decision(s) this one replaces. "
+                            "Repeatable and comma-separated both accumulate: "
+                            "`--supersedes a --supersedes b` == `--supersedes 'a, b'`.")
+    rec_p.add_argument("--corrects", default=None, action="append",
+                       help="Exact slug(s) of prior decision(s) this one corrects "
+                            "(kill-edge twin of --supersedes). Repeatable and "
+                            "comma-separated both accumulate.")
+    rec_p.add_argument("--amends", default=None, action="append",
+                       help="Exact slug(s) of decision(s) this one amends. Repeatable "
+                            "and comma-separated both accumulate.")
+    rec_p.add_argument("--narrows", default=None, action="append",
+                       help="Exact slug(s) of decision(s) this one narrows. Repeatable "
+                            "and comma-separated both accumulate.")
+    rec_p.add_argument("--depends-on", default=None, action="append", dest="depends_on",
+                       help="Exact slug(s) of decision(s) this one depends on. Repeatable "
+                            "and comma-separated both accumulate.")
+    rec_p.add_argument("--resolves", default=None, action="append",
+                       help="Exact slug(s) of open question(s) this one resolves (resolves "
+                            "is decision→open-question only). Repeatable and "
+                            "comma-separated both accumulate.")
+    rec_p.add_argument("--contradicts", default=None, action="append",
+                       help="Exact slug(s) of decision(s) this one contradicts. Repeatable "
+                            "and comma-separated both accumulate.")
+    # Accumulates like its siblings — its refusal fires downstream, in the validate
+    # phase — but its help stays a refusal explanation, teaching no spelling at all.
+    rec_p.add_argument("--derives-from", default=None, action="append", dest="derives_from", help="Not valid when recording a decision — a derives_from edge originates from an open question (open_question -> decision), so a decision cannot be its source. Use --cites to link a decision this one builds on.")
+    rec_p.add_argument("--cites", default=None, action="append",
+                       help="Exact slug(s) of decision(s) this one cites. Repeatable and "
+                            "comma-separated both accumulate.")
     rec_p.add_argument("--slug", required=True,
                        help=f"Explicit slug (handle) for the decision, required "
                             f"(≤{_SLUG_MAX_LEN} chars; an over-length slug is rejected, not truncated).")
@@ -5579,7 +5901,11 @@ def _build_parser() -> argparse.ArgumentParser:
     # `--axiom` an unambiguous prefix of `--axiom-file`: a 470-character axiom went
     # to the file reader and the command died as `[Errno 36] File name too long`
     # through the outermost boundary, as a "Fatal Unexpected Error" naming nothing
-    # the caller could act on. Setting `allow_abbrev=False` on the top-level parser
+    # the caller could act on. That founding example is now HISTORICAL — `--axiom`
+    # is a declared option, so it resolves exactly and no longer abbreviates
+    # anything; a reader reproducing it will find it does not reproduce. The rule
+    # still holds for every other flag (`--axiom-fil` is the probe that still
+    # bites). Setting `allow_abbrev=False` on the top-level parser
     # does NOT propagate — an `add_parser()` child keeps its own True — so it is
     # pinned here over the whole registered set rather than as a kwarg on `record`,
     # which the next verb added would be one forgotten argument away from missing.
@@ -5720,7 +6046,18 @@ def main() -> None:
         elif args.command == "projects":
             cmd_projects(as_json=args.as_json)
         elif args.command == "sync":
-            cmd_sync(config, auto_accept=args.yes, embed_only=args.embed_only, verbose=args.verbose)
+            # The split lives here, at the call site, exactly as 1a's join does:
+            # `None` (flag absent) survives as `None` so the handler can tell it
+            # from a flag supplied naming nothing. Handles reach `cmd_sync` in the
+            # caller's VERBATIM spelling — never `_normalize_slug`'d, which runs on
+            # the `record` path alone while the parser keeps a header slug verbatim.
+            cmd_sync(config, auto_accept=args.yes, embed_only=args.embed_only,
+                     verbose=args.verbose,
+                     repair_targets=(
+                         None if args.reconcile_entry is None
+                         else [h for v in args.reconcile_entry
+                               for h in _split_relation_slugs(v)]
+                     ))
         elif args.command == "reconcile":
             sys.exit(cmd_reconcile(config, as_json=args.as_json))
         elif args.command == "capture":
@@ -5743,15 +6080,29 @@ def main() -> None:
         elif args.command == "render":
             cmd_render(config, scope=args.scope, render_format=args.format)
         elif args.command in ("record", "record_decision"):
-            # Exactly one axiom source: the positional or --axiom-file (the
-            # quoting-safe twin of --rejected-file). Same JSON-aware dead-end
+            # Exactly one axiom source: the positional, --axiom, or --axiom-file
+            # (the quoting-safe twin of --rejected-file). Same JSON-aware dead-end
             # shape as the missing-rejected check below.
-            if (args.axiom is None) == (args.axiom_file is None):
+            #
+            # The COUNT feeds both the guard and the --json code, deliberately. The
+            # previous chooser read one dest — `"ambiguous" if args.axiom is not
+            # None else "missing"` — an exact discriminator at arity two and wrong
+            # at three: `--axiom X --axiom-file f` leaves the positional None and
+            # reported `missing_axiom` to a caller who had supplied two. One value,
+            # so the two cannot drift apart again. Gates are `is not None`, never
+            # truthiness: an empty axiom is a SUPPLIED source that the write path
+            # then refuses on its own terms.
+            _axiom_sources = [source for source
+                              in (args.axiom, args.axiom_flag, args.axiom_file)
+                              if source is not None]
+            if len(_axiom_sources) != 1:
                 msg = ("record requires exactly one axiom source: the positional "
-                       "axiom OR --axiom-file ('-' = stdin), not both and not neither.")
+                       "axiom, --axiom, or --axiom-file ('-' = stdin) — one of the "
+                       f"three, and {len(_axiom_sources)} were supplied.")
                 if args.as_json:
-                    _emit_json({"error": msg, "code": "ambiguous_axiom_source"
-                                if args.axiom is not None else "missing_axiom"})
+                    _emit_json({"error": msg,
+                                "code": ("ambiguous_axiom_source" if _axiom_sources
+                                         else "missing_axiom")})
                 else:
                     print(msg, file=sys.stderr)
                 sys.exit(2)
@@ -5769,7 +6120,11 @@ def main() -> None:
                 else:
                     print(msg, file=sys.stderr)
                 sys.exit(2)
-            axiom = _read_text_arg(args.axiom, args.axiom_file)
+            # The guard above proved at most one inline source is set, so coalescing
+            # them is safe and `_read_text_arg`'s file-wins precedence never fires on
+            # a caller who supplied both.
+            _inline_axiom = args.axiom if args.axiom is not None else args.axiom_flag
+            axiom = _read_text_arg(_inline_axiom, args.axiom_file)
             if args.axiom_file is not None and axiom.endswith("\n"):
                 axiom = axiom[:-1]  # strip the single trailing newline files/heredocs add
             rejected = _read_text_arg(args.rejected, args.rejected_file)
@@ -5791,15 +6146,15 @@ def main() -> None:
                 scope=args.scope,
                 mechanisms=args.mechanisms,
                 context=context,
-                supersedes=args.supersedes,
-                corrects=args.corrects,
-                amends=args.amends,
-                narrows=args.narrows,
-                depends_on=args.depends_on,
-                resolves=args.resolves,
-                contradicts=args.contradicts,
-                derives_from=args.derives_from,
-                cites=args.cites,
+                supersedes=_join_relation_flag(args.supersedes),
+                corrects=_join_relation_flag(args.corrects),
+                amends=_join_relation_flag(args.amends),
+                narrows=_join_relation_flag(args.narrows),
+                depends_on=_join_relation_flag(args.depends_on),
+                resolves=_join_relation_flag(args.resolves),
+                contradicts=_join_relation_flag(args.contradicts),
+                derives_from=_join_relation_flag(args.derives_from),
+                cites=_join_relation_flag(args.cites),
                 slug=args.slug,
                 acknowledge_neighbors=args.acknowledge_neighbors,
                 as_json=args.as_json,

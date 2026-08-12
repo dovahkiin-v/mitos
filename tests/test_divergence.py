@@ -575,7 +575,9 @@ def test_a_cache_entry_of_an_unexpected_shape_cannot_crash_status(tmp_path, caps
     truncated = {"checked": 3, "skipped": None, "cache_hit": True,
                  "commentary": [{"slug": "alpha", "fields": ["context"]}],
                  "scope": [], "graph_only": [{"slug": "gone"}]}
-    _print_divergence_rung(truncated)  # must not raise
+    # `project` is required and keyword-only (3b), matching cmd_status's idiom; the
+    # row is about `.get` robustness, not arity, so it loses nothing by naming one.
+    _print_divergence_rung(truncated, project="demo")  # must not raise
     out = capsys.readouterr().out
     assert "disagree in 2 place(s)" in out
     assert "alpha" in out, "the species it DOES understand must still be reported"

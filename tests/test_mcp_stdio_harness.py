@@ -19,6 +19,8 @@ import gc
 import json
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -611,6 +613,90 @@ async def test_the_harness_never_relabels_a_failure_that_is_not_its_own(tmp_path
         await asyncio.wait_for(_hold_a_hung_child(), timeout=2.0)
 
 
+def _raw_stdio_exchange(exchange, *, expect_lines, cwd, env, timeout=120):
+    """Drives a hand-written request stream at a real `serve`, reading raw stdout.
+
+    The shape is the whole point, and it is **not** `subprocess.run(input=...)`:
+    that writes the exchange and closes stdin at once, and the EOF starts
+    `mcp.server.stdio`'s shutdown while the response is still in flight. The
+    memory object stream the SDK writes responses into has capacity 0, so
+    ``send()`` returns as soon as the writer task has been *handed* the message —
+    before it has been scheduled to write and flush it. When the task group is
+    then cancelled the message dies unwritten, and the row fails reporting a
+    missing line, which is a stdout-hygiene message for a shutdown race.
+
+    So: write, drain the expected lines, and only then send EOF. Reader threads
+    on both pipes, because stderr must not fill its buffer while stdout is being
+    read, and both keep draining past the deadline so the purity assertion still
+    sees everything the child ever wrote — including anything emitted during
+    teardown, which is the one window the shipped shape could not observe.
+
+    Measured 2026-08-12 against `mcp` 1.27.2: the succeeding `list_scopes` call
+    and all three rendered refusals (absent selector, unknown name, relative
+    path) lost the tool-result line 0/40 each under this shape, and a trivial
+    non-mitos FastMCP server 0/60 — against 6/130 across the same arms under
+    `subprocess.run(input=...)`. See the row's own comment for the breakdown.
+
+    Args:
+        exchange: The complete request stream, newline-delimited JSON-RPC.
+        expect_lines: How many stdout lines to wait for before sending EOF.
+        cwd: Launch directory for the child.
+        env: The child's complete environment.
+        timeout: Seconds to wait for `expect_lines` before giving up and
+            closing stdin anyway — a starved row must fail on its own assertion,
+            never hang.
+
+    Returns:
+        ``(stdout, stderr)`` as text, complete through the child's exit.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "mitos.cli", "serve"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        cwd=str(cwd), env=env, text=True,
+    )
+    out, err = [], []
+
+    def _drain(stream, sink):
+        for line in stream:
+            sink.append(line)
+
+    readers = [
+        threading.Thread(target=_drain, args=(proc.stdout, out), daemon=True),
+        threading.Thread(target=_drain, args=(proc.stderr, err), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+
+    try:
+        try:
+            proc.stdin.write(exchange)
+            proc.stdin.flush()
+        except BrokenPipeError:
+            # The child died before it read the exchange. Swallowed on purpose:
+            # the row's own assertion, quoting the captured stderr, says far more
+            # than a BrokenPipeError raised from a line that is not the subject.
+            pass
+        deadline = time.monotonic() + timeout
+        while (len(out) < expect_lines
+               and time.monotonic() < deadline
+               and proc.poll() is None):
+            time.sleep(0.01)
+    finally:
+        try:
+            proc.stdin.close()  # the EOF, now that nothing is in flight
+        except BrokenPipeError:  # pragma: no cover — the child died first
+            pass
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:  # pragma: no cover
+            proc.kill()
+            proc.wait(timeout=10)
+        for reader in readers:
+            reader.join(timeout=10)
+
+    return "".join(out), "".join(err)
+
+
 def test_only_json_rpc_reaches_the_transport(tmp_path):
     """Nothing but JSON-RPC reaches the server's stdout — the protocol channel.
 
@@ -624,7 +710,8 @@ def test_only_json_rpc_reaches_the_transport(tmp_path):
 
     This row cannot use the harness: `stdio_client` consumes the stream, so raw
     stdout is unreachable from inside it. It drives a hand-written request stream
-    through a plain subprocess and exits on EOF.
+    through a plain subprocess, reads the two responses, and only then sends EOF
+    — see `_raw_stdio_exchange` for why the ordering is load-bearing.
 
     **It must reach a tool handler, not merely the handshake.** Measured: a stray
     flushed `print` inside a tool handler puts its own line on the pipe *and*
@@ -648,41 +735,43 @@ def test_only_json_rpc_reaches_the_transport(tmp_path):
         },
         {"jsonrpc": "2.0", "method": "notifications/initialized"},
         {
-            # A SUCCEEDING call, and the selector is what makes it one. Two
-            # reasons, and the second was measured rather than assumed.
+            # A SUCCEEDING call, and the selector is what makes it one: since 5b
+            # a selector-less call is refused, and this row's whole point is
+            # reaching a tool *handler* with a response on the wire. Do not
+            # "simplify" this back to `{}`.
             #
-            # (1) Since 5b a selector-less call is refused, and this row's whole
-            #     point is reaching a tool *handler* with a response on the wire.
-            # (2) A tool that RAISES loses its response on this row's shape often
-            #     enough to matter. Measured 2026-07-31, 40 runs each, stdin
-            #     closed immediately after the exchange: refusals dropped the
-            #     tool-result line 3/40 (missing class), 4/40 (unknown name),
-            #     1/40 (relative path); the success path dropped 0/40. It is a
-            #     race between the response write and the teardown that EOF
-            #     starts, it belongs to `mcp.server.stdio`'s shutdown rather than
-            #     to mitos (`mitos/` carries no diff here), and it predates this
-            #     phase — the two refusal classes above it are reachable today.
-            #     Every rendered-refusal row therefore lives on the harness, where
-            #     the session stays open and no EOF races the write.
+            # It is no longer also a flake defence. The EOF race that made a
+            # RAISING tool drop its response — measured 2026-07-31 at 3/40
+            # (absent selector), 4/40 (unknown name), 1/40 (relative path), with
+            # the success path at 0/40 — was a property of closing stdin before
+            # draining, not of the call class, and the success path's immunity
+            # was luck rather than structure: re-measured 2026-08-12 on the same
+            # `mcp` 1.27.2, that shape dropped the success line 2/30 and 1/40,
+            # and a trivial FastMCP server importing no mitos at all dropped it
+            # 3/60 under the identical shape. That control is what places the
+            # race in `mcp.server.stdio`'s shutdown rather than anywhere in
+            # mitos. `_raw_stdio_exchange` removes the class outright: 6/130
+            # lost across the old shape's arms, 0/220 across the new one's
+            # (success 0/40, each of the three refusals 0/40, control 0/60).
             #
-            # So: do not "simplify" this back to `{}`. It would restore a ~7%
-            # flake on a row whose failure message points at stdout hygiene.
+            # The rendered-refusal rows still live on the harness, and the reason
+            # is now the ordinary one rather than a flake: the harness is a real
+            # client session and this row is a hand-written stream that exists
+            # only because raw stdout is unreachable from inside one.
             "jsonrpc": "2.0", "id": 2, "method": "tools/call",
             "params": {"name": "list_scopes",
                        "arguments": {"project": str(ws)}},
         },
     ))
 
-    done = subprocess.run(
-        [sys.executable, "-m", "mitos.cli", "serve"],
-        input=exchange, cwd=str(ws), env=env,
-        capture_output=True, text=True, timeout=120,
+    stdout, stderr = _raw_stdio_exchange(
+        exchange, expect_lines=2, cwd=ws, env=env,
     )
 
-    lines = [line for line in done.stdout.splitlines() if line.strip()]
+    lines = [line for line in stdout.splitlines() if line.strip()]
     assert len(lines) == 2, (
         f"expected the initialize result and the tool result, got {len(lines)} "
-        f"lines:\n{done.stdout}\nstderr:\n{done.stderr}"
+        f"lines:\n{stdout}\nstderr:\n{stderr}"
     )
     for line in lines:
         try:
@@ -692,7 +781,7 @@ def test_only_json_rpc_reaches_the_transport(tmp_path):
                 f"non-JSON line on the protocol channel: {line!r} ({exc})"
             ) from exc
     # Named explicitly, because it is the one line we already know wants out.
-    assert "Starting Mitos MCP Server" not in done.stdout
+    assert "Starting Mitos MCP Server" not in stdout
 
 
 def test_the_harness_refuses_an_undeclared_environment_or_launch_directory(tmp_path):

@@ -22,6 +22,7 @@ is present — the judge is injected through the monkeypatched ``_build_conflict
 import os
 import shutil
 import sqlite3
+import sys
 import tempfile
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
@@ -299,14 +300,38 @@ def _drain_outbox(store: Any) -> None:
 def offline(monkeypatch: pytest.MonkeyPatch) -> None:
     """No reachable service; GEMINI key present (the sync gate), no ANTHROPIC key.
 
-    `_perform_sync_internal` returns early without GEMINI_API_KEY (sync.py:552), so it is
-    set. ANTHROPIC_API_KEY is unset because the judge is injected via the monkeypatched
-    `_build_conflict_judge` seam — no real client is ever built (keyless-deterministic).
+    `_perform_sync_internal` returns early without GEMINI_API_KEY (the key floor, above
+    the per-entry loop), so it is set — and it is set BEFORE `MitosConfig` is built, which
+    is the ordering that matters: `config.env` snapshots the environment at construction,
+    so a fixture that sets the key afterwards writes where nothing reads. ANTHROPIC_API_KEY
+    is unset because the judge is injected via the monkeypatched `_build_conflict_judge`
+    seam — no real client is ever built (keyless-deterministic).
+
+    Deliberately says NOTHING about stdin: `tests/test_repair_door.py` imports this fixture
+    for exactly the key injection above, and non-TTY is that module's subject. The TTY
+    posture is a separate fixture (`interactive_stdin`) for that reason.
     """
     monkeypatch.setenv("QDRANT_URL", "http://localhost:9")
     monkeypatch.setenv("GEMINI_API_KEY", "mock_key")
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def interactive_stdin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """States the TTY posture these suites always assumed and never wrote down.
+
+    Every row in the three conflict suites that drives `perform_sync(auto_accept=False)`
+    patches `builtins.input` — they are interactive by construction. Under pytest,
+    `sys.stdin.isatty()` is already False, so that assumption was implicit; the sync loop's
+    report-and-skip guard skips a pending entry when stdin is not a terminal, which would
+    turn the assumption into a silent skip one statement above every assertion these rows
+    make. Stating the posture keeps them exercising the path they describe.
+
+    Autouse in whichever module imports it — and pointedly NOT folded into `offline`,
+    whose importers include the module whose subject is the non-TTY path.
+    """
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
 
 
 @pytest.fixture

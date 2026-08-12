@@ -28,6 +28,7 @@ from conftest import resolve_like_main
 from mitos.config import MitosConfig
 from mitos.cli import cmd_init, cmd_list, cmd_open_questions, cmd_query, cmd_show, cmd_surface
 from mitos.parser import ParsedEntry
+from mitos.recall import assess_query_recall
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS
 from mitos.sync import MitosSyncManager
 from mitos.renderer import render_node_markdown, MitosRenderer
@@ -729,7 +730,15 @@ def test_cli_query_brief_drops_rejected_keeps_stamp(ws, capsys) -> None:
 def test_cli_query_true_miss_keeps_plain_message(ws, capsys) -> None:
     """A GENUINE miss — retrieval returned nothing — keeps the plain 2b message and a
     clean empty envelope with NO `all_superseded` field. (The true-miss leg of the
-    split that 2d's blackout vector required; proves blackout ≠ miss.)"""
+    split that 2d's blackout vector required; proves blackout ≠ miss.)
+
+    Whole-dict equality is the point: it is the tree's only such pin on this
+    envelope, and what it proves is that no stray key rides along. 3a widened it to
+    carry the confidence band rather than weakening it to a subset check — the band
+    is composed here rather than spelled as a literal because `config.project` is
+    the caller's own vocabulary (a registered name under this module's fixture, a
+    path under a hand-built config) and the CLI redirect interpolates it.
+    """
     config, m = ws
     _rec(m, "unrelated", scope=["x"])
     store = GraphStore(config.db_path, read_only=True)
@@ -738,11 +747,15 @@ def test_cli_query_true_miss_keeps_plain_message(ws, capsys) -> None:
     with patch("mitos.cli.MitosSyncManager", return_value=stub):
         cmd_query(config, "a claim that is not any slug", as_json=True)
     resp = json.loads(capsys.readouterr().out)
+    _, band_note = assess_query_recall(top_score=None, result_count=0,
+                                       config=config, surface="cli")
     assert resp == {"query": "a claim that is not any slug", "depth_mode": "letter",
                     "matches": [],
                     "project": config.project,
                     "collection": config.qdrant_collection,
-                    "workspace": config.workspace_dir}
+                    "workspace": config.workspace_dir,
+                    "confidence": "none",
+                    "note": band_note}
     assert "all_superseded" not in resp
 
     with patch("mitos.cli.MitosSyncManager", return_value=stub):

@@ -58,6 +58,7 @@ from _conflict_helpers import (
     _read_conflict_rows,
     _seed_active,
     env,
+    interactive_stdin,
     offline,
 )
 

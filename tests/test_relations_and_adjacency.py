@@ -26,9 +26,17 @@ import pytest
 from unittest.mock import patch
 
 from mitos.config import MitosConfig
-from mitos.cli import cmd_init, cmd_record, main
+from mitos.cli import _build_parser, cmd_init, cmd_record, main
+from mitos.identity import compute_node_id
 from mitos.store import GraphStore
 from mitos.sync import MitosSyncManager, _slugify, _normalize_slug, _SLUG_MAX_LEN
+
+# `tests/` is on sys.path under pytest's default prepend import mode (there is no
+# tests/__init__.py), so a sibling test module's helper is imported bare — the same
+# cross-module idiom test_check_cli.py, test_corpus_provenance.py and
+# test_status_deep_report.py already use.
+from test_cli_selector import _subparsers
+from test_neighbor_review import _armed_real_manager_factory
 
 
 @pytest.fixture
@@ -491,3 +499,308 @@ def test_mcp_record_decision_corrects_kill_edge(ws):
                                          corrects="mcp-ktarget", project=config.workspace_dir))
     assert res["status"] == "created"
     assert _edge(GraphStore(config.db_path), "mcp-kcorrector", "mcp-ktarget", "corrects")
+
+
+# --------------------------------------------------------------------------- #
+# ③b Repeatable relation flags (B1)
+#
+# The nine relation flags accumulate repeats: `--cites a --cites b` means the same
+# as `--cites "a, b"`. Before this, each flag was a plain last-wins string, so a
+# caller composing flags programmatically lost every value but the last WITHOUT a
+# word — and on the two kill-edge flags that is not a missing link but a false
+# claim about present truth, because state is computed from edges (M3): the prior
+# the author declared superseded stayed in the active view.
+#
+# The accumulation is `action="append"` (never a bare `extend`, which iterates the
+# string into characters) joined back to the shared comma form at main()'s
+# cmd_record call site, so `_split_relation_slugs` and every consumer below it are
+# reached unchanged.
+# --------------------------------------------------------------------------- #
+
+# flag → dest for all nine. Seven derive the dest from the flag name; --depends-on
+# and --derives-from carry an explicit `dest=`.
+_RELATION_FLAG_DESTS = (
+    ("--supersedes", "supersedes"),
+    ("--corrects", "corrects"),
+    ("--amends", "amends"),
+    ("--narrows", "narrows"),
+    ("--depends-on", "depends_on"),
+    ("--resolves", "resolves"),
+    ("--contradicts", "contradicts"),
+    ("--derives-from", "derives_from"),
+    ("--cites", "cites"),
+)
+
+# The three spellings that must be interchangeable, as (per-occurrence values,
+# joined string that must reach cmd_record): repeated, comma, and mixed.
+_RELATION_SPELLINGS = (
+    (("slug-a", "slug-b"), "slug-a, slug-b"),
+    (("slug-a, slug-b",), "slug-a, slug-b"),
+    (("slug-a, slug-b", "slug-c"), "slug-a, slug-b, slug-c"),
+)
+
+
+def _record_option_actions():
+    """The `record` subparser's argparse actions, keyed by option string.
+
+    Asserts run against `action.help` rather than `format_help()`: the rendered
+    help wraps at terminal width, so a substring assertion reds whenever the wrap
+    lands inside the phrase — and the width under pytest is not the width under a
+    shell. Reaching the subparser is test_cli_selector's shipped `_subparsers`.
+    """
+    return {opt: a
+            for a in _subparsers(_build_parser())["record"]._actions
+            for opt in a.option_strings}
+
+
+def _record_argv(workspace_dir, *tail):
+    return ["mitos", "-p", workspace_dir, "record", *tail]
+
+
+@pytest.mark.parametrize("values,expected", _RELATION_SPELLINGS,
+                         ids=("repeated", "comma", "mixed"))
+@pytest.mark.parametrize("flag,dest", _RELATION_FLAG_DESTS)
+@patch("mitos.cli.cmd_record")
+def test_relation_flag_spellings_are_interchangeable(
+    mock_record, flag, dest, values, expected, monkeypatch, workspace
+):
+    """Repeated, comma and mixed spellings reach cmd_record as the same joined string.
+
+    --derives-from is in the matrix on purpose: it accumulates at the parser like
+    its siblings and is refused downstream, in the validate phase, with its own
+    message — this row proves the first half.
+    """
+    argv = _record_argv(workspace, "ax", "--rejected", "r", "--slug", "the-slug")
+    for value in values:
+        argv += [flag, value]
+    monkeypatch.setattr(sys, "argv", argv)
+    main()
+    _, kwargs = mock_record.call_args
+    assert kwargs[dest] == expected
+
+
+@patch("mitos.cli.cmd_record")
+def test_relation_flags_absent_arrive_as_none(mock_record, monkeypatch, workspace):
+    """An unsupplied relation flag stays None — absent is not empty.
+
+    The distinction is live downstream (`extra_relations` skips a falsy value and
+    the serializer gates on `if supersedes:`), so a `default=[]` would be a
+    behaviour change wearing a tidy-up.
+    """
+    monkeypatch.setattr(sys, "argv", _record_argv(
+        workspace, "ax", "--rejected", "r", "--slug", "the-slug"))
+    main()
+    _, kwargs = mock_record.call_args
+    for _flag, dest in _RELATION_FLAG_DESTS:
+        assert kwargs[dest] is None, dest
+
+
+def test_repeated_cites_commits_every_edge(ws, monkeypatch, capsys):
+    """`--cites a --cites b` commits BOTH cites edges and reports both on the receipt.
+
+    The end-to-end proof that the merged set survives the join and reaches the
+    Phase-B commit — and, through the committed edge rows, the strong-pair screen
+    in `check`, which reads `store.get_edges()` and never sees a relation flag.
+    """
+    config, m = ws
+    for slug in ("cited-a", "cited-b"):
+        m.record_decision_entry(f"Axiom {slug}.", "rej", [], slug=slug)
+    monkeypatch.setattr(sys, "argv", _record_argv(
+        config.workspace_dir, "A citing decision.", "--rejected", "r",
+        "--slug", "citer", "--cites", "cited-a", "--cites", "cited-b", "--json"))
+    main()
+    res = json.loads(capsys.readouterr().out)
+    assert res["status"] == "created", res
+    assert {e["target"] for e in res["edges_created"]} == {"cited-a", "cited-b"}
+    assert "**Cites:** cited-a, cited-b" in _read(config)
+    store = GraphStore(config.db_path)
+    assert _edge(store, "citer", "cited-a", "cites")
+    assert _edge(store, "citer", "cited-b", "cites")
+
+
+def test_repeated_supersedes_retires_every_target(ws, monkeypatch, capsys):
+    """`--supersedes a --supersedes b` retires BOTH priors from the active view.
+
+    The severity leg: a dropped repeat here leaves a decision the author declared
+    superseded reporting as current truth on every surface/query/list answer.
+    """
+    config, m = ws
+    a = m.record_decision_entry("Axiom A.", "rej", [], slug="prior-a")
+    b = m.record_decision_entry("Axiom B.", "rej", [], slug="prior-b")
+    monkeypatch.setattr(sys, "argv", _record_argv(
+        config.workspace_dir, "Unifying axiom.", "--rejected", "r",
+        "--slug", "unifier", "--supersedes", "prior-a", "--supersedes", "prior-b"))
+    main()
+    store = GraphStore(config.db_path)
+    assert _edge(store, "unifier", "prior-a", "supersedes")
+    assert _edge(store, "unifier", "prior-b", "supersedes")
+    assert store.get_node_state(a["id"]) == "superseded"
+    assert store.get_node_state(b["id"]) == "superseded"
+    assert store.get_node_by_slug("prior-a") is None
+    assert store.get_node_by_slug("prior-b") is None
+
+
+def test_repeated_flag_exempts_every_target_from_the_pause(ws, monkeypatch, capsys):
+    """A neighbour declared through ANY occurrence of a repeated flag does not re-flag.
+
+    Both gathered neighbours are declared, one per occurrence, so the merged set
+    must reach the declared-target exemption for the record to commit. On the
+    last-wins build only the second occurrence is declared, the first re-flags and
+    the record pauses.
+    """
+    config, m = ws
+    m.record_decision_entry("Embedding upserts are batched per sync.", "rej", ["s"],
+                            slug="near-first")
+    m.record_decision_entry("Embedding upserts are batched per run.", "rej", ["s"],
+                            slug="near-second")
+    factory = _armed_real_manager_factory([{"slug": "near-first", "score": 0.9},
+                                           {"slug": "near-second", "score": 0.9}])
+    monkeypatch.setattr(sys, "argv", _record_argv(
+        config.workspace_dir, "Embedding upserts batch across the sync run.",
+        "--rejected", "r", "--slug", "near-new",
+        "--cites", "near-first", "--cites", "near-second", "--json"))
+    with patch("mitos.cli.MitosSyncManager", side_effect=factory):
+        main()
+    res = json.loads(capsys.readouterr().out)
+    assert res["status"] == "created", res
+
+
+def test_repeated_amends_seeds_the_lineage_suppression(ws, monkeypatch, capsys):
+    """The merged set also reaches the transitive lineage-suppression seed.
+
+    A separate consumer from the pause exemption: it unions the mutation ancestors
+    of the declared supersedes/amends/narrows targets into the declared set. The
+    armed neighbour is the chain ancestor, reachable only through the FIRST
+    occurrence — so on the last-wins build the seed never sees it and the record
+    pauses.
+    """
+    config, m = ws
+    m.record_decision_entry("The store uses SQLite for persistence.", "rej", ["s"],
+                            slug="chain-anc")
+    m.record_decision_entry("The store uses SQLite with a single connection.", "rej",
+                            ["s"], slug="chain-mid", amends="chain-anc")
+    m.record_decision_entry("The renderer emits MADR markdown.", "rej", ["s"],
+                            slug="side-note")
+    factory = _armed_real_manager_factory([{"slug": "chain-anc", "score": 0.9}])
+    monkeypatch.setattr(sys, "argv", _record_argv(
+        config.workspace_dir, "The store uses SQLite with WAL and a busy timeout.",
+        "--rejected", "r", "--slug", "chain-new",
+        "--amends", "chain-mid", "--amends", "side-note", "--json"))
+    with patch("mitos.cli.MitosSyncManager", side_effect=factory):
+        main()
+    res = json.loads(capsys.readouterr().out)
+    assert res["status"] == "created", res
+
+
+def test_same_slug_repeated_commits_one_edge(ws, monkeypatch, capsys):
+    """`--cites a --cites a` joins to `"a, a"` and commits exactly one edge.
+
+    The shape a scripted caller produces by accident. The reconciler dedups its
+    declared-gather loop, so the repeat is absorbed rather than double-INSERTing
+    the (source, target, edge_type) PK.
+    """
+    config, m = ws
+    m.record_decision_entry("Axiom A.", "rej", [], slug="cited-a")
+    monkeypatch.setattr(sys, "argv", _record_argv(
+        config.workspace_dir, "A citing decision.", "--rejected", "r",
+        "--slug", "citer", "--cites", "cited-a", "--cites", "cited-a", "--json"))
+    main()
+    res = json.loads(capsys.readouterr().out)
+    assert res["status"] == "created", res
+    assert [e["target"] for e in res["edges_created"]] == ["cited-a"]
+
+
+def test_repeated_derives_from_still_refuses_on_a_decision(ws, monkeypatch, capsys):
+    """Accumulating does not legalize --derives-from — it still refuses, with its own code.
+
+    The flag accumulates at the parser like its eight siblings and meets its refusal
+    downstream, in the validate phase, so the merged set changes what reaches the
+    refusal and never whether it fires.
+    """
+    config, _ = ws
+    monkeypatch.setattr(sys, "argv", _record_argv(
+        config.workspace_dir, "A decision.", "--rejected", "r", "--slug", "deriver",
+        "--derives-from", "a", "--derives-from", "b", "--json"))
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 1
+    res = json.loads(capsys.readouterr().out)
+    assert res["code"] == "derives_from_on_decision", res
+    assert "cites" in res["error"].lower()      # the redirect the author should take
+
+
+def test_repeated_relation_flags_do_not_move_the_node_id(ws, monkeypatch, capsys):
+    """MI-4: relation targets are edges, so a merged set cannot move a node id.
+
+    The expected id is recomputed independently here from the canonical core
+    (`kind`, `axiom`, `mechanism_refs`) rather than read back from the same code
+    path — edges are not among `compute_node_id`'s inputs, and this makes that a
+    fact rather than a reading.
+    """
+    config, m = ws
+    for slug in ("cited-a", "cited-b"):
+        m.record_decision_entry(f"Axiom {slug}.", "rej", [], slug=slug)
+    axiom = "The identity hash covers the canonical core alone."
+    monkeypatch.setattr(sys, "argv", _record_argv(
+        config.workspace_dir, axiom, "--rejected", "r", "--slug", "identity-probe",
+        "--mechanisms", "sqlite", "--cites", "cited-a", "--cites", "cited-b", "--json"))
+    main()
+    res = json.loads(capsys.readouterr().out)
+    assert res["status"] == "created", res
+    assert {e["target"] for e in res["edges_created"]} == {"cited-a", "cited-b"}
+    expected = compute_node_id(kind="decision", axiom=axiom, mechanism_refs=["sqlite"])
+    assert res["id"] == expected
+    assert GraphStore(config.db_path).get_node_by_slug("identity-probe")["id"] == expected
+
+
+def test_relation_flag_helps_teach_the_repeatable_spelling():
+    """Eight of the nine helps teach that repeats and commas both accumulate."""
+    actions = _record_option_actions()
+    for flag, _dest in _RELATION_FLAG_DESTS:
+        if flag == "--derives-from":
+            continue
+        assert "Repeatable and comma-separated both accumulate" in actions[flag].help, flag
+
+
+def test_derives_from_help_stays_its_refusal_explanation():
+    """--derives-from's help teaches no accumulation — its whole job is to be refused."""
+    help_text = _record_option_actions()["--derives-from"].help
+    assert "Not valid when recording a decision" in help_text
+    assert "--cites" in help_text          # the redirect the author should take
+    assert "Repeatable" not in help_text
+
+
+def test_no_relation_flag_help_promises_a_space_form():
+    """No relation-flag help promises a space-separated spelling, because it mis-teaches.
+
+    Two sibling flags on this same verb (`--scope`, `--mechanisms`) DO accumulate
+    space-separated values, so the spelling looks like the house style — but on a
+    relation flag it silently feeds `record`'s positional axiom (pinned below).
+
+    Casefolded: a rewrite that opened a sentence with "Space-separated …" is the
+    same mis-teach, and a case-sensitive pin would wave it through.
+    """
+    actions = _record_option_actions()
+    for flag, _dest in _RELATION_FLAG_DESTS:
+        assert "space" not in actions[flag].help.casefold(), flag
+
+
+def test_space_separated_relation_value_mis_binds_to_the_positional():
+    """`--cites a b` silently binds `b` to the axiom positional and keeps only `a`.
+
+    The behavioural reason the helps must not promise a space form, and the pin a
+    future `nargs="*"` "tidy" has to red against: with nargs the second value would
+    be swallowed as a relation target and the axiom would go missing instead.
+    """
+    ns = _build_parser().parse_args(
+        ["record", "--cites", "a", "b", "--rejected", "r", "--slug", "s"])
+    assert ns.axiom == "b"
+    assert ns.cites == ["a"]
+
+
+def test_space_separated_relation_value_after_the_axiom_is_rejected():
+    """With the axiom already supplied, the stray second value is a parse error."""
+    with pytest.raises(SystemExit) as exc:
+        _build_parser().parse_args(
+            ["record", "My axiom", "--cites", "a", "b", "--rejected", "r", "--slug", "s"])
+    assert exc.value.code == 2

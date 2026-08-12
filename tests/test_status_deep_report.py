@@ -1003,3 +1003,309 @@ def test_a_selectorless_status_renders_the_global_overview(
     rc = _run(["status", "fresh"])
     assert rc == 0
     assert "READY ✓" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- #
+# B3 — the four resolved corpus locations, on both encodings
+# --------------------------------------------------------------------------- #
+
+
+# The `checks` map as it ships, spelled rather than counted: the assertion is that
+# the map did not GROW, and a count says that only until two edits cancel out. A
+# resolved path is not a verdict, so none of the four may ever appear in here.
+_SHIPPED_CHECK_KEYS = {
+    "mitos_workspace", "decisions_buffer", "format_spec", "gemini_api_key",
+    "qdrant_reachable", "collection_exists", "collection_points", "graph_nodes",
+    "active_nodes", "missing_active_vectors", "missing_active_slugs",
+    "orphan_points", "graph_unbuilt", "mcp_project_entry",
+}
+
+_PATH_KEYS = ("decisions_file", "questions_file", "archive_dir", "db_path")
+
+
+def _four(ws):
+    """The four resolved values, read off the config rather than hand-built.
+
+    A hand-built path string would be a second derivation of the thing under test:
+    it passes while agreeing with the render and disagreeing with the config, which
+    is the exact failure a reader of this report cannot detect.
+    """
+    config = MitosConfig(str(ws))
+    return [getattr(config, key) for key in _PATH_KEYS]
+
+
+class TestTheFourResolvedPaths:
+    """`mitos status <project>` resolves four corpus locations and used to print
+    none of them. Two agent sessions grepped `.mitos/decisions.md` — because the row
+    order teaches that layout — and got well-formed, confident, **zero-hit** answers
+    for every slug over a corpus of hundreds. Nothing errored; nothing warned.
+
+    The rows below quantify over the four MEMBERS, not over sites × encodings: a
+    site/encoding grid reads complete with three paths in every cell, and the
+    archive is the member a phase drops. It is also the load-bearing one —
+    `<root>/decisions/archive` follows neither the root convention nor the `.mitos/`
+    one, so a reader told the other three still cannot derive it, and a correct path
+    makes a wrong absence-answer *more* credible than a pathless one did.
+    """
+
+    def test_all_four_render_on_the_wide_text_report(
+        self, tmp_path, monkeypatch, capsys
+    ) -> None:
+        ws = _fresh(tmp_path)
+        capsys.readouterr()
+        _healthy(monkeypatch)
+
+        cli.cmd_status(str(ws))
+
+        out = capsys.readouterr().out
+        for value in _four(ws):
+            assert value in out
+
+    def test_all_four_ride_the_wide_json_payload(
+        self, tmp_path, monkeypatch, capsys
+    ) -> None:
+        """`--json` is this verb's only agent-facing encoding — `status` has no MCP
+        twin — and the sessions that failed were agents, so a text-only repair would
+        have missed the consumer the item was written for.
+        """
+        ws = _fresh(tmp_path)
+        capsys.readouterr()
+        _healthy(monkeypatch)
+
+        cli.cmd_status(str(ws), as_json=True)
+
+        payload = json.loads(capsys.readouterr().out)
+        for key, value in zip(_PATH_KEYS, _four(ws)):
+            assert payload[key] == value
+            assert os.path.isabs(payload[key])
+
+    def test_the_decisions_row_carries_its_own_path(
+        self, tmp_path, monkeypatch, capsys
+    ) -> None:
+        """Scoped to the row's own line: the requirement is that a reader never has
+        to correlate a row with a path listed elsewhere on the page to learn which
+        file that row is about, and a whole-output assertion is satisfied by a path
+        four lines away.
+        """
+        ws = _fresh(tmp_path)
+        capsys.readouterr()
+        _healthy(monkeypatch)
+
+        cli.cmd_status(str(ws))
+
+        rows = [ln for ln in capsys.readouterr().out.splitlines()
+                if "decisions.md buffer" in ln]
+        assert len(rows) == 1
+        assert MitosConfig(str(ws)).decisions_file in rows[0]
+
+    def test_a_failing_decisions_row_still_names_the_path(
+        self, tmp_path, monkeypatch, capsys
+    ) -> None:
+        """Removing `decisions.md` takes `initialized` down with it, so this fixture
+        proves more than the glyph: the verdict is **NOT SET UP ✗** and the exit code
+        is 1, so the four render on a not-ready report and not merely beside a
+        failing check. (The founding sessions failed in workspaces where every row
+        read ✓ — which is why nothing here is conditioned on a verdict at all.)
+        """
+        ws = _fresh(tmp_path)
+        decisions_file = MitosConfig(str(ws)).decisions_file
+        os.remove(decisions_file)
+        capsys.readouterr()
+        _healthy(monkeypatch)
+
+        rc = cli.cmd_status(str(ws))
+
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "NOT SET UP ✗" in out
+        row = [ln for ln in out.splitlines() if "decisions.md buffer" in ln][0]
+        assert row.lstrip().startswith("✗")
+        assert decisions_file in row
+        for value in _four(ws):
+            assert value in out
+
+    def test_the_clone_renders_the_graph_path_it_has_no_file_for(
+        self, tmp_path, monkeypatch, capsys
+    ) -> None:
+        """`• graph holds {n} node(s)` is guarded on a graph existing; the graph PATH
+        is not. On a clone the neutral fact disappears and the location stays — which
+        is the state a reader most needs it in.
+        """
+        ws = _clone(tmp_path)
+        db_path = MitosConfig(str(ws)).db_path
+        assert not os.path.exists(db_path)
+        capsys.readouterr()
+        _healthy(monkeypatch)
+
+        cli.cmd_status(str(ws))
+
+        out = capsys.readouterr().out
+        assert f"• graph: {db_path}" in out
+        # Scoped to the neutral line: the unbuilt-graph rung's own prose legitimately
+        # says "the graph holds no nodes", so a whole-output assertion here would be
+        # red for the wrong reason.
+        assert not any(ln.startswith("  • graph holds") for ln in out.splitlines())
+        for value in _four(ws):
+            assert value in out
+
+    def test_the_config_error_payload_names_none_of_the_four(
+        self, tmp_path, capsys
+    ) -> None:
+        """The sibling of `test_a_malformed_config_payload_carries_the_same_keys`:
+        that arm reaches both its encodings **without ever constructing a
+        `MitosConfig`**, so the four values do not exist to render there. Absent, not
+        null — the arm already omits every key needing a config, and four always-null
+        path keys would be the only unresolvable-fact keys in a deliberately minimal
+        payload.
+        """
+        ws = tmp_path / "broken"
+        (ws / ".mitos").mkdir(parents=True)
+        (ws / ".mitos" / "config.toml").write_text("qdrant_collection = [1, 2\n",
+                                                   encoding="utf-8")
+        (ws / "decisions.md").write_text("", encoding="utf-8")
+
+        rc = cli.cmd_status(str(ws), as_json=True)
+
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 1
+        assert "config_error" in payload
+        for key in _PATH_KEYS:
+            assert key not in payload
+
+    def test_the_config_error_text_names_none_of_the_four(
+        self, tmp_path, capsys
+    ) -> None:
+        """The cell an enumeration written from the payload's side drops: the
+        `ConfigError` arm is one SITE with two encodings, not a `--json`-only site.
+        """
+        ws = tmp_path / "broken"
+        (ws / ".mitos").mkdir(parents=True)
+        (ws / ".mitos" / "config.toml").write_text("qdrant_collection = [1, 2\n",
+                                                   encoding="utf-8")
+        (ws / "decisions.md").write_text("", encoding="utf-8")
+
+        rc = cli.cmd_status(str(ws))
+
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "NOT SET UP ✗" in out
+        assert "config.toml malformed" in out
+        # No config exists to read the four off, so the absence is asserted on the
+        # distinguishing tails of the derivations instead.
+        assert os.path.join(str(ws), "decisions.md") not in out
+        assert "questions.md" not in out
+        assert os.path.join("decisions", "archive") not in out
+        assert "graph.sqlite" not in out
+
+    def test_no_resolved_path_became_a_check(
+        self, tmp_path, monkeypatch, capsys
+    ) -> None:
+        """The membership fence, on the payload. The row mark is a THREE-valued
+        lambda, so a neutral `—` row satisfies "no verdict" to the letter while
+        sitting in the list where every reader takes it for a rung. So the rule binds
+        on membership, in any glyph, on both encodings.
+        """
+        ws = _fresh(tmp_path)
+        capsys.readouterr()
+        _healthy(monkeypatch)
+
+        cli.cmd_status(str(ws), as_json=True)
+
+        checks = json.loads(capsys.readouterr().out)["checks"]
+        assert set(checks) == _SHIPPED_CHECK_KEYS
+        for key in _PATH_KEYS:
+            assert key not in checks
+
+    def test_the_three_rowless_paths_sit_on_no_verdict_line(
+        self, tmp_path, monkeypatch, capsys
+    ) -> None:
+        """The same fence on the text surface. `decisions.md`'s path is exempt by
+        design — it rides its own row's label, which is the whole point of D1; the
+        three that have no row must not acquire one.
+        """
+        ws = _fresh(tmp_path)
+        config = MitosConfig(str(ws))
+        capsys.readouterr()
+        _healthy(monkeypatch)
+
+        cli.cmd_status(str(ws))
+
+        lines = capsys.readouterr().out.splitlines()
+        for value in (config.questions_file, config.archive_dir, config.db_path):
+            carrying = [ln for ln in lines if value in ln]
+            assert carrying, value
+            assert all(ln.startswith("  • ") for ln in carrying), carrying
+
+    def test_ready_and_the_exit_codes_are_unchanged(
+        self, tmp_path, monkeypatch, capsys
+    ) -> None:
+        """The zero-byte-diff fence, in the same class as the render it fences, so a
+        reader meets the rule and its proof together. No path is a rung: a fresh
+        workspace has no `decisions/archive` directory and is healthy.
+        """
+        fresh, clone = _fresh(tmp_path), _clone(tmp_path)
+        capsys.readouterr()
+        _healthy(monkeypatch)
+
+        assert cli.cmd_status(str(fresh), as_json=True) == 0
+        assert json.loads(capsys.readouterr().out)["ready"] is True
+        assert cli.cmd_status(str(clone), as_json=True) == 1
+        assert json.loads(capsys.readouterr().out)["ready"] is False
+
+
+class TestNoFilesystemReadBehindAResolvedPath:
+    """A resolved path is **rendered, never inspected**. The temptation arrives
+    looking free: `cmd_status` already calls `corpus_graph_divergence`, which globs
+    the archive through `cutover._archive_files_oldest_first`, so "the listing is
+    already paid, a count is just arithmetic" is available on this very verb — and
+    it is a second, weaker report of what the divergence rung already covers,
+    drifting from it by construction (the rung counts entries; a listing counts
+    files). It is also the only thing B3 could add that is not O(1) in corpus size.
+    """
+
+    def test_the_archive_renders_with_no_archive_directory(
+        self, tmp_path, monkeypatch, capsys
+    ) -> None:
+        ws = _fresh(tmp_path)
+        archive_dir = MitosConfig(str(ws)).archive_dir
+        assert not os.path.exists(archive_dir)   # `init` creates none; rotation does
+        capsys.readouterr()
+        _healthy(monkeypatch)
+
+        cli.cmd_status(str(ws))
+
+        lines = [ln for ln in capsys.readouterr().out.splitlines()
+                 if archive_dir in ln]
+        assert lines == [f"  • decisions archive: {archive_dir}"]
+
+    def test_the_render_never_lists_the_archive(
+        self, tmp_path, monkeypatch, capsys
+    ) -> None:
+        """Non-vacuity is asserted, not assumed, in two halves.
+
+        `divergence._corpus_files` imports the lister **inside the function**, so a
+        module-attribute patch intercepts — the first assertion below resolves it the
+        same way and proves the seam is live. And the fixture is the `_clone`
+        deliberately: on a fresh workspace the shipped legitimate caller sits inside
+        `try/except Exception: pass`, which would SWALLOW the raiser, while the clone
+        has no `db_path` so the whole divergence block is skipped by its guard. Any
+        listing that fires here is therefore B3's own.
+        """
+        ws = _clone(tmp_path)
+        archive_dir = MitosConfig(str(ws)).archive_dir
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("B3 renders a resolved path; it never lists it")
+
+        monkeypatch.setattr("mitos.cutover._archive_files_oldest_first", _boom)
+        from mitos.cutover import _archive_files_oldest_first as _late_bound
+        with pytest.raises(AssertionError):
+            _late_bound(archive_dir)              # the seam bites
+
+        capsys.readouterr()
+        _healthy(monkeypatch)
+
+        rc = cli.cmd_status(str(ws))
+
+        assert rc == 1                            # the clone's shipped exit code
+        assert f"• decisions archive: {archive_dir}" in capsys.readouterr().out

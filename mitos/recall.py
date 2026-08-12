@@ -1,10 +1,18 @@
-"""Shared precedent-recall policy for the surface and scope hard-filter tools.
+"""Shared precedent-recall policy for the recall and scope hard-filter tools.
 
 The confidence threshold and the response ``note`` that distinguishes a settled
 precedent from loose neighbours / no match at all live here, so the MCP
 ``surface_decisions`` tool and its CLI twin ``mitos surface`` stay behaviourally
 identical (AX P5: a capped list of mid-score neighbours looked identical to a real
 hit, and an empty result looked identical to "precedent hiding below the cap").
+The **targeted** recall verbs — the MCP ``query_decisions`` tool and its CLI twin
+``mitos query`` — take the same band from :func:`_classify_recall` and their own
+register from :func:`assess_query_recall`: one classification, four surfaces. The
+register is separate because the question is: ``surface`` answers *is there
+precedent near this?* and may tell a caller to decide off a miss, while ``query``
+answers *did this lookup find the thing I named?* and says nothing about the
+corpus — the same wording on both is how an agent that reached for the wrong verb
+mints a duplicate of a decision the corpus already holds.
 
 The same unused-scope self-correction also serves the **scope hard-filter** read
 verbs — ``mitos list`` / ``mitos open-questions`` and the MCP ``list_decisions``
@@ -53,15 +61,27 @@ SURFACE_DIDYOUMEAN_CUTOFF: float = 0.6
 
 # Per-surface pointer wording. The policy never names a literal call-form; it references
 # a key here and the surface supplies its own verb (CLI shell command) or tool call-form
-# (MCP). ``complete_scope`` carries a ``{scope}`` placeholder. ``sync`` is the CLI
-# ``mitos sync`` on *both* surfaces — there is no MCP sync tool, so the literal shell
-# command is the only truthful pointer (a shell command is not the MCP-tool leak the T7
-# gate forbids).
+# (MCP). ``complete_scope`` carries a ``{scope}`` placeholder and ``precedent_scan``'s CLI
+# form a ``{project}`` one. ``sync`` is the CLI ``mitos sync`` on *both* surfaces — there
+# is no MCP sync tool, so the literal shell command is the only truthful pointer (a shell
+# command is not the MCP-tool leak the T7 gate forbids).
+#
+# ``precedent_scan`` is the ``query`` register's redirect: the verb that answers the
+# precedent question a targeted lookup did not. It must exist under BOTH outer keys — a
+# one-sided entry ships the redirect on one boundary and raises ``KeyError`` on the other.
+# The CLI form carries a selector because a response note is read wherever the caller was
+# standing and cwd stopped being a targeting channel at the flip; the project is rendered
+# through ``repr`` at composition (``cli._show_not_found_hint``'s idiom) because a legal
+# registered name may carry a space and an unregistered target's ``project`` is a path —
+# rendered bare, ``mitos surface -p /home/me/my projects/x`` fails misleadingly rather
+# than loudly. The MCP form keeps the shipped bare call-form: ``_example_call`` is where
+# addressing gets taught, and a recall note is not it.
 _SURFACE_POINTERS: Dict[str, Dict[str, str]] = {
     "cli": {
         "complete": "mitos list",
         "complete_scope": "mitos list --scope '{scope}'",
         "discovery": "mitos scopes",
+        "precedent_scan": "`mitos surface -p {project}`",
         "state_all": "mitos list --scope '{scope}' --state all",
         "sync": "mitos sync",
     },
@@ -69,6 +89,7 @@ _SURFACE_POINTERS: Dict[str, Dict[str, str]] = {
         "complete": "list_decisions()",
         "complete_scope": "list_decisions(scope='{scope}')",
         "discovery": "list_scopes",
+        "precedent_scan": "surface_decisions()",
         "state_all": "list_decisions(scope='{scope}', state='all')",
         "sync": "mitos sync",
     },
@@ -226,6 +247,40 @@ def scope_filter_recovery(
     return {"note": note}
 
 
+def _classify_recall(*, top_score: Optional[float], result_count: int) -> str:
+    """Decides the confidence band. The ONE place that band choice is made.
+
+    Reached only when ranking actually ran — a degraded read has no band, and the
+    two composers keep that fence in different ways (``assess_surface_recall``
+    returns before it; ``assess_query_recall`` has no degraded arm at all).
+
+    It is not top-score arithmetic alone: ``result_count`` is read too, which is
+    what separates a with-results ``"none"`` (everything ranked off-axis) from an
+    empty one (nothing ranked at all) at the composers.
+
+    The ``top_score is None`` clause fails **open** — a non-empty result set whose
+    scores never reached the caller reads ``"strong"``. That is deliberate and
+    inherited byte-for-byte: it keeps a surface that legitimately has no scores
+    (the degraded scope-listing fallback) from being labelled off-axis. The
+    consequence is that a call site which forgets to accumulate ``top_score``
+    ships an all-``strong`` band over every populated answer with nothing red, so
+    the repair lives at the call sites (each reads the score off its *surfaced*
+    list) and in the tests that pin a superseded-filtered ranking.
+
+    Args:
+        top_score: The highest score among the surfaced matches, or None.
+        result_count: How many matches are being returned.
+
+    Returns:
+        ``"strong"`` / ``"weak"`` / ``"none"``.
+    """
+    if result_count and (top_score is None or top_score >= SURFACE_STRONG_THRESHOLD):
+        return "strong"
+    if result_count and top_score >= SURFACE_WEAK_THRESHOLD:
+        return "weak"
+    return "none"
+
+
 def assess_surface_recall(
     *,
     semantic_ran: bool,
@@ -293,8 +348,10 @@ def assess_surface_recall(
             f"precedent. Use {complete_hint} (pure graph read) to check."
         )
 
+    band = _classify_recall(top_score=top_score, result_count=result_count)
+
     # Semantic ran with a real, confident hit.
-    if result_count and (top_score is None or top_score >= SURFACE_STRONG_THRESHOLD):
+    if band == "strong":
         matches_phrase = "Here are results that matched semantically." if scope_prefix else "Ranked top matches."
         return "strong", (
             f"{scope_prefix}{matches_phrase} For the COMPLETE set of decisions in a scope — a "
@@ -302,7 +359,7 @@ def assess_surface_recall(
         )
 
     # Semantic ran but it's in the Twilight Zone (loose neighbour / phrased differently)
-    if result_count and top_score >= SURFACE_WEAK_THRESHOLD:
+    if band == "weak":
         shown = f"{top_score:.2f}" if top_score is not None else "?"
         matches_phrase = "Here are results that matched semantically (twilight zone" if scope_prefix else "Twilight zone"
         return "weak", (
@@ -327,6 +384,90 @@ def assess_surface_recall(
     return "none", (
         f"No semantic match for {scope_phrase} — likely no settled precedent. Decide "
         f"and record it, or call {complete_hint} for a certain completeness check."
+    )
+
+
+def assess_query_recall(
+    *,
+    top_score: Optional[float],
+    result_count: int,
+    config: "object",
+    surface: str,
+) -> Tuple[str, str]:
+    """Classifies a targeted-lookup result and builds its ``query``-register note.
+
+    The band is :func:`_classify_recall`'s — the same three tokens
+    ``assess_surface_recall`` emits, because a band that meant different things on
+    two verbs would be worse than no band. The **note** is not shared, and none of
+    it may be inherited: ``surface``'s wording describes the *corpus* (*"likely no
+    settled precedent"*, *"decide and record it"*, *"the scope is populated"*),
+    and every one of those clauses is a claim a targeted lookup did not measure.
+    On this verb the band describes **this lookup's ranking** and nothing else, and
+    the corpus question is routed to the verb that answers it. No ``"none"``-band
+    note here tells the caller to decide or to record: a precedent that is in the
+    graph and absent from the ranking is an ordinary state, and answering it with a
+    write instruction is how a duplicate gets minted.
+
+    Two parameters are absent on purpose. There is no ``semantic_ran``: every
+    degraded route on both call sites returns before assessment, so a composer with
+    no degraded arm cannot author a degraded-register sentence at all. And there is
+    no ``scope``: it arrives structurally ``None`` on both surfaces, and a parameter
+    that can only ever be ``None`` grows branches nobody can reach.
+
+    Args:
+        top_score: The highest score among the **surfaced** matches — the list the
+            superseded filter already thinned, never the raw vector-store return.
+            None when nothing was surfaced.
+        result_count: How many matches are being returned.
+        config: The active ``MitosConfig`` (duck-typed to avoid an import cycle —
+            recall is a leaf module, as in :func:`corpus_provenance`). Read only
+            for ``project``, which the CLI redirect names as its selector.
+        surface: ``"cli"`` or ``"mcp"`` — selects the pointer wording. Required
+            keyword: no call site may silently emit the other surface's call-forms.
+
+    Returns:
+        A ``(confidence, note)`` pair. ``confidence`` is ``"strong"`` / ``"weak"``
+        / ``"none"`` and is **never** None — see the degraded fence above.
+    """
+    pointer = _SURFACE_POINTERS[surface]["precedent_scan"].format(
+        project=repr(getattr(config, "project", ""))
+    )
+    # Names a question, not a re-run: re-issuing this same string on the other verb
+    # buys the same embedding, the same ranking and the same matches for the price
+    # of a turn. What earns the turn is the precedent question stated as the claim
+    # the caller is about to commit to — a different string.
+    redirect = f"For whether precedent exists, restate the claim and ask {pointer}."
+
+    band = _classify_recall(top_score=top_score, result_count=result_count)
+
+    # Legend only, and it names no verb: the caller asked for a thing and got it, so
+    # a redirect here is a per-answer turn tax wearing a legend. It still carries a
+    # note — this is the band a caller meets most often, and dropping it leaves the
+    # common answer with no legend at all.
+    if band == "strong":
+        return band, (
+            "Top match cleared the strong threshold — a real hit for this lookup, "
+            "not a loose neighbour."
+        )
+
+    shown = f"{top_score:.2f}" if top_score is not None else "?"
+
+    if band == "weak":
+        return band, (
+            f"Twilight zone: top score {shown} — close, maybe not your handle. "
+            f"{redirect}"
+        )
+
+    # The ``"none"`` band forks the same way its sibling does: matches that all
+    # ranked off-axis, versus nothing ranked at all. Neither states a verdict on the
+    # corpus, and neither instructs a write.
+    if result_count:
+        return band, (
+            f"Off-axis: top score {shown} is too low to be related — nothing "
+            f"ranked close. {redirect}"
+        )
+    return band, (
+        f"No semantic match — this ranking returned nothing. {redirect}"
     )
 
 

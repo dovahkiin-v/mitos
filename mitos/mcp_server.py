@@ -27,9 +27,10 @@ from mitos.errors import (
 )
 from mitos.lexical import degraded_reason_from_error, lexical_fallback
 from mitos.parser import corpus_has_entries
-from mitos.recall import (assess_surface_recall, corpus_provenance,
-                          missing_graph_is_a_gap, missing_graph_note,
-                          missing_index_is_a_gap, scope_filter_recovery)
+from mitos.recall import (assess_query_recall, assess_surface_recall,
+                          corpus_provenance, missing_graph_is_a_gap,
+                          missing_graph_note, missing_index_is_a_gap,
+                          scope_filter_recovery)
 
 # Create FastMCP server instance
 mcp = FastMCP("Mitos")
@@ -639,13 +640,14 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
     """Surface active precedents for a CLAIM before you decide — the recall loop, use first.
 
     The broad "is there a settled decision near this?" scan: a ranked, capped (top
-    few) semantic match. Reach for this when deciding something; reach for
-    query_decisions to look up a SPECIFIC slug or claim, and list_decisions for the
-    EXHAUSTIVE set in a scope. Each returned precedent carries its `rejected_paths`
-    (why alternatives were ruled out) — the field that actually stops relitigation.
-    Every hit carries its full `rejected_paths` unless you pass `brief=True`. Closing
-    the loop: after you decide, `record_decision` the outcome so the next agent
-    inherits it instead of relitigating.
+    few) semantic match — and its `confidence` is the verdict on whether precedent
+    exists. Reach for this when deciding something; reach for query_decisions to
+    look up a SPECIFIC slug or claim (its band rates that ranking, not the corpus),
+    and list_decisions for the EXHAUSTIVE set in a scope. Every hit carries its full
+    `rejected_paths` — why alternatives were ruled out, the field that actually
+    stops relitigation — unless you pass `brief=True`. Closing the loop: after you
+    decide, `record_decision` the outcome so the next agent inherits it instead of
+    relitigating.
 
     Args:
         query: The semantic claim or topic string (e.g. 'cache strategy').
@@ -1065,8 +1067,9 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
 
     Use this when you know roughly what you're after (a slug you're carrying, or a
     pointed claim). For the broad "is there precedent near this?" scan before
-    deciding, use surface_decisions; for the EXHAUSTIVE set in a scope,
-    list_decisions. If query matches a unique slug exactly, returns that one
+    deciding, use surface_decisions — its `confidence` says whether precedent
+    exists, where this verb's rates only the ranking; for the EXHAUSTIVE set in a
+    scope, list_decisions. If query matches a unique slug exactly, returns that one
     decision in full (active view only — to dereference an EXACT handle including
     a superseded node, use show_node); otherwise a ranked semantic search for the
     claim. Once you decide, `record_decision` the outcome so the next agent
@@ -1126,6 +1129,11 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
                 "depth_mode": "letter"
             }
             output.update(store.get_modifiers(node["id"]))
+            # Provenance last, after the payload's own content fields — show_node's
+            # rule, one screen up, applied to the other dereference exit. Most
+            # valuable here: this is the answer an agent acts on directly, so a hit
+            # from the wrong corpus is the one that never looks wrong.
+            output.update(corpus_provenance(config))
             return dumps_display(output, ensure_ascii=False, indent=2)
     except Exception:
         # Not a slug collision or lookup failed; proceed to semantic claim lookup
@@ -1133,6 +1141,11 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
 
     # 2. Perform ranked semantic claim search
     if embed_provider and vector_store:
+        # Before the `try`, for the reason the CollectionMissingError arm below
+        # states: that arm builds its own empty envelope rather than falling
+        # through, so a `top_score` bound inside the loop would be an unbound local
+        # there.
+        top_score: Optional[float] = None
         try:
             top_k = clamp_limit(limit)
             q_vector = embed_provider.get_embedding(query, is_query=True)
@@ -1163,14 +1176,35 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
                 )
                 match.update(store.get_modifiers(node["id"]))
                 output_list.append(match)
+                # Off the SURFACED list, after the append — never off `matches`,
+                # which still holds the superseded and unresolvable nodes this loop
+                # just dropped (the CLI twin does the same, one file over).
+                if top_score is None or m["score"] > top_score:
+                    top_score = m["score"]
 
             # Blackout: retrieved precedents but every one superseded-filtered.
             # Add the retired handles so the agent gets a pointer, not a false miss
             # (CLI⇄MCP-identical `all_superseded` shape, T5 parity).
             envelope: Dict[str, Any] = {"query": query, "depth_mode": "letter", "matches": output_list}
             envelope.update(corpus_provenance(config))
+            # The confidence band, in the `query` register — a verdict on this
+            # ranking, never on the corpus. Assigned BEFORE the overrides below so
+            # blackout/unbuilt reassign the note over it (the note yields;
+            # `confidence` stands on every one of these exits).
+            confidence, note = assess_query_recall(
+                top_score=top_score,
+                result_count=len(output_list),
+                config=config,
+                surface="mcp",
+            )
+            envelope["confidence"] = confidence
+            envelope["note"] = note
             if not output_list and retired:
                 envelope["all_superseded"] = retired
+                # Withholding it here would be a fresh CLI⇄MCP divergence (the CLI
+                # twin prints it) and an MCP⇄MCP one (`surface_decisions` already
+                # emits it on this surface).
+                envelope["note"] = blackout_note(retired)
             # W31 — see surface_decisions. Both of this tool's empty envelopes carry
             # it: this one (semantic ran and matched nothing) and the healthy-empty
             # one built in the CollectionMissingError arm below. An unbuilt clone
@@ -1197,6 +1231,14 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
                 "query": query, "depth_mode": "letter", "matches": [],
             }
             empty.update(corpus_provenance(config))
+            # This is the healthy-empty arm, not a degraded one: ranking ran and
+            # matched nothing, so it takes the band exactly like the envelope above.
+            # (Its degraded sibling, ten lines up, returns before assessment.)
+            confidence, note = assess_query_recall(
+                top_score=top_score, result_count=0, config=config, surface="mcp",
+            )
+            empty["confidence"] = confidence
+            empty["note"] = note
             # W31 — the state this envelope was built for and the unbuilt graph are
             # the SAME workspace on a clone: no *.sqlite, so no collection was ever
             # created either. `missing_index_is_a_gap` said the absence is healthy

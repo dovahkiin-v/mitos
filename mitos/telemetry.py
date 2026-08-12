@@ -486,9 +486,22 @@ _JUDGMENT_BATCHES_ADD_MODEL_ID = """
 
 # ``check_runs`` — one summary row per check run: the run-level repetition memory
 # (P18: standing-count trend, time-to-resolution/nag-count per finding, the
-# long-standing-unresolved FP-suspect list). Written best-effort at run end by the
-# check engine's ``record_check_run`` (a later phase); this rung ships the table
-# empty. Nullability is the semantic line, pinned NOW because SQLite constraints are
+# long-standing-unresolved FP-suspect list). Written best-effort at run end by
+# ``TelemetryStore.record_check_run``, which ships and is called from both
+# ``cli.cmd_check`` and ``cli._run_staged_check`` — so a workspace `mitos check` has
+# run in carries a row per run, save the runs whose telemetry store could not be
+# constructed at all (``cli._build_check_telemetry`` returns None: the engine's
+# documented ``reuse_read`` degradation, where the KD5 seam records nothing). That
+# is the honest bound on "best-effort" and it is narrow — every ordinary run writes.
+# (Named by function rather than by line number: the two call sites drift with every
+# phase that edits ``cli.py``.)
+# Check-freshness state therefore EXISTS on disk today; the conditional
+# coherence-freshness gate is deferred on what a row MEANS — a run happened, not
+# that given writes are covered — never on the state being unavailable. See ADR
+# ``coherence-pointer-deferral-rests-on-check-runs-semantics-not-impossibility``,
+# which names this comment as the artifact a reader re-deriving the old
+# impossibility claim would land on.
+# Nullability is the semantic line, pinned NOW because SQLite constraints are
 # rebuild-only to change: NOT NULL = the run always knows it at run end; NULL =
 # "value not computable this run", deliberately distinct from a genuine zero
 # (CHK-D10 — a degraded run must never masquerade as "zero findings").

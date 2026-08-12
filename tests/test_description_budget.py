@@ -50,6 +50,17 @@ def _descriptions():
     return {tool.name: tool.description or "" for tool in tools}
 
 
+def _flat(text):
+    """Whitespace-collapsed view, for content rows that must survive a re-wrap.
+
+    FastMCP passes the docstring through verbatim, indentation and hard line
+    breaks included, so a phrase asserted raw is really an assertion about where
+    the source happens to wrap — which reformatting silently breaks while the
+    teaching is still there.
+    """
+    return " ".join(text.split())
+
+
 def test_every_tool_description_within_budget():
     over = {
         name: len(desc)
@@ -94,4 +105,42 @@ def test_query_decisions_verb_choice_guidance_is_front_loaded():
         "query_decisions' redirect to surface_decisions for the broad precedent "
         "scan must sit in the description head — it is the verb-choice teaching "
         "the 08-04 session lacked."
+    )
+
+
+def test_query_decisions_states_the_band_axis_inside_the_head_window():
+    """The verb-choice redirect now carries WHICH QUESTION each band answers.
+
+    A byte-count gate cannot see a trim that silently deletes the clause, so the
+    content gets its own row. Asserted inside the 600-char window rather than
+    anywhere in the description: the clause extends the redirect in place, and a
+    later edit that moved it behind the window would leave the budget row green
+    while the teaching left every truncating client.
+
+    The axis is the QUESTION each answer is a verdict on, never what the two verbs
+    retrieve — that is measured identical, and "surface returns the active set" is
+    measured false.
+    """
+    head = _flat(_descriptions()["query_decisions"][:600])
+    assert "confidence" in head and "whether precedent exists" in head, (
+        "query_decisions' description no longer says which question each recall "
+        "verb's band is a verdict on — an agent holding five matches at 0.61 is "
+        "back to guessing which verb it should have called."
+    )
+
+
+def test_surface_decisions_states_the_band_axis():
+    """The sibling half, gated by the ceiling alone — there is no front-load row on
+    this tool, and a phase told to check a head window here hunts for a gate that
+    is not on it.
+
+    The two descriptions must not converge: neither gains a `Returns:`-block gloss
+    for the other's fields, and this one keeps the corpus-level reading of the band
+    while `query_decisions` keeps the ranking-level one.
+    """
+    desc = _flat(_descriptions()["surface_decisions"])
+    assert "whether precedent exists" in desc and "confidence" in desc
+    assert "rates that ranking, not the corpus" in desc, (
+        "surface_decisions no longer contrasts its own band with query_decisions' "
+        "— the differentiator sentence was trimmed rather than extended"
     )

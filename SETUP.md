@@ -500,8 +500,9 @@ leaves a workspace that simply re-runs clean — no manual restore. Run these st
 ## When the corpus and the graph disagree
 
 The graph is a derivative of `decisions.md`, but nothing stops the two drifting apart:
-a hand-edit to an already-committed entry is skipped by `mitos sync` (a committed
-canonical core is treated as done), and an entry that leaves the corpus altogether
+a hand-edit to an already-committed entry only reaches the graph when `mitos sync`
+is authorized to apply it (it prints the field diff and asks; `--yes` applies
+everything but an edge *deletion*), and an entry that leaves the corpus altogether
 leaves its node behind with no source block. `mitos status .` reports both as an
 informational rung — never a readiness blocker, because a corpus mid-edit is a normal
 state, not breakage:
@@ -550,7 +551,13 @@ restored entry would mean inventing a date in your gold source.
 > reconstructs, so **a node with no source block loses its provenance along with
 > itself.** Restoring the blocks first is what lets the rebuild reach them.
 
-> **Commentary that differs is a separate case.** Today `mitos rebuild` is the only
-> thing that propagates a hand-edit to a committed entry; the rung reports the drift so
-> it is at least visible. Scope drift is worth acting on first — it is a *findability*
-> defect, so a wrong value hides the decision from every scope-filtered read.
+> **Commentary that differs is a separate case.** `mitos sync` propagates a hand-edit
+> to a committed entry: it prints the field diff and reconciles on confirmation, or
+> unattended under `--yes`. The one thing `--yes` will not do unattended is *delete* an
+> edge, so an entry whose relation line you removed needs
+> `mitos sync -p <project> --reconcile-entry <slug>`, which applies that one named
+> entry's whole reconcile and exits non-zero if it did not land. An entry that has
+> already rotated into an archive is out of `sync`'s reach either way — `sync` reads
+> the buffer alone, so that one's reconciler is still `mitos rebuild`. Scope drift is
+> worth acting on first — it is a *findability* defect, so a wrong value hides the
+> decision from every scope-filtered read.
