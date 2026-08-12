@@ -67,10 +67,10 @@ from mitos.migrations import is_pre_v1a_schema
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS, open_connection
 from mitos.cutover import default_aside_db_path, perform_swap, rebuild_and_gate
 from mitos.lexical import degraded_reason_from_error, lexical_fallback
-from mitos.recall import (assess_surface_recall, corpus_provenance,
-                          missing_graph_is_a_gap, missing_graph_note,
-                          missing_index_is_a_gap, provenance_line,
-                          scope_filter_recovery)
+from mitos.recall import (assess_query_recall, assess_surface_recall,
+                          corpus_provenance, missing_graph_is_a_gap,
+                          missing_graph_note, missing_index_is_a_gap,
+                          provenance_line, scope_filter_recovery)
 from mitos.sync import (MitosSyncManager, run_ambient_capture, _SLUG_MAX_LEN,
                         _ENTRIES_MARKER, _PAUSE_RESOLVING_RELATIONS,
                         _declared_echo_lines, _split_relation_slugs)
@@ -638,7 +638,7 @@ def cmd_init(config: MitosConfig, name: Optional[str] = None, force: bool = Fals
             "If the Mitos MCP server is wired into your agent, call these tools directly — best experience: structured args, no shell-quoting. If it is NOT wired, each maps to a CLI verb (and the CLI also accepts the long names as aliases, e.g. `mitos record_decision -p .`):\n"
             "- `record_decision`  (CLI: `mitos record -p .`) — the moment you commit to a foundational choice (a schema, a library, a pattern, a path you're abandoning), persist it WITH the alternatives you rejected and why, so future sessions inherit it instead of relitigating. Recording rich prose via the CLI? Use `--axiom-file -` / `--rejected-file -` / `--context-file -` to read from stdin and avoid shell-quoting.\n"
             "- `surface_decisions` (CLI: `mitos surface -p .`) — surface active precedents for a claim/scope BEFORE you decide, so you don't relitigate a settled call. This is the recall loop — use it first. Every hit carries its full `rejected_paths`; pass `brief=True` (CLI `--brief`) for an axiom-only scan.\n"
-            "- `query_decisions`   (CLI: `mitos query -p .`) — semantic or slug lookup when unsure whether a precedent exists.\n"
+            "- `query_decisions`   (CLI: `mitos query -p .`) — the TARGETED lookup: a slug you are carrying, or a pointed claim. Its confidence band rates how well the ranking matched what you named, not whether precedent exists — `surface_decisions` answers that one.\n"
             "- `list_decisions`    (CLI: `mitos list -p .`) — the EXHAUSTIVE recall path. surface/query are semantic and capped at the top few matches; this returns EVERY decision in a scope, deterministically, so a completeness pass or audit doesn't miss anything below the relevance cliff. Needs no key or Qdrant.\n\n"
             "## When to record — the capture trigger (YOUR judgement; Mitos stores, it does not decide what is worth storing)\n"
             "Recall is easy to ask for; knowing WHAT is worth recording is the real call, and it falls to you. Record a decision when it:\n"
@@ -1041,6 +1041,11 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
 
     store = manager.store
     top_k = clamp_limit(limit)
+    # Initialized BEFORE the `try` for the reason the CollectionMissingError arm's own
+    # comment gives below: that arm constructs the empty result rather than falling
+    # through, so a `top_score` bound inside the loop would be an unbound local on
+    # exactly the state (empty graph + absent collection) nobody reaches by hand.
+    top_score: Optional[float] = None
     try:
         q_vector = manager.embed_provider.get_embedding(query_text, is_query=True)
         raw_matches = manager.vector_store.query(q_vector, limit=top_k)
@@ -1072,6 +1077,12 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
             )
             match.update(store.get_modifiers(node["id"]))
             matches.append(match)
+            # Off the SURFACED list, after the append — never off `raw_matches`,
+            # which still holds the superseded and unresolvable nodes this loop
+            # just dropped. A band read off the raw return rates a match the
+            # caller never saw.
+            if top_score is None or m["score"] > top_score:
+                top_score = m["score"]
     except CollectionMissingError as e:
         # I8 — an absent collection over an EMPTY active set IS the empty index, and
         # a fresh project must not read as broken; over a populated graph it is a
@@ -1114,12 +1125,32 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         store, config, corpus_has_entries=corpus_has_entries
     )
 
+    # The confidence band, in the `query` register: it describes how this lookup's
+    # ranking did, never what the corpus holds. One call serves both encodings.
+    # `assess_query_recall` never returns None, so there is no `is not None` guard
+    # here — copying `cmd_surface`'s would be a branch that can never be False.
+    confidence, note = assess_query_recall(
+        top_score=top_score,
+        result_count=len(matches),
+        config=config,
+        surface="cli",
+    )
+
     # Build the per-match list once, then branch the two renderings over it.
     if as_json:
         envelope: Dict[str, Any] = {"query": query_text, "depth_mode": "letter", "matches": matches}
         envelope.update(corpus_provenance(config))
+        # Band note FIRST, then the overrides reassign it — the precedence is
+        # confidence note < blackout < unbuilt, and it is the NOTE that yields:
+        # `confidence` stands on every one of these exits (it is a fact about the
+        # ranking that an override about the graph does not contradict).
+        envelope["confidence"] = confidence
+        envelope["note"] = note
         if blackout:
             envelope["all_superseded"] = retired
+            # Closes the text/JSON divergence: the text branch below has printed
+            # this note since 2d while `--json` carried the handles alone.
+            envelope["note"] = blackout_note(retired)
         if unbuilt:
             envelope["note"] = missing_graph_note("cli")
         _emit_json(envelope)
@@ -1141,11 +1172,24 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
     if not matches:
         print(provenance_line(config))
         print("No matching decisions found.")
+        # This branch APPENDS where the envelope above assigns, so the override is
+        # written rather than inherited: left to the copy, a miss over an unbuilt
+        # graph would print the band note *and* the pointer, and the band note's
+        # redirect sends the caller to `surface`, which answers just as empty over
+        # that same unbuilt graph — a turn spent one line above the correct heal.
         if unbuilt:
             print(f"→ {missing_graph_note('cli')}")
+        else:
+            band_line = _query_band_line(confidence)
+            if band_line:
+                print(band_line)
+            print(f"→ {note}")
         return
 
     print(f"\nQuery matches for: '{query_text}'  [{provenance_line(config)}]")
+    band_line = _query_band_line(confidence)
+    if band_line:
+        print(band_line)
     print("-" * 60)
     for i, d in enumerate(matches, start=1):
         print(f"{i}. {d['slug']}  (score {d['score']:.3f})")
@@ -1158,6 +1202,38 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         if d["scope"]:
             print(f"   Scope:    {', '.join(d['scope'])}")
         print()
+    print(f"→ {note}")
+
+
+def _query_band_line(confidence: str) -> Optional[str]:
+    """The one-line band label for ``mitos query``'s text renderings, or None.
+
+    Two branches, not three: ``strong`` prints nothing, exactly as on ``surface``.
+    A label-axis reading of "the band renders" would compose a ``strong`` line
+    carrying ``⚠`` over a good result, which reads as a warning about an answer
+    that is fine. The ``⚠`` glyph is the shipped status legend (``✓``/``⚠``/``✗``),
+    not emphasis — a status line without it reads as a defect, not as calm.
+
+    The line carries the **label**; the note carries the legend and the register,
+    and stays legend-complete on its own (on MCP the label arrives as the typed
+    ``confidence`` field and there is no line at all).
+
+    The ``none`` line is one sentence true of **both** of that band's states —
+    matches that all ranked off-axis, and nothing ranked at all. ``surface``'s
+    shipped twin ("the scope is populated, but nothing matches your query") is
+    false twice over here, which is why it is not copied.
+
+    Args:
+        confidence: The band from ``assess_query_recall``.
+
+    Returns:
+        The line to print, or None when the band prints none.
+    """
+    if confidence == "weak":
+        return "⚠ confidence: weak — top matches are close but may not be this lookup's handle."
+    if confidence == "none":
+        return "⚠ confidence: none — nothing ranked as a real match for this lookup."
+    return None
 
 
 def _show_not_found_hint(config: MitosConfig) -> str:
@@ -5565,7 +5641,8 @@ def _build_parser() -> argparse.ArgumentParser:
     cap_p.add_argument("text", help="Raw decision description.")
 
     # query (alias: query_decisions — MCP tool name)
-    q_p = subparsers.add_parser("query", aliases=["query_decisions"], help="Semantic lookup for precedents.")
+    q_p = subparsers.add_parser("query", aliases=["query_decisions"],
+                                help="Targeted lookup by slug or pointed claim (its confidence rates the ranking, not the corpus).")
     q_p.add_argument("claim", help="Assertion or subsystem query.")
     q_p.add_argument("--depth", default="letter", help="Depth (default: letter).")
     q_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON.")
@@ -5575,7 +5652,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # surface (alias: surface_decisions — MCP tool name) — the precedent-recall loop
     surf_p = subparsers.add_parser("surface", aliases=["surface_decisions"],
-                                   help="Surface active decisions relevant to a query (precedent check before deciding).")
+                                   help="Surface active decisions relevant to a query (precedent check before deciding — its confidence rates whether precedent exists).")
     surf_p.add_argument("query", help="The claim or topic to find precedents for.")
     surf_p.add_argument("--scope", default=None, help="Optional scope hint (does NOT filter semantic recall — scopes open-questions + note only). Use `list --scope` to hard-filter by scope.")
     surf_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON.")
