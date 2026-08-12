@@ -2871,6 +2871,20 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
             "pre_v1a": pre_v1a,
             "qdrant_url": config.qdrant_url,
             "collection": config.qdrant_collection,
+            # The four resolved corpus locations, flat beside the other
+            # resolved-identity values rather than in a `paths` sub-map: `checks` is
+            # the payload's only nested map and it is a homogeneous verdict map,
+            # which these explicitly are not (a path passes and fails nothing). The
+            # key names mirror `MitosConfig.to_dict()`'s spellings so a consumer
+            # reading both finds the same words — a naming convention, deliberately
+            # NOT a code coupling: bound as attributes, so a future rename inside a
+            # debug mapping cannot propagate into a shipped payload contract
+            # (additive-only, data in the wild). Absolute by construction
+            # (`__init__` abspath's the workspace), so nothing here re-`abspath`s.
+            "decisions_file": config.decisions_file,
+            "questions_file": config.questions_file,
+            "archive_dir": config.archive_dir,
+            "db_path": config.db_path,
             "checks": {
                 "mitos_workspace": mitos_dir_ok,
                 "decisions_buffer": decisions_ok,
@@ -2945,7 +2959,14 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
         coll_mark, coll_hint = None, "auto-created on first record — none recorded yet"
     checks = [
         ("workspace (.mitos/ + config.toml)", mitos_dir_ok, "run `mitos init`"),
-        ("decisions.md buffer", decisions_ok, "created by `mitos init`"),
+        # The path rides INLINE in the label, not on a line elsewhere: the row's
+        # own job is to say which file it is about, and a reader must never have to
+        # correlate a `✗` row with a path listed further down to learn that. The
+        # parenthetical is the report's shipped idiom (`Qdrant reachable (…)`,
+        # `GEMINI_API_KEY (from …)`). The `mitos init` hint stays bare because
+        # `init` is selector-exempt — a bare `mitos init` is runnable, not a wall.
+        (f"decisions.md buffer ({config.decisions_file})", decisions_ok,
+         "created by `mitos init`"),
         # Reference copy for humans/agents — the parser reads the spec from the
         # installed package, so a missing workspace copy never gates readiness:
         # neutral "—", never a ✗ under a READY ✓ verdict (✗ is for real blockers).
@@ -2993,6 +3014,24 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
             print(f"      {rest[0]}")
     if q["reachable"] and q["collection_exists"] and q["points"] is not None:
         print(f"      ({q['points']} vector(s) indexed)")
+    # The three corpus locations that have no check row to hang off, as neutral `•`
+    # facts in the idiom the report already speaks (`• graph holds …`, `• {n}
+    # graveyard point(s)`) — a resolved path passes and fails nothing, so it is not
+    # a rung in any glyph and never joins `checks`. Unconditional by design: the two
+    # sessions that grepped `.mitos/decisions.md` and got confident zero-hit answers
+    # were working in HEALTHY workspaces where every row read ✓, so a path shown
+    # only on failure is absent from exactly the state that produced this item. The
+    # archive is the load-bearing member — `<root>/decisions/archive` follows
+    # neither the root convention `decisions.md` teaches nor the `.mitos/` one
+    # everything else does, so a reader told the other three still cannot derive it.
+    # Rendered, never inspected: no `stat`, no glob, no entry count. The archive
+    # listing is one import away and already on this verb's path
+    # (`corpus_graph_divergence`), and a count beside a path would be a second,
+    # weaker report of what the divergence rung already covers — drifting from it by
+    # construction, and the only thing here that is not O(1) in corpus size.
+    print(f"  • questions.md buffer: {config.questions_file}")
+    print(f"  • decisions archive: {config.archive_dir}")
+    print(f"  • graph: {config.db_path}")
     if graph_nodes is not None:
         print(f"  • graph holds {graph_nodes} node(s)")
     # The unbuilt graph (W31). A blocker, not a rung readers learn to skip: every
