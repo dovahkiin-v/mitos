@@ -9,10 +9,14 @@ no Qdrant, no LLM, no real ``mitos`` binary. This file runs in the ``-m 'not
 packaging'`` gate.
 """
 
+import os
 import subprocess
 
 import pytest
+
 from _pytest.outcomes import Skipped
+
+from mitos.config import RESOLVED_ENV_KEYS
 
 from mitos.errors import EmbeddingError, SynthesisError
 
@@ -28,6 +32,8 @@ from live_helpers import (
     skip_if_enrichment_quota_exhausted,
     skip_if_global_mitos_stale,
     skip_on_embed_quota,
+    apply_test_credentials,
+    TEST_CREDENTIAL_ALIASES,
 )
 
 
@@ -407,3 +413,78 @@ def test_enrichment_quota_skip_reason_is_loud_and_actionable():
     assert "NOT a code defect" in ENRICHMENT_QUOTA_SKIP_REASON
     # Names the SEPARATE generative bucket (distinct from the embed quota).
     assert "generate_content_free_tier_requests" in ENRICHMENT_QUOTA_SKIP_REASON
+
+
+# ---------------------------------------------------------------------------
+# Test-tier credential separation — which key the gate spends
+#
+# The live tier and real mitos usage billed the same Anthropic key, so a monthly
+# invoice could not answer "is this the gate or is this me?". These rows pin the
+# substitution AND its no-op fallback, because a mapping that silently does
+# nothing is indistinguishable from one that works — the vacuous-row shape.
+# ---------------------------------------------------------------------------
+
+def test_the_test_key_replaces_the_consumer_name(monkeypatch):
+    monkeypatch.setenv("MITOS_TEST_ANTHROPIC_API_KEY", "sk-test-tier")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-real-usage")
+    applied = apply_test_credentials()
+    assert applied == ("ANTHROPIC_API_KEY",)
+    assert os.environ["ANTHROPIC_API_KEY"] == "sk-test-tier"
+
+
+def test_an_exported_usage_key_does_not_survive_the_substitution(monkeypatch):
+    # The overwrite (not setdefault) IS the leak-closing half: a shell that
+    # exported the usage key would otherwise keep billing it for the whole run.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-real-usage")
+    monkeypatch.setenv("MITOS_TEST_ANTHROPIC_API_KEY", "sk-test-tier")
+    apply_test_credentials()
+    assert os.environ["ANTHROPIC_API_KEY"] != "sk-real-usage"
+
+
+def test_without_a_test_key_nothing_moves(monkeypatch):
+    # The fallback that makes this safe to ship before the key is minted: a box
+    # with no test credential runs exactly as it did before.
+    monkeypatch.delenv("MITOS_TEST_ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-real-usage")
+    assert apply_test_credentials() == ()
+    assert os.environ["ANTHROPIC_API_KEY"] == "sk-real-usage"
+
+
+def test_an_empty_test_key_is_not_a_supplied_one(monkeypatch):
+    # An empty slot is what `mitos init` scaffolds; it must not blank the real key.
+    monkeypatch.setenv("MITOS_TEST_ANTHROPIC_API_KEY", "")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-real-usage")
+    assert apply_test_credentials() == ()
+    assert os.environ["ANTHROPIC_API_KEY"] == "sk-real-usage"
+
+
+def test_repo_root_sourcing_reads_only_the_alias_names(tmp_path, monkeypatch):
+    # Loading the whole .env here would put QDRANT_URL and GOOGLE_API_KEY into
+    # every test's environment for the session — a behaviour change wearing a
+    # credential fix. Only the alias names may cross.
+    (tmp_path / ".env").write_text(
+        "MITOS_TEST_ANTHROPIC_API_KEY=sk-test-tier\n"
+        "QDRANT_URL=http://should-not-cross:9999\n"
+        "GOOGLE_API_KEY=should-not-cross\n",
+        encoding="utf-8",
+    )
+    for name in ("MITOS_TEST_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY",
+                 "QDRANT_URL", "GOOGLE_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    apply_test_credentials(repo_root=str(tmp_path))
+    assert os.environ["ANTHROPIC_API_KEY"] == "sk-test-tier"
+    assert "should-not-cross" not in os.environ.get("QDRANT_URL", "")
+    assert os.environ.get("GOOGLE_API_KEY") is None
+
+
+def test_the_alias_table_is_not_empty_and_targets_a_resolved_key():
+    # Non-vacuity for the rows above: an emptied table would pass every one of
+    # them by never substituting anything.
+    assert TEST_CREDENTIAL_ALIASES
+    # Every target must be a name mitos actually resolves, or the substitution
+    # lands somewhere no consumer reads.
+    assert set(TEST_CREDENTIAL_ALIASES.values()) <= set(RESOLVED_ENV_KEYS)
+    # Anthropic-only by decision: the judge is the spend. Gemini is a free-tier
+    # daily bucket and mitos defers embeds, so an alias there would be a code path
+    # nobody sets. Add it the day that changes — and update this row with it.
+    assert set(TEST_CREDENTIAL_ALIASES.values()) == {"ANTHROPIC_API_KEY"}

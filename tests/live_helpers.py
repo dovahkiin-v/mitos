@@ -74,6 +74,118 @@ def live_tests_disabled() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Test-tier credential separation — which key the gate spends
+# ---------------------------------------------------------------------------
+
+#: Test-tier credential names, mapped onto the names every consumer reads.
+#:
+#: The live tier and real mitos usage were billing the SAME key, so the only
+#: question a monthly invoice actually poses — *is this the gate or is this me?* —
+#: had no answer. These names give the gate its own credential without teaching
+#: any consumer a second name: the mapping lands in ``os.environ``, which is
+#: ``mitos.env``'s tier 1 and therefore masks both the project and global ``.env``
+#: for every consumer in the process, including the live modules that never load
+#: the repo ``.env`` themselves and would otherwise resolve the usage key off the
+#: global tier.
+#:
+#: **Anthropic only, deliberately.** The spend that raised the question is the
+#: batched SONNET tenability judgment — ``tests/golden/test_conflict_eval_live.py``
+#: is ~360s of the 8–12 minute un-braked run on its own, and
+#: ``test_conflict_dogfood_live.py`` drives the judge against the real corpus.
+#: Gemini's side is embeddings on a free tier with a daily bucket, and mitos is
+#: structurally frugal there (``record`` defers the embed; the five-workspace
+#: 0.15.0 migration priced out at zero real embed calls). A ``MITOS_TEST_GEMINI_*``
+#: entry would be a code path nobody sets and therefore nobody exercises — add it
+#: here the day Gemini spend becomes a question, which is one line.
+#:
+#: Absent, nothing changes: the name falls back to its standard twin, so a box
+#: that has not minted a test key runs exactly as before. That fallback is the
+#: reason this is safe to ship ahead of the key existing — and the reason it
+#: needs its own test, since a mapping that silently does nothing is
+#: indistinguishable from one that works.
+TEST_CREDENTIAL_ALIASES: dict[str, str] = {
+    "MITOS_TEST_ANTHROPIC_API_KEY": "ANTHROPIC_API_KEY",
+}
+
+
+def apply_test_credentials(repo_root: Optional[str] = None,
+                           env: Optional[dict] = None) -> Tuple[str, ...]:
+    """Points the live tier at the test-tier keys where they are supplied.
+
+    Copies each ``MITOS_TEST_*`` value over the name its consumers read. Called
+    at ``tests/conftest.py`` import — before any live module resolves a
+    credential — so the substitution reaches modules with their own ``.env``
+    loader and modules that go through ``mitos.env``'s resolver alike.
+
+    It **overwrites** rather than ``setdefault``s: a shell that exported the usage
+    key would otherwise keep it, which is precisely the leak this closes. Opting
+    the whole tier out stays the live brake's job (``MITOS_NO_LIVE_TESTS``), not
+    this function's.
+
+    When ``repo_root`` is given, the two alias names are read out of its ``.env``
+    first — and **only** those two. Loading the whole file here would put
+    ``QDRANT_URL`` and ``GOOGLE_API_KEY`` into the environment of every test in
+    the session, which is a behaviour change wearing a credential fix; the
+    per-module loaders keep owning the whole-file read.
+
+    Args:
+        repo_root: Repository root to source the alias names from, or None to use
+            only what is already in the environment.
+        env: Mapping to read and mutate. Defaults to ``os.environ``.
+
+    Returns:
+        The consumer names that were actually re-pointed, for a caller that wants
+        to report the substitution. Empty when no test key is supplied.
+    """
+    target = os.environ if env is None else env
+    if repo_root is not None:
+        env_path = os.path.join(repo_root, ".env")
+        if os.path.exists(env_path):
+            with open(env_path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    k = k.strip()
+                    if k in TEST_CREDENTIAL_ALIASES:
+                        target.setdefault(k, v.strip())
+    applied = []
+    for alias, consumer in TEST_CREDENTIAL_ALIASES.items():
+        value = target.get(alias)
+        if value:
+            target[consumer] = value
+            applied.append(consumer)
+    return tuple(applied)
+
+
+def load_live_env(repo_root: str) -> None:
+    """Loads the repo-root ``.env`` into ``os.environ``, then applies the test keys.
+
+    The single source for what five live modules each hand-rolled: read the file,
+    ``setdefault`` every name (so a real shell export still wins), then re-point
+    the credential names at their ``MITOS_TEST_*`` twins if any were supplied.
+
+    ``setdefault`` for the file's own names and an overwrite for the aliases is
+    deliberate and not a mixed convention: the first says *the shell outranks the
+    file*, the second says *the test key outranks whatever the usage key was*, and
+    they answer different questions.
+
+    Args:
+        repo_root: Absolute path to the repository root holding the ``.env``.
+    """
+    env_path = os.path.join(repo_root, ".env")
+    if os.path.exists(env_path):
+        with open(env_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    os.environ.setdefault(k.strip(), v.strip())
+    apply_test_credentials()
+
+
+# ---------------------------------------------------------------------------
 # Embed-quota (429) robustness
 # ---------------------------------------------------------------------------
 

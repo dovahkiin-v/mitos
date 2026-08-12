@@ -9,6 +9,8 @@ exercise those features re-enable them explicitly (``monkeypatch.delenv(...)``).
 
 import os
 
+import live_helpers
+
 import pytest
 
 
@@ -168,6 +170,24 @@ def workspace(tmp_path) -> str:
 #: ``_keyless`` fixtures on top of this baseline.
 _CREDENTIAL_NAMES: tuple[str, ...] = (
     "GEMINI_API_KEY", "GOOGLE_API_KEY", "ANTHROPIC_API_KEY",
+)
+
+
+#: The live tier spends the test-tier Anthropic key where one is supplied.
+#:
+#: Applied at conftest **import**, which is the only placement that reaches every
+#: live module: five of them hand-roll their own repo-``.env`` loader and the rest
+#: resolve credentials through ``mitos.env``, so a fixture — even an autouse,
+#: session-scoped one — would land after the import-time ``HAS_LIVE_KEYS`` gates
+#: have already read the environment. The substitution rides ``os.environ``, tier 1
+#: of that resolver, so it masks both ``.env`` files for consumers of either kind.
+#:
+#: Deliberately NOT gated on the live brake: applying it under
+#: ``MITOS_NO_LIVE_TESTS`` costs nothing (no call is made) and keeping the two
+#: mechanisms independent means a brake change cannot silently re-point the gate
+#: at the usage key.
+_APPLIED_TEST_CREDENTIALS = live_helpers.apply_test_credentials(
+    repo_root=os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
 
 
