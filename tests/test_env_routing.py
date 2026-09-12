@@ -122,13 +122,17 @@ def genai_keys(monkeypatch) -> List[Optional[str]]:
     client constructor is the only seam a routed key can be observed at. Do not
     "fix" that by adding an ``api_key`` attribute to make a row easier.
     """
+    from google import genai
+
     seen: List[Optional[str]] = []
 
     def _client(*, api_key: Optional[str] = None) -> Any:
         seen.append(api_key)
         return MagicMock()
 
-    monkeypatch.setattr(embeddings.genai, "Client", _client)
+    # On the SDK module, not `embeddings.genai`: the provider imports the SDK at
+    # construction, so the module attribute no longer exists.
+    monkeypatch.setattr(genai, "Client", _client)
     return seen
 
 

@@ -60,6 +60,82 @@ def test_strip_html_comments_outside_protected() -> None:
     assert "keep me --> in transcript" in cleaned
 
 
+def _reference_strip_html_comments(text: str) -> str:
+    """The per-character stripper `strip_html_comments` replaced, kept as an oracle.
+
+    The `str.find` rewrite (0.17.4) is a performance change only, so its output
+    must match this byte for byte on every input.
+    """
+    cleaned_lines = []
+    in_fenced_code = in_transcript = in_html_comment = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fenced_code = not in_fenced_code
+        if stripped == "[DECISION_TRANSCRIPT]":
+            in_transcript = True
+        elif stripped == "[/DECISION_TRANSCRIPT]":
+            in_transcript = False
+        if in_fenced_code or in_transcript:
+            cleaned_lines.append(line)
+            continue
+        new_chars = list(line)
+        i = 0
+        while i < len(line):
+            if not in_html_comment and line[i:i+4] == "<!--":
+                in_html_comment = True
+                new_chars[i:i+4] = "    "
+                i += 4
+            elif in_html_comment and line[i:i+3] == "-->":
+                in_html_comment = False
+                new_chars[i:i+3] = "   "
+                i += 3
+            else:
+                if in_html_comment:
+                    new_chars[i] = " "
+                i += 1
+        cleaned_lines.append("".join(new_chars))
+    return "\n".join(cleaned_lines)
+
+
+@pytest.mark.parametrize("raw", [
+    "a <!-- one --> b <!-- two --> c",
+    "open <!-- spans\nseveral\nlines --> close",
+    "<!---->adjacent<!-- -->",
+    "<!-- <!-- nested opener --> tail -->",
+    "unterminated <!-- to the end\nstill inside\n",
+    "--> stray closer <!",
+    "<!-- open\n```\ncode keeps <!-- this\n```\nstill open --> done",
+    "<!-- open\n[DECISION_TRANSCRIPT]\nUser: -->\n[/DECISION_TRANSCRIPT]\nx --> y",
+    "",
+    "\n\n<!-- -->\n",
+])
+def test_strip_html_comments_matches_the_reference(raw: str) -> None:
+    assert strip_html_comments(raw) == _reference_strip_html_comments(raw)
+
+
+def test_strip_html_comments_matches_the_reference_on_random_input() -> None:
+    """Seeded fuzz over the alphabet that matters: marker fragments, fences, newlines."""
+    import random
+
+    rng = random.Random(20260912)
+    pieces = ["<!--", "-->", "<", "!", "-", ">", "```", "\n", " ", "x",
+              "[DECISION_TRANSCRIPT]", "[/DECISION_TRANSCRIPT]"]
+    for _ in range(2000):
+        raw = "".join(rng.choice(pieces) for _ in range(rng.randint(0, 40)))
+        assert strip_html_comments(raw) == _reference_strip_html_comments(raw), repr(raw)
+
+
+def test_strip_html_comments_matches_the_reference_on_this_repo_corpus() -> None:
+    """The real 1.5 MB corpus — the input the rewrite was measured against."""
+    corpus = os.path.join(os.path.dirname(os.path.dirname(__file__)), "decisions.md")
+    if not os.path.exists(corpus):
+        pytest.skip("decisions.md is not present in this checkout")
+    with open(corpus, encoding="utf-8") as handle:
+        text = handle.read()
+    assert strip_html_comments(text) == _reference_strip_html_comments(text)
+
+
 def test_parse_header_formats() -> None:
     """Tests header extraction for standard and slug-only formats."""
     # Standard format with em-dash

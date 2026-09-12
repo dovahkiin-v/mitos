@@ -13,10 +13,13 @@ import json
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Dict, Optional, Any, Set, Tuple, Callable
+from typing import TYPE_CHECKING, List, Dict, Optional, Any, Set, Tuple, Callable
 from filelock import FileLock, Timeout
-from google import genai
-from google.genai import types
+
+if TYPE_CHECKING:
+    # The SDK is imported inside the two functions that call it: `google.genai`
+    # costs ~0.7s, and `cli` imports this module for every verb.
+    from google import genai
 
 from mitos import __version__ as MITOS_VERSION
 from mitos.config import MitosConfig, hint_due
@@ -102,7 +105,7 @@ class _ConflictSyncRun:
 
 
 def run_sync_enrichment(
-    client: genai.Client,
+    client: "genai.Client",
     entry: ParsedEntry,
     active_decisions: List[Dict[str, Any]],
     *,
@@ -158,6 +161,8 @@ Respond strictly in valid JSON format with the following keys:
     resolved_model = (
         model_id if model_id is not None else get_model_id("FLASH_LITE")
     )
+    from google.genai import types
+
     try:
         response = client.models.generate_content(
             model=resolved_model,
@@ -173,7 +178,7 @@ Respond strictly in valid JSON format with the following keys:
 
 
 def run_ambient_capture(
-    client: genai.Client, raw_text: str, *, model_id: Optional[str] = None
+    client: "genai.Client", raw_text: str, *, model_id: Optional[str] = None
 ) -> str:
     """Uses FLASH to convert raw conversational text into a canonical Markdown entry.
 
@@ -207,6 +212,8 @@ User: {raw_text}
 Make sure the slug is a clean, lowercase hyphenated string that matches the decision topic.
 """
     resolved_model = model_id if model_id is not None else get_model_id("FLASH")
+    from google.genai import types
+
     try:
         response = client.models.generate_content(
             model=resolved_model,
@@ -1286,6 +1293,10 @@ class MitosSyncManager:
                 conflict_run = self._new_conflict_run()
 
         # 3. Process each parsed entry
+        # The decisions snapshot is private and never rewritten after step 1, so it is
+        # read once, on the first decision entry. Re-reading it per entry made a large
+        # buffer's sync quadratic — 47% of a 3,704-entry cold sync (measured 2026-09-12).
+        snap_lines: Optional[List[str]] = None
         for entry in entries:
             # Read exact raw text block of this entry from snapshot for content-aware
             # rotation — DECISIONS ONLY (D5): the line range here indexes the
@@ -1294,8 +1305,9 @@ class MitosSyncManager:
             # buffer), so they need no raw-text block.
             entry_raw_text = ""
             if entry.kind == "decision":
-                with open(snapshot_path, "r", encoding="utf-8") as f:
-                    snap_lines = f.readlines()
+                if snap_lines is None:
+                    with open(snapshot_path, "r", encoding="utf-8") as f:
+                        snap_lines = f.readlines()
                 entry_raw_text = "".join(snap_lines[entry.line_start - 1 : entry.line_end])
 
             # Check if this node is already in the database (slug-free V1a id — V1-D2).

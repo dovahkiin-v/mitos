@@ -168,7 +168,9 @@ def test_a_key_dropped_into_the_scaffolded_env_still_just_works(tmp_path, monkey
         seen.append(api_key)
         return MagicMock()
 
-    monkeypatch.setattr(embeddings.genai, "Client", _client)
+    from google import genai
+
+    monkeypatch.setattr(genai, "Client", _client)
     config = MitosConfig(str(ws))
     assert config.env["GEMINI_API_KEY"] == "PROJKEY"
     cli.cmd_capture(config, "We will use python.")

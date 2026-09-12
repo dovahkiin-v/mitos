@@ -9,7 +9,6 @@ import json
 import hashlib
 import os
 from typing import List, Dict, Optional, Any, Tuple
-from google import genai
 from mitos.models import get_embedding_model_id
 from mitos.errors import EmbeddingError
 
@@ -119,6 +118,10 @@ class GeminiEmbeddingProvider:
                 "from the process environment, then the workspace's .env, then "
                 "the global .env (`mitos set-key <key>` writes one)"
             )
+        # Imported here, not at module scope: `google.genai` costs ~0.7s to import,
+        # and every `mitos` verb imports this module whether or not it embeds.
+        from google import genai
+
         self.client = genai.Client(api_key=api_key)
         self.model_id = (
             model_id if model_id is not None else get_embedding_model_id()

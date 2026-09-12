@@ -8,9 +8,11 @@ canonical Mitos entries.
 import os
 import json
 import re
-from typing import List, Dict, Any, Optional, Tuple
+from typing import TYPE_CHECKING, List, Dict, Any, Optional, Tuple
 from datetime import datetime
-import anthropic
+
+if TYPE_CHECKING:
+    import anthropic
 
 from mitos.config import MitosConfig
 from mitos.errors import CollectionMissingError, SynthesisError, ValidationError
@@ -23,7 +25,7 @@ from mitos.vector_store import QdrantVectorStore
 from mitos.renderer import MitosRenderer
 
 def run_llm_prose_compression(
-    client: anthropic.Anthropic,
+    client: "anthropic.Anthropic",
     title: str,
     prose_content: str,
     *,
@@ -168,7 +170,13 @@ class MitosProseImporter:
             print("ANTHROPIC_API_KEY environment variable is not set. Import --llm-extract requires it.")
             return
 
-        client = anthropic.Anthropic(api_key=api_key) if use_llm_extract else None
+        client = None
+        if use_llm_extract:
+            # Lazy: `cli` imports this module at module scope, so a top-level
+            # `import anthropic` would ride every `mitos` verb.
+            import anthropic
+
+            client = anthropic.Anthropic(api_key=api_key)
         # One resolution for both consumers below — the id the compression call
         # uses and the id stamped as `confirmed_by` are the same string by
         # construction, not by two lookups that happen to agree.

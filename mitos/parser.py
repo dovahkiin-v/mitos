@@ -135,32 +135,38 @@ def strip_html_comments(text: str) -> str:
         elif stripped == "[/DECISION_TRANSCRIPT]":
             in_transcript = False
 
-        if in_fenced_code or in_transcript:
-            # Preserve comments byte-for-byte in protected blocks
+        if in_fenced_code or in_transcript or (not in_html_comment and "<!--" not in line):
+            # Protected blocks keep comments byte-for-byte; a line with no comment
+            # in play is already clean.
             cleaned_lines.append(line)
         else:
-            # Replace characters inside <!-- ... --> with spaces to preserve line lengths
-            new_chars = list(line)
+            # Replace characters inside <!-- ... --> with spaces to preserve line
+            # lengths. Scans by `str.find` rather than per character: a per-character
+            # Python loop was 60% of a full corpus parse (measured 2026-09-12).
+            parts = []
             i = 0
-            while i < len(line):
-                if not in_html_comment and line[i:i+4] == "<!--":
-                    in_html_comment = True
-                    new_chars[i] = ' '
-                    new_chars[i+1] = ' '
-                    new_chars[i+2] = ' '
-                    new_chars[i+3] = ' '
-                    i += 4
-                elif in_html_comment and line[i:i+3] == "-->":
-                    in_html_comment = False
-                    new_chars[i] = ' '
-                    new_chars[i+1] = ' '
-                    new_chars[i+2] = ' '
-                    i += 3
+            n = len(line)
+            while i < n:
+                if in_html_comment:
+                    end = line.find("-->", i)
+                    if end < 0:
+                        parts.append(" " * (n - i))
+                        i = n
+                    else:
+                        parts.append(" " * (end + 3 - i))
+                        i = end + 3
+                        in_html_comment = False
                 else:
-                    if in_html_comment:
-                        new_chars[i] = ' '
-                    i += 1
-            cleaned_lines.append("".join(new_chars))
+                    start = line.find("<!--", i)
+                    if start < 0:
+                        parts.append(line[i:])
+                        i = n
+                    else:
+                        parts.append(line[i:start])
+                        parts.append("    ")
+                        i = start + 4
+                        in_html_comment = True
+            cleaned_lines.append("".join(parts))
 
     return "\n".join(cleaned_lines)
 

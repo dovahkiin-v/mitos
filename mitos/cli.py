@@ -16,7 +16,6 @@ import hashlib
 import argparse
 from datetime import datetime, timezone
 from typing import Callable, List, Mapping, Optional, Dict, Any, Set, Tuple
-from google import genai
 
 from mitos import __version__
 from mitos import check
@@ -854,7 +853,9 @@ def cmd_capture(config: MitosConfig, text: str) -> None:
     if not api_key:
         print("GEMINI_API_KEY environment variable is not set. Capture requires it.")
         return
-        
+
+    from google import genai
+
     client = genai.Client(api_key=api_key)
     print("Synthesizing canonical decision entry ...")
     

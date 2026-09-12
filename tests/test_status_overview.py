@@ -875,9 +875,10 @@ def test_the_corpus_gate_is_injected_and_not_re_derived(tmp_path, qdrant):
 def test_importing_the_overview_pulls_in_no_higher_tier_module():
     """The tier rule is a subprocess probe, not prose.
 
-    The sharper half is ``anthropic``: ``import mitos.cli`` drags the SDK at module
-    scope, so homing the sweep there would make every test of it — and any second
-    consumer — pay an SDK import to enumerate a TOML file.
+    The sharper half is ``anthropic``: an SDK must never be the price of
+    enumerating a TOML file. ``import mitos.cli`` no longer pays it either (the SDKs
+    import lazily since 0.17.4, pinned in ``test_cli_import_cost.py``), but the
+    sweep's tier rule stands on its own.
     """
     probe = (
         "import sys; import mitos.overview; "
