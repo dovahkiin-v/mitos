@@ -1381,8 +1381,7 @@ def corpus_has_entries(path: str) -> bool:
                 if in_transcript and stripped == TRANSCRIPT_CLOSE:
                     in_transcript = False
                     continue
-                if (not in_transcript and line.startswith("##")
-                        and not line.startswith("####")):
+                if not in_transcript and is_entry_heading(line):
                     if seen_sentinel:
                         return True
                     found_above_sentinel = True
