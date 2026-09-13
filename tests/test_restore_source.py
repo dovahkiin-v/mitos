@@ -651,3 +651,34 @@ def test_restore_emits_in_commit_order(tmp_path, capsys):
     assert pos["mike-third"] < pos["alpha-second"] < pos["zulu-first"], (
         f"newest-committed must sit highest in the buffer, got {pos}"
     )
+
+
+def test_the_isolation_check_accepts_a_reorder_and_refuses_a_different_tag_set():
+    """Order-insensitive by design, and pinned so a sweep does not "fix" it.
+
+    The divergence comparator became order-sensitive; this check did not, because its
+    job is proving the block round-trips the node's identity and commentary, and a
+    reorder is not a fidelity failure. The same fixture then carries a different tag
+    set, so the row cannot pass by accepting everything.
+    """
+    from mitos.identity import compute_node_id
+
+    node = {
+        "id": "placeholder", "slug": "reordered", "core_axiom": "An axiom.",
+        "mechanisms": ["m1"], "scope": ["alpha", "beta"], "rejected_paths": "A reason.",
+        "invalidates_if": None, "context": None, "source": "user",
+    }
+    block = render_source_block(node, [])
+    [parsed] = parse_entry_stream(block, "decision")
+    node["id"] = compute_node_id(kind="decision", axiom=parsed.axiom,
+                                 mechanism_refs=parsed.mechanisms)
+    verify_block_in_isolation(block, node)  # the unedited block passes: non-vacuous base
+
+    assert "**Scope:** alpha, beta" in block
+    verify_block_in_isolation(block.replace("**Scope:** alpha, beta", "**Scope:** beta, alpha"),
+                              node)
+
+    with pytest.raises(RestoreError, match="scope did not survive"):
+        verify_block_in_isolation(
+            block.replace("**Scope:** alpha, beta", "**Scope:** beta, gamma"), node
+        )

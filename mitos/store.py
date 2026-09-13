@@ -34,6 +34,7 @@ from mitos.migrations import (
     restore_from_snapshot,
 )
 from mitos.parser import ParsedEntry
+from mitos.scope_tags import normalize_scope_tags
 
 # Module logger for non-failing notices. The store is a pure primitive — it logs
 # (loud, testable via ``caplog``, no raw stdout I/O) and never prints to the user;
@@ -1464,16 +1465,15 @@ class GraphStore:
         confirmed_by = parsed.confirmed_by  # reserved — NULL in V1a in practice
         confirmed_at = parsed.confirmed_at
 
-        # Incoming scopes: strip + casefold + drop-empties (the parser already
-        # normalizes; re-applying ``str.casefold()`` is idempotent and keeps a
-        # hand-built entry honest — MI-9, never SQLite NOCASE/LOWER). A scope row
-        # is never empty/NULL. The list keeps the author's order (first occurrence
-        # wins a duplicate): the order is the ``ordinal``, and the first tag is the
-        # node's primary scope. Order is commentary-tier — it never reaches
+        # Incoming scopes through the shared scope-tag rule (`scope_tags`): the
+        # parser already normalizes, and re-applying it is idempotent and keeps a
+        # hand-built entry honest (MI-9). It is the SAME function the divergence
+        # comparator calls, so "equal" here and "not diverged" there cannot drift
+        # apart. The list keeps the author's order (first occurrence wins a
+        # duplicate): the order is the ``ordinal``, and the first tag is the node's
+        # primary scope. Order is commentary-tier — it never reaches
         # ``compute_node_id`` above (C1).
-        incoming_scopes = list(
-            dict.fromkeys(tag for s in parsed.scope if (tag := s.strip().casefold()))
-        )
+        incoming_scopes = normalize_scope_tags(parsed.scope)
         incoming_transcript = parsed.transcript or None  # falsy -> absent
 
         conn = self._get_connection()

@@ -93,7 +93,8 @@
       "id": "603843b54c0e6025bdcf31a9e0791230420e06bbed4a6b0baa7d4a55fceefc3e",
       "state": "active",
       "scope": [
-        "storage"
+        "storage",
+        "compliance"
       ],
       "modifiers": {},
       "lineage": [

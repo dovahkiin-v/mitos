@@ -17,8 +17,12 @@ Five species are reported:
 ``S1``  Commentary **text** — ``slug``, ``rejected_paths``, ``invalidates_if``,
         ``context``. Exactly the mutable half of the store's commentary
         ``UPDATE SET``, minus the confirmation pair (see below).
-``S2``  **Scope** — a *retrieval* defect rather than a reading one: a wrong value
-        makes the decision miss every scope-filtered read and ``mitos scopes``.
+``S2``  **Scope**, compared as an ordered list. Two classes, told apart by the
+        row's ``order_only`` flag. A *membership* difference is a retrieval
+        defect: a wrong tag set makes the decision miss scope-filtered reads and
+        ``mitos scopes``. An *order-only* difference hides nothing from any read;
+        it changes the primary scope (the first tag), and so which rendered scope
+        file holds the full body.
 ``S3``  **Absent source block** — a node with no ``### `` entry anywhere in the
         corpus. ``rebuild`` drops it, the completeness gate refuses, and the
         tool's own repair story stops working.
@@ -59,10 +63,12 @@ The module has two halves, and the split is the point:
 * ``corpus_graph_divergence`` is the whole-corpus **fold** — it owns the read, the
   advisory lock, and the sidecar cache, and it is ``status``'s half alone.
 
-Importing this module stays cheap and cycle-free either way: every ``mitos`` import
-the fold needs is function-local, so ``sync`` can import the leaf without dragging in
-the parser (which reads ``format-spec.md`` from package data at import time), the
-store, or the cutover replay machinery. A test pins that import graph.
+Importing this module stays cheap and cycle-free either way. Its only module-level
+``mitos`` import is the stdlib leaf ``scope_tags`` (the scope-tag rule the store's
+writer shares); every ``mitos`` import the fold needs is function-local, so ``sync``
+can import the leaf without dragging in the parser (which reads ``format-spec.md``
+from package data at import time), the store, or the cutover replay machinery. A test
+pins that import graph.
 
 **Open questions are out of scope, on both sides.** ``questions.md`` is not read, and
 open-question nodes are filtered out of the graph side to match — excluding them from
@@ -74,6 +80,8 @@ import hashlib
 import json
 import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from mitos.scope_tags import normalize_scope_tags
 
 # The S1 diff set, pinned. Exactly the mutable-commentary columns the store's
 # `UPDATE SET` can reach, minus the confirmation pair (graph-primary, see the module
@@ -194,10 +202,18 @@ def entry_divergence(
 
     Returns:
         A dict with ``commentary`` (list of diverged field names), ``scope``
-        (``{"graph", "markdown"}`` or ``None``), ``edges``
+        (``{"graph", "markdown", "order_only"}`` or ``None``), ``edges``
         (``{"added", "removed"}`` or ``None``), and ``source``
         (``{"graph", "markdown"}`` or ``None``). Every value is falsy when the entry
         and its node agree, so ``any(result.values())`` is the "diverged" predicate.
+
+        Scope is compared as an ordered list, with both sides normalized through
+        ``scope_tags.normalize_scope_tags`` (the rule the store's writer uses, so
+        "equal" means the same thing here and at the commit). Its two lists are in
+        authored order, never sorted, because the report is where a reader sees
+        which order diverged. ``order_only`` is True iff the lists hold the same
+        tags in a different order. An order-only difference is still a divergence,
+        and a reconcilable one: it moves the node's primary scope.
     """
     commentary: List[str] = []
 
@@ -212,11 +228,15 @@ def entry_divergence(
     if _normalized_text(entry.context) != _normalized_text(node.get("context")):
         commentary.append("context")
 
-    markdown_scopes = sorted({s.strip() for s in (entry.scope or []) if s.strip()})
-    graph_scopes = sorted({s.strip() for s in (stored_scopes or []) if s.strip()})
+    markdown_scopes = normalize_scope_tags(entry.scope)
+    graph_scopes = normalize_scope_tags(stored_scopes)
     scope = (
         None if markdown_scopes == graph_scopes
-        else {"graph": graph_scopes, "markdown": markdown_scopes}
+        else {
+            "graph": graph_scopes,
+            "markdown": markdown_scopes,
+            "order_only": set(markdown_scopes) == set(graph_scopes),
+        }
     )
 
     declared = _edge_key_set(declared_edges(entry))
@@ -282,9 +302,10 @@ def is_reconcilable(report: Dict[str, Any]) -> bool:
 #
 # Everything below owns I/O — the corpus read, the advisory lock, and the sidecar
 # cache — and is the `mitos status` half. Its `mitos` imports are deliberately
-# FUNCTION-LOCAL: importing `mitos.divergence` must not drag in the parser (which
-# reads `format-spec.md` from package data at import time), the store, or the cutover
-# replay machinery. `sync`'s per-entry loop imports this module for `entry_divergence`
+# FUNCTION-LOCAL (the module's only module-level `mitos` import is the stdlib leaf
+# `scope_tags`, which the pure half uses): importing `mitos.divergence` must not drag
+# in the parser (which reads `format-spec.md` from package data at import time), the
+# store, or the cutover replay machinery. `sync`'s per-entry loop imports this module for `entry_divergence`
 # alone and must not pay for any of that; the import-graph property is pinned by test.
 #
 # `sync` calls `entry_divergence` and never this: calling the fold inside sync's
@@ -301,10 +322,13 @@ _LOCK_TIMEOUT_SECONDS: float = 1.0
 
 _CACHE_BASENAME: str = "divergence_cache.json"
 
-# Bumped whenever the report SHAPE changes. Without it a cache written by a build with
-# a different species set is served verbatim to a reader that indexes the keys it
-# expects — a `KeyError` out of `mitos status`, from a stale file, for a command whose
-# entire job is to be the thing that still works.
+# Bumped whenever the report SHAPE or its VERDICT SEMANTICS change. Without it a cache
+# written by a build with a different species set is served verbatim to a reader that
+# indexes the keys it expects — a `KeyError` out of `mitos status`, from a stale file,
+# for a command whose entire job is to be the thing that still works. A verdict change
+# is the quieter case: the key hashes corpus bytes and the graph fingerprint, neither
+# of which moves when only the comparator changed, so an old build's "clean" would be
+# served as this build's answer — a sticky lie with no KeyError to announce it.
 #
 # "2" — the repairability verdict (`edge_verdicts` / `illegal_edge_types`) joined the
 # report, and `reconcilable` stopped counting entries whose edges foreclose the commit.
@@ -313,7 +337,11 @@ _CACHE_BASENAME: str = "divergence_cache.json"
 # since, neither moves — so a schema change is invisible until an unrelated edit. Every
 # future shape change needs this bump, and it is easy to forget precisely because the
 # dogfood corpus changes often enough to mask it.
-_CACHE_VERSION: str = "2"
+#
+# "3" — scope became an ordered comparison (a reorder is now a divergence, and both
+# sides casefold through `scope_tags`), and each scope row gained `order_only`. A "2"
+# sidecar holding "no scope divergence" for a reordered entry must not be served.
+_CACHE_VERSION: str = "3"
 
 
 def _empty_report(**overrides: Any) -> Dict[str, Any]:

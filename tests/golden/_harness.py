@@ -73,7 +73,9 @@ def snapshot(store: GraphStore) -> Dict[str, Any]:
         nodes[node["slug"]] = {
             "id": nid,
             "state": store.get_node_state(nid),
-            "scope": sorted(node.get("scope") or []),
+            # As hydrated: authored order. Sorting here would make the oracle blind
+            # to scope primacy (the first tag), which is a fact about the corpus.
+            "scope": list(node.get("scope") or []),
             "modifiers": store.get_modifiers(nid),
             "lineage": [n.get("slug") for n in store.get_lineage(nid)],
         }

@@ -288,10 +288,11 @@ def assemble_render(store: GraphStoreProtocol) -> Dict[str, Any]:
         # Dedupe by primary tag (the render-dedupe ADR): the full Letter-complete
         # body renders only under a decision's FIRST scope tag; under every
         # secondary tag a one-line pointer names the primary file. Single-tag
-        # decisions therefore render exactly as before. Note: the ADR says
-        # "author order", but the graph does not persist it — node_scopes is
-        # committed as a sorted set and hydrated sorted — so "first tag" here is
-        # the first of the node's scope list as every read surface presents it.
+        # decisions therefore render exactly as before. The first tag is the
+        # author's first tag: node_scopes persists it as the `ordinal` and hydrates
+        # in that order (ADR scope-primacy-is-the-authored-first-tag-persisted-as-a-
+        # node-scopes-ordinal). A graph that has not re-committed or rebuilt since
+        # the ordinal migration still reads its alphabetical backfill here.
         primaries = [d for d in decs if d.get("scope", [None])[0] == s]
         secondaries = [d for d in decs if d.get("scope", [None])[0] != s]
         s_blocks = blocks_for(primaries)

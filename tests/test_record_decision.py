@@ -836,6 +836,16 @@ def test_exists_receipt_names_the_fields_it_ignored(ws) -> None:
                                       ["alpha", "beta"], slug="pin-digest-length")
     assert changed["differs"] == ["rejected_paths", "scope"], changed
 
+    # A reorder-only re-record is a scope difference too: the first tag is the
+    # primary scope, and the stored order is not the order this call carried. (A
+    # separate node, because an `exists` re-record never mutates — the one above
+    # still holds `["alpha"]`, so reordering against it would test membership.)
+    m.record_decision_entry("Order the scope tags.", "A reason.", ["alpha", "beta"],
+                            slug="order-the-scope-tags")
+    reordered = m.record_decision_entry("Order the scope tags.", "A reason.",
+                                        ["beta", "alpha"], slug="order-the-scope-tags")
+    assert reordered["differs"] == ["scope"], reordered
+
 
 def test_exists_no_op_leaves_a_missing_source_block_missing(ws) -> None:
     """Re-recording does NOT restore a graph-only node's source block.

@@ -23,6 +23,7 @@ from mitos.errors import (
 from mitos.identity import SLUG_MAX_LEN
 from mitos.markers import (TRANSCRIPT_CLOSE, TRANSCRIPT_OPEN, is_entries_sentinel,
                            is_entry_heading, mask_inline_code)
+from mitos.scope_tags import normalize_scope_tags
 
 def load_dynamic_field_map() -> Dict[str, str]:
     """Builds the FIELD_MAP purely from format-spec.md (C5 single source, V1-D7).
@@ -647,14 +648,11 @@ def _normalize_mechanism_list(items: List[str]) -> List[str]:
 
 
 def _normalize_scope_list(items: List[str]) -> List[str]:
-    """Normalizes raw scope tags: casefold, drop empties, order-preserving dedup.
+    """Normalizes raw scope tags by delegating to ``scope_tags.normalize_scope_tags``.
 
-    Scope is a cross-kind tag set. Each tag is stripped and casefolded (Python
-    ``str.casefold`` — never SQLite ``NOCASE``/``LOWER``, MI-7/P9), empties are
-    dropped, and duplicates are removed preserving first-seen order, so no
-    empty/NULL scope row can ever reach the store (MI-9). Scope has **no**
-    ``identity.py`` counterpart (it is commentary, not hashed) — its byte-form is
-    pinned by its own golden, not by the cross-check.
+    The rule and its reasoning live in ``mitos/scope_tags.py``, shared with the
+    store's writer and the divergence comparator so the three cannot disagree. The
+    name is kept for its test import.
 
     Args:
         items: The raw scope tags (already comma-split).
@@ -662,7 +660,7 @@ def _normalize_scope_list(items: List[str]) -> List[str]:
     Returns:
         The casefolded, deduped scope list in authored order.
     """
-    return list(dict.fromkeys(s.strip().casefold() for s in items if s.strip()))
+    return normalize_scope_tags(items)
 
 
 def _normalize_questions_list(items: List[str]) -> List[str]:

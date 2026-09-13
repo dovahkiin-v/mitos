@@ -559,6 +559,8 @@ was decided.
 > `mitos sync -p <project> --reconcile-entry <slug>`, which applies that one named
 > entry's whole reconcile and exits non-zero if it did not land. An entry that has
 > already rotated into an archive is out of `sync`'s reach either way — `sync` reads
-> the buffer alone, so that one's reconciler is still `mitos rebuild`. Scope drift is
-> worth acting on first — it is a *findability* defect, so a wrong value hides the
-> decision from every scope-filtered read.
+> the buffer alone, so that one's reconciler is still `mitos rebuild`. Scope drift in
+> the tag *set* is worth acting on first — it is a *findability* defect, so a wrong
+> tag hides the decision from scope-filtered reads. A scope line whose tags only moved
+> is also reported and reconciled the same way; it hides nothing, but the first tag
+> decides which rendered scope file carries the full entry.

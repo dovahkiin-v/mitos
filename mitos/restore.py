@@ -204,6 +204,10 @@ def verify_block_in_isolation(block: str, node: Dict[str, Any]) -> None:
             raise RestoreError(
                 f"'{slug}': commentary field '{field}' did not survive the round trip"
             )
+    # Deliberately ORDER-INSENSITIVE, unlike divergence's ordered scope comparison.
+    # This check proves the regenerated block round-trips the node's identity and
+    # commentary; a reorder is not a fidelity failure, and tightening it would turn a
+    # future hydration-order quirk into a restore-source refusal. Do not "fix" it.
     if sorted(entry.scope or []) != sorted(node.get("scope") or []):
         raise RestoreError(f"'{slug}': scope did not survive the round trip")
 

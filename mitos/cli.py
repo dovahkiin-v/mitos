@@ -3333,12 +3333,24 @@ def _print_divergence_rung(report: Dict[str, Any], *, project: str) -> None:
               f"(the graph serves the stale value to every read)")
         for row in commentary[:5]:
             print(f"          - {row['slug']}: {', '.join(row['fields'])}")
-    if scope:
-        print(f"      • {len(scope)} entry(s) whose scope differs — a FINDABILITY "
-              f"defect: scope-filtered reads and `mitos scopes` miss them")
-        for row in scope[:5]:
-            print(f"          - {row['slug']}: graph {row['graph']} vs "
-                  f"markdown {row['markdown']}")
+    # Routed on the report's own `order_only` flag — `divergence` owns what kind of
+    # scope divergence a row is, so no set arithmetic is re-derived here.
+    membership = [row for row in scope if not row.get("order_only")]
+    order_only = [row for row in scope if row.get("order_only")]
+    if membership:
+        print(f"      • {len(membership)} entry(s) whose scope tags differ — a "
+              f"FINDABILITY defect: scope-filtered reads and `mitos scopes` miss them")
+        for row in membership[:5]:
+            print(f"          - {row.get('slug')}: graph {row.get('graph')} vs "
+                  f"markdown {row.get('markdown')}")
+    if order_only:
+        print(f"      • {len(order_only)} entry(s) whose scope tags match but are "
+              f"ordered differently — every scope-filtered read still finds them; the "
+              f"first tag is the primary scope, so the graph renders the full entry "
+              f"under a different scope file than the markdown names first")
+        for row in order_only[:5]:
+            print(f"          - {row.get('slug')}: graph {row.get('graph')} vs "
+                  f"markdown {row.get('markdown')}")
     if report.get("edges"):
         print(f"      • {len(report['edges'])} entry(s) whose declared relations "
               f"differ from the stored edges")
