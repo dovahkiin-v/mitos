@@ -1946,8 +1946,8 @@ def test_the_audit_row_records_full_edge_state_not_a_delta(
 # Committed green against the unmodified step 4 before the rotation core was
 # rewritten (CC-9). A red here after the rewrite means behaviour changed: fix the
 # code, not the row. Messages are deliberately not asserted — their channel moves.
-# The archive filename is wall-clock in 1c; 1d re-targets these rows to the UTC
-# quarter of `created_at` (grep: "1d re-targets").
+# The archive filename is the UTC quarter of each entry's `created_at`, so these rows
+# pin the commit stamp rather than straddle a wall-clock quarter boundary.
 
 _ROTATE_FIRST = (
     "## 2026-05-19 — rotate-first — Rotate First\n"
@@ -1965,10 +1965,16 @@ _ROTATE_SECOND = (
 )
 
 
-def _quarter_name() -> str:
-    from datetime import datetime
-    d = datetime.now()
-    return f"{d.year}-Q{(d.month - 1) // 3 + 1}.md"
+# The commit stamp a row pins, and the archive that stamp names. A fixed stamp makes
+# the expected name known before the sync, whatever the day the suite runs.
+_PINNED_STAMP = "2026-02-10T09:00:00+00:00"
+_PINNED_ARCHIVE = "2026-Q1.md"
+
+
+def _stored_archive_name(store: GraphStore, slug: str) -> str:
+    from mitos.rotation import archive_name_for
+    node_id = store.get_node_by_slug(slug)["id"]
+    return archive_name_for(store.created_at_for([node_id])[node_id])
 
 
 def _healed_header(manager: MitosSyncManager, config: MitosConfig) -> str:
@@ -1992,7 +1998,8 @@ def test_rotation_characterization_exact_buffer_and_archive_bytes(
     byte identity, not something to tidy. The blank separators leave the buffer with
     their blocks. An OQ in questions.md is not rotated and questions.md is untouched.
 
-    1d re-targets this row's archive name to the UTC quarter of ``created_at``.
+    The archive is named for the UTC quarter of the entries' ``created_at``. The commit
+    stamp is pinned, so that name is known before the sync.
     """
     config, manager, tmpdir = sync_env
     config.env["GEMINI_API_KEY"] = "mock_key"
@@ -2010,36 +2017,29 @@ def test_rotation_characterization_exact_buffer_and_archive_bytes(
     with open(questions_path, "r", encoding="utf-8") as f:
         questions_before = f.read()
 
-    name_before = _quarter_name()
     os.makedirs(config.archive_dir)
-    with open(os.path.join(config.archive_dir, name_before), "w", encoding="utf-8") as f:
+    with open(os.path.join(config.archive_dir, _PINNED_ARCHIVE), "w", encoding="utf-8") as f:
         f.write("PRIOR\n")
 
-    manager.perform_sync(auto_accept=True)
-    name_after = _quarter_name()
+    with patch("mitos.store._utc_now_iso", return_value=_PINNED_STAMP):
+        manager.perform_sync(auto_accept=True)
 
     with open(config.decisions_file, "r", encoding="utf-8") as f:
         assert f.read() == header
 
     appended = _ROTATE_SECOND + "\n" + "\n" + _ROTATE_FIRST + "\n" + "\n"
-    archives = sorted(os.listdir(config.archive_dir))
-    if name_before == name_after:
-        assert archives == [name_before]
-        with open(os.path.join(config.archive_dir, name_before), "r", encoding="utf-8") as f:
-            assert f.read() == "PRIOR\n" + appended
-    else:  # the sync straddled a quarter boundary
-        assert archives == sorted([name_before, name_after])
-        with open(os.path.join(config.archive_dir, name_after), "r", encoding="utf-8") as f:
-            assert f.read() == appended
+    assert sorted(os.listdir(config.archive_dir)) == [_PINNED_ARCHIVE]
+    with open(os.path.join(config.archive_dir, _PINNED_ARCHIVE), "r", encoding="utf-8") as f:
+        assert f.read() == "PRIOR\n" + appended
 
-    import re
-    assert all(re.match(r"^(\d{4})-Q([1-4])\.md$", n) for n in archives)
+    from mitos.cutover import _ARCHIVE_FILENAME_RE
+    assert _ARCHIVE_FILENAME_RE.match(_PINNED_ARCHIVE)
 
     with open(questions_path, "r", encoding="utf-8") as f:
         assert f.read() == questions_before
     store = GraphStore(config.db_path)
-    assert store.get_node_by_slug("rotate-first") is not None
-    assert store.get_node_by_slug("rotate-second") is not None
+    assert _stored_archive_name(store, "rotate-first") == _PINNED_ARCHIVE
+    assert _stored_archive_name(store, "rotate-second") == _PINNED_ARCHIVE
     assert {q["slug"] for q in store.get_open_questions()} == {"kept-oq"}
 
 
@@ -2054,7 +2054,8 @@ def test_rotation_characterization_fixpoint_commit_rotates_last(
     ``_record_decision_block`` appends it to ``synced_blocks`` after every main-pass
     commit. So it is archived after the plain decision, although it sits below it.
 
-    1d re-targets this row's archive name to the UTC quarter of ``created_at``.
+    The archive is named for the UTC quarter of ``created_at``, pinned here, and the
+    fixpoint's commit is looked up exactly like the main pass's.
     """
     config, manager, tmpdir = sync_env
     config.env["GEMINI_API_KEY"] = "mock_key"
@@ -2076,17 +2077,161 @@ def test_rotation_characterization_fixpoint_commit_rotates_last(
         "**Questions:** Which approach do we commit to?\n",
     )
 
-    names = {_quarter_name()}
-    manager.perform_sync(auto_accept=True)
-    names.add(_quarter_name())
+    with patch("mitos.store._utc_now_iso", return_value=_PINNED_STAMP):
+        manager.perform_sync(auto_accept=True)
 
     with open(config.decisions_file, "r", encoding="utf-8") as f:
         assert f.read() == header
-    archives = os.listdir(config.archive_dir)
-    assert len(archives) == 1 and archives[0] in names
-    with open(os.path.join(config.archive_dir, archives[0]), "r", encoding="utf-8") as f:
+    assert os.listdir(config.archive_dir) == [_PINNED_ARCHIVE]
+    with open(os.path.join(config.archive_dir, _PINNED_ARCHIVE), "r", encoding="utf-8") as f:
         assert f.read() == _ROTATE_FIRST + "\n" + "\n" + resolver + "\n" + "\n"
-    assert GraphStore(config.db_path).get_node_by_slug("resolver-rotates") is not None
+    assert _stored_archive_name(GraphStore(config.db_path), "resolver-rotates") == _PINNED_ARCHIVE
+
+
+@patch("google.genai.Client")
+def test_f1_the_archive_is_named_for_created_at_not_the_wall_clock(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """F1 (defect 5): the name follows the entry's stamp, whatever today's quarter is.
+
+    Only the commit stamp is patched, never a clock: after 1d the caller reads none.
+    """
+    config, manager, tmpdir = sync_env
+    config.env["GEMINI_API_KEY"] = "mock_key"
+    _append_decision(config, _rotating_decision("f1-dated"))
+
+    with patch("mitos.store._utc_now_iso", return_value="2025-11-15T12:00:00+00:00"):
+        manager.perform_sync(auto_accept=True)
+
+    assert os.listdir(config.archive_dir) == ["2025-Q4.md"]
+    assert "f1-dated" in _read(os.path.join(config.archive_dir, "2025-Q4.md"))
+    assert "f1-dated" not in _read(config.decisions_file)
+
+
+def test_the_rotation_step_reads_no_clock() -> None:
+    """Step 4 names archives from the stored stamp, so no clock call may creep back in.
+
+    Scoped to the ``if synced_blocks:`` step alone: the stale-entry warning elsewhere
+    in the same method reads the clock, and that one is not rotation's.
+    """
+    import ast
+    import mitos.sync as sync_module
+
+    with open(sync_module.__file__, encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    steps = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.If) and isinstance(node.test, ast.Name)
+        and node.test.id == "synced_blocks"
+    ]
+    assert len(steps) == 1, "non-vacuity: exactly one rotation step"
+    attributes = {
+        (node.value.id if isinstance(node.value, ast.Name) else None, node.attr)
+        for node in ast.walk(steps[0]) if isinstance(node, ast.Attribute)
+    }
+    assert {("rotation", "archive_name_for"), ("rotation", "rotate")} <= attributes
+    assert not {attr for _owner, attr in attributes} & {"now", "utcnow", "today"}
+
+
+@patch("google.genai.Client")
+def test_blocks_from_one_sync_are_filed_under_their_own_quarters(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """One sync, two stamps: the main pass's commit and the fixpoint's land apart.
+
+    The stamp moves when the fixpoint starts, so the resolver it commits carries
+    another quarter than the plain decision — and the lookup hits for both.
+    """
+    config, manager, tmpdir = sync_env
+    config.env["GEMINI_API_KEY"] = "mock_key"
+    _set_enrichment_passthrough(mock_client)
+    resolver = (
+        "## 2026-05-19 — resolver-apart — Resolver Apart\n"
+        "**Decided:** This decision answers the other thread.\n"
+        "**Rejected:** Leaving it open.\n"
+        "**Resolves:** oq-apart-target\n"
+    )
+    _healed_header(manager, config)
+    _append_decision(config, _ROTATE_FIRST)
+    _append_decision(config, resolver)
+    _write_questions(
+        tmpdir,
+        "### oq-apart-target\n\n"
+        "**Topic:** The thread the resolver closes.\n"
+        "**Questions:** Which approach do we commit to?\n",
+    )
+    import mitos.sync as sync_module
+    stamp = {"now": _PINNED_STAMP}
+    real_fixpoint = sync_module.commit_quarantine_fixpoint
+
+    def _fixpoint(*args, **kwargs):
+        stamp["now"] = "2025-11-15T12:00:00+00:00"
+        return real_fixpoint(*args, **kwargs)
+
+    with patch("mitos.store._utc_now_iso", side_effect=lambda: stamp["now"]), \
+            patch("mitos.sync.commit_quarantine_fixpoint", side_effect=_fixpoint):
+        manager.perform_sync(auto_accept=True)
+
+    assert sorted(os.listdir(config.archive_dir)) == ["2025-Q4.md", _PINNED_ARCHIVE]
+    assert _read(os.path.join(config.archive_dir, _PINNED_ARCHIVE)) == _ROTATE_FIRST + "\n\n"
+    assert _read(os.path.join(config.archive_dir, "2025-Q4.md")) == resolver + "\n\n"
+
+
+@patch("google.genai.Client")
+def test_a_failed_created_at_lookup_takes_the_failure_line_and_writes_nothing(
+    mock_client: MagicMock,
+    sync_env: Tuple[MitosConfig, MitosSyncManager, str],
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """D-1d-3: a graph read that fails before any write is the shipped failure, verbatim.
+
+    The commit stands, render still runs, and nothing about rotation reaches stdout.
+    """
+    from mitos.errors import DatabaseError
+
+    config, manager, tmpdir = sync_env
+    config.env["GEMINI_API_KEY"] = "mock_key"
+    _healed_header(manager, config)
+    _append_decision(config, _rotating_decision("lookup-refused"))
+    before = _read(config.decisions_file)
+
+    with patch("mitos.store.GraphStore.created_at_for",
+               side_effect=DatabaseError("injected: graph read refused")):
+        manager.perform_sync(auto_accept=True)
+
+    assert _read(config.decisions_file) == before
+    assert not os.path.exists(config.archive_dir)
+    assert GraphStore(config.db_path).get_node_by_slug("lookup-refused") is not None
+    assert os.path.exists(os.path.join(tmpdir, "live_axioms.md")), "render ran after rotation"
+    captured = capsys.readouterr()
+    failed = [ln for ln in captured.err.splitlines() if "Archive rotation failed" in ln]
+    assert len(failed) == 1, captured.err
+    assert "injected: graph read refused" in failed[0]
+    assert "none of the 1 entries was removed" in failed[0]
+    assert "Archive rotation failed" not in captured.out
+
+
+@patch("google.genai.Client")
+def test_a_node_with_no_stored_created_at_is_named_in_the_failure_line(
+    mock_client: MagicMock,
+    sync_env: Tuple[MitosConfig, MitosSyncManager, str],
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A missing id is located by slug, not rendered as a bare 64-hex ``KeyError``."""
+    config, manager, tmpdir = sync_env
+    config.env["GEMINI_API_KEY"] = "mock_key"
+    _healed_header(manager, config)
+    _append_decision(config, _rotating_decision("stamp-missing"))
+    before = _read(config.decisions_file)
+
+    with patch("mitos.store.GraphStore.created_at_for", return_value={}):
+        manager.perform_sync(auto_accept=True)
+
+    assert _read(config.decisions_file) == before
+    assert not os.path.exists(config.archive_dir)
+    failed = [ln for ln in capsys.readouterr().err.splitlines()
+              if "Archive rotation failed" in ln]
+    assert len(failed) == 1 and "'stamp-missing'" in failed[0], failed
 
 
 # ===========================================================================

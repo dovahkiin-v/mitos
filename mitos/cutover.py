@@ -70,9 +70,11 @@ from mitos.store import GraphStore, open_connection, write_embedding_seed
 
 logger = logging.getLogger(__name__)
 
-# Canonical archive filename, ``{year}-Q{quarter}.md`` (config
-# ``rotation_archive_path_template``). Anchored so a stray ``notes.md`` in the
-# archive dir is ignored, not mis-parsed as a quarter.
+# Canonical archive filename, ``{year}-Q{quarter}.md``. Its writer is
+# ``rotation.archive_name_for``, and the shape is a hand-agreed contract between the
+# two, not a config template. Anchored, so a file outside the shape (a stray
+# ``notes.md``, an in-flight ``.tmp``) is skipped silently rather than mis-parsed as a
+# quarter.
 _ARCHIVE_FILENAME_RE = re.compile(r"^(\d{4})-Q([1-4])\.md$")
 
 # The kill-edge value set, mirrored from ``store._KILL_EDGE_TYPES_SQL`` as a LOCAL

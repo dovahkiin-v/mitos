@@ -285,41 +285,25 @@ def test_importing_the_leaf_pulls_in_no_other_mitos_module():
     assert out.stdout.strip() == "mitos,mitos.atomic_file"
 
 
-# --- append_source (1c): durable, not atomic ------------------------------------------
+# --- ensure_parent_directory (1d): the durable mkdir before a first archive write ----
+#
+# The bytes-and-mode claim moved to `test_rotation.py`'s archive-mode row: the archive
+# file itself is now written by `write_source`, whose shared mode rules apply.
 
-def test_append_source_appends_plain_text_mode_bytes_and_keeps_the_mode(tmp_path):
-    """An append that re-modes would widen or narrow a file the user permissioned."""
-    text = "## Sprendimas — ąčę ✓\n\nline two\r\nend\n"
-    reference = tmp_path / "reference.md"
-    target = tmp_path / "2026-Q3.md"
-    for path in (reference, target):
-        path.write_text("PRIOR\n", encoding="utf-8")
-    with open(reference, "a", encoding="utf-8") as fh:
-        fh.write(text)
-    os.chmod(target, 0o640)
-    assert 0o640 != _umask_default(), "non-vacuity: the kept mode must not be the default"
-
-    atomic_file.append_source(str(target), text)
-
-    assert target.read_bytes() == reference.read_bytes()
-    assert _mode(target) == 0o640
-    assert _temps(tmp_path) == []
-
-
-def test_append_source_creates_the_file_and_its_parents_at_the_umask_default(tmp_path):
+def test_ensure_parent_directory_creates_the_parents_at_the_umask_default(tmp_path):
     target = tmp_path / "decisions" / "archive" / "2026-Q3.md"
     previous = os.umask(0o027)
     try:
-        atomic_file.append_source(str(target), "block\n")
+        atomic_file.ensure_parent_directory(str(target))
     finally:
         os.umask(previous)
 
-    assert target.read_text(encoding="utf-8") == "block\n"
-    assert _mode(target) == 0o640
+    assert target.parent.is_dir() and not target.exists()
+    assert _mode(target.parent) == _mode(target.parent.parent) == 0o750
 
 
-def test_append_source_fsyncs_the_file_and_the_created_directories(tmp_path):
-    """Without these, the archive bytes sit in the page cache while the buffer replace lands."""
+def test_ensure_parent_directory_fsyncs_each_created_directorys_entry(tmp_path):
+    """Without these, a power loss can drop a new archive/ after the buffer replace lands."""
     target = tmp_path / "decisions" / "archive" / "2026-Q3.md"
     file_syncs, dir_syncs = [], []
     real_fsync = os.fsync
@@ -329,15 +313,21 @@ def test_append_source_fsyncs_the_file_and_the_created_directories(tmp_path):
         return real_fsync(fd)
 
     with patch("mitos.atomic_file.os.fsync", side_effect=_fsync):
-        atomic_file.append_source(str(target), "block\n")
+        atomic_file.ensure_parent_directory(str(target))
 
-    assert file_syncs == [os.stat(target).st_ino]
-    for directory in (target.parent, target.parent.parent, tmp_path):
+    assert file_syncs == []
+    # `archive/`'s entry lives in `decisions/`, and `decisions/`'s in tmp_path.
+    for directory in (target.parent.parent, tmp_path):
         assert os.stat(directory).st_ino in dir_syncs, f"{directory} entry was never synced"
 
+    dir_syncs.clear()
+    with patch("mitos.atomic_file.os.fsync", side_effect=_fsync):
+        atomic_file.ensure_parent_directory(str(target))
+    assert dir_syncs == [], "nothing was created, so there is no entry to persist"
 
-def test_append_source_swallows_a_refused_directory_fsync(tmp_path):
-    target = tmp_path / "2026-Q3.md"
+
+def test_ensure_parent_directory_swallows_a_refused_directory_fsync(tmp_path):
+    target = tmp_path / "archive" / "2026-Q3.md"
     real_fsync = os.fsync
     refused = []
 
@@ -348,19 +338,19 @@ def test_append_source_swallows_a_refused_directory_fsync(tmp_path):
         return real_fsync(fd)
 
     with patch("mitos.atomic_file.os.fsync", side_effect=_fsync):
-        atomic_file.append_source(str(target), "block\n")
+        atomic_file.ensure_parent_directory(str(target))
 
     assert refused, "the directory fsync was never reached"
-    assert target.read_text(encoding="utf-8") == "block\n"
+    assert target.parent.is_dir()
 
 
-def test_append_source_propagates_a_blocked_parent_and_writes_elsewhere_nothing(tmp_path):
+def test_ensure_parent_directory_propagates_a_blocked_parent_and_writes_nothing(tmp_path):
     """A swallowed makedirs failure would let rotation replace the buffer with no archive."""
     (tmp_path / "decisions").write_text("not a directory\n", encoding="utf-8")
     before = sorted(os.listdir(tmp_path))
 
     with pytest.raises((NotADirectoryError, FileExistsError)):
-        atomic_file.append_source(str(tmp_path / "decisions" / "archive" / "2026-Q3.md"),
-                                  "block\n")
+        atomic_file.ensure_parent_directory(
+            str(tmp_path / "decisions" / "archive" / "2026-Q3.md"))
 
     assert sorted(os.listdir(tmp_path)) == before

@@ -18,6 +18,8 @@ import tempfile
 import os
 import json
 import logging
+from unittest.mock import patch
+
 import pytest
 from mitos.store import GraphStore, ValidationError, compute_hash
 from mitos.identity import compute_node_id
@@ -1826,3 +1828,39 @@ def test_edge_kind_matrix_matches_ddl(temp_store: GraphStore) -> None:
         conn.close()
 
     assert checked == 36, f"expected the full 9x2x2 grid, checked {checked}"
+
+
+# --- created_at_for (surface-entropy 1d): the batch read rotation names archives from ---
+
+
+def _committed_ids(store: GraphStore, count: int) -> list:
+    ids = []
+    for n in range(count):
+        store.commit_parsed_entry(_decision(slug=f"stamped-{n}", axiom=f"Stamped axiom {n}."))
+        ids.append(compute_node_id(kind="decision", axiom=f"Stamped axiom {n}.",
+                                   mechanism_refs=[]))
+    return ids
+
+
+def test_created_at_for_returns_exactly_the_present_ids(temp_store: GraphStore) -> None:
+    """Absent ids are missing from the map, never mapped to ``None``."""
+    ids = _committed_ids(temp_store, 3)
+    absent = "0" * 64
+
+    stamps = temp_store.created_at_for([ids[0], absent, ids[2]])
+
+    assert set(stamps) == {ids[0], ids[2]}
+    for node_id in (ids[0], ids[2]):
+        assert stamps[node_id] == _node_row(temp_store, node_id)["created_at"]
+    assert temp_store.created_at_for([]) == {}
+
+
+def test_created_at_for_reads_every_chunk(temp_store: GraphStore) -> None:
+    """A lookup larger than one statement's chunk must still return the whole map."""
+    ids = _committed_ids(temp_store, 5)
+    request = ids + ["f" * 64, "e" * 64]
+
+    with patch("mitos.store._CREATED_AT_CHUNK", 2):
+        stamps = temp_store.created_at_for(request)
+
+    assert set(stamps) == set(ids)

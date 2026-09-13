@@ -7,13 +7,17 @@ rests on: every archive append returns before the buffer replace starts.
 
 import ast
 import contextlib
+import errno
 import os
+import stat
 import subprocess
 import sys
 from unittest.mock import patch
 
+import pytest
+
 from mitos import atomic_file, rotation
-from mitos.rotation import RotationBlock, plan_rotation, rotate
+from mitos.rotation import RotationBlock, archive_name_for, plan_rotation, rotate
 
 _HEADER = "# Decisions\n<!-- BEGIN ENTRIES -->\n"
 
@@ -154,27 +158,38 @@ def _workspace(tmp_path, buffer: str):
     return str(buffer_path), str(tmp_path / "decisions" / "archive")
 
 
+def _temps(directory) -> list:
+    return [n for n in os.listdir(directory) if n.endswith(".tmp")]
+
+
+def _is_dir_fd(fd: int) -> bool:
+    return stat.S_ISDIR(os.fstat(fd).st_mode)
+
+
+def _read_bytes(path) -> bytes:
+    with open(path, "rb") as fh:
+        return fh.read()
+
+
 def test_blocks_for_two_archives_write_two_files_before_the_buffer(tmp_path):
-    """P3: 1d's `created_at` partition is a caller-only change — one batch, two files."""
+    """P3: 1d's `created_at` partition is a caller-only change — one batch, two files.
+
+    Each archive is a whole-file replace, and every one lands before the buffer's.
+    """
     a, b = _entry("a"), _entry("b")
     buffer_path, archive_dir = _workspace(tmp_path, _HEADER + a + b)
     events = []
-    real_append, real_write = atomic_file.append_source, atomic_file.write_source
-
-    def _append(path, text):
-        events.append(("append", os.path.basename(path)))
-        return real_append(path, text)
+    real_write = atomic_file.write_source
 
     def _write(path, content):
         events.append(("write", os.path.basename(path)))
         return real_write(path, content)
 
-    with patch("mitos.atomic_file.append_source", side_effect=_append), \
-            patch("mitos.atomic_file.write_source", side_effect=_write):
+    with patch("mitos.atomic_file.write_source", side_effect=_write):
         outcome = rotate(contextlib.nullcontext(), buffer_path, archive_dir,
                          [_block("a", a, "2026-Q2.md"), _block("b", b, "2026-Q3.md")])
 
-    assert events == [("append", "2026-Q2.md"), ("append", "2026-Q3.md"),
+    assert events == [("write", "2026-Q2.md"), ("write", "2026-Q3.md"),
                       ("write", "decisions.md")]
     assert [os.path.basename(p) for p in outcome.archive_paths] == ["2026-Q2.md", "2026-Q3.md"]
     with open(os.path.join(archive_dir, "2026-Q2.md"), encoding="utf-8") as fh:
@@ -206,22 +221,228 @@ def test_the_archive_is_fsynced_before_the_buffer(tmp_path):
 
 
 def test_a_failed_buffer_replace_leaves_the_buffer_whole(tmp_path):
+    """The archive replace lands and the buffer's is refused: a copy in both, harmless (M2).
+
+    The injection is filtered to the buffer, because the archive is a replace too.
+    """
     a = _entry("a")
     buffer = _HEADER + a
     buffer_path, archive_dir = _workspace(tmp_path, buffer)
+    buffer_real = os.path.realpath(buffer_path)
+    real_replace = os.replace
+    fired = []
 
-    with patch("mitos.atomic_file.os.replace", side_effect=OSError("disk gone")):
-        try:
+    def _replace(src, dst, *args, **kwargs):
+        if os.path.realpath(dst) == buffer_real:
+            fired.append(dst)
+            raise OSError("disk gone")
+        return real_replace(src, dst, *args, **kwargs)
+
+    with patch("mitos.atomic_file.os.replace", side_effect=_replace):
+        with pytest.raises(OSError):
             rotate(contextlib.nullcontext(), buffer_path, archive_dir, [_block("a", a)])
-        except OSError:
-            pass
-        else:
-            raise AssertionError("the replace failure must propagate")
 
+    assert len(fired) == 1, "the buffer replace must be attempted exactly once"
     with open(buffer_path, encoding="utf-8") as fh:
         assert fh.read() == buffer
     with open(os.path.join(archive_dir, "2026-Q3.md"), encoding="utf-8") as fh:
         assert fh.read() == a + "\n"
+    assert _temps(tmp_path) == [] and _temps(archive_dir) == []
+
+
+# --- 1d: the archive is a whole-file replace ------------------------------------------
+
+def test_f3_a_refused_archive_fsync_leaves_the_archive_byte_identical(tmp_path):
+    """F3 (CC-13): an append has already put its bytes down when its fsync raises.
+
+    A torn tail followed by a retry's re-append never fails to parse, and with a
+    newline guard the truncated commentary wins on replay. So the archive write must
+    land whole or not at all.
+    """
+    a = _entry("a")
+    buffer = _HEADER + a
+    buffer_path, archive_dir = _workspace(tmp_path, buffer)
+    os.makedirs(archive_dir)
+    archive = os.path.join(archive_dir, "2026-Q3.md")
+    with open(archive, "w", encoding="utf-8") as fh:
+        fh.write(_entry("settled") + "\n")
+    archive_before, buffer_before = _read_bytes(archive), _read_bytes(buffer_path)
+    real_fsync = os.fsync
+    refused = []
+
+    def _fsync(fd):
+        if not refused and not _is_dir_fd(fd):
+            refused.append(fd)
+            raise OSError(errno.EIO, "I/O error")
+        return real_fsync(fd)
+
+    with patch("mitos.atomic_file.os.fsync", side_effect=_fsync):
+        with pytest.raises(OSError):
+            rotate(contextlib.nullcontext(), buffer_path, archive_dir, [_block("a", a)])
+
+    assert len(refused) == 1
+    assert _read_bytes(archive) == archive_before
+    assert _read_bytes(buffer_path) == buffer_before
+    assert _temps(archive_dir) == [] and _temps(tmp_path) == []
+
+
+def test_f4_a_block_rotated_into_an_archive_without_a_final_newline_parses_back(tmp_path):
+    """F4: a hand-edited archive ending mid-line must not swallow the next heading.
+
+    Glued onto ``PRIOR``, the heading is no heading, and the rotated entry silently
+    vanishes from the stream — no failure is reported.
+    """
+    from mitos.parser import parse_file_reversed
+
+    a = _entry("rotate-first")
+    buffer_path, archive_dir = _workspace(tmp_path, _HEADER + a)
+    os.makedirs(archive_dir)
+    archive = os.path.join(archive_dir, "2026-Q3.md")
+    with open(archive, "w", encoding="utf-8") as fh:
+        fh.write("PRIOR")
+
+    rotate(contextlib.nullcontext(), buffer_path, archive_dir, [_block("rotate-first", a)])
+
+    failures = []
+    assert [e.slug for e in parse_file_reversed(archive, "decision", failures)] == [
+        "rotate-first"]
+    assert failures == []
+    with open(archive, encoding="utf-8") as fh:
+        assert fh.read() == "PRIOR\n" + a + "\n"
+
+
+def test_an_archive_ending_in_a_newline_gains_no_separator(tmp_path):
+    """The guard fires only on a missing final newline; mitos's own files never need it."""
+    a = _entry("a")
+    buffer_path, archive_dir = _workspace(tmp_path, _HEADER + a)
+    os.makedirs(archive_dir)
+    archive = os.path.join(archive_dir, "2026-Q3.md")
+    with open(archive, "w", encoding="utf-8") as fh:
+        fh.write("PRIOR\n")
+
+    rotate(contextlib.nullcontext(), buffer_path, archive_dir, [_block("a", a)])
+
+    with open(archive, encoding="utf-8") as fh:
+        assert fh.read() == "PRIOR\n" + a + "\n"
+
+
+def test_an_undecodable_second_archive_changes_no_file(tmp_path):
+    """Every archive is read before any is written, so a late decode fault writes nothing."""
+    a, b = _entry("a"), _entry("b")
+    buffer_path, archive_dir = _workspace(tmp_path, _HEADER + a + b)
+    os.makedirs(archive_dir)
+    second = os.path.join(archive_dir, "2026-Q3.md")
+    with open(second, "wb") as fh:
+        fh.write(b"PRIOR \xff\xfe not utf-8\n")
+    buffer_before = _read_bytes(buffer_path)
+
+    with pytest.raises(UnicodeDecodeError):
+        rotate(contextlib.nullcontext(), buffer_path, archive_dir,
+               [_block("a", a, "2026-Q2.md"), _block("b", b, "2026-Q3.md")])
+
+    assert sorted(os.listdir(archive_dir)) == ["2026-Q3.md"]
+    assert _read_bytes(second) == b"PRIOR \xff\xfe not utf-8\n"
+    assert _read_bytes(buffer_path) == buffer_before
+
+
+def test_an_existing_archive_keeps_its_mode_and_gains_plain_text_mode_bytes(tmp_path):
+    """A rewrite that re-modes would widen or narrow a file the user permissioned."""
+    a = _entry("a", " Sprendimas — ąčę ✓")
+    buffer_path, archive_dir = _workspace(tmp_path, _HEADER + a)
+    os.makedirs(archive_dir)
+    archive = os.path.join(archive_dir, "2026-Q3.md")
+    reference = tmp_path / "reference.md"
+    for path in (archive, reference):
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("PRIOR\n")
+    with open(reference, "a", encoding="utf-8") as fh:
+        fh.write(a + "\n")
+    os.chmod(archive, 0o640)
+    umask = os.umask(0)
+    os.umask(umask)
+    assert 0o640 != 0o666 & ~umask, "non-vacuity: the kept mode must not be the default"
+
+    rotate(contextlib.nullcontext(), buffer_path, archive_dir, [_block("a", a)])
+
+    assert _read_bytes(archive) == _read_bytes(reference)
+    assert stat.S_IMODE(os.stat(archive).st_mode) == 0o640
+    assert _temps(archive_dir) == []
+
+
+def test_a_fresh_archive_directory_is_durable_before_the_buffer_write(tmp_path):
+    """A new archive/ that only the page cache knows about reopens D1 one layer down."""
+    a = _entry("a")
+    buffer_path, archive_dir = _workspace(tmp_path, _HEADER + a)
+    synced = []
+    real_fsync = os.fsync
+
+    def _fsync(fd):
+        synced.append(os.fstat(fd).st_ino)
+        return real_fsync(fd)
+
+    previous = os.umask(0o027)
+    try:
+        with patch("mitos.atomic_file.os.fsync", side_effect=_fsync):
+            rotate(contextlib.nullcontext(), buffer_path, archive_dir, [_block("a", a)])
+    finally:
+        os.umask(previous)
+
+    archive = os.path.join(archive_dir, "2026-Q3.md")
+    assert stat.S_IMODE(os.stat(archive).st_mode) == 0o640
+    buffer_at = synced.index(os.stat(buffer_path).st_ino)
+    # The file's entry lives in archive/, archive/'s in decisions/, decisions/'s in tmp_path.
+    for directory in (archive_dir, os.path.dirname(archive_dir), str(tmp_path)):
+        ino = os.stat(directory).st_ino
+        assert ino in synced[:buffer_at], f"{directory} was not synced before the buffer"
+
+
+# --- 1d: archive_name_for ------------------------------------------------------------
+
+@pytest.mark.parametrize("stamp, name", [
+    ("2026-03-31T23:59:59.999999+00:00", "2026-Q1.md"),
+    ("2026-04-01T00:00:00+00:00", "2026-Q2.md"),
+    ("2026-12-31T23:59:59+00:00", "2026-Q4.md"),
+    ("2027-01-01T00:00:00+00:00", "2027-Q1.md"),
+    ("2026-09-13T17:21:14.640904+00:00", "2026-Q3.md"),
+    ("2026-09-13T17:21:14Z", "2026-Q3.md"),
+])
+def test_the_archive_name_is_the_quarter_of_a_utc_stamp(stamp, name):
+    assert archive_name_for(stamp) == name
+
+
+@pytest.mark.parametrize("stamp, name", [
+    ("2026-09-30T23:30:00-02:00", "2026-Q4.md"),
+    ("2026-10-01T01:00:00+03:00", "2026-Q3.md"),
+    ("2026-12-31T22:00:00-05:00", "2027-Q1.md"),
+])
+def test_an_offset_stamp_is_converted_to_utc_before_it_is_named(stamp, name):
+    """Naming the local quarter would file one instant under two names."""
+    assert archive_name_for(stamp) == name
+
+
+@pytest.mark.parametrize("stamp", ["2026-06-23T16:04:18", "2026-09-13"])
+def test_a_naive_stamp_is_refused(stamp):
+    """Converting it would silently assume local time — the defect being fixed."""
+    with pytest.raises(ValueError):
+        archive_name_for(stamp)
+
+
+@pytest.mark.parametrize("stamp", ["garbage", ""])
+def test_an_unparseable_stamp_is_refused(stamp):
+    with pytest.raises(ValueError):
+        archive_name_for(stamp)
+
+
+def test_every_archive_name_matches_the_archive_readers_filename_shape():
+    """The writer half of a hand-agreed contract; the reader's regex is imported, not copied."""
+    from mitos.cutover import _ARCHIVE_FILENAME_RE
+
+    names = {
+        archive_name_for(f"{year}-{month:02d}-01T00:00:00+00:00")
+        for year in (2026, 2027) for month in range(1, 13)
+    }
+    assert len(names) == 8, "non-vacuity: two years give eight quarters"
+    assert all(_ARCHIVE_FILENAME_RE.match(name) for name in names)
 
 
 class _MutatingLock:

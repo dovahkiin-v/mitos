@@ -537,9 +537,10 @@ commentary field byte-identical — and the whole buffer is re-parsed after the 
 prove no neighbouring entry was disturbed. Anything short of that is reported and
 skipped, and the file is rolled back byte-for-byte.
 
-Restored entries land in the **buffer**, not an archive: archives are
-quarter-partitioned and a node's `created_at` is stamped at commit time, so dating a
-restored entry would mean inventing a date in your gold source.
+Restored entries land in the **buffer**, not an archive: `restore-source` splices into
+`decisions.md`. Archives are written only by rotation, which files an entry under the
+UTC quarter of its `created_at` in the graph — the quarter the graph first saw it, not
+the date it was decided.
 
 `--slug <name>` restores one node; `--json` emits a machine-readable report.
 

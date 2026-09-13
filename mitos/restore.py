@@ -17,10 +17,10 @@ node id while ALSO minting a phantom entry — or would bleed into its neighbour
 the retired `mark` mode is a live demonstration of. So the whole buffer is re-parsed
 after the splice and every pre-existing entry must be byte-unchanged.
 
-**Restored into the buffer, never an archive.** Archives are quarter-partitioned and
-`nodes.created_at` is stamped at COMMIT time, not authoring time, so it cannot date an
-entry honestly — most of this corpus stamps one month because it was re-committed
-wholesale then. Choosing a quarter would put a fabricated date in the gold source.
+**Restored into the buffer, never an archive.** Restoring is a splice into the buffer.
+Archives are written only by rotation, which files an entry under the UTC quarter of
+its graph `created_at` — the quarter this graph first saw the entry, not when the
+decision was made.
 """
 
 import json

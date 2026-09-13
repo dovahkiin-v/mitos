@@ -3404,9 +3404,9 @@ def cmd_restore_source(
     an authoring act, and it refuses to write anything whose round trip it cannot
     prove.
 
-    Restored into the BUFFER, never an archive: archives are quarter-partitioned and
-    `created_at` is stamped at commit time, so choosing a quarter would put a
-    fabricated date in the gold source.
+    Restored into the BUFFER, never an archive: this verb is a buffer splice. Archives
+    are written only by rotation, which files an entry under the UTC quarter of its
+    graph `created_at` — when this graph first saw it, not when it was decided.
 
     Args:
         config: The workspace config.

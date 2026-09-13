@@ -10,7 +10,7 @@ import os
 import hashlib
 import logging
 from datetime import datetime, timezone
-from typing import List, Dict, Optional, Any, Set, Tuple
+from typing import List, Dict, Optional, Any, Sequence, Set, Tuple
 from mitos.errors import (
     DatabaseError,
     ValidationError,
@@ -364,6 +364,11 @@ def compute_hash(
         
     hasher.update(raw_text.encode("utf-8"))
     return hasher.hexdigest()
+
+
+# Ids bound per statement in ``GraphStore.created_at_for``: far below SQLite's
+# bound-variable limit on every build, including the older 999-variable default.
+_CREATED_AT_CHUNK = 500
 
 
 def _utc_now_iso() -> str:
@@ -911,6 +916,44 @@ class GraphStore:
             node["topic"] = topic
             node["questions_raised"] = json.loads(questions_raised_json or "[]")
         return node
+
+    def created_at_for(self, node_ids: Sequence[str]) -> Dict[str, str]:
+        """Reads the stored ``created_at`` of many nodes without hydrating them.
+
+        One indexed ``IN`` query per chunk — no scopes, no modifier stamps — so naming
+        the archives for a large first sync costs no per-node read.
+
+        Args:
+            node_ids: The node ids to look up.
+
+        Returns:
+            A mapping of node id → its ``created_at`` string. An id with no node is
+            simply absent from the map.
+
+        Raises:
+            DatabaseError: If the read fails.
+        """
+        ids = list(node_ids)
+        if not ids:
+            return {}
+        conn = self._get_connection()
+        try:
+            out: Dict[str, str] = {}
+            for start in range(0, len(ids), _CREATED_AT_CHUNK):
+                chunk = ids[start:start + _CREATED_AT_CHUNK]
+                placeholders = ",".join("?" for _ in chunk)
+                for row in conn.execute(
+                    f"SELECT id, created_at FROM nodes WHERE id IN ({placeholders})",
+                    chunk,
+                ):
+                    out[row["id"]] = row["created_at"]
+            return out
+        except sqlite3.Error as e:
+            raise DatabaseError(
+                f"Failed to read created_at for {len(ids)} node(s): {str(e)}"
+            )
+        finally:
+            conn.close()
 
     def _scopes_for(
         self, conn: sqlite3.Connection, node_ids: List[str]

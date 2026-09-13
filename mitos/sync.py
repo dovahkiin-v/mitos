@@ -1622,9 +1622,11 @@ class MitosSyncManager:
         for entry, _raw, exc in residual:
             self._report_commit_quarantine(entry, exc)
 
-        # 4. Archive rotation of this run's first commits. The core appends each archive
-        # durably and only then replaces the buffer whole, so a failure leaves
-        # decisions.md unchanged and nothing needs rolling back (ADR
+        # 4. Archive rotation of this run's first commits. Each block is filed under the
+        # UTC quarter of its node's created_at, read by node id in one lookup (never by
+        # slug, never from a clock). The core replaces each archive whole and durably,
+        # and only then the buffer, so a failure leaves decisions.md unchanged and
+        # nothing needs rolling back (ADR
         # archive-first-makes-rotations-buffer-write-rollback-free-so-it-keeps-its-own-sequence).
         # Every line it produces goes to stderr: rotation will be reached from the MCP
         # write path, where a stray stdout byte corrupts the protocol.
@@ -1638,13 +1640,28 @@ class MitosSyncManager:
             synced_blocks.clear()
 
         if synced_blocks:
-            now = datetime.now()
-            quarter_file = f"{now.year}-Q{(now.month - 1) // 3 + 1}.md"
-            blocks = [
-                rotation.RotationBlock(entry.slug, raw_block, quarter_file)
-                for entry, raw_block in synced_blocks
-            ]
+            # The lookup and the naming sit inside the try: a graph that contradicts a
+            # commit made seconds ago in this run fails the whole rotation before any
+            # write, through the one failure line (D-1d-3).
             try:
+                # The id exactly as commit_parsed_entry derived it.
+                node_ids = [
+                    compute_node_id(
+                        kind="decision", axiom=entry.axiom, mechanism_refs=entry.mechanisms
+                    )
+                    for entry, _raw_block in synced_blocks
+                ]
+                stamps = self.store.created_at_for(node_ids)
+                blocks = []
+                for (entry, raw_block), node_id in zip(synced_blocks, node_ids):
+                    if node_id not in stamps:
+                        raise LookupError(
+                            f"the graph holds no created_at for {entry.slug!r}, which "
+                            f"this run committed"
+                        )
+                    blocks.append(rotation.RotationBlock(
+                        entry.slug, raw_block, rotation.archive_name_for(stamps[node_id])
+                    ))
                 outcome = rotation.rotate(
                     self.lock, self.config.decisions_file, self.config.archive_dir, blocks
                 )
@@ -1652,8 +1669,8 @@ class MitosSyncManager:
                 sys.stdout.flush()
                 print(
                     f"[Warning] Archive rotation failed: {e}. decisions.md is unchanged, so "
-                    f"none of the {len(blocks)} entries was removed from it; an archive may "
-                    f"already hold a copy of them.",
+                    f"none of the {len(synced_blocks)} entries was removed from it; an "
+                    f"archive may already hold a copy of them.",
                     file=sys.stderr,
                 )
             else:
