@@ -642,6 +642,55 @@ def _v1c_schema(conn: sqlite3.Connection) -> None:
     conn.execute(_V1C_EMBEDDING_SEED_STATEMENT)
 
 
+# Step 4 (surface-entropy vision, phase 2a): ``node_scopes`` remembers the author's
+# ``**Scope:**`` order. ``ordinal`` is the tag's 0-based position in that line; the
+# first ordinal is the node's primary scope. The two statements run in order inside
+# the runner's transaction:
+#
+# 1. The ``ALTER`` adds the column NOT NULL with ``DEFAULT 0``. SQLite refuses a NOT
+#    NULL add without a default, and the default is also what keeps an older mitos
+#    writing this graph: its ``INSERT INTO node_scopes (node_id, scope)`` names no
+#    ordinal and lands at 0. Such a row ties with the node's authored primary and
+#    reads by the ``scope`` tiebreak, so it can displace that primary on that one
+#    node until new code re-commits it or ``mitos rebuild`` runs. That is a stated
+#    residual — deterministic and self-healing — not a feature.
+# 2. The backfill ranks each node's tags alphabetically under SQLite's BINARY
+#    collation, which is exactly the ``ORDER BY node_id, scope`` every read used
+#    before this step, so an existing graph reads (and renders) byte-identically
+#    until its entries are re-committed.
+#
+# No column-exists probe: the runner's version gate is MI-3's replay safety (ADR
+# ``migration-idempotency-via-transactional-version-gate``), and a backfill re-run over
+# authored ordinals would silently reset every node to alphabetical. No index on the
+# ordinal: a read sorts at most one node's handful of tags under the PK's
+# ``node_id`` search.
+_V2A_SCOPE_ORDINAL_STATEMENTS: Tuple[str, ...] = (
+    "ALTER TABLE node_scopes ADD COLUMN ordinal INTEGER NOT NULL DEFAULT 0;",
+    """
+    UPDATE node_scopes SET ordinal = (
+        SELECT COUNT(*) FROM node_scopes AS o
+        WHERE o.node_id = node_scopes.node_id AND o.scope < node_scopes.scope
+    );
+    """,
+)
+
+
+def _v2a_scope_ordinal(conn: sqlite3.Connection) -> None:
+    """Migration step 4: add the ``node_scopes.ordinal`` column and backfill it.
+
+    Adds the column (never a table rebuild) and ranks every existing node's tags
+    alphabetically, so a migrated graph's hydrated scope order equals what it was
+    before the step. Runs inside ``run_migrations``' transaction; does NOT touch
+    ``user_version`` or ``BEGIN``/``COMMIT`` (the runner owns both), and issues one
+    statement per ``conn.execute`` — never ``executescript``.
+
+    Args:
+        conn: An open, writable SQLite connection inside the runner's transaction.
+    """
+    for statement in _V2A_SCOPE_ORDINAL_STATEMENTS:
+        conn.execute(statement)
+
+
 # --- Pre-ladder DB snapshot harness (Phase 1a): binary migration reversal ------
 #
 # The first populated-schema migration (Phase 1b) rewrites a graph that already
@@ -853,3 +902,17 @@ MIGRATION_STEPS.append((2, _v1b_schema))
 # *object* at def-time, so an in-place append is seen by the live boot while a rebind
 # would be invisible to it (PATTERNS; §7 gotcha).
 MIGRATION_STEPS.append((3, _v1c_schema))
+
+
+# --- Scope ordinal registration (surface-entropy phase 2a) ---------------------
+#
+# Append step 4 — ``node_scopes.ordinal`` plus its alphabetical backfill (see the
+# comment above ``_v2a_scope_ordinal``). The ladder head becomes 4, so a populated v3
+# graph has a pending step and Phase 1a's pre-ladder snapshot fires on its real
+# ``v3→v4`` boot with ZERO change to that harness, retaining one graph-sized
+# ``graph.sqlite.snapshot_v3`` per upgrading workspace. Read-only stores never run
+# the ladder, so the store's scope read falls back to the legacy order on a graph
+# that has not migrated yet. Use ``.append`` — NEVER rebind ``MIGRATION_STEPS =
+# [...]``: ``run_migrations``'s default arg binds the list *object* at def-time
+# (PATTERNS; §7 gotcha).
+MIGRATION_STEPS.append((4, _v2a_scope_ordinal))

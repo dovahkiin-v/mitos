@@ -119,9 +119,10 @@ def test_invariant_m1_m2_m3_deep_dag_and_cascades(isolated_workspace) -> None:
     delta_a = store.commit_parsed_entry(a)
 
     assert delta_a.node_id is not None
-    # node_scope comes back scope-sorted (the store's deterministic contract), not
-    # in authoring order.
-    assert delta_a.node_scope == ["database", "substrate"]
+    # node_scope comes back in authoring order — the store's deterministic contract
+    # since the node_scopes ordinal. The delta and the hydrated read agree, and the
+    # order never enters the node id.
+    assert delta_a.node_scope == ["substrate", "database"]
     assert delta_a.self_old_scope == []
 
     # Verify node A is active

@@ -557,8 +557,8 @@ def test_a_named_target_whose_only_divergence_is_a_dropped_scope_tag(
 ) -> None:
     """MI-9's walk: the scope rows go to zero, and no `''` sentinel row appears.
 
-    `commit_parsed_entry` runs an insert-missing/delete-absent pass over
-    `node_scopes`, and `entry_divergence` reports scope as its own species — so a
+    `commit_parsed_entry` rewrites a node's `node_scopes` rows whenever its tag list
+    changes, and `entry_divergence` reports scope as its own species — so a
     hand-edit dropping a `**Scope:**` tag DELETES that row with no human present.
     MI-9's floor is zero rows, never an empty-string sentinel.
     """

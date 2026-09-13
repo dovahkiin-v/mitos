@@ -264,6 +264,19 @@ _SCOPE_FILTER_SQL: str = (
     "WHERE node_scopes.node_id = nodes.id AND node_scopes.scope = ?)"
 )
 
+# A node's scope order: authored position first, then the tag as tiebreak. The
+# tiebreak makes every read deterministic where two rows share an ordinal (only an
+# older mitos inserting at the column's DEFAULT 0 can create that) and reproduces the
+# pre-ordinal alphabetical order when a node's ordinals are all 0. One fragment, bound
+# by both the hydrating read and the commit path's prior read, so the two orders
+# cannot drift.
+_SCOPE_ORDER_SQL: str = "ordinal, scope"
+
+# SQLite's message when a read names ``ordinal`` on a graph that has not run ladder
+# step 4 (identical on a ``mode=ro`` connection). Matched exactly so a locked,
+# corrupt or otherwise-broken read still raises.
+_MISSING_ORDINAL_ERROR: str = "no such column: ordinal"
+
 
 def state_matches(computed_state: str, state_filter: Optional[str]) -> bool:
     """Reports whether a node's computed state passes the requested state filter.
@@ -963,23 +976,38 @@ class GraphStore:
     ) -> Dict[str, List[str]]:
         """Bulk-fetches scope tags for many nodes in ONE indexed query (never N+1).
 
+        A graph that has not run ladder step 4 has no ``ordinal`` column. A writable
+        store migrates at construction, but a read-only one never runs the ladder, so
+        on that one error this re-runs the pre-ordinal query ordered by tag — which is
+        exactly the order such a graph holds. Any other SQLite error propagates.
+
         Args:
             conn: An open connection (the caller owns its lifecycle).
             node_ids: The node IDs to fetch scopes for.
 
         Returns:
-            A mapping of node_id -> sorted scope-tag list; an id with no scopes is
-            simply absent from the map.
+            A mapping of node_id -> scope-tag list in authored order (ties, which only
+            an older writer or the step-4 backfill leaves, fall back to alphabetical);
+            an id with no scopes is simply absent from the map.
         """
         if not node_ids:
             return {}
         placeholders = ",".join("?" for _ in node_ids)
+        select = (
+            f"SELECT node_id, scope FROM node_scopes WHERE node_id IN ({placeholders})"
+        )
+        try:
+            rows = conn.execute(
+                f"{select} ORDER BY node_id, {_SCOPE_ORDER_SQL}", node_ids
+            ).fetchall()
+        except sqlite3.OperationalError as e:
+            if _MISSING_ORDINAL_ERROR not in str(e):
+                raise
+            rows = conn.execute(
+                f"{select} ORDER BY node_id, scope", node_ids
+            ).fetchall()
         out: Dict[str, List[str]] = {}
-        for row in conn.execute(
-            f"SELECT node_id, scope FROM node_scopes "
-            f"WHERE node_id IN ({placeholders}) ORDER BY node_id, scope",
-            node_ids,
-        ):
+        for row in rows:
             out.setdefault(row["node_id"], []).append(row["scope"])
         return out
 
@@ -1330,8 +1358,10 @@ class GraphStore:
         UPDATE** whose ``SET`` covers only commentary — ``slug`` is mutable (a
         rename), but the canonical core *and* ``source`` are fenced (MI-4). A
         byte-identical re-commit is a true no-op: ``updated_at`` does not tick
-        (MI-3 / V1-D17). ``node_scopes`` reconcile idempotently (casefolded,
-        insert-missing / delete-absent; MI-9) and ``transcripts`` are
+        (MI-3 / V1-D17). ``node_scopes`` reconcile idempotently (casefolded and
+        deduped, in authored order with each tag's position as its ``ordinal``; a
+        changed list — a same-set reorder included — rewrites the node's rows, an
+        equal one writes nothing; MI-9) and ``transcripts`` are
         write-once-preserve (insert / update / no-op-on-absent, **never** DELETE;
         V1-D16).
 
@@ -1437,8 +1467,13 @@ class GraphStore:
         # Incoming scopes: strip + casefold + drop-empties (the parser already
         # normalizes; re-applying ``str.casefold()`` is idempotent and keeps a
         # hand-built entry honest — MI-9, never SQLite NOCASE/LOWER). A scope row
-        # is never empty/NULL.
-        incoming_scopes = {tag for s in parsed.scope if (tag := s.strip().casefold())}
+        # is never empty/NULL. The list keeps the author's order (first occurrence
+        # wins a duplicate): the order is the ``ordinal``, and the first tag is the
+        # node's primary scope. Order is commentary-tier — it never reaches
+        # ``compute_node_id`` above (C1).
+        incoming_scopes = list(
+            dict.fromkeys(tag for s in parsed.scope if (tag := s.strip().casefold()))
+        )
         incoming_transcript = parsed.transcript or None  # falsy -> absent
 
         conn = self._get_connection()
@@ -1450,12 +1485,14 @@ class GraphStore:
                 prior = cursor.execute(
                     "SELECT * FROM nodes WHERE id = ?", (node_id,)
                 ).fetchone()
-                prior_scopes = {
+                prior_scopes = [
                     r["scope"]
                     for r in cursor.execute(
-                        "SELECT scope FROM node_scopes WHERE node_id = ?", (node_id,)
+                        "SELECT scope FROM node_scopes WHERE node_id = ? "
+                        f"ORDER BY {_SCOPE_ORDER_SQL}",
+                        (node_id,),
                     )
-                }
+                ]
                 prior_tx_row = cursor.execute(
                     "SELECT transcript_text FROM transcripts WHERE node_id = ?",
                     (node_id,),
@@ -1482,6 +1519,8 @@ class GraphStore:
                 commentary_changed = (not is_new) and any(
                     prior[col] != val for col, val in commentary.items()
                 )
+                # List equality: a same-set reorder is a footprint change (it moves
+                # the primary scope), so it rewrites the rows and ticks updated_at.
                 scopes_changed = incoming_scopes != prior_scopes
                 # Transcript write-once-preserve (V1-D16): an absent incoming
                 # transcript leaves the stored row untouched (never a change).
@@ -1538,17 +1577,21 @@ class GraphStore:
                 if is_new and parsed.kind == "decision":
                     self._register_mechanisms(cursor, parsed, now)
 
-                # --- Reconcile node_scopes (insert-missing / delete-absent) -----
-                for tag in incoming_scopes - prior_scopes:
+                # --- Reconcile node_scopes (rewrite in authored order) ----------
+                # Only a changed list writes: the node's rows are deleted and
+                # re-inserted with each tag's position as its ordinal (a handful of
+                # rows under the PK). An equal list writes nothing, so a
+                # byte-identical re-commit stays a true no-op (MI-3).
+                if scopes_changed:
                     cursor.execute(
-                        "INSERT INTO node_scopes (node_id, scope) VALUES (?, ?)",
-                        (node_id, tag),
+                        "DELETE FROM node_scopes WHERE node_id = ?", (node_id,)
                     )
-                for tag in prior_scopes - incoming_scopes:
-                    cursor.execute(
-                        "DELETE FROM node_scopes WHERE node_id = ? AND scope = ?",
-                        (node_id, tag),
-                    )
+                    for ordinal, tag in enumerate(incoming_scopes):
+                        cursor.execute(
+                            "INSERT INTO node_scopes (node_id, scope, ordinal) "
+                            "VALUES (?, ?, ?)",
+                            (node_id, tag, ordinal),
+                        )
 
                 # --- Transcripts: write-once-preserve (never DELETE) ------------
                 if transcript_changed:
@@ -1702,7 +1745,8 @@ class GraphStore:
                 # byte-identical re-commit trips neither gate -> ``[]``.
                 affected = set()
                 if is_new or direct_footprint_changed:
-                    affected |= incoming_scopes | prior_scopes
+                    # A set of scope names to re-render, not a node's order.
+                    affected |= set(incoming_scopes) | set(prior_scopes)
                 if edges_changed:
                     affected.update(
                         r["scope"]
@@ -1720,8 +1764,9 @@ class GraphStore:
 
                 return CommitDelta(
                     node_id=node_id,
-                    node_scope=sorted(incoming_scopes),
-                    self_old_scope=sorted(prior_scopes),
+                    # Authored order, the same order the hydrating read returns.
+                    node_scope=list(incoming_scopes),
+                    self_old_scope=list(prior_scopes),
                     commentary_fields_changed=(
                         False if is_new else direct_footprint_changed
                     ),

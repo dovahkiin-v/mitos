@@ -94,7 +94,7 @@ def _node_source(store: GraphStore, node_id: str) -> Optional[str]:
 
 @pytest.fixture
 def store() -> GraphStore:
-    """A temporary file GraphStore (boots the live V1b schema, user_version 2)."""
+    """A temporary file GraphStore (boots the live ladder to its head)."""
     fd, path = tempfile.mkstemp(suffix=".sqlite")
     os.close(fd)
     s = GraphStore(path)

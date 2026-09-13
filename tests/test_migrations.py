@@ -20,6 +20,7 @@ from mitos.migrations import (
     _v1_schema,
     _v1b_schema,
     _v1c_schema,
+    _v2a_scope_ordinal,
     is_pre_v1a_schema,
     run_migrations,
 )
@@ -58,14 +59,16 @@ def _create_step(table: str):
     return step
 
 
-def test_registry_has_v1a_v1b_and_v1c_schema_steps() -> None:
-    """The live registry carries three ladder rungs: V1a, V1b and V1c.
+def test_registry_has_v1a_v1b_v1c_and_scope_ordinal_steps() -> None:
+    """The live registry carries four ladder rungs: V1a, V1b, V1c and the scope ordinal.
 
     Phase 5a appended ``(1, _v1_schema)`` (entry-001 flip); the collection-absence
     phase 1b appended ``(2, _v1b_schema)`` (the ``mechanisms`` DDL + widened ``edges``
-    CHECK); phase 1c appends ``(3, _v1c_schema)`` (the ``embedding_seed`` coverage
-    marker) — each via ``.append``, never a rebind, so ``run_migrations``'s
-    def-time-bound default arg sees all three on the live boot.
+    CHECK); phase 1c appended ``(3, _v1c_schema)`` (the ``embedding_seed`` coverage
+    marker); surface-entropy phase 2a appends ``(4, _v2a_scope_ordinal)`` (the
+    ``node_scopes.ordinal`` column and its alphabetical backfill) — each via
+    ``.append``, never a rebind, so ``run_migrations``'s def-time-bound default arg
+    sees all four on the live boot.
 
     The count assertion is the deliberate hand-off tripwire each phase inherits: it
     reds on the next append, which is how the appending phase is forced to notice the
@@ -74,7 +77,8 @@ def test_registry_has_v1a_v1b_and_v1c_schema_steps() -> None:
     assert (1, _v1_schema) in MIGRATION_STEPS
     assert (2, _v1b_schema) in MIGRATION_STEPS
     assert (3, _v1c_schema) in MIGRATION_STEPS
-    assert len(MIGRATION_STEPS) == 3  # the V1a rung + the V1b rung + the V1c rung
+    assert (4, _v2a_scope_ordinal) in MIGRATION_STEPS
+    assert len(MIGRATION_STEPS) == 4  # V1a + V1b + V1c + the scope ordinal
 
 
 def test_empty_ladder_is_noop() -> None:
@@ -821,6 +825,20 @@ def test_full_ladder_boots_fresh_db_to_head_via_live_registry(tmp_path) -> None:
         _insert_node(conn, "q1", kind="open_question")
         _insert_edge(conn, "d1", "decision", "q1", "open_question", edge_type="cites")
         assert conn.execute("SELECT COUNT(*) FROM edges;").fetchone()[0] == 1
+        # Step 4's ALTER lands on the table step 1 created: node_scopes carries the
+        # ordinal NOT NULL with DEFAULT 0, and the PK is still (node_id, scope).
+        scope_cols = {
+            row[0]: {"notnull": row[1], "dflt": row[2], "pk": row[3]}
+            for row in conn.execute(
+                'SELECT name, "notnull", dflt_value, pk '
+                "FROM pragma_table_info('node_scopes');"
+            )
+        }
+        assert set(scope_cols) == {"node_id", "scope", "ordinal"}
+        assert scope_cols["ordinal"]["notnull"] == 1
+        assert scope_cols["ordinal"]["dflt"] == "0"
+        assert scope_cols["ordinal"]["pk"] == 0
+        assert _is_strict(conn, "node_scopes")
     finally:
         conn.close()
 
