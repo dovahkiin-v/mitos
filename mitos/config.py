@@ -132,10 +132,11 @@ ROTATION_MODES = frozenset({"archive", "mark", "prune"})
 #           parser-skipped annotation to sit in a reserved namespace — `parser.py`
 #           has no namespace predicate at all. Deprecating it loses nothing that was
 #           ever built.
-#   `prune` removes the block from the buffer and writes it NOWHERE (the archive
-#           write is gated on `rotation_mode == "archive"`), so the node has no source
-#           block and `rebuild` — the tool's own repair story — permanently cannot
-#           reconstruct it. Its "for users who fully trust the graph as source"
+#   `prune` removed the block from the buffer and wrote it NOWHERE (the archive
+#           write was gated on `rotation_mode == "archive"`; both non-archive branches
+#           were deleted in surface-entropy 1c, since this coercion made them
+#           unreachable), so the node had no source block and `rebuild` — the tool's
+#           own repair story — could never reconstruct it. Its "for users who fully trust the graph as source"
 #           rationale belongs to the pre-M7/P6 "storage is the graph, markdown is a
 #           render target" direction, which was later reversed.
 #
@@ -538,7 +539,7 @@ class MitosConfig:
 
         # `pending_threshold` LEFT the v0.1 file schema (its migration to
         # `rotation_volume_threshold_entries` is V3a's, not V1a's) but stays a
-        # default-valued attribute — `sync.py`'s rotation-prompt gate reads it. A
+        # default-valued attribute — `sync.py`'s rotation defer gate reads it. A
         # `pending_threshold` file key is now silently tolerated (a recognized
         # retired key — see RETIRED_CONFIG_KEYS), not applied.
         self.pending_threshold = 30

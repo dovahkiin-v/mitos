@@ -283,3 +283,84 @@ def test_importing_the_leaf_pulls_in_no_other_mitos_module():
     out = subprocess.run([sys.executable, "-c", probe],
                          capture_output=True, text=True, check=True)
     assert out.stdout.strip() == "mitos,mitos.atomic_file"
+
+
+# --- append_source (1c): durable, not atomic ------------------------------------------
+
+def test_append_source_appends_plain_text_mode_bytes_and_keeps_the_mode(tmp_path):
+    """An append that re-modes would widen or narrow a file the user permissioned."""
+    text = "## Sprendimas — ąčę ✓\n\nline two\r\nend\n"
+    reference = tmp_path / "reference.md"
+    target = tmp_path / "2026-Q3.md"
+    for path in (reference, target):
+        path.write_text("PRIOR\n", encoding="utf-8")
+    with open(reference, "a", encoding="utf-8") as fh:
+        fh.write(text)
+    os.chmod(target, 0o640)
+    assert 0o640 != _umask_default(), "non-vacuity: the kept mode must not be the default"
+
+    atomic_file.append_source(str(target), text)
+
+    assert target.read_bytes() == reference.read_bytes()
+    assert _mode(target) == 0o640
+    assert _temps(tmp_path) == []
+
+
+def test_append_source_creates_the_file_and_its_parents_at_the_umask_default(tmp_path):
+    target = tmp_path / "decisions" / "archive" / "2026-Q3.md"
+    previous = os.umask(0o027)
+    try:
+        atomic_file.append_source(str(target), "block\n")
+    finally:
+        os.umask(previous)
+
+    assert target.read_text(encoding="utf-8") == "block\n"
+    assert _mode(target) == 0o640
+
+
+def test_append_source_fsyncs_the_file_and_the_created_directories(tmp_path):
+    """Without these, the archive bytes sit in the page cache while the buffer replace lands."""
+    target = tmp_path / "decisions" / "archive" / "2026-Q3.md"
+    file_syncs, dir_syncs = [], []
+    real_fsync = os.fsync
+
+    def _fsync(fd):
+        (dir_syncs if _is_dir_fd(fd) else file_syncs).append(os.fstat(fd).st_ino)
+        return real_fsync(fd)
+
+    with patch("mitos.atomic_file.os.fsync", side_effect=_fsync):
+        atomic_file.append_source(str(target), "block\n")
+
+    assert file_syncs == [os.stat(target).st_ino]
+    for directory in (target.parent, target.parent.parent, tmp_path):
+        assert os.stat(directory).st_ino in dir_syncs, f"{directory} entry was never synced"
+
+
+def test_append_source_swallows_a_refused_directory_fsync(tmp_path):
+    target = tmp_path / "2026-Q3.md"
+    real_fsync = os.fsync
+    refused = []
+
+    def _fsync(fd):
+        if _is_dir_fd(fd):
+            refused.append(fd)
+            raise OSError(errno.EINVAL, "not supported on this mount")
+        return real_fsync(fd)
+
+    with patch("mitos.atomic_file.os.fsync", side_effect=_fsync):
+        atomic_file.append_source(str(target), "block\n")
+
+    assert refused, "the directory fsync was never reached"
+    assert target.read_text(encoding="utf-8") == "block\n"
+
+
+def test_append_source_propagates_a_blocked_parent_and_writes_elsewhere_nothing(tmp_path):
+    """A swallowed makedirs failure would let rotation replace the buffer with no archive."""
+    (tmp_path / "decisions").write_text("not a directory\n", encoding="utf-8")
+    before = sorted(os.listdir(tmp_path))
+
+    with pytest.raises((NotADirectoryError, FileExistsError)):
+        atomic_file.append_source(str(tmp_path / "decisions" / "archive" / "2026-Q3.md"),
+                                  "block\n")
+
+    assert sorted(os.listdir(tmp_path)) == before

@@ -1,7 +1,8 @@
-"""Whole-file atomic replace — the one home for tmp+replace and its two mode rules.
+"""Writes to mitos's files — the one home for tmp+replace, the durable append, and their mode rules.
 
-Two entry points, selected by name rather than by a flag, because the one property
-that must differ by target is the ``fsync``:
+Three entry points, selected by name rather than by a flag. The two whole-file
+replaces differ by the one property that must differ by target, the ``fsync``; the
+third is an append, which is durable but not atomic:
 
 * ``write_source`` — for a markdown file ``mitos rebuild`` replays from (the
   ``decisions.md`` buffer, ``questions.md``, ``decisions/archive/*.md``). Temp file →
@@ -15,8 +16,15 @@ that must differ by target is the ``fsync``:
   a power loss it **can be lost** (zero-length or garbage), not reverted — acceptable
   only because a render is rebuilt by the next regenerate. Never use it for a
   replayed-from file.
+* ``append_source`` — for appending to a replayed-from file (rotation's archive).
+  Missing parent directories are created; the file is opened for append, written,
+  ``fsync``'d, then its directory (and each directory the call created, on its
+  parent) gets a best-effort ``fsync``. **Durable, not atomic:** a crash mid-write can
+  leave a partial trailing block, and a raised exception means bytes may already be
+  appended. It never re-modes an existing file; a new one is created at ``0o666``
+  filtered by the umask. Not covered by the shared contract below.
 
-The contract both share:
+The contract the two replaces share:
 
 * A symlinked target is resolved first, so the link survives and its referent is
   replaced. A caller's lock keyed on the configured path still serializes, because
@@ -83,6 +91,51 @@ def write_derived(path: str, content: str) -> None:
             untouched.
     """
     _replace(path, content, durable=False)
+
+
+def append_source(path: str, text: str) -> None:
+    """Durably appends to a file ``mitos rebuild`` replays from.
+
+    Durable, not atomic: after a returned call the bytes survive a power loss (where
+    the filesystem accepts a directory ``fsync``, so does a newly created file's
+    entry), but a crash mid-write can leave a partial trailing block. Whether a reader
+    tolerates that tail or the archive becomes a whole-file replace is Phase 1d's
+    decision (CC-13).
+
+    Args:
+        path: The target file. Missing parent directories are created.
+        text: The text to append, written as ``open(path, "a", encoding="utf-8")``
+            writes it.
+
+    Raises:
+        OSError: If a directory cannot be made, or the open, write or file ``fsync``
+            fails — including ``NotADirectoryError``/``FileExistsError`` when a
+            non-directory blocks the parent path. Bytes may be partially appended.
+        UnicodeEncodeError: If ``text`` cannot be encoded as UTF-8. Bytes may be
+            partially appended.
+    """
+    target = os.path.realpath(path)
+    directory = os.path.dirname(target)
+
+    missing: list = []
+    probe = directory
+    while probe and not os.path.exists(probe):
+        missing.append(probe)
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    os.makedirs(directory, exist_ok=True)
+
+    with open(target, "a", encoding="utf-8") as fh:
+        fh.write(text)
+        fh.flush()
+        os.fsync(fh.fileno())
+
+    _fsync_directory_best_effort(directory)
+    # Outermost first: each created directory's entry lives in its parent.
+    for created in reversed(missing):
+        _fsync_directory_best_effort(os.path.dirname(created))
 
 
 def _replace(path: str, content: str, *, durable: bool) -> None:

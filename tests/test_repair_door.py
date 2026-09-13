@@ -352,16 +352,19 @@ def test_the_refusal_names_the_flag_and_no_command(
 
 
 # --------------------------------------------------------------------------- #
-# G9 — the rotation prompt stays unreachable, pinned rather than trusted
+# G9 — a guard-skipped run commits nothing and so rotates nothing, pinned rather than trusted
 # --------------------------------------------------------------------------- #
 
-def test_a_guard_skipped_run_never_reaches_the_rotation_prompt(
+def test_a_guard_skipped_run_rotates_nothing(
     env: Tuple[MitosConfig, MitosSyncManager, str], capsys: pytest.CaptureFixture
 ) -> None:
-    """The third `input()` in the loop stays unreachable after the guard lands.
+    """A guard-skipped entry never reaches the rotation set, so nothing rotates or defers.
 
-    `pending_threshold` is lowered to 1 so the rotation gate would open on a single commit
-    — the cheapest way to prove the guard, not the threshold, is what closes it.
+    When this row was written the rotation gate held a third `input()`, and the row pinned
+    that prompt unreachable. Surface-entropy 1c deleted the prompt (the gate now defers on
+    stderr), so the property that survives is the one below: the guard, not the threshold,
+    keeps the rotation set empty. `pending_threshold` is lowered to 1 so the defer gate
+    would open on a single commit — the cheapest way to prove that.
 
     The mechanic is two steps, and the second is the load-bearing one. `synced_blocks` has
     two append sites: the in-loop one is below the accept prompt (and gated on
@@ -377,11 +380,13 @@ def test_a_guard_skipped_run_never_reaches_the_rotation_prompt(
     config.pending_threshold = 1
     _append_decision(config, "door-rotate", "The axiom that must not rotate.")
 
-    manager.perform_sync(auto_accept=False)  # must not raise at the rotation prompt
+    manager.perform_sync(auto_accept=False)
 
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
+    out = captured.out
     assert len(_refusal_lines(out)) == 1
-    assert "[Lifecycle]" not in out, "the rotation prompt's own announcement"
+    # The rotation gate's line moved to stderr in 1c; reading stdout alone is vacuous.
+    assert "[Lifecycle]" not in out + captured.err, "the rotation gate's own announcement"
     with open(config.decisions_file, encoding="utf-8") as f:
         buffer_after = f.read()
     assert "door-rotate" in buffer_after, "the entry is still pending, in the buffer"

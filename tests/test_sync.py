@@ -1099,7 +1099,7 @@ def test_sync_open_questions_never_rotate(
 
     manager.perform_sync(auto_accept=True)
 
-    # questions.md is a persistent buffer — byte-for-byte unchanged.
+    # sync never writes questions.md — byte-for-byte unchanged.
     with open(questions_path, "r", encoding="utf-8") as f:
         assert f.read() == questions_before
 
@@ -2087,3 +2087,211 @@ def test_rotation_characterization_fixpoint_commit_rotates_last(
     with open(os.path.join(config.archive_dir, archives[0]), "r", encoding="utf-8") as f:
         assert f.read() == _ROTATE_FIRST + "\n" + "\n" + resolver + "\n" + "\n"
     assert GraphStore(config.db_path).get_node_by_slug("resolver-rotates") is not None
+
+
+# ===========================================================================
+# Phase 1c regression fixtures (R1–R4) and stream discipline (S1–S4)
+# ===========================================================================
+#
+# Each R row was run red against the pre-rewrite rotation block with this file
+# unchanged; the red assertion is recorded in the vision's IMPLEMENTATION_NOTES.
+# None imports `mitos.rotation`, so the rows run against either implementation.
+
+def _rotating_decision(slug: str) -> str:
+    return (
+        f"## 2026-05-19 — {slug} — Rotating Decision\n"
+        f"**Decided:** The {slug} axiom.\n"
+        "**Rejected:** Leaving the buffer unbounded.\n"
+        "**Mechanisms:** python\n"
+        "**Scope:** core\n"
+    )
+
+
+def _read(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def _archive_texts(config: MitosConfig) -> list:
+    if not os.path.isdir(config.archive_dir):
+        return []
+    return [_read(os.path.join(config.archive_dir, n)) for n in os.listdir(config.archive_dir)]
+
+
+def _line_anchored_count(text: str, block: str) -> int:
+    starts = [0] + [i + 1 for i, ch in enumerate(text) if ch == "\n"]
+    return sum(1 for s in starts if text.startswith(block, s))
+
+
+@patch("google.genai.Client")
+def test_r1_an_unusable_archive_path_leaves_the_buffer_whole(
+    mock_client: MagicMock,
+    sync_env: Tuple[MitosConfig, MitosSyncManager, str],
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """R1 + S2 (defect 1, failure path): the buffer is never truncated ahead of the archive.
+
+    A regular file at ``<tmpdir>/decisions`` makes ``decisions/archive`` impossible to
+    create, with no patching and no root sensitivity. Pre-1c the buffer was written
+    first and the archive step's error swallowed, so the block was in neither file.
+    The failure line is on stderr, with its "unchanged" clause, and not on stdout.
+    """
+    config, manager, tmpdir = sync_env
+    config.env["GEMINI_API_KEY"] = "mock_key"
+    _healed_header(manager, config)
+    _append_decision(config, _rotating_decision("r1-blocked"))
+    before = _read(config.decisions_file)
+    with open(os.path.join(tmpdir, "decisions"), "w", encoding="utf-8") as f:
+        f.write("an obstruction, not a directory\n")
+
+    manager.perform_sync(auto_accept=True)
+
+    assert _read(config.decisions_file) == before
+    assert GraphStore(config.db_path).get_node_by_slug("r1-blocked") is not None
+    captured = capsys.readouterr()
+    assert "Archive rotation failed" in captured.err
+    assert "decisions.md is unchanged" in captured.err
+    assert "Archive rotation failed" not in captured.out
+
+
+@patch("google.genai.Client")
+def test_r2_a_crash_between_the_writes_leaves_the_entry_in_both_files(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """R2 (the D1(a) proof): the buffer replace fails after the archive append landed.
+
+    The injection is target-filtered to decisions.md, because renders also replace
+    files. The header is healed first, or auto-heal's own replace would take the shot.
+    The copy in both files is harmless: a replayed block mints the same node id (M2).
+    Pre-1c rotation never called ``os.replace`` at all, and truncated the buffer.
+    """
+    config, manager, tmpdir = sync_env
+    config.env["GEMINI_API_KEY"] = "mock_key"
+    _healed_header(manager, config)
+    block = _rotating_decision("r2-crash")
+    _append_decision(config, block)
+    before = _read(config.decisions_file)
+    buffer_real = os.path.realpath(config.decisions_file)
+    real_replace = os.replace
+    fired = []
+
+    def _replace(src, dst, *args, **kwargs):
+        if os.path.realpath(dst) == buffer_real:
+            fired.append(dst)
+            raise OSError("injected: power cut between the archive and the buffer")
+        return real_replace(src, dst, *args, **kwargs)
+
+    with patch("mitos.atomic_file.os.replace", side_effect=_replace):
+        manager.perform_sync(auto_accept=True)
+
+    assert len(fired) == 1, "the buffer replace must be attempted exactly once"
+    assert any(block in text for text in _archive_texts(config))
+    assert _read(config.decisions_file) == before
+    assert [n for n in os.listdir(tmpdir) if n.endswith(".tmp")] == []
+    assert GraphStore(config.db_path).get_node_by_slug("r2-crash") is not None
+
+
+@patch("google.genai.Client")
+def test_r3_a_block_present_twice_is_never_removed(
+    mock_client: MagicMock,
+    sync_env: Tuple[MitosConfig, MitosSyncManager, str],
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """R3 (defect 3): an unbounded replace removed both copies while archiving one.
+
+    Sync commits the first copy and takes the idempotent branch for the second, so
+    exactly one ``(entry, raw)`` reaches rotation while both copies sit at line starts.
+    """
+    config, manager, tmpdir = sync_env
+    config.env["GEMINI_API_KEY"] = "mock_key"
+    _healed_header(manager, config)
+    block = _rotating_decision("r3-dup")
+    _append_decision(config, block)
+    _append_decision(config, block)
+    raw = block + "\n"
+    assert _line_anchored_count(_read(config.decisions_file), raw) == 2
+
+    manager.perform_sync(auto_accept=True)
+
+    assert _line_anchored_count(_read(config.decisions_file), raw) == 2
+    assert not any("r3-dup" in text for text in _archive_texts(config))
+    captured = capsys.readouterr()
+    skipped = [ln for ln in captured.err.splitlines() if "r3-dup" in ln and "2 times" in ln]
+    assert len(skipped) == 1, captured.err
+    assert "2 times" not in captured.out
+
+
+@patch("google.genai.Client")
+@patch("builtins.input", side_effect=["a", EOFError()])
+@patch("sys.stdin.isatty", return_value=True)
+def test_r4_a_terminal_whose_stdin_fails_defers_rotation_instead_of_dying(
+    mock_isatty: MagicMock,
+    mock_input: MagicMock,
+    mock_client: MagicMock,
+    sync_env: Tuple[MitosConfig, MitosSyncManager, str],
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """R4 + S3 (defect 4): the TTY-shaped caller is the only one that reached the prompt.
+
+    A non-TTY caller is report-and-skipped before any commit, so it never got here. A
+    human who accepts at a terminal and whose stdin then fails used to meet a second
+    ``input()`` that raised ``EOFError`` out of ``perform_sync`` after the commits,
+    skipping render and drain. Now there is no prompt: the run defers and renders.
+
+    S3 pins the deferred line's current truth: it names no command. The entries are
+    committed, so a ``--yes`` re-run finds them idempotent and would rotate nothing.
+    """
+    config, manager, tmpdir = sync_env
+    config.env["GEMINI_API_KEY"] = "mock_key"
+    config.pending_threshold = 1
+    _append_decision(config, _rotating_decision("r4-tty"))
+
+    manager.perform_sync(auto_accept=False)
+
+    assert mock_input.call_count == 1, "only the accept prompt may ask"
+    assert GraphStore(config.db_path).get_node_by_slug("r4-tty") is not None
+    assert "r4-tty" in _read(config.decisions_file)
+    assert not os.path.exists(config.archive_dir)
+    assert os.path.exists(os.path.join(tmpdir, "live_axioms.md")), "render ran after rotation"
+    captured = capsys.readouterr()
+    deferred = [ln for ln in captured.err.splitlines() if "rotation deferred" in ln]
+    assert len(deferred) == 1, captured.err
+    assert "--yes" not in deferred[0] and "mitos sync" not in deferred[0]
+    assert "rotation deferred" not in captured.out
+
+
+@patch("google.genai.Client")
+def test_s1_the_rotated_line_is_on_stderr_not_stdout(
+    mock_client: MagicMock,
+    sync_env: Tuple[MitosConfig, MitosSyncManager, str],
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """S1: rotation will be reached from the MCP path, where stdout is the protocol."""
+    config, manager, tmpdir = sync_env
+    config.env["GEMINI_API_KEY"] = "mock_key"
+    _append_decision(config, _rotating_decision("s1-moved"))
+
+    manager.perform_sync(auto_accept=True)
+
+    captured = capsys.readouterr()
+    assert "Rotated 1 entries to" in captured.err
+    assert "Rotated" not in captured.out
+    assert "s1-moved" not in _read(config.decisions_file)
+
+
+@patch("google.genai.Client")
+def test_s4_a_rotating_sync_keeps_the_buffer_mode(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """S4: the buffer replace preserves a user's 0640, as the truncating write did."""
+    import stat as _stat
+    config, manager, tmpdir = sync_env
+    config.env["GEMINI_API_KEY"] = "mock_key"
+    _healed_header(manager, config)
+    os.chmod(config.decisions_file, 0o640)
+    _append_decision(config, _rotating_decision("s4-mode"))
+
+    manager.perform_sync(auto_accept=True)
+
+    assert "s4-mode" not in _read(config.decisions_file), "non-vacuity: it rotated"
+    assert _stat.S_IMODE(os.stat(config.decisions_file).st_mode) == 0o640

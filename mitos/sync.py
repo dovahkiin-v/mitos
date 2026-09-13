@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 
 from mitos import __version__ as MITOS_VERSION
 from mitos import atomic_file
+from mitos import rotation
 from mitos.config import MitosConfig, hint_due
 from mitos.conflict import (
     CONFLICT_CANDIDATE_SOURCE,
@@ -1232,9 +1233,8 @@ class MitosSyncManager:
             return
 
         # Stale-entry detection (>14 days unprocessed) — DECISIONS ONLY (D5): the
-        # vision defers OQ stale-detection; questions.md is a persistent buffer that
-        # never rotates, so a >14-day open question must NOT emit a spurious
-        # "remains unsynced" warning.
+        # vision defers OQ stale-detection, so a >14-day open question must NOT emit a
+        # spurious "remains unsynced" warning.
         for entry in decision_entries:
             if entry.date:
                 try:
@@ -1301,9 +1301,9 @@ class MitosSyncManager:
         for entry in entries:
             # Read exact raw text block of this entry from snapshot for content-aware
             # rotation — DECISIONS ONLY (D5): the line range here indexes the
-            # DECISIONS snapshot, so an open-question entry's range would index the
-            # wrong file. OQ entries never rotate (questions.md is a persistent
-            # buffer), so they need no raw-text block.
+            # DECISIONS snapshot, and an open-question entry's range indexes
+            # questions.md, so slicing it here would take the wrong file's text. An OQ
+            # carries "" instead.
             entry_raw_text = ""
             if entry.kind == "decision":
                 if snap_lines is None:
@@ -1592,9 +1592,9 @@ class MitosSyncManager:
             self._best_effort_embed(delta, entry)
 
             # Record successfully committed block for rotation — DECISIONS ONLY (D5):
-            # questions.md never rotates (persistent buffer), and an OQ block would
-            # carry decisions-snapshot raw text, so OQ entries must not enter the
-            # rotation set or the pending_threshold rotation prompt's count.
+            # the block is text sliced from the decisions snapshot, and an OQ's line
+            # range indexes questions.md, so OQ entries must not enter the rotation set
+            # or the defer gate's count.
             if entry.kind == "decision":
                 synced_blocks.append((entry, entry_raw_text))
 
@@ -1622,53 +1622,42 @@ class MitosSyncManager:
         for entry, _raw, exc in residual:
             self._report_commit_quarantine(entry, exc)
 
-        # 4. Content-aware archive rotation under brief lock (V3b)
-        if synced_blocks:
-            if len(synced_blocks) >= self.config.pending_threshold and not auto_accept:
-                print(f"\n[Lifecycle] Sync volume threshold reached ({len(synced_blocks)} entries pending rotation).")
-                choice = input("Would you like to rotate the write-buffer to quarterly archive now? [y/n]: ").strip().lower()
-                if choice != 'y':
-                    synced_blocks.clear()
-                    print("Archive rotation deferred. Entries remain in write-buffer.")
+        # 4. Archive rotation of this run's first commits. The core appends each archive
+        # durably and only then replaces the buffer whole, so a failure leaves
+        # decisions.md unchanged and nothing needs rolling back (ADR
+        # archive-first-makes-rotations-buffer-write-rollback-free-so-it-keeps-its-own-sequence).
+        # Every line it produces goes to stderr: rotation will be reached from the MCP
+        # write path, where a stray stdout byte corrupts the protocol.
+        if synced_blocks and len(synced_blocks) >= self.config.pending_threshold and not auto_accept:
+            sys.stdout.flush()
+            print(
+                f"[Lifecycle] Rotation threshold reached with {len(synced_blocks)} committed "
+                f"entries; rotation deferred. The entries remain in decisions.md.",
+                file=sys.stderr,
+            )
+            synced_blocks.clear()
 
         if synced_blocks:
+            now = datetime.now()
+            quarter_file = f"{now.year}-Q{(now.month - 1) // 3 + 1}.md"
+            blocks = [
+                rotation.RotationBlock(entry.slug, raw_block, quarter_file)
+                for entry, raw_block in synced_blocks
+            ]
             try:
-                with self.lock:
-                    with open(self.config.decisions_file, "r", encoding="utf-8") as f:
-                        live_content = f.read()
-
-                    rotated_text = ""
-                    for entry, raw_block in synced_blocks:
-                        # Match by content block exactly and remove/modify in live file
-                        if raw_block in live_content:
-                            if self.config.rotation_mode == "mark":
-                                # Mark mode: wrap the raw block in an HTML comment so it's ignored but preserved
-                                commented_block = f"<!-- ROTATED START\n{raw_block}\nROTATED END -->"
-                                live_content = live_content.replace(raw_block, commented_block)
-                            else:
-                                # Archive/Prune mode: remove from live buffer
-                                live_content = live_content.replace(raw_block, "")
-                            rotated_text += raw_block + "\n"
-
-                    # Write back live buffer (non-destructive)
-                    with open(self.config.decisions_file, "w", encoding="utf-8") as f:
-                        f.write(live_content)
-
-                    # Only write to archive directory if in archive mode!
-                    if self.config.rotation_mode == "archive":
-                        quarter_file = f"{datetime.now().year}-Q{(datetime.now().month-1)//3 + 1}.md"
-                        os.makedirs(self.config.archive_dir, exist_ok=True)
-                        archive_path = os.path.join(self.config.archive_dir, quarter_file)
-                        
-                        with open(archive_path, "a", encoding="utf-8") as f:
-                            f.write(rotated_text)
-                        print(f"Rotated {len(synced_blocks)} entries to {archive_path} ✓")
-                    elif self.config.rotation_mode == "prune":
-                        print(f"Pruned {len(synced_blocks)} entries from buffer (rotation_mode=prune) ✓")
-                    elif self.config.rotation_mode == "mark":
-                        print(f"Marked {len(synced_blocks)} entries as rotated in buffer (rotation_mode=mark) ✓")
+                outcome = rotation.rotate(
+                    self.lock, self.config.decisions_file, self.config.archive_dir, blocks
+                )
             except Exception as e:
-                print(f"[Warning] Archive rotation failed: {str(e)}")
+                sys.stdout.flush()
+                print(
+                    f"[Warning] Archive rotation failed: {e}. decisions.md is unchanged, so "
+                    f"none of the {len(blocks)} entries was removed from it; an archive may "
+                    f"already hold a copy of them.",
+                    file=sys.stderr,
+                )
+            else:
+                self._report_rotation(outcome)
 
         # 5. Trigger renderer to statelessly regenerate files (C3)
         try:
@@ -1691,6 +1680,29 @@ class MitosSyncManager:
             hits, misses, rate = self.embed_provider.get_stats()
             print(f"\n[Observability] Cache Stats: Hits: {hits}, Misses: {misses}, Hit Rate: {rate*100:.1f}%")
 
+    @staticmethod
+    def _report_rotation(outcome: "rotation.RotationOutcome") -> None:
+        """Words a rotation outcome on stderr; a block left unmatched stays silent."""
+        sys.stdout.flush()
+        for archive_path in outcome.archive_paths:
+            name = os.path.basename(archive_path)
+            moved = sum(
+                1 for block in outcome.rotated if os.path.basename(block.archive_name) == name
+            )
+            print(f"Rotated {moved} entries to {archive_path} ✓", file=sys.stderr)
+        for label, count in outcome.duplicated:
+            print(
+                f"[Warning] Rotation skipped {label!r}: its block occurs {count} times in "
+                f"decisions.md, so nothing was removed.",
+                file=sys.stderr,
+            )
+        for label in outcome.overlapping:
+            print(
+                f"[Warning] Rotation skipped {label!r}: its block overlaps another block in "
+                f"this batch, so neither was rotated.",
+                file=sys.stderr,
+            )
+
     def _commit_quarantine_fixpoint(
         self,
         quarantined: List[Tuple[ParsedEntry, str, CommitError]],
@@ -1704,7 +1716,8 @@ class MitosSyncManager:
         never self-heal). This re-attempts that set until a pass commits nothing new,
         so any acyclic cross-file forward-ref chain converges in a **single** sync,
         order-independently. A decision committed here is appended to ``synced_blocks``
-        so it rotates with the main-pass commits; OQ nodes never rotate (D5).
+        so it rotates with the main-pass commits; an OQ is not, because its raw text is
+        ``""`` — its line range indexes questions.md, not the decisions snapshot (D5).
 
         The convergence loop is the shared :func:`mitos.replay.commit_quarantine_fixpoint`
         primitive (the same engine the ``mitos rebuild`` corpus replay uses). This
@@ -1724,7 +1737,7 @@ class MitosSyncManager:
             ``CommitError`` — ``[]`` when everything converged.
         """
         def _record_decision_block(entry: ParsedEntry, raw: str) -> None:
-            # Decisions rotate; OQs never do (raw is "" for an OQ, D5).
+            # Decisions only: an OQ's raw is "" — its range indexes questions.md (D5).
             if entry.kind == "decision":
                 synced_blocks.append((entry, raw))
 

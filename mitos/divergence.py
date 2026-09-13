@@ -559,9 +559,10 @@ def corpus_graph_divergence(store: Any, config: Any) -> Dict[str, Any]:
             all_edges = store.get_edges()
     except Timeout:
         # Another process holds the corpus lock. Report the skip, never a verdict:
-        # a read that catches the rotation window sees a truncated buffer and would
-        # report mass phantom graph-only nodes — and cached, that lie would stick
-        # until the next real edit.
+        # the holder may be mid-sequence — a rotation whose archive append has landed
+        # before its buffer replace, or a record whose graph commit will roll back its
+        # buffer write — so a fold now can report phantom graph-only nodes or a stale
+        # buffer, and cached, that lie would stick until the next real edit.
         return _empty_report(rotation_mode=rotation_mode, skipped="corpus busy")
 
     nodes_by_id = {n["id"]: n for n in all_nodes}
