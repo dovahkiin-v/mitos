@@ -428,3 +428,297 @@ def test_overflow_accounting_in_index_mode(temp_workspace, monkeypatch) -> None:
     assert len(entries) == 1
     assert entries[0]["threshold_chars"] == 200
     assert entries[0]["chars"] > 200
+
+
+# --------------------------------------------------------------------------- #
+# Per-scope degradation (the over-ceiling-scope-render ADR, phase 2c): the degrade
+# set is decided once from maximum-form sizes; a member renders as a stamped
+# oneline index under a self-declaring header, every other file byte-identical.
+# --------------------------------------------------------------------------- #
+
+import json
+import re
+import shlex
+import inspect
+
+from mitos.display import truncate_words
+
+_HUGE = 10_000_000
+_HEAVY = "A deliberately heavy rationale sentence for the degrade fixture. "
+
+
+def _modes(store) -> dict:
+    return {s: f["mode"] for s, f in assemble_render(store)["scopes"].items()}
+
+
+def _full_forms(store, monkeypatch) -> dict:
+    """Every scope's maximum-form record, read at a ceiling nothing crosses."""
+    monkeypatch.setattr(R, "SCOPE_OVERFLOW_WARN_CHARS", _HUGE)
+    return assemble_render(store)["scopes"]
+
+
+def _cli_recipe(content: str) -> str:
+    return re.search(r"`(mitos list [^`]*)`", content).group(1)
+
+
+def _mcp_recipe(content: str) -> str:
+    return re.search(r"`(list_decisions\(.*?\))`", content).group(1)
+
+
+def test_over_ceiling_scope_degrades_to_index(temp_workspace, monkeypatch) -> None:
+    """S1: an over-ceiling scope is one stamped row per tagged decision, no bodies,
+    no pointer section, accounting at index-row weight."""
+    store, _ = temp_workspace
+    for i in range(3):
+        _commit(store, f"big-{i}", ["big"], axiom=f"{_HEAVY * 8}Variant {i}.")
+    _commit(store, "big-guest", ["home", "big"])
+    monkeypatch.setattr(R, "SCOPE_OVERFLOW_WARN_CHARS", 300)
+
+    record = assemble_render(store)["scopes"]["big"]
+    content = record["content"]
+    assert record["mode"] == "index"
+    assert content.startswith("# Active Axioms for Scope: big — Index\n")
+    assert "Rejected" not in content and "## big-" not in content
+    assert R.POINTER_SECTION_HEADING not in content and "→ full entry" not in content
+    tagged = ["big-0", "big-1", "big-2", "big-guest"]
+    for slug in tagged:
+        assert content.count(f"- **{slug}** — ") == 1
+    assert [slug for slug, _ in record["decisions"]] == tagged
+    assert all(size < 200 for _, size in record["decisions"])
+
+
+def test_under_ceiling_scope_stays_full_and_byte_identical(temp_workspace, monkeypatch) -> None:
+    """S2: a sibling under the ceiling is the pre-degrade file, byte for byte."""
+    store, _ = temp_workspace
+    for i in range(3):
+        _commit(store, f"big-{i}", ["big"], axiom=f"{_HEAVY * 8}Variant {i}.")
+    _commit(store, "small-one", ["small"])
+    _commit(store, "shared-one", ["big", "small"])
+
+    shared_axiom = "Axiom for shared-one with enough words to truncate cleanly at a boundary."
+    expected_small = (
+        "# Active Axioms for Scope: small\n"
+        "*Generated automatically by Mitos. Derived statelessly from primary sources (M8).*\n\n"
+        "## small-one\n"
+        "- **Decided:** Axiom for small-one with enough words to truncate cleanly at a boundary.\n"
+        "- **Scope:** small\n"
+        "- **Rejected:**\n  Rejected for small-one.\n"
+        "\n## Also scoped here (full entries elsewhere)\n"
+        f"- **shared-one** — {truncate_words(shared_axiom, 70)} → full entry: big.md\n"
+    )
+    full = _full_forms(store, monkeypatch)
+    assert full["small"]["content"] == expected_small
+    ceiling = len(expected_small)
+    assert len(full["big"]["content"]) > ceiling
+    monkeypatch.setattr(R, "SCOPE_OVERFLOW_WARN_CHARS", ceiling)
+
+    scopes = assemble_render(store)["scopes"]
+    assert scopes["big"]["mode"] == "index"
+    assert scopes["small"]["mode"] == "full"
+    assert scopes["small"]["content"] == expected_small
+    assert scopes["small"]["decisions"] == full["small"]["decisions"]
+
+
+def test_scope_crossing_only_through_its_pointer_section_degrades(
+    temp_workspace, monkeypatch
+) -> None:
+    """S3 (the `substrate` shape): one primary, many secondary rows — the pointer
+    section alone carries the file over, and that is enough to degrade."""
+    store, _ = temp_workspace
+    _commit(store, "sub-own", ["sub"])
+    for i in range(20):
+        _commit(store, f"visitor-{i}", [f"home-{i}", "sub"])
+    full = _full_forms(store, monkeypatch)["sub"]["content"]
+    bodies_only = len(full[:full.index(R.POINTER_SECTION_HEADING)])
+    ceiling = (bodies_only + len(full)) // 2
+    assert bodies_only < ceiling < len(full)
+    monkeypatch.setattr(R, "SCOPE_OVERFLOW_WARN_CHARS", ceiling)
+
+    modes = _modes(store)
+    assert modes["sub"] == "index"
+    assert all(modes[f"home-{i}"] == "full" for i in range(20))
+
+
+def test_scope_reverts_to_full_when_a_supersede_shrinks_it(temp_workspace, monkeypatch) -> None:
+    """S4: the same ceiling across two renders; retiring the heavy decision brings
+    the file back under, and it renders as a fresh full-form file."""
+    store, _ = temp_workspace
+    _commit(store, "heavy-call", ["rev"], axiom=f"{_HEAVY * 12}Heavy.")
+    _commit(store, "light-call", ["rev"])
+    ceiling = len(_full_forms(store, monkeypatch)["rev"]["content"]) - 1
+    monkeypatch.setattr(R, "SCOPE_OVERFLOW_WARN_CHARS", ceiling)
+    assert assemble_render(store)["scopes"]["rev"]["mode"] == "index"
+
+    successor = ParsedEntry("decision", "heavy-successor", 1, 5)
+    successor.axiom = "A short successor axiom."
+    successor.rejected_paths = "The heavy call."
+    successor.scope = ["rev"]
+    successor.supersedes = ["heavy-call"]
+    store.commit_parsed_entry(successor)
+
+    after = assemble_render(store)["scopes"]["rev"]
+    fresh = _full_forms(store, monkeypatch)["rev"]
+    assert len(fresh["content"]) <= ceiling
+    assert after["mode"] == "full"
+    assert after["content"] == fresh["content"]
+
+
+def _degrade_corpus(store) -> None:
+    for i in range(3):
+        _commit(store, f"same-{i}", ["same", "peer"], axiom=f"{_HEAVY * 6}Variant {i}.")
+    _commit(store, "peer-own", ["peer"])
+
+
+def test_degraded_render_is_stateless_and_path_free(monkeypatch) -> None:
+    """S6: the same active set renders the same bytes twice and in two workspaces."""
+    import shutil
+    monkeypatch.setattr(R, "SCOPE_OVERFLOW_WARN_CHARS", 400)
+    renders, paths = [], []
+    for _ in range(2):
+        workspace = tempfile.mkdtemp()
+        paths.append(workspace)
+        try:
+            store = GraphStore(os.path.join(workspace, ".mitos", "graph.sqlite"))
+            _degrade_corpus(store)
+            first = assemble_render(store)
+            assert assemble_render(store) == first
+            renders.append(first["scopes"])
+        finally:
+            shutil.rmtree(workspace, ignore_errors=True)
+
+    assert {s: f["mode"] for s, f in renders[0].items()} == {"same": "index", "peer": "index"}
+    assert renders[0] == renders[1]
+    for scope_record in renders[0].values():
+        for path in paths:
+            assert path not in scope_record["content"]
+            assert os.path.realpath(path) not in scope_record["content"]
+
+
+def test_degraded_header_both_registers(temp_workspace, monkeypatch) -> None:
+    """S7: under the ceiling the header names the file, stamps, the corpus and both
+    tool forms with no size; over it, it adds the rows' size and the applied ceiling."""
+    store, _ = temp_workspace
+    for i in range(3):
+        _commit(store, f"reg-{i}", ["reg"], axiom=f"{_HEAVY * 8}Variant {i}.")
+    full_len = len(_full_forms(store, monkeypatch)["reg"]["content"])
+
+    monkeypatch.setattr(R, "SCOPE_OVERFLOW_WARN_CHARS", full_len - 1)
+    under = assemble_render(store)["scopes"]["reg"]
+    under_len = len(under["content"])
+    assert under["mode"] == "index" and under_len < full_len - 1
+    head = under["content"].split("\n- **reg-0**", 1)[0]
+    for needle in ("is an index of the 3 active decisions tagged `reg`", "modifier stamps",
+                   "full bodies are not in this file", "`decisions.md`",
+                   "`decisions/archive/`", "`grep`",
+                   "`mitos list --scope=reg --oneline -p .`",
+                   "from the workspace root, or `-p <that absolute path>` from anywhere",
+                   'list_decisions(scope="reg", oneline=True, project='):
+        assert needle in head
+    assert "chars" not in head
+
+    # At exactly the ceiling the short register stands; one below, the long one.
+    monkeypatch.setattr(R, "SCOPE_OVERFLOW_WARN_CHARS", under_len)
+    assert assemble_render(store)["scopes"]["reg"]["content"] == under["content"]
+    monkeypatch.setattr(R, "SCOPE_OVERFLOW_WARN_CHARS", under_len - 1)
+    over = assemble_render(store)["scopes"]["reg"]
+    rows_chars = sum(size for _, size in over["decisions"])
+    assert rows_chars < under_len - 1
+    assert over["mode"] == "index"
+    assert f"({R.SCOPE_OVERFLOW_WARN_CHARS:,} chars)" in over["content"]
+    assert f"rows alone come to {rows_chars:,} chars" in over["content"]
+    assert over["content"].replace(
+        over["content"].split("\n")[4] + "\n", "", 1) == under["content"]
+
+
+def test_degraded_header_carries_no_machine_identity(temp_workspace, monkeypatch) -> None:
+    """S8: the header states the addressing form, never a path, name or config key,
+    and names no semantic verb, no row tier and no later format."""
+    store, workspace = temp_workspace
+    for i in range(3):
+        _commit(store, f"plain-{i}", ["plain"], axiom=f"{_HEAVY * 6}Variant {i}.")
+    monkeypatch.setattr(R, "SCOPE_OVERFLOW_WARN_CHARS", 300)
+    content = assemble_render(store)["scopes"]["plain"]["content"]
+    assert "-p ." in content
+    assert ("project=<absolute path of the workspace directory this file's .mitos/ "
+            "sits in>)") in content
+    assert workspace not in content and os.path.realpath(workspace) not in content
+    assert os.getcwd() not in content
+    assert re.search(r"surface|query|show", content) is None
+    assert "madr" not in content.lower()
+    assert "render_scope_overflow_warn_chars" not in content
+    assert f"({R.SCOPE_OVERFLOW_WARN_CHARS:,} chars)" in content
+
+
+@pytest.mark.parametrize("tag", ["plain", "foo bar", "-x", "--oneline", "ž tag"])
+def test_degraded_header_recipes_parse(temp_workspace, monkeypatch, tag) -> None:
+    """S9: the CLI recipe parses to this scope's oneline listing with `-p .`, and the
+    MCP form's keywords are real `list_decisions` parameters, for awkward tags too."""
+    from mitos import cli, mcp_server
+    store, _ = temp_workspace
+    for i in range(2):
+        _commit(store, f"tagged-{i}", [tag], axiom=f"{_HEAVY * 6}Variant {i}.")
+    monkeypatch.setattr(R, "SCOPE_OVERFLOW_WARN_CHARS", 300)
+    record = assemble_render(store)["scopes"][tag]
+    assert record["mode"] == "index"
+
+    args = cli._build_parser().parse_args(shlex.split(_cli_recipe(record["content"]))[1:])
+    assert args.command == "list"
+    assert args.scope == tag
+    assert args.oneline is True
+    assert args.project_post == "."
+
+    mcp = _mcp_recipe(record["content"])
+    params = inspect.signature(mcp_server.list_decisions).parameters
+    keywords = re.findall(r"(?:\(|, )(\w+)=", mcp)
+    assert keywords == ["scope", "oneline", "project"]
+    assert set(keywords) <= set(params)
+    literal = re.match(r'list_decisions\(scope=(".*?"), oneline=', mcp).group(1)
+    assert json.loads(literal) == tag
+
+
+def test_render_all_writes_the_degraded_file(temp_workspace, monkeypatch) -> None:
+    """S10: disk equals the assembled index, every scope path is returned, and the
+    overflow record holds a degraded file iff the index itself is over."""
+    store, workspace = temp_workspace
+    for i in range(3):
+        _commit(store, f"fits-{i}", ["fits"], axiom=f"{_HEAVY * 10}Variant {i}.")
+    for i in range(40):
+        _commit(store, f"many-{i}", ["many"], axiom=f"Many rows decision number {i} here.")
+    monkeypatch.setattr(R, "SCOPE_OVERFLOW_WARN_CHARS", 1500)
+
+    assembled = assemble_render(store)
+    fits, many = assembled["scopes"]["fits"], assembled["scopes"]["many"]
+    assert fits["mode"] == "index" and len(fits["content"]) <= 1500
+    assert many["mode"] == "index" and len(many["content"]) > 1500
+
+    renderer = MitosRenderer(workspace)
+    written = renderer.render_all(store)
+    axioms = os.path.join(workspace, ".mitos", "axioms")
+    for name, record in (("fits", fits), ("many", many)):
+        path = os.path.join(axioms, f"{name}.md")
+        assert path in written
+        with open(path, encoding="utf-8") as f:
+            assert f.read() == record["content"]
+    names = [o["name"] for o in renderer.overflows]
+    assert "many.md" in names and "fits.md" not in names
+
+
+def test_degrade_set_is_one_pass_and_order_free(temp_workspace, monkeypatch) -> None:
+    """S11: two scopes sized by each other's secondary rows; at every threshold the
+    degrade set is the pass-one set, and reversing the store's order leaves it."""
+    store, _ = temp_workspace
+    for i in range(4):
+        _commit(store, f"xy-{i}", ["x", "y"], axiom=f"{_HEAVY * (i + 2)}Variant {i}.")
+        _commit(store, f"yx-{i}", ["y", "x"], axiom=f"{_HEAVY * (5 - i)}Other {i}.")
+    full = _full_forms(store, monkeypatch)
+    lengths = sorted(len(f["content"]) for f in full.values())
+    original = store.get_active_decisions
+
+    for ceiling in sorted({n + d for n in lengths for d in (-1, 0)}):
+        expected = {s: ("index" if len(f["content"]) > ceiling else "full")
+                    for s, f in full.items()}
+        monkeypatch.setattr(R, "SCOPE_OVERFLOW_WARN_CHARS", ceiling)
+        monkeypatch.setattr(store, "get_active_decisions", original)
+        assert _modes(store) == expected
+        monkeypatch.setattr(store, "get_active_decisions", lambda: list(reversed(original())))
+        assert _modes(store) == expected

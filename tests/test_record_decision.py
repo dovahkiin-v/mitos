@@ -297,14 +297,21 @@ def test_slug_prefix_is_not_a_collision(ws) -> None:
 
 @patch("mitos.sync.QdrantVectorStore")
 @patch("mitos.sync.GeminiEmbeddingProvider")
-def test_scope_overflow_summary_after_receipt_then_debounced(mock_provider, mock_vector, ws) -> None:
+def test_scope_overflow_summary_after_receipt_then_debounced(mock_provider, mock_vector, ws,
+                                                            monkeypatch) -> None:
     """An over-ceiling render attaches ONE debounced `scope_overflow` summary to the result.
 
     Reproduces the AX complaint and pins the fix end-to-end on the shared write path
     (so both the CLI and MCP surfaces inherit it): the receipt fields are always intact,
     the size nudge is a single line pointing at `mitos status` (not the per-write wall),
     and a second record in the same workspace within the window is silent.
+
+    Since the per-scope degrade (2c) an over-ceiling scope file becomes an index, and at
+    the default ceilings this one decision's index fits, so nothing would be over. The
+    scope ceiling is squeezed below the index itself, which is still reported.
     """
+    import mitos.renderer as R
+    monkeypatch.setattr(R, "SCOPE_OVERFLOW_WARN_CHARS", 200)
     config, _ = ws
     # Degrade the backends → no network and no P4 near-duplicate pause (which needs
     # embeddings), isolating the overflow-presentation behaviour under test.
