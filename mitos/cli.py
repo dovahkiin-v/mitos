@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from typing import Callable, List, Mapping, Optional, Dict, Any, Set, Tuple
 
 from mitos import __version__
+from mitos import atomic_file
 from mitos import check
 from mitos import overview
 from mitos import registry
@@ -652,16 +653,18 @@ def cmd_init(config: MitosConfig, name: Optional[str] = None, force: bool = Fals
         )
 
     # 3. Seed the decisions.md buffer when absent (with the extracted ## 3 sample).
+    #    Both seeds go through write_source: the existence guard never re-seeds a
+    #    torn file, so a failed seed must leave absence, never a partial buffer.
     if not os.path.exists(config.decisions_file):
-        with open(config.decisions_file, "w", encoding="utf-8") as f:
-            f.write(
-                "# Decisions for Mitos\n\n"
-                "<!-- This file is managed by mitos. LLM integration: see .mitos/skill.md once V5 ships. -->\n"
-                "<!-- DO NOT MODIFY ABOVE THIS LINE -->\n\n"
-                "## SAMPLE FORMAT — auto-restored by mitos sync, do not modify or delete\n\n"
-                f"{decision_sample}\n\n"
-                "<!-- BEGIN ENTRIES — new decisions go directly below this line, newest first -->\n"
-            )
+        atomic_file.write_source(
+            config.decisions_file,
+            "# Decisions for Mitos\n\n"
+            "<!-- This file is managed by mitos. LLM integration: see .mitos/skill.md once V5 ships. -->\n"
+            "<!-- DO NOT MODIFY ABOVE THIS LINE -->\n\n"
+            "## SAMPLE FORMAT — auto-restored by mitos sync, do not modify or delete\n\n"
+            f"{decision_sample}\n\n"
+            "<!-- BEGIN ENTRIES — new decisions go directly below this line, newest first -->\n",
+        )
 
     # 4. Seed the questions.md buffer when absent — the open-question authoring
     #    file (ADR open-questions-authored-in-separate-questions-md-file), parallel
@@ -669,15 +672,15 @@ def cmd_init(config: MitosConfig, name: Optional[str] = None, force: bool = Fals
     #    parser splits the preamble on that substring) and the ## 4 sample sitting in
     #    the preamble (it yields zero graph state on the first sync).
     if not os.path.exists(config.questions_file):
-        with open(config.questions_file, "w", encoding="utf-8") as f:
-            f.write(
-                "# Open Questions for Mitos\n\n"
-                "<!-- This file is managed by mitos. LLM integration: see .mitos/skill.md once V5 ships. -->\n"
-                "<!-- DO NOT MODIFY ABOVE THIS LINE -->\n\n"
-                "## SAMPLE FORMAT — auto-restored by mitos sync, do not modify or delete\n\n"
-                f"{question_sample}\n\n"
-                "<!-- BEGIN ENTRIES — new questions go directly below this line, newest first -->\n"
-            )
+        atomic_file.write_source(
+            config.questions_file,
+            "# Open Questions for Mitos\n\n"
+            "<!-- This file is managed by mitos. LLM integration: see .mitos/skill.md once V5 ships. -->\n"
+            "<!-- DO NOT MODIFY ABOVE THIS LINE -->\n\n"
+            "## SAMPLE FORMAT — auto-restored by mitos sync, do not modify or delete\n\n"
+            f"{question_sample}\n\n"
+            "<!-- BEGIN ENTRIES — new questions go directly below this line, newest first -->\n",
+        )
 
     # Touch database to initialize — boots the V1a STRICT schema via the migration
     # ladder (fresh -> user_version=1; an existing V1a graph re-runs as a no-op). A
@@ -843,7 +846,12 @@ def cmd_reconcile(config: MitosConfig, as_json: bool = False) -> int:
 
 
 def cmd_capture(config: MitosConfig, text: str) -> None:
-    """Captures a raw architectural thought and appends it to decisions.md.
+    """Captures a raw architectural thought into the decisions.md buffer.
+
+    The synthesized entry is spliced directly below the first `_ENTRIES_MARKER`
+    (newest first; appended at the end when the marker is absent), and the whole
+    file is replaced atomically under the buffer lock, so a failed write leaves the
+    buffer untouched.
 
     Every branch — the keyless refusal included — answers on stdout, so one leading
     echo covers the whole verb.
@@ -867,21 +875,22 @@ def cmd_capture(config: MitosConfig, text: str) -> None:
         print(f"Ambient capture failed: {str(e)}")
         return
 
-    # Append below BEGIN ENTRIES line under advisory lock
+    # Splice below the first BEGIN ENTRIES marker and replace the whole file
+    # atomically, all under the buffer lock.
     manager = MitosSyncManager(config)
     try:
         with manager.lock:
             with open(config.decisions_file, "r", encoding="utf-8") as f:
                 content = f.read()
 
-            marker = "<!-- BEGIN ENTRIES — new decisions go directly below this line, newest first -->"
-            if marker in content:
-                content = content.replace(marker, f"{marker}\n\n{entry_text}\n")
+            if _ENTRIES_MARKER in content:
+                content = content.replace(
+                    _ENTRIES_MARKER, f"{_ENTRIES_MARKER}\n\n{entry_text}\n", 1
+                )
             else:
                 content += f"\n\n{entry_text}\n"
 
-            with open(config.decisions_file, "w", encoding="utf-8") as f:
-                f.write(content)
+            atomic_file.write_source(config.decisions_file, content)
         print(f"Appended synthesized decision to decisions.md buffer ✓")
     except Exception as e:
         print(f"Failed to append captured entry: {str(e)}")

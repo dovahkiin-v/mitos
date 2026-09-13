@@ -230,8 +230,10 @@ Make sure the slug is a clean, lowercase hyphenated string that matches the deci
 
 # --- record_decision helpers (write-half of the MCP server) ---
 
-# The exact buffer marker, byte-for-byte identical to cmd_capture (cli.py). The
-# `—` is an em dash; do not retype it.
+# The exact buffer marker. Its consumers are record_decision_entry here and
+# cmd_capture / cmd_restore_source in cli.py; auto_heal_decisions_file and the
+# `mitos init` seed keep their own byte-identical copies. The `—` is an em dash;
+# do not retype it.
 _ENTRIES_MARKER = "<!-- BEGIN ENTRIES — new decisions go directly below this line, newest first -->"
 
 # A content line that looks like a Mitos field header (e.g. `**Decided:**`); the
