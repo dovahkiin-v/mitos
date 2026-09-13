@@ -5,8 +5,8 @@ generating global and per-scope markdown files atomically from primary source da
 """
 
 import os
-import tempfile
 from typing import List, Dict, Any, Optional, Tuple
+from mitos import atomic_file
 from mitos.display import oneline_axiom, truncate_words
 from mitos.protocols import GraphStoreProtocol
 from mitos.store import MODIFIER_EDGE_KEYS
@@ -206,25 +206,21 @@ def render_node_markdown(node: Dict[str, Any],
 
 
 def atomic_write(filepath: str, content: str) -> None:
-    """Writes content to filepath atomically using a tempfile and replace.
+    """Writes a render file atomically using a temp file and replace, without fsync.
 
-    Prevents partial/corrupted files during failure (F4b).
+    Prevents partial/corrupted files during failure (F4b). Delegates to
+    ``atomic_file.write_derived``, so after a power loss the file can be lost rather
+    than reverted — acceptable only because a render regenerates. Never use this for a
+    file ``mitos rebuild`` replays from; ``atomic_file.write_source`` is that path.
     """
     dirpath = os.path.dirname(filepath)
     if dirpath:
         os.makedirs(dirpath, exist_ok=True)
-        
-    # Write to a temporary file in the same directory (to ensure on same filesystem for rename)
-    fd, temp_path = tempfile.mkstemp(dir=dirpath or ".", suffix=".tmp")
+
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(content)
-        # Atomic rename
-        os.replace(temp_path, filepath)
+        atomic_file.write_derived(filepath, content)
     except Exception as e:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-        raise IOError(f"Atomic write failed for {filepath}: {str(e)}")
+        raise IOError(f"Atomic write failed for {filepath}: {str(e)}") from e
 
 
 def assemble_render(store: GraphStoreProtocol) -> Dict[str, Any]:

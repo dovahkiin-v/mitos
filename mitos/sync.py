@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from google import genai
 
 from mitos import __version__ as MITOS_VERSION
+from mitos import atomic_file
 from mitos.config import MitosConfig, hint_due
 from mitos.conflict import (
     CONFLICT_CANDIDATE_SOURCE,
@@ -1069,8 +1070,7 @@ class MitosSyncManager:
             current_header = parts[0]
             if current_header.strip() != canonical_header.strip():
                 new_content = canonical_header + marker + entries_content
-                with open(filepath, "w", encoding="utf-8") as f:
-                    f.write(new_content)
+                atomic_file.write_source(filepath, new_content)
                 # stderr, not stdout: this method is on `record_decision_entry`'s path,
                 # which the MCP write tool shares — and that transport uses stdout for
                 # JSON-RPC, so a stray line here is protocol corruption, not noise. It
@@ -1082,8 +1082,7 @@ class MitosSyncManager:
         else:
             if "## SAMPLE FORMAT" not in content:
                 new_content = canonical_header + marker + "\n\n" + content
-                with open(filepath, "w", encoding="utf-8") as f:
-                    f.write(new_content)
+                atomic_file.write_source(filepath, new_content)
                 print("Auto-restored missing sample format header and BEGIN ENTRIES "
                       "marker ✓", file=sys.stderr)
 
@@ -3152,19 +3151,19 @@ class MitosSyncManager:
             new_content = transform(original)
 
             try:
-                with open(self.config.decisions_file, "w", encoding="utf-8") as fh:
-                    fh.write(new_content)
+                atomic_file.write_source(self.config.decisions_file, new_content)
                 if after_write is not None:
                     after_write(new_content)
             except Exception:
                 try:
-                    with open(self.config.decisions_file, "w", encoding="utf-8") as fh:
-                        fh.write(original)
+                    atomic_file.write_source(self.config.decisions_file, original)
                 except Exception as restore_exc:
                     raise MitosError(
                         "The splice failed AND decisions.md could not be rolled back "
-                        f"(rollback error: {restore_exc}). The file may hold a partial "
-                        "edit — check it before running `mitos sync`."
+                        f"(rollback error: {restore_exc}). Each write replaces the file "
+                        "whole, so it holds whole content: either its text from before "
+                        "the splice or the unverified splice. Check which before running "
+                        "`mitos sync`."
                     ) from restore_exc
                 raise
             return new_content
@@ -3618,8 +3617,7 @@ class MitosSyncManager:
                 # — including an OSError on the write itself — roll the buffer back
                 # so a failure leaves NO orphan entry, and return JSON (never raise).
                 try:
-                    with open(self.config.decisions_file, "w", encoding="utf-8") as f:
-                        f.write(new_content)
+                    atomic_file.write_source(self.config.decisions_file, new_content)
                     delta = self.store.commit_parsed_entry(entry)
                 except (ValidationError, DatabaseError, OSError, CommitError) as commit_exc:
                     # Roll the buffer back so a failed write/commit leaves NO orphan
@@ -3631,8 +3629,7 @@ class MitosSyncManager:
                     # it). Surface the per-item messages so the agent sees the actionable
                     # field (P3 vector error), not a generic wall.
                     try:
-                        with open(self.config.decisions_file, "w", encoding="utf-8") as f:
-                            f.write(original_content)
+                        atomic_file.write_source(self.config.decisions_file, original_content)
                     except Exception as restore_exc:
                         return {
                             "error": (

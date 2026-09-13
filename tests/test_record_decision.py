@@ -419,6 +419,87 @@ def test_commit_failed_rolls_back_buffer(ws, exc) -> None:
     assert GraphStore(config.db_path).get_node_by_slug("will-fail") is None
 
 
+def _temps(config: MitosConfig) -> list:
+    directory = os.path.dirname(config.decisions_file)
+    return [n for n in os.listdir(directory) if n.endswith(".tmp")]
+
+
+def test_record_preserves_the_buffer_mode(ws) -> None:
+    """The atomic replace must not re-mode the gold source to the temp file's mode."""
+    config, m = ws
+    os.chmod(config.decisions_file, 0o640)
+    res = m.record_decision_entry("Mode survives.", "Rejection.", ["s"], slug="mode-ok")
+    assert res["status"] == "created"
+    assert os.stat(config.decisions_file).st_mode & 0o777 == 0o640
+    assert "mode-ok" in _read(config)
+
+
+def test_forward_buffer_write_failure_returns_commit_failed_and_leaves_buffer_whole(ws) -> None:
+    """A full disk on the forward write: commit_failed, buffer untouched, no node, no temp.
+
+    Injected at the real primitive's replace, so the temp file is genuinely created and
+    must be cleaned. The spy proves the failing call is the forward write carrying the
+    entry, not an auto-heal write (the `ws` header is canonical, so the heal makes none).
+    """
+    from mitos import atomic_file
+
+    config, m = ws
+    before = _read(config)
+    contents = []
+    real_write_source = atomic_file.write_source
+    real_replace = os.replace
+    replaces = {"n": 0}
+
+    def _spy(path, content):
+        contents.append(content)
+        return real_write_source(path, content)
+
+    def _fail_first_replace(src, dst):
+        replaces["n"] += 1
+        if replaces["n"] == 1:
+            raise OSError(28, "No space left on device")
+        return real_replace(src, dst)
+
+    with patch("mitos.atomic_file.write_source", side_effect=_spy), \
+            patch("mitos.atomic_file.os.replace", side_effect=_fail_first_replace):
+        res = m.record_decision_entry("Never lands.", "Rejection.", [], slug="never-lands")
+
+    assert res["code"] == "commit_failed"
+    assert len(contents) == 2, "forward write, then rollback write"
+    assert "never-lands" in contents[0] and contents[0] != before
+    assert _read(config) == before
+    assert GraphStore(config.db_path).get_node_by_slug("never-lands") is None
+    assert _temps(config) == []
+
+
+def test_refused_directory_fsync_does_not_turn_a_record_into_a_failed_rollback(ws) -> None:
+    """A mount that refuses directory fsync must still record cleanly.
+
+    Were the directory step fatal, the forward write would land and raise, the rollback
+    would land and raise, and the method would report "rollback failed" over a whole,
+    correctly rolled-back file — on every write on that mount.
+    """
+    import stat as _stat
+
+    config, m = ws
+    real_fsync = os.fsync
+    refused = []
+
+    def _fsync(fd):
+        if _stat.S_ISDIR(os.fstat(fd).st_mode):
+            refused.append(fd)
+            raise OSError(22, "Invalid argument")
+        return real_fsync(fd)
+
+    with patch("mitos.atomic_file.os.fsync", side_effect=_fsync):
+        res = m.record_decision_entry("Lands anyway.", "Rejection.", ["s"], slug="lands-anyway")
+
+    assert refused, "the directory fsync was never attempted"
+    assert "error" not in res and res["status"] == "created"
+    assert GraphStore(config.db_path).get_node_by_slug("lands-anyway") is not None
+    assert "lands-anyway" in _read(config)
+
+
 def test_concurrent_distinct_slugs_all_land(ws) -> None:
     """Five threads recording distinct decisions all commit with no buffer corruption."""
     config, m = ws

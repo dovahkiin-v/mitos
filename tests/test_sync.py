@@ -493,6 +493,49 @@ def test_sync_auto_heal_sample_block(sync_env: Tuple[MitosConfig, MitosSyncManag
     assert "Real core decision." in content
 
 
+def _spy_write_source():
+    from mitos import atomic_file
+    return patch("mitos.atomic_file.write_source", side_effect=atomic_file.write_source)
+
+
+def test_auto_heal_drifted_header_writes_through_the_primitive_and_keeps_mode(
+        sync_env: Tuple[MitosConfig, MitosSyncManager, str]) -> None:
+    """Branch 1 (marker present, header drifted): one durable write, mode preserved.
+
+    A second heal over the now-canonical header must write nothing at all.
+    """
+    config, manager, _ = sync_env  # fixture header is "# Decisions", i.e. drifted
+    os.chmod(config.decisions_file, 0o640)
+
+    with _spy_write_source() as spy:
+        manager.auto_heal_decisions_file()
+    assert spy.call_count == 1
+    assert spy.call_args.args[0] == config.decisions_file
+    assert os.stat(config.decisions_file).st_mode & 0o777 == 0o640
+
+    with _spy_write_source() as spy:
+        manager.auto_heal_decisions_file()
+    assert spy.call_count == 0
+
+
+def test_auto_heal_missing_marker_writes_through_the_primitive_and_keeps_mode(
+        sync_env: Tuple[MitosConfig, MitosSyncManager, str]) -> None:
+    """Branch 2 (no marker, no sample block): one durable write, mode preserved."""
+    config, manager, _ = sync_env
+    with open(config.decisions_file, "w", encoding="utf-8") as f:
+        f.write("### hand-written\n**Decided:** Something.\n")
+    os.chmod(config.decisions_file, 0o640)
+
+    with _spy_write_source() as spy:
+        manager.auto_heal_decisions_file()
+    assert spy.call_count == 1
+    assert os.stat(config.decisions_file).st_mode & 0o777 == 0o640
+    with open(config.decisions_file, "r", encoding="utf-8") as f:
+        healed = f.read()
+    assert "## SAMPLE FORMAT" in healed and "BEGIN ENTRIES" in healed
+    assert healed.endswith("### hand-written\n**Decided:** Something.\n")
+
+
 # --------------------------------------------------------------------------- #
 # Phase 4a — questions.md steady-state ingestion + per-entry commit-stage
 # quarantine floor. The quarantine lives in perform_sync ABOVE the commit, so it

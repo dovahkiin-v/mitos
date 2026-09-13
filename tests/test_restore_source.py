@@ -467,32 +467,76 @@ def test_splice_buffer_holds_the_same_lock_record_and_sync_use(tmp_path):
 
 
 def test_splice_buffer_reports_loudly_when_the_rollback_itself_fails(tmp_path):
-    """The one case silence would be unforgivable: the file is in an unknown state.
+    """The one case silence would be unforgivable: the rollback did not land.
 
-    A rollback failure means the buffer may hold a partial edit, so the error has to
-    name that rather than surfacing the original exception as if nothing was written.
+    The error has to say so rather than surfacing the original exception as if nothing
+    was written — and it has to name the state the file is actually in. Each write
+    replaces the file whole, so that state is the pre-splice text or the unverified
+    splice, never a partial edit; here verification refused, so it is the splice.
     """
     from unittest.mock import patch
+    from mitos import atomic_file
     from mitos.errors import MitosError
 
     config, manager = _manager(tmp_path)
-    real_open = open
-    calls = {"n": 0}
+    real_write_source = atomic_file.write_source
+    calls = []
 
-    def _fail_on_the_rollback_write(*args, **kwargs):
-        # 1st write = the splice, 2nd write = the rollback.
-        if len(args) > 1 and args[1] == "w":
-            calls["n"] += 1
-            if calls["n"] == 2:
-                raise OSError("disk went away")
-        return real_open(*args, **kwargs)
+    def _fail_on_the_rollback_write(path, content):
+        # 1st write = the splice, 2nd write = the rollback. `_manager` pre-healed the
+        # header, so auto-heal contributes no call of its own.
+        calls.append(content)
+        if len(calls) == 2:
+            raise OSError("disk went away")
+        return real_write_source(path, content)
 
     def _reject(_after_text):
         raise RestoreError("refused")
 
-    with patch("builtins.open", side_effect=_fail_on_the_rollback_write):
-        with pytest.raises(MitosError, match="could not be rolled back"):
+    with patch("mitos.atomic_file.write_source", side_effect=_fail_on_the_rollback_write):
+        with pytest.raises(MitosError, match="could not be rolled back") as info:
             manager.splice_buffer(lambda original: "NEW\n", after_write=_reject)
+
+    assert len(calls) == 2, "the injection must hit the rollback, not the heal"
+    message = str(info.value)
+    assert "partial" not in message
+    assert "whole" in message
+    assert _buffer(config) == "NEW\n", "the file holds the refused splice, whole"
+
+
+def test_splice_buffer_preserves_the_buffer_mode(tmp_path):
+    """A replace-based write that forgot the preserve rule re-modes the gold source."""
+    config, manager = _manager(tmp_path)
+    os.chmod(config.decisions_file, 0o640)
+
+    manager.splice_buffer(lambda original: original + "\n<!-- tail -->\n")
+
+    assert os.stat(config.decisions_file).st_mode & 0o777 == 0o640
+
+
+def test_splice_buffer_forward_write_failure_leaves_the_buffer_whole(tmp_path):
+    """A full disk on the splice write must not truncate the buffer it was replacing."""
+    from unittest.mock import patch
+
+    config, manager = _manager(tmp_path)
+    before = _buffer(config)
+    real_replace = os.replace
+    calls = {"n": 0}
+
+    def _fail_first_replace(src, dst):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError(28, "No space left on device")
+        return real_replace(src, dst)
+
+    with patch("mitos.atomic_file.os.replace", side_effect=_fail_first_replace):
+        with pytest.raises(OSError):
+            manager.splice_buffer(lambda original: "TOTALLY DIFFERENT CONTENT\n")
+
+    assert calls["n"] == 2, "forward write failed, then the rollback write ran"
+    assert _buffer(config) == before
+    directory = os.path.dirname(config.decisions_file)
+    assert [n for n in os.listdir(directory) if n.endswith(".tmp")] == []
 
 
 def test_graph_fingerprint_moves_with_every_write_path(tmp_path):

@@ -42,6 +42,32 @@ def test_atomic_write_safety() -> None:
             assert f.read() == content
 
 
+def test_render_never_reaches_the_durable_path(temp_workspace: Tuple[GraphStore, str]) -> None:
+    """A render is derivative: no fsync, and never the replayed-from entry point.
+
+    SQLite syncs in C and never calls `os.fsync`, so a zero count here is meaningful.
+    Nodes are committed before the spies start.
+    """
+    from unittest.mock import patch
+    from mitos import atomic_file
+
+    store, workspace = temp_workspace
+    entry = ParsedEntry("decision", "render-only", 1, 5)
+    entry.axiom = "Renders regenerate."
+    entry.rejected_paths = "Durable renders."
+    entry.scope = ["backend"]
+    store.commit_parsed_entry(entry)
+
+    with patch("os.fsync", side_effect=os.fsync) as fsync, \
+            patch("mitos.atomic_file.write_source",
+                  side_effect=atomic_file.write_source) as durable:
+        written = MitosRenderer(workspace).render_all(store)
+
+    assert written, "the render wrote nothing, so the zero counts would be vacuous"
+    assert fsync.call_count == 0
+    assert durable.call_count == 0
+
+
 def test_renderer_stateless_outputs(temp_workspace: Tuple[GraphStore, str]) -> None:
     """Tests global and per-scope renders against active nodes."""
     store, workspace = temp_workspace
