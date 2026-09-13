@@ -7,7 +7,7 @@ generating global and per-scope markdown files atomically from primary source da
 import json
 import os
 import shlex
-from typing import List, Dict, Any, Optional, Tuple
+from typing import AbstractSet, List, Dict, Any, Optional, Tuple
 from mitos import atomic_file
 from mitos.display import oneline_axiom, truncate_words
 from mitos.protocols import GraphStoreProtocol
@@ -26,30 +26,93 @@ _CHARS_PER_TOKEN = 4
 # Width of the truncated axiom in a secondary-scope pointer line (chars).
 POINTER_AXIOM_CHARS = 70
 
-# Section heading grouping the secondary-scope pointer lines below a scope
-# file's full entries (see render_pointer_line).
-POINTER_SECTION_HEADING = "## Also scoped here (full entries elsewhere)"
+# The addressing skeletons every generated tool pointer is composed from, concrete
+# (a real tag) or slot form (`<scope>` / `<slug>`), so the two cannot drift. A
+# generated file states the addressing form, never the machine's answer to it (ADR
+# generated-file-states-the-addressing-form-never-the-machines-answer).
+_MCP_PROJECT_SLOT = ("project=<absolute path of the workspace directory this file's "
+                     ".mitos/ sits in>")
+_SCOPE_SLOT = "<scope>"
+_SLUG_SLOT = "<slug>"
 
 
-def render_pointer_line(node: Dict[str, Any], primary_scope: str) -> str:
+def _list_forms(cli_scope: str, mcp_scope: str) -> Tuple[str, str]:
+    """Returns ``(mcp, cli)`` for the bounded oneline scope tier, from rendered scope tokens."""
+    return (f"list_decisions(scope={mcp_scope}, oneline=True, {_MCP_PROJECT_SLOT})",
+            f"mitos list --scope={cli_scope} --oneline -p .")
+
+
+def _show_forms(cli_slug: str, mcp_slug: str) -> Tuple[str, str]:
+    """Returns ``(mcp, cli)`` for the exact decision lookup, from rendered slug tokens.
+
+    The CLI form puts ``--`` before the slug because a hand-authored slug may start
+    with ``-``, and ``show`` takes it as a positional with no ``ident=`` spelling.
+    ``-p .`` stays before the ``--``, where it is still read as the selector.
+    """
+    return (f"show_node(ident={mcp_slug}, {_MCP_PROJECT_SLOT})",
+            f"mitos show -p . -- {cli_slug}")
+
+
+def _addressing_clause(forms: Tuple[str, str]) -> str:
+    """Renders ``(mcp, cli)`` as the two-form clause every generated pointer uses.
+
+    The MCP form comes first because it names the absolute path the CLI's "from
+    anywhere" clause refers back to (the skill.md Addressing order).
+    """
+    mcp, cli = forms
+    return (f"over MCP, `{mcp}`; on the CLI, `{cli}` from the workspace root, or "
+            "`-p <that absolute path>` from anywhere")
+
+
+# The constant a secondary row ends in when its primary scope's file is an index:
+# the body is in no file of the tree, so the row names none. It must never be longer
+# than the shortest file pointer (`` → full entry: x.md``), so rewriting a row in an
+# undegraded file never grows it and the one-pass degrade set stays exact (ADR
+# degrade-set-is-decided-in-one-pass-before-any-row-is-written, as amended in 2d).
+POINTER_INDEX_TARGET_MARKER = " → read via show"
+
+# The block heading the secondary-scope pointer lines below a scope file's full
+# entries (see render_pointer_line): the heading, then one line saying where each
+# row's full entry is, carrying the decision-tier recipe once for every row. It is
+# constant and pass one's maximum form emits it too, so it adds the same bytes to
+# the degrade measure and to the output. The code after it supplies the newline.
+POINTER_SECTION_HEADING = (
+    "## Also scoped here\n"
+    "Each row's full entry is elsewhere: in the scope file the row names, or, for a row "
+    f"ending `{POINTER_INDEX_TARGET_MARKER.strip()}` because the decision's primary "
+    "scope file is an index, through the exact lookup: "
+    f"{_addressing_clause(_show_forms(_SLUG_SLOT, json.dumps(_SLUG_SLOT)))}. Put the "
+    "slug in place of `<slug>`, shell-quoted on the CLI if it holds a space or a quote. "
+    "Without a tool, the authored text of every decision is in this workspace's "
+    "decisions file and its archives."
+)
+
+
+def render_pointer_line(node: Dict[str, Any], primary_scope: str,
+                        primary_is_index: bool = False) -> str:
     """Renders the one-line secondary-scope pointer for a multi-tag decision.
 
     Per the render-dedupe ADR, a decision's full Letter-complete body renders only
     under its PRIMARY tag (the first tag in its scope list as hydrated); every
-    secondary tag's file carries this pointer instead — slug, word-boundary-
-    truncated axiom, and where the full body lives — so scope-file weight stops
-    converging toward tags× corpus while the decision stays discoverable from
-    every scope it touches.
+    secondary tag's file carries this pointer instead — slug and word-boundary-
+    truncated axiom — so scope-file weight stops converging toward tags× corpus
+    while the decision stays discoverable from every scope it touches. While the
+    primary's file is full the row names it; once that file is an index the body is
+    in no file of the tree, so the row ends in ``POINTER_INDEX_TARGET_MARKER`` and the
+    section heading block carries the lookup.
 
     Args:
         node: The decision node dict.
         primary_scope: The decision's primary scope tag (its first, author order).
+        primary_is_index: Whether the primary scope's file degraded to an index.
 
     Returns:
         The pointer line, newline-terminated.
     """
     slug = node.get("slug", "")
     axiom = truncate_words(node.get("core_axiom", ""), POINTER_AXIOM_CHARS)
+    if primary_is_index:
+        return f"- **{slug}** — {axiom}{POINTER_INDEX_TARGET_MARKER}\n"
     return f"- **{slug}** — {axiom} → full entry: {primary_scope}.md\n"
 
 
@@ -100,37 +163,43 @@ def render_index_row(node: Dict[str, Any],
     return f"- **{slug}** — {oneline_axiom(node)}{_index_marker(modifiers)}\n"
 
 
+# The clause a global-index group heading carries in place of a file when that
+# scope's own file is an index: no file to name, and the route is in the banner.
+INDEX_GROUP_CLAUSE = "scope file is an index (routes above)"
+
+
 def _assemble_global_index(
     active_decisions: List[Dict[str, Any]],
     modifiers: Dict[str, Dict[str, List[str]]],
     full_chars: int,
+    degraded: AbstractSet[str],
+    ceiling: int,
 ) -> Tuple[str, List[Tuple[str, int]]]:
     """Builds the over-ceiling global file: a oneline index grouped by primary scope.
 
-    Per the global-render-degrades ADR: once the full global render would exceed
-    ``GLOBAL_OVERFLOW_WARN_CHARS``, live_axioms.md becomes an index — one line per
-    decision, grouped under its PRIMARY scope tag with a pointer to that scope's
-    per-scope file (the canonical full render). Untagged decisions gather in a
-    final unscoped group.
+    Per the global-render-degrades ADR: once the full global render would exceed the
+    global ceiling, live_axioms.md becomes an index — one line per decision, grouped
+    under its PRIMARY scope tag. A group heading names that scope's file only while
+    the file is full; a scope whose file degraded gets a heading that names no file,
+    and untagged decisions gather in a final ``## (unscoped)`` group that names none
+    either. The banner carries the routes for those: the scope tier and the decision
+    tier in slot form, in both addressing forms, and the corpus.
+
+    The banner picks its register the way a degraded scope header does: compose the
+    file short, and if that whole file is over ``ceiling``, recompose it with one
+    added sentence stating the rows' size (never the file's own length).
 
     Args:
         active_decisions: The active decision nodes, hydrated.
         modifiers: Reverse-relation modifiers keyed by node id.
         full_chars: The char size the full render would have been (for the banner).
+        degraded: The scope tags whose per-scope file is an index.
+        ceiling: The global ceiling the degrade predicate applied.
 
     Returns:
         ``(content, decisions)`` where ``decisions`` is the ``(slug, char_count)``
         accounting list at index-row weight.
     """
-    banner = (
-        "# Live Axioms — Index\n"
-        "*Generated automatically by Mitos. Derived statelessly from primary sources (M8).*\n\n"
-        f"The full render of this corpus ({full_chars:,} chars, "
-        f"~{estimate_tokens(full_chars):,} tokens) exceeds the global size ceiling "
-        f"({GLOBAL_OVERFLOW_WARN_CHARS:,} chars), so this file is a one-line index of "
-        "every active decision. The per-scope files named under each heading are the "
-        "canonical full renders.\n"
-    )
     groups: Dict[Optional[str], List[Dict[str, Any]]] = {}
     for dec in active_decisions:
         primary = (dec.get("scope") or [None])[0]
@@ -141,14 +210,57 @@ def _assemble_global_index(
     ordered = sorted((s for s in groups if s is not None)) + ([None] if None in groups else [])
     for s in ordered:
         if s is None:
-            heading = "## (unscoped) — no scope file; full entries live in decisions.md"
+            heading = "## (unscoped)"
+        elif s in degraded:
+            heading = f"## {s} — {INDEX_GROUP_CLAUSE}"
         else:
             heading = f"## {s} — full entries: .mitos/axioms/{s}.md"
         rows = [(d.get("slug", ""), render_index_row(d, modifiers.get(d["id"])))
                 for d in groups[s]]
         accounting.extend((slug, len(r)) for slug, r in rows)
         sections.append(heading + "\n" + "".join(r for _, r in rows))
-    return banner + "\n" + "\n".join(sections), accounting
+    body = "\n".join(sections)
+
+    has_file = any(s is not None and s not in degraded for s in groups)
+    has_index = any(s is not None and s in degraded for s in groups)
+    has_unscoped = None in groups
+    meaning: List[str] = []
+    if has_file:
+        meaning.append("A heading that names a file points at that scope's full entries.")
+    if has_index:
+        meaning.append(f"A heading marked `{INDEX_GROUP_CLAUSE}` names no file, because "
+                       "that scope's own file is an index.")
+    if has_unscoped:
+        meaning.append("`(unscoped)` gathers the decisions with no scope tag, which no "
+                       "scope file holds.")
+    if has_index or has_unscoped:
+        meaning.append("Reach the entries under a heading that names no file through the "
+                       "routes below.")
+
+    lead = (
+        "# Live Axioms — Index\n"
+        "*Generated automatically by Mitos. Derived statelessly from primary sources (M8).*\n\n"
+        f"The full render of this corpus ({_size_clause(full_chars)}) exceeds the global "
+        f"size ceiling ({ceiling:,} chars), so this file is a one-line index of every "
+        "active decision, with modifier stamps.\n"
+    )
+    scope_slot = _list_forms(_SCOPE_SLOT, json.dumps(_SCOPE_SLOT))
+    slug_slot = _show_forms(_SLUG_SLOT, json.dumps(_SLUG_SLOT))
+    guide = (
+        " ".join(meaning) + "\n"
+        f"- One scope, one line per decision: {_addressing_clause(scope_slot)}.\n"
+        f"- One decision's full entry: {_addressing_clause(slug_slot)}.\n"
+        "- Put a scope tag or slug in place of its slot, shell-quoted on the CLI if it "
+        "holds a space or a quote.\n"
+        + _corpus_pointer()
+    )
+    content = lead + guide + "\n" + body
+    if len(content) > ceiling:
+        rows_chars = sum(size for _, size in accounting)
+        over = (f"This index is itself over that ceiling; its rows alone come to "
+                f"{_size_clause(rows_chars)}.\n")
+        content = lead + over + guide + "\n" + body
+    return content, accounting
 
 
 def estimate_tokens(char_count: int) -> int:
@@ -237,11 +349,14 @@ def assemble_render(store: GraphStoreProtocol) -> Dict[str, Any]:
 
     The per-scope degrade set is decided in one pass before any row is written (ADR
     ``degrade-set-is-decided-in-one-pass-before-any-row-is-written``): pass one builds
-    every scope file in its maximum form (full bodies plus the pointer section) and
-    marks each one over ``SCOPE_OVERFLOW_WARN_CHARS``; pass two emits a marked scope as
-    its index and an unmarked one as exactly the pass-one file. Nothing written in pass
-    two feeds back into the set, so it depends neither on the order scopes are visited
-    nor on the order the store returns decisions.
+    every scope file in its maximum form (full bodies plus the pointer section, every
+    row naming its primary's file) and marks each one over ``SCOPE_OVERFLOW_WARN_CHARS``;
+    pass two emits a marked scope as its index, and an unmarked one with each row into
+    a marked primary rewritten to the constant marker (the pass-one file itself when no
+    row changes). Both rewrites only shrink a file, so nothing under the ceiling in pass
+    one crosses it in pass two. Nothing written in pass two feeds back into the set, so
+    it depends neither on the order scopes are visited nor on the order the store
+    returns decisions.
 
     Args:
         store: The initialized GraphStore to read active decisions from.
@@ -262,6 +377,7 @@ def assemble_render(store: GraphStoreProtocol) -> Dict[str, Any]:
     # Read at call time, once, so the degrade predicate and the number a degraded
     # header states are the same value.
     scope_ceiling = SCOPE_OVERFLOW_WARN_CHARS
+    global_ceiling = GLOBAL_OVERFLOW_WARN_CHARS
 
     scope_groups: Dict[str, List[Dict[str, Any]]] = {}
     for dec in active_decisions:
@@ -291,9 +407,9 @@ def assemble_render(store: GraphStoreProtocol) -> Dict[str, Any]:
     # size, no config knob. The size-contributor accounting follows the real contents
     # (index-row weight), so the overflow report stays honest in either mode: an
     # index rarely breaches its ceiling, but one that does is still reported.
-    if len(global_content) > GLOBAL_OVERFLOW_WARN_CHARS:
+    if len(global_content) > global_ceiling:
         global_content, global_decisions = _assemble_global_index(
-            active_decisions, modifiers, len(global_content))
+            active_decisions, modifiers, len(global_content), degraded, global_ceiling)
         global_mode = "index"
 
     # Pass two: rows written against the fixed set.
@@ -301,6 +417,8 @@ def assemble_render(store: GraphStoreProtocol) -> Dict[str, Any]:
     for s, decs in scope_groups.items():
         if s in degraded:
             scopes[s] = _index_scope_file(s, decs, modifiers, scope_ceiling)
+        elif any(d["scope"][0] in degraded for d in _split_by_primacy(s, decs)[1]):
+            scopes[s] = _full_scope_file(s, decs, modifiers, degraded)
         else:
             scopes[s] = full_files[s]
 
@@ -333,19 +451,22 @@ def _split_by_primacy(
 
 
 def _full_scope_file(s: str, decs: List[Dict[str, Any]],
-                     modifiers: Dict[str, Dict[str, List[str]]]) -> Dict[str, Any]:
-    """Builds a scope file in its maximum (full) form.
+                     modifiers: Dict[str, Dict[str, List[str]]],
+                     degraded: AbstractSet[str] = frozenset()) -> Dict[str, Any]:
+    """Builds a scope file in its full form.
 
     Dedupe by primary tag (the render-dedupe ADR): the full Letter-complete body
     renders only under a decision's primary scope tag; under every secondary tag a
-    one-line pointer names the primary file. Single-tag decisions therefore render
-    exactly as before. This one function is both the degrade predicate's measure and
-    the emitted file of every scope that does not degrade.
+    one-line pointer names the primary file, or ends in the constant marker when that
+    file is in ``degraded``. Single-tag decisions therefore render exactly as before.
+    Called with the empty set this is the degrade predicate's maximum-form measure;
+    called with the fixed set it is the emitted file of a scope that does not degrade.
 
     Args:
         s: The scope tag.
         decs: The active decisions tagged ``s``, in store order.
         modifiers: Reverse-relation modifiers keyed by node id.
+        degraded: The scope tags whose file is an index (empty in pass one).
 
     Returns:
         The file record, ``mode == "full"``.
@@ -357,7 +478,8 @@ def _full_scope_file(s: str, decs: List[Dict[str, Any]],
     primaries, secondaries = _split_by_primacy(s, decs)
     s_blocks = [(d.get("slug", ""), render_node_markdown(d, modifiers.get(d["id"])))
                 for d in primaries]
-    pointers = [(d.get("slug", ""), render_pointer_line(d, d["scope"][0]))
+    pointers = [(d.get("slug", ""),
+                 render_pointer_line(d, d["scope"][0], d["scope"][0] in degraded))
                 for d in secondaries]
     content = header + "\n".join(b for _, b in s_blocks)
     if pointers:
@@ -401,14 +523,8 @@ def _scope_tool_pointer(s: str) -> str:
     Returns:
         The bullet, newline-terminated.
     """
-    cli = f"mitos list --scope={shlex.quote(s)} --oneline -p ."
-    mcp = (f"list_decisions(scope={json.dumps(s, ensure_ascii=False)}, oneline=True, "
-           "project=<absolute path of the workspace directory this file's .mitos/ sits in>)")
-    # The MCP form comes first because it names the absolute path the CLI's
-    # "from anywhere" clause refers back to (the skill.md Addressing order).
-    return (f"- The same list through the bounded tool tier: over MCP, `{mcp}`; on the "
-            f"CLI, `{cli}` from the workspace root, or `-p <that absolute path>` from "
-            "anywhere.\n")
+    forms = _list_forms(shlex.quote(s), json.dumps(s, ensure_ascii=False))
+    return f"- The same list through the bounded tool tier: {_addressing_clause(forms)}.\n"
 
 
 def _corpus_pointer() -> str:
@@ -496,12 +612,13 @@ def _overflow_entry(file_info: Dict[str, Any], top_n: int = 5) -> Dict[str, Any]
 
     Args:
         file_info: An assembled file record (from ``assemble_render``).
-        top_n: How many of the largest decisions in the file to list.
+        top_n: How many of the file's largest accounted entries to list.
 
     Returns:
         A JSON-serializable record with the file's char/estimated-token size, the
-        ceiling it breached, and its ``top_decisions`` (largest first) — so a reader
-        knows which decisions to consider re-scoping.
+        ceiling it breached, and its ``top_decisions`` (largest first). Every file over
+        its ceiling is an index, so those are its longest rows — a size fact about
+        what makes the index long, not a list of decisions to move.
     """
     chars = len(file_info["content"])
     top = sorted(file_info["decisions"], key=lambda t: t[1], reverse=True)[:top_n]
@@ -522,12 +639,13 @@ def overflow_report(store: GraphStoreProtocol, top_n: int = 5) -> List[Dict[str,
 
     Assembles the same content ``render_all`` would write (without writing it) and
     returns one entry per over-ceiling file — each with its char/estimated-token size
-    and the top-N largest decisions in it — so a health surface (``mitos status``) can
-    tell an author *what* to re-scope. Returns an empty list when nothing is over.
+    and its top-N longest rows — so a health surface (``mitos status``) can say which
+    index files are still over and what makes them long. Every such file is an index
+    with nowhere further to degrade. Returns an empty list when nothing is over.
 
     Args:
         store: The initialized GraphStore to read from.
-        top_n: How many of the largest decisions to list per over-ceiling file.
+        top_n: How many of the longest rows to list per over-ceiling file.
 
     Returns:
         A list of overflow records (see ``_overflow_entry``), largest file first.

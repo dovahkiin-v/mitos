@@ -2426,22 +2426,27 @@ def _fmt_k(n: int) -> str:
 
 
 def _print_overflow_detail(overflows: List[Dict[str, Any]], *,
-                           verbose: bool = False) -> None:
+                           verbose: bool = False,
+                           project: Optional[str] = None) -> None:
     """Prints the size-ceiling breakdown for over-budget context files (status surface).
 
     The detailed counterpart to the one-line nudge the write path shows: per file, its
-    char/estimated-token size and — under ``verbose`` — the largest decisions in it, so
-    an author knows what to re-scope. Informational only — never a readiness blocker.
+    char/estimated-token size and — under ``verbose`` — its longest rows. Every file
+    over its ceiling is an index with nowhere further to degrade, and no render names
+    it as a destination, so the breakdown is a size fact, not corpus work; the footer
+    routes the reader to the bounded tiers instead. Informational only — never a
+    readiness blocker.
 
     **Why the per-file breakdown is gated and the per-file size line is not.** The
     ceiling is a corpus-growth fact, so past some size every run of the report carries
-    it, and unwrapping each over-ceiling file into its largest decisions buries the
+    it, and unwrapping each over-ceiling file into its longest rows buries the
     readiness verdict the report exists to give. (Measured on mitos-pub at 0.16.0: 8
     files over, 48 lines of report; the count only ever grows, which is the point —
     a figure stated as current here would be stale by the next release.) The size line
     per file is the signal — it names the file and how far over it is, which is what a
     routine or cron read is checking. The slug-level breakdown is what you want exactly
-    once, when you sit down to re-scope, and ``-v`` is the moment you say so.
+    once, when you sit down to see what makes an index long, and ``-v`` is the moment
+    you say so.
 
     The withheld detail is **announced, never silent**: an unmentioned ``-v`` is a
     capability the surface has and does not admit to, which is the same defect class
@@ -2452,7 +2457,10 @@ def _print_overflow_detail(overflows: List[Dict[str, Any]], *,
 
     Args:
         overflows: Overflow records from ``overflow_report`` (largest file first).
-        verbose: Render each file's largest-decisions breakdown. Off by default.
+        verbose: Render each file's longest-rows breakdown. Off by default.
+        project: The caller's selector (``config.project``), rendered through ``repr``
+            into the footer's recipes so they run as printed; ``None`` renders a
+            ``<project>`` placeholder.
     """
     n = len(overflows)
     noun = "file" if n == 1 else "files"
@@ -2466,7 +2474,7 @@ def _print_overflow_detail(overflows: List[Dict[str, Any]], *,
         if not top:
             continue
         if verbose:
-            print("          largest decisions:")
+            print("          longest rows:")
             for d in top:
                 print(f"            • {d['slug']}  ({d['chars']:,} chars)")
         else:
@@ -2474,9 +2482,14 @@ def _print_overflow_detail(overflows: List[Dict[str, Any]], *,
     if withheld:
         # Named on the default path only: under `-v` the breakdown is already above,
         # and re-offering the flag that produced it reads as a failed render.
-        print("    Re-run with `-v` for the largest decisions in each file.")
-    print("    These context files grow with the corpus — re-scope the largest "
-          "decisions in them, or split a broad scope.")
+        print("    Re-run with `-v` for the longest rows in each file.")
+    # `--scope=` and `--` keep a tag or slug that starts with `-` from reading as an
+    # option, the same spellings the generated files use.
+    selector = repr(project) if project is not None else "<project>"
+    print("    Each file listed is an index with nowhere further to degrade, and no "
+          "rendered file names it as a destination for full entries. Read a scope one "
+          f"line per decision with `mitos list --scope=<scope> --oneline -p {selector}`, "
+          f"or one decision in full with `mitos show -p {selector} -- <slug>`.")
 
 
 def _graph_behind_buffer(db_path: str) -> bool:
@@ -2870,7 +2883,8 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
     id_to_slug: Dict[str, str] = {}
     # Read-only size-ceiling report for the generated context files. This is the
     # health surface the write-path overflow nudge points at — the detailed breakdown
-    # (which files, which decisions to re-scope) lives here, not on every `record`.
+    # (which index files are still over, and their longest rows) lives here, not on
+    # every `record`.
     overflows: List[Dict[str, Any]] = []
     graph_behind = False
     embedding_seed: Optional[Dict[str, str]] = None
@@ -3227,7 +3241,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
             f"not an error."
         )
     if overflows:
-        _print_overflow_detail(overflows, verbose=verbose)
+        _print_overflow_detail(overflows, verbose=verbose, project=config.project)
     if divergence_report is not None:
         _print_divergence_rung(divergence_report, project=config.project)
     if graph_behind:

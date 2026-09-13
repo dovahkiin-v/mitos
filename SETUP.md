@@ -563,4 +563,4 @@ was decided.
 > the tag *set* is worth acting on first — it is a *findability* defect, so a wrong
 > tag hides the decision from scope-filtered reads. A scope line whose tags only moved
 > is also reported and reconciled the same way; it hides nothing, but the first tag
-> decides which rendered scope file carries the full entry.
+> decides which scope the full entry renders under.

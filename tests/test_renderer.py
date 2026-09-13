@@ -212,7 +212,7 @@ def test_overflow_report_ranks_largest_decision_first(
     assert o["scope"] == "substrate"
     assert o["chars"] > 200 and o["threshold_chars"] == 200
     assert o["est_tokens"] == o["chars"] // 4
-    # Largest decision is ranked first, so an author knows what to re-scope.
+    # The largest entry is ranked first, so the report says what makes the file long.
     assert o["top_decisions"][0]["slug"] == "big-one"
     assert o["top_decisions"][0]["chars"] >= o["top_decisions"][-1]["chars"]
 
@@ -348,11 +348,14 @@ def test_over_ceiling_global_degrades_to_index(temp_workspace, monkeypatch) -> N
     g = assembled["global"]
     assert g["mode"] == "index"
     content = g["content"]
-    # Banner states plainly what happened and where the full renders live.
+    # Banner states plainly what happened, and calls no file canonical (2d: a named
+    # file may be an index, so the banner routes instead of vouching).
     assert content.startswith("# Live Axioms — Index")
     assert "exceeds the global size ceiling" in content
-    assert "canonical full renders" in content
-    # Grouped by PRIMARY scope tag, each heading pointing at the per-scope file.
+    assert "one-line index of every active decision, with modifier stamps" in content
+    assert "canonical" not in content
+    # Grouped by PRIMARY scope tag; both scope files are full at the default scope
+    # ceiling, so each heading still names its file.
     assert "## alpha — full entries: .mitos/axioms/alpha.md" in content
     assert "## beta — full entries: .mitos/axioms/beta.md" in content
     # Multi-tag decision indexes once, under its primary tag's group only.
@@ -404,19 +407,24 @@ def test_threshold_boundary_is_deterministic(temp_workspace, monkeypatch) -> Non
 
 def test_overflow_accounting_in_index_mode(temp_workspace, monkeypatch) -> None:
     """In index mode the global file drops out of overflows (the index fits) —
-    but an index that itself breaches the ceiling is still reported honestly."""
-    monkeypatch.setattr(R, "GLOBAL_OVERFLOW_WARN_CHARS", 1200)
+    but an index that itself breaches the ceiling is still reported honestly.
+
+    The ceiling is derived from the full render's length (2d: the banner grew, so a
+    hand-picked number no longer sits between the index and the full render)."""
+    monkeypatch.setattr(R, "GLOBAL_OVERFLOW_WARN_CHARS", 10_000_000)
     monkeypatch.setattr(R, "SCOPE_OVERFLOW_WARN_CHARS", 10_000_000)
     store, workspace = temp_workspace
     for i in range(6):
         # Distinct axioms — identical content hashes to the same node id.
         _commit(store, f"bulk-{i}", ["alpha"],
-                axiom=f"A comfortably verbose axiom sentence for overflow test {i}. " * 3)
+                axiom=f"A comfortably verbose axiom sentence for overflow test {i}. " * 8)
+    ceiling = len(assemble_render(store)["global"]["content"]) - 1
+    monkeypatch.setattr(R, "GLOBAL_OVERFLOW_WARN_CHARS", ceiling)
 
-    # Full render > 1200 → index mode; the index is small → no global overflow entry.
+    # Full render > ceiling → index mode; the index fits → no global overflow entry.
     assembled = assemble_render(store)
     assert assembled["global"]["mode"] == "index"
-    assert len(assembled["global"]["content"]) <= 1200
+    assert len(assembled["global"]["content"]) <= ceiling
     assert overflow_report(store) == []
     # Accounting reflects index-row weight, not full-body weight.
     assert all(size < 200 for _, size in assembled["global"]["decisions"])
@@ -488,7 +496,9 @@ def test_over_ceiling_scope_degrades_to_index(temp_workspace, monkeypatch) -> No
 
 
 def test_under_ceiling_scope_stays_full_and_byte_identical(temp_workspace, monkeypatch) -> None:
-    """S2: a sibling under the ceiling is the pre-degrade file, byte for byte."""
+    """S2: a sibling under the ceiling stays full; its bytes are the pass-one measure
+    except that its row into the degraded `big` now ends in the marker (2d), which
+    never makes the file longer than the measure that kept it full."""
     store, _ = temp_workspace
     for i in range(3):
         _commit(store, f"big-{i}", ["big"], axiom=f"{_HEAVY * 8}Variant {i}.")
@@ -496,27 +506,33 @@ def test_under_ceiling_scope_stays_full_and_byte_identical(temp_workspace, monke
     _commit(store, "shared-one", ["big", "small"])
 
     shared_axiom = "Axiom for shared-one with enough words to truncate cleanly at a boundary."
-    expected_small = (
+    row_lead = f"- **shared-one** — {truncate_words(shared_axiom, 70)}"
+    measured_small = (
         "# Active Axioms for Scope: small\n"
         "*Generated automatically by Mitos. Derived statelessly from primary sources (M8).*\n\n"
         "## small-one\n"
         "- **Decided:** Axiom for small-one with enough words to truncate cleanly at a boundary.\n"
         "- **Scope:** small\n"
         "- **Rejected:**\n  Rejected for small-one.\n"
-        "\n## Also scoped here (full entries elsewhere)\n"
-        f"- **shared-one** — {truncate_words(shared_axiom, 70)} → full entry: big.md\n"
+        "\n" + R.POINTER_SECTION_HEADING + "\n"
+        f"{row_lead} → full entry: big.md\n"
     )
     full = _full_forms(store, monkeypatch)
-    assert full["small"]["content"] == expected_small
-    ceiling = len(expected_small)
+    assert full["small"]["content"] == measured_small
+    ceiling = len(measured_small)
     assert len(full["big"]["content"]) > ceiling
     monkeypatch.setattr(R, "SCOPE_OVERFLOW_WARN_CHARS", ceiling)
 
     scopes = assemble_render(store)["scopes"]
     assert scopes["big"]["mode"] == "index"
     assert scopes["small"]["mode"] == "full"
-    assert scopes["small"]["content"] == expected_small
-    assert scopes["small"]["decisions"] == full["small"]["decisions"]
+    emitted_small = measured_small.replace(
+        f"{row_lead} → full entry: big.md\n", f"{row_lead}{R.POINTER_INDEX_TARGET_MARKER}\n")
+    assert emitted_small != measured_small
+    assert scopes["small"]["content"] == emitted_small
+    assert len(emitted_small) <= len(measured_small)
+    assert ([slug for slug, _ in scopes["small"]["decisions"]]
+            == [slug for slug, _ in full["small"]["decisions"]])
 
 
 def test_scope_crossing_only_through_its_pointer_section_degrades(
@@ -722,3 +738,309 @@ def test_degrade_set_is_one_pass_and_order_free(temp_workspace, monkeypatch) -> 
         assert _modes(store) == expected
         monkeypatch.setattr(store, "get_active_decisions", lambda: list(reversed(original())))
         assert _modes(store) == expected
+
+
+# --------------------------------------------------------------------------- #
+# The pointer half of D5 (phase 2d): every surface that names a destination names
+# a full file, and anything else routes to the bounded tool tier its surface asks.
+# --------------------------------------------------------------------------- #
+
+from render_sweep import sweep_destinations
+
+
+def _pointer_corpus(store) -> None:
+    """`big` degrades; `home` holds rows into `big` and into full `lite` (the mix);
+    `degonly` / `fullonly` hold rows into one kind only; one decision is untagged."""
+    for i in range(3):
+        _commit(store, f"big-{i}", ["big"], axiom=f"{_HEAVY * 8}Variant {i}.")
+    for i in range(3):
+        _commit(store, f"big-guest-{i}", ["big", "home"], axiom=f"{_HEAVY * 3}Guest {i}.")
+    _commit(store, "big-visitor", ["big", "degonly"], axiom=f"{_HEAVY * 3}Visitor.")
+    _commit(store, "home-own", ["home"])
+    _commit(store, "lite-one", ["lite"])
+    _commit(store, "lite-guest", ["lite", "home"])
+    _commit(store, "lite-visitor", ["lite", "fullonly"])
+    untagged = ParsedEntry("decision", "loose-one", 1, 5)
+    untagged.axiom = f"{_HEAVY * 4}An untagged decision."
+    untagged.rejected_paths = "Rejected for loose-one."
+    store.commit_parsed_entry(untagged)
+
+
+def _pointer_tree(store, monkeypatch):
+    """The G1 near-ceiling fixture: the scope ceiling is exactly `home`'s pass-one
+    length, and the global file is forced into its index. Returns (measure, tree)."""
+    _pointer_corpus(store)
+    monkeypatch.setattr(R, "GLOBAL_OVERFLOW_WARN_CHARS", _HUGE)
+    full = _full_forms(store, monkeypatch)
+    global_full = len(assemble_render(store)["global"]["content"])
+    ceiling = len(full["home"]["content"])
+    assert len(full["big"]["content"]) > ceiling
+    assert all(len(full[s]["content"]) <= ceiling for s in ("lite", "degonly", "fullonly"))
+    monkeypatch.setattr(R, "SCOPE_OVERFLOW_WARN_CHARS", ceiling)
+    monkeypatch.setattr(R, "GLOBAL_OVERFLOW_WARN_CHARS", global_full - 1)
+    return full, assemble_render(store)
+
+
+def _lines_starting(content: str, lead: str) -> list:
+    return [line for line in content.splitlines() if line.startswith(lead)]
+
+
+def test_index_target_marker_never_longer_than_shortest_file_pointer() -> None:
+    """S1: the guard the one-pass exactness rests on, derived from the renderer: a
+    marker row for a one-character primary is no longer than its file-form row."""
+    node = {"slug": "s", "core_axiom": ""}
+    file_row = R.render_pointer_line(node, "x")
+    marker_row = R.render_pointer_line(node, "x", True)
+    assert file_row != marker_row
+    assert marker_row.endswith(R.POINTER_INDEX_TARGET_MARKER + "\n")
+    assert len(marker_row) <= len(file_row)
+
+
+def test_row_form_follows_its_target_mode(temp_workspace, monkeypatch) -> None:
+    """S2: in one undegraded file a row into a full primary keeps its file-form bytes
+    and a row into a degraded primary ends in the marker; the file never outgrows its
+    pass-one measure, and a file with no such row is the pass-one file itself."""
+    store, _ = temp_workspace
+    full, tree = _pointer_tree(store, monkeypatch)
+    home, measured = tree["scopes"]["home"], full["home"]
+    assert tree["scopes"]["big"]["mode"] == "index" and home["mode"] == "full"
+
+    lite_row = _lines_starting(measured["content"], "- **lite-guest**")
+    assert lite_row and lite_row[0].endswith(" → full entry: lite.md")
+    assert _lines_starting(home["content"], "- **lite-guest**") == lite_row
+    for i in range(3):
+        measured_row = _lines_starting(measured["content"], f"- **big-guest-{i}**")[0]
+        assert measured_row.endswith(" → full entry: big.md")
+        row = _lines_starting(home["content"], f"- **big-guest-{i}**")
+        assert len(row) == 1 and row[0].endswith(R.POINTER_INDEX_TARGET_MARKER)
+        assert ".md" not in row[0] and row[0].count(f"big-guest-{i}") == 1
+    assert home["content"] != measured["content"]
+    assert len(home["content"]) <= len(measured["content"])
+    assert tree["scopes"]["lite"]["content"] == full["lite"]["content"]
+    assert tree["scopes"]["fullonly"]["content"] == full["fullonly"]["content"]
+
+
+def test_pointer_section_block_is_constant_and_true_in_every_mix(
+        temp_workspace, monkeypatch) -> None:
+    """S3: rows all into full files, all into indexes, or mixed — one constant block,
+    carrying the decision tier in slot form, and no `(full entries elsewhere)`."""
+    store, workspace = temp_workspace
+    _, tree = _pointer_tree(store, monkeypatch)
+    kinds = {"fullonly": (1, 0), "degonly": (0, 1), "home": (1, 3)}
+    for s, (file_rows, marker_rows) in kinds.items():
+        content = tree["scopes"][s]["content"]
+        assert tree["scopes"][s]["mode"] == "full"
+        assert content.count(R.POINTER_SECTION_HEADING) == 1
+        assert content.count(" → full entry: ") == file_rows
+        assert content.count(R.POINTER_INDEX_TARGET_MARKER + "\n") == marker_rows
+        assert "(full entries elsewhere)" not in content
+    block = R.POINTER_SECTION_HEADING
+    assert "<slug>" in block and "mitos show -p . -- <slug>" in block
+    assert ("show_node(ident=\"<slug>\", project=<absolute path of the workspace "
+            "directory this file's .mitos/ sits in>)") in block
+    assert workspace not in block and ".md" not in block
+
+
+def _banner(content: str) -> str:
+    return content.split("\n## ", 1)[0]
+
+
+def _banner_corpus(store, kind: str) -> None:
+    if kind == "all-full":
+        for s in ("a", "b"):
+            for i in range(2):
+                _commit(store, f"{s}-{i}", [s], axiom=f"{_HEAVY * 6}{s} {i}.")
+    elif kind == "all-index":
+        for s in ("a", "b"):
+            for i in range(2):
+                _commit(store, f"{s}-{i}", [s], axiom=f"{_HEAVY * 6}{s} {i}.")
+    else:
+        _pointer_corpus(store)
+
+
+@pytest.mark.parametrize("kind", ["all-full", "all-index", "mixed"])
+def test_global_banner_routes_honestly_in_both_registers(monkeypatch, kind) -> None:
+    """S4: over its ceiling the banner calls nothing canonical, states the full
+    render's size and the ceiling, says what each heading kind present means, names
+    both tiers in slot form and the corpus; the rows' size appears only when the index
+    is itself over, chosen on the whole file."""
+    workspace = tempfile.mkdtemp()
+    try:
+        store = GraphStore(os.path.join(workspace, ".mitos", "graph.sqlite"))
+        _banner_corpus(store, kind)
+        monkeypatch.setattr(R, "GLOBAL_OVERFLOW_WARN_CHARS", _HUGE)
+        full = _full_forms(store, monkeypatch)
+        full_len = len(assemble_render(store)["global"]["content"])
+        if kind == "all-index":
+            scope_ceiling = min(len(f["content"]) for f in full.values()) - 1
+        elif kind == "mixed":
+            scope_ceiling = len(full["home"]["content"])
+        else:
+            scope_ceiling = _HUGE
+        monkeypatch.setattr(R, "SCOPE_OVERFLOW_WARN_CHARS", scope_ceiling)
+        modes = _modes(store)
+
+        monkeypatch.setattr(R, "GLOBAL_OVERFLOW_WARN_CHARS", full_len - 1)
+        short = assemble_render(store)["global"]
+        assert short["mode"] == "index"
+        assert "rows alone" not in short["content"]
+        assert len(short["content"]) <= full_len - 1
+        # The banner states the ceiling, so the bytes move with it; the register does
+        # not until the whole file is over.
+        monkeypatch.setattr(R, "GLOBAL_OVERFLOW_WARN_CHARS", len(short["content"]))
+        content = assemble_render(store)["global"]["content"]
+        assert "rows alone" not in content and len(content) <= len(short["content"])
+        banner = _banner(content)
+        assert "canonical" not in content
+        assert f"({full_len:,} chars, ~{full_len // 4:,} tokens)" in banner
+        assert f"({R.GLOBAL_OVERFLOW_WARN_CHARS:,} chars)" in banner
+        has_file = any(" — full entries: .mitos/axioms/" in l for l in content.splitlines())
+        has_index = any(l.endswith(R.INDEX_GROUP_CLAUSE) for l in content.splitlines())
+        has_unscoped = "\n## (unscoped)\n" in content
+        assert has_file == any(m == "full" for m in modes.values() if m)
+        assert has_index == (kind != "all-full")
+        assert ("A heading that names a file points at" in banner) == has_file
+        assert (f"`{R.INDEX_GROUP_CLAUSE}` names no file" in banner) == has_index
+        assert ("`(unscoped)` gathers" in banner) == has_unscoped
+        for needle in ("`mitos list --scope=<scope> --oneline -p .`",
+                       'list_decisions(scope="<scope>", oneline=True, project=',
+                       "`mitos show -p . -- <slug>`",
+                       'show_node(ident="<slug>", project=',
+                       R._corpus_pointer()):
+            assert needle in banner
+
+        squeezed = len(content) - 1
+        monkeypatch.setattr(R, "GLOBAL_OVERFLOW_WARN_CHARS", squeezed)
+        over = assemble_render(store)["global"]
+        rows_chars = sum(size for _, size in over["decisions"])
+        assert rows_chars < squeezed
+        assert f"its rows alone come to {rows_chars:,} chars" in _banner(over["content"])
+        over_line = next(l for l in over["content"].splitlines() if "rows alone" in l)
+        at_squeezed_short = content.replace(
+            f"({len(content):,} chars)", f"({squeezed:,} chars)", 1)
+        assert over["content"].replace(over_line + "\n", "", 1) == at_squeezed_short
+    finally:
+        import shutil
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
+def test_global_headings_name_a_file_only_while_it_is_full(temp_workspace, monkeypatch) -> None:
+    """S5: a full group's heading keeps its file clause byte for byte; an index
+    group's names no file; the unscoped heading is exactly `## (unscoped)`."""
+    store, _ = temp_workspace
+    _, tree = _pointer_tree(store, monkeypatch)
+    lines = tree["global"]["content"].splitlines()
+    assert tree["global"]["mode"] == "index"
+    assert "## home — full entries: .mitos/axioms/home.md" in lines
+    assert "## lite — full entries: .mitos/axioms/lite.md" in lines
+    big = _lines_starting(tree["global"]["content"], "## big")
+    assert big == [f"## big — {R.INDEX_GROUP_CLAUSE}"] and ".md" not in big[0]
+    assert _lines_starting(tree["global"]["content"], "## (unscoped)") == ["## (unscoped)"]
+
+
+def test_no_surface_names_a_non_full_destination(temp_workspace, monkeypatch) -> None:
+    """S6 (T5, 2d half): the derived sweep finds no violation over a ceiling-crossing
+    tree, parses every destination kind at least once, and flags a planted 2c row."""
+    store, _ = temp_workspace
+    _, tree = _pointer_tree(store, monkeypatch)
+    violations, counts = sweep_destinations(tree)
+    assert violations == []
+    for kind in ("file_heading", "index_heading", "unscoped_heading", "section_block",
+                 "file_row", "marker_row"):
+        assert counts[kind] > 0, kind
+
+    import copy
+    planted = copy.deepcopy(tree)
+    home = planted["scopes"]["home"]
+    home["content"] = home["content"].replace(
+        R.POINTER_INDEX_TARGET_MARKER + "\n", " → full entry: big.md\n", 1)
+    planted_violations, _ = sweep_destinations(planted)
+    assert len(planted_violations) == 1 and "big.md" in planted_violations[0]
+
+
+@pytest.mark.parametrize("token", ["plain", "foo bar", "-x"])
+def test_slot_recipes_parse_with_awkward_tokens(temp_workspace, monkeypatch, token) -> None:
+    """S7: the banner's and the section block's recipes, with a tag or slug put in
+    the slot shell-quoted, parse to the right verb, value and `-p .`; the MCP forms'
+    keywords are real tool parameters."""
+    from mitos import cli, mcp_server
+    store, _ = temp_workspace
+    _, tree = _pointer_tree(store, monkeypatch)
+    banner = _banner(tree["global"]["content"])
+    parser = cli._build_parser()
+    quoted = shlex.quote(token)
+
+    assert "--scope=<scope> " in banner
+    args = parser.parse_args(
+        shlex.split(_cli_recipe(banner).replace("<scope>", quoted))[1:])
+    assert (args.command, args.scope, args.oneline, args.project_post) == (
+        "list", token, True, ".")
+    for surface in (banner, R.POINTER_SECTION_HEADING):
+        recipe = re.search(r"`(mitos show [^`]*)`", surface).group(1)
+        assert recipe.endswith("-- <slug>")
+        args = parser.parse_args(shlex.split(recipe.replace("<slug>", quoted))[1:])
+        assert (args.command, args.ident, args.project_post) == ("show", token, ".")
+        mcp = re.search(r"`(show_node\(.*?\))`", surface).group(1)
+        keywords = re.findall(r"(?:\(|, )(\w+)=", mcp)
+        assert keywords == ["ident", "project"]
+        assert set(keywords) <= set(inspect.signature(mcp_server.show_node).parameters)
+        assert json.loads(re.match(r'show_node\(ident=(".*?"), ', mcp).group(1)) == "<slug>"
+    mcp_list = _mcp_recipe(banner)
+    assert re.findall(r"(?:\(|, )(\w+)=", mcp_list) == ["scope", "oneline", "project"]
+
+
+def test_pointer_surfaces_carry_no_machine_identity(monkeypatch) -> None:
+    """S8: banner and section block state forms, never a path or a semantic verb;
+    one corpus in two workspaces renders every file byte for byte."""
+    import shutil
+    trees, paths = [], []
+    for _ in range(2):
+        workspace = tempfile.mkdtemp()
+        paths.append(workspace)
+        try:
+            store = GraphStore(os.path.join(workspace, ".mitos", "graph.sqlite"))
+            trees.append(_pointer_tree(store, monkeypatch)[1])
+        finally:
+            shutil.rmtree(workspace, ignore_errors=True)
+    assert trees[0] == trees[1]
+    banner = _banner(trees[0]["global"]["content"])
+    for text in (banner, R.POINTER_SECTION_HEADING):
+        assert re.search(r"surface|query", text) is None
+        for path in paths:
+            assert path not in text and os.path.realpath(path) not in text
+    assert "project=<absolute path of the workspace directory" in banner
+
+
+def test_every_over_ceiling_file_is_an_index(temp_workspace, monkeypatch) -> None:
+    """S9: the invariant `mitos status` states — at every boundary ceiling of the
+    pointer fixture (G1 included), a file over its ceiling has `mode == "index"`,
+    so the overflow report names only index files."""
+    store, _ = temp_workspace
+    full, _ = _pointer_tree(store, monkeypatch)
+    global_ceiling = R.GLOBAL_OVERFLOW_WARN_CHARS
+    lengths = sorted(len(f["content"]) for f in full.values())
+    for ceiling in sorted({n + d for n in lengths for d in (-1, 0)}):
+        monkeypatch.setattr(R, "SCOPE_OVERFLOW_WARN_CHARS", ceiling)
+        for g in (global_ceiling, _HUGE):
+            monkeypatch.setattr(R, "GLOBAL_OVERFLOW_WARN_CHARS", g)
+            tree = assemble_render(store)
+            records = [tree["global"]] + list(tree["scopes"].values())
+            for record in records:
+                if len(record["content"]) > R._ceiling_for(record):
+                    assert record["mode"] == "index", (ceiling, record["name"])
+            by_name = {r["name"]: r for r in records}
+            assert all(by_name[o["name"]]["mode"] == "index" for o in overflow_report(store))
+
+
+def test_row_rewrite_keeps_the_degrade_set_order_free(temp_workspace, monkeypatch) -> None:
+    """S10: with rows into a degraded primary, reversing the store's order leaves the
+    degrade set and every record's mode unchanged."""
+    store, _ = temp_workspace
+    _, tree = _pointer_tree(store, monkeypatch)
+    expected = {s: f["mode"] for s, f in tree["scopes"].items()}
+    assert "index" in expected.values() and "full" in expected.values()
+    original = store.get_active_decisions
+    monkeypatch.setattr(store, "get_active_decisions", lambda: list(reversed(original())))
+    reversed_tree = assemble_render(store)
+    assert {s: f["mode"] for s, f in reversed_tree["scopes"].items()} == expected
+    assert reversed_tree["global"]["mode"] == tree["global"]["mode"]

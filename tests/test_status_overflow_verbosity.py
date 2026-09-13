@@ -7,8 +7,10 @@ put forty lines between the caller and the readiness verdict the report exists t
 give — on the one command a routine or a cron read runs unattended.
 
 So the split these pin: the per-file **size line** is the signal and stays on the
-default path; the per-file **slug breakdown** is what you want once, when you sit
-down to re-scope, and `-v` is where you say so. Two properties guard the seam —
+default path; the per-file **slug breakdown** (each index's longest rows) is what
+you want once, when you sit down to see what makes an index long, and `-v` is where
+you say so. Every listed file is an index with nowhere further to degrade, so the
+footer routes to the bounded tiers with the caller's selector, never to corpus work. Two properties guard the seam —
 the withheld detail is announced rather than silently dropped (an unmentioned flag
 is a capability the surface has and will not admit to, which is the same defect
 class this whole ledger is made of), and the `--json` encoding is **not** gated,
@@ -62,7 +64,7 @@ class TestTheDefaultPath:
         """The forty lines. No slug, and no header promising them."""
         _print_overflow_detail(_overflows())
         out = capsys.readouterr().out
-        assert "largest decisions:" not in out
+        assert "longest rows:" not in out
         assert "file0-decision-0" not in out
 
     def test_the_withholding_is_announced(self, capsys) -> None:
@@ -76,12 +78,46 @@ class TestTheDefaultPath:
 
         Gating the breakdown makes that word false on the default path — a line
         describing a render that no longer happened. Pinned because it is the
-        exact way a gate quietly turns working text into a lie.
+        exact way a gate quietly turns working text into a lie. (2d re-targets the
+        needle: the closing advice is now the tool route, and still points at no
+        breakdown above it.)
         """
         _print_overflow_detail(_overflows())
         out = capsys.readouterr().out
-        assert "re-scope the largest" in out
-        assert "decisions above" not in out
+        assert "mitos list --scope=<scope> --oneline -p <project>" in out
+        assert "decisions above" not in out and "rows above" not in out
+
+    def test_the_hint_names_what_the_breakdown_measures(self, capsys) -> None:
+        """Every listed file is an index, so the breakdown is its longest rows."""
+        _print_overflow_detail(_overflows())
+        out = capsys.readouterr().out
+        assert "Re-run with `-v` for the longest rows in each file." in out
+        assert "largest decisions" not in out
+
+
+class TestTheFooter:
+    """S11: what the files are, and the bounded tiers with the caller's selector."""
+
+    def test_the_recipes_carry_the_repr_selector(self, capsys) -> None:
+        _print_overflow_detail(_overflows(), project="proj")
+        out = capsys.readouterr().out
+        assert "index with nowhere further to degrade" in out
+        assert "`mitos list --scope=<scope> --oneline -p 'proj'`" in out
+        assert "`mitos show -p 'proj' -- <slug>`" in out
+        assert "-p ." not in out
+        assert "re-scope" not in out and "split a broad scope" not in out
+
+    def test_no_selector_renders_a_placeholder_never_none(self, capsys) -> None:
+        _print_overflow_detail(_overflows())
+        out = capsys.readouterr().out
+        assert "-p <project>" in out and "None" not in out
+
+    def test_a_selector_with_a_space_stays_one_shell_word(self, capsys) -> None:
+        import shlex
+        _print_overflow_detail(_overflows(), project="/abs/my proj")
+        out = capsys.readouterr().out
+        recipe = out.split("`mitos show ", 1)[1].split("`", 1)[0]
+        assert shlex.split(recipe)[:2] == ["-p", "/abs/my proj"]
 
 
 class TestTheVerbosePath:
@@ -90,7 +126,7 @@ class TestTheVerbosePath:
     def test_every_file_unfolds_to_its_slugs(self, capsys) -> None:
         _print_overflow_detail(_overflows(), verbose=True)
         out = capsys.readouterr().out
-        assert out.count("largest decisions:") == 2
+        assert out.count("longest rows:") == 2
         for i in range(2):
             for j in range(3):
                 assert f"file{i}-decision-{j}" in out
@@ -145,8 +181,9 @@ class TestTheWiring:
         root = _workspace_with_a_graph(tmp_path)
         seen: Dict[str, Any] = {}
 
-        def _spy(overflows, *, verbose=False):
+        def _spy(overflows, *, verbose=False, project=None):
             seen["verbose"] = verbose
+            seen["project"] = project
 
         monkeypatch.setattr(cli, "overflow_report", lambda store: _overflows())
         monkeypatch.setattr(cli, "_print_overflow_detail", _spy)
@@ -154,6 +191,9 @@ class TestTheWiring:
         with pytest.raises(SystemExit):
             main()
         assert seen.get("verbose") is expect_verbose
+        # The selector reaches the printer as the caller's own vocabulary: the
+        # unregistered path this row names, never None.
+        assert seen.get("project") in (root, os.path.realpath(root))
 
     @pytest.mark.parametrize("argv_tail", [[], ["-v"]])
     def test_the_json_payload_carries_every_slug_on_both_verbosities(
