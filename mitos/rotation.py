@@ -87,7 +87,8 @@ def plan_rotation(buffer_text: str, blocks: Sequence[RotationBlock]) -> Rotation
     """Plans which blocks leave the buffer, in one pass and before any write.
 
     A block is removable when its whole ``raw_text`` occurs exactly once starting at a
-    line start. Two or more such occurrences exclude it as ``duplicated``; none (or an
+    line start and ending at a line end (or, for text without a final newline, at the
+    end of the buffer). Two or more such occurrences exclude it as ``duplicated``; none (or an
     empty ``raw_text``) as ``unmatched``; a single match overlapping another block's
     match excludes both as ``overlapping``. Exclusion is per block, so the rest of
     the batch still rotates. Matching is line-anchored so text quoted mid-line inside
@@ -123,9 +124,14 @@ def plan_rotation(buffer_text: str, blocks: Sequence[RotationBlock]) -> Rotation
             unmatched.append(block.label)
             continue
         first_line = raw.split("\n", 1)[0]
+        # Anchored at both ends: a block with no final newline (the snapshot's last
+        # line) matches only at the end of the buffer, so a last line extended since
+        # the snapshot is a changed block, never a prefix cut out of its own line.
+        ends_on_line = raw.endswith("\n")
         matches = [
             start for start in line_starts.get(first_line, ())
             if buffer_text.startswith(raw, start)
+            and (ends_on_line or start + len(raw) == length)
         ]
         if not matches:
             unmatched.append(block.label)

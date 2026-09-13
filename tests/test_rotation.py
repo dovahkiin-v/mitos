@@ -86,6 +86,21 @@ def test_a_mid_line_quote_does_not_make_a_real_block_a_duplicate():
     assert [blk.label for blk in plan.rotated] == ["a"]
 
 
+def test_a_last_line_extended_since_the_snapshot_is_not_cut_mid_line():
+    """A block without a final newline matches only at the buffer's end.
+
+    The snapshot's EOF block carries no trailing newline. If its last line was extended
+    before the lock was taken, a start-anchored prefix match would archive the old text
+    and leave the extension stranded as a fragment of a line — the pre-1c `replace` did.
+    """
+    tail = "## 2026-05-19 — e — Title\n**Decided:** x.\n**Rejected:** The old"
+    buffer = _HEADER + tail + " and the amended ending.\n"
+    assert _sequential(buffer, [_block("e", tail)])[0] == _HEADER + " and the amended ending.\n"
+
+    plan = plan_rotation(buffer, [_block("e", tail)])
+    assert plan.unmatched == ["e"] and plan.new_buffer == buffer
+
+
 def test_overlapping_matches_exclude_both_blocks():
     a, b = _entry("a"), _entry("b")
     buffer = _HEADER + a + b
