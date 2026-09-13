@@ -21,8 +21,8 @@ Five species are reported:
         row's ``order_only`` flag. A *membership* difference is a retrieval
         defect: a wrong tag set makes the decision miss scope-filtered reads and
         ``mitos scopes``. An *order-only* difference hides nothing from any read;
-        it changes the primary scope (the first tag), and so which rendered scope
-        file holds the full body.
+        the stored order is the author's, and when the first tag moved it changes
+        the primary scope, and so which rendered scope file holds the full body.
 ``S3``  **Absent source block** — a node with no ``### `` entry anywhere in the
         corpus. ``rebuild`` drops it, the completeness gate refuses, and the
         tool's own repair story stops working.
@@ -213,7 +213,8 @@ def entry_divergence(
         authored order, never sorted, because the report is where a reader sees
         which order diverged. ``order_only`` is True iff the lists hold the same
         tags in a different order. An order-only difference is still a divergence,
-        and a reconcilable one: it moves the node's primary scope.
+        and a reconcilable one: the reconcile rewrites the stored order, which
+        moves the node's primary scope whenever the first tag differs.
     """
     commentary: List[str] = []
 
@@ -305,8 +306,9 @@ def is_reconcilable(report: Dict[str, Any]) -> bool:
 # FUNCTION-LOCAL (the module's only module-level `mitos` import is the stdlib leaf
 # `scope_tags`, which the pure half uses): importing `mitos.divergence` must not drag
 # in the parser (which reads `format-spec.md` from package data at import time), the
-# store, or the cutover replay machinery. `sync`'s per-entry loop imports this module for `entry_divergence`
-# alone and must not pay for any of that; the import-graph property is pinned by test.
+# store, or the cutover replay machinery. `sync`'s per-entry loop imports this module
+# for `entry_divergence` alone and must not pay for any of that; the import-graph
+# property is pinned by test.
 #
 # `sync` calls `entry_divergence` and never this: calling the fold inside sync's
 # per-entry loop would re-read the LIVE corpus against the locked snapshot sync is

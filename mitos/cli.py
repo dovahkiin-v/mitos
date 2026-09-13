@@ -3346,8 +3346,8 @@ def _print_divergence_rung(report: Dict[str, Any], *, project: str) -> None:
     if order_only:
         print(f"      • {len(order_only)} entry(s) whose scope tags match but are "
               f"ordered differently — every scope-filtered read still finds them; the "
-              f"first tag is the primary scope, so the graph renders the full entry "
-              f"under a different scope file than the markdown names first")
+              f"first tag is the primary scope, whose rendered file carries the full "
+              f"entry, so the graph's order is not the author's")
         for row in order_only[:5]:
             print(f"          - {row.get('slug')}: graph {row.get('graph')} vs "
                   f"markdown {row.get('markdown')}")
