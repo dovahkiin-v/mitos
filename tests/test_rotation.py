@@ -2,7 +2,9 @@
 
 The planner is pure, so the shapes that lose data (a duplicate, a mid-line quote, an
 overlap) are pinned without a sync. The I/O rows pin the order the durability claim
-rests on: every archive append returns before the buffer replace starts.
+rests on: every archive replace returns before the buffer replace starts. The layout
+rows pin where a batch lands: newest-first at the top of the archive's entry stream,
+which is what the reversing reader needs to replay it in commit order.
 """
 
 import ast
@@ -37,12 +39,20 @@ def _block(slug: str, text: str, archive: str = "2026-Q3.md") -> RotationBlock:
 
 
 def _sequential(buffer: str, blocks) -> "tuple[str, str]":
-    """Today's pre-1c algorithm, for the byte-equivalence rows."""
+    """The pre-1c buffer algorithm, and the archive text as the fix stacks it.
+
+    The buffer half is the old sequential ``replace``. The archive half is the batch
+    in reverse order, each block line-terminated and followed by one blank line.
+    """
     archived = ""
+    rotated = []
     for block in blocks:
         if block.raw_text in buffer:
             buffer = buffer.replace(block.raw_text, "")
-            archived += block.raw_text + "\n"
+            rotated.append(block)
+    for block in reversed(rotated):
+        raw = block.raw_text
+        archived += raw + ("" if raw.endswith("\n") else "\n") + "\n"
     return buffer, archived
 
 
@@ -131,9 +141,14 @@ def test_an_empty_raw_text_is_unmatched():
     assert plan.unmatched == ["empty"] and plan.new_buffer == buffer
 
 
-# --- P2: byte equivalence with the pre-1c algorithm -----------------------------------
+# --- P2: byte equivalence with the pre-1c buffer algorithm ----------------------------
 
 def test_unique_blocks_match_sequential_replace_byte_for_byte():
+    """The buffer keeps the old bytes; the archive stacks the batch newest-first.
+
+    The EOF block carries no final newline, so its terminator is the one place the
+    archive bytes are not ``raw + "\\n"``.
+    """
     transcript = "\n```\n> user: why?\n> agent: because\n```\n\n"
     entries = [_entry("a"), _entry("b", " With a blank\n\nparagraph."),
                _entry("c") + transcript, _entry("d")]
@@ -148,6 +163,33 @@ def test_unique_blocks_match_sequential_replace_byte_for_byte():
     assert [blk.label for blk in plan.rotated] == ["d", "b", "e", "c"]
     assert plan.new_buffer == expected_buffer
     assert plan.archive_texts == {"2026-Q3.md": expected_archive}
+    assert expected_archive == (entries[2] + "\n" + tail + "\n\n" + entries[1] + "\n"
+                                + entries[3] + "\n")
+
+
+def test_a_batch_stacks_newest_first_and_reads_back_in_commit_order(tmp_path):
+    """L1: the caller's batch is commit order; the file is read reversed.
+
+    Two batches into one archive: the second's blocks sit above the first's, and
+    inside each batch the last-committed block is highest, so ``parse_file_reversed``
+    yields the eight in the order they committed.
+    """
+    from mitos.parser import parse_file_reversed
+
+    first = [_entry(f"first-{i}") for i in range(4)]
+    second = [_entry(f"second-{i}") for i in range(4)]
+    buffer_path, archive_dir = _workspace(tmp_path, _HEADER + "".join(first + second))
+    for batch in (first, second):
+        rotate(contextlib.nullcontext(), buffer_path, archive_dir,
+               [_block(t.split(" — ")[1], t) for t in batch])
+
+    target = os.path.join(archive_dir, "2026-Q3.md")
+    with open(target, encoding="utf-8") as fh:
+        assert fh.read() == "".join(t + "\n" for t in list(reversed(second)) + list(reversed(first)))
+    failures = []
+    slugs = [e.slug for e in parse_file_reversed(target, "decision", failures)]
+    assert failures == []
+    assert slugs == [f"first-{i}" for i in range(4)] + [f"second-{i}" for i in range(4)]
 
 
 # --- I/O rows ------------------------------------------------------------------------
@@ -289,8 +331,9 @@ def test_f3_a_refused_archive_fsync_leaves_the_archive_byte_identical(tmp_path):
 def test_f4_a_block_rotated_into_an_archive_without_a_final_newline_parses_back(tmp_path):
     """F4: a hand-edited archive ending mid-line must not swallow the next heading.
 
-    Glued onto ``PRIOR``, the heading is no heading, and the rotated entry silently
-    vanishes from the stream — no failure is reported.
+    ``PRIOR`` is an archive with no entry, so its stream's top is the end of the file
+    and the batch goes after it — glued onto ``PRIOR``, the heading is no heading, and
+    the rotated entry silently vanishes from the stream with no failure reported.
     """
     from mitos.parser import parse_file_reversed
 
@@ -324,6 +367,102 @@ def test_an_archive_ending_in_a_newline_gains_no_separator(tmp_path):
 
     with open(archive, encoding="utf-8") as fh:
         assert fh.read() == "PRIOR\n" + a + "\n"
+
+
+def test_f5_a_batch_lands_below_an_archives_preamble_and_above_its_first_entry(tmp_path):
+    """F5: prose at the top of a hand-edited archive stays a preamble.
+
+    The parser folds any non-blank line after an entry's last field into that field,
+    blank lines or not. Inserted at line 1, the batch would end right above ``PRIOR``
+    and the rotated entry's ``Scope`` would read ``core PRIOR`` — a silent change to
+    the gold source. So the batch goes in at the first entry heading, and every field
+    of both entries reads back as authored.
+    """
+    from mitos.parser import parse_file_reversed
+
+    settled, rotated = _entry("settled"), _entry("rotate-first")
+    buffer_path, archive_dir = _workspace(tmp_path, _HEADER + rotated)
+    os.makedirs(archive_dir)
+    archive = os.path.join(archive_dir, "2026-Q3.md")
+    with open(archive, "w", encoding="utf-8") as fh:
+        fh.write("PRIOR prose the archivist left here.\n\n" + settled)
+
+    rotate(contextlib.nullcontext(), buffer_path, archive_dir,
+           [_block("rotate-first", rotated)])
+
+    with open(archive, encoding="utf-8") as fh:
+        assert fh.read() == "PRIOR prose the archivist left here.\n\n" + rotated + "\n" + settled
+    failures = []
+    entries = {e.slug: e for e in parse_file_reversed(archive, "decision", failures)}
+    assert failures == [] and sorted(entries) == ["rotate-first", "settled"]
+    for slug, entry in entries.items():
+        assert entry.axiom == f"The {slug} axiom."
+        assert entry.rejected_paths == "The alternative."
+        assert entry.scope == ["core"], "the preamble was folded into the last field"
+
+
+def test_f6_a_batch_lands_below_the_sentinel_and_leaves_the_sample_above_it_alone(tmp_path):
+    """F6: an archive shaped like the buffer — a sample entry above ``BEGIN ENTRIES``.
+
+    The sample is preamble by the parser's rule and must stay outside the stream; the
+    batch goes below the sentinel and above the first real entry.
+    """
+    from mitos.parser import parse_file_reversed
+
+    sample = "## SAMPLE\n\n### example-slug\n\n**Decided:** A sample.\n**Rejected:** x.\n\n"
+    sentinel = "<!-- BEGIN ENTRIES — newest first -->\n\n"
+    settled, rotated = _entry("settled"), _entry("rotate-first")
+    buffer_path, archive_dir = _workspace(tmp_path, _HEADER + rotated)
+    os.makedirs(archive_dir)
+    archive = os.path.join(archive_dir, "2026-Q3.md")
+    with open(archive, "w", encoding="utf-8") as fh:
+        fh.write(sample + sentinel + settled)
+
+    rotate(contextlib.nullcontext(), buffer_path, archive_dir,
+           [_block("rotate-first", rotated)])
+
+    with open(archive, encoding="utf-8") as fh:
+        assert fh.read() == sample + sentinel + rotated + "\n" + settled
+    failures = []
+    slugs = [e.slug for e in parse_file_reversed(archive, "decision", failures)]
+    assert failures == [] and slugs == ["settled", "rotate-first"]
+
+
+def test_a_sentinel_without_a_final_newline_gains_a_separator_before_the_batch(tmp_path):
+    """An archive that is only a sentinel line, unterminated: the batch starts a new line."""
+    a = _entry("a")
+    buffer_path, archive_dir = _workspace(tmp_path, _HEADER + a)
+    os.makedirs(archive_dir)
+    archive = os.path.join(archive_dir, "2026-Q3.md")
+    with open(archive, "w", encoding="utf-8") as fh:
+        fh.write("<!-- BEGIN ENTRIES -->")
+
+    rotate(contextlib.nullcontext(), buffer_path, archive_dir, [_block("a", a)])
+
+    with open(archive, encoding="utf-8") as fh:
+        assert fh.read() == "<!-- BEGIN ENTRIES -->\n" + a + "\n"
+
+
+def test_a_heading_inside_a_preamble_transcript_is_not_the_insertion_point(tmp_path):
+    """The insertion scan is transcript-aware, as the parser's section split is."""
+    from mitos.parser import parse_file_reversed
+
+    preamble = ("[DECISION_TRANSCRIPT]\n## not a heading\n[/DECISION_TRANSCRIPT]\n\n")
+    settled, rotated = _entry("settled"), _entry("rotate-first")
+    buffer_path, archive_dir = _workspace(tmp_path, _HEADER + rotated)
+    os.makedirs(archive_dir)
+    archive = os.path.join(archive_dir, "2026-Q3.md")
+    with open(archive, "w", encoding="utf-8") as fh:
+        fh.write(preamble + settled)
+
+    rotate(contextlib.nullcontext(), buffer_path, archive_dir,
+           [_block("rotate-first", rotated)])
+
+    with open(archive, encoding="utf-8") as fh:
+        assert fh.read() == preamble + rotated + "\n" + settled
+    failures = []
+    slugs = [e.slug for e in parse_file_reversed(archive, "decision", failures)]
+    assert failures == [] and slugs == ["settled", "rotate-first"]
 
 
 def test_an_undecodable_second_archive_changes_no_file(tmp_path):
@@ -406,7 +545,8 @@ def test_a_fresh_archive_directory_is_durable_before_the_buffer_write(tmp_path):
     ("2026-09-13T17:21:14.640904+00:00", "2026-Q3.md"),
     ("2026-09-13T17:21:14Z", "2026-Q3.md"),
 ])
-def test_the_archive_name_is_the_quarter_of_a_utc_stamp(stamp, name):
+def test_the_archive_name_is_the_quarter_of_a_utc_instant(stamp, name):
+    """The instant is the caller's rotation clock, passed in as a stamp."""
     assert archive_name_for(stamp) == name
 
 
@@ -510,8 +650,11 @@ def test_the_core_holds_no_input_and_no_print():
     assert names.isdisjoint({"print", "input"})
 
 
-def test_importing_the_core_pulls_in_only_the_leaf():
-    """Tier 2: `config`, `store`, `sync` or `filelock` here would bind it to one workspace."""
+def test_importing_the_core_pulls_in_only_the_leaves():
+    """Tier 2: `config`, `store`, `sync` or `filelock` here would bind it to one workspace.
+
+    `markers` is the second leaf: the insertion rule the parser also composes.
+    """
     probe = (
         "import sys; import mitos.rotation; "
         "print(','.join(sorted(m for m in sys.modules "
@@ -520,4 +663,5 @@ def test_importing_the_core_pulls_in_only_the_leaf():
     )
     out = subprocess.run([sys.executable, "-c", probe],
                          capture_output=True, text=True, check=True)
-    assert out.stdout.split() == ["mitos,mitos.atomic_file,mitos.rotation", "False"]
+    assert out.stdout.split() == [
+        "mitos,mitos.atomic_file,mitos.markers,mitos.rotation", "False"]

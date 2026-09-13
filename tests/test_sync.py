@@ -1965,16 +1965,12 @@ _ROTATE_SECOND = (
 )
 
 
-# The commit stamp a row pins, and the archive that stamp names. A fixed stamp makes
-# the expected name known before the sync, whatever the day the suite runs.
+# The rotation instant a row pins, and the archive that instant names. A fixed instant
+# makes the expected name known before the sync, whatever the day the suite runs. It is
+# pinned on sync's own bound helper, so the commit stamp (the store's) can be pinned
+# apart from it — the name follows the rotation instant, never the node's stamp.
 _PINNED_STAMP = "2026-02-10T09:00:00+00:00"
 _PINNED_ARCHIVE = "2026-Q1.md"
-
-
-def _stored_archive_name(store: GraphStore, slug: str) -> str:
-    from mitos.rotation import archive_name_for
-    node_id = store.get_node_by_slug(slug)["id"]
-    return archive_name_for(store.created_at_for([node_id])[node_id])
 
 
 def _healed_header(manager: MitosSyncManager, config: MitosConfig) -> str:
@@ -1990,16 +1986,19 @@ def test_rotation_characterization_exact_buffer_and_archive_bytes(
 ) -> None:
     """K1: which entries leave, and the exact bytes of both files afterwards.
 
-    Archive order is the order blocks entered ``synced_blocks``: ``parse_file_reversed``
+    Batch order is the order blocks entered ``synced_blocks``: ``parse_file_reversed``
     walks the buffer bottom-up (oldest-first under a newest-first sentinel), so the
     block appended last commits and rotates first; decisions precede OQs, and the
-    quarantine fixpoint appends last. Each raw block carries its trailing blank line
+    quarantine fixpoint appends last. The archive holds the batch **newest-first** —
+    the reverse of batch order, so the reversing reader replays it in commit order —
+    inserted at the top of the archive's entry stream; ``PRIOR`` holds no entry, so the
+    stream's top is the end of the file. Each raw block carries its trailing blank line
     and rotation adds one ``"\\n"``, hence two blank lines after each archived block —
     byte identity, not something to tidy. The blank separators leave the buffer with
     their blocks. An OQ in questions.md is not rotated and questions.md is untouched.
 
-    The archive is named for the UTC quarter of the entries' ``created_at``. The commit
-    stamp is pinned, so that name is known before the sync.
+    The archive is named for the UTC quarter of the rotation instant, pinned here, so
+    that name is known before the sync.
     """
     config, manager, tmpdir = sync_env
     config.env["GEMINI_API_KEY"] = "mock_key"
@@ -2021,16 +2020,17 @@ def test_rotation_characterization_exact_buffer_and_archive_bytes(
     with open(os.path.join(config.archive_dir, _PINNED_ARCHIVE), "w", encoding="utf-8") as f:
         f.write("PRIOR\n")
 
-    with patch("mitos.store._utc_now_iso", return_value=_PINNED_STAMP):
+    with patch("mitos.sync._utc_now_iso", return_value=_PINNED_STAMP):
         manager.perform_sync(auto_accept=True)
 
     with open(config.decisions_file, "r", encoding="utf-8") as f:
         assert f.read() == header
 
-    appended = _ROTATE_SECOND + "\n" + "\n" + _ROTATE_FIRST + "\n" + "\n"
+    # rotate-second committed first, so it is the older block and sits lower.
+    inserted = _ROTATE_FIRST + "\n" + "\n" + _ROTATE_SECOND + "\n" + "\n"
     assert sorted(os.listdir(config.archive_dir)) == [_PINNED_ARCHIVE]
     with open(os.path.join(config.archive_dir, _PINNED_ARCHIVE), "r", encoding="utf-8") as f:
-        assert f.read() == "PRIOR\n" + appended
+        assert f.read() == "PRIOR\n" + inserted
 
     from mitos.cutover import _ARCHIVE_FILENAME_RE
     assert _ARCHIVE_FILENAME_RE.match(_PINNED_ARCHIVE)
@@ -2038,8 +2038,6 @@ def test_rotation_characterization_exact_buffer_and_archive_bytes(
     with open(questions_path, "r", encoding="utf-8") as f:
         assert f.read() == questions_before
     store = GraphStore(config.db_path)
-    assert _stored_archive_name(store, "rotate-first") == _PINNED_ARCHIVE
-    assert _stored_archive_name(store, "rotate-second") == _PINNED_ARCHIVE
     assert {q["slug"] for q in store.get_open_questions()} == {"kept-oq"}
 
 
@@ -2052,10 +2050,11 @@ def test_rotation_characterization_fixpoint_commit_rotates_last(
     The resolver's ``Resolves:`` target is an OQ, attempted after decisions, so the
     resolver quarantines on the main pass and commits in the fixpoint — whose
     ``_record_decision_block`` appends it to ``synced_blocks`` after every main-pass
-    commit. So it is archived after the plain decision, although it sits below it.
+    commit. So it is the newer block and lands above the plain decision in the
+    archive, although it sat below it in the buffer.
 
-    The archive is named for the UTC quarter of ``created_at``, pinned here, and the
-    fixpoint's commit is looked up exactly like the main pass's.
+    The archive is named for the UTC quarter of the rotation instant, pinned here; the
+    fixpoint's commit rides the same batch and the same name.
     """
     config, manager, tmpdir = sync_env
     config.env["GEMINI_API_KEY"] = "mock_key"
@@ -2077,40 +2076,48 @@ def test_rotation_characterization_fixpoint_commit_rotates_last(
         "**Questions:** Which approach do we commit to?\n",
     )
 
-    with patch("mitos.store._utc_now_iso", return_value=_PINNED_STAMP):
+    with patch("mitos.sync._utc_now_iso", return_value=_PINNED_STAMP):
         manager.perform_sync(auto_accept=True)
 
     with open(config.decisions_file, "r", encoding="utf-8") as f:
         assert f.read() == header
     assert os.listdir(config.archive_dir) == [_PINNED_ARCHIVE]
     with open(os.path.join(config.archive_dir, _PINNED_ARCHIVE), "r", encoding="utf-8") as f:
-        assert f.read() == _ROTATE_FIRST + "\n" + "\n" + resolver + "\n" + "\n"
-    assert _stored_archive_name(GraphStore(config.db_path), "resolver-rotates") == _PINNED_ARCHIVE
+        assert f.read() == resolver + "\n" + "\n" + _ROTATE_FIRST + "\n" + "\n"
 
 
 @patch("google.genai.Client")
-def test_f1_the_archive_is_named_for_created_at_not_the_wall_clock(
+def test_f1_the_archive_is_named_for_the_rotation_instant_not_created_at(
     mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
 ) -> None:
-    """F1 (defect 5): the name follows the entry's stamp, whatever today's quarter is.
+    """F1: the name follows the instant the batch is rotated at, not the node's stamp.
 
-    Only the commit stamp is patched, never a clock: after 1d the caller reads none.
+    The commit stamp (the store's helper) and the rotation instant (sync's) are pinned
+    to different quarters; the archive takes the rotation's. Naming for ``created_at``
+    was the 1d design, reversed because it reorders replay against the buffer (ADR
+    ``rotation-names-the-archive-for-the-rotation-instant-not-created-at``).
     """
     config, manager, tmpdir = sync_env
     config.env["GEMINI_API_KEY"] = "mock_key"
     _append_decision(config, _rotating_decision("f1-dated"))
 
-    with patch("mitos.store._utc_now_iso", return_value="2025-11-15T12:00:00+00:00"):
+    with patch("mitos.store._utc_now_iso", return_value="2025-11-15T12:00:00+00:00"), \
+            patch("mitos.sync._utc_now_iso", return_value="2026-08-01T00:00:00+00:00"):
         manager.perform_sync(auto_accept=True)
 
-    assert os.listdir(config.archive_dir) == ["2025-Q4.md"]
-    assert "f1-dated" in _read(os.path.join(config.archive_dir, "2025-Q4.md"))
+    assert os.listdir(config.archive_dir) == ["2026-Q3.md"]
+    assert "f1-dated" in _read(os.path.join(config.archive_dir, "2026-Q3.md"))
     assert "f1-dated" not in _read(config.decisions_file)
+    store = GraphStore(config.db_path)
+    node_id = store.get_node_by_slug("f1-dated")["id"]
+    assert store.created_at_for([node_id])[node_id].startswith("2025-11-15"), "non-vacuity"
 
 
-def test_the_rotation_step_reads_no_clock() -> None:
-    """Step 4 names archives from the stored stamp, so no clock call may creep back in.
+def test_the_rotation_step_reads_the_clock_once_through_the_utc_helper_and_no_graph() -> None:
+    """Step 4 names the batch from one ``_utc_now_iso()`` read and reads no node stamp.
 
+    The MI-10 helper is the only clock the step may touch — a bare ``datetime.now``
+    would be local time, and a graph stamp (``created_at_for``) would reorder replay.
     Scoped to the ``if synced_blocks:`` step alone: the stale-entry warning elsewhere
     in the same method reads the clock, and that one is not rotation's.
     """
@@ -2131,16 +2138,24 @@ def test_the_rotation_step_reads_no_clock() -> None:
     }
     assert {("rotation", "archive_name_for"), ("rotation", "rotate")} <= attributes
     assert not {attr for _owner, attr in attributes} & {"now", "utcnow", "today"}
+    assert "created_at_for" not in {attr for _owner, attr in attributes}
+    calls = [
+        node.func.id for node in ast.walk(steps[0])
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    ]
+    assert calls.count("_utc_now_iso") == 1
 
 
 @patch("google.genai.Client")
-def test_blocks_from_one_sync_are_filed_under_their_own_quarters(
+def test_blocks_from_one_sync_are_filed_under_one_archive_whatever_their_stamps(
     mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
 ) -> None:
-    """One sync, two stamps: the main pass's commit and the fixpoint's land apart.
+    """One sync, two commit stamps, one archive: the batch is never split by stamp.
 
-    The stamp moves when the fixpoint starts, so the resolver it commits carries
-    another quarter than the plain decision — and the lookup hits for both.
+    The commit stamp moves when the fixpoint starts, so the resolver's ``created_at``
+    is a different quarter from the plain decision's; both land in the file named for
+    the rotation instant, the fixpoint's commit on top (the inverse of 1d's per-stamp
+    filing, which split a batch across files and reordered replay).
     """
     config, manager, tmpdir = sync_env
     config.env["GEMINI_API_KEY"] = "mock_key"
@@ -2169,34 +2184,38 @@ def test_blocks_from_one_sync_are_filed_under_their_own_quarters(
         return real_fixpoint(*args, **kwargs)
 
     with patch("mitos.store._utc_now_iso", side_effect=lambda: stamp["now"]), \
+            patch("mitos.sync._utc_now_iso", return_value=_PINNED_STAMP), \
             patch("mitos.sync.commit_quarantine_fixpoint", side_effect=_fixpoint):
         manager.perform_sync(auto_accept=True)
 
-    assert sorted(os.listdir(config.archive_dir)) == ["2025-Q4.md", _PINNED_ARCHIVE]
-    assert _read(os.path.join(config.archive_dir, _PINNED_ARCHIVE)) == _ROTATE_FIRST + "\n\n"
-    assert _read(os.path.join(config.archive_dir, "2025-Q4.md")) == resolver + "\n\n"
+    assert sorted(os.listdir(config.archive_dir)) == [_PINNED_ARCHIVE]
+    assert _read(os.path.join(config.archive_dir, _PINNED_ARCHIVE)) == (
+        resolver + "\n\n" + _ROTATE_FIRST + "\n\n")
+    store = GraphStore(config.db_path)
+    ids = [store.get_node_by_slug(s)["id"] for s in ("rotate-first", "resolver-apart")]
+    stamps = store.created_at_for(ids)
+    assert stamps[ids[0]] == _PINNED_STAMP and stamps[ids[1]].startswith("2025-11-15")
 
 
 @patch("google.genai.Client")
-def test_a_failed_created_at_lookup_takes_the_failure_line_and_writes_nothing(
+def test_a_failed_archive_read_takes_the_failure_line_and_writes_nothing(
     mock_client: MagicMock,
     sync_env: Tuple[MitosConfig, MitosSyncManager, str],
     capsys: pytest.CaptureFixture,
 ) -> None:
-    """D-1d-3: a graph read that fails before any write is the shipped failure, verbatim.
+    """D-1d-3: a read that fails before any write is the shipped failure, verbatim.
 
-    The commit stands, render still runs, and nothing about rotation reaches stdout.
+    The archive read is the step's last read before its first write. The commit
+    stands, render still runs, and nothing about rotation reaches stdout.
     """
-    from mitos.errors import DatabaseError
-
     config, manager, tmpdir = sync_env
     config.env["GEMINI_API_KEY"] = "mock_key"
     _healed_header(manager, config)
     _append_decision(config, _rotating_decision("lookup-refused"))
     before = _read(config.decisions_file)
 
-    with patch("mitos.store.GraphStore.created_at_for",
-               side_effect=DatabaseError("injected: graph read refused")):
+    with patch("mitos.rotation._read_archive",
+               side_effect=OSError("injected: archive read refused")):
         manager.perform_sync(auto_accept=True)
 
     assert _read(config.decisions_file) == before
@@ -2206,32 +2225,36 @@ def test_a_failed_created_at_lookup_takes_the_failure_line_and_writes_nothing(
     captured = capsys.readouterr()
     failed = [ln for ln in captured.err.splitlines() if "Archive rotation failed" in ln]
     assert len(failed) == 1, captured.err
-    assert "injected: graph read refused" in failed[0]
+    assert "injected: archive read refused" in failed[0]
     assert "none of the 1 entries was removed" in failed[0]
     assert "Archive rotation failed" not in captured.out
 
 
 @patch("google.genai.Client")
-def test_a_node_with_no_stored_created_at_is_named_in_the_failure_line(
+def test_the_rotation_step_does_not_read_the_graphs_stamps(
     mock_client: MagicMock,
     sync_env: Tuple[MitosConfig, MitosSyncManager, str],
     capsys: pytest.CaptureFixture,
 ) -> None:
-    """A missing id is located by slug, not rendered as a bare 64-hex ``KeyError``."""
+    """The inverse of 1d's lookup rows: a refused stamp read cannot touch rotation.
+
+    Naming from ``created_at`` was reversed; the step reads no node stamp, so a graph
+    that refuses that read still rotates the batch under the rotation instant.
+    """
     config, manager, tmpdir = sync_env
     config.env["GEMINI_API_KEY"] = "mock_key"
     _healed_header(manager, config)
-    _append_decision(config, _rotating_decision("stamp-missing"))
-    before = _read(config.decisions_file)
+    _append_decision(config, _rotating_decision("stamp-unread"))
 
-    with patch("mitos.store.GraphStore.created_at_for", return_value={}):
+    with patch("mitos.store.GraphStore.created_at_for",
+               side_effect=AssertionError("the step must not read created_at")), \
+            patch("mitos.sync._utc_now_iso", return_value=_PINNED_STAMP):
         manager.perform_sync(auto_accept=True)
 
-    assert _read(config.decisions_file) == before
-    assert not os.path.exists(config.archive_dir)
-    failed = [ln for ln in capsys.readouterr().err.splitlines()
-              if "Archive rotation failed" in ln]
-    assert len(failed) == 1 and "'stamp-missing'" in failed[0], failed
+    assert "stamp-unread" not in _read(config.decisions_file)
+    assert os.listdir(config.archive_dir) == [_PINNED_ARCHIVE]
+    assert "stamp-unread" in _read(os.path.join(config.archive_dir, _PINNED_ARCHIVE))
+    assert "Archive rotation failed" not in capsys.readouterr().err
 
 
 # ===========================================================================

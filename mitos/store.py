@@ -920,8 +920,11 @@ class GraphStore:
     def created_at_for(self, node_ids: Sequence[str]) -> Dict[str, str]:
         """Reads the stored ``created_at`` of many nodes without hydrating them.
 
-        One indexed ``IN`` query per chunk — no scopes, no modifier stamps — so naming
-        the archives for a large first sync costs no per-node read.
+        One indexed ``IN`` query per chunk — no scopes, no modifier stamps — so a
+        caller stamping a large batch costs no per-node read. Rotation no longer names
+        archives from it (the name follows the rotation instant, ADR
+        ``rotation-names-the-archive-for-the-rotation-instant-not-created-at``); the
+        read stays as a batch primitive.
 
         Args:
             node_ids: The node ids to look up.

@@ -1830,7 +1830,8 @@ def test_edge_kind_matrix_matches_ddl(temp_store: GraphStore) -> None:
     assert checked == 36, f"expected the full 9x2x2 grid, checked {checked}"
 
 
-# --- created_at_for (surface-entropy 1d): the batch read rotation names archives from ---
+# --- created_at_for (surface-entropy 1d): a batch stamp read; rotation named archives
+# from it until the archive-order fix, which names them for the rotation instant ---
 
 
 def _committed_ids(store: GraphStore, count: int) -> list:

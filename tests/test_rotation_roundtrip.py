@@ -2,14 +2,30 @@
 
 A per-defect assertion is silent against a whole failure class this row is loud
 against: an unbounded removal that took a second copy, a torn archive, a quarter
-file the reader never looks in, a heading form the parser cannot read back, or a
-removal that shifted a neighbour's canonical core. Each of those changes the rebuilt
-node id set, so the id set is compared across all kinds and all states — the
-completeness gate reads active cores only, and a superseded predecessor lost from
-the corpus would be invisible to it.
+file the reader never looks in, a heading form the parser cannot read back, a
+removal that shifted a neighbour's canonical core — or a batch written in an order
+the reversing reader replays inverted. Each of those changes the rebuilt node id
+set, so the id set is compared across all kinds and all states — the completeness
+gate reads active cores only, and a superseded predecessor lost from the corpus
+would be invisible to it.
+
+The fixture carries the two dependency shapes that made the real corpus's round
+trip red (fix brief, 2026-09-13), because a fixture with no citation between two
+rotated entries cannot see an ordering bug at all:
+
+* **Same file, different batches, with a kill edge between.** ``base-two`` rotates in
+  batch 1; ``amender`` (amends it) and ``successor-two`` (supersedes it) rotate in
+  batch 2 into the same file. Written oldest-first, the file replays as
+  ``successor-two, amender, base-two``: both are quarantined, ``successor-two``
+  retires the target first, and ``amender`` then fails ``dangling_edge``.
+* **Across files.** ``base-one`` rotates into an earlier quarter; ``amender-one``
+  (amends it) and ``successor-one`` (supersedes it) rotate into the later quarter in
+  two further batches, so the later file's own order has to hold too.
 
 The corpus is committed through parse→commit, so the row is keyless and
-deterministic. The rebuild is the in-process `cmd_rebuild --json`, swap included.
+deterministic. The rebuild is the in-process `cmd_rebuild --json`, swap included, and
+``swapped`` is asserted before the id set is — an identical id set read off a graph
+the gate refused to swap is vacuous.
 """
 
 import json
@@ -19,7 +35,7 @@ from mitos.cli import cmd_rebuild
 from mitos.config import MitosConfig
 from mitos.cutover import _ARCHIVE_FILENAME_RE
 from mitos.parser import parse_file_reversed
-from mitos.rotation import RotationBlock, archive_name_for, rotate
+from mitos.rotation import RotationBlock, rotate
 from mitos.store import GraphStore
 from mitos.sync import MitosSyncManager
 
@@ -33,10 +49,6 @@ _LEGACY = (
     "**Scope:** core\n"
     "\n"
 )
-
-_Q2 = "2026-05-02T10:00:00+00:00"
-_Q3 = "2026-08-01T00:00:00+00:00"
-_Q4_PREVIOUS_YEAR = "2025-12-20T08:00:00+00:00"
 
 
 def _block(slug, decided, *, scope, relations=()):
@@ -52,19 +64,29 @@ def _block(slug, decided, *, scope, relations=()):
     return "\n".join(lines) + "\n\n"
 
 
-# Oldest first; the buffer holds them newest-first below its sentinel.
+# Oldest first (commit order); the buffer holds them newest-first below its sentinel.
 _ENTRIES = [
-    ("base-one", _block("base-one", "The first base axiom.", scope=["core"]), _Q2),
-    ("base-two", _block("base-two", "The second base axiom.", scope=["core"]), _Q2),
-    ("multi-a", _block("multi-a", "A multi-scoped axiom.", scope=["zeta", "alpha"]), _Q2),
-    ("multi-b", _block("multi-b", "Another multi-scoped axiom.", scope=["ops", "core"]),
-     _Q4_PREVIOUS_YEAR),
-    ("successor", _block("successor", "The axiom that replaced the first base.",
-                         scope=["core"], relations=[("Supersedes", "base-one")]),
-     _Q4_PREVIOUS_YEAR),
+    ("base-one", _block("base-one", "The first base axiom.", scope=["core"])),
+    ("base-two", _block("base-two", "The second base axiom.", scope=["core"])),
+    ("multi-a", _block("multi-a", "A multi-scoped axiom.", scope=["zeta", "alpha"])),
+    ("amender-one", _block("amender-one", "A refinement of the first base.",
+                           scope=["core"], relations=[("Amends", "base-one")])),
     ("amender", _block("amender", "A refinement of the second base.",
-                       scope=["core"], relations=[("Amends", "base-two")]), _Q3),
-    ("keeper", _block("keeper", "An axiom that stays in the buffer.", scope=["core"]), _Q3),
+                       scope=["core"], relations=[("Amends", "base-two")])),
+    ("successor-two", _block("successor-two", "The axiom that replaced the second base.",
+                             scope=["core"], relations=[("Supersedes", "base-two")])),
+    ("successor-one", _block("successor-one", "The axiom that replaced the first base.",
+                             scope=["core"], relations=[("Supersedes", "base-one")])),
+    ("keeper", _block("keeper", "An axiom that stays in the buffer.", scope=["core"])),
+]
+
+# Each batch is a slice of commit order, named for the quarter it is rotated in, as
+# sync names them: the quarters never decrease across batches.
+_BATCHES = [
+    (["base-one"], "2026-Q2.md"),
+    (["base-two", "multi-a"], "2026-Q3.md"),
+    (["amender-one", "amender", "successor-two"], "2026-Q3.md"),
+    (["successor-one"], "2026-Q4.md"),
 ]
 
 
@@ -75,7 +97,7 @@ def _workspace(tmp_path):
     with open(os.path.join(config.archive_dir, "2026-Q2.md"), "w", encoding="utf-8") as fh:
         fh.write(_LEGACY)
     with open(config.decisions_file, "w", encoding="utf-8") as fh:
-        fh.write(_SENTINEL + "\n\n" + "".join(text for _s, text, _c in reversed(_ENTRIES)))
+        fh.write(_SENTINEL + "\n\n" + "".join(text for _s, text in reversed(_ENTRIES)))
 
     store = GraphStore(config.db_path)
     failures = []
@@ -83,16 +105,6 @@ def _workspace(tmp_path):
         for entry in parse_file_reversed(path, "decision", failures):
             store.commit_parsed_entry(entry)
     assert failures == []
-
-    # Every state: `base-one` is superseded, so the active-view slug lookup misses it.
-    ids = {n["slug"]: n["id"] for n in store.get_all_nodes()}
-    conn = store._get_connection()
-    try:
-        with conn:
-            for slug, _text, stamp in _ENTRIES:
-                conn.execute("UPDATE nodes SET created_at = ? WHERE id = ?", (stamp, ids[slug]))
-    finally:
-        conn.close()
     return config, store
 
 
@@ -107,52 +119,53 @@ def test_rotate_then_rebuild_returns_the_identical_node_id_set(tmp_path, capsys)
     config, store = _workspace(tmp_path)
     ids_before = {n["id"] for n in store.get_all_nodes()}
     assert len(ids_before) == len(_ENTRIES) + 1
+    # Non-vacuity of the dependency shapes: both amenders cite a target that a later
+    # entry retires, and the amend committed first (the state the rebuild must recreate).
+    assert store.get_node_state(store.get_node_by_slug("amender")["id"]) == "active"
+    assert store.get_node_by_slug("base-two") is None, "base-two is superseded"
 
     with open(config.decisions_file, encoding="utf-8") as fh:
         lines = fh.readlines()
     parsed = {e.slug: e for e in parse_file_reversed(config.decisions_file, "decision", [])}
-    ids = {n["slug"]: n["id"] for n in store.get_all_nodes()}
-    stamps = store.created_at_for(list(ids.values()))
 
-    def _rotation_block(slug):
+    def _rotation_block(slug, archive_name):
         entry = parsed[slug]
-        raw = "".join(lines[entry.line_start - 1:entry.line_end])
-        return RotationBlock(slug, raw, archive_name_for(stamps[ids[slug]]))
+        return RotationBlock(slug, "".join(lines[entry.line_start - 1:entry.line_end]),
+                             archive_name)
 
     lock = MitosSyncManager(config).lock
-    batches = [["base-one", "base-two", "multi-b"], ["multi-a", "successor", "amender"]]
     written = []
-    for batch in batches:
+    for batch, archive_name in _BATCHES:
         outcome = rotate(lock, config.decisions_file, config.archive_dir,
-                         [_rotation_block(slug) for slug in batch])
+                         [_rotation_block(slug, archive_name) for slug in batch])
         assert [b.label for b in outcome.rotated] == batch
         written += [os.path.basename(p) for p in outcome.archive_paths]
 
     # Non-vacuity: three quarter files, one of them the legacy file, and a file
-    # rewritten by both batches.
+    # rewritten by two batches.
     archives = sorted(os.listdir(config.archive_dir))
-    assert archives == ["2025-Q4.md", "2026-Q2.md", "2026-Q3.md"]
+    assert archives == ["2026-Q2.md", "2026-Q3.md", "2026-Q4.md"]
     assert all(_ARCHIVE_FILENAME_RE.match(name) for name in archives)
-    assert written.count("2026-Q2.md") == 2 and written.count("2025-Q4.md") == 2
+    assert written.count("2026-Q3.md") == 2
 
     q2 = os.path.join(config.archive_dir, "2026-Q2.md")
     with open(q2, encoding="utf-8") as fh:
         q2_text = fh.read()
     assert "## 2026-05-21 — legacy-dated — " in q2_text and "### base-one\n" in q2_text
-    assert sorted(_slugs(q2)) == ["base-one", "base-two", "legacy-dated", "multi-a"]
+    assert q2_text.index("### base-one") < q2_text.index("legacy-dated"), "newest on top"
+    assert _slugs(q2) == ["legacy-dated", "base-one"]
+    # The Q3 file replays in commit order: batch 1's blocks, then batch 2's.
+    assert _slugs(os.path.join(config.archive_dir, "2026-Q3.md")) == [
+        "base-two", "multi-a", "amender-one", "amender", "successor-two"]
     assert _slugs(config.decisions_file) == ["keeper"]
 
     assert cmd_rebuild(config, allow_drops=False, assume_yes=True, as_json=True) == 0
     report = json.loads(capsys.readouterr().out)
-    assert report["swapped"] is True
+    assert report["swapped"] is True, report
     assert report["gate_passed"] is True
     assert report["residual_casualties"] == [] and report["missing_cores"] == []
 
     rebuilt = GraphStore(config.db_path)
     assert {n["id"] for n in rebuilt.get_all_nodes()} == ids_before
-    # Carry-forward keeps each stamp, so every rotated entry still names its own file.
-    rebuilt_stamps = rebuilt.created_at_for(list(ids.values()))
-    for batch in batches:
-        for slug in batch:
-            name = archive_name_for(rebuilt_stamps[ids[slug]])
-            assert slug in _slugs(os.path.join(config.archive_dir, name))
+    assert rebuilt.get_node_state(rebuilt.get_node_by_slug("amender")["id"]) == "active"
+    assert rebuilt.get_node_state(rebuilt.get_node_by_slug("amender-one")["id"]) == "active"

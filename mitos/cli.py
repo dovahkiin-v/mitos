@@ -3405,8 +3405,8 @@ def cmd_restore_source(
     prove.
 
     Restored into the BUFFER, never an archive: this verb is a buffer splice. Archives
-    are written only by rotation, which files an entry under the UTC quarter of its
-    graph `created_at` — when this graph first saw it, not when it was decided.
+    are written only by rotation, which files a batch under the UTC quarter of the
+    instant it rotates it — when the entry was archived, not when it was decided.
 
     Args:
         config: The workspace config.

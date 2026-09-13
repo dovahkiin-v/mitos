@@ -538,9 +538,9 @@ prove no neighbouring entry was disturbed. Anything short of that is reported an
 skipped, and the file is rolled back byte-for-byte.
 
 Restored entries land in the **buffer**, not an archive: `restore-source` splices into
-`decisions.md`. Archives are written only by rotation, which files an entry under the
-UTC quarter of its `created_at` in the graph — the quarter the graph first saw it, not
-the date it was decided.
+`decisions.md`. Archives are written only by rotation, which files a batch under the
+UTC quarter of the moment it rotates it — when the entry was archived, not the date it
+was decided.
 
 `--slug <name>` restores one node; `--json` emits a machine-readable report.
 

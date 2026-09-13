@@ -1622,11 +1622,15 @@ class MitosSyncManager:
         for entry, _raw, exc in residual:
             self._report_commit_quarantine(entry, exc)
 
-        # 4. Archive rotation of this run's first commits. Each block is filed under the
-        # UTC quarter of its node's created_at, read by node id in one lookup (never by
-        # slug, never from a clock). The core replaces each archive whole and durably,
-        # and only then the buffer, so a failure leaves decisions.md unchanged and
-        # nothing needs rolling back (ADR
+        # 4. Archive rotation of this run's first commits. The batch is filed under the
+        # UTC quarter of this rotation's instant — one clock read, through the MI-10
+        # helper, never a graph stamp: rotation drains the buffer's oldest end, so
+        # naming for the instant keeps the quarter files in buffer order and `mitos
+        # rebuild` replays them as the buffer would have (ADR
+        # rotation-names-the-archive-for-the-rotation-instant-not-created-at). The core
+        # inserts the batch newest-first at the top of the archive's entry stream,
+        # replaces the archive whole and durably, and only then the buffer, so a
+        # failure leaves decisions.md unchanged and nothing needs rolling back (ADR
         # archive-first-makes-rotations-buffer-write-rollback-free-so-it-keeps-its-own-sequence).
         # Every line it produces goes to stderr: rotation will be reached from the MCP
         # write path, where a stray stdout byte corrupts the protocol.
@@ -1640,28 +1644,14 @@ class MitosSyncManager:
             synced_blocks.clear()
 
         if synced_blocks:
-            # The lookup and the naming sit inside the try: a graph that contradicts a
-            # commit made seconds ago in this run fails the whole rotation before any
-            # write, through the one failure line (D-1d-3).
+            # The naming sits inside the try with the rotation: any failure before a
+            # write takes the one failure line (D-1d-3).
             try:
-                # The id exactly as commit_parsed_entry derived it.
-                node_ids = [
-                    compute_node_id(
-                        kind="decision", axiom=entry.axiom, mechanism_refs=entry.mechanisms
-                    )
-                    for entry, _raw_block in synced_blocks
+                archive_name = rotation.archive_name_for(_utc_now_iso())
+                blocks = [
+                    rotation.RotationBlock(entry.slug, raw_block, archive_name)
+                    for entry, raw_block in synced_blocks
                 ]
-                stamps = self.store.created_at_for(node_ids)
-                blocks = []
-                for (entry, raw_block), node_id in zip(synced_blocks, node_ids):
-                    if node_id not in stamps:
-                        raise LookupError(
-                            f"the graph holds no created_at for {entry.slug!r}, which "
-                            f"this run committed"
-                        )
-                    blocks.append(rotation.RotationBlock(
-                        entry.slug, raw_block, rotation.archive_name_for(stamps[node_id])
-                    ))
                 outcome = rotation.rotate(
                     self.lock, self.config.decisions_file, self.config.archive_dir, blocks
                 )

@@ -18,9 +18,9 @@ the retired `mark` mode is a live demonstration of. So the whole buffer is re-pa
 after the splice and every pre-existing entry must be byte-unchanged.
 
 **Restored into the buffer, never an archive.** Restoring is a splice into the buffer.
-Archives are written only by rotation, which files an entry under the UTC quarter of
-its graph `created_at` — the quarter this graph first saw the entry, not when the
-decision was made.
+Archives are written only by rotation, which files a batch under the UTC quarter of
+the instant it rotates it — when the entry was archived, not when the decision was
+made.
 """
 
 import json
