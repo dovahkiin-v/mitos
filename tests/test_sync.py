@@ -1937,3 +1937,153 @@ def test_the_audit_row_records_full_edge_state_not_a_delta(
         "the retained edge must appear in the prior STATE"
     )
     assert rows[0]["new_values"]["edges"] == ["amends:kept-target", "cites:added-target"]
+
+
+# ===========================================================================
+# Phase 1c characterization — archive rotation, pinned against the pre-rewrite block
+# ===========================================================================
+#
+# Committed green against the unmodified step 4 before the rotation core was
+# rewritten (CC-9). A red here after the rewrite means behaviour changed: fix the
+# code, not the row. Messages are deliberately not asserted — their channel moves.
+# The archive filename is wall-clock in 1c; 1d re-targets these rows to the UTC
+# quarter of `created_at` (grep: "1d re-targets").
+
+_ROTATE_FIRST = (
+    "## 2026-05-19 — rotate-first — Rotate First\n"
+    "**Decided:** The first rotated axiom.\n"
+    "**Rejected:** Keeping it in the buffer.\n"
+    "**Mechanisms:** python\n"
+    "**Scope:** core\n"
+)
+_ROTATE_SECOND = (
+    "## 2026-05-19 — rotate-second — Rotate Second\n"
+    "**Decided:** The second rotated axiom.\n"
+    "**Rejected:** Keeping it in the buffer too.\n"
+    "**Mechanisms:** python\n"
+    "**Scope:** core\n"
+)
+
+
+def _quarter_name() -> str:
+    from datetime import datetime
+    d = datetime.now()
+    return f"{d.year}-Q{(d.month - 1) // 3 + 1}.md"
+
+
+def _healed_header(manager: MitosSyncManager, config: MitosConfig) -> str:
+    """Canonicalizes the fixture's header so sync's auto-heal writes nothing more."""
+    manager.auto_heal_decisions_file()
+    with open(config.decisions_file, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+@patch("google.genai.Client")
+def test_rotation_characterization_exact_buffer_and_archive_bytes(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """K1: which entries leave, and the exact bytes of both files afterwards.
+
+    Archive order is the order blocks entered ``synced_blocks``: ``parse_file_reversed``
+    walks the buffer bottom-up (oldest-first under a newest-first sentinel), so the
+    block appended last commits and rotates first; decisions precede OQs, and the
+    quarantine fixpoint appends last. Each raw block carries its trailing blank line
+    and rotation adds one ``"\\n"``, hence two blank lines after each archived block —
+    byte identity, not something to tidy. The blank separators leave the buffer with
+    their blocks. An OQ in questions.md is not rotated and questions.md is untouched.
+
+    1d re-targets this row's archive name to the UTC quarter of ``created_at``.
+    """
+    config, manager, tmpdir = sync_env
+    config.env["GEMINI_API_KEY"] = "mock_key"
+    _set_enrichment_passthrough(mock_client)
+
+    header = _healed_header(manager, config)
+    _append_decision(config, _ROTATE_FIRST)
+    _append_decision(config, _ROTATE_SECOND)
+    questions_path = _write_questions(
+        tmpdir,
+        "### kept-oq\n\n"
+        "**Topic:** An open thread that stays put.\n"
+        "**Questions:** Does sync leave questions.md alone?\n",
+    )
+    with open(questions_path, "r", encoding="utf-8") as f:
+        questions_before = f.read()
+
+    name_before = _quarter_name()
+    os.makedirs(config.archive_dir)
+    with open(os.path.join(config.archive_dir, name_before), "w", encoding="utf-8") as f:
+        f.write("PRIOR\n")
+
+    manager.perform_sync(auto_accept=True)
+    name_after = _quarter_name()
+
+    with open(config.decisions_file, "r", encoding="utf-8") as f:
+        assert f.read() == header
+
+    appended = _ROTATE_SECOND + "\n" + "\n" + _ROTATE_FIRST + "\n" + "\n"
+    archives = sorted(os.listdir(config.archive_dir))
+    if name_before == name_after:
+        assert archives == [name_before]
+        with open(os.path.join(config.archive_dir, name_before), "r", encoding="utf-8") as f:
+            assert f.read() == "PRIOR\n" + appended
+    else:  # the sync straddled a quarter boundary
+        assert archives == sorted([name_before, name_after])
+        with open(os.path.join(config.archive_dir, name_after), "r", encoding="utf-8") as f:
+            assert f.read() == appended
+
+    import re
+    assert all(re.match(r"^(\d{4})-Q([1-4])\.md$", n) for n in archives)
+
+    with open(questions_path, "r", encoding="utf-8") as f:
+        assert f.read() == questions_before
+    store = GraphStore(config.db_path)
+    assert store.get_node_by_slug("rotate-first") is not None
+    assert store.get_node_by_slug("rotate-second") is not None
+    assert {q["slug"] for q in store.get_open_questions()} == {"kept-oq"}
+
+
+@patch("google.genai.Client")
+def test_rotation_characterization_fixpoint_commit_rotates_last(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """K2: a decision the quarantine fixpoint commits leaves the buffer and is archived.
+
+    The resolver's ``Resolves:`` target is an OQ, attempted after decisions, so the
+    resolver quarantines on the main pass and commits in the fixpoint — whose
+    ``_record_decision_block`` appends it to ``synced_blocks`` after every main-pass
+    commit. So it is archived after the plain decision, although it sits below it.
+
+    1d re-targets this row's archive name to the UTC quarter of ``created_at``.
+    """
+    config, manager, tmpdir = sync_env
+    config.env["GEMINI_API_KEY"] = "mock_key"
+    _set_enrichment_passthrough(mock_client)
+
+    resolver = (
+        "## 2026-05-19 — resolver-rotates — Resolver Rotates\n"
+        "**Decided:** This decision answers the open thread.\n"
+        "**Rejected:** Leaving it open.\n"
+        "**Resolves:** oq-rotation-target\n"
+    )
+    header = _healed_header(manager, config)
+    _append_decision(config, _ROTATE_FIRST)
+    _append_decision(config, resolver)
+    _write_questions(
+        tmpdir,
+        "### oq-rotation-target\n\n"
+        "**Topic:** The thread the resolver closes.\n"
+        "**Questions:** Which approach do we commit to?\n",
+    )
+
+    names = {_quarter_name()}
+    manager.perform_sync(auto_accept=True)
+    names.add(_quarter_name())
+
+    with open(config.decisions_file, "r", encoding="utf-8") as f:
+        assert f.read() == header
+    archives = os.listdir(config.archive_dir)
+    assert len(archives) == 1 and archives[0] in names
+    with open(os.path.join(config.archive_dir, archives[0]), "r", encoding="utf-8") as f:
+        assert f.read() == _ROTATE_FIRST + "\n" + "\n" + resolver + "\n" + "\n"
+    assert GraphStore(config.db_path).get_node_by_slug("resolver-rotates") is not None
