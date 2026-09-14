@@ -615,6 +615,63 @@ def test_the_one_read_is_the_live_buffer_inside_the_lock(tmp_path):
         assert fh.read() == _HEADER + arrival
 
 
+def test_a_selector_is_handed_the_live_read_inside_the_lock(tmp_path):
+    """3b: the selector chooses from the same bytes the removal is planned against."""
+    a, arrival = _entry("a"), _entry("arrived")
+    buffer_path, archive_dir = _workspace(tmp_path, _HEADER + a)
+    lock = _MutatingLock(buffer_path, arrival)
+    seen = []
+
+    def _select(text):
+        seen.append((text, lock.held))
+        return [_block("a", a)]
+
+    outcome = rotation.rotate_selected(lock, buffer_path, archive_dir, _select)
+
+    assert seen == [(_HEADER + arrival + a, True)], "one call, live text, under the lock"
+    assert [b.label for b in outcome.rotated] == ["a"]
+    with open(buffer_path, encoding="utf-8") as fh:
+        assert fh.read() == _HEADER + arrival
+
+
+def test_a_selector_that_raises_writes_nothing(tmp_path):
+    """3b: a graph read failing inside the selector leaves every file as it was."""
+    buffer = _HEADER + _entry("a")
+    buffer_path, archive_dir = _workspace(tmp_path, buffer)
+
+    def _select(_text):
+        raise OSError("injected: graph read refused")
+
+    with pytest.raises(OSError, match="graph read refused"):
+        rotation.rotate_selected(contextlib.nullcontext(), buffer_path, archive_dir, _select)
+
+    assert not os.path.exists(archive_dir)
+    with open(buffer_path, encoding="utf-8") as fh:
+        assert fh.read() == buffer
+
+
+def test_entry_heading_indices_follows_the_parsers_section_rule():
+    """3b: the count rotation's trigger reads — sentinel, transcript and `####` aware."""
+    from mitos.markers import entry_heading_indices, first_entry_index
+
+    lines = (
+        "# Decisions\n"
+        "### example-slug above the sentinel\n"
+        "<!-- BEGIN ENTRIES -->\n"
+        "## 2026-05-19 — dated — Title\n"
+        "#### not an entry\n"
+        "[DECISION_TRANSCRIPT]\n"
+        "### inside a transcript\n"
+        "[/DECISION_TRANSCRIPT]\n"
+        "### current\n"
+    ).splitlines(keepends=True)
+
+    assert entry_heading_indices(lines) == [3, 8]
+    assert first_entry_index(lines) == 3
+    assert entry_heading_indices(["no entries here\n"]) == []
+    assert first_entry_index(["no entries here\n"]) == 1
+
+
 def test_nothing_matchable_writes_nothing(tmp_path):
     """P6: an all-unmatched batch neither rewrites the buffer nor creates an archive."""
     buffer = _HEADER + _entry("b")

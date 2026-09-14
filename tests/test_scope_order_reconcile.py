@@ -14,8 +14,8 @@ moves a tag to the front sees nothing happen. This module proves the whole chain
 * **R4** — the `mitos status` rung routes each scope row on the report's `order_only`
   flag, and only a membership row is called a findability defect.
 
-Seeding goes through `record`, never `sync`: a sync-committed entry is a first commit
-and rotates out of the buffer, and sync reads only the buffer. The helpers are copied
+Seeding goes through `record`, which commits and leaves the entry in the buffer
+without needing an embedding key; a keyless `sync` commits nothing. The helpers are copied
 in shape from `test_repair_door.py` rather than imported across test modules.
 """
 

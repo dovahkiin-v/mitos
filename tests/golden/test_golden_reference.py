@@ -438,10 +438,9 @@ def test_the_real_sync_path_reconciles_a_harbor_entry_end_to_end(tmp_path, monke
                  "this line, newest first -->\n")
     manager = MitosSyncManager(config)
 
-    # `record` rather than `sync` to seed: a sync-committed entry ROTATES out of the
-    # buffer, and sync reads only the buffer — so a rotated entry is not reconcilable
-    # at all. Record-authored entries never rotate, which is why they are the ones the
-    # reconcile actually meets on a live corpus.
+    # `record` rather than `sync` to seed: it commits and leaves the entry in the
+    # buffer, where sync — which reads only the buffer — can reconcile it. Rotation
+    # moves only settled entries, and a just-recorded one is recent, so it stays.
     seeded = manager.record_decision_entry(
         "Harbor backs up the metadata database nightly and retains 14 days of history.",
         "Continuous backup — operational cost unjustified at pilot scale.",

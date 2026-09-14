@@ -697,8 +697,8 @@ def _span_end_excluding_trailing_sentinels(
 ) -> int:
     """Rolls a section's ``line_end`` back over trailing legacy rotation sentinels.
 
-    A section's span is what ``sync`` slices out of the raw buffer to rotate the
-    entry, so a sentinel inside the span gets carried into the archive while its
+    A section's span is what rotation (``mitos.settledness``) slices out of the raw
+    buffer to move the entry, so a sentinel inside the span gets carried into the archive while its
     partner stays behind. A stranded ``<!-- ROTATED START`` is an unterminated HTML
     comment, and ``strip_html_comments`` carries that state across lines — blanking
     every entry below it for ``parse_decisions_file``, the lexical fallback's only
@@ -892,8 +892,8 @@ def _tokenize_entry(
         #
         # Consumed HERE rather than in `_split_entry_sections` deliberately. Dropping
         # the line at the splitter leaves it inside the section's `[line_start,
-        # line_end]` span, and `sync` slices the raw snapshot by exactly that span to
-        # rotate an entry — so rotation would carry away ONE HALF of a sentinel pair
+        # line_end]` span, and rotation slices the live buffer by exactly that span to
+        # move an entry — so rotation would carry away ONE HALF of a sentinel pair
         # and strand the other. A stranded `<!-- ROTATED START` is not cosmetic: it
         # is an unterminated HTML comment, and `strip_html_comments` carries that
         # state across lines, blanking every entry below it for `parse_decisions_file`

@@ -23,7 +23,7 @@ Tier 1: stdlib only, imports nothing from ``mitos``.
 """
 
 import re
-from typing import Sequence
+from typing import List, Sequence
 
 ENTRIES_SENTINEL = "BEGIN ENTRIES"
 TRANSCRIPT_OPEN = "[DECISION_TRANSCRIPT]"
@@ -97,20 +97,21 @@ def entry_stream_start(lines: Sequence[str]) -> int:
     return 0
 
 
-def first_entry_index(lines: Sequence[str]) -> int:
-    """Returns the index of the line that starts the entry stream's first entry.
+def entry_heading_indices(lines: Sequence[str]) -> List[int]:
+    """Returns the index of every line the parser would open an entry section on.
 
-    Scans from :func:`entry_stream_start`, transcript-aware, for the first heading
-    the parser would open a section on. Rotation inserts a batch at this line, so a
-    preamble stays a preamble and the batch's last field never runs into it.
+    Scans from :func:`entry_stream_start`, transcript-aware: a heading-shaped line
+    inside a transcript span is transcript text. The count is the buffer's entry
+    count without tokenizing a single field — the parser makes exactly one entry or
+    one failure per index returned here.
 
     Args:
         lines: The file's lines, with or without line endings.
 
     Returns:
-        The index of the first entry heading, or ``len(lines)`` when the stream
-        holds no entry — a batch then goes at the end of the file.
+        The indices, ascending, into ``lines``.
     """
+    indices: List[int] = []
     in_transcript = False
     for index in range(entry_stream_start(lines), len(lines)):
         stripped = lines[index].strip()
@@ -121,5 +122,23 @@ def first_entry_index(lines: Sequence[str]) -> int:
             in_transcript = False
             continue
         if not in_transcript and is_entry_heading(lines[index]):
-            return index
-    return len(lines)
+            indices.append(index)
+    return indices
+
+
+def first_entry_index(lines: Sequence[str]) -> int:
+    """Returns the index of the line that starts the entry stream's first entry.
+
+    The first of :func:`entry_heading_indices`. Rotation inserts a batch at this
+    line, so a preamble stays a preamble and the batch's last field never runs into
+    it.
+
+    Args:
+        lines: The file's lines, with or without line endings.
+
+    Returns:
+        The index of the first entry heading, or ``len(lines)`` when the stream
+        holds no entry — a batch then goes at the end of the file.
+    """
+    indices = entry_heading_indices(lines)
+    return indices[0] if indices else len(lines)

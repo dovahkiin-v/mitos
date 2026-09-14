@@ -352,49 +352,70 @@ def test_the_refusal_names_the_flag_and_no_command(
 
 
 # --------------------------------------------------------------------------- #
-# G9 — a guard-skipped run commits nothing and so rotates nothing, pinned rather than trusted
+# G9 — a guard-skipped entry is never committed and so never rotates, pinned rather than trusted
 # --------------------------------------------------------------------------- #
 
-def test_a_guard_skipped_run_rotates_nothing(
+def test_a_guard_skipped_entry_never_rotates(
     env: Tuple[MitosConfig, MitosSyncManager, str], capsys: pytest.CaptureFixture
 ) -> None:
-    """A guard-skipped entry never reaches the rotation set, so nothing rotates or defers.
+    """A guard-skipped run still evaluates rotation, and the skipped entry never moves.
 
     When this row was written the rotation gate held a third `input()`, and the row pinned
-    that prompt unreachable. Surface-entropy 1c deleted the prompt (the gate now defers on
-    stderr), so the property that survives is the one below: the guard, not the threshold,
-    keeps the rotation set empty. `pending_threshold` is lowered to 1 so the defer gate
-    would open on a single commit — the cheapest way to prove that.
+    that prompt unreachable. Surface-entropy 1c deleted the prompt, and 3b replaced the
+    whole "rotate what this run committed" set with settledness over the buffer — so a
+    guard-skipped run DOES evaluate (CC-12), and what keeps the skipped entry in place is
+    the *committed* conjunct: the guard fires above every commit, so the entry has no node,
+    and an uncommitted entry is never settled.
 
-    The mechanic is two steps, and the second is the load-bearing one. `synced_blocks` has
-    two append sites: the in-loop one is below the accept prompt (and gated on
-    decision-kind), so a guard-skipped entry never reaches it; the other lives inside
-    `_commit_quarantine_fixpoint`, which runs AFTER the loop and BEFORE the rotation gate —
-    *not* below the prompt at all. It is closed by a second step instead: the fixpoint only
-    ever re-tries entries in `quarantined`, whose sole append also sits below the prompt, so
-    a guard-skipped entry can never enter the set the fixpoint replays. Under `--yes` the
-    guard never fires and `not auto_accept` closes the gate from the other side.
+    The fixture puts a committed, quiet entry at the buffer's tail and the guard-skipped
+    one at its head, where capture and record write. The tail entry rotates — proof the
+    step ran on a guard-skipped run — and the head entry stays.
     """
+    from datetime import datetime, timedelta, timezone
+
     config, manager, _ = env
     assert not sys.stdin.isatty()
-    config.pending_threshold = 1
-    _append_decision(config, "door-rotate", "The axiom that must not rotate.")
+    with patch("google.genai.Client"):
+        result = manager.record_decision_entry(
+            "The settled axiom at the buffer's tail.", "Rejected the obvious alternative.",
+            ["api"], mechanisms=["python"], slug="door-settled", acknowledge_neighbors=True,
+        )
+    assert result.get("state") == "active", result
+    with open(config.decisions_file, encoding="utf-8") as f:
+        text = f.read()
+    marker = next(ln for ln in text.splitlines(keepends=True) if "BEGIN ENTRIES" in ln)
+    skipped = (
+        "## 2026-06-01 — door-rotate — Door Rotate\n"
+        "**Decided:** The axiom that must not rotate.\n"
+        "**Rejected:** Rejected the obvious alternative.\n"
+        "**Mechanisms:** python\n"
+        "**Scope:** api\n"
+    )
+    with open(config.decisions_file, "w", encoding="utf-8") as f:
+        f.write(text.replace(marker, marker + "\n" + skipped + "\n", 1))
+    config.rotation_volume_threshold_entries = 1
+    later = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
 
-    manager.perform_sync(auto_accept=False)
+    with patch("google.genai.Client"), patch("mitos.sync._utc_now_iso", return_value=later):
+        manager.perform_sync(auto_accept=False)
 
     captured = capsys.readouterr()
-    out = captured.out
-    assert len(_refusal_lines(out)) == 1
-    # The rotation gate's line moved to stderr in 1c; reading stdout alone is vacuous.
-    assert "[Lifecycle]" not in out + captured.err, "the rotation gate's own announcement"
+    assert len(_refusal_lines(captured.out)) == 1
     with open(config.decisions_file, encoding="utf-8") as f:
         buffer_after = f.read()
     assert "door-rotate" in buffer_after, "the entry is still pending, in the buffer"
-    assert not os.path.exists(config.archive_dir), "nothing was archived"
+    assert manager.store.get_node_by_slug("door-rotate") is None
+    assert "door-settled" not in buffer_after, "non-vacuity: the run evaluated and rotated"
+    archived = "".join(
+        open(os.path.join(config.archive_dir, name), encoding="utf-8").read()
+        for name in os.listdir(config.archive_dir)
+    )
+    assert "door-settled" in archived and "door-rotate" not in archived
 
-    # And the buffer has reached its fixpoint: the header auto-heal ran on the first sync,
-    # so a second run over the same still-pending entry leaves the file byte-identical.
-    manager.perform_sync(auto_accept=False)
+    # And the buffer has reached its fixpoint: the only entry left is uncommitted, so a
+    # second run over it leaves the file byte-identical.
+    with patch("google.genai.Client"), patch("mitos.sync._utc_now_iso", return_value=later):
+        manager.perform_sync(auto_accept=False)
     with open(config.decisions_file, encoding="utf-8") as f:
         assert f.read() == buffer_after
 

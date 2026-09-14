@@ -564,7 +564,7 @@ def cmd_init(config: MitosConfig, name: Optional[str] = None, force: bool = Fals
 
     # 1a. Seed config.toml when absent — from the single-source CONFIG_DEFAULTS map
     #     (P11 / WIRING_LEDGER entry-004), NOT hand-copied literals, so a seeded file
-    #     and the loader's deleted-key fallback can never diverge. The eight static
+    #     and the loader's deleted-key fallback can never diverge. The nine static
     #     keys serialize in CONFIG_DEFAULTS order; the dynamic qdrant_url line follows
     #     (an env-derived default, computed in MitosConfig.__init__).
     #     NO pending_threshold line — it left the v0.1 file schema (the loader would
@@ -3469,7 +3469,9 @@ def cmd_restore_source(
 
     Restored into the BUFFER, never an archive: this verb is a buffer splice. Archives
     are written only by rotation, which files a batch under the UTC quarter of the
-    instant it rotates it — when the entry was archived, not when it was decided.
+    instant it rotates it — when the entry was archived, not when it was decided. Like
+    any settled entry, a restored one may later be rotated to an archive, which
+    ``mitos rebuild`` reads.
 
     Args:
         config: The workspace config.

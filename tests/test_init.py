@@ -104,9 +104,9 @@ def test_seeded_config_round_trips_clean(tmp_path, capsys):
     config = MitosConfig(str(tmp_path))
     captured = capsys.readouterr()
     assert "unrecognized" not in captured.err
-    # A clean file warns about nothing. The seed is nine keys — the eight static
-    # CONFIG_DEFAULTS plus `qdrant_url` — which was TEN until `qdrant_collection`
-    # was retired from the schema and stopped being written. The count is pinned
+    # A clean file warns about nothing. The seed is the static CONFIG_DEFAULTS keys
+    # plus `qdrant_url` (ten keys since surface-entropy 3b minted `rotation_lag_days`;
+    # `qdrant_collection` stopped being written when it was retired from the schema). The count is pinned
     # structurally by `test_config_seeds_exactly_the_schema_keys` below; it is
     # spelled out here only so the next reader need not re-count.
     assert captured.err == ""
@@ -136,6 +136,7 @@ def test_config_seeds_exactly_the_schema_keys(tmp_path):
     assert set(data) == set(CONFIG_SCHEMA)  # every recognized key, nothing else
     assert set(data) == set(CONFIG_DEFAULTS) | {"qdrant_url"}
     assert "pending_threshold" not in data
+    assert data["rotation_lag_days"] == 14, "a new workspace is seeded with the lag"
     for key, default in CONFIG_DEFAULTS.items():
         assert data[key] == default
 

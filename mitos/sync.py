@@ -12,7 +12,6 @@ import re
 import json
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
 from typing import TYPE_CHECKING, List, Dict, Optional, Any, Set, Tuple, Callable
 from filelock import FileLock, Timeout
 
@@ -24,6 +23,7 @@ if TYPE_CHECKING:
 from mitos import __version__ as MITOS_VERSION
 from mitos import atomic_file
 from mitos import rotation
+from mitos import settledness
 from mitos.config import MitosConfig, hint_due
 from mitos.conflict import (
     CONFLICT_CANDIDATE_SOURCE,
@@ -1232,19 +1232,6 @@ class MitosSyncManager:
                 print("Zero pending entries found in the decisions.md / questions.md write-buffers.")
             return
 
-        # Stale-entry detection (>14 days unprocessed) — DECISIONS ONLY (D5): the
-        # vision defers OQ stale-detection, so a >14-day open question must NOT emit a
-        # spurious "remains unsynced" warning.
-        for entry in decision_entries:
-            if entry.date:
-                try:
-                    entry_dt = datetime.strptime(entry.date, "%Y-%m-%d")
-                    diff = datetime.now() - entry_dt
-                    if diff.days > 14:
-                        print(f"[Warning] Entry '{entry.slug}' was drafted on {entry.date} (>14 days ago) and remains unsynced.")
-                except Exception:
-                    pass
-
         api_key = self.config.env.get("GEMINI_API_KEY")
         if not api_key:
             print("GEMINI_API_KEY environment variable is not set. Sync requires API keys.")
@@ -1260,17 +1247,16 @@ class MitosSyncManager:
             
         renderer = MitosRenderer(self.config.workspace_dir)
 
-        synced_blocks: List[Tuple[ParsedEntry, str]] = []
-
         # 4b intra-sync fixpoint: the main pass below collects every entry the store
         # rejects with a CommitError (a forward-ref whose in-corpus target has not
         # committed yet, a slug collision, a kind/cycle violation) into this set
         # instead of reporting it immediately. After the main pass, the fixpoint
         # re-attempts the set until a pass makes no further progress, so any acyclic
         # cross-file forward-ref chain converges in THIS single sync. Each tuple
-        # carries the fully-prepared entry, its decisions-snapshot raw text (for
-        # rotation if a decision commits in the fixpoint; "" for OQs), and its latest
-        # failure (for the post-fixpoint residual report).
+        # carries the fully-prepared entry, a raw-text slot, and its latest failure
+        # (for the post-fixpoint residual report). The slot is the shape `replay`
+        # shares with `rebuild`; sync slices no raw text, so it carries "" — rotation
+        # reads its blocks from the live buffer instead.
         quarantined: List[Tuple[ParsedEntry, str, CommitError]] = []
 
         # Conflict sensor (5a): build the judgment executor ONCE per run (CONF-D4/D7) —
@@ -1294,23 +1280,7 @@ class MitosSyncManager:
                 conflict_run = self._new_conflict_run()
 
         # 3. Process each parsed entry
-        # The decisions snapshot is private and never rewritten after step 1, so it is
-        # read once, on the first decision entry. Re-reading it per entry made a large
-        # buffer's sync quadratic — 47% of a 3,704-entry cold sync (measured 2026-09-12).
-        snap_lines: Optional[List[str]] = None
         for entry in entries:
-            # Read exact raw text block of this entry from snapshot for content-aware
-            # rotation — DECISIONS ONLY (D5): the line range here indexes the
-            # DECISIONS snapshot, and an open-question entry's range indexes
-            # questions.md, so slicing it here would take the wrong file's text. An OQ
-            # carries "" instead.
-            entry_raw_text = ""
-            if entry.kind == "decision":
-                if snap_lines is None:
-                    with open(snapshot_path, "r", encoding="utf-8") as f:
-                        snap_lines = f.readlines()
-                entry_raw_text = "".join(snap_lines[entry.line_start - 1 : entry.line_end])
-
             # Check if this node is already in the database (slug-free V1a id — V1-D2).
             node_id = compute_node_id(
                 kind=entry.kind,
@@ -1337,9 +1307,8 @@ class MitosSyncManager:
                 # C′ — the commentary reconcile, DIVERGENCE-GATED. Without the gate
                 # this branch would reach `commit_parsed_entry` for every
                 # already-committed entry: on the dogfood corpus that is 203 accept
-                # prompts, 203 SONNET conflict judgments per sync, and the whole buffer
-                # rotated into the archive. Gated, a clean corpus takes the same
-                # `continue` as before — zero behavioural delta, and MI-3's
+                # prompts and 203 SONNET conflict judgments per sync. Gated, a clean
+                # corpus takes the same `continue` as before — zero behavioural delta, and MI-3's
                 # no-tick-on-a-byte-identical-recommit property stays intact.
                 if entry.kind != "decision":
                     # Decisions only, matching the detector, which excludes open
@@ -1384,9 +1353,10 @@ class MitosSyncManager:
                 # Reconciled. Deliberately falls through to `continue` rather than the
                 # commit path below: no conflict judge (the canonical core is unchanged,
                 # so there is no new claim to judge), no accept prompt, no confirmation
-                # re-stamp, and above all NO ROTATION — rotation stays tied to a FIRST
-                # commit, because an entry that leaves the buffer leaves sync's read-set
-                # and its future divergence becomes invisible again.
+                # re-stamp. The reconcile ticks `updated_at`, so the entry is recently
+                # touched and step 4's settledness keeps it in the buffer: an entry that
+                # leaves the buffer leaves sync's read-set, and its future divergence
+                # would become invisible again.
                 ledger.note(entry, "reconciled")
                 continue
 
@@ -1428,7 +1398,7 @@ class MitosSyncManager:
                     # The interactive `[c]orrection / [s]upersession` prompt used to sit
                     # here, and it is retired rather than fixed. Its answer was only ever
                     # applied in memory — nothing spliced the chosen line into the buffer,
-                    # and rotation archives the raw unmodified snapshot slice — so every
+                    # and rotation archived the raw unmodified block — so every
                     # interactively-resolved collision committed a kill-edge the gold
                     # source does not declare. Against P6/M7 (the markdown must remain the
                     # rebuildable truth): the entry replays at rebuild without its
@@ -1563,9 +1533,8 @@ class MitosSyncManager:
                 # 4b: collect (don't report yet) for the intra-sync fixpoint retry
                 # after this loop. The entry is fully prepared (enriched, collision-
                 # resolved, confirmed-stamped) — only the store-stage commit failed,
-                # and its in-corpus target may yet commit in this same sync. Carry
-                # entry_raw_text so a decision committed in the fixpoint still rotates.
-                quarantined.append((entry, entry_raw_text, exc))
+                # and its in-corpus target may yet commit in this same sync.
+                quarantined.append((entry, "", exc))
                 # Pessimistic stamp: the fixpoint below upgrades whichever of these
                 # it drains, so a missed correction leaves a shortfall rather than a
                 # false satisfaction.
@@ -1591,13 +1560,6 @@ class MitosSyncManager:
             # best-effort embedding upsert (C2) — applies to OQ nodes too.
             self._best_effort_embed(delta, entry)
 
-            # Record successfully committed block for rotation — DECISIONS ONLY (D5):
-            # the block is text sliced from the decisions snapshot, and an OQ's line
-            # range indexes questions.md, so OQ entries must not enter the rotation set
-            # or the defer gate's count.
-            if entry.kind == "decision":
-                synced_blocks.append((entry, entry_raw_text))
-
         # 3b. Intra-sync fixpoint retry (4b). The main pass committed every entry
         # whose targets were already present; re-attempt the quarantined set until a
         # pass makes no further progress, so any acyclic cross-file forward-ref chain
@@ -1607,9 +1569,8 @@ class MitosSyncManager:
         # ordering — D5/MI-12). A genuinely-unresolvable reference (a never-authored
         # target, or a true A↔B mutual-reference cycle) makes zero progress, terminates
         # after one no-progress pass, and surfaces below as a loud per-entry vector —
-        # never a hang, never a whole-sync abort. The fixpoint sits BEFORE rotation so
-        # a decision it commits is appended to synced_blocks and rotates with the rest.
-        residual = self._commit_quarantine_fixpoint(quarantined, synced_blocks)
+        # never a hang, never a whole-sync abort.
+        residual = self._commit_quarantine_fixpoint(quarantined)
         # The satisfied "committed" state is TWO sites, not one. A stamp placed only
         # after the main pass's `Committed node:` misses every entry the fixpoint
         # drains, so a named forward-ref target would exit non-zero on a run that
@@ -1622,48 +1583,23 @@ class MitosSyncManager:
         for entry, _raw, exc in residual:
             self._report_commit_quarantine(entry, exc)
 
-        # 4. Archive rotation of this run's first commits. The batch is filed under the
-        # UTC quarter of this rotation's instant — one clock read, through the MI-10
-        # helper, never a graph stamp: rotation drains the buffer's oldest end, so
-        # naming for the instant keeps the quarter files in buffer order and `mitos
-        # rebuild` replays them as the buffer would have (ADR
-        # rotation-names-the-archive-for-the-rotation-instant-not-created-at). The core
-        # inserts the batch newest-first at the top of the archive's entry stream,
-        # replaces the archive whole and durably, and only then the buffer, so a
-        # failure leaves decisions.md unchanged and nothing needs rolling back (ADR
-        # archive-first-makes-rotations-buffer-write-rollback-free-so-it-keeps-its-own-sequence).
-        # Every line it produces goes to stderr: rotation will be reached from the MCP
-        # write path, where a stray stdout byte corrupts the protocol.
-        if synced_blocks and len(synced_blocks) >= self.config.pending_threshold and not auto_accept:
+        # 4. Archive rotation of the buffer's settled tail. What rotates is a property
+        # of the buffer, not of this run's commits: `_rotate_settled` reads the live
+        # buffer once under the lock and moves the contiguous settled run at its
+        # oldest end, bounded per acquisition. A rotation failure — a graph read
+        # included — is reported here and never fails the sync: the commits stand.
+        # Every line goes to stderr, and nothing rotated is silence.
+        try:
+            outcome = self._rotate_settled(window=settledness.ROTATION_WINDOW_ENTRIES)
+        except Exception as e:
             sys.stdout.flush()
             print(
-                f"[Lifecycle] Rotation threshold reached with {len(synced_blocks)} committed "
-                f"entries; rotation deferred. The entries remain in decisions.md.",
+                f"[Warning] Archive rotation failed: {e}. decisions.md is unchanged; an "
+                f"archive may already hold a copy of the entries it was moving.",
                 file=sys.stderr,
             )
-            synced_blocks.clear()
-
-        if synced_blocks:
-            # The naming sits inside the try with the rotation: any failure before a
-            # write takes the one failure line (D-1d-3).
-            try:
-                archive_name = rotation.archive_name_for(_utc_now_iso())
-                blocks = [
-                    rotation.RotationBlock(entry.slug, raw_block, archive_name)
-                    for entry, raw_block in synced_blocks
-                ]
-                outcome = rotation.rotate(
-                    self.lock, self.config.decisions_file, self.config.archive_dir, blocks
-                )
-            except Exception as e:
-                sys.stdout.flush()
-                print(
-                    f"[Warning] Archive rotation failed: {e}. decisions.md is unchanged, so "
-                    f"none of the {len(synced_blocks)} entries was removed from it; an "
-                    f"archive may already hold a copy of them.",
-                    file=sys.stderr,
-                )
-            else:
+        else:
+            if outcome is not None:
                 self._report_rotation(outcome)
 
         # 5. Trigger renderer to statelessly regenerate files (C3)
@@ -1686,6 +1622,60 @@ class MitosSyncManager:
         if verbose and self.embed_provider:
             hits, misses, rate = self.embed_provider.get_stats()
             print(f"\n[Observability] Cache Stats: Hits: {hits}, Misses: {misses}, Hit Rate: {rate*100:.1f}%")
+
+    def _rotate_settled(self, *, window: int) -> Optional[rotation.RotationOutcome]:
+        """Rotates the buffer's settled tail, at most ``window`` entries, archive first.
+
+        Settledness (committed ∧ quiet ∧ not diverged) is evaluated by
+        ``settledness.select_settled_tail`` inside ``rotation.rotate_selected``'s one
+        read of the live buffer, under this manager's own lock — never a second read,
+        and never the sync snapshot, whose whole-file replace would discard every
+        capture since. The clock is read once: the same instant is the quiet test's
+        ``now`` and names the archive (ADR
+        ``rotation-names-the-archive-for-the-rotation-instant-not-created-at``). Only
+        ``config.decisions_file`` is read, and it is parsed as decisions, so an open
+        question never rotates.
+
+        On the sync path this runs after the commits and their quarantine fixpoint. A
+        sync that returns before that — an empty buffer, no ``GEMINI_API_KEY``, or a
+        lock timeout — evaluates nothing. A run whose entries were skipped for review
+        does evaluate: an uncommitted entry is simply never settled.
+
+        Args:
+            window: The most entries to evaluate, and so to move, in this acquisition.
+
+        Returns:
+            The rotation outcome, or ``None`` when nothing was selected and nothing was
+            written.
+
+        Raises:
+            Exception: Whatever the clock stamp, a graph read or the rotation raised.
+                The buffer is unchanged; an archive may already hold a copy of the
+                blocks. Prints nothing — each caller words the failure.
+        """
+        now = _utc_now_iso()
+        archive_name = rotation.archive_name_for(now)
+        chosen: List[settledness.Selection] = []
+
+        def _select(buffer_text: str) -> List[rotation.RotationBlock]:
+            selection = settledness.select_settled_tail(
+                buffer_text,
+                graph=self.store,
+                now=now,
+                lag_days=self.config.rotation_lag_days,
+                threshold=self.config.rotation_volume_threshold_entries,
+                window=window,
+                archive_name=archive_name,
+            )
+            chosen.append(selection)
+            return selection.blocks
+
+        outcome = rotation.rotate_selected(
+            self.lock, self.config.decisions_file, self.config.archive_dir, _select
+        )
+        if not chosen[0].blocks:
+            return None
+        return outcome
 
     @staticmethod
     def _report_rotation(outcome: "rotation.RotationOutcome") -> None:
@@ -1713,7 +1703,6 @@ class MitosSyncManager:
     def _commit_quarantine_fixpoint(
         self,
         quarantined: List[Tuple[ParsedEntry, str, CommitError]],
-        synced_blocks: List[Tuple[ParsedEntry, str]],
     ) -> List[Tuple[ParsedEntry, str, CommitError]]:
         """Drains the per-entry quarantine set to a fixpoint (4b).
 
@@ -1722,37 +1711,25 @@ class MitosSyncManager:
         in-corpus target had not committed yet, plus the structural rejections that
         never self-heal). This re-attempts that set until a pass commits nothing new,
         so any acyclic cross-file forward-ref chain converges in a **single** sync,
-        order-independently. A decision committed here is appended to ``synced_blocks``
-        so it rotates with the main-pass commits; an OQ is not, because its raw text is
-        ``""`` — its line range indexes questions.md, not the decisions snapshot (D5).
+        order-independently.
 
         The convergence loop is the shared :func:`mitos.replay.commit_quarantine_fixpoint`
         primitive (the same engine the ``mitos rebuild`` corpus replay uses). This
-        wrapper supplies the sync-specific embed + rotation callbacks and the loud
+        wrapper supplies the sync-specific embed callback and the loud
         convergence-observability line.
 
         Args:
             quarantined: The fully-prepared entries the main pass quarantined, each
-                with its decisions-snapshot raw text ("" for an OQ) and its latest
-                ``CommitError``.
-            synced_blocks: The rotation record; a committed decision is appended
-                ``(entry, raw)`` (mutated in place — the fixpoint runs before rotation
-                reads it).
+                with an empty raw-text slot and its latest ``CommitError``.
 
         Returns:
             The residual entries that never committed, each still carrying its latest
             ``CommitError`` — ``[]`` when everything converged.
         """
-        def _record_decision_block(entry: ParsedEntry, raw: str) -> None:
-            # Decisions only: an OQ's raw is "" — its range indexes questions.md (D5).
-            if entry.kind == "decision":
-                synced_blocks.append((entry, raw))
-
         committed, passes, residual = commit_quarantine_fixpoint(
             self.store,
             quarantined,
             embed_fn=self._best_effort_embed,
-            on_commit=_record_decision_block,
         )
 
         # Convergence observability: make the fixpoint's work visible (the vision

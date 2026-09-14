@@ -31,6 +31,11 @@ nothing of the trigger or the calling verb. Its inputs are injected: the lock (t
 caller's own instance — a second ``FileLock`` on the same path deadlocks against it),
 the buffer path, the archive directory, and the blocks, each carrying its archive
 file name as ``archive_name_for`` computes it from the instant the caller rotates at.
+A caller that chooses the blocks from the buffer's own contents passes a selector
+instead (``rotate_selected``): it is handed the core's one read of the live buffer,
+inside the lock, so the choice and the removal come from the same bytes (ADR
+``rotations-eligibility-set-and-removal-derive-from-one-read-of-one-file``). Whatever
+the selector reads, it reads — the core still reads nothing but files.
 
 Tier 2: stdlib plus the leaves ``mitos.atomic_file`` and ``mitos.markers``. The lock
 arrives as an object, so ``filelock`` is not imported here.
@@ -39,7 +44,7 @@ arrives as an object, so ``filelock`` is not imported here.
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import ContextManager, Dict, List, Sequence, Tuple
+from typing import Callable, ContextManager, Dict, List, Sequence, Tuple
 
 from mitos import atomic_file
 from mitos.markers import first_entry_index
@@ -51,7 +56,8 @@ class RotationBlock:
 
     Attributes:
         label: The entry's slug, used only to name it in the outcome.
-        raw_text: The block exactly as sliced from the sync snapshot.
+        raw_text: The block exactly as sliced from the buffer text it will be matched
+            against.
         archive_name: The basename in the archive directory (e.g. ``2026-Q3.md``).
             The caller supplies it from ``archive_name_for`` — one name per batch, the
             quarter of the rotation instant, so that a later batch never files into an
@@ -162,7 +168,7 @@ def plan_rotation(buffer_text: str, blocks: Sequence[RotationBlock]) -> Rotation
 
     Args:
         buffer_text: One read of the live buffer.
-        blocks: The batch, in the order its blocks entered the rotation set.
+        blocks: The batch, in commit order (oldest first).
 
     Returns:
         The plan. For unique, non-overlapping blocks ``new_buffer`` equals the
@@ -270,10 +276,44 @@ def rotate(
         UnicodeError: If the buffer or an archive cannot be decoded, or the text
             encoded. The buffer is unchanged.
     """
+    return rotate_selected(lock, buffer_path, archive_dir, lambda _text: blocks)
+
+
+def rotate_selected(
+    lock: ContextManager,
+    buffer_path: str,
+    archive_dir: str,
+    select: Callable[[str], Sequence[RotationBlock]],
+) -> RotationOutcome:
+    """Moves the blocks a selector chooses from the live buffer, archive first.
+
+    Exactly :func:`rotate`, except the batch is chosen under the lock from the same
+    one read the removal is planned against: ``select(buffer_text)`` runs after the
+    read and before :func:`plan_rotation`. A selector that raises propagates before
+    anything is written.
+
+    Args:
+        lock: The caller's lock instance for the buffer.
+        buffer_path: The buffer file to remove the blocks from.
+        archive_dir: The directory holding the archive files.
+        select: Called once with the live buffer text; returns the batch in commit
+            order (oldest first), each block sliced from that text.
+
+    Returns:
+        The outcome, including the blocks left in place and why.
+
+    Raises:
+        OSError: If a read or write failed. The buffer is unchanged; an archive may
+            already hold a copy of the rotated blocks.
+        UnicodeError: If the buffer or an archive cannot be decoded, or the text
+            encoded. The buffer is unchanged.
+        Exception: Whatever ``select`` raises. Nothing has been written.
+    """
     archive_paths: List[str] = []
     with lock:
         with open(buffer_path, "r", encoding="utf-8") as fh:
             buffer_text = fh.read()
+        blocks = select(buffer_text)
         plan = plan_rotation(buffer_text, blocks)
         if plan.rotated:
             # Every archive is read before any is written, so a late read or decode

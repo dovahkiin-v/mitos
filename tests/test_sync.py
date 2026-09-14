@@ -10,6 +10,7 @@ import os
 import shutil
 import json
 import pytest
+from datetime import datetime, timedelta, timezone
 from typing import Tuple
 from unittest.mock import MagicMock, patch
 
@@ -48,7 +49,15 @@ def sync_env() -> Tuple[MitosConfig, MitosSyncManager, str]:
 
 @patch("google.genai.Client")
 def test_sync_happy_path(mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]) -> None:
-    """New buffer entries are parsed, committed VERBATIM (strict-deterministic sync — no LLM enrichment), and rotated."""
+    """New buffer entries are parsed and committed VERBATIM (strict-deterministic sync — no
+    LLM enrichment), then stay in the buffer until they are settled.
+
+    Rotation is tied to settledness, not to a first commit: under the defaults a
+    just-committed entry is recent and the buffer is below the threshold, so the first
+    sync leaves it where every repair path can reach it. The second half makes it
+    settled on purpose (threshold 1, lag 0) and re-syncs: the committed block moves to
+    the archive byte-for-byte and the marker stays.
+    """
     config, manager, tmpdir = sync_env
 
     # 1. Append valid decision entry to write buffer
@@ -87,8 +96,14 @@ def test_sync_happy_path(mock_client: MagicMock, sync_env: Tuple[MitosConfig, Mi
     assert node["confirmed_by"] == "user"
     assert node["confirmed_at"] is not None
 
-    # 5. Assert content-aware archive rotation:
-    # decisions.md write buffer must be cleared of the entry raw block
+    # 5. Under the defaults the committed entry stays buffered and nothing is archived.
+    with open(config.decisions_file, "r", encoding="utf-8") as f:
+        assert "## 2026-05-19 — isolation" in f.read()
+    assert not os.path.exists(config.archive_dir)
+
+    # 6. Settled on purpose, the re-sync rotates it.
+    _rotate_immediately(config)
+    manager.perform_sync(auto_accept=True)
     with open(config.decisions_file, "r", encoding="utf-8") as f:
         remaining_content = f.read()
     assert "## 2026-05-19 — isolation" not in remaining_content
@@ -100,42 +115,6 @@ def test_sync_happy_path(mock_client: MagicMock, sync_env: Tuple[MitosConfig, Mi
     with open(os.path.join(config.archive_dir, archives[0]), "r", encoding="utf-8") as f:
         archive_content = f.read()
     assert "## 2026-05-19 — isolation" in archive_content
-
-
-@pytest.mark.skip(reason="V1a defers date-based stale detection (8a): parse_entry_stream "
-                         "uses slug-only headers (V1-D7) and does not extract entry.date, so "
-                         "the >14-day stale warning has no input. The capability rides dated "
-                         "headers, a prototype format V1a's spec dropped — deferred, not silently "
-                         "coerced (K5/OD1).")
-@patch("google.genai.Client")
-def test_sync_stale_entry_detection(mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str], capsys: pytest.CaptureFixture) -> None:
-    """Verifies that entries drafted >14 days ago trigger a stdout warning."""
-    config, manager, tmpdir = sync_env
-
-    # 1. Draft an entry dated 20 days ago (relative to June 2026 current time)
-    entry_text = (
-        "## 2026-05-10 — stale-slug — A stale decision\n"
-        "**Decided:** Use stable algorithms.\n"
-        "**Rejected:** Transient models.\n"
-    )
-    with open(config.decisions_file, "a", encoding="utf-8") as f:
-        f.write(entry_text + "\n")
-
-    # 2. Mock client response
-    mock_gen_resp = MagicMock()
-    mock_gen_resp.text = json.dumps({
-        "refined_core_axiom": "Use stable algorithms.",
-        "refined_mechanisms": [],
-        "refined_scope": ["core"],
-        "suggested_relationships": {}
-    })
-    mock_client.return_value.models.generate_content.return_value = mock_gen_resp
-    config.env["GEMINI_API_KEY"] = "mock_key"
-
-    manager.perform_sync(auto_accept=True)
-
-    captured = capsys.readouterr()
-    assert "was drafted on 2026-05-10 (>14 days ago) and remains unsynced" in captured.out
 
 
 @patch("google.genai.Client")
@@ -578,8 +557,48 @@ def _set_enrichment_passthrough(mock_client: MagicMock) -> None:
 
 
 def _append_decision(config: MitosConfig, text: str) -> None:
+    """Appends at the file end — the buffer's TAIL, its oldest position."""
     with open(config.decisions_file, "a", encoding="utf-8") as f:
         f.write(text + "\n")
+
+
+def _rotate_immediately(config: MitosConfig) -> None:
+    """Makes every committed, undiverged entry settled: threshold 1, lag 0.
+
+    Lag 0 still needs the rotation clock (``mitos.sync._utc_now_iso``) strictly after
+    the commit stamp (``mitos.store._utc_now_iso``), so a row that pins the rotation
+    clock to a past instant pins the store's clock earlier still.
+    """
+    config.rotation_volume_threshold_entries = 1
+    config.rotation_lag_days = 0
+
+
+def _ahead(days: int) -> str:
+    """A rotation instant ``days`` from now, in the MI-10 stamp shape."""
+    return (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+
+
+def _record(manager: MitosSyncManager, slug: str, **relations) -> None:
+    """Commits one entry through `record`, which PREPENDS it below the sentinel."""
+    result = manager.record_decision_entry(
+        f"The {slug} axiom.", f"The {slug} rejected reasoning.", ["alpha"],
+        mechanisms=[f"{slug}-mechanism"], slug=slug, acknowledge_neighbors=True,
+        **relations,
+    )
+    assert result.get("state") == "active", result
+
+
+def _buffer_slugs(config: MitosConfig) -> list:
+    """The buffer's entry slugs, top (newest) to bottom (oldest)."""
+    from mitos.parser import parse_entry_stream
+    with open(config.decisions_file, encoding="utf-8") as f:
+        return [e.slug for e in parse_entry_stream(f.read(), "decision")]
+
+
+def _back_date_every_node(config: MitosConfig, days: int) -> None:
+    stamp = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    with GraphStore(config.db_path)._get_connection() as conn:
+        conn.execute("UPDATE nodes SET updated_at = ?", (stamp,))
 
 
 def _write_questions(tmpdir: str, body: str) -> str:
@@ -913,7 +932,7 @@ def test_sync_fixpoint_is_load_bearing_for_deep_chain(
     )
 
     # Disable the fixpoint: commit nothing, surface everything as residual.
-    def _noop_fixpoint(self, quarantined, synced_blocks):  # type: ignore[no-untyped-def]
+    def _noop_fixpoint(self, quarantined):  # type: ignore[no-untyped-def]
         return list(quarantined)
 
     with patch.object(MitosSyncManager, "_commit_quarantine_fixpoint", _noop_fixpoint):
@@ -1082,10 +1101,16 @@ def test_sync_open_questions_never_rotate(
     mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
 ) -> None:
     """OQ does not rotate (D5): questions.md is byte-unchanged after sync, no archive
-    carries the OQ, while the decision rotates normally."""
+    carries the OQ, while the decision rotates normally.
+
+    The exclusion's home is structural: rotation reads ``config.decisions_file`` alone
+    and parses it as decisions. The row makes the decision settled on purpose, so the
+    archive assertions below run over an archive that exists.
+    """
     config, manager, tmpdir = sync_env
     config.env["GEMINI_API_KEY"] = "mock_key"
     _set_enrichment_passthrough(mock_client)
+    _rotate_immediately(config)
 
     _append_decision(config, _HOST_DECISION)
     questions_path = _write_questions(
@@ -1107,12 +1132,15 @@ def test_sync_open_questions_never_rotate(
     assert {q["slug"] for q in store.get_open_questions()} == {"persistent-oq"}
 
     # The decision rotated to archive; the OQ did not appear there.
-    if os.path.isdir(config.archive_dir):
-        for name in os.listdir(config.archive_dir):
-            with open(os.path.join(config.archive_dir, name), "r", encoding="utf-8") as f:
-                archive_text = f.read()
-            assert "persistent-oq" not in archive_text
-            assert "persistent open thread" not in archive_text
+    assert "host-decision" not in _read(config.decisions_file), "non-vacuity: it rotated"
+    archive_names = os.listdir(config.archive_dir)
+    assert archive_names, "non-vacuity: an archive exists to search"
+    for name in archive_names:
+        with open(os.path.join(config.archive_dir, name), "r", encoding="utf-8") as f:
+            archive_text = f.read()
+        assert "host-decision" in archive_text
+        assert "persistent-oq" not in archive_text
+        assert "persistent open thread" not in archive_text
 
 
 @patch("google.genai.Client")
@@ -1380,11 +1408,11 @@ def test_collision_never_discards_a_kill_edge_authored_at_another_slug(
 def _seed_committed_buffer(config, manager, *, amends=None, slug="reconcile-me"):
     """Commits one entry through `record`, leaving it IN the buffer for a re-sync.
 
-    Deliberately `record_decision_entry` rather than `perform_sync`: rotation is tied
-    to a first sync commit, so a sync-authored entry leaves the buffer immediately and
-    is no longer reconcilable (its reconciler is `rebuild`). `record`-authored entries
-    never rotate — which is exactly why the live corpus holds 203 entries in the buffer
-    against 6 in the archive, and why they are the entries the reconcile actually meets.
+    Deliberately `record_decision_entry` rather than `perform_sync`: it commits
+    without the embedding-key floor sync needs, and it is the writer the live corpus's
+    buffered entries overwhelmingly came from, so these are the entries the reconcile
+    actually meets. A just-recorded entry is recent, so no rotation can move it out of
+    sync's reach before the re-sync.
     """
     result = manager.record_decision_entry(
         "The reconcilable axiom.", "The original rejected reasoning.",
@@ -1494,22 +1522,54 @@ def test_the_reconcile_carries_stored_confirmation_provenance_forward(
 def test_the_reconcile_does_not_rotate_the_entry(
     mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
 ) -> None:
-    """Rotation stays tied to a FIRST commit — this is the invisibility mechanism.
+    """Nothing recently touched rotates — and a reconcile is a touch. This is the
+    invisibility mechanism.
 
     An entry that rotates out of the buffer leaves `sync`'s read-set, so its future
     divergence becomes undetectable by the very surface that just repaired it. A
-    reconcile that rotated would quietly re-create the disease it cures.
+    reconcile that rotated would quietly re-create the disease it cures. Rotation is
+    tied to settledness, and the reconcile ticks `updated_at`, so the repaired entry is
+    recent. Both nodes are back-dated past the lag first: the untouched sibling at the
+    tail rotates (the step really ran), while the reconciled one stays.
     """
     config, manager, tmpdir = sync_env
     config.env["GEMINI_API_KEY"] = "mock_key"
-    manager.config.pending_threshold = 1
+    _record(manager, "sibling")
     _seed_committed_buffer(config, manager)
+    assert _buffer_slugs(config) == ["reconcile-me", "sibling"], "sibling is the tail"
+    _back_date_every_node(config, 30)
+    config.rotation_volume_threshold_entries = 1
 
     _edit_buffer(config, "The original rejected reasoning.", "The CORRECTED reasoning.")
     manager.perform_sync(auto_accept=True)
 
-    with open(config.decisions_file, "r", encoding="utf-8") as f:
-        assert "### reconcile-me" in f.read(), "a reconciled entry must stay in the buffer"
+    assert GraphStore(config.db_path).get_node_by_slug("reconcile-me")["rejected_paths"] \
+        == "The CORRECTED reasoning.", "the fixture must reconcile"
+    assert _buffer_slugs(config) == ["reconcile-me"], "a reconciled entry must stay in the buffer"
+    assert any("### sibling" in text for text in _archive_texts(config)), "non-vacuity"
+
+
+@patch("google.genai.Client")
+def test_a_repair_target_sync_evaluates_rotation_and_keeps_the_target(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """T10-S8 (CC-12): a `repair_targets` sync evaluates settledness like any other.
+
+    The named reconcile ticks the target, so it stays; the settled sibling below it
+    rotates, and the run reports the target satisfied.
+    """
+    config, manager, tmpdir = sync_env
+    config.env["GEMINI_API_KEY"] = "mock_key"
+    _record(manager, "sibling")
+    _seed_committed_buffer(config, manager)
+    _back_date_every_node(config, 30)
+    config.rotation_volume_threshold_entries = 1
+
+    _edit_buffer(config, "The original rejected reasoning.", "The CORRECTED reasoning.")
+    assert manager.perform_sync(repair_targets=["reconcile-me"]) == []
+
+    assert _buffer_slugs(config) == ["reconcile-me"]
+    assert any("### sibling" in text for text in _archive_texts(config))
 
 
 @patch("google.genai.Client")
@@ -1971,6 +2031,9 @@ _ROTATE_SECOND = (
 # apart from it — the name follows the rotation instant, never the node's stamp.
 _PINNED_STAMP = "2026-02-10T09:00:00+00:00"
 _PINNED_ARCHIVE = "2026-Q1.md"
+# A commit stamp before the pinned rotation instant: settledness compares the two, so a
+# row pinning the rotation clock to the past pins commits earlier still.
+_EARLIER_STAMP = "2026-01-01T00:00:00+00:00"
 
 
 def _healed_header(manager: MitosSyncManager, config: MitosConfig) -> str:
@@ -1986,10 +2049,10 @@ def test_rotation_characterization_exact_buffer_and_archive_bytes(
 ) -> None:
     """K1: which entries leave, and the exact bytes of both files afterwards.
 
-    Batch order is the order blocks entered ``synced_blocks``: ``parse_file_reversed``
-    walks the buffer bottom-up (oldest-first under a newest-first sentinel), so the
-    block appended last commits and rotates first; decisions precede OQs, and the
-    quarantine fixpoint appends last. The archive holds the batch **newest-first** —
+    Batch order is buffer order from the tail: settledness walks the buffer bottom-up
+    (oldest-first under a newest-first sentinel), so the block appended last is the
+    oldest and leads the batch. OQs never enter it — rotation reads decisions.md
+    alone. The archive holds the batch **newest-first** —
     the reverse of batch order, so the reversing reader replays it in commit order —
     inserted at the top of the archive's entry stream; ``PRIOR`` holds no entry, so the
     stream's top is the end of the file. Each raw block carries its trailing blank line
@@ -1998,11 +2061,13 @@ def test_rotation_characterization_exact_buffer_and_archive_bytes(
     their blocks. An OQ in questions.md is not rotated and questions.md is untouched.
 
     The archive is named for the UTC quarter of the rotation instant, pinned here, so
-    that name is known before the sync.
+    that name is known before the sync. The commit stamp is pinned earlier still, so the
+    entries are quiet at lag 0.
     """
     config, manager, tmpdir = sync_env
     config.env["GEMINI_API_KEY"] = "mock_key"
     _set_enrichment_passthrough(mock_client)
+    _rotate_immediately(config)
 
     header = _healed_header(manager, config)
     _append_decision(config, _ROTATE_FIRST)
@@ -2020,13 +2085,14 @@ def test_rotation_characterization_exact_buffer_and_archive_bytes(
     with open(os.path.join(config.archive_dir, _PINNED_ARCHIVE), "w", encoding="utf-8") as f:
         f.write("PRIOR\n")
 
-    with patch("mitos.sync._utc_now_iso", return_value=_PINNED_STAMP):
+    with patch("mitos.store._utc_now_iso", return_value=_EARLIER_STAMP), \
+            patch("mitos.sync._utc_now_iso", return_value=_PINNED_STAMP):
         manager.perform_sync(auto_accept=True)
 
     with open(config.decisions_file, "r", encoding="utf-8") as f:
         assert f.read() == header
 
-    # rotate-second committed first, so it is the older block and sits lower.
+    # rotate-second is the tail, so it is the older block and sits lower.
     inserted = _ROTATE_FIRST + "\n" + "\n" + _ROTATE_SECOND + "\n" + "\n"
     assert sorted(os.listdir(config.archive_dir)) == [_PINNED_ARCHIVE]
     with open(os.path.join(config.archive_dir, _PINNED_ARCHIVE), "r", encoding="utf-8") as f:
@@ -2042,16 +2108,16 @@ def test_rotation_characterization_exact_buffer_and_archive_bytes(
 
 
 @patch("google.genai.Client")
-def test_rotation_characterization_fixpoint_commit_rotates_last(
+def test_rotation_characterization_a_fixpoint_commit_rotates_by_its_buffer_position(
     mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
 ) -> None:
     """K2: a decision the quarantine fixpoint commits leaves the buffer and is archived.
 
     The resolver's ``Resolves:`` target is an OQ, attempted after decisions, so the
-    resolver quarantines on the main pass and commits in the fixpoint — whose
-    ``_record_decision_block`` appends it to ``synced_blocks`` after every main-pass
-    commit. So it is the newer block and lands above the plain decision in the
-    archive, although it sat below it in the buffer.
+    resolver quarantines on the main pass and commits in the fixpoint. When it commits
+    no longer decides where it lands: rotation reads the buffer, where the resolver is
+    the tail — the oldest block — so it leads the batch and sits below the plain
+    decision in the archive, exactly as it sat below it in the buffer.
 
     The archive is named for the UTC quarter of the rotation instant, pinned here; the
     fixpoint's commit rides the same batch and the same name.
@@ -2059,6 +2125,7 @@ def test_rotation_characterization_fixpoint_commit_rotates_last(
     config, manager, tmpdir = sync_env
     config.env["GEMINI_API_KEY"] = "mock_key"
     _set_enrichment_passthrough(mock_client)
+    _rotate_immediately(config)
 
     resolver = (
         "## 2026-05-19 — resolver-rotates — Resolver Rotates\n"
@@ -2076,14 +2143,15 @@ def test_rotation_characterization_fixpoint_commit_rotates_last(
         "**Questions:** Which approach do we commit to?\n",
     )
 
-    with patch("mitos.sync._utc_now_iso", return_value=_PINNED_STAMP):
+    with patch("mitos.store._utc_now_iso", return_value=_EARLIER_STAMP), \
+            patch("mitos.sync._utc_now_iso", return_value=_PINNED_STAMP):
         manager.perform_sync(auto_accept=True)
 
     with open(config.decisions_file, "r", encoding="utf-8") as f:
         assert f.read() == header
     assert os.listdir(config.archive_dir) == [_PINNED_ARCHIVE]
     with open(os.path.join(config.archive_dir, _PINNED_ARCHIVE), "r", encoding="utf-8") as f:
-        assert f.read() == resolver + "\n" + "\n" + _ROTATE_FIRST + "\n" + "\n"
+        assert f.read() == _ROTATE_FIRST + "\n" + "\n" + resolver + "\n" + "\n"
 
 
 @patch("google.genai.Client")
@@ -2099,6 +2167,7 @@ def test_f1_the_archive_is_named_for_the_rotation_instant_not_created_at(
     """
     config, manager, tmpdir = sync_env
     config.env["GEMINI_API_KEY"] = "mock_key"
+    _rotate_immediately(config)
     _append_decision(config, _rotating_decision("f1-dated"))
 
     with patch("mitos.store._utc_now_iso", return_value="2025-11-15T12:00:00+00:00"), \
@@ -2113,37 +2182,59 @@ def test_f1_the_archive_is_named_for_the_rotation_instant_not_created_at(
     assert store.created_at_for([node_id])[node_id].startswith("2025-11-15"), "non-vacuity"
 
 
-def test_the_rotation_step_reads_the_clock_once_through_the_utc_helper_and_no_graph() -> None:
-    """Step 4 names the batch from one ``_utc_now_iso()`` read and reads no node stamp.
+def test_the_rotation_step_reads_the_clock_once_and_the_graph_only_through_the_leaf() -> None:
+    """``_rotate_settled`` takes one ``_utc_now_iso()`` read and never the divergence fold.
 
     The MI-10 helper is the only clock the step may touch — a bare ``datetime.now``
     would be local time, and a graph stamp (``created_at_for``) would reorder replay.
-    Scoped to the ``if synced_blocks:`` step alone: the stale-entry warning elsewhere
-    in the same method reads the clock, and that one is not rotation's.
+    The step does read the graph — each tail entry's node and edges, through
+    ``settledness`` — but never ``corpus_graph_divergence``, which builds a fresh lock
+    on the buffer's path and would deadlock inside rotation's hold (G1). The fold's
+    name is fenced from the method and from the whole ``settledness`` module.
     """
     import ast
+    import mitos.settledness as settledness_module
     import mitos.sync as sync_module
 
     with open(sync_module.__file__, encoding="utf-8") as f:
         tree = ast.parse(f.read())
-    steps = [
+    methods = [
         node for node in ast.walk(tree)
-        if isinstance(node, ast.If) and isinstance(node.test, ast.Name)
-        and node.test.id == "synced_blocks"
+        if isinstance(node, ast.FunctionDef) and node.name == "_rotate_settled"
     ]
-    assert len(steps) == 1, "non-vacuity: exactly one rotation step"
+    assert len(methods) == 1, "non-vacuity: exactly one rotation step"
     attributes = {
         (node.value.id if isinstance(node.value, ast.Name) else None, node.attr)
-        for node in ast.walk(steps[0]) if isinstance(node, ast.Attribute)
+        for node in ast.walk(methods[0]) if isinstance(node, ast.Attribute)
     }
-    assert {("rotation", "archive_name_for"), ("rotation", "rotate")} <= attributes
+    assert {("rotation", "archive_name_for"), ("rotation", "rotate_selected"),
+            ("settledness", "select_settled_tail")} <= attributes
     assert not {attr for _owner, attr in attributes} & {"now", "utcnow", "today"}
     assert "created_at_for" not in {attr for _owner, attr in attributes}
     calls = [
-        node.func.id for node in ast.walk(steps[0])
+        node.func.id for node in ast.walk(methods[0])
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
     ]
     assert calls.count("_utc_now_iso") == 1
+
+    def _names(root) -> set:
+        return ({n.id for n in ast.walk(root) if isinstance(n, ast.Name)}
+                | {n.attr for n in ast.walk(root) if isinstance(n, ast.Attribute)}
+                | {a.name for n in ast.walk(root) if isinstance(n, ast.ImportFrom)
+                   for a in n.names})
+
+    with open(settledness_module.__file__, encoding="utf-8") as f:
+        settledness_tree = ast.parse(f.read())
+    assert "entry_divergence" in _names(settledness_tree), "non-vacuity: the leaf is read"
+    assert "corpus_graph_divergence" not in _names(methods[0])
+    assert "corpus_graph_divergence" not in _names(settledness_tree)
+
+    internal = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_perform_sync_internal"
+    ]
+    assert [n.attr for n in ast.walk(internal[0]) if isinstance(n, ast.Attribute)
+            ].count("_rotate_settled") == 1, "step 4 is the one sync caller"
 
 
 @patch("google.genai.Client")
@@ -2154,12 +2245,14 @@ def test_blocks_from_one_sync_are_filed_under_one_archive_whatever_their_stamps(
 
     The commit stamp moves when the fixpoint starts, so the resolver's ``created_at``
     is a different quarter from the plain decision's; both land in the file named for
-    the rotation instant, the fixpoint's commit on top (the inverse of 1d's per-stamp
-    filing, which split a batch across files and reordered replay).
+    the rotation instant, in buffer order — the resolver is the tail, so it sits lowest
+    (the inverse of 1d's per-stamp filing, which split a batch across files and
+    reordered replay).
     """
     config, manager, tmpdir = sync_env
     config.env["GEMINI_API_KEY"] = "mock_key"
     _set_enrichment_passthrough(mock_client)
+    _rotate_immediately(config)
     resolver = (
         "## 2026-05-19 — resolver-apart — Resolver Apart\n"
         "**Decided:** This decision answers the other thread.\n"
@@ -2176,7 +2269,7 @@ def test_blocks_from_one_sync_are_filed_under_one_archive_whatever_their_stamps(
         "**Questions:** Which approach do we commit to?\n",
     )
     import mitos.sync as sync_module
-    stamp = {"now": _PINNED_STAMP}
+    stamp = {"now": _EARLIER_STAMP}
     real_fixpoint = sync_module.commit_quarantine_fixpoint
 
     def _fixpoint(*args, **kwargs):
@@ -2190,11 +2283,11 @@ def test_blocks_from_one_sync_are_filed_under_one_archive_whatever_their_stamps(
 
     assert sorted(os.listdir(config.archive_dir)) == [_PINNED_ARCHIVE]
     assert _read(os.path.join(config.archive_dir, _PINNED_ARCHIVE)) == (
-        resolver + "\n\n" + _ROTATE_FIRST + "\n\n")
+        _ROTATE_FIRST + "\n\n" + resolver + "\n\n")
     store = GraphStore(config.db_path)
     ids = [store.get_node_by_slug(s)["id"] for s in ("rotate-first", "resolver-apart")]
     stamps = store.created_at_for(ids)
-    assert stamps[ids[0]] == _PINNED_STAMP and stamps[ids[1]].startswith("2025-11-15")
+    assert stamps[ids[0]] == _EARLIER_STAMP and stamps[ids[1]].startswith("2025-11-15")
 
 
 @patch("google.genai.Client")
@@ -2210,6 +2303,7 @@ def test_a_failed_archive_read_takes_the_failure_line_and_writes_nothing(
     """
     config, manager, tmpdir = sync_env
     config.env["GEMINI_API_KEY"] = "mock_key"
+    _rotate_immediately(config)
     _healed_header(manager, config)
     _append_decision(config, _rotating_decision("lookup-refused"))
     before = _read(config.decisions_file)
@@ -2226,7 +2320,7 @@ def test_a_failed_archive_read_takes_the_failure_line_and_writes_nothing(
     failed = [ln for ln in captured.err.splitlines() if "Archive rotation failed" in ln]
     assert len(failed) == 1, captured.err
     assert "injected: archive read refused" in failed[0]
-    assert "none of the 1 entries was removed" in failed[0]
+    assert "decisions.md is unchanged" in failed[0]
     assert "Archive rotation failed" not in captured.out
 
 
@@ -2243,11 +2337,13 @@ def test_the_rotation_step_does_not_read_the_graphs_stamps(
     """
     config, manager, tmpdir = sync_env
     config.env["GEMINI_API_KEY"] = "mock_key"
+    _rotate_immediately(config)
     _healed_header(manager, config)
     _append_decision(config, _rotating_decision("stamp-unread"))
 
     with patch("mitos.store.GraphStore.created_at_for",
                side_effect=AssertionError("the step must not read created_at")), \
+            patch("mitos.store._utc_now_iso", return_value=_EARLIER_STAMP), \
             patch("mitos.sync._utc_now_iso", return_value=_PINNED_STAMP):
         manager.perform_sync(auto_accept=True)
 
@@ -2306,6 +2402,7 @@ def test_r1_an_unusable_archive_path_leaves_the_buffer_whole(
     """
     config, manager, tmpdir = sync_env
     config.env["GEMINI_API_KEY"] = "mock_key"
+    _rotate_immediately(config)
     _healed_header(manager, config)
     _append_decision(config, _rotating_decision("r1-blocked"))
     before = _read(config.decisions_file)
@@ -2335,6 +2432,7 @@ def test_r2_a_crash_between_the_writes_leaves_the_entry_in_both_files(
     """
     config, manager, tmpdir = sync_env
     config.env["GEMINI_API_KEY"] = "mock_key"
+    _rotate_immediately(config)
     _healed_header(manager, config)
     block = _rotating_decision("r2-crash")
     _append_decision(config, block)
@@ -2367,11 +2465,13 @@ def test_r3_a_block_present_twice_is_never_removed(
 ) -> None:
     """R3 (defect 3): an unbounded replace removed both copies while archiving one.
 
-    Sync commits the first copy and takes the idempotent branch for the second, so
-    exactly one ``(entry, raw)`` reaches rotation while both copies sit at line starts.
+    Both copies are one committed node, so settledness selects both tail blocks, and
+    the planner finds each one twice at a line start: neither is removed, and each
+    selected block earns its own "occurs 2 times" warning — two lines for two blocks.
     """
     config, manager, tmpdir = sync_env
     config.env["GEMINI_API_KEY"] = "mock_key"
+    _rotate_immediately(config)
     _healed_header(manager, config)
     block = _rotating_decision("r3-dup")
     _append_decision(config, block)
@@ -2385,14 +2485,14 @@ def test_r3_a_block_present_twice_is_never_removed(
     assert not any("r3-dup" in text for text in _archive_texts(config))
     captured = capsys.readouterr()
     skipped = [ln for ln in captured.err.splitlines() if "r3-dup" in ln and "2 times" in ln]
-    assert len(skipped) == 1, captured.err
+    assert len(skipped) == 2, captured.err
     assert "2 times" not in captured.out
 
 
 @patch("google.genai.Client")
 @patch("builtins.input", side_effect=["a", EOFError()])
 @patch("sys.stdin.isatty", return_value=True)
-def test_r4_a_terminal_whose_stdin_fails_defers_rotation_instead_of_dying(
+def test_r4_a_terminal_whose_stdin_fails_meets_no_rotation_prompt_and_renders(
     mock_isatty: MagicMock,
     mock_input: MagicMock,
     mock_client: MagicMock,
@@ -2404,28 +2504,25 @@ def test_r4_a_terminal_whose_stdin_fails_defers_rotation_instead_of_dying(
     A non-TTY caller is report-and-skipped before any commit, so it never got here. A
     human who accepts at a terminal and whose stdin then fails used to meet a second
     ``input()`` that raised ``EOFError`` out of ``perform_sync`` after the commits,
-    skipping render and drain. Now there is no prompt: the run defers and renders.
-
-    S3 pins the deferred line's current truth: it names no command. The entries are
-    committed, so a ``--yes`` re-run finds them idempotent and would rotate nothing.
+    skipping render and drain. There is no rotation prompt and no deferral any more:
+    the TTY caller's run reaches rotation like any other, completes, and renders.
     """
     config, manager, tmpdir = sync_env
     config.env["GEMINI_API_KEY"] = "mock_key"
-    config.pending_threshold = 1
+    _rotate_immediately(config)
     _append_decision(config, _rotating_decision("r4-tty"))
 
     manager.perform_sync(auto_accept=False)
 
     assert mock_input.call_count == 1, "only the accept prompt may ask"
     assert GraphStore(config.db_path).get_node_by_slug("r4-tty") is not None
-    assert "r4-tty" in _read(config.decisions_file)
-    assert not os.path.exists(config.archive_dir)
+    assert "r4-tty" not in _read(config.decisions_file), "non-vacuity: rotation ran"
+    assert any("r4-tty" in text for text in _archive_texts(config))
     assert os.path.exists(os.path.join(tmpdir, "live_axioms.md")), "render ran after rotation"
     captured = capsys.readouterr()
-    deferred = [ln for ln in captured.err.splitlines() if "rotation deferred" in ln]
-    assert len(deferred) == 1, captured.err
-    assert "--yes" not in deferred[0] and "mitos sync" not in deferred[0]
-    assert "rotation deferred" not in captured.out
+    # The retired gate announced itself with a `[Lifecycle]` prefix; nothing uses it now.
+    assert not any(ln.startswith("[Lifecycle]")
+                   for ln in (captured.out + captured.err).splitlines())
 
 
 @patch("google.genai.Client")
@@ -2434,9 +2531,10 @@ def test_s1_the_rotated_line_is_on_stderr_not_stdout(
     sync_env: Tuple[MitosConfig, MitosSyncManager, str],
     capsys: pytest.CaptureFixture,
 ) -> None:
-    """S1: rotation will be reached from the MCP path, where stdout is the protocol."""
+    """S1: rotation's lines stay off stdout, which machine readers of a sync consume."""
     config, manager, tmpdir = sync_env
     config.env["GEMINI_API_KEY"] = "mock_key"
+    _rotate_immediately(config)
     _append_decision(config, _rotating_decision("s1-moved"))
 
     manager.perform_sync(auto_accept=True)
@@ -2455,6 +2553,7 @@ def test_s4_a_rotating_sync_keeps_the_buffer_mode(
     import stat as _stat
     config, manager, tmpdir = sync_env
     config.env["GEMINI_API_KEY"] = "mock_key"
+    _rotate_immediately(config)
     _healed_header(manager, config)
     os.chmod(config.decisions_file, 0o640)
     _append_decision(config, _rotating_decision("s4-mode"))
@@ -2463,3 +2562,244 @@ def test_s4_a_rotating_sync_keeps_the_buffer_mode(
 
     assert "s4-mode" not in _read(config.decisions_file), "non-vacuity: it rotated"
     assert _stat.S_IMODE(os.stat(config.decisions_file).st_mode) == 0o640
+
+
+# ===========================================================================
+# Phase 3b (surface-entropy) — T10: settledness on the sync path
+# ===========================================================================
+#
+# Seeding goes through `record`, which prepends: the first entry recorded is the file
+# bottom, the buffer's tail, the oldest. The rotation clock is pinned 30 days ahead so
+# real commit stamps are past the default 14-day lag.
+
+@patch("google.genai.Client")
+def test_t10_s1_a_settled_tail_rotates_one_bounded_batch(
+    mock_client: MagicMock,
+    sync_env: Tuple[MitosConfig, MitosSyncManager, str],
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """The W bottom entries move; everything above them stays for a later acquisition."""
+    config, manager, tmpdir = sync_env
+    config.env["GEMINI_API_KEY"] = "mock_key"
+    slugs = [f"settled-{i}" for i in range(5)]
+    for slug in slugs:
+        _record(manager, slug)
+    assert _buffer_slugs(config) == list(reversed(slugs))
+    config.rotation_volume_threshold_entries = 1
+
+    with patch("mitos.settledness.ROTATION_WINDOW_ENTRIES", 3), \
+            patch("mitos.sync._utc_now_iso", return_value=_ahead(30)):
+        manager.perform_sync(auto_accept=True)
+
+    assert _buffer_slugs(config) == ["settled-4", "settled-3"]
+    archived = "".join(_archive_texts(config))
+    for slug in slugs[:3]:
+        assert f"### {slug}\n" in archived
+    for slug in slugs[3:]:
+        assert f"### {slug}\n" not in archived
+    captured = capsys.readouterr()
+    assert "Rotated 3 entries to" in captured.err
+    assert "Rotated" not in captured.out
+
+
+@patch("google.genai.Client")
+def test_t10_s2_a_diverged_tail_rotates_nothing_and_says_nothing(
+    mock_client: MagicMock,
+    sync_env: Tuple[MitosConfig, MitosSyncManager, str],
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """An edge-deletion divergence at the tail — which `--yes` will not apply — blocks the drain.
+
+    Nothing rotated is the resting state, and the resting state is silent: no
+    ``Rotated`` line, no failure line. The buffer bytes do not move.
+    """
+    from mitos import settledness
+    config, manager, tmpdir = sync_env
+    config.env["GEMINI_API_KEY"] = "mock_key"
+    _record(manager, "edge-target")
+    _record(manager, "edge-holder", amends="edge-target")
+    _record(manager, "above-edge")
+    # Move the target's block from the bottom to the top, so the holder is the tail,
+    # then delete the holder's relation line: an edge deletion.
+    text = _read(config.decisions_file)
+    lines = text.splitlines(keepends=True)
+    from mitos.parser import parse_entry_stream
+    target = next(e for e in parse_entry_stream(text, "decision") if e.slug == "edge-target")
+    block = "".join(lines[target.line_start - 1:target.line_end])
+    marker = next(ln for ln in lines if "BEGIN ENTRIES" in ln)
+    rest = text.replace(block, "", 1)
+    rest = "".join(ln for ln in rest.splitlines(keepends=True)
+                   if not ln.startswith("**Amends:**"))
+    with open(config.decisions_file, "w", encoding="utf-8") as f:
+        f.write(rest.replace(marker, marker + "\n" + block, 1))
+    assert _buffer_slugs(config)[-1] == "edge-holder"
+    before = _healed_header(manager, config)
+    later = _ahead(30)
+    stopped = settledness.select_settled_tail(
+        before, graph=GraphStore(config.db_path), now=later, lag_days=14, threshold=1,
+        window=20, archive_name="unused.md").stopped_at
+    assert stopped == ("edge-holder", "diverged"), "non-vacuity: the tail is diverged"
+    config.rotation_volume_threshold_entries = 1
+
+    with patch("mitos.sync._utc_now_iso", return_value=later):
+        manager.perform_sync(auto_accept=True)
+
+    assert _read(config.decisions_file) == before
+    assert not os.path.exists(config.archive_dir)
+    captured = capsys.readouterr()
+    assert "Rotated" not in captured.out + captured.err
+    assert "Archive rotation failed" not in captured.out + captured.err
+
+
+@patch("google.genai.Client")
+def test_t10_s3_a_capture_during_the_sync_survives_the_rotation(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """Rotation reads the live buffer, never the snapshot, so a mid-sync arrival stays.
+
+    The arrival is prepended below the sentinel, where capture and record write it, after
+    the snapshot was taken and before step 4 runs.
+    """
+    config, manager, tmpdir = sync_env
+    config.env["GEMINI_API_KEY"] = "mock_key"
+    _record(manager, "tail-a")
+    _record(manager, "tail-b")
+    _healed_header(manager, config)
+    config.rotation_volume_threshold_entries = 1
+    arrival = ("### arrival\n\n**Decided:** An entry captured while sync ran.\n"
+               "**Rejected:** Waiting for the sync to finish.\n\n")
+    real = MitosSyncManager._commit_quarantine_fixpoint
+
+    def _capture_then_fixpoint(self, quarantined):  # type: ignore[no-untyped-def]
+        text = _read(config.decisions_file)
+        marker = next(ln for ln in text.splitlines(keepends=True) if "BEGIN ENTRIES" in ln)
+        with open(config.decisions_file, "w", encoding="utf-8") as f:
+            f.write(text.replace(marker, marker + "\n" + arrival, 1))
+        return real(self, quarantined)
+
+    with patch.object(MitosSyncManager, "_commit_quarantine_fixpoint", _capture_then_fixpoint), \
+            patch("mitos.sync._utc_now_iso", return_value=_ahead(30)):
+        manager.perform_sync(auto_accept=True)
+
+    assert _buffer_slugs(config) == ["arrival"]
+    archived = "".join(_archive_texts(config))
+    assert "### tail-a\n" in archived and "### tail-b\n" in archived
+
+
+@patch("google.genai.Client")
+def test_t10_s4_a_rotating_sync_never_calls_the_divergence_fold(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """The fold would deadlock on its own fresh lock inside rotation's hold (G1)."""
+    config, manager, tmpdir = sync_env
+    config.env["GEMINI_API_KEY"] = "mock_key"
+    _record(manager, "fold-fenced")
+    config.rotation_volume_threshold_entries = 1
+
+    with patch("mitos.divergence.corpus_graph_divergence",
+               side_effect=AssertionError("rotation called the fold")), \
+            patch("mitos.sync._utc_now_iso", return_value=_ahead(30)):
+        manager.perform_sync(auto_accept=True)
+
+    assert _buffer_slugs(config) == [], "non-vacuity: it rotated"
+
+
+@patch("google.genai.Client")
+def test_t10_s5_a_failed_graph_read_is_a_rotation_failure_not_a_sync_failure(
+    mock_client: MagicMock,
+    sync_env: Tuple[MitosConfig, MitosSyncManager, str],
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """The commit stands, render runs, the buffer is untouched, one stderr line says so.
+
+    The edge read is refused only inside the rotation step: the main loop's reconcile
+    branch calls the same method, so a fault armed earlier would red this row for the
+    wrong reason.
+    """
+    from mitos.store import GraphStore as _Store
+    config, manager, tmpdir = sync_env
+    config.env["GEMINI_API_KEY"] = "mock_key"
+    _record(manager, "edges-refused")
+    _healed_header(manager, config)
+    config.rotation_volume_threshold_entries = 1
+    real = MitosSyncManager._rotate_settled
+    state = {}
+
+    def _refuse_edges_inside(self, *, window):  # type: ignore[no-untyped-def]
+        state["before"] = _read(config.decisions_file)
+        with patch.object(_Store, "get_outgoing_edges",
+                          side_effect=OSError("injected: edge read refused")) as refused:
+            try:
+                return real(self, window=window)
+            finally:
+                state["called"] = refused.called
+
+    with patch.object(MitosSyncManager, "_rotate_settled", _refuse_edges_inside), \
+            patch("mitos.sync._utc_now_iso", return_value=_ahead(30)):
+        result = manager.perform_sync(auto_accept=True)
+
+    assert result == []
+    assert state["called"], "non-vacuity: the predicate read the edges"
+    assert _read(config.decisions_file) == state["before"]
+    assert not os.path.exists(config.archive_dir)
+    assert os.path.exists(os.path.join(tmpdir, "live_axioms.md")), "render ran"
+    captured = capsys.readouterr()
+    failed = [ln for ln in captured.err.splitlines() if "Archive rotation failed" in ln]
+    assert len(failed) == 1, captured.err
+    assert "injected: edge read refused" in failed[0]
+    assert "decisions.md is unchanged" in failed[0]
+    assert "Archive rotation failed" not in captured.out
+
+
+@patch("google.genai.Client")
+def test_t10_s9_repeated_syncs_converge_to_a_fixed_point(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str]
+) -> None:
+    """P5 as fixed-point convergence: each sync may move a batch; the sequence settles.
+
+    Never a per-invocation no-op assertion — a collector running on the verb makes a
+    repeated sync over an unchanged buffer legitimately different.
+    """
+    config, manager, tmpdir = sync_env
+    config.env["GEMINI_API_KEY"] = "mock_key"
+    for i in range(12):
+        _record(manager, f"conv-{i:02d}")
+    config.rotation_volume_threshold_entries = 5
+    counts = [len(_buffer_slugs(config))]
+
+    with patch("mitos.settledness.ROTATION_WINDOW_ENTRIES", 3), \
+            patch("mitos.sync._utc_now_iso", return_value=_ahead(30)):
+        for _ in range(3):
+            manager.perform_sync(auto_accept=True)
+            counts.append(len(_buffer_slugs(config)))
+        at_rest = (_read(config.decisions_file), sorted(_archive_texts(config)))
+        manager.perform_sync(auto_accept=True)
+        again = (_read(config.decisions_file), sorted(_archive_texts(config)))
+
+    assert counts == [12, 9, 6, 3]
+    assert all(a >= b for a, b in zip(counts, counts[1:]))
+    assert again == at_rest, "below the threshold the buffer has reached its fixed point"
+
+
+@patch("google.genai.Client")
+def test_t10_s11_a_heading_count_the_parse_disagrees_with_rotates_nothing(
+    mock_client: MagicMock,
+    sync_env: Tuple[MitosConfig, MitosSyncManager, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The window_mismatch guard: when the count and the parse disagree, stall, never cut."""
+    from mitos import markers
+    config, manager, tmpdir = sync_env
+    config.env["GEMINI_API_KEY"] = "mock_key"
+    _record(manager, "mismatched")
+    before = _healed_header(manager, config)
+    config.rotation_volume_threshold_entries = 1
+    real = markers.entry_heading_indices
+    monkeypatch.setattr(markers, "entry_heading_indices",
+                        lambda lines: real(lines) + [len(lines)])
+
+    with patch("mitos.sync._utc_now_iso", return_value=_ahead(30)):
+        manager.perform_sync(auto_accept=True)
+
+    assert _read(config.decisions_file) == before
+    assert not os.path.exists(config.archive_dir)

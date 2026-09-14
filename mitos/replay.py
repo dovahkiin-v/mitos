@@ -63,8 +63,7 @@ def commit_quarantine_fixpoint(
             successful commit (sync embeds; the rebuild leaves embeddings to a
             later sync, so it passes ``None``).
         on_commit: Optional callback invoked ``on_commit(entry, raw)`` on each
-            successful commit (sync records the block for rotation; the rebuild
-            counts committed entries per kind).
+            successful commit (the rebuild counts committed entries per kind).
 
     Returns:
         ``(committed, passes, residual)`` — the number of entries committed across

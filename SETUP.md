@@ -541,7 +541,8 @@ skipped, and the file is rolled back byte-for-byte.
 Restored entries land in the **buffer**, not an archive: `restore-source` splices into
 `decisions.md`. Archives are written only by rotation, which files a batch under the
 UTC quarter of the moment it rotates it — when the entry was archived, not the date it
-was decided.
+was decided. Like any settled entry, a restored one may later be rotated to an archive,
+which `mitos rebuild` reads.
 
 `--slug <name>` restores one node; `--json` emits a machine-readable report.
 

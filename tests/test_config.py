@@ -1,6 +1,6 @@
 """Adversarial test suite for the Mitos configuration loader.
 
-Covers the v0.1 nine-key schema, the single-source `CONFIG_DEFAULTS` map, and the
+Covers the v0.1 ten-key schema, the single-source `CONFIG_DEFAULTS` map, and the
 strict `tomllib`-based failure-mode policy (§5.2.6, OD1-symmetric): a malformed or
 mistyped config is a loud, located `ConfigError`, never a silent fallback. Also
 pins the R12 attribute surface every live consumer binds, and the cross-check that
@@ -55,14 +55,15 @@ def test_config_defaults() -> None:
             assert getattr(config, key) == expected, key
         assert config.rotation_mode == "archive"
         assert config.rotation_volume_threshold_entries == 50
+        assert config.rotation_lag_days == 14
         assert config.stale_entry_window_days == 30
         assert config.embedding_cache_max_entries == 10_000
         # Dynamic defaults.
         assert config.qdrant_url == os.environ.get("QDRANT_URL", "http://localhost:7333")
         assert config.qdrant_collection == default_collection_name(tmpdir)
         assert config.qdrant_collection.startswith("mitos")
-        # Kept-but-de-schema'd attribute + convention paths.
-        assert config.pending_threshold == 30
+        # The retired rotation gate's attribute is gone; convention paths remain.
+        assert not hasattr(config, "pending_threshold")
         assert "graph.sqlite" in config.db_path
         assert "decisions.md" in config.decisions_file
         assert config.archive_dir.endswith(os.path.join("decisions", "archive"))
@@ -270,9 +271,10 @@ def test_retired_keys_silent_unknown_keys_warn(capsys: pytest.CaptureFixture) ->
 
     A recognized-but-retired key (`RETIRED_CONFIG_KEYS`: `pending_threshold`,
     `db_path`, `decisions_file`, `archive_dir`, `qdrant_collection`) was deliberately
-    dropped from the file schema but is still recognized — its ATTRIBUTE survives at
-    its default (R12) and its file occurrence is skipped with NO warning (it is not a
-    typo, so warning on it every call is noise). A genuinely unknown key (a typo)
+    dropped from the file schema but is still recognized — for the path keys the
+    ATTRIBUTE survives at its default (R12), `pending_threshold`'s attribute left with
+    the rotation gate that read it (surface-entropy 3b) — and its file occurrence is
+    skipped with NO warning (it is not a typo, so warning on it every call is noise). A genuinely unknown key (a typo)
     still earns one calm stderr line — that warning is the signal the setting won't
     take effect.
     """
@@ -289,8 +291,10 @@ def test_retired_keys_silent_unknown_keys_warn(capsys: pytest.CaptureFixture) ->
         # `mark` is deprecated and pins to `archive`, so it no longer demonstrates
         # an applied override.)
         assert config.stale_entry_window_days == 7
-        # Retired file keys are ignored — the attributes keep their defaults.
-        assert config.pending_threshold == 30
+        # Retired file keys are ignored — the line sets nothing, and the surviving
+        # path attribute keeps its default.
+        assert not hasattr(config, "pending_threshold")
+        assert config.inert_file_keys["pending_threshold"] == 99
         assert "graph.sqlite" in config.db_path
         err = capsys.readouterr().err
         # Retired keys are tolerated silently — no per-invocation noise.
@@ -309,7 +313,7 @@ def test_r12_attribute_surface_preserved() -> None:
     """Every consumer-bound MitosConfig attribute exists after construction (R12)."""
     with tempfile.TemporaryDirectory() as tmpdir:
         config = MitosConfig(tmpdir)
-        # The nine prototype consumer-bound attributes (§3 / §11) ...
+        # The eight surviving prototype consumer-bound attributes (§3 / §11) ...
         for attr in (
             "workspace_dir",
             "mitos_dir",
@@ -319,12 +323,14 @@ def test_r12_attribute_surface_preserved() -> None:
             "qdrant_url",
             "qdrant_collection",
             "rotation_mode",
-            "pending_threshold",
         ):
             assert hasattr(config, attr), attr
-        # ... plus the eight new static schema attributes.
+        # ... plus every static schema attribute.
         for attr in CONFIG_DEFAULTS:
             assert hasattr(config, attr), attr
+        # `pending_threshold` left with the rotation gate, its only reader. A symbol
+        # check, because a test assigning the attribute would silently re-create it.
+        assert not hasattr(config, "pending_threshold")
 
 
 def test_post_construction_attribute_assignment_untouched() -> None:
@@ -336,20 +342,22 @@ def test_post_construction_attribute_assignment_untouched() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         config = MitosConfig(tmpdir)
         config.db_path = "/custom/graph.sqlite"
-        config.pending_threshold = 1
+        config.rotation_lag_days = 0
         assert config.db_path == "/custom/graph.sqlite"
-        assert config.pending_threshold == 1
+        assert config.rotation_lag_days == 0
 
 
 def test_to_dict_carries_full_surface() -> None:
-    """to_dict exposes the convention paths, dynamic keys, and all eight schema keys."""
+    """to_dict exposes the convention paths, dynamic keys, and every static schema key."""
     with tempfile.TemporaryDirectory() as tmpdir:
         d = MitosConfig(tmpdir).to_dict()
         for key in CONFIG_DEFAULTS:
             assert key in d, key
-        for key in ("db_path", "qdrant_url", "qdrant_collection", "pending_threshold",
+        for key in ("db_path", "qdrant_url", "qdrant_collection",
                     "decisions_file", "archive_dir", "workspace_dir", "mitos_dir"):
             assert key in d, key
+        assert d["rotation_lag_days"] == 14
+        assert "pending_threshold" not in d
 
 
 # ---------------------------------------------------------------------------
@@ -454,8 +462,8 @@ def test_prototype_shaped_config_loads_clean(capsys: pytest.CaptureFixture) -> N
         assert config.qdrant_collection == default_collection_name(tmpdir)
         assert config.qdrant_collection != "mitos-mitos-pub"
         assert config.inert_file_keys["qdrant_collection"] == "mitos-mitos-pub"
-        # pending_threshold file key silently tolerated; attribute keeps its default.
-        assert config.pending_threshold == 30
+        # pending_threshold file key silently tolerated; it sets no attribute.
+        assert not hasattr(config, "pending_threshold")
         # The real seeded file now loads with a CLEAN stderr — no per-invocation
         # noise on the recognized-but-retired `pending_threshold` key.
         err = capsys.readouterr().err
@@ -485,19 +493,60 @@ def test_render_defaults_match_renderer_constants() -> None:
     )
 
 
-def test_schema_covers_nine_keys_and_defaults_are_the_static_eight() -> None:
-    """CONFIG_SCHEMA recognizes nine file keys; CONFIG_DEFAULTS holds the static eight.
+def test_schema_is_the_static_defaults_plus_qdrant_url() -> None:
+    """CONFIG_SCHEMA recognizes every static-default key plus exactly one dynamic key.
 
     ``qdrant_url`` is recognized + validated but defaulted in __init__, so it is in
-    CONFIG_SCHEMA and not CONFIG_DEFAULTS — and it is now the ONLY such key.
+    CONFIG_SCHEMA and not CONFIG_DEFAULTS — and it is the ONLY such key.
     ``qdrant_collection`` was the other one until it was retired from the file schema
-    entirely (its value is derived from the workspace path and not overridable), which
-    is what takes the count from ten to nine. v0.2's ``conflict_check_on_sync`` is in
-    BOTH (static default True).
+    entirely (its value is derived from the workspace path and not overridable).
+    v0.2's ``conflict_check_on_sync`` and surface-entropy 3b's ``rotation_lag_days``
+    are in BOTH. Stated by derivation, so the next static key does not re-stale a
+    count here; the named members pin the keys this row is about.
     """
-    assert len(CONFIG_SCHEMA) == 9
-    assert len(CONFIG_DEFAULTS) == 8
-    assert set(CONFIG_DEFAULTS) < set(CONFIG_SCHEMA)
+    assert len(CONFIG_SCHEMA) == len(CONFIG_DEFAULTS) + 1
+    assert set(CONFIG_SCHEMA) - set(CONFIG_DEFAULTS) == {"qdrant_url"}
+    assert {"rotation_volume_threshold_entries", "rotation_lag_days",
+            "stale_entry_window_days"} <= set(CONFIG_DEFAULTS)
+    assert CONFIG_SCHEMA["rotation_lag_days"] is int
+
+
+def test_rotation_lag_days_applies_from_the_file() -> None:
+    """A file value applies; a file without the line resolves to the default of 14."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _write_config(tmpdir, "rotation_lag_days = 30\n")
+        assert MitosConfig(tmpdir).rotation_lag_days == 30
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _write_config(tmpdir, 'rotation_mode = "archive"\n')
+        assert MitosConfig(tmpdir).rotation_lag_days == 14
+
+
+@pytest.mark.parametrize(
+    "body, key",
+    [
+        ("rotation_lag_days = -1\n", "rotation_lag_days"),
+        ("rotation_lag_days = 1000000000\n", "rotation_lag_days"),
+        ("rotation_volume_threshold_entries = 0\n", "rotation_volume_threshold_entries"),
+    ],
+)
+def test_a_nonsense_rotation_value_is_a_located_config_error(body: str, key: str) -> None:
+    """Both rotation keys decide what leaves the gold source, so a bad value is refused."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = _write_config(tmpdir, body)
+        with pytest.raises(ConfigError) as exc:
+            MitosConfig(tmpdir)
+        assert f"'{key}'" in str(exc.value)
+        assert path in str(exc.value)
+
+
+def test_a_zero_lag_and_a_threshold_of_one_are_legal() -> None:
+    """The boundaries the range checks admit: tests and immediate rotation use them."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _write_config(tmpdir, "rotation_lag_days = 0\n"
+                              "rotation_volume_threshold_entries = 1\n")
+        config = MitosConfig(tmpdir)
+        assert config.rotation_lag_days == 0
+        assert config.rotation_volume_threshold_entries == 1
     assert set(CONFIG_SCHEMA) - set(CONFIG_DEFAULTS) == {"qdrant_url"}
 
 

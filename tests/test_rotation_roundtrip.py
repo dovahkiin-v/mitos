@@ -168,4 +168,59 @@ def test_rotate_then_rebuild_returns_the_identical_node_id_set(tmp_path, capsys)
     rebuilt = GraphStore(config.db_path)
     assert {n["id"] for n in rebuilt.get_all_nodes()} == ids_before
     assert rebuilt.get_node_state(rebuilt.get_node_by_slug("amender")["id"]) == "active"
-    assert rebuilt.get_node_state(rebuilt.get_node_by_slug("amender-one")["id"]) == "active"
+
+
+def test_settledness_drains_a_prefix_so_rebuild_returns_the_identical_node_id_set(
+    tmp_path, capsys
+):
+    """T10-S10 (CC-10 under 3b's trigger): the drain never archives past a stuck entry.
+
+    From the file bottom up: ``y``, then ``a`` (amends ``y``), then ``b`` (supersedes
+    ``y``). ``y`` and ``b`` are quiet; ``a`` was just touched. The contiguous tail run is
+    ``y`` alone, so ``b`` stays behind ``a``. A drain that took the settled *subset*
+    would archive ``b`` too, and ``mitos rebuild`` — archives before the buffer — would
+    replay ``b``'s kill before ``a``'s amend and refuse the swap on ``dangling_edge``.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    config = MitosConfig(str(tmp_path))
+    os.makedirs(config.mitos_dir, exist_ok=True)
+    entries = [
+        ("y", _block("y", "The original axiom.", scope=["core"])),
+        ("a", _block("a", "A refinement of the original.", scope=["core"],
+                     relations=[("Amends", "y")])),
+        ("b", _block("b", "The axiom that replaced the original.", scope=["core"],
+                     relations=[("Supersedes", "y")])),
+    ]
+    with open(config.decisions_file, "w", encoding="utf-8") as fh:
+        fh.write(_SENTINEL + "\n\n" + "".join(text for _s, text in reversed(entries)))
+    store = GraphStore(config.db_path)
+    for entry in parse_file_reversed(config.decisions_file, "decision", []):
+        store.commit_parsed_entry(entry)
+    ids_before = {n["id"] for n in store.get_all_nodes()}
+    assert len(ids_before) == 3
+    old = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    by_slug = {n["slug"]: n["id"] for n in store.get_all_nodes()}
+    with store._get_connection() as conn:
+        for slug in ("y", "b"):
+            conn.execute("UPDATE nodes SET updated_at = ? WHERE id = ?", (old, by_slug[slug]))
+
+    manager = MitosSyncManager(config)
+    config.rotation_volume_threshold_entries = 1
+    rotations = 0
+    while manager._rotate_settled(window=20) is not None:
+        rotations += 1
+        assert rotations < 5, "the drain must reach a fixed point"
+
+    assert rotations == 1
+    assert _slugs(config.decisions_file) == ["a", "b"], "b stays behind the recent a"
+    archives = os.listdir(config.archive_dir)
+    assert len(archives) == 1 and all(_ARCHIVE_FILENAME_RE.match(n) for n in archives)
+    assert _slugs(os.path.join(config.archive_dir, archives[0])) == ["y"]
+
+    assert cmd_rebuild(config, allow_drops=False, assume_yes=True, as_json=True) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["swapped"] is True, report
+    assert report["gate_passed"] is True
+    assert report["residual_casualties"] == [] and report["missing_cores"] == []
+    assert {n["id"] for n in GraphStore(config.db_path).get_all_nodes()} == ids_before

@@ -280,10 +280,14 @@ def test_pathology_sync_advisory_lock_serialization(isolated_workspace) -> None:
 # P6 — Deprecated Rotation Modes: Prune and Mark both behave as Archive
 # ==============================================================================
 def _write_rotation_mode(config, mode: str) -> None:
-    """Writes `rotation_mode` into the workspace's config.toml and reloads it.
+    """Writes `rotation_mode` plus an immediate-rotation trigger, and reloads them.
 
     The epoch-1 pinning lives in the config LOADER, so a test that assigns
-    ``config.rotation_mode`` directly bypasses the behaviour it means to check.
+    ``config.rotation_mode`` directly bypasses the behaviour it means to check. The
+    threshold of 1 and lag of 0 make a one-entry workspace's just-committed entry
+    settled, so it commits and rotates in the same run. All three are copied back
+    because the fixture's ``config`` carries hand-set paths and is the object
+    ``cmd_sync`` receives.
 
     Args:
         config: The workspace config to rewrite and reload in place.
@@ -293,8 +297,16 @@ def _write_rotation_mode(config, mode: str) -> None:
 
     os.makedirs(config.mitos_dir, exist_ok=True)
     with open(os.path.join(config.mitos_dir, "config.toml"), "w", encoding="utf-8") as f:
-        f.write(f'rotation_mode = "{mode}"\n')
-    config.rotation_mode = MitosConfig(config.workspace_dir).rotation_mode
+        f.write(
+            f'rotation_mode = "{mode}"\n'
+            "rotation_volume_threshold_entries = 1\n"
+            "rotation_lag_days = 0\n"
+        )
+    reloaded = MitosConfig(config.workspace_dir)
+    config.rotation_mode = reloaded.rotation_mode
+    config.rotation_volume_threshold_entries = reloaded.rotation_volume_threshold_entries
+    config.rotation_lag_days = reloaded.rotation_lag_days
+    assert (config.rotation_volume_threshold_entries, config.rotation_lag_days) == (1, 0)
 @pytest.mark.skipif(not HAS_LIVE_KEYS, reason="Requires live GEMINI API key")
 def test_pathology_rotation_mode_prune_now_behaves_as_archive(isolated_workspace) -> None:
     """A `prune` workspace now ARCHIVES — the deprecation's regression fixture.
@@ -314,7 +326,7 @@ def test_pathology_rotation_mode_prune_now_behaves_as_archive(isolated_workspace
     cmd_init(config)
 
     _write_rotation_mode(config, "prune")
-    config.pending_threshold = 1 # Immediate rotation
+    # Immediate rotation rides the config file written above.
     
     # Write a new entry to decisions.md
     entry_text = (
@@ -360,7 +372,7 @@ def test_pathology_rotation_mode_mark_now_behaves_as_archive(isolated_workspace)
     cmd_init(config)
 
     _write_rotation_mode(config, "mark")
-    config.pending_threshold = 1 # Immediate rotation
+    # Immediate rotation rides the config file written above.
     
     # Write a new entry to decisions.md
     entry_text = (
