@@ -3608,8 +3608,7 @@ def _print_divergence_rung(report: Dict[str, Any], *, project: str) -> None:
         if verdicts.get("unresolvable"):
             print(f"          - {verdicts['unresolvable']} name no entry in the graph "
                   f"— fix the citation, or `mitos restore-source -p {project!r}` if its "
-                  f"block went "
-                  f"missing")
+                  f"block went missing")
         if verdicts.get("illegal"):
             offenders = report.get("illegal_edge_types") or []
             named = f" ({', '.join(sorted(offenders))})" if offenders else ""
