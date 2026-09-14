@@ -9,8 +9,11 @@ destination by the clause shapes the renderer emits (a global group heading's
 It takes any tree ``assemble_render`` returns, so a checkpoint can run it over a real
 corpus as well as over a fixture. It returns counts alongside the violations so every
 caller can assert non-vacuity: a parser that matches nothing reports no violations.
+``tree_from_disk`` builds the same shape from the files a render wrote, so a caller
+outside the rendering process runs this sweep over bytes on disk (phase 2g).
 """
 
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import mitos.renderer as R
@@ -18,6 +21,68 @@ import mitos.renderer as R
 _HEADING_FILE = " — full entries: .mitos/axioms/"
 _ROW_FILE = " → full entry: "
 _UNSCOPED = "## (unscoped)"
+# The global file's title; its index form carries the same suffix a scope index does.
+_GLOBAL_TITLE = "# Live Axioms"
+
+
+def _read_rendered(path: str) -> str:
+    """Reads a rendered file as the exact string the renderer wrote (no newline translation)."""
+    with open(path, encoding="utf-8", newline="") as f:
+        return f.read()
+
+
+def tree_from_disk(workspace_dir: str) -> Dict[str, Any]:
+    """Reads a rendered tree on disk into the dict ``sweep_destinations`` takes.
+
+    Each file's ``mode`` comes from the file's own self-declaration, never from a size
+    this reader measures: a scope file is an index when its first line is the scope
+    title plus ``_INDEX_TITLE_SUFFIX``, and ``live_axioms.md`` when its first line is
+    the index title. So a render that wrote the wrong form is read as the form it
+    claims, and the sweep holds that claim to its ceiling.
+
+    Only titled files are admitted as scope records: a ``.md`` whose first line is not
+    ``_scope_title(stem)`` or its index form (a person's ``notes.md``) is not a render,
+    and admitting it would let it answer a pointer as a destination.
+
+    Args:
+        workspace_dir: The workspace root holding ``live_axioms.md`` and
+            ``.mitos/axioms/``.
+
+    Returns:
+        ``{"global": <file>, "scopes": {stem: <file>}}``, each ``<file>`` being
+        ``{"name", "scope", "mode", "content"}`` with ``scope`` ``None`` for the global
+        file.
+
+    Raises:
+        ValueError: ``live_axioms.md`` does not open with either global title.
+    """
+    content = _read_rendered(os.path.join(workspace_dir, "live_axioms.md"))
+    first = content.split("\n", 1)[0]
+    if first == _GLOBAL_TITLE + R._INDEX_TITLE_SUFFIX:
+        mode = "index"
+    elif first == _GLOBAL_TITLE:
+        mode = "full"
+    else:
+        raise ValueError(f"live_axioms.md opens {first!r}, which is no global title")
+    tree: Dict[str, Any] = {
+        "global": {"name": "live_axioms.md", "scope": None, "mode": mode, "content": content},
+        "scopes": {},
+    }
+    axioms_dir = os.path.join(workspace_dir, ".mitos", "axioms")
+    for name in sorted(os.listdir(axioms_dir)):
+        if not name.endswith(".md"):
+            continue
+        stem = name[:-len(".md")]
+        content = _read_rendered(os.path.join(axioms_dir, name))
+        first = content.split("\n", 1)[0]
+        if first == R._scope_title(stem) + R._INDEX_TITLE_SUFFIX:
+            mode = "index"
+        elif first == R._scope_title(stem):
+            mode = "full"
+        else:
+            continue
+        tree["scopes"][stem] = {"name": name, "scope": stem, "mode": mode, "content": content}
+    return tree
 
 
 def sweep_destinations(assembled: Dict[str, Any],
