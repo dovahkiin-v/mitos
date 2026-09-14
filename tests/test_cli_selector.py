@@ -134,7 +134,7 @@ def test_every_registered_subparser_carries_the_project_option() -> None:
 
 
 def test_the_aliased_verbs_are_one_parser_object_registered_once() -> None:
-    """27 names over 22 objects — the reason the registration loop must dedupe by id().
+    """28 names over 23 objects — the reason the registration loop must dedupe by id().
 
     A second ``add_argument`` on the same object raises ``ArgumentError:
     conflicting option strings``, so this row is also what pins that the five
@@ -142,8 +142,8 @@ def test_the_aliased_verbs_are_one_parser_object_registered_once() -> None:
     ``list_scopes``, ``record_decision``) are free rather than forgotten.
     """
     choices = _subparsers(_build_parser())
-    assert len(choices) == 27
-    assert len({id(sub) for sub in choices.values()}) == 22
+    assert len(choices) == 28
+    assert len({id(sub) for sub in choices.values()}) == 23
     for alias, canonical in (("query_decisions", "query"),
                              ("surface_decisions", "surface"),
                              ("list_decisions", "list"),
@@ -1265,6 +1265,7 @@ def test_set_key_global_is_exempt_and_still_writes_the_machine_wide_env(
 #: mitos code runs, so a verb missing one would look like a `check`-shaped exit-2
 #: refusal while never reaching the targeting boundary at all.
 _MINIMAL_ARGS = {
+    "amend-commentary": ["a-slug", "--context", "x"],
     "capture": ["some prose"],
     "record": ["an axiom", "--slug", "a-slug"],
     "record_decision": ["an axiom", "--slug", "a-slug"],
@@ -1292,7 +1293,7 @@ def _require_list():
 
 
 def test_the_require_list_is_the_parser_minus_the_two_other_classes() -> None:
-    """23 verbs, measured — and the five aliases are among them, named.
+    """24 verbs, measured — and the five aliases are among them, named.
 
     The three classes of §3 partition the parser exactly: exempt (a selector is
     refused), optional (`status`, whose absence routes elsewhere), and required
@@ -1301,7 +1302,7 @@ def test_the_require_list_is_the_parser_minus_the_two_other_classes() -> None:
     drift.
     """
     verbs = _require_list()
-    assert len(verbs) == 23
+    assert len(verbs) == 24
     for alias in _ALIASES:
         assert alias in verbs
     assert set(_subparsers(_build_parser())) == (

@@ -16,9 +16,10 @@ import hashlib
 import argparse
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import Callable, List, Mapping, Optional, Dict, Any, Set, Tuple
+from typing import Callable, List, Mapping, Optional, Dict, Any, Sequence, Set, Tuple
 
 from mitos import __version__
+from mitos import amend
 from mitos import atomic_file
 from mitos import check
 from mitos import overview
@@ -55,8 +56,9 @@ from mitos.errors import (
     TARGET_EXEMPT_VERB, TARGET_MISSING, TARGET_PATH_NOT_A_WORKSPACE,
     TARGET_RELATIVE_PATH, TARGET_UNKNOWN_NAME,
 )
-from mitos.divergence import (_corpus_files, corpus_graph_divergence,
+from mitos.divergence import (RELATIONSHIP_FIELDS, _corpus_files, corpus_graph_divergence,
                               corpus_holds_entries, divergence_total)
+from mitos.restore import BufferFidelityError
 from mitos.env import resolve_key
 from mitos.vector_store import scroll_point_ids, hash_to_uuid, QdrantVectorStore
 from mitos.embeddings import GeminiEmbeddingProvider
@@ -1656,9 +1658,12 @@ def cmd_scopes(config: MitosConfig, as_json: bool = False, archived: bool = Fals
             parked_open_questions, authored_first_decisions, co_tagged_scopes}}``
             map, the rest naming the corpus it came
             from. The byte-identical twin of the MCP ``list_scopes`` payload.
-        archived: Include fully-dead domains (every scope present in the graph at a
-            ``0/0`` floor) — the scope-level parallel of ``list --state all``.
-            Omit for the live vocabulary only.
+        archived: Also include every scope tag still present in the graph whose
+            decisions are all retired and whose open questions are all resolved, at a
+            ``0/0`` floor — the scope-level parallel of ``list --state all``. A tag no
+            node carries any more (one ``amend-commentary --scope``/``--clear-scope``
+            removed from its last node) is not listed. Omit for the live vocabulary
+            only.
 
     Returns:
         None.
@@ -1702,14 +1707,17 @@ def cmd_scopes(config: MitosConfig, as_json: bool = False, archived: bool = Fals
         print(f"{scope:{name_w}}   {active:>6}  {parked:>6}  {active + parked:>6}"
               f"  {c['authored_first_decisions']:>6}  {c['co_tagged_scopes']:>7}")
     print()
-    # The corpus boundary (D6). Truthful for what ships now: it names the rebuild
-    # route only — no repair verb for a scope exists yet, and the report prescribes
-    # no change to any tag.
+    # The corpus boundary (D6). It names where a scope change goes, split by the repair
+    # verb's reach: `amend-commentary` edits entries still in decisions.md, so an
+    # archived entry's change still reaches the graph through a rebuild. The report
+    # prescribes no change to any tag.
     print("These counts cover every decision the graph holds, including entries "
           "whose source sits in decisions/archive/, and list only tags the graph "
           "still carries.")
-    print("A change to an archived entry's **Scope:** line reaches the graph only "
-          f"through `mitos rebuild -p {config.project!r}`.")
+    print("A **Scope:** change to an entry still in decisions.md goes through "
+          f"`mitos amend-commentary -p {config.project!r} <slug> --scope …`; one whose "
+          "source sits in decisions/archive/ reaches the graph only through "
+          f"`mitos rebuild -p {config.project!r}`.")
 
 
 def cmd_projects(as_json: bool = False) -> None:
@@ -3772,6 +3780,349 @@ def cmd_restore_source(
         print("\nNothing was written.", file=sys.stderr)
     print()
     return 1 if refused else 0
+
+
+# The error codes `amend-commentary` adds at the CLI boundary, beside 4a's vocabulary.
+# None is persisted. MCP reuses `buffer_fidelity`'s name for its raised body.
+AMEND_CODE_BUFFER_FIDELITY = "buffer_fidelity"
+AMEND_CODE_EMPTY_VALUE = "empty_value"
+AMEND_CODE_MULTIPLE_STDIN = "multiple_stdin_args"
+AMEND_CODE_UNREADABLE_FILE = "unreadable_file"
+
+# The text fields' flag stems: (argparse dest stem, `changes` key, clear flag or None).
+# `rejected` has no clear flag, because Rejected is a required field (M5).
+_AMEND_TEXT_FIELDS: Tuple[Tuple[str, str, Optional[str]], ...] = (
+    ("rejected", "rejected_paths", None),
+    ("invalidates_if", "invalidates_if", "--clear-invalidates-if"),
+    ("context", "context", "--clear-context"),
+)
+
+# Why each kill-edge route fits, keyed by `amend.ROUTES`' intent keys.
+_AMEND_ROUTE_INTENTS = {
+    "wrong": "if the original was wrong",
+    "outgrown": "if it has been outgrown",
+    "partial": "if only part of it moved",
+}
+
+
+def _amend_changes_from_args(args: argparse.Namespace) -> Tuple[Optional[Dict[str, Any]],
+                                                                Optional[Dict[str, str]]]:
+    """Builds `amend_commentary`'s ``changes`` from parsed flags, or a usage refusal.
+
+    The only translation the CLI owns: an absent flag contributes no key, a clear flag
+    maps to the value that removes its field, and the refusal-carrying flags pass
+    through untouched so the core's own refusal answers them.
+
+    Args:
+        args: The parsed ``amend-commentary`` namespace.
+
+    Returns:
+        ``(changes, None)``, or ``(None, {"error", "code"})`` for a request the CLI
+        refuses before dispatch.
+    """
+    stdin_args = [f"--{stem.replace('_', '-')}-file" for stem, _key, _clear in _AMEND_TEXT_FIELDS
+                  if getattr(args, f"{stem}_file") == "-"]
+    if len(stdin_args) > 1:
+        return None, {
+            "error": ("only one argument can read from stdin — these ask for it: "
+                      f"{', '.join(stdin_args)}. Pass a file path for all but one."),
+            "code": AMEND_CODE_MULTIPLE_STDIN,
+        }
+
+    changes: Dict[str, Any] = {}
+    for stem, key, clear_flag in _AMEND_TEXT_FIELDS:
+        file_path = getattr(args, f"{stem}_file")
+        flag = f"--{stem.replace('_', '-')}"
+        try:
+            value = _read_text_arg(getattr(args, stem), file_path)
+        except (OSError, UnicodeDecodeError) as exc:
+            # A value the caller supplied that cannot be read: a usage refusal, so
+            # `--json` still prints one object rather than main()'s bare crash line.
+            return None, {"error": f"{flag}-file could not be read: {exc}",
+                          "code": AMEND_CODE_UNREADABLE_FILE}
+        if file_path is not None and value.endswith("\n"):
+            value = value[:-1]  # the single trailing newline files/heredocs add, as --axiom-file
+        if value is not None:
+            if not value.strip():
+                # A whitespace-only value would reach the core as a clear, silently.
+                remedy = (f"to remove the field, pass {clear_flag}." if clear_flag else
+                          "Rejected is a required field, so it cannot be emptied.")
+                return None, {"error": f"{flag} was given an empty value; {remedy}",
+                              "code": AMEND_CODE_EMPTY_VALUE}
+            changes[key] = value
+        elif clear_flag is not None and getattr(args, f"clear_{stem}"):
+            changes[key] = None
+
+    if args.scope is not None:
+        if any(not tag.strip() for tag in args.scope):
+            # An empty tag is dropped on normalization, so `--scope ""` would clear the line.
+            return None, {"error": ("--scope was given an empty tag; to remove the "
+                                    "Scope line, pass --clear-scope."),
+                          "code": AMEND_CODE_EMPTY_VALUE}
+        changes["scope"] = list(args.scope)
+    elif args.clear_scope:
+        changes["scope"] = []
+    if args.new_slug is not None:
+        changes["slug"] = args.new_slug
+
+    if args.axiom is not None:
+        changes["axiom"] = args.axiom
+    if args.mechanisms is not None:
+        changes["mechanisms"] = list(args.mechanisms)
+    for field in RELATIONSHIP_FIELDS:
+        joined = _join_relation_flag(getattr(args, field))
+        if joined is not None:
+            changes[field] = joined
+    return changes, None
+
+
+def _amend_exit_code(result: Dict[str, Any]) -> int:
+    """Maps an amend result to its exit: 0 applied, 1 not applied, 2 a refused value.
+
+    The exit answers "is the corpus now in the state you asked for": ``unchanged`` is
+    already there, so it exits 0 beside ``amended``. A miss, a refusal and an
+    environment fault are answers about the target (1). The fidelity fence refused a
+    value the caller supplied, so the caller must change the request (2).
+    """
+    if result.get("code") == AMEND_CODE_BUFFER_FIDELITY:
+        return 2
+    if result.get("status") in (amend.STATUS_AMENDED, amend.STATUS_UNCHANGED):
+        return 0
+    return 1
+
+
+def _amend_fields(fields: Sequence[str]) -> str:
+    """Renders a refusal's ``fields`` list, reading naturally when it is empty."""
+    return ", ".join(repr(f) for f in fields) if fields else "the request"
+
+
+def _amend_amended_lines(result: Dict[str, Any], config: MitosConfig) -> List[str]:
+    lines = [f"Amended {result['slug']!r} ✓ — {', '.join(result['fields_changed'])}",
+             f"  Embedding: {result['embedding']}",
+             f"  Written:   {result['path']}"]
+    rename = result.get("rename")
+    if rename:
+        old, new = rename["from"], rename["to"]
+        lines.append(f"  Renamed:   {old!r} → {new!r}")
+        incoming = rename.get("incoming")
+        if incoming is None:
+            lines.append("  The entries citing it could not be read. Any relation line in "
+                         f"decisions.md that names {old!r} now reads as diverged, and that "
+                         f"entry cannot be amended until the line names {new!r}.")
+        elif incoming:
+            cited = ", ".join(f"{row['source']!r} ({row['kind']})" for row in incoming)
+            lines.append(f"  Cited by:  {cited}")
+            # No command: editing each line is the whole repair.
+            lines.append("  Those entries' relation lines in decisions.md still name "
+                         f"{old!r}, so they read as diverged and cannot be amended until "
+                         f"each line names {new!r}.")
+    return lines
+
+
+def _amend_refused_canonical_core(result: Dict[str, Any], config: MitosConfig) -> List[str]:
+    handle = result["slug"]
+    lines = [f"Amend refused [canonical_core]: {_amend_fields(result['fields'])} — Decided "
+             "and Mechanisms are what a decision is (its id is computed from them), so "
+             "changing them records a new decision rather than editing this one.",
+             f"  Record the new decision with `mitos record -p {config.project!r}`, naming "
+             "the relation that says why this one moved:"]
+    # Every route, by the distinction — never one door.
+    flags = {intent: f"--{relation} {handle!r}" for intent, relation in result["routes"].items()}
+    width = max((len(flag) for flag in flags.values()), default=0)
+    for intent, flag in flags.items():
+        lines.append(f"    {flag:{width}}  {_AMEND_ROUTE_INTENTS.get(intent, intent)}")
+    return lines
+
+
+def _amend_refused_edges(result: Dict[str, Any], config: MitosConfig) -> List[str]:
+    return [f"Amend refused [edges]: {_amend_fields(result['fields'])} — a relation change "
+            "can retire or resurrect a decision, so this verb does not make it.",
+            "  Edit the relation line in decisions.md, then apply it with "
+            f"`mitos sync -p {config.project!r} --reconcile-entry {result['slug']!r}`."]
+
+
+def _amend_refused_diverged(result: Dict[str, Any], config: MitosConfig) -> List[str]:
+    return [f"Amend refused [diverged]: the entry for {result['slug']!r} in decisions.md "
+            f"already differs from the graph in {_amend_fields(result['fields'])}.",
+            f"  Apply that edit with `mitos sync -p {config.project!r} --reconcile-entry "
+            f"{result['slug']!r}`, or undo it in decisions.md, then amend."]
+
+
+def _amend_refused_unparseable(result: Dict[str, Any], config: MitosConfig) -> List[str]:
+    return [f"Amend refused [unparseable]: an entry in decisions.md bearing "
+            f"{result['slug']!r} does not parse, so it cannot be edited safely.",
+            "  Fix that entry in decisions.md first."]
+
+
+def _amend_refused_open_question(result: Dict[str, Any], config: MitosConfig) -> List[str]:
+    return [f"Amend refused [open_question]: {result['slug']!r} is an open question; this "
+            "verb edits decision entries in decisions.md only."]
+
+
+def _amend_refused_invalid_value(result: Dict[str, Any], config: MitosConfig) -> List[str]:
+    return [f"Amend refused [invalid_value]: the value given for "
+            f"{_amend_fields(result['fields'])} cannot be written into the entry."]
+
+
+def _amend_refused_not_editable(result: Dict[str, Any], config: MitosConfig) -> List[str]:
+    return [f"Amend refused [not_editable]: {_amend_fields(result['fields'])} is not an "
+            "editable part of a committed entry."]
+
+
+def _amend_refused_unknown_field(result: Dict[str, Any], config: MitosConfig) -> List[str]:
+    return [f"Amend refused [unknown_field]: {_amend_fields(result['fields'])} is not a "
+            "field of a decision entry.",
+            "  `mitos amend-commentary --help` lists the fields this verb edits."]
+
+
+def _amend_refused_no_changes(result: Dict[str, Any], config: MitosConfig) -> List[str]:
+    return ["Amend refused [no_changes]: no field to change was given.",
+            "  `mitos amend-commentary --help` lists the field flags."]
+
+
+def _amend_archived_lines(result: Dict[str, Any], config: MitosConfig) -> List[str]:
+    # The same located cause as `_print_divergence_rung`'s archived_drift clause, with
+    # this surface's selectored recipe.
+    return [f"{result['slug']!r} is archived — its entry sits in decisions/archive/, and "
+            "this verb edits decisions.md only.",
+            "  `sync` reads only the buffer, so an archived entry's reconciler is "
+            f"`mitos rebuild -p {config.project!r}`: edit the entry in its archive file, "
+            "then rebuild."]
+
+
+def _amend_uncommitted_lines(result: Dict[str, Any], config: MitosConfig) -> List[str]:
+    # Names no command (D7): the draft is the author's to edit.
+    return [f"{result['slug']!r} is in decisions.md but not committed yet, so there is "
+            "nothing to amend — edit its entry there directly."]
+
+
+def _amend_not_found_lines(result: Dict[str, Any], config: MitosConfig) -> List[str]:
+    # Not `_show_not_found_hint`: that hint's "run sync" half holds only for a verb that
+    # reads no buffer, and this one just read decisions.md and found no such entry.
+    handle = result["slug"]
+    return [f"{handle!r} names no decision in the graph and no entry in decisions.md.",
+            f"  Find the handle with `mitos list -p {config.project!r} --oneline`, or "
+            f"`mitos show -p {config.project!r} -- {handle!r}`."]
+
+
+def _amend_refused_lines(result: Dict[str, Any], config: MitosConfig) -> List[str]:
+    return _AMEND_REFUSAL_RENDERERS[result["reason"]](result, config)
+
+
+def _amend_unchanged_lines(result: Dict[str, Any], config: MitosConfig) -> List[str]:
+    return [f"{result['slug']!r} already holds those values — nothing was written."]
+
+
+# One renderer per result class. Keyed by 4a's constants, and fenced by a coverage row
+# that reflects the constants off `mitos.amend`, so a new member reds there rather than
+# reaching the fallback line.
+_AMEND_STATUS_RENDERERS = {
+    amend.STATUS_AMENDED: _amend_amended_lines,
+    amend.STATUS_UNCHANGED: _amend_unchanged_lines,
+    amend.STATUS_REFUSED: _amend_refused_lines,
+    amend.STATUS_NOT_FOUND: _amend_not_found_lines,
+    amend.STATUS_ARCHIVED: _amend_archived_lines,
+    amend.STATUS_UNCOMMITTED: _amend_uncommitted_lines,
+}
+
+_AMEND_REFUSAL_RENDERERS = {
+    amend.REASON_CANONICAL_CORE: _amend_refused_canonical_core,
+    amend.REASON_EDGES: _amend_refused_edges,
+    amend.REASON_NOT_EDITABLE: _amend_refused_not_editable,
+    amend.REASON_UNKNOWN_FIELD: _amend_refused_unknown_field,
+    amend.REASON_INVALID_VALUE: _amend_refused_invalid_value,
+    amend.REASON_NO_CHANGES: _amend_refused_no_changes,
+    amend.REASON_OPEN_QUESTION: _amend_refused_open_question,
+    amend.REASON_UNPARSEABLE: _amend_refused_unparseable,
+    amend.REASON_DIVERGED: _amend_refused_diverged,
+}
+
+# The recovery clause per error code, where the code has an action; the fact alone
+# otherwise. `buffer_fidelity` is the CLI's own code, rendered with its own header.
+_AMEND_ERROR_ACTIONS: Dict[str, Optional[str]] = {
+    "slug_collision": "Choose another --new-slug.",
+    "commit_failed": None,
+    "audit_unavailable": None,
+    "lock_timeout": "Retry once the other mitos process finishes.",
+    "rollback_failed": "Check decisions.md before running any other mitos write.",
+}
+
+
+def _render_amend_result(result: Dict[str, Any], config: MitosConfig) -> List[str]:
+    """Renders an amend result as text lines, each class with this surface's recovery.
+
+    Args:
+        result: A result dict from ``MitosSyncManager.amend_commentary``, or the
+            ``buffer_fidelity`` error dict ``cmd_amend_commentary`` builds.
+        config: The resolved workspace config; recipes name ``config.project``.
+
+    Returns:
+        The lines to print, in order, on the result's channel.
+    """
+    code = result.get("code")
+    if code == AMEND_CODE_BUFFER_FIDELITY:
+        return [f"Amend refused [{code}]: {result['error']}",
+                "  Nothing was written: the value would change decisions.md beyond the "
+                "fields named — most often a line in it that starts with `##` or looks "
+                "like a `**Field:**` line. Rephrase that line and amend again."]
+    if code is not None:
+        lines = [f"Amend failed [{code}]: {result['error']}"]
+        action = _AMEND_ERROR_ACTIONS.get(code)
+        if action:
+            lines.append(f"  {action}")
+        return lines
+    renderer = _AMEND_STATUS_RENDERERS.get(result.get("status"))
+    if renderer is None:
+        return [f"Amend returned an unrecognized result: {json.dumps(result, sort_keys=True)}"]
+    return renderer(result, config)
+
+
+def cmd_amend_commentary(
+    config: MitosConfig, handle: str, changes: Dict[str, Any], *, as_json: bool = False
+) -> int:
+    """Edits one committed decision's commentary through the tool, and reports the result.
+
+    The CLI surface over ``MitosSyncManager.amend_commentary``. It stamps provenance,
+    renders each result with this boundary's recovery clause, and carries the result
+    class in the exit code. It reaches entries still in ``decisions.md``; an archived
+    entry answers ``archived``.
+
+    Text: an applied result answers on stdout; every other result on stderr, the
+    corpus echo leading its channel. ``--json`` prints one object on every exit — the
+    core's result verbatim plus ``project``/``collection``/``workspace``.
+
+    Args:
+        config: The resolved workspace config.
+        handle: The target slug or id, resolved as ``show`` resolves it.
+        changes: Field → new value, as ``_amend_changes_from_args`` builds it.
+        as_json: Emit one machine-readable object.
+
+    Returns:
+        ``0`` when the entry now holds the requested values (``amended``,
+        ``unchanged``), ``1`` when it does not (a refusal, a miss, a fault), ``2``
+        when the fidelity fence refused a supplied value.
+    """
+    manager = MitosSyncManager(config)
+    try:
+        result = manager.amend_commentary(handle, changes)
+    except BufferFidelityError as exc:
+        # Caught by name, never as MitosError: an MI-13 ValidationError is not a
+        # fidelity refusal, and it stays main()'s. Left uncaught, `--json` stdout
+        # would be empty.
+        result = {"error": str(exc), "code": AMEND_CODE_BUFFER_FIDELITY, "slug": handle}
+    exit_code = _amend_exit_code(result)
+
+    if as_json:
+        # Stamped here at the boundary, never inside the core.
+        result.update(corpus_provenance(config))
+        _emit_json(result)
+        return exit_code
+
+    stream = sys.stdout if exit_code == 0 else sys.stderr
+    _echo_corpus(config, file=stream)
+    for line in _render_amend_result(result, config):
+        print(line, file=stream)
+    return exit_code
 
 
 def cmd_agent_block(workspace_dir: str, check: bool = False) -> int:
@@ -5948,7 +6299,10 @@ def _build_parser() -> argparse.ArgumentParser:
                                      help="Enumerate the scope vocabulary with live-node counts, authored-first and co-tag counts (busiest first).")
     scopes_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON (for agents).")
     scopes_p.add_argument("--archived", action="store_true", dest="archived",
-                          help="Include fully-dead domains at a 0/0 floor (scope-level 'list --state all').")
+                          help="Also list tags whose decisions are all retired and whose open "
+                               "questions are all resolved, at a 0/0 floor (scope-level "
+                               "'list --state all'). A tag no decision or question carries "
+                               "any more is not listed.")
 
     # import
     imp_p = subparsers.add_parser("import", help="Import legacy prose ADR.")
@@ -6151,6 +6505,71 @@ def _build_parser() -> argparse.ArgumentParser:
     rs_p.add_argument("--json", action="store_true", dest="as_json",
                       help="Emit a machine-readable JSON report.")
 
+    # amend-commentary — edit a committed entry's commentary through the tool. No
+    # MCP-name alias: the signed set of five mirrors the first-contact verbs, and this
+    # is a repair verb whose agent path is the MCP tool.
+    _amend_reach = ("Edit a committed decision's rejected paths, invalidates-if, context, "
+                    "scope or slug in decisions.md, then re-commit it. Reaches entries "
+                    "still in decisions.md; an archived entry is edited in its archive "
+                    "file and reaches the graph through `mitos rebuild`.")
+    am_p = subparsers.add_parser("amend-commentary", help=_amend_reach,
+                                 description=_amend_reach)
+    am_p.add_argument("handle",
+                      help="The decision's slug or id, as `mitos show` resolves it. Give it "
+                           "before --scope or --mechanisms, which take every word after "
+                           "them.")
+    # Each text field's setters and its clear flag are one mutually exclusive group,
+    # so argparse refuses two values for one field instead of silently keeping one.
+    am_rejected = am_p.add_mutually_exclusive_group()
+    am_rejected.add_argument("--rejected", default=None,
+                             help="Replace the rejected paths (required, so never cleared).")
+    am_rejected.add_argument("--rejected-file", default=None, dest="rejected_file",
+                             help="Read --rejected from a file ('-' = stdin).")
+    am_invalidates = am_p.add_mutually_exclusive_group()
+    am_invalidates.add_argument("--invalidates-if", default=None, dest="invalidates_if",
+                                help="Replace the invalidates-if condition.")
+    am_invalidates.add_argument("--invalidates-if-file", default=None,
+                                dest="invalidates_if_file",
+                                help="Read --invalidates-if from a file ('-' = stdin).")
+    am_invalidates.add_argument("--clear-invalidates-if", action="store_true",
+                                dest="clear_invalidates_if",
+                                help="Remove the Invalidates-If line.")
+    am_context = am_p.add_mutually_exclusive_group()
+    am_context.add_argument("--context", default=None, help="Replace the context.")
+    am_context.add_argument("--context-file", default=None, dest="context_file",
+                            help="Read --context from a file ('-' = stdin).")
+    am_context.add_argument("--clear-context", action="store_true", dest="clear_context",
+                            help="Remove the Context line.")
+    am_scope = am_p.add_mutually_exclusive_group()
+    # `nargs="+"`, not record's "*": a bare `--scope` must be an argparse error, never
+    # an accidental clear. `extend` so repeats accumulate, as on record.
+    am_scope.add_argument("--scope", nargs="+", action="extend", default=None,
+                          help="Replace the scope tags, in order (the first is primary). "
+                               "Repeatable and space-separated both accumulate.")
+    am_scope.add_argument("--clear-scope", action="store_true", dest="clear_scope",
+                          help="Remove the Scope line.")
+    am_p.add_argument("--new-slug", default=None, dest="new_slug",
+                      help=f"Rename the entry's slug (≤{_SLUG_MAX_LEN} chars). The id and "
+                           "edges are unchanged; entries citing the old slug must be "
+                           "edited to name the new one.")
+    # Refusal-carrying flags: registered so the core's refusal, which names the route
+    # forward, is reachable from this surface instead of argparse's unrecognized-argument
+    # wall. Record's own names and arities; the relations derived, never hand-listed.
+    am_refused = am_p.add_argument_group(
+        "refused — listed so the refusal can route you",
+        "Decided and Mechanisms are what a decision is, and a relation can retire or "
+        "resurrect one, so this verb refuses these and names the command that makes "
+        "the change.")
+    am_refused.add_argument("--axiom", default=None, help="Refused: a new decision.")
+    am_refused.add_argument("--mechanisms", nargs="*", action="extend", default=None,
+                            help="Refused: a new decision.")
+    for _relation in RELATIONSHIP_FIELDS:
+        am_refused.add_argument(f"--{_relation.replace('_', '-')}", default=None,
+                                action="append", dest=_relation, metavar="SLUG",
+                                help="Refused: a relation change.")
+    am_p.add_argument("--json", action="store_true", dest="as_json",
+                      help="Emit one machine-readable JSON object.")
+
     # agent-block — print the canonical agent-file block to paste, or --check pasted copies.
     ab_p = subparsers.add_parser(
         "agent-block",
@@ -6186,7 +6605,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # Deduped by `id()` because the five aliased verbs (`query`/`query_decisions`,
     # `surface`/`surface_decisions`, `list`/`list_decisions`, `scopes`/
     # `list_scopes`, `record`/`record_decision`) are ONE parser object under two
-    # names: 27 names over 22 objects, and a second `add_argument` on the same
+    # names: 28 names over 23 objects, and a second `add_argument` on the same
     # object raises `ArgumentError: conflicting option strings`. The
     # `allow_abbrev` assignment above needs no such guard — it is idempotent — so
     # the dedupe guards only the registration. Being one object is also what makes
@@ -6437,6 +6856,18 @@ def main() -> None:
             sys.exit(cmd_restore_source(
                 config, slug=args.slug, all_graph_only=args.all_graph_only,
                 dry_run=args.dry_run, as_json=args.as_json))
+        elif args.command == "amend-commentary":
+            # Usage refusals before dispatch: exit 2, no echo (no handler has answered),
+            # the record arm's shape.
+            changes, usage = _amend_changes_from_args(args)
+            if usage is not None:
+                if args.as_json:
+                    _emit_json(usage)
+                else:
+                    print(usage["error"], file=sys.stderr)
+                sys.exit(2)
+            sys.exit(cmd_amend_commentary(config, args.handle, changes,
+                                          as_json=args.as_json))
         elif args.command == "agent-block":
             # THE CHANNEL CARVE-OUT (§4.7) — not an obligation carve-out; the two
             # are different arguments and must stay distinct. `agent-block`'s plain

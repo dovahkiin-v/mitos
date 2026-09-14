@@ -466,13 +466,28 @@ def test_cmd_scopes_text_shows_the_pair_and_the_boundary_footer(ws, capsys) -> N
     footer = out[out.index("These counts cover"):]
     assert f"mitos rebuild -p {config.project!r}" in footer
     assert "decisions/archive/" in footer
-    # 4b/4c ship `amend-commentary` and invert this: until then no in-tool repair
-    # verb for a scope exists, so the footer may not name one.
-    assert "amend" not in footer.lower()
+    # Inverted at 4b, which shipped `amend-commentary`: the footer names the verb and its
+    # reach (entries still in decisions.md), and keeps the rebuild route for archives.
+    assert f"mitos amend-commentary -p {config.project!r} <slug> --scope" in footer
+    assert "still in decisions.md" in footer
     for imperative in ("re-scope", "rescope", "retag", "re-tag", "split"):
         assert imperative not in footer.lower()
     # No number: a temp-path project name can hold digits, so strip it first.
     assert not any(ch.isdigit() for ch in footer.replace(repr(config.project), ""))
+
+
+def test_scopes_archived_help_names_what_it_does_not_list() -> None:
+    """4b's CC-20 correction: since `amend-commentary` can remove a tag from its last node,
+    "fully-dead domains" is no longer the whole story — a tag no node carries is not listed.
+    """
+    from mitos.cli import _build_parser
+    scopes = _build_parser()._subparsers._group_actions[0].choices["scopes"]
+    archived = next(a for a in scopes._actions if "--archived" in a.option_strings)
+    help_text = " ".join(archived.help.split())
+    assert "fully-dead" not in help_text
+    assert "0/0" in help_text and "is not listed" in help_text
+    doc = " ".join(cmd_scopes.__doc__.split())
+    assert "fully-dead" not in doc and "is not listed" in doc
 
 
 def test_cmd_scopes_empty_prints_no_boundary_footer(ws, capsys) -> None:

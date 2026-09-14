@@ -629,6 +629,7 @@ class TestTheRecordReceipt:
 #: a refusal is a response and §4.7's obligation is on responses.
 CLI_VERB_ARGS = {
     "agent-block": [],                     # positional path is optional; it is a selector source
+    "amend-commentary": ["no-such-handle", "--context", "x"],  # not_found, on stderr
     "capture": ["a raw architectural thought"],   # keyless refusal, on stdout
     "check": [],                           # embed absent + live decisions ⇒ fail-closed, on stderr
     "cutover": [],                         # already-V1a graph ⇒ the cheap no-op
