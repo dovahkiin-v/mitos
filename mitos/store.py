@@ -3043,8 +3043,9 @@ class GraphStore:
                     "node %s — the cycle closes at node %s. Returning the partial "
                     "lineage (%d ancestor(s)) walked before the bound fired. The "
                     "supported write path never authors a mutation cycle; this is an "
-                    "out-of-band or corrupt edge — resync from decisions.md (the "
-                    "authoritative source) to rebuild the derivative graph.",
+                    "out-of-band or corrupt edge — rebuild the derivative graph from "
+                    "the markdown corpus (decisions.md and decisions/archive/, the "
+                    "authoritative source) with `mitos rebuild`.",
                     node_id,
                     cycle_node,
                     len(ancestor_ids),
