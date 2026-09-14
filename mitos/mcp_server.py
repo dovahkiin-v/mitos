@@ -1370,7 +1370,8 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
         not run; absent neighbours are not checked-clean) or a debounced
         `scope_overflow` health nudge (not about this decision). It MAY carry
         `rotation`: OLDER settled entries this call moved to an archive
-        (outcome "rotated", `archives`), or outcome "failed" with `stage`,
+        (outcome "rotated", `archives`; blocks kept in place in `skipped`,
+        outcome "skipped" if none moved), or outcome "failed" with `stage`,
         `error` and `recovery` — the write still stands.
     """
     config = _target_config(project, "record_decision")
