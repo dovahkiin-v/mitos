@@ -515,8 +515,9 @@ state, not breakage:
 ```
   ⚠ corpus and graph disagree in 4 place(s) — informational, not a readiness blocker.
       • 1 entry(s) whose commentary text differs (the graph serves the stale value to every read)
-      • 3 node(s) have NO `### ` block in the corpus (2 active) — `mitos rebuild` cannot
-        reconstruct them, so its completeness gate refuses.
+      • 3 node(s) have NO `### ` block in the corpus (2 active) — `mitos rebuild -p 'myproject'`
+        cannot reconstruct them, so its completeness gate refuses. Run
+        `mitos restore-source -p 'myproject' --all-graph-only --dry-run` to review.
 ```
 
 **A node with no source block is the one that matters**, because it is what makes the

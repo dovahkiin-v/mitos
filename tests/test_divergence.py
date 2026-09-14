@@ -617,6 +617,52 @@ def test_a_cache_entry_of_an_unexpected_shape_cannot_crash_status(tmp_path, caps
     )
 
 
+def test_every_mitos_recipe_the_rung_prints_names_its_project(capsys) -> None:
+    """Every backticked `mitos …` span in the rung carries `-p <repr(project)>`.
+
+    Since the selector flip a bare `mitos rebuild` has no target, so a reader copying a
+    span out of the rung gets a second wall instead of a command. The subject is derived
+    from the output — every span that starts `mitos ` — never a hand list of route
+    clauses, so a clause added later is covered the day it prints. The report sets every
+    species key, because a clause that does not print cannot fail the selector check,
+    and each clause's lead phrase is asserted so the population cannot shrink silently.
+    """
+    import re
+    from mitos.cli import _print_divergence_rung
+
+    report = {
+        "checked": 9, "skipped": None, "cache_hit": False,
+        "commentary": [{"slug": "alpha", "fields": ["context"]}],
+        "scope": [
+            {"slug": "beta", "file": "decisions.md", "graph": ["x"], "markdown": ["y"],
+             "order_only": False},
+            {"slug": "gamma", "file": "decisions.md", "graph": ["x", "y"],
+             "markdown": ["y", "x"], "order_only": True},
+        ],
+        "edges": [{"slug": "delta"}],
+        "edge_verdicts": {"repairable": 1, "target_retired": 1, "unresolvable": 1,
+                          "illegal": 1},
+        "illegal_edge_types": ["resolves"],
+        "source": [{"slug": "epsilon"}],
+        "graph_only": [{"slug": "gone", "active": True}],
+        "reconcilable": 2,
+        "archived_drift": 1,
+    }
+    _print_divergence_rung(report, project="demo")
+    out = capsys.readouterr().out
+
+    for lead in ("commentary text differs", "scope tags differ", "ordered differently",
+                 "declared relations", "replays them", "since-retired", "if its block went",
+                 "can NEVER commit", "`**Source:**` line", "have NO", "can be repaired now",
+                 "sit in an ARCHIVE file"):
+        assert lead in out, f"the report sets this clause's species, so it must print: {lead!r}"
+
+    spans = re.findall(r"`(mitos [^`]*)`", out)
+    assert len(spans) >= 5, spans
+    bare = [span for span in spans if "-p 'demo'" not in span]
+    assert not bare, f"recipes printed without a selector: {bare}"
+
+
 def test_rotation_mode_is_not_served_stale_from_the_cache(tmp_path) -> None:
     """`rotation_mode` is live config, not a property of the corpus/graph pair.
 

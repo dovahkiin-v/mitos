@@ -3528,8 +3528,9 @@ def _print_divergence_rung(report: Dict[str, Any], *, project: str) -> None:
     since a rung that speaks on healthy projects is a rung readers learn to skip.
 
     Phrased like the vector-completeness rung above it, and for the same reason: this
-    is a SENSOR, and the repair verbs (`mitos sync`, `mitos restore-source`) are named
-    so the reader has somewhere to go rather than only something to worry about.
+    is a SENSOR, and the repair verbs (`sync`, `rebuild`, `restore-source`) are named as
+    selectored recipes so the reader has somewhere to go rather than only something to
+    worry about.
 
     Every key is read with ``.get``: the report may have come from the sidecar cache,
     written by a build whose species set differed, and a ``KeyError`` raised from here
@@ -3542,9 +3543,9 @@ def _print_divergence_rung(report: Dict[str, Any], *, project: str) -> None:
         project: The caller's own vocabulary for this workspace — ``config.project``,
             i.e. the registered name for a registered target and the workspace path
             otherwise. Required and keyword-only, matching ``cmd_status``'s own
-            idiom: the one recipe this function composes for a repair the reader can
-            run NOW has to carry a selector (since the selector flip a bare
-            ``mitos sync`` has no target), and it is passed in rather than
+            idiom: every ``mitos …`` recipe this function prints carries it as
+            ``-p <repr>`` (since the selector flip a bare ``mitos sync`` or
+            ``mitos rebuild`` has no target), and it is passed in rather than
             re-derived here for the reason 3d rejected by name — a reverse lookup
             misses on a symlinked route whose registry entry is hand-written
             non-canonically, printing a path for a registered project with every
@@ -3577,7 +3578,8 @@ def _print_divergence_rung(report: Dict[str, Any], *, project: str) -> None:
     order_only = [row for row in scope if row.get("order_only")]
     if membership:
         print(f"      • {len(membership)} entry(s) whose scope tags differ — a "
-              f"FINDABILITY defect: scope-filtered reads and `mitos scopes` miss them")
+              f"FINDABILITY defect: scope-filtered reads and `mitos scopes -p "
+              f"{project!r}` miss them")
         for row in membership[:5]:
             print(f"          - {row.get('slug')}: graph {row.get('graph')} vs "
                   f"markdown {row.get('markdown')}")
@@ -3598,14 +3600,15 @@ def _print_divergence_rung(report: Dict[str, Any], *, project: str) -> None:
         verdicts = report.get("edge_verdicts") or {}
         if verdicts.get("repairable"):
             print(f"          - {verdicts['repairable']} declared edge(s) whose target "
-                  f"is active and legal — `mitos rebuild` replays them")
+                  f"is active and legal — `mitos rebuild -p {project!r}` replays them")
         if verdicts.get("target_retired"):
             print(f"          - {verdicts['target_retired']} point at a since-retired "
                   f"target — legal, but a replay must reach them in COMMIT order "
                   f"(citations resolve against the active view)")
         if verdicts.get("unresolvable"):
             print(f"          - {verdicts['unresolvable']} name no entry in the graph "
-                  f"— fix the citation, or `mitos restore-source` if its block went "
+                  f"— fix the citation, or `mitos restore-source -p {project!r}` if its "
+                  f"block went "
                   f"missing")
         if verdicts.get("illegal"):
             offenders = report.get("illegal_edge_types") or []
@@ -3621,9 +3624,10 @@ def _print_divergence_rung(report: Dict[str, Any], *, project: str) -> None:
     if report.get("graph_only"):
         active = sum(1 for row in report["graph_only"] if row.get("active"))
         print(f"      • {len(report['graph_only'])} node(s) have NO `### ` block in "
-              f"the corpus ({active} active) — `mitos rebuild` cannot reconstruct "
-              f"them, so its completeness gate refuses. Run "
-              f"`mitos restore-source --all-graph-only --dry-run` to review.")
+              f"the corpus ({active} active) — `mitos rebuild -p {project!r}` cannot "
+              f"reconstruct them, so its completeness gate refuses. Run "
+              f"`mitos restore-source -p {project!r} --all-graph-only --dry-run` to "
+              f"review.")
 
     reconcilable = report.get("reconcilable") or 0
     if reconcilable:
@@ -3634,7 +3638,8 @@ def _print_divergence_rung(report: Dict[str, Any], *, project: str) -> None:
               f"reconcile — the only way to apply an edge DELETION unattended).")
     if report.get("archived_drift"):
         print(f"      ({report['archived_drift']} of these sit in an ARCHIVE file — "
-              f"`sync` reads only the buffer, so their reconciler is `mitos rebuild`.)")
+              f"`sync` reads only the buffer, so their reconciler is "
+              f"`mitos rebuild -p {project!r}`.)")
 
 
 def cmd_restore_source(
@@ -4059,8 +4064,8 @@ def _amend_refused_no_changes(result: Dict[str, Any], config: MitosConfig) -> Li
 
 
 def _amend_archived_lines(result: Dict[str, Any], config: MitosConfig) -> List[str]:
-    # The same located cause as `_print_divergence_rung`'s archived_drift clause, with
-    # this surface's selectored recipe.
+    # The same located cause, and the same selectored recipe, as
+    # `_print_divergence_rung`'s archived_drift clause.
     return [f"{result['slug']!r} is archived — its entry sits in decisions/archive/, and "
             "this verb edits decisions.md only.",
             "  `sync` reads only the buffer, so an archived entry's reconciler is "
