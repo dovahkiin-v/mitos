@@ -1044,3 +1044,419 @@ def test_row_rewrite_keeps_the_degrade_set_order_free(temp_workspace, monkeypatc
     reversed_tree = assemble_render(store)
     assert {s: f["mode"] for s, f in reversed_tree["scopes"].items()} == expected
     assert reversed_tree["global"]["mode"] == tree["global"]["mode"]
+
+
+# --------------------------------------------------------------------------- #
+# Phase 2e: the vacated-scope sweep (the directory is a projection of the active
+# set) and the write fence (no scope tag renders outside .mitos/axioms/)
+# --------------------------------------------------------------------------- #
+
+def _legacy_title(s: str) -> str:
+    """The scope title as typed by hand, byte-identical since v0.1 (`a84f0dd`).
+
+    Pinned independently of the renderer's title helper, so the rows below cannot
+    pass by deriving their expectation from the code under test.
+    """
+    return f"# Active Axioms for Scope: {s}"
+
+
+def _axioms(workspace: str) -> str:
+    return os.path.join(workspace, ".mitos", "axioms")
+
+
+def _plant(directory: str, name: str, first_line, body: bytes = b"Body line.\n") -> str:
+    """Writes a file byte-exactly (a CRLF or undecodable plant stays as planted)."""
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, name)
+    head = first_line if isinstance(first_line, bytes) else (first_line + "\n").encode("utf-8")
+    with open(path, "wb") as f:
+        f.write(head + body)
+    return path
+
+
+def _tree(directory: str) -> dict:
+    """Every entry under ``directory``: bytes for files, the link text for symlinks."""
+    found = {}
+    for dirpath, dirnames, filenames in os.walk(directory):
+        for name in dirnames + filenames:
+            path = os.path.join(dirpath, name)
+            rel = os.path.relpath(path, directory)
+            if os.path.islink(path):
+                found[rel] = ("link", os.readlink(path))
+            elif os.path.isdir(path):
+                found[rel] = ("dir",)
+            else:
+                with open(path, "rb") as f:
+                    found[rel] = f.read()
+    return found
+
+
+def _warnings(err: str) -> list:
+    return [ln for ln in err.splitlines() if ln.startswith("[Warning]")]
+
+
+def _vacated_tree(store, workspace) -> None:
+    """Scopes `a` and `b`, rendered; then `b` vacated by a same-core scope edit."""
+    _commit(store, "x", ["a", "b"])
+    MitosRenderer(workspace).render_all(store)
+    nodes = len(store.get_all_nodes())
+    _commit(store, "x", ["a"])
+    assert len(store.get_all_nodes()) == nodes, "the edit must re-commit one node, not add one"
+    assert os.path.exists(os.path.join(_axioms(workspace), "b.md"))
+
+
+def test_filtered_render_never_sweeps(temp_workspace, capsys) -> None:
+    """E1: a filtered render removes nothing; every other entry stays byte-identical."""
+    store, workspace = temp_workspace
+    _vacated_tree(store, workspace)
+    ax = _axioms(workspace)
+    _plant(ax, "notes.md", "# My notes")
+    before = _tree(ax)
+
+    renderer = MitosRenderer(workspace)
+    renderer.render_all(store, scope="a")
+
+    after = _tree(ax)
+    assert {k: v for k, v in after.items() if k != "a.md"} == \
+        {k: v for k, v in before.items() if k != "a.md"}
+    assert renderer.swept == [] and renderer.sweep_failures == []
+    assert _warnings(capsys.readouterr().err) == []
+
+    # Non-vacuity: the same tree under an unfiltered render loses b.md.
+    renderer.render_all(store)
+    assert renderer.swept == ["b.md"]
+    assert not os.path.exists(os.path.join(ax, "b.md"))
+
+
+def test_empty_scope_string_is_an_unfiltered_render(temp_workspace) -> None:
+    """E1b: `scope=""` renders every scope, so it sweeps too (one predicate for both)."""
+    store, workspace = temp_workspace
+    _vacated_tree(store, workspace)
+    renderer = MitosRenderer(workspace)
+    renderer.render_all(store, scope="")
+    assert renderer.swept == ["b.md"]
+    assert not os.path.exists(os.path.join(_axioms(workspace), "b.md"))
+
+
+def test_scope_vacated_by_an_edit_loses_its_file(temp_workspace, capsys) -> None:
+    """E2: the vacated file is removed, never returned, never an overflow; idempotent."""
+    store, workspace = temp_workspace
+    _vacated_tree(store, workspace)
+    ax = _axioms(workspace)
+    renderer = MitosRenderer(workspace)
+
+    written = renderer.render_all(store)
+
+    assert not os.path.exists(os.path.join(ax, "b.md"))
+    assert os.path.exists(os.path.join(ax, "a.md"))
+    assert all(os.path.basename(p) != "b.md" for p in written)
+    assert all(o["name"] != "b.md" for o in renderer.overflows)
+    assert renderer.swept == ["b.md"] and renderer.sweep_failures == []
+
+    again = renderer.render_all(store)
+    assert again == written
+    assert renderer.swept == [] and renderer.sweep_failures == []
+    assert capsys.readouterr().out == ""
+
+
+def test_scope_vacated_by_a_supersede_loses_its_file(temp_workspace) -> None:
+    """E3: a successor outside the old scope retires its last decision; the file goes."""
+    store, workspace = temp_workspace
+    _commit(store, "old-call", ["legacy"])
+    renderer = MitosRenderer(workspace)
+    renderer.render_all(store)
+    legacy = os.path.join(_axioms(workspace), "legacy.md")
+    assert os.path.exists(legacy)
+
+    successor = ParsedEntry("decision", "new-call", 1, 5)
+    successor.axiom = "The modern call replaces the legacy one."
+    successor.rejected_paths = "Keeping the legacy call."
+    successor.scope = ["modern"]
+    successor.supersedes = ["old-call"]
+    store.commit_parsed_entry(successor)
+
+    renderer.render_all(store)
+    assert not os.path.exists(legacy)
+    assert renderer.swept == ["legacy.md"]
+
+
+def test_foreign_entries_survive_the_sweep_byte_identical(temp_workspace, capsys) -> None:
+    """E4: only a file whose name AND first line are the renderer's own for an
+    unclaimed scope is removed; everything else survives unreported."""
+    store, workspace = temp_workspace
+    _commit(store, "ax-call", ["ax"])
+    ax = _axioms(workspace)
+    _plant(ax, "notes.md", "Arbitrary first line")
+    _plant(ax, "README.md", _legacy_title("readme"))
+    _plant(ax, "Upper.md", _legacy_title("upper"))
+    _plant(ax, "b.md", "# My notes on b")
+    _plant(ax, "ax-backup.md", _legacy_title("ax"))
+    _plant(ax, ".gone.md.0123456789ab.tmp", _legacy_title("gone"))
+    _plant(os.path.join(ax, "old"), "c.md", _legacy_title("c"))
+    outside = _plant(workspace, "outside-d.md", _legacy_title("d"))
+    os.symlink(outside, os.path.join(ax, "d.md"))
+    _plant(ax, "e.md", _legacy_title("e").encode("utf-8") + b"\xff\xfe\n")
+    with open(os.path.join(os.fsencode(ax), b"\xff.md"), "wb") as f:  # an undecodable name
+        f.write(b"# Active Axioms for Scope: \xff\n")
+    # Non-vacuity, in the same tree: two genuine orphans, one checked out with CRLF.
+    _plant(ax, "gone.md", _legacy_title("gone"))
+    _plant(ax, "crlf.md", (_legacy_title("crlf") + "\r\n").encode("utf-8"), b"Body.\r\n")
+    with open(outside, "rb") as f:
+        outside_bytes = f.read()
+    before = _tree(ax)
+
+    renderer = MitosRenderer(workspace)
+    renderer.render_all(store)
+
+    after = _tree(ax)
+    kept = {k: v for k, v in before.items() if k not in ("gone.md", "crlf.md", "ax.md")}
+    assert {k: v for k, v in after.items() if k != "ax.md"} == kept
+    assert os.path.islink(os.path.join(ax, "d.md"))
+    with open(outside, "rb") as f:
+        assert f.read() == outside_bytes
+    assert sorted(renderer.swept) == ["crlf.md", "gone.md"]
+    assert renderer.sweep_failures == []
+    assert _warnings(capsys.readouterr().err) == []
+
+
+def test_every_form_the_renderer_writes_is_recognised(temp_workspace, monkeypatch) -> None:
+    """E5: full, index and empty-state records all classify as the renderer's own,
+    and so does the hand-typed title every shipped version wrote."""
+    store, workspace = temp_workspace
+    _commit(store, "full-call", ["fullscope"])
+    for i in range(3):
+        _commit(store, f"heavy-{i}", ["indexscope"], axiom=f"{_HEAVY * 6}Variant {i}.")
+    full_len = len(_full_forms(store, monkeypatch)["indexscope"]["content"])
+    monkeypatch.setattr(R, "SCOPE_OVERFLOW_WARN_CHARS", full_len - 1)
+    scopes = assemble_render(store)["scopes"]
+    records = [scopes["fullscope"], scopes["indexscope"], R._empty_scope_file("z")]
+    assert [r["mode"] for r in records] == ["full", "index", "full"]
+
+    probe = os.path.join(workspace, "probe")
+    os.makedirs(probe)
+    for record in records:
+        with open(os.path.join(probe, record["name"]), "w", encoding="utf-8") as f:
+            f.write(record["content"])
+    _plant(probe, "legacy.md", _legacy_title("legacy"))
+    with os.scandir(probe) as entries:
+        verdicts = {e.name: R._is_vacated_scope_render(e, frozenset()) for e in entries}
+    assert verdicts == {"fullscope.md": True, "indexscope.md": True, "z.md": True,
+                        "legacy.md": True}
+
+
+def test_a_removal_failure_is_reported_and_never_raised(temp_workspace, capsys, monkeypatch) -> None:
+    """E6: one refused removal leaves the render's result intact and prints one stderr line."""
+    store, workspace = temp_workspace
+    _commit(store, "ok-call", ["ok"])
+    renderer = MitosRenderer(workspace)
+    clean = renderer.render_all(store)
+    clean_overflows = list(renderer.overflows)
+    ax = _axioms(workspace)
+    stuck = _plant(ax, "p.md", _legacy_title("p"))
+    _plant(ax, "q.md", _legacy_title("q"))
+    capsys.readouterr()
+
+    real_remove, fired = os.remove, []
+
+    def refuse_p(path, *args, **kwargs):
+        if path == stuck:
+            fired.append(path)
+            raise PermissionError(13, "Permission denied", path)
+        return real_remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "remove", refuse_p)
+    written = renderer.render_all(store)
+    monkeypatch.setattr(os, "remove", real_remove)
+
+    assert fired == [stuck]
+    assert written == clean and renderer.overflows == clean_overflows
+    assert os.path.exists(stuck) and not os.path.exists(os.path.join(ax, "q.md"))
+    assert renderer.swept == ["q.md"]
+    assert [f["name"] for f in renderer.sweep_failures] == ["p.md"]
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    lines = _warnings(captured.err)
+    assert len(lines) == 1 and "p.md" in lines[0] and "mitos " not in lines[0]
+
+
+def test_a_listing_failure_is_reported_and_the_render_stands(temp_workspace, capsys, monkeypatch) -> None:
+    """E8: the directory cannot be listed; one failure, one stderr line, normal return."""
+    store, workspace = temp_workspace
+    _commit(store, "ok-call", ["ok"])
+    renderer = MitosRenderer(workspace)
+    real_scandir, fired = os.scandir, []
+
+    def refuse_axioms(path=".", *args, **kwargs):
+        if path == renderer.axioms_dir:
+            fired.append(path)
+            raise PermissionError(13, "Permission denied", path)
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "scandir", refuse_axioms)
+    written = renderer.render_all(store)
+    monkeypatch.setattr(os, "scandir", real_scandir)
+
+    assert fired == [renderer.axioms_dir]
+    assert os.path.join(renderer.axioms_dir, "ok.md") in written
+    assert len(renderer.sweep_failures) == 1
+    captured = capsys.readouterr()
+    lines = _warnings(captured.err)
+    assert captured.out == "" and len(lines) == 1
+    # The line names the directory it could not check, never a "removal" of it.
+    assert "Could not check" in lines[0] and "remove" not in lines[0]
+
+
+def test_a_concurrent_removal_counts_as_success(temp_workspace, capsys, monkeypatch) -> None:
+    """E9: another render removed the candidate first; nothing is reported."""
+    store, workspace = temp_workspace
+    _commit(store, "ok-call", ["ok"])
+    gone = _plant(_axioms(workspace), "gone.md", _legacy_title("gone"))
+    real_remove, fired = os.remove, []
+
+    def already_gone(path, *args, **kwargs):
+        if path == gone:
+            fired.append(path)
+            real_remove(path)
+            raise FileNotFoundError(2, "No such file or directory", path)
+        return real_remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "remove", already_gone)
+    renderer = MitosRenderer(workspace)
+    renderer.render_all(store)
+    monkeypatch.setattr(os, "remove", real_remove)
+
+    assert fired == [gone]
+    assert renderer.sweep_failures == []
+    assert _warnings(capsys.readouterr().err) == []
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0,
+                    reason="environmental: permission bits do not bind root, so the "
+                           "unreadable-candidate state cannot be built")
+def test_an_unreadable_candidate_is_kept_and_reported(temp_workspace, capsys) -> None:
+    """E10: ownership cannot be proven without reading the title, so the file stays."""
+    store, workspace = temp_workspace
+    _commit(store, "ok-call", ["ok"])
+    locked = _plant(_axioms(workspace), "locked.md", _legacy_title("locked"))
+    os.chmod(locked, 0)
+    try:
+        renderer = MitosRenderer(workspace)
+        renderer.render_all(store)
+        assert os.path.exists(locked)
+        assert [f["name"] for f in renderer.sweep_failures] == ["locked.md"]
+        assert len(_warnings(capsys.readouterr().err)) == 1
+    finally:
+        os.chmod(locked, 0o644)
+
+
+def test_the_flat_listing_reaches_nothing_outside_the_tree(temp_workspace) -> None:
+    """E11: a titled orphan one directory up and one in a subdirectory both survive."""
+    store, workspace = temp_workspace
+    _commit(store, "ok-call", ["ok"])
+    above = _plant(os.path.join(workspace, ".mitos"), "x.md", _legacy_title("x"))
+    nested = _plant(os.path.join(_axioms(workspace), "sub"), "x.md", _legacy_title("x"))
+    renderer = MitosRenderer(workspace)
+    renderer.render_all(store)
+    assert os.path.exists(above) and os.path.exists(nested)
+    assert renderer.swept == [] and renderer.sweep_failures == []
+
+
+def test_no_scope_tag_renders_outside_the_axioms_tree(temp_workspace, capsys) -> None:
+    """E12: an escaping tag's file is skipped and reported; every other file renders,
+    the gold source is untouched, and a user's symlink is still written through."""
+    import shutil
+    store, workspace = temp_workspace
+    outside_dir = tempfile.mkdtemp()
+    try:
+        gold = os.path.join(workspace, "decisions.md")
+        with open(gold, "wb") as f:
+            f.write(b"GOLD SOURCE\n")
+        abs_tag = os.path.join(outside_dir, "abs-x")
+        escaping = ["../../decisions", abs_tag, "a/../../x"]
+        for i, tag in enumerate(escaping):
+            _commit(store, f"escape-{i}", [tag])
+        _commit(store, "nested-call", ["a/b"])
+        _commit(store, "ok-call", ["ok"])
+        ax = _axioms(workspace)
+        target = _plant(workspace, "ok-target.md", "user content")
+        os.makedirs(ax, exist_ok=True)
+        os.symlink(target, os.path.join(ax, "ok.md"))
+
+        renderer = MitosRenderer(workspace)
+        written = renderer.render_all(store)
+
+        with open(gold, "rb") as f:
+            assert f.read() == b"GOLD SOURCE\n"
+        assert not os.path.exists(abs_tag + ".md")
+        assert not os.path.exists(os.path.join(workspace, ".mitos", "x.md"))
+        assert os.path.exists(os.path.join(ax, "a", "b.md"))
+        assert os.path.islink(os.path.join(ax, "ok.md"))
+        with open(target, encoding="utf-8") as f:
+            assert f.read() == assemble_render(store)["scopes"]["ok"]["content"]
+        escaped = {os.path.normpath(os.path.join(ax, f"{t}.md")) for t in escaping}
+        assert not escaped & {os.path.normpath(p) for p in written}
+        assert sorted(r["scope"] for r in renderer.write_refusals) == sorted(escaping)
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        lines = _warnings(captured.err)
+        assert len(lines) == 3
+        assert all(any(repr(t) in ln for ln in lines) for t in escaping)
+
+        renderer.render_all(store, scope="../../decisions")
+        with open(gold, "rb") as f:
+            assert f.read() == b"GOLD SOURCE\n"
+        assert [r["scope"] for r in renderer.write_refusals] == ["../../decisions"]
+    finally:
+        shutil.rmtree(outside_dir, ignore_errors=True)
+
+
+def test_an_unwritable_escaping_tag_no_longer_stalls_the_render(temp_workspace) -> None:
+    """E12b (scout W2): before the fence, an absolute tag into an unwritable directory
+    raised mid-loop and every later scope went unwritten."""
+    store, workspace = temp_workspace
+    _commit(store, "unwritable-call", ["/proc/mitos-nope-x"])
+    _commit(store, "later-call", ["later"])
+    renderer = MitosRenderer(workspace)
+    renderer.render_all(store)
+    assert os.path.exists(os.path.join(_axioms(workspace), "later.md"))
+    assert [r["scope"] for r in renderer.write_refusals] == ["/proc/mitos-nope-x"]
+
+
+def test_a_refusal_is_still_reported_when_a_later_write_raises(temp_workspace, capsys, monkeypatch) -> None:
+    """A refusal recorded before an ordinary write failure is reported, not lost with the raise;
+    and the render that raised removes nothing."""
+    store, workspace = temp_workspace
+    _commit(store, "escape-call", ["../../decisions"])
+    _commit(store, "broken-call", ["broken"])
+    gone = _plant(_axioms(workspace), "gone.md", _legacy_title("gone"))
+    real_write = R.atomic_write
+
+    def refuse_broken(path, content):
+        if os.path.basename(path) == "broken.md":
+            raise IOError("disk full")
+        return real_write(path, content)
+
+    monkeypatch.setattr(R, "atomic_write", refuse_broken)
+    with pytest.raises(IOError):
+        MitosRenderer(workspace).render_all(store)
+    assert any("'../../decisions'" in ln for ln in _warnings(capsys.readouterr().err))
+    assert os.path.exists(gone)
+
+
+def test_a_call_that_raises_early_shows_none_of_the_last_calls_results(temp_workspace, monkeypatch) -> None:
+    """The three runtime attributes reset before assembly, so a call that raises there
+    never leaves the previous call's refusals and removals readable as its own."""
+    store, workspace = temp_workspace
+    _commit(store, "escape-call", ["../../decisions"])
+    _plant(_axioms(workspace), "gone.md", _legacy_title("gone"))
+    renderer = MitosRenderer(workspace)
+    renderer.render_all(store)
+    assert renderer.write_refusals and renderer.swept == ["gone.md"]
+
+    def broken_assembly(_store):
+        raise RuntimeError("graph unreadable")
+
+    monkeypatch.setattr(R, "assemble_render", broken_assembly)
+    with pytest.raises(RuntimeError):
+        renderer.render_all(store)
+    assert renderer.swept == [] and renderer.sweep_failures == [] and renderer.write_refusals == []

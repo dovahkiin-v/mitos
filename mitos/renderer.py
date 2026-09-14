@@ -7,10 +7,12 @@ generating global and per-scope markdown files atomically from primary source da
 import json
 import os
 import shlex
+import sys
 from typing import AbstractSet, List, Dict, Any, Optional, Tuple
 from mitos import atomic_file
 from mitos.display import oneline_axiom, truncate_words
 from mitos.protocols import GraphStoreProtocol
+from mitos.scope_tags import normalize_scope_tags
 from mitos.store import MODIFIER_EDGE_KEYS
 
 # Size ceilings for the generated context files, named in CHARACTERS — the unit the
@@ -472,7 +474,7 @@ def _full_scope_file(s: str, decs: List[Dict[str, Any]],
         The file record, ``mode == "full"``.
     """
     header = (
-        f"# Active Axioms for Scope: {s}\n"
+        f"{_scope_title(s)}\n"
         f"*Generated automatically by Mitos. Derived statelessly from primary sources (M8).*\n\n"
     )
     primaries, secondaries = _split_by_primacy(s, decs)
@@ -566,7 +568,7 @@ def _index_scope_file(s: str, decs: List[Dict[str, Any]],
     noun = "decision" if count == 1 else "decisions"
 
     lead = (
-        f"# Active Axioms for Scope: {s} — Index\n"
+        f"{_scope_title(s)}{_INDEX_TITLE_SUFFIX}\n"
         "*Generated automatically by Mitos. Derived statelessly from primary sources (M8).*\n\n"
         f"The full render of this scope would exceed the per-scope size ceiling, so this "
         f"file is an index of the {count} active {noun} tagged `{s}`: one line each, with "
@@ -593,13 +595,138 @@ def _empty_scope_file(s: str) -> Dict[str, Any]:
         "name": f"{s}.md",
         "scope": s,
         "content": (
-            f"# Active Axioms for Scope: {s}\n"
+            f"{_scope_title(s)}\n"
             f"*Generated automatically by Mitos. Derived statelessly from primary sources (M8).*\n\n"
             f"*No active decisions committed in this scope.*\n"
         ),
         "decisions": [],
         "mode": "full",
     }
+
+
+_INDEX_TITLE_SUFFIX = " — Index"
+
+
+def _scope_title(s: str) -> str:
+    """Returns the first line of every scope file the renderer writes for ``s``, unterminated.
+
+    The full and empty-state forms use it as is; the index form appends
+    ``_INDEX_TITLE_SUFFIX``. The sweep recognises its own files by this same string,
+    so the code that writes a scope file and the code that recognises one share it.
+    """
+    return f"# Active Axioms for Scope: {s}"
+
+
+def _is_vacated_scope_render(entry: "os.DirEntry[str]", claimed: AbstractSet[str]) -> bool:
+    """Decides whether a directory entry is this renderer's file for an unclaimed scope.
+
+    Candidates are taken positively (ADR render-sweep-takes-its-candidates-positively-
+    by-filename-shape), cheapest test first, and a file is a candidate only when its
+    name AND its first line are both the renderer's own:
+
+    1. A regular file, never a symlink: the renderer writes through a link but never
+       creates one, so a link in the tree is a person's construct.
+    2. ``<stem>.md`` where the stem is already a normalized scope tag. That excludes
+       ``README.md``, mixed-case names and ``atomic_file``'s temp files, which end in
+       ``_TEMP_SUFFIX`` (``.tmp``) and never in ``.md``.
+    3. The stem is not in ``claimed``.
+    4. The first line, read as bounded bytes and decoded as UTF-8 with one trailing
+       ``\\r`` tolerated (a ``core.autocrlf`` checkout), equals ``_scope_title(stem)``
+       or its index form. A first line that is not valid UTF-8 is not the renderer's.
+       Only the first line decides: bytes after the first newline are never decoded.
+
+    Reading the title decides ownership only; no byte of it reaches any render.
+
+    Args:
+        entry: An entry from a flat ``os.scandir`` of the axioms directory.
+        claimed: The scope tags the unfiltered render just wrote.
+
+    Returns:
+        True when the file may be removed.
+
+    Raises:
+        OSError: The title could not be read; the caller keeps the file.
+    """
+    if not entry.is_file(follow_symlinks=False) or not entry.name.endswith(".md"):
+        return False
+    stem = entry.name[:-len(".md")]
+    if not stem or normalize_scope_tags([stem]) != [stem] or stem in claimed:
+        return False
+    try:
+        stem.encode("utf-8")
+    except UnicodeEncodeError:
+        # A name the filesystem could not decode (surrogate-escaped bytes): scope
+        # tags are text, so the renderer never wrote it.
+        return False
+    title = _scope_title(stem)
+    index_title = title + _INDEX_TITLE_SUFFIX
+    # The longest title the stem can have, plus room for "\r\n".
+    limit = len(index_title.encode("utf-8")) + 2
+    with open(entry.path, "rb") as f:
+        head = f.read(limit)
+    line = head.split(b"\n", 1)[0]
+    if line.endswith(b"\r"):
+        line = line[:-1]
+    try:
+        text = line.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return text in (title, index_title)
+
+
+def _sweep_vacated_scope_files(axioms_dir: str, claimed: AbstractSet[str],
+                               swept: List[str], failures: List[Dict[str, str]]) -> None:
+    """Removes every file in a flat listing of ``axioms_dir`` that renders an unclaimed scope.
+
+    Never raises. A listing failure ends the sweep as one failure named for the
+    directory; a removal or title-read failure keeps that file and moves on; a file
+    already gone (a concurrent render removed it) is a silent success. Subdirectories
+    are never entered.
+
+    Args:
+        axioms_dir: The render tree's scope directory.
+        claimed: The scope tags the unfiltered render just wrote.
+        swept: Appended with each basename removed, in name order.
+        failures: Appended with ``{"name", "error"}`` per failure.
+    """
+    try:
+        with os.scandir(axioms_dir) as listing:
+            entries = sorted(listing, key=lambda e: e.name)
+    except OSError as exc:
+        failures.append({"name": axioms_dir, "error": str(exc)})
+        return
+    for entry in entries:
+        try:
+            if not _is_vacated_scope_render(entry, claimed):
+                continue
+            os.remove(entry.path)
+        except FileNotFoundError:
+            continue
+        except Exception as exc:
+            failures.append({"name": entry.name, "error": str(exc)})
+            continue
+        swept.append(entry.name)
+
+
+def _inside_directory(path: str, directory: str) -> bool:
+    """Checks lexically that ``path`` names something strictly below ``directory``.
+
+    Lexical on purpose: resolving links would refuse the write-through to a user's
+    symlinked render file that ``atomic_file`` performs deliberately. Every escape a
+    scope tag can spell (``..`` segments, an absolute tag, mixed forms) is lexical.
+
+    Args:
+        path: The destination to check.
+        directory: An absolute, normalized directory.
+
+    Returns:
+        True when ``path`` is inside ``directory``.
+    """
+    dest = os.path.normpath(path)
+    try:
+        return os.path.commonpath([dest, directory]) == directory and dest != directory
+    except ValueError:
+        return False
 
 
 def _ceiling_for(file_info: Dict[str, Any]) -> int:
@@ -691,9 +818,26 @@ class MitosRenderer:
         # ceiling. Read (not printed) so the write path can present a single debounced
         # summary AFTER its success receipt instead of a wall of per-file warnings.
         self.overflows: List[Dict[str, Any]] = []
+        # Also populated by render_all and reset on every call: the basenames an
+        # unfiltered render removed, the sweep's failures ({"name", "error"}), and the
+        # scope files not written because their tag escapes the tree ({"scope", "path"}).
+        self.swept: List[str] = []
+        self.sweep_failures: List[Dict[str, str]] = []
+        self.write_refusals: List[Dict[str, str]] = []
 
     def render_all(self, store: GraphStoreProtocol, scope: Optional[str] = None) -> List[str]:
         """Statelessly regenerates live_axioms.md and per-scope files.
+
+        An unfiltered call also removes each file in ``.mitos/axioms/`` that renders a
+        scope no longer in the active set, so the directory holds only active scopes'
+        renders. It removes only a regular file whose name and first line are both this
+        renderer's own for that scope, and only after every write has landed. A removal
+        that fails is recorded on ``self.sweep_failures``, reported on stderr, and never
+        raised; the next unfiltered render retries it.
+
+        A scope whose tag would put its file outside ``.mitos/axioms/`` is not written, on
+        any call. It is recorded on ``self.write_refusals`` and reported on stderr, and
+        every other file is still written.
 
         Size-ceiling overflows are recorded on ``self.overflows`` (not printed), so the
         write path can present a single debounced summary AFTER its success receipt and
@@ -702,11 +846,14 @@ class MitosRenderer:
 
         Args:
             store: The initialized GraphStore database.
-            scope: Optional scope filter. If specified, only that scope is rendered.
+            scope: Optional scope filter. If specified, only that scope is rendered, and
+                nothing is removed. An empty string renders every scope, like ``None``.
 
         Returns:
-            A list of paths rendered.
+            A list of paths written. A removed file is never in it.
         """
+        # Reset before anything can raise, so a failed call never shows the last call's.
+        self.swept, self.sweep_failures, self.write_refusals = [], [], []
         assembled = assemble_render(store)
         rendered_paths: List[str] = []
         written_files: List[Dict[str, Any]] = []
@@ -720,17 +867,40 @@ class MitosRenderer:
 
         # 2. Per-scope files (filtered to one scope when requested).
         os.makedirs(self.axioms_dir, exist_ok=True)
-        scopes_to_render = [scope] if scope else list(assembled["scopes"].keys())
-        for s in scopes_to_render:
-            if not s:
-                continue
-            # An explicitly-requested scope with no active decisions still gets an
-            # empty-state file (preserves the pre-refactor `render --scope` behaviour).
-            info = assembled["scopes"].get(s) or _empty_scope_file(s)
-            scope_filepath = os.path.join(self.axioms_dir, f"{s}.md")
-            atomic_write(scope_filepath, info["content"])
-            rendered_paths.append(scope_filepath)
-            written_files.append(info)
+        # One predicate decides both what the loop writes and whether the sweep runs,
+        # so the sweep runs exactly when this call wrote every active scope.
+        unfiltered = not scope
+        scopes_to_render = list(assembled["scopes"].keys()) if unfiltered else [scope]
+        axioms_root = os.path.normpath(self.axioms_dir)
+        try:
+            for s in scopes_to_render:
+                if not s:
+                    continue
+                # An explicitly-requested scope with no active decisions still gets an
+                # empty-state file (preserves the pre-refactor `render --scope` behaviour).
+                info = assembled["scopes"].get(s) or _empty_scope_file(s)
+                scope_filepath = os.path.join(self.axioms_dir, f"{s}.md")
+                if not _inside_directory(scope_filepath, axioms_root):
+                    # Skipped, not raised: a raise would stall every render in the
+                    # workspace on one tag; and not sanitized, because pointers name
+                    # the raw tag.
+                    self.write_refusals.append(
+                        {"scope": s, "path": os.path.normpath(scope_filepath)})
+                    continue
+                atomic_write(scope_filepath, info["content"])
+                rendered_paths.append(scope_filepath)
+                written_files.append(info)
+
+            # Only after every write landed: a render that raised above never sweeps.
+            if unfiltered:
+                try:
+                    _sweep_vacated_scope_files(self.axioms_dir, frozenset(assembled["scopes"]),
+                                               self.swept, self.sweep_failures)
+                except Exception as exc:
+                    self.sweep_failures.append({"name": self.axioms_dir, "error": str(exc)})
+        finally:
+            # Refusals recorded before a later write raised are still reported.
+            self._report_render_problems()
 
         # Record (don't print) which written files breached their size ceiling.
         self.overflows = [
@@ -738,3 +908,27 @@ class MitosRenderer:
         ]
 
         return rendered_paths
+
+    def _report_render_problems(self) -> None:
+        """Prints one stderr line per write refusal and sweep failure; stdout is never touched.
+
+        The renderer reports these itself because one of its callers swallows every
+        render exception and another must keep stdout clean. Nothing prints on success.
+        """
+        if not (self.write_refusals or self.sweep_failures):
+            return
+        sys.stdout.flush()
+        for refusal in self.write_refusals:
+            print(f"[Warning] Scope tag {refusal['scope']!r} would put its render file "
+                  f"outside .mitos/axioms/, so that file was not written. Every other "
+                  f"render file was written.", file=sys.stderr)
+        for failure in self.sweep_failures:
+            if failure["name"] == self.axioms_dir:
+                # The listing itself, or the sweep as a whole, failed: no file is named.
+                print(f"[Warning] Could not check {failure['name']!r} for stale scope "
+                      f"render files: {failure['error']}. The render and the write before "
+                      f"it are unaffected; the next full render retries.", file=sys.stderr)
+                continue
+            print(f"[Warning] Could not remove stale scope render {failure['name']!r}: "
+                  f"{failure['error']}. The render and the write before it are "
+                  f"unaffected; the next full render retries.", file=sys.stderr)

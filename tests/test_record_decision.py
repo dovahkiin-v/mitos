@@ -384,6 +384,49 @@ def test_write_path_warnings_go_to_stderr_not_stdout(mock_provider, mock_vector,
     assert "defer-clean" in captured.err
 
 
+@patch("mitos.sync.QdrantVectorStore")
+@patch("mitos.sync.GeminiEmbeddingProvider")
+def test_a_sweep_failure_on_the_record_path_leaves_the_commit_and_stdout_clean(
+        mock_provider, mock_vector, ws, capsys, monkeypatch) -> None:
+    """E7 (2e): the render's stale-scope sweep fails inside a record; the entry is
+    committed, stdout (the MCP JSON-RPC channel) stays clean, and the warning is on
+    stderr. The next record, with nothing refused, finishes the job."""
+    config, _ = ws
+    mock_provider.side_effect = Exception("provider down")
+    mock_vector.side_effect = Exception("qdrant down")
+    m = MitosSyncManager(config)  # rebuilt so the patched providers apply
+    axioms = os.path.join(config.workspace_dir, ".mitos", "axioms")
+    os.makedirs(axioms, exist_ok=True)
+    gone = os.path.join(axioms, "gone.md")
+    with open(gone, "w", encoding="utf-8") as f:
+        f.write("# Active Axioms for Scope: gone\nStale body.\n")
+
+    real_remove, fired = os.remove, []
+
+    def refuse_gone(path, *args, **kwargs):
+        if path == gone:
+            fired.append(path)
+            raise PermissionError(13, "Permission denied", path)
+        return real_remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "remove", refuse_gone)
+    res = m.record_decision_entry("Sweep failures never fail a write.", "Raising.",
+                                  ["reliability"], slug="sweep-refused")
+    monkeypatch.setattr(os, "remove", real_remove)
+
+    assert fired == [gone]
+    assert "error" not in res and res["status"] == "created"
+    assert GraphStore(config.db_path).get_node(res["id"]) is not None
+    captured = capsys.readouterr()
+    assert "[Warning]" not in captured.out
+    assert "gone.md" in captured.err
+    assert os.path.exists(gone)
+
+    m.record_decision_entry("A second write retries the sweep.", "Nothing.",
+                            ["reliability"], slug="sweep-retried")
+    assert not os.path.exists(gone)
+
+
 # --------------------------------------------------------------------------- #
 # MCP boundary
 # --------------------------------------------------------------------------- #
