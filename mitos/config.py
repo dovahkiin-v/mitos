@@ -50,8 +50,8 @@ RESOLVED_ENV_KEYS: Tuple[str, ...] = (
 CONFIG_DEFAULTS: Dict[str, Any] = {
     "rotation_mode": "archive",
     "rotation_archive_path_template": "decisions/archive/{year}-Q{quarter}.md",
-    # Sync-path rotation evaluates settledness once the buffer holds at least this
-    # many entries (`mitos.settledness`).
+    # Rotation evaluates settledness once the buffer holds at least this many entries
+    # (`mitos.settledness`) — at the end of `sync`, and after each `record` write.
     "rotation_volume_threshold_entries": 50,
     # How long a committed entry must go untouched (`updated_at`) before rotation may
     # move it. Deliberately long: a lag too short moves live work out of `sync`'s

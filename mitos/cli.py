@@ -76,7 +76,9 @@ from mitos.recall import (assess_query_recall, assess_surface_recall,
                           provenance_line, scope_filter_recovery)
 from mitos.sync import (MitosSyncManager, run_ambient_capture, _SLUG_MAX_LEN,
                         _ENTRIES_MARKER, _PAUSE_RESOLVING_RELATIONS,
-                        _declared_echo_lines, _split_relation_slugs)
+                        _declared_echo_lines, _split_relation_slugs,
+                        ROTATION_FAILED, ROTATION_REASON_DUPLICATED, ROTATION_ROTATED,
+                        ROTATION_SKIPPED, ROTATION_STAGE_FILE, ROTATION_STAGE_LOCK)
 from mitos._agent_block import agent_block, agent_block_drift, AGENT_GUIDE_VERSION
 from mitos.renderer import MitosRenderer, overflow_report
 from mitos.importer import MitosProseImporter
@@ -1825,6 +1827,11 @@ def cmd_record(
     stderr wall a ``--json`` consumer would miss. The existing exit codes are preserved (0
     created/exists, 2 needs_review, 1 error): exit code is the shell's signal, the JSON
     object is the agent's.
+
+    A ``created`` receipt may carry ``rotation``, the outcome of the bounded rotation
+    the write ran. The text surface prints what moved as receipt lines and a failure
+    as one stderr line with its recovery; ``--json`` emits the field as it is. A
+    rotation failure never changes the exit code — the write landed.
     """
     manager = MitosSyncManager(config)
     result = manager.record_decision_entry(
@@ -1933,6 +1940,14 @@ def cmd_record(
             print(f"  Entry:     {result['path']}  (where the existing entry lives)")
         else:
             print(f"  Written:   {result['path']}  (the human-readable entry — eyeball it)")
+    # This call's rotation, when it moved or skipped something: receipt lines, since
+    # they report what the call did. Named as OLDER entries — the one just written is
+    # at the head of decisions.md. A failure is not a receipt line; it rides stderr
+    # below, after the riders.
+    rotated = result.get("rotation")
+    if rotated and rotated.get("outcome") in (ROTATION_ROTATED, ROTATION_SKIPPED):
+        for line in _rotation_receipt_lines(rotated):
+            print(line)
     differs = result.get("differs")
     if differs:
         # AX round 10's ask, verbatim: *say what it ignored*. Named BEFORE the handle
@@ -1965,6 +1980,11 @@ def cmd_record(
     if review_notice:
         sys.stdout.flush()
         print(f"\n{review_notice}", file=sys.stderr)
+    # A rotation failure — the write stands. Same flush-first stderr shape, and before
+    # the coherence line, which stays last.
+    if rotated and rotated.get("outcome") == ROTATION_FAILED:
+        sys.stdout.flush()
+        print(f"\n{_rotation_failure_line(config, rotated)}", file=sys.stderr)
     # The standing coherence debt, last — so it reads as the answer to the notice
     # above it, which after the split carries no recovery of its own. Gated on the
     # FIELD, which sync sets on the `created` return alone: this text tail is shared
@@ -1978,6 +1998,46 @@ def cmd_record(
     if coherence:
         sys.stdout.flush()
         print(f"\n{coherence} {_coherence_audit_hint(config)}", file=sys.stderr)
+
+
+def _rotation_receipt_lines(report: Dict[str, Any]) -> List[str]:
+    """Words a record's ``rotated``/``skipped`` rotation field as receipt lines."""
+    lines = []
+    for archive in report.get("archives", []):
+        count = archive["entries"]
+        noun = "entry" if count == 1 else "entries"
+        lines.append(f"  Rotated:   {count} older settled {noun} to {archive['path']}")
+    # Exclusion is per block: a skipped entry stays while the rest of the batch may
+    # still have moved, so the line speaks for its own slug, never for the rotation.
+    for item in report.get("skipped", []):
+        if item["reason"] == ROTATION_REASON_DUPLICATED:
+            why = f"its block occurs {item['occurrences']} times in decisions.md"
+        else:
+            why = "its block overlaps another block in the batch"
+        lines.append(f"  Kept:      {item['slug']!r} in decisions.md — {why}, so it was "
+                     f"not moved")
+    return lines
+
+
+def _rotation_failure_line(config: MitosConfig, report: Dict[str, Any]) -> str:
+    """Composes the CLI's rotation-failure line — the cause plus this boundary's recovery.
+
+    The cause and the fact are the receipt's own (``error``, ``note``); only the
+    recovery is composed here, because the dict also reaches MCP, which names no
+    command. The route is the next record, never ``mitos sync``: a keyless sync
+    returns before it rotates, so naming it would print a route that does nothing.
+    """
+    line = (
+        f"[Warning] Archive rotation failed ({report['stage']}): {report['error']}. "
+        f"{report['note']} Nothing needs re-running: the next "
+        f"`mitos -p {config.project!r} record` that finds the buffer at its rotation "
+        f"threshold tries again."
+    )
+    if report["stage"] == ROTATION_STAGE_FILE:
+        line += " If it keeps failing, fix the file or directory the error names."
+    elif report["stage"] == ROTATION_STAGE_LOCK:
+        line += " If it keeps failing, find the process holding the decisions.md lock."
+    return line
 
 
 def _read_text_arg(inline: Optional[str], file_path: Optional[str]) -> Optional[str]:

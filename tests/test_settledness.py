@@ -27,6 +27,7 @@ from mitos.settledness import (
     UNPARSEABLE,
     UNSTAMPED,
     WINDOW_MISMATCH,
+    buffered_entries,
     select_settled_tail,
 )
 
@@ -329,6 +330,27 @@ def test_a_heading_inside_a_transcript_is_not_counted() -> None:
     buffer = _buffer(_block("above"), _TRANSCRIPT_BLOCK, _block("below"))
 
     assert _select(buffer, FakeGraph(), threshold=99).buffered == 3
+
+
+def test_the_record_paths_pre_gate_counts_what_the_selector_counts(tmp_path) -> None:
+    """R12 (3c): `buffered_entries` is the selector's own count, sample block excluded."""
+    from mitos import cli
+    cli.cmd_init(MitosConfig(str(tmp_path)))
+    with open(tmp_path / "decisions.md", encoding="utf-8") as fh:
+        seeded = fh.read()
+    texts = {
+        "init-seed": seeded,
+        "golden-reference": open(_GOLDEN, encoding="utf-8").read(),
+        "transcript": _buffer(_block("above"), _TRANSCRIPT_BLOCK, _block("below")),
+    }
+    counts = {name: buffered_entries(text) for name, text in texts.items()}
+
+    assert counts == {
+        name: _select(text, FakeGraph(), threshold=10**9).buffered
+        for name, text in texts.items()
+    }
+    assert counts["init-seed"] == 0 and counts["transcript"] == 3
+    assert counts["golden-reference"] > 0, "non-vacuity"
 
 
 @pytest.mark.parametrize("text", [

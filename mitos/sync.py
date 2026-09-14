@@ -10,6 +10,7 @@ import sys
 import shutil
 import re
 import json
+import sqlite3
 import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Dict, Optional, Any, Set, Tuple, Callable
@@ -438,6 +439,87 @@ _COHERENCE_AUDIT_NOTE = (
     "Coherence audit is cumulative and corpus-wide: this corpus holds recorded "
     "decisions that no contradiction check has covered yet."
 )
+
+# The `rotation` field of a `created` receipt: what this write's one bounded rotation
+# did. Runtime-only and never persisted; it crosses the JSON boundary on MCP
+# `record_decision` and `mitos record --json`, so it holds lists and dicts only. The
+# vocabulary lives here so the renderers and the tests import it rather than retype it.
+ROTATION_ROTATED = "rotated"
+ROTATION_SKIPPED = "skipped"
+ROTATION_FAILED = "failed"
+
+ROTATION_STAGE_LOCK = "lock"
+ROTATION_STAGE_GRAPH = "graph"
+ROTATION_STAGE_FILE = "file"
+ROTATION_STAGE_UNEXPECTED = "unexpected"
+
+ROTATION_REASON_DUPLICATED = "duplicated"
+ROTATION_REASON_OVERLAPPING = "overlapping"
+
+# A fact, not a recovery: like every receipt string it reaches MCP, so it names no
+# command. Each renderer composes its own recovery clause beside it.
+_ROTATION_FAILED_NOTE = (
+    "The decision was recorded. Rotation left decisions.md unchanged; an archive may "
+    "already hold a copy of the entries it was moving."
+)
+
+
+def _rotation_failure_stage(exc: BaseException) -> str:
+    """Classifies where a record-path rotation failed, by exception type.
+
+    ``filelock.Timeout`` subclasses ``TimeoutError`` and so ``OSError``: it is tested
+    first, or a busy lock would read as a file fault.
+    """
+    if isinstance(exc, Timeout):
+        return ROTATION_STAGE_LOCK
+    if isinstance(exc, (sqlite3.Error, DatabaseError)):
+        return ROTATION_STAGE_GRAPH
+    if isinstance(exc, (OSError, UnicodeError)):
+        return ROTATION_STAGE_FILE
+    return ROTATION_STAGE_UNEXPECTED
+
+
+def _rotation_failure(exc: Exception) -> Dict[str, Any]:
+    """Builds the receipt's ``rotation`` field for a rotation that raised."""
+    return {
+        "outcome": ROTATION_FAILED,
+        "stage": _rotation_failure_stage(exc),
+        "error": f"{type(exc).__name__}: {exc}",
+        "note": _ROTATION_FAILED_NOTE,
+    }
+
+
+def _rotation_report(outcome: "rotation.RotationOutcome") -> Optional[Dict[str, Any]]:
+    """Builds the receipt's ``rotation`` field from an outcome, or ``None`` for silence.
+
+    Archives are counted by basename exactly as sync's ``_report_rotation`` counts
+    them. A block left unmatched is silent here as it is on sync, so an outcome that
+    moved nothing and skipped nothing reports nothing.
+    """
+    skipped: List[Dict[str, Any]] = [
+        {"slug": label, "reason": ROTATION_REASON_DUPLICATED, "occurrences": count}
+        for label, count in outcome.duplicated
+    ]
+    skipped += [
+        {"slug": label, "reason": ROTATION_REASON_OVERLAPPING}
+        for label in outcome.overlapping
+    ]
+    if outcome.rotated:
+        archives = []
+        for archive_path in outcome.archive_paths:
+            name = os.path.basename(archive_path)
+            slugs = [
+                block.label for block in outcome.rotated
+                if os.path.basename(block.archive_name) == name
+            ]
+            archives.append({"path": archive_path, "entries": len(slugs), "slugs": slugs})
+        report: Dict[str, Any] = {"outcome": ROTATION_ROTATED, "archives": archives}
+        if skipped:
+            report["skipped"] = skipped
+        return report
+    if skipped:
+        return {"outcome": ROTATION_SKIPPED, "archives": [], "skipped": skipped}
+    return None
 
 # A new decision at/above this document-document similarity to an existing one the
 # author did NOT reference is paused for review (AX P4): the neighbour must surface
@@ -1640,6 +1722,13 @@ class MitosSyncManager:
         sync that returns before that — an empty buffer, no ``GEMINI_API_KEY``, or a
         lock timeout — evaluates nothing. A run whose entries were skipped for review
         does evaluate: an uncommitted entry is simply never settled.
+
+        On the record path ``record_decision_entry`` calls it once per ``created``
+        write, after that write's own lock hold has released, and only when the bytes
+        it just wrote hold at least ``rotation_volume_threshold_entries`` entries
+        (``settledness.buffered_entries``). Every other record exit — ``exists``,
+        ``needs_review``, an error, a lock timeout — evaluates nothing. The record
+        path turns a raise into its receipt's ``rotation`` field.
 
         Args:
             window: The most entries to evaluate, and so to move, in this acquisition.
@@ -3236,7 +3325,14 @@ class MitosSyncManager:
             unchecked; the notice names the cause and no command, each surface
             composing its own recovery), plus an always-present
             ``coherence_audit`` statement of the corpus's standing, cumulative
-            contradiction-check debt; OR, when a highly-similar unreferenced decision exists and
+            contradiction-check debt, plus an optional ``rotation`` report of the one
+            bounded rotation this write ran once its buffer reached
+            ``rotation_volume_threshold_entries``: ``outcome`` "rotated" (the
+            ``archives`` written, each ``{path, entries, slugs}``, and any
+            ``skipped``), "skipped" (nothing moved; each ``skipped`` element names
+            its slug and reason) or "failed" (``stage``/``error``/``note``; the write
+            still stands, and the field names no command); absent when nothing was
+            eligible; OR, when a highly-similar unreferenced decision exists and
             ``acknowledge_neighbors`` is False, a ``{status: "needs_review", code:
             "similar_decision_exists", slug, neighbors, message}`` pause that wrote
             NOTHING —
@@ -3649,6 +3745,29 @@ class MitosSyncManager:
                 "commit_failed", reason="another Mitos process holds the decisions.md lock"
             )
 
+        # 7b. One bounded rotation of the buffer's settled tail — the write landed, so
+        #     it is `created` and only `created` reaches here. It runs after the write's
+        #     lock hold releases, never woven into it, and takes its own acquisition,
+        #     reading the live buffer there: that one read holds the entry just written
+        #     plus anything a concurrent writer added since. `new_content` is exactly
+        #     the file just written, so it pre-gates the count without a second read —
+        #     below the threshold there is no acquisition at all. A stale gate either
+        #     way is harmless: the selector re-counts over the live read. One call, no
+        #     loop — the agent is blocked on this call, and the residual drains across
+        #     later writes. Unlike the embed and render steps around it, a failure here
+        #     prints nothing: it rides the receipt as data, and each renderer words it
+        #     once (a print here as well would say it twice on the CLI text surface).
+        rotation_report: Optional[Dict[str, Any]] = None
+        if (settledness.buffered_entries(new_content)
+                >= self.config.rotation_volume_threshold_entries):
+            try:
+                outcome = self._rotate_settled(window=settledness.ROTATION_WINDOW_ENTRIES)
+            except Exception as e:
+                rotation_report = _rotation_failure(e)
+            else:
+                if outcome is not None:
+                    rotation_report = _rotation_report(outcome)
+
         # 8. Embed best-effort (queues to the outbox if Gemini/Qdrant are down).
         try:
             self._best_effort_embed(delta, entry)
@@ -3707,4 +3826,8 @@ class MitosSyncManager:
         # by both surfaces (CLI prints it after the receipt; MCP returns it structured).
         if overflow_summary:
             result["scope_overflow"] = overflow_summary
+        # What this call's rotation did, only when it moved, skipped or failed — never
+        # the buffer's standing size, which is `mitos status`'s to report.
+        if rotation_report:
+            result["rotation"] = rotation_report
         return result

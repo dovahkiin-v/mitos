@@ -5,6 +5,7 @@ exposing surface_decisions and query_decisions tools to LLM clients.
 """
 
 import os
+import sys
 from typing import Optional, List, Dict, Any, Tuple
 from mcp.server.fastmcp import FastMCP
 
@@ -1280,6 +1281,16 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
     )
 
 
+#: MCP's recovery clause for a record-path rotation failure: a fact and a human next
+#: actor, never a command (the CLI text renderer composes its own). The register
+#: follows `recall.MISSING_GRAPH_POINTERS["mcp"]`.
+ROTATION_FAILURE_RECOVERY = (
+    "Nothing needs calling again: the decision is recorded, and the next "
+    "record_decision on this project tries rotation again. If it keeps failing, a "
+    "person with a shell in that project looks at the cause named in error."
+)
+
+
 @mcp.tool()
 def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str,
                     mechanisms: Optional[List[str]] = None, context: Optional[str] = None,
@@ -1357,7 +1368,10 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
         for neighbours that stand independently — or both at once for a mixed set. A "created"
         result MAY carry `neighbor_review_unavailable` (the near-dup review could
         not run; absent neighbours are not checked-clean) or a debounced
-        `scope_overflow` health nudge (not about this decision).
+        `scope_overflow` health nudge (not about this decision). It MAY carry
+        `rotation`: OLDER settled entries this call moved to an archive
+        (outcome "rotated", `archives`), or outcome "failed" with `stage`,
+        `error` and `recovery` — the write still stands.
     """
     config = _target_config(project, "record_decision")
     # Build our own writable manager — do NOT reuse get_workspace_components()
@@ -1365,7 +1379,7 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
     # resolved once above like the read tools. The import stays LAZY: mcp_server →
     # sync → cli → mcp_server is a real cycle, broken only by all three edges
     # being deferred to call time, and this is one of the three.
-    from mitos.sync import MitosSyncManager
+    from mitos.sync import ROTATION_FAILED, MitosSyncManager
     manager = MitosSyncManager(config)
     result = manager.record_decision_entry(
         axiom=axiom,
@@ -1385,6 +1399,18 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
         slug=slug,
         acknowledge_neighbors=acknowledge_neighbors,
     )
+    # A rotation failure leaves the write standing. The receipt carries the cause;
+    # this boundary adds its own recovery (no command — an agent handed one runs it)
+    # and one line to the server's stderr for whoever reads its log. Never stdout:
+    # that is the JSON-RPC channel.
+    rotation_report = result.get("rotation")
+    if rotation_report and rotation_report.get("outcome") == ROTATION_FAILED:
+        rotation_report["recovery"] = ROTATION_FAILURE_RECOVERY
+        print(
+            f"[Warning] Archive rotation failed after recording {result.get('slug')!r} "
+            f"in {config.workspace_dir}: {rotation_report['error']}",
+            file=sys.stderr,
+        )
     # The receipt names the corpus it just wrote to — the highest-value stamp in
     # the set precisely because it is the write: a mis-aimed read wastes a turn,
     # a mis-aimed write lands a real entry in another project's gold source.

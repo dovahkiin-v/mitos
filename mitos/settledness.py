@@ -88,6 +88,29 @@ class Selection:
     stopped_at: Optional[Tuple[str, str]] = None
 
 
+def buffered_entries(buffer_text: str) -> int:
+    """Counts the buffer's entries — the trigger's count, the same one the selector makes.
+
+    A caller that already holds the buffer's bytes pre-gates on this before taking the
+    lock, so it and :func:`select_settled_tail` share one home for the section rule and
+    cannot count differently.
+
+    Args:
+        buffer_text: The buffer's text.
+
+    Returns:
+        Entry headings after the buffer's sentinel; the init sample block above it is
+        not counted.
+    """
+    return len(_entry_heads(buffer_text)[1])
+
+
+def _entry_heads(buffer_text: str) -> Tuple[List[str], List[int]]:
+    """Splits the buffer into lines and indexes its entry headings: the one count rule."""
+    lines = buffer_text.splitlines(keepends=True)
+    return lines, markers.entry_heading_indices(lines)
+
+
 def select_settled_tail(
     buffer_text: str,
     *,
@@ -117,8 +140,7 @@ def select_settled_tail(
         ValueError: If ``now`` does not parse or carries no offset.
         Exception: Whatever a graph read raises.
     """
-    lines = buffer_text.splitlines(keepends=True)
-    heads = markers.entry_heading_indices(lines)
+    lines, heads = _entry_heads(buffer_text)
     buffered = len(heads)
     if buffered == 0 or buffered < threshold or window < 1:
         return Selection(buffered=buffered)

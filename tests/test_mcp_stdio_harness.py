@@ -784,6 +784,112 @@ def test_only_json_rpc_reaches_the_transport(tmp_path):
     assert "Starting Mitos MCP Server" not in stdout
 
 
+def _rotating_workspace(root, name, *, env, broken_archive=False):
+    """A workspace whose next record crosses the rotation threshold with a settled tail.
+
+    Built with no patching, since none crosses a process boundary: three keyless
+    records at the default threshold, then `config.toml`'s seeded rotation lines
+    REPLACED (tomllib refuses a duplicate key) and every node back-dated in SQL. With
+    `broken_archive`, `decisions/archive` is a regular file, so rotation's archive read
+    raises `NotADirectoryError` and writes nothing.
+    """
+    import re
+    import sqlite3
+    from datetime import datetime, timedelta, timezone
+
+    ws = _workspace(root, name, env=env)
+    for index in range(3):
+        _run_mitos(
+            "-p", str(ws), "record", f"The {name} seed-{index} axiom.",
+            "--rejected", "rej", "--slug", f"seed-{index}", "--acknowledge-neighbors",
+            cwd=ws, env=env,
+        )
+    config_path = ws / ".mitos" / "config.toml"
+    text = config_path.read_text(encoding="utf-8")
+    text, n_threshold = re.subn(r"^rotation_volume_threshold_entries = .*$",
+                                "rotation_volume_threshold_entries = 3", text, flags=re.M)
+    text, n_lag = re.subn(r"^rotation_lag_days = .*$", "rotation_lag_days = 1", text,
+                          flags=re.M)
+    assert (n_threshold, n_lag) == (1, 1), text
+    config_path.write_text(text, encoding="utf-8")
+    stamp = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+    conn = sqlite3.connect(ws / ".mitos" / "graph.sqlite")
+    with conn:
+        conn.execute("UPDATE nodes SET updated_at = ?", (stamp,))
+    conn.close()
+    if broken_archive:
+        (ws / "decisions").mkdir()
+        (ws / "decisions" / "archive").write_text("not a directory\n", encoding="utf-8")
+    return ws
+
+
+def test_a_rotating_record_and_a_failing_one_keep_the_transport_json_rpc(tmp_path):
+    """R13 (surface-entropy 3c): record-path rotation, both outcomes, over real stdio.
+
+    One server, two workspaces addressed per call: A's record rotates its settled
+    tail, B's rotation fails on an archive path that is a file. Every stdout line is
+    JSON-RPC, each receipt carries its `rotation` outcome, and the failure's operator
+    line is on the server's stderr — the channel a stray flushed print would corrupt.
+    """
+    env = _scaffold_env(tmp_path)
+    ws_a = _rotating_workspace(tmp_path, "ws_rotates", env=env)
+    ws_b = _rotating_workspace(tmp_path, "ws_fails", env=env, broken_archive=True)
+
+    def call(request_id, ws):
+        return {
+            "jsonrpc": "2.0", "id": request_id, "method": "tools/call",
+            "params": {"name": "record_decision", "arguments": {
+                "project": str(ws), "axiom": "A fresh write.", "rejected_paths": "rej",
+                "scope": [], "slug": "fresh-write", "acknowledge_neighbors": True,
+            }},
+        }
+
+    exchange = "".join(json.dumps(message) + "\n" for message in (
+        {
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "rotation-probe", "version": "0"},
+            },
+        },
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        call(2, ws_a),
+        call(3, ws_b),
+    ))
+
+    stdout, stderr = _raw_stdio_exchange(exchange, expect_lines=3, cwd=ws_a, env=env)
+
+    lines = [line for line in stdout.splitlines() if line.strip()]
+    assert len(lines) == 3, f"stdout:\n{stdout}\nstderr:\n{stderr}"
+    messages = []
+    for line in lines:
+        try:
+            messages.append(json.loads(line))
+        except json.JSONDecodeError as exc:
+            raise AssertionError(
+                f"non-JSON line on the protocol channel: {line!r} ({exc})"
+            ) from exc
+    by_id = {message.get("id"): message for message in messages}
+    rotated, failed = (
+        json.loads(by_id[request_id]["result"]["content"][0]["text"])
+        for request_id in (2, 3)
+    )
+
+    assert rotated["status"] == "created", rotated
+    assert rotated["rotation"]["outcome"] == "rotated"
+    assert rotated["rotation"]["archives"][0]["entries"] == 3
+    assert "recovery" not in rotated["rotation"]
+    assert by_id[3]["result"].get("isError") is False
+    assert failed["status"] == "created", failed
+    assert failed["rotation"]["outcome"] == "failed"
+    assert failed["rotation"]["stage"] == "file"
+    assert failed["rotation"]["recovery"]
+    assert any(line.startswith("[Warning] Archive rotation failed")
+               for line in stderr.splitlines()), stderr
+    assert "Starting Mitos MCP Server" not in stdout
+
+
 def test_the_harness_refuses_an_undeclared_environment_or_launch_directory(tmp_path):
     """Neither the environment nor the launch directory may be left implicit.
 
