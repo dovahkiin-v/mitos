@@ -422,8 +422,10 @@ def test_f6_the_sweep_runs_only_unfiltered_and_takes_only_its_own_files(frame) -
 # --------------------------------------------------------------------------- #
 
 # Values that differ between the two workspaces because they count or name their
-# entries, not because of overflow.
-_COUNT_SHAPED_CHECKS = {"graph_nodes", "active_nodes"}
+# entries, not because of overflow. The buffer's two size counts (surface-entropy 3d)
+# are the same class: the two corpora hold different entries.
+_COUNT_SHAPED_CHECKS = {"graph_nodes", "active_nodes",
+                        "decisions_buffer_entries", "decisions_buffer_chars"}
 
 
 def test_f7_status_reports_overflow_without_moving_the_verdict(frame) -> None:

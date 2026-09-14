@@ -1024,10 +1024,13 @@ def test_a_selectorless_status_renders_the_global_overview(
 
 
 # The `checks` map as it ships, spelled rather than counted: the assertion is that
-# the map did not GROW, and a count says that only until two edits cancel out. A
-# resolved path is not a verdict, so none of the four may ever appear in here.
+# the map did not GROW, and a count says that only until two edits cancel out. The
+# map holds verdicts and the counts that qualify them (surface-entropy 3d added the
+# buffer's two size counts beside its bool); a resolved path is neither, so none of
+# the four may ever appear in here.
 _SHIPPED_CHECK_KEYS = {
-    "mitos_workspace", "decisions_buffer", "format_spec", "gemini_api_key",
+    "mitos_workspace", "decisions_buffer", "decisions_buffer_entries",
+    "decisions_buffer_chars", "format_spec", "gemini_api_key",
     "qdrant_reachable", "collection_exists", "collection_points", "graph_nodes",
     "active_nodes", "missing_active_vectors", "missing_active_slugs",
     "orphan_points", "graph_unbuilt", "mcp_project_entry",

@@ -24,6 +24,7 @@ from mitos import check
 from mitos import overview
 from mitos import registry
 from mitos import routing
+from mitos import settledness
 from mitos.display import (
     apply_stdout_text_safety,
     blackout_note,
@@ -80,7 +81,7 @@ from mitos.sync import (MitosSyncManager, run_ambient_capture, _SLUG_MAX_LEN,
                         ROTATION_FAILED, ROTATION_REASON_DUPLICATED, ROTATION_ROTATED,
                         ROTATION_SKIPPED, ROTATION_STAGE_FILE, ROTATION_STAGE_LOCK)
 from mitos._agent_block import agent_block, agent_block_drift, AGENT_GUIDE_VERSION
-from mitos.renderer import MitosRenderer, overflow_report
+from mitos.renderer import MitosRenderer, estimate_tokens, overflow_report
 from mitos.importer import MitosProseImporter
 
 
@@ -2962,6 +2963,34 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
     )
     decisions_ok = os.path.exists(config.decisions_file)
     spec_ok = os.path.exists(os.path.join(workspace_dir, "format-spec.md"))
+    # The buffer's size, measured BESIDE the existence check and never folded into
+    # it: `decisions_ok` feeds `initialized`, so a size-shaped gate would make a large
+    # healthy buffer read as not set up. Entries is the rotation trigger's own count
+    # (`settledness.buffered_entries`), so this report and the trigger cannot disagree
+    # about what "N entries" means; chars is `len` of the same read. No lock: every
+    # mitos buffer writer replaces the file whole, so this read sees one whole version
+    # of a mitos write — a human's non-atomic editor save can still be read mid-way,
+    # which is harmless for a number the next `status` corrects. `None` means "not
+    # measured" (absent or unreadable), distinct from a measured `0`. The catch covers
+    # the read only: a counting defect must surface, not render as unreadable.
+    buffer_entries: Optional[int] = None
+    buffer_chars: Optional[int] = None
+    buffer_note: Optional[str] = None
+    if decisions_ok:
+        try:
+            buffer_text = read_text_or_none(config.decisions_file)
+        except (OSError, UnicodeError) as exc:
+            buffer_text = None
+            buffer_note = f"size could not be read ({type(exc).__name__})"
+        if buffer_text is not None:
+            buffer_entries = settledness.buffered_entries(buffer_text)
+            buffer_chars = len(buffer_text)
+            buffer_note = (
+                f"{buffer_entries:,} {'entry' if buffer_entries == 1 else 'entries'}, "
+                f"{buffer_chars:,} chars ({_fmt_k(estimate_tokens(buffer_chars))} tokens)"
+                f" — rotation archives settled entries once "
+                f"{config.rotation_volume_threshold_entries} or more are buffered"
+            )
     key_source = _gemini_key_source(workspace_dir)
     key_ok = key_source is not None
     q = _check_qdrant(config.qdrant_url, config.qdrant_collection)
@@ -3113,8 +3142,8 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
             "collection": config.qdrant_collection,
             # The four resolved corpus locations, flat beside the other
             # resolved-identity values rather than in a `paths` sub-map: `checks` is
-            # the payload's only nested map and it is a homogeneous verdict map,
-            # which these explicitly are not (a path passes and fails nothing). The
+            # the payload's only nested map and it holds verdicts and the counts that
+            # qualify them, never locations (a path passes and fails nothing). The
             # key names mirror `MitosConfig.to_dict()`'s spellings so a consumer
             # reading both finds the same words — a naming convention, deliberately
             # NOT a code coupling: bound as attributes, so a future rename inside a
@@ -3128,6 +3157,11 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
             "checks": {
                 "mitos_workspace": mitos_dir_ok,
                 "decisions_buffer": decisions_ok,
+                # Siblings, not a retype: the bool above is shipped. Both are ints
+                # together or `None` together (absent or unreadable), never `0` for
+                # unknown — `0` is a measured fresh buffer.
+                "decisions_buffer_entries": buffer_entries,
+                "decisions_buffer_chars": buffer_chars,
                 "format_spec": spec_ok,
                 "gemini_api_key": key_ok,
                 "qdrant_reachable": q["reachable"],
@@ -3205,13 +3239,20 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
         # parenthetical is the report's shipped idiom (`Qdrant reachable (…)`,
         # `GEMINI_API_KEY (from …)`). The `mitos init` hint stays bare because
         # `init` is selector-exempt — a bare `mitos init` is runnable, not a wall.
+        #
+        # The 4th slot (see the collection row below) carries the buffer's size on
+        # every state where it was measured, unconditionally and with no glyph: the
+        # buffer reaches the rotation threshold on every cycle by design, so a
+        # threshold-conditioned warning would fire in the healthy, managed state.
         (f"decisions.md buffer ({config.decisions_file})", decisions_ok,
-         "created by `mitos init`"),
+         "created by `mitos init`", buffer_note),
         # Reference copy for humans/agents — the parser reads the spec from the
         # installed package, so a missing workspace copy never gates readiness:
         # neutral "—", never a ✗ under a READY ✓ verdict (✗ is for real blockers).
+        # The hint states that fact; it presupposes no lost copy.
         ("format-spec.md", True if spec_ok else None,
-         "restore the reference copy: re-run `mitos init` (non-destructive)"),
+         "an optional reference for humans and agents — the parser reads the copy "
+         "bundled with mitos, and `mitos init` writes one here"),
         ("GEMINI_API_KEY" + (f" (from {key_source})" if key_source else ""), key_ok,
          "set it once for all projects: `mitos set-key --global <KEY>`"),
         (f"Qdrant reachable ({config.qdrant_url})", q["reachable"],
