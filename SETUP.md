@@ -586,3 +586,12 @@ which `mitos rebuild` reads.
 > tag hides the decision from scope-filtered reads. A scope line whose tags only moved
 > is also reported and reconciled the same way; it hides nothing, but the first tag
 > decides which scope the full entry renders under.
+
+> **An archive written by a released mitos 0.17.4 or earlier holds each rotated batch
+> oldest-first.** Those versions appended every batch to the end of its quarter file in
+> commit order, while `mitos rebuild` reads each corpus file newest-first. A batch holding
+> a decision and a later entry that cites it can therefore replay in the wrong order, and
+> `rebuild` refuses the swap, reporting casualties such as `missing_target`. The heal is in
+> the file: reverse the order of the entry blocks inside that archive so the newest entry
+> is on top, then run `mitos rebuild -p .` again. Later versions insert each batch
+> newest-first.
