@@ -993,8 +993,9 @@ def list_scopes(include_archived: bool = False, project: Optional[str] = None) -
         this scope first, and `co_tagged_scopes` is how many other scopes share a
         decision with it (both 0 for a scope with no active decision). A large
         `active_decisions` with a small `authored_first_decisions` marks a tag
-        rarely chosen first; what that means is yours to judge. The other three name the corpus the vocabulary came from: the
-        project as you addressed it, its derived collection, and its path.
+        rarely chosen first; what that means is yours to judge. The other three
+        name the corpus the vocabulary came from: the project as you addressed it,
+        its derived collection, and its path.
     """
     config = _target_config(project, "list_scopes")
     store, _embed, _vec = get_workspace_components(config)
