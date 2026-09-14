@@ -9,7 +9,7 @@ from typing import Optional, List, Dict, Any, Tuple
 from mcp.server.fastmcp import FastMCP
 
 from mitos import registry, routing
-from mitos.display import blackout_note, clamp_limit, dumps_display, letter_payload, oneline_payload, order_scope_counts, projects_payload, show_payload
+from mitos.display import blackout_note, clamp_limit, dumps_display, letter_payload, oneline_payload, order_scope_counts, projects_payload, scope_report, show_payload
 from mitos.config import MitosConfig
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS
 from mitos.embeddings import GeminiEmbeddingProvider
@@ -952,7 +952,7 @@ def list_decisions(scope: Optional[str] = None, state: str = "active", brief: bo
 
 @mcp.tool()
 def list_scopes(include_archived: bool = False, project: Optional[str] = None) -> str:
-    """List the project's scope-tag vocabulary with each domain's live-node counts.
+    """List the project's scope-tag vocabulary with live-node counts and scope health.
 
     The map an agent reads BEFORE recording or recalling: every scope tag that
     carries a live node, ranked busiest-domain-first (total active decisions +
@@ -969,6 +969,11 @@ def list_scopes(include_archived: bool = False, project: Optional[str] = None) -
     stamp). An empty/fresh project returns `{"scopes": {}, …}` — a valid empty
     vocabulary, never an error, and the provenance says which project was empty.
 
+    The counts cover every decision the graph holds, archived entries included, and
+    list only tags the graph still carries. A scope change to an archived entry
+    reaches the graph only through a full rebuild, which no tool here performs — a
+    person runs it.
+
     Args:
         include_archived: When False (default), returns only live domains (≥1 active
             decision OR ≥1 parked open question). When True, additionally includes
@@ -981,9 +986,14 @@ def list_scopes(include_archived: bool = False, project: Optional[str] = None) -
 
     Returns:
         A JSON string: `{scopes, project, collection, workspace}`. `scopes` is an
-        ordered map `{scope: {active_decisions, parked_open_questions}}`, busiest
-        domain first — the key order of THAT map IS the deliverable, so iterate it
-        as-is. The other three name the corpus the vocabulary came from: the
+        ordered map `{scope: {active_decisions, parked_open_questions,
+        authored_first_decisions, co_tagged_scopes}}`, busiest domain first — the
+        key order of THAT map IS the deliverable, so iterate it as-is. The last two
+        count active decisions only: `authored_first_decisions` is how many list
+        this scope first, and `co_tagged_scopes` is how many other scopes share a
+        decision with it (both 0 for a scope with no active decision). A large
+        `active_decisions` with a small `authored_first_decisions` marks a tag
+        rarely chosen first; what that means is yours to judge. The other three name the corpus the vocabulary came from: the
         project as you addressed it, its derived collection, and its path.
     """
     config = _target_config(project, "list_scopes")
@@ -993,7 +1003,10 @@ def list_scopes(include_archived: bool = False, project: Optional[str] = None) -
     # tag literally named `project`/`collection`/`workspace` would otherwise have
     # its own vocabulary silently overwritten by the provenance.
     envelope = {
-        "scopes": order_scope_counts(store.get_scope_counts(include_archived=include_archived)),
+        "scopes": scope_report(
+            store.get_scope_counts(include_archived=include_archived),
+            store.get_scope_discrimination(),
+        ),
     }
     envelope.update(corpus_provenance(config))
     return dumps_display(envelope, ensure_ascii=False, indent=2)

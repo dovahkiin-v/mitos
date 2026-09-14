@@ -33,6 +33,7 @@ from mitos.display import (
     oneline_payload,
     order_scope_counts,
     projects_payload,
+    scope_report,
     truncate_words,
     resolve_display_ensure_ascii,
     show_payload,
@@ -1619,7 +1620,7 @@ def cmd_open_questions(config: MitosConfig, scope: Optional[str] = None,
 
 
 def cmd_scopes(config: MitosConfig, as_json: bool = False, archived: bool = False) -> None:
-    """Enumerates the scope-tag vocabulary with each domain's live-node counts.
+    """Enumerates the scope-tag vocabulary with live-node counts and scope health.
 
     The discovery surface for the project's scope vocabulary — the CLI twin of the
     MCP ``list_scopes`` tool. An agent landing in a project can already *record*
@@ -1628,7 +1629,14 @@ def cmd_scopes(config: MitosConfig, as_json: bool = False, archived: bool = Fals
     decisions + parked open questions, descending; ties alphabetical), so the
     domains that matter most read first. Use it before recording or recalling, to
     learn the project's vocabulary instead of guessing it. A pure graph read — no
-    API key or Qdrant needed.
+    API key or Qdrant needed, and no model call.
+
+    Beside the counts it reports each scope's discriminator (surface-entropy 2f):
+    how many active decisions wrote the tag first, and how many other tags share a
+    decision with it. The numbers are the instrument; the text proposes no edit.
+    The text form ends with the report's corpus boundary, whose recovery clause is
+    this surface's own (a selectored ``mitos rebuild``) — the ``--json`` body
+    carries no prose, so it stays byte-identical to the MCP payload.
 
     This returns a tag→counts *aggregate*, not a decision payload: there is no node
     ``id`` to stamp, so the "every decision-read surface stamps modifiers" rule does
@@ -1639,7 +1647,8 @@ def cmd_scopes(config: MitosConfig, as_json: bool = False, archived: bool = Fals
         as_json: Emit the machine-readable ``{scopes, project, collection,
             workspace}`` envelope (for agents) instead of the text table —
             ``scopes`` being the ordered ``{scope: {active_decisions,
-            parked_open_questions}}`` map, the rest naming the corpus it came
+            parked_open_questions, authored_first_decisions, co_tagged_scopes}}``
+            map, the rest naming the corpus it came
             from. The byte-identical twin of the MCP ``list_scopes`` payload.
         archived: Include fully-dead domains (every scope present in the graph at a
             ``0/0`` floor) — the scope-level parallel of ``list --state all``.
@@ -1653,7 +1662,10 @@ def cmd_scopes(config: MitosConfig, as_json: bool = False, archived: bool = Fals
     if not as_json:
         _echo_corpus(config)
     store = GraphStore(config.db_path)
-    counts = order_scope_counts(store.get_scope_counts(include_archived=archived))
+    counts = scope_report(
+        store.get_scope_counts(include_archived=archived),
+        store.get_scope_discrimination(),
+    )
 
     if as_json:
         # Same construction as the `list_scopes` twin, provenance last, so the
@@ -1673,13 +1685,25 @@ def cmd_scopes(config: MitosConfig, as_json: bool = False, archived: bool = Fals
 
     name_w = max(len("scope"), max(len(s) for s in counts))
     print(f"\nScopes ({len(counts)} found, busiest first):")
-    print("-" * (name_w + 30))
-    print(f"{'scope':{name_w}}   {'active':>6}  {'parked':>6}  {'total':>6}")
+    print("first: active decisions that list this scope first; "
+          "co-tags: other scopes sharing a decision with it.")
+    print("-" * (name_w + 47))
+    print(f"{'scope':{name_w}}   {'active':>6}  {'parked':>6}  {'total':>6}"
+          f"  {'first':>6}  {'co-tags':>7}")
     for scope, c in counts.items():
         active = c["active_decisions"]
         parked = c["parked_open_questions"]
-        print(f"{scope:{name_w}}   {active:>6}  {parked:>6}  {active + parked:>6}")
+        print(f"{scope:{name_w}}   {active:>6}  {parked:>6}  {active + parked:>6}"
+              f"  {c['authored_first_decisions']:>6}  {c['co_tagged_scopes']:>7}")
     print()
+    # The corpus boundary (D6). Truthful for what ships now: it names the rebuild
+    # route only — no repair verb for a scope exists yet, and the report prescribes
+    # no change to any tag.
+    print("These counts cover every decision the graph holds, including entries "
+          "whose source sits in decisions/archive/, and list only tags the graph "
+          "still carries.")
+    print("A change to an archived entry's **Scope:** line reaches the graph only "
+          f"through `mitos rebuild -p {config.project!r}`.")
 
 
 def cmd_projects(as_json: bool = False) -> None:
@@ -5792,7 +5816,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # scopes (alias: list_scopes — the MCP tool name, so an agent's first instinct works)
     scopes_p = subparsers.add_parser("scopes", aliases=["list_scopes"],
-                                     help="Enumerate the scope vocabulary with live-node counts (busiest first).")
+                                     help="Enumerate the scope vocabulary with live-node counts, authored-first and co-tag counts (busiest first).")
     scopes_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON (for agents).")
     scopes_p.add_argument("--archived", action="store_true", dest="archived",
                           help="Include fully-dead domains at a 0/0 floor (scope-level 'list --state all').")

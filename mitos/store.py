@@ -277,6 +277,45 @@ _SCOPE_ORDER_SQL: str = "ordinal, scope"
 # step 4 (identical on a ``mode=ro`` connection). Matched exactly so a locked,
 # corrupt or otherwise-broken read still raises.
 _MISSING_ORDINAL_ERROR: str = "no such column: ordinal"
+# A query that names the column qualified (``ns.ordinal``) gets a message carrying the
+# qualifier, which this does not match — so fallback-guarded reads name it unqualified.
+
+
+def _scope_discrimination_sql(scope_order: str) -> str:
+    """Builds the authored-first / co-tag aggregate behind ``get_scope_discrimination``.
+
+    ``scope_order`` is the per-node tag order that decides "first": ``_SCOPE_ORDER_SQL``,
+    or ``"scope"`` on a graph without the ordinal column. It is interpolated
+    unqualified into a window over the single ``node_scopes`` read, so a missing
+    column raises exactly ``_MISSING_ORDINAL_ERROR``. Ranking reads every row of a
+    node before the liveness join drops any node, and ``nodes`` stays unaliased so
+    ``_ACTIVE_VIEW_PREDICATE`` binds (the §4.3 alias trap).
+    """
+    return (
+        "WITH ranked AS ("
+        "SELECT node_id, scope, "
+        f"ROW_NUMBER() OVER (PARTITION BY node_id ORDER BY {scope_order}) AS position "
+        "FROM node_scopes), "
+        "live AS ("
+        "SELECT nodes.id AS node_id FROM nodes "
+        f"WHERE nodes.kind = 'decision' AND {_ACTIVE_VIEW_PREDICATE}), "
+        "tags AS ("
+        "SELECT ranked.node_id, ranked.scope, ranked.position "
+        "FROM ranked JOIN live ON live.node_id = ranked.node_id), "
+        "firsts AS ("
+        "SELECT scope, COUNT(*) AS n FROM tags WHERE position = 1 GROUP BY scope), "
+        "partners AS ("
+        "SELECT a.scope, COUNT(DISTINCT b.scope) AS n FROM tags a "
+        "JOIN tags b ON b.node_id = a.node_id AND b.scope <> a.scope "
+        "GROUP BY a.scope) "
+        "SELECT t.scope, "
+        "COALESCE(firsts.n, 0) AS authored_first_decisions, "
+        "COALESCE(partners.n, 0) AS co_tagged_scopes "
+        "FROM (SELECT DISTINCT scope FROM tags) t "
+        "LEFT JOIN firsts ON firsts.scope = t.scope "
+        "LEFT JOIN partners ON partners.scope = t.scope "
+        "ORDER BY t.scope"
+    )
 
 
 def state_matches(computed_state: str, state_filter: Optional[str]) -> bool:
@@ -2446,6 +2485,53 @@ class GraphStore:
                 row["scope"]: {
                     "active_decisions": int(row["active_decisions"]),
                     "parked_open_questions": int(row["parked_open_questions"]),
+                }
+                for row in rows
+            }
+        finally:
+            conn.close()
+
+    def get_scope_discrimination(self) -> Dict[str, Dict[str, int]]:
+        """Per scope tag, how often active decisions chose it first and what it shares.
+
+        The discriminator beside ``get_scope_counts``' liveness counts. A tag carried
+        by many active decisions but written first by few has stopped telling those
+        decisions apart; the pair makes that visible without judging it:
+
+        - ``authored_first_decisions``: active decisions whose first tag is this one.
+          "First" is the first row under the read rule ``_SCOPE_ORDER_SQL`` (authored
+          ordinal, tag as tiebreak) — never ``ordinal = 0``, which an older writer
+          gives every tag of a node.
+        - ``co_tagged_scopes``: the number of distinct other tags carried by at least
+          one active decision that also carries this one.
+
+        Both are decision-only, over the live set ``_ACTIVE_VIEW_PREDICATE`` selects
+        (the set ``get_decisions(state="active")`` returns). One DB-side aggregate;
+        tags are ranked among each node's own rows before liveness filters nodes, and
+        only the tag→pair map crosses into Python.
+
+        A read-only store over a graph without ladder step 4 has no ``ordinal``
+        column; on exactly that error the aggregate re-runs with primacy ordered by
+        tag, the order such a graph holds (as ``_scopes_for`` does). Any other SQLite
+        error propagates.
+
+        Returns:
+            ``{scope: {"authored_first_decisions": int, "co_tagged_scopes": int}}``
+            for every tag carried by at least one active decision, alphabetical by
+            the stored (casefolded) tag. An empty graph returns ``{}``.
+        """
+        conn = self._get_connection()
+        try:
+            try:
+                rows = conn.execute(_scope_discrimination_sql(_SCOPE_ORDER_SQL)).fetchall()
+            except sqlite3.OperationalError as e:
+                if _MISSING_ORDINAL_ERROR not in str(e):
+                    raise
+                rows = conn.execute(_scope_discrimination_sql("scope")).fetchall()
+            return {
+                row["scope"]: {
+                    "authored_first_decisions": int(row["authored_first_decisions"]),
+                    "co_tagged_scopes": int(row["co_tagged_scopes"]),
                 }
                 for row in rows
             }

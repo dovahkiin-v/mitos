@@ -1766,6 +1766,170 @@ def test_3a_parked_oq_counted_resolved_excluded(temp_store: GraphStore) -> None:
     assert temp_store.get_scope_counts()["dom"]["parked_open_questions"] == 1
 
 
+# ===========================================================================
+# Phase 2f (surface-entropy) — get_scope_discrimination: authored-first and
+# co-tag breadth per scope, over the active decision set.
+#
+# The same discipline as 3a's gate above: the aggregate answers in SQL, and the
+# expected map is computed in the test from the read verb's own answer —
+# `get_decisions(state="active")`, whose hydrated `scope` lists come back in
+# `ORDER BY ordinal, scope` order — never from the aggregate, so a bug the two
+# shared could not pass tautologically.
+# ===========================================================================
+
+
+def _discrimination_from_verbs(store: GraphStore) -> dict:
+    """Derives the discrimination pair from the active decisions' hydrated tag lists."""
+    firsts: dict = {}
+    partners: dict = {}
+    for node in store.get_decisions(state="active"):
+        tags = node.get("scope") or []
+        if not tags:
+            continue
+        firsts[tags[0]] = firsts.get(tags[0], 0) + 1
+        for tag in tags:
+            partners.setdefault(tag, set()).update(t for t in tags if t != tag)
+    return {
+        tag: {"authored_first_decisions": firsts.get(tag, 0),
+              "co_tagged_scopes": len(partners[tag])}
+        for tag in sorted(partners)
+    }
+
+
+def _seed_discrimination_graph(store: GraphStore) -> None:
+    """Multi-scoped decisions authored out of alphabetical order, plus the two
+    populations the pair must ignore.
+
+    - ``d1 [zeta, alpha]``, ``d2 [alpha, mid, zeta]``, ``d3 [mid, alpha]``, ``solo``.
+    - ``old [zeta, gone]``, superseded by a scopeless successor: counted, it would
+      give ``zeta`` a second authored-first and a ``gone`` partner.
+    - A parked OQ ``[oqonly, alpha]``: counted, it would list ``oqonly`` and give
+      ``alpha`` a third partner.
+    """
+    store.commit_parsed_entry(_decision(slug="d1", axiom="D1.", scope=["zeta", "alpha"]))
+    store.commit_parsed_entry(_decision(slug="d2", axiom="D2.", scope=["alpha", "mid", "zeta"]))
+    store.commit_parsed_entry(_decision(slug="d3", axiom="D3.", scope=["mid", "alpha"]))
+    store.commit_parsed_entry(_decision(slug="solo", axiom="Solo.", scope=["solo"]))
+    store.commit_parsed_entry(_decision(slug="old", axiom="Old.", scope=["zeta", "gone"]))
+    _commit_kill(store, "old-v2", "Old, replaced.", "supersedes", "old")
+    store.commit_parsed_entry(
+        _open_question(slug="q1", topic="Q1?", scope=["oqonly", "alpha"])
+    )
+
+
+def test_2f_discrimination_equals_the_read_verbs_derivation(temp_store: GraphStore) -> None:
+    """The counts==verbs gate for the new pair (F1)."""
+    _seed_discrimination_graph(temp_store)
+    result = temp_store.get_scope_discrimination()
+    assert result == _discrimination_from_verbs(temp_store)
+    # Non-vacuity (an aliased `nodes` or a dropped join reads as zeros everywhere),
+    # and the hand-read values, so the derivation itself is checked once.
+    assert any(v["authored_first_decisions"] for v in result.values())
+    assert any(v["co_tagged_scopes"] for v in result.values())
+    assert result == {
+        "alpha": {"authored_first_decisions": 1, "co_tagged_scopes": 2},
+        "mid": {"authored_first_decisions": 1, "co_tagged_scopes": 2},
+        "solo": {"authored_first_decisions": 1, "co_tagged_scopes": 0},
+        "zeta": {"authored_first_decisions": 1, "co_tagged_scopes": 2},
+    }
+    assert list(result) == sorted(result)  # alphabetical, presentation-neutral
+    assert all(type(n) is int for v in result.values() for n in v.values())
+
+
+def test_2f_discrimination_empty_graph_is_empty(temp_store: GraphStore) -> None:
+    assert temp_store.get_scope_discrimination() == {}
+
+
+def test_2f_tied_ordinals_count_authored_first_under_exactly_one_scope(
+    temp_store: GraphStore,
+) -> None:
+    """An older writer inserts every tag at ordinal 0; "first" is the read rule's first
+    row (`ORDER BY ordinal, scope`), never `ordinal = 0` (F2, G1).
+
+    The rows are inserted in a non-alphabetical rowid order, so a rule that followed
+    insertion order would also pick a different tag.
+    """
+    delta = temp_store.commit_parsed_entry(
+        _decision(slug="tied", axiom="Tied.", scope=["zeta", "ax", "cli"])
+    )
+    conn = temp_store._get_connection()
+    try:
+        with conn:
+            conn.execute("DELETE FROM node_scopes WHERE node_id = ?", (delta.node_id,))
+            for tag in ("zeta", "ax", "cli"):
+                conn.execute(
+                    "INSERT INTO node_scopes (node_id, scope, ordinal) VALUES (?, ?, 0)",
+                    (delta.node_id, tag),
+                )
+    finally:
+        conn.close()
+
+    result = temp_store.get_scope_discrimination()
+    assert sum(v["authored_first_decisions"] for v in result.values()) == 1
+    assert result["ax"]["authored_first_decisions"] == 1
+    assert result == _discrimination_from_verbs(temp_store)
+
+
+def test_2f_a_read_only_store_over_a_step3_graph_reads_tag_order_primacy(tmp_path) -> None:
+    """A graph without ladder step 4 answers with the order it holds (F3, D-2f-6).
+
+    Drives the real query, not a fake: SQLite names a qualified column in its
+    missing-column message (`no such column: ns.ordinal`), so a query that qualified
+    `ordinal` would miss the exact-message fallback, and only a real step-3 graph
+    can show that.
+    """
+    from test_scope_ordinal import _build_step3_graph
+
+    path = str(tmp_path / "graph.sqlite")
+    _build_step3_graph(path)
+    ro = GraphStore(path, read_only=True)
+    assert ro.get_scope_discrimination() == {
+        "ax": {"authored_first_decisions": 1, "co_tagged_scopes": 3},
+        "cli": {"authored_first_decisions": 0, "co_tagged_scopes": 3},
+        "solo": {"authored_first_decisions": 1, "co_tagged_scopes": 0},
+        "z": {"authored_first_decisions": 1, "co_tagged_scopes": 1},
+        "zeta": {"authored_first_decisions": 0, "co_tagged_scopes": 3},
+        "ä": {"authored_first_decisions": 0, "co_tagged_scopes": 1},
+        "ž": {"authored_first_decisions": 0, "co_tagged_scopes": 3},
+    }
+    conn = sqlite3.connect(path)
+    try:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3  # never migrated
+    finally:
+        conn.close()
+
+
+class _FailingConn:
+    """A connection whose first ``execute`` raises and whose later ones answer empty."""
+
+    def __init__(self, message: str) -> None:
+        self.message = message
+        self.calls = 0
+
+    def execute(self, sql, params=()):
+        self.calls += 1
+        if self.calls == 1:
+            raise sqlite3.OperationalError(self.message)
+        return self
+
+    def fetchall(self) -> list:
+        return []
+
+    def close(self) -> None:
+        pass
+
+
+def test_2f_the_fallback_catches_only_the_missing_ordinal_column(temp_store: GraphStore) -> None:
+    for message in ("database is locked", "no such column: ns.ordinal"):
+        with patch.object(temp_store, "_get_connection", return_value=_FailingConn(message)):
+            with pytest.raises(sqlite3.OperationalError, match=message):
+                temp_store.get_scope_discrimination()
+    legacy = _FailingConn("no such column: ordinal")
+    with patch.object(temp_store, "_get_connection", return_value=legacy):
+        assert temp_store.get_scope_discrimination() == {}
+    assert legacy.calls == 2
+
+
 def test_edge_kind_matrix_matches_ddl(temp_store: GraphStore) -> None:
     """`edge_kind_is_legal` must agree with the `edges` CHECK on every cell.
 
