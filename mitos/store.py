@@ -2807,6 +2807,31 @@ class GraphStore:
         finally:
             conn.close()
 
+    def get_incoming_edges(self, node_id: str) -> List[Dict[str, str]]:
+        """Lists the committed edges that point AT a node, as write facts.
+
+        The twin of ``get_outgoing_edges``: each edge as ``{"kind": edge_type,
+        "source": <citing node's current slug>}`` in insertion order. A rename reads
+        this to state which entries still cite the old handle in their markdown.
+
+        Args:
+            node_id: The target node's id.
+
+        Returns:
+            A list of ``{"kind", "source"}`` dicts, empty when nothing cites the node.
+        """
+        conn = self._get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT e.edge_type AS edge_type, n.slug AS slug "
+                "FROM edges e JOIN nodes n ON n.id = e.source_id "
+                "WHERE e.target_id = ? ORDER BY e.rowid",
+                (node_id,),
+            ).fetchall()
+            return [{"kind": r["edge_type"], "source": r["slug"]} for r in rows]
+        finally:
+            conn.close()
+
     def get_modifiers_map(self, node_ids: List[str]) -> Dict[str, Dict[str, List[str]]]:
         """Maps each node to the slugs of later decisions that modify it.
 

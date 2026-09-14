@@ -387,8 +387,8 @@ def test_two_same_slug_entries_survive_an_honest_splice():
 
 # --- the buffer-surgery primitive (P20's binding output) --------------------------
 #
-# `splice_buffer` exists so a future `amend-commentary` verb consumes a proven seam
-# rather than re-implementing `record_decision_entry`'s discipline. Two implementations
+# `splice_buffer` exists so `restore-source` and `amend_commentary` both consume a proven
+# seam rather than re-implementing `record_decision_entry`'s discipline. Two implementations
 # of a sacred contract can drift, so its properties are pinned directly here rather
 # than only transitively through `restore-source`.
 

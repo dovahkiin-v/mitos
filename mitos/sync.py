@@ -13,7 +13,7 @@ import json
 import sqlite3
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Dict, Optional, Any, Set, Tuple, Callable
+from typing import TYPE_CHECKING, List, Dict, Mapping, Optional, Any, Set, Tuple, Callable
 from filelock import FileLock, Timeout
 
 if TYPE_CHECKING:
@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from google import genai
 
 from mitos import __version__ as MITOS_VERSION
+from mitos import amend
 from mitos import atomic_file
 from mitos import rotation
 from mitos import settledness
@@ -75,6 +76,7 @@ from mitos.identity import SLUG_MAX_LEN, compute_node_id, embedding_text
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.vector_store import QdrantVectorStore, hash_to_uuid
 from mitos.renderer import MitosRenderer, summarize_overflows
+from mitos.restore import BufferFidelityError, verify_amended_buffer
 
 
 @dataclass
@@ -319,6 +321,32 @@ def _split_relation_slugs(raw: Optional[str]) -> List[str]:
 def _record_error(code: str, **fields: Any) -> Dict[str, str]:
     """Builds a structured {error, code} dict using the canonical message for ``code``."""
     return {"error": _ERROR_MESSAGES[code].format(**fields), "code": code}
+
+
+class _AmendAnswer(Exception):
+    """Carries an in-band amendment answer out of ``splice_buffer``.
+
+    Raised, never returned as text: a transform that returned the original buffer would
+    still write it, run ``after_write``, commit a no-op and attribute it. Raised from the
+    transform it writes nothing; raised from ``after_write`` it rolls the buffer back.
+    """
+
+    def __init__(self, result: Dict[str, Any]) -> None:
+        super().__init__(result.get("status"))
+        self.result = result
+
+
+class _AmendFault(Exception):
+    """Carries an amendment's environment or graph fault out of ``after_write``.
+
+    A private type, so the rollback path can tell it apart from ``splice_buffer``'s own
+    rollback-failure ``MitosError`` — nearly every mitos exception is a ``MitosError``.
+    """
+
+    def __init__(self, code: str, **fields: Any) -> None:
+        super().__init__(code)
+        self.code = code
+        self.fields = fields
 
 
 def _embedding_input_text(
@@ -3111,8 +3139,9 @@ class MitosSyncManager:
         # rewritten, graph updated, audit row silent. That is exactly the unattributed
         # graph mutation P8 forbids, inside the feature that adds the attribution row.
         # `None` means no-change to the store, which restores the documented
-        # write-once-preserved semantics; transcript reconciliation is homed in the
-        # future `amend-commentary` verb along with its own attribution.
+        # write-once-preserved semantics. `amend_commentary` shipped without transcript
+        # editing (it withholds the transcript too), so transcript reconciliation is
+        # still unhomed.
         entry.transcript = None
 
         try:
@@ -3197,9 +3226,10 @@ class MitosSyncManager:
 
         The buffer-surgery primitive: **lock → auto-heal → read → splice → write →
         verify → roll back on failure.** Extracted rather than inlined at its first
-        caller because it is exactly what a future ``amend-commentary`` verb consumes
-        — the P20 Retrofit Test allows deferring that verb only on the condition that
-        its wiring is not left to be retrofitted.
+        caller (``cli.cmd_restore_source``) so the commentary amendment could consume
+        it without a retrofit; ``amend_commentary`` is its second consumer, committing
+        the graph inside ``after_write`` so the buffer edit and the commit roll back
+        together.
 
         Modelled on ``record_decision_entry``'s buffer-first + rollback contract,
         which this project treats as sacred. That method is deliberately NOT refactored
@@ -3255,6 +3285,230 @@ class MitosSyncManager:
                     ) from restore_exc
                 raise
             return new_content
+
+    def _amend_divergence(self, entry: ParsedEntry, node: Dict[str, Any],
+                          stored_edges: List[Dict[str, str]]) -> Tuple[List[str], Dict[str, Any]]:
+        """Names every way a buffered block and its node already disagree.
+
+        Args:
+            entry: The parsed buffer block.
+            node: Its committed node.
+            stored_edges: The node's outgoing edges.
+
+        Returns:
+            ``(species, report)``: the diverged field names — commentary fields,
+            ``scope``, ``edges``, ``source``, and ``slug`` for a case-only difference the
+            casefold comparison does not report — and the ``entry_divergence`` report.
+        """
+        report = entry_divergence(entry, node, node.get("scope") or [], stored_edges)
+        species = set(report.get("commentary") or [])
+        for key in ("scope", "edges", "source"):
+            if report.get(key):
+                species.add(key)
+        if (entry.slug or "") != (node.get("slug") or ""):
+            species.add("slug")
+        return sorted(species), report
+
+    def amend_commentary(self, slug: str, changes: Mapping[str, Any]) -> Dict[str, Any]:
+        """Edits one committed buffered entry's mutable fields and re-commits it.
+
+        The tool-side replacement for hand-editing ``decisions.md`` and running a
+        reconcile. It repairs commentary — ``amend.EDITABLE_FIELDS``, the reconcile's
+        set less edges — and never what a decision says: the canonical core and the
+        edges are refused as requests, with the kill-edge routes as data.
+
+        One lock hold, through ``splice_buffer``. The transform classifies the target on
+        the live locked read and applies field-line surgery; ``after_write`` runs the
+        whole-buffer fence (``restore.verify_amended_buffer``), writes the write-ahead
+        attribution row, and commits — so a refused fence, an unwritable audit row or a
+        failed commit rolls the buffer back byte for byte. Embedding and rendering run
+        after the lock, best-effort, warnings on stderr only; stdout stays empty because
+        an MCP twin shares this path. No rotation is evaluated: the entry count never
+        changes, and the target's ``updated_at`` tick keeps it recent anyway.
+
+        A target whose buffered block already disagrees with its node (a hand edit not
+        yet reconciled, or a citation left stale by a rename elsewhere) is refused as
+        ``diverged``: committing it would also apply edge or field changes the request
+        did not name.
+
+        CC-21: ``record_decision_entry`` diverges from this fence and is not edited. Its
+        structural-token check refuses heading- and field-shaped lines in the prose
+        fields, and its self-parse count guard refuses a phantom entry from the list and
+        relation arguments, both before any write; a new block is prepended below the
+        entries marker, so continuation bleed cannot reach a neighbour.
+
+        Args:
+            slug: The target handle (a slug, or an id), resolved as ``show`` resolves it.
+            changes: Field → new value; keys from ``amend.EDITABLE_FIELDS``. ``slug`` is
+                the new slug; ``invalidates_if``/``context`` take ``None`` or ``""`` to
+                remove the field; ``scope`` takes a list, ``[]`` removing the line.
+
+        Returns:
+            A JSON-safe dict whose ``status`` is ``amended`` (``id``, ``fields_changed``,
+            ``embedding``, ``path``, and ``rename`` = ``{"from", "to", "incoming"}`` on a
+            rename), ``unchanged`` (``id``), ``refused`` (``reason``, ``fields``,
+            ``routes`` for ``canonical_core``), ``not_found``, ``archived`` (``id``) or
+            ``uncommitted``; or a fault ``{"error", "code", "slug"}`` with code
+            ``slug_collision``, ``commit_failed``, ``audit_unavailable``,
+            ``lock_timeout`` or ``rollback_failed``. Every string states a cause and
+            names no command.
+
+        Raises:
+            BufferFidelityError: If the edit would change the buffer beyond the request
+                (a phantom entry, neighbour bleed, a moved core or an unrequested field);
+                the buffer is rolled back first. The only designed raise.
+            ValidationError: If the handle's slug resolves to more than one active node
+                (an MI-13 breach is not "not found").
+        """
+        refusal = amend.validate_changes(changes)
+        if refusal is not None:
+            return {**refusal, "slug": slug}
+
+        state: Dict[str, Any] = {}
+
+        def _transform(original: str) -> str:
+            target = amend.classify_target(
+                original, slug=slug,
+                resolve=self.store.resolve_handle, lookup=self.store.get_node,
+            )
+            if isinstance(target, amend.Miss):
+                raise _AmendAnswer(target.result)
+            species, _ = self._amend_divergence(
+                target.entry, target.node, self.store.get_outgoing_edges(target.node_id)
+            )
+            if species:
+                raise _AmendAnswer(amend.refused(amend.REASON_DIVERGED, species))
+            expected = amend.expected_fingerprint(target.entry, changes)
+            if amend.fingerprint_matches(expected, target.entry):
+                raise _AmendAnswer({"status": amend.STATUS_UNCHANGED, "id": target.node_id})
+            # The baseline is the text this transform saw, never a pre-lock snapshot.
+            state.update(before=original, target=target, expected=expected)
+            return amend.apply_changes(original, target, changes)
+
+        def _verify_and_commit(after_text: str) -> None:
+            target = state["target"]
+            entry = verify_amended_buffer(
+                state["before"], after_text,
+                target_id=target.node_id, expected=state["expected"],
+            )
+            node = self.store.get_node(target.node_id)
+            if node is None:
+                raise _AmendAnswer({"status": amend.STATUS_UNCOMMITTED})
+            stored_edges = self.store.get_outgoing_edges(target.node_id)
+            # Re-checked against the graph as it is now: a concurrent sync reconciles
+            # outside this lock. Only the requested fields may differ from the node.
+            species, divergence = self._amend_divergence(entry, node, stored_edges)
+            unrequested = sorted(set(species) - set(changes))
+            if unrequested:
+                raise _AmendAnswer(amend.refused(amend.REASON_DIVERGED, unrequested))
+            prior, new_values = self._reconcile_value_pair(entry, node, divergence, stored_edges)
+            if entry.slug != node.get("slug") and "slug" not in new_values:
+                # A case-only rename: the divergence leaf compares casefold.
+                prior["slug"], new_values["slug"] = node.get("slug"), entry.slug
+
+            audit_id = uuid.uuid4().hex
+            try:
+                telemetry = TelemetryStore(self.config.telemetry_path)
+                telemetry.record_commentary_intent(
+                    CommentaryAuditRow(
+                        audit_id=audit_id,
+                        node_id=target.node_id,
+                        slug=node.get("slug"),
+                        fields_changed=sorted(new_values),
+                        prior_values=prior,
+                        new_values=new_values,
+                        mitos_version=MITOS_VERSION,
+                    ),
+                    created_at=_utc_now_iso(),
+                )
+            except Exception as exc:
+                raise _AmendFault("audit_unavailable", reason=str(exc)) from exc
+
+            # Graph-primary confirmation pair carried forward, transcript withheld: the
+            # reconcile's two rules, for the same reasons.
+            entry.confirmed_by = node.get("confirmed_by")
+            entry.confirmed_at = node.get("confirmed_at")
+            entry.transcript = None
+            try:
+                delta = self.store.commit_parsed_entry(entry)
+            except (CommitError, DatabaseError, ValidationError, OSError) as exc:
+                reason = str(exc)
+                fault: Dict[str, Any] = {"code": "commit_failed"}
+                if isinstance(exc, CommitError) and exc.failure:
+                    reason = "; ".join(item.message for item in exc.failure.items) or reason
+                    if any(item.code == STORE_SLUG_COLLISION for item in exc.failure.items):
+                        fault = {"code": "slug_collision", "requested": entry.slug}
+                if fault["code"] == "commit_failed":
+                    fault["reason"] = reason
+                # Append-only closure, best-effort: the mutation did not happen.
+                try:
+                    telemetry.record_commentary_outcome(
+                        audit_id=uuid.uuid4().hex,
+                        correlates_to=audit_id,
+                        outcome=f"failed: {reason}",
+                        created_at=_utc_now_iso(),
+                        mitos_version=MITOS_VERSION,
+                    )
+                except Exception:
+                    pass
+                raise _AmendFault(**fault) from exc
+            state.update(delta=delta, entry=entry, old_slug=node.get("slug"),
+                         fields_changed=sorted(new_values))
+
+        try:
+            self.splice_buffer(_transform, after_write=_verify_and_commit)
+        except _AmendAnswer as answer:
+            return {**answer.result, "slug": slug}
+        except _AmendFault as fault:
+            return amend.error_result(fault.code, slug=slug, **fault.fields)
+        except BufferFidelityError:
+            raise
+        except Timeout:
+            return amend.error_result("lock_timeout", slug=slug)
+        except MitosError as exc:
+            # `splice_buffer` raises a bare MitosError, chained, only when its rollback
+            # write failed; every other MitosError is a subclass.
+            if type(exc) is MitosError and exc.__cause__ is not None:
+                return amend.error_result("rollback_failed", slug=slug, reason=str(exc.__cause__))
+            raise
+        except OSError as exc:
+            return amend.error_result(
+                "commit_failed", slug=slug, reason=f"the buffer could not be read or written: {exc}"
+            )
+
+        target, entry, delta = state["target"], state["entry"], state["delta"]
+        result: Dict[str, Any] = {
+            "status": amend.STATUS_AMENDED,
+            "slug": entry.slug,
+            "id": target.node_id,
+            "fields_changed": state["fields_changed"],
+        }
+        if entry.slug != state["old_slug"]:
+            # Read after the commit: the id is unchanged, so the edges survive; what goes
+            # stale is the citing entries' markdown.
+            try:
+                incoming: Optional[List[Dict[str, str]]] = self.store.get_incoming_edges(
+                    target.node_id
+                )
+            except Exception as e:
+                print(f"[Warning] Could not read the entries citing '{entry.slug}': {e}",
+                      file=sys.stderr)
+                incoming = None
+            result["rename"] = {"from": state["old_slug"], "to": entry.slug, "incoming": incoming}
+
+        try:
+            self._best_effort_embed(delta, entry)
+        except Exception as e:
+            print(f"[Warning] Embedding step failed for '{entry.slug}': {e}", file=sys.stderr)
+        try:
+            # Unfiltered, so a vacated scope's file is swept and a moved primary follows.
+            MitosRenderer(self.config.workspace_dir).render_all(self.store)
+        except Exception as e:
+            print(f"[Warning] Failed to render active axioms: {e}", file=sys.stderr)
+
+        result["embedding"] = self._embedding_status(target.node_id)
+        result["path"] = self.config.decisions_file
+        return result
 
     def record_decision_entry(
         self,

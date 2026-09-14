@@ -15,7 +15,9 @@ fidelity is not enough: a block whose commentary happens to contain a `### ` lin
 stray `**Decided:**`, or a `[DECISION_TRANSCRIPT]` marker would re-parse to the right
 node id while ALSO minting a phantom entry — or would bleed into its neighbour, which
 the retired `mark` mode is a live demonstration of. So the whole buffer is re-parsed
-after the splice and every pre-existing entry must be byte-unchanged.
+after the splice and every pre-existing entry must be byte-unchanged. The commentary
+amendment's fence, `verify_amended_buffer`, lives here too and shares that parse: one
+entry is allowed to change, and only into the exact shape the request names.
 
 **Restored into the buffer, never an archive.** Restoring is a splice into the buffer.
 Archives are written only by rotation, which files a batch under the UTC quarter of
@@ -50,6 +52,14 @@ _RELATIONSHIP_EMISSION: Tuple[Tuple[str, str], ...] = (
 
 class RestoreError(MitosError):
     """A block could not be regenerated at full fidelity, so nothing was written."""
+
+
+class BufferFidelityError(MitosError):
+    """An amendment would change the buffer beyond its request, so nothing was kept.
+
+    Distinct from ``RestoreError``: a refused amendment is not a failed restore, and
+    ``cmd_restore_source`` catches ``RestoreError`` by name.
+    """
 
 
 def render_source_block(
@@ -214,6 +224,116 @@ def verify_block_in_isolation(block: str, node: Dict[str, Any]) -> None:
         raise RestoreError(f"'{slug}': scope did not survive the round trip")
 
 
+def _fingerprint_key(entry: Any) -> str:
+    """Serializes an entry's fingerprint to a comparable, hashable key."""
+    return json.dumps(_entry_fingerprint(entry), sort_keys=True, default=str)
+
+
+def _fingerprint_counts(entries: List[Any]) -> Dict[str, int]:
+    """Counts entries by fingerprint — the multiset both buffer verifiers compare."""
+    counts: Dict[str, int] = {}
+    for entry in entries:
+        key = _fingerprint_key(entry)
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def verify_amended_buffer(
+    before_text: str,
+    after_text: str,
+    *,
+    target_id: str,
+    expected: Dict[str, Any],
+) -> Any:
+    """Asserts an amended buffer changed exactly one entry, exactly as requested.
+
+    ``verify_whole_buffer(added=0)`` refuses every amendment by construction, because
+    the edited entry's fingerprint is precisely what changes; this sibling states the
+    exact expected side instead. A value line shaped like a heading mints a phantom, a
+    line bleeding into a neighbour shifts it, a `**Decided:**`/`**Mechanisms:**` line
+    moves the canonical core, and a smuggled `**Scope:**` or dropped relation line moves
+    a field the request did not name — each fails one condition below.
+
+    Args:
+        before_text: The buffer as read under the lock.
+        after_text: The buffer as written.
+        target_id: The amended entry's node id, which must not change.
+        expected: The fingerprint the amended entry must parse back as.
+
+    Returns:
+        The amended entry as parsed from ``after_text``, so the commit need not parse
+        a third time.
+
+    Raises:
+        BufferFidelityError: On a new parse failure, a changed entry count, a target that
+            no longer hashes to ``target_id`` (or appears other than once), any other
+            entry changed, or a target whose fields differ from ``expected``.
+    """
+    from mitos.identity import compute_node_id
+    from mitos.parser import parse_entry_stream
+
+    before_failures: List[Any] = []
+    after_failures: List[Any] = []
+    before = parse_entry_stream(before_text, "decision", failures=before_failures)
+    after = parse_entry_stream(after_text, "decision", failures=after_failures)
+
+    if len(after_failures) > len(before_failures):
+        raise BufferFidelityError(
+            f"the amendment introduced a parse failure: {after_failures[-1]}"
+        )
+    if len(after) != len(before):
+        raise BufferFidelityError(
+            f"the amendment changed the entry count from {len(before)} to {len(after)} — "
+            "a value line opened an entry of its own"
+        )
+
+    def _hits(entries: List[Any]) -> List[int]:
+        return [
+            index for index, entry in enumerate(entries)
+            if compute_node_id(kind=entry.kind, axiom=entry.axiom,
+                               mechanism_refs=entry.mechanisms) == target_id
+        ]
+
+    before_hits, after_hits = _hits(before), _hits(after)
+    if len(before_hits) != 1:
+        raise BufferFidelityError(
+            f"the buffer holds {len(before_hits)} copies of the target entry, expected 1"
+        )
+    if len(after_hits) != 1:
+        raise BufferFidelityError(
+            "the amended entry no longer hashes to its node — a value line changed its "
+            "canonical core"
+            if not after_hits else
+            f"the amended buffer holds {len(after_hits)} copies of the target entry"
+        )
+
+    before_counts = _fingerprint_counts([e for i, e in enumerate(before) if i != before_hits[0]])
+    after_counts = _fingerprint_counts([e for i, e in enumerate(after) if i != after_hits[0]])
+    if before_counts != after_counts:
+        changed = next(
+            (key for key, count in before_counts.items() if after_counts.get(key, 0) < count),
+            None,
+        )
+        slug = json.loads(changed).get("slug") if changed else None
+        raise BufferFidelityError(
+            f"the amendment altered the neighbouring entry {slug!r} — continuation-line "
+            "bleed across an entry boundary"
+        )
+
+    amended = after[after_hits[0]]
+    if _fingerprint_key(amended) != json.dumps(expected, sort_keys=True, default=str):
+        actual = _entry_fingerprint(amended)
+        moved = sorted(
+            field for field in actual
+            if json.dumps(actual[field], default=str) != json.dumps(expected.get(field), default=str)
+        )
+        raise BufferFidelityError(
+            f"the amended entry does not parse as requested — field(s) {moved} differ "
+            "from the request"
+        )
+    return amended
+
+
 def verify_whole_buffer(before_text: str, after_text: str, added: int) -> None:
     """Asserts the spliced buffer gained exactly ``added`` entries and disturbed none.
 
@@ -253,14 +373,8 @@ def verify_whole_buffer(before_text: str, after_text: str, added: int) -> None:
     # hand-pasted input this check exists to survive (P13) — a splice could rewrite the
     # FIRST one and pass. Every pre-existing fingerprint must still be present, with
     # its multiplicity.
-    before_counts: Dict[str, int] = {}
-    for entry in before:
-        key = json.dumps(_entry_fingerprint(entry), sort_keys=True, default=str)
-        before_counts[key] = before_counts.get(key, 0) + 1
-    after_counts: Dict[str, int] = {}
-    for entry in after:
-        key = json.dumps(_entry_fingerprint(entry), sort_keys=True, default=str)
-        after_counts[key] = after_counts.get(key, 0) + 1
+    before_counts = _fingerprint_counts(before)
+    after_counts = _fingerprint_counts(after)
 
     for key, count in before_counts.items():
         if after_counts.get(key, 0) < count:
