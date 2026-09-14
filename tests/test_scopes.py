@@ -508,13 +508,16 @@ def test_list_scopes_description_states_the_boundary_without_a_command() -> None
     tool = next(t for t in asyncio.run(mcp.list_tools()) if t.name == "list_scopes")
     desc = _flat(tool.description)
     assert "archived entries included" in desc
-    assert "only through a full rebuild, which no tool here performs — a person runs it" in desc
+    # Inverted in 4c: the tool now exists, so the buffered case names it and the
+    # archived case keeps its fact and human next actor.
+    assert "still in decisions.md goes through `amend_commentary`" in desc
+    assert ("archived reaches the graph only through a full rebuild, which no tool here "
+            "performs — a person runs it") in desc
+    assert "A tag no decision or question carries any more is not listed" in desc
     assert "authored_first_decisions" in desc and "co_tagged_scopes" in desc
     assert "mitos " not in desc
     for syntax in FORBIDDEN_SYNTAX:
         assert syntax not in desc
-    # 4b/4c invert this. `amended_by` is the stamp key the description names as absent.
-    assert "amend" not in desc.replace("amended_by", "")
 
 
 # --------------------------------------------------------------------------- #

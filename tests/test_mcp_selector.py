@@ -61,12 +61,14 @@ TARGETING_TOOLS = (
     "show_node",
     "query_decisions",
     "record_decision",
+    "amend_commentary",
 )
 
-#: What each targeting tool needs beyond its selector, so a row can drive all six.
+#: What each targeting tool needs beyond its selector, so a row can drive every one.
 #: Keyed on the same names as `TARGETING_TOOLS`, which the live-set fence below
-#: pins — a seventh tool lands here as a `KeyError` rather than as silent
-#: non-coverage.
+#: pins — a further tool lands here as a `KeyError` rather than as silent
+#: non-coverage. `amend_commentary` carries a `context`: its argument faults answer
+#: before resolution, so these values must be ones that reach it.
 REQUIRED_ARGS = {
     "surface_decisions": {"query": "anything"},
     "list_decisions": {},
@@ -75,6 +77,7 @@ REQUIRED_ARGS = {
     "query_decisions": {"query": "anything"},
     "record_decision": {"axiom": "a", "rejected_paths": "b",
                         "scope": ["c"], "slug": "d"},
+    "amend_commentary": {"slug": "anything", "context": "x"},
 }
 
 
@@ -264,8 +267,8 @@ def test_project_is_optional_in_the_schema_and_never_required(tool) -> None:
     runs, so the teaching anatomy could never render and the caller would get a
     bare framework rejection carrying no registered vocabulary — the one failure
     that cannot recover in a single turn. The property is *absence from* the
-    `required` array, not the array's absence: four of the seven tools carry one
-    already (`query`, `record`, `show_node`, `surface`), so a row spelled
+    `required` array, not the array's absence: five of the eight tools carry one
+    already (`amend_commentary`, `query`, `record`, `show_node`, `surface`), so a row spelled
     `"required" not in schema` would be red out of the box and would then get
     "fixed" into something weaker.
     """
@@ -282,7 +285,7 @@ def test_the_targeting_tool_set_is_the_live_one_not_a_hand_copied_list() -> None
     """The fence under the four parametrized rows above, and under §4.10's net.
 
     Those rows are parametrized over a tuple written by hand, so on their own they
-    fence nothing: a seventh tool taking a `project` would simply not be
+    fence nothing: a further tool taking a `project` would simply not be
     parametrized, and its schema, its documented requirement and its
     forbidden-syntax sweep would all be unasserted while every row stayed green.
     This row makes the tuple a claim about the live tool table rather than a list
@@ -458,8 +461,8 @@ def test_a_targeting_failure_reaches_the_caller_from_every_tool(
     "semantic recall is degraded" with a nonsense reason and `isError: False` —
     the anatomy silently destroyed, on the two highest-traffic tools, with every
     existing row still green. This is the phase's single most likely wrong build,
-    which is why the row is parametrized over all six rather than written for the
-    two: the two are the hazard, the six are the contract.
+    which is why the row is parametrized over every targeting tool rather than
+    written for the two: the two are the hazard, the whole set is the contract.
     """
     _register(known=_workspace(tmp_path / "known"))
     monkeypatch.chdir(tmp_path)
@@ -1276,7 +1279,7 @@ def test_a_selectorless_call_is_refused_by_every_targeting_tool(
     actually meet — so it is asserted per tool rather than on a representative.
 
     The set is fenced by `test_the_targeting_tool_set_is_the_live_one_…`, so a
-    seventh targeting tool lands as a failing set comparison there rather than as
+    further targeting tool lands as a failing set comparison there rather than as
     a tool nobody checked here.
 
     Written on a **clean** registry deliberately. `resolve_project` calls

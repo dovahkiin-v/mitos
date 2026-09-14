@@ -39,12 +39,15 @@ from mitos.config import default_collection_name
 #: declare it and each write path opts in.
 DEAD_QDRANT_URL = "http://127.0.0.1:9"
 
-#: The seven tools the MCP surface exposes at this phase. Asserted as an exact
-#: set, against the names as they arrive on the wire — never derived from an
-#: import of `mitos.mcp_server`, which would make the row tautological. Phase 3c
-#: widened it by one (`list_projects`, the discovery twin of CLI `projects`); a
-#: later phase that adds a tool widens it again rather than deleting the row.
+#: The tools the MCP surface exposes at this phase. Asserted as an exact set,
+#: against the names as they arrive on the wire — never derived from an import of
+#: `mitos.mcp_server`, which would make the row tautological. Phase 3c widened it
+#: by one (`list_projects`, the discovery twin of CLI `projects`), and
+#: surface-entropy 4c by another (`amend_commentary`, the twin of CLI
+#: `amend-commentary`); a later phase that adds a tool widens it again rather than
+#: deleting the row.
 EXPECTED_TOOLS = {
+    "amend_commentary",
     "list_decisions",
     "list_projects",
     "list_scopes",

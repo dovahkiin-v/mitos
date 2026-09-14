@@ -397,7 +397,7 @@ class TestEchoValueRules:
 
 #: What each tool needs beyond its selector, so the completeness row below can
 #: call every one of them. The tool *set* is computed from the live schema — a
-#: seventh targeting tool lands here as a `KeyError`, not as silent non-coverage
+#: further targeting tool lands here as a `KeyError`, not as silent non-coverage
 #: (3c's lesson: a row parametrized over a hand-written set proves only what
 #: someone remembered to put in the set).
 TOOL_ARGS = {
@@ -409,11 +409,13 @@ TOOL_ARGS = {
     "record_decision": {"axiom": "The envelope rides every answer.",
                         "rejected_paths": "An unattributed answer.",
                         "scope": ["echo"], "slug": "envelope-probe"},
+    # A miss returned in-band, so it stamps like any other answer.
+    "amend_commentary": {"slug": "no-such-handle", "context": "x"},
 }
 
 
 def test_every_targeting_tool_carries_the_envelope(tmp_path, offline, monkeypatch):
-    """Criterion 4: all six tools that resolve a project echo it back.
+    """Criterion 4: every tool that resolves a project echoes it back.
 
     The set is read off `mcp.list_tools()` — membership by the `project`
     parameter, not by a remembered name — so a later phase adding a targeting
@@ -431,7 +433,7 @@ def test_every_targeting_tool_carries_the_envelope(tmp_path, offline, monkeypatc
 
     assert targeting == sorted(TOOL_ARGS), "a targeting tool is uncovered here"
 
-    # §11's explicit N/A row, so review does not read it as a seventh missing
+    # §11's explicit N/A row, so review does not read it as a missing
     # stamp: `list_projects` takes no selector and resolves no workspace — it
     # answers for the MACHINE, and the echo obligation is on responses that
     # resolve a project. Asserted on its payload, not only its schema.

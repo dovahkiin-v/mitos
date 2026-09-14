@@ -527,6 +527,8 @@ def test_a_phantom_heading_is_exit_two_and_writes_nothing(ws, capsys) -> None:
     code, out, err = _amend(capsys, "target", "--context", "c\n### phantom")
     assert code == 2 and out == ""
     assert _leads_with_echo(err, config) and "[buffer_fidelity]" in err
+    # Ledger entry-003 (4c): the parse failure reads as its entry, never an object repr.
+    assert "parse failure: entry 'phantom'" in err and "object at 0x" not in err
     assert _sha(config) == sha
 
 
@@ -538,7 +540,8 @@ def test_a_phantom_heading_under_json_is_one_object(ws, capsys) -> None:
     assert code == 2
     payload = json.loads(out)
     assert payload["code"] == cli.AMEND_CODE_BUFFER_FIDELITY and payload["slug"] == "target"
-    assert payload["error"]
+    assert "parse failure: entry 'phantom'" in payload["error"]
+    assert "object at 0x" not in payload["error"]
     assert {k: payload[k] for k in ("project", "collection", "workspace")} == corpus_provenance(config)
     assert _sha(config) == sha
 

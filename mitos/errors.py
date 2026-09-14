@@ -562,6 +562,28 @@ class EntryFailure:
         self.source_path = source_path
         self.raw_header = raw_header
 
+    def __str__(self) -> str:
+        """Renders the entry, its line and its first failure as one calm sentence.
+
+        Every message that interpolates an envelope reads this — the fidelity fence,
+        the splice verifier and restore's self-check — so the wording lives on the
+        type rather than at each raise site.
+        """
+        if self.slug is not None:
+            where = f"entry {self.slug!r}"
+        elif self.raw_header:
+            where = f"the entry headed {self.raw_header.strip()!r}"
+        else:
+            where = "an entry"
+        if self.line_start is not None:
+            where += f" (line {self.line_start})"
+        if not self.items:
+            return f"{where} does not parse"
+        message = self.items[0].message
+        if len(self.items) > 1:
+            message += f" (and {len(self.items) - 1} more)"
+        return f"{where}: {message}"
+
     def to_dict(self) -> Dict[str, Any]:
         """Serializes the envelope into a JSON-compatible dictionary.
 
