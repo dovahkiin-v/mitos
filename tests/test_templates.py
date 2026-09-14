@@ -21,11 +21,13 @@ would let a path-leaking template pass by luck, and `cmd_init` registers, so a
 collision also errors on the second init.
 """
 
+import asyncio
 import json
+import re
 
 import pytest
 
-from mitos import cli
+from mitos import cli, mcp_server
 from mitos._agent_block import AGENT_GUIDE_VERSION, agent_block
 from mitos.config import MitosConfig
 
@@ -177,7 +179,9 @@ def test_skill_md_spells_no_bare_workspace_verb_recipe(two_workspaces):
     without one is a command mitos ships that mitos rejects. Checked over the
     require-list verbs the template actually spells; `init` is selector-exempt and
     `status` is selector-*optional* (it answers about the machine instead), so
-    both are excluded here and covered by the presence rows above.
+    both are excluded here and covered by the presence rows above. `projects` is
+    excluded too: it is selector-exempt, so the recall list's bare
+    `mitos projects` is the correct recipe, not a missing selector.
 
     Scoped to the template's **own** body — the included `format-spec.md` is
     subtracted first. The spec's one hit (`Source:`'s note that `mitos import`
@@ -185,7 +189,8 @@ def test_skill_md_spells_no_bare_workspace_verb_recipe(two_workspaces):
     the reader is told to run, and the spec is not this phase's file to edit.
     """
     text = _skill(two_workspaces[0]).replace(cli.load_format_spec(), "")
-    for verb in ("record", "surface", "query", "list", "sync", "check", "import"):
+    for verb in ("record", "surface", "query", "list", "sync", "check", "import",
+                 "scopes", "show", "amend-commentary"):
         assert f"`mitos {verb}`" not in text, f"bare `mitos {verb}` recipe in skill.md"
 
 
@@ -193,18 +198,62 @@ def test_skill_md_keeps_the_contracts_older_than_the_addressing_rewrite(two_work
     """The four steers the rewrite had to carry through — re-flowing is how they get lost.
 
     Each predates this vision: the long-name CLI aliases (the surface mitos itself
-    points agents at), read-then-draft (the recall loop), engage-with-
-    `rejected_paths` (what stops the next agent re-proposing a rejected path), and
-    declare-the-relation (graph connectivity, all seven edge types).
+    points agents at — taught as *five of* the long names since the eighth tool
+    joined without one, because "the long names" stopped being true of all of
+    them), read-then-draft (the recall loop), engage-with-`rejected_paths` (what
+    stops the next agent re-proposing a rejected path), and declare-the-relation
+    (graph connectivity, all seven edge types).
     """
     text = _skill(two_workspaces[0])
-    assert "the CLI also accepts the long names as aliases" in text
+    assert "the CLI also accepts five of the long names as aliases" in text
     assert "This is the recall loop — use it first." in text
     assert "that is what stops the next agent re-proposing it" in text
     assert "## Linking decisions" in text
     for edge in ("supersedes", "amends", "narrows", "depends_on",
                  "resolves", "contradicts", "cites"):
         assert f"`{edge}`" in text
+
+
+# --- T14 — the recall list is derived from the live tool set ------------------
+
+def _tool_names():
+    """The live MCP tool set, off the server itself — never a hand list."""
+    return {tool.name for tool in asyncio.run(mcp_server.mcp.list_tools())}
+
+
+_TOOL_LINE = re.compile(r"^- `(\w+)`\s+\(CLI: `(mitos [^`]+)`\)", re.M)
+
+
+def test_skill_md_names_every_live_tool(two_workspaces):
+    """A tool nobody is told about exists only for the agents that stumble on it.
+
+    Derived from `list_tools()`, so a ninth tool reds here without anyone
+    remembering this file. The format spec is subtracted first so a tool name that
+    happens to appear in the spec cannot satisfy the row for the template.
+    """
+    tools = _tool_names()
+    assert len(tools) >= 8 and "amend_commentary" in tools   # non-vacuity
+    text = _skill(two_workspaces[0]).replace(cli.load_format_spec(), "")
+    missing = sorted(name for name in tools if f"`{name}`" not in text)
+    assert not missing, f"skill.md does not name {missing}"
+
+
+def test_skill_md_pairs_every_tool_with_a_selectored_cli_twin(two_workspaces):
+    """The list is the CLI-fallback map, so each tool line must carry a runnable twin.
+
+    One line per live tool, each `(CLI: `mitos …`)`, and every twin names its
+    project with `-p .` — except `mitos projects`, which is selector-exempt and
+    correctly bare (the no-bare-recipe row above sweeps the other direction).
+    """
+    tools = _tool_names()
+    assert len(tools) >= 8   # non-vacuity
+    text = _skill(two_workspaces[0]).replace(cli.load_format_spec(), "")
+    lines = dict(_TOOL_LINE.findall(text))
+    assert set(lines) == tools
+    for name, recipe in lines.items():
+        if recipe == "mitos projects":
+            continue
+        assert " -p ." in recipe, f"{name}'s CLI twin {recipe!r} names no project"
 
 
 def test_agent_block_teaches_the_computed_path_and_targeted_habits(two_workspaces):

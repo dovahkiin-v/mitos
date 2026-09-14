@@ -486,6 +486,62 @@ def _collection_echo_lines(config: MitosConfig,
     return lines
 
 
+def _skill_md_text(format_spec_content: str) -> str:
+    """Builds the `.mitos/skill.md` body `mitos init` writes. Pure; no I/O.
+
+    Single-sourced so `mitos status` can compare a workspace's copy against what
+    this mitos would write, rather than against a version marker nobody bumps.
+
+    Args:
+        format_spec_content: The installed format spec (`load_format_spec()`),
+            included verbatim.
+
+    Returns:
+        The complete `skill.md` text.
+    """
+    return (
+        "# Mitos Architecture Skill\n\n"
+        "You are operating in a workspace governed by Mitos, an architectural decision graph.\n"
+        "When you make an architectural decision or change a foundational pattern, you MUST record it in `decisions.md`.\n\n"
+        "(If `mitos` itself is ever `command not found`, it was uninstalled after setup — reinstall it (pipx) or flag it to the human; don't silently drop decision-recording.)\n\n"
+        "## Canonical Format Specification\n"
+        "Your entries MUST adhere EXACTLY to the following markdown format (loaded from format-spec.md):\n\n"
+        f"{format_spec_content}\n\n"
+        "## Setup — API Keys\n"
+        "Mitos reads keys from a `.env` file at the workspace root (`mitos init` scaffolds it with empty slots; it is gitignored). Set exactly one required key:\n"
+        "- **`GEMINI_API_KEY`** (Google Gemini) — REQUIRED for semantic `surface_decisions`/`query_decisions` and for `mitos sync -p .`. One key covers both embeddings and synthesis.\n"
+        "- `ANTHROPIC_API_KEY` — strongly recommended: it powers the LLM-judged layer (the `mitos check -p .` conflict audit, the sync-time conflict notice, `mitos import -p . --llm-extract`). Mitos runs without it, but only as a basic record-and-search store; with it, the corpus is audited for decisions that silently contradict each other. Degrades calmly when absent.\n"
+        "Without `GEMINI_API_KEY`, `record_decision` still works (it commits to the local graph; the embedding is queued and drains on the next `mitos sync -p .` once the key is set), but semantic surface/query are unavailable. If a tool reports a missing key, tell the human to put it in `.env`.\n\n"
+        "Mitos uses its own Qdrant on **:7333** (not the standard :6333), started with `docker compose up -d`. If semantic tools report Qdrant unreachable, tell the human to start it; `record_decision` still works meanwhile (embeddings queue and drain once it's up).\n\n"
+        "## Addressing — every call names the project it is for\n"
+        "One mitos install serves every project on this machine, so **every call must name its target**; a call that names none is refused rather than aimed at a guess. Your entries still land in THIS project's own decision graph and its own Qdrant collection — the separation is by naming, not by inability, which is exactly why the naming is worth getting right.\n"
+        "- **MCP tools:** pass `project` on every call, as the **absolute path of the workspace directory this file's `.mitos/` sits in** — you know that path, because you just read this file from it. (A registered project name works too when the human gives you one. A relative path is refused: the server has no working directory to resolve it against.)\n"
+        "- **CLI:** `-p .` on either side of the verb — `mitos surface -p . \"…\"` — when your shell is at the workspace root, or `-p <that absolute path>` from anywhere. `mitos status` and `mitos agent-block` take the same selector as a positional (`mitos status .`).\n"
+        "Do not paste a project *name* into any file this repo commits, this one included: names are machine-local, and a name that means this project here can name a different real project on someone else's machine — which is a write into the wrong corpus rather than an error you would notice.\n"
+        "Every answer echoes the corpus it acted on: `project · collection · workspace`. Read that line. Now that a call *can* reach another project, the echo is what makes a mis-aimed one visible instead of silently plausible.\n\n"
+        "## Recording & recall — MCP tools (preferred) or CLI fallback\n"
+        "If the Mitos MCP server is wired into your agent, call these tools directly — best experience: structured args, no shell-quoting. If it is NOT wired, each maps to a CLI verb (and the CLI also accepts five of the long names as aliases, e.g. `mitos record_decision -p .`):\n"
+        "- `record_decision`  (CLI: `mitos record -p .`) — the moment you commit to a foundational choice (a schema, a library, a pattern, a path you're abandoning), persist it WITH the alternatives you rejected and why, so future sessions inherit it instead of relitigating. Recording rich prose via the CLI? Use `--axiom-file -` / `--rejected-file -` / `--context-file -` to read from stdin and avoid shell-quoting.\n"
+        "- `surface_decisions` (CLI: `mitos surface -p .`) — surface active precedents for a claim/scope BEFORE you decide, so you don't relitigate a settled call. This is the recall loop — use it first. Every hit carries its full `rejected_paths`; pass `brief=True` (CLI `--brief`) for an axiom-only scan.\n"
+        "- `query_decisions`   (CLI: `mitos query -p .`) — the TARGETED lookup: a slug you are carrying, or a pointed claim. Its confidence band rates how well the ranking matched what you named, not whether precedent exists — `surface_decisions` answers that one.\n"
+        "- `list_decisions`    (CLI: `mitos list -p .`) — the EXHAUSTIVE recall path. surface/query are semantic and capped at the top few matches; this returns EVERY decision in a scope, deterministically, so a completeness pass or audit doesn't miss anything below the relevance cliff. Needs no key or Qdrant.\n"
+        "- `list_scopes`       (CLI: `mitos scopes -p .`) — the scope vocabulary with a count per tag. Read it before a scope-filtered read, or before tagging a new decision, so you reuse a tag that exists instead of minting a near-duplicate.\n"
+        "- `show_node`         (CLI: `mitos show -p . -- <slug>`) — dereference one exact handle (slug or id) to its full node, including a node that has been superseded.\n"
+        "- `amend_commentary`  (CLI: `mitos amend-commentary -p . <slug> …`) — fix a committed entry's commentary in place: `rejected_paths`, `invalidates_if`, `context`, `scope`, or its slug (`new_slug`). On the tool, `clear=[…]` empties `invalidates_if`, `context` or `scope`. It refuses a change to the axiom or mechanisms: that is a new decision, recorded with `corrects` / `supersedes` / `amends`. It reaches only entries still in `decisions.md`; an entry already rotated into an archive answers `archived`.\n"
+        "- `list_projects`     (CLI: `mitos projects`) — the project names registered on this machine. It takes no selector.\n\n"
+        "## When to record — the capture trigger (YOUR judgement; Mitos stores, it does not decide what is worth storing)\n"
+        "Recall is easy to ask for; knowing WHAT is worth recording is the real call, and it falls to you. Record a decision when it:\n"
+        "- sets a pattern future work must follow, or\n"
+        "- forecloses a real alternative you weighed and rejected (capture WHY in `rejected_paths` — that is what stops the next agent re-proposing it), or\n"
+        "- is structural or costly to reverse, or\n"
+        "- reverses or supersedes a prior decision, or\n"
+        "- has cross-cutting blast radius (touches many areas).\n"
+        "Skip the local, easily-reversible, or already-settled choice. A quick self-test at any fork: *would the next agent waste time re-deriving or re-litigating this?* If yes, record it. When unsure, `surface_decisions` first — if nothing is there and it clears the bar, record it.\n\n"
+        "## Linking decisions\n"
+        "When a decision relates to an existing one, pass that one's EXACT slug to the matching relation arg so the graph stays connected instead of accumulating silent tension: `supersedes` (replaces it), `amends`, `narrows`, `depends_on`, `resolves`, `contradicts`, `cites`. On `record_decision` these are args; on the CLI they are flags (`--supersedes`, `--depends-on`, …). Look the target up first to get its exact slug.\n"
+    )
+
+
 def cmd_init(config: MitosConfig, name: Optional[str] = None, force: bool = False) -> None:
     """Initializes (or idempotently re-initializes) the Mitos workspace.
 
@@ -622,43 +678,7 @@ def cmd_init(config: MitosConfig, name: Optional[str] = None, force: bool = Fals
     # 2. Always write/overwrite skill.md (by inclusion of format-spec.md)
     skill_path = os.path.join(config.mitos_dir, "skill.md")
     with open(skill_path, "w", encoding="utf-8") as f:
-        f.write(
-            "# Mitos Architecture Skill\n\n"
-            "You are operating in a workspace governed by Mitos, an architectural decision graph.\n"
-            "When you make an architectural decision or change a foundational pattern, you MUST record it in `decisions.md`.\n\n"
-            "(If `mitos` itself is ever `command not found`, it was uninstalled after setup — reinstall it (pipx) or flag it to the human; don't silently drop decision-recording.)\n\n"
-            "## Canonical Format Specification\n"
-            "Your entries MUST adhere EXACTLY to the following markdown format (loaded from format-spec.md):\n\n"
-            f"{format_spec_content}\n\n"
-            "## Setup — API Keys\n"
-            "Mitos reads keys from a `.env` file at the workspace root (`mitos init` scaffolds it with empty slots; it is gitignored). Set exactly one required key:\n"
-            "- **`GEMINI_API_KEY`** (Google Gemini) — REQUIRED for semantic `surface_decisions`/`query_decisions` and for `mitos sync -p .`. One key covers both embeddings and synthesis.\n"
-            "- `ANTHROPIC_API_KEY` — strongly recommended: it powers the LLM-judged layer (the `mitos check -p .` conflict audit, the sync-time conflict notice, `mitos import -p . --llm-extract`). Mitos runs without it, but only as a basic record-and-search store; with it, the corpus is audited for decisions that silently contradict each other. Degrades calmly when absent.\n"
-            "Without `GEMINI_API_KEY`, `record_decision` still works (it commits to the local graph; the embedding is queued and drains on the next `mitos sync -p .` once the key is set), but semantic surface/query are unavailable. If a tool reports a missing key, tell the human to put it in `.env`.\n\n"
-            "Mitos uses its own Qdrant on **:7333** (not the standard :6333), started with `docker compose up -d`. If semantic tools report Qdrant unreachable, tell the human to start it; `record_decision` still works meanwhile (embeddings queue and drain once it's up).\n\n"
-            "## Addressing — every call names the project it is for\n"
-            "One mitos install serves every project on this machine, so **every call must name its target**; a call that names none is refused rather than aimed at a guess. Your entries still land in THIS project's own decision graph and its own Qdrant collection — the separation is by naming, not by inability, which is exactly why the naming is worth getting right.\n"
-            "- **MCP tools:** pass `project` on every call, as the **absolute path of the workspace directory this file's `.mitos/` sits in** — you know that path, because you just read this file from it. (A registered project name works too when the human gives you one. A relative path is refused: the server has no working directory to resolve it against.)\n"
-            "- **CLI:** `-p .` on either side of the verb — `mitos surface -p . \"…\"` — when your shell is at the workspace root, or `-p <that absolute path>` from anywhere. `mitos status` and `mitos agent-block` take the same selector as a positional (`mitos status .`).\n"
-            "Do not paste a project *name* into any file this repo commits, this one included: names are machine-local, and a name that means this project here can name a different real project on someone else's machine — which is a write into the wrong corpus rather than an error you would notice.\n"
-            "Every answer echoes the corpus it acted on: `project · collection · workspace`. Read that line. Now that a call *can* reach another project, the echo is what makes a mis-aimed one visible instead of silently plausible.\n\n"
-            "## Recording & recall — MCP tools (preferred) or CLI fallback\n"
-            "If the Mitos MCP server is wired into your agent, call these tools directly — best experience: structured args, no shell-quoting. If it is NOT wired, each maps to a CLI verb (and the CLI also accepts the long names as aliases, e.g. `mitos record_decision -p .`):\n"
-            "- `record_decision`  (CLI: `mitos record -p .`) — the moment you commit to a foundational choice (a schema, a library, a pattern, a path you're abandoning), persist it WITH the alternatives you rejected and why, so future sessions inherit it instead of relitigating. Recording rich prose via the CLI? Use `--axiom-file -` / `--rejected-file -` / `--context-file -` to read from stdin and avoid shell-quoting.\n"
-            "- `surface_decisions` (CLI: `mitos surface -p .`) — surface active precedents for a claim/scope BEFORE you decide, so you don't relitigate a settled call. This is the recall loop — use it first. Every hit carries its full `rejected_paths`; pass `brief=True` (CLI `--brief`) for an axiom-only scan.\n"
-            "- `query_decisions`   (CLI: `mitos query -p .`) — the TARGETED lookup: a slug you are carrying, or a pointed claim. Its confidence band rates how well the ranking matched what you named, not whether precedent exists — `surface_decisions` answers that one.\n"
-            "- `list_decisions`    (CLI: `mitos list -p .`) — the EXHAUSTIVE recall path. surface/query are semantic and capped at the top few matches; this returns EVERY decision in a scope, deterministically, so a completeness pass or audit doesn't miss anything below the relevance cliff. Needs no key or Qdrant.\n\n"
-            "## When to record — the capture trigger (YOUR judgement; Mitos stores, it does not decide what is worth storing)\n"
-            "Recall is easy to ask for; knowing WHAT is worth recording is the real call, and it falls to you. Record a decision when it:\n"
-            "- sets a pattern future work must follow, or\n"
-            "- forecloses a real alternative you weighed and rejected (capture WHY in `rejected_paths` — that is what stops the next agent re-proposing it), or\n"
-            "- is structural or costly to reverse, or\n"
-            "- reverses or supersedes a prior decision, or\n"
-            "- has cross-cutting blast radius (touches many areas).\n"
-            "Skip the local, easily-reversible, or already-settled choice. A quick self-test at any fork: *would the next agent waste time re-deriving or re-litigating this?* If yes, record it. When unsure, `surface_decisions` first — if nothing is there and it clears the bar, record it.\n\n"
-            "## Linking decisions\n"
-            "When a decision relates to an existing one, pass that one's EXACT slug to the matching relation arg so the graph stays connected instead of accumulating silent tension: `supersedes` (replaces it), `amends`, `narrows`, `depends_on`, `resolves`, `contradicts`, `cites`. On `record_decision` these are args; on the CLI they are flags (`--supersedes`, `--depends-on`, …). Look the target up first to get its exact slug.\n"
-        )
+        f.write(_skill_md_text(format_spec_content))
 
     # 3. Seed the decisions.md buffer when absent (with the extracted ## 3 sample).
     #    Both seeds go through write_source: the existence guard never re-seeds a
@@ -2877,6 +2897,38 @@ def cmd_status_overview(as_json: bool = False) -> int:
     return 0
 
 
+def _skill_md_state(mitos_dir: str) -> str:
+    """Compares a workspace's `skill.md` with what this mitos would write.
+
+    The expected text is computed from `_skill_md_text(load_format_spec())` — the
+    same call `cmd_init` writes — so a changed template *or* a changed installed
+    format spec both read as `differs`, with no version marker to bump. The
+    comparison is direction-neutral: a committed `skill.md` can be newer than the
+    install reading it.
+
+    Line endings are normalized on both sides, and the file is read with
+    `newline=""` so that normalization is the code doing it rather than text mode.
+
+    Args:
+        mitos_dir: The workspace's `.mitos/` directory.
+
+    Returns:
+        `"current"`, `"differs"`, `"absent"` or `"unreadable"`.
+    """
+    skill_path = os.path.join(mitos_dir, "skill.md")
+    if not os.path.exists(skill_path):
+        return "absent"
+    try:
+        with open(skill_path, "r", encoding="utf-8", newline="") as f:
+            on_disk = f.read()
+    except (OSError, UnicodeDecodeError):
+        return "unreadable"
+    expected = _skill_md_text(load_format_spec())
+    if on_disk.replace("\r\n", "\n") == expected.replace("\r\n", "\n"):
+        return "current"
+    return "differs"
+
+
 def cmd_status(workspace_dir: str, as_json: bool = False, *,
                project: Optional[str] = None, verbose: bool = False) -> int:
     """Reports whether Mitos is set up for a project, and what (if anything) is missing.
@@ -2907,6 +2959,9 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
             ``None`` for an unregistered path / no selector. Keyword-only and
             defaulted, so the direct call sites (the suite's, and any future one)
             keep passing a bare path.
+        verbose: Expand the text report's size-ceiling breakdown to the largest
+            decisions in each over-ceiling file. The `--json` payload always
+            carries them.
 
     Returns:
         ``0`` if fully ready, ``1`` otherwise.
@@ -3094,6 +3149,12 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
             pass
 
     initialized = mitos_dir_ok and decisions_ok
+    # Best-effort, like the agent-file drift above: does `.mitos/skill.md` differ
+    # from what this mitos's `init` would write? Informational only — an
+    # under-listing skill costs discoverability, never correctness (tool schemas
+    # still reach agents through the server) — so it gates nothing. `None` when
+    # the workspace is not initialized: there is no skill.md to have an opinion on.
+    skill_md_state = _skill_md_state(config.mitos_dir) if initialized else None
     # The unbuilt graph (W31): a corpus holding entries over a graph holding no
     # nodes — the clone that carries the committed `.mitos/config.toml` and
     # `decisions.md` but not the gitignored `*.sqlite`. The same predicate the four
@@ -3208,6 +3269,9 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
             "scope_overflow": overflows,
             "agent_guide_version": AGENT_GUIDE_VERSION,
             "agent_files": agent_drift["files"],
+            "skill_md": (
+                None if skill_md_state is None else {"status": skill_md_state}
+            ),
         })
         return 0 if ready else 1
 
@@ -3419,6 +3483,20 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
         )
         print(f"  ⚠ agent-file mitos note out of date ({stale_files}) "
               f"— refresh with `mitos agent-block`")
+    if skill_md_state == "differs":
+        # "differs", never "outdated": a committed skill.md can be newer than this
+        # install. `absent` stays silent (a clone that does not commit skill.md is
+        # routine). The recipe uses `-C` because `init` is selector-exempt and acts
+        # on its scaffold location, and `--name` whenever the caller addressed a
+        # registered project: `init` rewrites skill.md BEFORE registering, so a
+        # bare re-run in a directory registered under another name refreshes the
+        # file and then refuses. `project` is the boundary value (see docstring),
+        # never `config.project`, which is a path for an unregistered route.
+        refresh = f"mitos -C {workspace_dir!r} init"
+        if project is not None:
+            refresh += f" --name {project!r}"
+        print(f"  ⚠ .mitos/skill.md differs from what this mitos writes "
+              f"— refresh it with `{refresh}`")
     print()
     if not ready:
         print("Next steps:")

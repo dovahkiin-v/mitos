@@ -25,6 +25,7 @@ corpus↔graph repair, and the `SETUP.md → <Heading>` pointers `mitos/` prints
 They live here because this is already the module that reads SETUP.md from disk.
 """
 
+import asyncio
 import os
 import pathlib
 import re
@@ -35,7 +36,8 @@ import pytest
 import requests
 
 from live_helpers import live_tests_disabled
-from mitos.config import default_collection_name
+from mitos import cli, mcp_server
+from mitos.config import CONFIG_DEFAULTS, default_collection_name
 
 # --- The recipe under test (VERBATIM from SETUP.md — keep in lockstep, KD4) ----
 # The shebang is hook scaffolding (implementer's latitude); the load-bearing
@@ -325,6 +327,93 @@ def test_every_setup_md_pointer_in_mitos_names_a_heading_that_exists():
             f"`mitos/` points at SETUP.md → {target!r}, which no heading matches. "
             f"Headings: {headings}"
         )
+
+
+# --------------------------------------------------------------------------- #
+# 4d — SETUP.md's tool tables and the amend reach, derived from the code
+# --------------------------------------------------------------------------- #
+
+def _live_tool_names():
+    """The live MCP tool set, off the server — never a hand list."""
+    return {tool.name for tool in asyncio.run(mcp_server.mcp.list_tools())}
+
+
+def _cli_verbs():
+    """Every CLI subparser name, aliases included."""
+    return set(cli._build_parser()._subparsers._group_actions[0].choices)
+
+
+def _tables(section):
+    """Parses the markdown tables in ``section``, in order.
+
+    Each table is a list of rows, each row a list of stripped cells; the header
+    and its ``|---|`` separator are dropped. A row whose cell count differs from
+    its header's fails loudly rather than being skipped — a pipe inside a cell
+    splits the row, and inline backticks do not protect it.
+    """
+    tables, current, width = [], None, None
+    for ln in section.splitlines():
+        if not ln.startswith("|"):
+            current = None
+            continue
+        cells = [c.strip() for c in ln.strip().strip("|").split("|")]
+        if current is None:
+            current, width = [], len(cells)
+            tables.append(current)
+            continue
+        if set("".join(cells)) <= set("-: "):
+            continue
+        assert len(cells) == width, f"table row has {len(cells)} cells, header {width}: {ln!r}"
+        current.append(cells)
+    return tables
+
+
+def _code(cell):
+    """Strips a cell to its code text: backticks and the ★ marker removed."""
+    return cell.replace("`", "").replace("★", "").strip()
+
+
+def test_setup_tool_tables_equal_the_live_tool_and_alias_sets():
+    """Both tables in "CLI vs MCP" enumerate the tool set, and prose never goes red.
+
+    Capability map: its MCP column (less `—`) equals the live tool set, and each
+    tool's CLI cell is a real verb. Name map: its first column equals the tool
+    set, its verb column names real verbs, and its alias column (less `—`) equals
+    the parser's subparser names that *are* tool names — the alias set derived,
+    not typed.
+    """
+    tools = _live_tool_names()
+    verbs = _cli_verbs()
+    aliases = verbs & tools
+    assert len(tools) >= 8 and "amend_commentary" in tools   # non-vacuity
+    assert aliases and not tools <= verbs                     # some, not all, aliased
+
+    section = _extract_section(_setup_text(), "CLI vs MCP — which surface does what")
+    tables = _tables(section)
+    assert len(tables) == 2, f"expected the capability map and the name map, got {len(tables)}"
+    capability, names = tables
+    assert all(len(row) == 3 for row in capability + names)
+
+    mcp_cells = {_code(row[2]): _code(row[1]) for row in capability if _code(row[2]) != "—"}
+    assert set(mcp_cells) == tools
+    for tool, cli_cell in mcp_cells.items():
+        assert cli_cell.startswith("mitos ") and cli_cell.split()[1] in verbs, (tool, cli_cell)
+
+    assert {_code(row[0]) for row in names} == tools
+    for row in names:
+        assert _code(row[1]).split()[1] in verbs, row
+    assert {_code(row[2]).removeprefix("mitos ") for row in names if _code(row[2]) != "—"} == aliases
+
+
+def test_setup_amend_reach_states_the_shipped_rotation_defaults():
+    """The reach sentence's two numbers are hand-typed, so each is pinned to the code."""
+    section = _extract_section(_setup_text(), "When the corpus and the graph disagree")
+    # `[\s>]+`: the sentence sits in a blockquote, so a wrap carries a `> ` prefix.
+    volume = re.search(r"`rotation_volume_threshold_entries`[\s>]+\(default (\d+)\)", section)
+    lag = re.search(r"`rotation_lag_days`[\s>]+\(default (\d+) days\)", section)
+    assert volume and lag, "the amend reach blockquote lost a default"
+    assert int(volume.group(1)) == CONFIG_DEFAULTS["rotation_volume_threshold_entries"]
+    assert int(lag.group(1)) == CONFIG_DEFAULTS["rotation_lag_days"]
 
 
 # --------------------------------------------------------------------------- #
