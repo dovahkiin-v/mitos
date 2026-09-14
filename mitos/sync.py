@@ -3349,7 +3349,8 @@ class MitosSyncManager:
             rename), ``unchanged`` (``id``), ``refused`` (``reason``, ``fields``,
             ``routes`` for ``canonical_core``), ``not_found``, ``archived`` (``id``) or
             ``uncommitted``; or a fault ``{"error", "code", "slug"}`` with code
-            ``slug_collision``, ``commit_failed``, ``audit_unavailable``,
+            ``slug_collision``, ``commit_failed`` (also a graph read that failed under
+            the lock), ``audit_unavailable``,
             ``lock_timeout`` or ``rollback_failed``. Every string states a cause and
             names no command.
 
@@ -3465,6 +3466,11 @@ class MitosSyncManager:
             raise
         except Timeout:
             return amend.error_result("lock_timeout", slug=slug)
+        except (DatabaseError, sqlite3.Error) as exc:
+            # A graph read under the lock failed (classification, the divergence checks
+            # or the re-read before commit): an environment fault, not an answer about
+            # the target, and the buffer was never written or has been rolled back.
+            return amend.error_result("commit_failed", slug=slug, reason=str(exc))
         except MitosError as exc:
             # `splice_buffer` raises a bare MitosError, chained, only when its rollback
             # write failed; every other MitosError is a subclass.

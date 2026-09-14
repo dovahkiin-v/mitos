@@ -547,6 +547,32 @@ def test_a_commit_failure_rolls_back_and_closes_the_intent_row(ws) -> None:
     assert _outcomes(config)[0]["correlates_to"] == _intents(config)[0]["audit_id"]
 
 
+@pytest.mark.parametrize("seam", ["get_outgoing_edges", "get_node"])
+def test_a_graph_read_fault_under_the_lock_is_an_error_dict_not_a_raise(ws, seam) -> None:
+    """Fresh-eyes 4a — the fence is the only designed raise; a read fault is a fault.
+
+    `get_outgoing_edges` fails in the transform (nothing written); `get_node` fails on
+    its third call — classification makes two — the re-read inside `after_write`
+    (written, then rolled back).
+    """
+    config, m = ws
+    _record(m, "target")
+    sha = _sha(config)
+    real = getattr(m.store, seam)
+    calls = {"n": 0}
+
+    def _flaky(*args, **kwargs):
+        calls["n"] += 1
+        if seam == "get_outgoing_edges" or calls["n"] >= 3:
+            raise DatabaseError("graph unreadable")
+        return real(*args, **kwargs)
+
+    with patch.object(m.store, seam, side_effect=_flaky):
+        result = _amend(m, "target", {"context": "Repaired."})
+    assert result["code"] == "commit_failed" and "graph unreadable" in result["error"]
+    assert _sha(config) == sha and _intents(config) == []
+
+
 def test_a_held_lock_times_out_and_writes_nothing(ws) -> None:
     """A15 — a second lock instance holds the path."""
     config, m = ws
