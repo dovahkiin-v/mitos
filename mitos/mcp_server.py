@@ -26,7 +26,7 @@ from mitos.errors import (
     TARGET_UNKNOWN_NAME,
 )
 from mitos.lexical import degraded_reason_from_error, lexical_fallback
-from mitos.parser import corpus_has_entries
+from mitos.divergence import _corpus_files, corpus_holds_entries
 from mitos.recall import (assess_query_recall, assess_surface_recall,
                           corpus_provenance, missing_graph_is_a_gap,
                           missing_graph_note, missing_index_is_a_gap,
@@ -574,15 +574,16 @@ def _lexical_degraded_response(query: str, *, config: MitosConfig, reason: str,
 
     The MCP twin of ``cli._emit_lexical_degraded`` (ADR
     ``read-verbs-degrade-to-lexical-decisions-md-fallback``): the shared
-    ``lexical_fallback`` runs the term-match over decisions.md, so the two
-    surfaces cannot drift. The envelope carries ``degraded: "lexical"`` and a
-    ``degraded_reason`` — never an ``{error}`` object or raw provider text.
+    ``lexical_fallback`` runs the term-match over the markdown corpus (buffer plus
+    archives), so the two surfaces cannot drift. The envelope carries
+    ``degraded: "lexical"`` and a ``degraded_reason`` — never an ``{error}`` object
+    or raw provider text.
 
     Args:
         query: The claim/topic the caller was trying to recall.
         config: The call's one resolved workspace config. The degraded envelope
             must name the workspace the caller *asked* for — it reads that
-            workspace's ``decisions.md`` and stamps its provenance — so this is
+            workspace's corpus files and stamps its provenance — so this is
             threaded in rather than rebuilt: a second construction here would
             answer a targeted call out of whichever directory the server started
             in, and label it as such.
@@ -598,7 +599,7 @@ def _lexical_degraded_response(query: str, *, config: MitosConfig, reason: str,
         The degraded envelope as a JSON string.
     """
     envelope = lexical_fallback(
-        query, config.decisions_file, reason=reason, store=store,
+        query, corpus_paths=_corpus_files(config), reason=reason, store=store,
         limit=limit, brief=brief,
     )
     envelope["query"] = query
@@ -693,7 +694,7 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
     # the highest-traffic tool, with every existing row still green.
     config = _target_config(project, "surface_decisions")
     # A pre-V1a graph raises at store construction — the graph is unusable, so
-    # the lexical fallback parses decisions.md directly (no graph access).
+    # the lexical fallback parses the markdown corpus directly (no graph access).
     try:
         store, embed_provider, vector_store = get_workspace_components(config)
     except Exception as e:
@@ -835,9 +836,9 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
     # retired handle is a node. CLI⇄MCP parity is structural: one predicate, one
     # composer, each surface's own register.
     if not results["active_decisions"] and missing_graph_is_a_gap(
-        store, config, corpus_has_entries=corpus_has_entries
+        store, config, corpus_scan=corpus_holds_entries
     ):
-        results["note"] = missing_graph_note("mcp")
+        results["note"] = missing_graph_note("mcp", config)
 
     return dumps_display(results, ensure_ascii=False, indent=2)
 
@@ -1119,7 +1120,7 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
     # would swallow a targeting failure into the lexical-degraded envelope.
     config = _target_config(project, "query_decisions")
     # A pre-V1a graph raises at store construction — the graph is unusable, so
-    # the lexical fallback parses decisions.md directly (no graph access).
+    # the lexical fallback parses the markdown corpus directly (no graph access).
     try:
         store, embed_provider, vector_store = get_workspace_components(config)
     except Exception as e:
@@ -1227,9 +1228,9 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             # not, and a diagnosis present on one exit only is a verb that reads as
             # done (3e's per-EXIT lesson).
             elif not output_list and missing_graph_is_a_gap(
-                store, config, corpus_has_entries=corpus_has_entries
+                store, config, corpus_scan=corpus_holds_entries
             ):
-                envelope["note"] = missing_graph_note("mcp")
+                envelope["note"] = missing_graph_note("mcp", config)
             return dumps_display(envelope, ensure_ascii=False, indent=2)
         except CollectionMissingError as e:
             # I8 — see surface_decisions. The healthy-empty envelope is BUILT here
@@ -1260,9 +1261,9 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             # set is empty, and names the heal that fixes both. Without it the clone
             # gets the cleanest possible empty answer over hundreds of decisions.
             if missing_graph_is_a_gap(
-                store, config, corpus_has_entries=corpus_has_entries
+                store, config, corpus_scan=corpus_holds_entries
             ):
-                empty["note"] = missing_graph_note("mcp")
+                empty["note"] = missing_graph_note("mcp", config)
             return dumps_display(empty, ensure_ascii=False, indent=2)
         except Exception as e:
             # Embedding/Qdrant failure mid-query (e.g. a 429): never the raw

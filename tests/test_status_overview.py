@@ -824,7 +824,7 @@ def test_a_populated_project_with_no_collection_is_flagged_and_names_no_heal(
     """The other side of the gate — and the flag prescribes a *report*, not a command.
 
     The overview reads no graph, so it cannot tell the clone whose graph was never
-    built (heal: `mitos sync`) from the project whose collection was swept (heal:
+    built (heal: `mitos rebuild`) from the project whose collection was swept (heal:
     `mitos reconcile`) — and for the clone `reconcile` is the heal 4b calls *"one
     word away and worse than silence"*: it diffs an empty active set against an
     absent collection, enqueues nothing, and reports success on a workspace it did
@@ -843,29 +843,34 @@ def test_a_populated_project_with_no_collection_is_flagged_and_names_no_heal(
     assert "mitos status 'project'" in notes
     assert "reconcile" not in notes
     assert "sync" not in notes
+    # The overview points at `status`, never at a heal — `rebuild` included.
+    assert "rebuild" not in notes
 
 
 def test_the_corpus_gate_is_injected_and_not_re_derived(tmp_path, qdrant):
     """The scan is a parameter, so a row can drive both verdicts without a filesystem.
 
-    It also pins *which* file is scanned: `decisions.md` beside `.mitos/` — the
-    shipped validity triple `is_workspace` just proved — rather than anything a
-    second config construction might derive.
+    It also pins *which* files are scanned: `decisions.md` beside `.mitos/` — the
+    shipped validity triple `is_workspace` just proved — and `decisions/archive/`
+    beside it, both literal joins rather than anything a second config construction
+    might derive. The archive half is what a drained buffer needs.
     """
     project = _workspace(tmp_path / "project")
     _register(project=project)
     payload = overview.build_overview()
     entry = _by_name(payload)["project"]
 
-    scanned: List[str] = []
+    scanned: List[Any] = []
 
-    def _scan(path: str) -> bool:
-        scanned.append(path)
+    def _scan(locator: Any) -> bool:
+        scanned.append(locator)
         return True
 
     notes = cli._overview_notes(entry, payload, corpus_scan=_scan)
 
-    assert scanned == [os.path.join(project, "decisions.md")]
+    assert [(s.decisions_file, s.archive_dir) for s in scanned] == [
+        (os.path.join(project, "decisions.md"),
+         os.path.join(project, "decisions", "archive"))]
     assert any("no vector collection" in note for note in notes)
     assert cli._overview_notes(entry, payload, corpus_scan=lambda _: False) == []
 

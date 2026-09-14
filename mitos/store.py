@@ -645,8 +645,8 @@ def _boot_migrations(
                 "was detected). Mitos will not migrate it in place. Run "
                 "the one-time cutover to rebuild it into the V1a store. "
                 "Meanwhile `mitos surface`/`query` fall back to a text match "
-                "over decisions.md, and `grep decisions.md` always works — "
-                "nothing is lost."
+                "over the markdown corpus, and grep over `decisions.md` and "
+                "`decisions/archive/` always works — nothing is lost."
             )
         snapshot_path = take_pre_ladder_snapshot(conn, db_path, steps)
         run_migrations(conn, steps)

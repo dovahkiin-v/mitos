@@ -499,7 +499,8 @@ leaves a workspace that simply re-runs clean — no manual restore. Run these st
 
 ## When the corpus and the graph disagree
 
-The graph is a derivative of `decisions.md`, but nothing stops the two drifting apart:
+The graph is a derivative of the markdown corpus (`decisions.md` and
+`decisions/archive/`), but nothing stops the two drifting apart:
 a hand-edit to an already-committed entry only reaches the graph when `mitos sync`
 is authorized to apply it (it prints the field diff and asks; `--yes` applies
 everything but an edge *deletion*), and an entry that leaves the corpus altogether

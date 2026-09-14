@@ -442,6 +442,30 @@ def _corpus_files(config: Any) -> List[str]:
     return paths
 
 
+def corpus_holds_entries(config: Any) -> bool:
+    """Answers whether the markdown corpus — buffer plus archives — holds any entry.
+
+    The population question for a workspace whose buffer may have been drained by
+    rotation: ``decisions.md`` alone is the working set, and asking it answers the
+    wrong file. Composed over :func:`_corpus_files` so "the corpus" keeps one
+    spelling, shared with ``rebuild``'s replay and the divergence fold — a file the
+    replay would skip (a misnamed archive) cannot make the corpus "populated" here.
+
+    The buffer is scanned first (it is the likeliest to hold an entry) and every scan
+    streams and short-circuits, so this is not the fold's cost.
+
+    Args:
+        config: Anything carrying ``decisions_file`` and ``archive_dir``.
+
+    Returns:
+        True when any corpus file holds an entry; an unreadable file counts as empty.
+    """
+    # Function-local: the leaf's import pin forbids `mitos.parser` at module level.
+    from mitos.parser import corpus_has_entries
+
+    return any(corpus_has_entries(path) for path in reversed(_corpus_files(config)))
+
+
 def _corpus_hash(paths: Sequence[str]) -> str:
     """Hashes the corpus bytes, cheaply, without parsing.
 

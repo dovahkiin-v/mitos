@@ -15,6 +15,7 @@ import sqlite3
 import hashlib
 import argparse
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Callable, List, Mapping, Optional, Dict, Any, Set, Tuple
 
 from mitos import __version__
@@ -53,14 +54,15 @@ from mitos.errors import (
     TARGET_EXEMPT_VERB, TARGET_MISSING, TARGET_PATH_NOT_A_WORKSPACE,
     TARGET_RELATIVE_PATH, TARGET_UNKNOWN_NAME,
 )
-from mitos.divergence import corpus_graph_divergence, divergence_total
+from mitos.divergence import (_corpus_files, corpus_graph_divergence,
+                              corpus_holds_entries, divergence_total)
 from mitos.env import resolve_key
 from mitos.vector_store import scroll_point_ids, hash_to_uuid, QdrantVectorStore
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.telemetry import TelemetryStore, ConflictCheckRow, JudgmentBatch
 from mitos.identity import compute_node_id
 from mitos.models import get_embedding_model_id, get_model_id
-from mitos.parser import (ParsedEntry, corpus_has_entries, parse_entry_stream,
+from mitos.parser import (ParsedEntry, parse_entry_stream,
                           read_text_or_none)
 from mitos.conflict import (run_conflict_check, ConflictUnavailableReason,
                             SEMANTIC_SUBSTRATE_REASONS)
@@ -184,8 +186,8 @@ _CUTOVER_GUIDANCE = (
     "Mitos will not migrate it in place — run the one-time cutover (`mitos "
     "cutover`) to rebuild it into the V1a store (see SETUP.md → Cutover). "
     "Meanwhile the markdown gold source still answers: `mitos surface`/`query` "
-    "fall back to a text match over decisions.md, and `grep decisions.md` "
-    "always works — nothing is lost."
+    "fall back to a text match over the markdown corpus, and grep over "
+    "`decisions.md` and `decisions/archive/` always works — nothing is lost."
 )
 
 
@@ -949,12 +951,13 @@ def _emit_lexical_degraded(config: MitosConfig, query: str, *, reason: str,
 
     The shared degraded exit for ``surface``/``query`` (ADR
     ``read-verbs-degrade-to-lexical-decisions-md-fallback``): one calm header
-    naming the cause, then a term-match over decisions.md — never the raw
-    provider blob, never the clean-empty header. Exit code stays 0 (deliberate:
-    the JSON ``degraded`` marker + changed header already disambiguate).
+    naming the cause, then a term-match over the markdown corpus (buffer plus
+    archives) — never the raw provider blob, never the clean-empty header. Exit
+    code stays 0 (deliberate: the JSON ``degraded`` marker + changed header
+    already disambiguate).
 
     Args:
-        config: The active workspace configuration (supplies decisions.md path).
+        config: The active workspace configuration (supplies the corpus files).
         query: The claim/topic the caller was trying to recall.
         reason: One-line cause phrase (see ``degraded_reason_from_error``).
         store: A readable graph store for active-filtering + modifier stamps,
@@ -966,7 +969,7 @@ def _emit_lexical_degraded(config: MitosConfig, query: str, *, reason: str,
             the envelope (present-if-scanned semantics — None means omitted).
     """
     envelope = lexical_fallback(
-        query, config.decisions_file, reason=reason, store=store,
+        query, corpus_paths=_corpus_files(config), reason=reason, store=store,
         limit=limit, brief=brief,
     )
     envelope["query"] = query
@@ -1033,7 +1036,7 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         raise ValueError(msg)
 
     # A pre-V1a graph raises at store construction — the SQLite graph is unusable,
-    # so the fallback parses decisions.md directly and must not touch the graph.
+    # so the fallback parses the markdown corpus directly and must not touch the graph.
     try:
         manager = MitosSyncManager(config)
     except Exception as e:
@@ -1133,7 +1136,7 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
     # `blackout` by construction (a retired handle is a node, and this fires only
     # over a graph with none), so the two can never contradict each other.
     unbuilt = not matches and missing_graph_is_a_gap(
-        store, config, corpus_has_entries=corpus_has_entries
+        store, config, corpus_scan=corpus_holds_entries
     )
 
     # The confidence band, in the `query` register: it describes how this lookup's
@@ -1163,7 +1166,7 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
             # this note since 2d while `--json` carried the handles alone.
             envelope["note"] = blackout_note(retired)
         if unbuilt:
-            envelope["note"] = missing_graph_note("cli")
+            envelope["note"] = missing_graph_note("cli", config)
         _emit_json(envelope)
         return
 
@@ -1189,7 +1192,7 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         # redirect sends the caller to `surface`, which answers just as empty over
         # that same unbuilt graph — a turn spent one line above the correct heal.
         if unbuilt:
-            print(f"→ {missing_graph_note('cli')}")
+            print(f"→ {missing_graph_note('cli', config)}")
         else:
             band_line = _query_band_line(confidence)
             if band_line:
@@ -2184,9 +2187,9 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     # heal. They cannot both apply in fact — a retired handle is a node — but the
     # precedence is written down rather than left to that coincidence.
     if not results["active_decisions"] and missing_graph_is_a_gap(
-        store, config, corpus_has_entries=corpus_has_entries
+        store, config, corpus_scan=corpus_holds_entries
     ):
-        results["note"] = missing_graph_note("cli")
+        results["note"] = missing_graph_note("cli", config)
         note = results["note"]
 
     if as_json:
@@ -2564,7 +2567,7 @@ _OVERVIEW_MARKS = {
 
 
 def _overview_notes(project: Dict[str, Any], payload: Dict[str, Any], *,
-                    corpus_scan: Callable[[str], bool] = corpus_has_entries) -> List[str]:
+                    corpus_scan: Callable[[Any], bool] = corpus_holds_entries) -> List[str]:
     """Words one project's findings — the sentences the leaf deliberately does not carry.
 
     Order is by what the reader most needs: where they are standing, then why the
@@ -2587,7 +2590,7 @@ def _overview_notes(project: Dict[str, Any], payload: Dict[str, Any], *,
       permanently. The corpus is the honest proxy this surface can afford, and it
       separates the fresh project (flagged before, healthy now) from a populated one.
     * **No prescription.** The corpus gate cannot separate the clone whose graph was
-      never built (heal: ``mitos sync``) from the project whose collection was swept
+      never built (heal: ``mitos rebuild``) from the project whose collection was swept
       (heal: ``mitos reconcile``), and for the clone ``reconcile`` is the heal 4b
       calls *"one word away and worse than silence"* — it diffs an empty active set
       against an absent collection, enqueues nothing, and reports success on a
@@ -2608,9 +2611,10 @@ def _overview_notes(project: Dict[str, Any], payload: Dict[str, Any], *,
         project: One entry of the payload's ``projects`` list.
         payload: The whole payload — read only for ``cwd_project`` and for the
             document order that decides a shared path's resolving name.
-        corpus_scan: The corpus-population predicate, ``parser.corpus_has_entries``
-            by default. Takes the corpus path; a missing or unreadable file is
-            ``False``.
+        corpus_scan: The corpus-population predicate,
+            ``divergence.corpus_holds_entries`` by default. Takes a locator carrying
+            ``decisions_file`` and ``archive_dir``, so buffer and archives are both
+            read; a missing or unreadable file is empty.
 
     Returns:
         Zero or more note lines, already indented.
@@ -2648,11 +2652,16 @@ def _overview_notes(project: Dict[str, Any], payload: Dict[str, Any], *,
 
     if project["collection"] is not None:
         # `decisions.md` beside `.mitos/` is the shipped validity triple `is_workspace`
-        # just proved for this entry and `MitosConfig` derives without a setting, so the
-        # join is a literal here rather than a config construction the sweep refuses to
-        # repeat.
-        if (project["collection_present"] is False
-                and corpus_scan(os.path.join(project["path"], "decisions.md"))):
+        # just proved for this entry, and it and `decisions/archive/` are what
+        # `MitosConfig` derives without a setting, so both joins are literals here
+        # rather than a config construction the sweep refuses to repeat. The archive
+        # join is not optional: a drained buffer holds no entry, and a buffer-only
+        # scan would suppress this warning over every archived decision.
+        locator = SimpleNamespace(
+            decisions_file=os.path.join(project["path"], "decisions.md"),
+            archive_dir=os.path.join(project["path"], "decisions", "archive"),
+        )
+        if project["collection_present"] is False and corpus_scan(locator):
             # A pointer, never a diagnosis and never a heal: the overview reads no
             # graph, so it can neither price what re-embedding would cost nor tell a
             # swept collection from an unbuilt one — and those two want opposite
@@ -2997,16 +3006,16 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
     # TWO guards, and each removes a heal that would be wrong on a report that is
     # already not-ready. `pre_v1a`: a prototype graph leaves `gap_store` None (the
     # two reads above skip it) while being, by definition, POPULATED — unguarded it
-    # would be told "run `mitos sync`" beside the `mitos cutover` line it already
+    # would be told "run `mitos rebuild`" beside the `mitos cutover` line it already
     # gets. `initialized`: a directory holding a `decisions.md` and no `.mitos/`
-    # cannot be synced at all, and its report already leads with `mitos init` — the
+    # cannot be rebuilt at all, and its report already leads with `mitos init` — the
     # rung there would be a second, unreachable instruction (measured by hand on a
     # real directory, not reasoned about). Neither guard touches the target state:
     # a clone carries the committed `.mitos/config.toml`, so it is `initialized`.
     graph_unbuilt = False
     if initialized and not pre_v1a:
         graph_unbuilt = missing_graph_is_a_gap(
-            gap_store, config, corpus_has_entries=corpus_has_entries
+            gap_store, config, corpus_scan=corpus_holds_entries
         )
 
     # An absent (or empty) collection is a normal ready state, NOT a blocker: a
@@ -3023,7 +3032,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
     # those report PARTIAL degradation over a working graph — the lexical fallback
     # still answers, `list`/`show` still serve — while this state has no working
     # graph at all, does not self-heal (nothing builds it but an explicit `mitos
-    # sync`, unlike an absent collection, which the first covering write creates),
+    # rebuild`, unlike an absent collection, which the first covering write creates),
     # and is read by an agent setup loop whose next move on a `0` is to trust an
     # empty answer. A gate that cannot stop that is not a gate. The 0/1 mapping is
     # unchanged and no new verdict appears: `initialized` is still True on a clone,
@@ -3209,7 +3218,9 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
     # semantic read over this workspace answers cleanly empty while the corpus holds
     # entries, so the caller is told "no precedent" for a project that has them.
     #
-    # The heal is `mitos sync` and EMPHATICALLY not `mitos reconcile`: reconcile
+    # The heal is `mitos rebuild` — the corpus is buffer plus archives, and `mitos
+    # sync` reads the buffer alone, so over a drained buffer it builds nothing — and
+    # EMPHATICALLY not `mitos reconcile`: reconcile
     # diffs an empty active set against an absent collection, finds nothing to
     # enqueue, and reports success on a workspace it did not touch — converting a
     # recoverable state into one the operator believes they already fixed. That is
@@ -3217,10 +3228,11 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
     # word's absence from this rung.
     if graph_unbuilt:
         print(
-            "\n  ⚠ the graph is unbuilt — decisions.md holds entries but the graph "
-            "holds no nodes, so every read answers empty and reads as 'no precedent'. "
-            "Run `mitos sync` to build it (usually a clone: the graph is gitignored, "
-            "the corpus is not)."
+            "\n  ⚠ the graph is unbuilt — the markdown corpus (decisions.md and "
+            "decisions/archive/) holds entries but the graph holds no nodes, so every "
+            "read answers empty and reads as 'no precedent'. "
+            f"Run `mitos rebuild -p {config.project!r}` to build it from the corpus "
+            "(usually a clone: the graph is gitignored, the corpus is not)."
         )
     # Vector-completeness verdict from the exact id-diff computed above (not a
     # count). Three outcomes:
@@ -3312,8 +3324,9 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
         if not q["reachable"]:
             print(f"  {n}. Start Mitos's Qdrant: `docker compose up -d` from the mitos repo"); n += 1
         if graph_unbuilt:
-            print(f"  {n}. Build the graph from your corpus: `mitos sync` "
-                  f"(the graph is derivative — decisions.md is the source)"); n += 1
+            print(f"  {n}. Build the graph from your corpus: "
+                  f"`mitos rebuild -p {config.project!r}` "
+                  f"(the graph is derivative — the markdown corpus is the source)"); n += 1
         print("  Full walkthrough → SETUP.md "
               "(https://github.com/dovahkiin-v/mitos/blob/main/SETUP.md)")
         print()
@@ -3946,9 +3959,14 @@ def cmd_rebuild(
         assume_yes: Skip the interactive swap confirmation (automation / non-TTY).
         as_json: Emit a machine-readable JSON report instead of the human summary.
 
+    An **absent** graph on an initialized workspace (``.mitos/`` present) is built
+    rather than refused: it is the clone, or a graph deleted on purpose, and this is
+    the heal every unbuilt-graph surface names. Nothing is carried forward (there is
+    no old graph) and no backup is minted. Without ``.mitos/`` it still refuses.
+
     Returns:
-        ``0`` on a successful swap, ``1`` otherwise (absent/prototype graph, refused
-        casualties/shortfall, declined/missing confirmation).
+        ``0`` on a successful swap, ``1`` otherwise (no ``.mitos/``, a prototype
+        graph, refused casualties/shortfall, declined/missing confirmation).
 
     Raises:
         CutoverError: On a corpus format defect during the rebuild (caught at the
@@ -3959,9 +3977,13 @@ def cmd_rebuild(
     if not as_json:
         _echo_corpus(config)
 
-    # 1. Probe: rebuild runs on a CURRENT graph. Absent → init; prototype → the
-    #    one-time cutover owns it (don't double-handle).
-    if not os.path.exists(config.db_path):
+    # 1. Probe: rebuild runs on a CURRENT graph or on none. No `.mitos/` → init owns
+    #    it; an absent graph under `.mitos/` is the clone (or a deleted graph) and is
+    #    built — the rebuild carries nothing forward and the swap mints no backup,
+    #    both of which already tolerate absence; prototype → the one-time cutover
+    #    owns it (don't double-handle).
+    graph_absent = not os.path.exists(config.db_path)
+    if graph_absent and not os.path.isdir(config.mitos_dir):
         if as_json:
             _emit_json({"workspace": config.workspace_dir,
                         "swapped": False, "reason": "no_graph",
@@ -3970,11 +3992,15 @@ def cmd_rebuild(
             print("No graph found at this workspace — run `mitos init` first "
                   "(nothing to rebuild).")
         return 1
-    probe_conn = open_connection(config.db_path, read_only=True)
-    try:
-        is_prototype = is_pre_v1a_schema(probe_conn)
-    finally:
-        probe_conn.close()
+    is_prototype = False
+    if not graph_absent:
+        probe_conn = open_connection(config.db_path, read_only=True)
+        try:
+            is_prototype = is_pre_v1a_schema(probe_conn)
+        finally:
+            probe_conn.close()
+    elif not as_json:
+        print("No graph file yet — building it from the corpus.")
     if is_prototype:
         if as_json:
             _emit_json({"workspace": config.workspace_dir,

@@ -42,6 +42,7 @@ from unittest.mock import patch
 from mitos import cli
 from mitos.cli import main
 from mitos.config import MitosConfig
+from mitos.divergence import corpus_holds_entries
 from mitos.parser import corpus_has_entries
 
 # The offline `status` seam, reused rather than re-spelled (the richer of the two
@@ -295,8 +296,14 @@ class _Store:
 
 
 class _Config:
-    def __init__(self, decisions_file):
+    """The two attributes the corpus scan reads. No ``archive_dir`` by default: the
+    rows below are about the gate, and a buffer-only corpus keeps them so. The
+    archived half of the state matrix lives in ``test_archived_corpus_readers.py``.
+    """
+
+    def __init__(self, decisions_file, archive_dir=None):
         self.decisions_file = decisions_file
+        self.archive_dir = archive_dir
 
 
 class TestTheGateIsTheNodeCount:
@@ -327,7 +334,7 @@ class TestTheGateIsTheNodeCount:
         store = _Store(node_count=7, active=set())
 
         assert missing_graph_is_a_gap(
-            store, _Config(str(corpus)), corpus_has_entries=corpus_has_entries
+            store, _Config(str(corpus)), corpus_scan=corpus_holds_entries
         ) is False
 
     def test_the_predicate_never_hydrates_the_active_view(self, tmp_path) -> None:
@@ -343,7 +350,7 @@ class TestTheGateIsTheNodeCount:
         store = _Store(node_count=0)
 
         missing_graph_is_a_gap(
-            store, _Config(str(corpus)), corpus_has_entries=corpus_has_entries
+            store, _Config(str(corpus)), corpus_scan=corpus_holds_entries
         )
 
         assert store.asked == ["graph_fingerprint"]
@@ -370,7 +377,7 @@ class TestTheGateIsTheNodeCount:
         corpus.write_text(corpus_text, encoding="utf-8")
 
         assert missing_graph_is_a_gap(
-            store, _Config(str(corpus)), corpus_has_entries=corpus_has_entries
+            store, _Config(str(corpus)), corpus_scan=corpus_holds_entries
         ) is expected
 
     def test_the_corpus_scan_is_required_never_defaulted(self) -> None:
@@ -380,23 +387,28 @@ class TestTheGateIsTheNodeCount:
         implementations quietly).
         """
         from mitos.recall import missing_graph_is_a_gap
-        with pytest.raises(TypeError):
+        # The message names the keyword, so this row tells a rename from a removal.
+        with pytest.raises(TypeError, match="corpus_scan"):
             missing_graph_is_a_gap(None, _Config("/nope"))
 
-    def test_the_note_names_sync_and_never_reconcile(self) -> None:
+    def test_the_note_names_rebuild_per_boundary_and_never_reconcile(self) -> None:
         """One word away from being the wrong answer, on both surfaces.
 
         `mitos reconcile` over an unbuilt graph diffs an empty active set against an
         absent collection, enqueues nothing, and reports SUCCESS on a workspace it
         did not touch — converting a recoverable state into one the operator
-        believes they already fixed.
+        believes they already fixed. And `mitos sync` is the other wrong word: it
+        reads the buffer alone, so over a rotated corpus it builds nothing. The CLI
+        names `rebuild` with its selector; MCP names no command at all.
         """
         from mitos.recall import missing_graph_note
         for surface in ("cli", "mcp"):
-            note = missing_graph_note(surface)
-            assert "mitos sync" in note
+            note = missing_graph_note(surface, _Config("/nope"))
+            assert "mitos sync" not in note
             assert "reconcile" not in note
             assert "unbuilt" in note
+        assert "mitos rebuild -p" in missing_graph_note("cli", _Config("/nope"))
+        assert "mitos " not in missing_graph_note("mcp", _Config("/nope"))
 
     def test_recall_stays_a_zero_mitos_import_leaf(self) -> None:
         """The reason the scan is injected at all, pinned so a later phase has to
@@ -424,7 +436,7 @@ class TestTheGateIsTheNodeCount:
 
 
 class TestTheClonedWorkspacePair:
-    def test_the_clone_names_the_missing_graph_and_mitos_sync(
+    def test_the_clone_names_the_missing_graph_and_mitos_rebuild(
         self, tmp_path, monkeypatch, capsys
     ) -> None:
         """The RUNG, asserted without the exit code — deliberately.
@@ -442,7 +454,7 @@ class TestTheClonedWorkspacePair:
 
         out = capsys.readouterr().out
         assert "the graph is unbuilt" in out
-        assert "mitos sync" in out
+        assert "mitos rebuild -p" in out
 
     def test_the_clone_is_not_ready(self, tmp_path, monkeypatch, capsys) -> None:
         """The gate. No new verdict and no new exit code: `initialized` is still True
@@ -473,7 +485,8 @@ class TestTheClonedWorkspacePair:
         rung = [ln for ln in capsys.readouterr().out.splitlines()
                 if "the graph is unbuilt" in ln and ln.lstrip().startswith("⚠")]
         assert len(rung) == 1
-        assert "mitos sync" in rung[0]
+        assert "mitos rebuild -p" in rung[0]
+        assert "mitos sync" not in rung[0]
         assert "reconcile" not in rung[0]
 
     def test_the_clone_gets_a_numbered_next_step(self, tmp_path, monkeypatch, capsys) -> None:
@@ -485,7 +498,7 @@ class TestTheClonedWorkspacePair:
 
         out = capsys.readouterr().out
         assert "Next steps:" in out
-        assert any("`mitos sync`" in ln and ln.strip()[0].isdigit()
+        assert any("`mitos rebuild -p" in ln and ln.strip()[0].isdigit()
                    for ln in out.splitlines())
 
     def test_the_collection_row_does_not_contradict_the_rung(
@@ -1288,11 +1301,18 @@ class TestNoFilesystemReadBehindAResolvedPath:
         same way and proves the seam is live. And the fixture is the `_clone`
         deliberately: on a fresh workspace the shipped legitimate caller sits inside
         `try/except Exception: pass`, which would SWALLOW the raiser, while the clone
-        has no `db_path` so the whole divergence block is skipped by its guard. Any
-        listing that fires here is therefore B3's own.
+        has no `db_path` so the whole divergence block is skipped by its guard.
+
+        Since 3a there is a SECOND legitimate lister on this verb, and it is not
+        B3's: the unbuilt-graph predicate reads the corpus as buffer plus archives
+        (`divergence.corpus_holds_entries`), because a drained buffer would otherwise
+        silence the rung. It is fenced here by replacing its injection at the `cli`
+        call site with a scan that lists nothing, so any listing that still fires is
+        therefore B3's own — the property this row exists for, unchanged.
         """
         ws = _clone(tmp_path)
         archive_dir = MitosConfig(str(ws)).archive_dir
+        monkeypatch.setattr(cli, "corpus_holds_entries", lambda _config: True)
 
         def _boom(*args, **kwargs):
             raise AssertionError("B3 renders a resolved path; it never lists it")
