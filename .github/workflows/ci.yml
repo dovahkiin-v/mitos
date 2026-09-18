@@ -47,7 +47,20 @@ jobs:
           cache-dependency-path: pyproject.toml
       - name: Install package and test deps
         run: python -m pip install -e '.[test]'
-      - name: Run substrate suite (no secrets, no services)
+      # The brake is set DELIBERATELY, and it buys legibility rather than coverage.
+      # Without it the live modules still load here and then skip for want of keys and
+      # Qdrant, and the live floor stays silent (correctly — a wholly-unavailable tier
+      # pretended to check nothing). The composite of those correct behaviours is a
+      # green tick that verified none of Layer B, which reads as more than it is. With
+      # the brake, this lane says what it is: the offline substrate.
+      #
+      # This does NOT weaken the local rule that MITOS_NO_LIVE_TESTS stays unset on a
+      # dev box — that rule exists so a human cannot lose the pre-push discipline by
+      # forgetting a flag, and CI has no such discipline to preserve. The live tier's
+      # real net is a keyed, serial, dispatch/scheduled run; it is not this lane.
+      - name: Run substrate suite (offline — live tier off by design)
+        env:
+          MITOS_NO_LIVE_TESTS: "1"
         run: python -m pytest -m "not packaging"
       - name: Run packaging install gate (real wheel build + non-editable install)
         run: python -m pytest -m "packaging"

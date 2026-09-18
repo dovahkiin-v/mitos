@@ -124,4 +124,5 @@ mitos = ["format-spec.md"]
 asyncio_mode = "strict"
 markers = [
     "packaging: slow real-install packaging test (fresh venv + non-editable pip install). CI runs it explicitly with `-m packaging`; the fast suite skips it with `-m 'not packaging'`. Not selected by testmon (no imported source) — the marker is its CI-selection contract.",
+    "judge: fires the live Anthropic judge and SPENDS REAL MONEY. Deselect with `-m 'not judge'` to run the rest of the live tier — Layer B retrieval, Qdrant integration — for free, since the embedding cache makes everything else near-zero. Run it when a change touches conflict judgment, the judge prompt, or the check engine; skip it for CLI, rendering or docs work. Measured 2026-09-18: three of these tests cost 8m23s, which is why selecting FEWER tests inside the module saves nothing and excluding the module is the only lever that does.",
 ]

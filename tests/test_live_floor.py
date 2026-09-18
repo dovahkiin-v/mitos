@@ -136,3 +136,71 @@ def test_hook_no_ops_on_an_xdist_worker(monkeypatch):
     s = _Session(_Rep(_partial_stats()), worker=True)
     pytest_sessionfinish(s, 0)
     assert s.exitstatus == 0
+
+
+# --- the judge marker: the cost brake, and the rebind that silently removes it ---
+
+
+def _judge_spending_sources() -> dict:
+    """Sources of every test module that fires the live judge, keyed by path.
+
+    This module excludes ITSELF: the sweep's own needles (``make_live_judge``,
+    ``pytest.mark.judge``) appear here as string literals, so a self-scan reports this
+    file as an unmarked spender and as a module with zero ``pytestmark`` assignments.
+    Both would be false — it spends nothing and marks nothing.
+    """
+    root = pathlib.Path(__file__).parent
+    here = pathlib.Path(__file__).resolve()
+    return {
+        p: src
+        for p in list(root.glob("test_*.py")) + list(root.glob("golden/test_*.py"))
+        if p.resolve() != here
+        and "make_live_judge" in (src := p.read_text(encoding="utf-8"))
+    }
+
+
+def test_every_judge_spending_module_carries_the_judge_marker():
+    """A module that fires the live judge must be deselectable with ``-m 'not judge'``.
+
+    The marker is the only lever that saves judge money — selecting fewer tests inside
+    a spending module does not (measured 2026-09-18: three of them ran 8m23s). A new
+    spending module added without the marker would silently rejoin the expensive lane.
+    """
+    unmarked = [
+        p.name
+        for p, src in _judge_spending_sources().items()
+        if "pytest.mark.judge" not in src
+    ]
+    assert not unmarked, (
+        f"these modules fire the live judge but carry no `judge` marker: {unmarked}"
+    )
+
+
+def test_a_judge_module_assigns_pytestmark_exactly_once():
+    """``pytestmark`` is a plain global — a second assignment silently erases the first.
+
+    Measured on 2026-09-18: adding ``pytestmark = pytest.mark.judge`` above an existing
+    ``pytestmark = pytest.mark.skipif(...)`` left the judge marker matching ZERO tests,
+    with the whole suite green and ``-m judge`` quietly collecting nothing. Marks that
+    share a module must share one assignment, so this counts the assignments rather
+    than trusting that they were combined.
+    """
+    import ast
+
+    offenders = {}
+    for path, src in _judge_spending_sources().items():
+        count = sum(
+            1
+            for node in ast.parse(src).body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(t, ast.Name) and t.id == "pytestmark" for t in node.targets
+            )
+        )
+        if count != 1:
+            offenders[path.name] = count
+
+    assert not offenders, (
+        f"module-level `pytestmark` assigned more than once (later wins, earlier marks "
+        f"are lost): {offenders}"
+    )

@@ -88,6 +88,7 @@ def _load_live_env() -> None:
 
 
 _load_live_env()
+
 # Conflict needs BOTH surfaces: Gemini embeddings (candidate gather) + Anthropic judgment.
 HAS_LIVE_KEYS = (not live_tests_disabled()) and bool(
     os.environ.get("GEMINI_API_KEY") and os.environ.get("ANTHROPIC_API_KEY")
@@ -98,11 +99,25 @@ QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:7333")
 # the same module-constant idiom as `QDRANT_URL` above.
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-pytestmark = pytest.mark.skipif(
-    not HAS_LIVE_KEYS,
-    reason="GEMINI_API_KEY and ANTHROPIC_API_KEY both required — the Layer-B conflict "
-    "eval drives live embeddings AND the live SONNET judge.",
-)
+# This module is the ONLY place in the suite that fires the live Anthropic judge —
+# every `make_live_judge()` call site is in this file — so it is the only place that
+# spends judge money, and `judge` makes that spend selectable. `-m 'not judge'` leaves
+# the rest of the live tier running for nearly nothing: the Gemini embeddings are served
+# from `tests/golden/.cache/`, so Qdrant reachability is the real cost everywhere else.
+# Deselecting individual tests HERE saves nothing (measured 2026-09-18: three of them ran
+# 8m23s) — excluding the module is the only lever that does.
+#
+# A LIST, not a bare mark: `pytestmark` is an ordinary module global, so a second
+# `pytestmark = ...` silently rebinds the first and the earlier marks vanish with every
+# test still green. Both marks must live in this one assignment.
+pytestmark = [
+    pytest.mark.judge,
+    pytest.mark.skipif(
+        not HAS_LIVE_KEYS,
+        reason="GEMINI_API_KEY and ANTHROPIC_API_KEY both required — the Layer-B conflict "
+        "eval drives live embeddings AND the live SONNET judge.",
+    ),
+]
 
 
 def _skip_if_unavailable(result) -> None:
