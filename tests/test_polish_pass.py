@@ -88,7 +88,10 @@ class TestStatusGlyph:
         out = run("status", str(tmp_path)).stdout
         spec_line = next(l for l in out.splitlines() if "format-spec.md" in l)
         assert "✗" not in spec_line
-        assert "—" in spec_line and "non-destructive" in spec_line
+        # The hint is a fact, not a repair: the file is an optional reference the
+        # parser never reads, so no wording may presuppose a lost copy.
+        assert "—" in spec_line and "optional reference" in spec_line
+        assert "restore" not in spec_line and "missing" not in spec_line
 
 
 class TestQdrantUrlPrecedence:

@@ -14,7 +14,7 @@ When you build software with AI assistants over months, the *reasoning* behind y
 
 The result: your AI collaborator stays consistent with the calls you've actually made — it stops contradicting a past decision or re-opening a settled question, and your decision record never silently rots.
 
-Under the hood: markdown for humans (`decisions.md` is the source of truth you can always read and grep), a typed graph for the agents (SQLite + a local Qdrant for semantic recall), and an MCP server so agents check precedent before deciding and record decisions as they make them.
+Under the hood: markdown for humans (`decisions.md` and its quarterly archives under `decisions/archive/` are the source of truth you can always read and grep), a typed graph for the agents (SQLite + a local Qdrant for semantic recall), and an MCP server so agents check precedent before deciding and record decisions as they make them.
 
 Available on [PyPI](https://pypi.org/project/mitos-adr/) and the [MCP Registry](https://registry.modelcontextprotocol.io/servers/io.github.dovahkiin-v/mitos).
 
@@ -66,8 +66,8 @@ Mitos is **per-project** — each project gets its own decision graph and its ow
 
 A few properties worth knowing:
 
-- **The markdown is the source of truth.** Every decision lands in `decisions.md`, human-readable and greppable; the graph and the search index are derived from it and can always be rebuilt (`mitos rebuild`).
-- **Decisions are never edited or deleted — they're superseded.** State (active / superseded / amended) is computed from typed relations between decisions, so the history of *why* always survives.
+- **The markdown is the source of truth.** Every decision lands in `decisions.md`, and rotation moves committed entries into `decisions/archive/`; both are human-readable and greppable, and the graph and the search index are derived from them and can always be rebuilt from them (`mitos rebuild`).
+- **A decision's axiom is never edited — it's superseded.** The axiom and its mechanisms change only through a later decision that supersedes, corrects or amends it, and state (active / superseded / amended) is computed from those typed relations, so the history of *why* always survives. Commentary (rejected paths, context, scope) can be fixed in place with `mitos amend-commentary`.
 - **It fails safe.** If the search index or the embedding API is down, recording still works and search degrades to an honest text-match over the markdown — nothing blocks, nothing is lost, and degraded output says it's degraded.
 - **It audits itself.** The corpus sweep (`mitos check -p .`) finds decisions that silently contradict each other, and `--staged` gates new entries as a pre-commit or CI step — see [SETUP.md](SETUP.md) for the hook, CI and cron recipes, which name their project three different ways.
 

@@ -8,6 +8,13 @@ ordering, `--archived` adding the dead 0/0 domains, empty-healthy, the casefold 
 flowing through, and a single counts==verbs spot-check through the verb (not a
 re-proof of 3a's gate).
 
+Surface-entropy 2f widened each scope's value with the discrimination pair
+(`authored_first_decisions`, `co_tagged_scopes`, composed by `display.scope_report`),
+so the exact-value pins below carry four keys, and the parity rows here are also that
+vision's T7 contract row: the pair equal on both surfaces, the map order unchanged,
+no stamps, no model SDK on the verb's path, and the corpus boundary stated in each
+surface's own register.
+
 Forced fully offline (unreachable Qdrant + no keys) so they exercise the pure graph
 read and never depend on the machine's running services.
 """
@@ -25,7 +32,7 @@ from unittest.mock import patch
 from conftest import resolve_like_main
 from mitos.config import MitosConfig
 from mitos.cli import cmd_init, cmd_list, cmd_open_questions, cmd_scopes, main
-from mitos.display import order_scope_counts
+from mitos.display import order_scope_counts, scope_report
 from mitos.store import GraphStore
 from mitos.sync import MitosSyncManager
 from mitos.parser import ParsedEntry
@@ -171,8 +178,12 @@ def test_cmd_scopes_json_ordering(ws, capsys) -> None:
     envelope = json.loads(capsys.readouterr().out)
     out = envelope["scopes"]
     assert list(out) == ["substrate", "store", "auth", "schema"]
-    assert out["substrate"] == {"active_decisions": 3, "parked_open_questions": 0}
-    assert out["auth"] == {"active_decisions": 0, "parked_open_questions": 1}
+    # Every seeded decision is single-tag: authored-first equals the active count and
+    # nothing co-occurs. The OQ-only `auth` reads 0/0 on the decision-only pair.
+    assert out["substrate"] == {"active_decisions": 3, "parked_open_questions": 0,
+                                "authored_first_decisions": 3, "co_tagged_scopes": 0}
+    assert out["auth"] == {"active_decisions": 0, "parked_open_questions": 1,
+                           "authored_first_decisions": 0, "co_tagged_scopes": 0}
     # The envelope names the corpus the vocabulary came from.
     assert envelope["project"] == config.project
     assert envelope["collection"] == config.qdrant_collection
@@ -191,7 +202,8 @@ def test_cmd_scopes_archived_adds_dead_domain(ws, capsys) -> None:
 
     cmd_scopes(config, as_json=True, archived=True)
     archived = json.loads(capsys.readouterr().out)["scopes"]
-    assert archived["dead"] == {"active_decisions": 0, "parked_open_questions": 0}
+    assert archived["dead"] == {"active_decisions": 0, "parked_open_questions": 0,
+                                "authored_first_decisions": 0, "co_tagged_scopes": 0}
     # The dead 0/0 domain sorts to the tail (lowest total).
     assert list(archived)[-1] == "dead"
 
@@ -265,7 +277,9 @@ def test_mcp_list_scopes_archived(ws) -> None:
     _seed(config)
     assert "dead" not in json.loads(_mcp_scopes(config))["scopes"]
     archived = json.loads(_mcp_scopes(config, include_archived=True))["scopes"]
-    assert archived["dead"] == {"active_decisions": 0, "parked_open_questions": 0}
+    assert archived["dead"] == {"active_decisions": 0, "parked_open_questions": 0,
+                                "authored_first_decisions": 0, "co_tagged_scopes": 0}
+    assert list(archived)[-1] == "dead"
 
 
 def test_mcp_list_scopes_empty_is_healthy(ws) -> None:
@@ -297,7 +311,9 @@ def test_mcp_list_scopes_envelope_nests_the_ordering_contract(ws) -> None:
     assert list(envelope["scopes"]) == ["collection", "project", "workspace"]  # ties alpha
     for tag in ("project", "collection", "workspace"):
         assert envelope["scopes"][tag] == {"active_decisions": 1,
-                                           "parked_open_questions": 0}
+                                           "parked_open_questions": 0,
+                                           "authored_first_decisions": 1,
+                                           "co_tagged_scopes": 0}
     assert envelope["workspace"] == config.workspace_dir  # the path, not the count
 
 
@@ -313,12 +329,37 @@ def test_mcp_list_scopes_registered() -> None:
 # T6 — CLI⇄MCP parity (the definition of done)
 # --------------------------------------------------------------------------- #
 
+_VALUE_KEYS = ["active_decisions", "parked_open_questions",
+               "authored_first_decisions", "co_tagged_scopes"]
+_STAMP_KEYS = ("superseded_by", "amended_by", "narrowed_by", "corrected_by")
+
+
+def _seed_multi(config) -> None:
+    """`_seed` plus one decision authored `[zulu, alpha]` — out of alphabetical order,
+    so authored-first and co-occurrence are non-trivial on both new tags.
+
+    Live map, busiest first, ties alpha (written out, never computed — 2b's lesson):
+        substrate, store, alpha, auth, schema, zulu
+    """
+    _seed(config)
+    _record(MitosSyncManager(config), "multi", scope=["zulu", "alpha"])
+
+
+_MULTI_ORDER = ["substrate", "store", "alpha", "auth", "schema", "zulu"]
+
+
 def test_cli_mcp_map_parity(ws, capsys) -> None:
     """The `scopes --json` map and `list_scopes` map are the SAME ordered dict —
     equal parsed maps with identical key order, and serialized bodies equal modulo
-    the CLI `print` newline (T6). Run under default UTF-8 capsys."""
+    the CLI `print` newline (T6; surface-entropy T7 with the discrimination pair).
+    Run under default UTF-8 capsys.
+
+    The map order is pinned to the pre-2f busiest-first literal, so a build that
+    re-ranked by the new pair reds here (D-2f-4), and a surface that skipped the
+    composition on one side reds the byte equality.
+    """
     config, _ = ws
-    _seed(config)
+    _seed_multi(config)
     capsys.readouterr()
     cmd_scopes(config, as_json=True)
     cli_out = capsys.readouterr().out
@@ -330,17 +371,211 @@ def test_cli_mcp_map_parity(ws, capsys) -> None:
     assert list(json.loads(cli_out)["scopes"]) == list(json.loads(mcp_out)["scopes"])
     assert cli_out.rstrip("\n") == mcp_out  # only the CLI print newline differs
 
+    scopes = json.loads(mcp_out)["scopes"]
+    assert list(scopes) == _MULTI_ORDER
+    assert all(list(v) == _VALUE_KEYS for v in scopes.values())
+    assert scopes["zulu"] == {"active_decisions": 1, "parked_open_questions": 0,
+                              "authored_first_decisions": 1, "co_tagged_scopes": 1}
+    assert scopes["alpha"] == {"active_decisions": 1, "parked_open_questions": 0,
+                               "authored_first_decisions": 0, "co_tagged_scopes": 1}
+
 
 def test_cli_mcp_parity_with_archived(ws, capsys) -> None:
     """Parity holds under --archived / include_archived=True (dead domains included)."""
     config, _ = ws
-    _seed(config)
+    _seed_multi(config)
     capsys.readouterr()
     cmd_scopes(config, as_json=True, archived=True)
     cli_out = capsys.readouterr().out
     mcp_out = _mcp_scopes(config, include_archived=True)
     assert json.loads(cli_out) == json.loads(mcp_out)
     assert list(json.loads(cli_out)["scopes"]) == list(json.loads(mcp_out)["scopes"])
+    assert cli_out.rstrip("\n") == mcp_out
+    assert list(json.loads(mcp_out)["scopes"]) == _MULTI_ORDER + ["dead"]
+
+
+def test_neither_body_carries_a_modifier_stamp(ws, capsys) -> None:
+    """The report is a tag→counts aggregate: no stamp key, even with a superseded
+    decision (`dead-v1`) in the seed (C4 carve-out)."""
+    config, _ = ws
+    _seed_multi(config)
+    capsys.readouterr()
+    cmd_scopes(config, as_json=True, archived=True)
+    bodies = [capsys.readouterr().out, _mcp_scopes(config, include_archived=True)]
+    for body in bodies:
+        for key in _STAMP_KEYS:
+            assert key not in body
+
+
+# --------------------------------------------------------------------------- #
+# display.scope_report — the composition leaf (unit)
+# --------------------------------------------------------------------------- #
+
+def test_scope_report_merges_zero_fills_and_keeps_the_count_order() -> None:
+    counts = {
+        "auth": {"active_decisions": 0, "parked_open_questions": 1},
+        "schema": {"active_decisions": 1, "parked_open_questions": 0},
+        "substrate": {"active_decisions": 3, "parked_open_questions": 0},
+    }
+    discrimination = {
+        "schema": {"authored_first_decisions": 0, "co_tagged_scopes": 5},
+        "substrate": {"authored_first_decisions": 3, "co_tagged_scopes": 0},
+        "stray": {"authored_first_decisions": 9, "co_tagged_scopes": 9},
+    }
+    report = scope_report(counts, discrimination)
+    assert list(report) == list(order_scope_counts(counts))
+    assert "stray" not in report  # the population is counts' keys, exactly
+    assert report["auth"] == {"active_decisions": 0, "parked_open_questions": 1,
+                              "authored_first_decisions": 0, "co_tagged_scopes": 0}
+    assert report["schema"]["co_tagged_scopes"] == 5
+    assert all(list(v) == _VALUE_KEYS for v in report.values())
+    # The store's value objects are not mutated.
+    assert counts["auth"] == {"active_decisions": 0, "parked_open_questions": 1}
+    assert scope_report({}, {}) == {}
+    assert scope_report({}, discrimination) == {}
+
+
+def test_scope_report_does_not_rerank_by_the_discriminator() -> None:
+    """A gap-first sort would put `wide` first; busiest-first keeps `busy` first."""
+    counts = {
+        "busy": {"active_decisions": 5, "parked_open_questions": 0},
+        "wide": {"active_decisions": 4, "parked_open_questions": 0},
+    }
+    discrimination = {
+        "busy": {"authored_first_decisions": 5, "co_tagged_scopes": 0},
+        "wide": {"authored_first_decisions": 0, "co_tagged_scopes": 7},
+    }
+    assert list(scope_report(counts, discrimination)) == ["busy", "wide"]
+
+
+# --------------------------------------------------------------------------- #
+# The corpus boundary, per surface (D-2f-5)
+# --------------------------------------------------------------------------- #
+
+def test_cmd_scopes_text_shows_the_pair_and_the_boundary_footer(ws, capsys) -> None:
+    config, _ = ws
+    _seed_multi(config)
+    capsys.readouterr()
+    cmd_scopes(config)
+    out = capsys.readouterr().out
+    header = next(ln for ln in out.splitlines() if ln.startswith("scope "))
+    assert "first" in header and "co-tags" in header
+    zulu = next(ln for ln in out.splitlines() if ln.startswith("zulu "))
+    assert zulu.split() == ["zulu", "1", "0", "1", "1", "1"]
+
+    footer = out[out.index("These counts cover"):]
+    assert f"mitos rebuild -p {config.project!r}" in footer
+    assert "decisions/archive/" in footer
+    # Inverted at 4b, which shipped `amend-commentary`: the footer names the verb and its
+    # reach (entries still in decisions.md), and keeps the rebuild route for archives.
+    assert f"mitos amend-commentary -p {config.project!r} <slug> --scope" in footer
+    assert "still in decisions.md" in footer
+    for imperative in ("re-scope", "rescope", "retag", "re-tag", "split"):
+        assert imperative not in footer.lower()
+    # No number: a temp-path project name can hold digits, so strip it first.
+    assert not any(ch.isdigit() for ch in footer.replace(repr(config.project), ""))
+
+
+def test_scopes_archived_help_names_what_it_does_not_list() -> None:
+    """4b's CC-20 correction: since `amend-commentary` can remove a tag from its last node,
+    "fully-dead domains" is no longer the whole story — a tag no node carries is not listed.
+    """
+    from mitos.cli import _build_parser
+    scopes = _build_parser()._subparsers._group_actions[0].choices["scopes"]
+    archived = next(a for a in scopes._actions if "--archived" in a.option_strings)
+    help_text = " ".join(archived.help.split())
+    assert "fully-dead" not in help_text
+    assert "0/0" in help_text and "is not listed" in help_text
+    doc = " ".join(cmd_scopes.__doc__.split())
+    assert "fully-dead" not in doc and "is not listed" in doc
+
+
+def test_cmd_scopes_empty_prints_no_boundary_footer(ws, capsys) -> None:
+    config, _ = ws
+    capsys.readouterr()
+    cmd_scopes(config)
+    out = capsys.readouterr().out
+    assert "No scopes yet" in out
+    assert "rebuild" not in out
+
+
+def test_list_scopes_description_states_the_boundary_without_a_command() -> None:
+    import asyncio
+    from mitos.mcp_server import mcp
+    from test_description_budget import _flat
+    from test_mcp_selector import FORBIDDEN_SYNTAX
+
+    tool = next(t for t in asyncio.run(mcp.list_tools()) if t.name == "list_scopes")
+    desc = _flat(tool.description)
+    assert "archived entries included" in desc
+    # Inverted in 4c: the tool now exists, so the buffered case names it and the
+    # archived case keeps its fact and human next actor.
+    assert "still in decisions.md goes through `amend_commentary`" in desc
+    assert ("archived reaches the graph only through a full rebuild, which no tool here "
+            "performs — a person runs it") in desc
+    assert "A tag no decision or question carries any more is not listed" in desc
+    assert "authored_first_decisions" in desc and "co_tagged_scopes" in desc
+    assert "mitos " not in desc
+    for syntax in FORBIDDEN_SYNTAX:
+        assert syntax not in desc
+
+
+# --------------------------------------------------------------------------- #
+# Pure CPU on the verb's path (CC-16)
+# --------------------------------------------------------------------------- #
+
+def test_scopes_json_through_main_imports_no_model_sdk(ws, tmp_path) -> None:
+    """A subprocess sees an import, not only a call: `mitos -p <ws> scopes --json`
+    through the real `main()` leaves both SDKs out of `sys.modules`."""
+    import subprocess
+    config, _ = ws
+    _seed_multi(config)
+    probe = (
+        "import sys, json; import mitos.cli; "
+        f"sys.argv = ['mitos', '-p', {config.workspace_dir!r}, 'scopes', '--json']\n"
+        "try:\n    mitos.cli.main()\nexcept SystemExit as e:\n    assert not e.code, e.code\n"
+        "print(sorted(m for m in ('anthropic', 'google.genai') if m in sys.modules))"
+    )
+    env = dict(os.environ, XDG_CONFIG_HOME=str(tmp_path / "xdg"),
+               XDG_CACHE_HOME=str(tmp_path / "cache"), MITOS_NO_UPDATE_CHECK="1",
+               QDRANT_URL="http://localhost:9", GEMINI_API_KEY="",
+               GOOGLE_API_KEY="", ANTHROPIC_API_KEY="")
+    out = subprocess.run([sys.executable, "-c", probe], capture_output=True,
+                         text=True, check=True, env=env).stdout
+    body, _, modules = out.rstrip("\n").rpartition("\n")
+    assert modules == "[]", modules
+    assert list(json.loads(body)["scopes"]) == _MULTI_ORDER  # the verb really ran
+
+
+def test_list_scopes_calls_no_model_client(ws) -> None:
+    config, _ = ws
+    _seed_multi(config)
+    boom = AssertionError("list_scopes reached a model client")
+    with patch("google.genai.Client", side_effect=boom), \
+            patch("anthropic.Anthropic", side_effect=boom):
+        assert list(json.loads(_mcp_scopes(config))["scopes"]) == _MULTI_ORDER
+
+
+def test_list_scopes_over_an_unmigrated_graph_reads_tag_order_primacy(ws) -> None:
+    """The MCP store is read-only and never migrates, so this is the surface that meets
+    a step-3 graph (D-2f-6): the report answers with the order that graph holds."""
+    import sqlite3
+    from test_scope_ordinal import _build_step3_graph
+
+    config, _ = ws
+    for suffix in ("", "-wal", "-shm"):
+        if os.path.exists(config.db_path + suffix):
+            os.remove(config.db_path + suffix)
+    _build_step3_graph(config.db_path)
+    scopes = json.loads(_mcp_scopes(config))["scopes"]
+    assert scopes["ax"] == {"active_decisions": 1, "parked_open_questions": 0,
+                            "authored_first_decisions": 1, "co_tagged_scopes": 3}
+    assert scopes["zeta"]["authored_first_decisions"] == 0
+    conn = sqlite3.connect(config.db_path)
+    try:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    finally:
+        conn.close()
 
 
 # --------------------------------------------------------------------------- #

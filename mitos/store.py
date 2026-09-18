@@ -10,7 +10,7 @@ import os
 import hashlib
 import logging
 from datetime import datetime, timezone
-from typing import List, Dict, Optional, Any, Set, Tuple
+from typing import List, Dict, Optional, Any, Sequence, Set, Tuple
 from mitos.errors import (
     DatabaseError,
     ValidationError,
@@ -34,6 +34,7 @@ from mitos.migrations import (
     restore_from_snapshot,
 )
 from mitos.parser import ParsedEntry
+from mitos.scope_tags import normalize_scope_tags
 
 # Module logger for non-failing notices. The store is a pure primitive — it logs
 # (loud, testable via ``caplog``, no raw stdout I/O) and never prints to the user;
@@ -264,6 +265,58 @@ _SCOPE_FILTER_SQL: str = (
     "WHERE node_scopes.node_id = nodes.id AND node_scopes.scope = ?)"
 )
 
+# A node's scope order: authored position first, then the tag as tiebreak. The
+# tiebreak makes every read deterministic where two rows share an ordinal (only an
+# older mitos inserting at the column's DEFAULT 0 can create that) and reproduces the
+# pre-ordinal alphabetical order when a node's ordinals are all 0. One fragment, bound
+# by both the hydrating read and the commit path's prior read, so the two orders
+# cannot drift.
+_SCOPE_ORDER_SQL: str = "ordinal, scope"
+
+# SQLite's message when a read names ``ordinal`` on a graph that has not run ladder
+# step 4 (identical on a ``mode=ro`` connection). Matched exactly so a locked,
+# corrupt or otherwise-broken read still raises.
+_MISSING_ORDINAL_ERROR: str = "no such column: ordinal"
+# A query that names the column qualified (``ns.ordinal``) gets a message carrying the
+# qualifier, which this does not match — so fallback-guarded reads name it unqualified.
+
+
+def _scope_discrimination_sql(scope_order: str) -> str:
+    """Builds the authored-first / co-tag aggregate behind ``get_scope_discrimination``.
+
+    ``scope_order`` is the per-node tag order that decides "first": ``_SCOPE_ORDER_SQL``,
+    or ``"scope"`` on a graph without the ordinal column. It is interpolated
+    unqualified into a window over the single ``node_scopes`` read, so a missing
+    column raises exactly ``_MISSING_ORDINAL_ERROR``. Ranking reads every row of a
+    node before the liveness join drops any node, and ``nodes`` stays unaliased so
+    ``_ACTIVE_VIEW_PREDICATE`` binds (the §4.3 alias trap).
+    """
+    return (
+        "WITH ranked AS ("
+        "SELECT node_id, scope, "
+        f"ROW_NUMBER() OVER (PARTITION BY node_id ORDER BY {scope_order}) AS position "
+        "FROM node_scopes), "
+        "live AS ("
+        "SELECT nodes.id AS node_id FROM nodes "
+        f"WHERE nodes.kind = 'decision' AND {_ACTIVE_VIEW_PREDICATE}), "
+        "tags AS ("
+        "SELECT ranked.node_id, ranked.scope, ranked.position "
+        "FROM ranked JOIN live ON live.node_id = ranked.node_id), "
+        "firsts AS ("
+        "SELECT scope, COUNT(*) AS n FROM tags WHERE position = 1 GROUP BY scope), "
+        "partners AS ("
+        "SELECT a.scope, COUNT(DISTINCT b.scope) AS n FROM tags a "
+        "JOIN tags b ON b.node_id = a.node_id AND b.scope <> a.scope "
+        "GROUP BY a.scope) "
+        "SELECT t.scope, "
+        "COALESCE(firsts.n, 0) AS authored_first_decisions, "
+        "COALESCE(partners.n, 0) AS co_tagged_scopes "
+        "FROM (SELECT DISTINCT scope FROM tags) t "
+        "LEFT JOIN firsts ON firsts.scope = t.scope "
+        "LEFT JOIN partners ON partners.scope = t.scope "
+        "ORDER BY t.scope"
+    )
+
 
 def state_matches(computed_state: str, state_filter: Optional[str]) -> bool:
     """Reports whether a node's computed state passes the requested state filter.
@@ -364,6 +417,11 @@ def compute_hash(
         
     hasher.update(raw_text.encode("utf-8"))
     return hasher.hexdigest()
+
+
+# Ids bound per statement in ``GraphStore.created_at_for``: far below SQLite's
+# bound-variable limit on every build, including the older 999-variable default.
+_CREATED_AT_CHUNK = 500
 
 
 def _utc_now_iso() -> str:
@@ -587,8 +645,8 @@ def _boot_migrations(
                 "was detected). Mitos will not migrate it in place. Run "
                 "the one-time cutover to rebuild it into the V1a store. "
                 "Meanwhile `mitos surface`/`query` fall back to a text match "
-                "over decisions.md, and `grep decisions.md` always works — "
-                "nothing is lost."
+                "over the markdown corpus, and grep over `decisions.md` and "
+                "`decisions/archive/` always works — nothing is lost."
             )
         snapshot_path = take_pre_ladder_snapshot(conn, db_path, steps)
         run_migrations(conn, steps)
@@ -912,28 +970,84 @@ class GraphStore:
             node["questions_raised"] = json.loads(questions_raised_json or "[]")
         return node
 
+    def created_at_for(self, node_ids: Sequence[str]) -> Dict[str, str]:
+        """Reads the stored ``created_at`` of many nodes without hydrating them.
+
+        One indexed ``IN`` query per chunk — no scopes, no modifier stamps — so a
+        caller stamping a large batch costs no per-node read. Rotation no longer names
+        archives from it (the name follows the rotation instant, ADR
+        ``rotation-names-the-archive-for-the-rotation-instant-not-created-at``); the
+        read stays as a batch primitive.
+
+        Args:
+            node_ids: The node ids to look up.
+
+        Returns:
+            A mapping of node id → its ``created_at`` string. An id with no node is
+            simply absent from the map.
+
+        Raises:
+            DatabaseError: If the read fails.
+        """
+        ids = list(node_ids)
+        if not ids:
+            return {}
+        conn = self._get_connection()
+        try:
+            out: Dict[str, str] = {}
+            for start in range(0, len(ids), _CREATED_AT_CHUNK):
+                chunk = ids[start:start + _CREATED_AT_CHUNK]
+                placeholders = ",".join("?" for _ in chunk)
+                for row in conn.execute(
+                    f"SELECT id, created_at FROM nodes WHERE id IN ({placeholders})",
+                    chunk,
+                ):
+                    out[row["id"]] = row["created_at"]
+            return out
+        except sqlite3.Error as e:
+            raise DatabaseError(
+                f"Failed to read created_at for {len(ids)} node(s): {str(e)}"
+            )
+        finally:
+            conn.close()
+
     def _scopes_for(
         self, conn: sqlite3.Connection, node_ids: List[str]
     ) -> Dict[str, List[str]]:
         """Bulk-fetches scope tags for many nodes in ONE indexed query (never N+1).
+
+        A graph that has not run ladder step 4 has no ``ordinal`` column. A writable
+        store migrates at construction, but a read-only one never runs the ladder, so
+        on that one error this re-runs the pre-ordinal query ordered by tag — which is
+        exactly the order such a graph holds. Any other SQLite error propagates.
 
         Args:
             conn: An open connection (the caller owns its lifecycle).
             node_ids: The node IDs to fetch scopes for.
 
         Returns:
-            A mapping of node_id -> sorted scope-tag list; an id with no scopes is
-            simply absent from the map.
+            A mapping of node_id -> scope-tag list in authored order (ties, which only
+            an older writer or the step-4 backfill leaves, fall back to alphabetical);
+            an id with no scopes is simply absent from the map.
         """
         if not node_ids:
             return {}
         placeholders = ",".join("?" for _ in node_ids)
+        select = (
+            f"SELECT node_id, scope FROM node_scopes WHERE node_id IN ({placeholders})"
+        )
+        try:
+            rows = conn.execute(
+                f"{select} ORDER BY node_id, {_SCOPE_ORDER_SQL}", node_ids
+            ).fetchall()
+        except sqlite3.OperationalError as e:
+            if _MISSING_ORDINAL_ERROR not in str(e):
+                raise
+            rows = conn.execute(
+                f"{select} ORDER BY node_id, scope", node_ids
+            ).fetchall()
         out: Dict[str, List[str]] = {}
-        for row in conn.execute(
-            f"SELECT node_id, scope FROM node_scopes "
-            f"WHERE node_id IN ({placeholders}) ORDER BY node_id, scope",
-            node_ids,
-        ):
+        for row in rows:
             out.setdefault(row["node_id"], []).append(row["scope"])
         return out
 
@@ -1284,8 +1398,10 @@ class GraphStore:
         UPDATE** whose ``SET`` covers only commentary — ``slug`` is mutable (a
         rename), but the canonical core *and* ``source`` are fenced (MI-4). A
         byte-identical re-commit is a true no-op: ``updated_at`` does not tick
-        (MI-3 / V1-D17). ``node_scopes`` reconcile idempotently (casefolded,
-        insert-missing / delete-absent; MI-9) and ``transcripts`` are
+        (MI-3 / V1-D17). ``node_scopes`` reconcile idempotently (casefolded and
+        deduped, in authored order with each tag's position as its ``ordinal``; a
+        changed list — a same-set reorder included — rewrites the node's rows, an
+        equal one writes nothing; MI-9) and ``transcripts`` are
         write-once-preserve (insert / update / no-op-on-absent, **never** DELETE;
         V1-D16).
 
@@ -1388,11 +1504,15 @@ class GraphStore:
         confirmed_by = parsed.confirmed_by  # reserved — NULL in V1a in practice
         confirmed_at = parsed.confirmed_at
 
-        # Incoming scopes: strip + casefold + drop-empties (the parser already
-        # normalizes; re-applying ``str.casefold()`` is idempotent and keeps a
-        # hand-built entry honest — MI-9, never SQLite NOCASE/LOWER). A scope row
-        # is never empty/NULL.
-        incoming_scopes = {tag for s in parsed.scope if (tag := s.strip().casefold())}
+        # Incoming scopes through the shared scope-tag rule (`scope_tags`): the
+        # parser already normalizes, and re-applying it is idempotent and keeps a
+        # hand-built entry honest (MI-9). It is the SAME function the divergence
+        # comparator calls, so "equal" here and "not diverged" there cannot drift
+        # apart. The list keeps the author's order (first occurrence wins a
+        # duplicate): the order is the ``ordinal``, and the first tag is the node's
+        # primary scope. Order is commentary-tier — it never reaches
+        # ``compute_node_id`` above (C1).
+        incoming_scopes = normalize_scope_tags(parsed.scope)
         incoming_transcript = parsed.transcript or None  # falsy -> absent
 
         conn = self._get_connection()
@@ -1404,12 +1524,14 @@ class GraphStore:
                 prior = cursor.execute(
                     "SELECT * FROM nodes WHERE id = ?", (node_id,)
                 ).fetchone()
-                prior_scopes = {
+                prior_scopes = [
                     r["scope"]
                     for r in cursor.execute(
-                        "SELECT scope FROM node_scopes WHERE node_id = ?", (node_id,)
+                        "SELECT scope FROM node_scopes WHERE node_id = ? "
+                        f"ORDER BY {_SCOPE_ORDER_SQL}",
+                        (node_id,),
                     )
-                }
+                ]
                 prior_tx_row = cursor.execute(
                     "SELECT transcript_text FROM transcripts WHERE node_id = ?",
                     (node_id,),
@@ -1436,6 +1558,8 @@ class GraphStore:
                 commentary_changed = (not is_new) and any(
                     prior[col] != val for col, val in commentary.items()
                 )
+                # List equality: a same-set reorder is a footprint change (it moves
+                # the primary scope), so it rewrites the rows and ticks updated_at.
                 scopes_changed = incoming_scopes != prior_scopes
                 # Transcript write-once-preserve (V1-D16): an absent incoming
                 # transcript leaves the stored row untouched (never a change).
@@ -1492,17 +1616,21 @@ class GraphStore:
                 if is_new and parsed.kind == "decision":
                     self._register_mechanisms(cursor, parsed, now)
 
-                # --- Reconcile node_scopes (insert-missing / delete-absent) -----
-                for tag in incoming_scopes - prior_scopes:
+                # --- Reconcile node_scopes (rewrite in authored order) ----------
+                # Only a changed list writes: the node's rows are deleted and
+                # re-inserted with each tag's position as its ordinal (a handful of
+                # rows under the PK). An equal list writes nothing, so a
+                # byte-identical re-commit stays a true no-op (MI-3).
+                if scopes_changed:
                     cursor.execute(
-                        "INSERT INTO node_scopes (node_id, scope) VALUES (?, ?)",
-                        (node_id, tag),
+                        "DELETE FROM node_scopes WHERE node_id = ?", (node_id,)
                     )
-                for tag in prior_scopes - incoming_scopes:
-                    cursor.execute(
-                        "DELETE FROM node_scopes WHERE node_id = ? AND scope = ?",
-                        (node_id, tag),
-                    )
+                    for ordinal, tag in enumerate(incoming_scopes):
+                        cursor.execute(
+                            "INSERT INTO node_scopes (node_id, scope, ordinal) "
+                            "VALUES (?, ?, ?)",
+                            (node_id, tag, ordinal),
+                        )
 
                 # --- Transcripts: write-once-preserve (never DELETE) ------------
                 if transcript_changed:
@@ -1656,7 +1784,8 @@ class GraphStore:
                 # byte-identical re-commit trips neither gate -> ``[]``.
                 affected = set()
                 if is_new or direct_footprint_changed:
-                    affected |= incoming_scopes | prior_scopes
+                    # A set of scope names to re-render, not a node's order.
+                    affected |= set(incoming_scopes) | set(prior_scopes)
                 if edges_changed:
                     affected.update(
                         r["scope"]
@@ -1674,8 +1803,9 @@ class GraphStore:
 
                 return CommitDelta(
                     node_id=node_id,
-                    node_scope=sorted(incoming_scopes),
-                    self_old_scope=sorted(prior_scopes),
+                    # Authored order, the same order the hydrating read returns.
+                    node_scope=list(incoming_scopes),
+                    self_old_scope=list(prior_scopes),
                     commentary_fields_changed=(
                         False if is_new else direct_footprint_changed
                     ),
@@ -2361,6 +2491,53 @@ class GraphStore:
         finally:
             conn.close()
 
+    def get_scope_discrimination(self) -> Dict[str, Dict[str, int]]:
+        """Per scope tag, how often active decisions chose it first and what it shares.
+
+        The discriminator beside ``get_scope_counts``' liveness counts. A tag carried
+        by many active decisions but written first by few has stopped telling those
+        decisions apart; the pair makes that visible without judging it:
+
+        - ``authored_first_decisions``: active decisions whose first tag is this one.
+          "First" is the first row under the read rule ``_SCOPE_ORDER_SQL`` (authored
+          ordinal, tag as tiebreak) — never ``ordinal = 0``, which an older writer
+          gives every tag of a node.
+        - ``co_tagged_scopes``: the number of distinct other tags carried by at least
+          one active decision that also carries this one.
+
+        Both are decision-only, over the live set ``_ACTIVE_VIEW_PREDICATE`` selects
+        (the set ``get_decisions(state="active")`` returns). One DB-side aggregate;
+        tags are ranked among each node's own rows before liveness filters nodes, and
+        only the tag→pair map crosses into Python.
+
+        A read-only store over a graph without ladder step 4 has no ``ordinal``
+        column; on exactly that error the aggregate re-runs with primacy ordered by
+        tag, the order such a graph holds (as ``_scopes_for`` does). Any other SQLite
+        error propagates.
+
+        Returns:
+            ``{scope: {"authored_first_decisions": int, "co_tagged_scopes": int}}``
+            for every tag carried by at least one active decision, alphabetical by
+            the stored (casefolded) tag. An empty graph returns ``{}``.
+        """
+        conn = self._get_connection()
+        try:
+            try:
+                rows = conn.execute(_scope_discrimination_sql(_SCOPE_ORDER_SQL)).fetchall()
+            except sqlite3.OperationalError as e:
+                if _MISSING_ORDINAL_ERROR not in str(e):
+                    raise
+                rows = conn.execute(_scope_discrimination_sql("scope")).fetchall()
+            return {
+                row["scope"]: {
+                    "authored_first_decisions": int(row["authored_first_decisions"]),
+                    "co_tagged_scopes": int(row["co_tagged_scopes"]),
+                }
+                for row in rows
+            }
+        finally:
+            conn.close()
+
     def get_all_nodes(self) -> List[Dict[str, Any]]:
         """Retrieves every node (any kind, any state) with its computed state.
 
@@ -2630,6 +2807,31 @@ class GraphStore:
         finally:
             conn.close()
 
+    def get_incoming_edges(self, node_id: str) -> List[Dict[str, str]]:
+        """Lists the committed edges that point AT a node, as write facts.
+
+        The twin of ``get_outgoing_edges``: each edge as ``{"kind": edge_type,
+        "source": <citing node's current slug>}`` in insertion order. A rename reads
+        this to state which entries still cite the old handle in their markdown.
+
+        Args:
+            node_id: The target node's id.
+
+        Returns:
+            A list of ``{"kind", "source"}`` dicts, empty when nothing cites the node.
+        """
+        conn = self._get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT e.edge_type AS edge_type, n.slug AS slug "
+                "FROM edges e JOIN nodes n ON n.id = e.source_id "
+                "WHERE e.target_id = ? ORDER BY e.rowid",
+                (node_id,),
+            ).fetchall()
+            return [{"kind": r["edge_type"], "source": r["slug"]} for r in rows]
+        finally:
+            conn.close()
+
     def get_modifiers_map(self, node_ids: List[str]) -> Dict[str, Dict[str, List[str]]]:
         """Maps each node to the slugs of later decisions that modify it.
 
@@ -2866,8 +3068,9 @@ class GraphStore:
                     "node %s — the cycle closes at node %s. Returning the partial "
                     "lineage (%d ancestor(s)) walked before the bound fired. The "
                     "supported write path never authors a mutation cycle; this is an "
-                    "out-of-band or corrupt edge — resync from decisions.md (the "
-                    "authoritative source) to rebuild the derivative graph.",
+                    "out-of-band or corrupt edge — rebuild the derivative graph from "
+                    "the markdown corpus (decisions.md and decisions/archive/, the "
+                    "authoritative source) with `mitos rebuild`.",
                     node_id,
                     cycle_node,
                     len(ancestor_ids),

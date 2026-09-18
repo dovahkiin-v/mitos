@@ -21,6 +21,9 @@ from mitos.errors import (
     PARSER_SLUG_TOO_LONG,
 )
 from mitos.identity import SLUG_MAX_LEN
+from mitos.markers import (TRANSCRIPT_CLOSE, TRANSCRIPT_OPEN, is_entries_sentinel,
+                           is_entry_heading, mask_inline_code)
+from mitos.scope_tags import normalize_scope_tags
 
 def load_dynamic_field_map() -> Dict[str, str]:
     """Builds the FIELD_MAP purely from format-spec.md (C5 single source, V1-D7).
@@ -130,9 +133,9 @@ def strip_html_comments(text: str) -> str:
             in_fenced_code = not in_fenced_code
 
         # Track transcript block state
-        if stripped == "[DECISION_TRANSCRIPT]":
+        if stripped == TRANSCRIPT_OPEN:
             in_transcript = True
-        elif stripped == "[/DECISION_TRANSCRIPT]":
+        elif stripped == TRANSCRIPT_CLOSE:
             in_transcript = False
 
         if in_fenced_code or in_transcript or (not in_html_comment and "<!--" not in line):
@@ -169,28 +172,6 @@ def strip_html_comments(text: str) -> str:
             cleaned_lines.append("".join(parts))
 
     return "\n".join(cleaned_lines)
-
-
-_INLINE_CODE_RE = re.compile(r'`[^`\n]+`')
-
-
-def mask_inline_code(line: str) -> str:
-    """Blanks the contents of inline-code spans for marker scanning.
-
-    A backtick-quoted token — a documented ``[NOTE: …]``, a quoted
-    BEGIN-ENTRIES sentinel — is prose *about* a marker, not the marker, so the
-    inline scanners (and sync's structural-token guard, which must agree with
-    them) scan a masked copy where span contents are replaced with same-length
-    spaces (column positions stay accurate). Single-line spans only; fenced
-    blocks are already protected upstream.
-
-    Args:
-        line: One raw line of markdown.
-
-    Returns:
-        The line with inline-code span contents blanked.
-    """
-    return _INLINE_CODE_RE.sub(lambda m: " " * len(m.group(0)), line)
 
 
 def parse_header(header_line: str) -> Tuple[str, Optional[str], Optional[str]]:
@@ -366,7 +347,7 @@ def parse_decisions_file(text: str, errors: Optional[List[ParseError]] = None) -
     begin_line_idx = 0
     raw_lines = text.splitlines()
     for idx, line in enumerate(raw_lines):
-        if "BEGIN ENTRIES" in mask_inline_code(line):
+        if is_entries_sentinel(line):
             begin_line_idx = idx
             break
 
@@ -463,10 +444,10 @@ def _parse_section(sec: Dict[str, Any]) -> ParsedEntry:
             stripped = line.strip()
 
             # Transcript boundary checks
-            if stripped == "[DECISION_TRANSCRIPT]":
+            if stripped == TRANSCRIPT_OPEN:
                 in_transcript = True
                 continue
-            elif stripped == "[/DECISION_TRANSCRIPT]":
+            elif stripped == TRANSCRIPT_CLOSE:
                 in_transcript = False
                 continue
 
@@ -667,14 +648,11 @@ def _normalize_mechanism_list(items: List[str]) -> List[str]:
 
 
 def _normalize_scope_list(items: List[str]) -> List[str]:
-    """Normalizes raw scope tags: casefold, drop empties, order-preserving dedup.
+    """Normalizes raw scope tags by delegating to ``scope_tags.normalize_scope_tags``.
 
-    Scope is a cross-kind tag set. Each tag is stripped and casefolded (Python
-    ``str.casefold`` — never SQLite ``NOCASE``/``LOWER``, MI-7/P9), empties are
-    dropped, and duplicates are removed preserving first-seen order, so no
-    empty/NULL scope row can ever reach the store (MI-9). Scope has **no**
-    ``identity.py`` counterpart (it is commentary, not hashed) — its byte-form is
-    pinned by its own golden, not by the cross-check.
+    The rule and its reasoning live in ``mitos/scope_tags.py``, shared with the
+    store's writer and the divergence comparator so the three cannot disagree. The
+    name is kept for its test import.
 
     Args:
         items: The raw scope tags (already comma-split).
@@ -682,7 +660,7 @@ def _normalize_scope_list(items: List[str]) -> List[str]:
     Returns:
         The casefolded, deduped scope list in authored order.
     """
-    return list(dict.fromkeys(s.strip().casefold() for s in items if s.strip()))
+    return normalize_scope_tags(items)
 
 
 def _normalize_questions_list(items: List[str]) -> List[str]:
@@ -719,8 +697,8 @@ def _span_end_excluding_trailing_sentinels(
 ) -> int:
     """Rolls a section's ``line_end`` back over trailing legacy rotation sentinels.
 
-    A section's span is what ``sync`` slices out of the raw buffer to rotate the
-    entry, so a sentinel inside the span gets carried into the archive while its
+    A section's span is what rotation (``mitos.settledness``) slices out of the raw
+    buffer to move the entry, so a sentinel inside the span gets carried into the archive while its
     partner stays behind. A stranded ``<!-- ROTATED START`` is an unterminated HTML
     comment, and ``strip_html_comments`` carries that state across lines — blanking
     every entry below it for ``parse_decisions_file``, the lexical fallback's only
@@ -791,22 +769,18 @@ def _split_entry_sections(
         file_line = i + 1  # 1-based, absolute file line
         stripped = line.strip()
 
-        if not in_transcript and stripped == "[DECISION_TRANSCRIPT]":
+        if not in_transcript and stripped == TRANSCRIPT_OPEN:
             in_transcript = True
             if current is not None:
                 current["lines"].append(line)
             continue
-        if in_transcript and stripped == "[/DECISION_TRANSCRIPT]":
+        if in_transcript and stripped == TRANSCRIPT_CLOSE:
             in_transcript = False
             if current is not None:
                 current["lines"].append(line)
             continue
 
-        is_header = (
-            not in_transcript
-            and line.startswith("##")
-            and not line.startswith("####")
-        )
+        is_header = not in_transcript and is_entry_heading(line)
         if is_header:
             if current is not None:
                 current["line_end"] = _span_end_excluding_trailing_sentinels(
@@ -890,11 +864,11 @@ def _tokenize_entry(
 
         # Transcript span: markers toggle, body is captured verbatim. A field- or
         # header-shaped line inside the span is literal transcript text.
-        if not in_transcript and stripped == "[DECISION_TRANSCRIPT]":
+        if not in_transcript and stripped == TRANSCRIPT_OPEN:
             in_transcript = True
             transcript_open_line = file_line
             continue
-        if in_transcript and stripped == "[/DECISION_TRANSCRIPT]":
+        if in_transcript and stripped == TRANSCRIPT_CLOSE:
             in_transcript = False
             continue
         if in_transcript:
@@ -918,8 +892,8 @@ def _tokenize_entry(
         #
         # Consumed HERE rather than in `_split_entry_sections` deliberately. Dropping
         # the line at the splitter leaves it inside the section's `[line_start,
-        # line_end]` span, and `sync` slices the raw snapshot by exactly that span to
-        # rotate an entry — so rotation would carry away ONE HALF of a sentinel pair
+        # line_end]` span, and rotation slices the live buffer by exactly that span to
+        # move an entry — so rotation would carry away ONE HALF of a sentinel pair
         # and strand the other. A stranded `<!-- ROTATED START` is not cosmetic: it
         # is an unterminated HTML comment, and `strip_html_comments` carries that
         # state across lines, blanking every entry below it for `parse_decisions_file`
@@ -935,7 +909,7 @@ def _tokenize_entry(
         if not in_fence and stripped in _LEGACY_ROTATION_SENTINELS:
             continue
 
-        if stripped == "[/DECISION_TRANSCRIPT]":
+        if stripped == TRANSCRIPT_CLOSE:
             # A close marker with no matching open (latitude, Decision 4): a
             # marker line is never field content, so it is consumed here. Loud
             # report when validating; otherwise silently dropped.
@@ -1295,7 +1269,7 @@ def parse_entry_stream(
     # begin_idx 0 -> the whole file is the entry stream.
     begin_idx = 0
     for i, line in enumerate(lines):
-        if "BEGIN ENTRIES" in mask_inline_code(line):
+        if is_entries_sentinel(line):
             begin_idx = i + 1
             break
 
@@ -1387,7 +1361,7 @@ def corpus_has_entries(path: str) -> bool:
     try:
         with open(path, "r", encoding="utf-8") as fh:
             for line in fh:
-                if not seen_sentinel and "BEGIN ENTRIES" in mask_inline_code(line):
+                if not seen_sentinel and is_entries_sentinel(line):
                     # The first sentinel wins (`parse_entry_stream` breaks on it),
                     # and this scan is transcript-blind here for exactly the same
                     # reason that one is: a *quoted* sentinel still cuts the stream,
@@ -1399,14 +1373,13 @@ def corpus_has_entries(path: str) -> bool:
                     in_transcript = False
                     continue
                 stripped = line.strip()
-                if not in_transcript and stripped == "[DECISION_TRANSCRIPT]":
+                if not in_transcript and stripped == TRANSCRIPT_OPEN:
                     in_transcript = True
                     continue
-                if in_transcript and stripped == "[/DECISION_TRANSCRIPT]":
+                if in_transcript and stripped == TRANSCRIPT_CLOSE:
                     in_transcript = False
                     continue
-                if (not in_transcript and line.startswith("##")
-                        and not line.startswith("####")):
+                if not in_transcript and is_entry_heading(line):
                     if seen_sentinel:
                         return True
                     found_above_sentinel = True

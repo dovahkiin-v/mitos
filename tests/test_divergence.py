@@ -136,16 +136,38 @@ def test_slug_case_alone_is_not_divergence() -> None:
 def test_scope_divergence_reports_both_sides() -> None:
     """Scope is a RETRIEVAL defect — a wrong value hides the decision from scoped reads."""
     report = entry_divergence(_entry(scope=["substrate", "config"]), _node(), _SCOPES, _EDGES)
-    assert report["scope"] == {"graph": ["store", "substrate"],
-                               "markdown": ["config", "substrate"]}
+    assert report["scope"] == {"graph": ["substrate", "store"],
+                               "markdown": ["substrate", "config"],
+                               "order_only": False}
     assert report["commentary"] == []
     assert is_reconcilable(report) is True
 
 
-def test_scope_order_and_duplicates_are_not_divergence() -> None:
-    """Scopes reconcile as a SET in the store, so ordering and repeats cannot diverge."""
-    entry = _entry(scope=["store", "substrate", "store"])
+def test_scope_duplicates_case_and_whitespace_are_not_divergence() -> None:
+    """A repeat, a case variant or padding is the same tag after normalization.
+
+    Both sides go through the store's own scope-tag rule, so what the comparator calls
+    equal is exactly what `commit_parsed_entry` would write no row for. A comparator
+    that saw a difference here would reconcile forever: every sync would re-commit an
+    entry whose commit changes nothing.
+    """
+    entry = _entry(scope=[" Substrate ", "", "substrate", "STORE", "store"])
     assert entry_divergence(entry, _node(), _SCOPES, _EDGES)["scope"] is None
+
+
+def test_a_scope_reorder_is_a_reconcilable_divergence() -> None:
+    """The store keeps authored order, so a same-set reorder IS a divergence.
+
+    The first tag is the primary scope, which decides the rendered file carrying the
+    full body. If a reorder did not diverge, sync would never reconcile a hand-edit
+    moving a tag to the front, and the author would see nothing happen. Both lists are
+    reported in authored order, and the leaf classifies the row as order-only.
+    """
+    report = entry_divergence(_entry(scope=["store", "substrate"]), _node(), _SCOPES, _EDGES)
+    assert report["scope"] == {"graph": ["substrate", "store"],
+                               "markdown": ["store", "substrate"],
+                               "order_only": True}
+    assert is_reconcilable(report) is True
 
 
 # --- S5: edges, additions and deletions split ------------------------------------
@@ -595,6 +617,52 @@ def test_a_cache_entry_of_an_unexpected_shape_cannot_crash_status(tmp_path, caps
     )
 
 
+def test_every_mitos_recipe_the_rung_prints_names_its_project(capsys) -> None:
+    """Every backticked `mitos …` span in the rung carries `-p <repr(project)>`.
+
+    Since the selector flip a bare `mitos rebuild` has no target, so a reader copying a
+    span out of the rung gets a second wall instead of a command. The subject is derived
+    from the output — every span that starts `mitos ` — never a hand list of route
+    clauses, so a clause added later is covered the day it prints. The report sets every
+    species key, because a clause that does not print cannot fail the selector check,
+    and each clause's lead phrase is asserted so the population cannot shrink silently.
+    """
+    import re
+    from mitos.cli import _print_divergence_rung
+
+    report = {
+        "checked": 9, "skipped": None, "cache_hit": False,
+        "commentary": [{"slug": "alpha", "fields": ["context"]}],
+        "scope": [
+            {"slug": "beta", "file": "decisions.md", "graph": ["x"], "markdown": ["y"],
+             "order_only": False},
+            {"slug": "gamma", "file": "decisions.md", "graph": ["x", "y"],
+             "markdown": ["y", "x"], "order_only": True},
+        ],
+        "edges": [{"slug": "delta"}],
+        "edge_verdicts": {"repairable": 1, "target_retired": 1, "unresolvable": 1,
+                          "illegal": 1},
+        "illegal_edge_types": ["resolves"],
+        "source": [{"slug": "epsilon"}],
+        "graph_only": [{"slug": "gone", "active": True}],
+        "reconcilable": 2,
+        "archived_drift": 1,
+    }
+    _print_divergence_rung(report, project="demo")
+    out = capsys.readouterr().out
+
+    for lead in ("commentary text differs", "scope tags differ", "ordered differently",
+                 "declared relations", "replays them", "since-retired", "if its block went",
+                 "can NEVER commit", "`**Source:**` line", "have NO", "can be repaired now",
+                 "sit in an ARCHIVE file"):
+        assert lead in out, f"the report sets this clause's species, so it must print: {lead!r}"
+
+    spans = re.findall(r"`(mitos [^`]*)`", out)
+    assert len(spans) >= 5, spans
+    bare = [span for span in spans if "-p 'demo'" not in span]
+    assert not bare, f"recipes printed without a selector: {bare}"
+
+
 def test_rotation_mode_is_not_served_stale_from_the_cache(tmp_path) -> None:
     """`rotation_mode` is live config, not a property of the corpus/graph pair.
 
@@ -728,3 +796,123 @@ def test_an_illegal_edge_is_legal_from_an_open_question_source() -> None:
     assert classify_absent_edge(
         "derives_from", "open_question", "t", [_graph_node(kind="decision")]
     ) == "repairable"
+
+
+# ===========================================================================
+# Phase 2b — authored order through the comparison
+# ===========================================================================
+
+_ADVERSARIAL_SCOPE_PAIRS = [
+    # (stored, markdown)
+    (["alpha", "beta"], ["beta", "alpha"]),                   # reorder
+    (["b", "a", "c"], ["b", "c", "a"]),                       # reorder, primary kept
+    (["alpha", "beta"], [" Alpha ", "BETA", "alpha", ""]),    # case + pad + dup + empty
+    (["strasse"], ["Straße"]),                                # casefold, not lower()
+    (["alpha", "beta"], ["alpha", "beta", "beta"]),           # dup only
+    ([], [" ", ""]),                                          # empties only
+    (["alpha"], ["alpha", "beta"]),                           # membership add
+    (["alpha", "beta"], ["alpha"]),                           # membership drop
+]
+
+
+@pytest.mark.parametrize("stored, markdown", _ADVERSARIAL_SCOPE_PAIRS)
+def test_the_comparator_agrees_with_the_stores_writer(tmp_path, stored, markdown) -> None:
+    """"Divergence says equal" ⇔ "a real commit writes nothing and ticks nothing".
+
+    If the two disagreed, sync would either reconcile forever (diverged, but the
+    commit writes no row) or never reconcile a real change (equal, but the commit
+    would have rewritten the rows). Driven through a real `GraphStore`, so it is the
+    writer's actual behaviour being compared, not a restatement of it.
+    """
+    import sqlite3
+
+    def entry_with(scope):
+        e = ParsedEntry("decision", "probe-slug", 1, 10)
+        e.axiom = "We use SQLite in WAL mode."
+        e.mechanisms = ["sqlite"]
+        e.rejected_paths = "pgvector — too heavy."
+        e.scope = list(scope)
+        return e
+
+    db = str(tmp_path / "graph.sqlite")
+    store = GraphStore(db)
+    store.commit_parsed_entry(entry_with(stored))
+    node = store.get_all_nodes()[0]
+
+    def rows():
+        with sqlite3.connect(db) as conn:
+            return conn.execute(
+                "SELECT scope, ordinal FROM node_scopes ORDER BY ordinal, scope"
+            ).fetchall()
+
+    rows_before, stamp_before = rows(), node["updated_at"]
+    verdict = entry_divergence(entry_with(markdown), node, node["scope"], [])["scope"]
+
+    store.commit_parsed_entry(entry_with(markdown))
+    after = GraphStore(db).get_all_nodes()[0]
+    wrote_nothing = rows() == rows_before and after["updated_at"] == stamp_before
+
+    assert (verdict is None) == wrote_nothing, (verdict, rows_before, rows())
+
+
+def test_a_previous_cache_version_is_not_served_for_a_reordered_corpus(tmp_path) -> None:
+    """A sidecar from the set-comparing build must miss, not answer "clean".
+
+    The key hashes corpus bytes and the graph fingerprint, and neither moves when only
+    the comparator changed — so without the version bump an old "no scope divergence"
+    for this exact corpus would be served verbatim. The row plants exactly that stale
+    sidecar under the previous version's prefix and asserts the fold recomputes.
+    """
+    import json as _json
+
+    config = _workspace(tmp_path, _block("alpha", "Alpha axiom.", scope=("alpha", "beta")))
+    with open(config.decisions_file, encoding="utf-8") as fh:
+        text = fh.read()
+    assert "**Scope:** alpha, beta" in text
+    with open(config.decisions_file, "w", encoding="utf-8") as fh:
+        fh.write(text.replace("**Scope:** alpha, beta", "**Scope:** beta, alpha"))
+
+    first = _report(config)
+    assert first["cache_hit"] is False
+    cache_path = os.path.join(config.mitos_dir, "divergence_cache.json")
+    payload = _json.loads(open(cache_path, encoding="utf-8").read())
+    prefix = f"{divergence._CACHE_VERSION}:"
+    assert payload["key"].startswith(prefix)
+
+    # "2" is the version the set-comparing build shipped — the build whose sidecar says
+    # "clean" about a reorder. A literal, not `_CACHE_VERSION - 1`: derived, the row
+    # would stay green under a build that never bumped the constant.
+    previous = "2"
+    stale_report = {**first, "scope": [], "reconcilable": 0}
+    with open(cache_path, "w", encoding="utf-8") as fh:
+        _json.dump({"key": previous + ":" + payload["key"][len(prefix):],
+                    "report": stale_report}, fh)
+
+    second = _report(config)
+    assert second["cache_hit"] is False, "a previous-version sidecar must never be served"
+    assert second["scope"] == [{"slug": "alpha", "file": "decisions.md",
+                                "graph": ["alpha", "beta"], "markdown": ["beta", "alpha"],
+                                "order_only": True}]
+
+
+def test_the_reconcile_audit_row_records_values_never_the_verdict() -> None:
+    """`order_only` is a classification, not a value the reconcile applies.
+
+    The telemetry pair records what the graph held and what the markdown declares, in
+    authored order, as plain JSON lists. The flag stays out of both halves: the
+    documented read rule matches an intent row's `new_values` against the graph, and
+    a verdict key there would never match anything.
+    """
+    import json as _json
+
+    from mitos.sync import MitosSyncManager
+
+    entry = _entry(scope=["store", "substrate"])
+    report = entry_divergence(entry, _node(), _SCOPES, _EDGES)
+    assert report["scope"]["order_only"] is True
+
+    prior, new_values = MitosSyncManager._reconcile_value_pair(entry, _node(), report, [])
+    assert prior == {"scope": ["substrate", "store"]}
+    assert new_values == {"scope": ["store", "substrate"]}
+    assert _json.loads(_json.dumps(new_values, sort_keys=True)) == new_values
+    assert "order_only" not in _json.dumps([prior, new_values])

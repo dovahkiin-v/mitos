@@ -94,7 +94,7 @@ def _node_source(store: GraphStore, node_id: str) -> Optional[str]:
 
 @pytest.fixture
 def store() -> GraphStore:
-    """A temporary file GraphStore (boots the live V1b schema, user_version 2)."""
+    """A temporary file GraphStore (boots the live ladder to its head)."""
     fd, path = tempfile.mkstemp(suffix=".sqlite")
     os.close(fd)
     s = GraphStore(path)
@@ -277,8 +277,11 @@ def test_sync_reencounter_is_pk_idempotent_across_resyncs(
     mock_client: MagicMock,
     sync_env: Tuple[MitosConfig, MitosSyncManager, str],
 ) -> None:
-    """Re-syncing the differing-source entry TWICE (re-appended after the first
-    rotates it out) still yields exactly one row (composite-PK INSERT OR IGNORE)."""
+    """Re-syncing the differing-source entry TWICE still yields exactly one row
+    (composite-PK INSERT OR IGNORE). The first sync does not rotate it out (it is
+    recent and below the rotation threshold), so the second sync meets two
+    byte-identical copies of the block — both re-encounter the one node, and the PK
+    keeps the row count at one."""
     config, manager, _ = sync_env
     _set_enrichment_passthrough(mock_client)
     config.env["GEMINI_API_KEY"] = "mock_key"
@@ -286,7 +289,7 @@ def test_sync_reencounter_is_pk_idempotent_across_resyncs(
     nid = _seed_reenc(manager, source="user")
     _append(config, _reenc_entry("import_llm"))
     manager.perform_sync(auto_accept=True)
-    _append(config, _reenc_entry("import_llm"))  # the first sync archived the buffer
+    _append(config, _reenc_entry("import_llm"))  # a second copy beside the first
     manager.perform_sync(auto_accept=True)
 
     assert len(_reencounter_rows(manager.store, nid)) == 1

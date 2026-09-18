@@ -5,11 +5,12 @@ exposing surface_decisions and query_decisions tools to LLM clients.
 """
 
 import os
+import sys
 from typing import Optional, List, Dict, Any, Tuple
 from mcp.server.fastmcp import FastMCP
 
-from mitos import registry, routing
-from mitos.display import blackout_note, clamp_limit, dumps_display, letter_payload, oneline_payload, order_scope_counts, projects_payload, show_payload
+from mitos import amend, registry, routing
+from mitos.display import blackout_note, clamp_limit, dumps_display, letter_payload, oneline_payload, order_scope_counts, projects_payload, scope_report, show_payload
 from mitos.config import MitosConfig
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS
 from mitos.embeddings import GeminiEmbeddingProvider
@@ -26,7 +27,10 @@ from mitos.errors import (
     TARGET_UNKNOWN_NAME,
 )
 from mitos.lexical import degraded_reason_from_error, lexical_fallback
-from mitos.parser import corpus_has_entries
+from mitos.divergence import _corpus_files, corpus_holds_entries
+# Module level on purpose: `amend` and `restore` close over no `cli`/`sync`/`store`
+# (measured at planning), so unlike `MitosSyncManager` neither needs deferring.
+from mitos.restore import BufferFidelityError
 from mitos.recall import (assess_query_recall, assess_surface_recall,
                           corpus_provenance, missing_graph_is_a_gap,
                           missing_graph_note, missing_index_is_a_gap,
@@ -574,15 +578,16 @@ def _lexical_degraded_response(query: str, *, config: MitosConfig, reason: str,
 
     The MCP twin of ``cli._emit_lexical_degraded`` (ADR
     ``read-verbs-degrade-to-lexical-decisions-md-fallback``): the shared
-    ``lexical_fallback`` runs the term-match over decisions.md, so the two
-    surfaces cannot drift. The envelope carries ``degraded: "lexical"`` and a
-    ``degraded_reason`` — never an ``{error}`` object or raw provider text.
+    ``lexical_fallback`` runs the term-match over the markdown corpus (buffer plus
+    archives), so the two surfaces cannot drift. The envelope carries
+    ``degraded: "lexical"`` and a ``degraded_reason`` — never an ``{error}`` object
+    or raw provider text.
 
     Args:
         query: The claim/topic the caller was trying to recall.
         config: The call's one resolved workspace config. The degraded envelope
             must name the workspace the caller *asked* for — it reads that
-            workspace's ``decisions.md`` and stamps its provenance — so this is
+            workspace's corpus files and stamps its provenance — so this is
             threaded in rather than rebuilt: a second construction here would
             answer a targeted call out of whichever directory the server started
             in, and label it as such.
@@ -598,7 +603,7 @@ def _lexical_degraded_response(query: str, *, config: MitosConfig, reason: str,
         The degraded envelope as a JSON string.
     """
     envelope = lexical_fallback(
-        query, config.decisions_file, reason=reason, store=store,
+        query, corpus_paths=_corpus_files(config), reason=reason, store=store,
         limit=limit, brief=brief,
     )
     envelope["query"] = query
@@ -693,7 +698,7 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
     # the highest-traffic tool, with every existing row still green.
     config = _target_config(project, "surface_decisions")
     # A pre-V1a graph raises at store construction — the graph is unusable, so
-    # the lexical fallback parses decisions.md directly (no graph access).
+    # the lexical fallback parses the markdown corpus directly (no graph access).
     try:
         store, embed_provider, vector_store = get_workspace_components(config)
     except Exception as e:
@@ -835,9 +840,9 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
     # retired handle is a node. CLI⇄MCP parity is structural: one predicate, one
     # composer, each surface's own register.
     if not results["active_decisions"] and missing_graph_is_a_gap(
-        store, config, corpus_has_entries=corpus_has_entries
+        store, config, corpus_scan=corpus_holds_entries
     ):
-        results["note"] = missing_graph_note("mcp")
+        results["note"] = missing_graph_note("mcp", config)
 
     return dumps_display(results, ensure_ascii=False, indent=2)
 
@@ -952,7 +957,7 @@ def list_decisions(scope: Optional[str] = None, state: str = "active", brief: bo
 
 @mcp.tool()
 def list_scopes(include_archived: bool = False, project: Optional[str] = None) -> str:
-    """List the project's scope-tag vocabulary with each domain's live-node counts.
+    """List the project's scope-tag vocabulary with live-node counts and scope health.
 
     The map an agent reads BEFORE recording or recalling: every scope tag that
     carries a live node, ranked busiest-domain-first (total active decisions +
@@ -969,22 +974,35 @@ def list_scopes(include_archived: bool = False, project: Optional[str] = None) -
     stamp). An empty/fresh project returns `{"scopes": {}, …}` — a valid empty
     vocabulary, never an error, and the provenance says which project was empty.
 
+    The counts cover every decision the graph holds, archived entries included, and
+    list only tags the graph still carries. A scope change to an entry still in
+    decisions.md goes through `amend_commentary`; one whose entry is archived
+    reaches the graph only through a full rebuild, which no tool here performs — a
+    person runs it.
+
     Args:
         include_archived: When False (default), returns only live domains (≥1 active
             decision OR ≥1 parked open question). When True, additionally includes
-            every other scope tag present in the graph at a `{active_decisions: 0,
-            parked_open_questions: 0}` floor — the scope-level parallel of
-            list_decisions(state="all").
+            the tags whose decisions are all retired and whose open questions are
+            all resolved, at a `{active_decisions: 0, parked_open_questions: 0}`
+            floor — the scope-level parallel of list_decisions(state="all"). A tag
+            no decision or question carries any more is not listed.
         project: Which project this call is about — REQUIRED on every call: a
             registered project name (e.g. 'mitos') or the absolute path of a
             workspace. Call `list_projects()` if you do not know the names.
 
     Returns:
         A JSON string: `{scopes, project, collection, workspace}`. `scopes` is an
-        ordered map `{scope: {active_decisions, parked_open_questions}}`, busiest
-        domain first — the key order of THAT map IS the deliverable, so iterate it
-        as-is. The other three name the corpus the vocabulary came from: the
-        project as you addressed it, its derived collection, and its path.
+        ordered map `{scope: {active_decisions, parked_open_questions,
+        authored_first_decisions, co_tagged_scopes}}`, busiest domain first — the
+        key order of THAT map IS the deliverable, so iterate it as-is. The last two
+        count active decisions only: `authored_first_decisions` is how many list
+        this scope first, and `co_tagged_scopes` is how many other scopes share a
+        decision with it (both 0 for a scope with no active decision). A large
+        `active_decisions` with a small `authored_first_decisions` marks a tag
+        rarely chosen first; what that means is yours to judge. The other three
+        name the corpus the vocabulary came from: the project as you addressed it,
+        its derived collection, and its path.
     """
     config = _target_config(project, "list_scopes")
     store, _embed, _vec = get_workspace_components(config)
@@ -993,7 +1011,10 @@ def list_scopes(include_archived: bool = False, project: Optional[str] = None) -
     # tag literally named `project`/`collection`/`workspace` would otherwise have
     # its own vocabulary silently overwritten by the provenance.
     envelope = {
-        "scopes": order_scope_counts(store.get_scope_counts(include_archived=include_archived)),
+        "scopes": scope_report(
+            store.get_scope_counts(include_archived=include_archived),
+            store.get_scope_discrimination(),
+        ),
     }
     envelope.update(corpus_provenance(config))
     return dumps_display(envelope, ensure_ascii=False, indent=2)
@@ -1105,7 +1126,7 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
     # would swallow a targeting failure into the lexical-degraded envelope.
     config = _target_config(project, "query_decisions")
     # A pre-V1a graph raises at store construction — the graph is unusable, so
-    # the lexical fallback parses decisions.md directly (no graph access).
+    # the lexical fallback parses the markdown corpus directly (no graph access).
     try:
         store, embed_provider, vector_store = get_workspace_components(config)
     except Exception as e:
@@ -1213,9 +1234,9 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             # not, and a diagnosis present on one exit only is a verb that reads as
             # done (3e's per-EXIT lesson).
             elif not output_list and missing_graph_is_a_gap(
-                store, config, corpus_has_entries=corpus_has_entries
+                store, config, corpus_scan=corpus_holds_entries
             ):
-                envelope["note"] = missing_graph_note("mcp")
+                envelope["note"] = missing_graph_note("mcp", config)
             return dumps_display(envelope, ensure_ascii=False, indent=2)
         except CollectionMissingError as e:
             # I8 — see surface_decisions. The healthy-empty envelope is BUILT here
@@ -1246,9 +1267,9 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             # set is empty, and names the heal that fixes both. Without it the clone
             # gets the cleanest possible empty answer over hundreds of decisions.
             if missing_graph_is_a_gap(
-                store, config, corpus_has_entries=corpus_has_entries
+                store, config, corpus_scan=corpus_holds_entries
             ):
-                empty["note"] = missing_graph_note("mcp")
+                empty["note"] = missing_graph_note("mcp", config)
             return dumps_display(empty, ensure_ascii=False, indent=2)
         except Exception as e:
             # Embedding/Qdrant failure mid-query (e.g. a 429): never the raw
@@ -1263,6 +1284,16 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
         query, config=config, reason=degraded_reason_from_error(None), store=store,
         brief=brief, limit=clamp_limit(limit),
     )
+
+
+#: MCP's recovery clause for a record-path rotation failure: a fact and a human next
+#: actor, never a command (the CLI text renderer composes its own). The register
+#: follows `recall.MISSING_GRAPH_POINTERS["mcp"]`.
+ROTATION_FAILURE_RECOVERY = (
+    "Nothing needs calling again: the decision is recorded, and the next "
+    "record_decision on this project tries rotation again. If it keeps failing, a "
+    "person with a shell in that project looks at the cause named in error."
+)
 
 
 @mcp.tool()
@@ -1342,7 +1373,11 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
         for neighbours that stand independently — or both at once for a mixed set. A "created"
         result MAY carry `neighbor_review_unavailable` (the near-dup review could
         not run; absent neighbours are not checked-clean) or a debounced
-        `scope_overflow` health nudge (not about this decision).
+        `scope_overflow` health nudge (not about this decision). It MAY carry
+        `rotation`: OLDER settled entries this call moved to an archive
+        (outcome "rotated", `archives`; blocks kept in place in `skipped`,
+        outcome "skipped" if none moved), or outcome "failed" with `stage`,
+        `error` and `recovery` — the write still stands.
     """
     config = _target_config(project, "record_decision")
     # Build our own writable manager — do NOT reuse get_workspace_components()
@@ -1350,7 +1385,7 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
     # resolved once above like the read tools. The import stays LAZY: mcp_server →
     # sync → cli → mcp_server is a real cycle, broken only by all three edges
     # being deferred to call time, and this is one of the three.
-    from mitos.sync import MitosSyncManager
+    from mitos.sync import ROTATION_FAILED, MitosSyncManager
     manager = MitosSyncManager(config)
     result = manager.record_decision_entry(
         axiom=axiom,
@@ -1370,6 +1405,18 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
         slug=slug,
         acknowledge_neighbors=acknowledge_neighbors,
     )
+    # A rotation failure leaves the write standing. The receipt carries the cause;
+    # this boundary adds its own recovery (no command — an agent handed one runs it)
+    # and one line to the server's stderr for whoever reads its log. Never stdout:
+    # that is the JSON-RPC channel.
+    rotation_report = result.get("rotation")
+    if rotation_report and rotation_report.get("outcome") == ROTATION_FAILED:
+        rotation_report["recovery"] = ROTATION_FAILURE_RECOVERY
+        print(
+            f"[Warning] Archive rotation failed after recording {result.get('slug')!r} "
+            f"in {config.workspace_dir}: {rotation_report['error']}",
+            file=sys.stderr,
+        )
     # The receipt names the corpus it just wrote to — the highest-value stamp in
     # the set precisely because it is the write: a mis-aimed read wastes a turn,
     # a mis-aimed write lands a real entry in another project's gold source.
@@ -1379,6 +1426,314 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
     # embedding/status/code/neighbors/message/error/edges_created/scope/
     # mechanisms/…) contain none of these three, so the update adds and never
     # overwrites.
+    result.update(corpus_provenance(config))
+    return dumps_display(result, ensure_ascii=False, indent=None)
+
+
+# --------------------------------------------------------------------------- #
+# amend_commentary — the MCP twin of the CLI's amend-commentary verb
+# --------------------------------------------------------------------------- #
+
+#: This boundary's codes beside 4a's vocabulary. `buffer_fidelity` and `empty_value`
+#: share the CLI's code names by value (pinned by a row, never imported — this module
+#: must not import `cli`); `conflicting_arguments` is this surface's form of
+#: argparse's mutex group.
+_AMEND_CODE_BUFFER_FIDELITY = "buffer_fidelity"
+_AMEND_CODE_EMPTY_VALUE = "empty_value"
+_AMEND_CODE_CONFLICTING_ARGUMENTS = "conflicting_arguments"
+
+#: Why each kill-edge route fits, keyed by `amend.ROUTES`' intent keys.
+_AMEND_ROUTE_INTENTS = {
+    "wrong": "if the original was wrong",
+    "outgrown": "if it has been outgrown",
+    "partial": "if only part of it moved",
+}
+
+_AMEND_ARGUMENTS_POINTER = "this tool's description lists its editable arguments and `clear`."
+
+#: The raised fidelity body's second line. The fact before it is the core's.
+_AMEND_FIDELITY_RECOVERY = (
+    "Nothing was written: a value would change decisions.md beyond the fields named "
+    "— most often a line that starts with `##` or reads like a `**Field:**` line. "
+    "Rephrase that line and call again."
+)
+
+
+def _amend_fields(fields: List[str]) -> str:
+    """Renders a refusal's ``fields`` list, reading naturally when it is empty."""
+    return ", ".join(repr(f) for f in fields) if fields else "the request"
+
+
+def _amend_verb(fields: List[str], singular: str, plural: str) -> str:
+    """Picks the verb that agrees with ``_amend_fields``' rendering of ``fields``."""
+    return plural if len(fields) > 1 else singular
+
+
+def _amend_amended_recovery(result: Dict[str, Any]) -> Optional[str]:
+    """States what a rename left behind; an edit that renamed nothing needs no clause."""
+    rename = result.get("rename")
+    if not rename:
+        return None
+    old, new = rename["from"], rename["to"]
+    incoming = rename.get("incoming")
+    if incoming is None:
+        return (f"The entries citing {old!r} could not be read. Any relation line in "
+                f"decisions.md that names {old!r} now reads as diverged, and that entry "
+                f"cannot be amended until the line names {new!r}.")
+    if not incoming:
+        return None
+    # A fact and no tool: editing each line is the whole repair.
+    return (f"The entries in `rename.incoming` still name {old!r} in their relation "
+            "lines in decisions.md, so they read as diverged and cannot be amended "
+            f"until each line names {new!r}.")
+
+
+def _amend_canonical_core_recovery(result: Dict[str, Any]) -> str:
+    """Names `record_decision` and every kill-edge route by its distinction."""
+    handle = result["slug"]
+    # Every route, by the distinction — never one door.
+    routes = "; ".join(
+        f"`{relation}={handle!r}` {_AMEND_ROUTE_INTENTS.get(intent, intent)}"
+        for intent, relation in result["routes"].items()
+    )
+    return ("Decided and Mechanisms are what a decision is — its id is computed from "
+            "them — so changing them records a new decision rather than editing this "
+            "one. Record it with `record_decision` on this same project, naming the "
+            f"relation that says why this one moved: {routes}.")
+
+
+#: One clause per refusal reason, keyed by 4a's constants and fenced by a reflection
+#: row, so a new reason reds there rather than returning without a clause.
+_AMEND_RECOVERY_BY_REASON: Dict[str, Any] = {
+    amend.REASON_CANONICAL_CORE: _amend_canonical_core_recovery,
+    # D7's edge-repair gap, stated: the reconcile is CLI-only, so a person is named.
+    amend.REASON_EDGES: lambda result: (
+        "A relation change can retire or resurrect a decision, so this tool does not "
+        "make it. Relation lines are edited in decisions.md and applied by a sync "
+        "reconcile, which no tool here performs — a person with a shell in that "
+        "project runs it."),
+    amend.REASON_DIVERGED: lambda result: (
+        f"The entry in decisions.md already differs from the graph in "
+        f"{_amend_fields(result['fields'])}. A person with a shell in that project "
+        "applies that edit with a sync reconcile or undoes it in decisions.md before "
+        "this tool can amend the entry."),
+    amend.REASON_UNPARSEABLE: lambda result: (
+        "An entry in decisions.md bearing this handle does not parse, so it cannot be "
+        "edited safely; it must be fixed there first."),
+    amend.REASON_OPEN_QUESTION: lambda result: (
+        "This handle names an open question; this tool edits decision entries in "
+        "decisions.md only."),
+    # Reached by a clear too (`clear=["rejected_paths"]`), where no value was given,
+    # so the clause says what may not be cleared rather than blaming a value.
+    amend.REASON_INVALID_VALUE: lambda result: (
+        f"The value for {_amend_fields(result['fields'])} cannot be written into the "
+        "entry. A slug and rejected paths can be replaced but never cleared; scope "
+        "tags hold no comma or line break."),
+    amend.REASON_NOT_EDITABLE: lambda result: (
+        f"{_amend_fields(result['fields'])} "
+        f"{_amend_verb(result['fields'], 'is not an editable part', 'are not editable parts')} "
+        "of a committed entry."),
+    amend.REASON_UNKNOWN_FIELD: lambda result: (
+        f"{_amend_fields(result['fields'])} "
+        f"{_amend_verb(result['fields'], 'is not a field', 'are not fields')} "
+        f"of a decision entry; {_AMEND_ARGUMENTS_POINTER}"),
+    amend.REASON_NO_CHANGES: lambda result: (
+        f"No field to change was given; {_AMEND_ARGUMENTS_POINTER}"),
+}
+
+
+def _amend_refused_recovery(result: Dict[str, Any]) -> Optional[str]:
+    clause = _AMEND_RECOVERY_BY_REASON.get(result.get("reason"))
+    return clause(result) if clause else None
+
+
+#: One entry per status; `None` where the result is its own answer.
+_AMEND_RECOVERY_BY_STATUS: Dict[str, Any] = {
+    amend.STATUS_AMENDED: _amend_amended_recovery,
+    amend.STATUS_UNCHANGED: None,
+    amend.STATUS_REFUSED: _amend_refused_recovery,
+    # Not SHOW_NOT_FOUND_HINT: its unsynced-draft clause is false for a tool that just
+    # read decisions.md and found no such entry.
+    amend.STATUS_NOT_FOUND: lambda result: (
+        "The handle names no decision in the graph and no entry in decisions.md. Check "
+        "it with `list_decisions` (oneline=True maps the whole corpus) or `show_node`, "
+        "on this same project."),
+    # A fact and a human: `rebuild` has no tool, so a command here would be one an
+    # agent runs (ADR archived-target-refusal-owes-two-boundary-clauses-mcp-names-no-rebuild).
+    amend.STATUS_ARCHIVED: lambda result: (
+        "This entry is archived: it sits in decisions/archive/, and a tool that edits "
+        "decisions.md cannot reach it. An archived entry changes through a full "
+        "rebuild of the graph, which no tool here performs — a person runs it."),
+    amend.STATUS_UNCOMMITTED: lambda result: (
+        "It is in decisions.md but not committed yet, so there is nothing to amend; "
+        "its entry is edited where it is written, in decisions.md."),
+}
+
+#: One entry per `amend.ERROR_FACTS` code; `None` where the fact is the whole answer.
+_AMEND_RECOVERY_BY_CODE: Dict[str, Optional[str]] = {
+    "slug_collision": "Choose another `new_slug`.",
+    "commit_failed": None,
+    "audit_unavailable": None,
+    "lock_timeout": "Call again once the other process holding the decisions.md lock finishes.",
+    "rollback_failed": "A person checks decisions.md before any other write to this project.",
+}
+
+
+def _amend_recovery(result: Dict[str, Any]) -> Optional[str]:
+    """Composes this boundary's recovery clause for an amend result.
+
+    Args:
+        result: A result dict from ``MitosSyncManager.amend_commentary``.
+
+    Returns:
+        The clause, or ``None`` when the result needs none.
+    """
+    code = result.get("code")
+    if code is not None:
+        return _AMEND_RECOVERY_BY_CODE.get(code)
+    clause = _AMEND_RECOVERY_BY_STATUS.get(result.get("status"))
+    return clause(result) if clause else None
+
+
+def _amend_argument_fault(slug: str, code: str, error: str) -> str:
+    """Answers an argument mistake before any project is resolved.
+
+    ``list_decisions``' precedent: the mistake is in the arguments, not the target,
+    so it carries no provenance — no config exists yet. Returned, never raised: a
+    raise here would read as call syntax.
+    """
+    return dumps_display({"error": error, "code": code, "slug": slug},
+                         ensure_ascii=False, indent=None)
+
+
+@mcp.tool()
+def amend_commentary(slug: str,
+                     rejected_paths: Optional[str] = None,
+                     invalidates_if: Optional[str] = None,
+                     context: Optional[str] = None,
+                     scope: Optional[List[str]] = None,
+                     new_slug: Optional[str] = None,
+                     clear: Optional[List[str]] = None,
+                     axiom: Optional[str] = None,
+                     mechanisms: Optional[List[str]] = None,
+                     supersedes: Optional[str] = None, corrects: Optional[str] = None,
+                     amends: Optional[str] = None, narrows: Optional[str] = None,
+                     depends_on: Optional[str] = None, resolves: Optional[str] = None,
+                     contradicts: Optional[str] = None,
+                     derives_from: Optional[str] = None, cites: Optional[str] = None,
+                     project: Optional[str] = None) -> str:
+    """Repair a committed decision's commentary in place — never a new decision.
+
+    Edits the rejected paths, invalidates-if, context, scope or slug of a decision
+    already recorded: the entry is repaired in decisions.md and re-committed to the
+    same node, id unchanged. Reach for it when a recorded entry carries a wrong
+    scope, a sloppy rejected path or a slug you regret — record_decision cannot fix
+    those, since an identical decision answers `exists` and saves no changed
+    commentary. It reaches entries still in decisions.md; an archived one answers
+    `archived`.
+
+    Every answer about the entry RETURNS a JSON result: read its `status` (or
+    `{error, code}` for a fault), and its `recovery` sentence where one applies.
+    Beyond an unresolvable `project`, only a value that would corrupt decisions.md
+    comes back as an error, and nothing is written then. To remove a field, name
+    it in `clear`. Passing `axiom`, `mechanisms` or a relation argument is refused
+    with the route that does change them. After a rename, the entries citing the
+    old slug must be edited to name the new one.
+
+    Args:
+        slug: The decision to repair — its slug or content-hash id.
+        rejected_paths: Replacement rejected paths. A required field: it can be
+            replaced, never cleared.
+        invalidates_if: Replacement invalidates-if text.
+        context: Replacement context prose.
+        scope: Replacement scope tags, in authored order (the first is primary).
+        new_slug: Rename the decision. Entries citing the old slug then read as
+            diverged until their relation lines in decisions.md name the new one;
+            the result lists them under `rename.incoming`.
+        clear: Field names to REMOVE, e.g. ["context"] or ["scope"]. An empty
+            string or an empty list is refused rather than read as a removal, so
+            a removal is always named here.
+        axiom: Declared, with mechanisms and the relation arguments (named as
+            record_decision names them), only to be refused: the decision itself
+            and its relations are not commentary, and the result names the route.
+        project: Which project this call is about — REQUIRED on every call: a
+            registered project name (e.g. 'mitos') or the absolute path of a
+            workspace. Call `list_projects()` if you do not know the names.
+
+    Returns:
+        A JSON string. `status` is amended (`fields_changed`, plus `rename` on a
+        rename), unchanged, refused (`reason`, `fields`), not_found, archived or
+        uncommitted; a fault is {error, code}. Each carries a trailing {project,
+        collection, workspace} echo naming the corpus, except an argument mistake,
+        which is answered before any project is resolved.
+    """
+    changes: Dict[str, Any] = {}
+    for field, value in (("rejected_paths", rejected_paths),
+                         ("invalidates_if", invalidates_if), ("context", context)):
+        if value is None:
+            continue
+        if not value.strip():
+            # The core reads an empty prose value as a removal; an agent produces one
+            # by accident (a failed template fill), so a removal is named in `clear`.
+            remedy = ("Rejected is a required field, so it cannot be emptied."
+                      if field == "rejected_paths" else
+                      f'to remove the field, name it in `clear` (clear=["{field}"]).')
+            return _amend_argument_fault(
+                slug, _AMEND_CODE_EMPTY_VALUE, f"`{field}` was given an empty value; {remedy}")
+        changes[field] = value
+    if scope is not None:
+        if not scope or any(not tag.strip() for tag in scope):
+            # `scope=[]` is a live clear in the core, and an empty tag normalizes away.
+            return _amend_argument_fault(
+                slug, _AMEND_CODE_EMPTY_VALUE,
+                "`scope` was given an empty list or an empty tag; to remove the Scope "
+                'line, name it in `clear` (clear=["scope"]).')
+        changes["scope"] = list(scope)
+    if new_slug is not None:
+        changes["slug"] = new_slug
+
+    # Refusal-carrying: FastMCP drops an undeclared argument silently, so an `axiom`
+    # beside a `context` would otherwise return `amended` with the axiom ignored.
+    if axiom is not None:
+        changes["axiom"] = axiom
+    if mechanisms is not None:
+        changes["mechanisms"] = list(mechanisms)
+    relations = {
+        "supersedes": supersedes, "corrects": corrects, "amends": amends,
+        "narrows": narrows, "depends_on": depends_on, "resolves": resolves,
+        "contradicts": contradicts, "derives_from": derives_from, "cites": cites,
+    }
+    for field, value in relations.items():
+        if value is not None:
+            changes[field] = value
+
+    if clear:
+        conflicting = sorted({name for name in clear if name in changes})
+        if conflicting:
+            return _amend_argument_fault(
+                slug, _AMEND_CODE_CONFLICTING_ARGUMENTS,
+                f"{_amend_fields(conflicting)} {_amend_verb(conflicting, 'was', 'were')} "
+                "both given a value and named in "
+                "`clear`; pass one or the other.")
+        # Any name passes through, so the core refuses what cannot be cleared.
+        for name in clear:
+            changes[name] = [] if name == "scope" else None
+
+    config = _target_config(project, "amend_commentary")
+    # LAZY, as in record_decision: mcp_server → sync → cli → mcp_server is a cycle.
+    from mitos.sync import MitosSyncManager
+    manager = MitosSyncManager(config)
+    try:
+        result = manager.amend_commentary(slug, changes)
+    except BufferFidelityError as exc:
+        # By name, never MitosError: an MI-13 ValidationError out of resolve_handle is
+        # a breach, not a refused value, and propagates as show_node's does.
+        raise _RenderedToolError(
+            f"[{_AMEND_CODE_BUFFER_FIDELITY}] {exc}\n  {_AMEND_FIDELITY_RECOVERY}") from exc
+
+    recovery = _amend_recovery(result)
+    if recovery is not None:
+        result["recovery"] = recovery
     result.update(corpus_provenance(config))
     return dumps_display(result, ensure_ascii=False, indent=None)
 

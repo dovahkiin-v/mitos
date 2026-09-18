@@ -190,7 +190,7 @@ def test_t1_s1_cold_start_round_trip(ws) -> None:
     assert node["slug"] == "use-sqlite-wal"
     assert node["core_axiom"] == "Use SQLite in WAL mode for the graph store."
     assert node["mechanisms"] == ["sqlite", "wal-mode"]
-    assert node["scope"] == ["database", "substrate"]  # casefold + sorted scopes
+    assert node["scope"] == ["substrate", "database"]  # casefold + authored order
     assert node["rejected_paths"].startswith("pgvector")
 
     # The write path's id IS the slug-free canonical-core hash (W2 identity) —

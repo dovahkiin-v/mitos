@@ -516,11 +516,12 @@ def _atomic_write(target: str, content: str) -> None:
 
     Writes a temp file in the **same directory** (same filesystem, so the replace
     is atomic) and ``os.replace``s it over the target: a concurrent reader sees
-    either the whole old file or the whole new one. Mirrors
-    ``renderer.atomic_write``, reimplemented rather than imported — that module
-    imports ``mitos.store``, and pulling it in here would break this leaf's tier
-    on day one. The ``fsync`` is the one addition: cheap durability on a
-    once-per-``init`` write.
+    either the whole old file or the whole new one, and the ``fsync`` buys
+    cheap durability on a once-per-``init`` write. It predates
+    ``mitos.atomic_file`` and keeps its own tmp+replace so that failures are
+    wrapped in ``RegistryError``; unlike that leaf it does not preserve an
+    existing file's mode (``mkstemp`` creates at ``0600``, which suits a
+    per-user config file).
 
     Raises:
         RegistryError: If the directory cannot be created or the write/replace

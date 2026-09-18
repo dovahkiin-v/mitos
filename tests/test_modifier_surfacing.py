@@ -31,7 +31,7 @@ from mitos.parser import ParsedEntry
 from mitos.recall import assess_query_recall
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS
 from mitos.sync import MitosSyncManager
-from mitos.renderer import render_node_markdown, MitosRenderer
+from mitos.renderer import render_node_markdown, MitosRenderer, assemble_render
 
 
 @pytest.fixture
@@ -1021,6 +1021,41 @@ def test_render_all_writes_modifier_marker(ws) -> None:
     with open(f"{config.workspace_dir}/live_axioms.md", encoding="utf-8") as f:
         content = f.read()
     assert "⚠ Amended by:** rendered-v2" in content
+
+
+def test_degraded_scope_file_rows_carry_modifier_stamps(ws, monkeypatch) -> None:
+    """A per-scope file degraded to an index still stamps every modified row.
+
+    The index is the half of the no-tool hand-join the raw corpus cannot supply: the
+    corpus has the text, only the render knows which decisions later ones moved on
+    from. `supersedes` retires its target from the active set, so a superseded
+    decision has no row at all — its stamp can never ride an index row.
+    """
+    import mitos.renderer as R
+    monkeypatch.setattr(R, "SCOPE_OVERFLOW_WARN_CHARS", 50)
+    config, m = ws
+    _rec(m, "stamped", scope=["deg"])
+    _rec(m, "stamped-v2", scope=["deg"], amends="stamped")
+    _rec(m, "fenced", scope=["deg"])
+    _rec(m, "fencer", scope=["deg"], narrows="fenced")
+    _rec(m, "retired", scope=["deg"])
+    _rec(m, "retirer", scope=["deg"], supersedes="retired")
+
+    store = GraphStore(config.db_path)
+    record = assemble_render(store)["scopes"]["deg"]
+    assert record["mode"] == "index"
+    rows = {line.split("**")[1]: line for line in record["content"].splitlines()
+            if line.startswith("- **")}
+    assert "⚠ amended by: stamped-v2" in rows["stamped"]
+    assert "narrowed by: fenced" not in rows["fenced"]
+    assert "narrowed by: fencer" in rows["fenced"]
+    assert "⚠" not in rows["stamped-v2"] and "⚠" not in rows["retirer"]
+    assert "retired" not in rows
+
+    MitosRenderer(config.workspace_dir).render_all(store)
+    with open(os.path.join(config.workspace_dir, ".mitos", "axioms", "deg.md"),
+              encoding="utf-8") as f:
+        assert f.read() == record["content"]
 
 
 # --------------------------------------------------------------------------- #

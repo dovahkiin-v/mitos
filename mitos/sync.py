@@ -10,10 +10,10 @@ import sys
 import shutil
 import re
 import json
+import sqlite3
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
-from typing import TYPE_CHECKING, List, Dict, Optional, Any, Set, Tuple, Callable
+from typing import TYPE_CHECKING, List, Dict, Mapping, Optional, Any, Set, Tuple, Callable
 from filelock import FileLock, Timeout
 
 if TYPE_CHECKING:
@@ -22,6 +22,10 @@ if TYPE_CHECKING:
     from google import genai
 
 from mitos import __version__ as MITOS_VERSION
+from mitos import amend
+from mitos import atomic_file
+from mitos import rotation
+from mitos import settledness
 from mitos.config import MitosConfig, hint_due
 from mitos.conflict import (
     CONFLICT_CANDIDATE_SOURCE,
@@ -72,6 +76,7 @@ from mitos.identity import SLUG_MAX_LEN, compute_node_id, embedding_text
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.vector_store import QdrantVectorStore, hash_to_uuid
 from mitos.renderer import MitosRenderer, summarize_overflows
+from mitos.restore import BufferFidelityError, verify_amended_buffer
 
 
 @dataclass
@@ -229,8 +234,10 @@ Make sure the slug is a clean, lowercase hyphenated string that matches the deci
 
 # --- record_decision helpers (write-half of the MCP server) ---
 
-# The exact buffer marker, byte-for-byte identical to cmd_capture (cli.py). The
-# `—` is an em dash; do not retype it.
+# The exact buffer marker. Its consumers are record_decision_entry here and
+# cmd_capture / cmd_restore_source in cli.py; auto_heal_decisions_file and the
+# `mitos init` seed keep their own byte-identical copies. The `—` is an em dash;
+# do not retype it.
 _ENTRIES_MARKER = "<!-- BEGIN ENTRIES — new decisions go directly below this line, newest first -->"
 
 # A content line that looks like a Mitos field header (e.g. `**Decided:**`); the
@@ -314,6 +321,32 @@ def _split_relation_slugs(raw: Optional[str]) -> List[str]:
 def _record_error(code: str, **fields: Any) -> Dict[str, str]:
     """Builds a structured {error, code} dict using the canonical message for ``code``."""
     return {"error": _ERROR_MESSAGES[code].format(**fields), "code": code}
+
+
+class _AmendAnswer(Exception):
+    """Carries an in-band amendment answer out of ``splice_buffer``.
+
+    Raised, never returned as text: a transform that returned the original buffer would
+    still write it, run ``after_write``, commit a no-op and attribute it. Raised from the
+    transform it writes nothing; raised from ``after_write`` it rolls the buffer back.
+    """
+
+    def __init__(self, result: Dict[str, Any]) -> None:
+        super().__init__(result.get("status"))
+        self.result = result
+
+
+class _AmendFault(Exception):
+    """Carries an amendment's environment or graph fault out of ``after_write``.
+
+    A private type, so the rollback path can tell it apart from ``splice_buffer``'s own
+    rollback-failure ``MitosError`` — nearly every mitos exception is a ``MitosError``.
+    """
+
+    def __init__(self, code: str, **fields: Any) -> None:
+        super().__init__(code)
+        self.code = code
+        self.fields = fields
 
 
 def _embedding_input_text(
@@ -434,6 +467,87 @@ _COHERENCE_AUDIT_NOTE = (
     "Coherence audit is cumulative and corpus-wide: this corpus holds recorded "
     "decisions that no contradiction check has covered yet."
 )
+
+# The `rotation` field of a `created` receipt: what this write's one bounded rotation
+# did. Runtime-only and never persisted; it crosses the JSON boundary on MCP
+# `record_decision` and `mitos record --json`, so it holds lists and dicts only. The
+# vocabulary lives here so the renderers and the tests import it rather than retype it.
+ROTATION_ROTATED = "rotated"
+ROTATION_SKIPPED = "skipped"
+ROTATION_FAILED = "failed"
+
+ROTATION_STAGE_LOCK = "lock"
+ROTATION_STAGE_GRAPH = "graph"
+ROTATION_STAGE_FILE = "file"
+ROTATION_STAGE_UNEXPECTED = "unexpected"
+
+ROTATION_REASON_DUPLICATED = "duplicated"
+ROTATION_REASON_OVERLAPPING = "overlapping"
+
+# A fact, not a recovery: like every receipt string it reaches MCP, so it names no
+# command. Each renderer composes its own recovery clause beside it.
+_ROTATION_FAILED_NOTE = (
+    "The decision was recorded. Rotation left decisions.md unchanged; an archive may "
+    "already hold a copy of the entries it was moving."
+)
+
+
+def _rotation_failure_stage(exc: BaseException) -> str:
+    """Classifies where a record-path rotation failed, by exception type.
+
+    ``filelock.Timeout`` subclasses ``TimeoutError`` and so ``OSError``: it is tested
+    first, or a busy lock would read as a file fault.
+    """
+    if isinstance(exc, Timeout):
+        return ROTATION_STAGE_LOCK
+    if isinstance(exc, (sqlite3.Error, DatabaseError)):
+        return ROTATION_STAGE_GRAPH
+    if isinstance(exc, (OSError, UnicodeError)):
+        return ROTATION_STAGE_FILE
+    return ROTATION_STAGE_UNEXPECTED
+
+
+def _rotation_failure(exc: Exception) -> Dict[str, Any]:
+    """Builds the receipt's ``rotation`` field for a rotation that raised."""
+    return {
+        "outcome": ROTATION_FAILED,
+        "stage": _rotation_failure_stage(exc),
+        "error": f"{type(exc).__name__}: {exc}",
+        "note": _ROTATION_FAILED_NOTE,
+    }
+
+
+def _rotation_report(outcome: "rotation.RotationOutcome") -> Optional[Dict[str, Any]]:
+    """Builds the receipt's ``rotation`` field from an outcome, or ``None`` for silence.
+
+    Archives are counted by basename exactly as sync's ``_report_rotation`` counts
+    them. A block left unmatched is silent here as it is on sync, so an outcome that
+    moved nothing and skipped nothing reports nothing.
+    """
+    skipped: List[Dict[str, Any]] = [
+        {"slug": label, "reason": ROTATION_REASON_DUPLICATED, "occurrences": count}
+        for label, count in outcome.duplicated
+    ]
+    skipped += [
+        {"slug": label, "reason": ROTATION_REASON_OVERLAPPING}
+        for label in outcome.overlapping
+    ]
+    if outcome.rotated:
+        archives = []
+        for archive_path in outcome.archive_paths:
+            name = os.path.basename(archive_path)
+            slugs = [
+                block.label for block in outcome.rotated
+                if os.path.basename(block.archive_name) == name
+            ]
+            archives.append({"path": archive_path, "entries": len(slugs), "slugs": slugs})
+        report: Dict[str, Any] = {"outcome": ROTATION_ROTATED, "archives": archives}
+        if skipped:
+            report["skipped"] = skipped
+        return report
+    if skipped:
+        return {"outcome": ROTATION_SKIPPED, "archives": [], "skipped": skipped}
+    return None
 
 # A new decision at/above this document-document similarity to an existing one the
 # author did NOT reference is paused for review (AX P4): the neighbour must surface
@@ -1069,8 +1183,7 @@ class MitosSyncManager:
             current_header = parts[0]
             if current_header.strip() != canonical_header.strip():
                 new_content = canonical_header + marker + entries_content
-                with open(filepath, "w", encoding="utf-8") as f:
-                    f.write(new_content)
+                atomic_file.write_source(filepath, new_content)
                 # stderr, not stdout: this method is on `record_decision_entry`'s path,
                 # which the MCP write tool shares — and that transport uses stdout for
                 # JSON-RPC, so a stray line here is protocol corruption, not noise. It
@@ -1082,8 +1195,7 @@ class MitosSyncManager:
         else:
             if "## SAMPLE FORMAT" not in content:
                 new_content = canonical_header + marker + "\n\n" + content
-                with open(filepath, "w", encoding="utf-8") as f:
-                    f.write(new_content)
+                atomic_file.write_source(filepath, new_content)
                 print("Auto-restored missing sample format header and BEGIN ENTRIES "
                       "marker ✓", file=sys.stderr)
 
@@ -1230,20 +1342,6 @@ class MitosSyncManager:
                 print("Zero pending entries found in the decisions.md / questions.md write-buffers.")
             return
 
-        # Stale-entry detection (>14 days unprocessed) — DECISIONS ONLY (D5): the
-        # vision defers OQ stale-detection; questions.md is a persistent buffer that
-        # never rotates, so a >14-day open question must NOT emit a spurious
-        # "remains unsynced" warning.
-        for entry in decision_entries:
-            if entry.date:
-                try:
-                    entry_dt = datetime.strptime(entry.date, "%Y-%m-%d")
-                    diff = datetime.now() - entry_dt
-                    if diff.days > 14:
-                        print(f"[Warning] Entry '{entry.slug}' was drafted on {entry.date} (>14 days ago) and remains unsynced.")
-                except Exception:
-                    pass
-
         api_key = self.config.env.get("GEMINI_API_KEY")
         if not api_key:
             print("GEMINI_API_KEY environment variable is not set. Sync requires API keys.")
@@ -1259,17 +1357,16 @@ class MitosSyncManager:
             
         renderer = MitosRenderer(self.config.workspace_dir)
 
-        synced_blocks: List[Tuple[ParsedEntry, str]] = []
-
         # 4b intra-sync fixpoint: the main pass below collects every entry the store
         # rejects with a CommitError (a forward-ref whose in-corpus target has not
         # committed yet, a slug collision, a kind/cycle violation) into this set
         # instead of reporting it immediately. After the main pass, the fixpoint
         # re-attempts the set until a pass makes no further progress, so any acyclic
         # cross-file forward-ref chain converges in THIS single sync. Each tuple
-        # carries the fully-prepared entry, its decisions-snapshot raw text (for
-        # rotation if a decision commits in the fixpoint; "" for OQs), and its latest
-        # failure (for the post-fixpoint residual report).
+        # carries the fully-prepared entry, a raw-text slot, and its latest failure
+        # (for the post-fixpoint residual report). The slot is the shape `replay`
+        # shares with `rebuild`; sync slices no raw text, so it carries "" — rotation
+        # reads its blocks from the live buffer instead.
         quarantined: List[Tuple[ParsedEntry, str, CommitError]] = []
 
         # Conflict sensor (5a): build the judgment executor ONCE per run (CONF-D4/D7) —
@@ -1293,23 +1390,7 @@ class MitosSyncManager:
                 conflict_run = self._new_conflict_run()
 
         # 3. Process each parsed entry
-        # The decisions snapshot is private and never rewritten after step 1, so it is
-        # read once, on the first decision entry. Re-reading it per entry made a large
-        # buffer's sync quadratic — 47% of a 3,704-entry cold sync (measured 2026-09-12).
-        snap_lines: Optional[List[str]] = None
         for entry in entries:
-            # Read exact raw text block of this entry from snapshot for content-aware
-            # rotation — DECISIONS ONLY (D5): the line range here indexes the
-            # DECISIONS snapshot, so an open-question entry's range would index the
-            # wrong file. OQ entries never rotate (questions.md is a persistent
-            # buffer), so they need no raw-text block.
-            entry_raw_text = ""
-            if entry.kind == "decision":
-                if snap_lines is None:
-                    with open(snapshot_path, "r", encoding="utf-8") as f:
-                        snap_lines = f.readlines()
-                entry_raw_text = "".join(snap_lines[entry.line_start - 1 : entry.line_end])
-
             # Check if this node is already in the database (slug-free V1a id — V1-D2).
             node_id = compute_node_id(
                 kind=entry.kind,
@@ -1336,9 +1417,8 @@ class MitosSyncManager:
                 # C′ — the commentary reconcile, DIVERGENCE-GATED. Without the gate
                 # this branch would reach `commit_parsed_entry` for every
                 # already-committed entry: on the dogfood corpus that is 203 accept
-                # prompts, 203 SONNET conflict judgments per sync, and the whole buffer
-                # rotated into the archive. Gated, a clean corpus takes the same
-                # `continue` as before — zero behavioural delta, and MI-3's
+                # prompts and 203 SONNET conflict judgments per sync. Gated, a clean
+                # corpus takes the same `continue` as before — zero behavioural delta, and MI-3's
                 # no-tick-on-a-byte-identical-recommit property stays intact.
                 if entry.kind != "decision":
                     # Decisions only, matching the detector, which excludes open
@@ -1383,9 +1463,10 @@ class MitosSyncManager:
                 # Reconciled. Deliberately falls through to `continue` rather than the
                 # commit path below: no conflict judge (the canonical core is unchanged,
                 # so there is no new claim to judge), no accept prompt, no confirmation
-                # re-stamp, and above all NO ROTATION — rotation stays tied to a FIRST
-                # commit, because an entry that leaves the buffer leaves sync's read-set
-                # and its future divergence becomes invisible again.
+                # re-stamp. The reconcile ticks `updated_at`, so the entry is recently
+                # touched and step 4's settledness keeps it in the buffer: an entry that
+                # leaves the buffer leaves sync's read-set, and its future divergence
+                # would become invisible again.
                 ledger.note(entry, "reconciled")
                 continue
 
@@ -1427,7 +1508,7 @@ class MitosSyncManager:
                     # The interactive `[c]orrection / [s]upersession` prompt used to sit
                     # here, and it is retired rather than fixed. Its answer was only ever
                     # applied in memory — nothing spliced the chosen line into the buffer,
-                    # and rotation archives the raw unmodified snapshot slice — so every
+                    # and rotation archived the raw unmodified block — so every
                     # interactively-resolved collision committed a kill-edge the gold
                     # source does not declare. Against P6/M7 (the markdown must remain the
                     # rebuildable truth): the entry replays at rebuild without its
@@ -1562,9 +1643,8 @@ class MitosSyncManager:
                 # 4b: collect (don't report yet) for the intra-sync fixpoint retry
                 # after this loop. The entry is fully prepared (enriched, collision-
                 # resolved, confirmed-stamped) — only the store-stage commit failed,
-                # and its in-corpus target may yet commit in this same sync. Carry
-                # entry_raw_text so a decision committed in the fixpoint still rotates.
-                quarantined.append((entry, entry_raw_text, exc))
+                # and its in-corpus target may yet commit in this same sync.
+                quarantined.append((entry, "", exc))
                 # Pessimistic stamp: the fixpoint below upgrades whichever of these
                 # it drains, so a missed correction leaves a shortfall rather than a
                 # false satisfaction.
@@ -1590,13 +1670,6 @@ class MitosSyncManager:
             # best-effort embedding upsert (C2) — applies to OQ nodes too.
             self._best_effort_embed(delta, entry)
 
-            # Record successfully committed block for rotation — DECISIONS ONLY (D5):
-            # questions.md never rotates (persistent buffer), and an OQ block would
-            # carry decisions-snapshot raw text, so OQ entries must not enter the
-            # rotation set or the pending_threshold rotation prompt's count.
-            if entry.kind == "decision":
-                synced_blocks.append((entry, entry_raw_text))
-
         # 3b. Intra-sync fixpoint retry (4b). The main pass committed every entry
         # whose targets were already present; re-attempt the quarantined set until a
         # pass makes no further progress, so any acyclic cross-file forward-ref chain
@@ -1606,9 +1679,8 @@ class MitosSyncManager:
         # ordering — D5/MI-12). A genuinely-unresolvable reference (a never-authored
         # target, or a true A↔B mutual-reference cycle) makes zero progress, terminates
         # after one no-progress pass, and surfaces below as a loud per-entry vector —
-        # never a hang, never a whole-sync abort. The fixpoint sits BEFORE rotation so
-        # a decision it commits is appended to synced_blocks and rotates with the rest.
-        residual = self._commit_quarantine_fixpoint(quarantined, synced_blocks)
+        # never a hang, never a whole-sync abort.
+        residual = self._commit_quarantine_fixpoint(quarantined)
         # The satisfied "committed" state is TWO sites, not one. A stamp placed only
         # after the main pass's `Committed node:` misses every entry the fixpoint
         # drains, so a named forward-ref target would exit non-zero on a run that
@@ -1621,53 +1693,24 @@ class MitosSyncManager:
         for entry, _raw, exc in residual:
             self._report_commit_quarantine(entry, exc)
 
-        # 4. Content-aware archive rotation under brief lock (V3b)
-        if synced_blocks:
-            if len(synced_blocks) >= self.config.pending_threshold and not auto_accept:
-                print(f"\n[Lifecycle] Sync volume threshold reached ({len(synced_blocks)} entries pending rotation).")
-                choice = input("Would you like to rotate the write-buffer to quarterly archive now? [y/n]: ").strip().lower()
-                if choice != 'y':
-                    synced_blocks.clear()
-                    print("Archive rotation deferred. Entries remain in write-buffer.")
-
-        if synced_blocks:
-            try:
-                with self.lock:
-                    with open(self.config.decisions_file, "r", encoding="utf-8") as f:
-                        live_content = f.read()
-
-                    rotated_text = ""
-                    for entry, raw_block in synced_blocks:
-                        # Match by content block exactly and remove/modify in live file
-                        if raw_block in live_content:
-                            if self.config.rotation_mode == "mark":
-                                # Mark mode: wrap the raw block in an HTML comment so it's ignored but preserved
-                                commented_block = f"<!-- ROTATED START\n{raw_block}\nROTATED END -->"
-                                live_content = live_content.replace(raw_block, commented_block)
-                            else:
-                                # Archive/Prune mode: remove from live buffer
-                                live_content = live_content.replace(raw_block, "")
-                            rotated_text += raw_block + "\n"
-
-                    # Write back live buffer (non-destructive)
-                    with open(self.config.decisions_file, "w", encoding="utf-8") as f:
-                        f.write(live_content)
-
-                    # Only write to archive directory if in archive mode!
-                    if self.config.rotation_mode == "archive":
-                        quarter_file = f"{datetime.now().year}-Q{(datetime.now().month-1)//3 + 1}.md"
-                        os.makedirs(self.config.archive_dir, exist_ok=True)
-                        archive_path = os.path.join(self.config.archive_dir, quarter_file)
-                        
-                        with open(archive_path, "a", encoding="utf-8") as f:
-                            f.write(rotated_text)
-                        print(f"Rotated {len(synced_blocks)} entries to {archive_path} ✓")
-                    elif self.config.rotation_mode == "prune":
-                        print(f"Pruned {len(synced_blocks)} entries from buffer (rotation_mode=prune) ✓")
-                    elif self.config.rotation_mode == "mark":
-                        print(f"Marked {len(synced_blocks)} entries as rotated in buffer (rotation_mode=mark) ✓")
-            except Exception as e:
-                print(f"[Warning] Archive rotation failed: {str(e)}")
+        # 4. Archive rotation of the buffer's settled tail. What rotates is a property
+        # of the buffer, not of this run's commits: `_rotate_settled` reads the live
+        # buffer once under the lock and moves the contiguous settled run at its
+        # oldest end, bounded per acquisition. A rotation failure — a graph read
+        # included — is reported here and never fails the sync: the commits stand.
+        # Every line goes to stderr, and nothing rotated is silence.
+        try:
+            outcome = self._rotate_settled(window=settledness.ROTATION_WINDOW_ENTRIES)
+        except Exception as e:
+            sys.stdout.flush()
+            print(
+                f"[Warning] Archive rotation failed: {e}. decisions.md is unchanged; an "
+                f"archive may already hold a copy of the entries it was moving.",
+                file=sys.stderr,
+            )
+        else:
+            if outcome is not None:
+                self._report_rotation(outcome)
 
         # 5. Trigger renderer to statelessly regenerate files (C3)
         try:
@@ -1690,10 +1733,93 @@ class MitosSyncManager:
             hits, misses, rate = self.embed_provider.get_stats()
             print(f"\n[Observability] Cache Stats: Hits: {hits}, Misses: {misses}, Hit Rate: {rate*100:.1f}%")
 
+    def _rotate_settled(self, *, window: int) -> Optional[rotation.RotationOutcome]:
+        """Rotates the buffer's settled tail, at most ``window`` entries, archive first.
+
+        Settledness (committed ∧ quiet ∧ not diverged) is evaluated by
+        ``settledness.select_settled_tail`` inside ``rotation.rotate_selected``'s one
+        read of the live buffer, under this manager's own lock — never a second read,
+        and never the sync snapshot, whose whole-file replace would discard every
+        capture since. The clock is read once: the same instant is the quiet test's
+        ``now`` and names the archive (ADR
+        ``rotation-names-the-archive-for-the-rotation-instant-not-created-at``). Only
+        ``config.decisions_file`` is read, and it is parsed as decisions, so an open
+        question never rotates.
+
+        On the sync path this runs after the commits and their quarantine fixpoint. A
+        sync that returns before that — an empty buffer, no ``GEMINI_API_KEY``, or a
+        lock timeout — evaluates nothing. A run whose entries were skipped for review
+        does evaluate: an uncommitted entry is simply never settled.
+
+        On the record path ``record_decision_entry`` calls it once per ``created``
+        write, after that write's own lock hold has released, and only when the bytes
+        it just wrote hold at least ``rotation_volume_threshold_entries`` entries
+        (``settledness.buffered_entries``). Every other record exit — ``exists``,
+        ``needs_review``, an error, a lock timeout — evaluates nothing. The record
+        path turns a raise into its receipt's ``rotation`` field.
+
+        Args:
+            window: The most entries to evaluate, and so to move, in this acquisition.
+
+        Returns:
+            The rotation outcome, or ``None`` when nothing was selected and nothing was
+            written.
+
+        Raises:
+            Exception: Whatever the clock stamp, a graph read or the rotation raised.
+                The buffer is unchanged; an archive may already hold a copy of the
+                blocks. Prints nothing — each caller words the failure.
+        """
+        now = _utc_now_iso()
+        archive_name = rotation.archive_name_for(now)
+        chosen: List[settledness.Selection] = []
+
+        def _select(buffer_text: str) -> List[rotation.RotationBlock]:
+            selection = settledness.select_settled_tail(
+                buffer_text,
+                graph=self.store,
+                now=now,
+                lag_days=self.config.rotation_lag_days,
+                threshold=self.config.rotation_volume_threshold_entries,
+                window=window,
+                archive_name=archive_name,
+            )
+            chosen.append(selection)
+            return selection.blocks
+
+        outcome = rotation.rotate_selected(
+            self.lock, self.config.decisions_file, self.config.archive_dir, _select
+        )
+        if not chosen[0].blocks:
+            return None
+        return outcome
+
+    @staticmethod
+    def _report_rotation(outcome: "rotation.RotationOutcome") -> None:
+        """Words a rotation outcome on stderr; a block left unmatched stays silent."""
+        sys.stdout.flush()
+        for archive_path in outcome.archive_paths:
+            name = os.path.basename(archive_path)
+            moved = sum(
+                1 for block in outcome.rotated if os.path.basename(block.archive_name) == name
+            )
+            print(f"Rotated {moved} entries to {archive_path} ✓", file=sys.stderr)
+        for label, count in outcome.duplicated:
+            print(
+                f"[Warning] Rotation skipped {label!r}: its block occurs {count} times in "
+                f"decisions.md, so nothing was removed.",
+                file=sys.stderr,
+            )
+        for label in outcome.overlapping:
+            print(
+                f"[Warning] Rotation skipped {label!r}: its block overlaps another block in "
+                f"this batch, so neither was rotated.",
+                file=sys.stderr,
+            )
+
     def _commit_quarantine_fixpoint(
         self,
         quarantined: List[Tuple[ParsedEntry, str, CommitError]],
-        synced_blocks: List[Tuple[ParsedEntry, str]],
     ) -> List[Tuple[ParsedEntry, str, CommitError]]:
         """Drains the per-entry quarantine set to a fixpoint (4b).
 
@@ -1702,36 +1828,25 @@ class MitosSyncManager:
         in-corpus target had not committed yet, plus the structural rejections that
         never self-heal). This re-attempts that set until a pass commits nothing new,
         so any acyclic cross-file forward-ref chain converges in a **single** sync,
-        order-independently. A decision committed here is appended to ``synced_blocks``
-        so it rotates with the main-pass commits; OQ nodes never rotate (D5).
+        order-independently.
 
         The convergence loop is the shared :func:`mitos.replay.commit_quarantine_fixpoint`
         primitive (the same engine the ``mitos rebuild`` corpus replay uses). This
-        wrapper supplies the sync-specific embed + rotation callbacks and the loud
+        wrapper supplies the sync-specific embed callback and the loud
         convergence-observability line.
 
         Args:
             quarantined: The fully-prepared entries the main pass quarantined, each
-                with its decisions-snapshot raw text ("" for an OQ) and its latest
-                ``CommitError``.
-            synced_blocks: The rotation record; a committed decision is appended
-                ``(entry, raw)`` (mutated in place — the fixpoint runs before rotation
-                reads it).
+                with an empty raw-text slot and its latest ``CommitError``.
 
         Returns:
             The residual entries that never committed, each still carrying its latest
             ``CommitError`` — ``[]`` when everything converged.
         """
-        def _record_decision_block(entry: ParsedEntry, raw: str) -> None:
-            # Decisions rotate; OQs never do (raw is "" for an OQ, D5).
-            if entry.kind == "decision":
-                synced_blocks.append((entry, raw))
-
         committed, passes, residual = commit_quarantine_fixpoint(
             self.store,
             quarantined,
             embed_fn=self._best_effort_embed,
-            on_commit=_record_decision_block,
         )
 
         # Convergence observability: make the fixpoint's work visible (the vision
@@ -3024,8 +3139,9 @@ class MitosSyncManager:
         # rewritten, graph updated, audit row silent. That is exactly the unattributed
         # graph mutation P8 forbids, inside the feature that adds the attribution row.
         # `None` means no-change to the store, which restores the documented
-        # write-once-preserved semantics; transcript reconciliation is homed in the
-        # future `amend-commentary` verb along with its own attribution.
+        # write-once-preserved semantics. `amend_commentary` shipped without transcript
+        # editing (it withholds the transcript too), so transcript reconciliation is
+        # still unhomed.
         entry.transcript = None
 
         try:
@@ -3110,9 +3226,10 @@ class MitosSyncManager:
 
         The buffer-surgery primitive: **lock → auto-heal → read → splice → write →
         verify → roll back on failure.** Extracted rather than inlined at its first
-        caller because it is exactly what a future ``amend-commentary`` verb consumes
-        — the P20 Retrofit Test allows deferring that verb only on the condition that
-        its wiring is not left to be retrofitted.
+        caller (``cli.cmd_restore_source``) so the commentary amendment could consume
+        it without a retrofit; ``amend_commentary`` is its second consumer, committing
+        the graph inside ``after_write`` so the buffer edit and the commit roll back
+        together.
 
         Modelled on ``record_decision_entry``'s buffer-first + rollback contract,
         which this project treats as sacred. That method is deliberately NOT refactored
@@ -3152,22 +3269,252 @@ class MitosSyncManager:
             new_content = transform(original)
 
             try:
-                with open(self.config.decisions_file, "w", encoding="utf-8") as fh:
-                    fh.write(new_content)
+                atomic_file.write_source(self.config.decisions_file, new_content)
                 if after_write is not None:
                     after_write(new_content)
             except Exception:
                 try:
-                    with open(self.config.decisions_file, "w", encoding="utf-8") as fh:
-                        fh.write(original)
+                    atomic_file.write_source(self.config.decisions_file, original)
                 except Exception as restore_exc:
                     raise MitosError(
                         "The splice failed AND decisions.md could not be rolled back "
-                        f"(rollback error: {restore_exc}). The file may hold a partial "
-                        "edit — check it before running `mitos sync`."
+                        f"(rollback error: {restore_exc}). Each write replaces the file "
+                        "whole, so it holds whole content: either its text from before "
+                        "the splice or the unverified splice. Check which before running "
+                        "`mitos sync`."
                     ) from restore_exc
                 raise
             return new_content
+
+    def _amend_divergence(self, entry: ParsedEntry, node: Dict[str, Any],
+                          stored_edges: List[Dict[str, str]]) -> Tuple[List[str], Dict[str, Any]]:
+        """Names every way a buffered block and its node already disagree.
+
+        Args:
+            entry: The parsed buffer block.
+            node: Its committed node.
+            stored_edges: The node's outgoing edges.
+
+        Returns:
+            ``(species, report)``: the diverged field names — commentary fields,
+            ``scope``, ``edges``, ``source``, and ``slug`` for a case-only difference the
+            casefold comparison does not report — and the ``entry_divergence`` report.
+        """
+        report = entry_divergence(entry, node, node.get("scope") or [], stored_edges)
+        species = set(report.get("commentary") or [])
+        for key in ("scope", "edges", "source"):
+            if report.get(key):
+                species.add(key)
+        if (entry.slug or "") != (node.get("slug") or ""):
+            species.add("slug")
+        return sorted(species), report
+
+    def amend_commentary(self, slug: str, changes: Mapping[str, Any]) -> Dict[str, Any]:
+        """Edits one committed buffered entry's mutable fields and re-commits it.
+
+        The tool-side replacement for hand-editing ``decisions.md`` and running a
+        reconcile. It repairs commentary — ``amend.EDITABLE_FIELDS``, the reconcile's
+        set less edges — and never what a decision says: the canonical core and the
+        edges are refused as requests, with the kill-edge routes as data.
+
+        One lock hold, through ``splice_buffer``. The transform classifies the target on
+        the live locked read and applies field-line surgery; ``after_write`` runs the
+        whole-buffer fence (``restore.verify_amended_buffer``), writes the write-ahead
+        attribution row, and commits — so a refused fence, an unwritable audit row or a
+        failed commit rolls the buffer back byte for byte. Embedding and rendering run
+        after the lock, best-effort, warnings on stderr only; stdout stays empty because
+        an MCP twin shares this path. No rotation is evaluated: the entry count never
+        changes, and the target's ``updated_at`` tick keeps it recent anyway.
+
+        A target whose buffered block already disagrees with its node (a hand edit not
+        yet reconciled, or a citation left stale by a rename elsewhere) is refused as
+        ``diverged``: committing it would also apply edge or field changes the request
+        did not name.
+
+        CC-21: ``record_decision_entry`` diverges from this fence and is not edited. Its
+        structural-token check refuses heading- and field-shaped lines in the prose
+        fields, and its self-parse count guard refuses a phantom entry from the list and
+        relation arguments, both before any write; a new block is prepended below the
+        entries marker, so continuation bleed cannot reach a neighbour.
+
+        Args:
+            slug: The target handle (a slug, or an id), resolved as ``show`` resolves it.
+            changes: Field → new value; keys from ``amend.EDITABLE_FIELDS``. ``slug`` is
+                the new slug; ``invalidates_if``/``context`` take ``None`` or ``""`` to
+                remove the field; ``scope`` takes a list, ``[]`` removing the line.
+
+        Returns:
+            A JSON-safe dict whose ``status`` is ``amended`` (``id``, ``fields_changed``,
+            ``embedding``, ``path``, and ``rename`` = ``{"from", "to", "incoming"}`` on a
+            rename), ``unchanged`` (``id``), ``refused`` (``reason``, ``fields``,
+            ``routes`` for ``canonical_core``), ``not_found``, ``archived`` (``id``) or
+            ``uncommitted``; or a fault ``{"error", "code", "slug"}`` with code
+            ``slug_collision``, ``commit_failed`` (also a graph read that failed under
+            the lock), ``audit_unavailable``,
+            ``lock_timeout`` or ``rollback_failed``. Every string states a cause and
+            names no command.
+
+        Raises:
+            BufferFidelityError: If the edit would change the buffer beyond the request
+                (a phantom entry, neighbour bleed, a moved core or an unrequested field);
+                the buffer is rolled back first. The only designed raise.
+            ValidationError: If the handle's slug resolves to more than one active node
+                (an MI-13 breach is not "not found").
+        """
+        refusal = amend.validate_changes(changes)
+        if refusal is not None:
+            return {**refusal, "slug": slug}
+
+        state: Dict[str, Any] = {}
+
+        def _transform(original: str) -> str:
+            target = amend.classify_target(
+                original, slug=slug,
+                resolve=self.store.resolve_handle, lookup=self.store.get_node,
+            )
+            if isinstance(target, amend.Miss):
+                raise _AmendAnswer(target.result)
+            species, _ = self._amend_divergence(
+                target.entry, target.node, self.store.get_outgoing_edges(target.node_id)
+            )
+            if species:
+                raise _AmendAnswer(amend.refused(amend.REASON_DIVERGED, species))
+            expected = amend.expected_fingerprint(target.entry, changes)
+            if amend.fingerprint_matches(expected, target.entry):
+                raise _AmendAnswer({"status": amend.STATUS_UNCHANGED, "id": target.node_id})
+            # The baseline is the text this transform saw, never a pre-lock snapshot.
+            state.update(before=original, target=target, expected=expected)
+            return amend.apply_changes(original, target, changes)
+
+        def _verify_and_commit(after_text: str) -> None:
+            target = state["target"]
+            entry = verify_amended_buffer(
+                state["before"], after_text,
+                target_id=target.node_id, expected=state["expected"],
+            )
+            node = self.store.get_node(target.node_id)
+            if node is None:
+                raise _AmendAnswer({"status": amend.STATUS_UNCOMMITTED})
+            stored_edges = self.store.get_outgoing_edges(target.node_id)
+            # Re-checked against the graph as it is now: a concurrent sync reconciles
+            # outside this lock. Only the requested fields may differ from the node.
+            species, divergence = self._amend_divergence(entry, node, stored_edges)
+            unrequested = sorted(set(species) - set(changes))
+            if unrequested:
+                raise _AmendAnswer(amend.refused(amend.REASON_DIVERGED, unrequested))
+            prior, new_values = self._reconcile_value_pair(entry, node, divergence, stored_edges)
+            if entry.slug != node.get("slug") and "slug" not in new_values:
+                # A case-only rename: the divergence leaf compares casefold.
+                prior["slug"], new_values["slug"] = node.get("slug"), entry.slug
+
+            audit_id = uuid.uuid4().hex
+            try:
+                telemetry = TelemetryStore(self.config.telemetry_path)
+                telemetry.record_commentary_intent(
+                    CommentaryAuditRow(
+                        audit_id=audit_id,
+                        node_id=target.node_id,
+                        slug=node.get("slug"),
+                        fields_changed=sorted(new_values),
+                        prior_values=prior,
+                        new_values=new_values,
+                        mitos_version=MITOS_VERSION,
+                    ),
+                    created_at=_utc_now_iso(),
+                )
+            except Exception as exc:
+                raise _AmendFault("audit_unavailable", reason=str(exc)) from exc
+
+            # Graph-primary confirmation pair carried forward, transcript withheld: the
+            # reconcile's two rules, for the same reasons.
+            entry.confirmed_by = node.get("confirmed_by")
+            entry.confirmed_at = node.get("confirmed_at")
+            entry.transcript = None
+            try:
+                delta = self.store.commit_parsed_entry(entry)
+            except (CommitError, DatabaseError, ValidationError, OSError) as exc:
+                reason = str(exc)
+                fault: Dict[str, Any] = {"code": "commit_failed"}
+                if isinstance(exc, CommitError) and exc.failure:
+                    reason = "; ".join(item.message for item in exc.failure.items) or reason
+                    if any(item.code == STORE_SLUG_COLLISION for item in exc.failure.items):
+                        fault = {"code": "slug_collision", "requested": entry.slug}
+                if fault["code"] == "commit_failed":
+                    fault["reason"] = reason
+                # Append-only closure, best-effort: the mutation did not happen.
+                try:
+                    telemetry.record_commentary_outcome(
+                        audit_id=uuid.uuid4().hex,
+                        correlates_to=audit_id,
+                        outcome=f"failed: {reason}",
+                        created_at=_utc_now_iso(),
+                        mitos_version=MITOS_VERSION,
+                    )
+                except Exception:
+                    pass
+                raise _AmendFault(**fault) from exc
+            state.update(delta=delta, entry=entry, old_slug=node.get("slug"),
+                         fields_changed=sorted(new_values))
+
+        try:
+            self.splice_buffer(_transform, after_write=_verify_and_commit)
+        except _AmendAnswer as answer:
+            return {**answer.result, "slug": slug}
+        except _AmendFault as fault:
+            return amend.error_result(fault.code, slug=slug, **fault.fields)
+        except BufferFidelityError:
+            raise
+        except Timeout:
+            return amend.error_result("lock_timeout", slug=slug)
+        except (DatabaseError, sqlite3.Error) as exc:
+            # A graph read under the lock failed (classification, the divergence checks
+            # or the re-read before commit): an environment fault, not an answer about
+            # the target, and the buffer was never written or has been rolled back.
+            return amend.error_result("commit_failed", slug=slug, reason=str(exc))
+        except MitosError as exc:
+            # `splice_buffer` raises a bare MitosError, chained, only when its rollback
+            # write failed; every other MitosError is a subclass.
+            if type(exc) is MitosError and exc.__cause__ is not None:
+                return amend.error_result("rollback_failed", slug=slug, reason=str(exc.__cause__))
+            raise
+        except OSError as exc:
+            return amend.error_result(
+                "commit_failed", slug=slug, reason=f"the buffer could not be read or written: {exc}"
+            )
+
+        target, entry, delta = state["target"], state["entry"], state["delta"]
+        result: Dict[str, Any] = {
+            "status": amend.STATUS_AMENDED,
+            "slug": entry.slug,
+            "id": target.node_id,
+            "fields_changed": state["fields_changed"],
+        }
+        if entry.slug != state["old_slug"]:
+            # Read after the commit: the id is unchanged, so the edges survive; what goes
+            # stale is the citing entries' markdown.
+            try:
+                incoming: Optional[List[Dict[str, str]]] = self.store.get_incoming_edges(
+                    target.node_id
+                )
+            except Exception as e:
+                print(f"[Warning] Could not read the entries citing '{entry.slug}': {e}",
+                      file=sys.stderr)
+                incoming = None
+            result["rename"] = {"from": state["old_slug"], "to": entry.slug, "incoming": incoming}
+
+        try:
+            self._best_effort_embed(delta, entry)
+        except Exception as e:
+            print(f"[Warning] Embedding step failed for '{entry.slug}': {e}", file=sys.stderr)
+        try:
+            # Unfiltered, so a vacated scope's file is swept and a moved primary follows.
+            MitosRenderer(self.config.workspace_dir).render_all(self.store)
+        except Exception as e:
+            print(f"[Warning] Failed to render active axioms: {e}", file=sys.stderr)
+
+        result["embedding"] = self._embedding_status(target.node_id)
+        result["path"] = self.config.decisions_file
+        return result
 
     def record_decision_entry(
         self,
@@ -3238,7 +3585,14 @@ class MitosSyncManager:
             unchecked; the notice names the cause and no command, each surface
             composing its own recovery), plus an always-present
             ``coherence_audit`` statement of the corpus's standing, cumulative
-            contradiction-check debt; OR, when a highly-similar unreferenced decision exists and
+            contradiction-check debt, plus an optional ``rotation`` report of the one
+            bounded rotation this write ran once its buffer reached
+            ``rotation_volume_threshold_entries``: ``outcome`` "rotated" (the
+            ``archives`` written, each ``{path, entries, slugs}``, and any
+            ``skipped``), "skipped" (nothing moved; each ``skipped`` element names
+            its slug and reason) or "failed" (``stage``/``error``/``note``; the write
+            still stands, and the field names no command); absent when nothing was
+            eligible; OR, when a highly-similar unreferenced decision exists and
             ``acknowledge_neighbors`` is False, a ``{status: "needs_review", code:
             "similar_decision_exists", slug, neighbors, message}`` pause that wrote
             NOTHING —
@@ -3618,8 +3972,7 @@ class MitosSyncManager:
                 # — including an OSError on the write itself — roll the buffer back
                 # so a failure leaves NO orphan entry, and return JSON (never raise).
                 try:
-                    with open(self.config.decisions_file, "w", encoding="utf-8") as f:
-                        f.write(new_content)
+                    atomic_file.write_source(self.config.decisions_file, new_content)
                     delta = self.store.commit_parsed_entry(entry)
                 except (ValidationError, DatabaseError, OSError, CommitError) as commit_exc:
                     # Roll the buffer back so a failed write/commit leaves NO orphan
@@ -3631,8 +3984,7 @@ class MitosSyncManager:
                     # it). Surface the per-item messages so the agent sees the actionable
                     # field (P3 vector error), not a generic wall.
                     try:
-                        with open(self.config.decisions_file, "w", encoding="utf-8") as f:
-                            f.write(original_content)
+                        atomic_file.write_source(self.config.decisions_file, original_content)
                     except Exception as restore_exc:
                         return {
                             "error": (
@@ -3652,6 +4004,29 @@ class MitosSyncManager:
             return _record_error(
                 "commit_failed", reason="another Mitos process holds the decisions.md lock"
             )
+
+        # 7b. One bounded rotation of the buffer's settled tail — the write landed, so
+        #     it is `created` and only `created` reaches here. It runs after the write's
+        #     lock hold releases, never woven into it, and takes its own acquisition,
+        #     reading the live buffer there: that one read holds the entry just written
+        #     plus anything a concurrent writer added since. `new_content` is exactly
+        #     the file just written, so it pre-gates the count without a second read —
+        #     below the threshold there is no acquisition at all. A stale gate either
+        #     way is harmless: the selector re-counts over the live read. One call, no
+        #     loop — the agent is blocked on this call, and the residual drains across
+        #     later writes. Unlike the embed and render steps around it, a failure here
+        #     prints nothing: it rides the receipt as data, and each renderer words it
+        #     once (a print here as well would say it twice on the CLI text surface).
+        rotation_report: Optional[Dict[str, Any]] = None
+        if (settledness.buffered_entries(new_content)
+                >= self.config.rotation_volume_threshold_entries):
+            try:
+                outcome = self._rotate_settled(window=settledness.ROTATION_WINDOW_ENTRIES)
+            except Exception as e:
+                rotation_report = _rotation_failure(e)
+            else:
+                if outcome is not None:
+                    rotation_report = _rotation_report(outcome)
 
         # 8. Embed best-effort (queues to the outbox if Gemini/Qdrant are down).
         try:
@@ -3711,4 +4086,8 @@ class MitosSyncManager:
         # by both surfaces (CLI prints it after the receipt; MCP returns it structured).
         if overflow_summary:
             result["scope_overflow"] = overflow_summary
+        # What this call's rotation did, only when it moved, skipped or failed — never
+        # the buffer's standing size, which is `mitos status`'s to report.
+        if rotation_report:
+            result["rotation"] = rotation_report
         return result

@@ -1167,7 +1167,7 @@ def test_the_unbuilt_override_takes_the_text_branch_that_appends(cloned):
     config, _ = cloned
     out = _cli_query([], cloned)
     assert "No matching decisions found." in out
-    assert "graph is unbuilt" in out and "mitos sync" in out
+    assert "graph is unbuilt" in out and "mitos rebuild -p" in out
     assert _band_lines(out) == []
     assert _query_note("cli", config=config, top_score=None, result_count=0) not in out
 
@@ -1179,7 +1179,8 @@ def test_the_unbuilt_override_keeps_the_label_on_the_machine_encodings(cloned, d
     same straight-line order `cmd_surface` has run since W31."""
     out = (_cli_query_json([], cloned) if driver == "cli" else _mcp_query([], cloned))
     assert out["confidence"] == "none"
-    assert "graph is unbuilt" in out["note"] and "mitos sync" in out["note"]
+    # Both registers name the rebuild: the CLI as a command, MCP as a fact.
+    assert "graph is unbuilt" in out["note"] and "rebuild" in out["note"]
     assert "reconcile" not in out["note"]
 
 

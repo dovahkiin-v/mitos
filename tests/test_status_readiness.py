@@ -97,9 +97,10 @@ def test_json_report_ready_and_has_mcp_project_entry_field(tmp_path, monkeypatch
 
 
 def test_status_reports_scope_overflow_detail(tmp_path, monkeypatch, capsys):
-    """status is the detail surface for size-ceiling overflows: per-file sizes + largest
-    decisions in the text report, and a structured list in the JSON report. This is where
-    the write path's one-line nudge sends the author for the actionable breakdown."""
+    """status is the detail surface for size-ceiling overflows: per-file sizes in the text
+    report, each index's longest rows under `-v`, and a structured list in the JSON
+    report. This is where the write path's one-line nudge sends the reader for the
+    breakdown. The overflow never changes the verdict, the exit code or the JSON keys."""
     import mitos.renderer as R
     from mitos.store import GraphStore
     from mitos.parser import ParsedEntry
@@ -122,21 +123,37 @@ def test_status_reports_scope_overflow_detail(tmp_path, monkeypatch, capsys):
     big.scope = ["substrate"]
     store.commit_parsed_entry(big)
 
-    # Text report names the over-ceiling file, the largest decision, and a token estimate.
+    def _overflow_block(text: str) -> str:
+        # The slug also reaches stdout through the missing-vectors list, so the needle
+        # is read inside the overflow block only.
+        return text.split("over the size ceiling", 1)[1].split("\n\n", 1)[0]
+
+    # Text report names the over-ceiling file and a token estimate; the slug is withheld.
     assert cli.cmd_status(str(tmp_path)) == 0
     out = capsys.readouterr().out
-    assert "over the size ceiling" in out
-    assert "substrate.md" in out
-    assert "big-axiom" in out
-    assert "tokens" in out
+    block = _overflow_block(out)
+    assert "substrate.md" in block and "tokens" in block
+    assert "big-axiom" not in block
+    assert "READY ✓" in out
 
-    # JSON report carries the structured scope_overflow list with ranked top decisions.
+    # Under -v the block names the index's longest row.
+    assert cli.cmd_status(str(tmp_path), verbose=True) == 0
+    block = _overflow_block(capsys.readouterr().out)
+    assert "longest rows:" in block and "big-axiom" in block
+
+    # JSON report carries the structured scope_overflow list with ranked top decisions,
+    # its keys exactly as before this vision (P1).
     assert cli.cmd_status(str(tmp_path), as_json=True) == 0
     data = json.loads(capsys.readouterr().out)
+    assert data["ready"] is True
     over = [o for o in data["scope_overflow"] if o["name"] == "substrate.md"]
     assert len(over) == 1
+    assert set(over[0]) == {"name", "scope", "chars", "est_tokens", "threshold_chars",
+                            "top_decisions"}
     assert over[0]["threshold_chars"] == 200
     assert over[0]["top_decisions"][0]["slug"] == "big-axiom"
+    sizes = [d["chars"] for d in over[0]["top_decisions"]]
+    assert sizes == sorted(sizes, reverse=True)
 
 
 def _commit_n(tmp_path, n):

@@ -38,7 +38,7 @@ RESOLVED_ENV_KEYS: Tuple[str, ...] = (
 # ---------------------------------------------------------------------------
 # v0.1 config schema (§5.2.6) — the SINGLE source of the static defaults.
 #
-# `CONFIG_DEFAULTS` holds the eight STATIC-default schema keys: `mitos init` (6b)
+# `CONFIG_DEFAULTS` holds the nine STATIC-default schema keys: `mitos init` (6b)
 # seeds `config.toml` from this exact map, and the loader's missing-key fallback
 # reads it — so a seeded file and a deleted-key fallback can never diverge (P11).
 # `qdrant_url` is recognized + type-validated (in `CONFIG_SCHEMA`) but NOT here:
@@ -50,7 +50,18 @@ RESOLVED_ENV_KEYS: Tuple[str, ...] = (
 CONFIG_DEFAULTS: Dict[str, Any] = {
     "rotation_mode": "archive",
     "rotation_archive_path_template": "decisions/archive/{year}-Q{quarter}.md",
+    # Rotation evaluates settledness once the buffer holds at least this many entries
+    # (`mitos.settledness`) — at the end of `sync`, and after each `record` write.
     "rotation_volume_threshold_entries": 50,
+    # How long a committed entry must go untouched (`updated_at`) before rotation may
+    # move it. Deliberately long: a lag too short moves live work out of `sync`'s
+    # reach and the error accumulates; a lag too long only drains more slowly.
+    "rotation_lag_days": 14,
+    # Dormant, read by nothing. It names the window of the prototype's warning about
+    # an UNSYNCED draft left in the buffer — a different clock over a different
+    # population from `rotation_lag_days` — and that warning had no input once
+    # entry headers stopped carrying a date, so it was deleted. Kept, not retired,
+    # so a vision that gives drafts a timestamp can use the name.
     "stale_entry_window_days": 30,
     "embedding_cache_max_entries": 10_000,
     # Pinned to renderer.py's GLOBAL/SCOPE_OVERFLOW_WARN_CHARS via a cross-check
@@ -64,7 +75,7 @@ CONFIG_DEFAULTS: Dict[str, Any] = {
 }
 
 # The recognized file keys → expected (TOML scalar) type, for strict validation.
-# The eight static keys above PLUS the dynamic-default `qdrant_url` = the nine-key
+# The nine static keys above PLUS the dynamic-default `qdrant_url` = the ten-key
 # schema. A file key NOT in this map is tolerated and skipped — split into two
 # buckets by `_load_config_file`: a RECOGNIZED-but-retired key (`RETIRED_CONFIG_KEYS`
 # below) is tolerated SILENTLY, while a genuinely unknown key (a typo) earns one
@@ -73,6 +84,7 @@ CONFIG_SCHEMA: Dict[str, type] = {
     "rotation_mode": str,
     "rotation_archive_path_template": str,
     "rotation_volume_threshold_entries": int,
+    "rotation_lag_days": int,
     "stale_entry_window_days": int,
     "embedding_cache_max_entries": int,
     "render_global_overflow_warn_chars": int,
@@ -82,11 +94,13 @@ CONFIG_SCHEMA: Dict[str, type] = {
 }
 
 # Keys the code DELIBERATELY dropped from the file schema but still recognizes —
-# their ATTRIBUTES survive at a default (R12); only the file-override capability is
-# gone. These are NOT typos, so the per-invocation "unrecognized config key" warning
-# is a false alarm: the `mitos init`-seeded `pending_threshold` line tripped it on
-# every single call. They are tolerated SILENTLY. The warning is reserved for keys
-# the code does not know at all — where it is the useful signal that a setting will
+# for the four path keys the ATTRIBUTE survives at a default (R12) and only the
+# file-override capability is gone; `pending_threshold`'s attribute is gone too,
+# with the rotation gate that read it (surface-entropy 3b), but pre-V1a-seeded files
+# still carry the line. These are NOT typos, so the per-invocation "unrecognized
+# config key" warning is a false alarm: the `mitos init`-seeded `pending_threshold`
+# line tripped it on every single call. They are tolerated SILENTLY. The warning is
+# reserved for keys the code does not know at all — where it is the useful signal that a setting will
 # silently not take effect.
 #
 # `qdrant_collection` joins them for a stronger reason than the other four: its
@@ -132,10 +146,11 @@ ROTATION_MODES = frozenset({"archive", "mark", "prune"})
 #           parser-skipped annotation to sit in a reserved namespace — `parser.py`
 #           has no namespace predicate at all. Deprecating it loses nothing that was
 #           ever built.
-#   `prune` removes the block from the buffer and writes it NOWHERE (the archive
-#           write is gated on `rotation_mode == "archive"`), so the node has no source
-#           block and `rebuild` — the tool's own repair story — permanently cannot
-#           reconstruct it. Its "for users who fully trust the graph as source"
+#   `prune` removed the block from the buffer and wrote it NOWHERE (the archive
+#           write was gated on `rotation_mode == "archive"`; both non-archive branches
+#           were deleted in surface-entropy 1c, since this coercion made them
+#           unreachable), so the node had no source block and `rebuild` — the tool's
+#           own repair story — could never reconstruct it. Its "for users who fully trust the graph as source"
 #           rationale belongs to the pre-M7/P6 "storage is the graph, markdown is a
 #           render target" direction, which was later reversed.
 #
@@ -536,13 +551,6 @@ class MitosConfig:
         self.questions_file = os.path.join(self.workspace_dir, "questions.md")
         self.archive_dir = os.path.join(self.workspace_dir, "decisions", "archive")
 
-        # `pending_threshold` LEFT the v0.1 file schema (its migration to
-        # `rotation_volume_threshold_entries` is V3a's, not V1a's) but stays a
-        # default-valued attribute — `sync.py`'s rotation-prompt gate reads it. A
-        # `pending_threshold` file key is now silently tolerated (a recognized
-        # retired key — see RETIRED_CONFIG_KEYS), not applied.
-        self.pending_threshold = 30
-
         # Dynamic-default schema keys: recognized + type-validated by CONFIG_SCHEMA,
         # file-overridable, but defaulted from their single-source helpers (not from
         # CONFIG_DEFAULTS, which holds only the STATIC defaults).
@@ -664,8 +672,8 @@ class MitosConfig:
         for key, val in data.items():
             if key not in CONFIG_SCHEMA:
                 # A recognized-but-retired key (deliberately dropped from the file
-                # schema; its attribute still lives at a default, R12) is tolerated
-                # SILENTLY — it is not a typo, so warning on it every call is pure
+                # schema; RETIRED_CONFIG_KEYS says which attributes survive) is
+                # tolerated SILENTLY — it is not a typo, so warning on it every call is pure
                 # noise. A genuinely unknown key (a typo whose setting silently won't
                 # take effect) still earns one calm, terse, screen-reader-clean line
                 # to stderr (P9, no emoji) — that warning is the useful signal.
@@ -706,6 +714,21 @@ class MitosConfig:
                 self.rotation_mode = "archive"
                 continue
 
+            # Both rotation keys decide what leaves the gold source, so a nonsense
+            # value is refused rather than silently changing what rotates. A lag of 0
+            # is legal: it rotates anything committed before the rotation instant.
+            if key == "rotation_volume_threshold_entries" and val < 1:
+                raise ConfigError(
+                    f"Config key '{key}' in {config_path} must be at least 1, got {val!r}."
+                )
+            # The upper bound is representability, not policy: a lag past what a
+            # `timedelta` holds would fail the rotation on every run instead.
+            if key == "rotation_lag_days" and not 0 <= val <= 999_999_999:
+                raise ConfigError(
+                    f"Config key '{key}' in {config_path} must be between 0 and "
+                    f"999999999 days, got {val!r}."
+                )
+
             # Schema keys are exactly the attribute names (R12 surface).
             setattr(self, key, val)
 
@@ -713,10 +736,9 @@ class MitosConfig:
         """Converts configuration to dictionary form.
 
         Includes the convention-path attributes, the two dynamically-defaulted
-        qdrant attributes, the kept-but-de-schema'd ``pending_threshold``, and the
-        eight static schema keys (sourced from ``CONFIG_DEFAULTS`` so the set can't
-        drift). ``qdrant_collection`` stays here even though it left the file
-        schema — that is the retirement pattern's promise: the attribute survives
+        qdrant attributes, and the nine static schema keys (sourced from
+        ``CONFIG_DEFAULTS`` so the set can't drift). ``qdrant_collection`` stays here
+        even though it left the file schema — that is the retirement pattern's promise: the attribute survives
         at its computed default and every consumer binding it is unaffected.
         ``inert_file_keys`` is deliberately absent (runtime-only, never persisted).
         No consumer binds this today; it exists for a future ``--json``/debug
@@ -732,12 +754,11 @@ class MitosConfig:
             "telemetry_path": self.telemetry_path,
             "qdrant_url": self.qdrant_url,
             "qdrant_collection": self.qdrant_collection,
-            "pending_threshold": self.pending_threshold,
             "decisions_file": self.decisions_file,
             "questions_file": self.questions_file,
             "archive_dir": self.archive_dir,
         }
-        # The eight static schema keys (incl. rotation_mode) from their one source.
+        # The nine static schema keys (incl. rotation_mode) from their one source.
         for key in CONFIG_DEFAULTS:
             result[key] = getattr(self, key)
         return result

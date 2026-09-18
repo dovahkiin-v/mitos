@@ -203,8 +203,10 @@ def order_scope_counts(counts: Dict[str, Dict[str, int]]) -> Dict[str, Dict[str,
     insertion order — it never transforms keys or values.
 
     Args:
-        counts: The ``{scope: {"active_decisions": int, "parked_open_questions":
-            int}}`` map from ``get_scope_counts`` (alphabetical, casefolded keys).
+        counts: A map keyed by casefolded scope tag whose values carry at least
+            ``active_decisions`` and ``parked_open_questions`` — ``get_scope_counts``'
+            two-key map, or ``scope_report``'s merged one. Only those two keys are
+            read; any others ride through in place.
 
     Returns:
         The same map, re-inserted in total-live-count-descending, ties-alphabetical
@@ -219,6 +221,42 @@ def order_scope_counts(counts: Dict[str, Dict[str, int]]) -> Dict[str, Dict[str,
             ),
         )
     )
+
+
+def scope_report(
+    counts: Dict[str, Dict[str, int]], discrimination: Dict[str, Dict[str, int]]
+) -> Dict[str, Dict[str, int]]:
+    """Merges the discrimination pair into the scope counts, in discovery order.
+
+    The one composition both ``mitos scopes`` and ``list_scopes`` call, so the merge
+    rule (key order, zero-fill) has a single home and CLI⇄MCP parity stays
+    structural. Each value keeps ``counts``' two keys first and gains
+    ``authored_first_decisions`` then ``co_tagged_scopes``; a scope the
+    discrimination map lacks (open-question-only, or a dead domain under
+    ``--archived``) reads ``0`` for both. The scope population is exactly
+    ``counts``' keys: a discrimination key absent from ``counts`` is not added. The
+    order is ``order_scope_counts``' — the discriminator never re-ranks the map.
+
+    Like ``order_scope_counts``, a tag→counts aggregate with no node to stamp. It
+    holds numbers only; any sentence about the report belongs to each surface.
+
+    Args:
+        counts: ``get_scope_counts``' map.
+        discrimination: ``get_scope_discrimination``' map.
+
+    Returns:
+        A new map, busiest domain first, each value a new four-key dict.
+    """
+    merged: Dict[str, Dict[str, int]] = {}
+    for scope, value in counts.items():
+        pair = discrimination.get(scope, {})
+        merged[scope] = {
+            "active_decisions": value["active_decisions"],
+            "parked_open_questions": value["parked_open_questions"],
+            "authored_first_decisions": pair.get("authored_first_decisions", 0),
+            "co_tagged_scopes": pair.get("co_tagged_scopes", 0),
+        }
+    return order_scope_counts(merged)
 
 
 def letter_payload(

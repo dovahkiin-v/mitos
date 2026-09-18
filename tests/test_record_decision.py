@@ -297,14 +297,21 @@ def test_slug_prefix_is_not_a_collision(ws) -> None:
 
 @patch("mitos.sync.QdrantVectorStore")
 @patch("mitos.sync.GeminiEmbeddingProvider")
-def test_scope_overflow_summary_after_receipt_then_debounced(mock_provider, mock_vector, ws) -> None:
+def test_scope_overflow_summary_after_receipt_then_debounced(mock_provider, mock_vector, ws,
+                                                            monkeypatch) -> None:
     """An over-ceiling render attaches ONE debounced `scope_overflow` summary to the result.
 
     Reproduces the AX complaint and pins the fix end-to-end on the shared write path
     (so both the CLI and MCP surfaces inherit it): the receipt fields are always intact,
     the size nudge is a single line pointing at `mitos status` (not the per-write wall),
     and a second record in the same workspace within the window is silent.
+
+    Since the per-scope degrade (2c) an over-ceiling scope file becomes an index, and at
+    the default ceilings this one decision's index fits, so nothing would be over. The
+    scope ceiling is squeezed below the index itself, which is still reported.
     """
+    import mitos.renderer as R
+    monkeypatch.setattr(R, "SCOPE_OVERFLOW_WARN_CHARS", 200)
     config, _ = ws
     # Degrade the backends → no network and no P4 near-duplicate pause (which needs
     # embeddings), isolating the overflow-presentation behaviour under test.
@@ -377,6 +384,49 @@ def test_write_path_warnings_go_to_stderr_not_stdout(mock_provider, mock_vector,
     assert "defer-clean" in captured.err
 
 
+@patch("mitos.sync.QdrantVectorStore")
+@patch("mitos.sync.GeminiEmbeddingProvider")
+def test_a_sweep_failure_on_the_record_path_leaves_the_commit_and_stdout_clean(
+        mock_provider, mock_vector, ws, capsys, monkeypatch) -> None:
+    """E7 (2e): the render's stale-scope sweep fails inside a record; the entry is
+    committed, stdout (the MCP JSON-RPC channel) stays clean, and the warning is on
+    stderr. The next record, with nothing refused, finishes the job."""
+    config, _ = ws
+    mock_provider.side_effect = Exception("provider down")
+    mock_vector.side_effect = Exception("qdrant down")
+    m = MitosSyncManager(config)  # rebuilt so the patched providers apply
+    axioms = os.path.join(config.workspace_dir, ".mitos", "axioms")
+    os.makedirs(axioms, exist_ok=True)
+    gone = os.path.join(axioms, "gone.md")
+    with open(gone, "w", encoding="utf-8") as f:
+        f.write("# Active Axioms for Scope: gone\nStale body.\n")
+
+    real_remove, fired = os.remove, []
+
+    def refuse_gone(path, *args, **kwargs):
+        if path == gone:
+            fired.append(path)
+            raise PermissionError(13, "Permission denied", path)
+        return real_remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "remove", refuse_gone)
+    res = m.record_decision_entry("Sweep failures never fail a write.", "Raising.",
+                                  ["reliability"], slug="sweep-refused")
+    monkeypatch.setattr(os, "remove", real_remove)
+
+    assert fired == [gone]
+    assert "error" not in res and res["status"] == "created"
+    assert GraphStore(config.db_path).get_node(res["id"]) is not None
+    captured = capsys.readouterr()
+    assert "[Warning]" not in captured.out
+    assert "gone.md" in captured.err
+    assert os.path.exists(gone)
+
+    m.record_decision_entry("A second write retries the sweep.", "Nothing.",
+                            ["reliability"], slug="sweep-retried")
+    assert not os.path.exists(gone)
+
+
 # --------------------------------------------------------------------------- #
 # MCP boundary
 # --------------------------------------------------------------------------- #
@@ -417,6 +467,87 @@ def test_commit_failed_rolls_back_buffer(ws, exc) -> None:
     assert res["code"] == "commit_failed"
     assert _read(config) == before  # rolled back, no orphan
     assert GraphStore(config.db_path).get_node_by_slug("will-fail") is None
+
+
+def _temps(config: MitosConfig) -> list:
+    directory = os.path.dirname(config.decisions_file)
+    return [n for n in os.listdir(directory) if n.endswith(".tmp")]
+
+
+def test_record_preserves_the_buffer_mode(ws) -> None:
+    """The atomic replace must not re-mode the gold source to the temp file's mode."""
+    config, m = ws
+    os.chmod(config.decisions_file, 0o640)
+    res = m.record_decision_entry("Mode survives.", "Rejection.", ["s"], slug="mode-ok")
+    assert res["status"] == "created"
+    assert os.stat(config.decisions_file).st_mode & 0o777 == 0o640
+    assert "mode-ok" in _read(config)
+
+
+def test_forward_buffer_write_failure_returns_commit_failed_and_leaves_buffer_whole(ws) -> None:
+    """A full disk on the forward write: commit_failed, buffer untouched, no node, no temp.
+
+    Injected at the real primitive's replace, so the temp file is genuinely created and
+    must be cleaned. The spy proves the failing call is the forward write carrying the
+    entry, not an auto-heal write (the `ws` header is canonical, so the heal makes none).
+    """
+    from mitos import atomic_file
+
+    config, m = ws
+    before = _read(config)
+    contents = []
+    real_write_source = atomic_file.write_source
+    real_replace = os.replace
+    replaces = {"n": 0}
+
+    def _spy(path, content):
+        contents.append(content)
+        return real_write_source(path, content)
+
+    def _fail_first_replace(src, dst):
+        replaces["n"] += 1
+        if replaces["n"] == 1:
+            raise OSError(28, "No space left on device")
+        return real_replace(src, dst)
+
+    with patch("mitos.atomic_file.write_source", side_effect=_spy), \
+            patch("mitos.atomic_file.os.replace", side_effect=_fail_first_replace):
+        res = m.record_decision_entry("Never lands.", "Rejection.", [], slug="never-lands")
+
+    assert res["code"] == "commit_failed"
+    assert len(contents) == 2, "forward write, then rollback write"
+    assert "never-lands" in contents[0] and contents[0] != before
+    assert _read(config) == before
+    assert GraphStore(config.db_path).get_node_by_slug("never-lands") is None
+    assert _temps(config) == []
+
+
+def test_refused_directory_fsync_does_not_turn_a_record_into_a_failed_rollback(ws) -> None:
+    """A mount that refuses directory fsync must still record cleanly.
+
+    Were the directory step fatal, the forward write would land and raise, the rollback
+    would land and raise, and the method would report "rollback failed" over a whole,
+    correctly rolled-back file — on every write on that mount.
+    """
+    import stat as _stat
+
+    config, m = ws
+    real_fsync = os.fsync
+    refused = []
+
+    def _fsync(fd):
+        if _stat.S_ISDIR(os.fstat(fd).st_mode):
+            refused.append(fd)
+            raise OSError(22, "Invalid argument")
+        return real_fsync(fd)
+
+    with patch("mitos.atomic_file.os.fsync", side_effect=_fsync):
+        res = m.record_decision_entry("Lands anyway.", "Rejection.", ["s"], slug="lands-anyway")
+
+    assert refused, "the directory fsync was never attempted"
+    assert "error" not in res and res["status"] == "created"
+    assert GraphStore(config.db_path).get_node_by_slug("lands-anyway") is not None
+    assert "lands-anyway" in _read(config)
 
 
 def test_concurrent_distinct_slugs_all_land(ws) -> None:
@@ -754,6 +885,16 @@ def test_exists_receipt_names_the_fields_it_ignored(ws) -> None:
     changed = m.record_decision_entry("Pin the digest length.", "CORRECTED reasoning.",
                                       ["alpha", "beta"], slug="pin-digest-length")
     assert changed["differs"] == ["rejected_paths", "scope"], changed
+
+    # A reorder-only re-record is a scope difference too: the first tag is the
+    # primary scope, and the stored order is not the order this call carried. (A
+    # separate node, because an `exists` re-record never mutates — the one above
+    # still holds `["alpha"]`, so reordering against it would test membership.)
+    m.record_decision_entry("Order the scope tags.", "A reason.", ["alpha", "beta"],
+                            slug="order-the-scope-tags")
+    reordered = m.record_decision_entry("Order the scope tags.", "A reason.",
+                                        ["beta", "alpha"], slug="order-the-scope-tags")
+    assert reordered["differs"] == ["scope"], reordered
 
 
 def test_exists_no_op_leaves_a_missing_source_block_missing(ws) -> None:

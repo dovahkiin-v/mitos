@@ -89,7 +89,7 @@ def _write_declared_decision(
     line (verified to parse to ``entry.narrows == [target]``). ``narrows`` is a non-kill
     edge (RF: unlike ``supersedes``/``corrects`` it does not retire the candidate), so the
     candidate stays active for the post-commit edge assertion. The whole buffer is rewritten
-    (not appended) so the round-trip fully controls it regardless of prior-sync rotation.
+    (not appended) so the round-trip fully controls it, whatever the prior sync left there.
 
     Args:
         config: The active workspace config (supplies ``decisions_file``).
@@ -501,15 +501,16 @@ def test_t8_telemetry_survives_rebuild_swap_e2e(
     sync writer path, then a real ``rebuild_and_gate`` + ``perform_swap`` swaps the graph.
     Because the swap set is ``graph.sqlite`` (+ ``.bak_<ts>`` / ``-wal`` / ``-shm``) ONLY,
     the sibling ``telemetry.sqlite`` and its rows are untouched. Both decisions are authored
-    through the buffer (so rotation archives them) → the rebuild reproduces the graph from
-    the archive and the completeness gate passes.
+    through the buffer, which keeps them (recent, below the rotation threshold) → the
+    rebuild, which reads buffer plus archives, reproduces the graph and the completeness
+    gate passes.
     """
     from mitos.cutover import default_aside_db_path, perform_swap, rebuild_and_gate
 
     config, manager, _ = env
 
-    # Seed the candidate through the buffer (auto_accept skips the check) so it rotates to
-    # the archive and the rebuild can reproduce it — a directly-committed node would be
+    # Seed the candidate through the buffer (auto_accept skips the check) so the corpus
+    # holds it and the rebuild can reproduce it — a directly-committed node would be
     # absent from the corpus and trip the completeness gate.
     _append_decision(config, "endpoints-auth", "All API endpoints require authentication.")
     manager.perform_sync(auto_accept=True)

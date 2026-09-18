@@ -104,9 +104,9 @@ def test_seeded_config_round_trips_clean(tmp_path, capsys):
     config = MitosConfig(str(tmp_path))
     captured = capsys.readouterr()
     assert "unrecognized" not in captured.err
-    # A clean file warns about nothing. The seed is nine keys — the eight static
-    # CONFIG_DEFAULTS plus `qdrant_url` — which was TEN until `qdrant_collection`
-    # was retired from the schema and stopped being written. The count is pinned
+    # A clean file warns about nothing. The seed is the static CONFIG_DEFAULTS keys
+    # plus `qdrant_url` (ten keys since surface-entropy 3b minted `rotation_lag_days`;
+    # `qdrant_collection` stopped being written when it was retired from the schema). The count is pinned
     # structurally by `test_config_seeds_exactly_the_schema_keys` below; it is
     # spelled out here only so the next reader need not re-count.
     assert captured.err == ""
@@ -136,6 +136,7 @@ def test_config_seeds_exactly_the_schema_keys(tmp_path):
     assert set(data) == set(CONFIG_SCHEMA)  # every recognized key, nothing else
     assert set(data) == set(CONFIG_DEFAULTS) | {"qdrant_url"}
     assert "pending_threshold" not in data
+    assert data["rotation_lag_days"] == 14, "a new workspace is seeded with the lag"
     for key, default in CONFIG_DEFAULTS.items():
         assert data[key] == default
 
@@ -200,6 +201,92 @@ def test_reinit_reseeds_deleted_buffers(tmp_path):
     _init(tmp_path)
     assert (tmp_path / "decisions.md").exists()
     assert (tmp_path / "questions.md").exists()
+    assert "BEGIN ENTRIES" in _read(tmp_path / "questions.md")
+
+
+# --- the seed class: one write mechanism for both buffers (Phase 1b) -------
+
+def test_fresh_seeds_are_created_at_the_umask_default_never_0600(tmp_path):
+    """A temp-file write that forgets the create-mode rule seeds the buffers at 0600.
+
+    The umask is set in-row: under a 077 umask the default *is* 0600, and the row would
+    pass whatever the code did.
+    """
+    old = os.umask(0o027)
+    try:
+        _init(tmp_path)
+        sibling = tmp_path / "sibling.md"
+        with open(sibling, "w", encoding="utf-8") as fh:
+            fh.write("plain open\n")
+    finally:
+        os.umask(old)
+
+    sibling_mode = os.stat(sibling).st_mode & 0o777
+    assert sibling_mode == 0o640
+    for name in ("decisions.md", "questions.md"):
+        mode = os.stat(tmp_path / name).st_mode & 0o777
+        assert mode == sibling_mode, name
+        assert mode != 0o600, name
+
+
+def test_both_seeds_go_through_write_source_as_one_class(tmp_path):
+    """Moving one seed back to `open(..., "w")` splits the class; this row reds on it."""
+    from mitos import atomic_file
+
+    config = MitosConfig(str(tmp_path))
+    targets = []
+    real_write_source = atomic_file.write_source
+
+    def _spy(path, content):
+        targets.append(os.path.realpath(path))
+        return real_write_source(path, content)
+
+    with patch("mitos.atomic_file.write_source", side_effect=_spy):
+        cli.cmd_init(config)
+    assert targets == [
+        os.path.realpath(config.decisions_file),
+        os.path.realpath(config.questions_file),
+    ]
+
+    targets.clear()
+    with patch("mitos.atomic_file.write_source", side_effect=_spy):
+        _init(tmp_path)
+    assert targets == [], "a re-init must not rewrite a present buffer"
+
+
+def test_a_failed_seed_leaves_absence_that_the_next_init_reseeds(tmp_path):
+    """A truncate-in-place seed can leave a torn questions.md the existence guard skips.
+
+    The failure is injected at the leaf's replace, filtered to questions.md, so a real
+    temp file exists and must be cleaned: a failed seed leaves absence, never a partial
+    file, and absence is what the guard re-seeds.
+    """
+    from mitos.parser import parse_entry_stream
+
+    config = MitosConfig(str(tmp_path))
+    real_replace = os.replace
+    fired = []
+
+    def _fail_questions_replace(src, dst, *args, **kwargs):
+        if os.path.realpath(dst) == os.path.realpath(config.questions_file):
+            fired.append(dst)
+            raise OSError(28, "No space left on device")
+        return real_replace(src, dst, *args, **kwargs)
+
+    with patch("mitos.atomic_file.os.replace", side_effect=_fail_questions_replace):
+        with pytest.raises(OSError):
+            cli.cmd_init(config)
+
+    assert len(fired) == 1
+    assert not (tmp_path / "questions.md").exists()
+    assert [n for n in os.listdir(tmp_path) if n.endswith(".tmp")] == []
+    decisions = _read(tmp_path / "decisions.md")
+    assert "BEGIN ENTRIES" in decisions
+    failures = []
+    assert parse_entry_stream(decisions, "decision", failures=failures) == []
+    assert failures == []
+
+    _init(tmp_path)
     assert "BEGIN ENTRIES" in _read(tmp_path / "questions.md")
 
 

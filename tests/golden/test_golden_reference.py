@@ -128,6 +128,12 @@ def test_non_kill_edges_and_scope_semantics(tmp_path):
     assert glob["modifiers"].get("narrowed_by") == ["harbor-health-endpoint-public"]
     assert n["harbor-health-endpoint-public"]["scope"] == ["api"]
 
+    # Multi-scoped, authored NON-alphabetically: the snapshot carries the author's
+    # order, and `storage` (the first tag) is the primary scope. Asserted here as a
+    # literal rather than only through the oracle, because a harness that re-added a
+    # sort and regenerated the oracle would still pass the oracle row.
+    assert n["harbor-blob-key-rotation-quarterly"]["scope"] == ["storage", "compliance"]
+
     # Weak edges commit and do not retire either endpoint.
     assert ["harbor-api-versioning", "cites", "harbor-storage-is-sqlite"] in edges
     assert ["harbor-api-versioning", "depends_on", "harbor-auth-sessions-v3"] in edges
@@ -349,7 +355,7 @@ def test_a_commentary_reconcile_updates_in_place_and_touches_nothing_else(tmp_pa
     assert node["core_axiom"] == target["core_axiom"]
     assert node["mechanisms"] == target["mechanisms"]
     assert node["rejected_paths"] == "Continuous backup — CORRECTED: revisited at pilot scale."
-    assert sorted(node["scope"]) == sorted(target["scope"]), "scope untouched by an S1 fix"
+    assert node["scope"] == target["scope"], "scope (and its order) untouched by an S1 fix"
     assert node["created_at"] == target["created_at"], "created_at never re-mints"
     assert node["confirmed_by"] == "agent", "the stored confirmation pair carries forward"
     assert node["confirmed_at"] == "2026-06-23T13:04:17.147973+00:00"
@@ -432,10 +438,9 @@ def test_the_real_sync_path_reconciles_a_harbor_entry_end_to_end(tmp_path, monke
                  "this line, newest first -->\n")
     manager = MitosSyncManager(config)
 
-    # `record` rather than `sync` to seed: a sync-committed entry ROTATES out of the
-    # buffer, and sync reads only the buffer — so a rotated entry is not reconcilable
-    # at all. Record-authored entries never rotate, which is why they are the ones the
-    # reconcile actually meets on a live corpus.
+    # `record` rather than `sync` to seed: it commits and leaves the entry in the
+    # buffer, where sync — which reads only the buffer — can reconcile it. Rotation
+    # moves only settled entries, and a just-recorded one is recent, so it stays.
     seeded = manager.record_decision_entry(
         "Harbor backs up the metadata database nightly and retains 14 days of history.",
         "Continuous backup — operational cost unjustified at pilot scale.",

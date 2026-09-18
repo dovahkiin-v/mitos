@@ -132,7 +132,7 @@
 ### harbor-blob-key-rotation-quarterly
 **Decided:** Harbor rotates blob encryption keys every quarter, re-wrapping data keys under a fresh master key.
 **Rejected:** Never rotating — a leaked master key would expose the whole corpus indefinitely.
-**Scope:** storage
+**Scope:** storage, compliance
 **Mechanisms:** kms
 **Amends:** harbor-blob-encryption-at-rest
 

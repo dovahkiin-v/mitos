@@ -98,11 +98,14 @@ _SURFACE_POINTERS: Dict[str, Dict[str, str]] = {
 
 # Per-surface wording for the unbuilt-graph signal, on the ``_SURFACE_POINTERS``
 # idiom: the policy emits the signal and composes the shared sentence, each surface
-# supplies its own closing clause. The verb is ``mitos sync`` on *both* — there is no
-# MCP sync tool, so the shell command is the only truthful pointer (a shell command is
-# not the MCP-tool leak the T7 gate forbids). What differs is the register: a CLI
-# caller can run it where they stand; an agent on the MCP surface cannot, and telling
-# it so beats letting it hunt for a tool that does not exist.
+# supplies its own closing clause. The heal is a full rebuild on both, because the
+# corpus is buffer plus archives and only ``mitos rebuild`` replays the archives —
+# ``mitos sync`` reads the buffer alone and reconstructs nothing from a rotated
+# corpus. The register differs by boundary. The CLI names the command with its
+# selector, ``project`` rendered through ``repr`` at composition (the
+# ``precedent_scan`` idiom above). The MCP clause names no command and no tool: it
+# states the fact and a person as the next actor, because an agent handed a shell
+# command runs it and there is no rebuild tool to hunt for.
 #
 # `mitos reconcile` is NOT a pointer here and must never become one: over an unbuilt
 # graph it diffs an empty active set against an absent collection, finds nothing to
@@ -110,12 +113,12 @@ _SURFACE_POINTERS: Dict[str, Dict[str, str]] = {
 # recoverable state into one the operator believes they already fixed.
 MISSING_GRAPH_POINTERS: Dict[str, Dict[str, str]] = {
     "cli": {
-        "build": "run `mitos sync` here to build it",
+        "build": "run `mitos rebuild -p {project}` to build it from the corpus",
     },
     "mcp": {
         "build": (
-            "`mitos sync` has to be run in that project to build it (there is no "
-            "tool for it on this surface)"
+            "only a full rebuild from the corpus builds it, which no tool on this "
+            "surface performs — a person with a shell in that project runs it"
         ),
     },
 }
@@ -546,7 +549,7 @@ def missing_graph_is_a_gap(
     store: Optional["object"],
     config: "object",
     *,
-    corpus_has_entries: Callable[[str], bool],
+    corpus_scan: Callable[[object], bool],
 ) -> bool:
     """Decides whether an unbuilt graph is a gap worth reporting (I8, W31).
 
@@ -557,18 +560,21 @@ def missing_graph_is_a_gap(
     behaviours.
 
     The state it names was made routine by the absolute-path escape hatch: a clone
-    carries the committed ``.mitos/config.toml`` and a ``decisions.md`` holding
-    hundreds of decisions, but not the gitignored ``*.sqlite`` — nobody commits a
-    binary graph on purpose. Every semantic read over that workspace answers
-    cleanly empty, and the agent reads *no precedents* for a project that has
-    hundreds. That is the *"could not check"* → *"checked, it's clean"* inversion,
-    arriving through the **graph** door instead of the collection one.
+    carries the committed ``.mitos/config.toml`` and a markdown corpus
+    (``decisions.md`` and ``decisions/archive/``) holding hundreds of decisions,
+    but not the gitignored ``*.sqlite`` — nobody commits a binary graph on purpose.
+    Every semantic read over that workspace answers cleanly empty, and the agent
+    reads *no precedents* for a project that has hundreds. That is the *"could not
+    check"* → *"checked, it's clean"* inversion, arriving through the **graph** door
+    instead of the collection one. The corpus is buffer **plus archives** because
+    rotation drains the buffer: a scan of ``decisions.md`` alone answers the wrong
+    file and fails in exactly that silent direction.
 
     **The gate is the TOTAL node count, never the active set**, and the reasoning
     is the sibling's own applied to a different heal: that predicate gates on
     ``get_active_node_ids`` because that set is exactly what ``mitos reconcile``
-    enqueues, while this one gates on the node count because ``mitos sync`` commits
-    *entries* to nodes regardless of computed state. Gate and heal agree by
+    enqueues, while this one gates on the node count because ``mitos rebuild``
+    commits every corpus *entry* to nodes regardless of computed state. Gate and heal agree by
     construction, and they are different heals — asking a **computed-state view**
     whether the graph was ever *built* is asking the wrong question, however the
     answer happens to come out.
@@ -581,7 +587,7 @@ def missing_graph_is_a_gap(
     therefore **unconstructible** end to end, which means an active-set build ships
     green and stays green until something — a corrupted graph, a future kill-edge
     type, a rebuild — makes the two diverge, at which point it renders "the graph is
-    missing, run ``mitos sync``" over a populated one. The difference lives in the
+    missing, run ``mitos rebuild``" over a populated one. The difference lives in the
     contract, so that is where the tests pin it.
 
     ``store`` is ``Optional`` because ``status`` genuinely has none — it guards
@@ -594,17 +600,18 @@ def missing_graph_is_a_gap(
         store: The graph store, or ``None`` when there is no graph file at all
             (duck-typed to avoid an import cycle — recall is a leaf module, as in
             :func:`corpus_provenance`).
-        config: The active ``MitosConfig`` (duck-typed; ``decisions_file`` is the
-            only attribute read).
-        corpus_has_entries: The corpus scan — ``parser.corpus_has_entries`` at
-            every call site. **Required**, never defaulted: this module keeps zero
-            ``mitos`` imports (see the module docstring for why the import is not
-            free), and a defaulted no-op would let a forgotten call site answer a
-            silent ``False`` instead of raising.
+        config: The active ``MitosConfig`` (duck-typed; handed to ``corpus_scan``
+            unread).
+        corpus_scan: The corpus scan, called with ``config`` —
+            ``divergence.corpus_holds_entries`` at every call site, which reads
+            buffer plus archives. **Required**, never defaulted: this module keeps
+            zero ``mitos`` imports (see the module docstring for why the import is
+            not free), and a defaulted no-op would let a forgotten call site answer
+            a silent ``False`` instead of raising.
 
     Returns:
         True when an unbuilt graph should be surfaced as a degradation — which is
-        exactly when the corpus has something for ``mitos sync`` to commit. An
+        exactly when the corpus has something for ``mitos rebuild`` to commit. An
         unreadable graph answers on the corpus too, the loud branch: "I could not
         check" must never render as the healthy "I checked, it is empty".
     """
@@ -614,10 +621,10 @@ def missing_graph_is_a_gap(
         node_count = 0
     if node_count:
         return False
-    return bool(corpus_has_entries(getattr(config, "decisions_file", "")))
+    return bool(corpus_scan(config))
 
 
-def missing_graph_note(surface: str) -> str:
+def missing_graph_note(surface: str, config: "object") -> str:
     """Words the unbuilt-graph signal for one surface.
 
     Composed here rather than at each call site for the reason the whole module
@@ -630,14 +637,20 @@ def missing_graph_note(surface: str) -> str:
         surface: ``"cli"`` or ``"mcp"``. Required and unkeyed by design, as in
             :func:`assess_surface_recall`: no call site may silently emit the other
             surface's register.
+        config: The active ``MitosConfig`` (duck-typed). Read only for
+            ``project``, which the CLI recipe names as its selector.
 
     Returns:
         The one-line note.
     """
+    recovery = MISSING_GRAPH_POINTERS[surface]["build"].format(
+        project=repr(getattr(config, "project", ""))
+    )
     return (
-        "The graph is unbuilt: decisions.md holds entries but the graph has no "
-        "nodes, so this empty answer means 'nothing is indexed yet', not 'no "
-        f"precedent exists' — {MISSING_GRAPH_POINTERS[surface]['build']}."
+        "The graph is unbuilt: the markdown corpus (`decisions.md` and "
+        "`decisions/archive/`) holds entries but the graph has no nodes, so this "
+        "empty answer means 'nothing is indexed yet', not 'no precedent exists' — "
+        f"{recovery}."
     )
 
 

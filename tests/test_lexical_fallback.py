@@ -3,7 +3,8 @@
 ADR ``read-verbs-degrade-to-lexical-decisions-md-fallback``: when semantic
 recall or the graph is unavailable for any reason, ``surface``/``query`` (CLI
 and MCP twins) degrade to a case-insensitive term-match over decisions.md —
-presented honestly as a grep (degraded header, ``degraded: "lexical"`` JSON
+presented honestly as a grep over the markdown corpus (decisions.md and
+decisions/archive/; degraded header, ``degraded: "lexical"`` JSON
 marker, no ``confidence``), modifier-stamped when the graph is readable, with
 a stamps-unavailable disclosure when it is not. The clean-empty "No active
 precedents found" header must never co-occur with a degraded note.
@@ -149,19 +150,19 @@ class TestLexicalFallbackCore:
             ("older-cache-strategy", "The cache strategy for redis."),
             ("unrelated", "Totally different."),
         ])
-        env = lexical_fallback("cache strategy", path, reason="test", store=None)
+        env = lexical_fallback("cache strategy", corpus_paths=[path], reason="test", store=None)
         slugs = [m["slug"] for m in env["matches"]]
         # older-cache-strategy matches 2 terms → first; newer-cache-entry 1 term.
         assert slugs == ["older-cache-strategy", "newer-cache-entry"]
         # Tie-break check: two 1-term matches keep file order (newer first).
-        env2 = lexical_fallback("cache", path, reason="test", store=None)
+        env2 = lexical_fallback("cache", corpus_paths=[path], reason="test", store=None)
         assert [m["slug"] for m in env2["matches"]] == [
             "newer-cache-entry", "older-cache-strategy",
         ]
 
     def test_envelope_shape_no_confidence_no_scores(self, tmp_path):
         path = self._md(tmp_path, [("cache-entry", "A cache axiom.")])
-        env = lexical_fallback("cache", path, reason="test cause", store=None)
+        env = lexical_fallback("cache", corpus_paths=[path], reason="test cause", store=None)
         assert env["degraded"] == "lexical"
         assert env["degraded_reason"] == "test cause"
         assert "confidence" not in env
@@ -174,16 +175,18 @@ class TestLexicalFallbackCore:
 
     def test_limit_and_brief(self, tmp_path):
         path = self._md(tmp_path, [(f"cache-{i}", "cache") for i in range(6)])
-        env = lexical_fallback("cache", path, reason="r", store=None, limit=3,
+        env = lexical_fallback("cache", corpus_paths=[path], reason="r", store=None, limit=3,
                                brief=True)
         assert len(env["matches"]) == 3
         assert all("rejected_paths" not in m for m in env["matches"])
 
     def test_zero_matches_notice(self, tmp_path):
         path = self._md(tmp_path, [("cache-entry", "A cache axiom.")])
-        env = lexical_fallback("zebra quantum", path, reason="r", store=None)
+        env = lexical_fallback("zebra quantum", corpus_paths=[path], reason="r", store=None)
         assert env["matches"] == []
-        assert "grep decisions.md" in env["note"]
+        # The grep pointer names the whole corpus: after rotation the buffer alone
+        # is the wrong place to grep "to be sure".
+        assert "`decisions.md` and `decisions/archive/`" in env["note"]
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +215,7 @@ class TestCliFailureModes:
         config, m = ws
         _rec(m, "cache-strategy", "Use a write-through cache.")
         out = _capture(cmd_surface, config, "cache strategy")
-        assert "deterministic text match over decisions.md" in out
+        assert "deterministic text match over the markdown corpus" in out
         assert "cache-strategy" in out
         assert "No active precedents found" not in out
 
@@ -305,7 +308,7 @@ class TestCliFailureModes:
         _rec(m, "cache-strategy", "Use a write-through cache.")
         out = _capture(cmd_surface, config, "zebra quantum entanglement")
         assert "Semantic recall unavailable" in out
-        assert "grep decisions.md" in out
+        assert "`decisions.md` and `decisions/archive/`" in out
         assert "No active precedents found" not in out
 
     def test_exit_code_zero_via_main(self, ws, monkeypatch):
@@ -622,12 +625,17 @@ class TestUnbuiltGraphOnTheReadSurfaces:
 
     # -- the clone: the empty answer says why it is empty ---------------------
 
-    def test_cli_query_text_names_the_unbuilt_graph_and_sync(self, cloned):
+    def test_cli_query_text_names_the_unbuilt_graph_and_rebuild(self, cloned):
+        """The heal is `rebuild`, not `sync`, even when the entries sit in the buffer:
+        one state, one heal — `rebuild` reads the buffer too, and `sync` reads
+        nothing else, so over a rotated corpus it would build nothing.
+        """
         out = self._cli(cloned, cmd_query)
 
         assert "No matching decisions found." in out
         assert "graph is unbuilt" in out
-        assert "mitos sync" in out
+        assert "mitos rebuild -p" in out
+        assert "mitos sync" not in out
         assert "reconcile" not in out
 
     def test_cli_query_json_carries_the_note(self, cloned):
@@ -635,30 +643,32 @@ class TestUnbuiltGraphOnTheReadSurfaces:
 
         assert data["matches"] == []
         assert "graph is unbuilt" in data["note"]
-        assert "mitos sync" in data["note"]
+        assert "mitos rebuild -p" in data["note"]
         assert data["collection"]              # the provenance stamp still rides
 
-    def test_cli_surface_names_the_unbuilt_graph_and_sync(self, cloned):
+    def test_cli_surface_names_the_unbuilt_graph_and_rebuild(self, cloned):
         out = self._cli(cloned, cmd_surface)
 
         assert "No active precedents found" in out
         assert "graph is unbuilt" in out
-        assert "mitos sync" in out
+        assert "mitos rebuild -p" in out
 
     @pytest.mark.parametrize("tool", ["query_decisions", "surface_decisions"])
     def test_mcp_tools_carry_the_note_in_their_own_register(
         self, cloned, tool
     ):
         """Same predicate, same composer, a different closing clause: an agent on
-        this surface cannot run a shell command where it stands, and saying so beats
-        letting it hunt for a `sync` tool that does not exist.
+        this surface is handed no shell command (it would run it) and no tool (there
+        is none that rebuilds), so the clause states the fact and names a person as
+        the next actor — beating letting it hunt for a tool that does not exist.
         """
         out = self._mcp(cloned, tool)
 
         assert out.get("matches", out.get("active_decisions")) == []
         assert "graph is unbuilt" in out["note"]
-        assert "mitos sync" in out["note"]
-        assert "no tool for it on this surface" in out["note"]
+        assert "mitos " not in out["note"]
+        assert "no tool on this surface performs" in out["note"]
+        assert "a person" in out["note"]
         assert "reconcile" not in out["note"]
 
     def test_the_note_is_not_a_degradation_the_envelope_stays_clean(
@@ -738,7 +748,7 @@ class TestUnbuiltGraphOnTheOrdinaryEmptyEnvelope:
 
         assert out.get("matches", out.get("active_decisions")) == []
         assert "graph is unbuilt" in out["note"]
-        assert "mitos sync" in out["note"]
+        assert "a person" in out["note"] and "mitos " not in out["note"]
 
     @pytest.mark.parametrize("tool", ["query_decisions", "surface_decisions"])
     def test_the_fresh_twin_on_the_same_envelope_says_nothing(
