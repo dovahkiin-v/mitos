@@ -39,7 +39,7 @@ from mitos.conflict import (
     RenderedPrompt,
     Unavailable,
 )
-from mitos.models import get_model_id
+from mitos.models import accepts_temperature, get_model_id
 
 # The model family+tier alias (P19 — never a raw versioned id). Rides on every
 # ``JudgmentExecution`` so 5b stamps each telemetry row's ``model_alias``.
@@ -51,6 +51,23 @@ _log = logging.getLogger(__name__)
 # retries, then slower ones to wait out rate-limit windows. The last two 60s
 # waits are the final attempt — if the quota is exhausted, we stop loudly.
 _RETRY_BACKOFFS_S: Tuple[float, ...] = (1, 1, 1, 10, 20, 30, 60, 60)
+
+
+def _is_transient(exc: Exception) -> bool:
+    """Reports whether retrying could plausibly succeed (timeouts, connection loss, 429, 5xx).
+
+    Any other status is the API refusing the request itself — a rejected parameter, a
+    revoked key, an unknown model id — and nine attempts buy the same refusal after
+    ~183s of sleeping (measured 2026-09-18: 186s per batch on a 400). An exception with
+    no status keeps the benefit of the doubt the ladder always gave it.
+    """
+    if isinstance(exc, (anthropic.APITimeoutError, anthropic.APIConnectionError)):
+        return True
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        return True
+    return status == 429 or status >= 500
+
 
 # Defence-in-depth budget for the tool-use response. The tool schema bounds shape;
 # this bounds length. Measured: tool-use verdicts emit ~160 tokens/verdict (812 for 5),
@@ -109,17 +126,23 @@ def execute_judgment(
     corpus path in ``check.py`` and the sync path in ``conflict.py``) are untouched.
 
     SDK retries are disabled (``max_retries=0``) so ``CONFLICT_LLM_TIMEOUT_S`` is a
-    true wall-clock ceiling per attempt. Transient errors (429, 5xx, timeouts) are
-    retried with an escalating backoff ladder (``_RETRY_BACKOFFS_S``): 3×1s, then 10s,
-    20s, 30s, 60s, 60s. If every attempt fails, the ``Unavailable`` detail names the
-    error class, the attempt count, and the total elapsed time — so the cause is
-    diagnosable without reading logs.
+    true wall-clock ceiling per attempt. Transient errors (429, 5xx, timeouts,
+    connection loss — :func:`_is_transient`) are retried with an escalating backoff
+    ladder (``_RETRY_BACKOFFS_S``): 3×1s, then 10s, 20s, 30s, 60s, 60s. If every
+    attempt fails, the ``Unavailable`` detail names the error class, the attempt count,
+    and the total elapsed time — so the cause is diagnosable without reading logs.
 
-    Fail-open (plan D4): transient errors map to ``Unavailable(JUDGMENT_TIMEOUT)``.
-    ``stop_reason='max_tokens'`` maps to ``Unavailable(JUDGMENT_TRUNCATED)`` — checked
-    BEFORE touching ``message.content``, since a truncated forced-tool response can
-    carry an incomplete or absent ``tool_use`` block. The executor never raises past
-    this seam and never blocks the commit.
+    Fail-open (plan D4): an exhausted ladder maps to ``Unavailable(JUDGMENT_TIMEOUT)``;
+    any other 4xx returns at once as ``Unavailable(JUDGMENT_REJECTED)`` with the
+    API's own message in the detail. ``stop_reason='max_tokens'`` maps to
+    ``Unavailable(JUDGMENT_TRUNCATED)`` — checked BEFORE touching ``message.content``,
+    since a truncated forced-tool response can carry an incomplete or absent
+    ``tool_use`` block. The executor never raises past this seam and never blocks the
+    commit.
+
+    ``temperature`` is sent only to a model that accepts it
+    (:func:`mitos.models.accepts_temperature`) — the models that reject sampling
+    parameters answer every call carrying one with a 400.
 
     Args:
         prompt: The rendered judgment prompt (from 3a's ``render_judgment_prompt``); its
@@ -136,9 +159,10 @@ def execute_judgment(
 
     Returns:
         A :class:`~mitos.conflict.JudgmentExecution` (raw text + batch_id + usage + elapsed)
-        on success, or an :class:`~mitos.conflict.Unavailable` with
-        ``reason=JUDGMENT_TIMEOUT`` on a timeout or any Anthropic error after all
-        retries are exhausted.
+        on success, or an :class:`~mitos.conflict.Unavailable` naming why not —
+        ``JUDGMENT_TIMEOUT`` (ladder exhausted), ``JUDGMENT_REJECTED`` (the request
+        was refused), ``JUDGMENT_TRUNCATED`` or ``JUDGMENT`` (the one response that
+        came back was unusable).
     """
     # Mint the batch id up front (W8) — one per batched call, shared by every
     # ``conflict_checks`` row 5b writes for this batch. A plain unique ``str``.
@@ -151,14 +175,16 @@ def execute_judgment(
     create_kwargs = dict(
         model=resolved_model,
         max_tokens=_JUDGMENT_MAX_TOKENS,
-        temperature=CONFLICT_JUDGMENT_TEMPERATURE,
         system=prompt.system,
         messages=[{"role": "user", "content": prompt.user}],
         tools=[_VERDICT_TOOL],
         tool_choice={"type": "tool", "name": "record_verdicts"},
     )
+    if accepts_temperature(resolved_model):
+        create_kwargs["temperature"] = CONFLICT_JUDGMENT_TEMPERATURE
 
     last_error: Optional[Exception] = None
+    rejected: Optional[Exception] = None
     attempts = 0
     started = time.perf_counter()
 
@@ -175,9 +201,10 @@ def execute_judgment(
                 max_retries=0, timeout=timeout_s
             ).messages.create(**create_kwargs)
             break  # success
-        except anthropic.APITimeoutError as exc:
-            last_error = exc
         except anthropic.AnthropicError as exc:
+            if not _is_transient(exc):
+                rejected = exc
+                break  # the API refused the request; retrying buys the same refusal
             last_error = exc
     else:
         total_s = time.perf_counter() - started
@@ -190,6 +217,18 @@ def execute_judgment(
         )
 
     elapsed_ms = int((time.perf_counter() - started) * 1000)
+
+    # Returned past the ladder, not from inside it: a refusal is decided from the one
+    # error response that came back, which is what files it first-attempt.
+    if rejected is not None:
+        status = getattr(rejected, "status_code", None)
+        return Unavailable(
+            reason=ConflictUnavailableReason.JUDGMENT_REJECTED,
+            detail=(
+                f"judgment rejected (HTTP {status}) on attempt {attempts} "
+                f"for model {resolved_model!r}: {rejected}"
+            ),
+        )
 
     # Truncation check BEFORE touching content — a forced-tool response truncated at
     # max_tokens can carry an incomplete or absent tool_use block.
@@ -212,6 +251,14 @@ def execute_judgment(
         return Unavailable(
             reason=ConflictUnavailableReason.JUDGMENT,
             detail="no tool_use block in response",
+        )
+
+    # A forced tool call is not a guarantee of the schema's required key; a payload
+    # without it is a malformed batch, returned typed like the absent block above.
+    if "verdicts" not in (tool_block.input or {}):
+        return Unavailable(
+            reason=ConflictUnavailableReason.JUDGMENT,
+            detail="tool_use block carries no 'verdicts' key",
         )
 
     # Serialize the verdicts array into raw_text so both parse_judgment_response

@@ -19,6 +19,20 @@ MODEL_IDS: Dict[str, str] = {
 MODEL_ALIASES = ["FLASH_LITE", "FLASH", "SONNET"]
 EMBEDDING_DIM = 3072  # Dimension size for gemini-embedding-2
 
+# Anthropic models that reject the sampling parameters (``temperature``/``top_p``/
+# ``top_k``) with a 400. Keyed on the concrete id rather than the alias, because an
+# alias can be overridden per workspace (``MITOS_MODEL_OVERRIDE_SONNET``) to any of
+# these. An id absent here is assumed to accept them — the shipped behaviour — and a
+# wrong assumption surfaces as a typed judge rejection on the first call, not a hang.
+_REJECTS_SAMPLING_PARAMS = frozenset({
+    "claude-sonnet-5",
+    "claude-opus-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-fable-5",
+    "claude-fable-5-1",
+})
+
 
 def get_model_id(alias: str, env: Optional[Mapping[str, str]] = None) -> str:
     """Gets the concrete model ID for a given model alias.
@@ -68,6 +82,21 @@ def get_embedding_model_id(env: Optional[Mapping[str, str]] = None) -> str:
     if env_override:
         return env_override
     return MODEL_IDS["EMBEDDING"]
+
+
+def accepts_temperature(model_id: str) -> bool:
+    """Reports whether a concrete model id accepts the ``temperature`` parameter.
+
+    A request builder consults this instead of learning model trivia itself, so a
+    model swap stays a one-file edit.
+
+    Args:
+        model_id: A resolved, versioned model id (after any override).
+
+    Returns:
+        False for a model that rejects sampling parameters, True otherwise.
+    """
+    return model_id not in _REJECTS_SAMPLING_PARAMS
 
 
 def _override(env: Optional[Mapping[str, str]], name: str) -> Optional[str]:

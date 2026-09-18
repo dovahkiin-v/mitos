@@ -2240,6 +2240,11 @@ class MitosSyncManager:
                 "Conflict judgment is unavailable (the judgment model did not respond in "
                 "time)"
             )
+        elif reason is ConflictUnavailableReason.JUDGMENT_REJECTED:
+            what = (
+                "Conflict judgment is unavailable (the judgment API rejected the request — "
+                "check the Anthropic key and any MITOS_MODEL_OVERRIDE_SONNET)"
+            )
         else:
             what = (
                 "Conflict judgment is unavailable (the judgment batch was malformed)"

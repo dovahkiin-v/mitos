@@ -116,7 +116,8 @@ class ConflictUnavailableReason(Enum):
     Defined here in 2a and shared across the pipeline: 2a raises the two
     semantic-substrate reasons; 3a adds ``JUDGMENT`` (a malformed judgment batch —
     its first consumer, plan D4); 3b adds ``JUDGMENT_TIMEOUT`` for the executor's
-    timeout/error path; the registry vision's 1b adds ``COLLECTION_MISSING`` (all
+    timeout/error path; the registry vision's 1b adds ``COLLECTION_MISSING``; 0.18.3
+    adds ``JUDGMENT_REJECTED`` for a request the API refused outright (all
     additive — no edit to the members already below). The reason is the
     machine-readable discriminator a surface (5a) switches on to word its user-facing
     notice; the core never formats UX text (core/surface bulkhead, CONF-D10).
@@ -134,9 +135,10 @@ class ConflictUnavailableReason(Enum):
     EMBEDDING = "embedding_unavailable"        # Gemini embed raised (S1).
     VECTOR_STORE = "vector_store_unavailable"  # Qdrant query raised (S2).
     JUDGMENT = "judgment_unavailable"          # A malformed judgment batch (3a parse) — never a partial batch.
-    JUDGMENT_TIMEOUT = "judgment_timeout"      # The 3b executor timed out OR hit any Anthropic error (fail-open, D4).
+    JUDGMENT_TIMEOUT = "judgment_timeout"      # The 3b executor exhausted its retry ladder on transient errors (timeouts, 429, 5xx, connection loss) — fail-open, D4.
     COLLECTION_MISSING = "collection_missing"  # Qdrant is up; the collection does not exist (1b) — heals with `mitos reconcile`.
     JUDGMENT_TRUNCATED = "judgment_truncated"  # The judge's response was truncated at max_tokens (tool-use budget exceeded).
+    JUDGMENT_REJECTED = "judgment_rejected"    # The API refused the request (a 4xx other than 429: bad key, unknown model, rejected parameter) — not retried.
 
 
 # Every reason that means "semantic recall went dark", as opposed to "the judge went
@@ -158,14 +160,18 @@ JUDGMENT_REASONS: Tuple[ConflictUnavailableReason, ...] = (
     ConflictUnavailableReason.JUDGMENT,
     ConflictUnavailableReason.JUDGMENT_TIMEOUT,
     ConflictUnavailableReason.JUDGMENT_TRUNCATED,
+    ConflictUnavailableReason.JUDGMENT_REJECTED,
 )
 
 # Defect-vs-environment partition: a reason that means "the code is broken" (test must
 # fail) vs "the world is down" (test may skip). Declared so the discriminator has a
-# fact to read, not an else branch to trust.
+# fact to read, not an else branch to trust. A rejection files as a defect: the request
+# mitos built — its key, model id or parameters — is what was refused, and a live test
+# that skipped on it would report a model swap the API cannot serve as merely skipped.
 JUDGMENT_DEFECT_REASONS: Tuple[ConflictUnavailableReason, ...] = (
     ConflictUnavailableReason.JUDGMENT,
     ConflictUnavailableReason.JUDGMENT_TRUNCATED,
+    ConflictUnavailableReason.JUDGMENT_REJECTED,
 )
 JUDGMENT_ENVIRONMENT_REASONS: Tuple[ConflictUnavailableReason, ...] = (
     ConflictUnavailableReason.JUDGMENT_TIMEOUT,
@@ -175,14 +181,21 @@ JUDGMENT_ENVIRONMENT_REASONS: Tuple[ConflictUnavailableReason, ...] = (
 # returning this reason? A ladder-exhausted reason survived nine attempts across ~183s
 # of backoff (``conflict_judgment._RETRY_BACKOFFS_S``), which is evidence the cause is
 # systematic — the next batch will meet it too. A first-attempt reason carries no such
-# evidence: truncation is decided from the one response that came back
-# (``conflict_judgment.py:198``, past the loop's ``break``), a missing tool_use block
-# the same way (``:213``), and a parse malformation never reaches the executor at all —
-# each varies with the batch's own content. ``check.execute_corpus_check`` reads this to
+# evidence: truncation is decided from the one response that came back (past the
+# loop's ``break`` in ``conflict_judgment.execute_judgment``), a missing tool_use block
+# or ``verdicts`` key the same way, and a parse malformation never reaches the executor
+# at all — each varies with the batch's own content. ``check.execute_corpus_check`` reads this to
 # decide whether ONE batch's failure convicts the remaining batches.
 #
-# These two happen to hold the same members as the defect/environment split above, and
-# that coincidence is not the reason either exists: defect/environment answers "must a
+# ``JUDGMENT_REJECTED`` is first-attempt too — the executor returns it without climbing
+# the ladder — though unlike the others it is usually systematic (a bad key or model id
+# refuses every batch). It is isolated anyway, deliberately: it costs one fast call,
+# not ~183s, so ``check``'s consecutive-failure cap convicts a systematic rejection
+# within three batches and seconds, while a content-specific 400 (an over-long batch)
+# is isolated and the rest of the corpus still gets judged.
+#
+# These two partitions held identical members until the rejection landed, and that
+# coincidence was never the reason either exists: defect/environment answers "must a
 # test fail or may it skip", this answers "how much evidence does this failure carry
 # about the next batch". They are declared separately so a divergence — a retried
 # truncation, a first-attempt reason for a permanent API rejection — moves one partition
@@ -193,6 +206,7 @@ LADDER_EXHAUSTED_JUDGMENT_REASONS: Tuple[ConflictUnavailableReason, ...] = (
 FIRST_ATTEMPT_JUDGMENT_REASONS: Tuple[ConflictUnavailableReason, ...] = (
     ConflictUnavailableReason.JUDGMENT,
     ConflictUnavailableReason.JUDGMENT_TRUNCATED,
+    ConflictUnavailableReason.JUDGMENT_REJECTED,
 )
 
 

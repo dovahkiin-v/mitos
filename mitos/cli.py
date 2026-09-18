@@ -4849,6 +4849,7 @@ _CHECK_DEPARTURE_WORDS: Dict[str, str] = {
 # judgment stage today and are worded anyway rather than left to a fallback.
 _JUDGMENT_FAILURE_WORDS: Dict[str, str] = {
     "judgment_timeout": "the judge timed out or returned an error",
+    "judgment_rejected": "the judge API rejected the request (key, model id or parameters)",
     "judgment_unavailable": "the judge's response could not be parsed",
     "judgment_truncated": "the judge's response hit max_tokens",
     "embedding_unavailable": "the embedding provider was unavailable",

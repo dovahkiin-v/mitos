@@ -2,8 +2,9 @@
 
 ``execute_judgment`` makes the single batched Anthropic tenability call, caps it hard
 (``with_options(max_retries=0, timeout=…)``), captures usage + elapsed + a minted
-``batch_id``, and returns a ``JudgmentExecution`` — OR a typed ``Unavailable(JUDGMENT_TIMEOUT)``
-on a timeout or any Anthropic error (**fail-open**, never raises past the seam).
+``batch_id``, and returns a ``JudgmentExecution`` — OR a typed ``Unavailable``: ``JUDGMENT_TIMEOUT``
+once the retry ladder is exhausted on transient errors, ``JUDGMENT_REJECTED`` at once on any
+other 4xx (**fail-open**, never raises past the seam).
 ``make_judgment_executor`` binds a client into the one-arg ``judge`` callable the facade uses.
 
 Discipline (scout brief / plan §9): SDK-faked via a plain ``MagicMock`` client passed as a
@@ -314,6 +315,128 @@ def test_make_judgment_executor_propagates_unavailable() -> None:
     result = judge(_prompt())
     assert isinstance(result, Unavailable)
     assert result.reason is ConflictUnavailableReason.JUDGMENT_TIMEOUT
+
+
+# --------------------------------------------------------------------------- #
+# 7b. The retry ladder is for transient errors only (0.18.3)
+# --------------------------------------------------------------------------- #
+
+def _status_error(status: int, message: str) -> anthropic.APIStatusError:
+    """An ``APIStatusError`` carrying ``status`` — the shape every HTTP-level refusal takes."""
+    return anthropic.APIStatusError(
+        message, response=httpx.Response(status, request=_req()), body=None
+    )
+
+
+def _counting_sleep(monkeypatch: pytest.MonkeyPatch) -> list:
+    """Replaces the backoff sleep with one that records each requested wait."""
+    waits: list = []
+    monkeypatch.setattr("mitos.conflict_judgment.time.sleep", waits.append)
+    return waits
+
+
+@pytest.mark.parametrize(
+    ("status", "message"),
+    [
+        (400, "`temperature` is deprecated for this model."),
+        (401, "invalid x-api-key"),
+        (404, "model: claude-sonet-5"),
+    ],
+)
+def test_a_refused_request_returns_rejected_on_the_first_attempt(
+    monkeypatch: pytest.MonkeyPatch, status: int, message: str
+) -> None:
+    """A 4xx other than 429 is not retried: one call, no sleep, the cause in the detail.
+
+    Before 0.18.3 these climbed the full ladder — 183s of sleeping per batch — and
+    came back as ``JUDGMENT_TIMEOUT``, which is what made a bad key or model id
+    invisible.
+    """
+    waits = _counting_sleep(monkeypatch)
+    client = _client_raising(_status_error(status, message))
+
+    result = execute_judgment(_prompt(), client=client)
+
+    assert isinstance(result, Unavailable)
+    assert result.reason is ConflictUnavailableReason.JUDGMENT_REJECTED
+    assert client.with_options.return_value.messages.create.call_count == 1
+    assert waits == []
+    assert str(status) in result.detail
+    assert message in result.detail
+
+
+@pytest.mark.parametrize("status", [429, 500, 529])
+def test_a_transient_status_still_climbs_the_whole_ladder(
+    monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    """429 and 5xx keep the ladder: every attempt made, every backoff slept."""
+    from mitos.conflict_judgment import _RETRY_BACKOFFS_S
+
+    waits = _counting_sleep(monkeypatch)
+    client = _client_raising(_status_error(status, "overloaded"))
+
+    result = execute_judgment(_prompt(), client=client)
+
+    assert isinstance(result, Unavailable)
+    assert result.reason is ConflictUnavailableReason.JUDGMENT_TIMEOUT
+    create = client.with_options.return_value.messages.create
+    assert create.call_count == len(_RETRY_BACKOFFS_S) + 1
+    assert tuple(waits) == _RETRY_BACKOFFS_S
+
+
+def test_a_refusal_after_a_transient_error_stops_the_ladder_there() -> None:
+    """A 529 then a 400 returns the rejection on attempt two, not a timeout on nine."""
+    client = MagicMock()
+    client.with_options.return_value.messages.create.side_effect = [
+        _status_error(529, "overloaded"),
+        _status_error(400, "bad parameter"),
+    ]
+
+    result = execute_judgment(_prompt(), client=client)
+
+    assert isinstance(result, Unavailable)
+    assert result.reason is ConflictUnavailableReason.JUDGMENT_REJECTED
+    assert client.with_options.return_value.messages.create.call_count == 2
+    assert "attempt 2" in result.detail
+
+
+# --------------------------------------------------------------------------- #
+# 7c. temperature follows the resolved model; the verdicts key is guarded (0.18.3)
+# --------------------------------------------------------------------------- #
+
+def test_temperature_is_omitted_for_a_model_that_rejects_it() -> None:
+    """An override to a sampling-free model gets no ``temperature`` — it would 400."""
+    client = _client_returning(_fake_message())
+
+    execute_judgment(_prompt(), client=client, model_id="claude-sonnet-5")
+
+    kwargs = client.with_options.return_value.messages.create.call_args.kwargs
+    assert kwargs["model"] == "claude-sonnet-5"
+    assert "temperature" not in kwargs
+
+
+def test_temperature_is_sent_to_an_unlisted_override() -> None:
+    """An id the registry does not know keeps the shipped behaviour and gets temperature."""
+    client = _client_returning(_fake_message())
+
+    execute_judgment(_prompt(), client=client, model_id="claude-sonnet-4-5")
+
+    kwargs = client.with_options.return_value.messages.create.call_args.kwargs
+    assert kwargs["temperature"] == CONFLICT_JUDGMENT_TEMPERATURE
+
+
+@pytest.mark.parametrize("payload", [{}, {"verdict": []}, None])
+def test_a_tool_call_without_verdicts_returns_unavailable_judgment(payload: Any) -> None:
+    """A forced tool call missing ``verdicts`` degrades typed instead of raising KeyError."""
+    message = _fake_message()
+    message.content[0].input = payload
+    client = _client_returning(message)
+
+    result = execute_judgment(_prompt(), client=client)
+
+    assert isinstance(result, Unavailable)
+    assert result.reason is ConflictUnavailableReason.JUDGMENT
+    assert "verdicts" in result.detail
 
 
 # --------------------------------------------------------------------------- #
