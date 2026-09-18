@@ -90,7 +90,8 @@ _CORPUS_JSON_KEYS = {
     "nodes_total", "nodes_swept", "pairs_judged_fresh", "pairs_reused",
     "batches_planned", "batches_executed", "batches_judged", "batches_failed",
     "batches_skipped", "findings",
-    "findings_new", "findings_known", "degradations", "coverage_exclusions",
+    "findings_new", "findings_known", "departed", "degradations",
+    "coverage_exclusions",
     "index_backlog_transient", "summary_row_written",
     "project", "collection", "workspace",
 }

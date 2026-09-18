@@ -14,6 +14,7 @@ import uuid
 import sqlite3
 import hashlib
 import argparse
+from collections import Counter
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Callable, List, Mapping, Optional, Dict, Any, Sequence, Set, Tuple
@@ -4823,6 +4824,32 @@ def _check_finding_side(node: Dict[str, Any]) -> Dict[str, Any]:
     return side
 
 
+# The departure vocabulary, rendered. Iteration order here IS the printed order, so
+# the sentence reads the same way every run regardless of which reason occurred first.
+# Wording lives on the surface (the engine ships the bare token, as with every other
+# degradation vocabulary) — and both members name a RESOLUTION, which is the whole
+# point: after the standing-finding carry, "the sweep did not re-screen it" stopped
+# being a way for a finding to leave the report.
+_CHECK_DEPARTURE_WORDS: Dict[str, str] = {
+    "edge-declared": "resolved by a declared relationship",
+    "side-no-longer-live": "no longer a live pair",
+}
+
+
+def _check_departed_json(departed: "check.DepartedFinding") -> Dict[str, Any]:
+    """Renders one departed finding as its flat JSON object.
+
+    Hashes rather than slugs: a departed pair's nodes may be gone, and the stored
+    slug is a mutable historical citation (M2) that cannot be resolved live for a
+    node that no longer exists.
+    """
+    return {
+        "reason": departed.reason,
+        "proposal_hash": departed.proposal_hash,
+        "partner_hash": departed.partner_hash,
+    }
+
+
 def _check_finding_json(finding: "check.CheckFinding") -> Dict[str, Any]:
     """Renders one :class:`~mitos.check.CheckFinding` as its flat JSON object (§8/KD7)."""
     return {
@@ -4905,6 +4932,7 @@ def _check_json_object(
         "findings": [_check_finding_json(f) for f in result.findings],
         "findings_new": row.findings_new,
         "findings_known": row.findings_known,
+        "departed": [_check_departed_json(d) for d in result.departed],
         "degradations": list(check.run_degradations(result)),
         "coverage_exclusions": exclusions,
         "index_backlog_transient": transient_count,
@@ -4998,6 +5026,18 @@ def _print_check_report(
             a, b = finding.proposal_node["slug"], finding.partner_node["slug"]
             print(f"  {a} — {b}   (confidence {finding.confidence:.2f}, "
                   f"first reported {finding.source_created_at})")
+
+    # The departure delta — counts by reason, never a list. Both reasons are
+    # resolutions, and a resolution stays true forever, so a narrated section would
+    # grow without bound and re-report the same settled pairs every run. The
+    # identities ride `--json` for anyone who wants them.
+    if result.departed:
+        by_reason = Counter(d.reason for d in result.departed)
+        parts = [f"{by_reason[key]} {_CHECK_DEPARTURE_WORDS[key]}"
+                 for key in _CHECK_DEPARTURE_WORDS if by_reason.get(key)]
+        noun = "finding" if len(result.departed) == 1 else "findings"
+        print(f"\n{len(result.departed)} previously-reported {noun} no longer "
+              f"standing ({', '.join(parts)}).")
 
     if degradations:
         print(f"\n[partial] This check could not fully run "

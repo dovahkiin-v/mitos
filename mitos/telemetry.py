@@ -42,7 +42,7 @@ import json
 import os
 import sqlite3
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from mitos.errors import DatabaseError
 from mitos.migrations import MigrationStep, run_migrations
@@ -828,6 +828,25 @@ class ReuseIndex:
     def __contains__(self, pair: "Tuple[str, str]") -> bool:
         """Orientation-blind membership for a ``(hash_a, hash_b)`` pair."""
         return tuple(sorted(pair)) in self._verdicts
+
+    def iter_pairs(self) -> "Iterator[Tuple[Tuple[str, str], StoredVerdict]]":
+        """Yields every indexed ``((hash_lo, hash_hi), verdict)`` at these pins.
+
+        The enumeration the standing-finding carry needs: a lookup answers "what
+        was decided about THIS pair", but carrying standing findings off the index
+        rather than off the sweep has to ask the index what it holds. Keys come out
+        sorted-pair (the same orientation-blind key :meth:`lookup` builds), so a
+        consumer comparing against swept pairs sorts its own side and nothing
+        depends on which side discovered the pair.
+
+        Iteration order is the underlying map's and is NOT a contract — every
+        consumer sorts by its own key (the engine sorts carried findings on the
+        pair key, mirroring ``dedup_oriented_pairs``).
+
+        Yields:
+            ``((hash_lo, hash_hi), StoredVerdict)`` for each pair the index holds.
+        """
+        return iter(self._verdicts.items())
 
     def __len__(self) -> int:
         """The count of distinct prior pairs at these pins (2c's reused-set size)."""

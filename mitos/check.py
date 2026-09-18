@@ -465,6 +465,156 @@ class CorpusPair:
     score: float
 
 
+@dataclass(frozen=True)
+class CarriedFinding:
+    """A standing finding carried off the reuse index, not re-screened this run.
+
+    The unit that closes the silent audit hole: a pair whose prior verdict is
+    finding-grade, whose two sides are both still live active decisions, which
+    carries no declared strong edge, and which this run's sweep did NOT rediscover
+    (the top-k window moved on as the corpus grew). It reports as standing anyway.
+
+    Carries no ``score``: the similarity is a property of a *gather* and this pair
+    was never gathered this run. The stored verdict does not hold one either, so
+    there is no honest float to put here — a stale or invented number in a report
+    field is the failure mode this whole change exists against.
+
+    Attributes:
+        proposal_hash: The oriented pair identity, lex-smaller side (M2).
+        partner_hash: The other side's content hash.
+        proposal_node: The proposal's hydrated live-at-snapshot node.
+        partner_node: The partner's hydrated node.
+        verdict: The stored verdict being carried, verbatim (M8 — its rationale,
+            confidence and provenance all ride out unchanged; nothing re-renders).
+    """
+
+    proposal_hash: str
+    partner_hash: str
+    proposal_node: Dict[str, Any]
+    partner_node: Dict[str, Any]
+    verdict: "StoredVerdict"
+
+
+@dataclass(frozen=True)
+class DepartedFinding:
+    """A finding-grade prior that is no longer standing, with the derived reason.
+
+    Counted, never narrated at length: the surface prints one line of counts by
+    reason and the identities ride the JSON. The pair's own nodes may be gone, so
+    this holds hashes rather than hydrated dicts.
+
+    The reason vocabulary is closed and both members are *resolutions*, which is
+    the point — after the carry lands, "the sweep did not re-screen it" is no
+    longer a way for a finding to leave.
+
+    Attributes:
+        proposal_hash: The oriented pair identity, lex-smaller side.
+        partner_hash: The other side's content hash.
+        reason: ``"edge-declared"`` — a strong edge now joins the pair, the
+            author's resolution path having worked; or ``"side-no-longer-live"``
+            — at least one side is no longer an active decision at the content
+            hash that was judged (superseded, removed, or edited, which is what
+            declaring a relationship on the entry itself does).
+    """
+
+    proposal_hash: str
+    partner_hash: str
+    reason: str
+
+
+def carry_standing_findings(
+    *,
+    reuse_index: Optional["ReuseIndex"],
+    snapshot: CorpusSnapshot,
+    swept_pairs: "Iterable[CorpusPair]",
+) -> "Tuple[List[CarriedFinding], List[DepartedFinding]]":
+    """Partitions the index's finding-grade priors the sweep did not re-screen.
+
+    The mechanism behind ``standing-findings-carry-on-the-reuse-index-not-the-sweep``.
+    ``plan_corpus_check`` builds its pair set from the sweep, and the reuse partition
+    then iterates only that set — so a pair pushed out of every node's ``top_k`` by
+    nearer neighbours as the corpus grows is never looked up, and its standing
+    finding leaves the report without being resolved. Measured on 2026-09-18: one
+    did, at 412 → 444 nodes. This re-reports it off the index instead.
+
+    Three screens, each of which must hold for a prior to be carried:
+
+    1. **Finding-grade** — the stored verdict re-derives through the one KD4 gate
+       (:func:`_is_finding` on raw ``tenable`` + ``confidence``, never the stored
+       ``surfaced`` column). A tenable or below-threshold prior is not a finding and
+       is silently skipped; it is not a departure either, having never stood.
+    2. **Both sides live** — each hash is an active decision in this run's snapshot.
+       Every resolution path mutates an entry, which changes its content hash, so a
+       resolved pair falls out here by construction.
+    3. **No declared strong edge** — the same :class:`StrongEdgeIndex` screen the
+       sweep applies. Without it the carry would resurrect exactly the findings an
+       author settled by declaring ``Supersedes:``/``Amends:``/``Narrows:``/
+       ``Contradicts:``, making the audit nag about resolved work.
+
+    A prior that clears screen 1 but fails 2 or 3 is a :class:`DepartedFinding`
+    carrying which screen rejected it. A prior the sweep DID rediscover is neither —
+    it is already reported through the normal reuse path, and carrying it too would
+    double-report it.
+
+    Pure and storeless: reads the pre-built index and snapshot, touches no I/O,
+    spends nothing. An unavailable index (``None``) carries nothing and reports no
+    departures — a run that cannot read its history must not claim findings left.
+
+    Args:
+        reuse_index: The plan's pre-run index, or ``None`` when the load failed.
+        snapshot: This run's corpus snapshot (the live node set and edge index).
+        swept_pairs: The pairs this run's sweep discovered — carried pairs are
+            those the sweep missed, so these are excluded.
+
+    Returns:
+        ``(carried, departed)``, each sorted on the oriented pair key so a run's
+        report order is a pure function of its corpus, never of map iteration.
+    """
+    if reuse_index is None:
+        return [], []
+
+    live: Dict[str, Dict[str, Any]] = {node["id"]: node for node in snapshot.nodes}
+    already = {
+        tuple(sorted((pair.proposal_hash, pair.partner_hash))) for pair in swept_pairs
+    }
+
+    carried: List[CarriedFinding] = []
+    departed: List[DepartedFinding] = []
+    for key, verdict in reuse_index.iter_pairs():
+        if not _is_finding(verdict.tenable, verdict.confidence):
+            continue
+        if key in already:
+            continue
+        lo, hi = key
+        if lo not in live or hi not in live:
+            departed.append(
+                DepartedFinding(
+                    proposal_hash=lo, partner_hash=hi, reason="side-no-longer-live"
+                )
+            )
+            continue
+        if hi in snapshot.edge_index.partners(lo):
+            departed.append(
+                DepartedFinding(
+                    proposal_hash=lo, partner_hash=hi, reason="edge-declared"
+                )
+            )
+            continue
+        carried.append(
+            CarriedFinding(
+                proposal_hash=lo,
+                partner_hash=hi,
+                proposal_node=live[lo],
+                partner_node=live[hi],
+                verdict=verdict,
+            )
+        )
+
+    carried.sort(key=lambda c: (c.proposal_hash, c.partner_hash))
+    departed.sort(key=lambda d: (d.proposal_hash, d.partner_hash))
+    return carried, departed
+
+
 def dedup_oriented_pairs(sweeps: "Iterable[NodeSweep]") -> "List[CorpusPair]":
     """Dedups the discovered pairs corpus-wide — each unordered pair exactly once.
 
@@ -818,6 +968,12 @@ class CheckPlan:
         start_probe: The run-entry backlog read (CHK-D4), taken BEFORE the corpus
             snapshot — the backlog that predates the snapshot is exactly what
             thinned the sweep the snapshot defines (KD1).
+        carried: Standing findings the sweep did not re-screen, carried off the
+            index instead (:func:`carry_standing_findings`). Empty under an
+            unavailable index — and empty is the honest reading there, since a run
+            that cannot read its history must not assert what is still standing.
+        departed: Finding-grade priors that stopped standing, with the derived
+            reason. Counted on the surface, never narrated.
     """
 
     run_id: str
@@ -834,6 +990,8 @@ class CheckPlan:
     reuse_index: Optional[ReuseIndex]
     reuse_unavailable: Optional[ReuseUnavailable]
     start_probe: StaleProbe
+    carried: Tuple[CarriedFinding, ...] = ()
+    departed: Tuple[DepartedFinding, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -846,7 +1004,10 @@ class CheckFinding:
         proposal_node: The proposal's hydrated live-at-snapshot node (3a resolves
             display slugs from here — MI-2, the stored slug is a citation).
         partner_node: The partner's hydrated node, ditto.
-        score: The gathered similarity — informational context (2b's carried float).
+        score: The gathered similarity — informational context (2b's carried
+            float), or ``None`` for a finding CARRIED off the reuse index, which
+            was never gathered this run and so has no similarity to report. Read
+            ``None`` as "not measured this run", never as zero.
         rationale: Fresh — this run's judgment rationale; reused — the stored
             verdict's, verbatim (M8: never a re-render).
         confidence: The raw judge confidence behind the gate.
@@ -863,7 +1024,7 @@ class CheckFinding:
     partner_hash: str
     proposal_node: Dict[str, Any]
     partner_node: Dict[str, Any]
-    score: float
+    score: Optional[float]
     rationale: str
     confidence: float
     reused: bool
@@ -918,6 +1079,9 @@ class CheckRunResult:
             cannot certify). Fork on the TYPE, never on emptiness — an empty
             probe is healthy. Completeness is certified only when BOTH probes
             read clean of transient rows.
+        departed: Finding-grade priors that stopped standing this run, echoed from
+            the plan with their derived reason. The surface prints counts by
+            reason; the identities ride the JSON.
     """
 
     run_id: str
@@ -939,6 +1103,7 @@ class CheckRunResult:
     telemetry_write_failures: Tuple[str, ...]
     start_probe: StaleProbe
     end_probe: "StaleProbe | ProbeUnavailable"
+    departed: Tuple[DepartedFinding, ...] = ()
 
     @property
     def judgment_degraded(self) -> Optional[Unavailable]:
@@ -1132,6 +1297,15 @@ def plan_corpus_check(
         else:
             fresh_pairs.append(pair)
 
+    # The standing-finding carry: the reuse partition above can only speak for pairs
+    # the sweep discovered, so a finding whose pair fell out of every node's top_k
+    # would leave the report silently. Carried off the index instead, screened
+    # against the same live-node and strong-edge facts the sweep screens on. Reads
+    # only what is already built — no judge contact, no extra store read.
+    carried, departed = carry_standing_findings(
+        reuse_index=reuse_index, snapshot=snapshot, swept_pairs=pairs
+    )
+
     return CheckPlan(
         run_id=run_id,
         started_at=started_at,
@@ -1147,6 +1321,8 @@ def plan_corpus_check(
         reuse_index=reuse_index,
         reuse_unavailable=reuse_unavailable,
         start_probe=start_probe,
+        carried=tuple(carried),
+        departed=tuple(departed),
     )
 
 
@@ -1279,6 +1455,27 @@ def execute_corpus_check(
                 source_batch_id=verdict.batch_id,
                 source_created_at=verdict.created_at,
                 reuse_index=plan.reuse_index,
+            )
+        )
+
+    # Carried standing findings — the ones the sweep never re-screened. Same zero
+    # spend, same verbatim stored verdict; they differ only in having no gathered
+    # similarity to report, and in being "known" by construction rather than by a
+    # lookup (the carry screen already re-derived finding-ness through the KD4 gate).
+    for carried in plan.carried:
+        findings.append(
+            CheckFinding(
+                proposal_hash=carried.proposal_hash,
+                partner_hash=carried.partner_hash,
+                proposal_node=carried.proposal_node,
+                partner_node=carried.partner_node,
+                score=None,
+                rationale=carried.verdict.rationale,
+                confidence=carried.verdict.confidence,
+                reused=True,
+                source_batch_id=carried.verdict.batch_id,
+                source_created_at=carried.verdict.created_at,
+                novelty="known",
             )
         )
 
@@ -1447,6 +1644,7 @@ def execute_corpus_check(
         telemetry_write_failures=tuple(write_failures),
         start_probe=plan.start_probe,
         end_probe=end_probe,
+        departed=plan.departed,
     )
 
 
