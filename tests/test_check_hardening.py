@@ -91,7 +91,7 @@ _CORPUS_JSON_KEYS = {
     "batches_planned", "batches_executed", "batches_judged", "batches_failed",
     "batches_skipped", "findings",
     "findings_new", "findings_known", "departed", "degradations",
-    "coverage_exclusions",
+    "judgment_failure_reasons", "coverage_exclusions",
     "index_backlog_transient", "summary_row_written",
     "project", "collection", "workspace",
 }

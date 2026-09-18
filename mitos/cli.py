@@ -4836,6 +4836,51 @@ _CHECK_DEPARTURE_WORDS: Dict[str, str] = {
 }
 
 
+# Why a judgment batch did not complete, in printed order. Keyed on the TYPED reason —
+# never on ``Unavailable.detail``, which ``conflict.py`` documents as logging/telemetry
+# only, never rendered to a user (the surface owns UX wording). Pasting the exception
+# text here is the obvious move and it breaks a stated contract; if a detail ever needs
+# to reach a human, that is a deliberate decision about that contract, not a slip made
+# while fixing a report.
+#
+# Total over ``ConflictUnavailableReason`` on purpose, so a member added later cannot
+# KeyError this renderer mid-report — pinned by an exhaustiveness row in
+# tests/test_check_cli.py. The semantic-substrate reasons are unreachable from the
+# judgment stage today and are worded anyway rather than left to a fallback.
+_JUDGMENT_FAILURE_WORDS: Dict[str, str] = {
+    "judgment_timeout": "the judge timed out or returned an error",
+    "judgment_unavailable": "the judge's response could not be parsed",
+    "judgment_truncated": "the judge's response hit max_tokens",
+    "embedding_unavailable": "the embedding provider was unavailable",
+    "vector_store_unavailable": "the vector store was unavailable",
+    "collection_missing": "the vector collection does not exist",
+}
+
+
+def _judgment_failure_breakdown(failures: Sequence[Any]) -> str:
+    """Words the judgment failures as grouped counts, in the vocabulary's own order.
+
+    The information exists in-process and rides ``CheckRunResult.judgment_failures``
+    all the way out; before this it was collapsed to a bool in the degradation-token
+    map and nothing else read it, so a report could say a batch failed and never say
+    why. Grouped rather than listed: 400 timeouts are one fact, not 400 lines.
+
+    Args:
+        failures: The run's ``Unavailable`` judgment failures.
+
+    Returns:
+        A human clause such as ``"1 the judge timed out or returned an error"``'s
+        grouped form, or ``""`` when there is nothing to say.
+    """
+    counted = Counter(f.reason.value for f in failures)
+    parts = [
+        f"{counted[reason]} × {words}"
+        for reason, words in _JUDGMENT_FAILURE_WORDS.items()
+        if counted.get(reason)
+    ]
+    return "; ".join(parts)
+
+
 def _check_departed_json(departed: "check.DepartedFinding") -> Dict[str, Any]:
     """Renders one departed finding as its flat JSON object.
 
@@ -4934,6 +4979,9 @@ def _check_json_object(
         "findings_known": row.findings_known,
         "departed": [_check_departed_json(d) for d in result.departed],
         "degradations": list(check.run_degradations(result)),
+        # The typed reasons behind `degradations: ["judgment"]`. Reasons only — never
+        # `Unavailable.detail`, which is logging/telemetry and not user-rendered.
+        "judgment_failure_reasons": [f.reason.value for f in result.judgment_failures],
         "coverage_exclusions": exclusions,
         "index_backlog_transient": transient_count,
         "summary_row_written": row_written,
@@ -5055,6 +5103,13 @@ def _print_check_report(
                 shortfall.append(f"{result.batches_skipped} never attempted")
             print(f"  Judged {result.batches_judged} of {result.batches_planned} "
                   f"judgment batches ({', '.join(shortfall)}).")
+            # The coverage number says how much was missed; this says why. Without it
+            # a reader can see "1 failed" on two consecutive audits and have no way to
+            # tell a judge timeout from an unparseable response — the same class of
+            # silence the standing-finding carry was fixing one line up.
+            breakdown = _judgment_failure_breakdown(result.judgment_failures)
+            if breakdown:
+                print(f"    Why: {breakdown}.")
 
     if not row_written:
         print("  Note: this run was not recorded to check history "
