@@ -65,11 +65,21 @@ def no_retry_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("mitos.conflict_judgment.time.sleep", lambda _: None)
 
 
-def _prompt() -> RenderedPrompt:
-    """A minimal RenderedPrompt — the executor only reads ``.system`` and ``.user``."""
+def _prompt(candidate_slugs: "tuple[str, ...]" = ("cand-a", "cand-b")) -> RenderedPrompt:
+    """A minimal RenderedPrompt — the executor reads ``.system``, ``.user`` and the slugs."""
     return RenderedPrompt(
-        system="SYSTEM-PREFIX", user="USER-BLOCK", prompt_version="conflict-tenability-v1"
+        system="SYSTEM-PREFIX",
+        user="USER-BLOCK",
+        prompt_version="conflict-tenability-v1",
+        candidate_slugs=tuple(candidate_slugs),
     )
+
+
+def _sent_tool(client: MagicMock) -> dict:
+    """The one tool definition the executor sent on the fake client's create call."""
+    kwargs = client.with_options.return_value.messages.create.call_args.kwargs
+    assert len(kwargs["tools"]) == 1
+    return kwargs["tools"][0]
 
 
 def _fake_message(
@@ -575,3 +585,60 @@ def test_t10_5a_cli_built_judge_issues_no_cache_control(
     kwargs = create.call_args.kwargs
     _assert_no_cache_control(kwargs)
     assert isinstance(kwargs["system"], str)
+
+
+# --------------------------------------------------------------------------- #
+# The slug fence — the tool schema names the batch (2026-09-19)
+# --------------------------------------------------------------------------- #
+
+def test_verdict_tool_is_fenced_to_the_batch() -> None:
+    """``slug`` is an enum of exactly the batch's candidate slugs, and the tool is strict.
+
+    Measured 2026-09-19: at temperature 0.3 the judge echoed a slug with a segment
+    spliced in from the candidate's own axiom prose, five runs out of six, and the
+    parser rightly refused the batch each time. An enum enforced by strict tool use makes
+    a mangled echo impossible instead of unlikely.
+    """
+    client = _client_returning(_fake_message("[]"))
+    slugs = ("rotation-prompt-x", "conflict-prompt-ordering-wired-now-caching", "repair-door-y")
+
+    execute_judgment(_prompt(slugs), client=client)
+
+    tool = _sent_tool(client)
+    assert tool["strict"] is True
+    verdict_schema = tool["input_schema"]["properties"]["verdicts"]["items"]
+    assert verdict_schema["properties"]["slug"] == {"type": "string", "enum": list(slugs)}
+    # Strict mode's schema contract: every object closed, every property required.
+    assert tool["input_schema"]["additionalProperties"] is False
+    assert verdict_schema["additionalProperties"] is False
+    assert tool["input_schema"]["required"] == ["verdicts"]
+    assert set(verdict_schema["required"]) == set(verdict_schema["properties"])
+    # The force is unchanged — the fence narrows the echo, not the call shape.
+    kwargs = client.with_options.return_value.messages.create.call_args.kwargs
+    assert kwargs["tool_choice"] == {"type": "tool", "name": "record_verdicts"}
+
+
+def test_verdict_tool_static_shape_is_batch_independent() -> None:
+    """Everything but the enum is identical across batches — CONF-D3 order included."""
+    c1 = _client_returning(_fake_message("[]"))
+    c2 = _client_returning(_fake_message("[]"))
+    execute_judgment(_prompt(("a", "b")), client=c1)
+    execute_judgment(_prompt(("x", "y", "z")), client=c2)
+
+    t1, t2 = _sent_tool(c1), _sent_tool(c2)
+    for tool in (t1, t2):
+        props = tool["input_schema"]["properties"]["verdicts"]["items"]["properties"]
+        # rationale BEFORE the gate fields — the chain-of-thought lever rides the schema.
+        assert list(props) == ["slug", "rationale", "tenable_together", "confidence"]
+    t1["input_schema"]["properties"]["verdicts"]["items"]["properties"]["slug"] = "ENUM"
+    t2["input_schema"]["properties"]["verdicts"]["items"]["properties"]["slug"] = "ENUM"
+    assert t1 == t2
+
+
+@pytest.mark.parametrize("slugs", [(), ("dup", "dup")])
+def test_unfenceable_batch_is_refused_before_any_spend(slugs: "tuple[str, ...]") -> None:
+    """An empty or duplicate-slug batch cannot be fenced 1:1 — refused before the call."""
+    client = _client_returning(_fake_message("[]"))
+    with pytest.raises(ValueError, match="candidate"):
+        execute_judgment(_prompt(slugs), client=client)
+    client.with_options.assert_not_called()

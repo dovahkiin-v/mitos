@@ -59,7 +59,7 @@ def _client_returning(msg: MagicMock) -> MagicMock:
 
 def _prompt() -> RenderedPrompt:
     return RenderedPrompt(
-        system="S", user="U", prompt_version="conflict-tenability-v2"
+        system="S", user="U", prompt_version="conflict-tenability-v2", candidate_slugs=("c",)
     )
 
 

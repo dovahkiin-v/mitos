@@ -351,6 +351,19 @@ def test_prompt_version_rides_on_rendered_prompt() -> None:
     assert rendered.prompt_version == CONFLICT_PROMPT_VERSION
 
 
+def test_render_carries_candidate_slugs_in_batch_order() -> None:
+    """The batch's slugs ride the RenderedPrompt, verbatim and in candidate order.
+
+    The executor fences the judge's ``slug`` echo to exactly these — the same list the
+    caller parses against — so the fence and the alignment target cannot drift apart.
+    """
+    proposal = JudgeInput(axiom="a", rejected_paths="", scope=[])
+    rendered = render_judgment_prompt(
+        proposal, [("Cand-B", proposal), ("cand-a", proposal), ("cand-c", proposal)]
+    )
+    assert rendered.candidate_slugs == ("Cand-B", "cand-a", "cand-c")  # verbatim, no casefold
+
+
 def test_output_schema_presents_rationale_before_gate_fields() -> None:
     """The schema in .system presents ``rationale`` BEFORE ``tenable_together`` (CONF-D3 lever)."""
     proposal = JudgeInput(axiom="a", rejected_paths="", scope=[])

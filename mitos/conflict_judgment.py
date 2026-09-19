@@ -26,7 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Callable, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 from uuid import uuid4
 
 import anthropic
@@ -76,39 +76,81 @@ def _is_transient(exc: Exception) -> bool:
 # when `stop_reason` is `max_tokens`.
 _JUDGMENT_MAX_TOKENS = 2000
 
-# The tool schema the judge is forced to call. Property order preserves the CONF-D3
-# chain-of-thought lever: rationale BEFORE tenable_together, so the model reasons
-# before it rules.
-_VERDICT_TOOL = {
-    "name": "record_verdicts",
-    "description": (
-        "Record the tenability verdicts for every candidate in this batch."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "verdicts": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "slug": {"type": "string"},
-                        "rationale": {"type": "string"},
-                        "tenable_together": {"type": "boolean"},
-                        "confidence": {"type": "number"},
+# The tool schema the judge is forced to call, built per batch. Property order
+# preserves the CONF-D3 chain-of-thought lever: rationale BEFORE tenable_together, so
+# the model reasons before it rules.
+#
+# ``slug`` is an enum of exactly the batch's candidate slugs and the tool is ``strict``,
+# so the API enforces the echo by constrained decoding rather than by instruction.
+# Measured 2026-09-19 (bridge/Mitos/RESULT-judge-parse-failure-20260919.md): at
+# temperature 0.3 the judge echoed one slug with a segment spliced in from that
+# candidate's own axiom prose, five runs out of six, and the parser rightly refused the
+# batch each time — billed, unpersisted, and re-bought on the next run. Fencing the
+# identifier makes a mangled echo impossible; it does not touch how the verdict is
+# reached, which is why it rides no CONFLICT_PROMPT_VERSION bump (Vinga's ruling,
+# 2026-09-19). Two costs, both accepted: the tool block now varies per batch, so
+# nothing ahead of it in the request is prefix-cacheable while the enum is per batch
+# (caching is already declined for check — see the ADR
+# check-prompt-caching-declined-sub-minimum-prefix); and strict mode compiles a grammar
+# per distinct schema, i.e. once per batch.
+_VERDICT_TOOL_NAME = "record_verdicts"
+
+
+def verdict_tool(candidate_slugs: "Sequence[str]") -> "Dict[str, Any]":
+    """Builds the strict ``record_verdicts`` tool definition fenced to one batch.
+
+    Args:
+        candidate_slugs: The batch's candidate slugs, verbatim, in candidate order — the
+            list the caller will parse the verdicts against.
+
+    Returns:
+        The tool definition dict for ``messages.create(tools=[...])``: ``strict`` with
+        every object closed (``additionalProperties: false``) and every property
+        required, and ``slug`` constrained to ``enum: candidate_slugs``.
+
+    Raises:
+        ValueError: If the batch is empty or holds a duplicate slug — neither can be
+            fenced 1:1, and the parser could not align such a batch anyway. Raised
+            before any request is built, so nothing is spent.
+    """
+    slugs = list(candidate_slugs)
+    if not slugs:
+        raise ValueError("cannot fence an empty candidate batch")
+    if len(set(slugs)) != len(slugs):
+        raise ValueError("cannot fence a candidate batch holding a duplicate slug")
+    return {
+        "name": _VERDICT_TOOL_NAME,
+        "description": (
+            "Record the tenability verdicts for every candidate in this batch."
+        ),
+        "strict": True,
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "verdicts": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "slug": {"type": "string", "enum": slugs},
+                            "rationale": {"type": "string"},
+                            "tenable_together": {"type": "boolean"},
+                            "confidence": {"type": "number"},
+                        },
+                        "required": [
+                            "slug",
+                            "rationale",
+                            "tenable_together",
+                            "confidence",
+                        ],
+                        "additionalProperties": False,
                     },
-                    "required": [
-                        "slug",
-                        "rationale",
-                        "tenable_together",
-                        "confidence",
-                    ],
-                },
-            }
+                }
+            },
+            "required": ["verdicts"],
+            "additionalProperties": False,
         },
-        "required": ["verdicts"],
-    },
-}
+    }
 
 
 def execute_judgment(
@@ -124,6 +166,8 @@ def execute_judgment(
     the verdict array from the tool_use block's ``input``, and serializes it into
     ``raw_text`` as a JSON array — so both ``parse_judgment_response`` consumers (the
     corpus path in ``check.py`` and the sync path in ``conflict.py``) are untouched.
+    The tool is built per batch by :func:`verdict_tool`: strict, with ``slug`` fenced to
+    ``prompt.candidate_slugs``, so the echo the parser aligns on cannot be mangled.
 
     SDK retries are disabled (``max_retries=0``) so ``CONFLICT_LLM_TIMEOUT_S`` is a
     true wall-clock ceiling per attempt. Transient errors (429, 5xx, timeouts,
@@ -163,7 +207,15 @@ def execute_judgment(
         ``JUDGMENT_TIMEOUT`` (ladder exhausted), ``JUDGMENT_REJECTED`` (the request
         was refused), ``JUDGMENT_TRUNCATED`` or ``JUDGMENT`` (the one response that
         came back was unusable).
+
+    Raises:
+        ValueError: If ``prompt.candidate_slugs`` cannot be fenced (empty, or a
+            duplicate slug) — a caller defect, refused before any spend, like the
+            pin-mismatch guards in ``check.py``.
     """
+    # The fence first — a batch that cannot be fenced is refused before any spend.
+    tool = verdict_tool(prompt.candidate_slugs)
+
     # Mint the batch id up front (W8) — one per batched call, shared by every
     # ``conflict_checks`` row 5b writes for this batch. A plain unique ``str``.
     batch_id = uuid4().hex
@@ -177,8 +229,8 @@ def execute_judgment(
         max_tokens=_JUDGMENT_MAX_TOKENS,
         system=prompt.system,
         messages=[{"role": "user", "content": prompt.user}],
-        tools=[_VERDICT_TOOL],
-        tool_choice={"type": "tool", "name": "record_verdicts"},
+        tools=[tool],
+        tool_choice={"type": "tool", "name": _VERDICT_TOOL_NAME},
     )
     if accepts_temperature(resolved_model):
         create_kwargs["temperature"] = CONFLICT_JUDGMENT_TEMPERATURE

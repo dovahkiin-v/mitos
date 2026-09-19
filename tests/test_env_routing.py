@@ -503,7 +503,7 @@ def test_the_bound_judge_issues_the_model_id_it_was_built_with():
     client = _client_returning(_fake_message("[]"))
     judge = make_judgment_executor(client, model_id="claude-sonnet-from-target")
 
-    judge(RenderedPrompt(system="S", user="U", prompt_version="conflict-tenability-v1"))
+    judge(RenderedPrompt(system="S", user="U", prompt_version="conflict-tenability-v1", candidate_slugs=("c",)))
 
     assert _created_model(client) == "claude-sonnet-from-target"
 

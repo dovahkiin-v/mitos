@@ -577,11 +577,18 @@ class RenderedPrompt:
         user: The volatile user block — escaped ``<proposal>``/``<candidates>`` data.
         prompt_version: ``== CONFLICT_PROMPT_VERSION`` — travels with the prompt so 5b
             can stamp the exact prompt identity onto each telemetry row.
+        candidate_slugs: The batch's candidate slugs, verbatim and in candidate order —
+            the same list the caller parses against. The executor fences the judge's
+            ``slug`` echo to exactly these (an enum in the strict tool schema), so the
+            fence and the alignment target are one list and cannot drift apart. Not
+            part of the prompt text: the snapshot fixtures and ``prompt_version`` do
+            not see it.
     """
 
     system: str
     user: str
     prompt_version: str
+    candidate_slugs: Tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -830,6 +837,7 @@ def render_judgment_prompt(
         system=_JUDGMENT_SYSTEM_PROMPT,
         user=user,
         prompt_version=CONFLICT_PROMPT_VERSION,
+        candidate_slugs=tuple(slug for slug, _ in candidates),
     )
 
 
