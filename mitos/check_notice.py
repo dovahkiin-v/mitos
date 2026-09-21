@@ -4,7 +4,7 @@ A blocked commit and ``mitos check``'s own report reach only the session that ra
 them. The last-attempt record (``telemetry.check_attempt``) holds the outcome, and
 this module turns it into one dated, plain line for the next agent or person to
 touch the corpus: new contradictions named by handle, a check that could not
-complete and why, a spend nobody was allowed to authorise, or a check that started
+complete and why, a spend nobody was allowed to authorize, or a check that started
 and recorded no outcome. The line is dated and claims nothing about the present.
 
 Three public names:
@@ -152,8 +152,8 @@ def check_notice_line(notice: Mapping[str, Any]) -> str:
         else:
             batches = f"{planned} judgment batch" + ("" if planned == 1 else "es")
         return (
-            f"{head} planned {batches} and was not authorised to spend; "
-            f"a person authorises that."
+            f"{head} planned {batches} and was not authorized to spend; "
+            f"a person authorizes that."
         )
     if state == ATTEMPT_STARTED:
         return (

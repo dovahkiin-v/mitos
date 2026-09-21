@@ -2441,7 +2441,7 @@ _FORMS = {
     "spend_not_authorized": (
         _notice_data(ATTEMPT_SPEND_NOT_AUTHORIZED, batches_planned=12),
         f"The last contradiction check {_NOTICE_T} planned 12 judgment batches and "
-        f"was not authorised to spend; a person authorises that.",
+        f"was not authorized to spend; a person authorizes that.",
     ),
     "started": (
         _notice_data(ATTEMPT_STARTED),
@@ -2759,7 +2759,7 @@ def test_sync_closes_with_the_notice_and_a_recipe_that_parses(sync_workspace, mo
 
 
 def test_sync_names_a_person_for_a_refused_spend(sync_workspace, monkeypatch, capsys) -> None:
-    """Criterion 17: the not-authorised clause names a person at a terminal, no waiver."""
+    """Criterion 17: the not-authorized clause names a person at a terminal, no waiver."""
     config = sync_workspace
     _seed_attempt(config, ATTEMPT_SPEND_NOT_AUTHORIZED)
     monkeypatch.setenv("ANTHROPIC_API_KEY", _DUMMY_KEY)

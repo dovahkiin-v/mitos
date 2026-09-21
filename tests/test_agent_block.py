@@ -352,7 +352,7 @@ def test_paste_line_names_the_directory_when_no_name_exists(tmp_path, monkeypatc
 
 
 def test_habit_line_teaches_check_before_commit_and_no_agent_yes():
-    """R14: the order that costs no extra turn, and who authorises a spend.
+    """R14: the order that costs no extra turn, and who authorizes a spend.
 
     `--yes` may appear only inside the sentence that says an agent does not pass it,
     so deleting that sentence or inverting it reds.

@@ -3183,7 +3183,7 @@ def _commit_gate_attempt_words(attempt: Dict[str, Any]) -> str:
         batches = attempt["batches_planned"]
         planned = ("planned batches: unknown" if batches is None
                    else f"{batches} planned batch(es)")
-        return words + f" ({planned}; a person authorises that spend)"
+        return words + f" ({planned}; a person authorizes that spend)"
     # A newer build's state: shown as stored.
     return f"{attempt['started_at']}, {state}"
 

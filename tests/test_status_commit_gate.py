@@ -462,7 +462,7 @@ _ATTEMPT_CASES = [
                      degradation_tokens=("x",)),
      "on_record", "could not complete", "new pair"),
     ("spend-not-authorized", _seed_refusal, "on_record",
-     "spend not authorized (5 planned batch(es); a person authorises that spend)", None),
+     "spend not authorized (5 planned batch(es); a person authorizes that spend)", None),
     ("spend-not-authorized-null-batches",
      lambda ws: (_seed_refusal(ws),
                  _raw(ws, "UPDATE check_attempt SET batches_planned = NULL")),
