@@ -588,3 +588,91 @@ def test_swept_exclusion_is_split_out_and_unswept_exclusion_is_dropped() -> None
     marks = check.coverage_marks_from_result(result)
     assert marks.covered == ("b",)
     assert marks.excluded == ("a",)
+
+
+# --------------------------------------------------------------------------- #
+# Across the seam — what a real run writes, the derivation leaf reads
+# --------------------------------------------------------------------------- #
+#
+# 2a pins the rows ``cmd_check`` writes and 2b pins what the leaf derives from rows;
+# these pin the join. The gate's pass condition (N = 0) rests on the sweep's
+# population and the leaf's ids-only read naming the same decisions, so an unscoped
+# clean run must leave nothing uncovered. (The leaf is fenced from the check family,
+# not from tests.)
+
+
+def test_a_clean_unscoped_run_leaves_no_audit_debt(workspace, monkeypatch, capsys) -> None:
+    """Before: N = M = 2. After one undegraded run: N = 0, K = 0, the empty fingerprint."""
+    from mitos.audit_debt import AuditDebt, derive_audit_debt, uncovered_fingerprint
+
+    config, store, tel = workspace
+    a_id, b_id, nbhds = _pair(store)
+    _drain_outbox(store)
+    before = derive_audit_debt(config.db_path, config.telemetry_path)
+    assert isinstance(before, AuditDebt)
+    assert before.uncovered_ids == frozenset({a_id, b_id}) and before.total == 2
+
+    embed, vector = _wire_substrate(monkeypatch, nbhds)
+    _wire_judge(monkeypatch, _judge_for(store, embed, vector, tel))
+    code, obj = _run(config, capsys)
+
+    assert code == 0 and obj["degradations"] == []
+    after = derive_audit_debt(config.db_path, config.telemetry_path)
+    assert after == AuditDebt(uncovered_ids=frozenset(), total=2, excluded=0)
+    assert after.fingerprint == uncovered_fingerprint(())
+
+
+def test_a_poisoned_node_reads_as_excluded_not_uncovered(workspace, monkeypatch, capsys) -> None:
+    """A run's exclusion reaches the leaf as K, never holding N above zero."""
+    from mitos.audit_debt import derive_audit_debt
+
+    config, store, tel = workspace
+    a_id, b_id, nbhds = _pair(store)
+    _drain_outbox(store)
+    _poison(store, a_id)
+    embed, vector = _wire_substrate(monkeypatch, nbhds)
+    _wire_judge(monkeypatch, _judge_for(store, embed, vector, tel))
+
+    code, _ = _run(config, capsys)
+
+    debt = derive_audit_debt(config.db_path, config.telemetry_path)
+    assert code == 0
+    assert (debt.uncovered, debt.total, debt.excluded) == (0, 2, 1)
+
+
+def test_a_degraded_run_leaves_the_debt_where_it_was(workspace, monkeypatch, capsys) -> None:
+    """A failing batch covers nothing, so the leaf still reads N = M."""
+    from mitos.audit_debt import derive_audit_debt
+
+    config, store, tel = workspace
+    a_id, b_id, nbhds = _pair(store)
+    _drain_outbox(store)
+    embed, vector = _wire_substrate(monkeypatch, nbhds)
+    failing = Unavailable(reason=ConflictUnavailableReason.JUDGMENT, detail="judge died")
+    _wire_judge(monkeypatch, _judge_for(store, embed, vector, tel, overrides={0: failing}))
+
+    code, _ = _run(config, capsys)
+
+    debt = derive_audit_debt(config.db_path, config.telemetry_path)
+    assert code == 2
+    assert debt.uncovered_ids == frozenset({a_id, b_id}) and debt.total == 2
+
+
+def test_a_decision_recorded_mid_run_is_the_debt_that_remains(
+    workspace, monkeypatch, capsys
+) -> None:
+    """The one decision the sweep never saw is exactly the uncovered set afterwards."""
+    from mitos.audit_debt import derive_audit_debt
+
+    config, store, tel = workspace
+    a_id, b_id, nbhds = _pair(store)
+    _drain_outbox(store)
+    embed, vector = _wire_substrate(monkeypatch, nbhds)
+    judge = _CommittingJudge(_judge_for(store, embed, vector, tel), store)
+    _wire_judge(monkeypatch, judge)
+
+    code, _ = _run(config, capsys)
+
+    debt = derive_audit_debt(config.db_path, config.telemetry_path)
+    assert code in (0, 1)
+    assert debt.uncovered_ids == frozenset({judge.committed}) and debt.total == 3
