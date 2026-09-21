@@ -99,8 +99,8 @@ from mitos.recall import (assess_query_recall, assess_surface_recall,
                           provenance_line, scope_filter_recovery,
                           count_withheld, window_lever, withheld_clause)
 from mitos.sync import (MitosSyncManager, run_ambient_capture, _SLUG_MAX_LEN,
-                        _ENTRIES_MARKER, _PAUSE_RESOLVING_RELATIONS,
-                        _declared_echo_lines, _split_relation_slugs,
+                        _ENTRIES_MARKER, _NEIGHBOR_REVIEW_THRESHOLD,
+                        _PAUSE_RESOLVING_RELATIONS, _declared_echo_lines, _split_relation_slugs,
                         ROTATION_FAILED, ROTATION_REASON_DUPLICATED, ROTATION_ROTATED,
                         ROTATION_SKIPPED, ROTATION_STAGE_FILE, ROTATION_STAGE_LOCK)
 from mitos._agent_block import agent_block, agent_block_drift, AGENT_GUIDE_VERSION
@@ -1976,6 +1976,13 @@ def cmd_render(config: MitosConfig, scope: Optional[str] = None, render_format: 
         print(f"  - {path}")
 
 
+# The text pause's terminal preview of a neighbour's rejected_paths, in characters.
+# The axiom prints whole (it is what the author judges by); a longer rejected_paths
+# is cut here and the cut is named, with a recipe for the whole field. The --json
+# and MCP payloads carry both fields whole.
+_PAUSE_REJECTED_PREVIEW = 80
+
+
 def cmd_record(
     config: MitosConfig,
     axiom: str,
@@ -2064,7 +2071,9 @@ def cmd_record(
         # rejected_paths, scope, modifier stamps) so the author can judge and link
         # without a dereference round-trip. Enrichment keys via .get(): production
         # always sends the full candidate_payload shape, but leaner dicts reach this
-        # render from canned fixtures.
+        # render from canned fixtures. The header states the floor, as the message
+        # does; the axiom prints whole; a rejected_paths past the preview width says
+        # it was shortened and names the `mitos show` recipe for the whole field.
         #
         # Then the caller's own declared targets, partitioned (A2) — after the
         # neighbour blocks and before the recovery menu. In front of the payload it
@@ -2072,8 +2081,9 @@ def cmd_record(
         # tenability from; the sentences are `_declared_echo_lines` over this same
         # dict's keys, so this render and the two machine encodings cannot disagree.
         _echo_corpus(config, file=sys.stderr)
-        print(f"⚠ Paused — '{result['slug']}' looks like an existing decision. Nothing written.",
-              file=sys.stderr)
+        print(f"⚠ Paused — '{result['slug']}' is ≥{_NEIGHBOR_REVIEW_THRESHOLD:.2f} "
+              f"similar to {len(result.get('neighbors', []))} existing decision(s) you "
+              "did not reference. Nothing written.", file=sys.stderr)
         for n in result.get("neighbors", []):
             score = n.get("score")
             score_s = f"{score:.2f}" if isinstance(score, (int, float)) else "?"
@@ -2082,10 +2092,18 @@ def cmd_record(
                 for key in ("amended_by", "narrowed_by") if n.get(key))
             print(f"  ↔ {n['slug']}  ({score_s}){stamps}", file=sys.stderr)
             if n.get("axiom"):
-                print(f"      {truncate_words(n['axiom'], 60)}", file=sys.stderr)
-            if n.get("rejected_paths"):
-                print(f"      rejected: {truncate_words(n['rejected_paths'], 80)}",
+                axiom = "\n      ".join(n["axiom"].splitlines())
+                print(f"      {axiom}", file=sys.stderr)
+            rejected = n.get("rejected_paths")
+            if rejected and len(rejected) > _PAUSE_REJECTED_PREVIEW:
+                print(f"      rejected (shortened): "
+                      f"{truncate_words(rejected, _PAUSE_REJECTED_PREVIEW)}",
                       file=sys.stderr)
+                print(f"      read it whole with "
+                      f"`mitos show -p {config.project!r} -- {n['slug']!r}`",
+                      file=sys.stderr)
+            elif rejected:
+                print(f"      rejected: {rejected}", file=sys.stderr)
             if n.get("scope"):
                 print(f"      scope: {', '.join(n['scope'])}", file=sys.stderr)
         for line in _declared_echo_lines(result):

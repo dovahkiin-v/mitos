@@ -333,9 +333,9 @@ each neighbour's axiom, `rejected_paths`, `scope`, and modifier stamps. Judge
 each neighbour from that payload: if the new decision
 amends/supersedes/contradicts/cites one, re-record with that relation pointing
 at its slug; if it is genuinely independent, re-record with
-`acknowledge_neighbors=True`. An
-`amended_by`/`narrowed_by` stamp means the neighbour has moved on — dereference
-that slug before linking.
+`acknowledge_neighbors=True`. If you go on to supersede or amend a neighbour, an
+`amended_by`/`narrowed_by` stamp on it means it has moved on — dereference that
+slug before linking.
 
 ---
 

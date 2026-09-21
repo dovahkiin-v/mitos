@@ -5,6 +5,7 @@ concurrency file locks, LLM capture enrichment, user reviews, and content-aware
 archive rotation.
 """
 
+import math
 import os
 import sys
 import shutil
@@ -13,6 +14,7 @@ import json
 import sqlite3
 import uuid
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_FLOOR
 from typing import TYPE_CHECKING, List, Dict, Mapping, Optional, Any, Set, Tuple, Callable
 from filelock import FileLock, Timeout
 
@@ -836,11 +838,19 @@ def _declared_echo_lines(payload: Dict[str, Any]) -> List[str]:
     count renders only on a collapse — rendered unconditionally it is the aggregate
     claim this surface is designed not to make.
 
+    The second group says what a declaration there is — valid, and not the relation
+    that resolves this pause — and states the floor its score sits below. A third
+    sentence, rendered whenever either group rendered, asks for every declaration
+    again on the re-record. It is one sentence for both groups on purpose: a clause
+    on the second group alone would make the pair say the first group need not be
+    sent again, which is the landed-edge reading the register floor forbids.
+
     Args:
         payload: The pause dict (or the echo keys alone).
 
     Returns:
-        Zero, one or two sentences without trailing punctuation, group one first.
+        Zero to three sentences without trailing punctuation: group one, group two,
+        then the re-send sentence.
     """
     lines: List[str] = []
 
@@ -857,15 +867,45 @@ def _declared_echo_lines(payload: Dict[str, Any]) -> List[str]:
         rendered = []
         for item in no_match:
             score = item.get("score")
-            rendered.append(item["slug"] if score is None
-                            else f"{item['slug']} ({score:.2f}, below floor)")
+            rendered.append(
+                item["slug"] if score is None
+                else f"{item['slug']} ({_floored_score_text(score)}, below the "
+                     f"{_NEIGHBOR_REVIEW_THRESHOLD:.2f} floor)"
+            )
         line = "Declared, not a near neighbour here: " + ", ".join(rendered)
         total = payload.get("declared_no_near_match_total")
         if total is not None:
             line += f" ({total} total)"
+        # Singular or plural by every member the line is about, elided ones included.
+        members = total if total is not None else len(no_match)
+        line += (" — a valid declaration that does not resolve this pause"
+                 if members == 1
+                 else " — valid declarations that do not resolve this pause")
         lines.append(line)
 
+    if lines:
+        lines.append("Pass every declaration again when you re-record")
+
     return lines
+
+
+def _floored_score_text(score: float) -> str:
+    """Renders a below-floor score to two places, rounded down.
+
+    Rounding to nearest would print 0.7967 as ``0.80`` beside a stated 0.80 floor it
+    is below. ``Decimal`` over the shortest repr floors exactly, where float
+    arithmetic turns 0.29 into 0.28. Display only: the payload keeps the raw float.
+
+    Args:
+        score: The cosine score of a declared target that was gathered.
+
+    Returns:
+        The score floored to two decimal places, e.g. ``"0.79"``.
+    """
+    score = float(score)
+    if not math.isfinite(score):
+        return str(score)       # quantize raises on inf; no rounding to fix there
+    return str(Decimal(str(score)).quantize(Decimal("0.01"), rounding=ROUND_FLOOR))
 
 
 def _normalize_slug(text: str) -> str:
@@ -4006,8 +4046,9 @@ class MitosSyncManager:
                         "neighbour this decision genuinely relates to, "
                         "acknowledge_neighbors=True for neighbours that stand "
                         "independently alongside it — or both at once for a mixed "
-                        "set. An amended_by/narrowed_by stamp means the neighbour "
-                        f"has moved on — dereference that slug before linking. {echo_prose}"
+                        "set. If you go on to supersede or amend a neighbour, an "
+                        "amended_by/narrowed_by stamp on it means it has moved on — "
+                        f"dereference that slug before linking. {echo_prose}"
                         "Nothing was written."
                     ),
                     **echo,

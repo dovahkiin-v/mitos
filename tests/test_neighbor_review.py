@@ -1269,7 +1269,7 @@ def test_empty_group_one_renders_no_key_and_no_none(ws, capsys):
     assert res["declared_no_near_match"] == [{"slug": "echo-x"}]
 
     sentences = _echo_sentences(res["message"])
-    assert len(sentences) == 1, res["message"]      # the lift is not vacuous
+    assert len(sentences) == 2, res["message"]      # group two + the re-send sentence
     for line in sentences:
         assert "none" not in line.casefold(), line
 
@@ -1279,7 +1279,11 @@ def test_empty_group_one_renders_no_key_and_no_none(ws, capsys):
             cmd_record(config, axiom=_ECHO_AXIOM, rejected="rej", scope=["s"],
                        slug="echo-new", cites="echo-x")
     rendered = _cli_echo_lines(capsys.readouterr().err)
-    assert rendered == ["Declared, not a near neighbour here: echo-x"]
+    assert rendered == [
+        "Declared, not a near neighbour here: echo-x — a valid declaration that "
+        "does not resolve this pause",
+        _RESEND,
+    ]
 
 
 def test_echo_sits_after_the_neighbours_and_before_the_closing_sentence(ws, capsys):
@@ -1312,13 +1316,13 @@ def test_echo_sits_after_the_neighbours_and_before_the_closing_sentence(ws, caps
     neighbour = max(i for i, line in enumerate(lines) if line.startswith("↔ "))
     menu = next(i for i, line in enumerate(lines) if line.startswith("→ "))
     echo = [i for i, line in enumerate(lines) if line.startswith(_ECHO_STEMS)]
-    assert len(echo) == 2, lines
+    assert len(echo) == 3, lines                    # group one, group two, re-send
     assert neighbour < min(echo) and max(echo) < menu, lines
 
     message = _echo_pause(m, _ECHO_GATHERED, cites="echo-b, echo-d")["message"]
     assert message.endswith("Nothing was written.")
     sentences = _echo_sentences(message)
-    assert len(sentences) == 2, message
+    assert len(sentences) == 3, message
     for sentence in sentences:
         assert message.index(sentence) < message.index("Nothing was written.")
 
@@ -1334,8 +1338,13 @@ def test_echo_sits_after_the_neighbours_and_before_the_closing_sentence(ws, caps
 # red on shipped text, and one relaxed until it stopped doing so would pin nothing.
 # --------------------------------------------------------------------------- #
 
-#: The echo's two sentence stems — the only prose this phase authored.
-_ECHO_STEMS = ("Declared: ", "Declared, not a near neighbour here: ")
+#: The echo's sentence stems: its two groups, then the re-send sentence (4d) that
+#: renders whenever either group did.
+_ECHO_STEMS = ("Declared: ", "Declared, not a near neighbour here: ",
+               "Pass every declaration again")
+
+#: The re-send sentence whole, as `_declared_echo_lines` returns it (no period).
+_RESEND = "Pass every declaration again when you re-record"
 
 
 def _echo_sentences(message: str):
@@ -1376,7 +1385,7 @@ def test_uncollapsed_echo_carries_no_count_anywhere(ws, capsys):
     assert "declared_no_near_match_total" not in res
 
     sentences = _echo_sentences(res["message"])
-    assert len(sentences) == 2, res["message"]
+    assert len(sentences) == 3, res["message"]
     for line in sentences:
         assert _count_markers(line) == [], line
 
@@ -1386,7 +1395,7 @@ def test_uncollapsed_echo_carries_no_count_anywhere(ws, capsys):
             cmd_record(config, axiom=_ECHO_AXIOM, rejected="rej", scope=["s"],
                        slug="echo-new", cites="echo-b, echo-d")
     rendered = _cli_echo_lines(capsys.readouterr().err)
-    assert len(rendered) == 2, rendered
+    assert len(rendered) == 3, rendered
     for line in rendered:
         assert _count_markers(line) == [], line
 
@@ -1413,12 +1422,30 @@ _PLANTED_ECHO_VIOLATIONS = (
     "Declared but unresolved: echo-x",                # a failure reading
     "Declared, missing from the sweep: echo-x",        # a not-valid reading
     "edges_created_no_near_match",                    # the claim in a key name
+    # 4d: one shape per word weighed for the new wording and refused.
+    "Declared; kept: echo-b",
+    "Declared, and the declaration stands: echo-b",
+    "Your declaration is recorded: echo-b",
+    "Declared, accepted, not a near neighbour here: echo-x",
+    "Declared, retained: echo-b",
+    "Declared, not a near neighbour here: echo-x — dropped",
+    "Declared, not a near neighbour here: echo-x — ignored by this pause",
+    "Declared, not a near neighbour here: echo-x — discarded",
+    "Pass every declaration again — nothing is lost",
+    "An unusual declaration: echo-x",
+    "An unexpected declaration: echo-x",
+    "An exception to the partition: echo-x",
 )
 
 #: Forbidden anywhere in a group label, a key name or an echo sentence (§3.5).
 _ECHO_FORBIDDEN = ("registered", "committed", "created", "saved", "applied",
                    "landed", "failed", "invalid", "unresolved", "warning",
-                   "error", "missing", "skipped", "rejected", "orphan")
+                   "error", "missing", "skipped", "rejected", "orphan",
+                   # 4d's refusal set: weighed for the group-two and re-send wording
+                   # and turned down (commit axis, then exception axis).
+                   "kept", "stands", "recorded", "accepted", "retained", "dropped",
+                   "ignored", "discarded", "lost", "unusual", "unexpected",
+                   "exception")
 
 
 def _echo_register_violations(text: str):
@@ -1457,7 +1484,7 @@ def test_echo_labels_and_key_names_claim_no_commitment(ws, capsys):
         assert _echo_register_violations(key) == [], key
 
     sentences = _echo_sentences(res["message"])
-    assert len(sentences) == 2, res["message"]      # the lift is not vacuous
+    assert len(sentences) == 3, res["message"]      # the lift is not vacuous
     for line in sentences:
         assert _echo_register_violations(line) == [], line
 
@@ -1467,7 +1494,7 @@ def test_echo_labels_and_key_names_claim_no_commitment(ws, capsys):
             cmd_record(config, axiom=_ECHO_AXIOM, rejected="rej", scope=["s"],
                        slug="echo-new", cites="echo-b, echo-d")
     rendered = _cli_echo_lines(capsys.readouterr().err)
-    assert len(rendered) == 2, rendered
+    assert len(rendered) == 3, rendered
     for line in rendered:
         assert _echo_register_violations(line) == [], line
 
@@ -1614,9 +1641,294 @@ def test_both_groups_collapse_independently_at_the_bound(ws, capsys, monkeypatch
         with pytest.raises(SystemExit):
             main()
     rendered = _cli_echo_lines(capsys.readouterr().err)
-    assert len(rendered) == 2, rendered
+    assert len(rendered) == 3, rendered              # group one, group two, re-send
     assert rendered[0].startswith("Declared: dep-00, dep-01,")
     assert rendered[0].endswith("dep-19 (25 total)")
     assert "dep-20" not in rendered[0]
-    assert rendered[1].endswith("cit-19 (25 total)")
+    # The marker sits before group two's suffix, and the plural reads the TOTAL.
+    assert rendered[1].endswith("cit-19 (25 total) — valid declarations that do not "
+                                "resolve this pause")
     assert "cit-20" not in rendered[1]
+    assert rendered[2] == _RESEND
+
+
+# --------------------------------------------------------------------------- #
+# What the pause renders and says (Phase 4d: A2 + B3 + B9)
+#
+# The payload is untouched; these rows pin the TEXT. The CLI render rows inject
+# neighbours through `_review_neighbors` (the `_FLAGGED` idiom) because the render is
+# their subject; the echo rows run the real gather through `_echo_pause` / the armed
+# factory, since the score and partition come from there. Every words assertion is a
+# literal, not a re-render through `_declared_echo_lines` — a row deriving its
+# expectation from the composer cannot catch the composer.
+# --------------------------------------------------------------------------- #
+
+_LONG_AXIOM = ("The pause prints each neighbour's axiom whole, because the axiom is "
+               "the one field the author judges a near restatement by, and a cut "
+               "one reads as a different decision from the one the graph holds "
+               "today in its active view.")
+_LONG_REJECTED = ("Rejected a sixty-character preview: the tail of a rejected path is "
+                  "usually where the reason lives, and an unnamed cut hides that.")
+_SHORT_REJECTED = "Rejected the obvious alternative, with reasons."
+
+
+def _neighbour(slug, axiom="An existing decision.", rejected=_SHORT_REJECTED):
+    return {"slug": slug, "axiom": axiom, "scope": ["s"], "score": 0.9,
+            "rejected_paths": rejected}
+
+
+def _cli_pause(config, neighbours, capsys):
+    """The CLI text pause over injected neighbours; returns its stderr."""
+    capsys.readouterr()
+    with patch.object(MitosSyncManager, "_review_neighbors", return_value=neighbours):
+        with pytest.raises(SystemExit) as exc:
+            cmd_record(config, axiom="A new call.", rejected="rej", slug="newcall")
+    assert exc.value.code == 2
+    return capsys.readouterr().err
+
+
+def _recipes(err):
+    return [r for r in err.split("`")[1::2] if r.startswith("mitos show")]
+
+
+def test_cli_pause_prints_the_neighbour_axiom_whole(ws, capsys):
+    """R-1 — the axiom is what the author judges by, so the text pause never cuts it."""
+    config, _ = ws
+    assert len(_LONG_AXIOM) > 150
+    err = _cli_pause(config, [_neighbour("long-axiom", axiom=_LONG_AXIOM)], capsys)
+    line = next(line for line in err.splitlines() if "The pause prints" in line)
+    assert line.strip() == _LONG_AXIOM
+    assert "…" not in line
+
+
+def test_cli_pause_names_a_shortened_rejected_paths_per_neighbour(ws, capsys):
+    """R-2 — a cut rejected_paths says it was shortened and names its own recipe."""
+    config, _ = ws
+    assert len(_LONG_REJECTED) > 80
+    err = _cli_pause(config, [_neighbour("first-long", rejected=_LONG_REJECTED),
+                              _neighbour("second-long", rejected=_LONG_REJECTED)],
+                     capsys)
+    assert err.count("rejected (shortened): Rejected a sixty-character") == 2
+    assert _LONG_REJECTED not in err                 # the terminal preview is cut
+    recipes = _recipes(err)
+    assert len(recipes) == 2
+    assert "'first-long'" in recipes[0] and "'second-long'" in recipes[1]
+
+
+def test_cli_pause_prints_a_short_rejected_paths_whole_with_no_pointer(ws, capsys):
+    """R-3 — nothing cut, so nothing is named cut: a pointer here is a false claim.
+
+    The positive control sits in the same call: one long neighbour beside the short
+    one proves this render does name a cut when there is one.
+    """
+    config, _ = ws
+    err = _cli_pause(config, [_neighbour("short-one"),
+                              _neighbour("long-one", rejected=_LONG_REJECTED)], capsys)
+    assert f"rejected: {_SHORT_REJECTED}" in err
+    assert err.count("shortened") == 1
+    recipes = _recipes(err)
+    assert len(recipes) == 1 and "'long-one'" in recipes[0]
+
+
+@pytest.mark.parametrize("project", [None, "my proj"], ids=["path", "name-with-space"])
+def test_cli_pause_rejected_recipe_parses(ws, capsys, project):
+    """R-3b — the printed recipe is a command a person can paste, selectored."""
+    import shlex
+    from mitos import cli
+    config, _ = ws
+    if project is not None:
+        config = MitosConfig(config.workspace_dir, project=project)
+    err = _cli_pause(config, [_neighbour("-dash-slug", rejected=_LONG_REJECTED)],
+                     capsys)
+    (recipe,) = _recipes(err)
+    args = cli._build_parser().parse_args(shlex.split(recipe)[1:])
+    assert args.command == "show"
+    assert args.ident == "-dash-slug"
+    assert args.project_post == config.project
+
+
+def test_cli_pause_header_states_the_floor_and_the_count(ws, capsys):
+    """R-4 — the header says the same thing the message does, floor included."""
+    config, _ = ws
+    err = _cli_pause(config, [_neighbour("one"), _neighbour("two")], capsys)
+    header = next(line for line in err.splitlines() if line.startswith("⚠ Paused"))
+    assert (f"is ≥{_NEIGHBOR_REVIEW_THRESHOLD:.2f} similar to 2 existing "
+            "decision(s) you did not reference") in header
+    assert header.endswith("Nothing written.")
+
+
+def test_below_floor_score_never_prints_as_the_floor(ws, capsys):
+    """R-5 — 0.7967 rounds to 0.80 beside a stated 0.80 floor; it must read 0.79."""
+    config, m = ws
+    _seed_echo_corpus(m)
+    gathered = [{"slug": "echo-c", "score": 0.84}, {"slug": "echo-d", "score": 0.7967}]
+    res = _echo_pause(m, gathered, cites="echo-d")
+    assert res["declared_no_near_match"] == [{"slug": "echo-d", "score": 0.7967}]
+    (group_two,) = [s for s in _echo_sentences(res["message"])
+                    if s.startswith("Declared, not")]
+    assert "echo-d (0.79, below the 0.80 floor)" in group_two
+    assert "(0.80" not in " ".join(_echo_sentences(res["message"]))
+
+    factory = _armed_real_manager_factory(gathered)
+    capsys.readouterr()
+    with patch("mitos.cli.MitosSyncManager", side_effect=factory):
+        with pytest.raises(SystemExit):
+            cmd_record(config, axiom=_ECHO_AXIOM, rejected="rej", scope=["s"],
+                       slug="echo-new", cites="echo-d")
+    rendered = _cli_echo_lines(capsys.readouterr().err)
+    assert "echo-d (0.79, below the 0.80 floor)" in rendered[0]
+    assert "(0.80" not in " ".join(rendered)
+
+
+@pytest.mark.parametrize("score", [0.0, 0.29, 0.5, 0.7949, 0.795, 0.7967, 0.79999999])
+def test_floored_score_text_stays_below_the_floor(score):
+    """R-5 sweep — floored, never rounded up; 0.29 is the float-arithmetic trap."""
+    from mitos.sync import _floored_score_text
+    text = _floored_score_text(score)
+    assert float(text) < _NEIGHBOR_REVIEW_THRESHOLD
+    assert float(text) <= score
+    if score == 0.29:
+        assert text == "0.29"
+
+
+def test_floored_score_text_survives_a_non_finite_score():
+    """The helper renders any float; `Decimal.quantize` alone raises on inf."""
+    from mitos.sync import _floored_score_text
+    assert _floored_score_text(float("-inf")) == "-inf"
+    assert _floored_score_text(float("nan")) == "nan"
+
+
+def test_group_two_clause_is_singular_or_plural_by_its_members(ws):
+    """R-6 — one member reads singular, several plural, the words pinned literally."""
+    config, m = ws
+    _seed_echo_corpus(m)
+    one = _echo_sentences(_echo_pause(m, _ECHO_GATHERED, cites="echo-x")["message"])
+    assert one[0] == ("Declared, not a near neighbour here: echo-x — a valid "
+                      "declaration that does not resolve this pause.")
+    two = _echo_sentences(_echo_pause(m, _ECHO_GATHERED,
+                                      cites="echo-x, echo-d")["message"])
+    assert two[0] == ("Declared, not a near neighbour here: echo-x, echo-d (0.62, "
+                      "below the 0.80 floor) — valid declarations that do not "
+                      "resolve this pause.")
+
+
+def test_group_two_clause_reads_the_total_on_a_collapse(ws, monkeypatch):
+    """R-6 collapsed — the switch counts elided members too (K11's target).
+
+    A bound of 1 over two declarations renders one member beside `(2 total)`; a
+    switch reading the rendered slice would call that line singular.
+    """
+    import mitos.sync
+    config, m = ws
+    _seed_echo_corpus(m)
+    monkeypatch.setattr(mitos.sync, "_DECLARED_ECHO_BOUND", 1)
+    res = _echo_pause(m, _ECHO_GATHERED, cites="echo-x, echo-d")
+    assert res["declared_no_near_match_total"] == 2
+    (group_two,) = [s for s in _echo_sentences(res["message"])
+                    if s.startswith("Declared, not")]
+    assert group_two == ("Declared, not a near neighbour here: echo-x (2 total) — "
+                         "valid declarations that do not resolve this pause.")
+
+
+@pytest.mark.parametrize("cites,groups", [
+    ("echo-b", ["declared"]),
+    ("echo-x", ["declared_no_near_match"]),
+    ("echo-b, echo-d", ["declared", "declared_no_near_match"]),
+], ids=["group-one-only", "group-two-only", "both"])
+def test_resend_sentence_covers_every_declaration(ws, capsys, cites, groups):
+    """R-7 — one sentence for both groups, last in the echo, on both text surfaces.
+
+    Attached to group two alone it would make the pair say group one need not go
+    again — the landed-edge reading; the group-one-only cell is the one that sees it.
+    """
+    config, m = ws
+    _seed_echo_corpus(m)
+    res = _echo_pause(m, _ECHO_GATHERED, cites=cites)
+    assert sorted(k for k in res if k.startswith("declared")) == groups
+    sentences = _echo_sentences(res["message"])
+    assert sentences[-1] == _RESEND + "."
+    assert res["message"].endswith(f"{_RESEND}. Nothing was written.")
+
+    factory = _armed_real_manager_factory(_ECHO_GATHERED)
+    capsys.readouterr()
+    with patch("mitos.cli.MitosSyncManager", side_effect=factory):
+        with pytest.raises(SystemExit):
+            cmd_record(config, axiom=_ECHO_AXIOM, rejected="rej", scope=["s"],
+                       slug="echo-new", cites=cites)
+    rendered = _cli_echo_lines(capsys.readouterr().err)
+    assert rendered[-1] == _RESEND
+    assert len(rendered) == len(groups) + 1
+
+
+def test_resend_sentence_is_absent_when_nothing_was_declared(ws, capsys):
+    """R-7 negative, with its positive control under the same armed factory."""
+    config, m = ws
+    _seed_echo_corpus(m)
+    factory = _armed_real_manager_factory(_ECHO_GATHERED)
+    for cites, expected in ((None, False), ("echo-b", True)):
+        capsys.readouterr()
+        with patch("mitos.cli.MitosSyncManager", side_effect=factory):
+            with pytest.raises(SystemExit):
+                cmd_record(config, axiom=_ECHO_AXIOM, rejected="rej", scope=["s"],
+                           slug="echo-new", cites=cites)
+        err = capsys.readouterr().err
+        assert ("Pass every declaration" in err) is expected, err
+
+
+def test_held_is_deliberately_off_the_echo_forbidden_list():
+    """R-8 — `held` was weighed for 4d's wording and refused, but stays OFF the list.
+
+    4e's tripwire applies this list to its own "nothing is held" sentence, where the
+    word is used in its negated, correct direction; adding it here would force 4e to
+    drop the vision's wording or weaken this list (plan p4d D4).
+    """
+    assert "held" not in _ECHO_FORBIDDEN and "hold" not in _ECHO_FORBIDDEN
+    assert _echo_register_violations(_RESEND) == []
+
+
+# --- B9: the stamp sentence carries its condition in all three shipped copies ---
+
+_STAMP_ANCHOR = "amended_by/narrowed_by stamp"
+
+
+def _normalised(text):
+    return " ".join(text.replace("`", "").split()).casefold()
+
+
+def _stamp_spans(text, *, parenthesis=False):
+    """Each sentence (or parenthesis) of the normalised text that holds the anchor."""
+    import re
+    flat = _normalised(text)
+    pieces = (re.findall(r"\([^()]*\)", flat) if parenthesis
+              else re.split(r"(?<=[.]) ", flat))
+    return [p for p in pieces if _STAMP_ANCHOR in p]
+
+
+def _stamp_copy(ws, where):
+    import pathlib
+    if where == "message":
+        config, m = ws
+        _seed_echo_corpus(m)
+        return _stamp_spans(_echo_pause(m, _ECHO_GATHERED)["message"])
+    if where == "description":
+        from test_description_budget import _descriptions, _flat
+        return _stamp_spans(_flat(_descriptions()["record_decision"]),
+                            parenthesis=True)
+    setup = pathlib.Path(__file__).resolve().parent.parent / "SETUP.md"
+    return _stamp_spans(setup.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("where", ["message", "description", "setup_md"])
+def test_stamp_sentence_carries_its_condition(ws, where):
+    """R-9 — the pause cannot know which relation the caller will draw, so the
+    condition lives in the wording: a caller that only cites is not sent to
+    dereference. One span per copy, found by a normalised anchor (the copies differ
+    in backticks and wrap)."""
+    (span,) = _stamp_copy(ws, where)
+    assert "supersede or amend" in span
+
+
+def test_stamp_sentence_in_the_pause_and_setup_agree_word_for_word(ws):
+    """R-9b — SETUP.md teaches the sentence the pause says; the description is a
+    paraphrase and exempt."""
+    assert _stamp_copy(ws, "message") == _stamp_copy(ws, "setup_md")

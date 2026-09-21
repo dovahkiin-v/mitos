@@ -1517,8 +1517,9 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
         axiom) for new reasoning. status="needs_review" (code
         "similar_decision_exists"): a PAUSE, not a failure — nothing was written;
         the response lists ≥0.80-similar unlinked `neighbors`, each with its axiom,
-        rejected_paths, scope, score and modifier stamps (an amended_by/narrowed_by
-        stamp means that neighbour has moved on — dereference before linking).
+        rejected_paths, scope, score and modifier stamps (if you go on to
+        supersede or amend a neighbour, an amended_by/narrowed_by stamp on it
+        means it has moved on — dereference that slug before linking).
         Judge each, then re-record with that judgment: a relation arg
         (amends/narrows/supersedes/corrects/contradicts/cites) pointing at any
         neighbour this decision genuinely relates to, acknowledge_neighbors=True
