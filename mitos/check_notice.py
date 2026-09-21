@@ -25,7 +25,8 @@ that closure. Nothing in the closure imports this module.
 The read is injected, never called from here: every boundary passes
 ``telemetry.read_last_attempt`` and its own store's ``get_node``, so the boundary owns
 which reader and which connection run, and a test can spy the read. The ``created``
-record receipt and ``mitos sync`` carry the notice today. The receipt carries it as
+record receipt, ``mitos sync`` and every ``surface`` exit (MCP and CLI; never
+``query``) carry the notice. The receipt carries it as
 the fact alone (ADR ``receipt-dict-strings-are-mcp-boundary-so-recovery-splits-per-renderer``),
 and its coherence line keeps the one ``mitos check`` recipe
 (ADR ``created-receipt-names-its-recovery-once-on-the-unconditional-line``).

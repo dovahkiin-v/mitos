@@ -851,13 +851,9 @@ def cmd_sync(config: MitosConfig, auto_accept: bool = False, embed_only: bool = 
     # sync's own report, and the notice is not its result. Before the shortfall
     # exit, so a failed repair still shows it. It carries its own recovery clause
     # because nothing else on this output names `mitos check`.
-    check_notice = compose_check_notice(
+    _print_check_notice(config, compose_check_notice(
         config, read_attempt=read_last_attempt, get_node=manager.store.get_node
-    )
-    if check_notice:
-        sys.stdout.flush()
-        print(f"\n{check_notice['line']}{_check_notice_recovery(config, check_notice)}",
-              file=sys.stderr)
+    ))
     if shortfall:
         # 1, matching the verb's two aborts — no new code vocabulary. The
         # contract binds only the caller who typed the flag; a bare `mitos sync`
@@ -1009,7 +1005,8 @@ def _retired_handle(store: GraphStore, slug: str) -> Optional[Dict[str, Any]]:
 def _emit_lexical_degraded(config: MitosConfig, query: str, *, reason: str,
                            store: Optional[GraphStore], as_json: bool,
                            brief: bool, limit: Optional[int],
-                           open_questions: Optional[List[Dict[str, Any]]] = None) -> None:
+                           open_questions: Optional[List[Dict[str, Any]]] = None,
+                           check_notice: Optional[Dict[str, Any]] = None) -> None:
     """Runs the deterministic lexical fallback and renders it on the CLI.
 
     The shared degraded exit for ``surface``/``query`` (ADR
@@ -1030,6 +1027,9 @@ def _emit_lexical_degraded(config: MitosConfig, query: str, *, reason: str,
         limit: Max matches; None ⇒ the lexical default.
         open_questions: An already-computed scoped parked-OQ list to carry on
             the envelope (present-if-scanned semantics — None means omitted).
+        check_notice: The standing check notice ``cmd_surface`` composed: the key
+            on JSON, the line plus its recovery clause last on text. None
+            (``cmd_query`` always) means omitted.
     """
     envelope = lexical_fallback(
         query, corpus_paths=_corpus_files(config), reason=reason, store=store,
@@ -1039,6 +1039,8 @@ def _emit_lexical_degraded(config: MitosConfig, query: str, *, reason: str,
     envelope.update(corpus_provenance(config))
     if open_questions is not None:
         envelope["open_questions"] = open_questions
+    if check_notice is not None:
+        envelope["check_notice"] = check_notice
     if as_json:
         _emit_json(envelope)
         return
@@ -1057,6 +1059,7 @@ def _emit_lexical_degraded(config: MitosConfig, query: str, *, reason: str,
         print()
     for oq in envelope.get("open_questions", []):
         print(f"[open question in scope] {oq['topic']}")
+    _print_check_notice(config, check_notice)
 
 
 def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
@@ -1098,6 +1101,11 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
             return
         raise ValueError(msg)
 
+    # No standing check notice on any exit of this verb, deliberately (vision §4.3):
+    # `surface` is the read put before a write and carries it; a second telemetry
+    # read on this hotter loop buys nothing. Parity pressure is not a reason to add
+    # one — `query_decisions` is silent for the same reason.
+    #
     # A pre-V1a graph raises at store construction — the SQLite graph is unusable,
     # so the fallback parses the markdown corpus directly and must not touch the graph.
     try:
@@ -1376,6 +1384,24 @@ def _coherence_audit_hint(config: MitosConfig) -> str:
         The recovery sentence, naming ``mitos check`` exactly once.
     """
     return f"The audit is `mitos check -p {config.project!r}` — one pass, whole corpus."
+
+
+def _print_check_notice(config: MitosConfig, notice: Optional[Mapping[str, Any]]) -> None:
+    """Prints the standing check notice, when one is shown, on a CLI text exit.
+
+    The one print site for ``mitos sync`` and every ``surface`` text exit: stdout
+    is flushed first, so the notice lands after the answer it rides, then the line
+    and :func:`_check_notice_recovery`'s clause go to stderr. Prints nothing for
+    ``None``.
+
+    Args:
+        config: The resolved workspace config, for the recovery clause.
+        notice: The composed ``check_notice`` payload, or None.
+    """
+    if not notice:
+        return
+    sys.stdout.flush()
+    print(f"\n{notice['line']}{_check_notice_recovery(config, notice)}", file=sys.stderr)
 
 
 def _check_notice_recovery(config: MitosConfig, notice: Mapping[str, Any]) -> str:
@@ -2217,13 +2243,28 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     try:
         manager = MitosSyncManager(config)
     except Exception as e:
+        # Telemetry does not depend on the graph, so the notice still rides; its
+        # pair handles resolve nothing (whole ids) rather than open a second store
+        # on a path whose graph just failed. Composed in the handler, not the
+        # `try` body, so a raise at this call propagates.
         _emit_lexical_degraded(
             config, query, reason=degraded_reason_from_error(e),
             store=None, as_json=as_json, brief=brief, limit=limit,
+            check_notice=compose_check_notice(
+                config, read_attempt=read_last_attempt, get_node=lambda _id: None
+            ),
         )
         return
 
     store = manager.store
+    # The standing check notice, composed once for every exit below. Outside the
+    # ranked `try` on purpose: the composer is total, so the only raise here is a
+    # defect at this call, and that `except Exception` would render it as
+    # degraded recall on a healthy read. No `try` of its own either — a broken
+    # call must be loud, never a notice that silently stops showing.
+    notice = compose_check_notice(
+        config, read_attempt=read_last_attempt, get_node=store.get_node
+    )
     top_k = clamp_limit(limit)
 
     def _shape(node, score):
@@ -2306,6 +2347,7 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
             config, query, reason=degraded_reason_from_error(degraded_error),
             store=store, as_json=as_json, brief=brief, limit=limit,
             open_questions=results.get("open_questions"),
+            check_notice=notice,
         )
         return
 
@@ -2353,6 +2395,10 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         results["note"] = missing_graph_note("cli", config)
         note = results["note"]
 
+    # After the recall answer's own keys; absent (never null) when not shown.
+    if notice:
+        results["check_notice"] = notice
+
     if as_json:
         _emit_json(results)
         return
@@ -2370,6 +2416,7 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
             print(provenance_line(config))
             print(f"No active precedents found for: '{query}'{scope_note}")
         print(f"→ {note}")
+        _print_check_notice(config, notice)
         return
     print(f"\nPrecedents for: '{query}'" + (f"  (scope: {scope})" if scope else "")
           + f"  [{provenance_line(config)}]")
@@ -2395,6 +2442,7 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         if marker:
             print(f"   {marker}")
     print(f"\n→ {note}")
+    _print_check_notice(config, notice)
 
 
 def cmd_serve() -> None:

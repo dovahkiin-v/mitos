@@ -27,6 +27,8 @@ from mitos.errors import (
     TARGET_UNKNOWN_NAME,
 )
 from mitos.lexical import degraded_reason_from_error, lexical_fallback
+from mitos.check_notice import compose_check_notice
+from mitos.telemetry import read_last_attempt
 from mitos.divergence import _corpus_files, corpus_holds_entries
 # Module level on purpose: `amend` and `restore` close over no `cli`/`sync`/`store`
 # (measured at planning), so unlike `MitosSyncManager` neither needs deferring.
@@ -573,7 +575,8 @@ def get_workspace_components(config: MitosConfig) -> Tuple[GraphStore, Optional[
 def _lexical_degraded_response(query: str, *, config: MitosConfig, reason: str,
                                store: Optional[GraphStore], brief: bool,
                                limit: int,
-                               open_questions: Optional[List[Dict[str, Any]]] = None) -> str:
+                               open_questions: Optional[List[Dict[str, Any]]] = None,
+                               check_notice: Optional[Dict[str, Any]] = None) -> str:
     """Builds the degraded lexical-fallback JSON for the MCP read tools.
 
     The MCP twin of ``cli._emit_lexical_degraded`` (ADR
@@ -598,6 +601,8 @@ def _lexical_degraded_response(query: str, *, config: MitosConfig, reason: str,
         limit: Max matches to return.
         open_questions: An already-computed scoped parked-OQ list to carry on
             the envelope (present-if-scanned semantics — None means omitted).
+        check_notice: The standing check notice ``surface_decisions`` composed,
+            carried verbatim; None (``query_decisions`` always) means omitted.
 
     Returns:
         The degraded envelope as a JSON string.
@@ -610,6 +615,8 @@ def _lexical_degraded_response(query: str, *, config: MitosConfig, reason: str,
     envelope.update(corpus_provenance(config))
     if open_questions is not None:
         envelope["open_questions"] = open_questions
+    if check_notice is not None:
+        envelope["check_notice"] = check_notice
     return dumps_display(envelope, ensure_ascii=False, indent=2)
 
 
@@ -702,10 +709,26 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
     try:
         store, embed_provider, vector_store = get_workspace_components(config)
     except Exception as e:
+        # Telemetry does not depend on the graph, so the notice still rides. Its
+        # pair handles resolve nothing (whole ids): no second store is opened on
+        # a path whose graph just failed to open. Composed in the handler, not
+        # the `try` body, so a raise at this call propagates.
         return _lexical_degraded_response(
             query, config=config, reason=degraded_reason_from_error(e), store=None,
             brief=brief, limit=top_k,
+            check_notice=compose_check_notice(
+                config, read_attempt=read_last_attempt, get_node=lambda _id: None
+            ),
         )
+
+    # The standing check notice, composed once for every exit below. Outside the
+    # ranked `try` on purpose: the composer is total, so the only raise here is a
+    # defect at this call, and that `except Exception` would render it as
+    # degraded recall on a healthy read. No `try` of its own either — a broken
+    # call must be loud, never a notice that silently stops showing.
+    notice = compose_check_notice(
+        config, read_attempt=read_last_attempt, get_node=store.get_node
+    )
 
     results: Dict[str, Any] = {"active_decisions": []}
     results.update(corpus_provenance(config))
@@ -797,6 +820,7 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
             query, config=config, reason=degraded_reason_from_error(degraded_error),
             store=store, brief=brief, limit=top_k,
             open_questions=results.get("open_questions"),
+            check_notice=notice,
         )
 
     # Confidence signal — let the agent tell a settled precedent from loose neighbours
@@ -843,6 +867,10 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         store, config, corpus_scan=corpus_holds_entries
     ):
         results["note"] = missing_graph_note("mcp", config)
+
+    # After the recall answer's own keys; absent (never null) when not shown.
+    if notice:
+        results["check_notice"] = notice
 
     return dumps_display(results, ensure_ascii=False, indent=2)
 
@@ -1117,6 +1145,11 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
         `all_superseded` list carries the retired handles — settled before, not a
         true miss; read the history with list_decisions(state="all").
     """
+    # No standing check notice on any exit of this verb, deliberately (vision §4.3):
+    # `surface_decisions` is the read put before a write and carries it; a second
+    # telemetry read on this hotter loop buys nothing. Parity pressure is not a
+    # reason to add one — `mitos query` is silent for the same reason.
+    #
     # The argument fault is answered before any project is resolved — see
     # list_decisions for why the ordering is deliberate.
     if depth != "letter":

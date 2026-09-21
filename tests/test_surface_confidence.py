@@ -894,14 +894,16 @@ class _StubManager:
         self.vector_store = vector_store
 
 
-def _cli_query(matches, ws, query="a claim that is not any slug", as_json=False):
+def _cli_query(matches, ws, query="a claim that is not any slug", as_json=False,
+               config=None):
     """Drives `cmd_query` end to end and returns the raw captured stdout.
 
     `matches=None` drives the degraded (no embed/vector) path; a vector-store
     instance is passed through as-is, so a fault stub drives its own route.
+    `config` overrides the `ws` one (a keyed config must be built after its key).
     """
     from mitos import cli
-    config, _ = ws
+    config = config or ws[0]
     store = GraphStore(config.db_path, read_only=True)
     if matches is None:
         stub = _StubManager(store, None, None)
@@ -1215,3 +1217,447 @@ def test_the_band_is_read_off_the_surfaced_list_not_the_raw_return(ws, driver):
     assert [d["slug"] for d in resp["matches"]] == ["live-one"]
     assert resp["confidence"] == "weak"
     assert "0.62" in resp["note"] and "0.95" not in resp["note"]
+
+
+# --------------------------------------------------------------------------- #
+# Phase 3g2 — the standing check notice on every `surface` exit, never `query`'s.
+#
+# Seeding goes through 3g1's real writers in `test_commit_gate` (imported
+# function-locally, as the receipt rows do). Every row sets its own key: the
+# `offline` fixture strips it, so every row above this section is the keyless
+# regression net for "a healthy or keyless surface pays zero bytes".
+# --------------------------------------------------------------------------- #
+
+import shlex  # noqa: E402
+import sys  # noqa: E402
+from contextlib import redirect_stderr  # noqa: E402
+
+from mitos.check_notice import check_notice_line  # noqa: E402
+from mitos.telemetry import (ATTEMPT_COULD_NOT_COMPLETE, ATTEMPT_NO_NEW_FINDINGS,  # noqa: E402
+                             ATTEMPT_SPEND_NOT_AUTHORIZED)
+
+
+def _gate():
+    """3g1's seeding and parsing helpers (`_seed_attempt`, `_keyed`, `_SHOWN`, …)."""
+    import test_commit_gate
+    return test_commit_gate
+
+
+class _PlantedFault(Exception):
+    """A raise planted at a call site; its class must come back out unchanged."""
+
+
+_HIT = [{"slug": "settled", "score": 0.91}]
+
+# Every route into a `surface` exit, as (components, scope). `None` components
+# means store construction raises (the no-graph route).
+_ROUTES = ("semantic", "scope_dump", "lexical_empty", "lexical_no_graph")
+
+
+def _components(route, store):
+    return {
+        "semantic": (store, _FakeEmbed(), _FakeVector(_HIT)),
+        "no_matches": (store, _FakeEmbed(), _NoMatches()),
+        "collection_missing": (store, _FakeEmbed(), _MissingCollection()),
+        "scope_dump": (store, None, None),
+        "lexical_empty": (store, None, None),
+        "lexical_no_graph": None,
+    }[route]
+
+
+def _scope(route):
+    return "db" if route == "scope_dump" else None
+
+
+def _mcp_surface(config, route, query="some claim"):
+    """`surface_decisions` on one route; returns (envelope, stderr)."""
+    from mitos import mcp_server
+    comps = _components(route, GraphStore(config.db_path, read_only=True))
+    kw = ({"side_effect": RuntimeError("pre-V1a")} if comps is None
+          else {"return_value": comps})
+    err = io.StringIO()
+    with patch.object(mcp_server, "get_workspace_components", **kw), redirect_stderr(err):
+        out = mcp_server.surface_decisions(query, scope=_scope(route),
+                                           project=config.workspace_dir)
+    return json.loads(out), err.getvalue()
+
+
+def _cli_surface(config, route, *, as_json, query="some claim", argv0="mitos"):
+    """`cmd_surface` on one route with `argv[0]` pinned; returns (stdout, stderr).
+
+    `config` is the caller's (keyed or not): the notice reads only its env.
+    """
+    from mitos import cli
+    comps = _components(route, GraphStore(config.db_path, read_only=True))
+    mm = (patch.object(cli, "MitosSyncManager", side_effect=RuntimeError("pre-V1a"))
+          if comps is None else
+          patch.object(cli, "MitosSyncManager", return_value=_StubManager(*comps)))
+    out, err = io.StringIO(), io.StringIO()
+    with mm, patch.object(sys, "argv", [argv0]), redirect_stdout(out), redirect_stderr(err):
+        cmd_surface(config, query, scope=_scope(route), as_json=as_json)
+    return (json.loads(out.getvalue()) if as_json else out.getvalue()), err.getvalue()
+
+
+def _two_decisions(ws):
+    """Commits `settled` and `other` (scope `db`); returns their node ids."""
+    config, m = ws
+    _rec(m, "settled", scope=["db"])
+    _rec(m, "other", scope=["db"])
+    return tuple(m.store.get_node_by_slug(s)["id"] for s in ("settled", "other"))
+
+
+def _seed_resolvable(ws):
+    """A `could_not_complete` record holding one pair of real node ids."""
+    config, _ = ws
+    ids = _two_decisions(ws)
+    _gate()._seed_attempt(config, ATTEMPT_COULD_NOT_COMPLETE, tokens=("sweep",),
+                          pairs=(ids,))
+    return ids
+
+
+def _assert_route_is(route, envelope):
+    """Guards against a vacuous row: the envelope is the exit the row names."""
+    if route in ("lexical_empty", "lexical_no_graph"):
+        assert envelope["degraded"] == "lexical"
+    else:
+        assert "degraded" not in envelope and envelope["active_decisions"], route
+        # Semantic ranking ran (a band) — or it did not, and this is the scope dump.
+        assert ("confidence" in envelope) == (route == "semantic"), route
+
+
+def _data(notice):
+    return {k: v for k, v in notice.items() if k != "line"}
+
+
+@pytest.mark.parametrize("route", _ROUTES)
+def test_the_notice_rides_every_surface_envelope_equal_on_both_boundaries(
+        ws, monkeypatch, route):
+    """Criterion 1: semantic, scope dump, and both lexical routes; MCP == `--json`."""
+    config, _ = ws
+    settled_id, other_id = _seed_resolvable(ws)
+    keyed = _gate()._keyed(config, monkeypatch)
+
+    mcp, _ = _mcp_surface(config, route)
+    cli_json, _ = _cli_surface(keyed, route, as_json=True)
+    _assert_route_is(route, mcp)
+    _assert_route_is(route, cli_json)
+
+    notice = mcp["check_notice"]
+    assert cli_json["check_notice"] == notice
+    assert set(notice) == _gate()._NOTICE_KEYS
+    assert notice["state"] == ATTEMPT_COULD_NOT_COMPLETE
+    assert notice["line"] == check_notice_line(_data(notice))
+    (pair,) = notice["new_pairs"]
+    assert (pair["proposal"]["id"], pair["partner"]["id"]) == (settled_id, other_id)
+    if route == "lexical_no_graph":
+        # No second store is opened: the handles are whole ids, never resolved.
+        assert pair["proposal"]["slug"] is None and pair["partner"]["slug"] is None
+    else:
+        assert (pair["proposal"]["slug"], pair["partner"]["slug"]) == ("settled", "other")
+
+
+@pytest.mark.parametrize("case", sorted(
+    ["started", "new_findings", "could_not_complete", "could_not_complete_with_pairs",
+     "spend_not_authorized", "unknown_state", "no_new_findings"]))
+def test_every_shown_state_rides_the_semantic_envelope_and_the_healthy_one_does_not(
+        ws, monkeypatch, case):
+    """Criterion 2: 3g1's `_SHOWN` cases ride; `no_new_findings` is absent on both."""
+    config, m = ws
+    _rec(m, "settled", scope=["db"])
+    gate = _gate()
+    if case == "no_new_findings":
+        gate._seed_attempt(config, ATTEMPT_NO_NEW_FINDINGS)
+    else:
+        seed = dict(gate._SHOWN[case])
+        gate._seed_attempt(config, seed.pop("state"), **seed)
+    keyed = gate._keyed(config, monkeypatch)
+
+    mcp, _ = _mcp_surface(config, "semantic")
+    cli_json, _ = _cli_surface(keyed, "semantic", as_json=True)
+    if case == "no_new_findings":
+        assert "check_notice" not in mcp and "check_notice" not in cli_json
+    else:
+        assert mcp["check_notice"]["state"] == gate._SHOWN[case]["state"]
+        assert cli_json["check_notice"] == mcp["check_notice"]
+
+
+@pytest.mark.parametrize("route", ["collection_missing", "no_matches"])
+def test_the_healthy_empty_index_carries_the_notice(ws, monkeypatch, route):
+    """Criterion 3: an absent collection over an empty active set is the empty index
+    a fresh clone meets — `semantic_ran` stays True and the envelope carries it."""
+    config, _ = ws
+    seed = dict(_gate()._SHOWN["could_not_complete"])
+    _gate()._seed_attempt(config, seed.pop("state"), **seed)
+    keyed = _gate()._keyed(config, monkeypatch)
+
+    mcp, _ = _mcp_surface(config, route)
+    cli_json, _ = _cli_surface(keyed, route, as_json=True)
+    for env in (mcp, cli_json):
+        assert "degraded" not in env and env["active_decisions"] == []
+        assert env["check_notice"]["state"] == ATTEMPT_COULD_NOT_COMPLETE
+    assert cli_json["check_notice"] == mcp["check_notice"]
+
+
+def _text_notice(err):
+    (line,) = _gate()._notice_lines(err)
+    return line
+
+
+@pytest.mark.parametrize("route", ["semantic", "no_matches", "lexical_empty",
+                                   "lexical_no_graph"])
+def test_the_text_exits_close_with_the_line_and_a_recipe_that_parses(
+        ws, monkeypatch, route):
+    """Criterion 4: full results, clean-empty, and both lexical routes. The notice
+    is the last thing on stderr, never on stdout, and its recipe resolves back to
+    the workspace with no `--yes`."""
+    config, _ = ws
+    _seed_resolvable(ws)
+    keyed = _gate()._keyed(config, monkeypatch)
+    notice, _ = _mcp_surface(config, route)
+    notice = notice["check_notice"]
+
+    out, err = _cli_surface(keyed, route, as_json=False)
+    if route == "no_matches":
+        assert "No active precedents found" in out  # the clean-empty exit
+    line = _text_notice(err)
+    assert err.rstrip().endswith(line)
+    assert notice["line"] not in out
+    assert line == f"{notice['line']} `mitos check -p {keyed.project!r}` attempts it again."
+    recipe = _gate()._last_backticked(line)
+    assert "--yes" not in recipe
+    _gate()._resolves_to(recipe, keyed)
+
+
+def test_a_refused_spend_names_a_person_at_a_terminal_on_surface(ws, monkeypatch):
+    """Criterion 4: `spend_not_authorized` hands the prompt to a person, never `--yes`."""
+    config, m = ws
+    _rec(m, "settled", scope=["db"])
+    _gate()._seed_attempt(config, ATTEMPT_SPEND_NOT_AUTHORIZED)
+    keyed = _gate()._keyed(config, monkeypatch)
+
+    _, err = _cli_surface(keyed, "semantic", as_json=False)
+    line = _text_notice(err)
+    assert line.endswith(f" A person runs `mitos check -p {keyed.project!r}` at a "
+                         "terminal and confirms the prompt.")
+    assert "--yes" not in line
+
+
+def test_the_surface_clause_names_the_invoked_build(ws, monkeypatch, tmp_path):
+    """Criterion 4 (W16): an absolute `argv[0]` whose realpath is not `PATH`'s mitos
+    is quoted as the command, and the rest of the recipe still parses."""
+    from mitos import cli
+    config, _ = ws
+    _seed_resolvable(ws)
+    keyed = _gate()._keyed(config, monkeypatch)
+    stub = str(tmp_path / "a venv" / "bin" / "mitos")
+    monkeypatch.setattr(cli.shutil, "which", lambda name: str(tmp_path / "other" / "mitos"))
+
+    _, err = _cli_surface(keyed, "semantic", as_json=False, argv0=stub)
+    recipe = _gate()._last_backticked(_text_notice(err))
+    tokens = shlex.split(recipe)
+    assert tokens[0] == stub and recipe.startswith(shlex.quote(stub) + " ")
+    args = cli._build_parser().parse_args(tokens[1:])
+    assert args.command == "check" and args.project_post == keyed.project
+
+
+def test_mcp_carries_the_payload_alone(ws, monkeypatch):
+    """Criterion 5: no command on the MCP line, and nothing beyond 3g1's payload."""
+    config, _ = ws
+    _seed_resolvable(ws)
+    keyed = _gate()._keyed(config, monkeypatch)
+    for route in _ROUTES:
+        mcp, _ = _mcp_surface(config, route)
+        notice = mcp["check_notice"]
+        assert "`" not in notice["line"] and "mitos " not in notice["line"], route
+        assert set(notice) == _gate()._NOTICE_KEYS
+        assert _cli_surface(keyed, route, as_json=True)[0]["check_notice"] == notice
+
+
+def _read_spies(monkeypatch):
+    """Counts calls to each boundary's own `read_last_attempt` binding."""
+    from mitos import cli, mcp_server
+    calls = []
+    for mod in (cli, mcp_server):
+        real = mod.read_last_attempt
+
+        def spy(path, _real=real, _mod=mod.__name__):
+            calls.append(_mod)
+            return _real(path)
+
+        monkeypatch.setattr(mod, "read_last_attempt", spy)
+    return calls
+
+
+def test_a_keyless_surface_reads_nothing_then_shows_once_keyed(ws, monkeypatch):
+    """Criterion 6, a transition: keyless pays no read on any exit; the same calls
+    show the notice once a key is set."""
+    from mitos import cli
+    config, _ = ws
+    _seed_resolvable(ws)
+    opens = _gate()._attempt_rung_opens(monkeypatch)
+    reads = _read_spies(monkeypatch)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    keyless = MitosConfig(config.workspace_dir, project=config.project)
+
+    for route in _ROUTES:
+        mcp, _ = _mcp_surface(config, route)
+        cli_json, _ = _cli_surface(keyless, route, as_json=True)
+        _, err = _cli_surface(keyless, route, as_json=False)
+        assert "check_notice" not in mcp and "check_notice" not in cli_json, route
+        assert _gate()._notice_lines(err) == [], route
+    assert opens == [] and reads == []
+
+    keyed = _gate()._keyed(config, monkeypatch)
+    mcp, _ = _mcp_surface(config, "semantic")
+    _, err = _cli_surface(keyed, "semantic", as_json=False)
+    assert mcp["check_notice"]["state"] == ATTEMPT_COULD_NOT_COMPLETE
+    assert len(_gate()._notice_lines(err)) == 1
+    assert opens and set(reads) == {cli.__name__, "mitos.mcp_server"}
+
+
+@pytest.mark.parametrize("record", ["no_new_findings", "no_telemetry_file"])
+def test_a_healthy_keyed_surface_is_byte_identical_to_a_keyless_one(ws, monkeypatch, record):
+    """Criterion 7: keyed + a healthy record (or no telemetry at all) adds nothing."""
+    config, m = ws
+    _rec(m, "settled", scope=["db"])
+    if record == "no_new_findings":
+        _gate()._seed_attempt(config, ATTEMPT_NO_NEW_FINDINGS)
+    else:
+        assert not os.path.exists(config.telemetry_path)
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    keyless = MitosConfig(config.workspace_dir, project=config.project)
+    before = {r: (_mcp_surface(config, r)[0], _cli_surface(keyless, r, as_json=True)[0],
+                  _cli_surface(keyless, r, as_json=False)) for r in _ROUTES}
+    keyed = _gate()._keyed(config, monkeypatch)
+    after = {r: (_mcp_surface(config, r)[0], _cli_surface(keyed, r, as_json=True)[0],
+                 _cli_surface(keyed, r, as_json=False)) for r in _ROUTES}
+    assert after == before
+    # Absent, never null — a relative comparison alone is blind to a key both sides set.
+    for mcp, cli_json, (_out, err) in after.values():
+        assert "check_notice" not in mcp and "check_notice" not in cli_json
+        assert _gate()._notice_lines(err) == []
+
+
+def test_query_carries_no_notice_on_any_exit(ws, monkeypatch):
+    """Criterion 8: `query_decisions` (exact slug, ranked, lexical) and `mitos query`
+    (`--json` and text; ranked and the no-provider lexical exit) — keyed, with a
+    shown record on file — carry no key, print no line and open no attempt rung.
+    The CLI has no exact-slug branch (ADR `cli-query-stays-semantic-not-dereference-twin`)."""
+    from mitos import mcp_server
+    config, _ = ws
+    _seed_resolvable(ws)
+    # `cmd_query` takes its config as an argument, and `config.env` is resolved at
+    # construction: only a config built after the key is set is keyed. The `ws`
+    # one is keyless, and a keyless silence would prove nothing about `query`.
+    keyed = _gate()._keyed(config, monkeypatch)
+    opens = _gate()._attempt_rung_opens(monkeypatch)
+
+    store = GraphStore(config.db_path, read_only=True)
+    mcp_exits = {
+        "exact_slug": ("settled", (store, _FakeEmbed(), _FakeVector(_HIT))),
+        "ranked": ("some claim", (store, _FakeEmbed(), _FakeVector(_HIT))),
+        "lexical": ("some claim", (store, None, None)),
+    }
+    for label, (query, comps) in mcp_exits.items():
+        err = io.StringIO()
+        with patch.object(mcp_server, "get_workspace_components", return_value=comps), \
+                redirect_stderr(err):
+            out = json.loads(mcp_server.query_decisions(query, project=config.workspace_dir))
+        assert ("degraded" in out) == (label == "lexical"), label  # the exit it names
+        assert "check_notice" not in out, label
+        assert _gate()._notice_lines(err.getvalue()) == [], label
+
+    for matches in (_HIT, None):  # ranked; the no-embed/vector lexical exit
+        for as_json in (True, False):
+            err = io.StringIO()
+            with redirect_stderr(err), patch.object(sys, "argv", ["mitos"]):
+                out = _cli_query(matches, ws, as_json=as_json, config=keyed)
+            assert "check_notice" not in out
+            assert _gate()._notice_lines(err.getvalue()) == []
+    assert opens == []
+
+    # The control: the same keyed setup shows the notice on `surface`, so the
+    # silence above is `query`'s and not the fixture's.
+    assert _mcp_surface(config, "semantic")[0]["check_notice"]
+    assert _cli_surface(keyed, "semantic", as_json=True)[0]["check_notice"]
+
+
+@pytest.mark.parametrize("boundary", ["mcp", "cli"])
+def test_a_raise_inside_the_read_leaves_the_ranking_whole(ws, monkeypatch, boundary):
+    """Criterion 9, the degrade: a raise planted at the boundary's `read_last_attempt`
+    is absorbed by the total composer. The ranked envelope comes back equal to an
+    unplanted one minus the notice — same decisions, confidence and note, never
+    `degraded` — with exactly one warning. Green under a misplaced call too (D3):
+    this row proves totality, not placement."""
+    from mitos import cli, mcp_server
+    config, _ = ws
+    _seed_resolvable(ws)
+    keyed = _gate()._keyed(config, monkeypatch)
+
+    def run():
+        if boundary == "mcp":
+            return _mcp_surface(config, "semantic")
+        return _cli_surface(keyed, "semantic", as_json=True)
+
+    whole, _ = run()
+    assert "check_notice" in whole
+
+    def planted(path):
+        raise _PlantedFault("planted in the read")
+
+    monkeypatch.setattr(mcp_server if boundary == "mcp" else cli,
+                        "read_last_attempt", planted)
+    degraded, err = run()
+    expected = {k: v for k, v in whole.items() if k != "check_notice"}
+    assert degraded == expected
+    assert "degraded" not in degraded and degraded["confidence"] == whole["confidence"]
+    assert len(_gate()._notice_warnings(err)) == 1
+
+
+@pytest.mark.parametrize("boundary", ["mcp", "cli"])
+def test_a_raise_at_the_call_site_propagates_and_is_never_degraded_recall(
+        ws, monkeypatch, boundary):
+    """Criterion 10, the placement row (4a's tripwire). A raise at the call site is
+    a defect in this code, not a fault of the read. Composed inside the ranked
+    `try`, the loop's blanket `except` would catch it and render a healthy ranked
+    read as a lexical-degraded envelope with a nonsense reason — §4.5's latent fault
+    by a new door. So the planted class must propagate out of the verb."""
+    from mitos import cli, mcp_server
+    config, _ = ws
+    _seed_resolvable(ws)
+    keyed = _gate()._keyed(config, monkeypatch)
+
+    def planted(*args, **kwargs):
+        raise _PlantedFault("planted at the call site")
+
+    monkeypatch.setattr(mcp_server if boundary == "mcp" else cli,
+                        "compose_check_notice", planted)
+    with pytest.raises(_PlantedFault):
+        if boundary == "mcp":
+            _mcp_surface(config, "semantic")
+        else:
+            _cli_surface(keyed, "semantic", as_json=True)
+
+
+def test_the_blackout_and_the_unbuilt_graph_carry_the_notice_too(ws, cloned, monkeypatch):
+    """Stretch (belt-and-braces over D1): the two note overrides still carry it."""
+    config, m = ws
+    _rec(m, "dead-v1", scope=["x"])
+    _rec(m, "dead-v2", scope=["x"], supersedes="dead-v1")
+    seed = dict(_gate()._SHOWN["started"])
+    _gate()._seed_attempt(config, seed.pop("state"))
+    _gate()._keyed(config, monkeypatch)
+    from mitos import mcp_server
+    store = GraphStore(config.db_path, read_only=True)
+    with patch.object(mcp_server, "get_workspace_components", return_value=(
+            store, _FakeEmbed(), _FakeVector([{"slug": "dead-v1", "score": 0.9}]))):
+        blackout = json.loads(mcp_server.surface_decisions("c", project=config.workspace_dir))
+    assert blackout["all_superseded"]
+    assert blackout["check_notice"]["state"] == _gate()._SHOWN["started"]["state"]
+
+    clone, _ = cloned
+    _gate()._seed_attempt(clone, _gate()._SHOWN["started"]["state"])
+    unbuilt, _ = _mcp_surface(clone, "no_matches")
+    assert "graph is unbuilt" in unbuilt["note"]
+    assert unbuilt["check_notice"]["state"] == _gate()._SHOWN["started"]["state"]
