@@ -479,6 +479,7 @@ def _render(result: Any, capsys: pytest.CaptureFixture) -> str:
     cli._print_check_report(
         result,
         exclusions=[],
+        failed_batches=[],
         denominator=2,
         scope=None,
         row_written=True,

@@ -1072,6 +1072,20 @@ class CheckPlan:
 
 
 @dataclass(frozen=True)
+class JudgeNotConfigured(Unavailable):
+    """The corpus run's no-judge abort: fresh work existed, no judge was built, nothing was billed.
+
+    ``reason`` stays ``ConflictUnavailableReason.JUDGMENT`` and ``detail`` is what a
+    plain :class:`~mitos.conflict.Unavailable` would carry, so every consumer that
+    switches on ``reason`` is unchanged (``run_degradations``, ``exit_code_for``, the
+    row's ``degraded_reason``, ``--json``'s ``judgment_failure_reasons``). The tag is
+    set at the one line that knows the truth, so the report asks a typed question
+    (``isinstance``) instead of inferring "no judge" from ``batches_executed == 0``.
+    It lives here, not as an enum member, because ``conflict.py`` is fenced.
+    """
+
+
+@dataclass(frozen=True)
 class CheckFinding:
     """One reported contradiction — fresh or reused, partitioned by novelty.
 
@@ -1143,7 +1157,8 @@ class CheckRunResult:
             failure stopped the remainder.
         judgment_failures: EVERY judgment-stage degradation this run recorded, in
             occurrence order — the isolated per-batch failures, the aborting one,
-            and the judge-absent degradation. Non-empty ⇒ the run is degraded
+            and the judge-absent degradation (a :class:`JudgeNotConfigured`, so
+            the report can word it). Non-empty ⇒ the run is degraded
             (:func:`run_degradations` reads it), whether or not it aborted.
         judgment_abort: The failure that stopped the remaining batches, or ``None``
             when the loop ran to the end. Always the LAST element of
@@ -1605,7 +1620,7 @@ def execute_corpus_check(
     if judge is None and plan.fresh_groups:
         # Not a batch failure — no batch was ever attempted, so it bypasses
         # `record_batch_failure` (nothing to isolate) and aborts outright.
-        judgment_abort = Unavailable(
+        judgment_abort = JudgeNotConfigured(
             reason=ConflictUnavailableReason.JUDGMENT,
             detail=(
                 f"no judge available for {len(plan.fresh_groups)} pending fresh "

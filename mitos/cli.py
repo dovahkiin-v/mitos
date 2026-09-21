@@ -32,7 +32,9 @@ from mitos.display import (
     blackout_note,
     clamp_limit,
     dumps_display,
+    handle_text,
     letter_payload,
+    node_handles,
     oneline_axiom,
     oneline_payload,
     order_scope_counts,
@@ -4847,8 +4849,9 @@ _CHECK_DEPARTURE_WORDS: Dict[str, str] = {
 #
 # Total over ``ConflictUnavailableReason`` on purpose, so a member added later cannot
 # KeyError this renderer mid-report — pinned by an exhaustiveness row in
-# tests/test_check_cli.py. The semantic-substrate reasons are unreachable from the
-# judgment stage today and are worded anyway rather than left to a fallback.
+# tests/test_check_failure_diagnosis.py. The semantic-substrate reasons are
+# unreachable from the judgment stage today and are worded anyway rather than left to
+# a fallback.
 _JUDGMENT_FAILURE_WORDS: Dict[str, str] = {
     "judgment_timeout": "the judge timed out or returned an error",
     "judgment_rejected": "the judge API rejected the request (key, model id or parameters)",
@@ -4859,6 +4862,18 @@ _JUDGMENT_FAILURE_WORDS: Dict[str, str] = {
     "collection_missing": "the vector collection does not exist",
 }
 
+# The keyless abort's own clause. Outside the map above on purpose: that map is total
+# over the enum, and "no judge was built" is not an enum member — it is told apart by
+# the `check.JudgeNotConfigured` tag. Uncounted ("1 ×" would read as a batch that
+# failed), and a constant, never built from the tag's `detail` (see above).
+_NO_JUDGE_WORDS = ("no judge is configured (ANTHROPIC_API_KEY is not set), so the "
+                   "fresh pairs were not judged")
+
+# How many failed batches the text report names before it counts the rest. `--json`
+# carries every one. A batch line holds a proposal and a group's partners, so this
+# counts a longer unit than a single-pair `A ✗ B` cap would, and borrows no such cap.
+_FAILED_BATCHES_SHOWN = 3
+
 
 def _judgment_failure_breakdown(failures: Sequence[Any]) -> str:
     """Words the judgment failures as grouped counts, in the vocabulary's own order.
@@ -4868,15 +4883,22 @@ def _judgment_failure_breakdown(failures: Sequence[Any]) -> str:
     map and nothing else read it, so a report could say a batch failed and never say
     why. Grouped rather than listed: 400 timeouts are one fact, not 400 lines.
 
+    The keyless abort (:class:`check.JudgeNotConfigured`) is not a batch that failed:
+    it is not counted, and its own clause comes first, so the report keeps one
+    ``Why:`` line. The tag decides, never a count such as ``batches_executed == 0``.
+
     Args:
         failures: The run's ``Unavailable`` judgment failures.
 
     Returns:
-        A human clause such as ``"1 the judge timed out or returned an error"``'s
-        grouped form, or ``""`` when there is nothing to say.
+        A human clause such as ``"1 × the judge timed out or returned an error"``,
+        or ``""`` when there is nothing to say. No trailing period: the caller adds it.
     """
-    counted = Counter(f.reason.value for f in failures)
-    parts = [
+    keyless = any(isinstance(f, check.JudgeNotConfigured) for f in failures)
+    counted = Counter(f.reason.value for f in failures
+                      if not isinstance(f, check.JudgeNotConfigured))
+    parts = [_NO_JUDGE_WORDS] if keyless else []
+    parts += [
         f"{counted[reason]} × {words}"
         for reason, words in _JUDGMENT_FAILURE_WORDS.items()
         if counted.get(reason)
@@ -4921,12 +4943,34 @@ def _resolve_exclusion_display(
     ``coverage_exclusion_ids`` returns content hashes; ``get_node`` is
     state-agnostic (a since-superseded node still resolves), so the raw-id fallback
     covers only a genuinely absent node (``None`` → ``slug`` ``None``). These reads
-    sit in the display-model build, before the write seam.
+    sit in the display-model build, before the write seam. The rule lives in
+    :func:`~mitos.display.node_handles`.
     """
+    return node_handles(ids, store.get_node)
+
+
+def _failed_batch_display(
+    store: GraphStore, batches: Sequence["check.FailedJudgmentBatch"]
+) -> List[Dict[str, Any]]:
+    """Builds the failed-batch display model, one dict per batch in occurrence order.
+
+    The same list feeds the text report and ``--json``'s ``judgment_failed_batches``,
+    so the two encodings cannot disagree. Every id resolves in one
+    :func:`~mitos.display.node_handles` call (one read per distinct id); the reads
+    sit in the display-model build, before the write seam, and a store fault
+    propagates to ``cmd_check``'s boundary. Each batch keeps its own ``reason``.
+    """
+    ids: List[str] = []
+    for batch in batches:
+        ids.append(batch.proposal_id)
+        ids.extend(batch.partner_ids)
+    handles = iter(node_handles(ids, store.get_node))
     out: List[Dict[str, Any]] = []
-    for node_id in ids:
-        node = store.get_node(node_id)
-        out.append({"id": node_id, "slug": node.get("slug") if node else None})
+    for batch in batches:
+        proposal = next(handles)
+        partners = [next(handles) for _ in batch.partner_ids]
+        out.append({"batch_id": batch.batch_id, "reason": batch.reason,
+                    "proposal": proposal, "partners": partners})
     return out
 
 
@@ -4943,6 +4987,7 @@ def _check_json_object(
     row: "check.CheckRunRow",
     *,
     exclusions: List[Dict[str, Any]],
+    failed_batches: List[Dict[str, Any]],
     exit_code: int,
     row_written: bool,
     scope: Optional[str],
@@ -4985,6 +5030,9 @@ def _check_json_object(
         # The typed reasons behind `degradations: ["judgment"]`. Reasons only — never
         # `Unavailable.detail`, which is logging/telemetry and not user-rendered.
         "judgment_failure_reasons": [f.reason.value for f in result.judgment_failures],
+        # Every failed batch's pairs, uncut (the text names the first few), from the
+        # same display model the text renders.
+        "judgment_failed_batches": failed_batches,
         "coverage_exclusions": exclusions,
         "index_backlog_transient": transient_count,
         "summary_row_written": row_written,
@@ -5039,6 +5087,7 @@ def _print_check_report(
     result: "check.CheckRunResult",
     *,
     exclusions: List[Dict[str, Any]],
+    failed_batches: List[Dict[str, Any]],
     denominator: Optional[int],
     scope: Optional[str],
     row_written: bool,
@@ -5113,6 +5162,20 @@ def _print_check_report(
             breakdown = _judgment_failure_breakdown(result.judgment_failures)
             if breakdown:
                 print(f"    Why: {breakdown}.")
+            # Which pairs went unjudged. From the failed-batch rows, never zipped with
+            # `judgment_failures` (that list also holds the keyless abort, which
+            # attempted nothing and has no row). Each line carries its own reason:
+            # the Why line groups them and cannot say which batch had which.
+            if failed_batches:
+                print("    Unjudged pairs, by failed batch:")
+                for item in failed_batches[:_FAILED_BATCHES_SHOWN]:
+                    partners = ", ".join(handle_text(p) for p in item["partners"])
+                    print(f"      {handle_text(item['proposal'])} — {partners}   "
+                          f"({_JUDGMENT_FAILURE_WORDS[item['reason']]})")
+                rest = len(failed_batches) - _FAILED_BATCHES_SHOWN
+                if rest > 0:
+                    noun = "batch" if rest == 1 else "batches"
+                    print(f"      …and {rest} more failed {noun}.")
 
     if not row_written:
         print("  Note: this run was not recorded to check history "
@@ -5121,7 +5184,7 @@ def _print_check_report(
     if exclusions:
         print("\nCoverage exclusions (chronically un-embedded — NOT audited):")
         for item in exclusions:
-            print(f"  - {item['slug'] or item['id']}")
+            print(f"  - {handle_text(item)}")
         print("  These keep failing to embed; the durable fix is outbox quarantine "
               "(substrate-owned). Re-run `mitos sync` to retry.")
 
@@ -5256,6 +5319,7 @@ def cmd_check(
         exclusions = _resolve_exclusion_display(
             store, check.coverage_exclusion_ids(result)
         )
+        failed_batches = _failed_batch_display(store, result.failed_batches)
         transient_count = _check_transient_count(result)
         denominator: Optional[int] = None
         if scope is not None and plan.nodes_total == 0:
@@ -5301,14 +5365,16 @@ def cmd_check(
         # no business gaining a routing parameter (the same argument D1 makes
         # against stamping inside `_emit_json`).
         _emit_json({**_check_json_object(
-            result, row, exclusions=exclusions, exit_code=exit_code,
+            result, row, exclusions=exclusions, failed_batches=failed_batches,
+            exit_code=exit_code,
             row_written=row_written, scope=scope, fresh=fresh,
             transient_count=transient_count,
         ), **corpus_provenance(config)})
     else:
         _echo_corpus(config)
         _print_check_report(
-            result, exclusions=exclusions, denominator=denominator, scope=scope,
+            result, exclusions=exclusions, failed_batches=failed_batches,
+            denominator=denominator, scope=scope,
             row_written=row_written, transient_count=transient_count,
         )
     return exit_code
@@ -5561,7 +5627,7 @@ def _print_staged_report(
     if exclusions:
         print("\nCoverage exclusions (chronically un-embedded — NOT audited):")
         for item in exclusions:
-            print(f"  - {item['slug'] or item['id']}")
+            print(f"  - {handle_text(item)}")
         print("  These keep failing to embed; run `mitos sync` to retry (the durable "
               "fix is outbox quarantine, substrate-owned).")
 

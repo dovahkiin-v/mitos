@@ -14,6 +14,10 @@ structurally impossible:
   M5 ``rejected_paths``-unless-``brief`` rule live in exactly one place. It is
   the *sibling* of :func:`dumps_display`, never an extension: shape and encoding
   are distinct seams and neither calls the other.
+* :func:`node_handles` / :func:`handle_text` — the single id→slug rule (the
+  *handle* seam): resolve each node id to its current slug when shown, print the
+  id where none resolves. The store is injected as a lookup callable, so this
+  leaf stays store-free; the caller owns caps, layout and fault handling.
 * :func:`resolve_display_ensure_ascii` — **CLI-internal.** Decides
   ``ensure_ascii``'s value by sniffing the live stdout encoding.
 * :func:`apply_stdout_text_safety` — **CLI-internal.** Makes raw-text
@@ -31,7 +35,7 @@ This module is **not** the hash-input serializer. ``identity.py`` is fenced
 
 import codecs
 import json
-from typing import Any, Dict, List, Mapping, Optional, TextIO
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, TextIO
 
 
 # The sane upper bound on the ranked-recall top-k (`--limit` / the MCP `limit`
@@ -179,6 +183,45 @@ def blackout_note(retired_handles: List[Mapping[str, Any]]) -> str:
         f"Read the retired history with: mitos list --state all "
         f"(or list_decisions(state=\"all\"))."
     )
+
+
+def node_handles(
+    ids: Sequence[str],
+    get_node: Callable[[str], Optional[Mapping[str, Any]]],
+) -> List[Dict[str, Optional[str]]]:
+    """Resolves node ids to ``{"id", "slug"}`` handles, one per id in input order.
+
+    A slug is a mutable handle (MI-2), so records hold ids and the slug is read at
+    display time. ``get_node`` is ``GraphStore.get_node`` at every call site today;
+    it is state-agnostic, so a ``None`` slug means the node is genuinely absent.
+    Each distinct id is looked up once. A raising lookup propagates: the caller's
+    fault boundary decides what a store fault means, and printing ids for a store
+    that is down would read as though the nodes were gone.
+
+    Args:
+        ids: Node ids (content hashes), repeats allowed.
+        get_node: Returns the node dict (with a ``"slug"`` key) or ``None``.
+
+    Returns:
+        One ``{"id": id, "slug": slug or None}`` per input id.
+    """
+    slugs: Dict[str, Optional[str]] = {}
+    out: List[Dict[str, Optional[str]]] = []
+    for node_id in ids:
+        if node_id not in slugs:
+            node = get_node(node_id)
+            slugs[node_id] = (node.get("slug") or None) if node else None
+        out.append({"id": node_id, "slug": slugs[node_id]})
+    return out
+
+
+def handle_text(handle: Mapping[str, Optional[str]]) -> str:
+    """Returns a handle's printed form: its slug, or its whole id where none resolved.
+
+    The id is never shortened: ``show_node`` takes it, and a truncated hash is a
+    handle nothing accepts.
+    """
+    return handle["slug"] or handle["id"]
 
 
 def order_scope_counts(counts: Dict[str, Dict[str, int]]) -> Dict[str, Dict[str, int]]:
