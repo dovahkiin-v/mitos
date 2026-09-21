@@ -108,13 +108,16 @@ def _arg_entry_span(description, arg):
     The entry starts at its name token and ends after the last character of its
     last continuation line (exclusive) — continuation being the following
     non-blank lines indented deeper than the name line, the rule
-    ``test_mcp_selector._project_arg_doc`` uses. The first matching entry wins.
+    ``test_mcp_selector._project_arg_doc`` uses. Only name lines at the block's
+    entry indent count, so a continuation line that happens to begin ``arg:``
+    is not mistaken for the entry. The first matching entry wins.
     A missing entry fails rather than skips: a required argument whose doc was
     deleted must red, not drop out of the measurement.
     """
     lines = description.splitlines(keepends=True)
     offset = 0
     args_indent = None
+    entry_indent = None
     for index, line in enumerate(lines):
         stripped = line.strip()
         indent = len(line) - len(line.lstrip())
@@ -123,7 +126,13 @@ def _arg_entry_span(description, arg):
                 args_indent = indent
         elif stripped and indent <= args_indent:
             break  # the Args: block has ended
-        elif stripped.startswith(f"{arg}:"):
+        elif stripped and entry_indent is None:
+            entry_indent = indent  # the first entry sets the name-line indent
+        if (
+            entry_indent is not None
+            and indent == entry_indent
+            and stripped.startswith(f"{arg}:")
+        ):
             start = offset + indent
             end = offset + len(line.rstrip("\n"))
             follower_offset = offset + len(line)
