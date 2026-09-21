@@ -400,6 +400,20 @@ def _scanned():
 # --- the rows ----------------------------------------------------------------
 
 
+def test_module_strings_descends_into_interpolations_once(tmp_path):
+    """The walk reads strings inside an f-string's expressions, and each part once.
+
+    No shipped module holds a taught form inside an interpolated expression today,
+    so without this row the descent could be undone and nothing would red (found by
+    8a1's re-plant). The constant parts must not be scanned a second time either
+    (6a's [PATTERN]).
+    """
+    module = tmp_path / "synthetic.py"
+    module.write_text(
+        'x = 1\ntext = f"a {\'show_node(id=1)\' if x else \'\'} b"\n', encoding="utf-8")
+    assert _module_strings(module) == ["a {} b", "show_node(id=1)", ""]
+
+
 def test_every_taught_keyword_is_declared_by_its_tool():
     _, (forms, fragments) = _scanned()
     offences = _check(forms, fragments)["keyword"]
