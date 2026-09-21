@@ -4,10 +4,14 @@ This module implements the MCP Server (F) and the C4 integration contract,
 exposing surface_decisions and query_decisions tools to LLM clients.
 """
 
+import difflib
+import json
 import os
 import sys
 from typing import Optional, List, Dict, Any, Tuple
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.utilities.func_metadata import FuncMetadata, func_metadata
+from pydantic import ValidationError
 
 from mitos import amend, registry, routing
 from mitos.display import RANKED_LIMIT_CEILING, blackout_note, clamp_limit, dumps_display, letter_payload, oneline_payload, order_scope_counts, projects_payload, scope_report, show_payload
@@ -38,9 +42,6 @@ from mitos.recall import (assess_query_recall, assess_surface_recall,
                           missing_graph_note, missing_index_is_a_gap,
                           scope_filter_recovery, count_withheld, window_lever,
                           withheld_clause)
-
-# Create FastMCP server instance
-mcp = FastMCP("Mitos")
 
 # No cross-call "seen" dedup state — deliberately. An earlier design cached
 # already-surfaced slugs in a process-global set and trimmed `rejected_paths` (the
@@ -157,12 +158,14 @@ def _decision_payload(node: Dict[str, Any], score: float, *, brief: bool,
     return payload
 
 class _RenderedToolError(Exception):
-    """An addressing failure already rendered for delivery. ``str()`` IS the body.
+    """A failure already rendered for delivery. ``str()`` IS the body.
 
-    Two classes ride it since 6c — the **targeting** anatomy and the **registry**
-    class's located cause plus escape hatch — and the shape is the same for both
-    because the delivery constraint below is a property of the transport, not of
-    either message.
+    Three bodies ride it: the **targeting** anatomy and the **registry** class's
+    located cause plus escape hatch (both since 6c, raised inside a tool), and the
+    **argument-fault** body (AX-3 6b, raised from the ``_MitosFastMCP.call_tool``
+    boundary before any tool runs). The shape is the same for all three because
+    the delivery constraint below is a property of the transport, not of any one
+    message.
 
     Module-private, and it never leaves this file. Its whole purpose is to be the
     thing a tool **raises** once the body has been composed, because that is
@@ -178,17 +181,244 @@ class _RenderedToolError(Exception):
     * ``return <anatomy>`` → an ordinary **success**, which an addressing-class
       failure is not.
 
-    ``Tool.run`` wraps whatever a tool raises as ``ToolError(f"Error executing
-    tool {name}: {e}")``, and the low-level server renders *that* through
-    ``_make_error_result(str(err))`` — so the delivered body is ``str()`` of what
-    was raised. FastMCP's prefix is kept rather than fought: it names the failing
-    tool, which the body would otherwise have to repeat.
+    The two delivery paths differ in one prefix:
+
+    * **Raised inside a tool** — ``Tool.run`` wraps it as ``ToolError(f"Error
+      executing tool {name}: {e}")``, and the low-level server renders *that*
+      through ``_make_error_result(str(err))``. FastMCP's prefix is kept rather
+      than fought: it names the failing tool, which the body would otherwise have
+      to repeat.
+    * **Raised from the boundary override** — nothing wraps it, so it arrives
+      bare (6a's S2/S3). That body names its tool on its first line itself.
 
     Deliberately **not** a ``MitosError`` and deliberately not a field on
     ``ProjectTargetingError``: a finished presentation string living on a shared
     error type is exactly the leak the composition locus forbids — it would put
     MCP call syntax one attribute away from the CLI boundary.
     """
+
+
+# The longest echo of a mistyped value, in characters of its JSON encoding. An
+# echo exists so the caller can see what arrived, not to reproduce a prose blob.
+ARGUMENT_ECHO_MAX = 80
+# `difflib`'s default 0.6 suggested `limit` for `claim` (ratio 0.60): a confident
+# wrong suggestion teaches less than none, since the parameter line already
+# lists the real names.
+ARGUMENT_DIDYOUMEAN_CUTOFF = 0.75
+ARGUMENT_DIDYOUMEAN_MAX = 2
+# A containment match needs both names at least this long, so `s` or `e` does
+# not "contain"-match nearly every parameter; `id` → `ident` still qualifies.
+_ARGUMENT_CONTAINMENT_MIN = 2
+
+# Closed table: the schema shapes mitos's tools declare, in words. Anything else
+# falls back to pydantic's own `msg`, which is plain English.
+_SCHEMA_TYPE_WORDS = {
+    "string": "a string",
+    "integer": "a whole number",
+    "boolean": "true or false",
+}
+
+
+def _expected_words(schema: Dict[str, Any]) -> Optional[str]:
+    """Says in words what one argument's schema accepts, or None off the table.
+
+    An ``anyOf`` with ``null`` reads as its non-null member: sending nothing is
+    what the optional form allows, and the words describe what to send.
+    """
+    if "anyOf" in schema:
+        members = [m for m in schema["anyOf"] if m.get("type") != "null"]
+        return _expected_words(members[0]) if len(members) == 1 else None
+    kind = schema.get("type")
+    if kind == "array":
+        item = schema.get("items", {}).get("type")
+        return "a list of strings" if item == "string" else None
+    return _SCHEMA_TYPE_WORDS.get(kind)
+
+
+def _received_words(value: Any) -> str:
+    """Renders a raw argument value as it arrived: its JSON kind, then its JSON.
+
+    Truncated at ``ARGUMENT_ECHO_MAX`` characters with an ellipsis.
+    """
+    text = json.dumps(value, ensure_ascii=False, default=repr)
+    if len(text) > ARGUMENT_ECHO_MAX:
+        text = text[:ARGUMENT_ECHO_MAX - 1] + "…"
+    if value is None or isinstance(value, bool):
+        return text
+    if isinstance(value, str):
+        return f"the string {text}"
+    if isinstance(value, (int, float)):
+        return f"the number {text}"
+    if isinstance(value, list):
+        return f"the list {text}"
+    if isinstance(value, dict):
+        return f"the object {text}"
+    return text
+
+
+def _close_names(unknown: str, candidates: List[str]) -> List[str]:
+    """Picks up to ``ARGUMENT_DIDYOUMEAN_MAX`` declared names close to an unknown.
+
+    Close means one name contains the other (``id`` → ``ident``,
+    ``axiom_scope`` → ``axiom``, ``scope``) or ``difflib`` rates them at
+    ``ARGUMENT_DIDYOUMEAN_CUTOFF`` or better (``fulltop`` → ``full_top``). The
+    closest come first, by ``SequenceMatcher`` ratio, ties in signature order.
+    """
+    folded = unknown.lower()
+    close = set(difflib.get_close_matches(folded, candidates, n=ARGUMENT_DIDYOUMEAN_MAX,
+                                          cutoff=ARGUMENT_DIDYOUMEAN_CUTOFF))
+    if len(folded) >= _ARGUMENT_CONTAINMENT_MIN:
+        close.update(c for c in candidates
+                     if len(c) >= _ARGUMENT_CONTAINMENT_MIN and (folded in c or c in folded))
+    ranked = sorted(close, key=lambda c: (-difflib.SequenceMatcher(None, folded, c).ratio(),
+                                          candidates.index(c)))
+    return ranked[:ARGUMENT_DIDYOUMEAN_MAX]
+
+
+def _render_argument_faults(tool: str, properties: Dict[str, Dict[str, Any]],
+                            arguments: Dict[str, Any], pre_parsed: Dict[str, Any],
+                            unknowns: List[str], errors: List[Dict[str, Any]]) -> str:
+    """Composes the boundary's one answer to a call whose arguments do not fit.
+
+    The anatomy: a first line naming the tool and the count of faulted
+    arguments; one indented line per faulted argument, unknowns first, then
+    missing, then mistyped; and a last line listing what the tool takes, in
+    signature order. The first line names the tool because nothing else will —
+    a body raised from the boundary arrives without FastMCP's prefix.
+
+    Like ``_render_targeting_error`` it reads nothing and never calls
+    ``str()`` on pydantic's error, whose wall (model title, error URL) is what
+    this replaces. It never echoes an unknown argument's value — the name is
+    the fault, and the value may be a prose blob — and it never marks a
+    parameter required: ``project`` is documented-required but not
+    schema-required, and a list that said otherwise would contradict the
+    description.
+
+    Args:
+        tool: The tool that was called.
+        properties: The tool's schema properties, in signature order.
+        arguments: The arguments exactly as they arrived.
+        pre_parsed: The known arguments after FastMCP's ``pre_parse_json``, so a
+            string rewritten as JSON can be told apart from one sent as a list.
+        unknowns: The arguments the tool does not declare, in the order sent.
+        errors: pydantic's ``errors()`` for the known arguments.
+
+    Returns:
+        The multi-line body.
+    """
+    declared = list(properties)
+    candidates = [name for name in declared if name not in arguments]
+    missing: List[str] = []
+    mistyped: Dict[str, List[Dict[str, Any]]] = {}
+    for error in errors:
+        field = str(error["loc"][0]) if error["loc"] else ""
+        if error["type"] == "missing" and len(error["loc"]) == 1:
+            missing.append(field)
+        else:
+            mistyped.setdefault(field, []).append(error)
+
+    lines = []
+    for name in unknowns:
+        line = f"  `{name}` is not an argument of {tool}"
+        close = _close_names(name, candidates)
+        if close:
+            line += f" — did you mean {' or '.join(f'`{c}`' for c in close)}?"
+        lines.append(line + ("" if close else "."))
+    for name in sorted(missing, key=lambda n: declared.index(n) if n in declared else len(declared)):
+        lines.append(f"  `{name}` is required and was not sent.")
+    for name in sorted(mistyped, key=lambda n: declared.index(n) if n in declared else len(declared)):
+        faults = mistyped[name]
+        expected = _expected_words(properties.get(name, {}))
+        raw = arguments.get(name)
+        line = (f"  `{name}` expects {expected}" if expected
+                else f"  `{name}`: {faults[0]['msg'].rstrip('.')}")
+        line += f"; it received {_received_words(raw)}"
+        if isinstance(raw, str) and pre_parsed.get(name) is not raw:
+            taken = {list: "a list", dict: "an object"}.get(type(pre_parsed.get(name)), "null")
+            line += f", which reads as JSON and was taken as {taken}"
+        items = [str(f["loc"][1]) for f in faults if len(f["loc"]) > 1]
+        if items:
+            line += (f" (the fault is at item {items[0]})" if len(items) == 1
+                     else f" (the faults are at items {', '.join(items)})")
+        lines.append(line + ".")
+
+    count = len(lines)
+    head = f"{tool} was not run: {count} argument fault{'' if count == 1 else 's'}."
+    tail = (f"  {tool} takes: {', '.join(declared)}." if declared
+            else f"  {tool} takes no arguments.")
+    return "\n".join([head, *lines, tail])
+
+
+class _CapturedArguments:
+    """One tool's argument model and its declared properties, read once at capture."""
+
+    def __init__(self, metadata: FuncMetadata) -> None:
+        self.metadata = metadata
+        self.properties: Dict[str, Dict[str, Any]] = (
+            metadata.arg_model.model_json_schema(by_alias=True).get("properties", {}))
+
+
+class _MitosFastMCP(FastMCP):
+    """FastMCP with an argument boundary: a bad call is refused before any tool runs.
+
+    FastMCP ignores an argument a tool does not declare, so a write could
+    succeed with part of the caller's intent silently gone, and it answers a
+    missing or mistyped argument with pydantic's raw wall. This boundary refuses
+    the undeclared argument and answers every argument fault of the call at
+    once, in mitos's voice (``_render_argument_faults``).
+
+    It validates before delegating rather than translating ``super()``'s
+    ``ToolError``: a mixed call (an unknown beside a valid set) would otherwise
+    have to *run the tool* to learn about the rest, and a translation would have
+    to tell FastMCP's argument error apart from a pydantic error raised inside a
+    tool body. A ``ToolError`` from ``super()`` is therefore always the tool's
+    own, and passes untouched — prefix and all.
+
+    The model is ``func_metadata(fn)``, the builder ``Tool.from_function`` uses,
+    captured in ``add_tool`` — the method ``FastMCP.tool()`` registers through.
+    ``tests/test_mcp_seam.py`` S7 and the parity row in
+    ``tests/test_mcp_argument_faults.py`` pin that it is the model FastMCP
+    registered. (No mitos tool takes a ``Context`` parameter, so nothing is
+    skipped; one that did would red the parity row.)
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self._captured_arguments: Dict[str, _CapturedArguments] = {}
+        super().__init__(*args, **kwargs)
+
+    def add_tool(self, fn: Any, *args: Any, **kwargs: Any) -> None:
+        """Registers the tool as FastMCP does, then captures its argument model."""
+        super().add_tool(fn, *args, **kwargs)
+        name = (args[0] if args else None) or kwargs.get("name") or fn.__name__
+        self._captured_arguments[name] = _CapturedArguments(func_metadata(fn))
+
+    async def call_tool(self, name: str, arguments: Dict[str, Any]) -> Any:
+        """Refuses a call whose arguments do not fit, else runs it as FastMCP does.
+
+        Raises:
+            _RenderedToolError: With the rendered body, when the call carries an
+                undeclared argument or pydantic refuses a declared one. It
+                arrives at the client bare, as ``isError``.
+        """
+        captured = self._captured_arguments.get(name)
+        if captured is None:
+            return await super().call_tool(name, arguments)
+        raw = arguments or {}
+        unknowns = [key for key in raw if key not in captured.properties]
+        known = {key: value for key, value in raw.items() if key in captured.properties}
+        pre_parsed = captured.metadata.pre_parse_json(known)
+        try:
+            captured.metadata.arg_model.model_validate(pre_parsed)
+            errors: List[Dict[str, Any]] = []
+        except ValidationError as exc:
+            errors = [dict(e) for e in exc.errors()]
+        if unknowns or errors:
+            raise _RenderedToolError(_render_argument_faults(
+                name, captured.properties, raw, pre_parsed, unknowns, errors))
+        return await super().call_tool(name, arguments)
+
+
+mcp = _MitosFastMCP("Mitos")
 
 
 def _example_project_name(err: ProjectTargetingError) -> Optional[str]:
@@ -1864,8 +2094,9 @@ def amend_commentary(slug: str,
     if new_slug is not None:
         changes["slug"] = new_slug
 
-    # Refusal-carrying: FastMCP drops an undeclared argument silently, so an `axiom`
-    # beside a `context` would otherwise return `amended` with the axiom ignored.
+    # Refusal-carrying: declared only so that the core's refusal can name the route
+    # that does change them. Undeclared, the boundary would still refuse `axiom`, but
+    # as "not an argument", which teaches less than naming the new-decision route.
     if axiom is not None:
         changes["axiom"] = axiom
     if mechanisms is not None:

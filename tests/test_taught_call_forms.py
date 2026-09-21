@@ -1,8 +1,8 @@
 """Every call form mitos teaches is checked against the arguments the tools declare.
 
 A7 makes an MCP tool's argument names **contract**: FastMCP drops an unknown
-argument silently today, and a later phase is planned to refuse it. From then
-on, every call form mitos itself hands an agent — the skill text, the pause message, a
+argument silently, and since AX-3 6b mitos's boundary (``_MitosFastMCP``) refuses
+it before the tool runs. So every call form mitos itself hands an agent — the skill text, the pause message, a
 degraded index header, a recall pointer, a tool description — becomes a promise
 that the named argument exists. This module keeps those promises true, so a
 rename reds here instead of turning mitos's own teaching into refusals.

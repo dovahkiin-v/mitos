@@ -1,11 +1,13 @@
 """The ``call_tool`` seam canary: what an overriding ``FastMCP`` subclass can see.
 
-Phase 6b is planned to build unknown-argument refusal on one framework seam: a
-subclass overriding ``FastMCP.call_tool(self, name, arguments)``, which FastMCP registers
-with the low-level server as ``call_tool(validate_input=False)``. These rows pin
-the six properties that build stands on, over a **throwaway** server defined
-here, never ``mitos.mcp_server.mcp`` (6b owns that instance; a test-time
-mutation of the module global would leak across xdist-shared imports).
+Phase 6b built unknown-argument refusal on one framework seam: a subclass
+(``mitos.mcp_server._MitosFastMCP``) overriding ``FastMCP.call_tool(self, name,
+arguments)``, which FastMCP registers with the low-level server as
+``call_tool(validate_input=False)``, and capturing each tool's argument model
+from ``func_metadata(fn)`` in an ``add_tool`` override. These rows pin the seven
+properties that build stands on, over a **throwaway** server defined here, never
+``mitos.mcp_server.mcp`` (a test-time mutation of the module global would leak
+across xdist-shared imports).
 
 Every row goes through the in-memory wire
 (``mcp.shared.memory.create_connected_server_and_client_session``): calling a
@@ -22,6 +24,7 @@ from typing import List, Optional
 import pytest
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.fastmcp.utilities.func_metadata import func_metadata
 from mcp.shared.memory import create_connected_server_and_client_session
 from pydantic import ValidationError
 
@@ -140,3 +143,46 @@ async def test_s6_an_unknown_tool_still_answers_as_it_does_today() -> None:
     assert ("nope", {"bogus": 1}) in server.seen
     assert result.isError
     assert result.content[0].text == "Unknown tool: nope"
+
+
+@pytest.mark.asyncio
+async def test_s7_func_metadata_is_the_model_fastmcp_registers_through_add_tool() -> None:
+    """S7: the model 6b pre-validates with is the one FastMCP validates with.
+
+    ``FastMCP.tool()`` registers through ``add_tool`` (so an override captures
+    every decorated tool); ``func_metadata(fn)``'s schema equals the registered
+    ``inputSchema``; and a bad call's ``errors()`` from it, after its own
+    ``pre_parse_json``, equal the ``errors()`` behind S4's ``ToolError``. If this
+    reds, the boundary's fallback is schema-only unknown + missing from
+    ``list_tools()`` (6b plan D2).
+    """
+    captured: list = []
+
+    class _Capturing(FastMCP):
+        def add_tool(self, fn, *args, **kwargs):
+            captured.append((fn, kwargs.get("name") or fn.__name__))
+            return super().add_tool(fn, *args, **kwargs)
+
+    server = _Capturing("seam-capture")
+
+    @server.tool()
+    def f(
+        a: str,
+        n: int,
+        context: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+    ) -> str:
+        return repr(context)
+
+    assert [name for _fn, name in captured] == ["f"]
+    metadata = func_metadata(captured[0][0])
+    schema = {t.name: t.inputSchema for t in await server.list_tools()}["f"]
+    assert metadata.arg_model.model_json_schema(by_alias=True) == schema
+
+    bad = {"n": "notint", "tags": '["x", 1]'}
+    with pytest.raises(ValidationError) as ours:
+        metadata.arg_model.model_validate(metadata.pre_parse_json(bad))
+    with pytest.raises(ToolError) as theirs:
+        await server.call_tool("f", bad)
+    assert isinstance(theirs.value.__cause__, ValidationError)
+    assert ours.value.errors() == theirs.value.__cause__.errors()

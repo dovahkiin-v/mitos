@@ -557,13 +557,14 @@ def _served_workspace(tmp_path, env):
 async def test_a_real_serve_returns_the_misses_and_raises_only_the_fidelity_refusal(tmp_path):
     """S1 + S3 — `isError` per class over the wire; the undeclared-argument measurement.
 
-    M9, measured and pinned: FastMCP registers its handler with `validate_input=False`
-    and its argument model sets no `extra`, so an undeclared key is DROPPED silently —
-    `rationale=` beside `context=` amends the context and says nothing about the
-    rationale. That behaviour is framework-wide (every tool shares it). It is why
-    `axiom`, `mechanisms` and the relations are declared: undeclared, `axiom=` beside
-    `context=` would return `amended` with the axiom ignored. Declared, it refuses and
-    writes nothing.
+    M9: FastMCP registers its handler with `validate_input=False` and its argument
+    model sets no `extra`, so an undeclared key was measured DROPPED silently —
+    `rationale=` beside `context=` amended the context and said nothing about the
+    rationale. Since AX-3 6b mitos's boundary refuses it before the tool runs: an
+    `isError` naming `rationale`, and the buffer byte-unchanged. `axiom`,
+    `mechanisms` and the relations stay declared so that their refusal names the
+    route that does change them, which "not an argument" would not; `axiom=` beside
+    `context=` refuses with `canonical_core` and writes nothing.
     """
     env = _scaffold_env(tmp_path)
     ws, archived = _served_workspace(tmp_path, env)
@@ -583,8 +584,8 @@ async def test_a_real_serve_returns_the_misses_and_raises_only_the_fidelity_refu
         fidelity = await call(slug="fresh-write", context=PHANTOM)
         after_fidelity = buffer.read_bytes()
 
-        dropped = _tool_json(await call(slug="fresh-write", context="Another context.",
-                                        rationale="an undeclared argument"))
+        dropped = await call(slug="fresh-write", context="Another context.",
+                             rationale="an undeclared argument")
         before_silent = buffer.read_bytes()
         silent = _tool_json(await call(slug="fresh-write", context="Yet another.",
                                        axiom="A different axiom."))
@@ -603,7 +604,11 @@ async def test_a_real_serve_returns_the_misses_and_raises_only_the_fidelity_refu
     assert "object at 0x" not in body and "mitos " not in body
     assert after_fidelity == before
 
-    assert dropped["status"] == amend.STATUS_AMENDED, "an undeclared argument is dropped"
+    assert dropped.isError is True, "an undeclared argument is refused, not dropped"
+    refusal = dropped.content[0].text
+    assert refusal.startswith("amend_commentary was not run: 1 argument fault.")
+    assert "`rationale`" in refusal and "Another context." not in refusal
+    assert before_silent == after_fidelity, "the refused call wrote nothing"
     assert (silent["status"], silent["reason"]) == (amend.STATUS_REFUSED,
                                                     amend.REASON_CANONICAL_CORE)
     assert after_silent == before_silent
