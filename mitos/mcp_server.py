@@ -713,12 +713,12 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
             workspace. Call `list_projects()` if you do not know the names.
             Distinct from `scope`: `project` picks the corpus, `scope` filters
             within it.
-        scope: Optional scope hint — does NOT filter the semantic search. Recall is
-            scope-blind by design, so a mis-guessed tag can't hide cross-scope
-            precedent; scope only narrows the `open_questions` scan and shapes the
-            recall `note` (incl. the "unused tag → valid scopes" redirect). For
-            scope-RESTRICTED retrieval use list_decisions(scope=...) — the only
-            surface that hard-filters by scope.
+        scope: Optional scope hint, one tag as a string — does NOT filter the
+            semantic search. Recall is scope-blind by design, so a mis-guessed tag
+            can't hide cross-scope precedent; scope only narrows the
+            `open_questions` scan and shapes the recall `note` (incl. the "unused
+            tag → valid scopes" redirect). For scope-RESTRICTED retrieval use
+            list_decisions(scope=...) — the only surface that hard-filters by scope.
         brief: An existence screen — "is there anything nearby?" — after which you
             dereference the hits that matter by slug (show_node). If True, every
             result is axiom-only (no `rejected_paths`). Default False keeps the full
@@ -982,9 +982,9 @@ def list_decisions(scope: Optional[str] = None, state: str = "active", brief: bo
             workspace. Call `list_projects()` if you do not know the names.
             Distinct from `scope`: `project` picks the corpus, `scope` filters
             within it.
-        scope: Optional scope tag filter (e.g. 'auth') — a true hard filter (this is
-            the only retrieval surface that restricts by scope). Omit for the whole
-            project.
+        scope: Optional scope tag filter, one tag as a string (e.g. 'auth') — a
+            true hard filter (this is the only retrieval surface that restricts by
+            scope). Omit for the whole project.
         state: 'active' (default) returns the live set (active + drifted); 'all'
             returns every decision regardless of state (including superseded); any
             other value is an exact computed-state match (e.g. 'superseded').
@@ -1487,7 +1487,7 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
 
     Relation args — pass the EXACT slug of an existing decision (look it up first
     with surface_decisions/query_decisions; each is validated to point at a real
-    decision, and each accepts a comma-separated list, e.g. supersedes="a, b"):
+    decision, and each is one string of comma-separated slugs, e.g. supersedes="a, b"):
       supersedes:   that decision is REPLACED — outgrown; it leaves the active view.
       corrects:     that decision was WRONG — also retires it (wrong, not outgrown).
       amends:       that decision still stands; this modifies part of it
@@ -1505,12 +1505,12 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
     Args:
         axiom: The decision as a single clear sentence true going forward.
         rejected_paths: The alternatives considered and rejected, and why. REQUIRED.
-        scope: Area tags, e.g. ["database", "auth"].
+        scope: A list of area tags, e.g. ["database", "auth"].
         slug: A short, descriptive handle (e.g. 'sqlite-wal-mode'), at most 100 characters.
         project: Required on every call: a registered project name (e.g. 'mitos')
             or a workspace's absolute path; `list_projects()` lists the names.
-        mechanisms: Concrete technologies/entities involved, e.g. ["sqlite"]. Folded
-            for identity (case; ASCII punctuation/whitespace runs to "-"): _FOO and FOO are one.
+        mechanisms: A list of the technologies/entities involved, e.g. ["sqlite"].
+            Folded for identity (case; ASCII punctuation/whitespace runs to "-"): _FOO and FOO are one.
         context: Optional background on why this was decided.
         acknowledge_neighbors: Leave False on the first attempt; set True to record
             past a near-duplicate pause for neighbours you judged independent.
@@ -1820,13 +1820,14 @@ def amend_commentary(slug: str,
             replaced, never cleared.
         invalidates_if: Replacement invalidates-if text.
         context: Replacement context prose.
-        scope: Replacement scope tags, in authored order (the first is primary).
+        scope: A list of replacement scope tags, in authored order (the first is
+            primary).
         new_slug: Rename the decision. Entries citing the old slug then read as
             diverged until their relation lines in decisions.md name the new one;
             the result lists them under `rename.incoming`.
-        clear: Field names to REMOVE, e.g. ["context"] or ["scope"]. An empty
-            string or an empty list is refused rather than read as a removal, so
-            a removal is always named here.
+        clear: A list of field names to REMOVE, e.g. ["context"] or ["scope"]. An
+            empty string or an empty list is refused rather than read as a
+            removal, so a removal is always named here.
         axiom: Declared, with mechanisms and the relation arguments (named as
             record_decision names them), only to be refused: the decision itself
             and its relations are not commentary, and the result names the route.

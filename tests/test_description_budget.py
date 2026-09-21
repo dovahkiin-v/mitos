@@ -22,12 +22,22 @@ own is the ordering and the total weight. Three rules, pinned here:
    purpose, which leaves the description as the only place that says it is
    needed. This window is measured on the raw text, because the raw text is
    what the client cuts; the phrase rows stay on the flat view.
+4. **Container rule** — where an argument's container is a live question, the
+   first sentence of its doc says which: an array-typed argument says ``list``;
+   a relation argument says ``string`` and ``comma-separated`` (it is one
+   string of slugs, never a list); a string argument that shares its name with
+   an array-typed argument on another tool says ``string``. The population is
+   derived from the schemas, so an argument that recreates the list-vs-string
+   asymmetry joins it the day it is declared. Single-valued strings with no
+   list homonym (``query``, ``slug``, ``project`` …) state nothing: a shape
+   there teaches no one and every session pays for it eagerly.
 
 Descriptions are read off ``mcp.list_tools()`` (the wire truth), not out of the
 source, mirroring ``test_mcp_selector._tools``.
 """
 
 import asyncio
+import re
 
 import pytest
 
@@ -316,3 +326,141 @@ def test_by_handle_reads_do_not_gloss_the_prose_fields(tool):
     assert "`invalidates_if`" not in desc
     if tool == "show_node":
         assert "mitos " not in desc
+
+
+# `amend_commentary` declares these only to refuse them (A7 §4.9), so their
+# container is moot and they carry no Args entry of their own. Each must still
+# be declared: when a later phase retires one, the stale-exemption row reds and
+# the entry is removed knowingly.
+CONTAINER_EXEMPT = frozenset(
+    {("amend_commentary", "axiom"), ("amend_commentary", "mechanisms")}
+    | {("amend_commentary", rel) for rel in RELATION_ARGS}
+)
+
+# The relation args carry no Args entries on record_decision; their shared
+# container clause is the catalog header, from here to the first definition.
+_RELATION_HEADER_START = "Relation args"
+_RELATION_HEADER_END = "supersedes:"
+
+
+def _arg_type(schema):
+    """Returns the JSON type of one property, with an optional's null unwrapped."""
+    if "anyOf" in schema:
+        types = [b.get("type") for b in schema["anyOf"] if b.get("type") != "null"]
+        return types[0] if len(types) == 1 else None
+    return schema.get("type")
+
+
+def _container_population():
+    """Derives the ``(tool, arg) -> shape words`` table from the live schemas.
+
+    (a) every array-typed argument; (b) every relation argument, on any tool
+    declaring it; (c) every string argument that is a homonym of an
+    array-typed argument on another tool. Exemptions are applied here, before
+    any doc is looked up, since the exempt arguments have no entry to find.
+    """
+    types = {
+        (name, arg): _arg_type(prop)
+        for name, tool in _tools().items()
+        for arg, prop in tool.inputSchema.get("properties", {}).items()
+    }
+    array_names = {arg for (_, arg), kind in types.items() if kind == "array"}
+    population = {}
+    for (name, arg), kind in types.items():
+        if kind == "array":
+            population[(name, arg)] = ("list",)
+        elif arg in RELATION_ARGS:
+            population[(name, arg)] = ("string", "comma-separated")
+        elif kind == "string" and arg in array_names:
+            population[(name, arg)] = ("string",)
+    return {
+        pair: words for pair, words in population.items()
+        if pair not in CONTAINER_EXEMPT
+    }
+
+
+def _first_sentence(text):
+    """Returns the flat text up to the first sentence end, ``e.g.``/``i.e.`` kept.
+
+    A sentence ends at a period followed by whitespace or the end of the text;
+    the abbreviations end nothing. No period means the whole text is the
+    sentence.
+    """
+    flat = _flat(text)
+    for match in re.finditer(r"\.(?=\s|$)", flat):
+        if flat[max(0, match.start() - 3):match.end()].lower() in ("e.g.", "i.e."):
+            continue
+        return flat[:match.end()]
+    return flat
+
+
+def _container_doc(tool, arg):
+    """Returns the text the container rule reads for one population member.
+
+    For a record_decision relation argument that is the whole catalog header
+    (it ends at a colon, so no first-sentence cut applies); otherwise the first
+    sentence of the argument's Args entry, its ``name:`` token dropped.
+    """
+    desc = _descriptions()[tool]
+    if tool == "record_decision" and arg in RELATION_ARGS:
+        start = desc.index(_RELATION_HEADER_START)
+        return _flat(desc[start:desc.index(_RELATION_HEADER_END, start)])
+    start, end = _arg_entry_span(desc, arg)
+    return _first_sentence(desc[start:end].split(":", 1)[1])
+
+
+_CONTAINER_POPULATION = _container_population()
+_CONTAINER_PAIRS = sorted(_CONTAINER_POPULATION)
+
+
+def test_container_population_is_derived_from_the_live_table():
+    """The shape rows below cannot shrink without this one noticing."""
+    measured = set(_CONTAINER_PAIRS)
+    for pair in (
+        ("record_decision", "scope"),
+        ("record_decision", "supersedes"),
+        ("surface_decisions", "scope"),
+    ):
+        assert pair in measured, (
+            f"{pair} fell out of the container population — the derivation "
+            "shrank, and that argument's shape is no longer measured"
+        )
+
+
+def test_container_exemptions_are_still_declared():
+    tools = _tools()
+    stale = sorted(
+        (name, arg) for name, arg in CONTAINER_EXEMPT
+        if arg not in tools[name].inputSchema.get("properties", {})
+    )
+    assert not stale, (
+        f"exempt argument(s) {stale} are no longer declared — remove them from "
+        "CONTAINER_EXEMPT, so the exemption does not outlive what it excused"
+    )
+
+
+def test_first_sentence_keeps_abbreviations():
+    assert _first_sentence('Tags, e.g. ["a"]. An empty list is refused.') == (
+        'Tags, e.g. ["a"].'
+    )
+    assert _first_sentence("One tag (i.e. a string)") == "One tag (i.e. a string)"
+
+
+@pytest.mark.parametrize(
+    ("tool", "arg"), _CONTAINER_PAIRS, ids=[f"{t}/{a}" for t, a in _CONTAINER_PAIRS]
+)
+def test_container_shape_is_stated_in_the_first_sentence(tool, arg):
+    words = _CONTAINER_POPULATION[(tool, arg)]
+    doc = _container_doc(tool, arg)
+    missing = [w for w in words if not re.search(rf"\b{w}\b", doc)]
+    assert not missing, (
+        f"{tool}'s `{arg}` doc does not say {missing} in its first sentence "
+        f"({doc!r}) — an agent guesses the container, and a list sent where one "
+        "string is declared (or the reverse) is the confusion the ledger "
+        "recorded six times."
+    )
+    if "string" in words:
+        assert not re.search(r"\blist\b", doc), (
+            f"{tool}'s `{arg}` takes one string, but its first sentence says "
+            f"'list' ({doc!r}) — the word an agent reads as ['a', 'b']."
+        )
