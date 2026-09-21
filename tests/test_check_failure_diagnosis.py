@@ -118,6 +118,8 @@ def _render(result: Any, capsys: pytest.CaptureFixture,
         scope=None,
         row_written=True,
         transient_count=0,
+        project="p",
+        attempt_unrecorded=None,
     )
     return capsys.readouterr().out
 
@@ -248,6 +250,7 @@ def test_json_carries_reasons_and_not_details() -> None:
         scope=None,
         fresh=False,
         transient_count=0,
+        attempt_unrecorded=None,
     )
 
     assert obj["judgment_failure_reasons"] == ["judgment_timeout"]
@@ -647,7 +650,8 @@ def test_a_multi_partner_batch_joins_and_prints_an_unresolved_id_whole(
     obj = cli._check_json_object(
         result, check.check_run_row_from_result(result, mode="corpus", exit_code=2),
         exclusions=[], failed_batches=[batch], exit_code=2, row_written=True,
-        scope=None, fresh=False, transient_count=0)
+        scope=None, fresh=False, transient_count=0,
+        attempt_unrecorded=None)
     assert obj["judgment_failed_batches"][0]["partners"][1] == {"id": full_id, "slug": None}
     assert '"slug": null' in json.dumps(obj)
 
@@ -673,7 +677,8 @@ def test_text_names_the_first_three_then_counts(
     obj = cli._check_json_object(
         result, check.check_run_row_from_result(result, mode="corpus", exit_code=2),
         exclusions=[], failed_batches=batches, exit_code=2, row_written=True,
-        scope=None, fresh=False, transient_count=0)
+        scope=None, fresh=False, transient_count=0,
+        attempt_unrecorded=None)
     assert obj["judgment_failed_batches"] == batches, "--json is never cut"
 
 
@@ -687,7 +692,8 @@ def test_healthy_run_prints_no_pair_list_and_carries_an_empty_list(
     obj = cli._check_json_object(
         result, check.check_run_row_from_result(result, mode="corpus", exit_code=0),
         exclusions=[], failed_batches=[], exit_code=0, row_written=True,
-        scope=None, fresh=False, transient_count=0)
+        scope=None, fresh=False, transient_count=0,
+        attempt_unrecorded=None)
 
     assert "Unjudged pairs" not in out
     assert obj["judgment_failed_batches"] == []
@@ -744,7 +750,8 @@ def test_the_keyless_abort_is_typed_and_nothing_else_moved(
     assert row == check.check_run_row_from_result(baseline, mode="corpus", exit_code=2)
     obj = cli._check_json_object(result, row, exclusions=[], failed_batches=[],
                                  exit_code=2, row_written=True, scope=None,
-                                 fresh=False, transient_count=0)
+                                 fresh=False, transient_count=0,
+                                 attempt_unrecorded=None)
     assert obj["judgment_failure_reasons"] == ["judgment_unavailable"]
 
 

@@ -913,6 +913,40 @@ def test_14c_above_threshold_interactive_decline_exits_2(workspace, monkeypatch,
     assert "nothing spent" in capsys.readouterr().out.lower()
 
 
+@pytest.mark.parametrize("as_json", [False, True], ids=["non-tty", "json"])
+def test_14d_staged_refusal_names_a_person_and_says_nothing_of_an_attempt(
+        workspace, monkeypatch, capsys, as_json) -> None:
+    """AX Hardening 3, 3b criteria 12–13: the shared refusal words, and nothing corpus.
+
+    ``--staged`` makes no attempt record, so its refusal carries no on-record clause
+    and no ``attempt_unrecorded`` key, and it never hands over ``--yes``.
+    """
+    config, store, telemetry = workspace
+    _seed_active(store)
+    _write_decisions(config, ("pending-y", _PENDING_AXIOM))
+    _wire_substrate(monkeypatch, {_PENDING_AXIOM: [_match("active-q", 0.9)]})
+    monkeypatch.setattr(check, "CHECK_CONFIRM_BATCHES", 0)
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(False))
+    judge_calls = _wire_judge(monkeypatch, _finding_judge())
+
+    code = cli.cmd_check(config, staged=True, scope=None, fresh=False,
+                         assume_yes=False, as_json=as_json)
+    captured = capsys.readouterr()
+
+    assert code == 2 and judge_calls == []
+    if as_json:
+        obj = json.loads(captured.out)
+        assert set(obj) == {"error", "code", "batches_planned"}
+        assert obj["code"] == "confirmation_required"
+        said = obj["error"]
+    else:
+        said = captured.err
+        assert captured.err.count("\n") == 1  # the refusal line alone
+    assert "--yes" not in said
+    assert "a person's authorization" in said and "nothing was spent" in said
+    assert cli._ATTEMPT_ON_RECORD_CLAUSE not in captured.out + captured.err
+
+
 # --------------------------------------------------------------------------- #
 # The staged mapper (KD7) — surface='check', MI-9 coercions, distinct-alias resolve
 # --------------------------------------------------------------------------- #

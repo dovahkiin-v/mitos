@@ -484,6 +484,8 @@ def _render(result: Any, capsys: pytest.CaptureFixture) -> str:
         scope=None,
         row_written=True,
         transient_count=0,
+        project="p",
+        attempt_unrecorded=None,
     )
     return capsys.readouterr().out
 

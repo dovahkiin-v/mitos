@@ -7,8 +7,10 @@ uncovered set last changed? This module grows one section per phase:
   (the ``started`` entry write and the outcome at the run-end seam), the read-only
   reader ``read_last_attempt``, the pure builder ``check.attempt_outcome_from_result``
   and ``cmd_check``'s two writes;
-* 3b onward — the refused-spend state, the hook predicate, the status gate row and
-  the standing notice.
+* 3b — the refused spend (``spend_not_authorized`` + the planned batch count, on the
+  attempt's own record), the unrecorded-attempt disclosure on every answer
+  ``cmd_check`` gives, and the refusal's on-record clause;
+* 3c onward — the hook predicate, the status gate row and the standing notice.
 
 Every ``cmd_check`` row injects both seams (substrate and judge): offline, a run with
 no embedding provider over a non-empty corpus exits before the seam, and a run-end
@@ -37,11 +39,14 @@ from mitos.telemetry import (
     ATTEMPT_COULD_NOT_COMPLETE,
     ATTEMPT_NEW_FINDINGS,
     ATTEMPT_NO_NEW_FINDINGS,
+    ATTEMPT_RUN_END_STATES,
     ATTEMPT_RUNG,
+    ATTEMPT_SPEND_NOT_AUTHORIZED,
     ATTEMPT_STARTED,
     FAILED_BATCHES_RUNG,
     TELEMETRY_MIGRATION_STEPS,
     AttemptOutcome,
+    AttemptRefusal,
     AttemptStart,
     CoverageMarks,
     LastAttempt,
@@ -333,7 +338,7 @@ def test_a_damaged_json_column_is_unreadable(tmp_path, column: str, damaged: str
 # 4 — the boundary shapes refuse before a connection opens
 # --------------------------------------------------------------------------- #
 
-@pytest.mark.parametrize("state", [ATTEMPT_STARTED, "spend_not_authorized", "done", ""])
+@pytest.mark.parametrize("state", [ATTEMPT_STARTED, ATTEMPT_SPEND_NOT_AUTHORIZED, "done", ""])
 def test_outcome_refuses_a_state_that_is_not_a_run_end_state(state: str) -> None:
     """Criterion 4: ``started`` and any unknown state are refused at construction."""
     with pytest.raises(ValueError, match="run-end state"):
@@ -696,10 +701,40 @@ def test_scoped_and_staged_runs_write_nothing(workspace, monkeypatch, capsys) ->
     assert _attempt(config.telemetry_path) == seeded
 
 
-def test_a_refused_spend_leaves_started(workspace, monkeypatch, capsys) -> None:
-    """Criterion 12: a refused spend exits 2 before the seam and leaves ``started``.
+def _refuse(config: MitosConfig, capsys: Any, monkeypatch: Any, form: str, *,
+            scope: Optional[str] = None) -> Tuple[int, int, str, str]:
+    """Runs a refused ``cmd_check`` in one of its three refusal forms.
 
-    Phase 3b inverts this row: the refusal will record ``spend_not_authorized``.
+    Returns ``(exit, batches_planned, out, err)``. The batch count is read off the
+    refusal's own output (the ``--json`` key, or the leading count of the text
+    line), never hand-counted.
+    """
+    if form == "tty":
+        monkeypatch.setattr("sys.stdin", _FakeStdin(tty=True))
+        monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+    else:
+        monkeypatch.setattr("sys.stdin", _FakeStdin(tty=False))
+    code = cli.cmd_check(config, scope=scope, fresh=False, assume_yes=False,
+                         as_json=form == "json")
+    captured = capsys.readouterr()
+    if form == "json":
+        obj = json.loads(captured.out)
+        assert obj["code"] == "confirmation_required"
+        planned = obj["batches_planned"]
+    else:
+        text = captured.err if form == "text" else captured.out
+        planned = int(text.split(" judgment batches pending", 1)[0].split()[-1])
+    return code, planned, captured.out, captured.err
+
+
+@pytest.mark.parametrize("form", ["text", "json", "tty"])
+def test_a_refused_spend_records_spend_not_authorized(workspace, monkeypatch, capsys,
+                                                       form: str) -> None:
+    """Criterion 12 (3a), inverted by 3b criterion 4: the refusal marks its own record.
+
+    Exit 2, no judge, no ``check_runs`` row; the record reads ``spend_not_authorized``
+    with the refusal's batch count, the entry fingerprint intact and no ``run_id``.
+    The refusal tells the caller the attempt is on record (3b criterion 12).
     """
     config, store, _tel = workspace
     _a, _b, nbhds = _pair(store)
@@ -708,13 +743,21 @@ def test_a_refused_spend_leaves_started(workspace, monkeypatch, capsys) -> None:
     _wire_substrate(monkeypatch, nbhds)
     invoked = _wire_judge(monkeypatch, None)
     monkeypatch.setattr(check, "CHECK_CONFIRM_BATCHES", 0)
-    monkeypatch.setattr("sys.stdin", _FakeStdin(tty=False))
 
-    code, obj = _run(config, capsys)
+    code, planned, out, err = _refuse(config, capsys, monkeypatch, form)
 
-    assert code == 2 and obj["code"] == "confirmation_required"
+    assert code == 2
     assert invoked == []
-    _assert_started(_attempt(config.telemetry_path), entry)
+    assert _read_check_runs(config) == []
+    row = _attempt(config.telemetry_path)
+    assert row["state"] == ATTEMPT_SPEND_NOT_AUTHORIZED
+    assert row["batches_planned"] == planned >= 1
+    assert row["fingerprint"] == entry
+    assert row["run_id"] is None and row["outcome_at"] is not None
+    assert all(row[c] is None for c in ("degradation_tokens", "new_pairs", "findings_known"))
+    said = {"text": err, "json": json.loads(out)["error"] if form == "json" else "",
+            "tty": out}[form]
+    assert cli._ATTEMPT_ON_RECORD_CLAUSE in said
 
 
 def test_a_second_attempt_replaces_the_first_whole(workspace, monkeypatch, capsys) -> None:
@@ -857,3 +900,383 @@ def test_a_seam_fault_leaves_started(workspace, monkeypatch, capsys) -> None:
     assert _read_check_runs(config) == []
     assert _coverage(config.telemetry_path) == {}
     _assert_started(_attempt(config.telemetry_path), entry)
+
+
+# =========================================================================== #
+# Phase 3b — the refused spend, and the unrecorded attempt
+# =========================================================================== #
+
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+
+class _FailingRefusalTelemetry:
+    """Delegates to a real store; only ``record_attempt_refusal`` raises ``exc``."""
+
+    def __init__(self, inner: TelemetryStore, exc: Exception) -> None:
+        self._inner = inner
+        self._exc = exc
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def record_attempt_refusal(self, refusal: AttemptRefusal) -> None:
+        raise self._exc
+
+
+def _refusal(**overrides: Any) -> AttemptRefusal:
+    base = dict(attempt_id="att-1", refused_at="2026-09-21T00:02:00.000000+00:00",
+                batches_planned=3)
+    base.update(overrides)
+    return AttemptRefusal(**base)
+
+
+def _unrecorded(cause: str) -> "cli._AttemptUnrecorded":
+    return cli._AttemptUnrecorded(cause)
+
+
+def _refusable_pair(config: MitosConfig, store: GraphStore, monkeypatch: Any) -> list:
+    """A pair planning one fresh group, a refusing threshold, both seams; returns ``invoked``."""
+    _a, _b, nbhds = _pair(store)
+    _drain_outbox(store)
+    _wire_substrate(monkeypatch, nbhds)
+    monkeypatch.setattr(check, "CHECK_CONFIRM_BATCHES", 0)
+    return _wire_judge(monkeypatch, None)
+
+
+# --------------------------------------------------------------------------- #
+# 1–3 — the refusal's boundary shape and round trip
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("overrides", [
+    {"attempt_id": ""}, {"refused_at": ""}, {"batches_planned": 0},
+    {"batches_planned": -1}, {"batches_planned": True}, {"batches_planned": "3"},
+], ids=["empty-id", "empty-time", "zero", "negative", "bool", "string"])
+def test_a_malformed_refusal_is_refused_before_any_connection(monkeypatch,
+                                                               overrides) -> None:
+    """Criterion 1: the shape refuses at construction, so nothing opens."""
+    opened = []
+    monkeypatch.setattr(telemetry, "open_connection",
+                        lambda *a, **k: opened.append(a) or pytest.fail("opened"))
+    with pytest.raises(ValueError, match="AttemptRefusal"):
+        _refusal(**overrides)
+    assert opened == []
+
+
+def test_a_refusal_round_trips_through_the_reader(tmp_path) -> None:
+    """Criterion 2: start → refusal → the reader returns exactly the refusal record."""
+    path = str(tmp_path / "telemetry.sqlite")
+    store = TelemetryStore(path)
+    start = _start(fingerprint="e" * 64)
+    store.record_attempt_start(start)
+    refusal = _refusal(attempt_id=start.attempt_id, batches_planned=4)
+
+    store.record_attempt_refusal(refusal)
+
+    assert read_last_attempt(path) == LastAttempt(
+        attempt_id=start.attempt_id, started_at=start.started_at,
+        fingerprint=start.fingerprint, state=ATTEMPT_SPEND_NOT_AUTHORIZED,
+        run_id=None, outcome_at=refusal.refused_at, degradation_tokens=None,
+        new_pairs=None, findings_known=None, batches_planned=4,
+    )
+
+
+def test_the_refusal_state_is_not_a_run_end_state() -> None:
+    """Criterion 3: the run-end seam can never write it (the refused-state row above)."""
+    assert ATTEMPT_SPEND_NOT_AUTHORIZED == "spend_not_authorized"
+    assert ATTEMPT_SPEND_NOT_AUTHORIZED not in ATTEMPT_RUN_END_STATES
+    with pytest.raises(ValueError, match="run-end state"):
+        _outcome(state=ATTEMPT_SPEND_NOT_AUTHORIZED)
+
+
+# --------------------------------------------------------------------------- #
+# 5–7 — who the refusal write reaches, and its faults
+# --------------------------------------------------------------------------- #
+
+def test_a_refusal_leaves_a_replaced_record_untouched(workspace, monkeypatch,
+                                                      capsys) -> None:
+    """Criterion 5: a newer attempt replaced the row before the refusal → it stays as is."""
+    config, store, tel = workspace
+    _refusable_pair(config, store, monkeypatch)
+    original = cli._confirm_spend
+
+    def _replacing_confirm(n: int, **kw: Any) -> Optional[int]:
+        # Strictly between the entry write and the refusal write.
+        TelemetryStore(config.telemetry_path).record_attempt_start(
+            _start(attempt_id="newer", fingerprint="n" * 64))
+        return original(n, **kw)
+
+    monkeypatch.setattr(cli, "_confirm_spend", _replacing_confirm)
+
+    code, _planned, _out, _err = _refuse(config, capsys, monkeypatch, "json")
+
+    assert code == 2
+    row = _attempt(config.telemetry_path)
+    assert row == {**dict.fromkeys(_ATTEMPT_COLUMNS), "slot": 1, "attempt_id": "newer",
+                   "started_at": _start().started_at, "fingerprint": "n" * 64,
+                   "state": ATTEMPT_STARTED}
+
+
+@pytest.mark.parametrize("scope, threshold", [("x", 0), ("", -1)],
+                         ids=["scope-x", "scope-empty"])
+def test_a_scoped_refusal_writes_nothing(workspace, monkeypatch, capsys, scope: str,
+                                         threshold: int) -> None:
+    """Criterion 6: a scoped refusal leaves a seeded record byte-identical, says no clause.
+
+    ``--scope ""`` matches no decision, so it plans no batch; a negative threshold
+    makes zero batches refuse, which is the only way to reach its refusal.
+    """
+    config, store, tel = workspace
+    a_axiom, b_axiom = "Scoped refusal axiom alpha.", "Scoped refusal axiom beta."
+    _commit(store, "scoped-a", a_axiom, scope=["x"])
+    _commit(store, "scoped-b", b_axiom, scope=["x"])
+    _drain_outbox(store)
+    _wire_substrate(monkeypatch, {a_axiom: [_match("scoped-b", 0.9)], b_axiom: []})
+    invoked = _wire_judge(monkeypatch, None)
+    monkeypatch.setattr(check, "CHECK_CONFIRM_BATCHES", threshold)
+    tel.record_attempt_start(_start(fingerprint="s" * 64))
+    tel.record_run_end(
+        _check_run_row("seeded-run"), coverage=None,
+        attempt=_outcome(run_id="seeded-run", new_pairs=(("p", "q"),),
+                         degradation_tokens=("judgment",),
+                         state=ATTEMPT_COULD_NOT_COMPLETE, findings_known=3))
+    _raw_attempt_update(config.telemetry_path,
+                        "UPDATE check_attempt SET batches_planned = ?", 9)
+    seeded = _attempt(config.telemetry_path)
+    assert all(v is not None for v in seeded.values())
+
+    for form in ("json", "text"):
+        code, _planned, out, err = _refuse(config, capsys, monkeypatch, form,
+                                           scope=scope)
+        assert code == 2 and invoked == []
+        assert _attempt(config.telemetry_path) == seeded
+        assert cli._ATTEMPT_ON_RECORD_CLAUSE not in out + err
+        if form == "json":
+            assert json.loads(out)["attempt_unrecorded"] is None
+
+
+@pytest.mark.parametrize("exc", [DatabaseError("provoked refusal-write fault"),
+                                 RuntimeError("a bug in the refusal write")],
+                         ids=["database-error", "runtime-error"])
+def test_a_refusal_write_fault_changes_nothing_the_caller_reads(workspace, monkeypatch,
+                                                                capsys, exc) -> None:
+    """Criterion 7: exit 2, one JSON object, the row stays ``started``; a bug warns once."""
+    config, store, tel = workspace
+    _refusable_pair(config, store, monkeypatch)
+    entry = _fingerprint(config)
+    faulted = _FailingRefusalTelemetry(TelemetryStore(config.telemetry_path), exc)
+    monkeypatch.setattr(cli, "_build_check_telemetry", lambda c: faulted)
+
+    code = cli.cmd_check(config, scope=None, fresh=False, assume_yes=False, as_json=True)
+    captured = capsys.readouterr()
+
+    assert code == 2
+    obj = json.loads(captured.out)  # the whole buffer is exactly one object
+    assert obj["code"] == "confirmation_required"
+    # The clause rests on the entry write, which landed.
+    assert cli._ATTEMPT_ON_RECORD_CLAUSE in obj["error"]
+    _assert_started(_attempt(config.telemetry_path), entry)
+    if isinstance(exc, DatabaseError):
+        assert captured.err == ""
+    else:
+        lines = captured.err.splitlines()
+        assert len(lines) == 1
+        assert lines[0].startswith("[Warning]") and "a bug in the refusal write" in lines[0]
+
+
+# --------------------------------------------------------------------------- #
+# 8–11 — the unrecorded attempt is said on every answer
+# --------------------------------------------------------------------------- #
+
+def test_every_unrecorded_cause_has_words_that_name_the_way_past() -> None:
+    """Criterion 8: the words map is closed over the causes; each message names the exit."""
+    assert cli._ATTEMPT_UNRECORDED_WORDS.keys() == set(cli._ATTEMPT_UNRECORDED_CAUSES)
+    for cause in cli._ATTEMPT_UNRECORDED_CAUSES:
+        got = cli._attempt_unrecorded_json(_unrecorded(cause))
+        assert got["cause"] == cause
+        assert cli._ATTEMPT_UNRECORDED_WORDS[cause] in got["message"]
+        assert "git commit --no-verify" in got["message"]
+        assert cli._attempt_unrecorded_line(_unrecorded(cause)) == got["message"]
+    for attempt in (None, cli._AttemptOnRecord("att-1")):
+        assert cli._attempt_unrecorded_json(attempt) is None
+        assert cli._attempt_unrecorded_line(attempt) is None
+
+
+def _telemetry_none_run(config: MitosConfig, store: GraphStore, monkeypatch: Any,
+                        as_json: bool, capsys: Any) -> Tuple[int, str, str]:
+    """A completed run over no telemetry: the entry write is ``telemetry_unavailable``."""
+    _a, _b, nbhds = _pair(store)
+    _drain_outbox(store)
+    embed, vector = _wire_substrate(monkeypatch, nbhds)
+    _wire_judge(monkeypatch, _judge_for(store, embed, vector, None))
+    monkeypatch.setattr(cli, "_build_check_telemetry", lambda c: None)
+    code = cli.cmd_check(config, scope=None, fresh=False, assume_yes=False,
+                         as_json=as_json)
+    captured = capsys.readouterr()
+    return code, captured.out, captured.err
+
+
+def test_the_report_says_an_unrecorded_attempt_after_the_history_note(
+        workspace, monkeypatch, capsys) -> None:
+    """Criterion 9 (text): the disclosure is the line right after the check-history note."""
+    config, store, _tel = workspace
+    code, out, _err = _telemetry_none_run(config, store, monkeypatch, False, capsys)
+
+    assert code == 2
+    lines = out.splitlines()
+    (note_at,) = [i for i, line in enumerate(lines)
+                  if "not recorded to check history" in line]
+    expected = cli._attempt_unrecorded_line(_unrecorded("telemetry_unavailable"))
+    assert lines[note_at + 1].strip() == expected
+
+
+def test_the_json_carries_an_unrecorded_attempt_beside_the_row_flag(
+        workspace, monkeypatch, capsys) -> None:
+    """Criterion 9 (``--json``): the key names the cause; its message is the text line."""
+    config, store, _tel = workspace
+    code, out, _err = _telemetry_none_run(config, store, monkeypatch, True, capsys)
+
+    assert code == 2
+    obj = json.loads(out)
+    assert obj["summary_row_written"] is False
+    assert obj["attempt_unrecorded"] == cli._attempt_unrecorded_json(
+        _unrecorded("telemetry_unavailable"))
+
+
+@pytest.mark.parametrize("as_json", [False, True], ids=["text", "json"])
+def test_substrate_unavailable_says_an_unrecorded_attempt(workspace, monkeypatch,
+                                                          capsys, as_json) -> None:
+    """Criterion 10: no embedding provider, no telemetry → the exit carries the disclosure."""
+    config, store, _tel = workspace
+    _pair(store)
+    _drain_outbox(store)
+    monkeypatch.setattr(cli, "_build_check_telemetry", lambda c: None)
+    expected = cli._attempt_unrecorded_json(_unrecorded("telemetry_unavailable"))
+
+    code = cli.cmd_check(config, scope=None, fresh=False, assume_yes=False,
+                         as_json=as_json)
+    captured = capsys.readouterr()
+
+    assert code == 2
+    if as_json:
+        obj = json.loads(captured.out)
+        assert obj["code"] == "substrate_unavailable"
+        assert obj["attempt_unrecorded"] == expected
+    else:
+        lines = captured.err.splitlines()
+        assert lines[-2].startswith("check could not run: cannot audit")
+        assert lines[-1] == expected["message"]
+
+
+@pytest.mark.parametrize("form", ["text", "json", "tty"])
+def test_a_refusal_says_an_unrecorded_attempt_instead_of_the_clause(
+        workspace, monkeypatch, capsys, form) -> None:
+    """Criterion 10: a refusal over no telemetry swaps the on-record clause for the disclosure."""
+    config, store, _tel = workspace
+    invoked = _refusable_pair(config, store, monkeypatch)
+    monkeypatch.setattr(cli, "_build_check_telemetry", lambda c: None)
+    expected = cli._attempt_unrecorded_json(_unrecorded("telemetry_unavailable"))
+
+    code, _planned, out, err = _refuse(config, capsys, monkeypatch, form)
+
+    assert code == 2 and invoked == []
+    assert cli._ATTEMPT_ON_RECORD_CLAUSE not in out + err
+    if form == "json":
+        assert json.loads(out)["attempt_unrecorded"] == expected
+    elif form == "text":
+        assert err.splitlines()[-1] == expected["message"]
+    else:
+        lines = out.splitlines()
+        assert lines[-2] == "Aborted — nothing spent."
+        assert lines[-1] == expected["message"]
+
+
+@pytest.mark.parametrize("as_json", [False, True], ids=["text", "json"])
+def test_check_faulted_says_an_unrecorded_attempt(workspace, monkeypatch, capsys,
+                                                  as_json) -> None:
+    """Criterion 10: a store fault after an entry write that failed → the disclosure."""
+    config, store, tel = workspace
+    _a, _b, nbhds = _pair(store)
+    _drain_outbox(store)
+    _wire_substrate(monkeypatch, nbhds)
+    _wire_judge(monkeypatch, None)
+    monkeypatch.setattr(cli, "GraphStore", lambda path: _FaultStore(GraphStore(path)))
+    faulted = _FailingStartTelemetry(TelemetryStore(config.telemetry_path),
+                                     DatabaseError("provoked entry-write fault"))
+    monkeypatch.setattr(cli, "_build_check_telemetry", lambda c: faulted)
+    expected = cli._attempt_unrecorded_json(_unrecorded("write_failed"))
+
+    code = cli.cmd_check(config, scope=None, fresh=False, assume_yes=False,
+                         as_json=as_json)
+    captured = capsys.readouterr()
+
+    assert code == 2
+    if as_json:
+        obj = json.loads(captured.out)
+        assert obj["code"] == "check_faulted"
+        assert obj["attempt_unrecorded"] == expected
+    else:
+        lines = captured.err.splitlines()
+        assert lines[-2].startswith("check could not run:")
+        assert lines[-1] == expected["message"]
+
+
+def test_an_entry_write_fault_is_named_on_json(workspace, monkeypatch, capsys) -> None:
+    """Criterion 10: the silent entry-write fault of 3a's row 14 now carries the key."""
+    config, store, tel = workspace
+    _a, _b, nbhds = _pair(store)
+    _drain_outbox(store)
+    embed, vector = _wire_substrate(monkeypatch, nbhds)
+    _wire_judge(monkeypatch, _judge_for(store, embed, vector, tel))
+    faulted = _FailingStartTelemetry(tel, DatabaseError("provoked entry-write fault"))
+    monkeypatch.setattr(cli, "_build_check_telemetry", lambda config: faulted)
+
+    code, obj = _run(config, capsys)
+
+    assert code == 0
+    assert obj["attempt_unrecorded"]["cause"] == "write_failed"
+
+
+def test_clean_and_scoped_runs_carry_null_and_say_nothing(workspace, monkeypatch,
+                                                          capsys) -> None:
+    """Criterion 11: an entry write that landed, and a scoped run, disclose nothing."""
+    config, store, tel = workspace
+    _a, _b, nbhds = _pair(store)
+    _drain_outbox(store)
+    embed, vector = _wire_substrate(monkeypatch, nbhds)
+
+    for scope in (None, "no-such-tag"):
+        _wire_judge(monkeypatch, _judge_for(store, embed, vector, tel))
+        code, obj = _run(config, capsys, scope=scope)
+        assert code == 0 and obj["attempt_unrecorded"] is None
+
+        _wire_judge(monkeypatch, _judge_for(store, embed, vector, tel))
+        code = cli.cmd_check(config, scope=scope, fresh=False, assume_yes=False,
+                             as_json=False)
+        captured = capsys.readouterr()
+        assert code == 0
+        assert "was not recorded" not in captured.out + captured.err
+
+
+@pytest.mark.parametrize("as_json", [False, True], ids=["text", "json"])
+def test_a_graph_that_cannot_open_made_no_attempt(workspace, monkeypatch, capsys,
+                                                  as_json) -> None:
+    """Criterion 11: ``GraphStore`` raising is no attempt at all → null, no line."""
+    config, _store, _tel = workspace
+
+    def _raising(path: str) -> Any:
+        raise DatabaseError("provoked graph-open fault")
+
+    monkeypatch.setattr(cli, "GraphStore", _raising)
+
+    code = cli.cmd_check(config, scope=None, fresh=False, assume_yes=False,
+                         as_json=as_json)
+    captured = capsys.readouterr()
+
+    assert code == 2
+    if as_json:
+        obj = json.loads(captured.out)
+        assert obj["code"] == "check_faulted" and obj["attempt_unrecorded"] is None
+    else:
+        assert "was not recorded" not in captured.err
+        assert captured.err.splitlines()[-1].startswith("check could not run:")

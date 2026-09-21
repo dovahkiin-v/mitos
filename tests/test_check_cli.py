@@ -11,7 +11,9 @@ with keyed fakes for the external substrate. The load-bearing surface under test
 * the no-row-on-refusal/pre-execute rule (KD4) and the run-end seam order (KD5) —
   a completed run leaves exactly one ``check_runs`` row whose ``exit_code`` equals
   the process exit; a refused/failed-before-execute run leaves none;
-* the machine-stable ``--json`` object (§8/KD7), through ``_emit_json`` only.
+* the machine-stable ``--json`` object (§8/KD7), through ``_emit_json`` only;
+* (AX Hardening 3, phase 3b) the refusal's person-naming words, ``--staged``'s help,
+  and every report recipe proven through the real parser.
 
 Discipline (PATTERNS + the 2c/2d suites): hand-rolled synchronous fakes, real temp
 stores seeded via ``commit_parsed_entry`` (every commit auto-enqueues an Outbox row —
@@ -22,6 +24,8 @@ keys. Run under ``./venv/bin/python -m pytest``.
 
 import json
 import os
+import re
+import shlex
 import shutil
 import sqlite3
 import tempfile
@@ -32,7 +36,7 @@ import pytest
 from mitos import __version__, check, cli
 from mitos.config import MitosConfig
 from mitos.conflict import CONFLICT_PROMPT_VERSION
-from mitos.errors import DatabaseError, MitosError
+from mitos.errors import CollectionMissingError, DatabaseError, MitosError
 from mitos.store import GraphStore, open_connection
 from mitos.telemetry import TelemetryStore
 
@@ -595,3 +599,156 @@ def test_keyless_reuse_only_exits_0(workspace, monkeypatch, capsys):
     assert code == 0  # the reused prior was tenable → silence, not a finding
     assert invoked == []  # no fresh groups → no client (no ANTHROPIC key needed)
     assert len(_read_check_runs(config)) == 1
+
+
+# --------------------------------------------------------------------------- #
+# AX Hardening 3, phase 3b — the check's own words (criteria 13–16)
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("as_json", [False, True], ids=["non-tty", "json"])
+def test_the_corpus_refusal_names_a_person_and_not_the_flag(workspace, monkeypatch,
+                                                            capsys, as_json) -> None:
+    """Criterion 13 (corpus): no ``--yes``, a person authorizes; code and count unchanged.
+
+    The ``--staged`` twin lives beside its refusal fixture in ``test_check_staged.py``.
+    """
+    config, store, _telemetry = workspace
+    _a, _b, nbhds = _pair(store)
+    _drain_outbox(store)
+    _wire_substrate(monkeypatch, nbhds)
+    invoked = _wire_judge(monkeypatch, None)
+    monkeypatch.setattr(check, "CHECK_CONFIRM_BATCHES", 0)
+    monkeypatch.setattr("sys.stdin", _FakeStdin(tty=False))
+
+    code = cli.cmd_check(config, scope=None, fresh=False, assume_yes=False,
+                         as_json=as_json)
+    captured = capsys.readouterr()
+
+    assert code == 2 and invoked == []
+    if as_json:
+        obj = json.loads(captured.out)
+        assert obj["code"] == "confirmation_required" and obj["batches_planned"] == 1
+        said = obj["error"]
+    else:
+        said = captured.err
+    assert "--yes" not in said
+    assert "a person's authorization" in said and "nothing was spent" in said
+
+
+def test_the_interactive_prompt_is_unchanged(workspace, monkeypatch, capsys) -> None:
+    """Criterion 13: the TTY prompt and its decline keep their shipped words."""
+    config, store, _telemetry = workspace
+    _a, _b, nbhds = _pair(store)
+    _drain_outbox(store)
+    _wire_substrate(monkeypatch, nbhds)
+    _wire_judge(monkeypatch, None)
+    monkeypatch.setattr(check, "CHECK_CONFIRM_BATCHES", 0)
+    monkeypatch.setattr("sys.stdin", _FakeStdin(tty=True))
+    prompts: List[str] = []
+    monkeypatch.setattr("builtins.input", lambda prompt="": prompts.append(prompt) or "n")
+
+    code = cli.cmd_check(config, scope=None, fresh=False, assume_yes=False, as_json=False)
+
+    assert code == 2
+    assert prompts == ["Proceed with the spend? [y/N] "]
+    assert "Aborted — nothing spent." in capsys.readouterr().out
+
+
+def test_staged_help_says_what_it_gates() -> None:
+    """Criterion 14: ``--staged``'s help drops the hook claim and names pending entries.
+
+    Read from the action, not ``format_help()``: the rendered help wraps at a width
+    the shell and pytest do not share.
+    """
+    from test_cli_selector import _subparsers
+    (action,) = [a for a in _subparsers(cli._build_parser())["check"]._actions
+                 if a.dest == "staged"]
+    assert "pre-commit" not in action.help
+    assert "PENDING" in action.help and "hand-authored" in action.help
+    assert "hook-run" not in action.help
+
+
+def _recipe(out: str, marker: str) -> str:
+    """The backticked ``mitos`` recipe on the one report line carrying ``marker``."""
+    (line,) = [line for line in out.splitlines() if marker in line]
+    return re.search(r"`(mitos [^`]*)`", line).group(1)
+
+
+def _assert_parses(recipe: str, command: str, project: str) -> None:
+    args = cli._build_parser().parse_args(shlex.split(recipe)[1:])
+    assert args.command == command
+    assert args.project_post == project
+
+
+@pytest.fixture(params=[None, "my proj"], ids=["path", "name-with-space"])
+def recipe_workspace(request) -> Tuple[MitosConfig, GraphStore, TelemetryStore]:
+    """The ``workspace`` shape, once as a path and once under a name with a space."""
+    tmpdir = tempfile.mkdtemp()
+    config = MitosConfig(tmpdir, project=request.param)
+    yield config, GraphStore(config.db_path), TelemetryStore(config.telemetry_path)
+    shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_the_collection_missing_recipe_parses(recipe_workspace, monkeypatch,
+                                              capsys) -> None:
+    """Criterion 15: the missing-collection words carry a reconcile recipe that parses."""
+    config, store, _telemetry = recipe_workspace
+    axiom = "Recipe row axiom for a missing collection."
+    _commit(store, "recipe-missing", axiom)
+    _drain_outbox(store)
+    embed, vector = _keyed_substrate({axiom: []}, vector_raises={axiom: (
+        CollectionMissingError("Qdrant collection 'mitos-x' does not exist",
+                               collection="mitos-x"))})
+    monkeypatch.setattr(cli, "_build_check_substrate", lambda c: (embed, vector, None))
+    _wire_judge(monkeypatch, None)
+
+    code = cli.cmd_check(config, scope=None, fresh=False, assume_yes=False, as_json=False)
+
+    assert code == 2
+    recipe = _recipe(capsys.readouterr().out, "the vector collection does not exist")
+    _assert_parses(recipe, "reconcile", config.project)
+
+
+def test_the_exclusions_recipe_parses(recipe_workspace, monkeypatch, capsys) -> None:
+    """Criterion 15: the coverage-exclusions retry recipe parses to a selectored sync."""
+    config, store, telemetry = recipe_workspace
+    a_id, _b_id, nbhds = _pair(store)
+    _drain_outbox(store)
+    _poison(store, a_id)
+    embed, vector = _wire_substrate(monkeypatch, nbhds)
+    _wire_judge(monkeypatch, _canned_for(store, embed, vector, telemetry,
+                                         tenable=True, confidence=0.9))
+
+    code = cli.cmd_check(config, scope=None, fresh=False, assume_yes=False, as_json=False)
+
+    assert code == 0
+    recipe = _recipe(capsys.readouterr().out, "to retry")
+    _assert_parses(recipe, "sync", config.project)
+
+
+def test_the_transient_recipe_parses(recipe_workspace, monkeypatch, capsys) -> None:
+    """Criterion 15: the transient-backlog recipe parses to a selectored sync."""
+    config, store, telemetry = recipe_workspace
+    _a, _b, nbhds = _pair(store)  # undrained: the commits sit in the outbox at retry 0
+    embed, vector = _wire_substrate(monkeypatch, nbhds)
+    _wire_judge(monkeypatch, _canned_for(store, embed, vector, telemetry,
+                                         tenable=True, confidence=0.9))
+
+    code = cli.cmd_check(config, scope=None, fresh=False, assume_yes=False, as_json=False)
+
+    assert code == 2
+    out = capsys.readouterr().out
+    recipe = _recipe(out, "behind the vector index")
+    _assert_parses(recipe, "sync", config.project)
+    # Criterion 16: the stale_index words say what is queued and carry no recipe of
+    # their own; the transient line above carries the one.
+    (partial,) = [line for line in out.splitlines() if line.startswith("[partial]")]
+    assert "embeddings are queued" in partial and "drain on sync" in partial
+    assert "`" not in partial
+
+
+def test_stale_index_words_carry_no_recipe() -> None:
+    """Criterion 16, at the renderer: queued embeddings, drained by sync, no backticks."""
+    words = cli._check_degradation_summary(("stale_index",), project="p")
+    assert "embeddings are queued" in words and "drain on sync" in words
+    assert "`" not in words

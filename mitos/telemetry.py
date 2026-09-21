@@ -41,8 +41,9 @@ constructor does both).
 
 ``check_attempt`` holds one row: the newest unscoped corpus check attempt, written
 ``started`` at entry (``record_attempt_start``) and given its outcome at the run-end
-seam, in that seam's transaction. Its reader is the module-level
-``read_last_attempt``.
+seam, in that seam's transaction, or ``spend_not_authorized`` and its planned batch
+count when the spend is refused (``record_attempt_refusal``). Its reader is the
+module-level ``read_last_attempt``.
 
 A corpus-check batch that fails leaves an append-only ``failed_judgment_batches``
 row (``record_failed_batch``), written at the failure site rather than at the
@@ -882,8 +883,11 @@ def _failed_judgment_batches_schema(conn: sqlite3.Connection) -> None:
 # uncovered set last changed? ``check_runs`` cannot answer it. Most
 # could-not-run exits write no row there, and a row written at entry would carry a
 # made-up exit code. So ``cmd_check`` writes this table twice: ``started`` at entry,
-# before the substrate is built, and the outcome at the run-end seam, inside that
-# seam's one transaction.
+# before the substrate is built, and then either the outcome at the run-end seam,
+# inside that seam's one transaction, or a refused spend's ``spend_not_authorized``
+# at the refusal site. On a refusal ``outcome_at`` is the refusal's own time and
+# ``run_id`` stays NULL (the DDL comments below predate the refusal and stay as
+# committed, because ``sqlite_master`` keeps the text).
 #
 # Newest-only by shape: ``slot`` is the primary key and may only be 1, and each
 # entry write replaces the row whole, so a column added later can never carry a
@@ -1125,12 +1129,16 @@ class CoverageMarks:
 # state, named for what is known: the record is read from the moment it is written,
 # and a check that is still running has not failed to finish (ADR
 # ``check-attempt-entry-state-is-started-and-later-writes-land-only-on-their-own-record``).
-# The other three are the run-end outcomes. A state read back that is none of these
-# is a newer build's, and the reader returns it as-is.
+# The next three are the run-end outcomes. ``spend_not_authorized`` is written only
+# by the corpus spend-refusal site (``record_attempt_refusal``), with the planned
+# batch count: the check stopped before it spent, which is not a run end. Readers
+# match states by these constants and never re-spell the strings. A state read back
+# that is none of these is a newer build's, and the reader returns it as-is.
 ATTEMPT_STARTED = "started"
 ATTEMPT_NO_NEW_FINDINGS = "no_new_findings"
 ATTEMPT_NEW_FINDINGS = "new_findings"
 ATTEMPT_COULD_NOT_COMPLETE = "could_not_complete"
+ATTEMPT_SPEND_NOT_AUTHORIZED = "spend_not_authorized"
 
 # The states the run-end seam may write. ``started`` is not one of them.
 ATTEMPT_RUN_END_STATES: Tuple[str, ...] = (
@@ -1156,6 +1164,14 @@ _REPLACE_ATTEMPT_SQL = (
 _UPDATE_ATTEMPT_OUTCOME_SQL = (
     "UPDATE check_attempt SET state = ?, run_id = ?, outcome_at = ?, "
     "degradation_tokens = ?, new_pairs = ?, findings_known = ? "
+    "WHERE slot = 1 AND attempt_id = ?"
+)
+
+# The refusal write, on the same own-record rule. It names no ``run_id``: a refused
+# spend writes no ``check_runs`` row, so there is nothing to join to. The columns it
+# leaves alone stay as the entry replace wrote them.
+_UPDATE_ATTEMPT_REFUSAL_SQL = (
+    "UPDATE check_attempt SET state = ?, outcome_at = ?, batches_planned = ? "
     "WHERE slot = 1 AND attempt_id = ?"
 )
 
@@ -1265,6 +1281,53 @@ class AttemptOutcome:
             json.dumps(list(self.degradation_tokens)),
             json.dumps([list(pair) for pair in self.new_pairs]),
             self.findings_known,
+            self.attempt_id,
+        )
+
+
+@dataclass(frozen=True)
+class AttemptRefusal:
+    """The refusal write of one attempt: the spend was not authorized.
+
+    A dumb boundary shape, checked at construction, before any connection opens.
+
+    Attributes:
+        attempt_id: The key the entry write used. The update matches on it.
+        refused_at: The refusal's own time (UTC ISO-8601, MI-10).
+        batches_planned: The judgment batches the refused spend would have run.
+    """
+
+    attempt_id: str
+    refused_at: str
+    batches_planned: int
+
+    def __post_init__(self) -> None:
+        """Rejects an empty key or time, and a batch count below one.
+
+        Raises:
+            ValueError: If ``attempt_id`` or ``refused_at`` is not a non-empty
+                string, or ``batches_planned`` is not an ``int`` of at least 1.
+        """
+        for name in ("attempt_id", "refused_at"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"AttemptRefusal.{name} must be a non-empty string")
+        count = self.batches_planned
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            raise ValueError(
+                f"AttemptRefusal.batches_planned must be an int of at least 1, got {count!r}"
+            )
+
+    def to_params(self) -> Tuple[str, str, int, str]:
+        """Produces the update's parameters, in ``_UPDATE_ATTEMPT_REFUSAL_SQL`` order.
+
+        Returns:
+            ``('spend_not_authorized', refused_at, batches_planned, attempt_id)``.
+        """
+        return (
+            ATTEMPT_SPEND_NOT_AUTHORIZED,
+            self.refused_at,
+            self.batches_planned,
             self.attempt_id,
         )
 
@@ -1715,6 +1778,28 @@ class TelemetryStore:
         finally:
             conn.close()
 
+    def record_attempt_refusal(self, refusal: AttemptRefusal) -> None:
+        """Marks this attempt's record ``spend_not_authorized`` with its batch count.
+
+        One fresh connection, one ``with conn:``, one ``UPDATE`` conditioned on the
+        attempt's own key: when a newer attempt has replaced the row, nothing
+        changes. Best-effort is the caller's call (``cli._record_spend_refusal``).
+
+        Args:
+            refusal: The attempt's key, the refusal time and the planned batches.
+
+        Raises:
+            DatabaseError: If the update cannot be persisted. Nothing lands.
+        """
+        conn = open_connection(self.telemetry_path)
+        try:
+            with conn:
+                conn.execute(_UPDATE_ATTEMPT_REFUSAL_SQL, refusal.to_params())
+        except sqlite3.Error as e:
+            raise DatabaseError(f"Failed to persist check refusal: {e}") from e
+        finally:
+            conn.close()
+
     def record_run_end(
         self,
         row: CheckRunRow,
@@ -1997,15 +2082,18 @@ class LastAttempt:
         attempt_id: The attempt's own key.
         started_at: When the attempt began (UTC ISO-8601).
         fingerprint: The uncovered-set fingerprint taken at entry.
-        state: ``started``, a run-end state, or a newer build's state.
-        run_id: The run's ``check_runs.run_id``; ``None`` while ``started``.
-        outcome_at: When the outcome landed; ``None`` while ``started``.
-        degradation_tokens: The run's degradation tokens; ``None`` while
+        state: ``started``, a run-end state, ``spend_not_authorized``, or a newer
+            build's state.
+        run_id: The run's ``check_runs.run_id``; ``None`` while ``started`` and
+            after a refused spend, which writes no run.
+        outcome_at: When the outcome or the refusal landed; ``None`` while
             ``started``.
+        degradation_tokens: The run's degradation tokens; ``None`` while
+            ``started`` and after a refused spend.
         new_pairs: ``(proposal_id, partner_id)`` of each new finding; ``None``
-            while ``started``.
-        findings_known: Known findings; ``None`` while ``started`` and when the
-            reuse index could not be read.
+            while ``started`` and after a refused spend.
+        findings_known: Known findings; ``None`` while ``started``, after a
+            refused spend, and when the reuse index could not be read.
         batches_planned: The planned batch count of a refused spend; ``None``
             otherwise.
     """

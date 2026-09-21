@@ -66,7 +66,9 @@ from mitos.restore import BufferFidelityError
 from mitos.env import resolve_key
 from mitos.vector_store import scroll_point_ids, hash_to_uuid, QdrantVectorStore
 from mitos.embeddings import GeminiEmbeddingProvider
-from mitos.telemetry import AttemptStart, TelemetryStore, ConflictCheckRow, JudgmentBatch
+from mitos.telemetry import (
+    AttemptRefusal, AttemptStart, TelemetryStore, ConflictCheckRow, JudgmentBatch,
+)
 from mitos.audit_debt import AuditDebt, derive_audit_debt
 from mitos.identity import compute_node_id
 from mitos.models import get_embedding_model_id, get_model_id
@@ -4663,7 +4665,31 @@ _CHECK_TOKENS_PER_BATCH_ESTIMATE = 3000
 _CHECK_MODIFIER_STAMP_KEYS: Tuple[str, ...] = tuple(MODIFIER_EDGE_KEYS.values())
 
 
-def _confirm_spend(n: int, *, assume_yes: bool, as_json: bool) -> Optional[int]:
+@dataclass(frozen=True)
+class _RefusalAddendum:
+    """What the corpus site adds to a spend refusal. Composed at that site only.
+
+    ``_confirm_spend`` prints and merges these and composes none of them, so the
+    words about the corpus check's attempt never reach ``--staged``.
+
+    Attributes:
+        line: Printed after the refusal, on the refusal's own text stream.
+        error_suffix: Appended, after one space, to the ``--json`` ``error`` sentence.
+        fields: Merged into the ``--json`` refusal object.
+    """
+
+    line: Optional[str]
+    error_suffix: Optional[str]
+    fields: Mapping[str, Any]
+
+
+def _confirm_spend(
+    n: int,
+    *,
+    assume_yes: bool,
+    as_json: bool,
+    addendum: Optional[_RefusalAddendum] = None,
+) -> Optional[int]:
     """The shared CHK-D5 spend confirm — corpus + staged (KD4).
 
     The single gate both ``check`` modes pass ``n`` (corpus: fresh judgment groups;
@@ -4673,36 +4699,52 @@ def _confirm_spend(n: int, *, assume_yes: bool, as_json: bool) -> Optional[int]:
     monkeypatch is seen); at/below the threshold or with ``assume_yes`` it returns
     ``None`` (proceed) without prompting. All three refusals return exit ``2``, zero
     spend: ``--json`` emits an error object (automation never prompts), a non-TTY
-    prints the vector message, an interactive decline prints "nothing spent".
+    prints the vector message, an interactive decline prints "nothing spent". The
+    two machine-facing forms name a person as the one who authorizes the spend and
+    never name the waiver flag: an agent reading them does not waive the spend on
+    its own (P15).
 
     Args:
         n: The disclosure unit — the count of pending judgment batches.
         assume_yes: Waive the confirm (the ``--yes`` opt-in).
         as_json: Automation surface — emit an error object instead of prompting.
+        addendum: The corpus site's additions to a refusal, or ``None``
+            (``--staged``). Printed or merged here, never composed here.
 
     Returns:
         A refusal exit code (``2``) when the spend is declined, or ``None`` to proceed.
     """
     if n <= check.CHECK_CONFIRM_BATCHES or assume_yes:
         return None
+    refused = (
+        f"{n} judgment batches pending — nothing was spent. A spend above "
+        f"{check.CHECK_CONFIRM_BATCHES} batches needs a person's authorization: "
+        f"they run this check at a terminal and confirm the prompt."
+    )
     if as_json:
         # Automation never prompts (a prompt would also corrupt the object).
+        error = refused
+        if addendum is not None and addendum.error_suffix:
+            error = f"{refused} {addendum.error_suffix}"
         _emit_json({
-            "error": (f"{n} judgment batches pending — re-run with --yes to "
-                      f"authorize the spend."),
+            "error": error,
             "code": "confirmation_required",
             "batches_planned": n,
+            **(addendum.fields if addendum is not None else {}),
         })
         return 2
     if not sys.stdin.isatty():
-        print(f"{n} judgment batches pending — re-run with --yes to authorize "
-              f"the spend.", file=sys.stderr)
+        print(refused, file=sys.stderr)
+        if addendum is not None and addendum.line:
+            print(addendum.line, file=sys.stderr)
         return 2
     estimate = n * _CHECK_TOKENS_PER_BATCH_ESTIMATE
     print(f"{n} judgment batches pending (≈{estimate:,} tokens) — this run "
           f"will call the judge model.")
     if input("Proceed with the spend? [y/N] ").strip().lower() not in ("y", "yes"):
         print("Aborted — nothing spent.")
+        if addendum is not None and addendum.line:
+            print(addendum.line)
         return 2
     return None
 
@@ -4770,7 +4812,8 @@ def _build_check_telemetry(config: MitosConfig) -> Optional[TelemetryStore]:
 
 
 # Why an unscoped corpus check's entry write left no attempt on record. Held by
-# ``cmd_check``; the report and ``--json`` word it in a later phase.
+# ``cmd_check``; ``_ATTEMPT_UNRECORDED_WORDS`` words each one for the report and
+# ``--json``.
 _ATTEMPT_UNRECORDED_CAUSES: Tuple[str, ...] = (
     "telemetry_unavailable",   # the telemetry store could not be constructed
     "fingerprint_unreadable",  # the uncovered set could not be derived
@@ -4798,6 +4841,130 @@ class _AttemptUnrecorded:
     """
 
     cause: str
+
+
+# One phrase per cause, closed over ``_ATTEMPT_UNRECORDED_CAUSES`` (a row pins the
+# keys equal).
+_ATTEMPT_UNRECORDED_WORDS: Dict[str, str] = {
+    "telemetry_unavailable": "telemetry.sqlite could not be opened",
+    "fingerprint_unreadable": "the set of uncovered decisions could not be read",
+    "write_failed": "the attempt could not be written to telemetry.sqlite",
+}
+
+# Said on an unscoped refusal whose entry write landed. Its truth rests on that
+# write, not on the refusal write after it: whatever state the record holds, it
+# carries this set's fingerprint, which is what the commit gate reads. The fact
+# leads, because a newer overlapping attempt can replace the record and make the
+# consequence overclaim.
+_ATTEMPT_ON_RECORD_CLAUSE = (
+    "This check attempt is on record, so a commit that mitos's commit gate "
+    "blocked will now pass."
+)
+
+
+def _attempt_unrecorded_message(attempt: object) -> Optional[str]:
+    """Composes the disclosure for an attempt that was not recorded, else ``None``.
+
+    The single source for the text line and the ``--json`` ``message``. The
+    consequence is conditional: where the gate cannot read telemetry either it
+    passes, and a project may have no gate installed, so "will block again" would
+    be false in those cases.
+
+    Args:
+        attempt: The run's attempt value (``None`` for a scoped run).
+
+    Returns:
+        The one-sentence disclosure, or ``None`` unless the attempt is unrecorded.
+    """
+    if not isinstance(attempt, _AttemptUnrecorded):
+        return None
+    return (
+        f"This check attempt was not recorded: "
+        f"{_ATTEMPT_UNRECORDED_WORDS[attempt.cause]}. mitos's commit gate cannot "
+        f"see it; if the gate blocks a commit, a check that also cannot record its "
+        f"attempt will not open it, and `git commit --no-verify` is the way past."
+    )
+
+
+def _attempt_unrecorded_json(attempt: object) -> Optional[Dict[str, str]]:
+    """Builds the ``attempt_unrecorded`` ``--json`` value.
+
+    Args:
+        attempt: The run's attempt value (``None`` for a scoped run).
+
+    Returns:
+        ``{"cause", "message"}`` for an unrecorded attempt, else ``None``.
+    """
+    message = _attempt_unrecorded_message(attempt)
+    if message is None:
+        return None
+    return {"cause": attempt.cause, "message": message}
+
+
+def _attempt_unrecorded_line(attempt: object) -> Optional[str]:
+    """Builds the text twin of ``attempt_unrecorded``: the same sentence.
+
+    Args:
+        attempt: The run's attempt value (``None`` for a scoped run).
+
+    Returns:
+        The disclosure line, or ``None``.
+    """
+    return _attempt_unrecorded_message(attempt)
+
+
+def _refusal_addendum(attempt: object) -> _RefusalAddendum:
+    """Composes the corpus site's additions to a spend refusal.
+
+    On record: the on-record clause. Unrecorded: the disclosure. Scoped
+    (``None``): nothing but the ``attempt_unrecorded: null`` key.
+
+    Args:
+        attempt: The run's attempt value.
+
+    Returns:
+        The addendum ``_confirm_spend`` prints and merges.
+    """
+    fields = {"attempt_unrecorded": _attempt_unrecorded_json(attempt)}
+    if isinstance(attempt, _AttemptOnRecord):
+        return _RefusalAddendum(
+            line=_ATTEMPT_ON_RECORD_CLAUSE,
+            error_suffix=_ATTEMPT_ON_RECORD_CLAUSE,
+            fields=fields,
+        )
+    return _RefusalAddendum(
+        line=_attempt_unrecorded_line(attempt), error_suffix=None, fields=fields
+    )
+
+
+def _record_spend_refusal(
+    telemetry: Optional[TelemetryStore], attempt: object, batches_planned: int
+) -> None:
+    """Marks this attempt's record ``spend_not_authorized``. Never raises.
+
+    Only an attempt on record is written; a scoped or unrecorded run writes
+    nothing. It runs after the refusal has been emitted, so nothing may escape: a
+    fault the write path knows about is swallowed silently, and any other
+    exception prints one warning line on stderr (never stdout, which may already
+    hold the one ``--json`` object).
+
+    Args:
+        telemetry: The run's telemetry store, or ``None``.
+        attempt: The run's attempt value.
+        batches_planned: The batch count the refused spend would have judged.
+    """
+    if telemetry is None or not isinstance(attempt, _AttemptOnRecord):
+        return
+    try:
+        telemetry.record_attempt_refusal(AttemptRefusal(
+            attempt_id=attempt.attempt_id,
+            refused_at=datetime.now(timezone.utc).isoformat(),
+            batches_planned=batches_planned,
+        ))
+    except (sqlite3.Error, DatabaseError):
+        return
+    except Exception as e:
+        print(f"[Warning] Check refusal write failed: {str(e)}", file=sys.stderr)
 
 
 def _begin_check_attempt(
@@ -5075,6 +5242,7 @@ def _check_json_object(
     scope: Optional[str],
     fresh: bool,
     transient_count: int,
+    attempt_unrecorded: Optional[Dict[str, str]],
 ) -> Dict[str, Any]:
     """Assembles the single §8 ``--json`` object (a shipped API — additive only).
 
@@ -5118,6 +5286,8 @@ def _check_json_object(
         "coverage_exclusions": exclusions,
         "index_backlog_transient": transient_count,
         "summary_row_written": row_written,
+        # Always present: null unless this unscoped run's entry write failed.
+        "attempt_unrecorded": attempt_unrecorded,
     })
     return obj
 
@@ -5145,18 +5315,25 @@ def _print_full_finding(finding: "check.CheckFinding") -> None:
     print(f"        {finding.rationale}   (confidence {finding.confidence:.2f})")
 
 
-def _check_degradation_summary(degradations: Tuple[str, ...]) -> str:
+def _check_degradation_summary(degradations: Tuple[str, ...], *, project: str) -> str:
     """Renders the degradation tokens as calm human wording (KD4 — from tokens, never
-    by re-parsing ``degraded_reason``)."""
+    by re-parsing ``degraded_reason``). ``project`` goes into the one recipe here.
+
+    ``stale_index`` carries no recipe: the transient line, which always prints
+    beside it, carries the ``mitos sync`` one."""
     words = {
         "sweep": "the corpus sweep degraded mid-run",
         "judgment": "some judgment batches did not complete",
         "reuse_read": "prior-verdict history was unreadable (findings shown unpartitioned)",
         "telemetry_write": "some per-batch results could not be recorded",
-        "stale_index": "the vector index is behind (recall may be thinned)",
+        "stale_index": (
+            "embeddings are queued and not yet in the vector index (recall may be "
+            "thinned; they drain on sync)"
+        ),
         "probe_read": "completeness could not be certified (the index probe was unreadable)",
         "collection_missing": (
-            "the vector collection does not exist — run `mitos reconcile` to rebuild it"
+            f"the vector collection does not exist — run "
+            f"`mitos reconcile -p {project!r}` to rebuild it"
         ),
         "judgment_truncated": (
             "the judge's response was truncated (max_tokens exceeded)"
@@ -5174,6 +5351,8 @@ def _print_check_report(
     scope: Optional[str],
     row_written: bool,
     transient_count: int,
+    project: str,
+    attempt_unrecorded: Optional[str],
 ) -> None:
     """Renders the human report to stdout (findings + disposition), calm ASCII (P9).
 
@@ -5223,7 +5402,7 @@ def _print_check_report(
 
     if degradations:
         print(f"\n[partial] This check could not fully run "
-              f"({_check_degradation_summary(degradations)}).")
+              f"({_check_degradation_summary(degradations, project=project)}).")
         print(f"  Swept {result.nodes_swept} of {result.nodes_total} decisions; any "
               f"findings above are labeled partial, not certified complete.")
         # Coverage is a NUMBER whenever judgment fell short of the plan — a partial
@@ -5263,16 +5442,21 @@ def _print_check_report(
         print("  Note: this run was not recorded to check history "
               "(the summary row could not be written).")
 
+    # Its own line and its own fact: the check-history note above is about
+    # `check_runs`, this one is about the attempt record the commit gate reads.
+    if attempt_unrecorded is not None:
+        print(f"  {attempt_unrecorded}")
+
     if exclusions:
         print("\nCoverage exclusions (chronically un-embedded — NOT audited):")
         for item in exclusions:
             print(f"  - {handle_text(item)}")
         print("  These keep failing to embed; the durable fix is outbox quarantine "
-              "(substrate-owned). Re-run `mitos sync` to retry.")
+              f"(substrate-owned). Re-run `mitos sync -p {project!r}` to retry.")
 
     if transient_count:
         print(f"\n{transient_count} decision(s) are behind the vector index — recall "
-              f"may be thinned. Run `mitos sync` to catch up.")
+              f"may be thinned. Run `mitos sync -p {project!r}` to catch up.")
 
     if not result.findings and not degradations:
         if scope is not None and result.nodes_total == 0:
@@ -5300,7 +5484,8 @@ def cmd_check(
     The one sequence (each step's contract in the phase plan §4): open the graph →
     build telemetry → the attempt's ``started`` entry write (unscoped only) → build
     substrate → provider-absent disposition (KD2) → ``plan_corpus_check`` → CHK-D5
-    confirm (KD3) → build judge iff fresh groups (KD6) → ``execute_corpus_check`` →
+    confirm (KD3; a refusal marks the attempt ``spend_not_authorized``) → build
+    judge iff fresh groups (KD6) → ``execute_corpus_check`` →
     build the full display model → the run-end seam (``exit_code_for`` → row +
     coverage marks + attempt outcome → ``record_run_end`` LAST, one transaction,
     KD5) → emit. ``cmd_check`` owns its
@@ -5309,8 +5494,8 @@ def cmd_check(
 
     Args:
         config: The active workspace config.
-        staged: Gate the pending buffer instead of sweeping the live corpus (the
-            pre-commit / CI gate mode — a self-contained sequence, Phase 3b).
+        staged: Judge the entries still pending in ``decisions.md`` instead of
+            sweeping the live corpus (a self-contained sequence, Phase 3b).
         scope: Optional scope tag filtering the audited (proposal) set (candidate
             recall stays scope-blind, CONF-D2).
         fresh: Re-judge every pair, bypassing verdict reuse (never the novelty read).
@@ -5347,6 +5532,10 @@ def cmd_check(
     # `conflict_judgment` module-scope would drag `anthropic` onto every other verb.
     from mitos.conflict_judgment import _JUDGMENT_MODEL_ALIAS
 
+    # Bound before the try: the check_faulted arm reads it. It stays None when
+    # GraphStore raises (no attempt was made), which is not _AttemptUnrecorded
+    # (an attempt was made and not recorded).
+    attempt: "_AttemptOnRecord | _AttemptUnrecorded | None" = None
     try:
         # GraphStore first: it migrates the graph, and the entry write's derive
         # opens the graph read-only, so a fingerprint taken before a graph
@@ -5379,10 +5568,14 @@ def cmd_check(
                        f"decision(s) — embeddings ({embed_detail}) unavailable.")
                 if as_json:
                     _emit_json({"error": msg, "code": "substrate_unavailable",
+                                "attempt_unrecorded": _attempt_unrecorded_json(attempt),
                                 **corpus_provenance(config)})
                 else:
                     _echo_corpus(config, file=sys.stderr)
                     print(msg, file=sys.stderr)
+                    unrecorded = _attempt_unrecorded_line(attempt)
+                    if unrecorded is not None:
+                        print(unrecorded, file=sys.stderr)
                 return 2
             # Empty snapshot → the providers are never touched (iter_sweep is lazy
             # over zero nodes); fall through to the one healthy-empty engine path.
@@ -5398,12 +5591,19 @@ def cmd_check(
         )
 
         # CHK-D5 confirm (KD3) — strictly above the threshold; all refusals exit 2,
-        # zero spend, no row. The shared `_confirm_spend` helper (KD4) is byte-identical
-        # for corpus and staged, so the `>` comparison can never fork between the modes.
+        # zero spend, no check_runs row. The shared `_confirm_spend` helper (KD4) is
+        # byte-identical for corpus and staged, so the `>` comparison can never fork
+        # between the modes. The corpus words ride the addendum, composed here. A
+        # refusal then marks this attempt's record `spend_not_authorized` with the
+        # planned batch count (after the emission: the words rest on the entry
+        # write, not on this one, and it never raises).
+        batches_planned = len(plan.fresh_groups)
         refusal = _confirm_spend(
-            len(plan.fresh_groups), assume_yes=assume_yes, as_json=as_json
+            batches_planned, assume_yes=assume_yes, as_json=as_json,
+            addendum=_refusal_addendum(attempt),
         )
         if refusal is not None:
+            _record_spend_refusal(telemetry, attempt, batches_planned)
             return refusal
 
         # Build the judge only after the confirm passes and only when there is fresh
@@ -5458,10 +5658,14 @@ def cmd_check(
         msg = f"check could not run: {exc}"
         if as_json:
             _emit_json({"error": msg, "code": "check_faulted",
+                        "attempt_unrecorded": _attempt_unrecorded_json(attempt),
                         **corpus_provenance(config)})
         else:
             _echo_corpus(config, file=sys.stderr)
             print(msg, file=sys.stderr)
+            unrecorded = _attempt_unrecorded_line(attempt)
+            if unrecorded is not None:
+                print(unrecorded, file=sys.stderr)
         return 2
 
     # Emission is pure (out of the write contract): one JSON object or the report.
@@ -5475,6 +5679,7 @@ def cmd_check(
             exit_code=exit_code,
             row_written=row_written, scope=scope, fresh=fresh,
             transient_count=transient_count,
+            attempt_unrecorded=_attempt_unrecorded_json(attempt),
         ), **corpus_provenance(config)})
     else:
         _echo_corpus(config)
@@ -5482,12 +5687,14 @@ def cmd_check(
             result, exclusions=exclusions, failed_batches=failed_batches,
             denominator=denominator, scope=scope,
             row_written=row_written, transient_count=transient_count,
+            project=config.project,
+            attempt_unrecorded=_attempt_unrecorded_line(attempt),
         )
     return exit_code
 
 
 # =========================================================================== #
-# Phase 3b — `mitos check --staged`: the pre-commit / CI gate mode.
+# Phase 3b — `mitos check --staged`: the pending-buffer gate mode.
 #
 # The proactive half of the `check` verb: it gates the PENDING (not-yet-committed)
 # decision entries of the working-tree `decisions.md` and fails CLOSED — a pending
@@ -6840,10 +7047,12 @@ def _build_parser() -> argparse.ArgumentParser:
     check_p.add_argument("--json", action="store_true", dest="as_json",
                          help="Emit one machine-readable JSON object (never prompts).")
     check_p.add_argument("--staged", action="store_true",
-                         help="Gate the PENDING buffer of decisions.md (the pre-commit / "
-                              "CI gate) instead of sweeping the live corpus. Fails closed: "
-                              "exit 2 when it cannot run. Not git's staging — reads the "
-                              "working-tree decisions.md. Rejects --scope/--fresh.")
+                         help="Judge the entries still PENDING in decisions.md — "
+                              "hand-authored and not yet synced — instead of sweeping the "
+                              "live corpus. Decisions recorded through record_decision are "
+                              "already in the graph, so they are not what it sees. Fails "
+                              "closed: exit 2 when it cannot run. Not git's staging — reads "
+                              "the working-tree decisions.md. Rejects --scope/--fresh.")
 
     # restore-source — re-materialize a graph-only node's `### slug` block.
     rs_p = subparsers.add_parser(
