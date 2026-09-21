@@ -36,7 +36,7 @@ from mitos.restore import BufferFidelityError
 from mitos.recall import (assess_query_recall, assess_surface_recall,
                           corpus_provenance, missing_graph_is_a_gap,
                           missing_graph_note, missing_index_is_a_gap,
-                          scope_filter_recovery)
+                          scope_filter_recovery, count_withheld, withheld_clause)
 
 # Create FastMCP server instance
 mcp = FastMCP("Mitos")
@@ -50,8 +50,8 @@ mcp = FastMCP("Mitos")
 # exactly the field it needed, with no way to tell it was being short-changed. No
 # connection/session key is fully correct either (a bare `/clear` keeps the connection
 # while resetting the agent's context), so the only correct shape is to hold no
-# cross-call state at all. A caller who wants a lightweight scan passes `brief=True` —
-# explicit, per-call, stateless. (V5 owns the rebuilt MCP server; carry this forward.)
+# cross-call state at all. A caller who wants a lightweight scan passes `brief=True`
+# (or `full_top=N` to keep the top N whole) — explicit, per-call, stateless. (V5 owns the rebuilt MCP server; carry this forward.)
 
 
 def _attach_modifiers(payload: Dict[str, Any], node: Dict[str, Any], store: GraphStore) -> Dict[str, Any]:
@@ -582,8 +582,8 @@ def get_workspace_components(config: MitosConfig) -> Tuple[GraphStore, Optional[
 
 
 def _lexical_degraded_response(query: str, *, config: MitosConfig, reason: str,
-                               store: Optional[GraphStore], brief: bool,
-                               limit: int,
+                               store: Optional[GraphStore],
+                               full_top: Optional[int], limit: int,
                                open_questions: Optional[List[Dict[str, Any]]] = None,
                                check_notice: Optional[Dict[str, Any]] = None) -> str:
     """Builds the degraded lexical-fallback JSON for the MCP read tools.
@@ -606,7 +606,9 @@ def _lexical_degraded_response(query: str, *, config: MitosConfig, reason: str,
         reason: One-line cause phrase (see ``degraded_reason_from_error``).
         store: A readable graph store for active-filtering + modifier stamps,
             or None when the graph itself is down (pre-V1a).
-        brief: Omit ``rejected_paths`` from each match.
+        full_top: How many top matches keep ``rejected_paths`` (None ⇒ all, 0 ⇒
+            none — the tool's ``brief``). A thinned answer says so by
+            ``rejected_paths_withheld`` and a note clause.
         limit: Max matches to return.
         open_questions: An already-computed scoped parked-OQ list to carry on
             the envelope (present-if-scanned semantics — None means omitted).
@@ -618,10 +620,16 @@ def _lexical_degraded_response(query: str, *, config: MitosConfig, reason: str,
     """
     envelope = lexical_fallback(
         query, corpus_paths=_corpus_files(config), reason=reason, store=store,
-        limit=limit, brief=brief,
+        limit=limit, full_top=full_top,
     )
     envelope["query"] = query
     envelope.update(corpus_provenance(config))
+    withheld = count_withheld(envelope["matches"])
+    if withheld:
+        envelope["note"] = (
+            f"{envelope['note']} {withheld_clause(withheld, surface='mcp', config=config)}"
+        )
+        envelope["rejected_paths_withheld"] = withheld
     if open_questions is not None:
         envelope["open_questions"] = open_questions
     if check_notice is not None:
@@ -655,9 +663,36 @@ def _oq_payload(oq: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
+def _full_top_fault(brief: bool, full_top: Optional[int]) -> Optional[str]:
+    """Answers the ranked reads' depth-argument fault, or None when there is none.
+
+    The bare read-tool refusal ``list_decisions`` gives ``brief and oneline``: an
+    argument fault, answered before any project is resolved, with no provenance.
+
+    Args:
+        brief: The call's ``brief``.
+        full_top: The call's ``full_top``.
+
+    Returns:
+        The refusal as a JSON string, or None when the pair is valid.
+    """
+    if brief and full_top is not None:
+        msg = "brief and full_top are mutually exclusive — brief is full_top=0; pass one."
+    elif full_top is not None and full_top < 0:
+        msg = "full_top must be 0 or more: the number of top ranks that keep rejected_paths."
+    else:
+        return None
+    return dumps_display({"error": msg}, ensure_ascii=False, indent=None)
+
+
+def _rank_thinned(rank: int, full_top: Optional[int]) -> bool:
+    """Says whether the hit at 1-based ``rank`` among returned decisions is thinned."""
+    return full_top is not None and rank > full_top
+
+
 @mcp.tool()
 def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = False, limit: int = 5,
-                      project: Optional[str] = None) -> str:
+                      project: Optional[str] = None, full_top: Optional[int] = None) -> str:
     """Surface active precedents for a CLAIM before you decide — the recall loop, use first.
 
     The broad "is there a settled decision near this?" scan: a ranked, capped (top
@@ -666,7 +701,7 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
     look up a SPECIFIC slug or claim (its band rates that ranking, not the corpus),
     and list_decisions for the EXHAUSTIVE set in a scope. Every hit carries its full
     `rejected_paths` — why alternatives were ruled out, the field that actually
-    stops relitigation — unless you pass `brief=True`. Closing the loop: after you
+    stops relitigation — unless you pass `brief=True` or `full_top`. Closing the loop: after you
     decide, `record_decision` the outcome so the next agent inherits it instead of
     relitigating.
 
@@ -683,16 +718,21 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
             recall `note` (incl. the "unused tag → valid scopes" redirect). For
             scope-RESTRICTED retrieval use list_decisions(scope=...) — the only
             surface that hard-filters by scope.
-        brief: If True, omit `rejected_paths` from every result (axiom-only — a quick
-            "is there anything nearby?" scan). Default False keeps the full reasoning.
+        brief: An existence screen — "is there anything nearby?" — after which you
+            dereference the hits that matter by slug (show_node). If True, every
+            result is axiom-only (no `rejected_paths`). Default False keeps the full
+            reasoning.
         limit: Ranked top-k to retrieve (default 5; clamped to 1–50). Raise it to dig
             deeper, lower it to save context — a context-budget dial, not a cap at 5.
+        full_top: Keep `rejected_paths` on ranks 1..N only; lower ranks are
+            axiom-only. Default: every rank whole. `full_top=0` is `brief=True`;
+            passing both is refused.
 
     Returns:
         A JSON string with `active_decisions` (ranked, Letter-mode), plus
         `open_questions` ONLY when a scope was given (absent = not scanned, [] = none
         parked in that scope). Each decision: slug, axiom, scope, score, and
-        rejected_paths unless brief. A precedent a later decision has moved on from
+        rejected_paths unless brief or full_top. A precedent a later decision has moved on from
         also carries the modifying slugs under
         `superseded_by`/`amended_by`/`narrowed_by`/`corrected_by` (always present when
         they apply, even on a brief scan) — chase those before treating its axiom as
@@ -706,6 +746,14 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         `superseded_by` successor when known) with the `note` naming them — that is a
         recoverable "it was settled before, go read the history", not a true miss.
     """
+    # An argument fault is answered before any project is resolved — see
+    # list_decisions for why the ordering is deliberate.
+    fault = _full_top_fault(brief, full_top)
+    if fault:
+        return fault
+    # One effective depth value from here down: `brief` is `full_top=0`.
+    if brief:
+        full_top = 0
     top_k = clamp_limit(limit)
     # Resolve BEFORE the `try` below, never inside it. That `except Exception`
     # exists to degrade a broken *graph* to the lexical fallback; a targeting
@@ -724,7 +772,7 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         # the `try` body, so a raise at this call propagates.
         return _lexical_degraded_response(
             query, config=config, reason=degraded_reason_from_error(e), store=None,
-            brief=brief, limit=top_k,
+            full_top=full_top, limit=top_k,
             check_notice=compose_check_notice(
                 config, read_attempt=read_last_attempt, get_node=lambda _id: None
             ),
@@ -776,8 +824,12 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
                         retired.append(handle)
                     continue
 
+                # Rank among the decisions returned, taken at append time — never
+                # the index into `matches`, whose skipped entries consume no rank.
+                rank = len(results["active_decisions"]) + 1
                 results["active_decisions"].append(
-                    _decision_payload(node, m["score"], brief=brief, store=store)
+                    _decision_payload(node, m["score"],
+                                      brief=_rank_thinned(rank, full_top), store=store)
                 )
                 if top_score is None or m["score"] > top_score:
                     top_score = m["score"]
@@ -805,8 +857,10 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         try:
             active_decs = store.get_active_decisions(scope=scope)
             for d in active_decs[:5]:
+                rank = len(results["active_decisions"]) + 1
                 results["active_decisions"].append(
-                    _decision_payload(d, 1.0, brief=brief, store=store)
+                    _decision_payload(d, 1.0, brief=_rank_thinned(rank, full_top),
+                                      store=store)
                 )
         except Exception:
             pass
@@ -831,7 +885,7 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
     if not semantic_ran and not results["active_decisions"]:
         return _lexical_degraded_response(
             query, config=config, reason=degraded_reason_from_error(degraded_error),
-            store=store, brief=brief, limit=top_k,
+            store=store, full_top=full_top, limit=top_k,
             open_questions=results.get("open_questions"),
             check_notice=notice,
         )
@@ -880,6 +934,16 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         store, config, corpus_scan=corpus_holds_entries
     ):
         results["note"] = missing_graph_note("mcp", config)
+
+    # A thinned answer says so by a count and a clause, after every note override
+    # (they need zero hits, so none can co-occur with a count) and before the notice.
+    # Absent at zero, so a default answer is byte-identical.
+    withheld = count_withheld(results["active_decisions"])
+    if withheld:
+        results["note"] = (
+            f"{results['note']} {withheld_clause(withheld, surface='mcp', config=config)}"
+        )
+        results["rejected_paths_withheld"] = withheld
 
     # After the recall answer's own keys; absent (never null) when not shown.
     if notice:
@@ -966,14 +1030,19 @@ def list_decisions(scope: Optional[str] = None, state: str = "active", brief: bo
     except Exception:
         pass
 
-    payload = {
+    payload: Dict[str, Any] = {
         "decisions": decisions,
         "open_questions": open_questions,
         "total": len(decisions),
         "scope": scope,
         "state": state,
-        **corpus_provenance(config),
     }
+    # The brief and oneline tiers withhold the field on every decision; the count
+    # says so (no clause: list has no note). Absent at zero, before provenance.
+    withheld = count_withheld(decisions)
+    if withheld:
+        payload["rejected_paths_withheld"] = withheld
+    payload.update(corpus_provenance(config))
 
     # On an empty scoped read, distinguish a genuinely-fresh scope from a misspelled one:
     # an absent-from-live scope rides two additive, in-band fields (never an error object
@@ -1124,7 +1193,7 @@ def show_node(ident: str, project: Optional[str] = None) -> str:
 
 @mcp.tool()
 def query_decisions(query: str, depth: str = "letter", brief: bool = False, limit: int = 5,
-                    project: Optional[str] = None) -> str:
+                    project: Optional[str] = None, full_top: Optional[int] = None) -> str:
     """Look up a SPECIFIC decision by slug or claim — the targeted lookup.
 
     Use this when you know roughly what you're after (a slug you're carrying, or a
@@ -1140,10 +1209,14 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
     Args:
         query: Unique decision slug identifier OR a semantic claim search query.
         depth: The retrieval depth (e.g. 'letter'). v0.1 enforces Letter mode.
-        brief: If True, omit `rejected_paths` from ranked semantic matches
-            (an exact-slug hit is always returned in full — you asked for that one).
+        brief: An existence screen over the ranked matches, to dereference from
+            by slug: if True, they omit `rejected_paths` (an exact-slug hit is
+            always returned in full — you asked for that one).
         limit: Ranked top-k for the SEMANTIC branch (default 5; clamped to 1–50).
             Ignored by an exact-slug hit.
+        full_top: Keep `rejected_paths` on ranked matches 1..N only; lower ranks
+            are axiom-only. Default: all whole. `full_top=0` is `brief=True`;
+            passing both is refused. An exact-slug hit is always whole.
         project: Which project this call is about — REQUIRED on every call: a
             registered project name (e.g. 'mitos') or the absolute path of a
             workspace. Call `list_projects()` if you do not know the names.
@@ -1167,6 +1240,12 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
     # list_decisions for why the ordering is deliberate.
     if depth != "letter":
         return dumps_display({"error": f"Depth mode '{depth}' is not yet implemented in v0.1 (Letter-only retrieval)."}, ensure_ascii=False, indent=None)
+    fault = _full_top_fault(brief, full_top)
+    if fault:
+        return fault
+    # One effective depth value from here down; the exact-slug branch ignores it.
+    if brief:
+        full_top = 0
 
     # Resolved BEFORE the `try` — see surface_decisions: that `except Exception`
     # would swallow a targeting failure into the lexical-degraded envelope.
@@ -1178,7 +1257,7 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
     except Exception as e:
         return _lexical_degraded_response(
             query, config=config, reason=degraded_reason_from_error(e), store=None,
-            brief=brief, limit=clamp_limit(limit),
+            full_top=full_top, limit=clamp_limit(limit),
         )
 
     # 1. Try resolving query as direct slug first. The `try` covers the store reads
@@ -1244,9 +1323,11 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
                         retired.append(handle)
                     continue
 
+                # Rank among the decisions returned, at append time (see
+                # surface_decisions).
                 match = letter_payload(
                     node,
-                    brief=brief,
+                    brief=_rank_thinned(len(output_list) + 1, full_top),
                     extras={"state": node_state, "score": m["score"], "depth_mode": "letter"},
                 )
                 match.update(store.get_modifiers(node["id"]))
@@ -1291,6 +1372,15 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
                 store, config, corpus_scan=corpus_holds_entries
             ):
                 envelope["note"] = missing_graph_note("mcp", config)
+            # See surface_decisions. Pure formatting, so it cannot raise into the
+            # `except Exception` below and pose as degraded recall.
+            withheld = count_withheld(output_list)
+            if withheld:
+                envelope["note"] = (
+                    f"{envelope['note']} "
+                    f"{withheld_clause(withheld, surface='mcp', config=config)}"
+                )
+                envelope["rejected_paths_withheld"] = withheld
             return dumps_display(envelope, ensure_ascii=False, indent=2)
         except CollectionMissingError as e:
             # I8 — see surface_decisions. The healthy-empty envelope is BUILT here
@@ -1300,7 +1390,7 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             if missing_index_is_a_gap(store):
                 return _lexical_degraded_response(
                     query, config=config, reason=degraded_reason_from_error(e),
-                    store=store, brief=brief, limit=clamp_limit(limit),
+                    store=store, full_top=full_top, limit=clamp_limit(limit),
                 )
             empty: Dict[str, Any] = {
                 "query": query, "depth_mode": "letter", "matches": [],
@@ -1330,13 +1420,13 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             # provider blob — the deterministic lexical fallback instead.
             return _lexical_degraded_response(
                 query, config=config, reason=degraded_reason_from_error(e),
-                store=store, brief=brief, limit=clamp_limit(limit),
+                store=store, full_top=full_top, limit=clamp_limit(limit),
             )
 
     # No embedding provider / vector store wired at all — degrade lexically.
     return _lexical_degraded_response(
         query, config=config, reason=degraded_reason_from_error(None), store=store,
-        brief=brief, limit=clamp_limit(limit),
+        full_top=full_top, limit=clamp_limit(limit),
     )
 
 

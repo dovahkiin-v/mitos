@@ -212,3 +212,51 @@ def test_oneline_payload_unit_shape() -> None:
     # A very long slug can't starve the axiom below the floor.
     assert len(p["axiom_oneline"]) >= 20
     assert p["axiom_oneline"] == oneline_axiom(node)
+
+
+# --------------------------------------------------------------------------- #
+# The thinner tiers name what they withhold (AX Hardening 3, phase 4b, R15)
+# --------------------------------------------------------------------------- #
+
+def _list_both(ws, capsys, scope, **kw):
+    """`cmd_list --json` and `list_decisions` on one fixture; returns (cli, mcp)."""
+    from mitos import mcp_server
+    config, _ = ws
+    capsys.readouterr()
+    cmd_list(config, scope=scope, as_json=True, **kw)
+    cli_out = json.loads(capsys.readouterr().out)
+    store = GraphStore(config.db_path, read_only=True)
+    with patch.object(mcp_server, "get_workspace_components",
+                      return_value=(store, None, None)):
+        mcp_out = json.loads(mcp_server.list_decisions(
+            scope=scope, project=config.workspace_dir, **kw))
+    return cli_out, mcp_out
+
+
+@pytest.mark.parametrize("tier", ["default", "brief", "oneline"])
+def test_a_thinner_list_tier_names_what_it_withholds_by_count(ws, capsys, tier) -> None:
+    """`brief` and `oneline` withhold `rejected_paths` on every decision, so K = total,
+    said by the key before the provenance triple; the default tier carries no key."""
+    _, m = ws
+    _record(m, "count-one", "The first call.", scope=["tier"])
+    _record(m, "count-two", "The second call.", scope=["tier"])
+    kw = {} if tier == "default" else {tier: True}
+
+    cli_out, mcp_out = _list_both(ws, capsys, "tier", **kw)
+
+    assert list(cli_out) == list(mcp_out)
+    for out in (cli_out, mcp_out):
+        assert list(out)[-3:] == ["project", "collection", "workspace"]
+        if tier == "default":
+            assert "rejected_paths_withheld" not in out
+            assert all("rejected_paths" in d for d in out["decisions"])
+        else:
+            assert out["rejected_paths_withheld"] == out["total"] == 2
+
+
+@pytest.mark.parametrize("tier", ["brief", "oneline"])
+def test_an_empty_thin_list_carries_no_count(ws, capsys, tier) -> None:
+    """Nothing returned, nothing withheld: the key is absent, never a zero."""
+    cli_out, mcp_out = _list_both(ws, capsys, "nothing-here", **{tier: True})
+    assert "rejected_paths_withheld" not in cli_out
+    assert "rejected_paths_withheld" not in mcp_out

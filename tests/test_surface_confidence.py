@@ -284,18 +284,25 @@ def test_surface_is_required_keyword():
 # MCP surface_decisions — confidence end to end (fake vector store)
 # --------------------------------------------------------------------------- #
 
-def _surface_with(matches, ws, query="some claim", scope=None):
+def _surface_with(matches, ws, query="some claim", scope=None, full_top=None, brief=False):
+    """`matches=None` drives no providers; a vector-store instance drives its own route."""
     from mitos import mcp_server
     config, _ = ws
     store = GraphStore(config.db_path, read_only=True)
+    vector = _FakeVector(matches) if isinstance(matches, list) else matches
+    embed = None if matches is None else _FakeEmbed()
     with patch.object(mcp_server, "get_workspace_components",
-                      return_value=(store, _FakeEmbed(), _FakeVector(matches))):
-        return json.loads(mcp_server.surface_decisions(query, scope=scope, project=config.workspace_dir))
+                      return_value=(store, embed, vector)):
+        return json.loads(mcp_server.surface_decisions(
+            query, scope=scope, brief=brief, project=config.workspace_dir,
+            full_top=full_top))
 
 
-def _cli_surface_json(matches, ws, query="some claim", scope=None):
+def _cli_surface_json(matches, ws, query="some claim", scope=None, full_top=None,
+                      brief=False):
     """Drives the CLI `cmd_surface` end-to-end with deterministic scores and returns the
-    parsed `--json` payload. `matches=None` exercises the degraded (no embed/vector) path."""
+    parsed `--json` payload. `matches=None` exercises the degraded (no embed/vector) path;
+    a vector-store instance is passed through as-is, so a fault stub drives its own route."""
     from mitos import cli
     config, _ = ws
     manager = MitosSyncManager(config)
@@ -304,11 +311,13 @@ def _cli_surface_json(matches, ws, query="some claim", scope=None):
         manager.vector_store = None
     else:
         manager.embed_provider = _FakeEmbed()
-        manager.vector_store = _FakeVector(matches)
+        manager.vector_store = (_FakeVector(matches) if isinstance(matches, list)
+                                else matches)
     buf = io.StringIO()
     with patch.object(cli, "MitosSyncManager", return_value=manager):
         with redirect_stdout(buf):
-            cmd_surface(config, query, as_json=True, scope=scope)
+            cmd_surface(config, query, as_json=True, scope=scope, brief=brief,
+                        full_top=full_top)
     return json.loads(buf.getvalue())
 
 
@@ -549,6 +558,13 @@ def test_query_none_empty_drops_the_corpus_verdict():
     assert "mitos surface -p" in note
 
 
+# The `query` register lock (ADR query-band-register-states-ranking-never-instructs-a-write):
+# no write instruction, no verdict on the corpus. One list, read by every row that
+# polices a sentence in that register (4b's withheld clause included).
+_QUERY_REGISTER_BANNED = ("decide", "record it", "before deciding", "the scope is populated",
+                          "no settled precedent")
+
+
 @pytest.mark.parametrize("label,kw", _QUERY_CASES)
 @pytest.mark.parametrize("surface", ["cli", "mcp"])
 def test_no_query_note_instructs_a_write_or_judges_the_corpus(surface, label, kw):
@@ -561,8 +577,7 @@ def test_no_query_note_instructs_a_write_or_judges_the_corpus(surface, label, kw
     """
     note = _query_note(surface, **kw)
     lowered = note.casefold()
-    for banned in ("decide", "record it", "before deciding", "the scope is populated",
-                   "no settled precedent"):
+    for banned in _QUERY_REGISTER_BANNED:
         assert banned not in lowered, f"{label}/{surface} note carries {banned!r}"
 
 
@@ -895,7 +910,7 @@ class _StubManager:
 
 
 def _cli_query(matches, ws, query="a claim that is not any slug", as_json=False,
-               config=None):
+               config=None, full_top=None, brief=False):
     """Drives `cmd_query` end to end and returns the raw captured stdout.
 
     `matches=None` drives the degraded (no embed/vector) path; a vector-store
@@ -914,15 +929,18 @@ def _cli_query(matches, ws, query="a claim that is not any slug", as_json=False,
     buf = io.StringIO()
     with patch.object(cli, "MitosSyncManager", return_value=stub):
         with redirect_stdout(buf):
-            cmd_query(config, query, as_json=as_json)
+            cmd_query(config, query, as_json=as_json, brief=brief, full_top=full_top)
     return buf.getvalue()
 
 
-def _cli_query_json(matches, ws, query="a claim that is not any slug"):
-    return json.loads(_cli_query(matches, ws, query=query, as_json=True))
+def _cli_query_json(matches, ws, query="a claim that is not any slug", full_top=None,
+                    brief=False):
+    return json.loads(_cli_query(matches, ws, query=query, as_json=True,
+                                 full_top=full_top, brief=brief))
 
 
-def _mcp_query(matches, ws, query="a claim that is not any slug"):
+def _mcp_query(matches, ws, query="a claim that is not any slug", full_top=None,
+               brief=False):
     from mitos import mcp_server
     config, _ = ws
     store = GraphStore(config.db_path, read_only=True)
@@ -930,7 +948,8 @@ def _mcp_query(matches, ws, query="a claim that is not any slug"):
     embed = None if matches is None else _FakeEmbed()
     with patch.object(mcp_server, "get_workspace_components",
                       return_value=(store, embed, vector)):
-        return json.loads(mcp_server.query_decisions(query, project=config.workspace_dir))
+        return json.loads(mcp_server.query_decisions(
+            query, brief=brief, project=config.workspace_dir, full_top=full_top))
 
 
 _BAND_LINE_PREFIX = "⚠ confidence:"
@@ -942,7 +961,7 @@ def _band_lines(out):
     return [ln for ln in out.splitlines() if ln.startswith(_BAND_LINE_PREFIX)]
 
 
-def _cli_surface_text(matches, ws, query="some claim", scope=None):
+def _cli_surface_text(matches, ws, query="some claim", scope=None, full_top=None):
     """`cmd_surface`'s text render — the module drove only its `--json` twin."""
     from mitos import cli
     config, _ = ws
@@ -952,7 +971,7 @@ def _cli_surface_text(matches, ws, query="some claim", scope=None):
     buf = io.StringIO()
     with patch.object(cli, "MitosSyncManager", return_value=manager):
         with redirect_stdout(buf):
-            cmd_surface(config, query, scope=scope)
+            cmd_surface(config, query, scope=scope, full_top=full_top)
     return buf.getvalue()
 
 
@@ -1890,3 +1909,281 @@ def test_the_blackout_and_the_unbuilt_graph_carry_the_notice_too(ws, cloned, mon
     unbuilt, _ = _mcp_surface(clone, "no_matches")
     assert "graph is unbuilt" in unbuilt["note"]
     assert unbuilt["check_notice"]["state"] == _gate()._SHOWN["started"]["state"]
+
+
+# --------------------------------------------------------------------------- #
+# Phase 4b — A1 depth: `full_top`, `rejected_paths_withheld`, the refusals.
+#
+# Ranks 1..N keep `rejected_paths`, lower ranks are axiom-only, and a thinned
+# answer says so by a count and one clause naming the by-handle read. Rank is
+# rank among the decisions RETURNED: the fixture puts 4a's parked OQ at
+# point-rank 1, so an implementation that ranks by `enumerate(matches)` spends
+# rank 1 on a hit it skipped. Four decisions, so a mid value has a real middle.
+# --------------------------------------------------------------------------- #
+
+from mitos import cli as _cli  # noqa: E402
+from mitos.recall import count_withheld, withheld_clause  # noqa: E402
+
+_4B_POINTS = [{"slug": "oq-parked", "score": 0.85}, {"slug": "dec-a", "score": 0.8},
+              {"slug": "dec-b", "score": 0.7}, {"slug": "dec-c", "score": 0.65},
+              {"slug": "dec-d", "score": 0.62}]
+_4B_SLUGS = ["dec-a", "dec-b", "dec-c", "dec-d"]
+
+
+def _seed_4b(ws):
+    """4a's seed (two decisions + the parked OQ) and two more decisions."""
+    _, m = ws
+    _seed_4a(ws)
+    _rec(m, "dec-c", scope=["x"])
+    _rec(m, "dec-d", scope=["x"])
+
+
+def _whole(hits):
+    return ["rejected_paths" in h for h in hits]
+
+
+def _clause_for(surface, config, count):
+    """The clause the envelope must end with. MCP names no project, so its config is
+    irrelevant; the CLI drivers hand `cmd_*` the `ws` config itself."""
+    return withheld_clause(count, surface=surface, config=config)
+
+
+@pytest.mark.parametrize("driver", list(_4A_DRIVERS))
+def test_an_omitted_full_top_is_the_default_byte_for_byte(ws, driver):
+    """R1: no `full_top`, `full_top=None` and `full_top` ≥ the hits all answer the same
+    bytes — every hit whole, and no `rejected_paths_withheld` key at all."""
+    _seed_4b(ws)
+    call, key, _verb, _surface = _4A_DRIVERS[driver]
+    default = call(_4B_POINTS, ws)
+    assert [h["slug"] for h in default[key]] == _4B_SLUGS
+    assert all(_whole(default[key]))
+    assert "rejected_paths_withheld" not in default
+    for full_top in (None, 4, 50):
+        assert json.dumps(call(_4B_POINTS, ws, full_top=full_top)) == json.dumps(default)
+
+
+@pytest.mark.parametrize("driver", list(_4A_DRIVERS))
+def test_full_top_zero_is_brief(ws, driver):
+    """R2: `full_top=0` answers exactly what `brief=True` answers, and counts every hit."""
+    _seed_4b(ws)
+    call, key, _verb, _surface = _4A_DRIVERS[driver]
+    zero = call(_4B_POINTS, ws, full_top=0)
+    assert json.dumps(zero) == json.dumps(call(_4B_POINTS, ws, brief=True))
+    assert _whole(zero[key]) == [False] * 4
+    assert zero["rejected_paths_withheld"] == len(zero[key]) == 4
+
+
+@pytest.mark.parametrize("driver", list(_4A_DRIVERS))
+def test_a_skipped_open_question_consumes_no_rank(ws, driver):
+    """R3: with the OQ at point-rank 1, `full_top=1` keeps the first DECISION whole."""
+    _seed_4b(ws)
+    call, key, _verb, _surface = _4A_DRIVERS[driver]
+    resp = call(_4B_POINTS, ws, full_top=1)
+    assert [h["slug"] for h in resp[key]] == _4B_SLUGS
+    assert _whole(resp[key]) == [True, False, False, False]
+    assert resp["rejected_paths_withheld"] == len(resp[key]) - 1
+
+
+@pytest.mark.parametrize("driver", list(_4A_DRIVERS))
+def test_a_mid_full_top_thins_below_the_cut_and_says_so(ws, driver):
+    """R4: ranks ≤ N whole, ranks > N axiom-only, K the thinned count, and the note ends
+    with the clause. A thinned hit is today's brief hit, key for key."""
+    config, _ = ws
+    _seed_4b(ws)
+    call, key, _verb, surface = _4A_DRIVERS[driver]
+    resp = call(_4B_POINTS, ws, full_top=2)
+    whole = call(_4B_POINTS, ws)
+    assert _whole(resp[key]) == [True, True, False, False]
+    assert resp["rejected_paths_withheld"] == 2 == count_withheld(resp[key])
+    assert resp["note"].endswith(" " + _clause_for(surface, config, 2))
+    assert resp[key][:2] == whole[key][:2]
+    for thin, full in zip(resp[key][2:], whole[key][2:]):
+        assert thin == {k: v for k, v in full.items() if k != "rejected_paths"}
+    # The count sits after the final note and before any notice (3g2: notice last).
+    keys = list(resp)
+    assert keys.index("rejected_paths_withheld") == keys.index("note") + 1
+
+
+_4B_BANDS = {
+    "strong": [0.95, 0.9, 0.85, 0.8],
+    "weak": [0.7, 0.68, 0.66, 0.64],
+    "none": [0.3, 0.25, 0.2, 0.15],
+}
+
+
+@pytest.mark.parametrize("driver", ["mcp-surface", "mcp-query"])
+def test_the_cut_never_follows_the_band(ws, driver):
+    """R5: the same `full_top` thins the same ranks over a strong, a weak and a
+    none-with-results ranking — depth is the caller's, never the band's."""
+    _seed_4b(ws)
+    call, key, _verb, _surface = _4A_DRIVERS[driver]
+    seen = {}
+    for band, scores in _4B_BANDS.items():
+        points = [{"slug": s, "score": sc} for s, sc in zip(_4B_SLUGS, scores)]
+        resp = call(points, ws, full_top=1)
+        assert resp["confidence"] == band
+        seen[band] = (_whole(resp[key]), resp["rejected_paths_withheld"])
+    assert all(v == ([True, False, False, False], 3) for v in seen.values()), seen
+
+
+@pytest.mark.parametrize("route", ["no providers", "mid-query fault"])
+@pytest.mark.parametrize("driver", list(_4A_DRIVERS))
+def test_the_lexical_envelope_honours_full_top_by_position(ws, driver, route):
+    """R6: the degraded lexical answer thins by position among its matches and carries
+    the key and the clause. The query term-matches every fixture axiom ("Axiom for …"),
+    so the row cannot pass on an empty envelope."""
+    config, _ = ws
+    _seed_4b(ws)
+    call, _key, _verb, surface = _4A_DRIVERS[driver]
+    matches = None if route == "no providers" else _Boom()
+    resp = call(matches, ws, query="axiom", full_top=1)
+    assert resp["degraded"] == "lexical"
+    assert len(resp["matches"]) >= 2
+    assert _whole(resp["matches"]) == [True] + [False] * (len(resp["matches"]) - 1)
+    assert resp["rejected_paths_withheld"] == len(resp["matches"]) - 1
+    assert resp["note"].endswith(" " + _clause_for(surface, config, len(resp["matches"]) - 1))
+    # Whole by default on the same route: the key exists only when something was cut.
+    assert "rejected_paths_withheld" not in call(matches, ws, query="axiom")
+
+
+@pytest.mark.parametrize("driver", ["mcp-surface", "cli-surface"])
+def test_the_scope_dump_honours_full_top_by_position(ws, driver):
+    """R7: `surface`'s degraded scoped dump thins by list position, with key and clause.
+    The dump is still `[:5]` — 4c owns making it follow `limit`."""
+    config, _ = ws
+    _seed_4b(ws)
+    call, key, _verb, surface = _4A_DRIVERS[driver]
+    resp = call(None, ws, scope="x", full_top=1)
+    assert "degraded" not in resp
+    assert sorted(h["slug"] for h in resp[key]) == _4B_SLUGS
+    assert _whole(resp[key]) == [True, False, False, False]
+    assert resp["rejected_paths_withheld"] == 3
+    assert resp["note"].endswith(" " + _clause_for(surface, config, 3))
+
+
+def test_an_exact_slug_hit_is_never_thinned(ws):
+    """R8: the dereference exit ignores `full_top` — whole, and no count."""
+    _seed_4b(ws)
+    resp = _mcp_query([], ws, query="dec-b", full_top=0)
+    assert resp["slug"] == "dec-b"
+    assert resp["rejected_paths"] == "Rejected for dec-b."
+    assert "rejected_paths_withheld" not in resp
+
+
+@pytest.mark.parametrize("argv", [
+    ["surface", "q", "--brief", "--full-top", "2"],
+    ["query", "q", "--brief", "--full-top", "2"],
+    ["surface", "q", "--full-top", "-1"],
+    ["query", "q", "--full-top=-1"],
+    ["surface", "q", "--full-top", "two"],
+])
+def test_the_cli_refuses_a_depth_fault_through_argparse(argv, capsys):
+    """R10: both-together and a negative value exit 2 before anything resolves."""
+    with pytest.raises(SystemExit) as exc:
+        _cli._build_parser().parse_args(["-p", "x", *argv])
+    assert exc.value.code == 2
+    assert "--full-top" in capsys.readouterr().err
+
+
+def test_the_cli_parses_full_top_and_leaves_it_none_by_default():
+    parse = _cli._build_parser().parse_args
+    assert parse(["surface", "q", "--full-top", "2"]).full_top == 2
+    assert parse(["query", "q", "--full-top", "0"]).full_top == 0
+    assert parse(["surface", "q"]).full_top is None
+    assert parse(["query", "q", "--brief"]).brief is True
+
+
+@pytest.mark.parametrize("verb", ["surface", "query"])
+def test_cli_and_mcp_thin_alike(ws, verb):
+    """R11: on one fixture and one `full_top`, both boundaries agree on the hits'
+    key sets, the count, and the clause modulo the call form."""
+    config, _ = ws
+    _seed_4b(ws)
+    mcp_call, key, _, _ = _4A_DRIVERS[f"mcp-{verb}"]
+    cli_call = _4A_DRIVERS[f"cli-{verb}"][0]
+    mcp_out = mcp_call(_4B_POINTS, ws, full_top=2)
+    cli_out = cli_call(_4B_POINTS, ws, full_top=2)
+    assert [set(h) for h in mcp_out[key]] == [set(h) for h in cli_out[key]]
+    assert mcp_out["rejected_paths_withheld"] == cli_out["rejected_paths_withheld"] == 2
+    mcp_clause, cli_clause = _clause_for("mcp", config, 2), _clause_for("cli", config, 2)
+    assert mcp_out["note"].endswith(mcp_clause) and cli_out["note"].endswith(cli_clause)
+    pointers = {s: _SURFACE_POINTERS[s]["dereference"] for s in ("cli", "mcp")}
+    cli_form = pointers["cli"].format(project=repr(config.project))
+    assert cli_clause.replace(cli_form, pointers["mcp"]) == mcp_clause
+
+
+def _cli_text(verb, ws, full_top):
+    if verb == "surface":
+        return _cli_surface_text(_4B_POINTS, ws, full_top=full_top)
+    return _cli_query(_4B_POINTS, ws, full_top=full_top)
+
+
+@pytest.mark.parametrize("verb", ["surface", "query"])
+def test_the_printed_clause_carries_a_recipe_that_parses(ws, verb):
+    """R12: the recipe on the printed `→` note parses to `show` on this workspace."""
+    config, _ = ws
+    _seed_4b(ws)
+    out = _cli_text(verb, ws, full_top=1)
+    note = next(ln for ln in out.splitlines()
+                if ln.startswith("→ ") and "omit rejected_paths" in ln)
+    recipes = [r for r in note.split("`")[1::2] if r.startswith("mitos show")]
+    assert len(recipes) == 1
+    args = _cli._build_parser().parse_args(shlex.split(recipes[0])[1:])
+    assert args.command == "show"
+    assert args.project_post == config.project
+    assert args.ident == "<slug>"
+
+
+@pytest.mark.parametrize("verb", ["surface", "query"])
+def test_a_thinned_text_hit_prints_no_rejected_line(ws, verb):
+    """R16: one whole hit prints one `Rejected:` line; the clause rides the `→` note."""
+    config, _ = ws
+    _seed_4b(ws)
+    out = _cli_text(verb, ws, full_top=1)
+    assert sum(ln.strip().startswith("Rejected:") for ln in out.splitlines()) == 1
+    assert _clause_for("cli", config, 3) in out
+    assert not any(_clause_for("cli", config, 3) in ln
+                   for ln in _cli_text(verb, ws, full_top=None).splitlines())
+
+
+def test_the_lexical_text_render_prints_the_clause_on_its_note_line(ws):
+    """W1: the degraded text render prints its note bare (no `→`), clause included."""
+    config, _ = ws
+    _seed_4b(ws)
+    out = _cli_query(None, ws, query="axiom", full_top=1)
+    assert sum(ln.strip().startswith("Rejected:") for ln in out.splitlines()) == 1
+    assert any(ln.endswith(_clause_for("cli", config, 3)) for ln in out.splitlines())
+
+
+@pytest.mark.parametrize("count", [1, 3])
+def test_the_clause_names_count_field_and_a_read(count):
+    """R13/R14: singular and plural right, the MCP form names no shell command, neither
+    crosses the boundary's call forms, and both pass the `query` register lock."""
+    cli = withheld_clause(count, surface="cli", config=_StubConfig("/home/user/my projects/demo"))
+    mcp = withheld_clause(count, surface="mcp", config=_StubConfig())
+    for clause in (cli, mcp):
+        assert clause.startswith(f"{count} hit{'' if count == 1 else 's'} ")
+        assert "rejected_paths" in clause
+        lowered = clause.casefold()
+        for banned in _QUERY_REGISTER_BANNED:
+            assert banned not in lowered
+    assert "mitos " not in mcp and "-p " not in mcp and "show_node(" in mcp
+    assert "show_node(" not in cli and "surface_decisions(" not in cli
+    assert "-p '/home/user/my projects/demo' -- <slug>" in cli
+
+
+def test_every_lexical_route_forwards_full_top():
+    """G2: each call into a lexical helper passes the effective `full_top` along — a
+    route that passed a literal would answer whole with every other row still green."""
+    import mitos.mcp_server as mcp_mod
+    targets = {"_lexical_degraded_response", "_emit_lexical_degraded"}
+    seen = 0
+    for mod in (mcp_mod, _cli):
+        for node in ast.walk(ast.parse(inspect.getsource(mod))):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id in targets):
+                seen += 1
+                kw = {k.arg: k.value for k in node.keywords}
+                assert isinstance(kw.get("full_top"), ast.Name), ast.unparse(node)
+                assert kw["full_top"].id == "full_top", ast.unparse(node)
+    assert seen == 12

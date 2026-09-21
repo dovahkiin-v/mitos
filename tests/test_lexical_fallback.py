@@ -174,11 +174,20 @@ class TestLexicalFallbackCore:
         assert "stamps not applied" in env["note"]
 
     def test_limit_and_brief(self, tmp_path):
+        # The boundaries' `brief` reaches this leaf as `full_top=0`.
         path = self._md(tmp_path, [(f"cache-{i}", "cache") for i in range(6)])
         env = lexical_fallback("cache", corpus_paths=[path], reason="r", store=None, limit=3,
-                               brief=True)
+                               full_top=0)
         assert len(env["matches"]) == 3
         assert all("rejected_paths" not in m for m in env["matches"])
+
+    def test_full_top_thins_by_position_among_returned_matches(self, tmp_path):
+        path = self._md(tmp_path, [(f"cache-{i}", "cache") for i in range(6)])
+        env = lexical_fallback("cache", corpus_paths=[path], reason="r", store=None, limit=4,
+                               full_top=2)
+        assert ["rejected_paths" in m for m in env["matches"]] == [True, True, False, False]
+        # The leaf has no surface: the count and its clause are the boundaries' to add.
+        assert "rejected_paths_withheld" not in env
 
     def test_zero_matches_notice(self, tmp_path):
         path = self._md(tmp_path, [("cache-entry", "A cache axiom.")])

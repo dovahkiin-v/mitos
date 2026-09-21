@@ -499,6 +499,10 @@ def test_the_exact_slug_exit_carries_the_envelope(tmp_path, offline, monkeypatch
 @pytest.mark.parametrize("tool,kwargs", [
     ("query_decisions", {"query": "q", "depth": "trace"}),
     ("list_decisions", {"brief": True, "oneline": True}),
+    ("surface_decisions", {"query": "q", "brief": True, "full_top": 2}),
+    ("surface_decisions", {"query": "q", "full_top": -1}),
+    ("query_decisions", {"query": "q", "brief": True, "full_top": 2}),
+    ("query_decisions", {"query": "q", "full_top": -1}),
 ])
 def test_an_argument_fault_carries_no_envelope(tool, kwargs, tmp_path, offline, monkeypatch):
     """The two deliberate non-stamps, asserted as rows rather than left as silences.

@@ -479,6 +479,14 @@ def test_a_targeting_failure_reaches_the_caller_from_every_tool(
      "brief and oneline are mutually exclusive"),
     ("query_decisions", {"query": "q", "depth": "trace"},
      "is not yet implemented"),
+    ("surface_decisions", {"query": "q", "brief": True, "full_top": 2},
+     "brief and full_top are mutually exclusive"),
+    ("surface_decisions", {"query": "q", "full_top": -1},
+     "full_top must be 0 or more"),
+    ("query_decisions", {"query": "q", "brief": True, "full_top": 2},
+     "brief and full_top are mutually exclusive"),
+    ("query_decisions", {"query": "q", "full_top": -1},
+     "full_top must be 0 or more"),
 ])
 def test_an_argument_fault_is_answered_before_the_project_is_resolved(
     tool, kwargs, fault

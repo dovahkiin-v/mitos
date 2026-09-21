@@ -116,7 +116,7 @@ def lexical_fallback(
     reason: str,
     store: Optional[Any] = None,
     limit: Optional[int] = None,
-    brief: bool = False,
+    full_top: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Runs the deterministic lexical fallback over the markdown corpus.
 
@@ -141,12 +141,15 @@ def lexical_fallback(
             match is modifier-stamped; when None, a stamps-unavailable
             disclosure rides the note instead.
         limit: Max matches to return; None ⇒ ``LEXICAL_DEFAULT_LIMIT``.
-        brief: Omit ``rejected_paths`` from each match.
+        full_top: How many top matches keep ``rejected_paths``, by position among
+            the matches returned; the rest are axiom-only. None ⇒ every match whole,
+            0 ⇒ none (the boundaries' ``brief``). The count and its note clause are
+            the boundaries' to add — this leaf has no surface.
 
     Returns:
         ``{degraded: "lexical", degraded_reason, matches: [...], note}`` — each
         match a Letter-shaped dict (slug, axiom, scope, rejected_paths unless
-        brief, matched_terms) plus state + modifier stamps when the graph is
+        thinned by ``full_top``, matched_terms) plus state + modifier stamps when the graph is
         readable. ``stamps_unavailable: True`` is set when it is not, and
         ``unread_files`` (basenames) only when some corpus file could not be read.
 
@@ -204,7 +207,9 @@ def lexical_fallback(
             "scope": entry.scope,
             "matched_terms": hit,
         }
-        if not brief:
+        # Rank among the matches returned: nothing is appended between here and
+        # the append below, and a filtered entry never reaches it.
+        if full_top is None or len(matches) + 1 <= full_top:
             payload["rejected_paths"] = entry.rejected_paths
         if store is not None:
             # Graph readable: filter to active, stamp modifiers. An entry the

@@ -40,7 +40,7 @@ business widening it.
 """
 
 import difflib
-from typing import Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # Top semantic score at/above which a match is treated as a real precedent rather than
 # a loose neighbour. Calibrated to observed Gemini-embedding scores: settled precedents
@@ -76,10 +76,17 @@ SURFACE_DIDYOUMEAN_CUTOFF: float = 0.6
 # rendered bare, ``mitos surface -p /home/me/my projects/x`` fails misleadingly rather
 # than loudly. The MCP form keeps the shipped bare call-form: ``_example_call`` is where
 # addressing gets taught, and a recall note is not it.
+#
+# ``dereference`` is the by-handle read that restores what a thinned ranked answer
+# withheld (:func:`withheld_clause`). Same selector and ``repr`` rule as
+# ``precedent_scan``; the CLI form puts ``--`` before the slug because a hand-authored
+# slug may start with ``-`` (``renderer._show_forms``' idiom). The MCP form names a
+# read tool and no shell command.
 _SURFACE_POINTERS: Dict[str, Dict[str, str]] = {
     "cli": {
         "complete": "mitos list",
         "complete_scope": "mitos list --scope '{scope}'",
+        "dereference": "`mitos show -p {project} -- <slug>`",
         "discovery": "mitos scopes",
         "precedent_scan": "`mitos surface -p {project}`",
         "state_all": "mitos list --scope '{scope}' --state all",
@@ -88,6 +95,7 @@ _SURFACE_POINTERS: Dict[str, Dict[str, str]] = {
     "mcp": {
         "complete": "list_decisions()",
         "complete_scope": "list_decisions(scope='{scope}')",
+        "dereference": "show_node(ident='<slug>')",
         "discovery": "list_scopes",
         "precedent_scan": "surface_decisions()",
         "state_all": "list_decisions(scope='{scope}', state='all')",
@@ -472,6 +480,53 @@ def assess_query_recall(
     return band, (
         f"No semantic match — this ranking returned nothing. {redirect}"
     )
+
+
+def count_withheld(hits: List[Dict[str, Any]]) -> int:
+    """Counts the hits in one answer that were returned without ``rejected_paths``.
+
+    Derived from the returned list, never counted in the loops that thinned it, so
+    the count cannot drift from the thinning rule: ``letter_payload`` and the lexical
+    fallback omit exactly this key on a thinned hit, and ``rejected_paths`` is a
+    required field (M5), so on a decision hit its absence always means withheld. An
+    open question skipped by a ranked loop is not in the list and counts as nothing.
+
+    Args:
+        hits: The decision payloads the answer returns.
+
+    Returns:
+        How many of them lack ``rejected_paths``; 0 on a default (whole) answer.
+    """
+    return sum(1 for hit in hits if "rejected_paths" not in hit)
+
+
+def withheld_clause(count: int, *, surface: str, config: "object") -> str:
+    """Words the note clause a thinned ranked answer ends with.
+
+    Verb-independent on purpose: ``surface`` and ``query`` gain the same characters
+    on one surface, so the query note stays no longer than the surface note it
+    displaces. It names the count, the field and the read that restores it — a read,
+    never a write, and no verdict on the corpus, so it is lawful in both registers.
+    Pure string formatting, so it cannot raise inside ``query_decisions``' ranked
+    ``try`` and pose as degraded recall.
+
+    Args:
+        count: How many hits omit ``rejected_paths`` (≥ 1; the caller only asks then).
+        surface: ``"cli"`` or ``"mcp"`` — selects the dereference wording.
+        config: The active ``MitosConfig`` (duck-typed, as in
+            :func:`assess_query_recall`). Read only for ``project``, which the CLI
+            recipe names as its selector.
+
+    Returns:
+        One sentence, e.g. ``"2 hits omit rejected_paths; read any one whole with
+        show_node(ident='<slug>')."``.
+    """
+    pointer = _SURFACE_POINTERS[surface]["dereference"].format(
+        project=repr(getattr(config, "project", ""))
+    )
+    if count == 1:
+        return f"1 hit omits rejected_paths; read it whole with {pointer}."
+    return f"{count} hits omit rejected_paths; read any one whole with {pointer}."
 
 
 def corpus_provenance(config: "object") -> Dict[str, str]:

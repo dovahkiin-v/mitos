@@ -95,7 +95,8 @@ from mitos.lexical import degraded_reason_from_error, lexical_fallback
 from mitos.recall import (assess_query_recall, assess_surface_recall,
                           corpus_provenance, missing_graph_is_a_gap,
                           missing_graph_note, missing_index_is_a_gap,
-                          provenance_line, scope_filter_recovery)
+                          provenance_line, scope_filter_recovery,
+                          count_withheld, withheld_clause)
 from mitos.sync import (MitosSyncManager, run_ambient_capture, _SLUG_MAX_LEN,
                         _ENTRIES_MARKER, _PAUSE_RESOLVING_RELATIONS,
                         _declared_echo_lines, _split_relation_slugs,
@@ -534,7 +535,7 @@ def _skill_md_text(format_spec_content: str) -> str:
         "## Recording & recall — MCP tools (preferred) or CLI fallback\n"
         "If the Mitos MCP server is wired into your agent, call these tools directly — best experience: structured args, no shell-quoting. If it is NOT wired, each maps to a CLI verb (and the CLI also accepts five of the long names as aliases, e.g. `mitos record_decision -p .`):\n"
         "- `record_decision`  (CLI: `mitos record -p .`) — the moment you commit to a foundational choice (a schema, a library, a pattern, a path you're abandoning), persist it WITH the alternatives you rejected and why, so future sessions inherit it instead of relitigating. Recording rich prose via the CLI? Use `--axiom-file -` / `--rejected-file -` / `--context-file -` to read from stdin and avoid shell-quoting.\n"
-        "- `surface_decisions` (CLI: `mitos surface -p .`) — surface active precedents for a claim/scope BEFORE you decide, so you don't relitigate a settled call. This is the recall loop — use it first. Every hit carries its full `rejected_paths`; pass `brief=True` (CLI `--brief`) for an axiom-only scan.\n"
+        "- `surface_decisions` (CLI: `mitos surface -p .`) — surface active precedents for a claim/scope BEFORE you decide, so you don't relitigate a settled call. This is the recall loop — use it first. Every hit carries its full `rejected_paths` by default. `brief=True` (CLI `--brief`) is an existence screen: scan the axioms, then read the hits that matter whole with `show_node`. `full_top=N` (CLI `--full-top N`) keeps the reasoning on the top N ranks only.\n"
         "- `query_decisions`   (CLI: `mitos query -p .`) — the TARGETED lookup: a slug you are carrying, or a pointed claim. Its confidence band rates how well the ranking matched what you named, not whether precedent exists — `surface_decisions` answers that one.\n"
         "- `list_decisions`    (CLI: `mitos list -p .`) — the EXHAUSTIVE recall path. surface/query are semantic and capped at the top few matches; this returns EVERY decision in a scope, deterministically, so a completeness pass or audit doesn't miss anything below the relevance cliff. Needs no key or Qdrant.\n"
         "- `list_scopes`       (CLI: `mitos scopes -p .`) — the scope vocabulary with a count per tag. Read it before a scope-filtered read, or before tagging a new decision, so you reuse a tag that exists instead of minting a near-duplicate.\n"
@@ -1011,9 +1012,17 @@ def _retired_handle(store: GraphStore, slug: str) -> Optional[Dict[str, Any]]:
     return handle
 
 
+def _rank_thinned(rank: int, full_top: Optional[int]) -> bool:
+    """Says whether the hit at 1-based ``rank`` among returned decisions is thinned.
+
+    The rule ``mcp_server._rank_thinned`` applies on the other boundary.
+    """
+    return full_top is not None and rank > full_top
+
+
 def _emit_lexical_degraded(config: MitosConfig, query: str, *, reason: str,
                            store: Optional[GraphStore], as_json: bool,
-                           brief: bool, limit: Optional[int],
+                           full_top: Optional[int], limit: Optional[int],
                            open_questions: Optional[List[Dict[str, Any]]] = None,
                            check_notice: Optional[Dict[str, Any]] = None) -> None:
     """Runs the deterministic lexical fallback and renders it on the CLI.
@@ -1032,7 +1041,9 @@ def _emit_lexical_degraded(config: MitosConfig, query: str, *, reason: str,
         store: A readable graph store for active-filtering + modifier stamps,
             or None when the graph itself is down (pre-V1a).
         as_json: Emit the degraded JSON envelope instead of text.
-        brief: Omit ``rejected_paths`` from each match.
+        full_top: How many top matches keep ``rejected_paths`` (None ⇒ all, 0 ⇒
+            none — the verb's ``--brief``). A thinned answer says so by
+            ``rejected_paths_withheld`` and a note clause, on both encodings.
         limit: Max matches; None ⇒ the lexical default.
         open_questions: An already-computed scoped parked-OQ list to carry on
             the envelope (present-if-scanned semantics — None means omitted).
@@ -1042,10 +1053,17 @@ def _emit_lexical_degraded(config: MitosConfig, query: str, *, reason: str,
     """
     envelope = lexical_fallback(
         query, corpus_paths=_corpus_files(config), reason=reason, store=store,
-        limit=limit, brief=brief,
+        limit=limit, full_top=full_top,
     )
     envelope["query"] = query
     envelope.update(corpus_provenance(config))
+    # Before the `as_json` split, so the printed note and the envelope's agree.
+    withheld = count_withheld(envelope["matches"])
+    if withheld:
+        envelope["note"] = (
+            f"{envelope['note']} {withheld_clause(withheld, surface='cli', config=config)}"
+        )
+        envelope["rejected_paths_withheld"] = withheld
     if open_questions is not None:
         envelope["open_questions"] = open_questions
     if check_notice is not None:
@@ -1073,7 +1091,7 @@ def _emit_lexical_degraded(config: MitosConfig, query: str, *, reason: str,
 
 def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
               as_json: bool = False, brief: bool = False,
-              limit: Optional[int] = None) -> None:
+              limit: Optional[int] = None, full_top: Optional[int] = None) -> None:
     """Queries the vector store semantically for similar decisions — the CLI twin
     of the MCP ``query_decisions`` tool's *ranked* branch.
 
@@ -1095,10 +1113,16 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         depth: The retrieval depth; v0.1 enforces ``letter``.
         as_json: Emit the machine-readable ranked JSON envelope instead of text.
         brief: Omit ``rejected_paths`` (axiom-only) — never sheds a modifier stamp.
+            The same as ``full_top=0``; argparse refuses the two together.
         limit: Ranked top-k to retrieve; ``None`` ⇒ the default 5. SETS the count
             (raises or lowers it), clamped to ``[1, RANKED_LIMIT_CEILING]`` — not a
             ``min(default, N)`` truncation.
+        full_top: Keep ``rejected_paths`` on ranks 1..N among the returned
+            decisions only; None ⇒ every rank whole.
     """
+    # One effective depth value from here down: `brief` is `full_top=0`.
+    if brief:
+        full_top = 0
     if depth != "letter":
         msg = f"Depth mode '{depth}' is not yet implemented in v0.1 (Letter-only retrieval)."
         if as_json:
@@ -1122,14 +1146,14 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
     except Exception as e:
         _emit_lexical_degraded(
             config, query_text, reason=degraded_reason_from_error(e),
-            store=None, as_json=as_json, brief=brief, limit=limit,
+            store=None, as_json=as_json, full_top=full_top, limit=limit,
         )
         return
 
     if not manager.embed_provider or not manager.vector_store:
         _emit_lexical_degraded(
             config, query_text, reason=degraded_reason_from_error(None),
-            store=manager.store, as_json=as_json, brief=brief, limit=limit,
+            store=manager.store, as_json=as_json, full_top=full_top, limit=limit,
         )
         return
 
@@ -1168,9 +1192,11 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
                 if handle:
                     retired.append(handle)
                 continue
+            # Rank among the decisions returned, at append time — never the index
+            # into `raw_matches`, whose skipped entries consume no rank.
             match = letter_payload(
                 node,
-                brief=brief,
+                brief=_rank_thinned(len(matches) + 1, full_top),
                 extras={"state": node_state, "score": m["score"], "depth_mode": "letter"},
             )
             match.update(store.get_modifiers(node["id"]))
@@ -1192,7 +1218,7 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         if missing_index_is_a_gap(store):
             _emit_lexical_degraded(
                 config, query_text, reason=degraded_reason_from_error(e),
-                store=store, as_json=as_json, brief=brief, limit=limit,
+                store=store, as_json=as_json, full_top=full_top, limit=limit,
             )
             return
         matches = []
@@ -1202,7 +1228,7 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         # provider blob — one calm cause line + the deterministic fallback.
         _emit_lexical_degraded(
             config, query_text, reason=degraded_reason_from_error(e),
-            store=store, as_json=as_json, brief=brief, limit=limit,
+            store=store, as_json=as_json, full_top=full_top, limit=limit,
         )
         return
 
@@ -1233,6 +1259,12 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         config=config,
         surface="cli",
     )
+    # A thinned answer says so, on both encodings: the clause joins the local note
+    # the text render prints and the envelope carries. The blackout and unbuilt
+    # overrides below need zero matches, so neither can co-occur with a count.
+    withheld = count_withheld(matches)
+    if withheld:
+        note = f"{note} {withheld_clause(withheld, surface='cli', config=config)}"
 
     # Build the per-match list once, then branch the two renderings over it.
     if as_json:
@@ -1251,6 +1283,8 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
             envelope["note"] = blackout_note(retired)
         if unbuilt:
             envelope["note"] = missing_graph_note("cli", config)
+        if withheld:
+            envelope["rejected_paths_withheld"] = withheld
         _emit_json(envelope)
         return
 
@@ -1624,14 +1658,19 @@ def cmd_list(config: MitosConfig, scope: Optional[str] = None,
         )
 
     if as_json:
-        payload = {
+        payload: Dict[str, Any] = {
             "decisions": [_list_item(d) for d in decisions],
             "open_questions": [_oq_payload(oq) for oq in parked],
             "total": len(decisions),
             "scope": scope,
             "state": effective_state,
-            **corpus_provenance(config),
         }
+        # The brief and oneline tiers withhold the field on every decision; the count
+        # says so (no clause: list has no note). Absent at zero, before provenance.
+        withheld = count_withheld(payload["decisions"])
+        if withheld:
+            payload["rejected_paths_withheld"] = withheld
+        payload.update(corpus_provenance(config))
         if recovery:
             payload["scope_known"] = False
             payload["scope_recovery"] = recovery["note"]
@@ -2229,7 +2268,7 @@ def _join_relation_flag(values: Optional[List[str]]) -> Optional[str]:
 
 def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
                 as_json: bool = False, brief: bool = False,
-                limit: Optional[int] = None) -> None:
+                limit: Optional[int] = None, full_top: Optional[int] = None) -> None:
     """Surfaces active decisions relevant to a query — the CLI twin of the MCP
     ``surface_decisions`` tool (the precedent-recall half of Mitos).
 
@@ -2238,7 +2277,7 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     ``scope`` only narrows the parked open questions and the recall note (plus the
     degraded fallback when semantic recall is down). For scope-RESTRICTED retrieval
     use ``mitos list --scope`` — the only surface that hard-filters by scope. (Both
-    surfaces return full ``rejected_paths``; pass ``--brief`` for a lighter scan.)
+    surfaces return full ``rejected_paths``; pass ``--brief`` or ``--full-top`` for a lighter scan.)
 
     Args:
         config: The active workspace configuration.
@@ -2248,9 +2287,15 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
             hard-filter by scope.
         as_json: Emit a machine-readable JSON report (for agents) instead of text.
         brief: Omit ``rejected_paths`` (axiom-only — a quick "anything nearby?" scan).
+            The same as ``full_top=0``; argparse refuses the two together.
         limit: Ranked top-k to retrieve; ``None`` ⇒ the default 5. SETS the count,
             clamped to ``[1, RANKED_LIMIT_CEILING]`` — not a ``min(default, N)`` clamp.
+        full_top: Keep ``rejected_paths`` on ranks 1..N among the returned
+            decisions only; None ⇒ every rank whole.
     """
+    # One effective depth value from here down: `brief` is `full_top=0`.
+    if brief:
+        full_top = 0
     # A pre-V1a graph raises at store construction — the graph is unusable, so
     # the lexical fallback parses decisions.md directly (no graph access).
     try:
@@ -2262,7 +2307,7 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         # `try` body, so a raise at this call propagates.
         _emit_lexical_degraded(
             config, query, reason=degraded_reason_from_error(e),
-            store=None, as_json=as_json, brief=brief, limit=limit,
+            store=None, as_json=as_json, full_top=full_top, limit=limit,
             check_notice=compose_check_notice(
                 config, read_attempt=read_last_attempt, get_node=lambda _id: None
             ),
@@ -2280,8 +2325,8 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     )
     top_k = clamp_limit(limit)
 
-    def _shape(node, score):
-        d = letter_payload(node, brief=brief, extras={"score": score})
+    def _shape(node, score, thinned):
+        d = letter_payload(node, brief=thinned, extras={"score": score})
         d.update(store.get_modifiers(node["id"]))
         return d
 
@@ -2313,7 +2358,12 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
                     if handle:
                         retired.append(handle)
                     continue
-                results["active_decisions"].append(_shape(node, m["score"]))
+                # Rank among the decisions returned, at append time — never the
+                # index into `matches`, whose skipped entries consume no rank.
+                rank = len(results["active_decisions"]) + 1
+                results["active_decisions"].append(
+                    _shape(node, m["score"], _rank_thinned(rank, full_top))
+                )
                 if top_score is None or m["score"] > top_score:
                     top_score = m["score"]
         except CollectionMissingError as e:
@@ -2335,7 +2385,10 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     if not semantic_ran and not results["active_decisions"] and scope:
         try:
             for d in store.get_active_decisions(scope=scope)[:5]:
-                results["active_decisions"].append(_shape(d, 1.0))
+                rank = len(results["active_decisions"]) + 1
+                results["active_decisions"].append(
+                    _shape(d, 1.0, _rank_thinned(rank, full_top))
+                )
         except Exception:
             pass
 
@@ -2361,7 +2414,7 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     if not semantic_ran and not results["active_decisions"]:
         _emit_lexical_degraded(
             config, query, reason=degraded_reason_from_error(degraded_error),
-            store=store, as_json=as_json, brief=brief, limit=limit,
+            store=store, as_json=as_json, full_top=full_top, limit=limit,
             open_questions=results.get("open_questions"),
             check_notice=notice,
         )
@@ -2410,6 +2463,14 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     ):
         results["note"] = missing_graph_note("cli", config)
         note = results["note"]
+
+    # A thinned answer says so by a count and a clause, after every note override
+    # (they need zero hits) and before the notice; the printed note follows.
+    withheld = count_withheld(results["active_decisions"])
+    if withheld:
+        results["note"] = f"{note} {withheld_clause(withheld, surface='cli', config=config)}"
+        note = results["note"]
+        results["rejected_paths_withheld"] = withheld
 
     # After the recall answer's own keys; absent (never null) when not shown.
     if notice:
@@ -7535,6 +7596,35 @@ def _render_targeting_error(err: ProjectTargetingError) -> str:
     return "\n".join(lines)
 
 
+_BRIEF_HELP = ("An existence screen: axiom-only hits (no rejected_paths) to scan, then "
+               "read the ones that matter whole with `show`.")
+_FULL_TOP_HELP = ("Keep rejected_paths on the top N ranks only; lower ranks are axiom-only "
+                  "(default: all).")
+
+
+def _non_negative_int(value: str) -> int:
+    """Parses ``--full-top``'s value, refusing a negative through argparse (exit 2).
+
+    Args:
+        value: The raw command-line value.
+
+    Returns:
+        The value as an int, 0 or more.
+
+    Raises:
+        argparse.ArgumentTypeError: When it is not an integer, or is negative.
+    """
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not an integer")
+    if number < 0:
+        raise argparse.ArgumentTypeError(
+            f"{value!r} is negative — N is how many top ranks keep rejected_paths, 0 or more"
+        )
+    return number
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Builds the CLI argument parser.
 
@@ -7631,7 +7721,11 @@ def _build_parser() -> argparse.ArgumentParser:
     q_p.add_argument("claim", help="Assertion or subsystem query.")
     q_p.add_argument("--depth", default="letter", help="Depth (default: letter).")
     q_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON.")
-    q_p.add_argument("--brief", action="store_true", help="Axiom-only (omit rejected_paths) — a quick scan.")
+    # --brief is --full-top 0 — one depth dial, so the two are refused together.
+    q_depth = q_p.add_mutually_exclusive_group()
+    q_depth.add_argument("--brief", action="store_true", help=_BRIEF_HELP)
+    q_depth.add_argument("--full-top", type=_non_negative_int, default=None, metavar="N",
+                         dest="full_top", help=_FULL_TOP_HELP)
     q_p.add_argument("--limit", type=int, default=None,
                      help="Set ranked top-k to retrieve (1–50; default 5). Raises or lowers the count — a context-budget dial.")
 
@@ -7641,7 +7735,10 @@ def _build_parser() -> argparse.ArgumentParser:
     surf_p.add_argument("query", help="The claim or topic to find precedents for.")
     surf_p.add_argument("--scope", default=None, help="Optional scope hint (does NOT filter semantic recall — scopes open-questions + note only). Use `list --scope` to hard-filter by scope.")
     surf_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON.")
-    surf_p.add_argument("--brief", action="store_true", help="Axiom-only (omit rejected_paths) — a quick scan.")
+    surf_depth = surf_p.add_mutually_exclusive_group()
+    surf_depth.add_argument("--brief", action="store_true", help=_BRIEF_HELP)
+    surf_depth.add_argument("--full-top", type=_non_negative_int, default=None, metavar="N",
+                            dest="full_top", help=_FULL_TOP_HELP)
     surf_p.add_argument("--limit", type=int, default=None,
                         help="Set ranked top-k to retrieve (1–50; default 5). Raises or lowers the count — a context-budget dial.")
 
@@ -8168,9 +8265,9 @@ def main() -> None:
         elif args.command == "capture":
             cmd_capture(config, args.text)
         elif args.command in ("query", "query_decisions"):
-            cmd_query(config, args.claim, depth=args.depth, as_json=args.as_json, brief=args.brief, limit=args.limit)
+            cmd_query(config, args.claim, depth=args.depth, as_json=args.as_json, brief=args.brief, limit=args.limit, full_top=args.full_top)
         elif args.command in ("surface", "surface_decisions"):
-            cmd_surface(config, args.query, scope=args.scope, as_json=args.as_json, brief=args.brief, limit=args.limit)
+            cmd_surface(config, args.query, scope=args.scope, as_json=args.as_json, brief=args.brief, limit=args.limit, full_top=args.full_top)
         elif args.command == "show":
             cmd_show(config, args.ident, as_json=args.as_json)
         elif args.command in ("list", "list_decisions"):
