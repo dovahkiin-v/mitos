@@ -1915,6 +1915,26 @@ def _amend_canonical_core_recovery(result: Dict[str, Any]) -> str:
             f"relation that says why this one moved: {routes}.")
 
 
+def _markup_first_hit(result: Dict[str, Any]) -> str:
+    """Names a markup refusal's first span, with a count of the rest; ``""`` for none."""
+    spans = result.get("markup_spans") or []
+    if not spans:
+        return ""
+    first, rest = spans[0], len(spans) - 1
+    more = f", plus {rest} more" if rest else ""
+    return f" ({first['span']!r} at character {first['offset']} of {first['field']!r}{more})"
+
+
+def _amend_tool_call_markup_recovery(result: Dict[str, Any]) -> str:
+    """States the cause and the backtick exemption; a new slug is reported as ``slug``."""
+    fields = result["fields"]
+    return (f"{_amend_fields(fields)} {_amend_verb(fields, 'holds', 'hold')} tool-call "
+            f"markup{_markup_first_hit(result)} — syntax from the tool call itself, not "
+            "part of the entry — so nothing was written. Remove it and call again; to "
+            "mention such a tag as prose, wrap it in backticks: inline-code spans are "
+            "exempt.")
+
+
 #: One clause per refusal reason, keyed by 4a's constants and fenced by a reflection
 #: row, so a new reason reds there rather than returning without a clause.
 _AMEND_RECOVERY_BY_REASON: Dict[str, Any] = {
@@ -1952,6 +1972,7 @@ _AMEND_RECOVERY_BY_REASON: Dict[str, Any] = {
         f"of a decision entry; {_AMEND_ARGUMENTS_POINTER}"),
     amend.REASON_NO_CHANGES: lambda result: (
         f"No field to change was given; {_AMEND_ARGUMENTS_POINTER}"),
+    amend.REASON_TOOL_CALL_MARKUP: _amend_tool_call_markup_recovery,
 }
 
 

@@ -22,7 +22,7 @@ Four properties are decisions, not details:
   recovery clause.
 
 Tier 2: imports ``divergence`` (constants), ``identity``, ``markers``, ``parser``,
-``restore``, ``scope_tags`` — never ``store``, ``sync``, ``telemetry`` or a lock.
+``restore``, ``scope_tags``, ``tool_markup`` — never ``store``, ``sync``, ``telemetry`` or a lock.
 """
 
 import json
@@ -38,6 +38,7 @@ from mitos.markers import TRANSCRIPT_CLOSE, TRANSCRIPT_OPEN
 from mitos.parser import FIELD_MAP, _FIELD_LINE_RE, parse_entry_stream, parse_header
 from mitos.restore import BufferFidelityError, _entry_fingerprint
 from mitos.scope_tags import normalize_scope_tags
+from mitos.tool_markup import field_values, find_tool_call_markup
 
 EDITABLE_FIELDS: Tuple[str, ...] = tuple(COMMENTARY_FIELDS) + ("scope",)
 
@@ -81,6 +82,7 @@ REASON_NO_CHANGES = "no_changes"
 REASON_OPEN_QUESTION = "open_question"
 REASON_UNPARSEABLE = "unparseable"
 REASON_DIVERGED = "diverged"
+REASON_TOOL_CALL_MARKUP = "tool_call_markup"
 
 # Error facts: the cause, never a recovery command (the renderers own recovery).
 ERROR_FACTS: Dict[str, str] = {
@@ -209,13 +211,18 @@ def validate_changes(changes: Any) -> Optional[Dict[str, Any]]:
     """Refuses a request that cannot be honoured as a request. Pure; no I/O.
 
     Precedence when several keys are wrong: canonical core, edges, not editable,
-    unknown, then invalid values.
+    unknown, then invalid values, then tool-call markup. The markup scan reads only
+    the values sent — never the target entry's untouched fields — so an entry that
+    already holds markup stays repairable through this verb.
 
     Args:
         changes: The field → new-value mapping.
 
     Returns:
-        A refusal result, or ``None`` when the request is well-formed.
+        A refusal result, or ``None`` when the request is well-formed. A
+        ``tool_call_markup`` refusal names the base fields in ``fields`` and carries
+        ``markup_spans`` (every hit, ``{field, span, offset}``, a scope tag as
+        ``scope[i]``).
     """
     if not isinstance(changes, Mapping):
         return refused(REASON_INVALID_VALUE, [])
@@ -246,6 +253,14 @@ def validate_changes(changes: Any) -> Optional[Dict[str, Any]]:
     invalid = [field for field, value in changes.items() if not _value_is_valid(field, value)]
     if invalid:
         return refused(REASON_INVALID_VALUE, invalid)
+
+    hits = find_tool_call_markup(
+        pair for field, value in changes.items() for pair in field_values(field, value))
+    if hits:
+        result = refused(REASON_TOOL_CALL_MARKUP,
+                         list({hit["field"].split("[", 1)[0] for hit in hits}))
+        result["markup_spans"] = hits
+        return result
     return None
 
 

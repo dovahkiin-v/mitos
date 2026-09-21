@@ -4678,6 +4678,22 @@ def _amend_refused_invalid_value(result: Dict[str, Any], config: MitosConfig) ->
             f"{_amend_fields(result['fields'])} cannot be written into the entry."]
 
 
+def _amend_refused_tool_call_markup(result: Dict[str, Any], config: MitosConfig) -> List[str]:
+    spans = result.get("markup_spans") or []
+    where = ""
+    if spans:
+        first, rest = spans[0], len(spans) - 1
+        more = f", plus {rest} more" if rest else ""
+        where = f" ({first['span']!r} at character {first['offset']} of {first['field']!r}{more})"
+    fields = result["fields"]
+    value, holds = ("values", "hold") if len(fields) > 1 else ("value", "holds")
+    return [f"Amend refused [tool_call_markup]: the {value} given for "
+            f"{_amend_fields(fields)} {holds} tool-call markup{where}, syntax from "
+            "the tool call itself; nothing was written.",
+            "  Remove it, or wrap a tag meant as prose in backticks: inline-code spans "
+            "are exempt."]
+
+
 def _amend_refused_not_editable(result: Dict[str, Any], config: MitosConfig) -> List[str]:
     return [f"Amend refused [not_editable]: {_amend_fields(result['fields'])} is not an "
             "editable part of a committed entry."]
@@ -4749,6 +4765,7 @@ _AMEND_REFUSAL_RENDERERS = {
     amend.REASON_OPEN_QUESTION: _amend_refused_open_question,
     amend.REASON_UNPARSEABLE: _amend_refused_unparseable,
     amend.REASON_DIVERGED: _amend_refused_diverged,
+    amend.REASON_TOOL_CALL_MARKUP: _amend_refused_tool_call_markup,
 }
 
 # The recovery clause per error code, where the code has an action; the fact alone

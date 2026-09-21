@@ -149,6 +149,185 @@ def test_narrow_header_rejection_allows_safe_markdown(ws, safe) -> None:
     assert "error" not in res, res
 
 
+# --------------------------------------------------------------------------- #
+# Tool-call markup is refused (Phase 7b, B2). The scanner's own rows, and the note on
+# which row keeps the parser accepting markup, are in `test_tool_markup.py`.
+# --------------------------------------------------------------------------- #
+
+_NS = "ant" + "ml:"  # built by concatenation: the tooling writing this parses the literal
+_MARKUP = {
+    "function_calls": "</function_calls>",
+    "invoke": "</invoke>",
+    "parameter": '<parameter name="context">',
+    "antml": "</" + _NS + "parameter>",
+    "field_closer": "</context>",
+}
+#: Not written into the entry, so never scanned.
+_UNWRITTEN = {"self", "actor", "acknowledge_neighbors", "draft_digest"}
+#: Every argument the record verb writes, read off its signature, so a new text argument
+#: gets a cell here and reds until the scan covers it (the plan's §14 stretch).
+_WRITTEN = [name for name, p in inspect.signature(MitosSyncManager.record_decision_entry)
+            .parameters.items() if name not in _UNWRITTEN and "str" in repr(p.annotation)]
+_LISTS = {"scope", "mechanisms"}
+
+
+def _clean_record() -> dict:
+    return dict(axiom="A clean axiom.", rejected_paths="A clean rejection.",
+                scope=["clean"], mechanisms=["clean-mech"], context="Clean context.",
+                slug="clean-slug")
+
+
+def _graph(config: MitosConfig) -> Tuple[set, set]:
+    with GraphStore(config.db_path)._get_connection() as conn:
+        return ({r[0] for r in conn.execute("SELECT id FROM nodes")},
+                {tuple(r) for r in conn.execute("SELECT * FROM edges")})
+
+
+def _assert_refused_unwritten(config: MitosConfig, res: dict, before: str, graph) -> None:
+    assert res["code"] == "tool_call_markup", res
+    assert _read(config) == before
+    assert _graph(config) == graph
+    assert json.loads(json.dumps(res)) == res
+    assert "mitos " not in res["error"]
+
+
+def test_the_scanned_fields_are_every_written_argument() -> None:
+    """Population guard for the signature-derived matrix below."""
+    assert set(_WRITTEN) == {
+        "axiom", "rejected_paths", "scope", "mechanisms", "context", "slug", "supersedes",
+        "corrects", "amends", "narrows", "depends_on", "resolves", "contradicts",
+        "derives_from", "cites"}
+
+
+@pytest.mark.parametrize("label", sorted(_MARKUP))
+@pytest.mark.parametrize("field", _WRITTEN)
+def test_tool_call_markup_in_any_written_field_is_refused(ws, field, label) -> None:
+    """R1 — the field, the verbatim span and its offset; nothing written."""
+    config, m = ws
+    m.record_decision_entry("A seed axiom.", "Seed rejection.", ["s"], slug="seed",
+                            acknowledge_neighbors=True)
+    before, graph = _read(config), _graph(config)
+    shape = _MARKUP[label]
+    value = f"lead{shape}tail"
+    kwargs = _clean_record()
+    if field in _LISTS:
+        kwargs[field] = ["ok", value]
+        expected_field = f"{field}[1]"
+    else:
+        kwargs[field] = value
+        expected_field = field
+    res = m.record_decision_entry(**kwargs)
+    _assert_refused_unwritten(config, res, before, graph)
+    assert res["markup_spans"] == [{"field": expected_field, "span": shape, "offset": 4}]
+    assert repr(expected_field) in res["error"] and repr(shape) in res["error"]
+
+
+def test_the_measured_shapes_are_refused_before_any_fold(ws) -> None:
+    """R4 — the mechanism and slug folds never see the tag; fleet's shape is two hits."""
+    config, m = ws
+    before, graph = _read(config), _graph(config)
+    res = m.record_decision_entry(**{**_clean_record(), "mechanisms": ["wal-mode</parameter>"]})
+    _assert_refused_unwritten(config, res, before, graph)
+    assert res["markup_spans"] == [
+        {"field": "mechanisms[0]", "span": "</parameter>", "offset": 8}]
+    res = m.record_decision_entry(**{**_clean_record(), "slug": "my-slug</invoke>"})
+    _assert_refused_unwritten(config, res, before, graph)
+    assert "my-slug-invoke" not in json.dumps(res)
+    fleet = "Polling, ruled out.</rejected_paths>\n<parameter name=\"context\">Why we chose it."
+    res = m.record_decision_entry(**{**_clean_record(), "rejected_paths": fleet})
+    _assert_refused_unwritten(config, res, before, graph)
+    assert [(h["span"], h["offset"]) for h in res["markup_spans"]] == [
+        ("</rejected_paths>", fleet.index("</")),
+        ('<parameter name="context">', fleet.index("<parameter"))]
+    assert ", plus 1 more span." in res["error"]
+
+
+def test_markup_offsets_count_the_crlf_normalised_value(ws) -> None:
+    """G3 — step 2 folds CRLF first, so the offset is one lower per line break."""
+    config, m = ws
+    res = m.record_decision_entry(**{**_clean_record(), "context": "a\r\nb</context>"})
+    assert res["markup_spans"] == [{"field": "context", "span": "</context>", "offset": 3}]
+
+
+def test_markup_precedence_on_record(ws) -> None:
+    """R5 — empty checks first; then markup before structure, derives_from, exists, digest."""
+    config, m = ws
+    assert m.record_decision_entry(**{**_clean_record(), "axiom": " ",
+                                      "context": "x</context>"})["code"] == "empty_axiom"
+    both = "**Decided:** smuggled\nand </context>"
+    assert m.record_decision_entry(**{**_clean_record(), "context": both})["code"] == "tool_call_markup"
+    assert m.record_decision_entry(**{**_clean_record(),
+                                      "derives_from": "x</invoke>"})["code"] == "tool_call_markup"
+    assert m.record_decision_entry(**{**_clean_record(), "context": "x</context>",
+                                      "draft_digest": "garbage"})["code"] == "tool_call_markup"
+    assert m.record_decision_entry(**_clean_record())["status"] == "created"
+    before, graph = _read(config), _graph(config)
+    res = m.record_decision_entry(**{**_clean_record(), "context": "Clean context.</context>"})
+    _assert_refused_unwritten(config, res, before, graph)
+
+
+@pytest.mark.parametrize("field", ["axiom", "rejected_paths", "context"])
+def test_backticked_markup_is_recorded_byte_exact(ws, field) -> None:
+    """R3 — inline-code spans are exempt; the mixed value gives the one unfenced hit."""
+    config, m = ws
+    prose = "Mention `</context>` and `" + _MARKUP["antml"] + "` as prose."
+    res = m.record_decision_entry(**{**_clean_record(), field: prose, "slug": f"bt-{field}"})
+    assert res["status"] == "created", res
+    assert prose in _read(config)
+    mixed = "Quoted `</invoke>` then </invoke> leaked."
+    res = m.record_decision_entry(**{**_clean_record(), field: mixed, "slug": f"mx-{field}"})
+    assert res["markup_spans"] == [
+        {"field": field, "span": "</invoke>", "offset": mixed.rindex("</invoke>")}]
+
+
+@pytest.mark.parametrize("near_miss", [
+    "</div>", "<parameter>", "</Context>", "< /context>", _NS + "parameter",
+])
+def test_near_miss_markup_is_recorded(ws, near_miss) -> None:
+    """R6 — the line D2 draws does not creep."""
+    config, m = ws
+    res = m.record_decision_entry(**{**_clean_record(), "context": f"About {near_miss}.",
+                                     "slug": f"nm-{abs(hash(near_miss)) % 9999}"})
+    assert res["status"] == "created", res
+
+
+def test_the_markup_code_is_one_word_on_both_verbs() -> None:
+    from mitos import amend
+    from mitos.sync import _ERROR_MESSAGES
+    assert amend.REASON_TOOL_CALL_MARKUP == "tool_call_markup"
+    assert amend.REASON_TOOL_CALL_MARKUP in _ERROR_MESSAGES
+
+
+def test_markup_refusal_reaches_both_record_surfaces(ws, capsys) -> None:
+    """R8 — CLI text and --json, and the MCP twin, carry the code and the spans."""
+    from mitos import mcp_server
+    from mitos.cli import cmd_record
+    config, m = ws
+    before = _read(config)
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as exc:
+        cmd_record(config, axiom="An axiom.", rejected="rej", context="x </parameter>",
+                   slug="cli-markup")
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "Record failed [tool_call_markup]: 'context' holds tool-call markup: " \
+           "'</parameter>' at character 2." in err
+    with pytest.raises(SystemExit) as exc:
+        cmd_record(config, axiom="An axiom.", rejected="rej", context="x </parameter>",
+                   slug="cli-markup", as_json=True)
+    assert exc.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["code"] == "tool_call_markup"
+    assert payload["markup_spans"] == [{"field": "context", "span": "</parameter>", "offset": 2}]
+    with patch("mitos.mcp_server.MitosConfig", return_value=config):
+        res = json.loads(mcp_server.record_decision(
+            "An axiom.", "rej", ["s"], context="x </parameter>", slug="mcp-markup",
+            project=config.workspace_dir))
+    assert res["code"] == "tool_call_markup" and "mitos " not in res["error"]
+    assert res["markup_spans"] == payload["markup_spans"]
+    assert _read(config) == before
+
+
 def test_crlf_normalised_for_hash(ws) -> None:
     """The same decision with \\r\\n vs \\n endings yields the same node id (idempotent)."""
     config, m = ws

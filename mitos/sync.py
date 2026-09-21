@@ -88,6 +88,7 @@ from mitos.identity import (
 )
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.provider_cause import describe_embed_failure
+from mitos.tool_markup import field_values, find_tool_call_markup
 from mitos.vector_store import QdrantVectorStore, hash_to_uuid
 from mitos.renderer import MitosRenderer, summarize_overflows
 from mitos.restore import BufferFidelityError, verify_amended_buffer
@@ -293,6 +294,7 @@ _ERROR_MESSAGES: Dict[str, str] = {
     "commit_failed": "The decision validated but the commit failed and nothing was written: {reason}. Retry; if it persists, the workspace store may be locked or corrupt.",
     "derives_from_on_decision": "derives_from is not valid when recording a decision: a derives_from edge originates from an open question (open_question -> decision), so a decision can never be its source. If you mean 'this decision builds on that one', use cites instead.",
     "draft_drifted": "This re-send's {fields} changed from the draft its draft_digest came from — the values of the call that paused, not your latest send. Restore those values and re-send with the same draft_digest, or omit draft_digest (which always clears this comparison) to record the draft as it is now.",
+    "tool_call_markup": "{field!r} holds tool-call markup: {span!r} at character {offset}{more}. That is syntax from the tool call itself, not part of the decision, so nothing was recorded. Remove it and send the call again — or, to mention such a tag as prose, wrap it in backticks (`...`): inline-code spans are exempt.",
     "draft_digest_unreadable": "draft_digest is not a value a pause returned, so this re-send cannot be compared with its draft. Pass the pause's draft_digest exactly as it came, or omit draft_digest (which always clears this comparison).",
 }
 
@@ -444,6 +446,30 @@ def _draft_drift(entry: ParsedEntry, draft_digest: Optional[str]) -> Optional[Di
         return None
     return {**_record_error("draft_drifted", fields=_readable_fields(drifted)),
             "drifted_fields": drifted}
+
+
+def _tool_call_markup_refusal(arguments: List[Tuple[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Refuses a record call that would write tool-call markup.
+
+    Pure and in memory: no store read, no raise (the scanner skips non-strings).
+
+    Args:
+        arguments: ``(name, value)`` for every argument the call writes; a list value
+            is scanned element by element as ``name[i]``.
+
+    Returns:
+        ``None`` when nothing is found; otherwise a ``tool_call_markup`` refusal
+        carrying ``markup_spans`` (every hit, ``{field, span, offset}``).
+    """
+    hits = find_tool_call_markup(
+        pair for name, value in arguments for pair in field_values(name, value))
+    if not hits:
+        return None
+    first, rest = hits[0], len(hits) - 1
+    more = f", plus {rest} more span{'s' if rest > 1 else ''}" if rest else ""
+    return {**_record_error("tool_call_markup", field=first["field"], span=first["span"],
+                            offset=first["offset"], more=more),
+            "markup_spans": hits}
 
 
 class _AmendAnswer(Exception):
@@ -3795,7 +3821,8 @@ class MitosSyncManager:
             A JSON-safe dict whose ``status`` is ``amended`` (``id``, ``fields_changed``,
             ``embedding``, ``path``, and ``rename`` = ``{"from", "to", "incoming"}`` on a
             rename), ``unchanged`` (``id``), ``refused`` (``reason``, ``fields``,
-            ``routes`` for ``canonical_core``), ``not_found``, ``archived`` (``id``) or
+            ``routes`` for ``canonical_core``, ``markup_spans`` for
+            ``tool_call_markup``), ``not_found``, ``archived`` (``id``) or
             ``uncommitted``; or a fault ``{"error", "code", "slug"}`` with code
             ``slug_collision``, ``commit_failed`` (also a graph read that failed under
             the lock), ``audit_unavailable``,
@@ -4081,7 +4108,10 @@ class MitosSyncManager:
             ``*_total`` sibling count when the group collapsed at
             :data:`_DECLARED_ECHO_BOUND`;
             OR a structured ``{error, code}`` failure (see spec §5) — a
-            ``draft_drifted`` one also carries ``drifted_fields``.
+            ``draft_drifted`` one also carries ``drifted_fields``, and a
+            ``tool_call_markup`` one carries ``markup_spans`` (every hit, ``{field,
+            span, offset}``; a list element's field reads ``name[i]``, and a prose
+            field's offset counts characters of its CRLF-normalised value).
         """
         # === Phase A — validate everything in memory (no writes) ===
 
@@ -4101,6 +4131,19 @@ class MitosSyncManager:
             return _record_error("empty_axiom")
         if not rejected_paths.strip():
             return _record_error("missing_rejected_paths")
+
+        # 2b. Refuse (never strip) tool-call markup in every value this call writes,
+        #     before any strip, slug fold, mechanism fold or hash can hide it. The prose
+        #     fields are scanned CRLF-normalised; everything else raw.
+        markup = _tool_call_markup_refusal([
+            ("axiom", axiom), ("rejected_paths", rejected_paths), ("context", context),
+            ("slug", slug), ("scope", scope), ("mechanisms", mechanisms),
+            ("supersedes", supersedes), ("corrects", corrects), ("amends", amends),
+            ("narrows", narrows), ("depends_on", depends_on), ("resolves", resolves),
+            ("contradicts", contradicts), ("derives_from", derives_from), ("cites", cites),
+        ])
+        if markup is not None:
+            return markup
 
         # 3. Reject (do NOT sanitise) content fields carrying structural tokens.
         #    Check the NON-stripped values: a leading-whitespace `  ## heading` is

@@ -408,6 +408,25 @@ def test_a_refused_clear_says_what_cannot_be_cleared_and_verbs_agree(ws) -> None
     assert "'context', 'scope' were both given" in both["error"]
 
 
+def test_a_markup_refusal_carries_its_spans_and_a_clause_naming_no_command(ws) -> None:
+    """R8 — in-band, with provenance; a new slug is reported as `slug` (G6)."""
+    config, m = ws
+    _plain(config, m)
+    sha = _sha(config)
+    payload = _call(slug="target", context="x </context>", new_slug="t</invoke>")
+    assert (payload["status"], payload["reason"], payload["fields"]) == (
+        "refused", amend.REASON_TOOL_CALL_MARKUP, ["context", "slug"])
+    assert payload["markup_spans"] == [
+        {"field": "context", "span": "</context>", "offset": 2},
+        {"field": "slug", "span": "</invoke>", "offset": 1}]
+    clause = payload["recovery"]
+    assert "'context', 'slug' hold tool-call markup ('</context>' at character 2 of " \
+           "'context', plus 1 more)" in clause
+    assert "backticks" in clause and "mitos " not in clause
+    assert all(payload[key] for key in PROVENANCE)
+    assert _sha(config) == sha
+
+
 def test_the_description_is_terse_true_and_names_no_command() -> None:
     """M5 + D-4c-6 — no shell syntax, no count, no future capability; the channel is stated."""
     desc = _flat(_tools()["amend_commentary"].description)
