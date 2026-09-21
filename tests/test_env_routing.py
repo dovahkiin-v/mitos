@@ -820,8 +820,9 @@ class TestTheKeylessPostureWhereTheFallbackUsedToAnswer:
 
 # --- the structural net ----------------------------------------------------
 
-# EVERY `os.environ` read in `mitos/`, as `(module, function)`. **Five keys, six
-# reads** since 6a — `MITOS_NO_MCP_HINT` retired with the per-project MCP-wiring
+# EVERY `os.environ` read in `mitos/`, as `(module, function)`. **Five keys plus
+# the whole mapping once, seven reads** since 3d added `_git._git_env`'s
+# whole-mapping read; five keys, six reads before it, since 6a — `MITOS_NO_MCP_HINT` retired with the per-project MCP-wiring
 # nudge, so `cli.py` now reads the process environment nowhere at all. After 5c
 # there is no second dict beside this one either: the transitional shim's single
 # read is gone, and so is `cli.load_dotenv_file`'s pair — which were also the
@@ -834,17 +835,24 @@ PERMANENT_ENV_READS = {
     ("config.py", "config_home"): 1,        # XDG_CONFIG_HOME — likewise
     ("_update.py", "_cache_path"): 1,       # XDG
     ("_update.py", "update_notice"): 1,     # MITOS_NO_UPDATE_CHECK quiet-switch
+    ("_git.py", "_git_env"): 1,             # the whole mapping, minus git's repo-locating vars
 }
 
 
 def _environ_reads(path: str) -> List[str]:
     """Every `os.environ` READ in a module, as the name of its enclosing function.
 
-    Four shapes, because the tree uses all four: ``os.environ.get(...)``,
+    Four keyed shapes, because the tree uses all four: ``os.environ.get(...)``,
     ``os.environ.setdefault/pop(...)``, ``name in os.environ``, and a
-    ``os.environ[name]`` subscript in either context. Swept over the AST rather
-    than the text — several of these modules discuss ``os.environ`` in prose, it
-    being the thing this design stopped consulting.
+    ``os.environ[name]`` subscript in either context. Plus, since 3d, the
+    whole-mapping reads, which consult every key at once and were invisible to the
+    keyed arms: ``os.environ.copy/items/keys/values()``, the mapping passed whole
+    as a call argument, positional or keyword (``dict(os.environ)``,
+    ``env=os.environ``), unpacked (``{**os.environ}``), or
+    iterated (``for``/comprehension). Each environ node is counted by exactly one
+    arm. Swept over the AST rather than the text — several of these modules
+    discuss ``os.environ`` in prose, it being the thing this design stopped
+    consulting.
     """
     found: List[str] = []
 
@@ -871,8 +879,29 @@ def _environ_reads(path: str) -> List[str]:
         def visit_Call(self, node: ast.Call) -> None:
             func = node.func
             if (isinstance(func, ast.Attribute)
-                    and func.attr in ("get", "setdefault", "pop")
+                    and func.attr in ("get", "setdefault", "pop",
+                                      "copy", "items", "keys", "values")
                     and self._is_environ(func.value)):
+                self._hit()
+            # dict(os.environ), sorted(os.environ), run(..., env=os.environ), f(**os.environ)
+            for arg in [*node.args, *(kw.value for kw in node.keywords)]:
+                if self._is_environ(arg):
+                    self._hit()
+            self.generic_visit(node)
+
+        def visit_Dict(self, node: ast.Dict) -> None:
+            for key, value in zip(node.keys, node.values):   # {**os.environ}
+                if key is None and self._is_environ(value):
+                    self._hit()
+            self.generic_visit(node)
+
+        def visit_For(self, node: ast.For) -> None:
+            if self._is_environ(node.iter):
+                self._hit()
+            self.generic_visit(node)
+
+        def visit_comprehension(self, node: ast.comprehension) -> None:
+            if self._is_environ(node.iter):
                 self._hit()
             self.generic_visit(node)
 
@@ -890,6 +919,25 @@ def _environ_reads(path: str) -> List[str]:
     return found
 
 
+@pytest.mark.parametrize("source", [
+    "import os\ndef f():\n    return os.environ.get('K')",
+    "import os\ndef f():\n    return 'K' in os.environ",
+    "import os\ndef f():\n    return os.environ['K']",
+    "import os\ndef f():\n    return os.environ.copy()",
+    "import os\ndef f():\n    return dict(os.environ)",
+    "import os, subprocess\ndef f():\n    subprocess.run(['x'], env=os.environ)",
+    "import os\ndef f():\n    return {**os.environ}",
+    "import os\ndef f():\n    return [k for k in os.environ]",
+    "import os\ndef f():\n    for k in os.environ:\n        pass",
+], ids=["get", "in", "subscript", "copy", "positional-arg", "keyword-arg", "unpacked",
+        "comprehension", "for"])
+def test_the_read_visitor_counts_each_shape_exactly_once(tmp_path, source):
+    """In-row positive controls for every arm, keyed and whole-mapping (3d widened it)."""
+    module = tmp_path / "plant.py"
+    module.write_text(source, encoding="utf-8")
+    assert _environ_reads(str(module)) == ["f"]
+
+
 def test_the_process_environment_is_read_only_at_the_declared_sites():
     """The exact set of `os.environ` reads in `mitos/` — the checklist, not a comment.
 
@@ -901,14 +949,19 @@ def test_the_process_environment_is_read_only_at_the_declared_sites():
     with its only member — an empty dict left behind is a hook for the next
     shim.
 
-    **Five keys, six reads** since 6a, which retired ``MITOS_NO_MCP_HINT`` along
-    with the nudge it silenced — leaving ``cli.py`` reading the process
-    environment nowhere. The prior count is pinned independently outside this
-    file: the ADR recorded at 2b says *"nine permanent … and exactly one
-    transitional … 5c shrinks the first to seven and the second to zero"* —
-    reads, not keys — and 6a takes that seven to six by deleting a reader, not by
-    re-routing one. Two sources agreeing is the check; any other number means one
-    of them is wrong.
+    **Five keys plus the whole mapping once, seven reads** since 3d. 6a left five keys and six reads, retiring
+    ``MITOS_NO_MCP_HINT`` along with the nudge it silenced — leaving ``cli.py``
+    reading the process environment nowhere. The ADR recorded at 2b says *"nine
+    permanent … and exactly one transitional … 5c shrinks the first to seven and
+    the second to zero"* — reads, not keys — and 6a took that seven to six by
+    deleting a reader, not by re-routing one; that ADR stays true of its phase.
+    3d added one whole-mapping read, ``_git._git_env``, which hands git the
+    environment minus its repository-locating variables, and widened this sweep so
+    a whole-mapping read is counted at all. The current count is pinned
+    independently outside this file by the ADR
+    ``git-is-asked-from-the-workspace-dir-with-gits-repo-locating-env-cleared``
+    (*"takes the declared process-environment reads to seven"*). Two sources
+    agreeing is the check; any other number means one of them is wrong.
 
     This is the row that catches a bare read growing back — including the
     asymmetric case the behavioural rows cannot see: route every credential but
@@ -921,13 +974,14 @@ def test_the_process_environment_is_read_only_at_the_declared_sites():
             counted[(module, func)] = counted.get((module, func), 0) + 1
 
     assert counted == PERMANENT_ENV_READS
-    assert sum(counted.values()) == 6
+    assert sum(counted.values()) == 7
 
 
 def test_the_process_environment_is_written_nowhere_in_mitos():
     """The other half, and the one 5c makes absolute: `mitos` mutates no environment.
 
-    The read set above tolerates six legitimate consultations (five keys). There is no
+    The read set above tolerates seven legitimate consultations (five keys, plus
+    the whole mapping once). There is no
     legitimate **write**: a program that writes its own environment cannot answer
     the same question twice about two different projects, which is the property
     this vision exists to establish. Until 5c the tree had exactly one writer,

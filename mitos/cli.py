@@ -77,7 +77,7 @@ from mitos.commit_gate import (CAUSE_GRAPH, CAUSE_NO_GRAPH, CAUSE_TELEMETRY, GAT
                                GATE_UNREADABLE, HOOK_BLOCK_EXIT, evaluate_gate)
 from mitos.identity import compute_node_id
 from mitos.models import get_embedding_model_id, get_model_id
-from mitos.parser import (ParsedEntry, parse_entry_stream,
+from mitos.parser import (ParsedEntry, load_format_spec, parse_entry_stream,
                           read_text_or_none)
 from mitos.conflict import (run_conflict_check, ConflictUnavailableReason,
                             SEMANTIC_SUBSTRATE_REASONS)
@@ -273,13 +273,6 @@ def _oq_payload(oq: Dict[str, Any]) -> Dict[str, Any]:
     """
     return {"topic": oq["slug"], "questions_raised": oq["questions_raised"],
             "park_reason": oq.get("park_reason"), **_oq_modifiers(oq)}
-
-
-def load_format_spec() -> str:
-    """Loads the canonical format specification from the package's single source of truth."""
-    spec_path = os.path.join(os.path.dirname(__file__), "format-spec.md")
-    with open(spec_path, "r", encoding="utf-8") as f:
-        return f.read()
 
 
 def _ensure_gitignore_entry(gitignore_path: str, entry: str) -> None:

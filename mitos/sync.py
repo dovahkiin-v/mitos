@@ -61,8 +61,8 @@ from mitos.errors import (
     STORE_SLUG_COLLISION,
 )
 from mitos.models import get_embedding_model_id, get_model_id
-from mitos.parser import (ParsedEntry, mask_inline_code, parse_entry_stream,
-                          parse_file_reversed)
+from mitos.parser import (ParsedEntry, load_format_spec, mask_inline_code,
+                          parse_entry_stream, parse_file_reversed)
 from mitos.replay import commit_quarantine_fixpoint
 from mitos.store import (
     GraphStore,
@@ -1186,7 +1186,6 @@ class MitosSyncManager:
             return
 
         # Load canonical format spec from package single source of truth
-        from mitos.cli import load_format_spec
         try:
             format_spec_content = load_format_spec()
         except Exception:

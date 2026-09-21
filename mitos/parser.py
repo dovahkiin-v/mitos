@@ -25,6 +25,13 @@ from mitos.markers import (TRANSCRIPT_CLOSE, TRANSCRIPT_OPEN, is_entries_sentine
                            is_entry_heading, mask_inline_code)
 from mitos.scope_tags import normalize_scope_tags
 
+def load_format_spec() -> str:
+    """Loads the canonical format specification from the package's single source of truth."""
+    spec_path = os.path.join(os.path.dirname(__file__), "format-spec.md")
+    with open(spec_path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
 def load_dynamic_field_map() -> Dict[str, str]:
     """Builds the FIELD_MAP purely from format-spec.md (C5 single source, V1-D7).
 

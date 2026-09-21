@@ -4,10 +4,10 @@ These are deliberately heavy: they build a real wheel and install it into a
 *fresh, throwaway* virtualenv (non-editable). That is the whole point — an
 editable install reads ``format-spec.md`` from the source tree and would hide a
 missing-``package-data`` bug. ``mitos/format-spec.md`` is read from the installed
-package dir in two places (``mitos.cli.load_format_spec`` at ``mitos init`` time
-and ``mitos.parser`` at *import* time), so a wheel missing it doesn't just break
-``init`` — it breaks ``import mitos.parser`` outright. Only a non-editable install
-exercises that real read path (vision V1-D7 / §6.2).
+package dir in two places, both in ``mitos.parser`` (``load_format_spec``, which
+``mitos init`` calls, and ``load_dynamic_field_map`` at *import* time), so a wheel
+missing it doesn't just break ``init`` — it breaks ``import mitos.parser``
+outright. Only a non-editable install exercises that real read path (vision V1-D7 / §6.2).
 
 Both tests carry the ``packaging`` marker: they are slow (venv + network build
 isolation pulls setuptools/wheel) and testmon will not select them on its own, so
