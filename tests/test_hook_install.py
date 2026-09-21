@@ -853,6 +853,33 @@ def test_hook_install_help_says_what_where_what_it_refuses_and_how_it_dies() -> 
         assert phrase in text, phrase
 
 
+@_needs_git
+def test_the_epilog_promises_no_block_where_the_arm_prints_none(tmp_path,
+                                                               capsys) -> None:
+    """8a1 D5: the epilog's refusal sentence agrees with the FOREIGN_WITH_BLOCK arm.
+
+    The arm is driven first, so a row over wording alone cannot pass it: exit 1,
+    one stderr sentence, and no block marker on either stream. The epilog must
+    then carve that case out of "prints a block to paste by hand".
+    """
+    repo, ws = _repo_with_workspace(tmp_path)
+    hook = _hook_of(repo)
+    with open(hook, "w", encoding="utf-8") as f:
+        f.write(_FOREIGN + render_hook_block(command=["/opt/mitos"], selector=ws,
+                                             guard_dir=None))
+    code, out, err = _install(ws, _stub(tmp_path / "bin"), capsys)
+    assert code == 1
+    assert HOOK_BLOCK_MARKER not in out and HOOK_BLOCK_MARKER not in err
+    assert "already carries a mitos commit gate block" in err
+
+    text = _flat_help("hook-install")
+    promise = "for those two it prints a block to paste by hand"
+    assert promise in text
+    after = text.split(promise, 1)[1].split(". ", 1)[0]
+    assert "already carrying that block is left as it is" in after
+    assert "no second block printed" in after
+
+
 def test_hook_run_help_describes_hook_file() -> None:
     sub = _subparsers(cli._build_parser())["hook-run"]
     action = next(a for a in sub._actions if "--hook-file" in a.option_strings)

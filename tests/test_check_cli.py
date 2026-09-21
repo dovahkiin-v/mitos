@@ -668,6 +668,32 @@ def test_staged_help_says_what_it_gates() -> None:
     assert "hook-run" not in action.help
 
 
+def _check_help(dest: str) -> str:
+    from test_cli_selector import _subparsers
+    (action,) = [a for a in _subparsers(cli._build_parser())["check"]._actions
+                 if a.dest == dest]
+    return " ".join(action.help.split())
+
+
+def test_yes_help_names_whose_flag_it_is() -> None:
+    """8a1 D5: ``--yes`` belongs to a person who decided the spend.
+
+    The refusal an agent reads names a person at a terminal; help calling the
+    flag "the opt-in on every non-interactive surface" read as an invitation.
+    """
+    text = _check_help("yes")
+    assert "a person who has already decided that spend" in text
+    assert "every non-interactive surface" not in text
+
+
+def test_scope_help_says_a_scoped_run_is_not_the_gate_attempt() -> None:
+    """8a1 D5: an agent sent by a block must not take a scoped run for the attempt.
+
+    ``_begin_check_attempt`` runs only when ``scope is None``.
+    """
+    assert "not the check attempt the commit gate reads" in _check_help("scope")
+
+
 def _recipe(out: str, marker: str) -> str:
     """The backticked ``mitos`` recipe on the one report line carrying ``marker``."""
     (line,) = [line for line in out.splitlines() if marker in line]

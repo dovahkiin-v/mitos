@@ -8221,12 +8221,13 @@ def _build_parser() -> argparse.ArgumentParser:
              "refused, or could not run.")
     check_p.add_argument("--scope", default=None,
                          help="Restrict the audited (proposal) set to one scope tag "
-                              "(candidate recall stays scope-blind).")
+                              "(candidate recall stays scope-blind). A scoped run is "
+                              "not the check attempt the commit gate reads.")
     check_p.add_argument("--fresh", action="store_true",
                          help="Re-judge every pair, bypassing verdict reuse.")
     check_p.add_argument("--yes", action="store_true",
-                         help="Authorize the LLM spend without prompting (the opt-in "
-                              "on every non-interactive surface).")
+                         help="Authorize the LLM spend without prompting: the flag "
+                              "of a person who has already decided that spend.")
     check_p.add_argument("--json", action="store_true", dest="as_json",
                          help="Emit one machine-readable JSON object (never prompts).")
     check_p.add_argument("--staged", action="store_true",
@@ -8274,7 +8275,9 @@ def _build_parser() -> argparse.ArgumentParser:
             "It refuses someone else's pre-commit, never overwriting or appending to "
             "a file mitos did not write, and refuses a shared hooks directory (a "
             "core.hooksPath inside the work tree or outside the repository); for "
-            "those two it prints a block to paste by hand. Every refusal exits 1 and "
+            "those two it prints a block to paste by hand, except that a pre-commit "
+            "already carrying that block is left as it is, with no second block "
+            "printed. Every refusal exits 1 and "
             "writes nothing. Running it again replaces the hook it wrote. The hook "
             "serves one workspace. Removing the gate is deleting the file it names."))
 
