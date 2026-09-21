@@ -1397,3 +1397,162 @@ def test_the_coherence_line_reaches_a_combined_pipe_after_the_receipt(tmp_path) 
     assert "Recorded decision 'piped-record'" in combined, combined
     assert "mitos check" in combined, combined
     assert combined.index("mitos check") > combined.index("Handle:"), combined
+
+
+# --------------------------------------------------------------------------- #
+# Phase 3g1 — the standing check notice on the `created` receipt
+# --------------------------------------------------------------------------- #
+#
+# `ws` has no telemetry (2c's gotcha D-1): every shown row seeds a record first,
+# through 3g1's writer helper. The key is set before the config is built, because
+# `config.env` is resolved at construction.
+
+from test_commit_gate import _SHOWN, _seed_attempt  # noqa: E402
+
+_KEY = "sk-dummy-never-sent"
+
+
+def _keyed_ws(config: MitosConfig, monkeypatch) -> Tuple[MitosConfig, MitosSyncManager]:
+    """The same workspace under a config (and manager) built with a judge key set."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", _KEY)
+    keyed = MitosConfig(config.workspace_dir, project=config.project)
+    return keyed, MitosSyncManager(keyed)
+
+
+def _seed_shown(config: MitosConfig, case: str) -> None:
+    seed = dict(_SHOWN[case])
+    _seed_attempt(config, seed.pop("state"), **seed)
+
+
+def _text_receipt(config: MitosConfig, capsys, axiom: str, slug: str) -> Tuple[str, str]:
+    from mitos.cli import cmd_record
+    capsys.readouterr()
+    cmd_record(config, axiom=axiom, rejected="rej", slug=slug, acknowledge_neighbors=True)
+    return capsys.readouterr()
+
+
+@pytest.mark.parametrize("case", sorted(_SHOWN))
+def test_each_shown_outcome_rides_all_three_receipt_encodings(ws, monkeypatch, capsys,
+                                                             case) -> None:
+    """Criterion 10: MCP and `--json` carry equal notices; text prints the line just
+    above the coherence line.
+
+    Equality is right here, unlike the audit-debt parity row: nothing between the
+    two writes touches the attempt record, so both read the same one.
+    """
+    from mitos.check_notice import check_notice_line
+    from mitos.cli import _coherence_audit_hint
+    config, _ = ws
+    _seed_shown(config, case)
+    keyed, _ = _keyed_ws(config, monkeypatch)
+
+    cli_payload, mcp_payload = _record_on_both_encodings(keyed, capsys)
+    assert cli_payload["check_notice"] == mcp_payload["check_notice"]
+    notice = mcp_payload["check_notice"]
+    assert notice["state"] == _SHOWN[case]["state"]
+    assert notice["line"] == check_notice_line(
+        {k: v for k, v in notice.items() if k != "line"})
+
+    _out, err = _text_receipt(keyed, capsys, "The text encoding of the notice.", "cn-text")
+    lines = [ln for ln in err.splitlines() if ln]
+    at = lines.index(notice["line"])
+    assert lines[at + 1].endswith(_coherence_audit_hint(keyed))
+
+
+@pytest.mark.parametrize("setup", ["no_new_findings", "keyless", "no_telemetry"])
+def test_a_healthy_keyless_or_unrecorded_workspace_pays_zero_bytes(ws, monkeypatch, capsys,
+                                                                  setup) -> None:
+    """Criterion 11: no `check_notice` key on MCP or `--json`, and no line on text."""
+    from test_commit_gate import _seed_attempt as seed
+    from mitos.telemetry import ATTEMPT_COULD_NOT_COMPLETE, ATTEMPT_NO_NEW_FINDINGS
+    config, _ = ws
+    if setup == "no_new_findings":
+        seed(config, ATTEMPT_NO_NEW_FINDINGS)
+        config, _ = _keyed_ws(config, monkeypatch)
+    elif setup == "keyless":
+        seed(config, ATTEMPT_COULD_NOT_COMPLETE, tokens=("judgment",))
+    else:
+        config, _ = _keyed_ws(config, monkeypatch)
+
+    cli_payload, mcp_payload = _record_on_both_encodings(config, capsys)
+    assert "check_notice" not in cli_payload and "check_notice" not in mcp_payload
+    _out, err = _text_receipt(config, capsys, "A text write with nothing to show.", "cn-quiet")
+    assert "The last contradiction check" not in err
+    if setup == "no_telemetry":
+        # The keyed read opens read-only and never builds the file it did not find.
+        assert not os.path.exists(config.telemetry_path)
+
+
+def test_a_raising_notice_read_still_returns_created(ws, monkeypatch, capsys) -> None:
+    """Criterion 12 (the degrade): the read raising costs the notice and nothing else.
+
+    Patched at ``mitos.sync.read_last_attempt``, the name the step looks up.
+    """
+    from mitos.telemetry import ATTEMPT_COULD_NOT_COMPLETE
+    config, _ = ws
+    _seed_attempt(config, ATTEMPT_COULD_NOT_COMPLETE, tokens=("judgment",))
+    keyed, m = _keyed_ws(config, monkeypatch)
+    capsys.readouterr()
+    with patch("mitos.sync.read_last_attempt", side_effect=RuntimeError("planted")):
+        res = _created(m, "A write whose notice read breaks.", "cn-raises")
+
+    assert "check_notice" not in res
+    assert res["id"] in GraphStore(keyed.db_path, read_only=True).get_active_decision_ids()
+    assert res["coherence_audit"] and isinstance(res["audit_debt"], dict)
+    assert res["edges_created"] == [] and res["embedding"]
+    err = capsys.readouterr().err
+    assert [ln for ln in err.splitlines() if "Check notice" in ln] == [
+        "[Warning] Check notice could not be composed: RuntimeError: planted"]
+
+
+def test_a_standing_notice_leaves_one_mitos_check_on_the_text_receipt(ws, monkeypatch,
+                                                                     capsys) -> None:
+    """Criterion 13: the notice line adds no second recipe; the coherence line has it.
+
+    ``argv[0]`` is pinned to bare ``mitos``: a recovery clause leaking onto this
+    receipt would otherwise spell pytest's path and stay invisible to the count.
+    """
+    config, _ = ws
+    monkeypatch.setattr(sys, "argv", ["mitos"])
+    _seed_shown(config, "could_not_complete_with_pairs")
+    keyed, _ = _keyed_ws(config, monkeypatch)
+    out, err = _text_receipt(keyed, capsys, "The notice stands on this receipt.", "cn-once")
+    assert "The last contradiction check" in err
+    assert (out + err).count("mitos check") == 1, out + err
+
+
+@pytest.mark.parametrize("case", sorted(_SHOWN))
+def test_the_mcp_notice_names_no_command(ws, monkeypatch, case) -> None:
+    """Criterion 14: the MCP line carries no backtick and no `mitos ` command."""
+    from mitos import mcp_server
+    config, _ = ws
+    _seed_shown(config, case)
+    keyed, _ = _keyed_ws(config, monkeypatch)
+    with patch("mitos.mcp_server.MitosConfig", return_value=keyed):
+        payload = json.loads(mcp_server.record_decision(
+            "An MCP write under a standing notice.", "rej", ["s"], slug="cn-mcp",
+            acknowledge_neighbors=True, project=keyed.workspace_dir))
+    line = payload["check_notice"]["line"]
+    assert "`" not in line and "mitos " not in line
+
+
+def test_exists_and_needs_review_carry_no_notice(ws, monkeypatch, capsys) -> None:
+    """Criterion 15: only a write that landed carries the notice."""
+    config, _ = ws
+    _seed_shown(config, "could_not_complete")
+    keyed, m = _keyed_ws(config, monkeypatch)
+    assert "check_notice" in _created(m, "The sync lock is held during commit.", "cn-prior")
+
+    again = m.record_decision_entry("The sync lock is held during commit.", "rej", ["s"],
+                                    slug="cn-prior", acknowledge_neighbors=True)
+    assert again["status"] == "exists" and "check_notice" not in again
+    with patch.object(MitosSyncManager, "_review_neighbors",
+                      return_value=[{"slug": "cn-prior", "score": 0.9,
+                                     "axiom": "The sync lock is held during commit."}]):
+        paused = m.record_decision_entry("The sync lock is held for the commit duration.",
+                                         "rej", ["s"], slug="cn-paused")
+    assert paused["status"] == "needs_review" and "check_notice" not in paused
+
+    _out, err = _text_receipt(keyed, capsys, "The sync lock is held during commit.",
+                              "cn-prior")
+    assert "The last contradiction check" not in err

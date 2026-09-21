@@ -76,6 +76,7 @@ from mitos.telemetry import (
     read_last_attempt,
 )
 from mitos.audit_debt import AuditDebt, NoGraph, derive_audit_debt
+from mitos.check_notice import compose_check_notice
 from mitos.commit_gate import (CAUSE_GRAPH, CAUSE_NO_GRAPH, CAUSE_TELEMETRY, GATE_BLOCKED,
                                GATE_UNREADABLE, HOOK_ABSENT, HOOK_BLOCK_EXIT, HOOK_FOREIGN,
                                HOOK_FOREIGN_WITH_BLOCK, HOOK_OURS, HOOK_UNREADABLE,
@@ -785,7 +786,8 @@ def cmd_sync(config: MitosConfig, auto_accept: bool = False, embed_only: bool = 
     report from here. What the handler prints on its own is refusals — the two
     aborts and the two ``--reconcile-entry`` compositions below — and each carries
     its own echo on stderr, because an echo pinned to stdout is invisible to a
-    caller reading the refusal.
+    caller reading the refusal. The one other line is the standing check notice
+    (``check_notice.compose_check_notice``), on stderr after either branch returns.
 
     The shortfall exit is the handler's too: exiting from inside the loop would
     truncate the run before ``render_all`` and the outbox drain, so ``perform_sync``
@@ -826,6 +828,7 @@ def cmd_sync(config: MitosConfig, auto_accept: bool = False, embed_only: bool = 
                   file=sys.stderr)
             sys.exit(1)
     manager = MitosSyncManager(config)
+    shortfall: List[str] = []
     if embed_only:
         manager.drain_pending_embeddings()
     else:
@@ -844,12 +847,23 @@ def cmd_sync(config: MitosConfig, auto_accept: bool = False, embed_only: bool = 
             _echo_corpus(config, file=sys.stderr)
             print(f"Sync Aborted: Validation error.\n{str(e)}", file=sys.stderr)
             sys.exit(1)
-        if shortfall:
-            # 1, matching the verb's two aborts — no new code vocabulary. The
-            # contract binds only the caller who typed the flag; a bare `mitos sync`
-            # returns an empty list and is untouched. This exit prints nothing
-            # itself (the report's lines came from `sync.py`), so it owes no echo.
-            sys.exit(1)
+    # The standing check notice closes both branches, on stderr: stdout is the
+    # sync's own report, and the notice is not its result. Before the shortfall
+    # exit, so a failed repair still shows it. It carries its own recovery clause
+    # because nothing else on this output names `mitos check`.
+    check_notice = compose_check_notice(
+        config, read_attempt=read_last_attempt, get_node=manager.store.get_node
+    )
+    if check_notice:
+        sys.stdout.flush()
+        print(f"\n{check_notice['line']}{_check_notice_recovery(config, check_notice)}",
+              file=sys.stderr)
+    if shortfall:
+        # 1, matching the verb's two aborts — no new code vocabulary. The
+        # contract binds only the caller who typed the flag; a bare `mitos sync`
+        # returns an empty list and is untouched. This exit prints nothing
+        # itself (the report's lines came from `sync.py`), so it owes no echo.
+        sys.exit(1)
 
 
 def cmd_reconcile(config: MitosConfig, as_json: bool = False) -> int:
@@ -1362,6 +1376,30 @@ def _coherence_audit_hint(config: MitosConfig) -> str:
         The recovery sentence, naming ``mitos check`` exactly once.
     """
     return f"The audit is `mitos check -p {config.project!r}` — one pass, whole corpus."
+
+
+def _check_notice_recovery(config: MitosConfig, notice: Mapping[str, Any]) -> str:
+    """Composes the CLI's recovery clause for the standing check notice.
+
+    The notice's line (``check_notice.check_notice_line``) states what the last
+    check did and names no command, because MCP shares it. This is the CLI's own
+    addition, appended where no other line already carries the recipe: on
+    ``mitos sync``, not on the ``created`` receipt, whose coherence line names
+    ``mitos check`` once. A refused spend names a person at a terminal, never the
+    waiver flag. The command is the running build and the selector is
+    ``config.project`` through ``repr``.
+
+    Args:
+        config: The resolved workspace config, carrying ``project``.
+        notice: The ``check_notice`` payload; only its ``state`` is read.
+
+    Returns:
+        The clause, with a leading space and its own terminal punctuation.
+    """
+    recipe = f"`{_running_mitos_command()} check -p {config.project!r}`"
+    if notice.get("state") == ATTEMPT_SPEND_NOT_AUTHORIZED:
+        return f" A person runs {recipe} at a terminal and confirms the prompt."
+    return f" {recipe} attempts it again."
 
 
 def cmd_show(config: MitosConfig, ident: str, as_json: bool = False) -> None:
@@ -2040,8 +2078,16 @@ def cmd_record(
     if rotated and rotated.get("outcome") == ROTATION_FAILED:
         sys.stdout.flush()
         print(f"\n{_rotation_failure_line(config, rotated)}", file=sys.stderr)
-    # The standing coherence debt, last — so it reads as the answer to the notice
-    # above it, which after the split carries no recovery of its own. Gated on the
+    # The standing check notice: the last contradiction check's outcome, `created`
+    # only (sync sets the key on that return alone). No recovery clause here: the
+    # coherence line below names `mitos check` once, and this line sits directly
+    # above it so the one recipe answers both.
+    check_notice = result.get("check_notice")
+    if check_notice:
+        sys.stdout.flush()
+        print(f"\n{check_notice['line']}", file=sys.stderr)
+    # The standing coherence debt, last — so it reads as the answer to the notices
+    # above it, which after the split carry no recovery of their own. Gated on the
     # FIELD, which sync sets on the `created` return alone: this text tail is shared
     # with the `exists` exit (it branches only on the headline and the path label),
     # and a no-op incurs no audit debt — an unconditional print would also put a
@@ -3051,7 +3097,7 @@ def _commit_gate_row(config: MitosConfig) -> Dict[str, Any]:
             "state": attempt.state,
             "outcome_at": attempt.outcome_at,
             "findings_known": attempt.findings_known,
-            # A count: the notice owns naming pairs.
+            # A count: the notice owns naming pairs (mitos/check_notice.py).
             "new_pairs": None if attempt.new_pairs is None else len(attempt.new_pairs),
             "batches_planned": attempt.batches_planned,
         }

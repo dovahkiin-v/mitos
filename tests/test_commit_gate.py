@@ -14,7 +14,12 @@ uncovered set last changed? This module grows one section per phase:
   ``config.judge_api_key``, the five rows each proven as a transition from
   ``blocked``, ``cmd_hook_run``'s channels and block code, a subprocess probe that no
   row loads an LLM SDK, and ``--staged``'s blindness to an MCP-path record;
-* 3c2 onward — the verb's own boundary, the status gate row and the standing notice.
+* 3c2 — the verb's own boundary and the running-build recipe (the status gate row
+  lives in ``tests/test_status_commit_gate.py``);
+* 3g1 — the standing notice: ``check_notice``'s renderer and total composer, its
+  show rule (the key test first), the pair cap, and ``mitos sync``'s closing line
+  with its recovery clause. The ``created`` receipt's rows are in
+  ``tests/test_record_decision.py``.
 
 Every ``cmd_check`` row injects both seams (substrate and judge): offline, a run with
 no embedding provider over a non-empty corpus exits before the seam, and a run-end
@@ -55,7 +60,7 @@ from mitos.commit_gate import (
 )
 from mitos.config import MitosConfig, judge_api_key
 from mitos.conflict import ConflictUnavailableReason, Unavailable
-from mitos.errors import DatabaseError, MitosError
+from mitos.errors import DatabaseError, MitosError, ParseError
 from mitos.migrations import _pending_head, run_migrations
 from mitos.recall import provenance_line
 from mitos.store import GraphStore, open_connection
@@ -2332,3 +2337,507 @@ def test_the_help_states_the_check_the_cost_and_the_exit_contract() -> None:
     assert f"Exit {HOOK_BLOCK_EXIT} is the block, and the only failure status" in text
     assert f"A hook should fail on exit {HOOK_BLOCK_EXIT} alone." in text
     assert "is a pass: exit 0" in text
+
+
+# =========================================================================== #
+# Phase 3g1 — the standing notice
+# =========================================================================== #
+#
+# The renderer rows hand ``check_notice_line`` a payload dict (pure). The composer
+# rows seed a real record through the real writers and read it back through
+# ``read_last_attempt``. The ``sync`` rows drive ``main()`` with ``argv[0]`` pinned,
+# because the recovery clause names the running build.
+
+from mitos import check_notice  # noqa: E402
+from mitos.check_notice import (  # noqa: E402
+    NOTICE_PAIRS_SHOWN,
+    check_notice_line,
+    compose_check_notice,
+)
+
+_NOTICE_AT = "2026-09-21T10:15:32.104512+00:00"
+_NOTICE_T = "(2026-09-21 10:15:32 UTC)"
+_NOTICE_KEYS = {"state", "started_at", "reasons", "new_pairs", "new_pair_count",
+                "batches_planned", "line"}
+_UNKNOWN_STATE = "settled_by_a_newer_build"
+
+
+def _handle(node_id: str, slug: Optional[str] = None) -> Dict[str, Optional[str]]:
+    return {"id": node_id, "slug": slug}
+
+
+def _notice_data(state: str, **overrides: Any) -> Dict[str, Any]:
+    """A payload's six data keys, ``null`` where the form does not use them."""
+    base: Dict[str, Any] = dict(state=state, started_at=_NOTICE_AT, reasons=None,
+                                new_pairs=None, new_pair_count=None,
+                                batches_planned=None)
+    base.update(overrides)
+    return base
+
+
+def _pairs(n: int) -> list:
+    return [{"proposal": _handle(f"p{i}", f"prop-{i}"),
+             "partner": _handle(f"q{i}", f"part-{i}")} for i in range(n)]
+
+
+def _seed_attempt(config: MitosConfig, state: str, *, tokens: Tuple[str, ...] = (),
+                  pairs: Tuple[Tuple[str, str], ...] = (),
+                  started_at: str = _NOTICE_AT, batches: int = 3) -> None:
+    """Writes one last-attempt record through the real writers.
+
+    ``started`` stops after the entry write; ``spend_not_authorized`` refuses; a
+    run-end state writes its outcome; any other state is a newer build's, written
+    over a run-end record by hand (no writer here accepts it).
+    """
+    tel = TelemetryStore(config.telemetry_path)
+    tel.record_attempt_start(AttemptStart(attempt_id="att-1", started_at=started_at,
+                                          fingerprint="f" * 64))
+    if state == ATTEMPT_STARTED:
+        return
+    if state == ATTEMPT_SPEND_NOT_AUTHORIZED:
+        tel.record_attempt_refusal(_refusal(batches_planned=batches))
+        return
+    run_end_state = state if state in ATTEMPT_RUN_END_STATES else ATTEMPT_NO_NEW_FINDINGS
+    tel.record_run_end(_check_run_row("run-1"), coverage=None, attempt=_outcome(
+        state=run_end_state, degradation_tokens=tokens, new_pairs=pairs))
+    if state != run_end_state:
+        _raw_attempt_update(config.telemetry_path,
+                            "UPDATE check_attempt SET state = ?", state)
+
+
+def _compose(config: MitosConfig, store: GraphStore) -> Optional[Dict[str, Any]]:
+    return compose_check_notice(config, read_attempt=read_last_attempt,
+                                get_node=store.get_node)
+
+
+def _notice_warnings(err: str) -> list:
+    return [ln for ln in err.splitlines()
+            if ln.startswith("[Warning] Check notice could not be composed:")]
+
+
+# --------------------------------------------------------------------------- #
+# 1, 8, 9 — the renderer
+# --------------------------------------------------------------------------- #
+
+_FORMS = {
+    "new_findings": (
+        _notice_data(ATTEMPT_NEW_FINDINGS, reasons=[], new_pairs=_pairs(2),
+                     new_pair_count=2),
+        f"The last contradiction check {_NOTICE_T} found 2 new contradictions: "
+        f"prop-0 ✗ part-0, prop-1 ✗ part-1.",
+    ),
+    "could_not_complete": (
+        _notice_data(ATTEMPT_COULD_NOT_COMPLETE, reasons=["sweep", "collection_missing"],
+                     new_pairs=[], new_pair_count=0),
+        f"The last contradiction check {_NOTICE_T} could not complete: the corpus "
+        f"sweep degraded; the vector collection was missing.",
+    ),
+    "could_not_complete_with_pairs": (
+        _notice_data(ATTEMPT_COULD_NOT_COMPLETE, reasons=["judgment"],
+                     new_pairs=_pairs(1), new_pair_count=1),
+        f"The last contradiction check {_NOTICE_T} could not complete: some judgment "
+        f"batches did not complete. It reported 1 new contradiction: prop-0 ✗ part-0.",
+    ),
+    "spend_not_authorized": (
+        _notice_data(ATTEMPT_SPEND_NOT_AUTHORIZED, batches_planned=12),
+        f"The last contradiction check {_NOTICE_T} planned 12 judgment batches and "
+        f"was not authorised to spend; a person authorises that.",
+    ),
+    "started": (
+        _notice_data(ATTEMPT_STARTED),
+        f"The last contradiction check {_NOTICE_T} started and has recorded no "
+        f"outcome: it is still running, or it ended without one.",
+    ),
+    "unknown_state": (
+        _notice_data(_UNKNOWN_STATE),
+        f"The last contradiction check {_NOTICE_T} recorded an outcome this build "
+        f"does not know: {_UNKNOWN_STATE}.",
+    ),
+}
+
+
+@pytest.mark.parametrize("form", sorted(_FORMS))
+def test_each_notice_form_renders_dated_to_the_second(form: str) -> None:
+    """Criterion 1: each of the five forms and the residual, with seconds and UTC."""
+    data, expected = _FORMS[form]
+    assert check_notice_line(data) == expected
+
+
+@pytest.mark.parametrize("stamp, shown", [
+    ("2026-09-21T12:15:32+02:00", "(2026-09-21 10:15:32 UTC)"),
+    ("2026-09-21T10:15:32", "(2026-09-21 10:15:32 UTC)"),
+    ("yesterday-ish", "(yesterday-ish)"),
+])
+def test_the_notice_time_converts_to_utc_or_prints_verbatim(stamp: str, shown: str) -> None:
+    """Criterion 1: another offset converts, no offset reads as UTC, non-ISO is verbatim."""
+    line = check_notice_line(_notice_data(ATTEMPT_STARTED, started_at=stamp))
+    assert line.startswith(f"The last contradiction check {shown} started")
+
+
+def test_the_reason_map_is_total_command_free_and_disjoint_from_b7() -> None:
+    """Criterion 8: one phrase per token; no command; no judgment-failure wording."""
+    words = check_notice._REASON_WORDS
+    assert set(words) == set(check._DEGRADATION_TOKENS)
+    for phrase in words.values():
+        assert "`" not in phrase and "mitos " not in phrase
+    line = check_notice_line(_notice_data(
+        ATTEMPT_COULD_NOT_COMPLETE, reasons=list(check._DEGRADATION_TOKENS),
+        new_pairs=[], new_pair_count=0))
+    for b7 in cli._JUDGMENT_FAILURE_WORDS.values():
+        assert b7 not in line
+    for phrase in words.values():
+        assert phrase in line
+
+
+def test_an_unknown_reason_token_prints_verbatim() -> None:
+    """Criterion 8: a newer build's token is named as stored, never dropped."""
+    line = check_notice_line(_notice_data(
+        ATTEMPT_COULD_NOT_COMPLETE, reasons=["judgment", "quantum_drift"],
+        new_pairs=[], new_pair_count=0))
+    assert line.endswith("could not complete: some judgment batches did not complete; "
+                         "quantum_drift.")
+
+
+@pytest.mark.parametrize("reasons", [None, []])
+def test_no_reasons_prints_no_colon_clause(reasons: Optional[list]) -> None:
+    """Form 2: a null or empty token list ends the sentence at "could not complete"."""
+    line = check_notice_line(_notice_data(ATTEMPT_COULD_NOT_COMPLETE, reasons=reasons,
+                                          new_pairs=[], new_pair_count=0))
+    assert line == f"The last contradiction check {_NOTICE_T} could not complete."
+
+
+@pytest.mark.parametrize("pairs", [None, []])
+def test_new_findings_with_no_stored_pairs_reads_as_a_sentence(pairs: Optional[list]) -> None:
+    """A hand-damaged NULL pair list on ``new_findings``: no "0 …: ." fragment."""
+    line = check_notice_line(_notice_data(ATTEMPT_NEW_FINDINGS, new_pairs=pairs,
+                                          new_pair_count=0 if pairs is not None else None))
+    assert line == f"The last contradiction check {_NOTICE_T} found new contradictions."
+
+
+def test_a_null_batch_count_reads_unknown_never_none() -> None:
+    """Criterion 9: a hand-damaged NULL ``batches_planned`` on a refused spend."""
+    line = check_notice_line(_notice_data(ATTEMPT_SPEND_NOT_AUTHORIZED))
+    assert "planned an unknown number of judgment batches" in line
+    assert "None" not in line
+
+
+def test_one_planned_batch_is_singular() -> None:
+    line = check_notice_line(_notice_data(ATTEMPT_SPEND_NOT_AUTHORIZED, batches_planned=1))
+    assert "planned 1 judgment batch and" in line
+
+
+# --------------------------------------------------------------------------- #
+# 2–7 — the composer
+# --------------------------------------------------------------------------- #
+
+_SHOWN = {
+    "started": dict(state=ATTEMPT_STARTED),
+    "new_findings": dict(state=ATTEMPT_NEW_FINDINGS, pairs=(("a" * 64, "b" * 64),)),
+    "could_not_complete": dict(state=ATTEMPT_COULD_NOT_COMPLETE,
+                               tokens=("judgment", "judgment_truncated")),
+    "could_not_complete_with_pairs": dict(state=ATTEMPT_COULD_NOT_COMPLETE,
+                                          tokens=("sweep",),
+                                          pairs=(("a" * 64, "b" * 64),)),
+    "spend_not_authorized": dict(state=ATTEMPT_SPEND_NOT_AUTHORIZED),
+    "unknown_state": dict(state=_UNKNOWN_STATE),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_SHOWN))
+def test_every_outcome_but_no_new_findings_is_shown(workspace, monkeypatch, case) -> None:
+    """Criterion 2: a payload with one key set in every form; ``line`` rebuilds from it."""
+    config, store, _tel = workspace
+    seed = dict(_SHOWN[case])
+    _seed_attempt(config, seed.pop("state"), **seed)
+    notice = _compose(_keyed(config, monkeypatch), store)
+
+    assert notice is not None and set(notice) == _NOTICE_KEYS
+    assert notice["state"] == _SHOWN[case]["state"]
+    assert notice["started_at"] == _NOTICE_AT
+    assert notice["line"] == check_notice_line(
+        {k: v for k, v in notice.items() if k != "line"})
+    assert json.loads(json.dumps(notice)) == notice  # lists, never tuples
+
+
+def test_no_new_findings_shows_nothing(workspace, monkeypatch) -> None:
+    """Criterion 2: the healthy record composes to ``None``."""
+    config, store, _tel = workspace
+    _seed_attempt(config, ATTEMPT_NO_NEW_FINDINGS)
+    assert _compose(_keyed(config, monkeypatch), store) is None
+
+
+def test_the_payload_carries_each_form_s_own_fields(workspace, monkeypatch) -> None:
+    """§3.3: tokens as stored; pairs and count only on the two pair states."""
+    config, store, _tel = workspace
+    _seed_attempt(config, ATTEMPT_COULD_NOT_COMPLETE, tokens=("sweep", "collection_missing"),
+                  pairs=(("a" * 64, "b" * 64),))
+    notice = _compose(_keyed(config, monkeypatch), store)
+    assert notice["reasons"] == ["sweep", "collection_missing"]
+    assert notice["new_pairs"] == [{"proposal": _handle("a" * 64), "partner": _handle("b" * 64)}]
+    assert notice["new_pair_count"] == 1
+    assert notice["batches_planned"] is None
+
+    _seed_attempt(config, ATTEMPT_SPEND_NOT_AUTHORIZED, batches=7)
+    notice = _compose(_keyed(config, monkeypatch), store)
+    assert (notice["reasons"], notice["new_pairs"], notice["new_pair_count"],
+            notice["batches_planned"]) == (None, None, None, 7)
+
+
+def _attempt_rung_opens(monkeypatch) -> list:
+    """Records every ``_open_read_only`` call that asks for the attempt rung."""
+    seen: list = []
+    real = telemetry._open_read_only
+
+    def spy(path: str, *, required_rung: int) -> Any:
+        if required_rung == ATTEMPT_RUNG:
+            seen.append(path)
+        return real(path, required_rung=required_rung)
+
+    monkeypatch.setattr(telemetry, "_open_read_only", spy)
+    return seen
+
+
+def test_a_keyless_workspace_never_opens_the_attempt_table(workspace, monkeypatch) -> None:
+    """Criterion 3, a transition: keyless reads nothing; the same record shows once keyed."""
+    config, store, _tel = workspace
+    _seed_attempt(config, ATTEMPT_COULD_NOT_COMPLETE, tokens=("judgment",))
+    opens = _attempt_rung_opens(monkeypatch)
+    reads: list = []
+
+    def read(path: str) -> Any:
+        reads.append(path)
+        return read_last_attempt(path)
+
+    keyless = _keyless(config, monkeypatch)
+    assert compose_check_notice(keyless, read_attempt=read, get_node=store.get_node) is None
+    assert reads == [] and opens == []
+
+    keyed = _keyed(config, monkeypatch)
+    notice = compose_check_notice(keyed, read_attempt=read, get_node=store.get_node)
+    assert notice is not None and notice["state"] == ATTEMPT_COULD_NOT_COMPLETE
+    assert reads == [config.telemetry_path] and opens == [config.telemetry_path]
+
+
+def _below_rung(config: MitosConfig) -> None:
+    os.remove(config.telemetry_path)
+    conn = open_connection(config.telemetry_path)
+    run_migrations(conn, TELEMETRY_MIGRATION_STEPS[:FAILED_BATCHES_RUNG])
+    conn.close()
+
+
+@pytest.mark.parametrize("damage", ["no_file", "below_rung", "unreadable", "empty_table"])
+def test_an_absent_or_unreadable_record_shows_nothing_silently(workspace, monkeypatch,
+                                                              capsys, damage) -> None:
+    """Criterion 4: no file, below the rung, a non-SQLite file or no row → ``None``."""
+    config, store, _tel = workspace
+    {"no_file": lambda: os.remove(config.telemetry_path),
+     "below_rung": lambda: _below_rung(config),
+     "unreadable": lambda: _corrupt(config.telemetry_path),
+     "empty_table": lambda: None}[damage]()
+    capsys.readouterr()
+    assert _compose(_keyed(config, monkeypatch), store) is None
+    assert _notice_warnings(capsys.readouterr().err) == []
+
+
+def test_a_raising_read_or_lookup_warns_once_and_shows_nothing(workspace, monkeypatch,
+                                                              capsys) -> None:
+    """Criterion 5: the composer is total; the fault is one stderr line, not a raise."""
+    config, store, _tel = workspace
+    _seed_attempt(config, ATTEMPT_NEW_FINDINGS, pairs=(("a" * 64, "b" * 64),))
+    keyed = _keyed(config, monkeypatch)
+    capsys.readouterr()
+
+    def boom(_arg: str) -> Any:
+        raise RuntimeError("planted")
+
+    assert compose_check_notice(keyed, read_attempt=boom, get_node=store.get_node) is None
+    assert _notice_warnings(capsys.readouterr().err) == [
+        "[Warning] Check notice could not be composed: RuntimeError: planted"]
+
+    assert compose_check_notice(keyed, read_attempt=read_last_attempt, get_node=boom) is None
+    assert len(_notice_warnings(capsys.readouterr().err)) == 1
+
+
+def test_seven_pairs_name_five_and_count_the_rest(workspace, monkeypatch) -> None:
+    """Criterion 6 and gotchas 9–10: the cap, the stored orientation, and whole ids."""
+    config, store, _tel = workspace
+    ids = [_commit(store, f"notice-{i}", f"Notice cap axiom number {i}.") for i in range(4)]
+    absent = "c" * 64
+    pairs = ((ids[1], ids[0]), (ids[2], absent), (ids[3], ids[0]),
+             (ids[0], ids[2]), (ids[1], ids[3]), (ids[2], ids[1]), (ids[3], ids[2]))
+    _seed_attempt(config, ATTEMPT_NEW_FINDINGS, pairs=pairs)
+    calls: list = []
+
+    def get_node(node_id: str) -> Any:
+        calls.append(node_id)
+        return store.get_node(node_id)
+
+    notice = compose_check_notice(_keyed(config, monkeypatch),
+                                  read_attempt=read_last_attempt, get_node=get_node)
+    assert notice["new_pair_count"] == 7 and len(notice["new_pairs"]) == NOTICE_PAIRS_SHOWN
+    assert [(p["proposal"]["id"], p["partner"]["id"]) for p in notice["new_pairs"]] == \
+        list(pairs[:NOTICE_PAIRS_SHOWN])
+    assert sorted(calls) == sorted({side for pair in pairs[:5] for side in pair})
+    assert notice["line"].endswith(
+        "found 7 new contradictions: notice-1 ✗ notice-0, notice-2 ✗ " + absent +
+        ", notice-3 ✗ notice-0, notice-0 ✗ notice-2, notice-1 ✗ notice-3, and 2 more.")
+
+
+def test_a_started_record_shows_whether_it_is_seconds_or_a_day_old(workspace,
+                                                                  monkeypatch) -> None:
+    """Criterion 7: both show, both state both possibilities, and the times differ."""
+    from datetime import datetime, timedelta, timezone
+    config, store, _tel = workspace
+    keyed = _keyed(config, monkeypatch)
+    now = datetime.now(timezone.utc)
+    lines = []
+    for moment in (now, now - timedelta(days=1)):
+        _seed_attempt(config, ATTEMPT_STARTED, started_at=moment.isoformat())
+        notice = _compose(keyed, store)
+        assert notice is not None
+        assert notice["line"].endswith("it is still running, or it ended without one.")
+        assert moment.strftime("%Y-%m-%d %H:%M:%S UTC") in notice["line"]
+        lines.append(notice["line"])
+    assert lines[0] != lines[1]
+
+
+# --------------------------------------------------------------------------- #
+# 16–20 — `mitos sync`
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture(params=[None, "my proj"])
+def sync_workspace(request, tmp_path) -> MitosConfig:
+    """A valid workspace with telemetry at head, selected by path or by a spaced name."""
+    ws = make_workspace(tmp_path / "it's ws")
+    if request.param:
+        registry.register(ws, request.param)
+    config = MitosConfig(ws, project=request.param or ws)
+    TelemetryStore(config.telemetry_path)
+    return config
+
+
+def _sync(config: MitosConfig, *extra: str, argv0: str = "mitos") -> int:
+    """``main()`` on ``sync -p <project>``, with ``argv[0]`` pinned."""
+    with patch.object(sys, "argv", [argv0, "sync", "-p", config.project, *extra]):
+        try:
+            cli.main()
+        except SystemExit as exc:
+            return exc.code
+    return 0
+
+
+def _notice_lines(err: str) -> list:
+    return [ln for ln in err.splitlines() if ln.startswith("The last contradiction check")]
+
+
+def _resolves_to(recipe: str, config: MitosConfig) -> None:
+    """Parses a printed recipe (bare ``mitos``) and resolves its selector to ``config``."""
+    tokens = shlex.split(recipe)
+    assert tokens[0] == "mitos"
+    args = cli._build_parser().parse_args(tokens[1:])
+    assert args.command == "check"
+    resolved = cli._resolve_selector(cli._selector_from_args(args), args.command)
+    assert os.path.realpath(resolved.root) == os.path.realpath(config.workspace_dir)
+
+
+def test_sync_closes_with_the_notice_and_a_recipe_that_parses(sync_workspace, monkeypatch,
+                                                             capsys) -> None:
+    """Criterion 16: the line plus " `mitos check -p '<name>'` attempts it again."."""
+    config = sync_workspace
+    _seed_attempt(config, ATTEMPT_COULD_NOT_COMPLETE, tokens=("judgment",))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", _DUMMY_KEY)
+    capsys.readouterr()
+
+    assert _sync(config) == 0
+    err = capsys.readouterr().err
+    (line,) = _notice_lines(err)
+    assert err.rstrip().endswith(line)
+    assert line.endswith(f" `mitos check -p {config.project!r}` attempts it again.")
+    recipe = _last_backticked(line)
+    assert "--yes" not in recipe
+    _resolves_to(recipe, config)
+
+
+def test_sync_names_a_person_for_a_refused_spend(sync_workspace, monkeypatch, capsys) -> None:
+    """Criterion 17: the not-authorised clause names a person at a terminal, no waiver."""
+    config = sync_workspace
+    _seed_attempt(config, ATTEMPT_SPEND_NOT_AUTHORIZED)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", _DUMMY_KEY)
+    capsys.readouterr()
+
+    assert _sync(config) == 0
+    (line,) = _notice_lines(capsys.readouterr().err)
+    assert line.endswith(f" A person runs `mitos check -p {config.project!r}` at a "
+                         f"terminal and confirms the prompt.")
+    assert "--yes" not in line
+    _resolves_to(_last_backticked(line), config)
+
+
+def test_embed_only_carries_the_notice(sync_workspace, monkeypatch, capsys) -> None:
+    """Criterion 18: the drain branch closes with it too."""
+    config = sync_workspace
+    _seed_attempt(config, ATTEMPT_STARTED)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", _DUMMY_KEY)
+    capsys.readouterr()
+    assert _sync(config, "--embed-only") == 0
+    assert len(_notice_lines(capsys.readouterr().err)) == 1
+
+
+def test_a_shortfall_still_prints_the_notice_and_exits_one(sync_workspace, monkeypatch,
+                                                          capsys) -> None:
+    """Criterion 18: the notice lands before the shortfall's exit, which stays 1."""
+    config = sync_workspace
+    _seed_attempt(config, ATTEMPT_STARTED)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", _DUMMY_KEY)
+    capsys.readouterr()
+    assert _sync(config, "--reconcile-entry", "no-such-entry") == 1
+    assert len(_notice_lines(capsys.readouterr().err)) == 1
+
+
+def test_a_parse_abort_carries_no_notice(sync_workspace, monkeypatch, capsys) -> None:
+    """Criterion 18: a ParseError abort exits before the notice."""
+    config = sync_workspace
+    _seed_attempt(config, ATTEMPT_STARTED)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", _DUMMY_KEY)
+
+    def abort(self, **_kw: Any) -> list:
+        raise ParseError("planted malformed entry", 1, 1)
+
+    monkeypatch.setattr(MitosSyncManager, "perform_sync", abort)
+    capsys.readouterr()
+    assert _sync(config) == 1
+    err = capsys.readouterr().err
+    assert "Sync Aborted" in err
+    assert _notice_lines(err) == []
+
+
+def test_keyless_sync_prints_no_notice_and_opens_no_attempt(sync_workspace, monkeypatch,
+                                                           capsys) -> None:
+    """Criterion 19: keyless, nothing is shown and the attempt rung is never opened."""
+    config = sync_workspace
+    _seed_attempt(config, ATTEMPT_COULD_NOT_COMPLETE, tokens=("judgment",))
+    opens = _attempt_rung_opens(monkeypatch)
+    capsys.readouterr()
+    assert _sync(config) == 0
+    assert _notice_lines(capsys.readouterr().err) == []
+    assert opens == []
+
+
+def test_the_sync_clause_names_the_invoked_build(tmp_path, monkeypatch, capsys) -> None:
+    """Criterion 20: an absolute ``argv[0]`` whose realpath is not ``PATH``'s mitos."""
+    ws = make_workspace(tmp_path / "ws")
+    config = MitosConfig(ws, project=ws)
+    TelemetryStore(config.telemetry_path)
+    _seed_attempt(config, ATTEMPT_NEW_FINDINGS, pairs=(("a" * 64, "b" * 64),))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", _DUMMY_KEY)
+    root = tmp_path / "it's a dir"
+    root.mkdir()
+    _real, link = _venv_with_link(root)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: str(tmp_path / "other" / "mitos"))
+    capsys.readouterr()
+
+    assert _sync(config, argv0=link) == 0
+    (line,) = _notice_lines(capsys.readouterr().err)
+    recipe = _last_backticked(line)
+    assert recipe.startswith(shlex.quote(link) + " check -p ")
+    assert shlex.split(recipe)[0] == link

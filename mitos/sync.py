@@ -42,7 +42,8 @@ from mitos.conflict import (
     screen_candidates,
 )
 from mitos.telemetry import (CommentaryAuditRow, ConflictCheckRow, JudgmentBatch,
-                            TelemetryStore)
+                            TelemetryStore, read_last_attempt)
+from mitos.check_notice import compose_check_notice
 from mitos.audit_debt import AuditDebt, derive_audit_debt
 from mitos.divergence import declared_edges, entry_divergence, is_reconcilable
 from mitos.errors import (
@@ -2949,6 +2950,21 @@ class MitosSyncManager:
                   "excluded": debt.excluded}
         return _audit_debt_line(**counts), counts
 
+    def _check_notice_field(self) -> Optional[Dict[str, Any]]:
+        """Composes the `created` receipt's standing check notice, never raising.
+
+        Called after the commit and outside the lock, like
+        :meth:`_audit_debt_fields`. The composer is total: it returns None for a
+        keyless workspace, an absent or unreadable record, or a healthy outcome,
+        and writes its own stderr warning on an unexpected fault.
+
+        Returns:
+            The ``check_notice`` payload, or None.
+        """
+        return compose_check_notice(
+            self.config, read_attempt=read_last_attempt, get_node=self.store.get_node
+        )
+
     def _exists_receipt_extras(
         self, entry: ParsedEntry, existing: Dict[str, Any], node_id: str
     ) -> Dict[str, Any]:
@@ -3667,7 +3683,10 @@ class MitosSyncManager:
             ``skipped``), "skipped" (nothing moved; each ``skipped`` element names
             its slug and reason) or "failed" (``stage``/``error``/``note``; the write
             still stands, and the field names no command); absent when nothing was
-            eligible; OR, when a highly-similar unreferenced decision exists and
+            eligible; plus an optional ``check_notice`` (the last contradiction
+            check's outcome, :func:`~mitos.check_notice.compose_check_notice`),
+            present only while a judge key is set and that outcome is not
+            ``no_new_findings``; OR, when a highly-similar unreferenced decision exists and
             ``acknowledge_neighbors`` is False, a ``{status: "needs_review", code:
             "similar_decision_exists", slug, neighbors, message}`` pause that wrote
             NOTHING —
@@ -4130,6 +4149,11 @@ class MitosSyncManager:
         #     (it adds nothing to the §7.3 hold), and never able to fail the write.
         coherence_audit, audit_debt = self._audit_debt_fields(entry.slug)
 
+        # 9c. The standing check notice: the last contradiction check's outcome, for
+        #     an agent that was not there. Same place and same never-raising shape
+        #     as 9b; None on a keyless workspace or a healthy record.
+        check_notice = self._check_notice_field()
+
         # 10. Return. A freshly recorded decision is always active. Everything below is
         #     post-commit read-back — the write contract is untouched (the commit
         #     already succeeded above).
@@ -4172,4 +4196,8 @@ class MitosSyncManager:
         # the buffer's standing size, which is `mitos status`'s to report.
         if rotation_report:
             result["rotation"] = rotation_report
+        # Present only when shown, so a healthy corpus pays zero bytes. The fact
+        # alone: each renderer decides whether a recovery clause follows it.
+        if check_notice:
+            result["check_notice"] = check_notice
         return result
