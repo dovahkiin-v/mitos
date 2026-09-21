@@ -71,10 +71,13 @@ from mitos.vector_store import scroll_point_ids, hash_to_uuid, QdrantVectorStore
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.telemetry import (
     AttemptRefusal, AttemptStart, TelemetryStore, ConflictCheckRow, JudgmentBatch,
+    ATTEMPT_COULD_NOT_COMPLETE, ATTEMPT_NEW_FINDINGS, ATTEMPT_NO_NEW_FINDINGS,
+    ATTEMPT_SPEND_NOT_AUTHORIZED, ATTEMPT_STARTED, LastAttempt, TelemetryUnreadable,
+    read_last_attempt,
 )
-from mitos.audit_debt import AuditDebt, derive_audit_debt
+from mitos.audit_debt import AuditDebt, NoGraph, derive_audit_debt
 from mitos.commit_gate import (CAUSE_GRAPH, CAUSE_NO_GRAPH, CAUSE_TELEMETRY, GATE_BLOCKED,
-                               GATE_UNREADABLE, HOOK_BLOCK_EXIT, HOOK_FOREIGN,
+                               GATE_UNREADABLE, HOOK_ABSENT, HOOK_BLOCK_EXIT, HOOK_FOREIGN,
                                HOOK_FOREIGN_WITH_BLOCK, HOOK_OURS, HOOK_UNREADABLE,
                                classify_hook_file, evaluate_gate, render_hook_block,
                                render_hook_script, unsafe_shell_path)
@@ -675,8 +678,12 @@ def cmd_init(config: MitosConfig, name: Optional[str] = None, force: bool = Fals
                 "# or drop a project-specific key on the line below to override it.\n"
                 "# Get one: https://aistudio.google.com/app/apikey\n"
                 "GEMINI_API_KEY=\n\n"
-                "# Anthropic (Claude) API key — OPTIONAL. Only used by\n"
-                "# `mitos import --llm-extract` to convert legacy prose ADRs.\n"
+                "# Anthropic (Claude) API key — OPTIONAL, but recommended. It runs\n"
+                "# the contradiction check (`mitos check -p .`) and the conflict\n"
+                "# notice at sync, and it arms the commit gate\n"
+                "# (`mitos hook-install -p .`). Without it no pair is judged and the\n"
+                "# gate stays inactive; mitos still records and searches. The import\n"
+                "# verb's --llm-extract (converting legacy prose ADRs) uses it too.\n"
                 "# Get one: https://console.anthropic.com/settings/keys\n"
                 "ANTHROPIC_API_KEY=\n"
             )
@@ -758,6 +765,15 @@ def cmd_init(config: MitosConfig, name: Optional[str] = None, force: bool = Fals
     #    every verb returns.
     for line in _collection_echo_lines(config, outcome):
         print(line)
+    # 7. Name the commit gate, never install it: a stray `init` must not write
+    #    outside its workspace. Git is asked about the directory being
+    #    initialised, not the cwd; `status` keeps a ⚠ row until the gate exists.
+    #    Function-local, 3d's rule: `subprocess` stays off every other verb's path.
+    from mitos import _git
+    if isinstance(_git.locate_repository(config.workspace_dir), _git.GitLocation):
+        print(f"In a git repository: `mitos hook-install -p {outcome.name!r}` installs "
+              f"the commit gate, which holds a commit until a contradiction check "
+              f"is attempted.")
     sys.stdout.flush()
 
 
@@ -2939,6 +2955,200 @@ def _skill_md_state(mitos_dir: str) -> str:
     return "differs"
 
 
+# The commit gate row's states, first match wins: the `commit_gate.state` token on
+# `status --json`. A payload contract, additive-only from the day it shipped, so a
+# row pins this tuple's exact value and that the renderer covers exactly it.
+_COMMIT_GATE_STATES: Tuple[str, ...] = (
+    "git_unavailable", "outside_work_tree", "keyless", "no_hook", "unreadable",
+    "foreign", "foreign_with_block", "installed",
+)
+# `classify_hook_file`'s kinds → the row's state. Spelled from the constants.
+_COMMIT_GATE_STATE_OF_KIND: Dict[str, str] = {
+    HOOK_ABSENT: "no_hook",
+    HOOK_UNREADABLE: "unreadable",
+    HOOK_FOREIGN: "foreign",
+    HOOK_FOREIGN_WITH_BLOCK: "foreign_with_block",
+    HOOK_OURS: "installed",
+}
+# The glyph and headline for each state, formatted from the row's own keys. The
+# `installed` glyph turns ⚠ when the hook does not serve this workspace. Never ✗:
+# the row is informational and blocks nothing, and ✗ means a real blocker.
+_COMMIT_GATE_WORDS: Dict[str, Tuple[str, str]] = {
+    "git_unavailable": ("—", "git was not found, so status cannot tell whether a "
+                             "repository holds this workspace"),
+    "outside_work_tree": ("—", "this workspace is not inside a git work tree"),
+    "keyless": ("—", "inactive: no judge key (ANTHROPIC_API_KEY) is configured, so "
+                     "no commit is gated"),
+    "no_hook": ("⚠", "no pre-commit in {hooks_dir}"),
+    "unreadable": ("⚠", "{hook_file} could not be read, so status cannot tell what "
+                        "it runs"),
+    "foreign": ("⚠", "{hook_file} exists; mitos did not write it, and it does not "
+                     "carry the gate block's marker"),
+    "foreign_with_block": ("•", "{hook_file} carries the pasted gate block's marker; "
+                                "mitos did not write the file, and the marker is all "
+                                "status checked"),
+    "installed": ("✓", "installed at {hook_file}"),
+}
+_COMMIT_GATE_KEYS: Tuple[str, ...] = (
+    "state", "hooks_dir", "hooks_dir_shared", "hook_file", "serves",
+    "serves_this_workspace", "last_attempt_status", "last_attempt", "debt_status",
+    "uncovered", "excluded",
+)
+
+
+def _commit_gate_row(config: MitosConfig) -> Dict[str, Any]:
+    """Reads what stands between this workspace's commits and its gate, as ``status --json``'s ``commit_gate``.
+
+    Git first, then the key, then the hook file: the more basic truth wins, and
+    no store is opened before the key test passes (keyless reads identically
+    with or without a hook). Telemetry and the graph are read only for a hook
+    mitos wrote. Every reader is total on file faults, so nothing here catches:
+    a programming error propagates rather than becoming a quietly wrong row.
+
+    Args:
+        config: The workspace's config; git is asked from its directory.
+
+    Returns:
+        The row, with every key of ``_COMMIT_GATE_KEYS`` in every state. A key
+        the row never reached is ``None``.
+    """
+    # Function-local, 3d's rule: `subprocess` stays off every other verb's path.
+    from mitos import _git
+
+    row: Dict[str, Any] = dict.fromkeys(_COMMIT_GATE_KEYS)
+    location = _git.locate_repository(config.workspace_dir)
+    if isinstance(location, _git.NotAWorkTree):
+        row["state"] = {_git.REASON_GIT_UNAVAILABLE: "git_unavailable",
+                        _git.REASON_OUTSIDE_WORK_TREE: "outside_work_tree"}[location.reason]
+        return row
+    if judge_api_key(config) is None:
+        row["state"] = "keyless"
+        return row
+
+    # The same two paths `hook-install` uses. A shared directory's `pre-commit`
+    # is still read: that is where a hand-pasted block lives.
+    hooks_dir = location.hooks_dir
+    hook_file = os.path.join(hooks_dir, "pre-commit")
+    hook = classify_hook_file(hook_file)
+    row.update(state=_COMMIT_GATE_STATE_OF_KIND[hook.kind], hooks_dir=hooks_dir,
+               hooks_dir_shared=not _git.is_within(hooks_dir, location.common_dir),
+               hook_file=hook_file)
+    if hook.kind != HOOK_OURS:
+        return row
+
+    served = hook.served_workspace
+    row["serves"] = served
+    # Realpath on both sides: the hook bakes the spelling it was installed by.
+    row["serves_this_workspace"] = (
+        served is not None
+        and os.path.realpath(served) == os.path.realpath(config.workspace_dir)
+    )
+    attempt = read_last_attempt(config.telemetry_path)
+    if isinstance(attempt, LastAttempt):
+        row["last_attempt_status"] = "on_record"
+        row["last_attempt"] = {
+            "started_at": attempt.started_at,
+            "state": attempt.state,
+            "outcome_at": attempt.outcome_at,
+            "findings_known": attempt.findings_known,
+            # A count: the notice owns naming pairs.
+            "new_pairs": None if attempt.new_pairs is None else len(attempt.new_pairs),
+            "batches_planned": attempt.batches_planned,
+        }
+    elif isinstance(attempt, TelemetryUnreadable):
+        row["last_attempt_status"] = "unreadable"
+    else:
+        # No row, no file, or a ladder below the attempt rung: never attempted.
+        row["last_attempt_status"] = "none"
+    debt = derive_audit_debt(config.db_path, config.telemetry_path)
+    if isinstance(debt, AuditDebt):
+        row.update(debt_status="read", uncovered=debt.uncovered, excluded=debt.excluded)
+    elif isinstance(debt, NoGraph):
+        row["debt_status"] = "no_graph"
+    else:
+        row["debt_status"] = "unreadable"
+    return row
+
+
+def _commit_gate_attempt_words(attempt: Dict[str, Any]) -> str:
+    """Describes an on-record attempt from the row's ``last_attempt`` object alone."""
+    state = attempt["state"]
+    if state == ATTEMPT_STARTED:
+        return f"{attempt['started_at']}, started, no outcome recorded"
+    words = f"{attempt['started_at']}, {state.replace('_', ' ')}"
+    if state == ATTEMPT_NO_NEW_FINDINGS:
+        known = attempt["findings_known"]
+        return words + (" (known findings: unknown)" if known is None
+                        else f" ({known} known finding(s))")
+    if state in (ATTEMPT_NEW_FINDINGS, ATTEMPT_COULD_NOT_COMPLETE):
+        pairs = attempt["new_pairs"]
+        return words + (f" ({pairs} new pair(s))" if pairs else "")
+    if state == ATTEMPT_SPEND_NOT_AUTHORIZED:
+        # The writer insists on an int ≥ 1 but the reader does not, so a
+        # hand-edited NULL says "unknown" rather than printing "None".
+        batches = attempt["batches_planned"]
+        planned = ("planned batches: unknown" if batches is None
+                   else f"{batches} planned batch(es)")
+        return words + f" ({planned}; a person authorises that spend)"
+    # A newer build's state: shown as stored.
+    return f"{attempt['started_at']}, {state}"
+
+
+def _commit_gate_lines(row: Dict[str, Any], *, project: str) -> List[str]:
+    """Renders the commit gate row's text from the ``--json`` object alone.
+
+    Args:
+        row: ``_commit_gate_row``'s result.
+        project: The selector the recipe names (``config.project``).
+
+    Returns:
+        The row's lines, headline first.
+    """
+    state = row["state"]
+    glyph, headline = _COMMIT_GATE_WORDS[state]
+    if state == "installed" and not row["serves_this_workspace"]:
+        glyph = "⚠"
+    line = f"  {glyph} commit gate: {headline.format(**row)}"
+    recipe = f"`mitos hook-install -p {project!r}`"
+    lines = []
+    if state == "no_hook":
+        lines.append(f"{line}   → {recipe}")
+        if row["hooks_dir_shared"]:
+            lines.append("      that hooks directory is shared, so hook-install prints "
+                         "a block to paste there instead of writing a file")
+    elif state == "foreign":
+        lines.append(f"{line}   → {recipe}")
+        lines.append("      a hook manager may still run the gate from configuration "
+                     "status cannot see; hook-install prints the block to paste")
+    elif state == "installed":
+        lines.append(line)
+        if row["serves"] is None:
+            lines.append("      serves: could not be read (written by mitos, but its "
+                         "workspace line is missing or malformed)")
+        elif row["serves_this_workspace"]:
+            lines.append("      serves: this workspace")
+        else:
+            lines.append(f"      serves: another workspace, {row['serves']}")
+        if row["last_attempt_status"] == "on_record":
+            attempt = _commit_gate_attempt_words(row["last_attempt"])
+        elif row["last_attempt_status"] == "unreadable":
+            attempt = "the last attempt could not be read"
+        else:
+            attempt = "no attempt on record"
+        lines.append(f"      last check attempt: {attempt}")
+        if row["debt_status"] == "read":
+            lines.append(f"      uncovered decisions: {row['uncovered']}, "
+                         f"excluded: {row['excluded']}")
+        elif row["debt_status"] == "no_graph":
+            lines.append("      uncovered decisions: no graph yet")
+        else:
+            lines.append("      uncovered decisions: the count could not be read")
+        lines.append(f"      to remove the gate, delete {row['hook_file']}")
+    else:
+        lines.append(line)
+    return lines
+
+
 def cmd_status(workspace_dir: str, as_json: bool = False, *,
                project: Optional[str] = None, verbose: bool = False) -> int:
     """Reports whether Mitos is set up for a project, and what (if anything) is missing.
@@ -3207,6 +3417,11 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
     # so the shipped middle value (NEEDS ATTENTION ⚠) already fits.
     ready = (initialized and key_ok and q["reachable"]
              and not pre_v1a and not graph_unbuilt)
+    # The commit gate row: computed after `ready` is bound and never feeding it —
+    # an informational row that always prints for an initialized workspace, so a
+    # missing gate keeps saying so on every readiness check. `None` when not
+    # initialized (the `skill_md` precedent: no claim about what was never looked at).
+    commit_gate = _commit_gate_row(config) if initialized else None
 
     if as_json:
         _emit_json({
@@ -3282,6 +3497,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
             "skill_md": (
                 None if skill_md_state is None else {"status": skill_md_state}
             ),
+            "commit_gate": commit_gate,
         })
         return 0 if ready else 1
 
@@ -3397,6 +3613,9 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
     print(f"  • graph: {config.db_path}")
     if graph_nodes is not None:
         print(f"  • graph holds {graph_nodes} node(s)")
+    if commit_gate is not None:
+        for line in _commit_gate_lines(commit_gate, project=config.project):
+            print(line)
     # The unbuilt graph (W31). A blocker, not a rung readers learn to skip: every
     # semantic read over this workspace answers cleanly empty while the corpus holds
     # entries, so the caller is told "no precedent" for a project that has them.
