@@ -732,8 +732,9 @@ def _mk_entry(axiom: str, slug: str):
 
 def test_receipt_carries_committed_edges_and_resolved_fields(ws) -> None:
     """The "created" receipt echoes the edges the commit actually wired (incl. a
-    comma-split multi-target flag) and scope/mechanisms as normalised — write
-    facts read back from the store, not the raw input args."""
+    comma-split multi-target flag), scope as normalised and mechanisms as authored
+    (stripped, empties dropped) — write facts read back from the committed entry,
+    not the raw input args."""
     config, m = ws
     for slug in ("old-a", "old-b", "cited-c"):
         # acknowledge_neighbors: the seeds are near-twins of each other; with live
@@ -746,7 +747,7 @@ def test_receipt_carries_committed_edges_and_resolved_fields(ws) -> None:
         supersedes="old-a, old-b", cites="cited-c", slug="unifier",
     )
     assert res["status"] == "created"
-    # Normalised echo of what was committed (whitespace stripped, empties dropped).
+    # Echo of what was committed (whitespace stripped, empties dropped).
     assert res["scope"] == ["db", "auth"]
     assert res["mechanisms"] == ["sqlite"]
     # Edge facts, one per wired edge; order-insensitive compare.
@@ -1086,6 +1087,8 @@ def test_pause_and_error_exits_carry_no_coherence_audit(ws) -> None:
     assert paused["status"] == "needs_review"
     assert "coherence_audit" not in paused
     assert "audit_debt" not in paused
+    # A5: the mechanisms echo and its fold map ride `created` only.
+    assert "mechanisms" not in paused and "mechanisms_normalized" not in paused
 
     failed = m.record_decision_entry("An axiom pointing nowhere.", "rej", ["s"],
                                      slug="coh-dangling", supersedes="no-such-slug")
@@ -1631,3 +1634,232 @@ def test_record_unreadable_file_under_json_is_one_object(workspace, tmp_path, mo
         assert payload["code"] == AMEND_CODE_UNREADABLE_FILE == "unreadable_file"
         assert payload["error"].startswith(f"{flag} could not be read: ")
         spy.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# A5 — the receipt echoes mechanisms as authored and names each fold
+# --------------------------------------------------------------------------- #
+#
+# `mechanisms` on a `created` receipt is what decisions.md now holds (authored
+# spelling and order, read from the entry the record path parsed back), and
+# `mechanisms_normalized` maps each token the identity fold changed to its folded
+# form — `{}` when none changed, never absent. Identity is untouched: the node id
+# still hashes the folded, sorted, deduped list.
+
+# Captured PRE-CHANGE at commit 0b38c88 (Phase 4f), before any 5a source edit, in a
+# scratch keyless workspace: axiom "Receipts echo mechanisms as authored.", rejected
+# "rej", scope [], mechanisms ["Zebra Timer", "os.replace"]. The slug is not in the
+# hash. A literal is the point: `compute_node_id` equality alone would pass even if
+# both sides moved together.
+_A5_PRE_CHANGE_ID = "1a7464a402c0b3678922dc55637bbeca6c31679029ed734a8581e91a159f8325"
+
+
+def _mechanisms_line(config: MitosConfig, slug: str) -> str:
+    """Returns ``slug``'s mechanisms as decisions.md holds them, joined.
+
+    Reads through ``parse_entry_stream`` — the tokenizer the record path and sync
+    use, and the one that fills ``mechanisms_authored``.
+    """
+    from mitos.parser import parse_entry_stream
+    parsed = parse_entry_stream(_read(config), "decision")
+    entry = next(e for e in parsed if e.slug == slug)
+    return ", ".join(entry.mechanisms_authored)
+
+
+def test_a5_echo_keeps_authored_spelling_and_order(ws) -> None:
+    """EC A5's live probe: the echo is the authored list exactly, not folded or sorted."""
+    config, m = ws
+    authored = ["Zebra Timer", "CSS transition-delay", "aria_describedby", "Alpha"]
+    res = m.record_decision_entry("Receipts keep the authored order.", "rej", [],
+                                  mechanisms=authored, slug="a5-order")
+    assert res["status"] == "created"
+    assert res["mechanisms"] == authored
+    assert _mechanisms_line(config, "a5-order") == ", ".join(authored)
+    assert f"**Mechanisms:** {', '.join(authored)}\n" in _read(config)
+
+
+def test_a5_map_names_each_fold_class_and_omits_canonical_tokens(ws) -> None:
+    """Case, `_`, `.`, and whitespace each fold; an already-canonical token is absent."""
+    config, m = ws
+    authored = ["Alpha", "aria_describedby", "os.replace", "127.0.0.1", "Zebra Timer",
+                "sqlite"]
+    res = m.record_decision_entry("Every fold class is named.", "rej", [],
+                                  mechanisms=authored, slug="a5-classes")
+    assert res["mechanisms_normalized"] == {
+        "Alpha": "alpha",
+        "aria_describedby": "aria-describedby",
+        "os.replace": "os-replace",
+        "127.0.0.1": "127-0-0-1",
+        "Zebra Timer": "zebra-timer",
+    }
+    # Keys ride in authored order.
+    assert list(res["mechanisms_normalized"]) == authored[:5]
+    # The A5 → A6 join: folded values plus the unchanged tokens are the graph's set.
+    folds = res["mechanisms_normalized"]
+    joined = set(folds.values()) | {t for t in res["mechanisms"] if t not in folds}
+    node = GraphStore(config.db_path).get_node(res["id"])
+    assert joined == set(node["mechanisms"])
+
+
+def test_a5_map_is_present_and_empty_when_nothing_folds(ws) -> None:
+    """`{}` rides the receipt — with canonical tokens, and with no mechanisms at all."""
+    config, m = ws
+    res = m.record_decision_entry("Canonical tokens need no fold.", "rej", [],
+                                  mechanisms=["sqlite", "wal-mode"], slug="a5-canon")
+    assert "mechanisms_normalized" in res
+    assert res["mechanisms_normalized"] == {}
+    assert res["mechanisms"] == ["sqlite", "wal-mode"]
+
+    bare = m.record_decision_entry("No mechanisms at all.", "rej", [], slug="a5-bare",
+                                   acknowledge_neighbors=True)
+    assert bare["status"] == "created"
+    assert bare["mechanisms"] == [] and bare["mechanisms_normalized"] == {}
+
+
+def test_a5_echo_is_the_split_the_gold_source_holds(ws) -> None:
+    """D1: the echo comes from the parsed-back entry, never from the argument.
+
+    One element carrying a comma is written into one ``**Mechanisms:**`` line that
+    the parser splits in two; an element carrying a newline spills onto a second
+    line that the parser joins with a space. The echo says what decisions.md holds.
+    """
+    config, m = ws
+    res = m.record_decision_entry("A comma inside an element splits.", "rej", [],
+                                  mechanisms=["alpha, Beta"], slug="a5-comma")
+    assert res["mechanisms"] == ["alpha", "Beta"]
+    assert res["mechanisms_normalized"] == {"Beta": "beta"}
+    assert _mechanisms_line(config, "a5-comma") == ", ".join(res["mechanisms"])
+    assert "**Mechanisms:** alpha, Beta\n" in _read(config)
+
+    res = m.record_decision_entry("A newline inside an element joins.", "rej", [],
+                                  mechanisms=["alpha\nBeta Gamma"], slug="a5-newline",
+                                  acknowledge_neighbors=True)
+    assert res["mechanisms"] == ["alpha Beta Gamma"]
+    assert res["mechanisms_normalized"] == {"alpha Beta Gamma": "alpha-beta-gamma"}
+    assert _mechanisms_line(config, "a5-newline") == "alpha Beta Gamma"
+
+
+def test_a5_duplicates_echo_as_stored_and_land_as_one_entity(ws) -> None:
+    """`["Foo", "foo"]` echoes both, maps only the one that changed, and is one mechanism."""
+    config, m = ws
+    res = m.record_decision_entry("Spellings that fold alike are one.", "rej", [],
+                                  mechanisms=["Foo", "foo"], slug="a5-dup")
+    assert res["mechanisms"] == ["Foo", "foo"]
+    assert res["mechanisms_normalized"] == {"Foo": "foo"}
+    assert GraphStore(config.db_path).get_node(res["id"])["mechanisms"] == ["foo"]
+
+    res = m.record_decision_entry("A repeated spelling is one key.", "rej", [],
+                                  mechanisms=["Foo", "Foo"], slug="a5-dup-same",
+                                  acknowledge_neighbors=True)
+    assert res["mechanisms"] == ["Foo", "Foo"]
+    assert res["mechanisms_normalized"] == {"Foo": "foo"}
+
+
+def test_a5_node_identity_is_unchanged(ws) -> None:
+    """The id still hashes the folded list: it equals the pre-change capture."""
+    from mitos.identity import compute_node_id, mechanism_refs_list_norm
+    config, m = ws
+    axiom = "Receipts echo mechanisms as authored."
+    res = m.record_decision_entry(axiom, "rej", [], mechanisms=["Zebra Timer", "os.replace"],
+                                  slug="a5-id-pin")
+    assert res["status"] == "created"
+    assert res["id"] == _A5_PRE_CHANGE_ID
+    assert res["id"] == compute_node_id(
+        kind="decision", axiom=axiom,
+        mechanism_refs=mechanism_refs_list_norm(["Zebra Timer", "os.replace"]))
+
+
+def test_a5_non_ascii_token_on_both_machine_encodings(ws, capsys) -> None:
+    """`Ärger` casefolds, so it is in the map — decoded alike on MCP and `--json`."""
+    from mitos import mcp_server
+    from mitos.cli import cmd_record
+    config, m = ws
+    capsys.readouterr()
+    cmd_record(config, axiom="A non-ASCII mechanism on the CLI.", rejected="rej",
+               mechanisms=["Ärger"], slug="a5-umlaut-cli", as_json=True)
+    cli_payload = json.loads(capsys.readouterr().out)
+    with patch("mitos.mcp_server.MitosConfig", return_value=config):
+        mcp_payload = json.loads(mcp_server.record_decision(
+            "A non-ASCII mechanism on MCP.", "rej", [], slug="a5-umlaut-mcp",
+            mechanisms=["Ärger"], acknowledge_neighbors=True,
+            project=config.workspace_dir))
+    for payload in (cli_payload, mcp_payload):
+        assert payload["status"] == "created"
+        assert payload["mechanisms"] == ["Ärger"]
+        assert payload["mechanisms_normalized"] == {"Ärger": "ärger"}
+
+
+def test_a5_both_encodings_single_source_the_map(ws, capsys) -> None:
+    """CC-5: each payload's map rebuilds from its own `mechanisms` via the one helper."""
+    from mitos import mcp_server
+    from mitos.cli import cmd_record
+    from mitos.sync import _mechanisms_fold_map
+    config, m = ws
+    authored = ["Zebra Timer", "sqlite", "os.replace"]
+    capsys.readouterr()
+    cmd_record(config, axiom="Parity on the CLI encoding.", rejected="rej",
+               mechanisms=authored, slug="a5-parity-cli", as_json=True)
+    cli_payload = json.loads(capsys.readouterr().out)
+    with patch("mitos.mcp_server.MitosConfig", return_value=config):
+        mcp_payload = json.loads(mcp_server.record_decision(
+            "Parity on the MCP encoding.", "rej", [], slug="a5-parity-mcp",
+            mechanisms=authored, acknowledge_neighbors=True,
+            project=config.workspace_dir))
+    for payload in (cli_payload, mcp_payload):
+        assert payload["mechanisms"] == authored
+        assert "mechanisms_normalized" in payload
+        assert payload["mechanisms_normalized"] == _mechanisms_fold_map(payload["mechanisms"])
+
+
+def test_a5_cli_text_names_each_fold_and_stays_bare_when_none(ws, capsys) -> None:
+    """The text receipt shows the authored list, then a fold line only when one folded."""
+    from mitos.cli import cmd_record
+    config, m = ws
+    capsys.readouterr()
+    cmd_record(config, axiom="The text names the fold.", rejected="rej",
+               mechanisms=["Zebra Timer", "os.replace", "sqlite"], slug="a5-text")
+    out = capsys.readouterr().out
+    assert "Mechanisms: Zebra Timer, os.replace, sqlite" in out
+    fold_lines = [ln for ln in out.splitlines() if ln.lstrip().startswith("Folded:")]
+    assert len(fold_lines) == 1
+    assert "Zebra Timer → zebra-timer" in fold_lines[0]
+    assert "os.replace → os-replace" in fold_lines[0]
+    assert "sqlite" not in fold_lines[0]
+    # Nothing to run, and no claim that anything was lost or merged.
+    assert "mitos " not in fold_lines[0]
+    for word in ("lost", "merged", "collid", "conflat", "wrong"):
+        assert word not in fold_lines[0].casefold()
+    # The fold line sits beside the line it modifies.
+    lines = out.splitlines()
+    assert lines.index(fold_lines[0]) == next(
+        i for i, ln in enumerate(lines) if "Mechanisms:" in ln) + 1
+
+    cmd_record(config, axiom="Canonical tokens print no fold line.", rejected="rej",
+               mechanisms=["sqlite", "wal-mode"], slug="a5-text-canon",
+               acknowledge_neighbors=True)
+    out = capsys.readouterr().out
+    assert "Mechanisms: sqlite, wal-mode" in out
+    assert "Folded:" not in out
+
+
+def test_a5_exists_replay_carries_neither_key(ws) -> None:
+    """An `exists` no-op wrote nothing, so it echoes no mechanisms and names no fold."""
+    config, m = ws
+    first = m.record_decision_entry("A replayed decision with mechanisms.", "rej", [],
+                                    mechanisms=["Zebra Timer"], slug="a5-replay")
+    assert first["status"] == "created"
+    again = m.record_decision_entry("A replayed decision with mechanisms.", "rej", [],
+                                    mechanisms=["Zebra Timer"], slug="a5-replay",
+                                    acknowledge_neighbors=True)
+    assert again["status"] == "exists"
+    assert "mechanisms" not in again and "mechanisms_normalized" not in again
+
+
+def test_a5_description_states_the_fold_without_naming_the_map() -> None:
+    """The fold is stated on the argument; the Returns block does not gloss the new key."""
+    from test_description_budget import _descriptions, _flat
+    description = _flat(_descriptions()["record_decision"])
+    assert "Folded for identity" in description
+    assert "_FOO and FOO are one" in description
+    assert "committed scope, plus mechanisms as authored" in description
+    assert "mechanisms_normalized" not in description

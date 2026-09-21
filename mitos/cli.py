@@ -2183,8 +2183,10 @@ def cmd_record(
               f"graph holds — run `mitos sync` to reconcile the entry in decisions.md.")
     print(f"  Handle:    '{result['slug']}' — pass this to --supersedes/--amends/--depends-on/… to link future decisions.")
     # Write facts read back from the committed node (NOT an echo of the flags):
-    # the edges the commit actually wired, and scope/mechanisms as stored. Lines
-    # are omitted when empty — a bare decision keeps a bare receipt.
+    # the edges the commit actually wired, scope as stored, and mechanisms as
+    # authored in decisions.md, followed by the fold line when the identity fold
+    # changed any of them. Lines are omitted when empty — a bare decision keeps a
+    # bare receipt.
     edges = result.get("edges_created")
     if edges:
         edges_s = ", ".join(f"{e['kind']} → {e['target']}" for e in edges)
@@ -2193,6 +2195,12 @@ def cmd_record(
         print(f"  Scope:     {', '.join(result['scope'])}")
     if result.get("mechanisms"):
         print(f"  Mechanisms: {', '.join(result['mechanisms'])}")
+    # Keyed on truthiness, not presence: `{}` rides every created receipt and
+    # means nothing folded, so it prints nothing.
+    folds = result.get("mechanisms_normalized")
+    if folds:
+        folds_s = ", ".join(f"{a} → {c}" for a, c in folds.items())
+        print(f"  Folded:     {folds_s} (the form the graph holds)")
     # Keyed on presence: [] and None are both answers, only the flag's absence isn't.
     if "acknowledged_neighbors" in result:
         print(_acknowledged_line(result["acknowledged_neighbors"]))

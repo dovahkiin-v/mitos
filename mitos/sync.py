@@ -78,7 +78,13 @@ from mitos.store import (
     _KILL_EDGE_FIELDS,
     edge_kind_is_legal,
 )
-from mitos.identity import SLUG_LENGTH_REASON, SLUG_MAX_LEN, compute_node_id, embedding_text
+from mitos.identity import (
+    SLUG_LENGTH_REASON,
+    SLUG_MAX_LEN,
+    compute_node_id,
+    embedding_text,
+    mechanism_canonical_norm,
+)
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.vector_store import QdrantVectorStore, hash_to_uuid
 from mitos.renderer import MitosRenderer, summarize_overflows
@@ -516,6 +522,29 @@ def _contains_structural_token(text: str) -> bool:
 # you change it, update that docstring (mcp_server.py) too.
 _SLUG_MAX_LEN = SLUG_MAX_LEN  # shared source of truth in identity.py (re-exported here for cli.py + the record path)
 _SLUG_MIN_LEN = 32  # auto-derive only: don't trim a word boundary back past here — hard-cap instead
+
+
+def _mechanisms_fold_map(authored: List[str]) -> Dict[str, str]:
+    """Maps each authored mechanism token the identity fold changes to its folded form.
+
+    Tokens the fold leaves byte-identical are omitted, so the map is ``{}`` when
+    nothing changed. Keys keep first-occurrence authored order. Pure and total: it
+    only reads :func:`~mitos.identity.mechanism_canonical_norm`, the fold that keys
+    the mechanism registry and feeds the node id.
+
+    Args:
+        authored: The mechanism tokens as ``decisions.md`` holds them.
+
+    Returns:
+        ``{authored: folded}`` for every token whose folded form differs.
+    """
+    folded: Dict[str, str] = {}
+    for token in authored:
+        canon = mechanism_canonical_norm(token)
+        if canon != token:
+            folded.setdefault(token, canon)
+    return folded
+
 
 # Returned on the two "exists" short-circuits, which write nothing at all. The
 # no-op is deliberate (a committed canonical core is immutable, M1) — what was
@@ -3912,8 +3941,12 @@ class MitosSyncManager:
             "created"|"exists"); on the "created" path it also carries
             ``edges_created`` (the edges the commit actually wired, each
             ``{kind, target}`` — write facts read back from the store, not an
-            echo of the input args), the resolved ``scope`` and ``mechanisms``
-            as committed, plus an optional
+            echo of the input args), the resolved ``scope`` as committed (the
+            graph's casefolded form), ``mechanisms`` as authored — the spelling
+            and order ``decisions.md`` now holds, read back from the parsed
+            entry — and ``mechanisms_normalized``, mapping each authored token
+            the fold changed to its folded form (the form the graph and the node
+            id hold; ``{}`` when none changed), plus an optional
             ``neighbor_review_unavailable`` notice when the pre-commit near-dup
             check could not run (the record fails open — the commit proceeds
             unchecked; the notice names the cause and no command, each surface
@@ -4429,7 +4462,13 @@ class MitosSyncManager:
             # stamped: ADR `record-pause-neighbors-are-stamped-decision-read-surface`.)
             "edges_created": self.store.get_outgoing_edges(node_id),
             "scope": entry.scope,
-            "mechanisms": entry.mechanisms,
+            # `mechanisms` is the gold source's authored form, read from the entry
+            # step 6 parsed back from the serialised text (so an element carrying a
+            # comma echoes as the split the markdown holds), never from the argument.
+            # `mechanisms_normalized` names the fold, unconditionally — `{}` when
+            # nothing changed, so an absent key never has to be interpreted.
+            "mechanisms": list(entry.mechanisms_authored),
+            "mechanisms_normalized": _mechanisms_fold_map(entry.mechanisms_authored),
             # Unconditional, and only here: a write that landed incurred coherence
             # debt, while `exists`/`needs_review`/every error wrote nothing and owe
             # nothing. Carrying the FACT on the field (rather than leaving the CLI

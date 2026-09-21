@@ -1494,7 +1494,8 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
         slug: A short, descriptive handle (e.g. 'sqlite-wal-mode'), at most 100 characters.
         project: Required on every call: a registered project name (e.g. 'mitos')
             or a workspace's absolute path; `list_projects()` lists the names.
-        mechanisms: Concrete technologies/entities involved, e.g. ["sqlite", "wal-mode"].
+        mechanisms: Concrete technologies/entities involved, e.g. ["sqlite"]. Folded
+            for identity (case; ASCII punctuation/whitespace runs to "-"): _FOO and FOO are one.
         context: Optional background on why this was decided.
         acknowledge_neighbors: Leave False on the first attempt; set True to record
             past a near-duplicate pause for neighbours you judged independent.
@@ -1513,8 +1514,8 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
         the corpus this write landed in — check it. Only a top-level {error, code}
         is a failure. status="created": newly recorded, with `edges_created` write
         facts (read back from the committed graph — empty means no edge landed)
-        and the committed scope/mechanisms. status="exists": a SUCCESS no-op, not
-        an error — the same axiom and mechanisms are already recorded, whatever the
+        and the committed scope, plus mechanisms as authored. status="exists": a
+        SUCCESS no-op, not an error — the same axiom and mechanisms are already recorded, whatever the
         slug; changed commentary/relations are NOT saved and are listed under
         `differs`; record a NEW decision (a distinct
         axiom) for new reasoning. status="needs_review" (code
@@ -1579,8 +1580,8 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
     # `record_decision_entry`: the buffer-first + rollback contract is not the
     # place for a routing concern, and the receipt keys it emits (slug/id/state/
     # embedding/status/code/neighbors/message/draft_digest/drifted_fields/error/
-    # edges_created/scope/mechanisms/…) contain none of these three, so the update
-    # adds and never overwrites.
+    # edges_created/scope/mechanisms/mechanisms_normalized/…) contain none of
+    # these three, so the update adds and never overwrites.
     result.update(corpus_provenance(config))
     return dumps_display(result, ensure_ascii=False, indent=None)
 
