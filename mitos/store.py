@@ -1438,9 +1438,9 @@ class GraphStore:
         # ``-O`` flag (the 2a IMPL_NOTES precedent: a vector error is durable).
         #
         # Slug-length backstop (both kinds): the parser gates this on every file route
-        # and the record path gates it early, but the slug is the permanent citation
-        # handle — an over-length one reaching the store means a caller bypassed the
-        # parser, so fence it here too (unbypassable identity invariant, MI-11 spirit).
+        # and the record path gates it early, but the slug is the handle other
+        # decisions cite — an over-length one reaching the store means a caller bypassed
+        # the parser, so fence it here too (an unbypassable format invariant, MI-11 spirit).
         if len(parsed.slug) > SLUG_MAX_LEN:
             raise ValidationError(
                 f"Slug '{parsed.slug}' reached the store at {len(parsed.slug)} "

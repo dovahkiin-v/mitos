@@ -1464,6 +1464,7 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
                     resolves: Optional[str] = None, contradicts: Optional[str] = None,
                     derives_from: Optional[str] = None, cites: Optional[str] = None,
                     acknowledge_neighbors: bool = False,
+                    draft_digest: Optional[str] = None,
                     project: Optional[str] = None) -> str:
     """Record a decision the moment you commit to a foundational choice — a schema,
     a library, a pattern, a path abandoned — with the alternatives you rejected and
@@ -1497,6 +1498,8 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
         context: Optional background on why this was decided.
         acknowledge_neighbors: Leave False on the first attempt; set True to record
             past a near-duplicate pause for neighbours you judged independent.
+        draft_digest: Optional; pass back a pause's draft_digest to compare this
+            re-send with that draft. Omit it after a deliberate edit.
 
     `rejected_paths` is what stops the next agent re-proposing a ruled-out option;
     one "(N) <option>: REJECTED — <reason>" per line scans best. A slug is the
@@ -1555,6 +1558,7 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
         cites=cites,
         slug=slug,
         acknowledge_neighbors=acknowledge_neighbors,
+        draft_digest=draft_digest,
     )
     # A rotation failure leaves the write standing. The receipt carries the cause;
     # this boundary adds its own recovery (no command — an agent handed one runs it)
@@ -1574,9 +1578,9 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
     # Stamped HERE, at the boundary that serializes it, never inside
     # `record_decision_entry`: the buffer-first + rollback contract is not the
     # place for a routing concern, and the receipt keys it emits (slug/id/state/
-    # embedding/status/code/neighbors/message/error/edges_created/scope/
-    # mechanisms/…) contain none of these three, so the update adds and never
-    # overwrites.
+    # embedding/status/code/neighbors/message/draft_digest/drifted_fields/error/
+    # edges_created/scope/mechanisms/…) contain none of these three, so the update
+    # adds and never overwrites.
     result.update(corpus_provenance(config))
     return dumps_display(result, ensure_ascii=False, indent=None)
 

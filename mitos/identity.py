@@ -69,6 +69,11 @@ from typing import Dict, List, Mapping, Optional
 # without a dependency-tier inversion. The MCP `record_decision` slug docstring
 # carries this number as a literal — update it (mcp_server.py) if this changes.
 SLUG_MAX_LEN = 100
+# The one reason both over-length refusals give (the record path's `slug_too_long` and
+# the parser's twin), so the two can never disagree about what a slug is. A string
+# constant only: the parser imports it on the same edge as SLUG_MAX_LEN and still
+# computes no identity. No braces — `sync._ERROR_MESSAGES` splices it into a template.
+SLUG_LENGTH_REASON = "A slug is the handle other decisions cite, so mitos never shortens one"
 
 # Maximal run of ASCII whitespace OR ASCII punctuation -> a single hyphen. The
 # ``re.ASCII`` flag restricts ``\s`` to ASCII whitespace ([ \t\n\r\f\v]) so the

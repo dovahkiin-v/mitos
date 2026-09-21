@@ -101,6 +101,7 @@ from mitos.recall import (assess_query_recall, assess_surface_recall,
 from mitos.sync import (MitosSyncManager, run_ambient_capture, _SLUG_MAX_LEN,
                         _ENTRIES_MARKER, _NEIGHBOR_REVIEW_THRESHOLD,
                         _PAUSE_RESOLVING_RELATIONS, _declared_echo_lines, _split_relation_slugs,
+                        PAUSE_HELD_CLAUSE,
                         ROTATION_FAILED, ROTATION_REASON_DUPLICATED, ROTATION_ROTATED,
                         ROTATION_SKIPPED, ROTATION_STAGE_FILE, ROTATION_STAGE_LOCK)
 from mitos._agent_block import agent_block, agent_block_drift, AGENT_GUIDE_VERSION
@@ -2002,6 +2003,7 @@ def cmd_record(
     *,
     slug: str,
     acknowledge_neighbors: bool = False,
+    draft_digest: Optional[str] = None,
     as_json: bool = False,
 ) -> None:
     """Records a decision directly to the write-buffer and graph (thin wrapper).
@@ -2037,6 +2039,7 @@ def cmd_record(
         cites=cites,
         slug=slug,
         acknowledge_neighbors=acknowledge_neighbors,
+        draft_digest=draft_digest,
     )
 
     if as_json:
@@ -2115,6 +2118,9 @@ def cmd_record(
               "<slug> at any neighbour this decision relates to, "
               "--acknowledge-neighbors for neighbours that stand independently — or "
               "both at once for a mixed set.", file=sys.stderr)
+        # The message's held clause without its digest half: this render carries no
+        # draft_digest, and pointing at a key the reader cannot see would be false.
+        print(f"  → {PAUSE_HELD_CLAUSE}.", file=sys.stderr)
         sys.exit(2)
 
     # The "exists" short-circuit writes nothing, so it must not borrow the
@@ -2265,6 +2271,35 @@ def _read_text_arg(inline: Optional[str], file_path: Optional[str]) -> Optional[
         with open(file_path, "r", encoding="utf-8") as f:
             return f.read()
     return inline
+
+
+def _read_record_text_arg(inline: Optional[str], file_path: Optional[str], flag: str,
+                          *, as_json: bool) -> Optional[str]:
+    """Reads one of ``record``'s text arguments, refusing an unreadable file with exit 2.
+
+    The ``record`` dispatch's twin of ``_amend_changes_from_args``' guard: the same
+    words and code (``AMEND_CODE_UNREADABLE_FILE``), so an unreadable file is a located
+    usage refusal — one ``{error, code}`` object under ``--json`` — never ``main()``'s
+    bare crash line. Pre-dispatch, so no corpus echo (like ``multiple_stdin_args``).
+
+    Args:
+        inline: The value passed directly on the command line, if any.
+        file_path: A file path to read instead, or ``"-"`` for stdin.
+        flag: The file flag named in the refusal, e.g. ``"--axiom-file"``.
+        as_json: Whether the refusal speaks JSON on stdout.
+
+    Returns:
+        The resolved text, or None if neither source was provided.
+    """
+    try:
+        return _read_text_arg(inline, file_path)
+    except (OSError, UnicodeDecodeError) as exc:
+        msg = f"{flag} could not be read: {exc}"
+        if as_json:
+            _emit_json({"error": msg, "code": AMEND_CODE_UNREADABLE_FILE})
+        else:
+            print(msg, file=sys.stderr)
+        sys.exit(2)
 
 
 def _join_relation_flag(values: Optional[List[str]]) -> Optional[str]:
@@ -7921,6 +7956,10 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="Record past the near-duplicate review (the decision is genuinely "
                             "independent). Combines with the relation flags — declared edges "
                             "are still written.")
+    rec_p.add_argument("--draft-digest", dest="draft_digest", metavar="DIGEST",
+                       help="The draft_digest a --json pause returned: this re-send is compared "
+                            "with that draft and refused, naming the fields, if one changed. "
+                            "Omit it after a deliberate edit.")
     rec_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON.")
 
     # serve
@@ -8361,10 +8400,12 @@ def main() -> None:
             # them is safe and `_read_text_arg`'s file-wins precedence never fires on
             # a caller who supplied both.
             _inline_axiom = args.axiom if args.axiom is not None else args.axiom_flag
-            axiom = _read_text_arg(_inline_axiom, args.axiom_file)
+            axiom = _read_record_text_arg(_inline_axiom, args.axiom_file,
+                                          "--axiom-file", as_json=args.as_json)
             if args.axiom_file is not None and axiom.endswith("\n"):
                 axiom = axiom[:-1]  # strip the single trailing newline files/heredocs add
-            rejected = _read_text_arg(args.rejected, args.rejected_file)
+            rejected = _read_record_text_arg(args.rejected, args.rejected_file,
+                                             "--rejected-file", as_json=args.as_json)
             if not (rejected and rejected.strip()):
                 msg = ("record requires --rejected or --rejected-file "
                        "(the rejected alternatives are mandatory).")
@@ -8375,7 +8416,8 @@ def main() -> None:
                 else:
                     print(msg, file=sys.stderr)
                 sys.exit(2)
-            context = _read_text_arg(args.context, args.context_file)
+            context = _read_record_text_arg(args.context, args.context_file,
+                                            "--context-file", as_json=args.as_json)
             cmd_record(
                 config,
                 axiom=axiom,
@@ -8394,6 +8436,7 @@ def main() -> None:
                 cites=_join_relation_flag(args.cites),
                 slug=args.slug,
                 acknowledge_neighbors=args.acknowledge_neighbors,
+                draft_digest=args.draft_digest,
                 as_json=args.as_json,
             )
         elif args.command == "serve":

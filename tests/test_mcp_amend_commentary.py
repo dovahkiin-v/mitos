@@ -501,7 +501,7 @@ def test_the_refusal_arguments_equal_the_relation_set_and_records_types() -> Non
     own = {"slug", "rejected_paths", "invalidates_if", "context", "scope", "new_slug",
            "clear", "axiom", "mechanisms", "project"}
     record_own = {"axiom", "rejected_paths", "scope", "slug", "mechanisms", "context",
-                  "acknowledge_neighbors", "project"}
+                  "acknowledge_neighbors", "draft_digest", "project"}
     assert set(amend_props) - own == set(RELATIONSHIP_FIELDS) == set(record_props) - record_own
     for name in RELATIONSHIP_FIELDS:
         assert amend_props[name] == record_props[name], name

@@ -5,6 +5,7 @@ concurrency file locks, LLM capture enrichment, user reviews, and content-aware
 archive rotation.
 """
 
+import hashlib
 import math
 import os
 import sys
@@ -76,7 +77,7 @@ from mitos.store import (
     _KILL_EDGE_FIELDS,
     edge_kind_is_legal,
 )
-from mitos.identity import SLUG_MAX_LEN, compute_node_id, embedding_text
+from mitos.identity import SLUG_LENGTH_REASON, SLUG_MAX_LEN, compute_node_id, embedding_text
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.vector_store import QdrantVectorStore, hash_to_uuid
 from mitos.renderer import MitosRenderer, summarize_overflows
@@ -270,7 +271,7 @@ _ERROR_MESSAGES: Dict[str, str] = {
     "not_initialized": "No Mitos workspace found here. Run 'mitos init' before recording decisions.",
     "empty_axiom": "'axiom' is empty. Provide the decision as a single clear sentence that is true going forward.",
     "empty_slug": "'slug' is empty. Provide a short, explicit, hyphenated handle (e.g. 'sqlite-wal-mode').",
-    "slug_too_long": "slug '{slug}' is {length} characters — {over} over the {max}-character limit. The slug is the permanent citation handle (it is folded into the decision's identity), so it is NOT silently truncated. Pass a shorter 'slug' of at most {max} characters.",
+    "slug_too_long": "slug '{slug}' is {length} characters — {over} over the {max}-character limit. " + SLUG_LENGTH_REASON + ". Pass a shorter 'slug' of at most {max} characters.",
     "missing_rejected_paths": "'rejected_paths' is required: state the alternatives you considered and why you ruled them out — this is what stops you or another agent from re-proposing them later.",
     "parse_failed": "The decision could not be serialised into a valid entry — most likely a structural token in axiom/rejected_paths/context: a line beginning with '##' or '###' (indent it or use '#'/'####' instead), a line shaped like '**Something:**', or a '[DECISION_TRANSCRIPT]' / '[DECISION_PARKED:' / 'BEGIN ENTRIES' / '[NOTE:' / '[PARKED:' marker. Remove or rephrase that line and retry — or, to mention a marker as prose, wrap it in backticks (`...`): inline-code spans are exempt.",
     "slug_collision": "A different decision already uses the slug '{slug}'. Give this one a distinct 'slug'; and if it is meant to replace the existing decision, also set supersedes='{slug}' (the new decision must still have its own slug — two decisions cannot share one).",
@@ -282,6 +283,8 @@ _ERROR_MESSAGES: Dict[str, str] = {
     "relation_target_ambiguous": "{relation}='{target}' matches more than one decision. Use query_decisions to find the exact, full slug and pass that.",
     "commit_failed": "The decision validated but the commit failed and nothing was written: {reason}. Retry; if it persists, the workspace store may be locked or corrupt.",
     "derives_from_on_decision": "derives_from is not valid when recording a decision: a derives_from edge originates from an open question (open_question -> decision), so a decision can never be its source. If you mean 'this decision builds on that one', use cites instead.",
+    "draft_drifted": "This re-send's {fields} changed from the draft its draft_digest came from — the values of the call that paused, not your latest send. Restore those values and re-send with the same draft_digest, or omit draft_digest (which always clears this comparison) to record the draft as it is now.",
+    "draft_digest_unreadable": "draft_digest is not a value a pause returned, so this re-send cannot be compared with its draft. Pass the pause's draft_digest exactly as it came, or omit draft_digest (which always clears this comparison).",
 }
 
 # The user-facing typed relations beyond `supersedes` (which is special: it changes
@@ -325,6 +328,100 @@ def _split_relation_slugs(raw: Optional[str]) -> List[str]:
 def _record_error(code: str, **fields: Any) -> Dict[str, str]:
     """Builds a structured {error, code} dict using the canonical message for ``code``."""
     return {"error": _ERROR_MESSAGES[code].format(**fields), "code": code}
+
+
+# The pause's draft digest (A3). mitos holds nothing between calls, so the digest
+# travels with the caller: a version tag, then one short hash per field in this fixed
+# order, so a re-send that passes it back can be told WHICH fields drifted. The names
+# are the record_decision argument names, so a drifted field maps straight back to the
+# argument the caller sent. Never stored, never an identity input (MI-1/MI-7).
+DRAFT_DIGEST_FIELDS = ("slug", "axiom", "rejected_paths", "context", "scope", "mechanisms")
+_DRAFT_DIGEST_TAG = "d1"
+_DRAFT_DIGEST_WIDTH = 10  # hex chars per field: 40 bits against accidental drift, not a MAC
+_DRAFT_DIGEST_RE = re.compile(
+    rf"{_DRAFT_DIGEST_TAG}(\.[0-9a-f]{{{_DRAFT_DIGEST_WIDTH}}}){{{len(DRAFT_DIGEST_FIELDS)}}}")
+
+# The pause's "nothing is held" clause, single-sourced: the message appends the digest
+# clause to it; the CLI text pause prints it alone (its render carries no digest).
+PAUSE_HELD_CLAUSE = ("Nothing is held between calls: re-send the same values, "
+                     "declarations included, with the relation or acknowledgement added")
+_PAUSE_DIGEST_CLAUSE = ("; pass this pause's draft_digest with them to have the re-send "
+                        "compared with this draft, or omit it if you changed the draft "
+                        "on purpose.")
+
+
+def _draft_digest_segment(value: Any) -> str:
+    """Hashes one draft field's value to its short digest segment.
+
+    ``ensure_ascii=True`` is deliberate and the opposite of
+    ``identity.canonical_core_json_form``: a lone surrogate becomes a ``\\udc80``
+    escape rather than a UTF-8 encode, so this can never raise. Don't harmonise the two.
+
+    Args:
+        value: The field as the built entry holds it (a string, ``None``, or a list).
+
+    Returns:
+        The first ``_DRAFT_DIGEST_WIDTH`` hex characters of the value's SHA-256.
+    """
+    blob = json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    return hashlib.sha256(blob).hexdigest()[:_DRAFT_DIGEST_WIDTH]
+
+
+def _draft_digest(entry: ParsedEntry) -> str:
+    """Computes the draft digest a pause returns, over the built entry.
+
+    Reads the entry ``parse_entry_stream`` built, never the raw arguments, so the digest
+    canonicalises exactly as the write does and adds no normalisation of its own
+    (case-folded scope compares equal; reordered scope is drift, MI-9).
+
+    Args:
+        entry: The built entry of the call being paused or compared.
+
+    Returns:
+        ``d1.<slug>.<axiom>.<rejected_paths>.<context>.<scope>.<mechanisms>`` segments.
+    """
+    return ".".join([_DRAFT_DIGEST_TAG] + [
+        _draft_digest_segment(getattr(entry, field)) for field in DRAFT_DIGEST_FIELDS])
+
+
+def _readable_fields(fields: List[str]) -> str:
+    """Joins field names as prose: ``a``, ``a and b``, ``a, b and c``."""
+    return fields[0] if len(fields) == 1 else f"{', '.join(fields[:-1])} and {fields[-1]}"
+
+
+def _draft_drift(entry: ParsedEntry, draft_digest: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Compares a re-send's built entry with the draft its digest came from.
+
+    Pure and in memory: no store read, no raise. An absent or blank digest is omitted
+    (the call behaves exactly as without one). A value this build cannot read is refused
+    with its own code, never read as drift of all six fields.
+
+    Args:
+        entry: The re-send's built entry.
+        draft_digest: The digest the caller passed back, or ``None``.
+
+    Returns:
+        ``None`` when there is nothing to refuse; otherwise a ``draft_digest_unreadable``
+        refusal, or a ``draft_drifted`` refusal carrying ``drifted_fields`` (a list, in
+        :data:`DRAFT_DIGEST_FIELDS` order).
+    """
+    if draft_digest is None:
+        return None
+    if not isinstance(draft_digest, str):
+        return _record_error("draft_digest_unreadable")
+    given = draft_digest.strip().lower()
+    if not given:
+        return None  # blank is omitted, as for the relation arguments
+    if not _DRAFT_DIGEST_RE.fullmatch(given):
+        return _record_error("draft_digest_unreadable")
+    current = _draft_digest(entry).split(".")[1:]
+    drifted = [field for field, now, then in zip(DRAFT_DIGEST_FIELDS, current,
+                                                  given.split(".")[1:])
+               if now != then]
+    if not drifted:
+        return None
+    return {**_record_error("draft_drifted", fields=_readable_fields(drifted)),
+            "drifted_fields": drifted}
 
 
 class _AmendAnswer(Exception):
@@ -407,9 +504,9 @@ def _contains_structural_token(text: str) -> bool:
     return False
 
 
-# The citation-handle length cap. The slug is folded into the canonical-core identity
-# (V1-D2), so it is permanent once committed — generous enough for a descriptive
-# multi-word handle (real corpus handles top out ~68 chars), firm enough to keep one
+# The citation-handle length cap. The slug is the handle other decisions cite (it is
+# not part of the canonical-core identity, V1-D2, and can be renamed) — generous
+# enough for a descriptive multi-word handle (real corpus handles top out ~68 chars), firm enough to keep one
 # from running away. An *explicit* slug over this is REJECTED with an exact char count
 # (never silently truncated — a silent trim diverges the stored handle from the one the
 # author already cited: self-inflicted citation rot). Auto-derived slugs still trim to it.
@@ -913,8 +1010,8 @@ def _normalize_slug(text: str) -> str:
 
     The character-normalisation half of :func:`_slugify`, factored out so the write
     path can validate an explicit slug's *length* without silently truncating it: an
-    over-length explicit slug is the author's permanent citation handle, so the right
-    move is to reject (and ask for a shorter one), not to mangle it down to fit.
+    over-length explicit slug is the handle the author will cite, so the right move is
+    to reject (and ask for a shorter one), not to mangle it down to fit.
 
     Args:
         text: Free text — an explicit slug, or an axiom for auto-derivation.
@@ -3662,6 +3759,7 @@ class MitosSyncManager:
         slug: Optional[str] = None,
         actor: str = "agent",
         acknowledge_neighbors: bool = False,
+        draft_digest: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Records a single decision into the buffer and graph, non-interactively.
 
@@ -3699,6 +3797,10 @@ class MitosSyncManager:
             acknowledge_neighbors: Skip the pre-commit near-duplicate review and record
                 even when a highly-similar unreferenced decision exists (P4). Pass True
                 to commit a genuinely independent decision past the pause.
+            draft_digest: Optional; the ``draft_digest`` a pause returned. The built
+                draft is compared with it, field by field, before any store read — a
+                drifted field refuses the call, under ``acknowledge_neighbors`` too.
+                ``None`` or blank skips the comparison.
 
         Returns:
             A success dict ``{slug, id, state, embedding, status}`` (status
@@ -3728,8 +3830,9 @@ class MitosSyncManager:
             present only while a judge key is set and that outcome is not
             ``no_new_findings``; OR, when a highly-similar unreferenced decision exists and
             ``acknowledge_neighbors`` is False, a ``{status: "needs_review", code:
-            "similar_decision_exists", slug, neighbors, message}`` pause that wrote
-            NOTHING —
+            "similar_decision_exists", slug, neighbors, message, draft_digest}`` pause
+            that wrote NOTHING — ``draft_digest`` (:func:`_draft_digest`) is what a
+            re-send passes back to be compared with this draft;
             each ``neighbors`` element is an enriched, modifier-stamped decision-read
             payload (:func:`~mitos.conflict.candidate_payload`: ``slug`` / ``axiom`` /
             ``scope`` / ``score`` / ``rejected_paths`` plus any ``amended_by``/
@@ -3741,7 +3844,8 @@ class MitosSyncManager:
             declarations that moved nothing on this call), each with a
             ``*_total`` sibling count when the group collapsed at
             :data:`_DECLARED_ECHO_BOUND`;
-            OR a structured ``{error, code}`` failure (see spec §5).
+            OR a structured ``{error, code}`` failure (see spec §5) — a
+            ``draft_drifted`` one also carries ``drifted_fields``.
         """
         # === Phase A — validate everything in memory (no writes) ===
 
@@ -3803,8 +3907,8 @@ class MitosSyncManager:
             return _record_error("derives_from_on_decision")
 
         # 4. Slug — validate, don't mangle. The slug is now mandatory and explicit, and
-        #    it is folded into the canonical-core identity (V1-D2), so it is permanent
-        #    once committed. Normalise case/separators, but REJECT an over-length slug
+        #    it is the handle other decisions cite (not part of the canonical-core
+        #    identity, V1-D2). Normalise case/separators, but REJECT an over-length slug
         #    with an exact char count rather than silently truncating it — a silent trim
         #    would diverge the stored handle from the one the author already cited
         #    (self-inflicted citation rot, the exact failure the handle subsystem exists
@@ -3849,6 +3953,15 @@ class MitosSyncManager:
         if len(parsed) != 1:
             return _record_error("parse_failed")
         entry = parsed[0]
+
+        # A re-send carrying the pause's draft_digest is compared here: after the
+        # entry is built (so it canonicalises exactly as the write does) and before any
+        # store read, so a drifted draft is refused ahead of the exists short-circuit
+        # (which would hide it) and under acknowledge_neighbors (which skips the review
+        # a drifted draft would otherwise commit past). Pure; it can never raise.
+        drift = _draft_drift(entry, draft_digest)
+        if drift:
+            return drift
 
         # Pre-validate supersedes with an EXACT match — comma-separated for a
         # multi-target supersede (each slug resolved independently; a lone slug is the
@@ -3907,8 +4020,9 @@ class MitosSyncManager:
 
         # Identity (slug-free canonical-core hash — V1-D2). Computed over the SAME
         # fields commit_parsed_entry hashes, so this pre-commit idempotency id equals
-        # the commit id: a same-core re-record with a new --slug is an in-place UPDATE
-        # (slug rename), never a spurious slug_collision (G3, V1-D16).
+        # the commit id: a same-core re-record with a new --slug answers `exists` below
+        # and renames nothing, never a spurious slug_collision (G3, V1-D16). A rename
+        # is amend_commentary's `new_slug`.
         node_id = compute_node_id(
             kind=entry.kind,
             axiom=entry.axiom,
@@ -4048,9 +4162,11 @@ class MitosSyncManager:
                         "independently alongside it — or both at once for a mixed "
                         "set. If you go on to supersede or amend a neighbour, an "
                         "amended_by/narrowed_by stamp on it means it has moved on — "
-                        f"dereference that slug before linking. {echo_prose}"
+                        "dereference that slug before linking. "
+                        f"{PAUSE_HELD_CLAUSE}{_PAUSE_DIGEST_CLAUSE} {echo_prose}"
                         "Nothing was written."
                     ),
+                    "draft_digest": _draft_digest(entry),
                     **echo,
                 }
 

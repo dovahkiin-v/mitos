@@ -28,8 +28,9 @@ from mitos.conflict import ConflictUnavailableReason, Unavailable
 from mitos.errors import DatabaseError, EmbeddingError, VectorStoreError
 from mitos.parser import ParsedEntry
 from mitos.store import GraphStore
-from mitos.sync import (MitosSyncManager, _NEIGHBOR_REVIEW_THRESHOLD,
-                        _PAUSE_RESOLVING_RELATIONS)
+from mitos.sync import (DRAFT_DIGEST_FIELDS, MitosSyncManager, PAUSE_HELD_CLAUSE,
+                        _NEIGHBOR_REVIEW_THRESHOLD, _PAUSE_DIGEST_CLAUSE,
+                        _PAUSE_RESOLVING_RELATIONS, _draft_digest)
 
 
 @pytest.fixture
@@ -1086,7 +1087,8 @@ def test_pause_that_declared_nothing_is_byte_identical(ws, capsys):
     """No declarations at all → no echo anywhere, and the pause body is unchanged.
 
     The majority path pays nothing for the echo: neither key, and sync's `message`
-    still closes `…before linking. Nothing was written.` with no sentence between. The
+    still closes `…before linking. <held sentence> Nothing was written.` with no echo
+    sentence between (4e's held sentence is the one addition, and it is pinned whole). The
     exact-substring assertion is the point — an empty-group render (`Declared: none`,
     or a bare stem) would slip past a key-absence check while shipping a wall on the
     quiet path.
@@ -1096,7 +1098,8 @@ def test_pause_that_declared_nothing_is_byte_identical(ws, capsys):
     res = _echo_pause(m, _ECHO_GATHERED)
     assert "declared" not in res and "declared_no_near_match" not in res
     assert res["message"].endswith(
-        "dereference that slug before linking. Nothing was written.")
+        "dereference that slug before linking. "
+        f"{PAUSE_HELD_CLAUSE}{_PAUSE_DIGEST_CLAUSE} Nothing was written.")
     assert "Declared" not in res["message"]
 
     factory = _armed_real_manager_factory(_ECHO_GATHERED)
@@ -1932,3 +1935,425 @@ def test_stamp_sentence_in_the_pause_and_setup_agree_word_for_word(ws):
     """R-9b — SETUP.md teaches the sentence the pause says; the description is a
     paraphrase and exempt."""
     assert _stamp_copy(ws, "message") == _stamp_copy(ws, "setup_md")
+
+
+# --------------------------------------------------------------------------- #
+# 4e — A3: the pause's `draft_digest`, and the "nothing is held" sentence.
+#
+# mitos holds nothing between calls, so the pause returns a digest the caller
+# carries back; a re-send that passes it is compared with the paused draft field by
+# field BEFORE any store read, and a drifted field refuses the write. The digest is
+# computed over the built entry, so it canonicalises exactly as the write does:
+# case-only scope is not drift, reordered scope is (MI-9), folded mechanisms are not.
+# --------------------------------------------------------------------------- #
+
+_DIGEST_SHAPE = r"d1(\.[0-9a-f]{10}){6}"
+
+#: The paused draft the digest rows share: a near-dup of the seeded `use-sqlite`.
+_DRAFT = {"axiom": "Adopt SQLite as the storage engine.", "rejected_paths": "rej",
+          "scope": ["db"], "slug": "adopt-sqlite"}
+
+#: One drifted value per digest field, against `_DRAFT` (mechanisms/context absent).
+_DRIFTS = {
+    "slug": {"slug": "adopt-sqlite-now"},
+    "axiom": {"axiom": "Adopt SQLite as the only storage engine."},
+    "rejected_paths": {"rejected_paths": "rej, and Postgres too heavy"},
+    "context": {"context": "Chosen for the single-file deploy."},
+    "scope": {"scope": ["db", "store"]},
+    "mechanisms": {"mechanisms": ["sqlite"]},
+}
+
+
+def _digest_pause(m, **overrides):
+    """Seed the one neighbour, arm the sweep, pause `_DRAFT` (+ overrides); the digest."""
+    if GraphStore(m.config.db_path).get_node_by_slug("use-sqlite") is None:
+        _seed(m, "use-sqlite", "Use SQLite for the store.")
+    _arm(m, [{"slug": "use-sqlite", "score": 0.9}])
+    res = m.record_decision_entry(**{**_DRAFT, **overrides})
+    assert res["status"] == "needs_review", res
+    return res["draft_digest"]
+
+
+def _buffer(config):
+    with open(config.decisions_file, "rb") as f:
+        return f.read()
+
+
+def test_pause_carries_a_well_formed_digest_equal_on_every_encoding(ws, capsys):
+    """Row 1 — sync dict, MCP and `record --json` carry one digest, and the
+    MCP ⇄ `--json` pause dicts stay equal with the new key riding both."""
+    import re
+    from mitos import mcp_server
+    config, m = ws
+    sync_digest = _digest_pause(m)
+    assert re.fullmatch(_DIGEST_SHAPE, sync_digest)
+
+    factory = _armed_real_manager_factory([{"slug": "use-sqlite", "score": 0.9}])
+    with patch("mitos.cli.MitosSyncManager", side_effect=factory), \
+         patch("mitos.sync.MitosSyncManager", side_effect=factory), \
+         patch("mitos.mcp_server.MitosConfig", return_value=config):
+        capsys.readouterr()
+        with pytest.raises(SystemExit) as exc:
+            cmd_record(config, axiom=_DRAFT["axiom"], rejected="rej", scope=["db"],
+                       slug="adopt-sqlite", as_json=True)
+        assert exc.value.code == 2
+        cli_payload = json.loads(capsys.readouterr().out)
+        mcp_payload = json.loads(mcp_server.record_decision(
+            _DRAFT["axiom"], "rej", ["db"], slug="adopt-sqlite",
+            project=config.workspace_dir))
+
+    assert cli_payload["draft_digest"] == mcp_payload["draft_digest"] == sync_digest
+    assert cli_payload == mcp_payload
+
+
+def test_pause_message_places_the_held_sentence_between_b9_and_the_echo(ws, capsys):
+    """Row 2 — B9 → held sentence → echo → `Nothing was written.` last; the CLI text
+    pause prints the held clause but neither the digest clause nor the digest."""
+    config, m = ws
+    _seed_echo_corpus(m)
+    res = _echo_pause(m, _ECHO_GATHERED, cites="echo-b, echo-d")
+    msg = res["message"]
+    held = f"{PAUSE_HELD_CLAUSE}{_PAUSE_DIGEST_CLAUSE}"
+    assert msg.count(held) == 1
+    b9_end = msg.index("dereference that slug before linking. ")
+    first_echo = min(msg.index(s) for s in _echo_sentences(msg))
+    assert b9_end < msg.index(held) < first_echo
+    assert msg.endswith("Nothing was written.")
+    assert msg.index(held) + len(held) < msg.index("Nothing was written.")
+
+    factory = _armed_real_manager_factory(_ECHO_GATHERED)
+    capsys.readouterr()
+    with patch("mitos.cli.MitosSyncManager", side_effect=factory):
+        with pytest.raises(SystemExit):
+            cmd_record(config, axiom=_ECHO_AXIOM, rejected="rej", scope=["s"],
+                       slug="echo-new", cites="echo-b, echo-d")
+    err = capsys.readouterr().err
+    lines = [line.strip() for line in err.splitlines()]
+    assert f"→ {PAUSE_HELD_CLAUSE}." in lines
+    assert "draft_digest" not in err
+    assert res["draft_digest"] not in err
+    menu = next(i for i, line in enumerate(lines) if line.startswith("→ Judge"))
+    assert lines.index(f"→ {PAUSE_HELD_CLAUSE}.") == menu + 1
+
+
+@pytest.mark.parametrize("resolve", [{"amends": "use-sqlite"},
+                                     {"acknowledge_neighbors": True}],
+                         ids=["relation", "acknowledge"])
+def test_clean_resend_with_the_digest_commits(ws, resolve):
+    """Row 3 — the same six values plus the judgment and the digest → created."""
+    config, m = ws
+    digest = _digest_pause(m)
+    res = m.record_decision_entry(**_DRAFT, draft_digest=digest, **resolve)
+    assert res["status"] == "created", res
+
+
+@pytest.mark.parametrize("field", DRAFT_DIGEST_FIELDS)
+def test_each_drifted_field_is_refused_by_name_and_writes_nothing(ws, field):
+    """Row 4 (and 7's drifted half) — one field changed on a digest-carrying re-send →
+    `draft_drifted` naming exactly that field; buffer and graph unchanged. Driven under
+    acknowledge_neighbors=True, the case the digest earns its place on."""
+    config, m = ws
+    digest = _digest_pause(m)
+    before = _buffer(config)
+    drifted = {**_DRAFT, **_DRIFTS[field]}
+    res = m.record_decision_entry(**drifted, draft_digest=digest,
+                                  acknowledge_neighbors=True)
+    assert res["code"] == "draft_drifted", res
+    assert res["drifted_fields"] == [field]
+    assert f"re-send's {field} changed" in res["error"]
+    assert _buffer(config) == before
+    store = GraphStore(config.db_path)
+    assert store.get_node_by_slug(drifted["slug"]) is None
+
+
+def test_several_drifted_fields_are_listed_in_fixed_order(ws):
+    """Row 4 (multi) — the list follows DRAFT_DIGEST_FIELDS, whatever changed first."""
+    config, m = ws
+    digest = _digest_pause(m)
+    res = m.record_decision_entry(**{**_DRAFT, **_DRIFTS["scope"], **_DRIFTS["slug"],
+                                     **_DRIFTS["axiom"]},
+                                  draft_digest=digest, acknowledge_neighbors=True)
+    assert res["drifted_fields"] == ["slug", "axiom", "scope"]
+    assert "re-send's slug, axiom and scope changed" in res["error"]
+    assert json.loads(json.dumps(res))["drifted_fields"] == res["drifted_fields"]
+
+
+@pytest.mark.parametrize("paused, resent, drift", [
+    ({"scope": ["db", "store"]}, {"scope": ["DB", "Store"]}, None),
+    ({"scope": ["db", "store"]}, {"scope": ["store", "db"]}, ["scope"]),
+    ({"scope": []}, {"scope": None}, None),
+    ({"mechanisms": ["sqlite", "WAL Mode"]}, {"mechanisms": ["wal-mode", "SQLite"]}, None),
+], ids=["scope-case-only", "scope-reorder", "scope-none-vs-empty", "mechanisms-fold"])
+def test_the_digest_canonicalises_exactly_as_the_write_does(ws, paused, resent, drift):
+    """Row 5 — no normalisation of its own: what the built entry folds compares equal;
+    a reorder the markdown stores (MI-9) is drift."""
+    config, m = ws
+    digest = _digest_pause(m, **paused)
+    res = m.record_decision_entry(**{**_DRAFT, **resent}, draft_digest=digest,
+                                  acknowledge_neighbors=True)
+    if drift is None:
+        assert res["status"] == "created", res
+    else:
+        assert res["drifted_fields"] == drift
+
+
+def test_a_drifted_draft_matching_an_existing_core_is_refused_not_exists(ws):
+    """D1 — the compare precedes the `exists` short-circuit, which would otherwise
+    answer a drifted re-send whose axiom happens to match a committed decision."""
+    config, m = ws
+    digest = _digest_pause(m)
+    res = m.record_decision_entry(**{**_DRAFT, "axiom": "Use SQLite for the store."},
+                                  draft_digest=digest, acknowledge_neighbors=True)
+    assert res.get("code") == "draft_drifted", res
+    assert res["drifted_fields"] == ["axiom"]
+    without = m.record_decision_entry(**{**_DRAFT, "axiom": "Use SQLite for the store."},
+                                      acknowledge_neighbors=True)
+    assert without["status"] == "exists"      # the path the compare must precede
+
+
+def test_an_omitted_digest_behaves_exactly_as_today(ws):
+    """Row 6 — a drifted re-send without the digest commits: the guard is opt-in."""
+    config, m = ws
+    _digest_pause(m)
+    res = m.record_decision_entry(**{**_DRAFT, **_DRIFTS["rejected_paths"]},
+                                  acknowledge_neighbors=True)
+    assert res["status"] == "created", res
+
+
+def test_the_digest_is_compared_under_acknowledge_neighbors(ws):
+    """Row 7 — acknowledgement skips the review, never the comparison."""
+    config, m = ws
+    digest = _digest_pause(m)
+    refused = m.record_decision_entry(**{**_DRAFT, **_DRIFTS["context"]},
+                                      draft_digest=digest, acknowledge_neighbors=True)
+    assert refused["code"] == "draft_drifted"
+    created = m.record_decision_entry(**_DRAFT, draft_digest=digest,
+                                      acknowledge_neighbors=True)
+    assert created["status"] == "created", created
+
+
+def _unreadable_variants(digest):
+    return {
+        "truncated": digest[:-3],
+        "wrong-tag": "d2" + digest[2:],
+        "non-hex": digest[:-1] + "z",
+        "one-segment-short": digest.rsplit(".", 1)[0],
+    }
+
+
+@pytest.mark.parametrize("variant", ["truncated", "wrong-tag", "non-hex",
+                                     "one-segment-short"])
+def test_an_unreadable_digest_has_its_own_code(ws, variant):
+    """Row 8 — never read as drift of all six fields; nothing written."""
+    config, m = ws
+    digest = _digest_pause(m)
+    before = _buffer(config)
+    res = m.record_decision_entry(**_DRAFT, acknowledge_neighbors=True,
+                                  draft_digest=_unreadable_variants(digest)[variant])
+    assert res["code"] == "draft_digest_unreadable", res
+    assert "drifted_fields" not in res
+    assert _buffer(config) == before
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_a_blank_digest_is_omitted(ws, blank):
+    """Row 8 — blank is omitted (the relation arguments' convention): drift commits."""
+    config, m = ws
+    _digest_pause(m)
+    res = m.record_decision_entry(**{**_DRAFT, **_DRIFTS["axiom"]}, draft_digest=blank,
+                                  acknowledge_neighbors=True)
+    assert res["status"] == "created", res
+
+
+def test_a_digest_is_read_leniently(ws):
+    """Row 8 — surrounding whitespace and upper-case hex are the same digest."""
+    config, m = ws
+    digest = _digest_pause(m)
+    res = m.record_decision_entry(**_DRAFT, draft_digest=f"  {digest.upper()}\n",
+                                  acknowledge_neighbors=True)
+    assert res["status"] == "created", res
+
+
+@pytest.mark.parametrize("field", ["rejected_paths", "context"])
+def test_a_lone_surrogate_never_raises_in_the_digest(ws, field):
+    """Row 9 — the pause returns a digest over a surrogate-bearing field, and a re-send
+    that changes only the axiom is refused naming `axiom` alone: the surrogate field
+    was hashed on both calls and compared clean. (No clean commit here: the buffer
+    write's own surrogate raise is vision §7's separate pass.)"""
+    config, m = ws
+    digest = _digest_pause(m, **{field: "reasoning \udc80 here"})
+    res = m.record_decision_entry(**{**_DRAFT, field: "reasoning \udc80 here",
+                                     **_DRIFTS["axiom"]},
+                                  draft_digest=digest, acknowledge_neighbors=True)
+    assert res["drifted_fields"] == ["axiom"], res
+
+
+def test_the_refusals_name_their_recovery_and_no_command(ws):
+    """Row 10 — against the paused call, not the latest send; omitting always works;
+    no shell command (the same strings reach MCP)."""
+    config, m = ws
+    digest = _digest_pause(m)
+    drifted = m.record_decision_entry(**{**_DRAFT, **_DRIFTS["scope"]},
+                                      draft_digest=digest, acknowledge_neighbors=True)
+    unreadable = m.record_decision_entry(**_DRAFT, draft_digest="d1.nope",
+                                         acknowledge_neighbors=True)
+    assert "the values of the call that paused, not your latest send" in drifted["error"]
+    for res in (drifted, unreadable):
+        assert "omit draft_digest (which always clears this comparison)" in res["error"]
+        assert "mitos " not in res["error"] and "`" not in res["error"]
+        assert "Nothing was written" not in res["error"]
+
+
+# --- 6b: T15 through the outer boundaries -------------------------------------
+
+def _boundary_pause(config, capsys, surface):
+    """Pause `_DRAFT` through one surface; the digest as that surface emitted it."""
+    from mitos import mcp_server
+    if surface == "mcp":
+        payload = json.loads(mcp_server.record_decision(
+            _DRAFT["axiom"], "rej", ["db"], slug="adopt-sqlite",
+            project=config.workspace_dir))
+    else:
+        capsys.readouterr()
+        with pytest.raises(SystemExit):
+            cmd_record(config, axiom=_DRAFT["axiom"], rejected="rej", scope=["db"],
+                       slug="adopt-sqlite", as_json=True)
+        payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "needs_review"
+    return payload["draft_digest"]
+
+
+def _boundary_resend(config, capsys, surface, *, rejected="rej", digest=None):
+    """Re-send through the same surface with acknowledge; (payload, exit code)."""
+    from mitos import mcp_server
+    if surface == "mcp":
+        return json.loads(mcp_server.record_decision(
+            _DRAFT["axiom"], rejected, ["db"], slug="adopt-sqlite",
+            acknowledge_neighbors=True, draft_digest=digest,
+            project=config.workspace_dir)), None
+    capsys.readouterr()
+    code = 0
+    try:
+        cmd_record(config, axiom=_DRAFT["axiom"], rejected=rejected, scope=["db"],
+                   slug="adopt-sqlite", acknowledge_neighbors=True,
+                   draft_digest=digest, as_json=True)
+    except SystemExit as exc:
+        code = exc.code
+    return json.loads(capsys.readouterr().out), code
+
+
+@pytest.mark.parametrize("surface", ["mcp", "cli-json"])
+@pytest.mark.parametrize("case", ["clean", "drifted", "omitted"])
+def test_the_digest_round_trips_through_each_boundary(ws, capsys, surface, case):
+    """Row 6b (T15) — pause, copy `draft_digest` out of the emitted JSON, re-send."""
+    config, m = ws
+    _seed(m, "use-sqlite", "Use SQLite for the store.")
+    factory = _armed_real_manager_factory([{"slug": "use-sqlite", "score": 0.9}])
+    with patch("mitos.cli.MitosSyncManager", side_effect=factory), \
+         patch("mitos.sync.MitosSyncManager", side_effect=factory), \
+         patch("mitos.mcp_server.MitosConfig", return_value=config):
+        digest = _boundary_pause(config, capsys, surface)
+        rejected = "rej" if case == "clean" else "rej, edited"
+        payload, code = _boundary_resend(
+            config, capsys, surface, rejected=rejected,
+            digest=None if case == "omitted" else digest)
+
+    assert payload["workspace"] == config.workspace_dir   # provenance on every outcome
+    if case == "drifted":
+        assert payload["code"] == "draft_drifted"
+        assert payload["drifted_fields"] == ["rejected_paths"]
+        assert code in (None, 1)
+    else:
+        assert payload["status"] == "created", payload
+        assert code in (None, 0)
+
+
+def test_a_drift_refusal_on_the_cli_text_surface(ws, capsys):
+    """The text error branch carries the named fields (exit 1), unchanged code."""
+    config, m = ws
+    digest = _digest_pause(m)
+    capsys.readouterr()
+    with patch("mitos.cli.MitosSyncManager", return_value=m):
+        with pytest.raises(SystemExit) as exc:
+            cmd_record(config, axiom=_DRAFT["axiom"], rejected="rej",
+                       scope=["db", "store"], slug="adopt-sqlite",
+                       acknowledge_neighbors=True, draft_digest=digest)
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "Record failed [draft_drifted]: This re-send's scope changed" in err
+
+
+# --- 11: the tripwire — the echo and the held sentence meet both lists ---------
+
+#: The hold axis (4e): no word may say mitos kept anything between calls or that a
+#: re-send resumes something. `held` stays off — the sentence negates it.
+_HELD_FORBIDDEN = ("stored", "remember", "pending", "cached", "resume", "token",
+                   "queued", "draft id", "on file",
+                   # 4e's refusal set, weighed for the held sentence and turned down.
+                   "persist", "retrieve", "continue", "picks up", "session", "later")
+
+_PLANTED_HELD_VIOLATIONS = (
+    "Your draft is stored until you re-send",
+    "mitos will remember these values",
+    "The pending draft resumes on re-send",
+    "Re-send with the token",
+    "The draft persists between calls",
+    "Re-send later and the call continues",
+)
+
+
+def _held_register_violations(text: str):
+    from test_record_decision import register_violations
+    return register_violations(text, substrings=_HELD_FORBIDDEN)
+
+
+def test_the_echo_and_the_held_sentence_agree_across_both_lists(ws, capsys):
+    """Row 11 — 4d's echo lines and 4e's held sentence (message form and CLI form)
+    each carry no word from either list; each list proven live by a planted string.
+    Scoped per sentence: the judge sentence legitimately says `rejected_paths`."""
+    config, m = ws
+    _seed_echo_corpus(m)
+    res = _echo_pause(m, _ECHO_GATHERED, cites="echo-b, echo-d")
+    message_held = f"{PAUSE_HELD_CLAUSE}{_PAUSE_DIGEST_CLAUSE}"
+    assert message_held in res["message"]
+
+    factory = _armed_real_manager_factory(_ECHO_GATHERED)
+    capsys.readouterr()
+    with patch("mitos.cli.MitosSyncManager", side_effect=factory):
+        with pytest.raises(SystemExit):
+            cmd_record(config, axiom=_ECHO_AXIOM, rejected="rej", scope=["s"],
+                       slug="echo-new", cites="echo-b, echo-d")
+    err = capsys.readouterr().err
+    (cli_held,) = [line.strip() for line in err.splitlines()
+                   if line.strip().startswith(f"→ {PAUSE_HELD_CLAUSE[:20]}")]
+
+    echo = _echo_sentences(res["message"]) + _cli_echo_lines(err)
+    assert len(echo) == 6, echo
+    for sentence in [message_held, cli_held] + echo:
+        assert _echo_register_violations(sentence) == [], sentence
+        assert _held_register_violations(sentence) == [], sentence
+
+    for planted in _PLANTED_HELD_VIOLATIONS:
+        assert _held_register_violations(planted), planted
+    for planted in _PLANTED_ECHO_VIOLATIONS:
+        assert _echo_register_violations(planted), planted
+
+
+# --- 12: the CLI flag parses and reaches the manager --------------------------
+
+def test_draft_digest_flag_parses_and_reaches_the_manager(tmp_path, monkeypatch):
+    """Row 12 — `record --draft-digest` through the real parser and dispatch."""
+    from mitos import cli
+    from conftest import make_workspace
+    workspace = make_workspace(tmp_path / "ws")
+    argv = ["mitos", "-p", workspace, "record", "An axiom.", "--rejected", "r",
+            "--slug", "s", "--draft-digest", "d1.abc"]
+    args = cli._build_parser().parse_args(argv[1:])
+    assert args.draft_digest == "d1.abc"
+
+    monkeypatch.setattr(sys, "argv", argv)
+    with patch.object(MitosSyncManager, "record_decision_entry",
+                      return_value={"error": "x", "code": "y"}) as spy:
+        with pytest.raises(SystemExit):
+            cli.main()
+    assert spy.call_args.kwargs["draft_digest"] == "d1.abc"

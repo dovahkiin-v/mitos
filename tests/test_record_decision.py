@@ -1556,3 +1556,78 @@ def test_exists_and_needs_review_carry_no_notice(ws, monkeypatch, capsys) -> Non
     _out, err = _text_receipt(keyed, capsys, "The sync lock is held during commit.",
                               "cn-prior")
     assert "The last contradiction check" not in err
+
+
+# --------------------------------------------------------------------------- #
+# B12 — an unreadable file argument on `mitos record` is a located usage refusal
+# (exit 2, the flag named, `{error, code}` under --json), the twin of
+# amend-commentary's `unreadable_file` — never main()'s "Fatal Unexpected Error".
+# --------------------------------------------------------------------------- #
+
+_RECORD_FILE_FLAGS = ("--axiom-file", "--rejected-file", "--context-file")
+
+
+def _record_argv(workspace, flag, path, *extra):
+    """A `record` call whose other sources are valid, so only `flag`'s read can fail."""
+    argv = ["mitos", "-p", workspace, "record", "--slug", "s", flag, path]
+    if flag != "--axiom-file":
+        argv.insert(4, "An axiom.")
+    if flag != "--rejected-file":
+        argv += ["--rejected", "r"]
+    return argv + list(extra)
+
+
+def _run_record_main(monkeypatch, capsys, argv):
+    from unittest.mock import patch
+    from mitos import cli
+    monkeypatch.setattr(sys, "argv", argv)
+    capsys.readouterr()
+    code = 0
+    with patch("mitos.cli.cmd_record") as spy:
+        try:
+            cli.main()
+        except SystemExit as exc:
+            code = exc.code
+    out, err = capsys.readouterr()
+    return code, out, err, spy
+
+
+def _unreadable_paths(tmp_path):
+    binary = tmp_path / "binary.txt"
+    binary.write_bytes(b"\xff\xfe\xfa")
+    return {"missing": str(tmp_path / "missing.txt"), "undecodable": str(binary)}
+
+
+@pytest.mark.parametrize("kind", ["missing", "undecodable"])
+@pytest.mark.parametrize("flag", _RECORD_FILE_FLAGS)
+def test_record_unreadable_file_is_a_located_refusal(workspace, tmp_path, monkeypatch,
+                                                      capsys, flag, kind):
+    """Row 13 — exit 2, the flag named on stderr, no crash line, no dispatch. The
+    same call with a readable file reaches `cmd_record` (the transition)."""
+    readable = tmp_path / "ok.txt"
+    readable.write_text("readable text\n", encoding="utf-8")
+    code, out, err, spy = _run_record_main(
+        monkeypatch, capsys, _record_argv(workspace, flag, str(readable)))
+    spy.assert_called_once()
+
+    code, out, err, spy = _run_record_main(
+        monkeypatch, capsys, _record_argv(workspace, flag, _unreadable_paths(tmp_path)[kind]))
+    assert code == 2 and out == ""
+    assert f"{flag} could not be read" in err and "Fatal" not in err
+    spy.assert_not_called()
+
+
+@pytest.mark.parametrize("flag", _RECORD_FILE_FLAGS)
+def test_record_unreadable_file_under_json_is_one_object(workspace, tmp_path, monkeypatch,
+                                                          capsys, flag):
+    """Row 14 — stdout is exactly one `{error, code}` object, stderr empty, exit 2."""
+    from mitos.cli import AMEND_CODE_UNREADABLE_FILE
+    for path in _unreadable_paths(tmp_path).values():
+        code, out, err, spy = _run_record_main(
+            monkeypatch, capsys, _record_argv(workspace, flag, path, "--json"))
+        assert code == 2 and err == ""
+        payload = json.loads(out)
+        assert set(payload) == {"error", "code"}
+        assert payload["code"] == AMEND_CODE_UNREADABLE_FILE == "unreadable_file"
+        assert payload["error"].startswith(f"{flag} could not be read: ")
+        spy.assert_not_called()

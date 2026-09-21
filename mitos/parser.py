@@ -20,7 +20,7 @@ from mitos.errors import (
     PARSER_MALFORMED_MARKER,
     PARSER_SLUG_TOO_LONG,
 )
-from mitos.identity import SLUG_MAX_LEN
+from mitos.identity import SLUG_LENGTH_REASON, SLUG_MAX_LEN
 from mitos.markers import (TRANSCRIPT_CLOSE, TRANSCRIPT_OPEN, is_entries_sentinel,
                            is_entry_heading, mask_inline_code)
 from mitos.scope_tags import normalize_scope_tags
@@ -583,7 +583,9 @@ def _parse_section(sec: Dict[str, Any]) -> ParsedEntry:
 # C1 PURITY (Key Decision 2): the normalization helpers below fold/casefold/dedup
 # to the SAME §12 byte-forms as ``mitos/identity.py`` (so a token the parser
 # stores matches the token identity later hashes), but this module MUST NOT
-# import ``identity`` — that would reverse the C1 direction. Drift is caught
+# import ``identity``'s hash functions — that would reverse the C1 direction. The
+# one edge it has carries constants only (``SLUG_MAX_LEN``, ``SLUG_LENGTH_REASON``);
+# the parser never computes identity. Drift is caught
 # structurally by a cross-check test that imports identity and asserts equality.
 # ---------------------------------------------------------------------------
 
@@ -1177,10 +1179,11 @@ def _validate_section(
     # already appended to ``items`` during tokenization.
     _check_required_fields(entry, kind, sec, items)
 
-    # Slug-length is a format constraint (the slug is the permanent citation handle,
-    # folded into identity), so it belongs here at the C1 parse boundary — this is the
-    # ONLY slug-length gate on the file route (mitos sync / rebuild / import); the
-    # record write path has its own early check. Anchored to the header line.
+    # Slug-length is a format constraint (the slug is the handle other decisions cite,
+    # so it is never shortened for the author), so it belongs here at the C1 parse
+    # boundary — this is the ONLY slug-length gate on the file route (mitos sync /
+    # rebuild / import); the record write path has its own early check. Anchored to
+    # the header line.
     if len(entry.slug) > SLUG_MAX_LEN:
         items.append(
             FailureItem(
@@ -1189,8 +1192,7 @@ def _validate_section(
                 message=(
                     f"Slug is {len(entry.slug)} characters — "
                     f"{len(entry.slug) - SLUG_MAX_LEN} over the {SLUG_MAX_LEN}-character "
-                    "limit. The slug is the permanent citation handle (folded into the "
-                    "decision's identity), so it is not silently truncated; shorten it."
+                    f"limit. {SLUG_LENGTH_REASON}; shorten it in the entry."
                 ),
                 field=None,
                 line_start=sec["line_start"],
