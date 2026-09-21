@@ -1233,3 +1233,95 @@ def test_cmd_open_questions_json_stamps_oq_modifier_subset(ws, capsys) -> None:
     assert base["amended_by"] == ["q-amender"]
     assert "superseded_by" not in base
     assert "corrected_by" not in base
+
+
+# --------------------------------------------------------------------------- #
+# B4 — the `created` receipt's `edges_created` target echo is a stamped surface
+#
+# The "every decision-read surface stamps modifiers" rule, applied to the record
+# receipt's identification echo: each entry's `target_stamps` is exactly what
+# `GraphStore.get_modifiers` says of the target — including the source-liveness
+# de-projection of a dead amender, inherited from `_modifiers_map`, never re-derived.
+# --------------------------------------------------------------------------- #
+
+def _echo_for(res: dict, target: str) -> dict:
+    [entry] = [e for e in res["edges_created"] if e["target"] == target]
+    return entry
+
+
+def test_receipt_echo_stamps_equal_get_modifiers_amended_and_narrowed(ws) -> None:
+    """R12: an amended target and a narrowed target, each cited by a new record,
+    echo `target_stamps` equal to the store's modifier map for them."""
+    config, m = ws
+    a = _rec(m, "a")
+    n = _rec(m, "n")
+    _rec(m, "amender", amends="a")
+    _rec(m, "narrower", narrows="n")
+    res = _rec(m, "citer", cites="a, n")
+    store = GraphStore(config.db_path)
+    assert _echo_for(res, "a")["target_stamps"] == store.get_modifiers(a["id"]) == {
+        "amended_by": ["amender"]}
+    assert _echo_for(res, "n")["target_stamps"] == store.get_modifiers(n["id"]) == {
+        "narrowed_by": ["narrower"]}
+
+
+def test_receipt_echo_inherits_the_dead_amender_deprojection(ws) -> None:
+    """R12: A amended by B, B then superseded by C — a later record citing A echoes
+    `{}` exactly as `get_modifiers` does (read, held nothing), not `amended_by: [b]`."""
+    config, m = ws
+    a = _rec(m, "a")
+    _rec(m, "b", amends="a")
+    _rec(m, "c", supersedes="b")
+    res = _rec(m, "citer", cites="a")
+    store = GraphStore(config.db_path)
+    assert store.get_modifiers(a["id"]) == {}
+    entry = _echo_for(res, "a")
+    assert entry["target_stamps"] == {}
+    assert entry["target_state"] == "active"
+
+
+def _rebuilt_echo(store: GraphStore, kind: str, slug: str) -> dict:
+    """The echo entry rebuilt from the target's own store reads (the parity oracle)."""
+    node = store.get_node_by_slug(slug)
+    entry = {"kind": kind, "target": slug,
+             "target_state": store.get_node_state(node["id"]),
+             "target_stamps": store.get_modifiers(node["id"])}
+    if kind in ("supersedes", "corrects", "amends", "narrows", "contradicts"):
+        entry["target_axiom"] = node["core_axiom"]
+    return entry
+
+
+def test_receipt_echo_parity_across_both_encodings_is_a_transition(ws, capsys) -> None:
+    """R13: `mitos record --json` and MCP `record_decision` carry the one composer's
+    echo. Each receipt equals the echo rebuilt from its own target's store reads
+    right after its write, the key sets match per relation, and the second write's
+    stamps are the first's plus itself (a transition, not equality)."""
+    from mitos import mcp_server
+    from mitos.cli import cmd_record
+    config, m = ws
+    _rec(m, "shared-target")
+    _rec(m, "cited")
+    capsys.readouterr()
+    cmd_record(config, axiom="The CLI encoding amends.", rejected="rej",
+               amends="shared-target", cites="cited", slug="via-cli", as_json=True)
+    cli_payload = json.loads(capsys.readouterr().out)
+    store = GraphStore(config.db_path)
+    cli_rebuilt = [_rebuilt_echo(store, e["kind"], e["target"])
+                   for e in cli_payload["edges_created"]]
+    with patch("mitos.mcp_server.MitosConfig", return_value=config):
+        mcp_payload = json.loads(mcp_server.record_decision(
+            "The MCP encoding amends.", "rej", [], slug="via-mcp",
+            amends="shared-target", cites="cited", project=config.workspace_dir))
+    store = GraphStore(config.db_path)
+    mcp_rebuilt = [_rebuilt_echo(store, e["kind"], e["target"])
+                   for e in mcp_payload["edges_created"]]
+
+    assert cli_payload["edges_created"] == cli_rebuilt
+    assert mcp_payload["edges_created"] == mcp_rebuilt
+    assert [(e["kind"], list(e)) for e in cli_payload["edges_created"]] == [
+        (e["kind"], list(e)) for e in mcp_payload["edges_created"]]
+    cli_amends = _echo_for(cli_payload, "shared-target")
+    mcp_amends = _echo_for(mcp_payload, "shared-target")
+    assert cli_amends["target_stamps"] == {"amended_by": ["via-cli"]}
+    assert mcp_amends["target_stamps"] == {
+        "amended_by": sorted(cli_amends["target_stamps"]["amended_by"] + ["via-mcp"])}

@@ -2815,9 +2815,12 @@ class GraphStore:
         """Lists the committed outgoing edges of a node as write facts.
 
         Returns each edge as ``{"kind": edge_type, "target": <target's current
-        slug>}`` in insertion order. This reads what the commit actually wired
-        (the receipt's ``edges_created`` source of truth), never a re-derivation
-        from author input.
+        slug>}`` in insertion order. This reads what the commit actually wired,
+        never a re-derivation from author input. The repair, amend, divergence,
+        restore and settledness paths read it, and the ``created`` receipt falls
+        back to it when
+        :meth:`get_outgoing_edge_targets` (its healthy-path read) fails, so the
+        edges survive with null target keys.
 
         Args:
             node_id: The source node's id.
@@ -2838,6 +2841,70 @@ class GraphStore:
             return [{"kind": r["edge_type"], "target": r["slug"]} for r in rows]
         finally:
             conn.close()
+
+    def get_outgoing_edge_targets(self, node_id: str) -> List[Dict[str, Any]]:
+        """Lists a node's outgoing edges with each target hydrated, stamped and stated.
+
+        The read behind the ``created`` receipt's identification echo (B4): one
+        query over the node's outgoing edges joined to their targets, then ONE bulk
+        scope fetch and ONE bulk modifier stamp via :meth:`_hydrate_rows` — never a
+        per-edge ``get_node`` loop (P11). The state is computed here, at read time
+        (M3), in the vocabulary of the target's kind:
+
+          - a decision reads ``superseded`` / ``corrected`` from its incoming
+            kill-edge, else ``drifted`` when a drifted signal is set, else
+            ``active`` — :meth:`get_node_state`'s logic through the same fragments;
+          - an open question reads its kill state if it has one, else its Stage-2
+            ``resolved`` / ``parked`` — :meth:`get_open_questions`' logic, so a
+            ``resolves`` the caller just wrote is visible in its own read-back.
+            (:meth:`get_node_state` is kill-edge-only for an OQ, so it is not used.)
+
+        The joined ``nodes`` is deliberately UNALIASED and the edges table is
+        aliased ``e``: ``_KILLER_TYPE_SQL``, ``_IS_DRIFTED_SQL`` and
+        ``_OQ_RESOLVED_SQL`` correlate on the bare ``nodes`` (the §4.3 alias trap).
+
+        Args:
+            node_id: The source node's id.
+
+        Returns:
+            One dict per edge in insertion order: ``{"kind": edge_type, "target":
+            <target's current slug>, "node": <hydrated, modifier-stamped target>,
+            "state": <computed state>}``. Empty when the node has no outgoing edges.
+        """
+        conn = self._get_connection()
+        try:
+            rows = conn.execute(
+                f"SELECT nodes.*, {_IS_DRIFTED_SQL}, {_KILLER_TYPE_SQL}, "
+                f"{_OQ_RESOLVED_SQL}, e.edge_type AS echo_edge_type "
+                "FROM edges e JOIN nodes ON nodes.id = e.target_id "
+                "WHERE e.source_id = ? ORDER BY e.rowid",
+                (node_id,),
+            ).fetchall()
+            nodes = self._hydrate_rows(conn, rows)
+        finally:
+            conn.close()
+        result: List[Dict[str, Any]] = []
+        # _hydrate_rows preserves row order and pops killer_type / is_resolved, so
+        # both are read off the raw row; the edge alias is popped so it never rides
+        # the hydrated target.
+        for node, row in zip(nodes, rows):
+            node.pop("echo_edge_type", None)
+            killer_type = row["killer_type"]
+            if node["kind"] == "open_question" and killer_type is None:
+                state = _computed_oq_state(row["is_resolved"])
+            elif killer_type is None and node["is_drifted"]:
+                state = "drifted"
+            else:
+                state = _computed_decision_state(killer_type)
+            result.append(
+                {
+                    "kind": row["echo_edge_type"],
+                    "target": node["slug"],
+                    "node": node,
+                    "state": state,
+                }
+            )
+        return result
 
     def get_incoming_edges(self, node_id: str) -> List[Dict[str, str]]:
         """Lists the committed edges that point AT a node, as write facts.

@@ -770,6 +770,14 @@ def test_receipt_edges_created_empty_on_bare_record(ws) -> None:
     assert res["scope"] == [] and res["mechanisms"] == []
 
 
+# The full `amends` echo the two receipt rows below pin (B4): an acting relation
+# carries state, stamps and the whole axiom, in that key order.
+_PRIOR_AMENDS_ECHO = {
+    "kind": "amends", "target": "prior", "target_state": "active",
+    "target_stamps": {"amended_by": ["follow-up"]}, "target_axiom": "Prior axiom.",
+}
+
+
 def test_cli_json_receipt_carries_edges_and_fields(ws, capsys) -> None:
     """`mitos record --json` emits the enriched receipt verbatim."""
     from mitos.cli import cmd_record
@@ -778,7 +786,9 @@ def test_cli_json_receipt_carries_edges_and_fields(ws, capsys) -> None:
     cmd_record(config, axiom="Follow-up axiom.", rejected="rej", scope=["db"],
                mechanisms=["sqlite"], amends="prior", slug="follow-up", as_json=True)
     payload = json.loads(capsys.readouterr().out)
-    assert payload["edges_created"] == [{"kind": "amends", "target": "prior"}]
+    # B4 (R1): the stamped identification echo — prior's state computed now, the
+    # amended_by stamp this very write put on it, and its whole axiom.
+    assert payload["edges_created"] == [_PRIOR_AMENDS_ECHO]
     assert payload["scope"] == ["db"] and payload["mechanisms"] == ["sqlite"]
 
 
@@ -812,7 +822,7 @@ def test_mcp_receipt_carries_edges_and_fields(ws) -> None:
             "Follow-up axiom.", "rej", ["db"], slug="follow-up",
             mechanisms=["sqlite"], amends="prior", project=config.workspace_dir))
     assert res["status"] == "created"
-    assert res["edges_created"] == [{"kind": "amends", "target": "prior"}]
+    assert res["edges_created"] == [_PRIOR_AMENDS_ECHO]
     assert res["scope"] == ["db"] and res["mechanisms"] == ["sqlite"]
 
 
@@ -1863,3 +1873,396 @@ def test_a5_description_states_the_fold_without_naming_the_map() -> None:
     assert "_FOO and FOO are one" in description
     assert "committed scope, plus mechanisms as authored" in description
     assert "mechanisms_normalized" not in description
+
+
+# --------------------------------------------------------------------------- #
+# B4 — the target echo: each `edges_created` entry names what the write hit
+# --------------------------------------------------------------------------- #
+
+from mitos.sync import (  # noqa: E402 — section-local, like the A5 imports above
+    _ECHO_AXIOM_RELATIONS, _ECHO_TOPIC_RELATIONS, _EXTRA_RELATIONS, _KILL_EDGE_FIELDS,
+)
+from test_modifier_surfacing import _commit_oq  # noqa: E402 — the repo's OQ committer
+
+# The eight relations the record path wires, read from the constants that define
+# them (derives_from is refused on a decision before any write or read).
+_B4_RELATIONS = [n for n, _ in _EXTRA_RELATIONS if n != "derives_from"] + list(
+    _KILL_EDGE_FIELDS)
+# The echo's base keys, in order, and the one text key each relation adds. This is
+# the test's own oracle, not the constants: moving `cites` into the axiom set, or
+# dropping a relation out of it, must redden R2.
+_B4_BASE_KEYS = ["kind", "target", "target_state", "target_stamps"]
+_B4_TEXT_KEY = {"supersedes": "target_axiom", "corrects": "target_axiom",
+                "amends": "target_axiom", "narrows": "target_axiom",
+                "contradicts": "target_axiom", "resolves": "target_topic",
+                "cites": None, "depends_on": None}
+
+
+def _b4_seed(config, m, relation: str, slug: str) -> str:
+    """Seeds the target a relation needs: an open question for `resolves`, else a
+    decision. Returns the target's slug."""
+    if relation == "resolves":
+        _commit_oq(GraphStore(config.db_path), slug)
+    else:
+        assert m.record_decision_entry(f"Seed axiom {slug}.", "rej", [], slug=slug,
+                                       acknowledge_neighbors=True)["status"] == "created"
+    return slug
+
+
+def _b4_keys(relation: str) -> list:
+    text = _B4_TEXT_KEY[relation]
+    return _B4_BASE_KEYS + ([text] if text else [])
+
+
+def test_b4_relation_list_is_the_eight_record_path_relations() -> None:
+    """The parametrisation below covers exactly the relations the oracle names."""
+    assert sorted(_B4_RELATIONS) == sorted(_B4_TEXT_KEY)
+    assert len(_B4_RELATIONS) == 8
+
+
+@pytest.mark.parametrize("relation", _B4_RELATIONS)
+def test_b4_entry_shape_is_decided_by_the_relation(ws, relation) -> None:
+    """R2 + R7: each entry's keys, in order, are exactly the relation's allowed set —
+    no reasoning, no target field beyond the identifying ones."""
+    config, m = ws
+    target = _b4_seed(config, m, relation, "b4-target")
+    res = m.record_decision_entry("A B4 shape probe.", "rej", [], slug="b4-shape",
+                                  **{relation: target})
+    assert res["status"] == "created", res
+    [entry] = res["edges_created"]
+    assert list(entry) == _b4_keys(relation)
+    assert entry["kind"] == relation and entry["target"] == target
+    for forbidden in ("rejected_paths", "scope", "mechanisms", "score", "id",
+                      "core_axiom", "context"):
+        assert forbidden not in entry
+    assert isinstance(entry["target_stamps"], dict)
+    assert entry["target_state"] in {"active", "drifted", "superseded", "corrected",
+                                     "parked", "resolved"}
+
+
+def test_b4_relation_constants_partition_the_record_path_relations() -> None:
+    """R2: the acting set and the topic set are named, disjoint, and leave the weak
+    relations in neither — a future relation gets no text until someone decides."""
+    assert _ECHO_AXIOM_RELATIONS == {"supersedes", "corrects", "amends", "narrows",
+                                     "contradicts"}
+    assert _ECHO_TOPIC_RELATIONS == {"resolves"}
+    assert not (_ECHO_AXIOM_RELATIONS & _ECHO_TOPIC_RELATIONS)
+    weak = set(_B4_RELATIONS) - _ECHO_AXIOM_RELATIONS - _ECHO_TOPIC_RELATIONS
+    assert weak == {"cites", "depends_on"}
+
+
+def test_b4_derives_from_is_refused_before_any_echo_read(ws) -> None:
+    """R2: `derives_from` on a decision is refused before the commit, so no read runs."""
+    config, m = ws
+    _b4_seed(config, m, "amends", "b4-df-target")
+    with patch.object(GraphStore, "get_outgoing_edge_targets") as echo, \
+            patch.object(GraphStore, "get_outgoing_edges") as base:
+        res = m.record_decision_entry("Derives from a decision.", "rej", [],
+                                      slug="b4-df", derives_from="b4-df-target")
+    assert "error" in res
+    echo.assert_not_called()
+    base.assert_not_called()
+
+
+@pytest.mark.parametrize("relation,state,stamp", [
+    ("supersedes", "superseded", "superseded_by"),
+    ("corrects", "corrected", "corrected_by"),
+])
+def test_b4_kill_edges_read_their_effect(ws, relation, state, stamp) -> None:
+    """R3: a kill edge's receipt says the target left the active view, stamped by
+    this very write (Gotcha 4: the new slug is the confirmation, not filtered)."""
+    config, m = ws
+    _b4_seed(config, m, relation, "b4-old")
+    res = m.record_decision_entry("A B4 kill probe.", "rej", [], slug="b4-new",
+                                  **{relation: "b4-old"})
+    assert res["status"] == "created", res
+    [entry] = res["edges_created"]
+    assert entry["target_state"] == state
+    assert entry["target_stamps"] == {stamp: ["b4-new"]}
+    assert entry["target_axiom"] == "Seed axiom b4-old."
+
+
+def test_b4_comma_split_supersedes_gives_two_entries_in_rowid_order(ws) -> None:
+    """R3: `supersedes="a, b"` wires two edges, echoed in insertion order."""
+    config, m = ws
+    for slug in ("b4-a", "b4-b"):
+        _b4_seed(config, m, "supersedes", slug)
+    res = m.record_decision_entry("Unify a and b.", "rej", [], slug="b4-unify",
+                                  supersedes="b4-a, b4-b")
+    assert res["status"] == "created", res
+    assert [(e["kind"], e["target"], e["target_state"], e["target_stamps"])
+            for e in res["edges_created"]] == [
+        ("supersedes", "b4-a", "superseded", {"superseded_by": ["b4-unify"]}),
+        ("supersedes", "b4-b", "superseded", {"superseded_by": ["b4-unify"]}),
+    ]
+
+
+def test_b4_trap_row_a_cited_target_reads_its_standing_amendment(ws) -> None:
+    """R4: a target already amended by x, then cited, reads active + amended_by:[x] —
+    state without stamps would be the trap — and a weak relation carries no axiom."""
+    config, m = ws
+    _b4_seed(config, m, "amends", "b4-base")
+    assert m.record_decision_entry("The x amendment.", "rej", [], slug="x",
+                                   amends="b4-base")["status"] == "created"
+    res = m.record_decision_entry("A citing record.", "rej", [], slug="b4-citer",
+                                  cites="b4-base")
+    [entry] = res["edges_created"]
+    assert entry == {"kind": "cites", "target": "b4-base", "target_state": "active",
+                     "target_stamps": {"amended_by": ["x"]}}
+    assert "target_axiom" not in entry
+
+
+def test_b4_resolves_reads_resolved_and_the_stored_topic(ws) -> None:
+    """R5: the write's own `resolves` is visible in its read-back (Stage-2 state, not
+    the kill-edge-only `active`), and the topic is the stored Topic, not the slug."""
+    config, m = ws
+    _commit_oq(GraphStore(config.db_path), "q-auth")
+    res = m.record_decision_entry("Rotate tokens hourly.", "rej", [], slug="b4-resolver",
+                                  resolves="q-auth")
+    assert res["status"] == "created", res
+    [entry] = res["edges_created"]
+    assert entry["target_state"] == "resolved"
+    assert entry["target_topic"] == "Topic for q-auth"
+    assert entry["target_topic"] != entry["target"]
+    assert "target_axiom" not in entry
+    assert entry["target_stamps"] == {}
+
+
+def test_b4_axiom_is_whole_and_byte_equal(ws) -> None:
+    """R6: a long axiom rides whole — never truncated."""
+    config, m = ws
+    long_axiom = ("The graph store keeps every amendment chain intact, " * 8).strip()
+    assert len(long_axiom) > 300
+    assert m.record_decision_entry(long_axiom, "rej", [], slug="b4-long",
+                                   acknowledge_neighbors=True)["status"] == "created"
+    res = m.record_decision_entry("Narrow the long one.", "rej", [], slug="b4-narrower",
+                                  narrows="b4-long")
+    [entry] = res["edges_created"]
+    stored = GraphStore(config.db_path).get_node_by_slug("b4-long")["core_axiom"]
+    assert entry["target_axiom"] == stored
+    assert entry["target_axiom"] == long_axiom
+
+
+def test_b4_echo_is_bound_to_the_stored_slug_not_the_argument(ws) -> None:
+    """R1 (K10): a mixed-case target resolves to the stored casing, and the echo
+    names what the store holds — never the argument's spelling."""
+    config, m = ws
+    m.record_decision_entry("Prior axiom.", "rej", [], slug="prior")
+    res = m.record_decision_entry("Follow-up axiom.", "rej", [], slug="follow-up",
+                                  amends="PRIOR")
+    assert res["status"] == "created", res
+    assert res["edges_created"] == [_PRIOR_AMENDS_ECHO]
+
+
+def _b4_seed_three(config, m) -> None:
+    for slug in ("b4-prior", "b4-cited"):
+        _b4_seed(config, m, "amends", slug)
+    _commit_oq(GraphStore(config.db_path), "q-b4")
+
+
+_B4_THREE = {"amends": "b4-prior", "cites": "b4-cited", "resolves": "q-b4"}
+
+
+def test_b4_echo_read_raises_once_the_receipt_survives_with_null_keys(ws, capsys) -> None:
+    """R8: the echo read raising after the commit degrades the echo, never the
+    receipt — `created`, the base edges with null target keys shaped by relation,
+    one warning, the entry written and the node resolvable."""
+    config, m = ws
+    _b4_seed_three(config, m)
+    twin = m.record_decision_entry("The healthy twin.", "rej", [], slug="b4-twin",
+                                   **_B4_THREE)
+    assert twin["status"] == "created", twin
+    capsys.readouterr()
+    with patch.object(GraphStore, "get_outgoing_edge_targets",
+                      side_effect=RuntimeError("planted")):
+        res = m.record_decision_entry("The degraded record.", "rej", [], slug="b4-degraded",
+                                      **_B4_THREE)
+    assert res["status"] == "created", res
+    by_kind = {e["kind"]: e for e in res["edges_created"]}
+    assert len(by_kind) == 3
+    assert by_kind["amends"] == {"kind": "amends", "target": "b4-prior",
+                                 "target_state": None, "target_stamps": None,
+                                 "target_axiom": None}
+    assert by_kind["cites"] == {"kind": "cites", "target": "b4-cited",
+                                "target_state": None, "target_stamps": None}
+    assert by_kind["resolves"] == {"kind": "resolves", "target": "q-b4",
+                                   "target_state": None, "target_stamps": None,
+                                   "target_topic": None}
+    # The shape stays relation-decided: each entry's keys equal the healthy twin's.
+    assert [list(e) for e in res["edges_created"]] == [
+        list(e) for e in twin["edges_created"]]
+    assert set(res) == set(twin)
+    err = capsys.readouterr().err
+    warnings = [ln for ln in err.splitlines() if "Edge" in ln]
+    assert warnings == ["[Warning] Edge echo read failed for 'b4-degraded': planted"]
+    assert "b4-degraded" in _read(config)
+    assert res["id"] in GraphStore(config.db_path, read_only=True).get_active_decision_ids()
+
+
+def test_b4_both_edge_reads_raise_edges_created_is_null(ws, capsys) -> None:
+    """R9: when the base read fails too, the edges could not be read back — `null`,
+    never a guessed list — and the write still reports `created`."""
+    config, m = ws
+    _b4_seed_three(config, m)
+    capsys.readouterr()
+    with patch.object(GraphStore, "get_outgoing_edge_targets",
+                      side_effect=RuntimeError("planted")), \
+            patch.object(GraphStore, "get_outgoing_edges",
+                         side_effect=RuntimeError("base planted")):
+        res = m.record_decision_entry("Both reads fail.", "rej", [], slug="b4-blind",
+                                      **_B4_THREE)
+    assert res["status"] == "created", res
+    assert res["edges_created"] is None
+    err = capsys.readouterr().err
+    assert [ln for ln in err.splitlines() if "Edge" in ln] == [
+        "[Warning] Edge echo read failed for 'b4-blind': planted",
+        "[Warning] Edge read failed for 'b4-blind': base planted",
+    ]
+    assert res["id"] in GraphStore(config.db_path, read_only=True).get_active_decision_ids()
+
+
+def test_b4_cli_null_edges_print_the_unknown_line_and_json_carries_null(ws, capsys) -> None:
+    """R9 on the CLI: text prints the `unknown —` line; `--json` carries `null`."""
+    from mitos.cli import cmd_record
+    config, m = ws
+    _b4_seed_three(config, m)
+    capsys.readouterr()
+    with patch.object(GraphStore, "get_outgoing_edge_targets",
+                      side_effect=RuntimeError("planted")), \
+            patch.object(GraphStore, "get_outgoing_edges",
+                         side_effect=RuntimeError("base planted")):
+        cmd_record(config, axiom="Blind text.", rejected="rej", slug="b4-blind-text",
+                   amends="b4-prior")
+        out = capsys.readouterr().out
+        cmd_record(config, axiom="Blind json.", rejected="rej", slug="b4-blind-json",
+                   amends="b4-prior", as_json=True)
+        payload = json.loads(capsys.readouterr().out)
+    edge_lines = [ln for ln in out.splitlines() if "Edges:" in ln]
+    assert edge_lines == [
+        "  Edges:     unknown — the edges this record wired could not be read back"]
+    assert "edges_created" in payload and payload["edges_created"] is None
+    assert payload["status"] == "created"
+
+
+def test_b4_bare_record_keeps_an_empty_list_and_no_edges_line(ws, capsys) -> None:
+    """R10: no relation → `[]` (read, held nothing), and the text prints no Edges line."""
+    from mitos.cli import cmd_record
+    config, m = ws
+    capsys.readouterr()
+    cmd_record(config, axiom="A bare B4 record.", rejected="rej", slug="b4-bare",
+               as_json=True)
+    assert json.loads(capsys.readouterr().out)["edges_created"] == []
+    cmd_record(config, axiom="Another bare B4 record.", rejected="rej", slug="b4-bare-2",
+               acknowledge_neighbors=True)
+    out = capsys.readouterr().out
+    assert "Edges:" not in out
+
+
+def test_b4_cli_text_names_state_stamps_and_the_acting_axiom(ws, capsys) -> None:
+    """R11: one line per edge with state and stamp words; the whole axiom (every
+    line indented) under an acting edge and not under a weak one; no recipe."""
+    from mitos.cli import cmd_record
+    config, m = ws
+    m.record_decision_entry("Prior axiom.", "rej", [], slug="prior")
+    _b4_seed(config, m, "cites", "b4-cited")
+    capsys.readouterr()
+    cmd_record(config, axiom="Follow-up axiom.", rejected="rej", slug="follow-up",
+               amends="prior", cites="b4-cited")
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+    first = next(i for i, ln in enumerate(lines) if ln.startswith("  Edges:"))
+    assert lines[first].startswith("  Edges:     amends → prior")
+    assert "active" in lines[first] and "amended by: follow-up" in lines[first]
+    assert lines[first + 1].strip() == "axiom: Prior axiom."
+    assert lines[first + 1].startswith(" " * 13)
+    assert lines[first + 2].strip().startswith("cites → b4-cited")
+    assert "active" in lines[first + 2] and "amended by" not in lines[first + 2]
+    # The weak edge carries no axiom line: the next line, if any, is another field.
+    rest = lines[first + 3:]
+    assert not rest or not rest[0].strip().startswith(("axiom", "topic"))
+    for ln in lines[first:first + 3]:
+        assert "mitos " not in ln
+
+
+def test_b4_cli_text_null_echo_says_the_state_could_not_be_read(ws, capsys) -> None:
+    """R11: a null echo prints the unknown state in words, never a blank or None."""
+    from mitos.cli import cmd_record
+    config, m = ws
+    _b4_seed_three(config, m)
+    capsys.readouterr()
+    with patch.object(GraphStore, "get_outgoing_edge_targets",
+                      side_effect=RuntimeError("planted")):
+        cmd_record(config, axiom="Null echo text.", rejected="rej", slug="b4-null-text",
+                   amends="b4-prior", cites="b4-cited")
+    lines = capsys.readouterr().out.splitlines()
+    first = next(i for i, ln in enumerate(lines) if ln.startswith("  Edges:"))
+    assert lines[first].startswith("  Edges:     amends → b4-prior")
+    assert "state could not be read" in lines[first]
+    assert lines[first + 1].strip() == "axiom could not be read"
+    assert "cites → b4-cited" in lines[first + 2]
+    assert "state could not be read" in lines[first + 2]
+    for ln in lines[first:first + 3]:
+        assert "None" not in ln and "mitos " not in ln
+
+
+def test_b4_cli_text_indents_every_line_of_a_multiline_axiom() -> None:
+    """R6/R11: a multi-line stored axiom prints whole, each line under the indent."""
+    from mitos.cli import _edge_echo_lines
+    lines = "\n".join(_edge_echo_lines([
+        {"kind": "amends", "target": "p", "target_state": "active",
+         "target_stamps": {}, "target_axiom": "First line.\nSecond line."}])).splitlines()
+    assert lines == ["  Edges:     amends → p  [active]",
+                     "               axiom: First line.",
+                     "               Second line."]
+
+
+def test_b4_exists_text_receipt_prints_no_edges_line(ws, capsys) -> None:
+    """The text tail is shared with `exists`, which carries no `edges_created`: the
+    unknown line is keyed on the key's presence, so a no-op prints no Edges line."""
+    from mitos.cli import cmd_record
+    config, m = ws
+    cmd_record(config, axiom="A replayed text record.", rejected="rej", slug="b4-replay")
+    capsys.readouterr()
+    cmd_record(config, axiom="A replayed text record.", rejected="rej", slug="b4-replay",
+               acknowledge_neighbors=True)
+    out = capsys.readouterr().out
+    assert "already" in out or "exists" in out
+    assert "Edges:" not in out
+
+
+def test_b4_state_is_computed_at_receipt_time_not_at_commit(ws) -> None:
+    """Stretch: a target superseded between the commit and the echo read is reported
+    as it stands at read time — the read takes no lock and reads now (M3)."""
+    config, m = ws
+    _b4_seed(config, m, "cites", "b4-moving")
+    original = GraphStore.get_outgoing_edge_targets
+
+    def supersede_first(self, node_id):
+        other = MitosSyncManager(config).record_decision_entry(
+            "Replaces the moving target.", "rej", [], slug="b4-replacer",
+            supersedes="b4-moving")
+        assert other["status"] == "created", other
+        return original(self, node_id)
+
+    with patch.object(GraphStore, "get_outgoing_edge_targets", autospec=True,
+                      side_effect=supersede_first):
+        res = m.record_decision_entry("Cites the moving target.", "rej", [],
+                                      slug="b4-citer-late", cites="b4-moving")
+    [entry] = res["edges_created"]
+    assert entry["target_state"] == "superseded"
+    assert entry["target_stamps"] == {"superseded_by": ["b4-replacer"]}
+
+
+def test_b4_store_read_strips_its_helper_columns_from_the_target(ws) -> None:
+    """Gotcha 10: the joined edge alias and the derived state columns never ride the
+    hydrated target node."""
+    config, m = ws
+    _b4_seed(config, m, "amends", "b4-clean")
+    res = m.record_decision_entry("Amends the clean one.", "rej", [], slug="b4-cleaner",
+                                  amends="b4-clean")
+    [t] = GraphStore(config.db_path).get_outgoing_edge_targets(res["id"])
+    for helper in ("echo_edge_type", "killer_type", "is_resolved", "edge_type"):
+        assert helper not in t["node"]
+    assert t["kind"] == "amends" and t["target"] == "b4-clean"
+    assert t["state"] == "active"
+    assert t["node"]["amended_by"] == ["b4-cleaner"]

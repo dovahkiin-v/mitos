@@ -854,7 +854,7 @@ def test_graph_fault_during_pause_read_commits_with_notice(ws):
 
     gather_candidates propagates graph-store faults by design; the record call site
     catches exactly (DatabaseError, ValidationError). Phase B uses get_node /
-    commit_parsed_entry / get_outgoing_edges — none of them the patched read — so the
+    commit_parsed_entry / get_outgoing_edge_targets — none of them the patched read — so the
     commit proceeds. (Nothing post-commit calls the patched method anymore: the
     `related` echo and its blanket-catch scan were deleted.)
     """

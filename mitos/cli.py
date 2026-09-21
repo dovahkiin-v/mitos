@@ -1984,6 +1984,51 @@ def cmd_render(config: MitosConfig, scope: Optional[str] = None, render_format: 
 _PAUSE_REJECTED_PREVIEW = 80
 
 
+# The indent of an edge's second and later lines: under the first edge's text,
+# past the `  Edges:     ` label column.
+_EDGE_LINE_INDENT = " " * 13
+
+
+def _edge_echo_lines(edges: List[Dict[str, Any]]) -> List[str]:
+    """Renders the `created` receipt's ``edges_created`` echo as text lines (B4).
+
+    One line per edge carries its kind, target, the target's state and each
+    modifier stamp with the slugs it names. An acting relation adds an indented
+    line with the target's whole axiom (``resolves`` its topic), every line of it
+    indented, because this is where a human spots a mis-aimed slug. A target key
+    that is ``None`` could not be read and says so in words. No recipe rides: these
+    are receipt lines.
+
+    Args:
+        edges: The ``edges_created`` entries (possibly empty).
+
+    Returns:
+        The lines, without trailing newlines; the first begins ``  Edges:``.
+    """
+    lines: List[str] = []
+    for i, e in enumerate(edges):
+        label = "  Edges:     " if i == 0 else _EDGE_LINE_INDENT
+        state = e.get("target_state")
+        if state is None:
+            status = "state could not be read"
+        else:
+            stamps = e.get("target_stamps") or {}
+            status = "; ".join(
+                [state] + [f"{key.replace('_', ' ')}: {', '.join(slugs)}"
+                           for key, slugs in stamps.items()])
+        lines.append(f"{label}{e['kind']} → {e['target']}  [{status}]")
+        for key, word in (("target_axiom", "axiom"), ("target_topic", "topic")):
+            if key not in e:
+                continue
+            indent = _EDGE_LINE_INDENT + "  "
+            if e[key] is None:
+                lines.append(f"{indent}{word} could not be read")
+            else:
+                text = f"\n{indent}".join(e[key].splitlines())
+                lines.append(f"{indent}{word}: {text}")
+    return lines
+
+
 def _acknowledged_line(value: Optional[List[str]]) -> str:
     """Renders the `created` receipt's ``acknowledged_neighbors`` as one line (F10).
 
@@ -2071,7 +2116,9 @@ def cmd_record(
         # The receipt is already the structured dict — emit it verbatim, no reshaping
         # (the pause's `neighbors` is a stamped decision-read surface: each entry is
         # the enriched candidate_payload, modifier stamps included; the created
-        # receipt's write-facts stay unstamped write results). scope_overflow, when
+        # receipt's `edges_created` is a stamped identification echo — each target's
+        # state and stamps, and its whole axiom on an acting relation, never its
+        # reasoning). scope_overflow, when
         # present, is already inside `result`. The one addition is the trailing
         # provenance, naming the corpus the write landed in — stamped here at the
         # boundary, never inside `record_decision_entry`, so the buffer-first +
@@ -2182,15 +2229,18 @@ def cmd_record(
         print(f"  Ignored:   this call carried different {', '.join(differs)} than the "
               f"graph holds — run `mitos sync` to reconcile the entry in decisions.md.")
     print(f"  Handle:    '{result['slug']}' — pass this to --supersedes/--amends/--depends-on/… to link future decisions.")
-    # Write facts read back from the committed node (NOT an echo of the flags):
-    # the edges the commit actually wired, scope as stored, and mechanisms as
-    # authored in decisions.md, followed by the fold line when the identity fold
-    # changed any of them. Lines are omitted when empty — a bare decision keeps a
-    # bare receipt.
-    edges = result.get("edges_created")
-    if edges:
-        edges_s = ", ".join(f"{e['kind']} → {e['target']}" for e in edges)
-        print(f"  Edges:     {edges_s}")
+    # Read back from the committed node (NOT an echo of the flags): the edges the
+    # commit actually wired, each naming what it hit, scope as stored, and
+    # mechanisms as authored in decisions.md, followed by the fold line when the
+    # identity fold changed any of them. Lines are omitted when empty — a bare
+    # decision keeps a bare receipt.
+    # Keyed on presence for the unknown line: this tail is shared with the
+    # `exists` exit, which carries no `edges_created` at all; only a created
+    # receipt's None means the edges could not be read back.
+    if "edges_created" in result and result["edges_created"] is None:
+        print("  Edges:     unknown — the edges this record wired could not be read back")
+    for line in _edge_echo_lines(result.get("edges_created") or []):
+        print(line)
     if result.get("scope"):
         print(f"  Scope:     {', '.join(result['scope'])}")
     if result.get("mechanisms"):

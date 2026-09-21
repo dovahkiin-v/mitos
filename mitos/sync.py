@@ -76,6 +76,7 @@ from mitos.store import (
     _strip_citation,
     _EDGE_KIND_REQUIREMENT,
     _KILL_EDGE_FIELDS,
+    MODIFIER_EDGE_KEYS,
     edge_kind_is_legal,
 )
 from mitos.identity import (
@@ -308,6 +309,19 @@ _EXTRA_RELATIONS = (
     ("derives_from", "Derives-From"),
     ("cites", "Cites"),
 )
+
+# The `created` receipt's identification echo (B4): which relations carry the
+# target's identifying text beside its state and stamps. Named as the sets of
+# relations that ACT on their target — a wrong-but-existing slug there changes the
+# wrong decision, and the receipt is the only read-back of what was hit — never as
+# "all but cites/depends_on", so a future relation carries no text until someone
+# decides it acts. ADR
+# `record-receipt-edges-are-a-stamped-read-surface-axiom-rides-acting-relations-only`.
+_ECHO_AXIOM_RELATIONS: frozenset = frozenset(
+    {"supersedes", "corrects", "amends", "narrows", "contradicts"}
+)
+# `resolves` targets an open question, whose identifying text is its Topic field.
+_ECHO_TOPIC_RELATIONS: frozenset = frozenset({"resolves"})
 
 
 def _split_relation_slugs(raw: Optional[str]) -> List[str]:
@@ -3236,6 +3250,73 @@ class MitosSyncManager:
             self.config, read_attempt=read_last_attempt, get_node=self.store.get_node
         )
 
+    def _edges_created_field(
+        self, node_id: str, slug: str
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Composes the `created` receipt's `edges_created` echo, never raising.
+
+        Each committed edge names its target's state computed now, its modifier
+        stamps, and — on an acting relation — the target's whole axiom (the open
+        question's topic on ``resolves``). The key set is decided by the relation,
+        never by the value. Called after the commit and outside the lock, like
+        :meth:`_audit_debt_fields`: a raise here would report a committed write as
+        failed, and the caller's retry would answer ``exists``. So a failed echo
+        read falls back to the base edge read with the target keys ``null``, and a
+        failure of that read too gives ``None``. Each failed read writes one stderr
+        warning. ADRs
+        `record-receipt-edges-are-a-stamped-read-surface-axiom-rides-acting-relations-only`
+        and `identification-echo-is-stamped-but-sub-letter-letter-default-governs-precedent-reads`.
+
+        Args:
+            node_id: The committed node's id.
+            slug: The recorded entry's slug, named in the warnings.
+
+        Returns:
+            One entry per edge in insertion order, ``[]`` for a node with no edges,
+            or None when the edges could not be read back.
+        """
+        try:
+            entries: List[Dict[str, Any]] = []
+            for t in self.store.get_outgoing_edge_targets(node_id):
+                node = t["node"]
+                entry: Dict[str, Any] = {
+                    "kind": t["kind"],
+                    "target": t["target"],
+                    "target_state": t["state"],
+                    "target_stamps": {
+                        key: node[key]
+                        for key in MODIFIER_EDGE_KEYS.values() if key in node
+                    },
+                }
+                if t["kind"] in _ECHO_AXIOM_RELATIONS:
+                    entry["target_axiom"] = node["core_axiom"]
+                elif t["kind"] in _ECHO_TOPIC_RELATIONS:
+                    entry["target_topic"] = node["topic"]
+                entries.append(entry)
+            return entries
+        except Exception as e:
+            # stderr: the MCP write tool shares this path and uses stdout for JSON-RPC.
+            print(f"[Warning] Edge echo read failed for '{slug}': {str(e)}",
+                  file=sys.stderr)
+        # The fallback keeps the edges when only the echo failed: the base read,
+        # with every target key the relation carries set to null (not absent).
+        try:
+            base = self.store.get_outgoing_edges(node_id)
+        except Exception as e:
+            print(f"[Warning] Edge read failed for '{slug}': {str(e)}",
+                  file=sys.stderr)
+            return None
+        degraded: List[Dict[str, Any]] = []
+        for b in base:
+            entry = {"kind": b["kind"], "target": b["target"],
+                     "target_state": None, "target_stamps": None}
+            if b["kind"] in _ECHO_AXIOM_RELATIONS:
+                entry["target_axiom"] = None
+            elif b["kind"] in _ECHO_TOPIC_RELATIONS:
+                entry["target_topic"] = None
+            degraded.append(entry)
+        return degraded
+
     def _exists_receipt_extras(
         self, entry: ParsedEntry, existing: Dict[str, Any], node_id: str
     ) -> Dict[str, Any]:
@@ -3939,9 +4020,13 @@ class MitosSyncManager:
         Returns:
             A success dict ``{slug, id, state, embedding, status}`` (status
             "created"|"exists"); on the "created" path it also carries
-            ``edges_created`` (the edges the commit actually wired, each
-            ``{kind, target}`` — write facts read back from the store, not an
-            echo of the input args), the resolved ``scope`` as committed (the
+            ``edges_created`` (the edges the commit actually wired, read back
+            from the store and not echoed from the input args, each ``{kind,
+            target, target_state, target_stamps}`` plus the target's whole
+            ``target_axiom`` on an acting relation or its ``target_topic`` on
+            ``resolves`` — an identification echo, never the target's reasoning;
+            the target keys are ``null`` when the echo read failed, and the list
+            is ``None`` when the edges could not be read back), the resolved ``scope`` as committed (the
             graph's casefolded form), ``mechanisms`` as authored — the spelling
             and order ``decisions.md`` now holds, read back from the parsed
             entry — and ``mechanisms_normalized``, mapping each authored token
@@ -4445,6 +4530,11 @@ class MitosSyncManager:
             acknowledged = self._acknowledged_neighbors_field(
                 entry, supersedes, corrects, extra_relations)
 
+        # 9e. The edges this write wired, each naming what it hit (B4). Same
+        #     never-raising shape as 9b/9c/9d, so the literal below holds a value
+        #     and no live store read.
+        edges_created = self._edges_created_field(node_id, entry.slug)
+
         # 10. Return. A freshly recorded decision is always active. Everything below is
         #     post-commit read-back — the write contract is untouched (the commit
         #     already succeeded above).
@@ -4455,12 +4545,17 @@ class MitosSyncManager:
             "embedding": self._embedding_status(node_id),
             "status": "created",
             "path": self.config.decisions_file,
-            # Write FACTS read back from the committed node — what the commit actually
-            # wired/stored, never re-derived from the author's input args. Deliberately
-            # unstamped: write facts are not a decision-read surface — a reader acting on
-            # a target dereferences it by slug. (Contrast the pause `neighbors`, which IS
-            # stamped: ADR `record-pause-neighbors-are-stamped-decision-read-surface`.)
-            "edges_created": self.store.get_outgoing_edges(node_id),
+            # A stamped identification echo, read back from the committed graph and
+            # never re-derived from the author's input args: each edge names its
+            # target's state, computed at receipt time (M3), and its modifier stamps,
+            # plus the whole axiom on a relation that acts on its target (the topic on
+            # `resolves`). It identifies what the write hit and is not a precedent
+            # read, so no reasoning rides — a reader who needs the target's reasoning
+            # dereferences it by slug. `null` target keys mean the read failed; `{}`
+            # stamps mean it was read and held none. ADRs
+            # `record-receipt-edges-are-a-stamped-read-surface-axiom-rides-acting-relations-only`
+            # and `identification-echo-is-stamped-but-sub-letter-letter-default-governs-precedent-reads`.
+            "edges_created": edges_created,
             "scope": entry.scope,
             # `mechanisms` is the gold source's authored form, read from the entry
             # step 6 parsed back from the serialised text (so an element carrying a
