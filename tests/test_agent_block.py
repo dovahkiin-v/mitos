@@ -8,8 +8,16 @@ integration.
 """
 
 import json
+import os
+import re
+import shlex
+import sys
+from unittest.mock import patch
+
+import pytest
 
 from mitos import cli
+from mitos.cli import main
 from mitos.config import MitosConfig
 from mitos._agent_block import (
     AGENT_GUIDE_VERSION,
@@ -228,3 +236,130 @@ def test_status_text_quiet_when_agent_note_current(tmp_path, monkeypatch, capsys
     (tmp_path / "CLAUDE.md").write_text(agent_block(), encoding="utf-8")
     cli.cmd_status(str(tmp_path))
     assert "agent-file mitos note out of date" not in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- #
+# 3i — every refresh recipe the agent-file lines print is selectored and runs
+# --------------------------------------------------------------------------- #
+
+def _run(argv):
+    """Drives ``main()`` with ``argv``; returns the exit code."""
+    with patch.object(sys, "argv", ["mitos"] + list(argv)):
+        try:
+            main()
+        except SystemExit as exc:
+            return exc.code
+    return 0
+
+
+def _recipe_selector(out, lead):
+    """Parses the one ``mitos agent-block -p …`` recipe on the line holding ``lead``.
+
+    Goes through the real parser and reads the selector the way
+    ``_selector_from_args`` does; returns it.
+    """
+    (line,) = [ln for ln in out.splitlines() if lead in ln]
+    (recipe,) = [part for part in line.split("`") if part.startswith("mitos agent-block")]
+    tokens = shlex.split(recipe)
+    args = cli._build_parser().parse_args(tokens[1:])
+    assert args.command == "agent-block"
+    assert args.project_post is not None, f"recipe names no project: {recipe!r}"
+    return cli._selector_from_args(args)
+
+
+def _harbor(tmp_path):
+    """An `init`ed workspace registered as ``harbor`` with a stale paste in CLAUDE.md."""
+    ws = tmp_path / "x" / "harbor"
+    ws.mkdir(parents=True)
+    _init(ws)
+    (ws / "CLAUDE.md").write_text(_LEGACY_BLOCK, encoding="utf-8")
+    return ws
+
+
+def test_status_drift_line_names_the_registered_project(tmp_path, monkeypatch, capsys):
+    """R10: the status drift line's recipe names the project status was asked about."""
+    ws = _harbor(tmp_path)
+    monkeypatch.setenv("GEMINI_API_KEY", "testkey")
+    monkeypatch.setattr(cli, "_check_qdrant", _qdrant(True, True, points=1))
+    capsys.readouterr()
+
+    cli.cmd_status(str(ws), project="harbor")
+
+    selector = _recipe_selector(capsys.readouterr().out, "agent-file mitos note out of date")
+    assert selector == "harbor"
+    resolved = cli._resolve_selector(selector, "agent-block")
+    assert os.path.realpath(resolved.root) == os.path.realpath(ws)
+
+
+_OUTDATED = "<!-- mitos-agent-guide: v1 -->\n## Architectural Decisions — Mitos\n"
+
+
+@pytest.mark.parametrize("paste", [_OUTDATED, _LEGACY_BLOCK], ids=["outdated", "unversioned"])
+@pytest.mark.parametrize("given", [True, False], ids=["project_given", "project_omitted"])
+def test_check_arms_print_a_selectored_recipe(tmp_path, capsys, paste, given):
+    """R11: both stale arms; an omitted project falls back to the workspace's path."""
+    (tmp_path / "CLAUDE.md").write_text(paste, encoding="utf-8")
+    kwargs = {"project": "harbor"} if given else {}
+
+    assert cli.cmd_agent_block(str(tmp_path), check=True, **kwargs) == 1
+
+    selector = _recipe_selector(capsys.readouterr().out, "⚠ CLAUDE.md")
+    assert selector == ("harbor" if given else os.path.abspath(str(tmp_path)))
+
+
+def test_check_through_main_names_the_addressed_project(tmp_path, monkeypatch, capsys):
+    """R12: the dispatch passes `config.project`, so the recipe carries the name.
+
+    The fallback would print the path instead and still parse; only this row sees a
+    dropped pass.
+    """
+    ws = _harbor(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    capsys.readouterr()
+
+    assert _run(["agent-block", "-p", "harbor", "--check"]) == 1
+
+    assert _recipe_selector(capsys.readouterr().out, "⚠ CLAUDE.md") == "harbor"
+    assert os.path.realpath(cli._resolve_selector("harbor", "agent-block").root) == \
+        os.path.realpath(ws)
+
+
+@pytest.mark.parametrize("route", ["no_workspace", "malformed_config"])
+def test_paste_line_names_the_directory_when_no_name_exists(tmp_path, monkeypatch,
+                                                            capsys, route):
+    """R13: the no-file arm, over both routes that carry no registered name.
+
+    A directory with no workspace goes through the ordinary dispatch (it echoes a
+    corpus on stderr); a workspace whose config does not parse goes through
+    `_answer_workspace_optional_verb`, which echoes none. Both print the root.
+    """
+    target = tmp_path / route
+    target.mkdir()
+    if route == "malformed_config":
+        (target / ".mitos").mkdir()
+        (target / ".mitos" / "config.toml").write_text("qdrant_collection = [1, 2\n",
+                                                       encoding="utf-8")
+        (target / "decisions.md").write_text("", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    capsys.readouterr()
+
+    assert _run(["agent-block", str(target), "--check"]) == 0
+
+    captured = capsys.readouterr()
+    assert ("corpus: " in captured.err) is (route == "no_workspace")
+    selector = _recipe_selector(captured.out, "Paste what")
+    assert selector == os.path.abspath(str(target))
+
+
+def test_habit_line_teaches_check_before_commit_and_no_agent_yes():
+    """R14: the order that costs no extra turn, and who authorises a spend.
+
+    `--yes` may appear only inside the sentence that says an agent does not pass it,
+    so deleting that sentence or inverting it reds.
+    """
+    block = agent_block()
+    assert "after recording decisions and before committing" in block
+    assert "mitos check -p ." in block
+    assert "a commit that follows a record waits until a check has been attempted" in block
+    sentences = [s for s in re.split(r"(?<=[.;])\s", block) if "--yes" in s]
+    assert sentences == ["an agent does not pass `--yes` on its own."]

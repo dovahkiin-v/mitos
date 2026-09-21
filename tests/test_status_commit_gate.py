@@ -705,6 +705,41 @@ def test_init_in_a_work_tree_names_hook_install_once(tmp_path, capsys, sub) -> N
     _assert_recipe_resolves(recipe, "hook-install", os.path.realpath(target))
 
 
+def _setup_init_sample() -> List[str]:
+    """Returns the lines of the untagged fence under SETUP.md's init step."""
+    setup_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              "SETUP.md")
+    with open(setup_path, encoding="utf-8") as fh:
+        text = fh.read()
+    step = text.split("\n### 1. Initialize the workspace\n", 1)[1].split("\n### ", 1)[0]
+    # Fences are paired in order: a closing fence also reads as an untagged opener.
+    samples, body, tag = [], None, None
+    for ln in step.splitlines():
+        if ln.startswith("```"):
+            if body is None:
+                body, tag = [], ln[3:].strip()
+            else:
+                if not tag:
+                    samples.append(body)
+                body = None
+        elif body is not None:
+            body.append(ln)
+    assert len(samples) == 1, "the init step should hold exactly one untagged sample fence"
+    return samples[0]
+
+
+@_needs_git
+def test_setup_init_sample_ends_with_the_line_init_prints(tmp_path, capsys) -> None:
+    """3i R9: SETUP.md's sample ends with the exact hook line a real `init` prints.
+
+    The sample's workspace is `harbor`, so the scratch repository is named that too;
+    `init` names the project after the basename.
+    """
+    repo = make_scratch_repo(str(tmp_path / "x" / "harbor"))
+    (line,) = _gate_lines(_init_out(repo, capsys))
+    assert _setup_init_sample()[-1] == line
+
+
 @_needs_git
 def test_init_outside_a_work_tree_prints_no_line(tmp_path, capsys) -> None:
     """Criterion 20: outside a work tree."""

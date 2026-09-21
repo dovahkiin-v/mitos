@@ -143,7 +143,10 @@ what it registered:
 Initialized Mitos workspace at /home/you/projects/harbor ✓
 Registered as "harbor" → /home/you/projects/harbor
 collection: mitos-harbor-4f2a91c3
+In a git repository: `mitos hook-install -p 'harbor'` installs the commit gate, which holds a commit until a contradiction check is attempted.
 ```
+
+The last line prints only when the workspace sits inside a git work tree.
 
 The name defaults to the directory's basename; `mitos init --name <name>` picks
 another, and `--force` repoints an existing name at this workspace. The
@@ -253,9 +256,9 @@ paste-ready, and `mitos projects` carries none: it answers for the machine.)
 
 | Form | Use it when | Wrong when |
 |---|---|---|
-| `-p .` (or an explicit path) | your working directory **is** the workspace root when the command runs — a git hook, a CI job, you at a terminal | anything launched from elsewhere: cron, a scheduler, a service |
+| `-p .` (or an explicit path) | your working directory **is** the workspace root when the command runs — a CI job, you at a terminal | anything launched from elsewhere: cron, a scheduler, a service |
 | `-p <registered-name>` | machine-local state that never travels — a crontab, a shell alias, an interactive habit | anything committed to a repo: the same name means a different project on someone else's machine |
-| `-p <absolute path>` | an artifact that must travel and cannot use `.` — the `project` argument in a committed agent template | never wrong, only verbose |
+| `-p <absolute path>` | an artifact that must travel and cannot use `.` — the `project` argument in a committed agent template; the hook `mitos hook-install` writes (it bakes the workspace's absolute path) | never wrong, only verbose |
 
 ---
 
@@ -336,22 +339,78 @@ that slug before linking.
 
 ---
 
-## Gating commits with `mitos check` (pre-commit / CI / cron)
+## Gating commits and auditing with `mitos check`
 
 `mitos check` audits the corpus for undeclared contradictions. Two modes: the
 default **corpus sweep** audits every active decision; **`--staged`** gates just
-the pending buffer of `decisions.md` before it lands. The exit contract is
-scriptable — `0` clean or known-only, `1` a NEW contradiction, `2` degraded /
-refused / could-not-run (a check that cannot certify never returns `0`/`1`).
+the pending buffer of a hand-authored `decisions.md` before it lands. The exit
+contract is scriptable — `0` clean or known-only, `1` a NEW contradiction, `2`
+degraded / refused / could-not-run (a check that cannot certify never returns
+`0`/`1`).
 
-Each recipe below names its project, and the three do not name it the same way.
-The discriminator is *where the job runs*: a hook and a CI job run **in** the
-checkout, so `.` is the workspace root; a cron job runs from `$HOME`, so it needs
-a name.
+What holds a commit is the **commit gate**: a `pre-commit` hook, written by
+`mitos hook-install`, that runs `hook-run` with the `mitos` that installed it. It
+does not run the check. It asks whether one has been attempted since decisions
+last changed, and it blocks with an exit code of its own, never one of `check`'s.
 
-### Pre-commit hook
+Every recipe below names its project. Which form fits depends on where the
+command runs — see *Naming the project on every call*.
 
-Wire the staged gate into `.git/hooks/pre-commit` (or your hook manager). Guard
+### The commit gate (`mitos hook-install`)
+
+From the workspace root, inside the git work tree:
+
+```sh
+mitos hook-install -p .
+```
+
+It writes an executable `pre-commit` into the repository's own git directory
+(the hooks directory under its common git directory). The hook carries
+**absolute** paths to this workspace and to the `mitos` that installed it, so it
+does not matter which directory git runs it from. One hook serves one workspace;
+running the command again replaces the hook it wrote. There is no uninstall verb:
+removing the gate is deleting the file the command names.
+
+It refuses a `pre-commit` it did not write, and it refuses a shared hooks
+directory (a `core.hooksPath` inside the work tree or outside the repository).
+For those two it writes nothing and prints a block to paste by hand (a
+`pre-commit` that already carries that block is left as it is, with no second
+block printed). For your own
+`pre-commit`, the block names this workspace and this `mitos` by absolute path.
+A shared hooks directory reaches other clones or repositories, so its block names
+no machine path: the workspace by a path relative to the repository root (`.`,
+or `./`-led) and `mitos` from `PATH`.
+
+The gate runs on `git commit` and on `git commit --amend`. It does not run on a
+merge that git completes itself, nor on `git revert`, `git cherry-pick` or
+`git rebase`. `git commit --no-verify` skips it — the deliberate human bypass.
+
+On each commit it reads the graph and the check telemetry and asks one question:
+have decisions changed without a contradiction check being attempted since? It
+runs no judge, spends nothing and reaches no network. When the answer is yes, the
+commit is blocked and the message names the check to run, spelled with the
+`mitos` the hook runs: `… check -p '<name>'`. Run it, read what it reports, and
+commit again. The gate asks only that a check was attempted, so any attempt at
+that check opens it, including one that fails or is refused before it spends. A
+`--scope` or `--staged` run is a different check and does not.
+
+Over a corpus that already holds decisions, the first commit after install is
+blocked once, and one attended check clears it. An empty corpus passes. With no
+Anthropic key configured, the hook is installed and stays inactive: every commit
+passes until a key is set.
+
+If your `mitos` answers `hook-install` with an argparse `invalid choice` error,
+the build predates the commit gate; update it as *Prerequisites → Updating*
+describes.
+
+### Staged gate for a hand-authored `decisions.md`
+
+This one is for people who track and hand-author `decisions.md`. A decision
+recorded through `record_decision` (MCP or `mitos record`) is already in the
+graph, never pending, so `--staged` does not see it; the commit gate above is
+what covers those. `--staged` judges the entries still pending in the buffer.
+
+Wire it into `.git/hooks/pre-commit` (or your hook manager). Guard
 the divergence first — `mitos check --staged` reads the **working tree**, but git
 commits the **index**; if they differ, the gate checks the wrong bytes:
 
@@ -370,7 +429,7 @@ mitos check --staged -p .
 level, so `.` **is** the workspace root at run time.
 
 A commit that touches no pending decision entries short-circuits to exit `0` with
-**zero LLM contact** — the hook is effectively free on the overwhelming majority
+**zero LLM contact** — this hook is effectively free on the overwhelming majority
 of commits.
 
 ### CI job
@@ -404,6 +463,12 @@ open an issue), `2` degraded (alert — the audit couldn't certify).
 
 ### Keys, Qdrant, and the secretless-CI consequence
 
+The commit gate needs only the **Anthropic key** (`ANTHROPIC_API_KEY`) to be
+armed; without it the gate is inactive and never blocks. It needs no Gemini key
+and no Qdrant, because it reads the local graph and check telemetry. It lives on
+a keyed dev machine: the hook is installed per clone and does not travel with the
+repository, so a secretless runner has none.
+
 `--staged` with pending entries needs a **Gemini key + Anthropic key + reachable
 Qdrant** in the hook's environment. A secretless CI runner **cannot** pass the
 gate on a buffer with pending entries — it exits `2` (fail-closed: a gate that
@@ -422,6 +487,11 @@ hatch when you need to commit past the gate on purpose.
 
 ### Latency
 
+- **The commit gate** reads the local graph and check telemetry on each commit;
+  it runs no judge and reaches no network, whether it passes or blocks.
+
+For `--staged`:
+
 - **No pending decision entries** → exit `0`, zero LLM contact, effectively
   instant (the common commit).
 - **N pending entries** → N sequential judgment calls at ~**5s P95 each**, so a
@@ -434,6 +504,8 @@ The first corpus sweep judges every fresh pair, so its preflight budget estimate
 (~3K tokens/batch) can print a large one-time number. It does not recur: `--scope`
 narrows the sweep, and verdict **reuse** means subsequent runs re-judge only
 genuinely-changed pairs. The big number on run 1 is expected, not alarming.
+The commit gate's first block over an existing corpus asks for exactly this sweep;
+if its spend needs confirming, a person runs it at a terminal and confirms.
 
 ---
 

@@ -23,12 +23,16 @@ Since 6b this module also carries the **doc-shape** rows for SETUP.md's other
 recipes: the scheduled sweep, the secretless-CI prose that points at it, the
 corpus↔graph repair, and the `SETUP.md → <Heading>` pointers `mitos/` prints.
 They live here because this is already the module that reads SETUP.md from disk.
+Since 3i it also carries the commit gate's static prose rows (SETUP.md's gating
+section, keys section and `-p` table, and README's audit bullet); none reaches a
+key or a network.
 """
 
 import asyncio
 import os
 import pathlib
 import re
+import shlex
 import subprocess
 import uuid
 
@@ -414,6 +418,167 @@ def test_setup_amend_reach_states_the_shipped_rotation_defaults():
     assert volume and lag, "the amend reach blockquote lost a default"
     assert int(volume.group(1)) == CONFIG_DEFAULTS["rotation_volume_threshold_entries"]
     assert int(lag.group(1)) == CONFIG_DEFAULTS["rotation_lag_days"]
+
+
+# --------------------------------------------------------------------------- #
+# 3i — the commit gate's prose: SETUP.md's gating section, the -p table, README
+# --------------------------------------------------------------------------- #
+
+_GATING_HEADING = "Gating commits and auditing with `mitos check`"
+_GATE_HEADING = "The commit gate (`mitos hook-install`)"
+_STAGED_HEADING = "Staged gate for a hand-authored `decisions.md`"
+
+
+def _extract_h2_section(text, heading):
+    """Returns a ``##`` section's whole body, its ``###`` subsections included.
+
+    `_extract_section` stops at any heading on purpose (its cron row needs that),
+    so a claim about "the gating section" needs its own reader: this one stops
+    only at the next ``## `` heading.
+    """
+    lines = text.splitlines()
+    start = next(
+        (i for i, ln in enumerate(lines)
+         if ln.startswith("## ") and ln[3:].strip() == heading),
+        None,
+    )
+    assert start is not None, f"SETUP.md has no section {heading!r} — it was renamed or lost"
+    body = []
+    for ln in lines[start + 1:]:
+        if ln.startswith("## "):
+            break
+        body.append(ln)
+    return "\n".join(body)
+
+
+def _shell_fences(section):
+    """Returns the section's ``sh``/``bash`` fenced blocks, one string each, in order."""
+    return re.findall(r"^```(?:sh|bash)\n(.*?)^```", section, re.S | re.M)
+
+
+def _flat(text):
+    """Collapses line wraps, so a pinned phrase survives re-wrapping the paragraph."""
+    return " ".join(text.split())
+
+
+def test_setup_gating_section_leads_with_the_commit_gate():
+    """R1: the commit gate is the primary recipe; `--staged` comes second.
+
+    The first fenced block holding a `mitos` line holds `mitos hook-install`, and it
+    sits before the block holding the staged gate command.
+    """
+    blocks = _shell_fences(_extract_h2_section(_setup_text(), _GATING_HEADING))
+    with_mitos = [i for i, b in enumerate(blocks)
+                  if any(ln.startswith("mitos ") for ln in b.splitlines())]
+    staged = [i for i, b in enumerate(blocks) if GATE_COMMAND in b]
+    assert with_mitos and staged, "the gating section lost its recipes"
+    assert "mitos hook-install" in blocks[with_mitos[0]]
+    assert with_mitos[0] < staged[0]
+
+
+def test_every_gating_recipe_parses_and_names_its_project():
+    """R2: each `mitos` line in the gating section's fences runs, with a selector.
+
+    Parsed by the real parser; the selector is read the way `_selector_from_args`
+    reads it (either `-p` position or the positional), never through one `dest`.
+    `comments=True` because the cron lines carry trailing shell comments.
+    """
+    parser = cli._build_parser()
+    checked = []
+    for block in _shell_fences(_extract_h2_section(_setup_text(), _GATING_HEADING)):
+        for line in block.splitlines():
+            if not line.startswith("mitos "):
+                continue
+            try:
+                args = parser.parse_args(shlex.split(line, comments=True)[1:])
+            except SystemExit:
+                pytest.fail(f"SETUP.md's gating recipe does not parse: {line!r}")
+            assert cli._selector_from_args(args), f"recipe names no project: {line!r}"
+            checked.append(args.command)
+    assert len(checked) >= 3, checked          # non-vacuity
+    assert "hook-install" in checked
+
+
+def test_staged_recipe_equals_the_tested_recipe_byte_for_byte():
+    """R3: the whole `--staged` block is `RECIPE` without its shebang.
+
+    `test_setup_recipe_is_in_lockstep` pins three pieces; the comment lines between
+    them are only seen here.
+    """
+    blocks = [b for b in _shell_fences(_extract_h2_section(_setup_text(), _GATING_HEADING))
+              if GATE_COMMAND in b]
+    assert len(blocks) == 1
+    assert blocks[0] == RECIPE.split("\n", 1)[1]
+
+
+def test_commit_gate_prose_states_its_reach_first_block_and_keyless_row():
+    """R4: reach, bypass, the first-commit block and the keyless row, as 3h proved them.
+
+    The does-not-run sentence must name all four verbs git runs no `pre-commit` for.
+    """
+    gate = _flat(_extract_section(_setup_text(), _GATE_HEADING))
+    assert "on `git commit`" in gate
+    assert "`git commit --amend`" in gate
+    assert "`git commit --no-verify` skips it" in gate
+    does_not = re.search(r"It does not run on [^.]*\.", gate)
+    assert does_not, "the does-not-run sentence is gone"
+    for verb in ("merge", "revert", "cherry-pick", "rebase"):
+        assert verb in does_not.group(0), verb
+    assert "the first commit after install is blocked once" in gate
+    assert "An empty corpus passes" in gate
+    assert "installed and stays inactive" in gate
+    assert "any attempt at that check opens it" in gate
+    assert "A `--scope` or `--staged` run is a different check and does not" in gate
+
+
+def test_upgrade_sentence_names_the_error_and_no_version():
+    """R5: an old build is recognised by its argparse error, never by a version number.
+
+    The merge mints the version, so a number written here would be a guess.
+    """
+    gate = _flat(_extract_section(_setup_text(), _GATE_HEADING))
+    assert re.search(r"`hook-install` with an argparse `invalid choice` error", gate)
+    assert "Prerequisites → Updating" in gate
+    section = _extract_h2_section(_setup_text(), _GATING_HEADING)
+    assert not re.search(r"\b\d+\.\d+\.\d+\b", section), "a version number in the gating section"
+
+
+def test_p_table_moves_the_hook_to_the_absolute_path_row():
+    """R6: `-p .` no longer names a git hook, and the installed hook has its row.
+
+    The hook `hook-install` writes bakes an absolute path; a hand-written hook is
+    still covered by the `-p .` row's "workspace root when the command runs".
+    Presence and absence together.
+    """
+    (table,) = _tables(_extract_section(_setup_text(), "Naming the project on every call"))
+    dot = [row for row in table if row[0].startswith("`-p .`")]
+    assert len(dot) == 1
+    assert "hook" not in dot[0][1]
+    assert any("hook-install" in cell for row in table for cell in row)
+
+
+def test_keys_section_names_what_the_commit_gate_needs():
+    """R7: the gate is armed by the Anthropic key alone; the sweep advice stays."""
+    block = _flat(_extract_section(
+        _setup_text(), "Keys, Qdrant, and the secretless-CI consequence"))
+    assert "The commit gate" in block
+    assert "`ANTHROPIC_API_KEY`" in block
+    assert "no Gemini key and no Qdrant" in block
+    assert "corpus sweep" in block
+
+
+def test_readme_audit_bullet_names_the_commit_gate_and_nothing_wider():
+    """R8: README (the PyPI long description) says "on `git commit`" and no more.
+
+    `--staged` must never again read as the pre-commit step. The `mcp-name` line is
+    pinned by `test_packaging_meta` too; this is the row a README editor meets.
+    """
+    readme = pathlib.Path(_REPO_ROOT, "README.md").read_text(encoding="utf-8")
+    assert readme.splitlines()[1] == "<!-- mcp-name: io.github.dovahkiin-v/mitos -->"
+    (bullet,) = [ln for ln in readme.splitlines() if "It audits itself" in ln]
+    assert "on `git commit`" in bullet
+    assert "`mitos hook-install -p .`" in bullet
+    assert "as a pre-commit" not in bullet
 
 
 # --------------------------------------------------------------------------- #

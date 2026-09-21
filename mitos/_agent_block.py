@@ -14,7 +14,7 @@ It is a **copy**, and copies drift. Two design choices keep that manageable:
   there is little to go stale.
 - **The block carries a version marker** (``<!-- mitos-agent-guide: vN -->``) so the
   rare time the pointer block itself changes, a pasted copy that predates it can be
-  *detected* (``mitos status``) and *refreshed* (``mitos agent-block``).
+  *detected* (``mitos status .``) and *refreshed* (``mitos agent-block .``).
 
 This module is the single source of truth for both the emitted block and the drift
 check, so the two can never disagree.
@@ -29,7 +29,7 @@ from typing import Dict, List, Optional
 # copies to refresh. The marker embeds this number; `mitos status` compares a project's
 # pasted marker against it. (Not tied to the package __version__ — most releases don't
 # touch the block.)
-AGENT_GUIDE_VERSION = 3
+AGENT_GUIDE_VERSION = 4
 
 # The agent-instruction filenames mitos knows about (SETUP.md's list — named without
 # a section number on purpose; that file is renumbered by its own edits), checked at
@@ -45,7 +45,7 @@ _MARKER_RE = re.compile(r"<!--\s*mitos-agent-guide:\s*v(\d+)", re.IGNORECASE)
 # (e.g. mitos's own dev guide, or a doc that references `record_decision`) is NOT
 # mistaken for a stale paste — precision over recall, so the drift signal never cries
 # wolf. A custom-worded note without the heading is the author's own; once refreshed
-# via `mitos agent-block` it gains the marker and is tracked from then on.
+# via `mitos agent-block .` it gains the marker and is tracked from then on.
 _BLOCK_HEADING_RE = re.compile(
     r"^#{1,6}\s+Architectural Decisions\b.*\bMitos\b", re.IGNORECASE | re.MULTILINE
 )
@@ -89,10 +89,15 @@ def agent_block(version: int = AGENT_GUIDE_VERSION) -> str:
         "self-describing — their schemas state the required fields and constraints "
         "(including the slug handle) — and SETUP.md is the full guide: what's worth "
         "recording, how to choose a slug, and how to link related decisions.\n"
-        "- **Keep the graph honest:** after a burst of `record_decision` writes — or "
-        "when starting a session — run `mitos check -p .` to audit the live corpus for "
-        "undeclared contradictions (read-only; it never edits anything). Resolve any "
-        "finding the normal way: declare the relationship in `decisions.md`.\n"
+        "- **Keep the graph honest:** after recording decisions and before committing "
+        "— or when starting a session — run `mitos check -p .` to audit the live "
+        "corpus for undeclared contradictions (read-only; it never edits anything). "
+        "Where this project has the commit gate, a commit that follows a record waits "
+        "until a check has been attempted, so checking first lets the commit pass the "
+        "first time. If the check says its spend needs a person's authorization, tell "
+        "the user and let them run it; an agent does not pass `--yes` on its own. "
+        "Resolve any finding the normal way: declare the relationship in "
+        "`decisions.md`.\n"
         "<!-- /mitos-agent-guide -->"
     )
 

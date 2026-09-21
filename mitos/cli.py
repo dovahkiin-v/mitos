@@ -3805,7 +3805,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
             if f["status"] in ("outdated", "unversioned")
         )
         print(f"  ⚠ agent-file mitos note out of date ({stale_files}) "
-              f"— refresh with `mitos agent-block`")
+              f"— refresh with `mitos agent-block -p {config.project!r}`")
     if skill_md_state == "differs":
         # "differs", never "outdated": a committed skill.md can be newer than this
         # install. `absent` stays silent (a clone that does not commit skill.md is
@@ -4530,7 +4530,8 @@ def cmd_amend_commentary(
     return exit_code
 
 
-def cmd_agent_block(workspace_dir: str, check: bool = False) -> int:
+def cmd_agent_block(workspace_dir: str, check: bool = False, *,
+                    project: Optional[str] = None) -> int:
     """Prints the canonical agent-file block, or checks pasted copies for drift.
 
     The block is the thin, versioned pointer a project pastes into its agent files
@@ -4542,6 +4543,9 @@ def cmd_agent_block(workspace_dir: str, check: bool = False) -> int:
     Args:
         workspace_dir: The project root (only used by ``--check``).
         check: Report drift in the project's agent files instead of printing the block.
+        project: The selector the printed refresh recipes name — the registered
+            name when the caller addressed one. ``None`` falls back to the
+            workspace's absolute path, which parses and resolves just the same.
 
     Returns:
         ``0`` on a plain print, or when ``--check`` finds no stale copy; ``1`` when
@@ -4552,23 +4556,24 @@ def cmd_agent_block(workspace_dir: str, check: bool = False) -> int:
         return 0
 
     workspace_dir = os.path.abspath(workspace_dir)
+    recipe = f"`mitos agent-block -p {(project or workspace_dir)!r}`"
     report = agent_block_drift(workspace_dir)
     files = report["files"]
     print(f"\nAgent-file mitos note (current guide: v{AGENT_GUIDE_VERSION}) for {workspace_dir}\n")
     if not files:
         print("  — no agent file references mitos yet.")
-        print("    Paste `mitos agent-block` into your AGENTS.md / CLAUDE.md / GEMINI.md so")
-        print("    the next agent knows mitos is set up here.\n")
+        print(f"    Paste what {recipe} prints into your AGENTS.md /")
+        print("    CLAUDE.md / GEMINI.md so the next agent knows mitos is set up here.\n")
         return 0
     for f in files:
         if f["status"] == "current":
             print(f"  ✓ {f['file']}  (guide v{f['marker_version']})")
         elif f["status"] == "outdated":
             print(f"  ⚠ {f['file']}  (guide v{f['marker_version']} → v{AGENT_GUIDE_VERSION}) "
-                  f"— refresh with `mitos agent-block`")
+                  f"— refresh with {recipe}")
         else:  # unversioned
             print(f"  ⚠ {f['file']}  (mitos note with no version marker) "
-                  f"— refresh with `mitos agent-block`")
+                  f"— refresh with {recipe}")
     print()
     return 1 if report["stale"] else 0
 
@@ -7183,7 +7188,7 @@ def _answer_workspace_optional_verb(args: argparse.Namespace,
         # `agent-block`, whose namespace carries no `verbose`.
         return cmd_status(root, as_json=args.as_json, project=target.name,
                           verbose=getattr(args, "verbose", False))
-    return cmd_agent_block(root, check=args.check)
+    return cmd_agent_block(root, check=args.check, project=target.name or root)
 
 
 def _selector_from_args(args: argparse.Namespace) -> Optional[str]:
@@ -8284,7 +8289,8 @@ def main() -> None:
             # machines" stays a structural fact rather than a discipline someone
             # could later tidy onto stdout.
             _echo_corpus(config, file=sys.stderr)
-            sys.exit(cmd_agent_block(config.workspace_dir, check=args.check))
+            sys.exit(cmd_agent_block(config.workspace_dir, check=args.check,
+                                     project=config.project))
         elif args.command == "set-key":
             # The other dispatch-site echo, for the same reason: `cmd_set_key` takes
             # a bare path, not a config, and `main()` is the only place that holds
