@@ -4,7 +4,7 @@ Clients truncate long tool descriptions — measured 2026-08-04 (`AX_FEEDBACK.md
 `record_decision`'s description was cut mid-sentence *inside the relation
 catalog*, and `query_decisions`' likewise, so an agent chose relation types from
 the visible half. The cut point is client-side and not ours to control; what we
-own is the ordering and the total weight. Two rules, pinned here:
+own is the ordering and the total weight. Three rules, pinned here:
 
 1. **Front-load rule** — the content an agent must not lose lands in the head of
    the description: `record_decision`'s full relation vocabulary (edges are the
@@ -15,6 +15,13 @@ own is the ordering and the total weight. Two rules, pinned here:
    the responses themselves (the pause lists its own recovery, the receipt
    carries `differs`), so tail loss on an aggressive client is tolerable by
    design.
+3. **Required-arguments window** — every required argument's Args entry ends
+   inside the head a truncating client still shows, so a first call can be
+   made from what arrives. "Required" is the schema's `required` list plus
+   `project` wherever a tool declares it: `project` is schema-optional on
+   purpose, which leaves the description as the only place that says it is
+   needed. This window is measured on the raw text, because the raw text is
+   what the client cuts; the phrase rows stay on the flat view.
 
 Descriptions are read off ``mcp.list_tools()`` (the wire truth), not out of the
 source, mirroring ``test_mcp_selector._tools``.
@@ -22,7 +29,9 @@ source, mirroring ``test_mcp_selector._tools``.
 
 import asyncio
 
-from mitos import mcp_server
+import pytest
+
+from mitos import identity, mcp_server
 
 # The regression ceiling (chars). Not a promise the client shows this much —
 # only that we never regrow toward the 5,937-char shape that buried the catalog.
@@ -31,6 +40,13 @@ DESCRIPTION_BUDGET = 4_800
 # The head window the front-load rule guards. Chosen below the smallest observed
 # client cut (a 2,221-char description was truncated), with margin.
 FRONT_WINDOW = 1_500
+
+# The window every required argument's doc must end inside (raw chars). One
+# client, measured on the wire 2026-09-20, cuts a tool description at exactly
+# 2,048 characters — characters, not bytes. Only the description is cut; the
+# input schema travels separately and arrives whole. 1,900 leaves margin below
+# that cut without pretending to know any other client's.
+REQUIRED_ARGS_WINDOW = 1_900
 
 RELATION_ARGS = (
     "supersedes",
@@ -59,6 +75,68 @@ def _flat(text):
     teaching is still there.
     """
     return " ".join(text.split())
+
+
+def _tools():
+    return {tool.name: tool for tool in asyncio.run(mcp_server.mcp.list_tools())}
+
+
+def _required_args(tool):
+    """Names a caller must supply: schema-``required``, plus ``project`` where declared.
+
+    ``project`` joins by property, not by a list of tool names, so a tool that
+    gains the selector is measured the day it arrives.
+    """
+    schema = tool.inputSchema
+    names = set(schema.get("required", ()))
+    if "project" in schema.get("properties", {}):
+        names.add("project")
+    return names
+
+
+def _required_pairs():
+    return sorted(
+        (name, arg)
+        for name, tool in _tools().items()
+        for arg in _required_args(tool)
+    )
+
+
+def _arg_entry_span(description, arg):
+    """Returns the raw ``(start, end)`` of ``arg``'s entry in the ``Args:`` block.
+
+    The entry starts at its name token and ends after the last character of its
+    last continuation line (exclusive) — continuation being the following
+    non-blank lines indented deeper than the name line, the rule
+    ``test_mcp_selector._project_arg_doc`` uses. The first matching entry wins.
+    A missing entry fails rather than skips: a required argument whose doc was
+    deleted must red, not drop out of the measurement.
+    """
+    lines = description.splitlines(keepends=True)
+    offset = 0
+    args_indent = None
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        indent = len(line) - len(line.lstrip())
+        if args_indent is None:
+            if stripped == "Args:":
+                args_indent = indent
+        elif stripped and indent <= args_indent:
+            break  # the Args: block has ended
+        elif stripped.startswith(f"{arg}:"):
+            start = offset + indent
+            end = offset + len(line.rstrip("\n"))
+            follower_offset = offset + len(line)
+            for follower in lines[index + 1:]:
+                if not follower.strip():
+                    break
+                if len(follower) - len(follower.lstrip()) <= indent:
+                    break
+                end = follower_offset + len(follower.rstrip("\n"))
+                follower_offset += len(follower)
+            return start, end
+        offset += len(line)
+    raise AssertionError(f"no `{arg}:` entry in the Args: block")
 
 
 def test_every_tool_description_within_budget():
@@ -130,9 +208,9 @@ def test_query_decisions_states_the_band_axis_inside_the_head_window():
 
 
 def test_surface_decisions_states_the_band_axis():
-    """The sibling half, gated by the ceiling alone — there is no front-load row on
-    this tool, and a phase told to check a head window here hunts for a gate that
-    is not on it.
+    """The sibling half. Its phrases are gated by the ceiling alone: the window
+    this tool is under is the required-arguments one, which measures where
+    `query` and `project` end, not where this contrast sits.
 
     The two descriptions must not converge: neither gains a `Returns:`-block gloss
     for the other's fields, and this one keeps the corpus-level reading of the band
@@ -143,4 +221,59 @@ def test_surface_decisions_states_the_band_axis():
     assert "rates that ranking, not the corpus" in desc, (
         "surface_decisions no longer contrasts its own band with query_decisions' "
         "— the differentiator sentence was trimmed rather than extended"
+    )
+
+
+_REQUIRED_PAIRS = _required_pairs()
+
+
+def test_required_argument_population_is_derived_from_the_live_table():
+    """The population rows below cannot shrink without this one noticing.
+
+    Re-derived here by set containment rather than compared with a hand list,
+    so neither a count nor a tool list sits anywhere to decay.
+    """
+    measured = set(_REQUIRED_PAIRS)
+    for name, tool in _tools().items():
+        schema = tool.inputSchema
+        if "project" in schema.get("properties", {}):
+            assert (name, "project") in measured, (
+                f"{name} declares `project` but its doc is not measured against "
+                "the required-arguments window"
+            )
+        for arg in schema.get("required", ()):
+            assert (name, arg) in measured, (
+                f"{name}'s schema-required `{arg}` is not measured against the "
+                "required-arguments window"
+            )
+
+
+@pytest.mark.parametrize(
+    ("tool", "arg"), _REQUIRED_PAIRS, ids=[f"{t}/{a}" for t, a in _REQUIRED_PAIRS]
+)
+def test_required_argument_doc_ends_inside_the_window(tool, arg):
+    _, end = _arg_entry_span(_descriptions()[tool], arg)
+    assert end <= REQUIRED_ARGS_WINDOW, (
+        f"{tool}'s `{arg}` doc ends at raw char {end}, past "
+        f"REQUIRED_ARGS_WINDOW={REQUIRED_ARGS_WINDOW} — a client that cuts the "
+        "description at 2,048 chars hides it. Move the entry up (required "
+        "arguments first in Args:) or shorten what precedes it."
+    )
+
+
+def test_record_decision_slug_doc_tells_the_truth_about_the_handle():
+    """B13: a slug is a mutable handle and is not part of a decision's identity.
+
+    `identity.compute_node_id` hashes kind, axiom and mechanism refs; the slug
+    can be renamed (`amend_commentary`). The description must not say otherwise,
+    and its slug entry carries the length limit as the literal that
+    `identity.SLUG_MAX_LEN`'s comment promises.
+    """
+    desc = _descriptions()["record_decision"]
+    assert "permanent" not in desc
+    assert "identity = slug" not in desc
+    start, end = _arg_entry_span(desc, "slug")
+    assert str(identity.SLUG_MAX_LEN) in desc[start:end], (
+        f"record_decision's slug entry no longer states the {identity.SLUG_MAX_LEN}-"
+        "char limit that identity.SLUG_MAX_LEN enforces"
     )

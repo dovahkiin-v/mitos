@@ -656,6 +656,11 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
 
     Args:
         query: The semantic claim or topic string (e.g. 'cache strategy').
+        project: Which project this call is about — REQUIRED on every call: a
+            registered project name (e.g. 'mitos') or the absolute path of a
+            workspace. Call `list_projects()` if you do not know the names.
+            Distinct from `scope`: `project` picks the corpus, `scope` filters
+            within it.
         scope: Optional scope hint — does NOT filter the semantic search. Recall is
             scope-blind by design, so a mis-guessed tag can't hide cross-scope
             precedent; scope only narrows the `open_questions` scan and shapes the
@@ -666,11 +671,6 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
             "is there anything nearby?" scan). Default False keeps the full reasoning.
         limit: Ranked top-k to retrieve (default 5; clamped to 1–50). Raise it to dig
             deeper, lower it to save context — a context-budget dial, not a cap at 5.
-        project: Which project this call is about — REQUIRED on every call: a
-            registered project name (e.g. 'mitos') or the absolute path of a
-            workspace. Call `list_projects()` if you do not know the names.
-            Distinct from `scope`: `project` picks the corpus, `scope` filters
-            within it.
 
     Returns:
         A JSON string with `active_decisions` (ranked, Letter-mode), plus
@@ -863,6 +863,11 @@ def list_decisions(scope: Optional[str] = None, state: str = "active", brief: bo
     when you want results restricted to a scope, this is the verb.
 
     Args:
+        project: Which project this call is about — REQUIRED on every call: a
+            registered project name (e.g. 'mitos') or the absolute path of a
+            workspace. Call `list_projects()` if you do not know the names.
+            Distinct from `scope`: `project` picks the corpus, `scope` filters
+            within it.
         scope: Optional scope tag filter (e.g. 'auth') — a true hard filter (this is
             the only retrieval surface that restricts by scope). Omit for the whole
             project.
@@ -878,11 +883,6 @@ def list_decisions(scope: Optional[str] = None, state: str = "active", brief: bo
             scan the map here, then dereference the few that matter with query/show.
             Letter-complete stays the default depth; this is an explicit opt-down,
             never a default. Mutually exclusive with brief.
-        project: Which project this call is about — REQUIRED on every call: a
-            registered project name (e.g. 'mitos') or the absolute path of a
-            workspace. Call `list_projects()` if you do not know the names.
-            Distinct from `scope`: `project` picks the corpus, `scope` filters
-            within it.
 
     Returns:
         A JSON string: {decisions, open_questions, total, scope, state}. Each
@@ -981,15 +981,15 @@ def list_scopes(include_archived: bool = False, project: Optional[str] = None) -
     person runs it.
 
     Args:
+        project: Which project this call is about — REQUIRED on every call: a
+            registered project name (e.g. 'mitos') or the absolute path of a
+            workspace. Call `list_projects()` if you do not know the names.
         include_archived: When False (default), returns only live domains (≥1 active
             decision OR ≥1 parked open question). When True, additionally includes
             the tags whose decisions are all retired and whose open questions are
             all resolved, at a `{active_decisions: 0, parked_open_questions: 0}`
             floor — the scope-level parallel of list_decisions(state="all"). A tag
             no decision or question carries any more is not listed.
-        project: Which project this call is about — REQUIRED on every call: a
-            registered project name (e.g. 'mitos') or the absolute path of a
-            workspace. Call `list_projects()` if you do not know the names.
 
     Returns:
         A JSON string: `{scopes, project, collection, workspace}`. `scopes` is an
@@ -1306,8 +1306,9 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
                     derives_from: Optional[str] = None, cites: Optional[str] = None,
                     acknowledge_neighbors: bool = False,
                     project: Optional[str] = None) -> str:
-    """Record a decision you just made, with the alternatives you rejected and why,
-    so future sessions and other agents inherit it instead of relitigating it.
+    """Record a decision the moment you commit to a foundational choice — a schema,
+    a library, a pattern, a path abandoned — with the alternatives you rejected and
+    why, so future sessions and other agents inherit it instead of relitigating it.
 
     Relation args — pass the EXACT slug of an existing decision (look it up first
     with surface_decisions/query_decisions; each is validated to point at a real
@@ -1326,42 +1327,34 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
       derives_from: NOT valid when recording a decision — that edge originates from
                     an open question; use cites for a decision this one builds on.
 
-    Call this the moment you commit to a foundational choice — a schema, a library,
-    a pattern, or a path you've decided to abandon. `rejected_paths` is REQUIRED:
-    recording WHY you ruled options out is what stops you (or the next agent) from
-    re-proposing them.
-
     Args:
         axiom: The decision as a single clear sentence true going forward.
         rejected_paths: The alternatives considered and rejected, and why. REQUIRED.
-            One "(N) <option>: REJECTED — <reason>" per line scans best.
         scope: Area tags, e.g. ["database", "auth"].
+        slug: A short, descriptive handle (e.g. 'sqlite-wal-mode'), at most 100 characters.
+        project: Required on every call: a registered project name (e.g. 'mitos')
+            or a workspace's absolute path; `list_projects()` lists the names.
         mechanisms: Concrete technologies/entities involved, e.g. ["sqlite", "wal-mode"].
         context: Optional background on why this was decided.
-        slug: The short, descriptive handle for the decision (e.g. 'sqlite-wal-mode').
-            At most 100 characters — it is the permanent citation handle, so an
-            over-length one is rejected (not silently truncated).
-        acknowledge_neighbors: Record past the near-duplicate review after inspecting
-            the flagged neighbours and judging this decision genuinely independent.
-            Leave False (default) on the first attempt. Combines with the relation
-            args — declared edges are still written.
-        project: Which project this decision belongs to — REQUIRED on every
-            call: a registered project name (e.g. 'mitos') or the absolute path of
-            a workspace. Call `list_projects()` if you do not know the names.
-            Distinct from `scope`: `project` picks the corpus, `scope` filters
-            within it. This is the write — a mis-aimed call lands a real entry in
-            another project's corpus.
+        acknowledge_neighbors: Leave False on the first attempt; set True to record
+            past a near-duplicate pause for neighbours you judged independent.
+
+    `rejected_paths` is what stops the next agent re-proposing a ruled-out option;
+    one "(N) <option>: REJECTED — <reason>" per line scans best. A slug is the
+    handle other decisions cite, so an over-length one is refused, not silently
+    shortened. `project` picks the corpus, `scope` filters within it; this is the
+    write, so a mis-aimed call lands a real entry in another project's corpus.
 
     Returns:
         A JSON string: {slug, id, state, embedding, status} or {error, code}, every
         outcome carrying a trailing {project, collection, workspace} echo naming
         the corpus this write landed in — check it. Only a top-level {error, code}
         is a failure. status="created": newly recorded, with `edges_created` write
-        facts (each {kind, target}, read back from the committed graph — empty
-        means no edge landed) and the committed scope/mechanisms. status="exists":
-        a SUCCESS no-op, not an error — the identical decision (identity = slug +
-        axiom + mechanisms) is already recorded; changed commentary/relations are
-        NOT saved and are listed under `differs`; record a NEW decision (a distinct
+        facts (read back from the committed graph — empty means no edge landed)
+        and the committed scope/mechanisms. status="exists": a SUCCESS no-op, not
+        an error — the same axiom and mechanisms are already recorded, whatever the
+        slug; changed commentary/relations are NOT saved and are listed under
+        `differs`; record a NEW decision (a distinct
         axiom) for new reasoning. status="needs_review" (code
         "similar_decision_exists"): a PAUSE, not a failure — nothing was written;
         the response lists ≥0.80-similar unlinked `neighbors`, each with its axiom,
@@ -1374,10 +1367,8 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
         result MAY carry `neighbor_review_unavailable` (the near-dup review could
         not run; absent neighbours are not checked-clean) or a debounced
         `scope_overflow` health nudge (not about this decision). It MAY carry
-        `rotation`: OLDER settled entries this call moved to an archive
-        (outcome "rotated", `archives`; blocks kept in place in `skipped`,
-        outcome "skipped" if none moved), or outcome "failed" with `stage`,
-        `error` and `recovery` — the write still stands.
+        `rotation`: older settled entries this call moved to an archive, with its
+        own `outcome`; a failed rotation leaves the write standing.
     """
     config = _target_config(project, "record_decision")
     # Build our own writable manager — do NOT reuse get_workspace_components()
@@ -1642,6 +1633,9 @@ def amend_commentary(slug: str,
 
     Args:
         slug: The decision to repair — its slug or content-hash id.
+        project: Which project this call is about — REQUIRED on every call: a
+            registered project name (e.g. 'mitos') or the absolute path of a
+            workspace. Call `list_projects()` if you do not know the names.
         rejected_paths: Replacement rejected paths. A required field: it can be
             replaced, never cleared.
         invalidates_if: Replacement invalidates-if text.
@@ -1656,9 +1650,6 @@ def amend_commentary(slug: str,
         axiom: Declared, with mechanisms and the relation arguments (named as
             record_decision names them), only to be refused: the decision itself
             and its relations are not commentary, and the result names the route.
-        project: Which project this call is about — REQUIRED on every call: a
-            registered project name (e.g. 'mitos') or the absolute path of a
-            workspace. Call `list_projects()` if you do not know the names.
 
     Returns:
         A JSON string. `status` is amended (`fields_changed`, plus `rename` on a
