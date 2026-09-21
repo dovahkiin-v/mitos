@@ -87,16 +87,18 @@ class TestTermMatching:
         exc = EmbeddingError(
             '429 {"error": {"status": "RESOURCE_EXHAUSTED", "message": "..."}}'
         )
-        reason = degraded_reason_from_error(exc)
-        assert "429" in reason
+        reason = degraded_reason_from_error(exc, surface="cli", project="p")
+        assert reason == "embedding provider rate-limited (429)"  # the shipped phrase
         assert "RESOURCE_EXHAUSTED" not in reason
 
     def test_reason_pre_v1a(self):
         exc = DatabaseError("This graph predates the V1a schema (a prototype ...)")
-        assert "V1a" in degraded_reason_from_error(exc)
+        assert "V1a" in degraded_reason_from_error(exc, surface="cli", project="p")
 
     def test_reason_none_means_unwired(self):
-        assert "unavailable" in degraded_reason_from_error(None)
+        for surface in ("cli", "mcp"):
+            assert degraded_reason_from_error(
+                None, surface=surface, project="p") == "embeddings/Qdrant unavailable"
 
     def test_reason_collection_missing_beats_the_vector_store_arm(self):
         """G1: the subclass arm must precede the one it subclasses, or it is dead.
@@ -111,19 +113,20 @@ class TestTermMatching:
         exc = CollectionMissingError(
             "Qdrant collection 'mitos-x' does not exist", collection="mitos-x"
         )
-        reason = degraded_reason_from_error(exc)
+        reason = degraded_reason_from_error(exc, surface="cli", project="p")
 
         assert "mitos-x" in reason
         assert "mitos reconcile" in reason
         assert "Qdrant unavailable" not in reason
         # The broad arm still answers for a genuine outage.
         assert degraded_reason_from_error(
-            VectorStoreError("Qdrant connection refused")
+            VectorStoreError("Qdrant connection refused"), surface="cli", project="p"
         ) == "Qdrant unavailable"
 
     def test_reason_collection_missing_without_a_name_still_reads(self):
         """The name is an affordance, not a dependency — an unnamed instance degrades."""
-        reason = degraded_reason_from_error(CollectionMissingError("gone"))
+        reason = degraded_reason_from_error(
+            CollectionMissingError("gone"), surface="cli", project="p")
         assert "collection missing" in reason
         assert "mitos reconcile" in reason
         assert "''" not in reason  # no empty-quote artefact
@@ -490,8 +493,13 @@ class TestAbsentCollectionOnTheReadSurfaces:
         out = self._mcp(config, tool)
 
         assert out["degraded"] == "lexical"
+        # 7a inverted this row on purpose: it pinned `mitos reconcile` on MCP, a shell
+        # command handed to an agent (ROADMAP G14). The collection is still named and
+        # the heal still stated, in the MCP register: a fact and a person as the actor.
         assert _ABSENT in out["degraded_reason"]
-        assert "mitos reconcile" in out["degraded_reason"]
+        assert "mitos " not in out["degraded_reason"]
+        assert "reconcile" in out["degraded_reason"]
+        assert "a person with a shell" in out["degraded_reason"]
         assert "Qdrant unavailable" not in out["degraded_reason"]
         assert out["matches"][0]["slug"] == "cache-strategy"
 

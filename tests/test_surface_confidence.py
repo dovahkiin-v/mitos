@@ -39,10 +39,17 @@ from mitos.errors import CollectionMissingError
 from mitos.parser import ParsedEntry
 from mitos.store import GraphStore
 from mitos.sync import MitosSyncManager
+from mitos.provider_cause import AUTH, provider_cause_phrase
 from mitos.recall import (_SURFACE_POINTERS, assess_query_recall,
                           assess_surface_recall, SURFACE_STRONG_THRESHOLD,
                           SURFACE_WEAK_THRESHOLD, WindowLever, limit_clause,
                           window_lever)
+
+
+# The cause the degraded rows inject. It is the phrase the "no providers" route
+# really produces (``degraded_reason_from_error(None, …)``), so an end-to-end row
+# on that route and a pure-policy row compare against the same words.
+_DEGRADED = "embeddings/Qdrant unavailable"
 
 
 @pytest.fixture
@@ -109,14 +116,14 @@ def _counts(*names_and_counts):
 # --------------------------------------------------------------------------- #
 
 def test_policy_strong_when_top_score_clears_threshold():
-    conf, note = assess_surface_recall(lever=None, semantic_ran=True, top_score=0.9, result_count=2,
+    conf, note = assess_surface_recall(lever=None, semantic_ran=True, degraded_reason=None, top_score=0.9, result_count=2,
                                        scope="db", surface="cli")
     assert conf == "strong"
     assert "mitos list" in note and "list_decisions" not in note
 
 
 def test_policy_strong_mcp_uses_mcp_callform():
-    conf, note = assess_surface_recall(lever=None, semantic_ran=True, top_score=0.9, result_count=2,
+    conf, note = assess_surface_recall(lever=None, semantic_ran=True, degraded_reason=None, top_score=0.9, result_count=2,
                                        scope="db", surface="mcp")
     assert conf == "strong"
     assert "list_decisions(scope='db')" in note
@@ -124,27 +131,27 @@ def test_policy_strong_mcp_uses_mcp_callform():
 
 def test_policy_strong_at_exact_threshold():
     """The threshold is inclusive — a score exactly at the bar is strong."""
-    conf, _ = assess_surface_recall(lever=None, semantic_ran=True, top_score=SURFACE_STRONG_THRESHOLD,
+    conf, _ = assess_surface_recall(lever=None, semantic_ran=True, degraded_reason=None, top_score=SURFACE_STRONG_THRESHOLD,
                                     result_count=1, scope=None, surface="cli")
     assert conf == "strong"
 
 
 def test_policy_weak_below_threshold_names_the_score():
-    conf, note = assess_surface_recall(lever=None, semantic_ran=True, top_score=0.61, result_count=3,
+    conf, note = assess_surface_recall(lever=None, semantic_ran=True, degraded_reason=None, top_score=0.61, result_count=3,
                                        scope=None, surface="cli")
     assert conf == "weak"
     assert "0.61" in note
 
 
 def test_policy_off_axis_below_weak_threshold():
-    conf, note = assess_surface_recall(lever=None, semantic_ran=True, top_score=0.55, result_count=3,
+    conf, note = assess_surface_recall(lever=None, semantic_ran=True, degraded_reason=None, top_score=0.55, result_count=3,
                                        scope=None, surface="cli")
     assert conf == "none"
     assert "0.55" in note and "off-axis" in note.lower()
 
 
 def test_policy_none_no_match_points_to_list():
-    conf, note = assess_surface_recall(lever=None, semantic_ran=True, top_score=None, result_count=0,
+    conf, note = assess_surface_recall(lever=None, semantic_ran=True, degraded_reason=None, top_score=None, result_count=0,
                                        scope=None, surface="cli")
     assert conf == "none" and "No semantic match" in note
     assert "mitos list" in note and "list_decisions" not in note
@@ -152,7 +159,7 @@ def test_policy_none_no_match_points_to_list():
 
 def test_policy_none_scope_unused_bounded_vector():
     """Migrated from the old `Valid scopes are: db` enumeration → bounded vector."""
-    conf, note = assess_surface_recall(lever=None, semantic_ran=True, top_score=None, result_count=0,
+    conf, note = assess_surface_recall(lever=None, semantic_ran=True, degraded_reason=None, top_score=None, result_count=0,
                                        scope="ghost", scope_counts=_counts(("db", 1)),
                                        surface="cli")
     assert conf == "none"
@@ -161,7 +168,7 @@ def test_policy_none_scope_unused_bounded_vector():
 
 
 def test_policy_weak_scope_unused_but_has_matches():
-    conf, note = assess_surface_recall(lever=None, semantic_ran=True, top_score=0.65, result_count=1,
+    conf, note = assess_surface_recall(lever=None, semantic_ran=True, degraded_reason=None, top_score=0.65, result_count=1,
                                        scope="ghost", scope_counts=_counts(("auth", 1)),
                                        surface="cli")
     assert conf == "weak"
@@ -171,7 +178,7 @@ def test_policy_weak_scope_unused_but_has_matches():
 
 
 def test_policy_degraded_with_results_is_not_a_ranking():
-    conf, note = assess_surface_recall(lever=None, semantic_ran=False, top_score=None, result_count=4,
+    conf, note = assess_surface_recall(lever=None, semantic_ran=False, degraded_reason=_DEGRADED, top_score=None, result_count=4,
                                        scope="db", surface="cli")
     assert conf is None
     assert "unavailable" in note and "NOT a relevance ranking" in note
@@ -179,7 +186,7 @@ def test_policy_degraded_with_results_is_not_a_ranking():
 
 
 def test_policy_degraded_empty_scope_unused():
-    conf, note = assess_surface_recall(lever=None, semantic_ran=False, top_score=None, result_count=0,
+    conf, note = assess_surface_recall(lever=None, semantic_ran=False, degraded_reason=_DEGRADED, top_score=None, result_count=0,
                                        scope="ghost", scope_counts={}, surface="cli")
     assert conf is None and "unavailable" in note and "unused scope tag" in note
 
@@ -189,7 +196,7 @@ def test_policy_degraded_empty_scope_unused():
 # --------------------------------------------------------------------------- #
 
 def test_unused_vector_did_you_mean():
-    _, note = assess_surface_recall(lever=None, semantic_ran=True, top_score=None, result_count=0,
+    _, note = assess_surface_recall(lever=None, semantic_ran=True, degraded_reason=None, top_score=None, result_count=0,
                                     scope="ath", scope_counts=_counts(("auth", 3)),
                                     surface="cli")
     assert "Did you mean 'auth'?" in note
@@ -199,7 +206,7 @@ def test_unused_vector_top_k_and_overflow_bounded():
     """At most K busiest-first tags + a discovery pointer; the (K+1)th tag is absent."""
     counts = _counts(("substrate", 9), ("store", 8), ("schema", 7), ("vector", 6),
                      ("parser", 5), ("config", 4), ("render", 3))  # 7 live > K=5
-    _, note = assess_surface_recall(lever=None, semantic_ran=True, top_score=None, result_count=0,
+    _, note = assess_surface_recall(lever=None, semantic_ran=True, degraded_reason=None, top_score=None, result_count=0,
                                     scope="ghost", scope_counts=counts, surface="cli")
     assert "Live scopes (busiest first): substrate, store, schema, vector, parser." in note
     assert "config" not in note and "render" not in note   # the 6th/7th are not listed
@@ -208,13 +215,13 @@ def test_unused_vector_top_k_and_overflow_bounded():
 
 def test_unused_vector_overflow_pointer_mcp_form():
     counts = _counts(("a1", 9), ("b2", 8), ("c3", 7), ("d4", 6), ("e5", 5), ("f6", 4))
-    _, note = assess_surface_recall(lever=None, semantic_ran=True, top_score=None, result_count=0,
+    _, note = assess_surface_recall(lever=None, semantic_ran=True, degraded_reason=None, top_score=None, result_count=0,
                                     scope="ghost", scope_counts=counts, surface="mcp")
     assert "list_scopes" in note and "mitos scopes" not in note
 
 
 def test_unused_vector_sync_hedge_present():
-    _, note = assess_surface_recall(lever=None, semantic_ran=True, top_score=None, result_count=0,
+    _, note = assess_surface_recall(lever=None, semantic_ran=True, degraded_reason=None, top_score=None, result_count=0,
                                     scope="ghost", scope_counts=_counts(("auth", 1)),
                                     surface="cli")
     assert "mitos sync" in note
@@ -223,7 +230,7 @@ def test_unused_vector_sync_hedge_present():
 def test_unused_vector_empty_project_is_calm():
     """A fresh/empty project: just the unused-tag statement + sync hedge — no list, no
     did-you-mean."""
-    _, note = assess_surface_recall(lever=None, semantic_ran=True, top_score=None, result_count=0,
+    _, note = assess_surface_recall(lever=None, semantic_ran=True, degraded_reason=None, top_score=None, result_count=0,
                                     scope="ghost", scope_counts={}, surface="cli")
     assert "unused scope tag" in note and "mitos sync" in note
     assert "Did you mean" not in note and "Live scopes" not in note
@@ -233,7 +240,7 @@ def test_unused_signal_keys_on_live_map_not_active_count():
     """A scope present in the live map (e.g. live only via a parked OQ → count 0/1) is
     NOT flagged unused — membership, not active-decision count, is the oracle."""
     counts = {"auth": {"active_decisions": 0, "parked_open_questions": 1}}
-    _, note = assess_surface_recall(lever=None, semantic_ran=True, top_score=None, result_count=0,
+    _, note = assess_surface_recall(lever=None, semantic_ran=True, degraded_reason=None, top_score=None, result_count=0,
                                     scope="auth", scope_counts=counts, surface="cli")
     assert "unused scope tag" not in note
 
@@ -241,7 +248,7 @@ def test_unused_signal_keys_on_live_map_not_active_count():
 def test_none_scope_counts_never_fabricates_unused():
     """`scope_counts=None` (callsite couldn't compute) → calm degradation, never a typo
     hint."""
-    _, note = assess_surface_recall(lever=None, semantic_ran=True, top_score=None, result_count=0,
+    _, note = assess_surface_recall(lever=None, semantic_ran=True, degraded_reason=None, top_score=None, result_count=0,
                                     scope="ghost", scope_counts=None, surface="cli")
     assert "unused scope tag" not in note
 
@@ -259,7 +266,9 @@ def test_surface_leak_gate_cli_never_emits_mcp_callforms():
         dict(semantic_ran=True, top_score=None, result_count=0, scope=None),       # no match, no scope
     ]
     for c in cases:
-        _, note = assess_surface_recall(lever=None, scope_counts=counts, surface="cli", **c)
+        _, note = assess_surface_recall(
+            lever=None, scope_counts=counts, surface="cli",
+            degraded_reason=None if c["semantic_ran"] else _DEGRADED, **c)
         assert "list_decisions(" not in note, c
         assert "list_scopes(" not in note, c
 
@@ -267,9 +276,9 @@ def test_surface_leak_gate_cli_never_emits_mcp_callforms():
 def test_cli_mcp_signal_parity_for_unused_scope():
     """Same unused-scope *signal* on both surfaces; only the pointer wording differs."""
     counts = _counts(("auth", 3))
-    _, cli_note = assess_surface_recall(lever=None, semantic_ran=True, top_score=None, result_count=0,
+    _, cli_note = assess_surface_recall(lever=None, semantic_ran=True, degraded_reason=None, top_score=None, result_count=0,
                                         scope="ghost", scope_counts=counts, surface="cli")
-    _, mcp_note = assess_surface_recall(lever=None, semantic_ran=True, top_score=None, result_count=0,
+    _, mcp_note = assess_surface_recall(lever=None, semantic_ran=True, degraded_reason=None, top_score=None, result_count=0,
                                         scope="ghost", scope_counts=counts, surface="mcp")
     assert "unused scope tag" in cli_note and "unused scope tag" in mcp_note
     assert "list_decisions(" not in cli_note
@@ -279,7 +288,7 @@ def test_cli_mcp_signal_parity_for_unused_scope():
 def test_surface_is_required_keyword():
     # `lever=None` passed so this row keeps testing `surface`, not the newer keyword.
     with pytest.raises(TypeError):
-        assess_surface_recall(lever=None, semantic_ran=True, top_score=0.9, result_count=1, scope=None)
+        assess_surface_recall(lever=None, semantic_ran=True, degraded_reason=None, top_score=0.9, result_count=1, scope=None)
 
 
 # --------------------------------------------------------------------------- #
@@ -629,7 +638,7 @@ def test_the_mcp_query_note_is_no_longer_than_the_one_it_displaces(label, kw, le
     (P15) — it earns its bytes by replacing prose, not by adding to it.
     """
     q = _query_note("mcp", lever=lever, **kw)
-    s = assess_surface_recall(lever=lever, semantic_ran=True, scope=None, surface="mcp", **kw)[1]
+    s = assess_surface_recall(lever=lever, semantic_ran=True, degraded_reason=None, scope=None, surface="mcp", **kw)[1]
     assert len(q) <= len(s), f"{label}: query note {len(q)} > surface note {len(s)}"
 
 
@@ -649,7 +658,7 @@ def test_the_cli_query_prose_is_no_longer_than_the_one_it_displaces(label, kw, l
     """
     config = _StubConfig()
     q = _query_note("cli", config=config, lever=lever, **kw)
-    s = assess_surface_recall(lever=lever, semantic_ran=True, scope=None, surface="cli", **kw)[1]
+    s = assess_surface_recall(lever=lever, semantic_ran=True, degraded_reason=None, scope=None, surface="cli", **kw)[1]
     q_prose = len(q) - (len(_query_pointer("cli", config)) if "mitos surface" in q else 0)
     s_prose = len(s) - (len(_SURFACE_POINTERS["cli"]["complete"])
                         if _SURFACE_POINTERS["cli"]["complete"] in s else 0)
@@ -700,7 +709,7 @@ def test_the_query_note_differs_from_the_surface_note_at_every_input(surface, la
     about the branch where the shipped wording is most obviously dangerous.
     """
     q = _query_note(surface, **kw)
-    s = assess_surface_recall(lever=None, semantic_ran=True, scope=None, surface=surface, **kw)[1]
+    s = assess_surface_recall(lever=None, semantic_ran=True, degraded_reason=None, scope=None, surface=surface, **kw)[1]
     assert q != s, f"{label}/{surface}: the query register inherited surface's sentence"
 
 
@@ -714,7 +723,7 @@ def test_the_divergence_holds_on_a_note_a_driven_call_site_emitted(ws):
     config, m = ws
     _rec(m, "cache-strategy", scope=["db"])
     resp = _cli_query_json([{"slug": "cache-strategy", "score": 0.91}], ws)
-    surface_note = assess_surface_recall(lever=None, semantic_ran=True, top_score=0.91,
+    surface_note = assess_surface_recall(lever=None, semantic_ran=True, degraded_reason=None, top_score=0.91,
                                          result_count=1, scope=None, surface="cli")[1]
     assert resp["confidence"] == "strong"
     assert resp["note"] != surface_note
@@ -1303,7 +1312,7 @@ _4A_DRIVERS = {
 def _4a_band(verb, surface, config, top_score, n):
     """The band the surfaced decisions alone earn, from the policy itself."""
     if verb == "surface":
-        return assess_surface_recall(lever=None, semantic_ran=True, top_score=top_score,
+        return assess_surface_recall(lever=None, semantic_ran=True, degraded_reason=None, top_score=top_score,
                                      result_count=n, scope=None, surface=surface)
     return assess_query_recall(lever=None, top_score=top_score, result_count=n, config=config,
                                surface=surface)
@@ -2259,7 +2268,7 @@ def test_the_lever_is_a_required_keyword_on_both_composers():
     """ADR register-selecting-keyword-is-required-on-every-axis-never-defaulted: a
     forgotten call site is a TypeError, not a silently missing clause."""
     with pytest.raises(TypeError, match="lever"):
-        assess_surface_recall(semantic_ran=True, top_score=0.7, result_count=1,
+        assess_surface_recall(semantic_ran=True, degraded_reason=None, top_score=0.7, result_count=1,
                               scope=None, surface="mcp")
     with pytest.raises(TypeError, match="lever"):
         assess_query_recall(top_score=0.7, result_count=1, config=_StubConfig(),
@@ -2362,11 +2371,11 @@ def test_the_clause_rides_exactly_the_weak_and_populated_none_forks(surface, for
             return assess_query_recall(lever=lv, top_score=top, result_count=n,
                                        config=_StubConfig(), surface=surface)[1]
         if verb == "surface-degraded":
-            return assess_surface_recall(lever=lv, semantic_ran=False, top_score=None,
+            return assess_surface_recall(lever=lv, semantic_ran=False, degraded_reason=_DEGRADED, top_score=None,
                                          result_count=n, scope="x", scope_total=extra,
                                          scope_counts=_counts(("x", 8)), surface=surface)[1]
         scope, counts = ("ghost", _counts(("x", 3))) if extra else (None, None)
-        return assess_surface_recall(lever=lv, semantic_ran=True, top_score=top,
+        return assess_surface_recall(lever=lv, semantic_ran=True, degraded_reason=None, top_score=top,
                                      result_count=n, scope=scope, scope_counts=counts,
                                      surface=surface)[1]
 
@@ -2560,32 +2569,39 @@ def _seed_dump(ws):
     _rec(m, "only-one", scope=["solo"])
 
 
-def _dump_note(surface, shown, total, scope="y"):
-    return assess_surface_recall(lever=None, semantic_ran=False, top_score=None,
-                                 result_count=shown, scope=scope, scope_total=total,
-                                 surface=surface)[1]
+def _dump_note(surface, shown, total, scope="y", reason=_DEGRADED):
+    return assess_surface_recall(lever=None, semantic_ran=False, degraded_reason=reason,
+                                 top_score=None, result_count=shown, scope=scope,
+                                 scope_total=total, surface=surface)[1]
 
 
 def test_the_dump_sentence_names_how_much_of_the_scope_it_shows():
-    """Row 14's words, pinned once here: part, all, and the singular — with the head
-    7a replaces kept verbatim and today's complete_hint tail."""
-    head = "Semantic recall unavailable (embeddings/Qdrant down) — showing "
+    """Row 14's words, pinned once here: part, all, and the singular — with today's
+    complete_hint tail. The head is 7a's: it names the injected cause, and the
+    hard-coded "(embeddings/Qdrant down)" it replaced is gone (a cause the note never
+    saw, which 4a caught blaming Qdrant for a KeyError)."""
+    reason = provider_cause_phrase(AUTH)
+    head = f"Semantic recall unavailable ({reason}) — showing "
     tail = (" as a fallback, NOT a relevance ranking. For the authoritative set use "
             "list_decisions(scope='y') (pure graph read).")
-    assert _dump_note("mcp", 7, 8) == f"{head}7 of the 8 active decisions in scope 'y'{tail}"
-    assert _dump_note("mcp", 8, 8) == f"{head}all 8 active decisions in scope 'y'{tail}"
-    assert _dump_note("mcp", 1, 1) == f"{head}the one active decision in scope 'y'{tail}"
+    assert (_dump_note("mcp", 7, 8, reason=reason)
+            == f"{head}7 of the 8 active decisions in scope 'y'{tail}")
+    assert (_dump_note("mcp", 8, 8, reason=reason)
+            == f"{head}all 8 active decisions in scope 'y'{tail}")
+    assert (_dump_note("mcp", 1, 1, reason=reason)
+            == f"{head}the one active decision in scope 'y'{tail}")
+    assert "embeddings/Qdrant down" not in _dump_note("mcp", 7, 8)
 
 
 def test_the_partial_list_sentence_is_byte_identical_to_4b():
     """Row 14's other half / K5: without a scope_total (the G9a partial ranked list)
-    the shared sentence is untouched — frozen here from `4b23e68`, and a lever on
-    that degraded arm is ignored."""
-    frozen = ("Semantic recall unavailable (embeddings/Qdrant down) — showing the "
+    the shared sentence is frozen from `4b23e68` except its head, which 7a changed on
+    purpose to name the injected cause; a lever on that degraded arm is ignored."""
+    frozen = (f"Semantic recall unavailable ({_DEGRADED}) — showing the "
               "active decisions in scope 'x' as a fallback, NOT a relevance ranking. "
               "For the authoritative set use list_decisions(scope='x') (pure graph read).")
     for lever in (None, WindowLever(5, 5)):
-        assert assess_surface_recall(lever=lever, semantic_ran=False, top_score=None,
+        assert assess_surface_recall(lever=lever, semantic_ran=False, degraded_reason=_DEGRADED, top_score=None,
                                      result_count=2, scope="x", scope_total=None,
                                      surface="mcp")[1] == frozen
 
@@ -2603,7 +2619,8 @@ def test_the_dump_follows_limit_and_counts_on_both_surfaces(ws, limit, shown, ro
         assert "degraded" not in resp and "confidence" not in resp
         assert len(resp["active_decisions"]) == shown
         assert set(h["slug"] for h in resp["active_decisions"]) <= set(_DUMP_SLUGS)
-        assert resp["note"] == _dump_note(surface, shown, 8)
+        reason = _DEGRADED if route == "no providers" else "Qdrant unreachable"
+        assert resp["note"] == _dump_note(surface, shown, 8, reason=reason)
         got[surface] = resp
     assert ([h["slug"] for h in got["mcp"]["active_decisions"]]
             == [h["slug"] for h in got["cli"]["active_decisions"]])

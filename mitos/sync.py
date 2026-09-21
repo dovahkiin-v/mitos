@@ -87,6 +87,7 @@ from mitos.identity import (
     mechanism_canonical_norm,
 )
 from mitos.embeddings import GeminiEmbeddingProvider
+from mitos.provider_cause import describe_embed_failure
 from mitos.vector_store import QdrantVectorStore, hash_to_uuid
 from mitos.renderer import MitosRenderer, summarize_overflows
 from mitos.restore import BufferFidelityError, verify_amended_buffer
@@ -1949,7 +1950,7 @@ class MitosSyncManager:
         try:
             self.drain_pending_embeddings()
         except Exception as e:
-            print(f"[Warning] Outbox queue drain failed: {str(e)}")
+            print(f"[Warning] Outbox queue drain failed: {describe_embed_failure(e)}")
 
         # 7. Surplus hit/miss stats observability (4.D)
         if verbose and self.embed_provider:
@@ -2640,7 +2641,7 @@ class MitosSyncManager:
         except Exception as e:
             # The commit already enqueued this node (C2); leave the row for the next
             # drain. stderr — shared with the MCP write tool's JSON-RPC stdout channel.
-            print(f"[Warning] Embedding upsert deferred for '{entry.slug}': {str(e)}", file=sys.stderr)
+            print(f"[Warning] Embedding upsert deferred for '{entry.slug}': {describe_embed_failure(e)}", file=sys.stderr)
             return None
 
     def drain_pending_embeddings(self) -> None:
@@ -2784,7 +2785,7 @@ class MitosSyncManager:
                             self.store.increment_pending_attempts(node_id)
                         except Exception:
                             pass
-                        print(f"[Warning] Failed to drain embedding for '{node['slug']}': {str(e)}")
+                        print(f"[Warning] Failed to drain embedding for '{node['slug']}': {describe_embed_failure(e)}")
 
                 # The refusal escapes the claim-batch loop too — the inner `break` only
                 # left the per-item one, and re-claiming would meet the same absent
@@ -3952,7 +3953,7 @@ class MitosSyncManager:
         try:
             self._best_effort_embed(delta, entry)
         except Exception as e:
-            print(f"[Warning] Embedding step failed for '{entry.slug}': {e}", file=sys.stderr)
+            print(f"[Warning] Embedding step failed for '{entry.slug}': {describe_embed_failure(e)}", file=sys.stderr)
         try:
             # Unfiltered, so a vacated scope's file is swept and a moved primary follows.
             MitosRenderer(self.config.workspace_dir).render_all(self.store)
@@ -4503,7 +4504,7 @@ class MitosSyncManager:
             self._best_effort_embed(delta, entry)
         except Exception as e:
             # stderr: the MCP write tool shares this path and uses stdout for JSON-RPC.
-            print(f"[Warning] Embedding step failed for '{entry.slug}': {str(e)}", file=sys.stderr)
+            print(f"[Warning] Embedding step failed for '{entry.slug}': {describe_embed_failure(e)}", file=sys.stderr)
 
         # 9. Re-render live_axioms.md (a render failure must not fail the commit).
         #    The renderer records size-ceiling overflows on `.overflows` instead of

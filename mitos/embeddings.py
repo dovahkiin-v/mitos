@@ -186,7 +186,7 @@ class GeminiEmbeddingProvider:
             return vector
             
         except Exception as e:
-            raise EmbeddingError(f"Gemini embedding API call failed: {str(e)}")
+            raise EmbeddingError(f"Gemini embedding API call failed: {str(e)}") from e
 
     def get_embeddings_batch(self, texts: List[str]) -> List[List[float]]:
         """Gets embeddings for a batch of documents, utilizing token-aware bounds.
@@ -262,7 +262,7 @@ class GeminiEmbeddingProvider:
                         
                     processed_count += len(batch)
                 except Exception as e:
-                    raise EmbeddingError(f"Batch embedding API call failed: {str(e)}")
+                    raise EmbeddingError(f"Batch embedding API call failed: {str(e)}") from e
 
         # Filter out any None values (should be none)
         return [r for r in results if r is not None]

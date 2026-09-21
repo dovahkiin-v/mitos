@@ -879,7 +879,8 @@ def cmd_reconcile(config: MitosConfig, as_json: bool = False) -> int:
         as_json: Whether to emit the result as a JSON object.
 
     Returns:
-        Process exit code (0 on success, 1 if Qdrant/embedding provider is down).
+        Process exit code (0 on success, 1 if Qdrant is down). An absent
+        or failing embedding provider is reported as a warning and still exits 0.
     """
     manager = MitosSyncManager(config)
     # Ahead of the call, not ahead of the report: `reconcile_embeddings` writes its
@@ -890,7 +891,7 @@ def cmd_reconcile(config: MitosConfig, as_json: bool = False) -> int:
     try:
         result = manager.reconcile_embeddings()
     except VectorStoreError as e:
-        msg = f"Reconcile unavailable — Qdrant or embedding provider down: {str(e)}"
+        msg = f"Reconcile unavailable — Qdrant down: {str(e)}"
         if as_json:
             print(json.dumps({"error": msg, **corpus_provenance(config)}))
         else:
@@ -1147,14 +1148,16 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         manager = MitosSyncManager(config)
     except Exception as e:
         _emit_lexical_degraded(
-            config, query_text, reason=degraded_reason_from_error(e),
+            config, query_text, reason=degraded_reason_from_error(
+                e, surface="cli", project=config.project),
             store=None, as_json=as_json, full_top=full_top, limit=limit,
         )
         return
 
     if not manager.embed_provider or not manager.vector_store:
         _emit_lexical_degraded(
-            config, query_text, reason=degraded_reason_from_error(None),
+            config, query_text, reason=degraded_reason_from_error(
+                None, surface="cli", project=config.project),
             store=manager.store, as_json=as_json, full_top=full_top, limit=limit,
         )
         return
@@ -1225,7 +1228,8 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         # graph + absent collection) nobody reaches by hand.
         if missing_index_is_a_gap(store):
             _emit_lexical_degraded(
-                config, query_text, reason=degraded_reason_from_error(e),
+                config, query_text, reason=degraded_reason_from_error(
+                    e, surface="cli", project=config.project),
                 store=store, as_json=as_json, full_top=full_top, limit=limit,
             )
             return
@@ -1235,7 +1239,8 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         # Embedding/Qdrant failure mid-query (e.g. a 429): never the raw
         # provider blob — one calm cause line + the deterministic fallback.
         _emit_lexical_degraded(
-            config, query_text, reason=degraded_reason_from_error(e),
+            config, query_text, reason=degraded_reason_from_error(
+                e, surface="cli", project=config.project),
             store=store, as_json=as_json, full_top=full_top, limit=limit,
         )
         return
@@ -2507,7 +2512,8 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         # on a path whose graph just failed. Composed in the handler, not the
         # `try` body, so a raise at this call propagates.
         _emit_lexical_degraded(
-            config, query, reason=degraded_reason_from_error(e),
+            config, query, reason=degraded_reason_from_error(
+                e, surface="cli", project=config.project),
             store=None, as_json=as_json, full_top=full_top, limit=limit,
             check_notice=compose_check_notice(
                 config, read_attempt=read_last_attempt, get_node=lambda _id: None
@@ -2600,6 +2606,12 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         except Exception:
             pass
 
+    # The degraded cause, computed once and handed to both the lexical exit's header
+    # and the scope-dump / partial-list note, so the two cannot name different causes.
+    reason = (degraded_reason_from_error(degraded_error, surface="cli",
+                                         project=config.project)
+              if not semantic_ran else None)
+
     # Open questions only when a scope was given (absent = not scanned, [] = none here).
     if scope:
         open_questions = []
@@ -2621,7 +2633,7 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     # survived) rides along on the degraded output.
     if not semantic_ran and not results["active_decisions"]:
         _emit_lexical_degraded(
-            config, query, reason=degraded_reason_from_error(degraded_error),
+            config, query, reason=reason,
             store=store, as_json=as_json, full_top=full_top, limit=limit,
             open_questions=results.get("open_questions"),
             check_notice=notice,
@@ -2647,6 +2659,7 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         surface="cli",
         lever=lever,
         scope_total=dump_total,
+        degraded_reason=reason,
     )
     if confidence is not None:
         results["confidence"] = confidence
@@ -3655,6 +3668,9 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
                 f" — rotation archives settled entries once "
                 f"{config.rotation_volume_threshold_entries} or more are buffered"
             )
+    # Presence only: status makes no provider call, so it cannot know the key works
+    # (a revoked or mistyped key is present). The row's label says what was checked,
+    # and `--json`'s `gemini_api_key` bool has always meant exactly this.
     key_source = _gemini_key_source(workspace_dir)
     key_ok = key_source is not None
     q = _check_qdrant(config.qdrant_url, config.qdrant_collection)
@@ -3838,7 +3854,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
                 "decisions_buffer_entries": buffer_entries,
                 "decisions_buffer_chars": buffer_chars,
                 "format_spec": spec_ok,
-                "gemini_api_key": key_ok,
+                "gemini_api_key": key_ok,  # present, not verified against the provider
                 "qdrant_reachable": q["reachable"],
                 "collection_exists": q["collection_exists"],
                 "collection_points": q["points"],
@@ -3899,7 +3915,8 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
         # below carries the detail); still neutral, never a readiness ✗.
         coll_mark, coll_hint = (
             None,
-            f"missing — {len(active_ids)} active node(s) have no vectors; run `mitos reconcile`",
+            f"missing — {len(active_ids)} active node(s) have no vectors; "
+            f"run `mitos reconcile -p {config.project!r}`",
         )
     elif graph_unbuilt:
         # The calm fresh-project sentence below is FALSE over a corpus of hundreds,
@@ -3932,7 +3949,9 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
         ("format-spec.md", True if spec_ok else None,
          "an optional reference for humans and agents — the parser reads the copy "
          "bundled with mitos, and `mitos init` writes one here"),
-        ("GEMINI_API_KEY" + (f" (from {key_source})" if key_source else ""), key_ok,
+        ("GEMINI_API_KEY"
+         + (f" (from {key_source}) — present, not checked against the provider"
+            if key_source else ""), key_ok,
          "set it once for all projects: `mitos set-key --global <KEY>`"),
         (f"Qdrant reachable ({config.qdrant_url})", q["reachable"],
          "start it: `docker compose up -d` in the mitos repo"),
@@ -4033,22 +4052,25 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
     if scroll_failed:
         print(
             "\n  ⚠ could not verify vector completeness — Qdrant scroll failed; "
-            "run `mitos status` again when Qdrant is reachable."
+            f"run `mitos status -p {config.project!r}` again when Qdrant is reachable."
         )
     elif missing_active_slugs:
         n = len(missing_active_slugs)
         print(
             f"\n  ⚠ vector index incomplete — {n} active node(s) have no vector "
-            f"and are invisible to semantic surface/query. Run `mitos reconcile` "
-            f"to re-embed them (or `mitos sync` if the outbox is non-empty) — "
-            f"informational, not a readiness blocker."
+            f"and are invisible to semantic surface/query. Run "
+            f"`mitos reconcile -p {config.project!r}` to re-embed them (or "
+            f"`mitos sync -p {config.project!r}` if the outbox is non-empty) — either "
+            f"needs the embedding provider to answer, which this report does not "
+            f"check. Informational, not a readiness blocker."
         )
         if embedding_seed:
             # Which of the two heals applies is knowable here, so say it rather than
             # leaving the operator to infer it from "if the outbox is non-empty".
             print(
                 f"      the embedding queue was seeded by `{embedding_seed['established_by']}` "
-                f"at {embedding_seed['established_at']} — `mitos sync` restores search"
+                f"at {embedding_seed['established_at']} — `mitos sync -p {config.project!r}` "
+                f"restores search once the embedding provider answers"
             )
         if n <= 5:
             for slug in missing_active_slugs:

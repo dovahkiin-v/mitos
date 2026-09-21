@@ -1002,8 +1002,9 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         # a path whose graph just failed to open. Composed in the handler, not
         # the `try` body, so a raise at this call propagates.
         return _lexical_degraded_response(
-            query, config=config, reason=degraded_reason_from_error(e), store=None,
-            full_top=full_top, limit=top_k,
+            query, config=config,
+            reason=degraded_reason_from_error(e, surface="mcp", project=config.project),
+            store=None, full_top=full_top, limit=top_k,
             check_notice=compose_check_notice(
                 config, read_attempt=read_last_attempt, get_node=lambda _id: None
             ),
@@ -1075,7 +1076,7 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
             # `semantic_ran` True so this renders "ran and found nothing" (which is
             # also what suppresses the degraded-only unranked scope dump below).
             # Over a populated graph it is a real hole in recall and degrades, with
-            # the header naming the collection and `mitos reconcile`.
+            # the header naming the collection and its heal.
             if missing_index_is_a_gap(store):
                 semantic_ran = False
                 degraded_error = e
@@ -1102,6 +1103,12 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         except Exception:
             pass
 
+    # The degraded cause, computed once and handed to both the lexical exit's header
+    # and the scope-dump / partial-list note, so the two cannot name different causes.
+    reason = (degraded_reason_from_error(degraded_error, surface="mcp",
+                                         project=config.project)
+              if not semantic_ran else None)
+
     # 3. Append Open Questions ONLY when a scope was given (C4 resolves clause).
     #    Omitting the key when no scope disambiguates "not scanned" from "none here".
     if scope:
@@ -1121,7 +1128,7 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
     # along on the degraded envelope.
     if not semantic_ran and not results["active_decisions"]:
         return _lexical_degraded_response(
-            query, config=config, reason=degraded_reason_from_error(degraded_error),
+            query, config=config, reason=reason,
             store=store, full_top=full_top, limit=top_k,
             open_questions=results.get("open_questions"),
             check_notice=notice,
@@ -1148,6 +1155,7 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         surface="mcp",
         lever=lever,
         scope_total=dump_total,
+        degraded_reason=reason,
     )
     if confidence is not None:
         results["confidence"] = confidence
@@ -1504,7 +1512,8 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
         store, embed_provider, vector_store = get_workspace_components(config)
     except Exception as e:
         return _lexical_degraded_response(
-            query, config=config, reason=degraded_reason_from_error(e), store=None,
+            query, config=config, reason=degraded_reason_from_error(
+                e, surface="mcp", project=config.project), store=None,
             full_top=full_top, limit=clamp_limit(limit),
         )
 
@@ -1647,7 +1656,8 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             # empty path to fall through to at all.
             if missing_index_is_a_gap(store):
                 return _lexical_degraded_response(
-                    query, config=config, reason=degraded_reason_from_error(e),
+                    query, config=config, reason=degraded_reason_from_error(
+                        e, surface="mcp", project=config.project),
                     store=store, full_top=full_top, limit=clamp_limit(limit),
                 )
             empty: Dict[str, Any] = {
@@ -1679,13 +1689,15 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             # Embedding/Qdrant failure mid-query (e.g. a 429): never the raw
             # provider blob — the deterministic lexical fallback instead.
             return _lexical_degraded_response(
-                query, config=config, reason=degraded_reason_from_error(e),
+                query, config=config, reason=degraded_reason_from_error(
+                    e, surface="mcp", project=config.project),
                 store=store, full_top=full_top, limit=clamp_limit(limit),
             )
 
     # No embedding provider / vector store wired at all — degrade lexically.
     return _lexical_degraded_response(
-        query, config=config, reason=degraded_reason_from_error(None), store=store,
+        query, config=config, reason=degraded_reason_from_error(
+            None, surface="mcp", project=config.project), store=store,
         full_top=full_top, limit=clamp_limit(limit),
     )
 

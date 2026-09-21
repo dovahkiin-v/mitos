@@ -62,9 +62,11 @@ SURFACE_DIDYOUMEAN_CUTOFF: float = 0.6
 # Per-surface pointer wording. The policy never names a literal call-form; it references
 # a key here and the surface supplies its own verb (CLI shell command) or tool call-form
 # (MCP). ``complete_scope`` carries a ``{scope}`` placeholder and ``precedent_scan``'s CLI
-# form a ``{project}`` one. ``sync`` is the CLI ``mitos sync`` on *both* surfaces — there
-# is no MCP sync tool, so the literal shell command is the only truthful pointer (a shell
-# command is not the MCP-tool leak the T7 gate forbids).
+# form a ``{project}`` one. ``sync`` is the unused-scope hedge's pointer. The CLI names
+# the command. There is no MCP sync tool, and an agent handed a shell command runs it,
+# so the MCP form names none: it says what would help and that a person with a shell
+# performs it (``MISSING_GRAPH_POINTERS["mcp"]``' register). The CLI form stays bare —
+# ``_unused_scope_prefix`` has no project in hand to selector it.
 #
 # ``precedent_scan`` is the ``query`` register's redirect: the verb that answers the
 # precedent question a targeted lookup did not. It must exist under BOTH outer keys — a
@@ -109,7 +111,7 @@ _SURFACE_POINTERS: Dict[str, Dict[str, str]] = {
         "limit_arg": "limit={n}",
         "precedent_scan": "surface_decisions()",
         "state_all": "list_decisions(scope='{scope}', state='all')",
-        "sync": "mitos sync",
+        "sync": "a sync, which a person with a shell in that project runs,",
     },
 }
 
@@ -407,6 +409,7 @@ def assess_surface_recall(
     surface: str,
     lever: Optional[WindowLever],
     scope_total: Optional[int] = None,
+    degraded_reason: Optional[str],
 ) -> Tuple[Optional[str], str]:
     """Classifies a surface result and builds the agent-facing note.
 
@@ -431,6 +434,15 @@ def assess_surface_recall(
             degraded scope dump. Its presence is what selects the dump's own
             sentence, which names how many of them it shows; None keeps the shared
             degraded sentence, which a partial ranked list also reaches.
+        degraded_reason: The cause phrase the caller computed once with
+            ``lexical.degraded_reason_from_error`` and also put on its degraded
+            header, so the header and this note cannot disagree. Required keyword,
+            never defaulted; read only when ``semantic_ran`` is False, so a ranked
+            call passes None. Injected as a string: this module never classifies.
+
+    Raises:
+        ValueError: ``semantic_ran`` is False and ``degraded_reason`` is None — a
+            call-site defect, loud on purpose rather than a note with no cause.
 
     Returns:
         A ``(confidence, note)`` pair. ``confidence`` is ``"strong"`` / ``"weak"`` /
@@ -459,6 +471,11 @@ def assess_surface_recall(
 
     # Degraded — no semantic ranking happened.
     if not semantic_ran:
+        if degraded_reason is None:
+            raise ValueError(
+                "assess_surface_recall: a degraded call must pass degraded_reason — "
+                "the cause the caller's degraded header names"
+            )
         if result_count and scope_total is not None:
             # The dump's own branch: it names how many of the scope's decisions it
             # shows. ``result_count`` is what the envelope returns, so a dump cut
@@ -472,13 +489,13 @@ def assess_surface_recall(
             else:
                 shown_part = f"all {scope_total} active decisions in {scope_phrase}"
             return None, (
-                f"Semantic recall unavailable (embeddings/Qdrant down) — showing "
+                f"Semantic recall unavailable ({degraded_reason}) — showing "
                 f"{shown_part} as a fallback, NOT a relevance ranking. For the "
                 f"authoritative set use {complete_hint} (pure graph read)."
             )
         if result_count:
             return None, (
-                f"Semantic recall unavailable (embeddings/Qdrant down) — showing the "
+                f"Semantic recall unavailable ({degraded_reason}) — showing the "
                 f"active decisions in {scope_phrase} as a fallback, NOT a relevance "
                 f"ranking. For the authoritative set use {complete_hint} (pure graph read)."
             )

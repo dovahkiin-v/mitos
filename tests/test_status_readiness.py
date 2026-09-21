@@ -378,7 +378,10 @@ def test_status_names_the_seeding_verb_when_a_coverage_marker_stands(
     out = capsys.readouterr().out
     assert "vector index incomplete" in out
     assert "seeded by `rebuild`" in out
-    assert "`mitos sync` restores search" in out
+    # 7a: the recipe carries its selector and the restore is conditioned on the
+    # provider, which status never calls (the C5 rows below parse the recipe).
+    assert f"`mitos sync -p {str(tmp_path)!r}` restores search" in out
+    assert "once the embedding provider answers" in out
     assert len(ids) == 2
 
 
@@ -463,3 +466,98 @@ def test_the_inert_pin_reaches_the_json_payload_as_a_value_not_a_sentence(
     # prose in a machine payload, not about a feature that never shipped.
     assert cli.cmd_status(str(tmp_path)) == 0
     assert "inert legacy config" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- #
+# 7a (B1): status says what it verified, and every recipe it prints parses with
+# its selector. A project name holding a space proves the `!r` rider.
+# --------------------------------------------------------------------------- #
+
+import re
+import shlex
+
+import pytest
+
+
+def _recipes(line):
+    """Returns the backticked `mitos …` recipes in one printed line."""
+    return re.findall(r"`(mitos [^`]+)`", line)
+
+
+def _line_with(out, marker):
+    hits = [line for line in out.splitlines() if marker in line]
+    assert len(hits) == 1, (marker, out)
+    return hits[0]
+
+
+def _status_out(ws, monkeypatch, capsys, *, scroll, qdrant=(True, True), seed=False):
+    _init(ws)
+    monkeypatch.setenv("GEMINI_API_KEY", "testkey")
+    _commit_n(ws, 2)
+    if seed:
+        from mitos.store import GraphStore
+        GraphStore(MitosConfig(str(ws)).db_path).stamp_embedding_seed("rebuild")
+    monkeypatch.setattr(cli, "_check_qdrant", _qdrant(*qdrant, points=0))
+    monkeypatch.setattr(cli, "scroll_point_ids", scroll)
+    capsys.readouterr()
+    cli.cmd_status(str(ws))
+    return capsys.readouterr().out
+
+
+# (marker that picks the printed line, expected verbs in order, status setup)
+_STATUS_RECIPE_LINES = {
+    "collection-hint": ("active node(s) have no vectors", ["reconcile"],
+                        dict(scroll=_scroll(set()), qdrant=(True, False))),
+    "scroll-failed": ("could not verify vector completeness", ["status"],
+                      dict(scroll=_scroll_fails())),
+    "incomplete": ("vector index incomplete", ["reconcile", "sync"],
+                   dict(scroll=_scroll(set()))),
+    "seeded": ("seeded by `rebuild`", ["sync"],
+               dict(scroll=_scroll(set()), seed=True)),
+}
+
+
+@pytest.mark.parametrize("line_id", sorted(_STATUS_RECIPE_LINES))
+def test_every_status_advice_recipe_parses_with_its_selector(
+    tmp_path, monkeypatch, capsys, line_id
+):
+    """C5: each advice line's recipe goes through the real parser and names this
+    project, a name with a space included."""
+    marker, verbs, setup = _STATUS_RECIPE_LINES[line_id]
+    ws = tmp_path / "my proj"
+    ws.mkdir()
+    line = _line_with(_status_out(ws, monkeypatch, capsys, **setup), marker)
+    recipes = _recipes(line)
+    assert [shlex.split(r)[1] for r in recipes] == verbs, line
+    for recipe in recipes:
+        args = cli._build_parser().parse_args(shlex.split(recipe)[1:])
+        assert args.command == shlex.split(recipe)[1]
+        assert args.project_post == str(ws), recipe
+
+
+@pytest.mark.parametrize("line_id", ["incomplete", "seeded"])
+def test_a_re_embed_advice_line_says_the_provider_must_answer(
+    tmp_path, monkeypatch, capsys, line_id
+):
+    """C6: status makes no provider call, so a line that sends the operator to
+    re-embed says the provider has to answer rather than implying it does."""
+    marker, _verbs, setup = _STATUS_RECIPE_LINES[line_id]
+    line = _line_with(_status_out(tmp_path, monkeypatch, capsys, **setup), marker)
+    assert re.search(r"embedding provider (to )?answers?\b", line), line
+
+
+def test_the_key_row_says_present_never_that_the_key_works(tmp_path, monkeypatch, capsys):
+    """C6: a revoked key is still present; the row says only what was checked, and
+    `--json`'s `gemini_api_key` stays the same bool it always was."""
+    _init(tmp_path)
+    monkeypatch.setenv("GEMINI_API_KEY", "bogus-revoked-key")
+    monkeypatch.setattr(cli, "_check_qdrant", _qdrant(True, True, points=0))
+    capsys.readouterr()
+    cli.cmd_status(str(tmp_path))
+    row = _line_with(capsys.readouterr().out, "GEMINI_API_KEY")
+    assert "present" in row and "not checked" in row, row
+    assert "bogus-revoked-key" not in row
+
+    cli.cmd_status(str(tmp_path), as_json=True)
+    data = json.loads(capsys.readouterr().out)
+    assert data["checks"]["gemini_api_key"] is True
