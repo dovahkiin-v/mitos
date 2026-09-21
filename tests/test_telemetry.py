@@ -1218,7 +1218,7 @@ def test_commentary_audit_table_exists_at_rung_three(tmp_path) -> None:
     """The audit table ships as a plain additive rung on telemetry's own ladder."""
     from mitos.telemetry import TELEMETRY_MIGRATION_STEPS, TelemetryStore
 
-    assert [rung for rung, _fn in TELEMETRY_MIGRATION_STEPS] == [1, 2, 3, 4, 5]
+    assert [rung for rung, _fn in TELEMETRY_MIGRATION_STEPS] == [1, 2, 3, 4, 5, 6]
 
     path = str(tmp_path / "telemetry.sqlite")
     TelemetryStore(path)

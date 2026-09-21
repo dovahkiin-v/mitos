@@ -178,7 +178,7 @@ def test_rung_four_file_upgrades_with_rows_intact_and_replay_is_a_no_op(tmp_path
             c.close()
 
     before = snapshot()
-    assert before[0] == COVERAGE_RUNG
+    assert before[0] == _pending_head(TELEMETRY_MIGRATION_STEPS)
     assert before[2] == [("new-run",), ("old-run",)]
     conn = open_connection(path)
     run_migrations(conn, TELEMETRY_MIGRATION_STEPS)

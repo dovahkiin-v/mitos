@@ -25,6 +25,7 @@ import pytest
 import anthropic
 
 from mitos.check import (
+    _billed_execution,
     CheckPlan,
     CorpusPair,
     JudgmentGroup,
@@ -42,6 +43,7 @@ from mitos.conflict import (
 )
 from mitos.conflict_judgment import (
     _JUDGMENT_MODEL_ALIAS,
+    BilledUnavailable,
     execute_judgment,
     make_judgment_executor,
 )
@@ -643,3 +645,111 @@ def test_unfenceable_batch_is_refused_before_any_spend(slugs: "tuple[str, ...]")
     with pytest.raises(ValueError, match="candidate"):
         execute_judgment(_prompt(slugs), client=client)
     client.with_options.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# 9. B7 — a failure decided from a billed response carries its usage (Phase 2d)
+# --------------------------------------------------------------------------- #
+
+def _no_tool_use_message() -> MagicMock:
+    """A response that came back and was billed, with a text block and no tool_use."""
+    msg = MagicMock()
+    text_block = MagicMock()
+    text_block.type = "text"
+    msg.content = [text_block]
+    msg.stop_reason = "end_turn"
+    msg.usage = MagicMock(input_tokens=310, output_tokens=77,
+                          cache_read_input_tokens=5, cache_creation_input_tokens=6)
+    return msg
+
+
+def _no_verdicts_message() -> MagicMock:
+    """A forced tool call whose input lacks the ``verdicts`` key."""
+    message = _fake_message(input_tokens=410, output_tokens=88, cache_read=7,
+                            cache_creation=8)
+    message.content[0].input = {"verdict": []}
+    return message
+
+
+def test_a_truncated_response_carries_its_billed_usage() -> None:
+    """E1: ``max_tokens`` returns a ``BilledUnavailable`` whose ``billed`` is that response."""
+    message = _fake_message(input_tokens=900, output_tokens=2000, cache_read=3,
+                            cache_creation=4, stop_reason="max_tokens")
+
+    result = execute_judgment(_prompt(), client=_client_returning(message))
+
+    assert isinstance(result, BilledUnavailable)
+    assert result.reason is ConflictUnavailableReason.JUDGMENT_TRUNCATED
+    assert "max_tokens" in result.detail
+    billed = result.billed
+    assert (billed.token_input, billed.token_output, billed.token_cache_read,
+            billed.token_cache_creation) == (900, 2000, 3, 4)
+    assert billed.stop_reason == "max_tokens"
+    assert billed.raw_text == ""
+    assert billed.model_alias == _JUDGMENT_MODEL_ALIAS
+    assert len(billed.batch_id) == 32
+    int(billed.batch_id, 16)
+    assert billed.elapsed_ms >= 0
+
+
+@pytest.mark.parametrize(
+    ("build", "counts", "stop_reason", "detail"),
+    [
+        (_no_tool_use_message, (310, 77, 5, 6), "end_turn", "no tool_use block"),
+        (_no_verdicts_message, (410, 88, 7, 8), "tool_use", "no 'verdicts' key"),
+    ],
+)
+def test_an_unusable_response_carries_its_billed_usage(
+    build: Any, counts: tuple, stop_reason: str, detail: str
+) -> None:
+    """E2: no tool_use block and no ``verdicts`` key each carry the response's usage."""
+    result = execute_judgment(_prompt(), client=_client_returning(build()))
+
+    assert isinstance(result, BilledUnavailable)
+    assert result.reason is ConflictUnavailableReason.JUDGMENT
+    assert detail in result.detail
+    billed = result.billed
+    assert (billed.token_input, billed.token_output, billed.token_cache_read,
+            billed.token_cache_creation) == counts
+    assert billed.stop_reason == stop_reason
+    assert billed.raw_text == ""
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        anthropic.APITimeoutError(_req()),
+        _status_error(400, "`temperature` is deprecated for this model."),
+    ],
+    ids=["ladder_exhausted", "refused"],
+)
+def test_a_failure_with_no_usage_stays_a_plain_unavailable(exc: BaseException) -> None:
+    """E3: the exhausted ladder and a refusal got no usage object, so nothing is carried."""
+    result = execute_judgment(_prompt(), client=_client_raising(exc))
+
+    assert type(result) is Unavailable
+    assert not hasattr(result, "billed")
+    assert _billed_execution(result) is None
+
+
+def test_the_billed_carry_is_what_the_check_engine_reads() -> None:
+    """E4: the attribute name is a join key; ``check`` reads the executor's real return."""
+    message = _fake_message(stop_reason="max_tokens")
+    result = execute_judgment(_prompt(), client=_client_returning(message))
+
+    assert isinstance(result, BilledUnavailable)
+    assert _billed_execution(result) is result.billed
+    plain = Unavailable(reason=ConflictUnavailableReason.JUDGMENT, detail="x")
+    assert _billed_execution(plain) is None
+
+
+def test_a_truncated_response_shares_the_success_path_usage_read() -> None:
+    """E5: a ``None`` cache field on a truncated response carries 0, as on success."""
+    message = _fake_message(cache_read=None, cache_creation=None,
+                            stop_reason="max_tokens")
+
+    result = execute_judgment(_prompt(), client=_client_returning(message))
+
+    assert isinstance(result, BilledUnavailable)
+    assert result.billed.token_cache_read == 0
+    assert result.billed.token_cache_creation == 0

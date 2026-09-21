@@ -39,6 +39,12 @@ check verb reach it through the module-level ``read_coverage``, which opens
 read-only and never creates or migrates the file (``TelemetryStore``'s
 constructor does both).
 
+A corpus-check batch that fails leaves an append-only ``failed_judgment_batches``
+row (``record_failed_batch``), written at the failure site rather than at the
+run-end seam: its pairs, pin and billed usage, NULL where no response arrived.
+Total judgment spend is ``SPEND_UNION_SQL``, a ``UNION ALL`` over that table and
+``judgment_batches``.
+
 Tier 2 (logic/store): it reuses ``store.open_connection`` (the MI-8 connection
 chokepoint) and ``migrations.run_migrations`` (the ladder primitive) rather than
 re-implementing either, and defines its **own** ``TELEMETRY_MIGRATION_STEPS`` in a
@@ -61,11 +67,11 @@ from mitos.store import open_connection
 
 # --- Boundary-crossing row shapes ---------------------------------------------
 #
-# Three frozen dataclasses cross the persistence boundary (Python -> parameterized
-# INSERT -> STRICT columns -> read-back). Each carries a ``to_params()`` producing
-# a value tuple in a *fixed column order* that must match the module-level column
-# tuples below, so a single INSERT is fully parameterized (P8) and column/param
-# order cannot drift (the per-tuple length is lockstep-pinned by test).
+# The frozen row dataclasses below cross the persistence boundary (Python ->
+# parameterized INSERT -> STRICT columns -> read-back). Each carries a
+# ``to_params()`` producing a value tuple in a *fixed column order* that must match
+# the module-level column tuples below, so a single INSERT is fully parameterized
+# (P8) and column/param order cannot drift (the per-tuple length is lockstep-pinned by test).
 
 
 @dataclass(frozen=True)
@@ -193,8 +199,10 @@ class JudgmentBatch:
     pair, so they live in their own side-table keyed on ``batch_id`` (PK). That
     makes exactly-once a *structural* property — one metrics row per batch — and
     keeps the append-only writer uniform (no "is-this-the-designated-row" branch
-    over ``conflict_checks``). A naive ``SUM(token_input)`` over this table returns
-    true spend, never ``N x`` the batch size (RF-2/D1).
+    over ``conflict_checks``). A naive ``SUM(token_input)`` over this table counts
+    each judged batch's spend exactly once, never ``N x`` the batch size (RF-2/D1).
+    It is judged spend only: a failed corpus-check batch's spend lands in
+    ``failed_judgment_batches``, and total spend is :data:`SPEND_UNION_SQL`.
 
     All five metrics are caller-supplied (3b measures them from the Anthropic
     response; 1b only stores) — the writer performs zero wall-clock or API reads.
@@ -215,7 +223,8 @@ class JudgmentBatch:
         elapsed_ms: Wall-clock latency of the batched call, in milliseconds.
         stop_reason: The API ``stop_reason`` from the response (``"tool_use"``,
             ``"max_tokens"``, …). Nullable TEXT — ``None`` on pre-rung-4 rows and
-            when the executor returns ``Unavailable`` before constructing this object.
+            when the executor returns ``Unavailable`` before constructing this object
+            (a failed batch's stop reason is on its :class:`FailedJudgmentBatch`).
     """
 
     batch_id: str
@@ -374,6 +383,88 @@ class CheckRunRow:
             self.findings_known,
             self.coverage_exclusions,
             self.degraded_reason,
+            self.mitos_version,
+        )
+
+
+@dataclass(frozen=True)
+class FailedJudgmentBatch:
+    """One corpus-check batch the engine filed as failed — its pairs and its spend.
+
+    The sibling of :class:`JudgmentBatch` for a batch that produced no verdicts. It is
+    spend attribution first: a truncated response or one without its tool block is
+    billed in full, and this row is the only place that bill is recorded. It is also
+    the carry on ``check.CheckRunResult.failed_batches``, so the result and the table
+    hold one shape, built once at the failure site.
+
+    Usage is whole or absent. Where a response arrived the four token fields hold its
+    counts; where none did (the exhausted ladder, a refusal) all four are ``None``,
+    never 0 — a zero would read as "billed nothing". The table's ``CHECK`` refuses a
+    half-null row. There is deliberately no ``detail`` field: an ``Unavailable``'s
+    detail can carry a request id, and it stays unstored.
+
+    Attributes:
+        batch_id: The PK. The executor's minted id when a response arrived, else
+            one ``check.py`` minted at the failure site.
+        run_id: The check run that attempted the batch (``check_runs.run_id``);
+            the row stands without that row, which a failed run-end seam never
+            writes.
+        created_at: Caller-supplied UTC ISO-8601 stamp taken at the failure (MI-10).
+        reason: The engine's ``ConflictUnavailableReason`` value.
+        proposal_id: The group's proposal node id (a content hash, never a slug).
+        partner_ids: The group's partner node ids, in the group's partner-hash
+            order. Stored as a JSON array.
+        token_input: Input tokens billed, or ``None`` when no response arrived.
+        token_output: Output tokens billed, or ``None``.
+        token_cache_read: Cache-read tokens billed, or ``None``.
+        token_cache_creation: Cache-creation tokens billed, or ``None``.
+        stop_reason: The response's API stop reason, or ``None``.
+        model_id: The resolved versioned id for ``model_alias``; ``None`` when
+            resolution failed.
+        model_alias: The pin's model alias (P19).
+        prompt_version: The pin's prompt version.
+        mitos_version: The build that ran the batch (a failed batch has no
+            ``conflict_checks`` rows to join for it).
+    """
+
+    batch_id: str
+    run_id: str
+    created_at: str
+    reason: str
+    proposal_id: str
+    partner_ids: List[str]
+    token_input: Optional[int]
+    token_output: Optional[int]
+    token_cache_read: Optional[int]
+    token_cache_creation: Optional[int]
+    stop_reason: Optional[str]
+    model_id: Optional[str]
+    model_alias: str
+    prompt_version: str
+    mitos_version: str
+
+    def to_params(self) -> Tuple:
+        """Produces the INSERT parameter tuple in ``_FAILED_JUDGMENT_BATCHES_COLUMNS`` order.
+
+        Returns:
+            A value tuple positionally matching ``_FAILED_JUDGMENT_BATCHES_COLUMNS``,
+            with ``partner_ids`` serialized as a JSON array.
+        """
+        return (
+            self.batch_id,
+            self.run_id,
+            self.created_at,
+            self.reason,
+            self.proposal_id,
+            json.dumps(list(self.partner_ids)),
+            self.token_input,
+            self.token_output,
+            self.token_cache_read,
+            self.token_cache_creation,
+            self.stop_reason,
+            self.model_id,
+            self.model_alias,
+            self.prompt_version,
             self.mitos_version,
         )
 
@@ -695,12 +786,98 @@ def _check_coverage_schema(conn: sqlite3.Connection) -> None:
     conn.execute(_CHECK_COVERAGE_SCHEMA)
 
 
+# --- Rung 6: failed judgment batches — a failed batch's pairs and spend -------
+#
+# A corpus-check batch that comes back truncated, or without its tool block, is
+# billed in full and yields no verdicts. Before this rung its spend and its pairs
+# were recorded nowhere. One row per failed batch, written at the failure site (not
+# at the run-end seam), so a killed run or a failed seam still keeps what was paid.
+#
+# Not a nullable column set on ``judgment_batches``: that table's metrics are NOT
+# NULL in a STRICT table, so a batch that got no response would store zeros, a false
+# "billed nothing". Here the four token columns are nullable together: the CHECK
+# makes usage whole or absent. There is no ``detail`` column on purpose (it can carry
+# a request id). ``proposal_id``/``partner_ids`` are node ids, never slugs (MI-2).
+#
+# Total spend reads both tables: see ``SPEND_UNION_SQL`` below.
+_FAILED_JUDGMENT_BATCHES_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS failed_judgment_batches (
+        batch_id TEXT NOT NULL,        -- executor's id when a response arrived, else minted at the failure
+        run_id TEXT NOT NULL,          -- check_runs.run_id; a PLAIN COLUMN (a failed seam writes no run row)
+        created_at TEXT NOT NULL,      -- application-supplied UTC ISO-8601 (MI-10)
+        reason TEXT NOT NULL,          -- ConflictUnavailableReason value; the engine's vocabulary
+        proposal_id TEXT NOT NULL,     -- content-hash id of the group's proposal
+        partner_ids TEXT NOT NULL,     -- JSON array of partner content-hash ids, group order
+        token_input INTEGER,           -- NULL = no response arrived, NOT a zero
+        token_output INTEGER,
+        token_cache_read INTEGER,
+        token_cache_creation INTEGER,
+        stop_reason TEXT,              -- the response's stop reason; NULL when none
+        model_id TEXT,                 -- resolved versioned id; NULL when resolution failed
+        model_alias TEXT NOT NULL,     -- the pin (P19)
+        prompt_version TEXT NOT NULL,  -- the pin
+        mitos_version TEXT NOT NULL,   -- nothing to join for it
+        PRIMARY KEY (batch_id),
+        CHECK (
+            (token_input IS NULL AND token_output IS NULL
+             AND token_cache_read IS NULL AND token_cache_creation IS NULL)
+            OR (token_input IS NOT NULL AND token_output IS NOT NULL
+                AND token_cache_read IS NOT NULL AND token_cache_creation IS NOT NULL)
+        )
+    ) STRICT;
+"""
+
+# The rung the failed-batch table lands on; the ladder literal below uses it.
+FAILED_BATCHES_RUNG = 6
+
+# Total judgment spend across both batch tables, plus how many failed batches carry
+# no usage (no response arrived, so nothing was billed that can be counted). UNION
+# ALL, never UNION: UNION drops a failed row whose counts equal a judged row's, a
+# silent undercount. Its reader today is a person's SQL; a test executes it.
+SPEND_UNION_SQL = """
+    SELECT
+        COALESCE(SUM(token_input), 0) AS token_input,
+        COALESCE(SUM(token_output), 0) AS token_output,
+        COALESCE(SUM(token_cache_read), 0) AS token_cache_read,
+        COALESCE(SUM(token_cache_creation), 0) AS token_cache_creation,
+        COALESCE(SUM(no_usage), 0) AS failed_batches_without_usage
+    FROM (
+        SELECT token_input, token_output, token_cache_read, token_cache_creation,
+               0 AS no_usage
+        FROM judgment_batches
+        UNION ALL
+        SELECT token_input, token_output, token_cache_read, token_cache_creation,
+               CASE WHEN token_input IS NULL THEN 1 ELSE 0 END AS no_usage
+        FROM failed_judgment_batches
+    )
+"""
+
+
+def _failed_judgment_batches_schema(conn: sqlite3.Connection) -> None:
+    """Migration step 6: the failed-judgment-batch table.
+
+    A plain additive rung: one CREATE, nothing to back-fill. Does NOT touch
+    ``user_version`` or manage the transaction; ``run_migrations`` owns both.
+
+    **Death story (P4).** Append-only. It grows with failures, not with runs: a few
+    hundred bytes per failed batch, and a healthy run writes nothing. Rows are never
+    pruned; retention belongs to the ROADMAP's telemetry-retention item, like the
+    rest of this file.
+
+    Args:
+        conn: An open, writable SQLite connection inside the runner's transaction
+            (opened via ``store.open_connection``, MI-8).
+    """
+    conn.execute(_FAILED_JUDGMENT_BATCHES_SCHEMA)
+
+
 TELEMETRY_MIGRATION_STEPS: List[MigrationStep] = [
     (1, _conflict_checks_schema),
     (2, _check_attribution_schema),
     (3, _commentary_audit_schema),
     (4, _judgment_batches_add_stop_reason),
     (COVERAGE_RUNG, _check_coverage_schema),
+    (FAILED_BATCHES_RUNG, _failed_judgment_batches_schema),
 ]
 
 
@@ -764,6 +941,25 @@ _CHECK_RUNS_COLUMNS: Tuple[str, ...] = (
 )
 
 
+_FAILED_JUDGMENT_BATCHES_COLUMNS: Tuple[str, ...] = (
+    "batch_id",
+    "run_id",
+    "created_at",
+    "reason",
+    "proposal_id",
+    "partner_ids",
+    "token_input",
+    "token_output",
+    "token_cache_read",
+    "token_cache_creation",
+    "stop_reason",
+    "model_id",
+    "model_alias",
+    "prompt_version",
+    "mitos_version",
+)
+
+
 def _insert_sql(table: str, columns: Tuple[str, ...]) -> str:
     """Builds a fully-parameterized INSERT over code-internal column literals.
 
@@ -782,6 +978,9 @@ def _insert_sql(table: str, columns: Tuple[str, ...]) -> str:
 _INSERT_CONFLICT_CHECK_SQL = _insert_sql("conflict_checks", _CONFLICT_CHECKS_COLUMNS)
 _INSERT_JUDGMENT_BATCH_SQL = _insert_sql("judgment_batches", _JUDGMENT_BATCHES_COLUMNS)
 _INSERT_CHECK_RUN_SQL = _insert_sql("check_runs", _CHECK_RUNS_COLUMNS)
+_INSERT_FAILED_BATCH_SQL = _insert_sql(
+    "failed_judgment_batches", _FAILED_JUDGMENT_BATCHES_COLUMNS
+)
 
 # The last undegraded run that swept a node wins, including a demotion from
 # ``covered`` to ``excluded`` (a node whose embedding is stuck NOW cannot be found by
@@ -1038,8 +1237,9 @@ class TelemetryStore:
     connection-stateless: every operation opens its own connection through the MI-8
     chokepoint and closes it, holding no long-lived handle. Writers:
     ``record_judged_batch`` (the per-batch judgment grain, append-only),
-    ``record_run_end`` (a corpus run's summary row plus its coverage upsert, one
-    transaction) and ``record_check_run`` (the summary row alone, for staged runs).
+    ``record_failed_batch`` (a failed corpus-check batch's pairs and spend,
+    append-only), ``record_run_end`` (a corpus run's summary row plus its coverage
+    upsert, one transaction) and ``record_check_run`` (the summary row alone, for staged runs).
     ``check_coverage`` is the one table here that is updated in place: a per-node
     state table, bounded by the nodes the corpus has ever held, not a per-run log.
     Its bulk reader ``load_reuse_index`` opens ``mode=ro``, so "no writes on the
@@ -1121,6 +1321,31 @@ class TelemetryStore:
             # one-line ``Error: …`` under the CLI's ``except MitosError`` boundary
             # (§13; mint no new error class).
             raise DatabaseError(f"Failed to persist judged batch: {e}") from e
+        finally:
+            conn.close()
+
+    def record_failed_batch(self, row: FailedJudgmentBatch) -> None:
+        """Persists one failed corpus-check batch's row, at the failure site.
+
+        Same manners as :meth:`record_judged_batch`: its own fresh connection, one
+        ``with conn:`` transaction, an INSERT only. It does not join the run-end
+        transaction: this is a batch-grain spend fact, and a run killed mid-loop or a
+        failed run-end seam must not erase what was already billed.
+
+        Args:
+            row: The failed batch's row, verbatim.
+
+        Raises:
+            DatabaseError: If the row cannot be persisted (a duplicate ``batch_id``,
+                a half-null usage set refused by the CHECK, or any other SQLite
+                error). Nothing lands.
+        """
+        conn = open_connection(self.telemetry_path)
+        try:
+            with conn:
+                conn.execute(_INSERT_FAILED_BATCH_SQL, row.to_params())
+        except sqlite3.Error as e:
+            raise DatabaseError(f"Failed to persist failed batch: {e}") from e
         finally:
             conn.close()
 

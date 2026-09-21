@@ -498,7 +498,8 @@ def test_parse_malformation_isolates_the_bad_batch_and_keeps_judging(
     temp_store: GraphStore, temp_telemetry: TelemetryStore
 ) -> None:
     """§9-4: a garbage response on the first batch is ISOLATED, not a trip — billed
-    but unpersisted (all-or-nothing parse), zero rows for the bad batch, and the
+    (spend recorded in ``failed_judgment_batches``), verdicts unpersisted
+    (all-or-nothing parse), zero ``conflict_checks`` rows for the bad batch, and the
     SECOND batch is still judged and persisted.
 
     ``JUDGMENT`` is a first-attempt reason: the parse never reaches the executor's

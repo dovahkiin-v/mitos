@@ -115,6 +115,7 @@ from mitos.telemetry import (
     CheckRunRow,
     ConflictCheckRow,
     CoverageMarks,
+    FailedJudgmentBatch,
     JudgmentBatch,
     ReuseIndex,
     ReuseUnavailable,
@@ -769,6 +770,76 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _billed_execution(failure: Unavailable) -> Optional[JudgmentExecution]:
+    """Reads the billed response a judgment failure carries, if it carries one.
+
+    The executor returns a subclass of :class:`Unavailable` with a ``billed``
+    attribute when the failure was decided from a response that arrived. This module
+    must not import the executor (that would pull ``anthropic`` into the check
+    family's closure), so it reads the attribute by name; the name is the join key.
+
+    Args:
+        failure: A batch-level judgment failure.
+
+    Returns:
+        The carried :class:`JudgmentExecution`, or ``None`` when no response arrived.
+    """
+    carried = getattr(failure, "billed", None)
+    return carried if isinstance(carried, JudgmentExecution) else None
+
+
+def _failed_batch_row(
+    failure: Unavailable,
+    *,
+    group: "JudgmentGroup",
+    billed: Optional[JudgmentExecution],
+    plan: "CheckPlan",
+    env: Optional[Mapping[str, str]],
+    created_at: str,
+) -> FailedJudgmentBatch:
+    """Builds the row for one failed batch — its pairs, its pin and its spend.
+
+    Usage comes from ``billed`` when a response arrived and is ``None`` throughout
+    when none did, never 0. The pin is the plan's: the batch was partitioned and
+    rendered at it, and for a parse failure the KD5 alias check has already proved
+    the execution's alias equal. ``failure.detail`` is not stored.
+
+    Args:
+        failure: The batch's failure; its reason value is stored.
+        group: The failed batch's group; its hashes are the row's node ids.
+        billed: The response that arrived, or ``None``.
+        plan: The run's plan (run id and pin).
+        env: The workspace env the model id resolves against.
+        created_at: The UTC ISO-8601 stamp taken at the failure (MI-10).
+
+    Returns:
+        The :class:`FailedJudgmentBatch` for the result carry and the telemetry row.
+    """
+    try:
+        model_id: Optional[str] = get_model_id(plan.model_alias, env)
+    except ValueError:
+        model_id = None  # provenance-only, as on the judged path
+    return FailedJudgmentBatch(
+        batch_id=billed.batch_id if billed is not None else uuid4().hex,
+        run_id=plan.run_id,
+        created_at=created_at,
+        reason=failure.reason.value,
+        proposal_id=group.proposal_hash,
+        partner_ids=[pair.partner_hash for pair in group.pairs],
+        token_input=billed.token_input if billed is not None else None,
+        token_output=billed.token_output if billed is not None else None,
+        token_cache_read=billed.token_cache_read if billed is not None else None,
+        token_cache_creation=(
+            billed.token_cache_creation if billed is not None else None
+        ),
+        stop_reason=billed.stop_reason if billed is not None else None,
+        model_id=model_id,
+        model_alias=plan.model_alias,
+        prompt_version=plan.prompt_version,
+        mitos_version=__version__,
+    )
+
+
 def _is_finding(tenable: bool, confidence: float) -> bool:
     """The ONE gate site (KD4): is a raw verdict a reportable finding?
 
@@ -1063,8 +1134,8 @@ class CheckRunResult:
         pairs_reused: ``len(plan.reused)``.
         batches_planned: ``len(plan.fresh_groups)``.
         batches_executed: Batches on which a judge call was fired — includes a
-            batch whose execution or parse then failed (billed but unpersisted is
-            a named cost, not a silent drop).
+            batch whose execution or parse then failed (its verdicts unpersisted;
+            its spend, where a response arrived, is in ``failed_batches``).
         batches_failed: Executed batches that persisted no verdicts — the isolated
             failures plus the aborting one. ``batches_executed - batches_failed``
             is the coverage numerator (:attr:`batches_judged`).
@@ -1090,6 +1161,11 @@ class CheckRunResult:
         departed: Finding-grade priors that stopped standing this run, echoed from
             the plan with their derived reason. The surface prints counts by
             reason; the identities ride the JSON.
+        failed_batches: One row per failed batch, in occurrence order, so
+            ``len(failed_batches) == batches_failed``: its pairs, pin and usage
+            (``None`` where no response arrived). The same rows land in
+            telemetry's ``failed_judgment_batches``. The no-judge abort and
+            skipped batches add none; nothing was attempted.
     """
 
     run_id: str
@@ -1113,6 +1189,7 @@ class CheckRunResult:
     start_probe: StaleProbe
     end_probe: "StaleProbe | ProbeUnavailable"
     departed: Tuple[DepartedFinding, ...] = ()
+    failed_batches: Tuple[FailedJudgmentBatch, ...] = ()
 
     @property
     def judgment_degraded(self) -> Optional[Unavailable]:
@@ -1360,8 +1437,10 @@ def execute_corpus_check(
 
     A batch-level :class:`Unavailable` — an executor error/timeout OR an
     all-or-nothing parse malformation — is dispositioned by CLASS, on how much the
-    failure says about the batches after it (a malformed batch is billed but
-    unpersisted either way, a named cost):
+    failure says about the batches after it. Either way the batch's verdicts are
+    unpersisted, and the failure leaves a :class:`FailedJudgmentBatch` on the
+    result and in telemetry, written at the failure site, with the spend where a
+    response arrived:
 
     * A reason in ``conflict.FIRST_ATTEMPT_JUDGMENT_REASONS`` is **isolated**: the
       batch is counted in ``batches_failed``, the run is degraded, and the loop
@@ -1443,10 +1522,38 @@ def execute_corpus_check(
     batches_failed = 0
     batches_skipped = 0
     pairs_judged_fresh = 0
+    failed_batches: List[FailedJudgmentBatch] = []
 
-    def record_batch_failure(failure: Unavailable) -> None:
-        """Files one batch failure — isolating it, or tripping the abort."""
+    def record_batch_failure(
+        failure: Unavailable,
+        *,
+        group: JudgmentGroup,
+        billed: Optional[JudgmentExecution],
+    ) -> None:
+        """Files one batch failure — records it, then isolates it or trips the abort."""
         nonlocal judgment_abort, batches_failed, consecutive_failures
+        # The row first, and written now (a killed run keeps what was billed). The
+        # write degrades like a judged batch's (KD6); it never skips the abort check.
+        row = _failed_batch_row(
+            failure,
+            group=group,
+            billed=billed,
+            plan=plan,
+            env=env,
+            created_at=_utc_now_iso(),
+        )
+        failed_batches.append(row)
+        if telemetry is None:
+            write_failures.append(
+                f"failed batch {row.batch_id}: telemetry store unavailable "
+                "(never constructed)"
+            )
+        else:
+            try:
+                telemetry.record_failed_batch(row)
+            except Exception as exc:
+                write_failures.append(f"failed batch {row.batch_id}: {exc}")
+
         judgment_failures.append(failure)
         batches_failed += 1
         consecutive_failures += 1
@@ -1532,7 +1639,9 @@ def execute_corpus_check(
         execution = judge(prompt)
         batches_executed += 1
         if isinstance(execution, Unavailable):
-            record_batch_failure(execution)  # isolated, or the abort — by class
+            record_batch_failure(  # isolated, or the abort — by class
+                execution, group=group, billed=_billed_execution(execution)
+            )
             continue
         # KD5, alias half — before parse/persist: rows at a pin the partition was
         # not computed at would poison every later run's reuse join.
@@ -1545,7 +1654,8 @@ def execute_corpus_check(
 
         judgments = parse_judgment_response(execution.raw_text, partner_slugs)
         if isinstance(judgments, Unavailable):
-            record_batch_failure(judgments)  # billed but unpersisted — a named cost
+            # Billed and recorded as a failed batch; its verdicts are unpersisted.
+            record_batch_failure(judgments, group=group, billed=execution)
             continue
 
         consecutive_failures = 0  # a judged batch clears the streak
@@ -1662,6 +1772,7 @@ def execute_corpus_check(
         start_probe=plan.start_probe,
         end_probe=end_probe,
         departed=plan.departed,
+        failed_batches=tuple(failed_batches),
     )
 
 

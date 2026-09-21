@@ -104,6 +104,9 @@ def test_truncated_tool_use_response_returns_judgment_truncated() -> None:
     assert isinstance(result, Unavailable)
     assert result.reason is ConflictUnavailableReason.JUDGMENT_TRUNCATED
     assert "max_tokens" in result.detail
+    # The billed carry reads the captured response's own usage (B7).
+    assert result.billed.token_input == fixture["usage"]["input_tokens"]
+    assert result.billed.token_output == fixture["usage"]["output_tokens"]
 
 
 def test_truncated_fixture_has_incomplete_tool_input() -> None:
