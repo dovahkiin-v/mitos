@@ -99,13 +99,22 @@ def _retired_handle(store: GraphStore, slug: str) -> Optional[Dict[str, Any]]:
         slug: The slug of the superseded-filtered match.
 
     Returns:
-        The retired-handle dict, or ``None`` if the slug does not resolve.
+        The retired-handle dict, or ``None`` if the slug does not resolve or names
+        no decision (a superseded open question is not a retired precedent).
     """
     try:
         node_ids = store.resolve_slug(slug)
     except Exception:
         return None
     if not node_ids:
+        return None
+    # A retired open question is not a retired precedent: only a slug that names a
+    # decision is offered (a `supersedes` lineage is same-kind, so "any decision"
+    # never keeps a mixed handle).
+    try:
+        if "decision" not in store.resolve_slug_kinds(slug):
+            return None
+    except Exception:
         return None
     node_id = node_ids[0]
     try:
@@ -753,6 +762,10 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
                     if handle:
                         retired.append(handle)
                     continue
+                if node["kind"] != "decision":
+                    # An open question: never embedding-ranked (C4), not retired —
+                    # skipped before the band sees its score.
+                    continue
 
                 # Verify computed active status in SQLite (M3 computed state is source-of-truth)
                 node_state = store.get_node_state(node["id"])
@@ -1168,30 +1181,35 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             brief=brief, limit=clamp_limit(limit),
         )
 
-    # 1. Try resolving query as direct slug first
+    # 1. Try resolving query as direct slug first. The `try` covers the store reads
+    #    only: a failed lookup falls through to the ranked search, as does a slug
+    #    that names no decision (an open question's slug is not a dereference — its
+    #    kind decides that, not a swallowed KeyError). Composition sits outside, so
+    #    a malformed decision fails loudly instead of posing as a ranked search.
     try:
         node = store.get_node_by_slug(query)
-        if node:
+        hit = node is not None and node["kind"] == "decision"
+        if hit:
             state = store.get_node_state(node["id"])
-
-            output = {
-                "slug": node["slug"],
-                "axiom": node["core_axiom"],
-                "rejected_paths": node["rejected_paths"],
-                "scope": node["scope"],
-                "state": state,
-                "depth_mode": "letter"
-            }
-            output.update(store.get_modifiers(node["id"]))
-            # Provenance last, after the payload's own content fields — show_node's
-            # rule, one screen up, applied to the other dereference exit. Most
-            # valuable here: this is the answer an agent acts on directly, so a hit
-            # from the wrong corpus is the one that never looks wrong.
-            output.update(corpus_provenance(config))
-            return dumps_display(output, ensure_ascii=False, indent=2)
+            modifiers = store.get_modifiers(node["id"])
     except Exception:
-        # Not a slug collision or lookup failed; proceed to semantic claim lookup
-        pass
+        hit = False
+    if hit:
+        output = {
+            "slug": node["slug"],
+            "axiom": node["core_axiom"],
+            "rejected_paths": node["rejected_paths"],
+            "scope": node["scope"],
+            "state": state,
+            "depth_mode": "letter"
+        }
+        output.update(modifiers)
+        # Provenance last, after the payload's own content fields — show_node's
+        # rule, one screen up, applied to the other dereference exit. Most
+        # valuable here: this is the answer an agent acts on directly, so a hit
+        # from the wrong corpus is the one that never looks wrong.
+        output.update(corpus_provenance(config))
+        return dumps_display(output, ensure_ascii=False, indent=2)
 
     # 2. Perform ranked semantic claim search
     if embed_provider and vector_store:
@@ -1214,6 +1232,9 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
                     handle = _retired_handle(store, slug)
                     if handle:
                         retired.append(handle)
+                    continue
+                if node["kind"] != "decision":
+                    # An open question: never embedding-ranked (C4), not retired.
                     continue
 
                 node_state = store.get_node_state(node["id"])

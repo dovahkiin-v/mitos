@@ -36,6 +36,7 @@ def test_query_decisions_tool(mock_get_components: MagicMock, tmp_path) -> None:
     mock_store.get_node_by_slug.return_value = {
         "id": "hash-abc",
         "slug": "auth-decision",
+        "kind": "decision",
         "core_axiom": "We use JWTs.",
         "rejected_paths": "Direct session lookups.",
         "mechanisms": ["jwt"],

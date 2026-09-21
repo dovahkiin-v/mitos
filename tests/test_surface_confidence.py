@@ -1220,6 +1220,235 @@ def test_the_band_is_read_off_the_surfaced_list_not_the_raw_return(ws, driver):
 
 
 # --------------------------------------------------------------------------- #
+# Phase 4a — ranked reads return decisions only.
+#
+# Sync embeds open questions into the same collection, `get_node_by_slug` is
+# kind-agnostic and `get_node_state` calls a parked OQ `active` — so an OQ in the
+# window reached the payload shaper, raised `KeyError` on `core_axiom`, and the
+# loop's blanket catch turned a healthy read into degraded recall (or, on
+# `surface` at rank 2, a cut list with no band). The record path's gather learned
+# this first (`conflict.gather_candidates`). Every fake point here carries only
+# `{"slug", "score"}`: the rows pass because the STORE says `open_question`
+# (D1), never because the point does.
+# --------------------------------------------------------------------------- #
+
+def _seed_4a(ws):
+    """Two decisions and one parked OQ, with the exact trap asserted up front."""
+    config, m = ws
+    _rec(m, "dec-a", scope=["x"])
+    _rec(m, "dec-b", scope=["x"])
+    _commit_oq(m.store, "oq-parked", scope=["x"])
+    oq = m.store.get_node_by_slug("oq-parked")
+    assert oq is not None and oq["kind"] == "open_question"
+    assert m.store.get_node_state(oq["id"]) == "active"
+    assert "core_axiom" not in oq
+
+
+def _seed_retired_oq(m):
+    """G5: `oq-old` superseded by `oq-new` — a legal same-kind lineage."""
+    _commit_oq(m.store, "oq-old", scope=["x"])
+    e = ParsedEntry("open_question", "oq-new", 1, 5)
+    e.topic = "Topic for oq-new"
+    e.questions_raised = ["What about oq-new?"]
+    e.scope = ["x"]
+    e.supersedes = ["oq-old"]
+    m.store.commit_parsed_entry(e)
+    assert m.store.get_node_by_slug("oq-old") is None
+    assert m.store.resolve_slug_kinds("oq-old") == ["open_question"]
+
+
+# driver → (call, list key, verb, surface)
+_4A_DRIVERS = {
+    "mcp-surface": (_surface_with, "active_decisions", "surface", "mcp"),
+    "cli-surface": (_cli_surface_json, "active_decisions", "surface", "cli"),
+    "mcp-query": (_mcp_query, "matches", "query", "mcp"),
+    "cli-query": (_cli_query_json, "matches", "query", "cli"),
+}
+
+
+def _4a_band(verb, surface, config, top_score, n):
+    """The band the surfaced decisions alone earn, from the policy itself."""
+    if verb == "surface":
+        return assess_surface_recall(semantic_ran=True, top_score=top_score,
+                                     result_count=n, scope=None, surface=surface)
+    return assess_query_recall(top_score=top_score, result_count=n, config=config,
+                               surface=surface)
+
+
+@pytest.mark.parametrize("driver", list(_4A_DRIVERS))
+@pytest.mark.parametrize("oq_rank", [1, 2])
+def test_an_open_question_in_the_window_is_skipped_and_the_hits_survive(ws, driver, oq_rank):
+    """Rows 1–2. At rank 1 today every surface degrades to lexical (`KeyError`).
+
+    At rank 2 `surface` does not degrade: it keeps the rank-1 decision, drops the
+    one below, and writes no `confidence` at all (G2) — so the row asserts the
+    decision BELOW the OQ and the band, not merely "no `degraded` key".
+    """
+    config, _ = ws
+    _seed_4a(ws)
+    call, key, verb, surface = _4A_DRIVERS[driver]
+    decs = [{"slug": "dec-a", "score": 0.8}, {"slug": "dec-b", "score": 0.7}]
+    matches = list(decs)
+    matches.insert(oq_rank - 1, {"slug": "oq-parked", "score": 0.85 if oq_rank == 1 else 0.75})
+    resp = call(matches, ws)
+    assert "degraded" not in resp
+    assert [d["slug"] for d in resp[key]] == ["dec-a", "dec-b"]
+    assert (resp["confidence"], resp["note"]) == _4a_band(verb, surface, config, 0.8, 2)
+
+
+@pytest.mark.parametrize("driver", list(_4A_DRIVERS))
+def test_the_band_is_read_off_decisions_never_off_a_skipped_open_question(ws, driver):
+    """Row 3 (G3). The OQ scores strong at rank 1; both decisions sit below strong.
+
+    A fix that skips the OQ AFTER raising `top_score` passes rows 1–2 and reads
+    `strong` here — a verdict on a point the caller never saw. The fixture proves
+    it can tell: the band with the OQ's score counted must differ from the right one.
+    """
+    config, _ = ws
+    _seed_4a(ws)
+    call, key, verb, surface = _4A_DRIVERS[driver]
+    oq_score = min(1.0, SURFACE_STRONG_THRESHOLD + 0.1)
+    hi = (SURFACE_STRONG_THRESHOLD + SURFACE_WEAK_THRESHOLD) / 2
+    lo = SURFACE_WEAK_THRESHOLD - 0.05
+    matches = [{"slug": "oq-parked", "score": oq_score},
+               {"slug": "dec-a", "score": hi}, {"slug": "dec-b", "score": lo}]
+    right = _4a_band(verb, surface, config, hi, 2)
+    assert right[0] != _4a_band(verb, surface, config, oq_score, 2)[0]
+    resp = call(matches, ws)
+    assert "degraded" not in resp
+    assert [d["slug"] for d in resp[key]] == ["dec-a", "dec-b"]
+    assert (resp["confidence"], resp["note"]) == right
+
+
+@pytest.mark.parametrize("driver", list(_4A_DRIVERS))
+def test_a_retired_open_question_is_never_offered_as_a_retired_precedent(ws, driver):
+    """Row 4. Alone in the window — beside a live decision the blackout never fires.
+
+    Today `_retired_handle` resolves the superseded OQ's slug without reading
+    its kind, and the blackout presents a parked question as a settled
+    decision's retired precedent. No crash, a wrong answer. The positive control
+    (a superseded DECISION alone) proves the retired arm is screened, not disabled.
+    """
+    config, m = ws
+    _seed_4a(ws)
+    _seed_retired_oq(m)
+    _rec(m, "dead-v1", scope=["x"])
+    _rec(m, "dead-v2", scope=["x"], supersedes="dead-v1")
+    call, key, verb, surface = _4A_DRIVERS[driver]
+
+    resp = call([{"slug": "oq-old", "score": 0.9}], ws)
+    assert "all_superseded" not in resp and "degraded" not in resp
+    assert resp[key] == []
+    assert (resp["confidence"], resp["note"]) == _4a_band(verb, surface, config, None, 0)
+
+    control = call([{"slug": "dead-v1", "score": 0.9}], ws)
+    assert [h["slug"] for h in control["all_superseded"]] == ["dead-v1"]
+
+
+@pytest.mark.parametrize("driver", list(_4A_DRIVERS))
+def test_beside_a_retired_decision_only_the_decision_is_a_retired_handle(ws, driver):
+    """Row 5 — pins D2's boundary. Green before the fix on the decision's side
+    (its handle was always kept); the OQ's handle is what it removes."""
+    _, m = ws
+    _seed_4a(ws)
+    _seed_retired_oq(m)
+    _rec(m, "dead-v1", scope=["x"])
+    _rec(m, "dead-v2", scope=["x"], supersedes="dead-v1")
+    call, key, _, _ = _4A_DRIVERS[driver]
+    resp = call([{"slug": "oq-old", "score": 0.9}, {"slug": "dead-v1", "score": 0.8}], ws)
+    assert resp[key] == []
+    assert [h["slug"] for h in resp["all_superseded"]] == ["dead-v1"]
+
+
+def test_an_open_questions_exact_slug_falls_through_to_the_ranked_search(ws):
+    """Row 6 (MCP `query_decisions` only — the CLI twin has no exact-slug arm).
+
+    The OQ's slug is not a dereference: it goes on to the ranked search by its
+    kind, and the ranked window (where the OQ also sits) lists decisions only.
+    """
+    config, _ = ws
+    _seed_4a(ws)
+    matches = [{"slug": "oq-parked", "score": 0.9}, {"slug": "dec-a", "score": 0.8}]
+    resp = _mcp_query(matches, ws, query="oq-parked")
+    assert "axiom" not in resp and "degraded" not in resp
+    assert [d["slug"] for d in resp["matches"]] == ["dec-a"]
+    assert (resp["confidence"], resp["note"]) == _4a_band("query", "mcp", config, 0.8, 1)
+
+
+def test_an_exact_slug_composition_fault_is_loud_not_a_silent_ranked_search(ws, monkeypatch):
+    """Row 7 — D3's proof, and the only row that can tell "falls through by kind"
+    from "falls through by exception".
+
+    A DECISION-kind node missing `core_axiom` is a defect in the exact-slug
+    composition. Kept inside the old `except Exception: pass`, it slid silently
+    into the ranked search and returned a healthy-looking envelope; with the
+    `try` narrowed to the store reads, it raises. Only the planted slug is
+    malformed — the ranked loop's lookups reach the real method.
+    """
+    from mitos import mcp_server
+    config, _ = ws
+    _seed_4a(ws)
+    real = GraphStore.get_node_by_slug
+    dec_a_id = GraphStore(config.db_path, read_only=True).get_node_by_slug("dec-a")["id"]
+
+    def planted(self, slug):
+        if slug == "planted-slug":
+            return {"id": dec_a_id, "slug": "planted-slug", "kind": "decision",
+                    "rejected_paths": [], "scope": ["x"]}
+        return real(self, slug)
+
+    monkeypatch.setattr(GraphStore, "get_node_by_slug", planted)
+    store = GraphStore(config.db_path, read_only=True)
+    with patch.object(mcp_server, "get_workspace_components",
+                      return_value=(store, _FakeEmbed(),
+                                    _FakeVector([{"slug": "dec-b", "score": 0.8}]))):
+        with pytest.raises(KeyError):
+            mcp_server.query_decisions("planted-slug", project=config.workspace_dir)
+
+
+@pytest.mark.parametrize("verb", ["surface", "query"])
+def test_text_renders_rank_the_decisions_past_an_open_question(ws, verb):
+    """Row 8. Unscoped on purpose: a scoped degraded dump prints `(score 1.000)`
+    lines too. The degraded lexical render prints no score at all, so a scored
+    ranked line is the marker — never the degraded note's wording (7a rewrites it)."""
+    _seed_4a(ws)
+    matches = [{"slug": "oq-parked", "score": 0.85},
+               {"slug": "dec-a", "score": 0.8}, {"slug": "dec-b", "score": 0.7}]
+    out = _cli_surface_text(matches, ws) if verb == "surface" else _cli_query(matches, ws)
+    assert "1. dec-a  (score 0.800)" in out
+    assert "2. dec-b  (score 0.700)" in out
+    assert "oq-parked" not in out
+
+
+def test_every_ranked_read_loop_screens_kind():
+    """Stretch: the structural twin of the matrix above. Every loop in the two
+    surface modules that resolves a slug to a node carries a `kind` comparison —
+    and a fifth such loop fails the set comparison until it is screened too."""
+    import mitos.cli
+    import mitos.mcp_server
+
+    def loops(module):
+        for fn in ast.walk(ast.parse(inspect.getsource(module))):
+            if not isinstance(fn, ast.FunctionDef):
+                continue
+            for loop in (n for n in ast.walk(fn) if isinstance(n, ast.For)):
+                calls = {c.func.attr for c in ast.walk(loop)
+                         if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)}
+                if "get_node_by_slug" in calls:
+                    kinded = any(isinstance(c, ast.Compare) and isinstance(c.left, ast.Subscript)
+                                 and isinstance(c.left.slice, ast.Constant)
+                                 and c.left.slice.value == "kind" for c in ast.walk(loop))
+                    yield fn.name, kinded
+
+    # A list, not a dict: every loop is judged, so a second unscreened loop in one
+    # verb cannot hide behind a screened sibling.
+    found = list(loops(mitos.mcp_server)) + list(loops(mitos.cli))
+    assert {name for name, _ in found} == {
+        "surface_decisions", "query_decisions", "cmd_surface", "cmd_query"}
+    assert all(kinded for _, kinded in found), found
+
+
+# --------------------------------------------------------------------------- #
 # Phase 3g2 — the standing check notice on every `surface` exit, never `query`'s.
 #
 # Seeding goes through 3g1's real writers in `test_commit_gate` (imported

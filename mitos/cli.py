@@ -979,13 +979,22 @@ def _retired_handle(store: GraphStore, slug: str) -> Optional[Dict[str, Any]]:
         slug: The slug of the superseded-filtered match.
 
     Returns:
-        The retired-handle dict, or ``None`` if the slug does not resolve.
+        The retired-handle dict, or ``None`` if the slug does not resolve or names
+        no decision (a superseded open question is not a retired precedent).
     """
     try:
         node_ids = store.resolve_slug(slug)
     except Exception:
         return None
     if not node_ids:
+        return None
+    # A retired open question is not a retired precedent: only a slug that names a
+    # decision is offered (a `supersedes` lineage is same-kind, so "any decision"
+    # never keeps a mixed handle).
+    try:
+        if "decision" not in store.resolve_slug_kinds(slug):
+            return None
+    except Exception:
         return None
     node_id = node_ids[0]
     try:
@@ -1148,6 +1157,10 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
                 handle = _retired_handle(store, m["slug"])
                 if handle:
                     retired.append(handle)
+                continue
+            if node["kind"] != "decision":
+                # An open question: never embedding-ranked (C4), not retired —
+                # skipped before the band sees its score.
                 continue
             node_state = store.get_node_state(node["id"])
             if node_state not in ("active", "drifted"):
@@ -2290,6 +2303,9 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
                     handle = _retired_handle(store, m["slug"])
                     if handle:
                         retired.append(handle)
+                    continue
+                if node["kind"] != "decision":
+                    # An open question: never embedding-ranked (C4), not retired.
                     continue
                 state = store.get_node_state(node["id"])
                 if state not in ("active", "drifted"):
