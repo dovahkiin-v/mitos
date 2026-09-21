@@ -134,7 +134,7 @@ def test_every_registered_subparser_carries_the_project_option() -> None:
 
 
 def test_the_aliased_verbs_are_one_parser_object_registered_once() -> None:
-    """29 names over 24 objects — the reason the registration loop must dedupe by id().
+    """30 names over 25 objects — the reason the registration loop must dedupe by id().
 
     A second ``add_argument`` on the same object raises ``ArgumentError:
     conflicting option strings``, so this row is also what pins that the five
@@ -142,8 +142,8 @@ def test_the_aliased_verbs_are_one_parser_object_registered_once() -> None:
     ``list_scopes``, ``record_decision``) are free rather than forgotten.
     """
     choices = _subparsers(_build_parser())
-    assert len(choices) == 29
-    assert len({id(sub) for sub in choices.values()}) == 24
+    assert len(choices) == 30
+    assert len({id(sub) for sub in choices.values()}) == 25
     for alias, canonical in (("query_decisions", "query"),
                              ("surface_decisions", "surface"),
                              ("list_decisions", "list"),
@@ -1293,7 +1293,7 @@ def _require_list():
 
 
 def test_the_require_list_is_the_parser_minus_the_two_other_classes() -> None:
-    """25 verbs, measured — and the five aliases are among them, named.
+    """26 verbs, measured — and the five aliases are among them, named.
 
     The three classes of §3 partition the parser exactly: exempt (a selector is
     refused), optional (`status`, whose absence routes elsewhere), and required
@@ -1302,7 +1302,7 @@ def test_the_require_list_is_the_parser_minus_the_two_other_classes() -> None:
     drift.
     """
     verbs = _require_list()
-    assert len(verbs) == 25
+    assert len(verbs) == 26
     for alias in _ALIASES:
         assert alias in verbs
     assert set(_subparsers(_build_parser())) == (

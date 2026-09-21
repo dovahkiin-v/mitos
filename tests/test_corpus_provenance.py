@@ -635,6 +635,8 @@ CLI_VERB_ARGS = {
     "capture": ["a raw architectural thought"],   # keyless refusal, on stdout
     "check": [],                           # embed absent + live decisions ⇒ fail-closed, on stderr
     "cutover": [],                         # already-V1a graph ⇒ the cheap no-op
+    "hook-install": [],                    # git capped at tmp_path ⇒ "not inside a git
+                                           # work tree", after the echo; never writes
     "import": ["legacy.md"],               # a cwd-rooted FILE, not a selector (3b)
     "list": [],
     "list_decisions": [],
@@ -748,6 +750,12 @@ class TestTheCliRequireList:
         name, target = _register_workspace(tmp_path, monkeypatch)
         (tmp_path / "legacy.md").write_text("no headings here\n", encoding="utf-8")
         config = MitosConfig(target, project=name)
+        # For every verb, harmless for all but one: git discovery stops at tmp_path
+        # and machine config is masked, so `hook-install` can never find (and write
+        # into) a repository that happens to enclose the test's TMPDIR.
+        monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+        monkeypatch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
         capsys.readouterr()
 
         _run(["-p", name, verb, *CLI_VERB_ARGS[verb]])

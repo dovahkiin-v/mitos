@@ -74,7 +74,10 @@ from mitos.telemetry import (
 )
 from mitos.audit_debt import AuditDebt, derive_audit_debt
 from mitos.commit_gate import (CAUSE_GRAPH, CAUSE_NO_GRAPH, CAUSE_TELEMETRY, GATE_BLOCKED,
-                               GATE_UNREADABLE, HOOK_BLOCK_EXIT, evaluate_gate)
+                               GATE_UNREADABLE, HOOK_BLOCK_EXIT, HOOK_FOREIGN,
+                               HOOK_FOREIGN_WITH_BLOCK, HOOK_OURS, HOOK_UNREADABLE,
+                               classify_hook_file, evaluate_gate, render_hook_block,
+                               render_hook_script, unsafe_shell_path)
 from mitos.identity import compute_node_id
 from mitos.models import get_embedding_model_id, get_model_id
 from mitos.parser import (ParsedEntry, load_format_spec, parse_entry_stream,
@@ -5528,6 +5531,55 @@ def _running_mitos_command() -> str:
                                        _MITOS_PACKAGE_DIR)
 
 
+def _hook_command_from(argv0: str, executable: str,
+                       which: Callable[[str], Optional[str]],
+                       package_dir: str) -> Optional[List[str]]:
+    """Names the running build as an absolute argv prefix, for baking into a hook.
+
+    The sibling of ``_running_mitos_command_from``, with the same injected facts and
+    arms, but never bare ``mitos`` and never relative: a hook runs from the
+    work-tree root on every commit, long after this process has gone.
+
+    - ``argv0`` has no path separator: ``which(argv0)`` made absolute. Residue, the
+      sibling's: a bare ``argv0`` is taken to be what ``PATH`` found. A
+      shebang-launched console script always carries a separator (the kernel passes
+      the resolved path), so this arm serves harnesses.
+    - ``argv0`` is a file inside the ``mitos`` package: ``[executable, "-m",
+      "mitos"]``. Residue, as 3c2 documented: under ``-m``, ``sys.path[0]`` is the
+      hook's working directory, so a repository whose root holds a ``mitos/``
+      package can shadow this one.
+    - Otherwise ``abspath(argv0)``, not the realpath: a venv's ``bin/mitos`` or
+      pipx's ``~/.local/bin/mitos`` is the handle that survives upgrades.
+
+    Args:
+        argv0: ``sys.argv[0]``.
+        executable: ``sys.executable``.
+        which: ``shutil.which``, or a stand-in.
+        package_dir: The ``mitos`` package directory.
+
+    Returns:
+        The argv prefix, or ``None`` when a bare ``argv0`` is not on ``PATH``, so
+        the running executable cannot be named.
+    """
+    if os.sep not in argv0 and not (os.altsep and os.altsep in argv0):
+        found = which(argv0)
+        return [os.path.abspath(found)] if found else None
+    invoked = os.path.abspath(argv0)
+    if os.path.dirname(os.path.realpath(invoked)) == os.path.realpath(package_dir):
+        return [executable, "-m", "mitos"]
+    return [invoked]
+
+
+def _hook_command() -> Optional[List[str]]:
+    """Names the running build for a hook (see ``_hook_command_from``).
+
+    Returns:
+        The absolute argv prefix, or ``None``.
+    """
+    return _hook_command_from(sys.argv[0], sys.executable, shutil.which,
+                              _MITOS_PACKAGE_DIR)
+
+
 def _hook_block_recipe(config: MitosConfig) -> str:
     """Composes the command the commit gate's block names: the one place it is spelled.
 
@@ -5638,6 +5690,13 @@ _HOOK_BOUNDARY_LINES: Dict[str, str] = {
               "through."),
     "unexpected": ("mitos commit gate: an unexpected {error} stopped the gate, so it "
                    "could not decide; the commit was let through."),
+    # Only with `--hook-file`, which the script `hook-install` writes passes: the
+    # file names itself, so the way out is concrete. The pasted blocks pass no
+    # flag and keep the TARGET_PATH_NOT_A_WORKSPACE line above.
+    "stale_hook": ("mitos commit gate: the hook {hook_file} gates {path}, which is no "
+                   "longer a Mitos workspace, so the commit was let through; install "
+                   "the hook again for the workspace's new location, or delete "
+                   "{hook_file}."),
 }
 
 
@@ -5680,9 +5739,17 @@ def _run_hook_boundary(args: argparse.Namespace) -> int:
         stage = "gate"
         return cmd_hook_run(config)
     except ProjectTargetingError as e:
-        template = _HOOK_BOUNDARY_LINES.get(e.discriminator,
-                                            _HOOK_BOUNDARY_LINES["targeting"])
-        line = template.format(selector=repr(e.selector), path=repr(e.path))
+        hook_file = getattr(args, "hook_file", None)
+        if e.discriminator == TARGET_PATH_NOT_A_WORKSPACE and hook_file:
+            # Its own branch, not one more key through the shared `.format`: that
+            # call passes no `hook_file`, and a KeyError here would escape the
+            # boundary as a traceback.
+            line = _HOOK_BOUNDARY_LINES["stale_hook"].format(
+                hook_file=repr(hook_file), path=repr(e.path))
+        else:
+            template = _HOOK_BOUNDARY_LINES.get(e.discriminator,
+                                                _HOOK_BOUNDARY_LINES["targeting"])
+            line = template.format(selector=repr(e.selector), path=repr(e.path))
         code = 0
     except RegistryError:
         line = _HOOK_BOUNDARY_LINES["registry"]
@@ -5708,6 +5775,173 @@ def _run_hook_boundary(args: argparse.Namespace) -> int:
             code = 1
     print(line, file=sys.stderr)
     return code
+
+
+def _hook_install_report(config: MitosConfig, *, hook_file: str,
+                         command: List[str], previous: Optional[str],
+                         replaced_ours: bool) -> None:
+    """Prints ``hook-install``'s success report on stdout, one statement per line.
+
+    Args:
+        config: The served workspace's config.
+        hook_file: The file written.
+        command: The baked argv prefix.
+        previous: The workspace a replaced mitos hook served, when readable.
+        replaced_ours: Whether a mitos-written hook was replaced.
+    """
+    workspace = config.workspace_dir
+    print(f"Wrote the commit gate hook to {hook_file}.")
+    print(f"It gates the workspace at {workspace}.")
+    print(f"It runs {' '.join(shlex.quote(part) for part in command)}.")
+    on_path = shutil.which("mitos")
+    if not on_path or os.path.realpath(on_path) != os.path.realpath(command[0]):
+        print("That is this build, not the mitos on your PATH, so install the hook "
+              "again if this build is moved or removed.")
+    if replaced_ours:
+        if previous is None:
+            print("It replaces a mitos hook whose workspace could not be read.")
+        elif os.path.realpath(previous) != os.path.realpath(workspace):
+            print(f"Previously served {previous}.")
+    if judge_api_key(config) is None:
+        # Keyless first, and no store is opened on this path: 3c1's rule.
+        print("No judge key is configured, so the gate stays inactive and every "
+              "commit passes until one is.")
+    else:
+        debt = derive_audit_debt(config.db_path, config.telemetry_path)
+        if not isinstance(debt, AuditDebt):
+            print("The uncovered count could not be read; the gate reads it again "
+                  "on every commit.")
+        elif debt.uncovered == 0:
+            print("The gate is armed, and no decision is uncovered.")
+        else:
+            subject = ("1 decision is" if debt.uncovered == 1
+                       else f"{debt.uncovered} decisions are")
+            print(f"{subject} not yet covered by a contradiction check; the next "
+                  f"commit is blocked once until {_hook_block_recipe(config)} has "
+                  f"been attempted.")
+    print(f"To remove the gate, delete {hook_file}.")
+
+
+def cmd_hook_install(config: MitosConfig) -> int:
+    """Writes the commit gate's ``pre-commit`` into the repository's own git directory.
+
+    The first thing mitos writes outside its workspace, into a directory that
+    belongs to git and often to other people, so every step refuses rather than
+    guesses (ADR ``hook-install-writes-only-the-repos-own-git-dir-marker-means-whole-file``):
+
+    1. The echo, first, so it precedes a refusal too.
+    2. Git is asked from the workspace's own directory, never the caller's.
+    3. The hooks directory must lie within the repository's common git directory.
+       That test comes first, because the default ``.git/hooks`` is inside the work
+       tree too. Anything else is shared — tracked with collaborators when inside
+       the work tree, with other repositories when outside both — and gets the
+       block with no machine path.
+    4. A ``pre-commit`` mitos did not write is never overwritten or appended to; a
+       foreign one gets the absolute block on stdout.
+    5. Every baked path must quote safely, and the running executable must be
+       nameable.
+    6. The write is durable, then ``chmod 0o755``: a new file lands non-executable,
+       and git skips such a hook with only a hint.
+
+    Serves one workspace (ADR
+    ``repo-hook-serves-one-workspace-several-deferred-runtime-discovery-rejected``).
+
+    Args:
+        config: The workspace the hook will gate.
+
+    Returns:
+        0 when written (keyless included), 1 when refused.
+    """
+    # Function-local, 3d's rule: `subprocess` stays off every other verb's path.
+    from mitos import _git
+
+    _echo_corpus(config)
+    workspace = config.workspace_dir
+    # Before git is asked: a newline in the top level would read as "not a work
+    # tree", hiding the reason that is actually true.
+    reason = unsafe_shell_path(workspace)
+    if reason is not None:
+        print(f"The workspace path {workspace!r} cannot be written into a hook "
+              f"safely ({reason}); nothing was written.", file=sys.stderr)
+        return 1
+    location = _git.locate_repository(workspace)
+    if isinstance(location, _git.NotAWorkTree):
+        if location.reason == _git.REASON_GIT_UNAVAILABLE:
+            print("git was not found, so hook-install cannot tell which repository "
+                  "this workspace belongs to; nothing was written.", file=sys.stderr)
+        else:
+            print(f"The workspace at {workspace} is not inside a git work tree, so "
+                  f"there is no repository to install a hook into; nothing was "
+                  f"written.", file=sys.stderr)
+        return 1
+
+    hooks_dir = location.hooks_dir
+    if not _git.is_within(hooks_dir, location.common_dir):
+        relative = os.path.relpath(os.path.realpath(workspace), location.top_level)
+        if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+            print(f"The workspace at {workspace} does not lie under the work tree "
+                  f"{location.top_level}, so no relative path can name it; nothing "
+                  f"was written.", file=sys.stderr)
+            return 1
+        selector = "." if relative == os.curdir else "./" + relative
+        if _git.is_within(hooks_dir, location.top_level):
+            where = ("is inside this repository's work tree, so it is tracked and "
+                     "shared with collaborators")
+        else:
+            where = ("is outside this repository, such as a core.hooksPath in global "
+                     "git configuration, so other repositories share it")
+        print(f"Git's hooks directory {hooks_dir} {where}; hook-install writes only "
+              f"into the repository's own git directory, so nothing was written. "
+              f"To gate commits there, paste this block into its pre-commit:",
+              file=sys.stderr)
+        print(render_hook_block(command=None, selector=selector,
+                                guard_dir=selector + "/.mitos"), end="")
+        return 1
+
+    hook_file = os.path.join(hooks_dir, "pre-commit")
+    state = classify_hook_file(hook_file)
+    if state.kind == HOOK_UNREADABLE:
+        print(f"{hook_file} could not be read, so hook-install cannot tell who wrote "
+              f"it; nothing was written.", file=sys.stderr)
+        return 1
+    if state.kind == HOOK_FOREIGN_WITH_BLOCK:
+        print(f"{hook_file} already carries a mitos commit gate block, so hook-install "
+              f"changes nothing.", file=sys.stderr)
+        return 1
+
+    command = _hook_command()
+    if command is None:
+        print("hook-install cannot tell which mitos executable is running, so it "
+              "cannot name one in a hook; nothing was written.", file=sys.stderr)
+        return 1
+    for path in (command[0], hook_file):
+        reason = unsafe_shell_path(path)
+        if reason is not None:
+            print(f"The path {path!r} cannot be written into a hook safely "
+                  f"({reason}); nothing was written.", file=sys.stderr)
+            return 1
+
+    if state.kind == HOOK_FOREIGN:
+        print(f"{hook_file} exists and mitos did not write it, so hook-install leaves "
+              f"it unchanged. To add the gate, paste this block into it:",
+              file=sys.stderr)
+        print(render_hook_block(command=command, selector=workspace,
+                                guard_dir=None), end="")
+        return 1
+
+    script = render_hook_script(command=command, workspace=workspace,
+                                hook_file=hook_file)
+    try:
+        atomic_file.ensure_parent_directory(hook_file)
+        atomic_file.write_source(hook_file, script)
+        os.chmod(hook_file, 0o755)
+    except OSError as e:
+        print(f"Could not write {hook_file}: {e.strerror or e}.", file=sys.stderr)
+        return 1
+    _hook_install_report(config, hook_file=hook_file, command=command,
+                         previous=state.served_workspace,
+                         replaced_ours=state.kind == HOOK_OURS)
+    return 0
 
 
 def cmd_check(
@@ -7299,7 +7533,7 @@ def _build_parser() -> argparse.ArgumentParser:
                               "the working-tree decisions.md. Rejects --scope/--fresh.")
 
     # hook-run — the commit gate a git pre-commit hook runs (no judge, no spend).
-    subparsers.add_parser(
+    hook_run_p = subparsers.add_parser(
         "hook-run",
         help=f"The commit gate a git pre-commit hook runs: exits {HOOK_BLOCK_EXIT} "
              f"(block) only when decisions have not been covered by a contradiction "
@@ -7316,6 +7550,28 @@ def _build_parser() -> argparse.ArgumentParser:
             f"it meets (a moved workspace, an unreadable registry, config or graph) "
             f"is a pass: exit 0, with one line on stderr naming it. An unexpected "
             f"error exits 1. A hook should fail on exit {HOOK_BLOCK_EXIT} alone."))
+    hook_run_p.add_argument(
+        "--hook-file", dest="hook_file", default=None, metavar="PATH",
+        help="The hook file running this gate; the script hook-install writes passes "
+             "its own path. When the workspace is gone, the one line then names "
+             "this file and the two ways out: install again, or delete it.")
+
+    # hook-install — write that hook into the repository's own git directory.
+    subparsers.add_parser(
+        "hook-install",
+        help="Install the commit gate as the repository's pre-commit hook.",
+        description=(
+            "Writes an executable pre-commit hook that runs the commit gate "
+            "(hook-run) for this workspace. It writes only into the repository's "
+            "own git directory, the hooks directory under its common git directory, "
+            "and bakes absolute paths to this workspace and to the running mitos."),
+        epilog=(
+            "It refuses someone else's pre-commit, never overwriting or appending to "
+            "a file mitos did not write, and refuses a shared hooks directory (a "
+            "core.hooksPath inside the work tree or outside the repository); for "
+            "those two it prints a block to paste by hand. Every refusal exits 1 and "
+            "writes nothing. Running it again replaces the hook it wrote. The hook "
+            "serves one workspace. Removing the gate is deleting the file it names."))
 
     # restore-source — re-materialize a graph-only node's `### slug` block.
     rs_p = subparsers.add_parser(
@@ -7431,7 +7687,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # Deduped by `id()` because the five aliased verbs (`query`/`query_decisions`,
     # `surface`/`surface_decisions`, `list`/`list_decisions`, `scopes`/
     # `list_scopes`, `record`/`record_decision`) are ONE parser object under two
-    # names: 29 names over 24 objects, and a second `add_argument` on the same
+    # names: 30 names over 25 objects, and a second `add_argument` on the same
     # object raises `ArgumentError: conflicting option strings`. The
     # `allow_abbrev` assignment above needs no such guard — it is idempotent — so
     # the dedupe guards only the registration. Being one object is also what makes
@@ -7731,6 +7987,8 @@ def main() -> None:
         elif args.command == "rebuild":
             sys.exit(cmd_rebuild(config, allow_drops=args.allow_drops,
                                  assume_yes=args.yes, as_json=args.as_json))
+        elif args.command == "hook-install":
+            sys.exit(cmd_hook_install(config))
         elif args.command == "check":
             sys.exit(cmd_check(config, staged=args.staged, scope=args.scope,
                                fresh=args.fresh, assume_yes=args.yes,
