@@ -280,6 +280,30 @@ def test_required_argument_doc_ends_inside_the_window(tool, arg):
     )
 
 
+def test_a_deeper_line_beginning_arg_colon_is_not_the_entry():
+    """``_arg_entry_span`` matches name lines at the entry indent only (1a fresh-eyes).
+
+    No shipped description has a continuation line that begins with an argument
+    name, so without this row the depth rule could be undone and nothing would red
+    (found by 8a1's re-plant). A decoy one level deeper, ahead of the real entry,
+    must not be measured in its place.
+    """
+    description = (
+        "Summary.\n"
+        "\n"
+        "Args:\n"
+        "    first: The first argument.\n"
+        "        slug: a continuation line that starts like an entry.\n"
+        "    slug: The real slug entry.\n"
+        "        Its continuation.\n"
+        "\n"
+        "Returns:\n"
+        "    Something.\n"
+    )
+    start, end = _arg_entry_span(description, "slug")
+    assert description[start:end] == "slug: The real slug entry.\n        Its continuation."
+
+
 def test_record_decision_slug_doc_tells_the_truth_about_the_handle():
     """B13: a slug is a mutable handle and is not part of a decision's identity.
 
