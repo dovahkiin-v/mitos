@@ -10,7 +10,7 @@ import os
 import hashlib
 import logging
 from datetime import datetime, timezone
-from typing import List, Dict, Optional, Any, Sequence, Set, Tuple
+from typing import List, Dict, Optional, Any, FrozenSet, Sequence, Set, Tuple
 from mitos.errors import (
     DatabaseError,
     ValidationError,
@@ -2311,6 +2311,38 @@ class GraphStore:
                 params.append(scope)
             rows = conn.execute(sql, params).fetchall()
             return self._hydrate_rows(conn, rows)
+        finally:
+            conn.close()
+
+    def get_active_decision_ids(self) -> FrozenSet[str]:
+        """Returns the ids of the active-view decisions, unhydrated.
+
+        The same population :meth:`get_active_decisions` returns (and so the same
+        one ``check`` sweeps), read as ids only for the uncovered-decision
+        derivation (``mitos.audit_debt``): no ``_IS_DRIFTED_SQL``, no
+        ``_hydrate_rows``. A drifted decision stays in, because the predicate does
+        not retire it and neither does the sweep. Unscoped on purpose: the gate's
+        population is the whole corpus.
+
+        The two reads must never disagree, so this binds the shipped
+        ``_ACTIVE_VIEW_PREDICATE`` rather than re-encoding it, and ``nodes`` stays
+        UNALIASED so the correlated predicate binds (the alias trap the constant's
+        own comment warns about). ``tests/test_audit_debt.py`` pins the agreement
+        over a fixture matrix (superseded, corrected, drifted, open questions).
+
+        Store faults propagate (``DatabaseError`` / ``sqlite3.Error``); the
+        derivation is what turns them into a result.
+
+        Returns:
+            The active decision node ids.
+        """
+        conn = self._get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT nodes.id FROM nodes "
+                f"WHERE nodes.kind = 'decision' AND {_ACTIVE_VIEW_PREDICATE}"
+            ).fetchall()
+            return frozenset(row[0] for row in rows)
         finally:
             conn.close()
 
