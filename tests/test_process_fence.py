@@ -387,9 +387,15 @@ def test_a_linked_worktree_names_the_main_repositorys_git_dir(tmp_path) -> None:
 
 
 @_needs_git
-def test_a_plain_directory_is_outside_a_work_tree(tmp_path) -> None:
+def test_a_plain_directory_is_outside_a_work_tree(tmp_path, monkeypatch) -> None:
+    """Asked from inside a repository, so an answer read off the cwd would be "inside".
+
+    Without the chdir this row's red under a dropped ``cwd=`` depended on pytest
+    happening to run from a git checkout (found by 8a1's re-plant in a copy).
+    """
     plain = tmp_path / "plain"
     plain.mkdir()
+    monkeypatch.chdir(make_scratch_repo(str(tmp_path / "cwd-repo")))
     assert locate_repository(str(plain)) == NotAWorkTree(REASON_OUTSIDE_WORK_TREE)
 
 
