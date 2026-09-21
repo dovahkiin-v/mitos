@@ -48,8 +48,9 @@ Fences:
   refused spend, a ``started`` attempt that never reached its run end, and a state
   from a newer build all open the gate.
 * No catch-all. Both readers return typed results on a file fault; a programming
-  error propagates to ``main()``'s boundary and exits 1, which the installed hook
-  treats as a pass. A catch-all here would turn a bug into a silent pass no row
+  error propagates to the hook boundary (``cli._run_hook_boundary``), which prints
+  one line naming its class and exits 1, which the installed hook treats as a
+  pass. A catch-all here would turn a bug into a silent pass no row
   can see.
 
 ADRs: ``telemetry-readers-outside-check-open-read-only-absent-is-empty-not-unreadable``,
@@ -102,7 +103,8 @@ GATE_CAUSES: Tuple[str, ...] = (CAUSE_NO_GRAPH, CAUSE_GRAPH, CAUSE_TELEMETRY)
 
 #: The exit status that blocks a commit, and the only one the installed hook maps
 #: to a failure. Chosen outside every status something else can produce: 0; 1
-#: (Python's uncaught exception, ``main()``'s fault arms); 2 (argparse's usage
+#: (Python's uncaught exception, ``main()``'s fault arms, and the hook boundary's
+#: unexpected-exception arm); 2 (argparse's usage
 #: error); 120 (the interpreter failing to flush stdout at exit); 124–127
 #: (``timeout``, ``env``, and the shell's not-executable / not-found); >= 128
 #: (signals). Pinned against that set by a row.

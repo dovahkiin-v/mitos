@@ -1309,7 +1309,17 @@ def test_the_require_list_is_the_parser_minus_the_two_other_classes() -> None:
         set(verbs) | set(_SELECTOR_EXEMPT_VERBS) | {"status"})
 
 
-@pytest.mark.parametrize("verb", _require_list())
+#: Require-list verbs that answer a selectorless call with their own one line and a
+#: pass rather than the refusal anatomy. `hook-run` is a git hook's verb: every
+#: fault it meets, a missing selector included, is one stderr line and exit 0, and
+#: it still never resolves the working directory (I1 holds — it passes the commit).
+#: Its selectorless row lives in `test_commit_gate.py`. Excluded by name, so a new
+#: verb cannot slip out of the row below by accident.
+_ONE_LINE_BOUNDARY_VERBS = frozenset({"hook-run"})
+
+
+@pytest.mark.parametrize(
+    "verb", [v for v in _require_list() if v not in _ONE_LINE_BOUNDARY_VERBS])
 def test_every_require_list_verb_refuses_a_selectorless_call(
     verb, tmp_path, monkeypatch, capsys
 ) -> None:

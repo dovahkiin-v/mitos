@@ -666,13 +666,15 @@ CLI_VERB_ARGS = {
 #: 3d's MCP row carves out `list_projects`, so the gap is a row rather than a
 #: silence.
 #:
-#: `hook-run` (3c1) is carved out for the obligation, not the channel: offline it
-#: lands on the commit gate's keyless row and prints nothing, which the echo row
-#: would read as a missing echo, and its quiet passes must stay silent on every
-#: commit. It does echo, on stderr, on the one answer it gives (a block). The
-#: carve-out's ADR amendment
-#: (`cli-echo-obligation-is-a-handler-locus-rule-with-two-distinct-carve-outs`) and
-#: its break-once row are 3c2's.
+#: `hook-run` is carved out for the obligation, not the channel (ADR
+#: `hook-run-is-a-third-echo-carve-out-of-the-obligation-kind`, amending
+#: `cli-echo-obligation-is-a-handler-locus-rule-with-two-distinct-carve-outs`):
+#: offline it lands on the commit gate's keyless row and prints nothing, which the
+#: echo row would read as a missing echo, and its quiet passes must stay silent on
+#: every commit. The answers it gives inside the handler — the block and the
+#: unreadable row — do echo, on stderr; its boundary's pre-dispatch one-liners carry
+#: none, as `main()`'s fault arms carry none. Moving it into `CLI_VERB_ARGS` turns
+#: the echo row red on that silence (observed once, 3c2).
 CLI_ECHO_CARVE_OUTS = {"status", "hook-run"}
 
 

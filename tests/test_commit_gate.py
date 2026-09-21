@@ -26,14 +26,18 @@ never hardcoded. Real SQLite throughout.
 import dataclasses
 import json
 import os
+import re
+import shlex
 import sqlite3
 import subprocess
 import sys
 from typing import Any, Dict, Optional, Tuple
+from unittest.mock import patch
 
 import pytest
 
-from mitos import check, cli, telemetry
+from conftest import make_workspace
+from mitos import check, cli, registry, telemetry
 from mitos.audit_debt import AuditDebt, derive_audit_debt
 from mitos.check import CheckFinding
 from mitos.cli import cmd_init
@@ -1647,6 +1651,7 @@ def test_a_block_echoes_then_names_the_count_and_the_check(workspace, monkeypatc
     """Criterion 15: exit ``HOOK_BLOCK_EXIT``; nothing on stdout; stderr is the echo, then the message."""
     config, store, _tel = workspace
     _a, _b, _nbhds, keyed = _blocked_pair(config, store, monkeypatch)
+    monkeypatch.setattr(sys, "argv", ["mitos"])   # the recipe names the running build
     if extra:
         _commit(store, "gate-third", "A third uncovered decision.")
 
@@ -1680,6 +1685,7 @@ def test_the_block_recipe_parses_to_check_on_this_workspace(recipe_workspace, mo
     config, store, _tel = recipe_workspace
     _pair(store)
     keyed = _keyed(config, monkeypatch)
+    monkeypatch.setattr(sys, "argv", ["mitos"])   # the recipe names the running build
 
     assert cli.cmd_hook_run(keyed) == HOOK_BLOCK_EXIT
     recipe = _recipe(capsys.readouterr().err, "not been covered")
@@ -1728,7 +1734,7 @@ def test_the_quiet_passes_print_nothing(workspace, monkeypatch, capsys, row: str
 @pytest.mark.parametrize("cause", GATE_CAUSES)
 def test_an_unreadable_row_says_one_line_and_passes(workspace, tmp_path, monkeypatch,
                                                     capsys, cause: str) -> None:
-    """Criterion 18: each row-1 cause → exit 0, stdout empty, exactly one stderr line."""
+    """Criterion 18 (moved by 3c2's D4): each row-1 cause → exit 0, stdout empty, the echo, then one line."""
     config, store, tel = workspace
     if cause == "no_graph":
         target = _keyed(MitosConfig(str(tmp_path)), monkeypatch)
@@ -1742,13 +1748,15 @@ def test_an_unreadable_row_says_one_line_and_passes(workspace, tmp_path, monkeyp
     out, err = capsys.readouterr()
 
     assert code == 0 and out == ""
-    assert len(err.splitlines()) == 1 and err.endswith("\n")
-    assert "let through" in err and "`" not in err
+    lines = err.splitlines()
+    assert lines == [provenance_line(target), cli._HOOK_UNREADABLE_LINES[cause]]
+    assert err.endswith("\n")
+    assert "let through" in lines[1] and "`" not in lines[1]
 
 
 def test_an_unreadable_attempt_record_says_one_line_too(workspace, monkeypatch,
                                                         capsys) -> None:
-    """Criterion 18: the lazily read attempt's fault (D3) is the telemetry line."""
+    """Criterion 18 (moved by 3c2's D4): the lazily read attempt's fault (D3) is the echo, then the telemetry line."""
     config, store, tel = workspace
     _a, _b, _nbhds, keyed = _blocked_pair(config, store, monkeypatch)
     tel.record_attempt_start(_start(fingerprint=_fingerprint(config)))
@@ -1757,7 +1765,8 @@ def test_an_unreadable_attempt_record_says_one_line_too(workspace, monkeypatch,
 
     assert cli.cmd_hook_run(keyed) == 0
     out, err = capsys.readouterr()
-    assert out == "" and err == cli._HOOK_UNREADABLE_LINES["telemetry"] + "\n"
+    assert out == "" and err == (provenance_line(keyed) + "\n"
+                                 + cli._HOOK_UNREADABLE_LINES["telemetry"] + "\n")
 
 
 def test_the_block_code_is_one_nothing_else_produces() -> None:
@@ -1767,7 +1776,8 @@ def test_the_block_code_is_one_nothing_else_produces() -> None:
     be something a crash or the shell could return:
 
     * 0 — success;
-    * 1 — Python's uncaught exception, and ``main()``'s fault arms;
+    * 1 — Python's uncaught exception, ``main()``'s fault arms, and the hook
+      boundary's unexpected-exception arm;
     * 2 — argparse's usage error (and the interpreter's own);
     * 120 — the interpreter when flushing stdout fails at exit;
     * 124–127 — ``timeout``, ``env``, and the shell's not-executable / not-found;
@@ -1878,3 +1888,447 @@ def test_staged_sees_nothing_after_an_mcp_path_record(tmp_path, monkeypatch, cap
 
     assert code == 0
     assert capsys.readouterr().out == "Gate clear — no pending decisions to check.\n"
+
+
+# =========================================================================== #
+# Phase 3c2 — `hook-run`'s CLI boundary
+# =========================================================================== #
+#
+# Driven through ``main()`` by argv unless a row says otherwise. The hostile
+# environment is on for every boundary row: an unknown config key, a deprecated
+# ``rotation_mode``, and an update notice that would print if the ``finally`` ran.
+# ``update_notice`` is patched on ``mitos._update``, because ``main()`` imports it
+# inside the ``finally``; a patch on ``cli`` would do nothing.
+
+
+_NOTICE = "A newer mitos is available (probe notice)."
+_HOSTILE_CONFIG = 'bogus_key = 1\nrotation_mode = "mark"\n'
+
+
+def _main(argv: list) -> int:
+    """Drives ``cli.main()`` with ``argv[0] == "mitos"``; returns the exit status."""
+    with patch.object(sys, "argv", ["mitos"] + list(argv)):
+        try:
+            cli.main()
+        except SystemExit as exc:
+            return exc.code
+    return 0
+
+
+@pytest.fixture
+def notice_on(monkeypatch: Any) -> None:
+    """Lets the update notice print: the opt-out unset and the notice always due."""
+    import mitos._update
+    monkeypatch.delenv("MITOS_NO_UPDATE_CHECK", raising=False)
+    monkeypatch.setattr(mitos._update, "update_notice", lambda *a, **k: _NOTICE)
+
+
+def _hostile(ws: str) -> str:
+    """Makes ``ws`` a valid workspace whose config holds both warnable values."""
+    os.makedirs(os.path.join(ws, ".mitos"), exist_ok=True)
+    with open(os.path.join(ws, ".mitos", "config.toml"), "w", encoding="utf-8") as f:
+        f.write(_HOSTILE_CONFIG)
+    decisions = os.path.join(ws, "decisions.md")
+    if not os.path.exists(decisions):
+        open(decisions, "w", encoding="utf-8").close()
+    return ws
+
+
+def _write_registry_text(text: str) -> None:
+    path = registry.registry_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def _assert_one_fault_line(code: int, out: str, err: str) -> None:
+    assert code == 0, err
+    assert out == ""
+    assert err.endswith("\n") and len(err.splitlines()) == 1, err
+    assert err.startswith("mitos commit gate: ") and "let through" in err
+    assert "Traceback" not in err and "`" not in err
+    assert "--project" not in err and _NOTICE not in err
+
+
+# --------------------------------------------------------------------------- #
+# Pre-dispatch faults: one line, exit 0, no anatomy, no notice
+# --------------------------------------------------------------------------- #
+
+def _fault_unknown_name(tmp_path) -> list:
+    return ["hook-run", "-p", "nosuch"]
+
+
+def _fault_no_workspace(tmp_path) -> list:
+    return ["hook-run", "-p", str(tmp_path / "moved-away")]
+
+
+def _fault_registered_vanished(tmp_path) -> list:
+    _write_registry_text(f'"vanished" = "{tmp_path / "vanished"}"\n')
+    return ["hook-run", "-p", "vanished"]
+
+
+def _fault_relative(tmp_path) -> list:
+    return ["hook-run", "-p", "~/somewhere"]
+
+
+def _fault_missing(tmp_path) -> list:
+    return ["hook-run"]
+
+
+def _fault_registry_by_name(tmp_path) -> list:
+    _write_registry_text("this is [[ not toml = =\n")
+    return ["hook-run", "-p", "theproject"]
+
+
+def _fault_registry_by_path(tmp_path) -> list:
+    ws = _hostile(make_workspace(tmp_path / "ws"))
+    _write_registry_text("this is [[ not toml = =\n")
+    return ["hook-run", "-p", ws]
+
+
+def _fault_bad_config(tmp_path) -> list:
+    ws = make_workspace(tmp_path / "ws")
+    with open(os.path.join(ws, ".mitos", "config.toml"), "w", encoding="utf-8") as f:
+        f.write("this is = = not toml\n")
+    return ["hook-run", "-p", ws]
+
+
+def _fault_missing_directory(tmp_path) -> list:
+    ws = _hostile(make_workspace(tmp_path / "ws"))
+    return ["-C", str(tmp_path / "no-such-dir"), "hook-run", "-p", ws]
+
+
+def _fault_directory_is_a_file(tmp_path) -> list:
+    ws = _hostile(make_workspace(tmp_path / "ws"))
+    (tmp_path / "a-file").write_text("", encoding="utf-8")
+    return ["-C", str(tmp_path / "a-file"), "hook-run", "-p", ws]
+
+
+def _fault_named_twice(tmp_path) -> list:
+    return ["-p", "a", "hook-run", "-p", "b"]
+
+
+_PRE_DISPATCH_FAULTS = {
+    "unknown_name": (_fault_unknown_name, "'nosuch'"),
+    "no_workspace": (_fault_no_workspace, "moved-away"),
+    "registered_vanished": (_fault_registered_vanished, "'vanished'"),
+    "relative": (_fault_relative, "'~/somewhere'"),
+    "missing": (_fault_missing, "no project selector"),
+    "registry_by_name": (_fault_registry_by_name, "registry"),
+    "registry_by_path": (_fault_registry_by_path, "registry"),
+    "bad_config": (_fault_bad_config, "config.toml"),
+    "missing_directory": (_fault_missing_directory, "no-such-dir"),
+    "directory_is_a_file": (_fault_directory_is_a_file, "a-file"),
+    "named_twice": (_fault_named_twice, "named twice"),
+}
+
+
+@pytest.mark.parametrize("fault", list(_PRE_DISPATCH_FAULTS))
+def test_a_pre_dispatch_fault_is_one_line_and_a_pass(fault: str, tmp_path, notice_on,
+                                                     capsys) -> None:
+    """Criterion 2: every targeting, registry, config and ``-C`` fault → one line, exit 0.
+
+    Exactly one stderr line is what proves ``main()``'s multi-line anatomy is gone;
+    no notice proves the ``finally`` never ran.
+    """
+    build, names = _PRE_DISPATCH_FAULTS[fault]
+    argv = build(tmp_path)
+    capsys.readouterr()
+
+    code = _main(argv)
+    out, err = capsys.readouterr()
+
+    _assert_one_fault_line(code, out, err)
+    assert names in err
+
+
+def test_a_refused_chdir_is_a_directory_fault_not_a_bug(tmp_path, monkeypatch, notice_on,
+                                                       capsys) -> None:
+    """An existing ``-C`` target ``os.chdir`` refuses is one line and exit 0, not exit 1."""
+    ws = _hostile(make_workspace(tmp_path / "ws"))
+
+    def refuse(path: str) -> None:
+        raise PermissionError(13, "Permission denied", path)
+
+    monkeypatch.setattr(os, "chdir", refuse)
+    code = _main(["-C", str(tmp_path), "hook-run", "-p", ws])
+    out, err = capsys.readouterr()
+
+    _assert_one_fault_line(code, out, err)
+    assert "-C directory" in err and "PermissionError" not in err
+
+
+def test_a_value_with_a_newline_cannot_break_the_one_line(tmp_path, notice_on,
+                                                          capsys) -> None:
+    """D3: the caller's values are ``repr``-rendered, so a newline in one stays one line."""
+    code = _main(["hook-run", "-p", "two\nlines"])
+    out, err = capsys.readouterr()
+
+    _assert_one_fault_line(code, out, err)
+    assert "'two\\nlines'" in err
+
+
+def test_the_same_faults_keep_their_anatomy_on_other_verbs(tmp_path, notice_on,
+                                                           capsys) -> None:
+    """Transition: the fixture is the fault, the boundary is the one-liner (criterion 6)."""
+    argv = _fault_no_workspace(tmp_path)
+    assert _main(argv) == 0
+    capsys.readouterr()
+
+    code = _main(["list"] + argv[1:])
+    err = capsys.readouterr().err
+    assert code == 1
+    assert len(err.splitlines()) > 1 and _NOTICE in err
+
+
+def test_an_unexpected_exception_is_one_line_and_exit_one(workspace, monkeypatch, notice_on,
+                                                          capsys) -> None:
+    """Criterion 3: a bug exits 1 with one line naming its class, and no traceback."""
+    config, store, _tel = workspace
+    _blocked_pair(config, store, monkeypatch)
+    _hostile(config.workspace_dir)
+
+    def _boom(config: MitosConfig) -> Any:
+        raise RuntimeError("probe bug")
+
+    monkeypatch.setattr(cli, "evaluate_gate", _boom)
+    capsys.readouterr()
+
+    code = _main(["hook-run", "-p", config.workspace_dir])
+    out, err = capsys.readouterr()
+
+    assert code == 1 and out == ""
+    assert len(err.splitlines()) == 1 and "RuntimeError" in err
+    assert "Traceback" not in err and "probe bug" not in err and _NOTICE not in err
+
+
+# --------------------------------------------------------------------------- #
+# Rows 2–4 are silent, the block and row 1 echo — under the hostile environment
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("row", list(_QUIET_PASSES))
+def test_the_quiet_passes_are_silent_through_main(workspace, monkeypatch, notice_on,
+                                                  capsys, row: str) -> None:
+    """Criterion 1: rows 2–4 write nothing with every warnable thing present.
+
+    A transition twice over: the gate moves from ``blocked`` to the row, and the same
+    workspace under ``status`` prints both warnings and the notice, so the silence is
+    the boundary's and not the fixture's.
+    """
+    config, store, tel = workspace
+    _a, _b, nbhds, _keyed_config = _blocked_pair(config, store, monkeypatch)
+    moved = _QUIET_PASSES[row](config, store, tel, monkeypatch, capsys, nbhds)
+    ws = _hostile(config.workspace_dir)
+    assert evaluate_gate(moved).row == row
+    capsys.readouterr()
+
+    assert _main(["hook-run", "-p", ws]) == 0
+    assert capsys.readouterr() == ("", "")
+
+    _main(["status", "-p", ws])
+    err = capsys.readouterr().err
+    assert "bogus_key" in err and "rotation_mode = 'mark'" in err and _NOTICE in err
+
+
+def test_a_block_through_main_is_the_echo_then_the_message(workspace, monkeypatch, notice_on,
+                                                           capsys) -> None:
+    """Criterion 4: exit 3; stderr is exactly the echo and the message — no warning, no notice."""
+    config, store, _tel = workspace
+    _a, _b, _nbhds, keyed = _blocked_pair(config, store, monkeypatch)
+    ws = _hostile(config.workspace_dir)
+    monkeypatch.setattr(sys, "argv", ["mitos"])   # so the expected recipe reads as main()'s
+    capsys.readouterr()
+
+    code = _main(["hook-run", "-p", ws])
+    out, err = capsys.readouterr()
+
+    assert code == HOOK_BLOCK_EXIT and out == ""
+    assert err == (provenance_line(MitosConfig(ws, warn_unknown_keys=False)) + "\n"
+                   + cli._hook_block_message(keyed, 2) + "\n")
+
+
+def test_row_one_through_main_is_the_echo_then_one_line(workspace, monkeypatch, notice_on,
+                                                        capsys) -> None:
+    """D4: an in-handler row 1 names its workspace by the echo, then says its one line."""
+    config, store, _tel = workspace
+    _blocked_pair(config, store, monkeypatch)
+    ws = _hostile(config.workspace_dir)
+    _corrupt(config.db_path)
+    capsys.readouterr()
+
+    code = _main(["hook-run", "-p", ws])
+    out, err = capsys.readouterr()
+
+    assert code == 0 and out == ""
+    assert err.splitlines() == [provenance_line(MitosConfig(ws, warn_unknown_keys=False)),
+                                cli._HOOK_UNREADABLE_LINES["graph"]]
+
+
+@pytest.mark.parametrize("argv", [["-p", "{ws}", "hook-run"], ["hook-run", "-p", "{ws}"]],
+                         ids=["before-the-verb", "after-the-verb"])
+def test_both_selector_placements_reach_the_boundary(workspace, monkeypatch, notice_on,
+                                                     capsys, argv: list) -> None:
+    """Gotcha 5: ``-p`` on either side of the verb routes to the gate."""
+    config, store, _tel = workspace
+    _blocked_pair(config, store, monkeypatch)
+    ws = _hostile(config.workspace_dir)
+
+    assert _main([a.format(ws=ws) for a in argv]) == HOOK_BLOCK_EXIT
+    assert _NOTICE not in capsys.readouterr().err
+
+
+def test_a_selectorless_hook_run_never_resolves_the_working_directory(
+        workspace, monkeypatch, notice_on, capsys) -> None:
+    """D2 / I1: standing in a blocked workspace, no ``-p`` is one line and a pass.
+
+    It replaces ``test_cli_selector``'s selectorless refusal for this verb (excluded
+    there by name). Had it fallen back to the working directory, it would block.
+    """
+    config, store, _tel = workspace
+    _blocked_pair(config, store, monkeypatch)
+    ws = _hostile(config.workspace_dir)
+    _write_registry_text(f'"theproject" = "{ws}"\n')
+    monkeypatch.chdir(ws)
+    capsys.readouterr()
+
+    code = _main(["hook-run"])
+    out, err = capsys.readouterr()
+
+    _assert_one_fault_line(code, out, err)
+    assert "no project selector" in err and "theproject" not in err
+
+
+def test_the_boundary_returns_only_pass_bug_or_block(workspace, tmp_path, monkeypatch,
+                                                     notice_on, capsys) -> None:
+    """Data-level join with 3e: every exit the boundary produces is in ``{0, 1, 3}``."""
+    config, store, _tel = workspace
+    _blocked_pair(config, store, monkeypatch)
+    ws = _hostile(config.workspace_dir)
+    seen = {_main(["hook-run", "-p", ws]),
+            _main(["hook-run", "-p", str(tmp_path / "gone")])}
+    monkeypatch.setattr(cli, "evaluate_gate", lambda c: 1 / 0)
+    seen.add(_main(["hook-run", "-p", ws]))
+    assert seen == {0, 1, HOOK_BLOCK_EXIT}
+
+
+# --------------------------------------------------------------------------- #
+# The running-build rule (W16)
+# --------------------------------------------------------------------------- #
+
+def _venv_with_link(root) -> Tuple[str, str]:
+    """``<root>/venv/bin/mitos`` (a real file) and ``<root>/bin/mitos`` linking to it."""
+    real = root / "venv" / "bin" / "mitos"
+    real.parent.mkdir(parents=True)
+    real.write_text("#!/bin/sh\n")
+    real.chmod(0o755)
+    link = root / "bin" / "mitos"
+    link.parent.mkdir()
+    link.symlink_to(os.path.join("..", "venv", "bin", "mitos"))
+    return str(real), str(link)
+
+
+_PY = "/opt/py 3/bin/python"
+
+
+def _rule(argv0: str, on_path: Optional[str]) -> str:
+    return cli._running_mitos_command_from(argv0, _PY, lambda name: on_path,
+                                           cli._MITOS_PACKAGE_DIR)
+
+
+def test_a_path_lookup_prints_bare_mitos() -> None:
+    """Table row 1: no path separator in ``argv[0]``."""
+    assert _rule("mitos", None) == "mitos"
+
+
+def test_paths_meeting_at_one_realpath_print_bare_mitos(tmp_path) -> None:
+    """Table row 2: through the symlink or at its target, ``PATH``'s ``mitos`` is this one."""
+    real, link = _venv_with_link(tmp_path)
+    assert _rule(link, link) == "mitos"
+    assert _rule(real, link) == "mitos"
+
+
+def test_another_build_or_none_on_path_prints_the_invoked_path(tmp_path, monkeypatch) -> None:
+    """Table row 3: the invoked path, absolute and quoted — not the realpath."""
+    real, link = _venv_with_link(tmp_path)
+    other = str(tmp_path / "elsewhere" / "mitos")
+    assert _rule(link, other) == link
+    assert _rule(link, None) == link
+    monkeypatch.chdir(tmp_path)
+    assert _rule(os.path.join(".", "bin", "mitos"), None) == link
+
+
+@pytest.mark.parametrize("module_file", ["__main__.py", "cli.py"])
+def test_python_dash_m_prints_the_interpreter(module_file: str) -> None:
+    """Table row 4 (D6), plus ``python -m mitos.cli``: the interpreter that ran the gate."""
+    argv0 = os.path.join(cli._MITOS_PACKAGE_DIR, module_file)
+    assert _rule(argv0, "/usr/bin/mitos") == f"'{_PY}' -m mitos"
+
+
+def test_another_packages_main_is_not_dash_m_mitos(tmp_path) -> None:
+    """``python -m pytest`` also has ``…/__main__.py``: only the ``mitos`` package counts."""
+    other = tmp_path / "pytest" / "__main__.py"
+    other.parent.mkdir()
+    other.write_text("")
+    assert _rule(str(other), None) == str(other)
+
+
+def test_a_hostile_directory_name_round_trips_through_the_shell(tmp_path) -> None:
+    """A space and a ``'`` in the path: quoted, and ``shlex.split`` gives the path back."""
+    root = tmp_path / "it's a dir"
+    root.mkdir()
+    _real, link = _venv_with_link(root)
+    spelled = _rule(link, None)
+    assert spelled != link
+    assert shlex.split(spelled) == [link]
+
+
+def _last_backticked(line: str) -> str:
+    """The recipe span on a line, whatever command it leads with."""
+    return re.findall(r"`([^`]*)`", line)[-1]
+
+
+def _strip_command(recipe: str) -> list:
+    """The recipe's arguments: one prefix token for an executable, three for ``-m``."""
+    tokens = shlex.split(recipe)
+    return tokens[3:] if tokens[1:3] == ["-m", "mitos"] else tokens[1:]
+
+
+@pytest.mark.parametrize("spelling", ["bare", "path", "dash-m"])
+def test_every_block_recipe_spelling_parses_to_check(recipe_workspace, tmp_path, monkeypatch,
+                                                     capsys, spelling: str) -> None:
+    """Criterion 5: through the real reader, each prefix form parses to ``check -p <project>``."""
+    config, store, _tel = recipe_workspace
+    _pair(store)
+    keyed = _keyed(config, monkeypatch)
+    root = tmp_path / "it's a dir"
+    root.mkdir()
+    _real, link = _venv_with_link(root)
+    argv0, prefix = {
+        "bare": ("mitos", ["mitos"]),
+        "path": (link, [link]),
+        "dash-m": (os.path.join(cli._MITOS_PACKAGE_DIR, "__main__.py"),
+                   [sys.executable, "-m", "mitos"]),
+    }[spelling]
+    monkeypatch.setattr(sys, "argv", [argv0])
+    monkeypatch.setattr(cli.shutil, "which", lambda name: None)
+
+    assert cli.cmd_hook_run(keyed) == HOOK_BLOCK_EXIT
+    (line,) = [ln for ln in capsys.readouterr().err.splitlines() if "not been covered" in ln]
+    recipe = _last_backticked(line)
+    assert shlex.split(recipe)[:len(prefix)] == prefix
+    args = cli._build_parser().parse_args(_strip_command(recipe))
+    assert args.command == "check"
+    assert args.project_post == config.project
+
+
+def test_the_help_states_the_check_the_cost_and_the_exit_contract() -> None:
+    """Criterion 7: what it checks, that it runs no judge and spends nothing, and that
+    only the block status fails. Read from the parser, not ``format_help()`` (width)."""
+    from test_cli_selector import _subparsers
+    sub = _subparsers(cli._build_parser())["hook-run"]
+    text = " ".join((sub.description + " " + sub.epilog).split())
+    assert "contradiction check" in text
+    assert "runs no judge, spends nothing" in text
+    assert f"Exit {HOOK_BLOCK_EXIT} is the block, and the only failure status" in text
+    assert f"A hook should fail on exit {HOOK_BLOCK_EXIT} alone." in text
+    assert "is a pass: exit 0" in text

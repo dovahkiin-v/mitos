@@ -8,6 +8,8 @@ MCP serving.
 import sys
 import os
 import re
+import shlex
+import shutil
 import time
 import json
 import uuid
@@ -59,7 +61,7 @@ from mitos.errors import (
     ProjectTargetingError, RegistryError,
     EXEMPT_CREATES_REGISTRATION, EXEMPT_EXPLICITLY_GLOBAL, EXEMPT_NO_WORKSPACE,
     TARGET_EXEMPT_VERB, TARGET_MISSING, TARGET_PATH_NOT_A_WORKSPACE,
-    TARGET_RELATIVE_PATH, TARGET_UNKNOWN_NAME,
+    TARGET_REGISTERED_UNREACHABLE, TARGET_RELATIVE_PATH, TARGET_UNKNOWN_NAME,
 )
 from mitos.divergence import (RELATIONSHIP_FIELDS, _corpus_files, corpus_graph_divergence,
                               corpus_holds_entries, divergence_total)
@@ -5474,19 +5476,80 @@ def _print_check_report(
                   f"no contradictions found.")
 
 
+#: The directory of the ``mitos`` package, which ``python -m mitos`` (and
+#: ``python -m mitos.cli``) runs a file from.
+_MITOS_PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _running_mitos_command_from(argv0: str, executable: str,
+                                which: Callable[[str], Optional[str]],
+                                package_dir: str) -> str:
+    """Spells the command that runs this build, from injected process facts.
+
+    A recipe that names bare ``mitos`` can run a different build from the one that
+    printed it — an older ``mitos`` on ``PATH`` whose ``check`` records nothing, so
+    a gate waiting on that record never opens. So bare ``mitos`` is printed only
+    when it is this executable:
+
+    - ``argv0`` has no path separator: the process was reached by a ``PATH``
+      lookup (or a harness spelled it so).
+    - ``argv0`` is a file inside the ``mitos`` package: the process runs under
+      ``python -m``, and the interpreter is the handle. Residue: under ``-m``,
+      ``sys.path[0]`` is the working directory, so the recipe run from elsewhere
+      may import another installed ``mitos``. Printing bare ``mitos`` instead would
+      be the two-build trap itself.
+    - ``PATH``'s ``mitos`` has the same ``realpath`` as ``argv0``: bare ``mitos``.
+      Real paths, because pipx's ``~/.local/bin/mitos`` is a symlink.
+    - Otherwise the invoked path, made absolute and shell-quoted. Not the realpath:
+      a venv's ``bin/mitos`` is the stable handle, and a pipx venv path is uglier.
+
+    Args:
+        argv0: ``sys.argv[0]``.
+        executable: ``sys.executable``.
+        which: ``shutil.which``, or a stand-in.
+        package_dir: The ``mitos`` package directory.
+
+    Returns:
+        A shell-ready command prefix: ``mitos``, a quoted path, or
+        ``'<python>' -m mitos``.
+    """
+    if os.sep not in argv0 and not (os.altsep and os.altsep in argv0):
+        return "mitos"
+    invoked = os.path.abspath(argv0)
+    real = os.path.realpath(invoked)
+    if os.path.dirname(real) == os.path.realpath(package_dir):
+        return f"{shlex.quote(executable)} -m mitos"
+    on_path = which("mitos")
+    if on_path and os.path.realpath(on_path) == real:
+        return "mitos"
+    return shlex.quote(invoked)
+
+
+def _running_mitos_command() -> str:
+    """Spells the command that runs this build (see ``_running_mitos_command_from``).
+
+    Returns:
+        A shell-ready command prefix for a recipe.
+    """
+    return _running_mitos_command_from(sys.argv[0], sys.executable, shutil.which,
+                                       _MITOS_PACKAGE_DIR)
+
+
 def _hook_block_recipe(config: MitosConfig) -> str:
     """Composes the command the commit gate's block names: the one place it is spelled.
 
     Selectored and ``repr``-rendered like every recipe on this surface, so the
-    agent that reads it runs the check against the corpus the hook gated.
+    agent that reads it runs the check against the corpus the hook gated, and led
+    by the running build's own spelling, so the check it runs is one that records
+    the attempt this gate reads.
 
     Args:
         config: The gated workspace's config.
 
     Returns:
-        The backticked ``mitos check -p …`` recipe.
+        The backticked ``… check -p …`` recipe.
     """
-    return f"`mitos check -p {config.project!r}`"
+    return f"`{_running_mitos_command()} check -p {config.project!r}`"
 
 
 def _hook_block_message(config: MitosConfig, uncovered: int) -> str:
@@ -5522,8 +5585,9 @@ def cmd_hook_run(config: MitosConfig) -> int:
     """Runs the commit gate a git pre-commit hook calls. No judge, no spend, no network.
 
     Evaluates :func:`mitos.commit_gate.evaluate_gate` and maps the verdict to the
-    hook's exit status. Only a block prints the corpus echo and answers on stderr;
-    the three quiet passes print nothing, so a commit that is fine stays silent.
+    hook's exit status. A block and an unreadable row print the corpus echo and
+    then answer on stderr; the three quiet passes print nothing, so a commit that
+    is fine stays silent. Reached only through :func:`_run_hook_boundary`.
 
     Args:
         config: The target workspace's config.
@@ -5533,6 +5597,7 @@ def cmd_hook_run(config: MitosConfig) -> int:
     """
     verdict = evaluate_gate(config)
     if verdict.row == GATE_UNREADABLE:
+        _echo_corpus(config, file=sys.stderr)
         print(_HOOK_UNREADABLE_LINES[verdict.cause], file=sys.stderr)
         return 0
     if verdict.row != GATE_BLOCKED:
@@ -5540,6 +5605,116 @@ def cmd_hook_run(config: MitosConfig) -> int:
     _echo_corpus(config, file=sys.stderr)
     print(_hook_block_message(config, verdict.uncovered), file=sys.stderr)
     return HOOK_BLOCK_EXIT
+
+
+#: The hook boundary's pre-dispatch one-liners, keyed by where the fault arose.
+#: Fixed sentences with the caller's values in ``repr`` form, so a newline in a
+#: value cannot break the one line; never ``str(e)``, whose bodies are
+#: multi-line or name commands. Like ``_HOOK_UNREADABLE_LINES`` they name no
+#: command, and carry no echo: no config was resolved, or the config is the fault.
+_HOOK_BOUNDARY_LINES: Dict[str, str] = {
+    "directory": ("mitos commit gate: the -C directory {directory} could not be "
+                  "entered, so there is nothing to gate; the commit was let through."),
+    "selector": ("mitos commit gate: the project was named twice, so the gate "
+                 "could not tell which to check; the commit was let through."),
+    TARGET_MISSING: ("mitos commit gate: no project selector was given, so the gate "
+                     "could not tell which workspace to check; the commit was let "
+                     "through."),
+    TARGET_UNKNOWN_NAME: ("mitos commit gate: no project named {selector} is "
+                          "registered, so there is nothing to gate; the commit was "
+                          "let through."),
+    TARGET_RELATIVE_PATH: ("mitos commit gate: the project selector {selector} is "
+                           "neither a name nor an absolute path, so the gate could "
+                           "not tell which workspace to check; the commit was let "
+                           "through."),
+    TARGET_PATH_NOT_A_WORKSPACE: ("mitos commit gate: no Mitos workspace at {path} "
+                                  "(project selector {selector}), so there is "
+                                  "nothing to gate; the commit was let through."),
+    TARGET_REGISTERED_UNREACHABLE: ("mitos commit gate: the project {selector} is "
+                                    "registered at {path}, but no Mitos workspace "
+                                    "is there, so there is nothing to gate; the "
+                                    "commit was let through."),
+    "targeting": ("mitos commit gate: the project selector {selector} could not be "
+                  "resolved, so the gate could not decide; the commit was let "
+                  "through."),
+    "registry": ("mitos commit gate: the project registry could not be read, so the "
+                 "gate could not decide; the commit was let through."),
+    "config": ("mitos commit gate: the config at {path} could not be read, so the "
+               "gate could not decide; the commit was let through."),
+    "fault": ("mitos commit gate: the gate could not decide; the commit was let "
+              "through."),
+    "unexpected": ("mitos commit gate: an unexpected {error} stopped the gate, so it "
+                   "could not decide; the commit was let through."),
+}
+
+
+def _run_hook_boundary(args: argparse.Namespace) -> int:
+    """Runs ``hook-run`` behind a boundary of its own; ``main()`` exits with its result.
+
+    Repeats ``main()``'s ordering contract — ``-C`` first, then the selector, then
+    resolution, then the config — and answers every fault on the way with one
+    stderr line and exit 0: a hook that cannot decide lets the commit through. An
+    unexpected exception is one line naming its class and exit 1, which the
+    installed script also treats as a pass but which stays distinguishable from a
+    fault the gate expects.
+
+    ``main()`` routes here before its ``try``, so its ``finally`` never runs: the
+    update-notice exemption is structural, and so is the absence of ``main()``'s
+    multi-line fault anatomy. The config is built with ``warn_unknown_keys=False``
+    and the deprecated-``rotation_mode`` warner is never called, so no row prints a
+    config-hygiene warning. A missing selector is a fault like any other here: the
+    gate never falls back to the working directory, it passes the commit.
+
+    Args:
+        args: The parsed command line (``args.command == "hook-run"``).
+
+    Returns:
+        0, 1 or ``HOOK_BLOCK_EXIT``. Never raises.
+    """
+    stage = "directory"
+    selector: Optional[str] = None
+    root: Optional[str] = None
+    try:
+        _enter_target_directory(args.directory)
+        stage = "selector"
+        selector = _selector_from_args(args)
+        stage = "resolve"
+        target = _resolve_selector(selector, args.command)
+        root = target.root
+        stage = "config"
+        config = MitosConfig(target.root, project=target.name,
+                             warn_unknown_keys=False)
+        stage = "gate"
+        return cmd_hook_run(config)
+    except ProjectTargetingError as e:
+        template = _HOOK_BOUNDARY_LINES.get(e.discriminator,
+                                            _HOOK_BOUNDARY_LINES["targeting"])
+        line = template.format(selector=repr(e.selector), path=repr(e.path))
+        code = 0
+    except RegistryError:
+        line = _HOOK_BOUNDARY_LINES["registry"]
+        code = 0
+    except MitosError:
+        if stage == "config" and root is not None:
+            line = _HOOK_BOUNDARY_LINES["config"].format(
+                path=repr(os.path.join(root, ".mitos", "config.toml")))
+        elif stage in ("directory", "selector"):
+            line = _HOOK_BOUNDARY_LINES[stage].format(directory=repr(args.directory))
+        else:
+            line = _HOOK_BOUNDARY_LINES["fault"]
+        code = 0
+    except Exception as e:
+        if stage == "directory" and isinstance(e, OSError):
+            # `os.chdir` refusing an existing -C target (a permission, say) is a -C
+            # fault like an absent one, not a bug.
+            line = _HOOK_BOUNDARY_LINES["directory"].format(
+                directory=repr(args.directory))
+            code = 0
+        else:
+            line = _HOOK_BOUNDARY_LINES["unexpected"].format(error=type(e).__name__)
+            code = 1
+    print(line, file=sys.stderr)
+    return code
 
 
 def cmd_check(
@@ -6414,6 +6589,10 @@ _POSITIONAL_SELECTOR_VERBS: frozenset = frozenset({"status", "agent-block"})
 # steps — SETUP.md's agent loop is built on that report — and `agent-block`'s
 # plain form prints a workspace-independent block, so refusing a pre-`init` repo
 # would block a legitimate use.
+#
+# `hook-run` is not here, and its config fault is not answered by this carve-out:
+# it has a boundary of its own (`_run_hook_boundary`). The argument does not fit
+# a gate either — for a gate, a missing workspace is a pass, not an answer.
 _WORKSPACE_OPTIONAL_VERBS: frozenset = frozenset({"status", "agent-block"})
 
 
@@ -7132,7 +7311,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help=f"The commit gate a git pre-commit hook runs: exits {HOOK_BLOCK_EXIT} "
              f"(block) only when decisions have not been covered by a contradiction "
              f"check and no check has been attempted since they changed; runs no "
-             f"judge and spends nothing.")
+             f"judge and spends nothing.",
+        description=(
+            "The commit gate a git pre-commit hook runs. It reads the graph and the "
+            "check telemetry and asks one question: have decisions changed without "
+            "a contradiction check being attempted since? It runs no judge, spends "
+            "nothing and reaches no network."),
+        epilog=(
+            f"Exit {HOOK_BLOCK_EXIT} is the block, and the only failure status: it "
+            f"names the check to run. When all is well it prints nothing. A fault "
+            f"it meets (a moved workspace, an unreadable registry, config or graph) "
+            f"is a pass: exit 0, with one line on stderr naming it. An unexpected "
+            f"error exits 1. A hook should fail on exit {HOOK_BLOCK_EXIT} alone."))
 
     # restore-source — re-materialize a graph-only node's `### slug` block.
     rs_p = subparsers.add_parser(
@@ -7279,6 +7469,11 @@ def main() -> None:
     apply_stdout_text_safety(sys.stdout)
     parser = _build_parser()
     args = parser.parse_args()
+    if args.command == "hook-run":
+        # Routed BEFORE the `try`, into a boundary of its own: a git hook speaks on
+        # every commit, so every fault it meets is one line and a pass, and the
+        # `finally`'s update notice (up to two seconds offline) never runs.
+        sys.exit(_run_hook_boundary(args))
 
     try:
         # Constructed INSIDE the try so a strict-loader ConfigError on a malformed
@@ -7547,8 +7742,6 @@ def main() -> None:
             sys.exit(cmd_check(config, staged=args.staged, scope=args.scope,
                                fresh=args.fresh, assume_yes=args.yes,
                                as_json=args.as_json))
-        elif args.command == "hook-run":
-            sys.exit(cmd_hook_run(config))
     except ProjectTargetingError as e:
         # ABOVE `except MitosError`, which it subclasses: without this arm the
         # fallback `str(e)` would render — a terse discriminator-level sentence
@@ -7600,6 +7793,8 @@ def main() -> None:
         # Best-effort 'new version available' nudge, AFTER the command's own
         # output (the finally runs even on the sys.exit paths above). Skipped for
         # the long-running MCP server; fully fail-silent so it never disrupts work.
+        # `hook-run` is exempt too, structurally: it returns before the `try`, so
+        # it never reaches this arm. Folding its route back inside would lose that.
         if args.command != "serve":
             try:
                 from mitos._update import update_notice
