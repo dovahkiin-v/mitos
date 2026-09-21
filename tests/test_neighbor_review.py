@@ -287,7 +287,8 @@ def test_mcp_record_decision_pauses(ws):
 def test_mcp_record_decision_acknowledge_commits(ws):
     from mitos import mcp_server
     config, _ = ws
-    # _review_neighbors must NOT even be consulted when acknowledged.
+    # The pause never consults _review_neighbors when acknowledged. The post-commit
+    # gather (F10) would, but this manager is offline, so it answers None first.
     with patch("mitos.mcp_server.MitosConfig", return_value=config), \
          patch.object(MitosSyncManager, "_review_neighbors", return_value=_FLAGGED):
         res = json.loads(mcp_server.record_decision("A new call.", "rej", ["s"],
@@ -893,8 +894,10 @@ def test_offline_unconfigured_carries_no_notice(ws):
 
 
 def test_acknowledge_bypass_carries_no_notice(ws):
-    """A declined check is not a failed one: acknowledge_neighbors=True runs no gather,
-    so even a broken embed provider yields a clean receipt with no notice."""
+    """A declined check is not a failed one: acknowledge_neighbors=True skips the
+    pre-commit review, so a broken embed provider yields no notice. The post-commit
+    gather (F10) does run, meets the same broken provider, and says so on its own
+    key: `acknowledged_neighbors` is None, never the notice."""
     config, m = ws
     m.embed_provider = _RaisingEmbed(EmbeddingError("would raise if consulted"))
     m.vector_store = _FakeVector([])
@@ -902,6 +905,7 @@ def test_acknowledge_bypass_carries_no_notice(ws):
                                   slug="ack-clean", acknowledge_neighbors=True)
     assert res["status"] == "created"
     assert "neighbor_review_unavailable" not in res
+    assert res["acknowledged_neighbors"] is None
 
 
 def test_mixed_neighbors_declared_edge_survives_acknowledge_bypass(ws):
@@ -963,6 +967,8 @@ def test_created_receipt_carries_no_related_echo(ws):
                                   acknowledge_neighbors=True)
     assert res["status"] == "created"
     assert "related" not in res
+    # The acknowledged path's own key (F10) names the neighbour and invites nothing.
+    assert res["acknowledged_neighbors"] == ["echo-prior"]
 
 
 def test_cli_record_renders_degraded_notice(ws, capsys):
@@ -2357,3 +2363,331 @@ def test_draft_digest_flag_parses_and_reaches_the_manager(tmp_path, monkeypatch)
         with pytest.raises(SystemExit):
             cli.main()
     assert spy.call_args.kwargs["draft_digest"] == "d1.abc"
+
+
+# --------------------------------------------------------------------------- #
+# F10 (4f): an acknowledgement names the neighbours it covered
+#
+# `acknowledge_neighbors=True` skips the pause, and mitos holds nothing between
+# calls, so a cleared pause and a blind pre-disarm look the same. The `created`
+# receipt lists, under `acknowledged_neighbors`, every unlinked live decision at
+# or above the floor the write went past: the pause's gather re-run after the
+# commit and the embed, uncapped by the pause's top 5. [] means it looked and
+# found none; None means it could not look; the key is absent without the flag.
+# --------------------------------------------------------------------------- #
+
+from mitos.cli import _acknowledged_line
+from mitos.conflict import CONFLICT_OVERFETCH_LIMIT, CONFLICT_TOP_K
+from mitos.errors import CollectionMissingError, ValidationError
+
+#: No rendered form may claim the caller looked at anything (§3.3). The last
+#: words were weighed for the gloss and refused.
+_ACK_FORBIDDEN = ("reviewed", "judged", "checked", "cleared", "confirmed", "safe",
+                  "clean", "independent", "seen", "considered", "approved",
+                  "verified", "accepted", "dismissed")
+
+
+def _ack(m, slug, axiom="Adopt SQLite as the storage engine.", **kw):
+    res = m.record_decision_entry(axiom, "rej", ["s"], slug=slug,
+                                  acknowledge_neighbors=True, **kw)
+    assert res["status"] == "created", res
+    return res
+
+
+def test_f10_an_acknowledged_write_lists_the_neighbour_it_went_past(ws):
+    """Row 1 — the list state, and the write lands as it always did."""
+    config, m = ws
+    _seed(m, "use-sqlite", "Use SQLite for the store.")
+    _arm(m, [{"slug": "use-sqlite", "score": 0.9}])
+    res = _ack(m, "adopt-sqlite")
+    assert res["acknowledged_neighbors"] == ["use-sqlite"]
+    assert GraphStore(config.db_path).get_node_by_slug("adopt-sqlite") is not None
+
+
+def test_f10_an_empty_window_reads_empty_not_null(ws):
+    """Row 2 — the gather ran and found none: present, and []."""
+    config, m = ws
+    _arm(m, [])
+    res = _ack(m, "lonely")
+    assert "acknowledged_neighbors" in res and res["acknowledged_neighbors"] == []
+
+
+@pytest.mark.parametrize("score,listed", [(0.79, False), (0.80, True)])
+def test_f10_the_floor_is_the_pauses_and_inclusive(ws, score, listed):
+    """Row 3 — 0.79 is below the floor, exactly 0.80 is at it."""
+    config, m = ws
+    _seed(m, "use-sqlite", "Use SQLite for the store.")
+    _arm(m, [{"slug": "use-sqlite", "score": score}])
+    res = _ack(m, "adopt-sqlite")
+    assert res["acknowledged_neighbors"] == (["use-sqlite"] if listed else [])
+
+
+def test_f10_no_provider_reads_null_without_consulting_the_review(ws):
+    """Row 4 — an offline manager: present and None, and no gather is attempted.
+
+    `_review_neighbors` answers a healthy [] without providers; calling it here
+    would claim a gather that never ran.
+    """
+    config, m = ws
+    assert m.embed_provider is None or m.vector_store is None
+    with patch.object(MitosSyncManager, "_review_neighbors", autospec=True,
+                      return_value=[]) as spy:
+        res = _ack(m, "offline-ack")
+    assert "acknowledged_neighbors" in res and res["acknowledged_neighbors"] is None
+    assert spy.call_count == 0
+
+
+@pytest.mark.parametrize("embed,vector", [
+    (_RaisingEmbed(EmbeddingError("embed down")), _FakeVector([])),
+    (_FakeEmbed(), _RaisingVector(VectorStoreError("qdrant down"))),
+], ids=["embedding", "vector-store"])
+def test_f10_an_unavailable_gather_reads_null_and_raises_no_notice(ws, embed, vector):
+    """Row 5 — a typed Unavailable is None; the pre-commit notice stays unset."""
+    config, m = ws
+    m.embed_provider, m.vector_store = embed, vector
+    res = _ack(m, "degraded-ack")
+    assert res["acknowledged_neighbors"] is None
+    assert "neighbor_review_unavailable" not in res
+
+
+@pytest.mark.parametrize("exc", [DatabaseError("db gone"), ValidationError("bad row"),
+                                 RuntimeError("bug"), KeyError("slug")],
+                         ids=["DatabaseError", "ValidationError", "RuntimeError",
+                              "KeyError"])
+def test_f10_a_raising_gather_degrades_its_key_and_never_the_write(ws, capsys, exc):
+    """Row 6 — standing rule 2's degrade proof. RuntimeError and KeyError are the
+    faults the pause's narrow arm would let through; after the commit none may."""
+    config, m = ws
+    _arm(m, [])
+    capsys.readouterr()
+    with patch.object(MitosSyncManager, "_review_neighbors", side_effect=exc):
+        res = _ack(m, "raised-ack")
+    assert res["acknowledged_neighbors"] is None
+    err = capsys.readouterr().err
+    assert err.count("[Warning]") == 1, err
+    (line,) = [ln for ln in err.splitlines() if "[Warning]" in ln]
+    assert "'raised-ack'" in line
+    assert GraphStore(config.db_path).get_node_by_slug("raised-ack") is not None
+    with open(config.decisions_file, encoding="utf-8") as f:
+        assert "raised-ack" in f.read()
+
+
+def test_f10_the_key_is_absent_on_every_other_exit(ws):
+    """Row 7 — created without the flag, exists, needs_review, slug_collision and
+    draft_drifted under the flag: none carries the key."""
+    config, m = ws
+    _arm(m, [])
+    plain = m.record_decision_entry("A plain decision.", "rej", ["s"], slug="plain")
+    assert plain["status"] == "created"
+    exists = m.record_decision_entry("A plain decision.", "rej", ["s"], slug="plain",
+                                     acknowledge_neighbors=True)
+    assert exists["status"] == "exists"
+    collision = m.record_decision_entry("A different decision.", "rej", ["s"],
+                                        slug="plain", acknowledge_neighbors=True)
+    assert collision.get("code") == "slug_collision", collision
+    digest = _digest_pause(m)
+    paused = m.record_decision_entry(**_DRAFT)
+    assert paused["status"] == "needs_review"
+    drifted = m.record_decision_entry(**{**_DRAFT, **_DRIFTS["axiom"]},
+                                      draft_digest=digest, acknowledge_neighbors=True)
+    assert drifted.get("code") == "draft_drifted", drifted
+    for res in (plain, exists, collision, paused, drifted):
+        assert "acknowledged_neighbors" not in res, res
+
+
+def test_f10_a_declared_neighbour_is_not_listed(ws):
+    """Row 8 — `cites` resolved one neighbour; only the other was gone past."""
+    config, m = ws
+    _seed(m, "mixed-related", "Divergence is reported on status as an informational rung.")
+    _seed(m, "mixed-unrelated", "Scope discovery lists the live subset, not the full spine.")
+    _arm(m, [{"slug": "mixed-related", "score": 0.82},
+             {"slug": "mixed-unrelated", "score": 0.80}])
+    res = _ack(m, "mixed-new", "Reads distinguish empty from unbuilt.",
+               cites="mixed-related")
+    assert res["acknowledged_neighbors"] == ["mixed-unrelated"]
+
+
+def test_f10_an_ancestor_behind_a_declared_chain_head_is_not_listed(ws):
+    """Row 9 — amends the chain head covers its lineage, as it does for the pause."""
+    config, m = ws
+    _seed(m, "chain-c1", "The store uses SQLite for persistence.")
+    _seed(m, "chain-c2", "The store uses SQLite with a single connection.", amends="chain-c1")
+    _seed(m, "chain-c3", "The store uses SQLite with WAL journaling.", amends="chain-c2")
+    _seed(m, "chain-other", "The renderer emits MADR markdown files per decision.")
+    _arm(m, [{"slug": "chain-c1", "score": 0.9}, {"slug": "chain-other", "score": 0.85}])
+    res = _ack(m, "chain-c4", "The store uses SQLite with WAL and a busy timeout.",
+               amends="chain-c3")
+    assert res["acknowledged_neighbors"] == ["chain-other"]
+
+
+def test_f10_the_write_never_lists_itself(ws):
+    """Row 10 — the new node's own vector sits in the post-commit window."""
+    config, m = ws
+    _seed(m, "use-sqlite", "Use SQLite for the store.")
+    _arm(m, [{"slug": "adopt-sqlite", "score": 0.99},
+             {"slug": "use-sqlite", "score": 0.9}])
+    res = _ack(m, "adopt-sqlite")
+    assert res["acknowledged_neighbors"] == ["use-sqlite"]
+
+
+def test_f10_covered_is_the_gates_set_uncapped(ws):
+    """Row 11 (D1) — seven neighbours: the pause shows five, the acknowledgement
+    lists all seven, most similar first, with the pause's slugs as its prefix; with
+    three the two lists are equal."""
+    config, m = ws
+    slugs = [f"near-{i}" for i in range(7)]
+    for i, slug in enumerate(slugs):
+        _seed(m, slug, f"Near-neighbour decision number {i} about the store.")
+    # Armed out of order, so the ranking is the gather's and not the fixture's.
+    scores = [0.83, 0.97, 0.80, 0.91, 0.88, 0.95, 0.86]
+    _arm(m, [{"slug": s, "score": sc} for s, sc in zip(slugs, scores)])
+    ranked = [s for _, s in sorted(zip(scores, slugs), reverse=True)]
+
+    paused = m.record_decision_entry("The store is a near-twin.", "rej", ["s"],
+                                     slug="crowded")
+    assert paused["status"] == "needs_review"
+    shown = [n["slug"] for n in paused["neighbors"]]
+    assert len(shown) == CONFLICT_TOP_K
+    listed = _ack(m, "crowded", "The store is a near-twin.")["acknowledged_neighbors"]
+    assert listed == ranked
+    assert len(listed) == 7 <= CONFLICT_OVERFETCH_LIMIT
+    assert listed[:CONFLICT_TOP_K] == shown
+
+    three = [{"slug": s, "score": sc} for s, sc in zip(slugs[:3], scores[:3])]
+    _arm(m, three)
+    paused3 = m.record_decision_entry("A second near-twin.", "rej", ["s"], slug="sparse")
+    shown3 = [n["slug"] for n in paused3["neighbors"]]
+    listed3 = _ack(m, "sparse", "A second near-twin.")["acknowledged_neighbors"]
+    assert len(shown3) == 3 and listed3 == shown3
+
+
+def test_f10_both_machine_encodings_carry_the_same_list(ws, capsys):
+    """Row 12 — `record --json` and MCP `record_decision`, over one armed window."""
+    from mitos import mcp_server
+    config, m = ws
+    _seed(m, "par-seed", "Use SQLite for the store.")
+    factory = _armed_real_manager_factory([{"slug": "par-seed", "score": 0.9}])
+    with patch("mitos.cli.MitosSyncManager", side_effect=factory), \
+         patch("mitos.sync.MitosSyncManager", side_effect=factory), \
+         patch("mitos.mcp_server.MitosConfig", return_value=config):
+        capsys.readouterr()
+        cmd_record(config, axiom="The CLI twin of the store decision.", rejected="rej",
+                   slug="par-cli", acknowledge_neighbors=True, as_json=True)
+        cli_payload = json.loads(capsys.readouterr().out)
+        mcp_payload = json.loads(mcp_server.record_decision(
+            "The MCP twin of the store decision.", "rej", ["s"], slug="par-mcp",
+            acknowledge_neighbors=True, project=config.workspace_dir))
+    assert cli_payload["acknowledged_neighbors"] == ["par-seed"]
+    assert mcp_payload["acknowledged_neighbors"] == ["par-seed"]
+    assert set(cli_payload) == set(mcp_payload)
+
+
+def _ack_lines(out):
+    return [ln for ln in out.splitlines() if ln.strip().startswith("Acknowledged:")]
+
+
+def test_f10_the_text_receipt_prints_one_line_per_form(ws, capsys):
+    """Row 13 — the three forms through `cmd_record`, and none without the flag."""
+    config, m = ws
+    _seed(m, "txt-seed", "Use SQLite for the store.")
+    floor = f"{_NEIGHBOR_REVIEW_THRESHOLD:.2f}"
+
+    def record(slug, matches, **kw):
+        capsys.readouterr()
+        if matches is None:
+            cmd_record(config, axiom=f"Decision {slug}.", rejected="rej", slug=slug, **kw)
+        else:
+            with patch("mitos.cli.MitosSyncManager",
+                       side_effect=_armed_real_manager_factory(matches)):
+                cmd_record(config, axiom=f"Decision {slug}.", rejected="rej",
+                           slug=slug, **kw)
+        return _ack_lines(capsys.readouterr().out)
+
+    (listed,) = record("txt-list", [{"slug": "txt-seed", "score": 0.9}],
+                       acknowledge_neighbors=True)
+    (empty,) = record("txt-empty", [], acknowledge_neighbors=True)
+    (null,) = record("txt-null", None, acknowledge_neighbors=True)
+    assert record("txt-plain", [], ) == []
+    assert record("txt-plain-offline", None) == []
+
+    assert "txt-seed" in listed and floor in listed and floor in empty
+    assert null != empty
+    for line in (listed, empty, null):
+        assert "None" not in line and "[]" not in line, line
+        bare = line.replace("txt-seed", "")
+        assert "`" not in bare and "mitos" not in bare, line
+    for line in (listed, empty, null):
+        lowered = line.casefold()
+        assert [w for w in _ACK_FORBIDDEN if w in lowered] == [], line
+
+
+def test_f10_the_forbidden_sweep_catches_a_planted_word():
+    """Row 13's register cell has teeth: each planted word is caught."""
+    base = _acknowledged_line(["a-slug"])
+    for word in _ACK_FORBIDDEN:
+        assert word in f"{base} {word}".casefold()
+    assert _acknowledged_line(None) != _acknowledged_line([])
+
+
+def test_f10_the_write_embeds_once(ws, tmp_path):
+    """Row 14 — the post-commit gather hits the cache step 8 filled: one provider
+    call for an acknowledged write, and one in total for a pause plus its
+    acknowledged re-send."""
+    from mitos.embeddings import GeminiEmbeddingProvider
+    from unittest.mock import MagicMock
+    config, m = ws
+    _seed(m, "use-sqlite", "Use SQLite for the store.")
+    with patch("google.genai.Client") as client:
+        emb = MagicMock()
+        emb.values = [0.1, 0.2, 0.3]
+        client.return_value.models.embed_content.return_value.embeddings = [emb]
+        calls = client.return_value.models.embed_content
+        m.embed_provider = GeminiEmbeddingProvider(str(tmp_path / "cache.sqlite"),
+                                                   api_key="mock_key")
+        m.vector_store = _FakeVector([{"slug": "use-sqlite", "score": 0.9}])
+
+        res = _ack(m, "blind-ack", "A blind acknowledged decision.")
+        assert res["acknowledged_neighbors"] == ["use-sqlite"]
+        assert calls.call_count == 1
+
+        calls.reset_mock()
+        paused = m.record_decision_entry("Adopt SQLite as the storage engine.", "rej",
+                                         ["s"], slug="adopt-sqlite")
+        assert paused["status"] == "needs_review"
+        res = _ack(m, "adopt-sqlite")
+        assert res["acknowledged_neighbors"] == ["use-sqlite"]
+        assert calls.call_count == 1
+
+
+def test_f10_record_decision_entry_docstring_names_the_key():
+    """Row 15 — the Returns block says when the key is there and what it holds."""
+    doc = MitosSyncManager.record_decision_entry.__doc__
+    assert "acknowledged_neighbors" in doc
+
+
+class _CreatableVector:
+    """A collection that is absent until the first `upsert(..., may_create=True)`."""
+
+    def __init__(self):
+        self.exists = False
+
+    def query(self, vector, limit=5):
+        if not self.exists:
+            raise CollectionMissingError("absent")
+        return []
+
+    def upsert(self, node_id, vector, payload, may_create=False):
+        if not self.exists:
+            if not may_create:
+                raise CollectionMissingError("absent")
+            self.exists = True
+
+
+def test_f10_a_fresh_workspace_reads_empty_not_null(ws):
+    """Row 16 (D2) — the gather runs after step 8 has created the collection, so the
+    first-ever write answers [] instead of meeting an absent collection."""
+    config, m = ws
+    m.embed_provider, m.vector_store = _FakeEmbed(), _CreatableVector()
+    res = _ack(m, "first-ever")
+    assert m.vector_store.exists
+    assert res["acknowledged_neighbors"] == []

@@ -32,6 +32,7 @@ from mitos import settledness
 from mitos.config import MitosConfig, hint_due, judge_api_key
 from mitos.conflict import (
     CONFLICT_CANDIDATE_SOURCE,
+    CONFLICT_OVERFETCH_LIMIT,
     CONFLICT_PROMPT_VERSION,
     CONFLICT_TOP_K,
     ConflictCheckResult,
@@ -2897,6 +2898,7 @@ class MitosSyncManager:
 
     def _review_neighbors(self, entry: ParsedEntry, declared_targets: set, *,
                           gathered_index: Optional[Dict[str, Tuple[str, float]]] = None,
+                          top_k: int = CONFLICT_TOP_K,
                           ) -> "List[Dict[str, Any]] | Unavailable":
         """Pre-commit: existing live decisions too similar to ``entry`` to ignore (P4).
 
@@ -2905,7 +2907,7 @@ class MitosSyncManager:
         over-fetches one bounded KNN window, and keeps only live *decisions* — an
         open question in the window is screened by kind, never crashed on — then
         :func:`screen_candidates` drops declared/self, floors at
-        ``_NEIGHBOR_REVIEW_THRESHOLD``, and truncates to ``CONFLICT_TOP_K``.
+        ``_NEIGHBOR_REVIEW_THRESHOLD``, and truncates to ``top_k``.
         Surfacing survivors BEFORE the write is the whole point: after the commit the
         author can no longer point an amends/supersedes at them (a re-record is a no-op).
 
@@ -2930,6 +2932,12 @@ class MitosSyncManager:
                 fell short are indistinguishable there. A sink rather than a widened
                 return type, so the eight ``patch.object`` sites binding this method by
                 string stay green.
+            top_k: How many screened survivors to keep. The pause uses the default,
+                ``CONFLICT_TOP_K``, which is what it displays. The acknowledged path
+                (:meth:`_acknowledged_neighbors_field`) passes
+                ``CONFLICT_OVERFETCH_LIMIT``, the whole gather window, because an
+                acknowledgement covers every neighbour the gate would have held the
+                write for, not only the ones a pause would show.
 
         Returns:
             A list of :func:`~mitos.conflict.candidate_payload` dicts for
@@ -2963,7 +2971,7 @@ class MitosSyncManager:
             declared_targets=declared_targets,
             own_slug=entry.slug,
             floor=_NEIGHBOR_REVIEW_THRESHOLD,
-            top_k=CONFLICT_TOP_K,
+            top_k=top_k,
         )
         return [candidate_payload(c) for c in screened]
 
@@ -3039,6 +3047,103 @@ class MitosSyncManager:
             for ancestor in self.store.get_lineage(ids[0]):
                 suppressed.add(ancestor["slug"].casefold())
         return suppressed
+
+    def _review_declared_targets(self, supersedes: Optional[str],
+                                 corrects: Optional[str],
+                                 extra_relations: Dict[str, str]) -> set[str]:
+        """Builds the neighbour review's suppression set from the raw relation args.
+
+        The one source for both callers: the pre-commit pause and the acknowledged
+        path's post-commit gather (:meth:`_acknowledged_neighbors_field`). Two copies
+        would drift, and the first drift would name a neighbour the caller had linked.
+        The set is every declared relation target, casefolded, plus the transitive
+        mutation lineage of the ``supersedes``/``amends``/``narrows`` targets (3b).
+        The lineage walk is skipped without providers: the gate is then a no-op
+        (:meth:`_review_neighbors` returns ``[]``), and the walk only ever grows the
+        set, so direct suppression of all nine types holds either way (DoD #13b). It
+        is suppression-only and re-declares nothing, so a bridged predecessor still
+        reads un-amended (§6.2).
+
+        It reads the raw args and writes nothing back: Phase B writes edges from the
+        same raw args, and normalising them here would drop declared edges under
+        ``acknowledge_neighbors`` (``test_mixed_neighbors_declared_edge_survives_acknowledge_bypass``).
+
+        Args:
+            supersedes: The raw ``supersedes`` argument.
+            corrects: The raw ``corrects`` argument.
+            extra_relations: The seven non-kill relations, stripped, non-empty only.
+
+        Returns:
+            The casefolded slugs the review must not flag. Graph-store faults from the
+            lineage walk propagate; each caller owns its disposition.
+        """
+        declared = {
+            t.casefold()
+            for raw in ([supersedes, corrects] + list(extra_relations.values()))
+            for t in _split_relation_slugs(raw)
+        }
+        if self.embed_provider and self.vector_store:
+            declared |= self._lineage_suppression_slugs(
+                _split_relation_slugs(supersedes)
+                + _split_relation_slugs(extra_relations.get("amends"))
+                + _split_relation_slugs(extra_relations.get("narrows"))
+            )
+        return declared
+
+    def _acknowledged_neighbors_field(self, entry: ParsedEntry,
+                                      supersedes: Optional[str],
+                                      corrects: Optional[str],
+                                      extra_relations: Dict[str, str],
+                                      ) -> Optional[List[str]]:
+        """Names the neighbours an acknowledged write went past, never raising (F10).
+
+        ``acknowledge_neighbors=True`` skips the pause, and mitos holds nothing between
+        calls, so a pause cleared on a re-send and a flag passed blind on the first
+        call look the same. This lists the neighbours for both. It re-runs the pause's
+        own gather after the commit and the embed, so the axiom's vector is already in
+        the embedding cache and the gather adds one vector query, no embedding call.
+        The list is not cut to the pause's ``CONFLICT_TOP_K``: an acknowledgement
+        covers every neighbour the gate would have held the write for, bounded only by
+        the gather window (``CONFLICT_OVERFETCH_LIMIT``). The new node's own vector is
+        in that window, and the own-slug screen drops it.
+
+        Called after the commit and outside the lock, like :meth:`_audit_debt_fields`.
+        ``None`` means nothing is claimed: no embedding provider or vector store (where
+        :meth:`_review_neighbors` would answer a healthy ``[]`` for a gather that never
+        ran), a typed :class:`Unavailable`, or any exception, which also writes one
+        stderr warning. The write has landed, so nothing here may escape (§7).
+
+        Args:
+            entry: The committed entry.
+            supersedes: The raw ``supersedes`` argument.
+            corrects: The raw ``corrects`` argument.
+            extra_relations: The seven non-kill relations, as the pause reads them.
+
+        Returns:
+            The neighbours' stored slugs, most similar first; ``[]`` when the gather
+            ran and found none; ``None`` when it could not run.
+        """
+        if not self.embed_provider or not self.vector_store:
+            return None
+        # Step 8 met a missing collection it could not create: the gather would meet
+        # it too, and with the new node live `missing_index_is_a_gap` says True, so it
+        # would answer Unavailable. Same None, one round trip fewer. A first write
+        # (may_create) never sets the latch, so a fresh workspace still gathers.
+        if self._collection_absent:
+            return None
+        try:
+            declared = self._review_declared_targets(supersedes, corrects,
+                                                     extra_relations)
+            reviewed = self._review_neighbors(entry, declared,
+                                              top_k=CONFLICT_OVERFETCH_LIMIT)
+        except Exception as e:
+            # stderr: the MCP write tool shares this path and uses stdout for JSON-RPC.
+            print(f"[Warning] Acknowledged-neighbour read failed for '{entry.slug}': "
+                  f"{str(e)}", file=sys.stderr)
+            return None
+        if isinstance(reviewed, Unavailable):
+            return None
+        return [n["slug"] for n in reviewed]
 
     def _node_state(self, node_id: str) -> str:
         """Returns the computed state of a node ('active'/'superseded'/'corrected'/'drifted')."""
@@ -3828,7 +3933,11 @@ class MitosSyncManager:
             eligible; plus an optional ``check_notice`` (the last contradiction
             check's outcome, :func:`~mitos.check_notice.compose_check_notice`),
             present only while a judge key is set and that outcome is not
-            ``no_new_findings``; OR, when a highly-similar unreferenced decision exists and
+            ``no_new_findings``; plus, only when ``acknowledge_neighbors`` was
+            passed, ``acknowledged_neighbors`` (:meth:`_acknowledged_neighbors_field`):
+            the stored slugs of every unlinked live decision at or above the floor
+            that the write went past, most similar first, ``[]`` when there were
+            none, or ``None`` when the gather could not run; OR, when a highly-similar unreferenced decision exists and
             ``acknowledge_neighbors`` is False, a ``{status: "needs_review", code:
             "similar_decision_exists", slug, neighbors, message, draft_digest}`` pause
             that wrote NOTHING — ``draft_digest`` (:func:`_draft_digest`) is what a
@@ -4077,8 +4186,8 @@ class MitosSyncManager:
         if not acknowledge_neighbors:
             neighbors: List[Dict[str, Any]] = []
             # The caller's own declarations, per relation, for the pause echo — built
-            # BESIDE the declared_targets comprehension below, which folds the relation
-            # name away. Purely additive: nothing that Phase B reads moves in here.
+            # BESIDE the declared-targets set below (_review_declared_targets), which
+            # folds the relation name away. Purely additive: nothing that Phase B reads moves in here.
             # `test_mixed_neighbors_declared_edge_survives_acknowledge_bypass` documents
             # why that matters — this whole block is skipped under acknowledge_neighbors
             # while Phase B still writes edges from the raw relation args, so relocating
@@ -4091,27 +4200,11 @@ class MitosSyncManager:
             # input to the partition (M8); empty when the sweep never ran.
             gathered_index: Dict[str, Tuple[str, float]] = {}
             try:
-                declared_targets = {
-                    t.casefold()
-                    for raw in ([supersedes, corrects] + list(extra_relations.values()))
-                    for t in _split_relation_slugs(raw)
-                }
-                # Transitive-lineage suppression (3b): also suppress the pause for the
-                # OLDER members of an amends/narrows/supersedes chain reachable through a
-                # declared mutation edge — by naming the chain head the author has
-                # acknowledged the whole lineage (consuming get_lineage from 3a). Seed only
-                # the mutation three (corrects + the other five stay direct-only). Skip the
-                # walk when the gate is a no-op (offline → _review_neighbors returns []);
-                # the augmentation only ever GROWS the set, so direct suppression of all
-                # nine types is preserved (DoD #13b). The walk is suppression-only: it does
-                # NOT re-declare amends/narrows (that serves modifier stamping, a different
-                # consumer — §6.2), so a bridged predecessor still reads un-amended.
-                if self.embed_provider and self.vector_store:
-                    declared_targets |= self._lineage_suppression_slugs(
-                        _split_relation_slugs(supersedes)
-                        + _split_relation_slugs(extra_relations.get("amends"))
-                        + _split_relation_slugs(extra_relations.get("narrows"))
-                    )
+                # Declared targets plus their transitive mutation lineage (3b): by
+                # naming a chain head the author has acknowledged the whole lineage.
+                # One source with the acknowledged path's post-commit gather.
+                declared_targets = self._review_declared_targets(
+                    supersedes, corrects, extra_relations)
                 reviewed = self._review_neighbors(entry, declared_targets,
                                                   gathered_index=gathered_index)
             except (DatabaseError, ValidationError) as exc:
@@ -4311,6 +4404,14 @@ class MitosSyncManager:
         #     as 9b; None on a keyless workspace or a healthy record.
         check_notice = self._check_notice_field()
 
+        # 9d. Under acknowledge_neighbors, the neighbours this write went past (F10):
+        #     the pause's gather re-run after the embed, so it hits the embedding
+        #     cache. Same never-raising shape as 9b/9c; None when it could not run.
+        acknowledged: Optional[List[str]] = None
+        if acknowledge_neighbors:
+            acknowledged = self._acknowledged_neighbors_field(
+                entry, supersedes, corrects, extra_relations)
+
         # 10. Return. A freshly recorded decision is always active. Everything below is
         #     post-commit read-back — the write contract is untouched (the commit
         #     already succeeded above).
@@ -4357,4 +4458,8 @@ class MitosSyncManager:
         # alone: each renderer decides whether a recovery clause follows it.
         if check_notice:
             result["check_notice"] = check_notice
+        # Keyed on the flag, not the value: None ("could not look") and [] ("looked,
+        # none") are both answers, and the key's absence means the flag was not passed.
+        if acknowledge_neighbors:
+            result["acknowledged_neighbors"] = acknowledged
         return result

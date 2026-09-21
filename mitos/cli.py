@@ -1984,6 +1984,30 @@ def cmd_render(config: MitosConfig, scope: Optional[str] = None, render_format: 
 _PAUSE_REJECTED_PREVIEW = 80
 
 
+def _acknowledged_line(value: Optional[List[str]]) -> str:
+    """Renders the `created` receipt's ``acknowledged_neighbors`` as one line (F10).
+
+    The key is there only when the record passed ``--acknowledge-neighbors``, and a
+    slug is listed for a pause the caller saw and for a flag passed blind alike, so
+    no form says the caller looked at anything. ``None`` means the gather could not
+    run and must not read as an empty list.
+
+    Args:
+        value: The key's value: slugs, ``[]``, or ``None``.
+
+    Returns:
+        The receipt line, without a trailing newline.
+    """
+    floor = f"{_NEIGHBOR_REVIEW_THRESHOLD:.2f}"
+    if value is None:
+        return ("  Acknowledged: unknown — the neighbours this record went past "
+                "could not be gathered")
+    if not value:
+        return f"  Acknowledged: no unlinked decision at or above {floor} similarity"
+    return (f"  Acknowledged: {', '.join(value)} — the unlinked decisions at or above "
+            f"{floor} similarity this record went past")
+
+
 def cmd_record(
     config: MitosConfig,
     axiom: str,
@@ -2169,6 +2193,9 @@ def cmd_record(
         print(f"  Scope:     {', '.join(result['scope'])}")
     if result.get("mechanisms"):
         print(f"  Mechanisms: {', '.join(result['mechanisms'])}")
+    # Keyed on presence: [] and None are both answers, only the flag's absence isn't.
+    if "acknowledged_neighbors" in result:
+        print(_acknowledged_line(result["acknowledged_neighbors"]))
     # Debounced size-ceiling nudge — AFTER the receipt, on stderr (an ancillary health
     # hint, never the receipt itself), so a healthy growing corpus can't bury "Recorded ✓".
     # Flush stdout first so the receipt lands before the nudge even when stdout is piped
