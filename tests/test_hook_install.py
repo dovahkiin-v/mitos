@@ -44,6 +44,10 @@ _SH = "/bin/sh"
 @pytest.fixture(autouse=True)
 def _git_isolation(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     isolate_git(monkeypatch, str(tmp_path))
+    # pytest's cwd is the checkout. A regression (or a constraint-10 break) that
+    # asks git from the cwd instead of the workspace would otherwise install into
+    # the developer's own `.git/hooks`; here it lands in a directory git cannot see.
+    monkeypatch.chdir(tmp_path)
 
 
 # --------------------------------------------------------------------------- #
