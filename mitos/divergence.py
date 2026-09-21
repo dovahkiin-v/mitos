@@ -70,6 +70,12 @@ can import the leaf without dragging in the parser (which reads ``format-spec.md
 from package data at import time), the store, or the cutover replay machinery. A test
 pins that import graph.
 
+The span helpers (``judged_text``, ``differing_span``, ``code_point_names``) serve
+``sync``'s divergence report, and they restate the S1 comparison rule rather than
+share it: ``judged_text`` is the value exactly as ``entry_divergence`` compares it, so
+the report locates the difference the comparator saw and never one it ignored. A test
+pins the two to agree, field by field, over a table of cases.
+
 **Open questions are out of scope, on both sides.** ``questions.md`` is not read, and
 open-question nodes are filtered out of the graph side to match — excluding them from
 one side only would report every one as a source-block orphan whose named repair
@@ -79,6 +85,7 @@ cannot touch it.
 import hashlib
 import json
 import os
+import unicodedata
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from mitos.scope_tags import normalize_scope_tags
@@ -103,6 +110,11 @@ RELATIONSHIP_FIELDS: tuple = (
     "supersedes", "corrects", "amends", "narrows", "depends_on",
     "resolves", "contradicts", "derives_from", "cites",
 )
+
+# How many characters of one side's differing span the report names by code point. A
+# homoglyph is one character; a long rewritten span in a non-English corpus would
+# otherwise print hundreds of names, and the reader has `--full` for the whole value.
+SPAN_CODEPOINT_CAP: int = 12
 
 
 def strip_citation(raw: str) -> str:
@@ -142,6 +154,111 @@ def _normalized_text(value: Optional[str]) -> str:
         The value stripped, or ``""`` when absent.
     """
     return (value or "").strip()
+
+
+def judged_text(field: str, value: Optional[str]) -> str:
+    """Returns a commentary value exactly as ``entry_divergence`` compares it.
+
+    Stripped, with ``None`` read as ``""``, then casefolded for ``slug`` alone (the
+    same order the comparator applies). The divergence report locates its span on
+    this value, so whitespace the comparator ignores can never be reported as the
+    difference.
+
+    Args:
+        field: A ``COMMENTARY_FIELDS`` name.
+        value: The raw value from either side.
+
+    Returns:
+        The judged value.
+    """
+    text = _normalized_text(value)
+    return text.casefold() if field == "slug" else text
+
+
+def differing_span(graph: str, markdown: str) -> Optional[Dict[str, Any]]:
+    """Locates the one span where two judged values part.
+
+    Offsets count characters of the judged value (Python ``str`` indexes by code
+    point), never bytes and never positions in a ``repr``. The value is the stripped
+    one, so an offset is relative to it and not to the line in ``decisions.md``.
+
+    Args:
+        graph: The graph side, already a ``judged_text`` value.
+        markdown: The markdown side, already a ``judged_text`` value.
+
+    Returns:
+        ``None`` when the two are equal. Otherwise ``offset`` (shared leading
+        characters), ``shared_after`` (shared trailing characters, never overlapping
+        the prefix), each side's differing ``graph``/``markdown`` span, and each
+        side's ``graph_len``/``markdown_len``.
+    """
+    if graph == markdown:
+        return None
+    limit = min(len(graph), len(markdown))
+    offset = 0
+    while offset < limit and graph[offset] == markdown[offset]:
+        offset += 1
+    # Bounded by what the prefix left, or "abc" against "abcabc" counts the shared
+    # "abc" twice and slices a negative-width span.
+    shared_after = 0
+    while (
+        shared_after < limit - offset
+        and graph[-1 - shared_after] == markdown[-1 - shared_after]
+    ):
+        shared_after += 1
+    return {
+        "offset": offset,
+        "shared_after": shared_after,
+        "graph": graph[offset:len(graph) - shared_after],
+        "markdown": markdown[offset:len(markdown) - shared_after],
+        "graph_len": len(graph),
+        "markdown_len": len(markdown),
+    }
+
+
+def _is_printable_ascii(text: str) -> bool:
+    """Reports whether every character is printable ASCII (space through tilde)."""
+    return all(" " <= ch <= "~" for ch in text)
+
+
+def needs_code_points(graph_span: str, markdown_span: str) -> bool:
+    """Reports whether a span pair must be named by code point.
+
+    Either side holding a character outside printable ASCII is enough, and then both
+    sides are named: a homoglyph faces an ASCII twin, and naming one side alone leaves
+    the reader guessing what it was compared with.
+
+    Args:
+        graph_span: The graph side's differing span.
+        markdown_span: The markdown side's differing span.
+
+    Returns:
+        True when the report owes a code-point line.
+    """
+    return not (_is_printable_ascii(graph_span) and _is_printable_ascii(markdown_span))
+
+
+def code_point_names(span: str) -> str:
+    """Names a span's characters as ``U+XXXX NAME``, capped.
+
+    Args:
+        span: One side's differing span.
+
+    Returns:
+        The names joined by ``", "``, at most ``SPAN_CODEPOINT_CAP`` of them followed
+        by ``(+N more)``, or ``(none)`` for an empty span. A character with no
+        Unicode name (a control character) is given by its code point alone.
+    """
+    if not span:
+        return "(none)"
+    names = []
+    for ch in span[:SPAN_CODEPOINT_CAP]:
+        name = unicodedata.name(ch, "")
+        names.append(f"U+{ord(ch):04X} {name}" if name else f"U+{ord(ch):04X}")
+    text = ", ".join(names)
+    if len(span) > SPAN_CODEPOINT_CAP:
+        text += f" (+{len(span) - SPAN_CODEPOINT_CAP} more)"
+    return text
 
 
 def _edge_key_set(pairs: Sequence[Dict[str, str]]) -> set:

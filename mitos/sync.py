@@ -49,7 +49,10 @@ from mitos.telemetry import (CommentaryAuditRow, ConflictCheckRow, JudgmentBatch
                             TelemetryStore, read_last_attempt)
 from mitos.check_notice import compose_check_notice
 from mitos.audit_debt import AuditDebt, derive_audit_debt
-from mitos.divergence import declared_edges, entry_divergence, is_reconcilable
+from mitos.divergence import (
+    code_point_names, declared_edges, differing_span, entry_divergence, is_reconcilable,
+    judged_text, needs_code_points,
+)
 from mitos.errors import (
     CollectionMissingError,
     MitosError,
@@ -470,6 +473,50 @@ def _tool_call_markup_refusal(arguments: List[Tuple[str, Any]]) -> Optional[Dict
     return {**_record_error("tool_call_markup", field=first["field"], span=first["span"],
                             offset=first["offset"], more=more),
             "markup_spans": hits}
+
+
+def _divergence_field_lines(field: str, graph_raw: Optional[str],
+                            markdown_raw: Optional[str], *, full: bool) -> List[str]:
+    """Renders one diverged commentary field for the reconcile report.
+
+    The span is located on the judged values (``judged_text``), never on the raw
+    reprs: the comparator strips and casefolds a slug, so a raw diff can point at a
+    difference it ignored. The span is printed whole and with ``repr``, which shows
+    whitespace and invisible characters but not a homoglyph, so a span holding
+    anything outside printable ASCII also names its code points, on both sides.
+
+    Args:
+        field: The ``COMMENTARY_FIELDS`` name ``entry_divergence`` listed.
+        graph_raw: The stored value, as read from the node.
+        markdown_raw: The parsed value, as read from the entry.
+        full: ``--full``: the two whole raw values, byte for byte as before the span
+            report existed.
+
+    Returns:
+        The field's lines, unterminated.
+    """
+    span = None if full else differing_span(judged_text(field, graph_raw),
+                                            judged_text(field, markdown_raw))
+    if span is None:
+        # `--full`, or a listed field whose judged values agree. The second cannot
+        # happen while the comparator and `judged_text` agree (a test pins that);
+        # if they ever drift, both whole sides is honest and "no difference" under a
+        # divergence header is not.
+        return [f"  {field}:",
+                f"    graph:    {graph_raw!r}",
+                f"    markdown: {markdown_raw!r}"]
+    label = f"{field} (compared casefolded)" if field == "slug" else field
+    lines = [
+        f"  {label}: parts after {span['offset']} shared characters "
+        f"(graph {span['graph_len']}, markdown {span['markdown_len']}; "
+        f"{span['shared_after']} shared at the end)",
+        f"    graph:       {span['graph']!r}",
+        f"    markdown:    {span['markdown']!r}",
+    ]
+    if needs_code_points(span["graph"], span["markdown"]):
+        lines.append(f"    code points: graph {code_point_names(span['graph'])}; "
+                     f"markdown {code_point_names(span['markdown'])}")
+    return lines
 
 
 class _AmendAnswer(Exception):
@@ -1450,7 +1497,8 @@ class MitosSyncManager:
                       "marker ✓", file=sys.stderr)
 
     def perform_sync(self, auto_accept: bool = False, verbose: bool = False,
-                     repair_targets: Optional[List[str]] = None) -> List[str]:
+                     repair_targets: Optional[List[str]] = None,
+                     full: bool = False) -> List[str]:
         """Executes the complete transactional sync flow.
 
         The repair ledger is built and reported HERE rather than inside
@@ -1467,6 +1515,8 @@ class MitosSyncManager:
             repair_targets: Handles named by ``--reconcile-entry``, in the caller's
                 verbatim spelling. ``None`` (no flag) and ``[]`` mean the same
                 thing here — nothing was named, so the ledger is inert.
+            full: ``--full``: the divergence report prints each diverged commentary
+                field whole on both sides instead of its differing span.
 
         Returns:
             The named targets that did NOT end in the state their markdown
@@ -1480,7 +1530,8 @@ class MitosSyncManager:
         questions_snapshot_path = os.path.join(self.config.mitos_dir, "questions_snapshot.md")
         try:
             self._perform_sync_internal(
-                snapshot_path, questions_snapshot_path, auto_accept, verbose, ledger
+                snapshot_path, questions_snapshot_path, auto_accept, verbose, ledger,
+                full=full,
             )
         finally:
             for path in (snapshot_path, questions_snapshot_path):
@@ -1491,7 +1542,7 @@ class MitosSyncManager:
                         pass
         return ledger.report()
 
-    def _perform_sync_internal(self, snapshot_path: str, questions_snapshot_path: str, auto_accept: bool = False, verbose: bool = False, ledger: Optional["_RepairLedger"] = None) -> None:
+    def _perform_sync_internal(self, snapshot_path: str, questions_snapshot_path: str, auto_accept: bool = False, verbose: bool = False, ledger: Optional["_RepairLedger"] = None, full: bool = False) -> None:
         """Executes the internal transactional sync flow.
 
         ``ledger`` is defaulted so the sole production caller stays the only site
@@ -1706,7 +1757,7 @@ class MitosSyncManager:
 
                 if not self._apply_commentary_reconcile(
                     entry, existing, node_id, divergence, auto_accept,
-                    authorized=ledger.authorizes(entry),
+                    authorized=ledger.authorizes(entry), full=full,
                 ):
                     ledger.note(entry, "reconcile_refused")
                     continue
@@ -3458,6 +3509,7 @@ class MitosSyncManager:
         auto_accept: bool,
         *,
         authorized: bool = False,
+        full: bool = False,
     ) -> bool:
         """Applies one commentary reconcile, or reports why it was skipped.
 
@@ -3481,6 +3533,8 @@ class MitosSyncManager:
                 mid-reconcile leaves exactly the state a confirmed reconcile leaves
                 today. The named-target test lives at the call site, so this
                 function stays ignorant of the flag's vocabulary.
+            full: ``--full``: print each diverged commentary field whole on both
+                sides, and no pointer to the flag.
 
         Returns:
             True if the reconcile was applied.
@@ -3489,10 +3543,12 @@ class MitosSyncManager:
         removals = edges.get("removed") or []
 
         print(f"\n[Divergence] '{existing.get('slug')}' — the corpus and graph disagree.")
-        for field in divergence.get("commentary") or []:
-            print(f"  {field}:")
-            print(f"    graph:    {existing.get(field)!r}")
-            print(f"    markdown: {getattr(entry, field, None)!r}")
+        commentary = divergence.get("commentary") or []
+        for field in commentary:
+            for line in _divergence_field_lines(
+                field, existing.get(field), getattr(entry, field, None), full=full,
+            ):
+                print(line)
         if divergence.get("scope"):
             print(f"  scope:      graph {divergence['scope']['graph']} → "
                   f"markdown {divergence['scope']['markdown']}")
@@ -3502,6 +3558,11 @@ class MitosSyncManager:
             # Printed explicitly, and named as a deletion, because a re-commit mirrors
             # edges declaratively: a line removed from the markdown DELETES that edge.
             print(f"  edge DELETED: {removed}")
+        if commentary and not full:
+            # After the edge lines and before any refusal, so this recipe never sits
+            # beside a `--reconcile-entry` one where the two could be mistaken.
+            print("  Only the differing spans are shown. For the whole values:")
+            print(f"    mitos sync -p {self.config.project!r} --full")
 
         # `authorized` satisfies BOTH branches below for the entry the caller named,
         # and nothing else: the fall-through is the shipped one, not a second route.

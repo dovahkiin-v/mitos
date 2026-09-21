@@ -578,7 +578,7 @@ leaves a workspace that simply re-runs clean — no manual restore. Run these st
 The graph is a derivative of the markdown corpus (`decisions.md` and
 `decisions/archive/`), but nothing stops the two drifting apart:
 a hand-edit to an already-committed entry only reaches the graph when `mitos sync`
-is authorized to apply it (it prints the field diff and asks; `--yes` applies
+is authorized to apply it (it prints where each field differs and asks; `--yes` applies
 everything but an edge *deletion*), and an entry that leaves the corpus altogether
 leaves its node behind with no source block. `mitos status .` reports both as an
 informational rung — never a readiness blocker, because a corpus mid-edit is a normal
@@ -647,8 +647,10 @@ which `mitos rebuild` reads.
 > amendment until those lines name the new one.
 
 > **Commentary that differs is a separate case.** `mitos sync` propagates a hand-edit
-> to a committed entry: it prints the field diff and reconciles on confirmation, or
-> unattended under `--yes`. The one thing `--yes` will not do unattended is *delete* an
+> to a committed entry: it prints where each field differs (the offset, the differing
+> text on each side, and the code points of any character a terminal could render
+> alike) and reconciles on confirmation, or unattended under `--yes`;
+> `mitos sync -p <project> --full` prints both sides whole instead. The one thing `--yes` will not do unattended is *delete* an
 > edge, so an entry whose relation line you removed needs
 > `mitos sync -p <project> --reconcile-entry <slug>`, which applies that one named
 > entry's whole reconcile and exits non-zero if it did not land. An entry that has

@@ -782,12 +782,14 @@ def cmd_init(config: MitosConfig, name: Optional[str] = None, force: bool = Fals
 
 
 def cmd_sync(config: MitosConfig, auto_accept: bool = False, embed_only: bool = False,
-             verbose: bool = False, repair_targets: Optional[List[str]] = None) -> None:
+             verbose: bool = False, repair_targets: Optional[List[str]] = None,
+             full: bool = False) -> None:
     """Synchronizes the decisions write buffer with the graph store.
 
     The report itself is ``perform_sync``'s, so the corpus echo leads its stdout
     report from here. What the handler prints on its own is refusals — the two
-    aborts and the two ``--reconcile-entry`` compositions below — and each carries
+    aborts, the two ``--reconcile-entry`` compositions and ``--full`` with
+    ``--embed-only`` below — and each carries
     its own echo on stderr, because an echo pinned to stdout is invisible to a
     caller reading the refusal. The one other line is the standing check notice
     (``check_notice.compose_check_notice``), on stderr after either branch returns.
@@ -805,6 +807,8 @@ def cmd_sync(config: MitosConfig, auto_accept: bool = False, embed_only: bool = 
             means the flag was absent; ``[]`` means it was supplied and named
             nothing, which is a refusal rather than a fallback — the same rule the
             selector follows (``-p ""`` renders, it does not fall back to cwd).
+        full: ``--full`` — the divergence report prints each diverged commentary
+            field whole on both sides instead of its differing span.
     """
     _echo_corpus(config)
     # Refused here rather than at the parser. `add_mutually_exclusive_group` would
@@ -830,6 +834,15 @@ def cmd_sync(config: MitosConfig, auto_accept: bool = False, embed_only: bool = 
                   "diverged buffer entry, as `mitos status` reports it.",
                   file=sys.stderr)
             sys.exit(1)
+    # The same silent no-op, the same register: `--full` changes only what the
+    # reconcile prints, and `--embed-only` never reaches the reconcile.
+    if full and embed_only:
+        sys.stdout.flush()
+        _echo_corpus(config, file=sys.stderr)
+        print("--full shows a full sync's divergence report: --embed-only drains the "
+              "pending embeddings queue and reads no buffer entries. Re-run without "
+              "--embed-only.", file=sys.stderr)
+        sys.exit(1)
     manager = MitosSyncManager(config)
     shortfall: List[str] = []
     if embed_only:
@@ -838,7 +851,7 @@ def cmd_sync(config: MitosConfig, auto_accept: bool = False, embed_only: bool = 
         try:
             shortfall = manager.perform_sync(
                 auto_accept=auto_accept, verbose=verbose,
-                repair_targets=repair_targets,
+                repair_targets=repair_targets, full=full,
             )
         except ParseError as e:
             sys.stdout.flush()
@@ -7935,6 +7948,10 @@ def _build_parser() -> argparse.ArgumentParser:
     sync_p.add_argument("--yes", action="store_true", help="Auto-accept all parsed changes.")
     sync_p.add_argument("--embed-only", action="store_true", help="Drain the pending embeddings outbox queue only.")
     sync_p.add_argument("--verbose", action="store_true", help="Show verbose cache statistics.")
+    sync_p.add_argument(
+        "--full", action="store_true",
+        help="Print each diverged commentary field whole on both sides, instead of "
+             "where the two part.")
     # The repair door. Same arity as the nine relation flags below: `action="append"`
     # with no `nargs`, so each occurrence stays one whole value (a bare `extend`
     # iterates the string into characters; `nargs="*"` would make the space form
@@ -8507,7 +8524,7 @@ def main() -> None:
             # caller's VERBATIM spelling — never `_normalize_slug`'d, which runs on
             # the `record` path alone while the parser keeps a header slug verbatim.
             cmd_sync(config, auto_accept=args.yes, embed_only=args.embed_only,
-                     verbose=args.verbose,
+                     verbose=args.verbose, full=args.full,
                      repair_targets=(
                          None if args.reconcile_entry is None
                          else [h for v in args.reconcile_entry
