@@ -40,6 +40,8 @@ def test_query_decisions_tool(mock_get_components: MagicMock, tmp_path) -> None:
         "core_axiom": "We use JWTs.",
         "rejected_paths": "Direct session lookups.",
         "mechanisms": ["jwt"],
+        "invalidates_if": None,
+        "context": None,
         "scope": ["auth"],
         "transcript": "Secret conversation text."  # C4: must be excluded!
     }

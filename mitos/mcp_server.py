@@ -1169,7 +1169,10 @@ def show_node(ident: str, project: Optional[str] = None) -> str:
         unsynced draft as the other possibility. Both shapes carry the
         trailing `project`/`collection`/`workspace` provenance — most valuable on
         the absent one, which is otherwise ambiguous between "no such handle
-        here" and "you are asking the wrong project".
+        here" and "you are asking the wrong project". `mechanisms` is the folded
+        identity form the graph stores. No by-handle read returns transcripts
+        (they stay in `decisions.md`), graph-primary provenance (`source`,
+        `created_at`, `confirmed_by`/`confirmed_at`) or outgoing edges.
     """
     config = _target_config(project, "show_node")
     store, _embed, _vec = get_workspace_components(config)
@@ -1189,11 +1192,13 @@ def show_node(ident: str, project: Optional[str] = None) -> str:
         missing.update(corpus_provenance(config))
         return dumps_display(missing, ensure_ascii=False, indent=2)
 
-    # state from the separate computed-state read (never node.get("state") —
-    # absent on the resolved dict); modifiers are the one kind-agnostic stamp
-    # source. Stamping is LOAD-BEARING: surfacing the superseded is this tool's
-    # whole job, so the superseded_by stamp is not decoration.
-    state = store.get_node_state(node["id"])
+    # state from the separate kind-aware computed-state read (never
+    # node.get("state") — absent on the resolved dict), the one cmd_show calls, so
+    # an open question reads parked/resolved here as it does on the receipt echo;
+    # modifiers are the one kind-agnostic stamp source. Stamping is LOAD-BEARING:
+    # surfacing the superseded is this tool's whole job, so the superseded_by
+    # stamp is not decoration.
+    state = store.get_handle_state(node["id"])
     modifiers = store.get_modifiers(node["id"])
     payload = show_payload(node, state=state, modifiers=modifiers)
     payload.update(corpus_provenance(config))
@@ -1238,7 +1243,11 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
         chase these before trusting its axiom's mechanism. When every retrieved
         precedent is superseded (a blackout), `matches` stays empty and a sibling
         `all_superseded` list carries the retired handles — settled before, not a
-        true miss; read the history with list_decisions(state="all").
+        true miss; read the history with list_decisions(state="all"). An
+        exact-slug hit's `mechanisms` is the folded identity form the graph
+        stores; no by-handle read returns transcripts (they stay in
+        `decisions.md`), graph-primary provenance (`source`, `created_at`,
+        `confirmed_by`/`confirmed_at`) or outgoing edges.
     """
     # No standing check notice on any exit of this verb, deliberately (vision §4.3):
     # `surface_decisions` is the read put before a write and carries it; a second
@@ -1289,7 +1298,13 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             "rejected_paths": node["rejected_paths"],
             "scope": node["scope"],
             "state": state,
-            "depth_mode": "letter"
+            "depth_mode": "letter",
+            # The by-handle read returns what is stored, whole and present when
+            # empty (show_payload's rule). Indexed, not `.get`: a decision missing
+            # a stored key fails loudly here, outside the `try`.
+            "mechanisms": node["mechanisms"],
+            "invalidates_if": node["invalidates_if"],
+            "context": node["context"],
         }
         output.update(modifiers)
         # Provenance last, after the payload's own content fields — show_node's

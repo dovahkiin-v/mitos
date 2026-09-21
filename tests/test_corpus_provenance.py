@@ -478,6 +478,10 @@ def test_the_exact_slug_exit_carries_the_envelope(tmp_path, offline, monkeypatch
     # both the ranked envelope and the lexical-degraded one carry `matches`.
     assert payload["slug"] == "the-cli-echo-names-its-corpus"
     assert "state" in payload
+    # 5d: the dereference exit returns the three stored fields, present when empty.
+    assert "mechanisms" in payload
+    assert "invalidates_if" in payload
+    assert "context" in payload
     assert "matches" not in payload
 
     assert payload["project"] == name

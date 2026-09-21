@@ -541,7 +541,7 @@ def _skill_md_text(format_spec_content: str) -> str:
         "- `query_decisions`   (CLI: `mitos query -p .`) — the TARGETED lookup: a slug you are carrying, or a pointed claim. Its confidence band rates how well the ranking matched what you named, not whether precedent exists — `surface_decisions` answers that one.\n"
         "- `list_decisions`    (CLI: `mitos list -p .`) — the EXHAUSTIVE recall path. surface/query are semantic and capped at the top few matches; this returns EVERY decision in a scope, deterministically, so a completeness pass or audit doesn't miss anything below the relevance cliff. Needs no key or Qdrant.\n"
         "- `list_scopes`       (CLI: `mitos scopes -p .`) — the scope vocabulary with a count per tag. Read it before a scope-filtered read, or before tagging a new decision, so you reuse a tag that exists instead of minting a near-duplicate.\n"
-        "- `show_node`         (CLI: `mitos show -p . -- <slug>`) — dereference one exact handle (slug or id) to its full node, including a node that has been superseded.\n"
+        "- `show_node`         (CLI: `mitos show -p . -- <slug>`) — dereference one exact handle (slug or id) to its stored fields, including a node that has been superseded; transcripts, provenance and outgoing edges are left out.\n"
         "- `amend_commentary`  (CLI: `mitos amend-commentary -p . <slug> …`) — fix a committed entry's commentary in place: `rejected_paths`, `invalidates_if`, `context`, `scope`, or its slug (`new_slug`). On the tool, `clear=[…]` empties `invalidates_if`, `context` or `scope`. It refuses a change to the axiom or mechanisms: that is a new decision, recorded with `corrects` / `supersedes` / `amends`. It reaches only entries still in `decisions.md`; an entry already rotated into an archive answers `archived`.\n"
         "- `list_projects`     (CLI: `mitos projects`) — the project names registered on this machine. It takes no selector.\n\n"
         "## When to record — the capture trigger (YOUR judgement; Mitos stores, it does not decide what is worth storing)\n"
@@ -1536,8 +1536,10 @@ def cmd_show(config: MitosConfig, ident: str, as_json: bool = False) -> None:
         print(f"Node with ID or Slug '{ident}' not found — {hint}.")
         return
 
-    # Compute current active/superseded state (single-node V1a derivation, 8a)
-    state = store.get_node_state(node["id"])
+    # Compute the node's state in its own kind's vocabulary — the kind-aware read
+    # `show_node` calls too, so an open question reads parked/resolved (or a kill
+    # state) on both surfaces, as it does on the record receipt's echo.
+    state = store.get_handle_state(node["id"])
 
     # One stamp source for both the text and the --json branch (kind-agnostic — an OQ
     # carries only amended_by/narrowed_by). A superseded show that omits its modifier
@@ -1595,6 +1597,7 @@ def cmd_show(config: MitosConfig, ident: str, as_json: bool = False) -> None:
         if node.get("context"):
             print(f"Context:      {node['context']}")
     else:
+        print(f"Topic:        {node['topic']}")
         print(f"Park Reason:  {node.get('park_reason') or 'None'}")
         print("Questions Raised:")
         for q in node["questions_raised"]:

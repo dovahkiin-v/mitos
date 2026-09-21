@@ -378,6 +378,39 @@ def _computed_oq_state(is_resolved: int) -> str:
     return "resolved" if is_resolved else "parked"
 
 
+def _computed_node_state(
+    kind: str, killer_type: Optional[str], is_drifted: bool, is_resolved: int
+) -> str:
+    """Derives one node's state in the vocabulary of its own kind (M3).
+
+    The one kind-aware ladder, shared by the receipt's identification echo
+    (:meth:`GraphStore.get_outgoing_edge_targets`) and the by-handle reads
+    (:meth:`GraphStore.get_handle_state`). The kill check comes first for both
+    kinds, because Stage 1 precedes Stage 2: a killed node reads ``superseded`` /
+    ``corrected`` whatever its kind. An unkilled open question then reads its
+    Stage-2 ``resolved`` / ``parked`` and takes no drift, as
+    :meth:`GraphStore.get_open_questions` does. An unkilled decision reads
+    ``drifted`` when a drifted signal is set, else ``active``.
+
+    Args:
+        kind: The node's ``kind`` (``"decision"`` or ``"open_question"``).
+        killer_type: The incoming kill-edge type, or None when there is none.
+        is_drifted: Whether a drifted signal is set on the node.
+        is_resolved: The ``is_resolved`` derived column; read for an open
+            question only.
+
+    Returns:
+        The computed state string.
+    """
+    if killer_type is not None:
+        return _computed_decision_state(killer_type)
+    if kind == "open_question":
+        return _computed_oq_state(is_resolved)
+    if is_drifted:
+        return "drifted"
+    return "active"
+
+
 def compute_hash(
     kind: str,
     slug: str,
@@ -1276,11 +1309,12 @@ class GraphStore:
         vector, P3).
 
         The state is **decision-centric** (``active`` / ``superseded`` /
-        ``corrected`` / ``drifted``). Open-question resolution state
-        (``parked`` / ``resolved``) rides the ``resolves`` edge — that edge commits
-        as of V1b 2a, but deriving the OQ ``parked`` / ``resolved`` state from it is
-        a later V1b phase — so an open_question resolves to its kill-edge state here,
-        never ``parked`` / ``resolved`` (G7; V1b owns OQ resolution).
+        ``corrected`` / ``drifted``), and an open_question resolves to its
+        kill-edge state here, never ``parked`` / ``resolved``. Its callers — the
+        ranked loops, the list text, the conflict gather, the ``exists`` receipts —
+        expect decision vocabulary. An open question's Stage-2 state is read by
+        :meth:`get_open_questions` on the list surfaces and by
+        :meth:`get_handle_state` on the by-handle reads.
 
         Args:
             node_id: The content-hash id of the node to derive state for.
@@ -1300,6 +1334,46 @@ class GraphStore:
             if row["killer_type"] is None and row["is_drifted"]:
                 return "drifted"
             return _computed_decision_state(row["killer_type"])
+        finally:
+            conn.close()
+
+    def get_handle_state(self, node_id: str) -> str:
+        """Computes one node's state in its own kind's vocabulary, for a by-handle read.
+
+        The state behind ``show_node`` and ``mitos show``, which dereference a handle
+        that may name an open question. A decision reads what :meth:`get_node_state`
+        gives. An open question reads its kill state if it has an incoming kill
+        edge, else ``resolved`` / ``parked`` — the same state the receipt's
+        identification echo reports, through the same :func:`_computed_node_state`.
+
+        :meth:`get_node_state` stays decision-centric because every other caller
+        expects decision vocabulary; this read has exactly the two by-handle callers.
+        One SELECT serves both kinds: ``_OQ_RESOLVED_SQL`` yields 0 on a decision
+        row. ``FROM nodes`` stays unaliased, because all three fragments correlate on
+        the bare ``nodes`` (the §4.3 alias trap). An absent node defaults to
+        ``"active"``, as :meth:`get_node_state` does, for the same defensive reason.
+
+        Args:
+            node_id: The content-hash id of the node to derive state for.
+
+        Returns:
+            The computed state string.
+        """
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                f"SELECT nodes.kind, {_IS_DRIFTED_SQL}, {_KILLER_TYPE_SQL}, "
+                f"{_OQ_RESOLVED_SQL} FROM nodes WHERE nodes.id = ?",
+                (node_id,),
+            ).fetchone()
+            if row is None:
+                return "active"
+            return _computed_node_state(
+                row["kind"],
+                row["killer_type"],
+                bool(row["is_drifted"]),
+                row["is_resolved"],
+            )
         finally:
             conn.close()
 
@@ -2859,6 +2933,9 @@ class GraphStore:
             ``resolves`` the caller just wrote is visible in its own read-back.
             (:meth:`get_node_state` is kill-edge-only for an OQ, so it is not used.)
 
+        Both kinds go through :func:`_computed_node_state`, the ladder
+        :meth:`get_handle_state` shares.
+
         The joined ``nodes`` is deliberately UNALIASED and the edges table is
         aliased ``e``: ``_KILLER_TYPE_SQL``, ``_IS_DRIFTED_SQL`` and
         ``_OQ_RESOLVED_SQL`` correlate on the bare ``nodes`` (the §4.3 alias trap).
@@ -2889,13 +2966,9 @@ class GraphStore:
         # the hydrated target.
         for node, row in zip(nodes, rows):
             node.pop("echo_edge_type", None)
-            killer_type = row["killer_type"]
-            if node["kind"] == "open_question" and killer_type is None:
-                state = _computed_oq_state(row["is_resolved"])
-            elif killer_type is None and node["is_drifted"]:
-                state = "drifted"
-            else:
-                state = _computed_decision_state(killer_type)
+            state = _computed_node_state(
+                node["kind"], row["killer_type"], node["is_drifted"], row["is_resolved"]
+            )
             result.append(
                 {
                     "kind": row["echo_edge_type"],

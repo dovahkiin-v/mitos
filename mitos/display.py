@@ -375,8 +375,17 @@ def show_payload(
     merely test-enforced). Kind-correct: a **decision** routes through
     :func:`letter_payload` for the Letter-complete core (``slug``/``axiom``/
     ``scope``/``rejected_paths``) with ``kind``/``id``/``state`` interleaved as
-    extras; an **open question** carries its body (``topic``/``questions_raised``/
-    ``park_reason``).
+    extras; an **open question** carries its ``slug`` and body (the stored
+    ``topic``, ``questions_raised``, ``park_reason``).
+
+    Both kinds then carry ``mechanisms``, ``invalidates_if`` and ``context`` as
+    present keys, read as stored and composed of nothing: ``mechanisms`` is the
+    graph's folded identity form (never the registry's first-seen
+    ``authored_name``), and the two prose fields are the column bytes, a stored
+    ``""`` included. An empty field is ``[]`` / ``None``, never a missing key. An
+    open question stores none of the three, so it reads ``[]`` / ``None`` /
+    ``None``. Transcripts, graph-primary provenance and outgoing edges are not
+    part of this payload.
 
     Modifier-stamping is the **single trailing** ``.update(modifiers)`` — the one
     kind-agnostic stamp source. This is **load-bearing**: ``show_node``'s whole job
@@ -394,31 +403,48 @@ def show_payload(
     Args:
         node: A hydrated, modifier-stamped node dict (decision or open question)
             from ``GraphStore.resolve_handle``.
-        state: The computed single-node state from ``GraphStore.get_node_state`` —
-            never ``node.get("state")`` (absent on the resolved dict).
+        state: The computed single-node state from ``GraphStore.get_handle_state``,
+            which answers in the node's own kind's vocabulary (an open question
+            reads ``parked``/``resolved`` or a kill state) — never
+            ``node.get("state")`` (absent on the resolved dict).
         modifiers: The present reverse-relation keys from
             ``GraphStore.get_modifiers``; ``{}`` for an unmodified node.
 
     Returns:
         The kind-correct, modifier-stamped dereference dict.
     """
+    # Two conventions meet here and both stand. The three stored fields below are
+    # columns, so a present key with `[]` / `None` means "stored empty" and absence
+    # is never how it is said. The modifier stamps are relations, so they stay
+    # present-only and an absent stamp means "none". Unifying them either way would
+    # make one of the two lie.
     if node["kind"] == "decision":
         payload = letter_payload(
             node,
             brief=False,
             extras={"kind": node["kind"], "id": node["id"], "state": state},
         )
+        # Indexed, not `.get`: a decision missing a stored key fails loudly.
+        payload["mechanisms"] = node["mechanisms"]
+        payload["invalidates_if"] = node["invalidates_if"]
+        payload["context"] = node["context"]
     else:
-        # OQ body: the three content fields only. The trailing `.update(modifiers)`
-        # supplies the modifier keys (one stamp source) — so no `_oq_payload`
-        # pre-merge is needed here, and the leaf stays store-free.
+        # OQ body: the slug, the stored topic and the content fields. The trailing
+        # `.update(modifiers)` supplies the modifier keys (one stamp source) — so no
+        # `_oq_payload` pre-merge is needed here, and the leaf stays store-free. An
+        # open question stores no mechanisms or commentary prose, so the three keys
+        # read empty.
         payload = {
             "kind": node["kind"],
             "id": node["id"],
             "state": state,
-            "topic": node["slug"],
+            "slug": node["slug"],
+            "topic": node["topic"],
             "questions_raised": node["questions_raised"],
             "park_reason": node.get("park_reason"),
+            "mechanisms": [],
+            "invalidates_if": None,
+            "context": None,
         }
     payload.update(modifiers)
     return payload

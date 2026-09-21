@@ -453,8 +453,9 @@ def test_cli_show_json_found_decision_letter_complete_stamped(ws, capsys) -> Non
 
 
 def test_cli_show_json_oq_body_and_modifier_subset(ws, capsys) -> None:
-    """`show --json` on an OQ emits the OQ body (topic/questions_raised/park_reason) and
-    only the OQ-applicable modifier keys (the subset is structural, not filtered)."""
+    """`show --json` on an OQ emits its slug and body (the stored topic,
+    questions_raised, park_reason) and only the OQ-applicable modifier keys (the
+    subset is structural, not filtered)."""
     config, m = ws
     store = GraphStore(config.db_path)
     _commit_oq(store, "rate-policy")
@@ -463,7 +464,10 @@ def test_cli_show_json_oq_body_and_modifier_subset(ws, capsys) -> None:
     cmd_show(config, "rate-policy", as_json=True)
     out = json.loads(capsys.readouterr().out)
     assert out["kind"] == "open_question"
-    assert out["topic"] == "rate-policy"  # _oq_payload keys topic off slug
+    # 5d: the by-handle read names the slug as `slug` and returns the stored
+    # `**Topic:**` under `topic` (it used to put the slug there).
+    assert out["slug"] == "rate-policy"
+    assert out["topic"] == "Topic for rate-policy"
     assert out["questions_raised"]
     assert "park_reason" in out
     assert out["amended_by"] == ["rate-policy-v2"]
@@ -546,8 +550,9 @@ def test_mcp_show_node_by_id_resolves(ws) -> None:
 
 
 def test_mcp_show_node_oq_body_and_modifier_subset(ws) -> None:
-    """T11 (OQ): show_node on an OQ emits the OQ body (topic/questions_raised/park_reason)
-    and only the OQ-applicable modifier keys (subset is structural, not filtered)."""
+    """T11 (OQ): show_node on an OQ emits its slug and body (the stored topic,
+    questions_raised, park_reason) and only the OQ-applicable modifier keys (subset
+    is structural, not filtered)."""
     from mitos import mcp_server
     config, m = ws
     store = GraphStore(config.db_path)
@@ -557,7 +562,8 @@ def test_mcp_show_node_oq_body_and_modifier_subset(ws) -> None:
     with patch.object(mcp_server, "get_workspace_components", return_value=(ro, None, None)):
         resp = json.loads(mcp_server.show_node("oq-policy", project=config.workspace_dir))
     assert resp["kind"] == "open_question"
-    assert resp["topic"] == "oq-policy"
+    assert resp["slug"] == "oq-policy"
+    assert resp["topic"] == "Topic for oq-policy"
     assert resp["questions_raised"]
     assert "park_reason" in resp
     assert resp["amended_by"] == ["oq-policy-v2"]
@@ -618,12 +624,15 @@ def test_show_node_parity_with_cli_show_json(ws, capsys) -> None:
     from mitos import mcp_server
     config, m = ws
     store = GraphStore(config.db_path)
-    # found decision (superseded, the most demanding shape)
-    _rec(m, "par-v1")
+    # found decision (superseded, the most demanding shape), carrying all three
+    # stored fields, so equality is not three nulls agreeing (5d)
+    _rec(m, "par-v1", mechanisms=["os.replace", "SQLite"], context="Why par-v1.")
+    assert m.amend_commentary("par-v1", {"invalidates_if": "par breaks."})["status"] == "amended"
     _rec(m, "par-v2", supersedes="par-v1")
-    # found OQ (amended)
+    # found OQ (amended, and resolved — the Stage-2 state get_node_state never read)
     _commit_oq(store, "par-oq")
     _commit_oq(store, "par-oq-v2", amends="par-oq")
+    _rec(m, "par-res", resolves="par-oq")
 
     ro = GraphStore(config.db_path, read_only=True)
     for ident in ("par-v1", "par-oq", "nope-not-here"):
@@ -640,8 +649,16 @@ def test_show_node_parity_with_cli_show_json(ws, capsys) -> None:
             assert cli_out["hint"] != mcp_out["hint"]
             assert f"-p {config.project!r}" in cli_out["hint"]   # names its selector
             assert "mitos " not in mcp_out["hint"]               # no shell command
+            # Nothing was found, so no stored field is claimed (5d).
+            assert not {"mechanisms", "invalidates_if", "context"} & cli_out.keys()
         else:
             assert cli_out == mcp_out, f"CLI⇄MCP show parity drift on {ident!r}"
+            if ident == "par-v1":
+                assert cli_out["mechanisms"] == ["os-replace", "sqlite"]
+                assert cli_out["invalidates_if"] == "par breaks."
+                assert cli_out["context"] == "Why par-v1."
+            else:
+                assert cli_out["state"] == "resolved"
         # Both shapes stamped, including the not-found one — the half that is
         # ambiguous between "no such handle" and "wrong project", and the half a
         # found-branch-only stamp would leave bare.
@@ -1325,3 +1342,334 @@ def test_receipt_echo_parity_across_both_encodings_is_a_transition(ws, capsys) -
     assert cli_amends["target_stamps"] == {"amended_by": ["via-cli"]}
     assert mcp_amends["target_stamps"] == {
         "amended_by": sorted(cli_amends["target_stamps"]["amended_by"] + ["via-mcp"])}
+
+
+# --------------------------------------------------------------------------- #
+# A6 (5d) — a by-handle read returns what is stored, whole and present when empty
+#
+# The three by-handle reads (`mitos show --json`, `show_node`, and the exact-slug
+# hit of `query_decisions`) carry `mechanisms` (the graph's folded form),
+# `invalidates_if` and `context` (column bytes, a stored "" included), as keys
+# present even when empty. No ranked or list hit gains any of them. An open
+# question's by-handle read reports its own state (parked / resolved, or a kill
+# state) and its stored topic, beside its slug.
+# --------------------------------------------------------------------------- #
+
+_A6_KEYS = ("mechanisms", "invalidates_if", "context")
+
+
+def _a6_show_both(config: MitosConfig, ident: str, capsys) -> Tuple[dict, dict]:
+    """Reads one handle through `mitos show --json` and `show_node`."""
+    from mitos import mcp_server
+    capsys.readouterr()
+    cmd_show(config, ident, as_json=True)
+    cli_out = json.loads(capsys.readouterr().out)
+    ro = GraphStore(config.db_path, read_only=True)
+    with patch.object(mcp_server, "get_workspace_components", return_value=(ro, None, None)):
+        mcp_out = json.loads(mcp_server.show_node(ident, project=config.workspace_dir))
+    return cli_out, mcp_out
+
+
+def _a6_exact_slug(config: MitosConfig, slug: str) -> dict:
+    """Reads one decision through `query_decisions`' exact-slug hit."""
+    from mitos import mcp_server
+    ro = GraphStore(config.db_path, read_only=True)
+    with patch.object(mcp_server, "get_workspace_components", return_value=(ro, None, None)):
+        return json.loads(mcp_server.query_decisions(slug, project=config.workspace_dir))
+
+
+def _a6_commit_markdown(config: MitosConfig, text: str):
+    """Commits one hand-authored decision block through the parser path.
+
+    The hand-authored route, deliberately not `record_decision`/`amend_commentary`:
+    only the parser can store a `""` context, and the markup fixture must not
+    depend on write verbs that will refuse tool-call markup.
+    """
+    from mitos.parser import parse_entry_stream
+    (entry,) = parse_entry_stream(text, "decision")
+    GraphStore(config.db_path).commit_parsed_entry(entry)
+    return entry
+
+
+def _a6_raw_context(config: MitosConfig, slug: str):
+    """Reads the raw `nodes.context` column for an active slug, bypassing hydration."""
+    import sqlite3
+    conn = sqlite3.connect(config.db_path)
+    try:
+        return conn.execute("SELECT context FROM nodes WHERE slug = ?", (slug,)).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_a6_by_handle_reads_carry_the_three_stored_fields_in_order(ws, capsys) -> None:
+    """Row 1: both whole-node reads carry the three keys after the Letter core and
+    before the stamps, with `mechanisms` in the graph's folded form, never the
+    authored spelling (`os.replace` folds to `os-replace`)."""
+    config, m = ws
+    _rec(m, "a6-full", mechanisms=["os.replace", "SQLite"],
+         context="Why we chose it.\nSecond line.")
+    assert m.amend_commentary("a6-full", {"invalidates_if": "The disk lies."})["status"] == "amended"
+    _rec(m, "a6-amender", amends="a6-full")
+    for out in _a6_show_both(config, "a6-full", capsys):
+        assert list(out)[:11] == [
+            "slug", "axiom", "scope", "kind", "id", "state", "rejected_paths",
+            "mechanisms", "invalidates_if", "context", "amended_by",
+        ]
+        assert out["mechanisms"] == ["os-replace", "sqlite"]
+        assert "os.replace" not in out["mechanisms"]
+        assert out["invalidates_if"] == "The disk lies."
+        assert out["context"] == "Why we chose it.\nSecond line."
+
+
+def test_a6_empty_fields_are_present_keys_never_absent(ws, capsys) -> None:
+    """Row 2: a decision with none of the three still carries all three keys, as
+    `[]` / None / None, on all three by-handle reads."""
+    config, m = ws
+    _rec(m, "a6-bare")
+    reads = (*_a6_show_both(config, "a6-bare", capsys), _a6_exact_slug(config, "a6-bare"))
+    for out in reads:
+        assert all(k in out for k in _A6_KEYS)
+        assert out["mechanisms"] == []
+        assert out["invalidates_if"] is None
+        assert out["context"] is None
+
+
+def test_a6_a_stored_empty_context_reads_back_empty_not_null(ws, capsys) -> None:
+    """Row 3: a hand-authored bare `**Context:**` stores `""`, and all three reads
+    return `""` — no normalisation to None."""
+    config, _m = ws
+    entry = _a6_commit_markdown(config, (
+        "### a6-empty-ctx\n\n"
+        "**Decided:** Axiom for a6-empty-ctx.\n"
+        "**Rejected:** Rejected alternative for a6-empty-ctx.\n"
+        "**Context:**\n"
+    ))
+    assert entry.context == "" and _a6_raw_context(config, "a6-empty-ctx") == ""
+    reads = (*_a6_show_both(config, "a6-empty-ctx", capsys),
+             _a6_exact_slug(config, "a6-empty-ctx"))
+    for out in reads:
+        assert out["context"] == ""
+
+
+def test_a6_stray_markup_in_context_reads_back_byte_exact(ws, capsys) -> None:
+    """Row 4: a context carrying a leaked tool-call tail — modelled on the damaged
+    dowser entries — reads back byte-exact on all three reads, equal to the parsed
+    value and the raw column. Newly visible, not newly corrupt; nothing scrubs it."""
+    config, _m = ws
+    entry = _a6_commit_markdown(config, (
+        "### a6-markup\n\n"
+        "**Decided:** Axiom for a6-markup.\n"
+        "**Rejected:** Rejected alternative for a6-markup.\n"
+        "**Context:** The recipe read is live on every send.\n"
+        "Whatever the grade. </context>\n"
+        "</invoke>\n"
+        "**Scope:** mail\n"
+    ))
+    raw = _a6_raw_context(config, "a6-markup")
+    assert raw == entry.context
+    assert raw.endswith("</context>\n</invoke>")
+    reads = (*_a6_show_both(config, "a6-markup", capsys), _a6_exact_slug(config, "a6-markup"))
+    for out in reads:
+        assert out["context"] == raw
+
+
+def test_a6_open_question_payload_names_slug_and_stored_topic(ws, capsys) -> None:
+    """Row 5: an OQ's by-handle read carries `slug`, the stored topic under `topic`,
+    and the three keys empty (an OQ stores none of them)."""
+    config, _m = ws
+    _commit_oq(GraphStore(config.db_path), "a6-oq")
+    for out in _a6_show_both(config, "a6-oq", capsys):
+        assert list(out)[:10] == [
+            "kind", "id", "state", "slug", "topic", "questions_raised", "park_reason",
+            "mechanisms", "invalidates_if", "context",
+        ]
+        assert out["slug"] == "a6-oq"
+        assert out["topic"] == "Topic for a6-oq"
+        assert out["mechanisms"] == []
+        assert out["invalidates_if"] is None
+        assert out["context"] is None
+
+
+def test_a6_open_question_by_handle_state_is_its_own(ws, capsys) -> None:
+    """Row 6: parked → resolved → parked again when the resolver is superseded (M3
+    self-healing) → superseded once the OQ itself is. Both surfaces, every step.
+    The `resolved` step is the pre-5d bug: this read used to say `active`."""
+    config, m = ws
+    store = GraphStore(config.db_path)
+    _commit_oq(store, "a6-q")
+    node_id = store.get_node_by_slug("a6-q")["id"]
+
+    def states():
+        return [out["state"] for out in _a6_show_both(config, node_id, capsys)]
+
+    assert states() == ["parked", "parked"]
+    _rec(m, "a6-q-resolver", resolves="a6-q")
+    assert states() == ["resolved", "resolved"]
+    assert store.get_node_state(node_id) == "active"  # the kill-edge-only read it replaced
+    _rec(m, "a6-q-resolver-v2", supersedes="a6-q-resolver")
+    assert states() == ["parked", "parked"]
+    _commit_oq(store, "a6-q-v2", supersedes="a6-q")
+    assert states() == ["superseded", "superseded"]
+
+
+def test_a6_cmd_show_text_open_question_prints_its_topic(ws, capsys) -> None:
+    """Row 7 (OQ half): `mitos show` text prints a `Topic:` line with the stored
+    topic and `State:` in the OQ's own vocabulary."""
+    config, m = ws
+    _commit_oq(GraphStore(config.db_path), "a6-tq")
+    _rec(m, "a6-tq-res", resolves="a6-tq")
+    capsys.readouterr()
+    cmd_show(config, "a6-tq")
+    lines = capsys.readouterr().out.splitlines()
+    assert "State:        resolved" in lines
+    assert "Topic:        Topic for a6-tq" in lines
+    assert lines.index("Topic:        Topic for a6-tq") < next(
+        i for i, ln in enumerate(lines) if ln.startswith("Park Reason:"))
+
+
+def test_a6_cmd_show_text_decision_lines_are_unchanged(ws, capsys) -> None:
+    """Row 7 (decision half): the decision text is the pre-5d line list exactly —
+    no `Topic:` line, and the three fields print as they always did."""
+    config, m = ws
+    _rec(m, "a6-txt", mechanisms=["os.replace"], context="Ctx.")
+    assert m.amend_commentary("a6-txt", {"invalidates_if": "Inv."})["status"] == "amended"
+    node_id = GraphStore(config.db_path).get_node_by_slug("a6-txt")["id"]
+    capsys.readouterr()
+    cmd_show(config, "a6-txt")
+    lines = capsys.readouterr().out.splitlines()
+    start = lines.index("[DECISION] a6-txt")
+    assert lines[start:] == [
+        "[DECISION] a6-txt",
+        f"ID:           {node_id}",
+        "State:        active",
+        "Modified by:  none",
+        "Decided:      Axiom for a6-txt.",
+        "Rejected:     Rejected alternative for a6-txt.",
+        "Mechanisms:   os-replace",
+        "Scope:        ",
+        "Invalidates:  Inv.",
+        "Context:      Ctx.",
+        "",
+    ]
+
+
+def test_a6_exact_slug_hit_carries_the_three_after_depth_mode(ws) -> None:
+    """Row 11: the exact-slug hit gains the three keys after `depth_mode`, and
+    still no ranked-envelope key."""
+    config, m = ws
+    _rec(m, "a6-hit", mechanisms=["os.replace", "SQLite"], context="Hit ctx.")
+    assert m.amend_commentary("a6-hit", {"invalidates_if": "Hit inv."})["status"] == "amended"
+    out = _a6_exact_slug(config, "a6-hit")
+    assert list(out)[:9] == [
+        "slug", "axiom", "rejected_paths", "scope", "state", "depth_mode",
+        "mechanisms", "invalidates_if", "context",
+    ]
+    assert out["mechanisms"] == ["os-replace", "sqlite"]
+    assert out["invalidates_if"] == "Hit inv."
+    assert out["context"] == "Hit ctx."
+    assert not {"score", "matches", "confidence", "note"} & out.keys()
+
+
+def test_a6_the_two_mcp_by_handle_reads_agree_on_the_three(ws, capsys) -> None:
+    """Row 12: for one active decision the exact-slug hit and `show_node` return the
+    same three values — the two by-handle reads cannot differ in fullness."""
+    config, m = ws
+    _rec(m, "a6-agree", mechanisms=["Zebra Timer"], context="Agree.\nTwo lines.")
+    assert m.amend_commentary("a6-agree", {"invalidates_if": "Agree inv."})["status"] == "amended"
+    _cli, shown = _a6_show_both(config, "a6-agree", capsys)
+    hit = _a6_exact_slug(config, "a6-agree")
+    assert {k: hit[k] for k in _A6_KEYS} == {k: shown[k] for k in _A6_KEYS}
+    assert shown["mechanisms"] == ["zebra-timer"]
+
+
+def _a6_ranked_hits(config: MitosConfig, route: str) -> list:
+    """Returns the per-decision hit dicts one ranked or list read produces."""
+    from mitos import mcp_server
+    ro = GraphStore(config.db_path, read_only=True)
+    vec = _FakeVector([{"slug": "a6-ranked", "score": 0.9}])
+    claim = "a claim that is not any slug"
+    if route == "surface":
+        with patch.object(mcp_server, "get_workspace_components",
+                          return_value=(ro, _FakeEmbed(), vec)):
+            return json.loads(mcp_server.surface_decisions(
+                query=claim, project=config.workspace_dir))["active_decisions"]
+    if route == "query_ranked":
+        with patch.object(mcp_server, "get_workspace_components",
+                          return_value=(ro, _FakeEmbed(), vec)):
+            return json.loads(mcp_server.query_decisions(
+                claim, project=config.workspace_dir))["matches"]
+    if route == "list":
+        with patch.object(mcp_server, "get_workspace_components", return_value=(ro, None, None)):
+            return json.loads(mcp_server.list_decisions(
+                scope="a6", project=config.workspace_dir))["decisions"]
+    with patch.object(mcp_server, "get_workspace_components",
+                      side_effect=RuntimeError("pre-V1a")):
+        out = json.loads(mcp_server.query_decisions(
+            "a6-ranked context", project=config.workspace_dir))
+    assert out["degraded"] == "lexical"
+    return out["matches"]
+
+
+@pytest.mark.parametrize("route", ["surface", "query_ranked", "list", "lexical_degraded"])
+def test_a6_ranked_and_list_hits_gain_none_of_the_three(ws, route) -> None:
+    """Row 13: no ranked or list hit carries `mechanisms`, `invalidates_if` or
+    `context` — the fields live on the by-handle reads alone."""
+    config, m = ws
+    _rec(m, "a6-ranked", scope=["a6"], mechanisms=["os.replace"], context="Ranked ctx.")
+    hits = _a6_ranked_hits(config, route)
+    assert any(h["slug"] == "a6-ranked" for h in hits), hits  # non-vacuous
+    for hit in hits:
+        assert not set(_A6_KEYS) & hit.keys(), (route, hit)
+
+
+def test_a6_get_handle_state_matches_get_node_state_on_decisions(ws) -> None:
+    """Row 14: for every decision state reachable offline the two reads agree; they
+    differ only for an unkilled open question."""
+    config, m = ws
+    _rec(m, "a6-live")
+    _rec(m, "a6-sup")
+    _rec(m, "a6-sup-v2", supersedes="a6-sup")
+    _rec(m, "a6-cor")
+    _rec(m, "a6-cor-v2", corrects="a6-cor")
+    store = GraphStore(config.db_path)
+    for slug, expected in (("a6-live", "active"), ("a6-sup", "superseded"),
+                           ("a6-cor", "corrected")):
+        node_id = store.resolve_handle(slug)["id"]
+        assert store.get_handle_state(node_id) == store.get_node_state(node_id) == expected
+    _commit_oq(store, "a6-hq")
+    oq_id = store.get_node_by_slug("a6-hq")["id"]
+    assert store.get_handle_state(oq_id) == "parked"
+    assert store.get_node_state(oq_id) == "active"
+    assert store.get_handle_state("no-such-id") == "active"
+
+
+def test_a6_get_node_state_stays_kill_edge_only_for_an_open_question(ws) -> None:
+    """Row 15: `get_node_state` keeps its decision vocabulary on an OQ — a resolved
+    OQ still reads `active` there, and a superseded one `superseded`."""
+    config, m = ws
+    store = GraphStore(config.db_path)
+    _commit_oq(store, "a6-kq")
+    oq_id = store.get_node_by_slug("a6-kq")["id"]
+    _rec(m, "a6-kq-res", resolves="a6-kq")
+    assert store.get_node_state(oq_id) == "active"
+    _commit_oq(store, "a6-kq-v2", supersedes="a6-kq")
+    assert store.get_node_state(oq_id) == "superseded"
+
+
+def test_a6_get_handle_state_has_exactly_the_two_by_handle_callers() -> None:
+    """Stretch: only `cmd_show` and `show_node` call `get_handle_state`, so no ranked
+    loop picks up OQ vocabulary by accident."""
+    import ast
+    import pathlib
+    import mitos
+    callers = set()
+    for path in pathlib.Path(mitos.__file__).parent.glob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for node in ast.walk(fn):
+                if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "get_handle_state"):
+                    callers.add(f"{path.stem}.{fn.name}")
+    assert callers == {"cli.cmd_show", "mcp_server.show_node"}

@@ -286,3 +286,33 @@ def test_record_decision_slug_doc_tells_the_truth_about_the_handle():
         f"record_decision's slug entry no longer states the {identity.SLUG_MAX_LEN}-"
         "char limit that identity.SLUG_MAX_LEN enforces"
     )
+
+
+@pytest.mark.parametrize("tool", ["show_node", "query_decisions"])
+def test_by_handle_reads_say_mechanisms_are_folded_and_what_they_never_return(tool):
+    """A6: each by-handle read's description says `mechanisms` is the folded
+    identity form, and names what no by-handle read returns — transcripts,
+    graph-primary provenance and outgoing edges — with where transcripts live.
+
+    Placed after `project:`'s Args entry (inside `Returns:`), so it spends only the
+    budget and moves no window.
+    """
+    desc = _flat(_descriptions()[tool])
+    assert "`mechanisms` is the folded identity form" in desc
+    assert "no by-handle read returns transcripts" in desc.lower()
+    assert "`decisions.md`" in desc
+    assert "graph-primary provenance" in desc
+    assert "`created_at`" in desc and "`confirmed_by`/`confirmed_at`" in desc
+    assert "outgoing edges" in desc
+
+
+@pytest.mark.parametrize("tool", ["show_node", "query_decisions"])
+def test_by_handle_reads_do_not_gloss_the_prose_fields(tool):
+    """A6 (D6): the response delivers `context` / `invalidates_if` in-band, so the
+    description does not enumerate them (no Returns-block gloss), and
+    `show_node` names no shell command."""
+    desc = _descriptions()[tool]
+    assert "`context`" not in desc
+    assert "`invalidates_if`" not in desc
+    if tool == "show_node":
+        assert "mitos " not in desc
