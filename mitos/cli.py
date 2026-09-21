@@ -50,6 +50,7 @@ from mitos.config import (
     CONFIG_DEFAULTS,
     default_collection_name,
     global_env_path,
+    judge_api_key,
     toml_scalar,
 )
 from mitos.errors import (
@@ -70,6 +71,8 @@ from mitos.telemetry import (
     AttemptRefusal, AttemptStart, TelemetryStore, ConflictCheckRow, JudgmentBatch,
 )
 from mitos.audit_debt import AuditDebt, derive_audit_debt
+from mitos.commit_gate import (CAUSE_GRAPH, CAUSE_NO_GRAPH, CAUSE_TELEMETRY, GATE_BLOCKED,
+                               GATE_UNREADABLE, HOOK_BLOCK_EXIT, evaluate_gate)
 from mitos.identity import compute_node_id
 from mitos.models import get_embedding_model_id, get_model_id
 from mitos.parser import (ParsedEntry, parse_entry_stream,
@@ -4973,9 +4976,10 @@ def _begin_check_attempt(
     """Writes an unscoped corpus check's ``started`` record. Never raises.
 
     Mints the attempt's key and time, derives the fingerprint of the uncovered set
-    through the audit-debt leaf (any later reader comparing against it must derive
-    through the same leaf, so the join key has one recipe), and replaces the
-    last-attempt record. Best effort: an entry write can never fail the check (ADR
+    through the audit-debt leaf (``commit_gate.evaluate_gate`` compares against it
+    and derives through the same leaf, so the join key has one recipe), and
+    replaces the last-attempt record. Best effort: an entry write can never fail
+    the check (ADR
     ``check-run-end-writes-commit-together-a-seam-failure-covers-nothing``,
     rejected path 5). A fault the write path knows about is remembered silently; any
     other exception is a bug, so it also prints one warning line on stderr rather
@@ -5040,8 +5044,8 @@ def _build_check_judge(config: MitosConfig) -> Optional[Callable]:
         The bound one-arg ``judge`` callable, or ``None`` when ``ANTHROPIC_API_KEY``
         is absent.
     """
-    api_key = config.env.get("ANTHROPIC_API_KEY")
-    if not api_key:
+    api_key = judge_api_key(config)
+    if api_key is None:
         return None
     import anthropic
     from mitos.conflict_judgment import (_JUDGMENT_MODEL_ALIAS,
@@ -5468,6 +5472,74 @@ def _print_check_report(
             noun = "decision" if result.nodes_swept == 1 else "decisions"
             print(f"Corpus coherent — {result.nodes_swept} {noun} audited, "
                   f"no contradictions found.")
+
+
+def _hook_block_recipe(config: MitosConfig) -> str:
+    """Composes the command the commit gate's block names: the one place it is spelled.
+
+    Selectored and ``repr``-rendered like every recipe on this surface, so the
+    agent that reads it runs the check against the corpus the hook gated.
+
+    Args:
+        config: The gated workspace's config.
+
+    Returns:
+        The backticked ``mitos check -p …`` recipe.
+    """
+    return f"`mitos check -p {config.project!r}`"
+
+
+def _hook_block_message(config: MitosConfig, uncovered: int) -> str:
+    """Composes the commit gate's block message, with number agreement.
+
+    Args:
+        config: The gated workspace's config.
+        uncovered: N, the uncovered count (always > 0 on a block).
+
+    Returns:
+        The one-line message.
+    """
+    subject = ("1 decision has" if uncovered == 1
+               else f"{uncovered} decisions have")
+    return (f"{subject} not been covered by a contradiction check. Run "
+            f"{_hook_block_recipe(config)} and read what it reports, then commit "
+            f"again — the gate asks only that the check was attempted.")
+
+
+#: Row 1's one line per cause. Each names the fact and no command: the commit
+#: passed, and a recipe here would owe the parser proof and the running-build rule.
+_HOOK_UNREADABLE_LINES: Dict[str, str] = {
+    CAUSE_NO_GRAPH: ("mitos commit gate: this workspace has no graph yet, so there "
+                     "is nothing to gate; the commit was let through."),
+    CAUSE_GRAPH: ("mitos commit gate: the graph could not be read, so the gate "
+                  "could not decide; the commit was let through."),
+    CAUSE_TELEMETRY: ("mitos commit gate: the check telemetry could not be read, "
+                      "so the gate could not decide; the commit was let through."),
+}
+
+
+def cmd_hook_run(config: MitosConfig) -> int:
+    """Runs the commit gate a git pre-commit hook calls. No judge, no spend, no network.
+
+    Evaluates :func:`mitos.commit_gate.evaluate_gate` and maps the verdict to the
+    hook's exit status. Only a block prints the corpus echo and answers on stderr;
+    the three quiet passes print nothing, so a commit that is fine stays silent.
+
+    Args:
+        config: The target workspace's config.
+
+    Returns:
+        ``HOOK_BLOCK_EXIT`` when the commit is blocked, else 0.
+    """
+    verdict = evaluate_gate(config)
+    if verdict.row == GATE_UNREADABLE:
+        print(_HOOK_UNREADABLE_LINES[verdict.cause], file=sys.stderr)
+        return 0
+    if verdict.row != GATE_BLOCKED:
+        return 0
+    _echo_corpus(config, file=sys.stderr)
+    print(_hook_block_message(config, verdict.uncovered), file=sys.stderr)
+    return HOOK_BLOCK_EXIT
 
 
 def cmd_check(
@@ -7054,6 +7126,14 @@ def _build_parser() -> argparse.ArgumentParser:
                               "closed: exit 2 when it cannot run. Not git's staging — reads "
                               "the working-tree decisions.md. Rejects --scope/--fresh.")
 
+    # hook-run — the commit gate a git pre-commit hook runs (no judge, no spend).
+    subparsers.add_parser(
+        "hook-run",
+        help=f"The commit gate a git pre-commit hook runs: exits {HOOK_BLOCK_EXIT} "
+             f"(block) only when decisions have not been covered by a contradiction "
+             f"check and no check has been attempted since they changed; runs no "
+             f"judge and spends nothing.")
+
     # restore-source — re-materialize a graph-only node's `### slug` block.
     rs_p = subparsers.add_parser(
         "restore-source",
@@ -7168,7 +7248,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # Deduped by `id()` because the five aliased verbs (`query`/`query_decisions`,
     # `surface`/`surface_decisions`, `list`/`list_decisions`, `scopes`/
     # `list_scopes`, `record`/`record_decision`) are ONE parser object under two
-    # names: 28 names over 23 objects, and a second `add_argument` on the same
+    # names: 29 names over 24 objects, and a second `add_argument` on the same
     # object raises `ArgumentError: conflicting option strings`. The
     # `allow_abbrev` assignment above needs no such guard — it is idempotent — so
     # the dedupe guards only the registration. Being one object is also what makes
@@ -7467,6 +7547,8 @@ def main() -> None:
             sys.exit(cmd_check(config, staged=args.staged, scope=args.scope,
                                fresh=args.fresh, assume_yes=args.yes,
                                as_json=args.as_json))
+        elif args.command == "hook-run":
+            sys.exit(cmd_hook_run(config))
     except ProjectTargetingError as e:
         # ABOVE `except MitosError`, which it subclasses: without this arm the
         # fallback `str(e)` would render — a terse discriminator-level sentence

@@ -665,7 +665,15 @@ CLI_VERB_ARGS = {
 #: the header gaining the registered name. Carved out by NAME and reason, exactly as
 #: 3d's MCP row carves out `list_projects`, so the gap is a row rather than a
 #: silence.
-CLI_ECHO_CARVE_OUTS = {"status"}
+#:
+#: `hook-run` (3c1) is carved out for the obligation, not the channel: offline it
+#: lands on the commit gate's keyless row and prints nothing, which the echo row
+#: would read as a missing echo, and its quiet passes must stay silent on every
+#: commit. It does echo, on stderr, on the one answer it gives (a block). The
+#: carve-out's ADR amendment
+#: (`cli-echo-obligation-is-a-handler-locus-rule-with-two-distinct-carve-outs`) and
+#: its break-once row are 3c2's.
+CLI_ECHO_CARVE_OUTS = {"status", "hook-run"}
 
 
 def _register_workspace(tmp_path, monkeypatch, *, name="named", decisions=True):

@@ -26,7 +26,7 @@ from mitos import amend
 from mitos import atomic_file
 from mitos import rotation
 from mitos import settledness
-from mitos.config import MitosConfig, hint_due
+from mitos.config import MitosConfig, hint_due, judge_api_key
 from mitos.conflict import (
     CONFLICT_CANDIDATE_SOURCE,
     CONFLICT_PROMPT_VERSION,
@@ -1968,8 +1968,8 @@ class MitosSyncManager:
         """
         if self.embed_provider is None or self.vector_store is None:
             return None
-        api_key = self.config.env.get("ANTHROPIC_API_KEY")
-        if not api_key:
+        api_key = judge_api_key(self.config)
+        if api_key is None:
             return None
         # Lazy import (CONF-D4/§8, load-bearing): `conflict_judgment` is the sole
         # module-scope `import anthropic` in the conflict pipeline. Importing it here keeps

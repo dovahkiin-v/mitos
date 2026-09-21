@@ -762,3 +762,30 @@ class MitosConfig:
         for key in CONFIG_DEFAULTS:
             result[key] = getattr(self, key)
         return result
+
+
+def judge_api_key(config: MitosConfig) -> Optional[str]:
+    """Returns the judge's key off the workspace's resolved env, or None when none is configured.
+
+    The one spelling of "is a contradiction judge configured here?". ``check``'s
+    judge builder and the commit gate's keyless row both ask it, so the two
+    cannot disagree about a workspace; the status row and the record notice ask
+    it the same way. It returns the value rather than a bool because the builder
+    needs the key itself. An empty string counts as keyless, as it always has in
+    the builder: an exported-empty ``ANTHROPIC_API_KEY`` masks both ``.env``
+    files and leaves no key.
+
+    It lives here, not beside the builder, so a caller can ask without importing
+    ``cli`` or an LLM SDK.
+
+    Args:
+        config: The target workspace's config; the key comes off its ``env``,
+            never the process environment.
+
+    Returns:
+        The non-empty ``ANTHROPIC_API_KEY`` value, or ``None``.
+    """
+    api_key = config.env.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return None
+    return api_key

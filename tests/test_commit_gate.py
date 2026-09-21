@@ -10,7 +10,11 @@ uncovered set last changed? This module grows one section per phase:
 * 3b — the refused spend (``spend_not_authorized`` + the planned batch count, on the
   attempt's own record), the unrecorded-attempt disclosure on every answer
   ``cmd_check`` gives, and the refusal's on-record clause;
-* 3c onward — the hook predicate, the status gate row and the standing notice.
+* 3c1 — the hook predicate (``commit_gate.evaluate_gate``): the shared key test
+  ``config.judge_api_key``, the five rows each proven as a transition from
+  ``blocked``, ``cmd_hook_run``'s channels and block code, a subprocess probe that no
+  row loads an LLM SDK, and ``--staged``'s blindness to an MCP-path record;
+* 3c2 onward — the verb's own boundary, the status gate row and the standing notice.
 
 Every ``cmd_check`` row injects both seams (substrate and judge): offline, a run with
 no embedding provider over a non-empty corpus exits before the seam, and a run-end
@@ -23,6 +27,8 @@ import dataclasses
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 from typing import Any, Dict, Optional, Tuple
 
 import pytest
@@ -30,11 +36,26 @@ import pytest
 from mitos import check, cli, telemetry
 from mitos.audit_debt import AuditDebt, derive_audit_debt
 from mitos.check import CheckFinding
-from mitos.config import MitosConfig
+from mitos.cli import cmd_init
+from mitos.commit_gate import (
+    GATE_ATTEMPTED,
+    GATE_BLOCKED,
+    GATE_CAUSES,
+    GATE_KEYLESS,
+    GATE_NOTHING_UNCOVERED,
+    GATE_ROWS,
+    GATE_UNREADABLE,
+    HOOK_BLOCK_EXIT,
+    GateVerdict,
+    evaluate_gate,
+)
+from mitos.config import MitosConfig, judge_api_key
 from mitos.conflict import ConflictUnavailableReason, Unavailable
 from mitos.errors import DatabaseError, MitosError
 from mitos.migrations import _pending_head, run_migrations
+from mitos.recall import provenance_line
 from mitos.store import GraphStore, open_connection
+from mitos.sync import MitosSyncManager
 from mitos.telemetry import (
     ATTEMPT_COULD_NOT_COMPLETE,
     ATTEMPT_NEW_FINDINGS,
@@ -58,14 +79,17 @@ from mitos.telemetry import (
 )
 
 from _conflict_helpers import _drain_outbox, _match
-from test_check_cli import (  # noqa: F401  (offline is autouse; workspace a fixture)
+from test_check_cli import (  # noqa: F401  (offline is autouse; the rest fixtures)
     _FakeStdin,
     _FaultStore,
+    _assert_parses,
     _pair,
     _read_check_runs,
+    _recipe,
     _wire_judge,
     _wire_substrate,
     offline,
+    recipe_workspace,
     workspace,
 )
 from test_check_coverage import (
@@ -75,9 +99,10 @@ from test_check_coverage import (
     _healthy_result,
     _judge_for,
     _run,
+    _scoped_corpus,
     _tables,
 )
-from test_check_probe import _commit, _seed_verdict
+from test_check_probe import _commit, _poison, _seed_verdict
 
 
 # =========================================================================== #
@@ -1280,3 +1305,576 @@ def test_a_graph_that_cannot_open_made_no_attempt(workspace, monkeypatch, capsys
     else:
         assert "was not recorded" not in captured.err
         assert captured.err.splitlines()[-1].startswith("check could not run:")
+
+
+# =========================================================================== #
+# Phase 3c1 — the predicate, the shared key test, the block code, `hook-run`
+# =========================================================================== #
+#
+# Every pass row is a transition: it starts from a fixture verified ``blocked``,
+# changes the one thing the row names, and asserts the new row by name on the
+# verdict. Rows 2–4 look the same from outside (silence, exit 0), so a row that
+# asserted only "passed" would prove nothing. The judge key is a dummy string
+# nothing ever sends: every ``cmd_check`` that reaches judging wires its judge.
+
+_DUMMY_KEY = "sk-dummy-never-sent"
+
+
+def _keyed(config: MitosConfig, monkeypatch: Any, key: str = _DUMMY_KEY) -> MitosConfig:
+    """A fresh config for the same workspace with a judge key in its env.
+
+    ``config.env`` is resolved at construction, so the key only counts on a config
+    built after it is set. The project name is carried so recipes keep it.
+    """
+    monkeypatch.setenv("ANTHROPIC_API_KEY", key)
+    return MitosConfig(config.workspace_dir, project=config.project)
+
+
+def _keyless(config: MitosConfig, monkeypatch: Any) -> MitosConfig:
+    """A fresh config for the same workspace with no judge key anywhere."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    return MitosConfig(config.workspace_dir, project=config.project)
+
+
+def _blocked_pair(config: MitosConfig, store: GraphStore,
+                  monkeypatch: Any) -> Tuple[str, str, Dict[str, Any], MitosConfig]:
+    """Two committed decisions, telemetry at head, no attempt; asserts ``blocked``.
+
+    Returns the pair's ids, their neighbourhoods and the keyed config.
+    """
+    a_id, b_id, nbhds = _pair(store)
+    _drain_outbox(store)
+    keyed = _keyed(config, monkeypatch)
+    assert evaluate_gate(keyed) == GateVerdict(GATE_BLOCKED, uncovered=2)
+    return a_id, b_id, nbhds, keyed
+
+
+def _corrupt(path: str) -> None:
+    """Overwrites a store file with bytes SQLite cannot read, dropping WAL siblings."""
+    for sibling in (path + "-wal", path + "-shm"):
+        if os.path.exists(sibling):
+            os.remove(sibling)
+    with open(path, "wb") as f:
+        f.write(b"this is not a sqlite database" * 64)
+
+
+def _tree(root: str) -> list:
+    """Every path under ``root``, relative and sorted."""
+    return sorted(
+        os.path.relpath(os.path.join(d, name), root)
+        for d, dirs, files in os.walk(root) for name in dirs + files
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 1–2 — the key test
+# --------------------------------------------------------------------------- #
+
+def test_the_key_test_reads_the_workspace_env(workspace, monkeypatch) -> None:
+    """Criterion 1: the key when set; ``None`` when unset or exported empty."""
+    config, _store, _tel = workspace
+
+    assert judge_api_key(_keyed(config, monkeypatch)) == _DUMMY_KEY
+    assert judge_api_key(_keyless(config, monkeypatch)) is None
+    assert judge_api_key(_keyed(config, monkeypatch, key="")) is None
+
+
+@pytest.mark.parametrize("key", [None, "", "   ", _DUMMY_KEY],
+                         ids=["unset", "empty", "whitespace", "dummy"])
+def test_check_and_the_gate_agree_on_keyless(workspace, monkeypatch, key) -> None:
+    """Criterion 2: ``_build_check_judge`` is ``None`` exactly when the key test is.
+
+    The real builder, unstubbed: a dummy key builds a real client offline and sends
+    nothing. The whitespace case is what a second spelling in the builder (a
+    ``.strip()``) would split on.
+    """
+    config, _store, _tel = workspace
+    target = (_keyless(config, monkeypatch) if key is None
+              else _keyed(config, monkeypatch, key=key))
+
+    assert (cli._build_check_judge(target) is None) == (judge_api_key(target) is None)
+
+
+# --------------------------------------------------------------------------- #
+# 3–10 — the predicate rows as transitions
+# --------------------------------------------------------------------------- #
+
+def test_uncovered_decisions_with_no_attempt_block(workspace, monkeypatch) -> None:
+    """Criterion 3, row 5: two committed decisions and no attempt → ``blocked``, N = 2."""
+    config, store, _tel = workspace
+    _blocked_pair(config, store, monkeypatch)
+    assert read_last_attempt(config.telemetry_path) is None
+
+
+def test_a_keyless_workspace_is_inactive_and_opens_no_store(workspace, monkeypatch) -> None:
+    """Criterion 4, row 2: removing the key → ``keyless``, even over a corrupt graph.
+
+    The corrupt graph is D2's proof: were the key asked after the stores are read,
+    it would read ``unreadable`` instead.
+    """
+    config, store, _tel = workspace
+    _blocked_pair(config, store, monkeypatch)
+
+    assert evaluate_gate(_keyless(config, monkeypatch)) == GateVerdict(GATE_KEYLESS)
+
+    _corrupt(config.db_path)
+    assert evaluate_gate(_keyless(config, monkeypatch)) == GateVerdict(GATE_KEYLESS)
+    assert evaluate_gate(_keyed(config, monkeypatch)).row == GATE_UNREADABLE
+
+
+def test_a_clean_run_leaves_nothing_uncovered(workspace, monkeypatch, capsys) -> None:
+    """Criterion 5, row 3: a clean unscoped check covers both → ``nothing_uncovered``."""
+    config, store, tel = workspace
+    _a, _b, nbhds, keyed = _blocked_pair(config, store, monkeypatch)
+    embed, vector = _wire_substrate(monkeypatch, nbhds)
+    _wire_judge(monkeypatch, _judge_for(store, embed, vector, tel))
+
+    code, obj = _run(config, capsys)
+
+    assert code == 0 and obj["degradations"] == []
+    assert evaluate_gate(keyed) == GateVerdict(GATE_NOTHING_UNCOVERED, uncovered=0)
+
+
+def test_an_empty_corpus_has_nothing_uncovered(workspace, monkeypatch) -> None:
+    """Criterion 5: a built graph with zero decisions lands on row 3 directly."""
+    config, _store, _tel = workspace
+    assert evaluate_gate(_keyed(config, monkeypatch)) == GateVerdict(
+        GATE_NOTHING_UNCOVERED, uncovered=0)
+
+
+def test_a_decision_recorded_mid_run_blocks_the_next_commit(workspace, monkeypatch,
+                                                             capsys) -> None:
+    """Criterion 6: the attempt's fingerprint is the set at entry, not the set now.
+
+    The run covers what it swept and leaves exactly the new decision uncovered, so
+    the recorded attempt no longer matches and the gate blocks on one. (Row 4 is
+    reachable with N > 0 only through an attempt that covered nothing, which is why
+    the next row carries its proof.)
+    """
+    config, store, tel = workspace
+    _a, _b, nbhds, keyed = _blocked_pair(config, store, monkeypatch)
+    embed, vector = _wire_substrate(monkeypatch, nbhds)
+    judge = _CommittingJudge(_judge_for(store, embed, vector, tel), store)
+    _wire_judge(monkeypatch, judge)
+
+    code, _obj = _run(config, capsys)
+
+    assert code in (0, 1)
+    assert read_last_attempt(config.telemetry_path).state in ATTEMPT_RUN_END_STATES
+    assert evaluate_gate(keyed) == GateVerdict(GATE_BLOCKED, uncovered=1)
+
+
+def _substrate_unavailable(config, store, tel, monkeypatch, capsys, nbhds) -> None:
+    # No substrate patch: real construction has no embedding provider offline → exit 2
+    # before the run end, so the record stays ``started``.
+    code, obj = _run(config, capsys)
+    assert code == 2 and obj["code"] == "substrate_unavailable"
+
+
+def _refused(config, store, tel, monkeypatch, capsys, nbhds) -> None:
+    _wire_substrate(monkeypatch, nbhds)
+    _wire_judge(monkeypatch, None)
+    monkeypatch.setattr(check, "CHECK_CONFIRM_BATCHES", 0)
+    code, _planned, _out, _err = _refuse(config, capsys, monkeypatch, "json")
+    assert code == 2
+
+
+def _failing_batch(config, store, tel, monkeypatch, capsys, nbhds) -> None:
+    embed, vector = _wire_substrate(monkeypatch, nbhds)
+    failing = Unavailable(reason=ConflictUnavailableReason.JUDGMENT, detail="judge died")
+    _wire_judge(monkeypatch, _judge_for(store, embed, vector, tel, overrides={0: failing}))
+    code, _obj = _run(config, capsys)
+    assert code == 2
+
+
+_FAILED_ATTEMPTS = {
+    ATTEMPT_STARTED: _substrate_unavailable,
+    ATTEMPT_SPEND_NOT_AUTHORIZED: _refused,
+    ATTEMPT_COULD_NOT_COMPLETE: _failing_batch,
+}
+
+
+@pytest.mark.parametrize("state", list(_FAILED_ATTEMPTS))
+def test_a_failed_attempt_opens_the_gate(workspace, monkeypatch, capsys, state) -> None:
+    """Criterion 7, row 4: an attempt that covered nothing opens the gate, whatever its state.
+
+    ``started`` never reached its run end and ``spend_not_authorized`` is not a run-end
+    state at all; both open it, because the gate answers forgetting, not failure.
+    """
+    config, store, tel = workspace
+    _a, _b, nbhds, keyed = _blocked_pair(config, store, monkeypatch)
+
+    _FAILED_ATTEMPTS[state](config, store, tel, monkeypatch, capsys, nbhds)
+
+    assert read_last_attempt(config.telemetry_path).state == state
+    assert evaluate_gate(keyed) == GateVerdict(GATE_ATTEMPTED, uncovered=2)
+
+
+def test_a_record_after_an_attempt_blocks_again(workspace, monkeypatch, capsys) -> None:
+    """Criterion 8: from ``attempted``, one more decision → ``blocked`` over N + 1."""
+    config, store, tel = workspace
+    _a, _b, nbhds, keyed = _blocked_pair(config, store, monkeypatch)
+    _substrate_unavailable(config, store, tel, monkeypatch, capsys, nbhds)
+    assert evaluate_gate(keyed) == GateVerdict(GATE_ATTEMPTED, uncovered=2)
+
+    _commit(store, "gate-late", "A decision recorded after the attempt.")
+
+    assert evaluate_gate(keyed) == GateVerdict(GATE_BLOCKED, uncovered=3)
+
+
+def test_a_scoped_run_shrinks_the_set_but_is_no_attempt(workspace, monkeypatch,
+                                                        capsys) -> None:
+    """Criterion 9: ``--scope x`` covers what it swept and writes no attempt → still blocked."""
+    config, store, tel = workspace
+    _x1, _x2, _y1, nbhds = _scoped_corpus(store)
+    _drain_outbox(store)
+    keyed = _keyed(config, monkeypatch)
+    assert evaluate_gate(keyed) == GateVerdict(GATE_BLOCKED, uncovered=3)
+    embed, vector = _wire_substrate(monkeypatch, nbhds)
+    _wire_judge(monkeypatch, _judge_for(store, embed, vector, tel, scope="x"))
+
+    code, obj = _run(config, capsys, scope="x")
+
+    assert code == 0
+    swept = obj["nodes_swept"]
+    assert 0 < swept < 3
+    assert read_last_attempt(config.telemetry_path) is None
+    assert evaluate_gate(keyed) == GateVerdict(GATE_BLOCKED, uncovered=3 - swept)
+
+
+def test_an_excluded_node_does_not_hold_the_count_up(workspace, monkeypatch,
+                                                     capsys) -> None:
+    """Criterion 10: a clean run that excludes one poison node → ``nothing_uncovered``."""
+    config, store, tel = workspace
+    a_id, _b, nbhds, keyed = _blocked_pair(config, store, monkeypatch)
+    _poison(store, a_id)
+    embed, vector = _wire_substrate(monkeypatch, nbhds)
+    _wire_judge(monkeypatch, _judge_for(store, embed, vector, tel))
+
+    code, _obj = _run(config, capsys)
+
+    assert code == 0
+    assert evaluate_gate(keyed) == GateVerdict(GATE_NOTHING_UNCOVERED, uncovered=0)
+
+
+# --------------------------------------------------------------------------- #
+# 11–14 — row 1, and absent is not unreadable
+# --------------------------------------------------------------------------- #
+
+def test_no_graph_is_unreadable_and_creates_nothing(tmp_path, monkeypatch) -> None:
+    """Criterion 11: no ``graph.sqlite`` → ``unreadable`` / ``no_graph``; the tree is unchanged."""
+    keyed = _keyed(MitosConfig(str(tmp_path)), monkeypatch)
+    before = _tree(str(tmp_path))
+
+    assert evaluate_gate(keyed) == GateVerdict(GATE_UNREADABLE, cause="no_graph")
+    assert _tree(str(tmp_path)) == before
+
+
+@pytest.mark.parametrize("store_path, cause", [
+    ("db_path", "graph"), ("telemetry_path", "telemetry"),
+])
+def test_an_unreadable_store_lets_the_commit_through(workspace, monkeypatch,
+                                                     store_path: str, cause: str) -> None:
+    """Criterion 12: a corrupt graph or telemetry file → ``unreadable`` naming it."""
+    config, store, _tel = workspace
+    _blocked_pair(config, store, monkeypatch)
+
+    _corrupt(getattr(config, store_path))
+
+    assert evaluate_gate(_keyed(config, monkeypatch)) == GateVerdict(
+        GATE_UNREADABLE, cause=cause)
+
+
+def test_an_unreadable_attempt_record_is_row_one_not_a_block(workspace,
+                                                             monkeypatch) -> None:
+    """Criterion 13 (D3): coverage reads fine, the attempt row does not → row 1, never 5."""
+    config, store, tel = workspace
+    _a, _b, _nbhds, keyed = _blocked_pair(config, store, monkeypatch)
+    tel.record_attempt_start(_start(fingerprint=_fingerprint(config)))
+    _raw_attempt_update(config.telemetry_path,
+                        "UPDATE check_attempt SET new_pairs = ?", "not json at all")
+
+    assert evaluate_gate(keyed) == GateVerdict(GATE_UNREADABLE, cause="telemetry")
+
+
+def _graph_only_workspace(tmp_path: Any) -> MitosConfig:
+    """A workspace with two committed decisions and no telemetry file."""
+    config = MitosConfig(str(tmp_path))
+    store = GraphStore(config.db_path)
+    _commit(store, "gate-a", "Graph-only axiom alpha.")
+    _commit(store, "gate-b", "Graph-only axiom beta.")
+    return config
+
+
+def test_a_telemetry_file_below_the_attempt_rung_blocks(tmp_path, monkeypatch) -> None:
+    """Criterion 14: a rung-6 file holds coverage but no attempt → ``blocked``, N = M.
+
+    The first commit after an upgrade. The file's ``user_version`` is unchanged.
+    """
+    config = _graph_only_workspace(tmp_path)
+    conn = open_connection(config.telemetry_path)
+    run_migrations(conn, TELEMETRY_MIGRATION_STEPS[:FAILED_BATCHES_RUNG])
+    conn.close()
+
+    assert evaluate_gate(_keyed(config, monkeypatch)) == GateVerdict(
+        GATE_BLOCKED, uncovered=2)
+    conn = sqlite3.connect(config.telemetry_path)
+    try:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == FAILED_BATCHES_RUNG
+    finally:
+        conn.close()
+
+
+def test_no_telemetry_file_blocks_and_creates_none(tmp_path, monkeypatch) -> None:
+    """Criterion 14: no telemetry file → ``blocked``, N = M, and still no file afterwards."""
+    config = _graph_only_workspace(tmp_path)
+    assert not os.path.exists(config.telemetry_path)
+
+    assert evaluate_gate(_keyed(config, monkeypatch)) == GateVerdict(
+        GATE_BLOCKED, uncovered=2)
+    assert not os.path.exists(config.telemetry_path)
+
+
+# --------------------------------------------------------------------------- #
+# 15–19 — the handler
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("extra, subject", [
+    (False, "2 decisions have"), (True, "3 decisions have"),
+], ids=["two", "three"])
+def test_a_block_echoes_then_names_the_count_and_the_check(workspace, monkeypatch, capsys,
+                                                           extra: bool, subject: str) -> None:
+    """Criterion 15: exit ``HOOK_BLOCK_EXIT``; nothing on stdout; stderr is the echo, then the message."""
+    config, store, _tel = workspace
+    _a, _b, _nbhds, keyed = _blocked_pair(config, store, monkeypatch)
+    if extra:
+        _commit(store, "gate-third", "A third uncovered decision.")
+
+    code = cli.cmd_hook_run(keyed)
+    out, err = capsys.readouterr()
+
+    assert code == HOOK_BLOCK_EXIT
+    assert out == ""
+    lines = err.splitlines()
+    assert lines[0] == provenance_line(keyed)
+    assert len(lines) == 2
+    assert lines[1].startswith(f"{subject} not been covered by a contradiction check. Run `mitos check -p ")
+    assert "the gate asks only that the check was attempted" in lines[1]
+
+
+def test_a_block_over_one_decision_is_singular(tmp_path, monkeypatch, capsys) -> None:
+    """Criterion 15: one uncovered decision reads "1 decision has"."""
+    config = MitosConfig(str(tmp_path))
+    _commit(GraphStore(config.db_path), "gate-only", "The only decision.")
+    keyed = _keyed(config, monkeypatch)
+
+    assert cli.cmd_hook_run(keyed) == HOOK_BLOCK_EXIT
+    err = capsys.readouterr().err
+    assert "1 decision has not been covered" in err
+    assert "1 decisions" not in err
+
+
+def test_the_block_recipe_parses_to_check_on_this_workspace(recipe_workspace, monkeypatch,
+                                                            capsys) -> None:
+    """Criterion 16: the recipe parses through the real parser to ``check`` with the selector."""
+    config, store, _tel = recipe_workspace
+    _pair(store)
+    keyed = _keyed(config, monkeypatch)
+
+    assert cli.cmd_hook_run(keyed) == HOOK_BLOCK_EXIT
+    recipe = _recipe(capsys.readouterr().err, "not been covered")
+    _assert_parses(recipe, "check", config.project)
+
+
+def _to_keyless(config, store, tel, monkeypatch, capsys, nbhds) -> MitosConfig:
+    return _keyless(config, monkeypatch)
+
+
+def _to_nothing_uncovered(config, store, tel, monkeypatch, capsys, nbhds) -> MitosConfig:
+    embed, vector = _wire_substrate(monkeypatch, nbhds)
+    _wire_judge(monkeypatch, _judge_for(store, embed, vector, tel))
+    assert _run(config, capsys)[0] == 0
+    return _keyed(config, monkeypatch)
+
+
+def _to_attempted(config, store, tel, monkeypatch, capsys, nbhds) -> MitosConfig:
+    _substrate_unavailable(config, store, tel, monkeypatch, capsys, nbhds)
+    return _keyed(config, monkeypatch)
+
+
+_QUIET_PASSES = {
+    GATE_KEYLESS: _to_keyless,
+    GATE_NOTHING_UNCOVERED: _to_nothing_uncovered,
+    GATE_ATTEMPTED: _to_attempted,
+}
+
+
+@pytest.mark.parametrize("row", list(_QUIET_PASSES))
+def test_the_quiet_passes_print_nothing(workspace, monkeypatch, capsys, row: str) -> None:
+    """Criterion 17: from ``blocked``, each quiet pass exits 0 with both channels empty."""
+    config, store, tel = workspace
+    _a, _b, nbhds, keyed = _blocked_pair(config, store, monkeypatch)
+    assert cli.cmd_hook_run(keyed) == HOOK_BLOCK_EXIT
+    capsys.readouterr()
+
+    moved = _QUIET_PASSES[row](config, store, tel, monkeypatch, capsys, nbhds)
+    capsys.readouterr()
+    assert evaluate_gate(moved).row == row
+
+    assert cli.cmd_hook_run(moved) == 0
+    assert capsys.readouterr() == ("", "")
+
+
+@pytest.mark.parametrize("cause", GATE_CAUSES)
+def test_an_unreadable_row_says_one_line_and_passes(workspace, tmp_path, monkeypatch,
+                                                    capsys, cause: str) -> None:
+    """Criterion 18: each row-1 cause → exit 0, stdout empty, exactly one stderr line."""
+    config, store, tel = workspace
+    if cause == "no_graph":
+        target = _keyed(MitosConfig(str(tmp_path)), monkeypatch)
+    else:
+        _blocked_pair(config, store, monkeypatch)
+        _corrupt(config.db_path if cause == "graph" else config.telemetry_path)
+        target = _keyed(config, monkeypatch)
+    assert evaluate_gate(target) == GateVerdict(GATE_UNREADABLE, cause=cause)
+
+    code = cli.cmd_hook_run(target)
+    out, err = capsys.readouterr()
+
+    assert code == 0 and out == ""
+    assert len(err.splitlines()) == 1 and err.endswith("\n")
+    assert "let through" in err and "`" not in err
+
+
+def test_an_unreadable_attempt_record_says_one_line_too(workspace, monkeypatch,
+                                                        capsys) -> None:
+    """Criterion 18: the lazily read attempt's fault (D3) is the telemetry line."""
+    config, store, tel = workspace
+    _a, _b, _nbhds, keyed = _blocked_pair(config, store, monkeypatch)
+    tel.record_attempt_start(_start(fingerprint=_fingerprint(config)))
+    _raw_attempt_update(config.telemetry_path,
+                        "UPDATE check_attempt SET new_pairs = ?", "not json at all")
+
+    assert cli.cmd_hook_run(keyed) == 0
+    out, err = capsys.readouterr()
+    assert out == "" and err == cli._HOOK_UNREADABLE_LINES["telemetry"] + "\n"
+
+
+def test_the_block_code_is_one_nothing_else_produces() -> None:
+    """Criterion 19: ``HOOK_BLOCK_EXIT`` is outside every status another cause can produce.
+
+    The installed hook maps this status alone to a failed commit, so it must never
+    be something a crash or the shell could return:
+
+    * 0 — success;
+    * 1 — Python's uncaught exception, and ``main()``'s fault arms;
+    * 2 — argparse's usage error (and the interpreter's own);
+    * 120 — the interpreter when flushing stdout fails at exit;
+    * 124–127 — ``timeout``, ``env``, and the shell's not-executable / not-found;
+    * 128–255 — death by signal.
+    """
+    excluded = {0, 1, 2, 120} | set(range(124, 128)) | set(range(128, 256))
+    assert type(HOOK_BLOCK_EXIT) is int
+    assert 0 <= HOOK_BLOCK_EXIT <= 255
+    assert HOOK_BLOCK_EXIT not in excluded
+
+
+def test_the_rows_are_a_closed_set_in_table_order() -> None:
+    """The five row names, in the vision's table order; ``blocks`` is row 5 alone."""
+    assert GATE_ROWS == ("unreadable", "keyless", "nothing_uncovered", "attempted",
+                         "blocked")
+    assert [GateVerdict(r).blocks for r in GATE_ROWS] == [False] * 4 + [True]
+
+
+# --------------------------------------------------------------------------- #
+# 20 — through main(), in a subprocess: no row loads an LLM SDK
+# --------------------------------------------------------------------------- #
+
+_HOOK_PROBE = """
+import json, sys
+sys.argv = ["mitos", "hook-run", "-p", {ws!r}]
+from mitos.cli import main
+try:
+    main()
+    code = 0
+except SystemExit as e:
+    code = e.code
+print(json.dumps([code, sorted(m for m in ("anthropic", "google.genai") if m in sys.modules)]))
+"""
+
+
+def _probe_hook(ws: str, *, keyed: bool) -> Tuple[int, list]:
+    """Runs ``mitos hook-run -p <ws>`` through ``main()`` in a fresh interpreter.
+
+    Returns the exit status and which LLM SDKs were imported. The environment is
+    this test's own (hermetic ``XDG_*``, credentials stripped) plus, when ``keyed``,
+    a dummy judge key.
+    """
+    env = os.environ.copy()
+    env.pop("ANTHROPIC_API_KEY", None)
+    env["MITOS_NO_UPDATE_CHECK"] = "1"
+    if keyed:
+        env["ANTHROPIC_API_KEY"] = _DUMMY_KEY
+    out = subprocess.run([sys.executable, "-c", _HOOK_PROBE.format(ws=ws)],
+                         capture_output=True, text=True, env=env, check=True)
+    code, sdks = json.loads(out.stdout.strip().splitlines()[-1])
+    return code, sdks
+
+
+def test_hook_run_loads_no_llm_sdk_on_any_row(tmp_path, capsys) -> None:
+    """Criterion 20 (D6): rows 3, 2, 5, 4 through the real verb; no SDK on any of them.
+
+    One ``init``'d workspace moved between states. A block must not buy the SDK
+    either. In-process this would be vacuous: the test process has imported both.
+    """
+    ws = str(tmp_path / "hookws")
+    os.makedirs(ws)
+    config = MitosConfig(ws)
+    cmd_init(config)
+    capsys.readouterr()
+    config = MitosConfig(ws)
+
+    assert _probe_hook(ws, keyed=True) == (0, [])          # row 3: empty corpus
+
+    store = GraphStore(config.db_path)
+    _commit(store, "probe-a", "Probe axiom alpha.")
+    _commit(store, "probe-b", "Probe axiom beta.")
+    assert _probe_hook(ws, keyed=False) == (0, [])         # row 2: keyless
+    assert _probe_hook(ws, keyed=True) == (HOOK_BLOCK_EXIT, [])  # row 5
+
+    TelemetryStore(config.telemetry_path).record_attempt_start(
+        _start(fingerprint=_fingerprint(config)))
+    assert _probe_hook(ws, keyed=True) == (0, [])          # row 4
+
+
+# --------------------------------------------------------------------------- #
+# 22 — constraint 12: `--staged` finds nothing pending after an MCP-path record
+# --------------------------------------------------------------------------- #
+
+def test_staged_sees_nothing_after_an_mcp_path_record(tmp_path, monkeypatch, capsys) -> None:
+    """Criterion 22 (vision §2.3): ``check --staged`` is blind to a recorded decision.
+
+    ``record_decision`` commits to the graph as it writes the buffer, so the entry is
+    never pending and ``--staged`` answers its free one-line clear without building a
+    judge or a substrate. That is why the commit gate asks about coverage, not about
+    pending entries; whoever revisits ``--staged`` inverts this row.
+    """
+    config = MitosConfig(str(tmp_path))
+    cmd_init(config)
+    manager = MitosSyncManager(config)
+    manager.record_decision_entry(
+        "Gate rows are evaluated in a fixed order.", "Evaluate them in any order.",
+        [], slug="gate-order")
+    capsys.readouterr()
+
+    def _never(config: MitosConfig) -> Any:
+        raise AssertionError("--staged built a check seam with nothing pending")
+
+    monkeypatch.setattr(cli, "_build_check_judge", _never)
+    monkeypatch.setattr(cli, "_build_check_substrate", _never)
+
+    code = cli.cmd_check(config, staged=True, scope=None, fresh=False,
+                         assume_yes=False, as_json=False)
+
+    assert code == 0
+    assert capsys.readouterr().out == "Gate clear — no pending decisions to check.\n"
