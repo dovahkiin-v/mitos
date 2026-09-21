@@ -1184,7 +1184,8 @@ def _mark(config: MitosConfig, run_id: str, covered=(), excluded=()) -> None:
     row = _check_run_row(run_id)
     TelemetryStore(config.telemetry_path).record_run_end(
         row, coverage=CoverageMarks(run_id=run_id, marked_at=row.ended_at,
-                                    covered=tuple(covered), excluded=tuple(excluded)))
+                                    covered=tuple(covered), excluded=tuple(excluded)),
+        attempt=None)
 
 
 def test_every_created_receipt_counts_the_corpus(ws) -> None:

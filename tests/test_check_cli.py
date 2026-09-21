@@ -165,7 +165,7 @@ class _FailingWriteTelemetry:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
 
-    def record_run_end(self, row: Any, *, coverage: Any) -> None:
+    def record_run_end(self, row: Any, *, coverage: Any, attempt: Any) -> None:
         raise DatabaseError("provoked summary-row write fault")
 
 

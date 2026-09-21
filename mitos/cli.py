@@ -15,6 +15,7 @@ import sqlite3
 import hashlib
 import argparse
 from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Callable, List, Mapping, Optional, Dict, Any, Sequence, Set, Tuple
@@ -65,7 +66,8 @@ from mitos.restore import BufferFidelityError
 from mitos.env import resolve_key
 from mitos.vector_store import scroll_point_ids, hash_to_uuid, QdrantVectorStore
 from mitos.embeddings import GeminiEmbeddingProvider
-from mitos.telemetry import TelemetryStore, ConflictCheckRow, JudgmentBatch
+from mitos.telemetry import AttemptStart, TelemetryStore, ConflictCheckRow, JudgmentBatch
+from mitos.audit_debt import AuditDebt, derive_audit_debt
 from mitos.identity import compute_node_id
 from mitos.models import get_embedding_model_id, get_model_id
 from mitos.parser import (ParsedEntry, parse_entry_stream,
@@ -4767,6 +4769,86 @@ def _build_check_telemetry(config: MitosConfig) -> Optional[TelemetryStore]:
         return None
 
 
+# Why an unscoped corpus check's entry write left no attempt on record. Held by
+# ``cmd_check``; the report and ``--json`` word it in a later phase.
+_ATTEMPT_UNRECORDED_CAUSES: Tuple[str, ...] = (
+    "telemetry_unavailable",   # the telemetry store could not be constructed
+    "fingerprint_unreadable",  # the uncovered set could not be derived
+    "write_failed",            # the entry write raised
+)
+
+
+@dataclass(frozen=True)
+class _AttemptOnRecord:
+    """The entry write landed; the run-end seam updates this attempt's record.
+
+    Attributes:
+        attempt_id: The key the entry write used.
+    """
+
+    attempt_id: str
+
+
+@dataclass(frozen=True)
+class _AttemptUnrecorded:
+    """The entry write did not land; the run-end seam writes no outcome.
+
+    Attributes:
+        cause: One of :data:`_ATTEMPT_UNRECORDED_CAUSES`.
+    """
+
+    cause: str
+
+
+def _begin_check_attempt(
+    config: MitosConfig, telemetry: Optional[TelemetryStore]
+) -> "_AttemptOnRecord | _AttemptUnrecorded":
+    """Writes an unscoped corpus check's ``started`` record. Never raises.
+
+    Mints the attempt's key and time, derives the fingerprint of the uncovered set
+    through the audit-debt leaf (any later reader comparing against it must derive
+    through the same leaf, so the join key has one recipe), and replaces the
+    last-attempt record. Best effort: an entry write can never fail the check (ADR
+    ``check-run-end-writes-commit-together-a-seam-failure-covers-nothing``,
+    rejected path 5). A fault the write path knows about is remembered silently; any
+    other exception is a bug, so it also prints one warning line on stderr rather
+    than hiding behind the swallow.
+
+    A decision recorded between the derive and the write leaves the stored
+    fingerprint older than the set. A reader comparing fingerprints then sees the
+    set as changed since the attempt, which is the safe direction, so it is not
+    worth a lock.
+
+    Args:
+        config: The active workspace config.
+        telemetry: The run's telemetry store, or ``None`` when it could not be
+            constructed.
+
+    Returns:
+        :class:`_AttemptOnRecord` when the record landed, else
+        :class:`_AttemptUnrecorded` naming why.
+    """
+    if telemetry is None:
+        return _AttemptUnrecorded("telemetry_unavailable")
+    try:
+        debt = derive_audit_debt(config.db_path, config.telemetry_path)
+        if not isinstance(debt, AuditDebt):
+            # DebtUnreadable, or NoGraph in a race. No sentinel fingerprint is written.
+            return _AttemptUnrecorded("fingerprint_unreadable")
+        attempt_id = uuid.uuid4().hex
+        telemetry.record_attempt_start(AttemptStart(
+            attempt_id=attempt_id,
+            started_at=datetime.now(timezone.utc).isoformat(),
+            fingerprint=debt.fingerprint,
+        ))
+    except (sqlite3.Error, DatabaseError):
+        return _AttemptUnrecorded("write_failed")
+    except Exception as e:
+        print(f"[Warning] Check attempt write failed: {str(e)}", file=sys.stderr)
+        return _AttemptUnrecorded("write_failed")
+    return _AttemptOnRecord(attempt_id)
+
+
 def _build_check_judge(config: MitosConfig) -> Optional[Callable]:
     """Builds the bound conflict-judgment executor, or ``None`` when keyless (KD6).
 
@@ -5215,11 +5297,13 @@ def cmd_check(
 ) -> int:
     """Audits the live corpus for undeclared contradictions (read-only) → exit 0/1/2.
 
-    The one sequence (each step's contract in the phase plan §4): build substrate →
-    provider-absent disposition (KD2) → ``plan_corpus_check`` → CHK-D5 confirm (KD3)
-    → build judge iff fresh groups (KD6) → ``execute_corpus_check`` → build the full
-    display model → the run-end seam (``exit_code_for`` → row + coverage marks →
-    ``record_run_end`` LAST, one transaction, KD5) → emit. ``cmd_check`` owns its
+    The one sequence (each step's contract in the phase plan §4): open the graph →
+    build telemetry → the attempt's ``started`` entry write (unscoped only) → build
+    substrate → provider-absent disposition (KD2) → ``plan_corpus_check`` → CHK-D5
+    confirm (KD3) → build judge iff fresh groups (KD6) → ``execute_corpus_check`` →
+    build the full display model → the run-end seam (``exit_code_for`` → row +
+    coverage marks + attempt outcome → ``record_run_end`` LAST, one transaction,
+    KD5) → emit. ``cmd_check`` owns its
     error boundary (KD1a): store faults around plan/execute/display map to a calm
     exit-2 vector message, never a traceback read by CI as "new findings".
 
@@ -5264,9 +5348,24 @@ def cmd_check(
     from mitos.conflict_judgment import _JUDGMENT_MODEL_ALIAS
 
     try:
+        # GraphStore first: it migrates the graph, and the entry write's derive
+        # opens the graph read-only, so a fingerprint taken before a graph
+        # migration could fail to read. A graph that cannot open here exits
+        # check_faulted with no attempt written. That is accepted: a read-only
+        # open of the same graph, which is how any reader derives the fingerprint,
+        # would most likely fail too.
         store = GraphStore(config.db_path)
-        embed, vector, embed_detail = _build_check_substrate(config)
+        # Hoisted above the substrate: it needs only config. It creates and
+        # migrates telemetry.sqlite, as it already did before the substrate's
+        # disposition returned.
         telemetry = _build_check_telemetry(config)
+        # The entry write, before anything environmental can fail: a check that
+        # dies of a missing key, a down Qdrant or a kill has still left its attempt
+        # on record. Unscoped corpus runs only; `--scope ""` is a scoped run.
+        attempt = (
+            _begin_check_attempt(config, telemetry) if scope is None else None
+        )
+        embed, vector, embed_detail = _build_check_substrate(config)
 
         # KD2 — provider-absent disposition keys on whether the run has sweep work.
         # Only the embedding provider can be absent at this point: the vector store
@@ -5334,10 +5433,17 @@ def cmd_check(
         exit_code = check.exit_code_for(result)
         row = check.check_run_row_from_result(result, mode="corpus", exit_code=exit_code)
         coverage = check.coverage_marks_from_result(result)
+        # Built here, outside the try below, so a builder defect raises rather
+        # than hiding behind the seam's DatabaseError catch.
+        outcome = (
+            check.attempt_outcome_from_result(result, attempt_id=attempt.attempt_id)
+            if isinstance(attempt, _AttemptOnRecord)
+            else None
+        )
         row_written = False
         if telemetry is not None:
             try:
-                telemetry.record_run_end(row, coverage=coverage)
+                telemetry.record_run_end(row, coverage=coverage, attempt=outcome)
                 row_written = True
             except DatabaseError:
                 # The write is the last fallible act: a failure only moves toward 2.

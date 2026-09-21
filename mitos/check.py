@@ -112,6 +112,10 @@ from mitos.conflict import (
 from mitos.errors import DatabaseError
 from mitos.models import get_model_id
 from mitos.telemetry import (
+    ATTEMPT_COULD_NOT_COMPLETE,
+    ATTEMPT_NEW_FINDINGS,
+    ATTEMPT_NO_NEW_FINDINGS,
+    AttemptOutcome,
     CheckRunRow,
     ConflictCheckRow,
     CoverageMarks,
@@ -1951,11 +1955,11 @@ def check_run_row_from_result(
     ``reuse_unavailable`` stays a TRUE zero: the run genuinely reused nothing.
 
     The seam order, pinned for 3a (KD5): compute ``exit_code_for(result)`` →
-    build this row and :func:`coverage_marks_from_result` →
-    ``TelemetryStore.record_run_end`` LAST, so a write failure can only move
-    the exit toward 2 and a persisted row's ``exit_code`` always equals the
-    actual process exit. 3b hand-builds its staged row
-    instead of calling this (staged accounting is not a :class:`CheckRunResult`).
+    build this row, :func:`coverage_marks_from_result` and
+    :func:`attempt_outcome_from_result` → ``TelemetryStore.record_run_end``
+    LAST, so a write failure can only move the exit toward 2 and a persisted
+    row's ``exit_code`` always equals the actual process exit. 3b hand-builds its
+    staged row instead of calling this (staged accounting is not a :class:`CheckRunResult`).
 
     Args:
         result: The typed run outcome (the same object the report reads).
@@ -2043,4 +2047,56 @@ def coverage_marks_from_result(result: CheckRunResult) -> Optional[CoverageMarks
         marked_at=result.ended_at,
         covered=tuple(covered),
         excluded=tuple(excluded),
+    )
+
+
+def attempt_outcome_from_result(
+    result: CheckRunResult, *, attempt_id: str
+) -> AttemptOutcome:
+    """Assembles the attempt outcome one unscoped corpus run writes at its seam.
+
+    Beside :func:`coverage_marks_from_result` and read off the same result. The
+    state does not mirror the exit code. Degraded dominates the exit code and
+    never the record: any degradation token gives ``could_not_complete`` and the
+    record still carries the run's new pairs, because on this corpus every new
+    finding ever recorded arrived inside a degraded run, and the next run reports
+    those pairs as known (ADR
+    ``degraded-check-attempt-keeps-its-new-pairs-the-record-does-not-mirror-the-exit-code``).
+    Otherwise a new finding gives ``new_findings``, and none gives
+    ``no_new_findings``. A finding whose novelty is ``None`` (the reuse index was
+    unreadable) is never new.
+
+    Args:
+        result: The typed run outcome (the same object the report reads).
+        attempt_id: The key the attempt's entry write used.
+
+    Returns:
+        The run's :class:`~mitos.telemetry.AttemptOutcome`. Pairs are
+        ``(proposal_hash, partner_hash)`` node ids in the result's pair-key order;
+        ``findings_known`` follows :func:`check_run_row_from_result`'s NULL rule.
+    """
+    tokens = run_degradations(result)
+    new_pairs = tuple(
+        (f.proposal_hash, f.partner_hash)
+        for f in result.findings
+        if f.novelty == "new"
+    )
+    if tokens:
+        state = ATTEMPT_COULD_NOT_COMPLETE
+    elif new_pairs:
+        state = ATTEMPT_NEW_FINDINGS
+    else:
+        state = ATTEMPT_NO_NEW_FINDINGS
+    if result.reuse_unavailable is not None:
+        findings_known: Optional[int] = None
+    else:
+        findings_known = sum(1 for f in result.findings if f.novelty == "known")
+    return AttemptOutcome(
+        attempt_id=attempt_id,
+        state=state,
+        run_id=result.run_id,
+        outcome_at=result.ended_at,
+        degradation_tokens=tokens,
+        new_pairs=new_pairs,
+        findings_known=findings_known,
     )

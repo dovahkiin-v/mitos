@@ -39,6 +39,11 @@ check verb reach it through the module-level ``read_coverage``, which opens
 read-only and never creates or migrates the file (``TelemetryStore``'s
 constructor does both).
 
+``check_attempt`` holds one row: the newest unscoped corpus check attempt, written
+``started`` at entry (``record_attempt_start``) and given its outcome at the run-end
+seam, in that seam's transaction. Its reader is the module-level
+``read_last_attempt``.
+
 A corpus-check batch that fails leaves an append-only ``failed_judgment_batches``
 row (``record_failed_batch``), written at the failure site rather than at the
 run-end seam: its pairs, pin and billed usage, NULL where no response arrived.
@@ -871,6 +876,65 @@ def _failed_judgment_batches_schema(conn: sqlite3.Connection) -> None:
     conn.execute(_FAILED_JUDGMENT_BATCHES_SCHEMA)
 
 
+# --- Rung 7: the last check attempt — newest-only, one row --------------------
+#
+# The record that answers: has an unscoped corpus check been *attempted* since the
+# uncovered set last changed? ``check_runs`` cannot answer it. Most
+# could-not-run exits write no row there, and a row written at entry would carry a
+# made-up exit code. So ``cmd_check`` writes this table twice: ``started`` at entry,
+# before the substrate is built, and the outcome at the run-end seam, inside that
+# seam's one transaction.
+#
+# Newest-only by shape: ``slot`` is the primary key and may only be 1, and each
+# entry write replaces the row whole, so a column added later can never carry a
+# value over from the previous attempt. ``state`` is closed in code, never by
+# CHECK: a later state (3b's ``spend_not_authorized``) is a release, not a rung.
+# Every column this vision writes is here now, because a committed rung is never
+# edited: ``batches_planned`` stays NULL until the spend refusal writes it.
+# ``fingerprint`` is ``audit_debt.uncovered_fingerprint`` of the entry-time
+# uncovered set, and no later write names it. ADRs
+# ``check-attempt-state-is-a-newest-only-telemetry-table-not-a-workspace-json-file``,
+# amended by ``check-attempt-entry-state-is-started-and-later-writes-land-only-on-their-own-record``.
+_CHECK_ATTEMPT_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS check_attempt (
+        slot INTEGER NOT NULL CHECK (slot = 1),  -- newest-only by shape; never a state CHECK
+        attempt_id TEXT NOT NULL,        -- uuid4 hex minted by cmd_check; the own-record key
+        started_at TEXT NOT NULL,        -- UTC ISO-8601 µs, application-supplied (MI-10)
+        fingerprint TEXT NOT NULL,       -- uncovered-set fingerprint at entry; never rewritten
+        state TEXT NOT NULL,             -- closed in code (the ATTEMPT_* constants)
+        run_id TEXT,                     -- check_runs.run_id, a PLAIN column; NULL while started
+        outcome_at TEXT,                 -- the run's ended_at; NULL while started
+        degradation_tokens TEXT,         -- JSON array, check._DEGRADATION_TOKENS order; NULL while started
+        new_pairs TEXT,                  -- JSON array of [proposal_id, partner_id]; NULL while started
+        findings_known INTEGER,          -- NULL while started, and under reuse_read (check_runs' rule)
+        batches_planned INTEGER,         -- written by the spend refusal only
+        PRIMARY KEY (slot)
+    ) STRICT;
+"""
+
+# The rung the attempt table lands on; the ladder literal and the reader use it.
+ATTEMPT_RUNG = 7
+
+
+def _check_attempt_schema(conn: sqlite3.Connection) -> None:
+    """Migration step 7: the last-check-attempt table.
+
+    A plain additive rung: one CREATE, nothing to back-fill. A workspace that has
+    not run a check since upgrading holds no row, which reads as "no attempt on
+    record", the honest answer. Does NOT touch ``user_version`` or manage the
+    transaction; ``run_migrations`` owns both.
+
+    **Death story (P4).** It does not grow. It holds at most one row, and each
+    attempt replaces the last whole, so it needs no retention. The history of
+    completed runs stays in ``check_runs``.
+
+    Args:
+        conn: An open, writable SQLite connection inside the runner's transaction
+            (opened via ``store.open_connection``, MI-8).
+    """
+    conn.execute(_CHECK_ATTEMPT_SCHEMA)
+
+
 TELEMETRY_MIGRATION_STEPS: List[MigrationStep] = [
     (1, _conflict_checks_schema),
     (2, _check_attribution_schema),
@@ -878,6 +942,7 @@ TELEMETRY_MIGRATION_STEPS: List[MigrationStep] = [
     (4, _judgment_batches_add_stop_reason),
     (COVERAGE_RUNG, _check_coverage_schema),
     (FAILED_BATCHES_RUNG, _failed_judgment_batches_schema),
+    (ATTEMPT_RUNG, _check_attempt_schema),
 ]
 
 
@@ -1052,6 +1117,156 @@ class CoverageMarks:
             (node_id, COVERAGE_MARK_EXCLUDED, self.run_id, self.marked_at)
             for node_id in self.excluded
         ]
+
+
+# --- The last check attempt (rung 7): states, SQL, boundary shapes -------------
+#
+# The state vocabulary, closed in code, not by CHECK. ``started`` is the entry
+# state, named for what is known: the record is read from the moment it is written,
+# and a check that is still running has not failed to finish (ADR
+# ``check-attempt-entry-state-is-started-and-later-writes-land-only-on-their-own-record``).
+# The other three are the run-end outcomes. A state read back that is none of these
+# is a newer build's, and the reader returns it as-is.
+ATTEMPT_STARTED = "started"
+ATTEMPT_NO_NEW_FINDINGS = "no_new_findings"
+ATTEMPT_NEW_FINDINGS = "new_findings"
+ATTEMPT_COULD_NOT_COMPLETE = "could_not_complete"
+
+# The states the run-end seam may write. ``started`` is not one of them.
+ATTEMPT_RUN_END_STATES: Tuple[str, ...] = (
+    ATTEMPT_NO_NEW_FINDINGS,
+    ATTEMPT_NEW_FINDINGS,
+    ATTEMPT_COULD_NOT_COMPLETE,
+)
+
+# The entry write replaces the one row whole. Every column it does not name lands
+# NULL, so nothing from the previous attempt survives the replace.
+_REPLACE_ATTEMPT_SQL = (
+    "INSERT OR REPLACE INTO check_attempt "
+    "(slot, attempt_id, started_at, fingerprint, state) VALUES (?, ?, ?, ?, ?)"
+)
+
+# The run-end write lands only on the record its own attempt wrote. When a newer
+# attempt has replaced the row, zero rows update, which is the intended result and
+# is not reported. The SET list names neither ``fingerprint`` nor ``started_at``: a
+# decision recorded while the check ran was not swept and must still ask for a
+# check of its own, so the entry-time fingerprint is never rewritten (ADR
+# ``check-attempt-entry-state-is-started-and-later-writes-land-only-on-their-own-record``,
+# rejected path 4). Read by module-global name inside ``record_run_end``.
+_UPDATE_ATTEMPT_OUTCOME_SQL = (
+    "UPDATE check_attempt SET state = ?, run_id = ?, outcome_at = ?, "
+    "degradation_tokens = ?, new_pairs = ?, findings_known = ? "
+    "WHERE slot = 1 AND attempt_id = ?"
+)
+
+_SELECT_ATTEMPT_SQL = (
+    "SELECT attempt_id, started_at, fingerprint, state, run_id, outcome_at, "
+    "degradation_tokens, new_pairs, findings_known, batches_planned "
+    "FROM check_attempt WHERE slot = 1"
+)
+
+
+@dataclass(frozen=True)
+class AttemptStart:
+    """The entry write of one unscoped corpus check attempt.
+
+    A dumb boundary shape: the key, the time and the fingerprint are minted by
+    ``cli.cmd_check``. Each field must be a non-empty string, checked at
+    construction, before any connection opens.
+
+    Attributes:
+        attempt_id: The attempt's own key (uuid4 hex). The run-end write matches it.
+        started_at: UTC ISO-8601 with microseconds (MI-10).
+        fingerprint: ``audit_debt.uncovered_fingerprint`` of the uncovered set at
+            entry. Never rewritten.
+    """
+
+    attempt_id: str
+    started_at: str
+    fingerprint: str
+
+    def __post_init__(self) -> None:
+        """Rejects an empty or non-string field.
+
+        Raises:
+            ValueError: If any field is not a non-empty string.
+        """
+        for name in ("attempt_id", "started_at", "fingerprint"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"AttemptStart.{name} must be a non-empty string")
+
+    def to_params(self) -> Tuple[int, str, str, str, str]:
+        """Produces the replace's parameters, in ``_REPLACE_ATTEMPT_SQL`` order.
+
+        Returns:
+            ``(1, attempt_id, started_at, fingerprint, 'started')``.
+        """
+        return (1, self.attempt_id, self.started_at, self.fingerprint, ATTEMPT_STARTED)
+
+
+@dataclass(frozen=True)
+class AttemptOutcome:
+    """The run-end write of one attempt: what the run found and whether it finished.
+
+    A dumb boundary shape. The rules that pick the state live in
+    ``check.attempt_outcome_from_result``. Checked here, before any connection
+    opens: the state is a run-end state, and every pair is two strings.
+
+    Attributes:
+        attempt_id: The key the entry write used. The update matches on it.
+        state: One of :data:`ATTEMPT_RUN_END_STATES`.
+        run_id: The ``check_runs.run_id`` written in the same transaction.
+        outcome_at: The run's ``ended_at`` (UTC ISO-8601, MI-10).
+        degradation_tokens: The run's degradation tokens, in declaration order.
+        new_pairs: ``(proposal_id, partner_id)`` of every new finding, in the
+            order the result carries them. Node ids, never slugs (MI-2).
+        findings_known: The count of known findings, or ``None`` when the reuse
+            index could not be read (``check_runs``' rule).
+    """
+
+    attempt_id: str
+    state: str
+    run_id: str
+    outcome_at: str
+    degradation_tokens: Tuple[str, ...]
+    new_pairs: Tuple[Tuple[str, str], ...]
+    findings_known: Optional[int]
+
+    def __post_init__(self) -> None:
+        """Rejects a state that is not a run-end state, and a malformed pair.
+
+        Raises:
+            ValueError: If ``state`` is ``started`` or unknown, or a pair is not
+                two strings.
+        """
+        if self.state not in ATTEMPT_RUN_END_STATES:
+            raise ValueError(
+                f"an attempt's run-end state must be one of {ATTEMPT_RUN_END_STATES!r}, "
+                f"got {self.state!r}"
+            )
+        for pair in self.new_pairs:
+            if len(pair) != 2 or not all(isinstance(side, str) for side in pair):
+                raise ValueError(f"a new pair is two node ids, got {pair!r}")
+
+    def to_params(self) -> Tuple[Any, ...]:
+        """Produces the update's parameters, in ``_UPDATE_ATTEMPT_OUTCOME_SQL`` order.
+
+        Tuples persist as JSON lists (no tuple survives a JSON round trip).
+
+        Returns:
+            ``(state, run_id, outcome_at, tokens_json, pairs_json, findings_known,
+            attempt_id)``.
+        """
+        return (
+            self.state,
+            self.run_id,
+            self.outcome_at,
+            json.dumps(list(self.degradation_tokens)),
+            json.dumps([list(pair) for pair in self.new_pairs]),
+            self.findings_known,
+            self.attempt_id,
+        )
 
 
 # --- Read-side boundary shapes (verdict-reuse / novelty projection) -----------
@@ -1238,14 +1453,17 @@ class TelemetryStore:
     chokepoint and closes it, holding no long-lived handle. Writers:
     ``record_judged_batch`` (the per-batch judgment grain, append-only),
     ``record_failed_batch`` (a failed corpus-check batch's pairs and spend,
-    append-only), ``record_run_end`` (a corpus run's summary row plus its coverage
-    upsert, one transaction) and ``record_check_run`` (the summary row alone, for staged runs).
-    ``check_coverage`` is the one table here that is updated in place: a per-node
-    state table, bounded by the nodes the corpus has ever held, not a per-run log.
+    append-only), ``record_attempt_start`` (an unscoped corpus check's ``started``
+    record, replacing the last), ``record_run_end`` (a corpus run's summary row plus
+    its coverage upsert and attempt outcome, one transaction) and
+    ``record_check_run`` (the summary row alone, for staged runs). Two tables here
+    are updated in place: ``check_coverage``, a per-node state table bounded by the
+    nodes the corpus has ever held, not a per-run log; and ``check_attempt``, a
+    single row holding the newest attempt only.
     Its bulk reader ``load_reuse_index`` opens ``mode=ro``, so "no writes on the
     read path" is structural, not disciplinary. Because construction creates and
     migrates the file, readers outside the check verb use the module-level
-    ``read_coverage`` instead of this class.
+    ``read_coverage`` and ``read_last_attempt`` instead of this class.
     """
 
     def __init__(self, telemetry_path: str) -> None:
@@ -1474,16 +1692,46 @@ class TelemetryStore:
             out.append(record)
         return out
 
+    def record_attempt_start(self, start: AttemptStart) -> None:
+        """Replaces the last-attempt record with a new attempt's ``started`` row.
+
+        One fresh connection through the MI-8 chokepoint, one ``with conn:``, one
+        ``INSERT OR REPLACE`` of the singleton row: the previous attempt's record,
+        outcome columns included, is gone whole. Best-effort is the caller's call
+        (``cli._begin_check_attempt``); this writer raises like the others.
+
+        Args:
+            start: The attempt's key, start time and entry-time fingerprint.
+
+        Raises:
+            DatabaseError: If the row cannot be persisted. Nothing lands.
+        """
+        conn = open_connection(self.telemetry_path)
+        try:
+            with conn:
+                conn.execute(_REPLACE_ATTEMPT_SQL, start.to_params())
+        except sqlite3.Error as e:
+            raise DatabaseError(f"Failed to persist check attempt: {e}") from e
+        finally:
+            conn.close()
+
     def record_run_end(
-        self, row: CheckRunRow, *, coverage: Optional[CoverageMarks]
+        self,
+        row: CheckRunRow,
+        *,
+        coverage: Optional[CoverageMarks],
+        attempt: Optional[AttemptOutcome],
     ) -> None:
-        """Persists a check run's summary row and its coverage in one transaction.
+        """Persists a check run's summary row, coverage and attempt outcome at once.
 
         The run-end seam. One fresh deferred-isolation connection, one
-        ``with conn:`` holding the ``check_runs`` INSERT and then the coverage
-        upsert, so the two commit together or not at all: a run can never read
-        degraded in one table and covered in the other, and a failure lands
-        nothing. No wall-clock read; both carry the caller's MI-10 stamps.
+        ``with conn:`` holding the ``check_runs`` INSERT, the coverage upsert and
+        the attempt-outcome update, so all three commit together or not at all: a
+        run can never read degraded in one table and covered in the other, and a
+        failure lands nothing, which leaves the attempt ``started``. The outcome
+        update is conditioned on the attempt's own key, so when a newer attempt
+        has replaced the record it updates zero rows. That is intended and is not
+        reported. No wall-clock read; both carry the caller's MI-10 stamps.
         ``run_id`` is the ``check_runs`` PK, so a second write for the same run
         raises and rolls its coverage back with it.
 
@@ -1500,6 +1748,9 @@ class TelemetryStore:
             coverage: The run's coverage marks, or ``None`` to write the row alone
                 (a degraded run, or a staged run). Keyword-only: further run-end
                 writes join this same transaction as further keywords.
+            attempt: The run's attempt outcome, or ``None`` when no attempt record
+                is this run's to update (a scoped or staged run, or an entry
+                write that did not land).
 
         Raises:
             DatabaseError: If anything cannot be persisted (duplicate ``run_id``,
@@ -1513,6 +1764,8 @@ class TelemetryStore:
                 conn.execute(_INSERT_CHECK_RUN_SQL, row.to_params())
                 if coverage is not None:
                     conn.executemany(_UPSERT_COVERAGE_SQL, coverage.to_params())
+                if attempt is not None:
+                    conn.execute(_UPDATE_ATTEMPT_OUTCOME_SQL, attempt.to_params())
         except sqlite3.Error as e:
             raise DatabaseError(f"Failed to persist check run: {e}") from e
         finally:
@@ -1524,7 +1777,7 @@ class TelemetryStore:
         ``cli._run_staged_check`` writes through here; staged runs write no
         coverage. The corpus path writes through :meth:`record_run_end`. Same
         transaction manners and failure contract, because it is that method with
-        ``coverage=None``.
+        ``coverage=None`` and ``attempt=None``.
 
         Args:
             row: The assembled summary row, verbatim.
@@ -1533,7 +1786,7 @@ class TelemetryStore:
             DatabaseError: If the row cannot be persisted (duplicate ``run_id``,
                 a CHECK/NOT NULL breach, or any other SQLite error).
         """
-        self.record_run_end(row, coverage=None)
+        self.record_run_end(row, coverage=None, attempt=None)
 
     def load_reuse_index(
         self, *, prompt_version: str, model_alias: str
@@ -1728,3 +1981,136 @@ def read_coverage(
     finally:
         opened.close()
     return CoverageRead(covered=frozenset(covered), excluded=frozenset(excluded))
+
+
+@dataclass(frozen=True)
+class LastAttempt:
+    """The last-attempt record as read from ``check_attempt``.
+
+    Every column but ``slot`` (always 1). JSON columns are decoded to tuples, and a
+    NULL column is ``None``. ``state`` is returned as stored, including a state this
+    build does not know (a newer build's). An attempt is an attempt whatever its
+    state, so a consumer decides what an unknown state means; this reader never
+    rejects one.
+
+    Attributes:
+        attempt_id: The attempt's own key.
+        started_at: When the attempt began (UTC ISO-8601).
+        fingerprint: The uncovered-set fingerprint taken at entry.
+        state: ``started``, a run-end state, or a newer build's state.
+        run_id: The run's ``check_runs.run_id``; ``None`` while ``started``.
+        outcome_at: When the outcome landed; ``None`` while ``started``.
+        degradation_tokens: The run's degradation tokens; ``None`` while
+            ``started``.
+        new_pairs: ``(proposal_id, partner_id)`` of each new finding; ``None``
+            while ``started``.
+        findings_known: Known findings; ``None`` while ``started`` and when the
+            reuse index could not be read.
+        batches_planned: The planned batch count of a refused spend; ``None``
+            otherwise.
+    """
+
+    attempt_id: str
+    started_at: str
+    fingerprint: str
+    state: str
+    run_id: Optional[str]
+    outcome_at: Optional[str]
+    degradation_tokens: Optional[Tuple[str, ...]]
+    new_pairs: Optional[Tuple[Tuple[str, str], ...]]
+    findings_known: Optional[int]
+    batches_planned: Optional[int]
+
+
+def _decode_tokens(raw: Optional[str]) -> Optional[Tuple[str, ...]]:
+    """Decodes the ``degradation_tokens`` column.
+
+    Args:
+        raw: The stored JSON text, or ``None``.
+
+    Returns:
+        The tokens as a tuple, or ``None`` for a NULL column.
+
+    Raises:
+        ValueError: If the text is not a JSON array of strings.
+    """
+    if raw is None:
+        return None
+    tokens = json.loads(raw)
+    if not isinstance(tokens, list) or not all(isinstance(t, str) for t in tokens):
+        raise ValueError(f"degradation_tokens is not a list of strings: {raw!r}")
+    return tuple(tokens)
+
+
+def _decode_pairs(raw: Optional[str]) -> Optional[Tuple[Tuple[str, str], ...]]:
+    """Decodes the ``new_pairs`` column.
+
+    Args:
+        raw: The stored JSON text, or ``None``.
+
+    Returns:
+        The pairs as a tuple of 2-tuples, or ``None`` for a NULL column.
+
+    Raises:
+        ValueError: If the text is not a JSON array of two-string arrays.
+    """
+    if raw is None:
+        return None
+    pairs = json.loads(raw)
+    if not isinstance(pairs, list):
+        raise ValueError(f"new_pairs is not a list: {raw!r}")
+    out = []
+    for pair in pairs:
+        if (
+            not isinstance(pair, list)
+            or len(pair) != 2
+            or not all(isinstance(side, str) for side in pair)
+        ):
+            raise ValueError(f"new_pairs holds a pair that is not two ids: {pair!r}")
+        out.append((pair[0], pair[1]))
+    return tuple(out)
+
+
+def read_last_attempt(
+    telemetry_path: str,
+) -> "LastAttempt | None | TelemetryAbsent | TelemetryUnreadable":
+    """Reads the last check attempt without creating or migrating anything.
+
+    Args:
+        telemetry_path: Path to ``telemetry.sqlite`` (typically
+            ``config.telemetry_path``).
+
+    Returns:
+        A :class:`LastAttempt`; ``None`` when the table exists and holds no row
+        (a different type from :class:`TelemetryAbsent`); :class:`TelemetryAbsent`
+        when there is no file or it predates the attempt rung; or
+        :class:`TelemetryUnreadable` when the file exists and a read failed, or a
+        JSON column does not decode (a damaged row). Never raises on a bad file.
+    """
+    opened = _open_read_only(telemetry_path, required_rung=ATTEMPT_RUNG)
+    if not isinstance(opened, sqlite3.Connection):
+        return opened
+    try:
+        row = opened.execute(_SELECT_ATTEMPT_SQL).fetchone()
+        if row is None:
+            return None
+        return LastAttempt(
+            attempt_id=row["attempt_id"],
+            started_at=row["started_at"],
+            fingerprint=row["fingerprint"],
+            state=row["state"],
+            run_id=row["run_id"],
+            outcome_at=row["outcome_at"],
+            degradation_tokens=_decode_tokens(row["degradation_tokens"]),
+            new_pairs=_decode_pairs(row["new_pairs"]),
+            findings_known=row["findings_known"],
+            batches_planned=row["batches_planned"],
+        )
+    except sqlite3.Error as e:
+        # Deeper page corruption surfaces only at query time.
+        return TelemetryUnreadable(str(e))
+    except (ValueError, TypeError) as e:
+        # A JSON column that does not decode is a damaged row, never an empty one.
+        return TelemetryUnreadable(f"check_attempt row does not decode: {e}")
+    finally:
+        opened.close()

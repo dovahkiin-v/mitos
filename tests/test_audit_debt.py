@@ -76,6 +76,7 @@ def _mark(telemetry_path: str, run_id: str, *, covered=(), excluded=()) -> None:
         _check_run_row(run_id),
         coverage=CoverageMarks(run_id=run_id, marked_at="t",
                                covered=tuple(covered), excluded=tuple(excluded)),
+        attempt=None,
     )
 
 

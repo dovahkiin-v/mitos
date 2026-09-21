@@ -163,6 +163,7 @@ def test_rung_four_file_upgrades_with_rows_intact_and_replay_is_a_no_op(tmp_path
         _check_run_row("new-run"),
         coverage=CoverageMarks(run_id="new-run", marked_at="t", covered=("n1",),
                                excluded=()),
+        attempt=None,
     )
 
     def snapshot() -> Tuple[int, list, list, list]:
@@ -429,13 +430,14 @@ def test_duplicate_run_id_rolls_its_coverage_back(tmp_path) -> None:
     """A failed row INSERT takes the same transaction's coverage with it."""
     path = str(tmp_path / "telemetry.sqlite")
     store = TelemetryStore(path)
-    store.record_run_end(_check_run_row("r1"), coverage=None)
+    store.record_run_end(_check_run_row("r1"), coverage=None, attempt=None)
 
     with pytest.raises(telemetry.DatabaseError):
         store.record_run_end(
             _check_run_row("r1"),
             coverage=CoverageMarks(run_id="r1", marked_at="t", covered=("n1",),
                                    excluded=()),
+            attempt=None,
         )
     assert _coverage(path) == {}
 
@@ -514,6 +516,7 @@ def test_reader_splits_marks_and_empty_is_a_different_type(tmp_path) -> None:
         _check_run_row("r1"),
         coverage=CoverageMarks(run_id="r1", marked_at="t", covered=("n1", "n2"),
                                excluded=("n3",)),
+        attempt=None,
     )
     assert read_coverage(path) == CoverageRead(
         covered=frozenset({"n1", "n2"}), excluded=frozenset({"n3"}))

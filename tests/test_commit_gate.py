@@ -1,0 +1,859 @@
+"""Tests for the commit gate (G1) — hermetic, no network, no spend.
+
+G1's hook asks one question: has an unscoped corpus check been *attempted* since the
+uncovered set last changed? This module grows one section per phase:
+
+* 3a — the last-attempt record: telemetry rung 7 (``check_attempt``), its writers
+  (the ``started`` entry write and the outcome at the run-end seam), the read-only
+  reader ``read_last_attempt``, the pure builder ``check.attempt_outcome_from_result``
+  and ``cmd_check``'s two writes;
+* 3b onward — the refused-spend state, the hook predicate, the status gate row and
+  the standing notice.
+
+Every ``cmd_check`` row injects both seams (substrate and judge): offline, a run with
+no embedding provider over a non-empty corpus exits before the seam, and a run-end
+row that injected only the judge would pass for that reason. Values that shift
+between runs (ids, timestamps, fingerprints) are read back and compared across rows,
+never hardcoded. Real SQLite throughout.
+"""
+
+import dataclasses
+import json
+import os
+import sqlite3
+from typing import Any, Dict, Optional, Tuple
+
+import pytest
+
+from mitos import check, cli, telemetry
+from mitos.audit_debt import AuditDebt, derive_audit_debt
+from mitos.check import CheckFinding
+from mitos.config import MitosConfig
+from mitos.conflict import ConflictUnavailableReason, Unavailable
+from mitos.errors import DatabaseError, MitosError
+from mitos.migrations import _pending_head, run_migrations
+from mitos.store import GraphStore, open_connection
+from mitos.telemetry import (
+    ATTEMPT_COULD_NOT_COMPLETE,
+    ATTEMPT_NEW_FINDINGS,
+    ATTEMPT_NO_NEW_FINDINGS,
+    ATTEMPT_RUNG,
+    ATTEMPT_STARTED,
+    FAILED_BATCHES_RUNG,
+    TELEMETRY_MIGRATION_STEPS,
+    AttemptOutcome,
+    AttemptStart,
+    CoverageMarks,
+    LastAttempt,
+    ReuseUnavailable,
+    TelemetryAbsent,
+    TelemetryStore,
+    TelemetryUnreadable,
+    read_last_attempt,
+)
+
+from _conflict_helpers import _drain_outbox, _match
+from test_check_cli import (  # noqa: F401  (offline is autouse; workspace a fixture)
+    _FakeStdin,
+    _FaultStore,
+    _pair,
+    _read_check_runs,
+    _wire_judge,
+    _wire_substrate,
+    offline,
+    workspace,
+)
+from test_check_coverage import (
+    _CommittingJudge,
+    _check_run_row,
+    _coverage,
+    _healthy_result,
+    _judge_for,
+    _run,
+    _tables,
+)
+from test_check_probe import _commit, _seed_verdict
+
+
+# =========================================================================== #
+# Phase 3a — the last-attempt record
+# =========================================================================== #
+
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+
+_ATTEMPT_COLUMNS = (
+    "slot", "attempt_id", "started_at", "fingerprint", "state", "run_id",
+    "outcome_at", "degradation_tokens", "new_pairs", "findings_known",
+    "batches_planned",
+)
+
+_OUTCOME_COLUMNS = (
+    "run_id", "outcome_at", "degradation_tokens", "new_pairs", "findings_known",
+)
+
+
+def _attempt_rows(path: str) -> list:
+    """Every ``check_attempt`` row, as dicts over every column."""
+    conn = sqlite3.connect(path)
+    try:
+        return [
+            dict(zip(_ATTEMPT_COLUMNS, row))
+            for row in conn.execute(
+                f"SELECT {', '.join(_ATTEMPT_COLUMNS)} FROM check_attempt"
+            )
+        ]
+    finally:
+        conn.close()
+
+
+def _attempt(path: str) -> Optional[Dict[str, Any]]:
+    """The one attempt row, or ``None``; asserts there is never more than one."""
+    rows = _attempt_rows(path)
+    assert len(rows) <= 1
+    return rows[0] if rows else None
+
+
+def _fingerprint(config: MitosConfig) -> str:
+    """The leaf's fingerprint of the uncovered set, right now."""
+    debt = derive_audit_debt(config.db_path, config.telemetry_path)
+    assert isinstance(debt, AuditDebt)
+    return debt.fingerprint
+
+
+def _assert_started(row: Optional[Dict[str, Any]], fingerprint: str) -> None:
+    """The row is an entry record: ``started``, the fingerprint, no outcome."""
+    assert row is not None
+    assert row["state"] == ATTEMPT_STARTED
+    assert row["fingerprint"] == fingerprint
+    assert all(row[c] is None for c in _OUTCOME_COLUMNS)
+    assert row["batches_planned"] is None
+
+
+def _outcome(**overrides: Any) -> AttemptOutcome:
+    base = dict(
+        attempt_id="att-1", state=ATTEMPT_NO_NEW_FINDINGS, run_id="run-1",
+        outcome_at="2026-09-21T00:01:00.000000+00:00", degradation_tokens=(),
+        new_pairs=(), findings_known=0,
+    )
+    base.update(overrides)
+    return AttemptOutcome(**base)
+
+
+def _start(attempt_id: str = "att-1", fingerprint: str = "f" * 64) -> AttemptStart:
+    return AttemptStart(attempt_id=attempt_id,
+                        started_at="2026-09-21T00:00:00.000000+00:00",
+                        fingerprint=fingerprint)
+
+
+def _raw_attempt_update(path: str, sql: str, *params: Any) -> None:
+    conn = sqlite3.connect(path)
+    with conn:
+        conn.execute(sql, params)
+    conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# 1 — the rung
+# --------------------------------------------------------------------------- #
+
+def test_fresh_store_boots_to_head_with_the_attempt_table(tmp_path) -> None:
+    """Criterion 1: a fresh store reaches the head with ``check_attempt`` present."""
+    path = str(tmp_path / "telemetry.sqlite")
+    TelemetryStore(path)
+    conn = sqlite3.connect(path)
+    try:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == _pending_head(
+            TELEMETRY_MIGRATION_STEPS)
+        assert "check_attempt" in _tables(conn)
+    finally:
+        conn.close()
+    assert dict(TELEMETRY_MIGRATION_STEPS)[ATTEMPT_RUNG] is telemetry._check_attempt_schema
+    assert ATTEMPT_RUNG > FAILED_BATCHES_RUNG
+
+
+def test_rung_six_file_upgrades_with_rows_intact_and_replay_is_a_no_op(tmp_path) -> None:
+    """Criterion 1: a rung-6 file upgrades keeping its rows; replay at head changes nothing."""
+    path = str(tmp_path / "telemetry.sqlite")
+    conn = open_connection(path)
+    run_migrations(conn, TELEMETRY_MIGRATION_STEPS[:FAILED_BATCHES_RUNG])
+    conn.close()
+    conn = open_connection(path)
+    with conn:
+        conn.execute(telemetry._INSERT_CHECK_RUN_SQL,
+                     _check_run_row("old-run").to_params())
+        conn.executemany(
+            telemetry._UPSERT_COVERAGE_SQL,
+            CoverageMarks(run_id="old-run", marked_at="t", covered=("n1",),
+                          excluded=()).to_params(),
+        )
+    conn.close()
+
+    store = TelemetryStore(path)
+    store.record_attempt_start(_start())
+
+    def snapshot() -> Tuple[int, list, list, list, list]:
+        c = sqlite3.connect(path)
+        try:
+            return (
+                c.execute("PRAGMA user_version").fetchone()[0],
+                c.execute("SELECT sql FROM sqlite_master ORDER BY name").fetchall(),
+                c.execute("SELECT run_id FROM check_runs").fetchall(),
+                c.execute("SELECT * FROM check_coverage").fetchall(),
+                c.execute("SELECT * FROM check_attempt").fetchall(),
+            )
+        finally:
+            c.close()
+
+    before = snapshot()
+    assert before[0] == _pending_head(TELEMETRY_MIGRATION_STEPS)
+    assert before[2] == [("old-run",)]
+    assert [r[:2] for r in before[3]] == [("n1", "covered")]
+    assert len(before[4]) == 1
+    conn = open_connection(path)
+    run_migrations(conn, TELEMETRY_MIGRATION_STEPS)
+    conn.close()
+    TelemetryStore(path)
+    assert snapshot() == before
+
+
+# --------------------------------------------------------------------------- #
+# 2–3 — the read-only reader and the round trip
+# --------------------------------------------------------------------------- #
+
+def test_reader_on_an_absent_path_creates_nothing(tmp_path) -> None:
+    """Criterion 2: no file (or no parent) → ``TelemetryAbsent('no_file')``, still no file."""
+    path = tmp_path / "telemetry.sqlite"
+    assert read_last_attempt(str(path)) == TelemetryAbsent("no_file")
+    assert not os.path.exists(path)
+
+    nested = tmp_path / "missing-dir" / "telemetry.sqlite"
+    assert read_last_attempt(str(nested)) == TelemetryAbsent("no_file")
+    assert not os.path.exists(nested.parent)
+
+
+def test_reader_on_a_rung_six_file_leaves_it_untouched(tmp_path) -> None:
+    """Criterion 2: a rung-6 file → ``below_rung``; its bytes and user_version unchanged."""
+    path = tmp_path / "telemetry.sqlite"
+    conn = open_connection(str(path))
+    run_migrations(conn, TELEMETRY_MIGRATION_STEPS[:FAILED_BATCHES_RUNG])
+    conn.close()
+    before = path.read_bytes()
+
+    assert read_last_attempt(str(path)) == TelemetryAbsent("below_rung")
+    assert path.read_bytes() == before
+    conn = sqlite3.connect(str(path))
+    try:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == FAILED_BATCHES_RUNG
+        assert "check_attempt" not in _tables(conn)
+    finally:
+        conn.close()
+
+
+def test_reader_on_a_corrupt_file_or_a_directory_is_unreadable(tmp_path) -> None:
+    """Criterion 2: a file that exists and cannot be read is a fault, never "no attempt"."""
+    corrupt = tmp_path / "telemetry.sqlite"
+    corrupt.write_bytes(b"this is not a sqlite database, not even close" * 20)
+    assert isinstance(read_last_attempt(str(corrupt)), TelemetryUnreadable)
+
+    directory = tmp_path / "a-directory"
+    directory.mkdir()
+    assert isinstance(read_last_attempt(str(directory)), TelemetryUnreadable)
+
+
+def test_reader_on_an_empty_table_is_none_not_absent(tmp_path) -> None:
+    """Criterion 2: a rung-7 file with no row → ``None``, a different type from Absent."""
+    path = str(tmp_path / "telemetry.sqlite")
+    TelemetryStore(path)
+    assert read_last_attempt(path) is None
+
+
+def test_round_trip_start_then_outcome(tmp_path) -> None:
+    """Criterion 3: a start then an outcome read back as tuples, nulls as ``None``."""
+    path = str(tmp_path / "telemetry.sqlite")
+    store = TelemetryStore(path)
+    start = _start()
+    store.record_attempt_start(start)
+
+    assert read_last_attempt(path) == LastAttempt(
+        attempt_id=start.attempt_id, started_at=start.started_at,
+        fingerprint=start.fingerprint, state=ATTEMPT_STARTED, run_id=None,
+        outcome_at=None, degradation_tokens=None, new_pairs=None,
+        findings_known=None, batches_planned=None,
+    )
+
+    outcome = _outcome(state=ATTEMPT_COULD_NOT_COMPLETE,
+                       degradation_tokens=("judgment", "judgment_truncated"),
+                       new_pairs=(("p1", "q1"), ("p2", "q2")), findings_known=None)
+    store.record_run_end(_check_run_row("run-1"), coverage=None, attempt=outcome)
+
+    read = read_last_attempt(path)
+    assert read == LastAttempt(
+        attempt_id=start.attempt_id, started_at=start.started_at,
+        fingerprint=start.fingerprint, state=ATTEMPT_COULD_NOT_COMPLETE,
+        run_id="run-1", outcome_at=outcome.outcome_at,
+        degradation_tokens=("judgment", "judgment_truncated"),
+        new_pairs=(("p1", "q1"), ("p2", "q2")), findings_known=None,
+        batches_planned=None,
+    )
+    assert isinstance(read.new_pairs[0], tuple)
+    # Persisted as JSON lists, never tuples.
+    raw = _attempt(path)
+    assert json.loads(raw["new_pairs"]) == [["p1", "q1"], ["p2", "q2"]]
+    assert json.loads(raw["degradation_tokens"]) == ["judgment", "judgment_truncated"]
+
+
+def test_reader_returns_an_unknown_state_verbatim(tmp_path) -> None:
+    """Criterion 3: a newer build's state is returned as-is, never rejected."""
+    path = str(tmp_path / "telemetry.sqlite")
+    TelemetryStore(path).record_attempt_start(_start())
+    _raw_attempt_update(path, "UPDATE check_attempt SET state = ?", "a_later_state")
+
+    read = read_last_attempt(path)
+    assert isinstance(read, LastAttempt) and read.state == "a_later_state"
+
+
+@pytest.mark.parametrize("column, damaged", [
+    ("new_pairs", "not json at all"),
+    ("new_pairs", '[["only-one-id"]]'),
+    ("new_pairs", '[["p", 7]]'),
+    ("degradation_tokens", '{"not": "a list"}'),
+], ids=["pairs-not-json", "pair-of-one", "pair-not-strings", "tokens-not-a-list"])
+def test_a_damaged_json_column_is_unreadable(tmp_path, column: str, damaged: str) -> None:
+    """Criterion 3: a column that does not decode is a damaged row → ``TelemetryUnreadable``."""
+    path = str(tmp_path / "telemetry.sqlite")
+    TelemetryStore(path).record_attempt_start(_start())
+    _raw_attempt_update(path, f"UPDATE check_attempt SET {column} = ?", damaged)
+
+    assert isinstance(read_last_attempt(path), TelemetryUnreadable)
+
+
+# --------------------------------------------------------------------------- #
+# 4 — the boundary shapes refuse before a connection opens
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("state", [ATTEMPT_STARTED, "spend_not_authorized", "done", ""])
+def test_outcome_refuses_a_state_that_is_not_a_run_end_state(state: str) -> None:
+    """Criterion 4: ``started`` and any unknown state are refused at construction."""
+    with pytest.raises(ValueError, match="run-end state"):
+        _outcome(state=state)
+
+
+def test_outcome_refuses_a_pair_that_is_not_two_ids() -> None:
+    with pytest.raises(ValueError, match="two node ids"):
+        _outcome(new_pairs=(("only-one",),))
+
+
+@pytest.mark.parametrize("field", ["attempt_id", "started_at", "fingerprint"])
+def test_start_refuses_an_empty_field(field: str) -> None:
+    """Criterion 4: every entry field is a non-empty string."""
+    with pytest.raises(ValueError, match=field):
+        dataclasses.replace(_start(), **{field: ""})
+
+
+def test_refusal_happens_before_any_connection(tmp_path, monkeypatch) -> None:
+    """Criterion 4: a refused shape never reaches the writer, so nothing opens."""
+    opened = []
+    monkeypatch.setattr(telemetry, "open_connection",
+                        lambda *a, **k: opened.append(a) or pytest.fail("opened"))
+    with pytest.raises(ValueError):
+        _outcome(state=ATTEMPT_STARTED)
+    with pytest.raises(ValueError):
+        _start(attempt_id="")
+    assert opened == []
+
+
+# --------------------------------------------------------------------------- #
+# 5 — the builder, over synthetic results
+# --------------------------------------------------------------------------- #
+
+def _finding(proposal: str, partner: str, novelty: Optional[str]) -> CheckFinding:
+    return CheckFinding(
+        proposal_hash=proposal, partner_hash=partner,
+        proposal_node={"id": proposal}, partner_node={"id": partner},
+        score=0.9, rationale="Synthetic.", confidence=0.9, reused=novelty == "known",
+        source_batch_id="b0", source_created_at="2026-09-21T00:00:00+00:00",
+        novelty=novelty,
+    )
+
+
+_JUDGMENT_FAILURE = (Unavailable(reason=ConflictUnavailableReason.JUDGMENT, detail="x"),)
+
+_BUILDER_CASES = {
+    "healthy-known-only": (
+        dict(findings=(_finding("a", "b", "known"), _finding("a", "c", "known"))),
+        ATTEMPT_NO_NEW_FINDINGS, (), 2,
+    ),
+    "healthy-one-new": (
+        dict(findings=(_finding("a", "b", "new"), _finding("a", "c", "known"))),
+        ATTEMPT_NEW_FINDINGS, (("a", "b"),), 1,
+    ),
+    "degraded-one-new": (
+        dict(findings=(_finding("a", "b", "new"),), judgment_failures=_JUDGMENT_FAILURE,
+             batches_failed=1),
+        ATTEMPT_COULD_NOT_COMPLETE, (("a", "b"),), 0,
+    ),
+    "degraded-none": (
+        dict(judgment_failures=_JUDGMENT_FAILURE, batches_failed=1),
+        ATTEMPT_COULD_NOT_COMPLETE, (), 0,
+    ),
+    "reuse-read-novelty-none": (
+        dict(findings=(_finding("a", "b", None),),
+             reuse_unavailable=ReuseUnavailable("broken read")),
+        ATTEMPT_COULD_NOT_COMPLETE, (), None,
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(_BUILDER_CASES), ids=list(_BUILDER_CASES))
+def test_builder_rules(case: str) -> None:
+    """Criterion 5: degraded dominates the state and keeps the pairs; None is never new."""
+    overrides, state, pairs, known = _BUILDER_CASES[case]
+    result = _healthy_result(**overrides)
+
+    outcome = check.attempt_outcome_from_result(result, attempt_id="att-x")
+
+    assert outcome.state == state
+    assert outcome.new_pairs == pairs
+    assert outcome.findings_known == known
+    assert outcome.degradation_tokens == check.run_degradations(result)
+    assert (outcome.attempt_id, outcome.run_id, outcome.outcome_at) == (
+        "att-x", result.run_id, result.ended_at)
+    row = check.check_run_row_from_result(
+        result, mode="corpus", exit_code=check.exit_code_for(result))
+    assert outcome.findings_known == row.findings_known
+
+
+def test_builder_keeps_tokens_in_declaration_order() -> None:
+    """Criterion 5: two tokens arrive in ``_DEGRADATION_TOKENS`` order, as the row joins them."""
+    result = _healthy_result(judgment_failures=_JUDGMENT_FAILURE, batches_failed=1,
+                             telemetry_write_failures=("batch b0: disk full",))
+    outcome = check.attempt_outcome_from_result(result, attempt_id="att-x")
+    assert outcome.degradation_tokens == ("judgment", "telemetry_write")
+    row = check.check_run_row_from_result(
+        result, mode="corpus", exit_code=check.exit_code_for(result))
+    assert ",".join(outcome.degradation_tokens) == row.degraded_reason
+
+
+# --------------------------------------------------------------------------- #
+# 6 — the entry write precedes the substrate
+# --------------------------------------------------------------------------- #
+
+def test_substrate_unavailable_leaves_started(workspace, capsys) -> None:
+    """Criterion 6: no embedding provider over a non-empty corpus → exit 2, ``started``."""
+    config, store, _tel = workspace
+    _pair(store)
+    _drain_outbox(store)
+    entry = _fingerprint(config)
+    # No substrate monkeypatch: real construction has no embedding provider offline.
+
+    code, obj = _run(config, capsys)
+
+    assert code == 2 and obj["code"] == "substrate_unavailable"
+    _assert_started(_attempt(config.telemetry_path), entry)
+
+
+def test_a_substrate_that_raises_still_leaves_started(workspace, monkeypatch, capsys) -> None:
+    """Criterion 6 (scout W-1): the entry write sits before the substrate is built at all."""
+    config, store, _tel = workspace
+    _pair(store)
+    _drain_outbox(store)
+    entry = _fingerprint(config)
+
+    def _raising(config: MitosConfig) -> Any:
+        raise MitosError("substrate construction blew up")
+
+    monkeypatch.setattr(cli, "_build_check_substrate", _raising)
+
+    code, obj = _run(config, capsys)
+
+    assert code == 2 and obj["code"] == "check_faulted"
+    _assert_started(_attempt(config.telemetry_path), entry)
+
+
+def test_a_store_fault_at_the_start_probe_leaves_started(workspace, monkeypatch, capsys) -> None:
+    """Criterion 6: ``check_faulted`` after entry leaves ``started``, with no run row."""
+    config, store, _tel = workspace
+    _a, _b, nbhds = _pair(store)
+    _drain_outbox(store)
+    entry = _fingerprint(config)
+    _wire_substrate(monkeypatch, nbhds)
+    _wire_judge(monkeypatch, None)
+    # Replaces only cli's name; the leaf imports GraphStore from mitos.store.
+    monkeypatch.setattr(cli, "GraphStore", lambda path: _FaultStore(GraphStore(path)))
+
+    code, obj = _run(config, capsys)
+
+    assert code == 2 and obj["code"] == "check_faulted"
+    assert _read_check_runs(config) == []
+    _assert_started(_attempt(config.telemetry_path), entry)
+
+
+# --------------------------------------------------------------------------- #
+# 7–10 — the run-end outcome, through cmd_check
+# --------------------------------------------------------------------------- #
+
+def _reported_new_pairs(obj: Dict[str, Any]) -> list:
+    """The new findings the run's own report names, as ``[proposal_id, partner_id]``."""
+    return [[f["proposal"]["id"], f["partner"]["id"]]
+            for f in obj["findings"] if f["novelty"] == "new"]
+
+
+def _assert_outcome_joins_its_run(config: MitosConfig, obj: Dict[str, Any],
+                                  row: Dict[str, Any], entry: str) -> None:
+    (run,) = [r for r in _read_check_runs(config) if r["run_id"] == obj["run_id"]]
+    assert row["run_id"] == run["run_id"]
+    assert row["outcome_at"] == run["ended_at"]
+    assert row["fingerprint"] == entry
+
+
+def test_a_reused_known_finding_records_no_new_findings(workspace, monkeypatch, capsys) -> None:
+    """Criterion 7: known only → ``no_new_findings``, ``findings_known == 1``."""
+    config, store, tel = workspace
+    a_id, b_id, nbhds = _pair(store)
+    _drain_outbox(store)
+    _seed_verdict(tel, proposal_hash=a_id, candidate_hash=b_id, tenable=False,
+                  confidence=0.9, batch_id="gate-prior-batch",
+                  created_at="2026-06-01T00:00:00.000000+00:00")
+    entry = _fingerprint(config)
+    _wire_substrate(monkeypatch, nbhds)
+    _wire_judge(monkeypatch, None)  # reuse-only: the judge is never built
+
+    code, obj = _run(config, capsys)
+
+    assert code == 0
+    row = _attempt(config.telemetry_path)
+    assert row["state"] == ATTEMPT_NO_NEW_FINDINGS
+    assert row["findings_known"] == 1
+    assert json.loads(row["new_pairs"]) == []
+    assert json.loads(row["degradation_tokens"]) == []
+    _assert_outcome_joins_its_run(config, obj, row, entry)
+
+
+def test_a_first_ever_finding_records_new_findings(workspace, monkeypatch, capsys) -> None:
+    """Criterion 7: one new finding → ``new_findings`` with its pair."""
+    config, store, tel = workspace
+    a_id, b_id, nbhds = _pair(store)
+    _drain_outbox(store)
+    entry = _fingerprint(config)
+    embed, vector = _wire_substrate(monkeypatch, nbhds)
+    _wire_judge(monkeypatch, _judge_for(store, embed, vector, tel, tenable=False))
+
+    code, obj = _run(config, capsys)
+
+    assert code == 1
+    row = _attempt(config.telemetry_path)
+    assert row["state"] == ATTEMPT_NEW_FINDINGS
+    pairs = json.loads(row["new_pairs"])
+    assert pairs == _reported_new_pairs(obj)
+    assert len(pairs) == 1 and set(pairs[0]) == {a_id, b_id}
+    assert row["findings_known"] == 0
+    _assert_outcome_joins_its_run(config, obj, row, entry)
+    assert read_last_attempt(config.telemetry_path).new_pairs == (tuple(pairs[0]),)
+
+
+def test_a_failing_batch_records_could_not_complete(workspace, monkeypatch, capsys) -> None:
+    """Criterion 7: a failing batch, no finding → ``could_not_complete`` naming judgment."""
+    config, store, tel = workspace
+    _a, _b, nbhds = _pair(store)
+    _drain_outbox(store)
+    entry = _fingerprint(config)
+    embed, vector = _wire_substrate(monkeypatch, nbhds)
+    failing = Unavailable(reason=ConflictUnavailableReason.JUDGMENT, detail="judge died")
+    _wire_judge(monkeypatch, _judge_for(store, embed, vector, tel, overrides={0: failing}))
+
+    code, obj = _run(config, capsys)
+
+    assert code == 2
+    row = _attempt(config.telemetry_path)
+    assert row["state"] == ATTEMPT_COULD_NOT_COMPLETE
+    assert "judgment" in json.loads(row["degradation_tokens"])
+    assert json.loads(row["new_pairs"]) == []
+    _assert_outcome_joins_its_run(config, obj, row, entry)
+
+
+def test_a_degraded_run_keeps_its_new_pair(workspace, monkeypatch, capsys) -> None:
+    """Criterion 8: one failing batch plus one new finding → tokens **and** the pair."""
+    config, store, tel = workspace
+    a_axiom, b_axiom, c_axiom = (
+        "Gate axiom alpha.", "Gate axiom beta.", "Gate axiom gamma.")
+    a_id = _commit(store, "gate-a", a_axiom)
+    b_id = _commit(store, "gate-b", b_axiom)
+    c_id = _commit(store, "gate-c", c_axiom)
+    nbhds = {a_axiom: [_match("gate-b", 0.9)], b_axiom: [],
+             c_axiom: [_match("gate-b", 0.9)]}
+    _drain_outbox(store)
+    entry = _fingerprint(config)
+    embed, vector = _wire_substrate(monkeypatch, nbhds)
+    failing = Unavailable(reason=ConflictUnavailableReason.JUDGMENT, detail="judge died")
+    _wire_judge(monkeypatch, _judge_for(store, embed, vector, tel, tenable=False,
+                                        overrides={0: failing}))
+
+    code, obj = _run(config, capsys)
+
+    assert code == 2  # degraded dominates the exit code ...
+    row = _attempt(config.telemetry_path)
+    assert row["state"] == ATTEMPT_COULD_NOT_COMPLETE  # ... and never the record
+    assert "judgment" in json.loads(row["degradation_tokens"])
+    pairs = json.loads(row["new_pairs"])
+    assert pairs == _reported_new_pairs(obj)
+    assert len(pairs) == 1 and b_id in pairs[0] and {a_id, c_id} & set(pairs[0])
+    _assert_outcome_joins_its_run(config, obj, row, entry)
+
+
+def test_the_fingerprint_is_not_rewritten(workspace, monkeypatch, capsys) -> None:
+    """Criterion 9: a decision committed mid-run leaves the entry-time fingerprint standing."""
+    config, store, tel = workspace
+    _a, _b, nbhds = _pair(store)
+    _drain_outbox(store)
+    entry = _fingerprint(config)
+    embed, vector = _wire_substrate(monkeypatch, nbhds)
+    judge = _CommittingJudge(_judge_for(store, embed, vector, tel), store)
+    _wire_judge(monkeypatch, judge)
+
+    code, obj = _run(config, capsys)
+
+    assert judge.committed is not None and obj["degradations"] == []
+    row = _attempt(config.telemetry_path)
+    assert row["state"] in (ATTEMPT_NO_NEW_FINDINGS, ATTEMPT_NEW_FINDINGS)
+    assert row["fingerprint"] == entry
+    after = derive_audit_debt(config.db_path, config.telemetry_path)
+    assert after.uncovered_ids == frozenset({judge.committed})
+    assert row["fingerprint"] != after.fingerprint
+
+
+class _OverlappingJudge:
+    """Delegates to a canned judge; on its first call a second attempt replaces the record."""
+
+    def __init__(self, inner: Any, tel: TelemetryStore, start: AttemptStart) -> None:
+        self._inner = inner
+        self._tel = tel
+        self._start = start
+        self.replaced = False
+
+    def __call__(self, prompt: Any) -> Any:
+        if not self.replaced:
+            self._tel.record_attempt_start(self._start)
+            self.replaced = True
+        return self._inner(prompt)
+
+
+def test_an_overlapping_attempt_keeps_the_record(workspace, monkeypatch, capsys) -> None:
+    """Criterion 10: A's outcome lands nowhere once B replaced it; A's run row and coverage land."""
+    config, store, tel = workspace
+    a_id, b_id, nbhds = _pair(store)
+    _drain_outbox(store)
+    embed, vector = _wire_substrate(monkeypatch, nbhds)
+    b_start = _start(attempt_id="attempt-b", fingerprint="b" * 64)
+    judge = _OverlappingJudge(_judge_for(store, embed, vector, tel), tel, b_start)
+    _wire_judge(monkeypatch, judge)
+
+    code, obj = _run(config, capsys)
+
+    assert judge.replaced and code == 0
+    row = _attempt(config.telemetry_path)
+    assert (row["attempt_id"], row["fingerprint"]) == ("attempt-b", "b" * 64)
+    _assert_started(row, "b" * 64)
+    assert obj["summary_row_written"] is True
+    assert [r["run_id"] for r in _read_check_runs(config)] == [obj["run_id"]]
+    cov = _coverage(config.telemetry_path)
+    assert set(cov) == {a_id, b_id}
+    assert {run_id for _, run_id, _ in cov.values()} == {obj["run_id"]}
+
+
+# --------------------------------------------------------------------------- #
+# 11–13 — who writes, and what survives
+# --------------------------------------------------------------------------- #
+
+def test_scoped_and_staged_runs_write_nothing(workspace, monkeypatch, capsys) -> None:
+    """Criterion 11: ``--scope x``, ``--scope ""`` and ``--staged`` leave the row byte-identical."""
+    config, store, tel = workspace
+    _a, _b, nbhds = _pair(store)
+    _drain_outbox(store)
+    tel.record_attempt_start(_start(fingerprint="s" * 64))
+    tel.record_run_end(
+        _check_run_row("seeded-run"), coverage=None,
+        attempt=_outcome(run_id="seeded-run", new_pairs=(("p", "q"),),
+                         degradation_tokens=("judgment",),
+                         state=ATTEMPT_COULD_NOT_COMPLETE, findings_known=3))
+    _raw_attempt_update(config.telemetry_path,
+                        "UPDATE check_attempt SET batches_planned = ?", 9)
+    seeded = _attempt(config.telemetry_path)
+    assert all(v is not None for v in seeded.values())  # every column compared
+    _wire_substrate(monkeypatch, nbhds)
+    _wire_judge(monkeypatch, None)
+
+    for scope in ("no-such-tag", ""):
+        code, _obj = _run(config, capsys, scope=scope)
+        assert code == 0
+        assert _attempt(config.telemetry_path) == seeded
+
+    code = cli.cmd_check(config, staged=True, scope=None, fresh=False,
+                         assume_yes=False, as_json=True)
+    capsys.readouterr()
+    assert code == 0
+    assert _attempt(config.telemetry_path) == seeded
+
+
+def test_a_refused_spend_leaves_started(workspace, monkeypatch, capsys) -> None:
+    """Criterion 12: a refused spend exits 2 before the seam and leaves ``started``.
+
+    Phase 3b inverts this row: the refusal will record ``spend_not_authorized``.
+    """
+    config, store, _tel = workspace
+    _a, _b, nbhds = _pair(store)
+    _drain_outbox(store)
+    entry = _fingerprint(config)
+    _wire_substrate(monkeypatch, nbhds)
+    invoked = _wire_judge(monkeypatch, None)
+    monkeypatch.setattr(check, "CHECK_CONFIRM_BATCHES", 0)
+    monkeypatch.setattr("sys.stdin", _FakeStdin(tty=False))
+
+    code, obj = _run(config, capsys)
+
+    assert code == 2 and obj["code"] == "confirmation_required"
+    assert invoked == []
+    _assert_started(_attempt(config.telemetry_path), entry)
+
+
+def test_a_second_attempt_replaces_the_first_whole(workspace, monkeypatch, capsys) -> None:
+    """Criterion 13 (D1): one row, the second attempt's; no column carries over."""
+    config, store, tel = workspace
+    _a, _b, nbhds = _pair(store)
+    _drain_outbox(store)
+    embed, vector = _wire_substrate(monkeypatch, nbhds)
+    _wire_judge(monkeypatch, _judge_for(store, embed, vector, tel))
+    code, first_obj = _run(config, capsys)
+    assert code == 0
+    first = _attempt(config.telemetry_path)
+    # A column only a later phase writes, seeded on the first attempt.
+    _raw_attempt_update(config.telemetry_path,
+                        "UPDATE check_attempt SET batches_planned = ?", 5)
+
+    _wire_judge(monkeypatch, _judge_for(store, embed, vector, tel))
+    code, second_obj = _run(config, capsys)
+
+    assert code == 0
+    rows = _attempt_rows(config.telemetry_path)
+    assert len(rows) == 1
+    (second,) = rows
+    assert second["attempt_id"] != first["attempt_id"]
+    assert second["run_id"] == second_obj["run_id"] != first_obj["run_id"]
+    assert second["state"] == ATTEMPT_NO_NEW_FINDINGS
+    assert second["batches_planned"] is None
+
+
+# --------------------------------------------------------------------------- #
+# 14–15 — faults: the entry write is best-effort, the outcome is transactional
+# --------------------------------------------------------------------------- #
+
+class _FailingStartTelemetry:
+    """Delegates to a real store; only ``record_attempt_start`` raises ``exc``."""
+
+    def __init__(self, inner: TelemetryStore, exc: Exception) -> None:
+        self._inner = inner
+        self._exc = exc
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def record_attempt_start(self, start: AttemptStart) -> None:
+        raise self._exc
+
+
+def test_an_entry_write_fault_does_not_touch_the_run(workspace, monkeypatch, capsys) -> None:
+    """Criterion 14: the check runs as if unfaulted; there is just no attempt row."""
+    config, store, tel = workspace
+    a_id, b_id, nbhds = _pair(store)
+    _drain_outbox(store)
+    embed, vector = _wire_substrate(monkeypatch, nbhds)
+    _wire_judge(monkeypatch, _judge_for(store, embed, vector, tel))
+    faulted = _FailingStartTelemetry(tel, DatabaseError("provoked entry-write fault"))
+    monkeypatch.setattr(cli, "_build_check_telemetry", lambda config: faulted)
+
+    code = cli.cmd_check(config, scope=None, fresh=False, assume_yes=False, as_json=True)
+    captured = capsys.readouterr()
+    obj = json.loads(captured.out)
+
+    assert code == 0 and obj["degradations"] == []
+    assert obj["summary_row_written"] is True
+    assert captured.err == ""  # a known fault is remembered silently
+    assert set(_coverage(config.telemetry_path)) == {a_id, b_id}
+    assert _attempt(config.telemetry_path) is None
+
+
+def test_begin_attempt_without_telemetry_is_telemetry_unavailable(workspace) -> None:
+    config, _store, _tel = workspace
+    assert cli._begin_check_attempt(config, None) == cli._AttemptUnrecorded(
+        "telemetry_unavailable")
+
+
+def test_begin_attempt_over_a_corrupt_graph_is_fingerprint_unreadable(tmp_path) -> None:
+    config = MitosConfig(str(tmp_path))
+    tel = TelemetryStore(config.telemetry_path)
+    os.makedirs(os.path.dirname(config.db_path), exist_ok=True)
+    with open(config.db_path, "wb") as fh:
+        fh.write(b"this is not a sqlite database, not even close" * 20)
+
+    assert cli._begin_check_attempt(config, tel) == cli._AttemptUnrecorded(
+        "fingerprint_unreadable")
+    assert _attempt(config.telemetry_path) is None
+
+
+def test_begin_attempt_write_fault_is_write_failed_silently(workspace, capsys) -> None:
+    config, _store, tel = workspace
+    faulted = _FailingStartTelemetry(tel, DatabaseError("provoked"))
+    assert cli._begin_check_attempt(config, faulted) == cli._AttemptUnrecorded(
+        "write_failed")
+    assert capsys.readouterr().err == ""
+
+
+def test_begin_attempt_unexpected_exception_warns_once(workspace, capsys) -> None:
+    """Criterion 14 (D5): a bug is still ``write_failed``, and says so on stderr, once."""
+    config, _store, tel = workspace
+    faulted = _FailingStartTelemetry(tel, RuntimeError("a bug in the write path"))
+    assert cli._begin_check_attempt(config, faulted) == cli._AttemptUnrecorded(
+        "write_failed")
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    lines = captured.err.splitlines()
+    assert len(lines) == 1
+    assert lines[0].startswith("[Warning]") and "a bug in the write path" in lines[0]
+
+
+def test_begin_attempt_lands_the_started_record(workspace) -> None:
+    """The happy path: the key it returns is the key on the row."""
+    config, store, tel = workspace
+    _pair(store)
+    entry = _fingerprint(config)
+
+    got = cli._begin_check_attempt(config, tel)
+
+    assert isinstance(got, cli._AttemptOnRecord)
+    row = _attempt(config.telemetry_path)
+    assert row["attempt_id"] == got.attempt_id
+    _assert_started(row, entry)
+
+
+def test_the_unrecorded_causes_are_a_closed_set() -> None:
+    assert cli._ATTEMPT_UNRECORDED_CAUSES == (
+        "telemetry_unavailable", "fingerprint_unreadable", "write_failed")
+
+
+def test_a_seam_fault_leaves_started(workspace, monkeypatch, capsys) -> None:
+    """Criterion 15: the outcome rides the seam's transaction; a fault lands none of it."""
+    config, store, tel = workspace
+    _a, _b, nbhds = _pair(store)
+    _drain_outbox(store)
+    entry = _fingerprint(config)
+    embed, vector = _wire_substrate(monkeypatch, nbhds)
+    _wire_judge(monkeypatch, _judge_for(store, embed, vector, tel))
+    monkeypatch.setattr(telemetry, "_UPSERT_COVERAGE_SQL", "NOT SQL")
+
+    code, obj = _run(config, capsys)
+
+    assert code == 2 and obj["summary_row_written"] is False
+    assert _read_check_runs(config) == []
+    assert _coverage(config.telemetry_path) == {}
+    _assert_started(_attempt(config.telemetry_path), entry)
