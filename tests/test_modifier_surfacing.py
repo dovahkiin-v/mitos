@@ -807,7 +807,7 @@ def test_cli_query_true_miss_keeps_plain_message(ws, capsys) -> None:
     with patch("mitos.cli.MitosSyncManager", return_value=stub):
         cmd_query(config, "a claim that is not any slug", as_json=True)
     resp = json.loads(capsys.readouterr().out)
-    _, band_note = assess_query_recall(top_score=None, result_count=0,
+    _, band_note = assess_query_recall(lever=None, top_score=None, result_count=0,
                                        config=config, surface="cli")
     assert resp == {"query": "a claim that is not any slug", "depth_mode": "letter",
                     "matches": [],

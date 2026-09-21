@@ -10,7 +10,7 @@ from typing import Optional, List, Dict, Any, Tuple
 from mcp.server.fastmcp import FastMCP
 
 from mitos import amend, registry, routing
-from mitos.display import blackout_note, clamp_limit, dumps_display, letter_payload, oneline_payload, order_scope_counts, projects_payload, scope_report, show_payload
+from mitos.display import RANKED_LIMIT_CEILING, blackout_note, clamp_limit, dumps_display, letter_payload, oneline_payload, order_scope_counts, projects_payload, scope_report, show_payload
 from mitos.config import MitosConfig
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS
 from mitos.embeddings import GeminiEmbeddingProvider
@@ -36,7 +36,8 @@ from mitos.restore import BufferFidelityError
 from mitos.recall import (assess_query_recall, assess_surface_recall,
                           corpus_provenance, missing_graph_is_a_gap,
                           missing_graph_note, missing_index_is_a_gap,
-                          scope_filter_recovery, count_withheld, withheld_clause)
+                          scope_filter_recovery, count_withheld, window_lever,
+                          withheld_clause)
 
 # Create FastMCP server instance
 mcp = FastMCP("Mitos")
@@ -793,6 +794,8 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
     top_score: Optional[float] = None
     retired: List[Dict[str, Any]] = []
     degraded_error: Optional[Exception] = None
+    lever = None
+    dump_total: Optional[int] = None
 
     # 1. Semantic search if embeddings and vector store are active
     if embed_provider and vector_store:
@@ -801,6 +804,9 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
             q_vector = embed_provider.get_embedding(query, is_query=True)
             matches = vector_store.query(q_vector, limit=top_k)
             semantic_ran = True
+            # Raw points, not surfaced decisions: the lever reads retrieval depth.
+            lever = window_lever(points=len(matches), limit=top_k,
+                                 ceiling=RANKED_LIMIT_CEILING, full_top=full_top)
 
             for m in matches:
                 slug = m["slug"]
@@ -856,7 +862,8 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
     if not semantic_ran and not results["active_decisions"] and scope:
         try:
             active_decs = store.get_active_decisions(scope=scope)
-            for d in active_decs[:5]:
+            dump_total = len(active_decs)
+            for d in active_decs[:top_k]:
                 rank = len(results["active_decisions"]) + 1
                 results["active_decisions"].append(
                     _decision_payload(d, 1.0, brief=_rank_thinned(rank, full_top),
@@ -909,6 +916,8 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         scope=scope,
         scope_counts=scope_counts,
         surface="mcp",
+        lever=lever,
+        scope_total=dump_total,
     )
     if confidence is not None:
         results["confidence"] = confidence
@@ -1301,6 +1310,9 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             top_k = clamp_limit(limit)
             q_vector = embed_provider.get_embedding(query, is_query=True)
             matches = vector_store.query(q_vector, limit=top_k)
+            # Raw points, not surfaced matches — see surface_decisions.
+            lever = window_lever(points=len(matches), limit=top_k,
+                                 ceiling=RANKED_LIMIT_CEILING, full_top=full_top)
 
             output_list = []
             retired: List[Dict[str, Any]] = []
@@ -1352,6 +1364,7 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
                 result_count=len(output_list),
                 config=config,
                 surface="mcp",
+                lever=lever,
             )
             envelope["confidence"] = confidence
             envelope["note"] = note
@@ -1399,8 +1412,10 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             # This is the healthy-empty arm, not a degraded one: ranking ran and
             # matched nothing, so it takes the band exactly like the envelope above.
             # (Its degraded sibling, ten lines up, returns before assessment.)
+            # No lever: the query raised before any window came back.
             confidence, note = assess_query_recall(
                 top_score=top_score, result_count=0, config=config, surface="mcp",
+                lever=None,
             )
             empty["confidence"] = confidence
             empty["note"] = note

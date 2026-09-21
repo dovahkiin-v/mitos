@@ -40,7 +40,7 @@ business widening it.
 """
 
 import difflib
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 # Top semantic score at/above which a match is treated as a real precedent rather than
 # a loose neighbour. Calibrated to observed Gemini-embedding scores: settled precedents
@@ -82,12 +82,20 @@ SURFACE_DIDYOUMEAN_CUTOFF: float = 0.6
 # ``precedent_scan``; the CLI form puts ``--`` before the slug because a hand-authored
 # slug may start with ``-`` (``renderer._show_forms``' idiom). The MCP form names a
 # read tool and no shell command.
+#
+# ``limit_arg`` and ``full_top_arg`` spell the two knobs :func:`limit_clause` names,
+# each with an ``{n}`` placeholder. They are argument spellings, not commands: the
+# clause rides ``surface`` and ``query`` alike, so it cannot name a verb, and the CLI
+# fragments are flags that parse on either verb as printed. Unwrapped on purpose —
+# the backticks above mark a whole command a reader can run.
 _SURFACE_POINTERS: Dict[str, Dict[str, str]] = {
     "cli": {
         "complete": "mitos list",
         "complete_scope": "mitos list --scope '{scope}'",
         "dereference": "`mitos show -p {project} -- <slug>`",
         "discovery": "mitos scopes",
+        "full_top_arg": "--full-top {n}",
+        "limit_arg": "--limit {n}",
         "precedent_scan": "`mitos surface -p {project}`",
         "state_all": "mitos list --scope '{scope}' --state all",
         "sync": "mitos sync",
@@ -97,6 +105,8 @@ _SURFACE_POINTERS: Dict[str, Dict[str, str]] = {
         "complete_scope": "list_decisions(scope='{scope}')",
         "dereference": "show_node(ident='<slug>')",
         "discovery": "list_scopes",
+        "full_top_arg": "full_top={n}",
+        "limit_arg": "limit={n}",
         "precedent_scan": "surface_decisions()",
         "state_all": "list_decisions(scope='{scope}', state='all')",
         "sync": "mitos sync",
@@ -258,6 +268,101 @@ def scope_filter_recovery(
     return {"note": note}
 
 
+class WindowLever(NamedTuple):
+    """The result window a ranked answer filled, as :func:`limit_clause` names it.
+
+    Attributes:
+        limit: The clamped top-k this call asked the vector store for.
+        held: How many ranks stay whole if the caller widens the window; 0 means
+            the answer is already axiom-only throughout.
+    """
+
+    limit: int
+    held: int
+
+
+def window_lever(
+    *, points: int, limit: int, ceiling: int, full_top: Optional[int]
+) -> Optional[WindowLever]:
+    """Decides whether a ranked answer may name a wider window as the next move.
+
+    The ONE place that rule is made, for all four ranked surfaces. A wider window
+    reaches something only when this one came back full and a higher ``limit``
+    would not clamp straight back to it; on a short window (a small or fresh
+    corpus) or at the ceiling the lever does nothing, and naming it would be a
+    false line.
+
+    ``points`` is the length of the **raw** vector-store return, not the surfaced
+    list. That is deliberate and does not contradict the ADR
+    ``confidence-band-inputs-come-from-the-surfaced-list-not-raw-retrieval``: the
+    band's ``top_score`` and ``result_count`` stay off the surfaced list, because
+    they describe what the caller got. The lever describes retrieval depth, so it
+    reads retrieval — an open question or a retired handle in a full window leaves
+    fewer decisions than ``limit``, but the window was still full and a higher
+    ``limit`` still reaches further.
+
+    ``ceiling`` is injected by the boundary (``display.RANKED_LIMIT_CEILING``)
+    rather than imported, per this module's zero-``mitos``-imports rule (module
+    docstring).
+
+    Args:
+        points: How many points the vector store returned for this query.
+        limit: The clamped top-k the call asked for.
+        ceiling: The clamp ceiling a higher ``limit`` would be cut back to.
+        full_top: The effective ``full_top`` after the boundary normalised
+            ``brief`` to 0; None when the caller set no cutoff.
+
+    Returns:
+        A :class:`WindowLever`, or None when the clause must stay absent.
+    """
+    if points < limit or limit >= ceiling:
+        return None
+    held = limit if full_top is None else min(full_top, limit)
+    return WindowLever(limit=limit, held=held)
+
+
+def limit_clause(lever: WindowLever, *, surface: str) -> str:
+    """Words the clause a filled ``weak``/``none`` ranking ends its band note with.
+
+    Verb-independent on purpose, as :func:`withheld_clause` is: ``surface`` and
+    ``query`` gain the same characters on one surface, so the query note stays no
+    longer than the surface note it displaces. It speaks about this ranking's depth
+    only — no verdict on the corpus, no write instruction, and no claim that the
+    deeper ranks score higher — so it is lawful in both registers. It names the
+    held rank count as a number, so the re-send works in one turn; with nothing
+    held it names ``limit`` alone, since naming ``full_top`` would hand a ``brief``
+    caller a re-send the boundary refuses. Pure string formatting, so it cannot
+    raise inside ``query_decisions``' ranked ``try`` and pose as degraded recall.
+
+    Args:
+        lever: The window this ranking filled (from :func:`window_lever`).
+        surface: ``"cli"`` or ``"mcp"`` — selects the argument spellings.
+
+    Returns:
+        One sentence, e.g. ``"This ranking filled limit=5; a higher limit reaches
+        further ranks, and with full_top=5 the added ones come back axiom-only."``.
+    """
+    pointers = _SURFACE_POINTERS[surface]
+    filled = pointers["limit_arg"].format(n=lever.limit)
+    if lever.held == 0:
+        return (
+            f"This ranking filled {filled}; a higher limit reaches further ranks, "
+            f"axiom-only like these."
+        )
+    held = pointers["full_top_arg"].format(n=lever.held)
+    return (
+        f"This ranking filled {filled}; a higher limit reaches further ranks, and "
+        f"with {held} the added ones come back axiom-only."
+    )
+
+
+def _with_lever(note: str, lever: Optional[WindowLever], surface: str) -> str:
+    """Appends the window clause to a band note when a lever was granted."""
+    if lever is None:
+        return note
+    return f"{note} {limit_clause(lever, surface=surface)}"
+
+
 def _classify_recall(*, top_score: Optional[float], result_count: int) -> str:
     """Decides the confidence band. The ONE place that band choice is made.
 
@@ -300,6 +405,8 @@ def assess_surface_recall(
     scope: Optional[str],
     scope_counts: Optional[Dict[str, Dict[str, int]]] = None,
     surface: str,
+    lever: Optional[WindowLever],
+    scope_total: Optional[int] = None,
 ) -> Tuple[Optional[str], str]:
     """Classifies a surface result and builds the agent-facing note.
 
@@ -316,6 +423,14 @@ def assess_surface_recall(
             fabricate a typo hint).
         surface: ``"cli"`` or ``"mcp"`` — selects the pointer wording. Required keyword:
             no callsite may silently emit the wrong surface's call-forms (the T7 gate).
+        lever: The filled window from :func:`window_lever`, or None. Required keyword,
+            never defaulted: every call site decides. It rides only the ``weak`` note
+            and the with-results ``none`` note; ``strong``, the nothing-ranked fork
+            and every degraded arm ignore it.
+        scope_total: How many active decisions the scope holds, passed only by the
+            degraded scope dump. Its presence is what selects the dump's own
+            sentence, which names how many of them it shows; None keeps the shared
+            degraded sentence, which a partial ranked list also reaches.
 
     Returns:
         A ``(confidence, note)`` pair. ``confidence`` is ``"strong"`` / ``"weak"`` /
@@ -344,6 +459,23 @@ def assess_surface_recall(
 
     # Degraded — no semantic ranking happened.
     if not semantic_ran:
+        if result_count and scope_total is not None:
+            # The dump's own branch: it names how many of the scope's decisions it
+            # shows. ``result_count`` is what the envelope returns, so a dump cut
+            # short by a mid-loop fault is still counted truthfully.
+            if result_count < scope_total:
+                shown_part = (
+                    f"{result_count} of the {scope_total} active decisions in {scope_phrase}"
+                )
+            elif scope_total == 1:
+                shown_part = f"the one active decision in {scope_phrase}"
+            else:
+                shown_part = f"all {scope_total} active decisions in {scope_phrase}"
+            return None, (
+                f"Semantic recall unavailable (embeddings/Qdrant down) — showing "
+                f"{shown_part} as a fallback, NOT a relevance ranking. For the "
+                f"authoritative set use {complete_hint} (pure graph read)."
+            )
         if result_count:
             return None, (
                 f"Semantic recall unavailable (embeddings/Qdrant down) — showing the "
@@ -373,9 +505,11 @@ def assess_surface_recall(
     if band == "weak":
         shown = f"{top_score:.2f}" if top_score is not None else "?"
         matches_phrase = "Here are results that matched semantically (twilight zone" if scope_prefix else "Twilight zone"
-        return "weak", (
+        return "weak", _with_lever(
             f"{scope_prefix}{matches_phrase}: top score {shown} is close. They might be family neighbours or "
-            f"exact precedent phrased differently. Check carefully before deciding."
+            f"exact precedent phrased differently. Check carefully before deciding.",
+            lever,
+            surface,
         )
 
     # Semantic ran but every match is garbage (off-axis)
@@ -385,7 +519,7 @@ def assess_surface_recall(
             msg = f"{scope_prefix}Top score {shown} is too low to be related. Treat as no-precedent and decide fresh."
         else:
             msg = f"Very likely off-axis: top score {shown} is too low to be related. The scope is populated, but nothing matches your query. Treat as no-precedent and decide fresh."
-        return "none", msg
+        return "none", _with_lever(msg, lever, surface)
 
     # Semantic ran and returned nothing surfaceable.
     if scope_unused:
@@ -404,6 +538,7 @@ def assess_query_recall(
     result_count: int,
     config: "object",
     surface: str,
+    lever: Optional[WindowLever],
 ) -> Tuple[str, str]:
     """Classifies a targeted-lookup result and builds its ``query``-register note.
 
@@ -435,6 +570,10 @@ def assess_query_recall(
             for ``project``, which the CLI redirect names as its selector.
         surface: ``"cli"`` or ``"mcp"`` — selects the pointer wording. Required
             keyword: no call site may silently emit the other surface's call-forms.
+        lever: The filled window from :func:`window_lever`, or None. Required
+            keyword, never defaulted. It rides the ``weak`` and with-results
+            ``none`` notes after the redirect, in the same characters
+            ``assess_surface_recall`` appends.
 
     Returns:
         A ``(confidence, note)`` pair. ``confidence`` is ``"strong"`` / ``"weak"``
@@ -464,18 +603,22 @@ def assess_query_recall(
     shown = f"{top_score:.2f}" if top_score is not None else "?"
 
     if band == "weak":
-        return band, (
+        return band, _with_lever(
             f"Twilight zone: top score {shown} — close, maybe not your handle. "
-            f"{redirect}"
+            f"{redirect}",
+            lever,
+            surface,
         )
 
     # The ``"none"`` band forks the same way its sibling does: matches that all
     # ranked off-axis, versus nothing ranked at all. Neither states a verdict on the
     # corpus, and neither instructs a write.
     if result_count:
-        return band, (
+        return band, _with_lever(
             f"Off-axis: top score {shown} is too low to be related — nothing "
-            f"ranked close. {redirect}"
+            f"ranked close. {redirect}",
+            lever,
+            surface,
         )
     return band, (
         f"No semantic match — this ranking returned nothing. {redirect}"

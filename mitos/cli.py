@@ -31,6 +31,7 @@ from mitos import registry
 from mitos import routing
 from mitos import settledness
 from mitos.display import (
+    RANKED_LIMIT_CEILING,
     apply_stdout_text_safety,
     blackout_note,
     clamp_limit,
@@ -96,7 +97,7 @@ from mitos.recall import (assess_query_recall, assess_surface_recall,
                           corpus_provenance, missing_graph_is_a_gap,
                           missing_graph_note, missing_index_is_a_gap,
                           provenance_line, scope_filter_recovery,
-                          count_withheld, withheld_clause)
+                          count_withheld, window_lever, withheld_clause)
 from mitos.sync import (MitosSyncManager, run_ambient_capture, _SLUG_MAX_LEN,
                         _ENTRIES_MARKER, _PAUSE_RESOLVING_RELATIONS,
                         _declared_echo_lines, _split_relation_slugs,
@@ -1163,10 +1164,16 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
     # comment gives below: that arm constructs the empty result rather than falling
     # through, so a `top_score` bound inside the loop would be an unbound local on
     # exactly the state (empty graph + absent collection) nobody reaches by hand.
+    # `lever` for the same reason: that arm falls through to the assessment below.
     top_score: Optional[float] = None
+    lever = None
     try:
         q_vector = manager.embed_provider.get_embedding(query_text, is_query=True)
         raw_matches = manager.vector_store.query(q_vector, limit=top_k)
+        # `raw_matches`, not `matches`: the lever reads retrieval depth, and
+        # `matches` below is the surfaced list.
+        lever = window_lever(points=len(raw_matches), limit=top_k,
+                             ceiling=RANKED_LIMIT_CEILING, full_top=full_top)
 
         # Filter superseded first, then stamp + Letter — mirrors the ranked loop in
         # mcp_server.query_decisions byte-for-byte (T4 parity). A superseded-not-reused
@@ -1258,6 +1265,7 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         result_count=len(matches),
         config=config,
         surface="cli",
+        lever=lever,
     )
     # A thinned answer says so, on both encodings: the clause joins the local note
     # the text render prints and the envelope carries. The blackout and unbuilt
@@ -2336,12 +2344,17 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     top_score: Optional[float] = None
     retired: List[Dict[str, Any]] = []
     degraded_error: Optional[Exception] = None
+    lever = None
+    dump_total: Optional[int] = None
 
     if manager.embed_provider and manager.vector_store:
         try:
             q_vector = manager.embed_provider.get_embedding(query, is_query=True)
             matches = manager.vector_store.query(q_vector, limit=top_k)
             semantic_ran = True
+            # Raw points, not surfaced decisions: the lever reads retrieval depth.
+            lever = window_lever(points=len(matches), limit=top_k,
+                                 ceiling=RANKED_LIMIT_CEILING, full_top=full_top)
             for m in matches:
                 node = store.get_node_by_slug(m["slug"])
                 if not node:
@@ -2384,7 +2397,9 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     # semantic run that found nothing must not masquerade as an unranked scope dump.
     if not semantic_ran and not results["active_decisions"] and scope:
         try:
-            for d in store.get_active_decisions(scope=scope)[:5]:
+            active_decs = store.get_active_decisions(scope=scope)
+            dump_total = len(active_decs)
+            for d in active_decs[:top_k]:
                 rank = len(results["active_decisions"]) + 1
                 results["active_decisions"].append(
                     _shape(d, 1.0, _rank_thinned(rank, full_top))
@@ -2437,6 +2452,8 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         scope=scope,
         scope_counts=scope_counts,
         surface="cli",
+        lever=lever,
+        scope_total=dump_total,
     )
     if confidence is not None:
         results["confidence"] = confidence

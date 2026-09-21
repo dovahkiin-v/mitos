@@ -41,7 +41,8 @@ from mitos.store import GraphStore
 from mitos.sync import MitosSyncManager
 from mitos.recall import (_SURFACE_POINTERS, assess_query_recall,
                           assess_surface_recall, SURFACE_STRONG_THRESHOLD,
-                          SURFACE_WEAK_THRESHOLD)
+                          SURFACE_WEAK_THRESHOLD, WindowLever, limit_clause,
+                          window_lever)
 
 
 @pytest.fixture
@@ -108,14 +109,14 @@ def _counts(*names_and_counts):
 # --------------------------------------------------------------------------- #
 
 def test_policy_strong_when_top_score_clears_threshold():
-    conf, note = assess_surface_recall(semantic_ran=True, top_score=0.9, result_count=2,
+    conf, note = assess_surface_recall(lever=None, semantic_ran=True, top_score=0.9, result_count=2,
                                        scope="db", surface="cli")
     assert conf == "strong"
     assert "mitos list" in note and "list_decisions" not in note
 
 
 def test_policy_strong_mcp_uses_mcp_callform():
-    conf, note = assess_surface_recall(semantic_ran=True, top_score=0.9, result_count=2,
+    conf, note = assess_surface_recall(lever=None, semantic_ran=True, top_score=0.9, result_count=2,
                                        scope="db", surface="mcp")
     assert conf == "strong"
     assert "list_decisions(scope='db')" in note
@@ -123,27 +124,27 @@ def test_policy_strong_mcp_uses_mcp_callform():
 
 def test_policy_strong_at_exact_threshold():
     """The threshold is inclusive — a score exactly at the bar is strong."""
-    conf, _ = assess_surface_recall(semantic_ran=True, top_score=SURFACE_STRONG_THRESHOLD,
+    conf, _ = assess_surface_recall(lever=None, semantic_ran=True, top_score=SURFACE_STRONG_THRESHOLD,
                                     result_count=1, scope=None, surface="cli")
     assert conf == "strong"
 
 
 def test_policy_weak_below_threshold_names_the_score():
-    conf, note = assess_surface_recall(semantic_ran=True, top_score=0.61, result_count=3,
+    conf, note = assess_surface_recall(lever=None, semantic_ran=True, top_score=0.61, result_count=3,
                                        scope=None, surface="cli")
     assert conf == "weak"
     assert "0.61" in note
 
 
 def test_policy_off_axis_below_weak_threshold():
-    conf, note = assess_surface_recall(semantic_ran=True, top_score=0.55, result_count=3,
+    conf, note = assess_surface_recall(lever=None, semantic_ran=True, top_score=0.55, result_count=3,
                                        scope=None, surface="cli")
     assert conf == "none"
     assert "0.55" in note and "off-axis" in note.lower()
 
 
 def test_policy_none_no_match_points_to_list():
-    conf, note = assess_surface_recall(semantic_ran=True, top_score=None, result_count=0,
+    conf, note = assess_surface_recall(lever=None, semantic_ran=True, top_score=None, result_count=0,
                                        scope=None, surface="cli")
     assert conf == "none" and "No semantic match" in note
     assert "mitos list" in note and "list_decisions" not in note
@@ -151,7 +152,7 @@ def test_policy_none_no_match_points_to_list():
 
 def test_policy_none_scope_unused_bounded_vector():
     """Migrated from the old `Valid scopes are: db` enumeration → bounded vector."""
-    conf, note = assess_surface_recall(semantic_ran=True, top_score=None, result_count=0,
+    conf, note = assess_surface_recall(lever=None, semantic_ran=True, top_score=None, result_count=0,
                                        scope="ghost", scope_counts=_counts(("db", 1)),
                                        surface="cli")
     assert conf == "none"
@@ -160,7 +161,7 @@ def test_policy_none_scope_unused_bounded_vector():
 
 
 def test_policy_weak_scope_unused_but_has_matches():
-    conf, note = assess_surface_recall(semantic_ran=True, top_score=0.65, result_count=1,
+    conf, note = assess_surface_recall(lever=None, semantic_ran=True, top_score=0.65, result_count=1,
                                        scope="ghost", scope_counts=_counts(("auth", 1)),
                                        surface="cli")
     assert conf == "weak"
@@ -170,7 +171,7 @@ def test_policy_weak_scope_unused_but_has_matches():
 
 
 def test_policy_degraded_with_results_is_not_a_ranking():
-    conf, note = assess_surface_recall(semantic_ran=False, top_score=None, result_count=4,
+    conf, note = assess_surface_recall(lever=None, semantic_ran=False, top_score=None, result_count=4,
                                        scope="db", surface="cli")
     assert conf is None
     assert "unavailable" in note and "NOT a relevance ranking" in note
@@ -178,7 +179,7 @@ def test_policy_degraded_with_results_is_not_a_ranking():
 
 
 def test_policy_degraded_empty_scope_unused():
-    conf, note = assess_surface_recall(semantic_ran=False, top_score=None, result_count=0,
+    conf, note = assess_surface_recall(lever=None, semantic_ran=False, top_score=None, result_count=0,
                                        scope="ghost", scope_counts={}, surface="cli")
     assert conf is None and "unavailable" in note and "unused scope tag" in note
 
@@ -188,7 +189,7 @@ def test_policy_degraded_empty_scope_unused():
 # --------------------------------------------------------------------------- #
 
 def test_unused_vector_did_you_mean():
-    _, note = assess_surface_recall(semantic_ran=True, top_score=None, result_count=0,
+    _, note = assess_surface_recall(lever=None, semantic_ran=True, top_score=None, result_count=0,
                                     scope="ath", scope_counts=_counts(("auth", 3)),
                                     surface="cli")
     assert "Did you mean 'auth'?" in note
@@ -198,7 +199,7 @@ def test_unused_vector_top_k_and_overflow_bounded():
     """At most K busiest-first tags + a discovery pointer; the (K+1)th tag is absent."""
     counts = _counts(("substrate", 9), ("store", 8), ("schema", 7), ("vector", 6),
                      ("parser", 5), ("config", 4), ("render", 3))  # 7 live > K=5
-    _, note = assess_surface_recall(semantic_ran=True, top_score=None, result_count=0,
+    _, note = assess_surface_recall(lever=None, semantic_ran=True, top_score=None, result_count=0,
                                     scope="ghost", scope_counts=counts, surface="cli")
     assert "Live scopes (busiest first): substrate, store, schema, vector, parser." in note
     assert "config" not in note and "render" not in note   # the 6th/7th are not listed
@@ -207,13 +208,13 @@ def test_unused_vector_top_k_and_overflow_bounded():
 
 def test_unused_vector_overflow_pointer_mcp_form():
     counts = _counts(("a1", 9), ("b2", 8), ("c3", 7), ("d4", 6), ("e5", 5), ("f6", 4))
-    _, note = assess_surface_recall(semantic_ran=True, top_score=None, result_count=0,
+    _, note = assess_surface_recall(lever=None, semantic_ran=True, top_score=None, result_count=0,
                                     scope="ghost", scope_counts=counts, surface="mcp")
     assert "list_scopes" in note and "mitos scopes" not in note
 
 
 def test_unused_vector_sync_hedge_present():
-    _, note = assess_surface_recall(semantic_ran=True, top_score=None, result_count=0,
+    _, note = assess_surface_recall(lever=None, semantic_ran=True, top_score=None, result_count=0,
                                     scope="ghost", scope_counts=_counts(("auth", 1)),
                                     surface="cli")
     assert "mitos sync" in note
@@ -222,7 +223,7 @@ def test_unused_vector_sync_hedge_present():
 def test_unused_vector_empty_project_is_calm():
     """A fresh/empty project: just the unused-tag statement + sync hedge — no list, no
     did-you-mean."""
-    _, note = assess_surface_recall(semantic_ran=True, top_score=None, result_count=0,
+    _, note = assess_surface_recall(lever=None, semantic_ran=True, top_score=None, result_count=0,
                                     scope="ghost", scope_counts={}, surface="cli")
     assert "unused scope tag" in note and "mitos sync" in note
     assert "Did you mean" not in note and "Live scopes" not in note
@@ -232,7 +233,7 @@ def test_unused_signal_keys_on_live_map_not_active_count():
     """A scope present in the live map (e.g. live only via a parked OQ → count 0/1) is
     NOT flagged unused — membership, not active-decision count, is the oracle."""
     counts = {"auth": {"active_decisions": 0, "parked_open_questions": 1}}
-    _, note = assess_surface_recall(semantic_ran=True, top_score=None, result_count=0,
+    _, note = assess_surface_recall(lever=None, semantic_ran=True, top_score=None, result_count=0,
                                     scope="auth", scope_counts=counts, surface="cli")
     assert "unused scope tag" not in note
 
@@ -240,7 +241,7 @@ def test_unused_signal_keys_on_live_map_not_active_count():
 def test_none_scope_counts_never_fabricates_unused():
     """`scope_counts=None` (callsite couldn't compute) → calm degradation, never a typo
     hint."""
-    _, note = assess_surface_recall(semantic_ran=True, top_score=None, result_count=0,
+    _, note = assess_surface_recall(lever=None, semantic_ran=True, top_score=None, result_count=0,
                                     scope="ghost", scope_counts=None, surface="cli")
     assert "unused scope tag" not in note
 
@@ -258,7 +259,7 @@ def test_surface_leak_gate_cli_never_emits_mcp_callforms():
         dict(semantic_ran=True, top_score=None, result_count=0, scope=None),       # no match, no scope
     ]
     for c in cases:
-        _, note = assess_surface_recall(scope_counts=counts, surface="cli", **c)
+        _, note = assess_surface_recall(lever=None, scope_counts=counts, surface="cli", **c)
         assert "list_decisions(" not in note, c
         assert "list_scopes(" not in note, c
 
@@ -266,9 +267,9 @@ def test_surface_leak_gate_cli_never_emits_mcp_callforms():
 def test_cli_mcp_signal_parity_for_unused_scope():
     """Same unused-scope *signal* on both surfaces; only the pointer wording differs."""
     counts = _counts(("auth", 3))
-    _, cli_note = assess_surface_recall(semantic_ran=True, top_score=None, result_count=0,
+    _, cli_note = assess_surface_recall(lever=None, semantic_ran=True, top_score=None, result_count=0,
                                         scope="ghost", scope_counts=counts, surface="cli")
-    _, mcp_note = assess_surface_recall(semantic_ran=True, top_score=None, result_count=0,
+    _, mcp_note = assess_surface_recall(lever=None, semantic_ran=True, top_score=None, result_count=0,
                                         scope="ghost", scope_counts=counts, surface="mcp")
     assert "unused scope tag" in cli_note and "unused scope tag" in mcp_note
     assert "list_decisions(" not in cli_note
@@ -276,15 +277,17 @@ def test_cli_mcp_signal_parity_for_unused_scope():
 
 
 def test_surface_is_required_keyword():
+    # `lever=None` passed so this row keeps testing `surface`, not the newer keyword.
     with pytest.raises(TypeError):
-        assess_surface_recall(semantic_ran=True, top_score=0.9, result_count=1, scope=None)
+        assess_surface_recall(lever=None, semantic_ran=True, top_score=0.9, result_count=1, scope=None)
 
 
 # --------------------------------------------------------------------------- #
 # MCP surface_decisions — confidence end to end (fake vector store)
 # --------------------------------------------------------------------------- #
 
-def _surface_with(matches, ws, query="some claim", scope=None, full_top=None, brief=False):
+def _surface_with(matches, ws, query="some claim", scope=None, full_top=None, brief=False,
+                  limit=None):
     """`matches=None` drives no providers; a vector-store instance drives its own route."""
     from mitos import mcp_server
     config, _ = ws
@@ -293,13 +296,14 @@ def _surface_with(matches, ws, query="some claim", scope=None, full_top=None, br
     embed = None if matches is None else _FakeEmbed()
     with patch.object(mcp_server, "get_workspace_components",
                       return_value=(store, embed, vector)):
+        kw = {} if limit is None else {"limit": limit}
         return json.loads(mcp_server.surface_decisions(
             query, scope=scope, brief=brief, project=config.workspace_dir,
-            full_top=full_top))
+            full_top=full_top, **kw))
 
 
 def _cli_surface_json(matches, ws, query="some claim", scope=None, full_top=None,
-                      brief=False):
+                      brief=False, limit=None):
     """Drives the CLI `cmd_surface` end-to-end with deterministic scores and returns the
     parsed `--json` payload. `matches=None` exercises the degraded (no embed/vector) path;
     a vector-store instance is passed through as-is, so a fault stub drives its own route."""
@@ -317,7 +321,7 @@ def _cli_surface_json(matches, ws, query="some claim", scope=None, full_top=None
     with patch.object(cli, "MitosSyncManager", return_value=manager):
         with redirect_stdout(buf):
             cmd_surface(config, query, as_json=True, scope=scope, brief=brief,
-                        full_top=full_top)
+                        full_top=full_top, limit=limit)
     return json.loads(buf.getvalue())
 
 
@@ -484,8 +488,13 @@ def _query_pointer(surface, config):
     )
 
 
-def _query_note(surface, config=None, **kw):
-    return assess_query_recall(config=config or _StubConfig(), surface=surface, **kw)[1]
+# The three lever shapes the register and length rows range over (4c, G5): none,
+# a filled window with every rank held whole, and a filled window already axiom-only.
+_4C_LEVERS = [None, WindowLever(5, 5), WindowLever(5, 0)]
+
+
+def _query_note(surface, config=None, lever=None, **kw):
+    return assess_query_recall(lever=lever, config=config or _StubConfig(), surface=surface, **kw)[1]
 
 
 # --------------------------------------------------------------------------- #
@@ -502,7 +511,7 @@ def test_query_strong_is_a_legend_and_names_no_verb():
     follow is "so `strong` carries no note": this is the band a caller meets most
     often, and dropping it leaves the common answer with no legend at all.
     """
-    conf, note = assess_query_recall(top_score=0.91, result_count=2,
+    conf, note = assess_query_recall(lever=None, top_score=0.91, result_count=2,
                                      config=_StubConfig(), surface="cli")
     assert conf == "strong"
     assert note                                        # it keeps a note
@@ -518,7 +527,7 @@ def test_query_weak_names_the_score_and_redirects():
     — "check carefully before deciding" is the precedent-check register, and that
     is `surface`'s question, not this verb's.
     """
-    conf, note = assess_query_recall(top_score=0.61, result_count=3,
+    conf, note = assess_query_recall(lever=None, top_score=0.61, result_count=3,
                                      config=_StubConfig(), surface="cli")
     assert conf == "weak"
     assert "0.61" in note
@@ -534,7 +543,7 @@ def test_query_none_with_results_drops_the_scope_clause():
     "treat as no-precedent and decide fresh" is a decide instruction off a
     targeted miss.
     """
-    conf, note = assess_query_recall(top_score=0.55, result_count=3,
+    conf, note = assess_query_recall(lever=None, top_score=0.55, result_count=3,
                                      config=_StubConfig(), surface="cli")
     assert conf == "none"
     assert "0.55" in note
@@ -551,7 +560,7 @@ def test_query_none_empty_drops_the_corpus_verdict():
     reached for the wrong verb mints a duplicate of a decision the corpus already
     holds. The band is honest about the ranking and silent about the corpus.
     """
-    conf, note = assess_query_recall(top_score=None, result_count=0,
+    conf, note = assess_query_recall(lever=None, top_score=None, result_count=0,
                                      config=_StubConfig(), surface="cli")
     assert conf == "none"
     assert "no settled precedent" not in note
@@ -609,8 +618,9 @@ def test_the_query_register_leaks_no_call_form_across_the_boundary(label, kw):
     assert "mitos surface" not in mcp_note and "-p " not in mcp_note
 
 
+@pytest.mark.parametrize("lever", _4C_LEVERS)
 @pytest.mark.parametrize("label,kw", _QUERY_CASES)
-def test_the_mcp_query_note_is_no_longer_than_the_one_it_displaces(label, kw):
+def test_the_mcp_query_note_is_no_longer_than_the_one_it_displaces(label, kw, lever):
     """The comparative bound (D3), stated where nothing data-dependent muddies it.
 
     On MCP both pointers are bare call-forms, so the whole composed note compares
@@ -618,13 +628,14 @@ def test_the_mcp_query_note_is_no_longer_than_the_one_it_displaces(label, kw):
     sentence it displaces at the same inputs. The register is a per-answer cost
     (P15) — it earns its bytes by replacing prose, not by adding to it.
     """
-    q = _query_note("mcp", **kw)
-    s = assess_surface_recall(semantic_ran=True, scope=None, surface="mcp", **kw)[1]
+    q = _query_note("mcp", lever=lever, **kw)
+    s = assess_surface_recall(lever=lever, semantic_ran=True, scope=None, surface="mcp", **kw)[1]
     assert len(q) <= len(s), f"{label}: query note {len(q)} > surface note {len(s)}"
 
 
+@pytest.mark.parametrize("lever", _4C_LEVERS)
 @pytest.mark.parametrize("label,kw", _QUERY_CASES)
-def test_the_cli_query_prose_is_no_longer_than_the_one_it_displaces(label, kw):
+def test_the_cli_query_prose_is_no_longer_than_the_one_it_displaces(label, kw, lever):
     """The same bound on the CLI, with each side's pointer priced out — and why.
 
     The CLI redirect carries a selector and a `repr` because a response note is
@@ -637,8 +648,8 @@ def test_the_cli_query_prose_is_no_longer_than_the_one_it_displaces(label, kw):
     data-dependent term removed from both sides.
     """
     config = _StubConfig()
-    q = _query_note("cli", config=config, **kw)
-    s = assess_surface_recall(semantic_ran=True, scope=None, surface="cli", **kw)[1]
+    q = _query_note("cli", config=config, lever=lever, **kw)
+    s = assess_surface_recall(lever=lever, semantic_ran=True, scope=None, surface="cli", **kw)[1]
     q_prose = len(q) - (len(_query_pointer("cli", config)) if "mitos surface" in q else 0)
     s_prose = len(s) - (len(_SURFACE_POINTERS["cli"]["complete"])
                         if _SURFACE_POINTERS["cli"]["complete"] in s else 0)
@@ -657,7 +668,7 @@ def test_the_query_composer_has_no_degraded_and_no_scope_arm():
     assert "semantic_ran" not in params and "scope" not in params
     assert "scope_counts" not in params
     for _label, kw in _QUERY_CASES:
-        assert assess_query_recall(config=_StubConfig(), surface="cli", **kw)[0] is not None
+        assert assess_query_recall(lever=None, config=_StubConfig(), surface="cli", **kw)[0] is not None
 
 
 def test_the_precedent_scan_pointer_exists_under_both_outer_keys():
@@ -689,7 +700,7 @@ def test_the_query_note_differs_from_the_surface_note_at_every_input(surface, la
     about the branch where the shipped wording is most obviously dangerous.
     """
     q = _query_note(surface, **kw)
-    s = assess_surface_recall(semantic_ran=True, scope=None, surface=surface, **kw)[1]
+    s = assess_surface_recall(lever=None, semantic_ran=True, scope=None, surface=surface, **kw)[1]
     assert q != s, f"{label}/{surface}: the query register inherited surface's sentence"
 
 
@@ -703,7 +714,7 @@ def test_the_divergence_holds_on_a_note_a_driven_call_site_emitted(ws):
     config, m = ws
     _rec(m, "cache-strategy", scope=["db"])
     resp = _cli_query_json([{"slug": "cache-strategy", "score": 0.91}], ws)
-    surface_note = assess_surface_recall(semantic_ran=True, top_score=0.91,
+    surface_note = assess_surface_recall(lever=None, semantic_ran=True, top_score=0.91,
                                          result_count=1, scope=None, surface="cli")[1]
     assert resp["confidence"] == "strong"
     assert resp["note"] != surface_note
@@ -910,7 +921,7 @@ class _StubManager:
 
 
 def _cli_query(matches, ws, query="a claim that is not any slug", as_json=False,
-               config=None, full_top=None, brief=False):
+               config=None, full_top=None, brief=False, limit=None):
     """Drives `cmd_query` end to end and returns the raw captured stdout.
 
     `matches=None` drives the degraded (no embed/vector) path; a vector-store
@@ -929,18 +940,19 @@ def _cli_query(matches, ws, query="a claim that is not any slug", as_json=False,
     buf = io.StringIO()
     with patch.object(cli, "MitosSyncManager", return_value=stub):
         with redirect_stdout(buf):
-            cmd_query(config, query, as_json=as_json, brief=brief, full_top=full_top)
+            cmd_query(config, query, as_json=as_json, brief=brief, full_top=full_top,
+                      limit=limit)
     return buf.getvalue()
 
 
 def _cli_query_json(matches, ws, query="a claim that is not any slug", full_top=None,
-                    brief=False):
+                    brief=False, limit=None):
     return json.loads(_cli_query(matches, ws, query=query, as_json=True,
-                                 full_top=full_top, brief=brief))
+                                 full_top=full_top, brief=brief, limit=limit))
 
 
 def _mcp_query(matches, ws, query="a claim that is not any slug", full_top=None,
-               brief=False):
+               brief=False, limit=None):
     from mitos import mcp_server
     config, _ = ws
     store = GraphStore(config.db_path, read_only=True)
@@ -948,8 +960,10 @@ def _mcp_query(matches, ws, query="a claim that is not any slug", full_top=None,
     embed = None if matches is None else _FakeEmbed()
     with patch.object(mcp_server, "get_workspace_components",
                       return_value=(store, embed, vector)):
+        kw = {} if limit is None else {"limit": limit}
         return json.loads(mcp_server.query_decisions(
-            query, brief=brief, project=config.workspace_dir, full_top=full_top))
+            query, brief=brief, project=config.workspace_dir, full_top=full_top,
+            **kw))
 
 
 _BAND_LINE_PREFIX = "⚠ confidence:"
@@ -961,7 +975,8 @@ def _band_lines(out):
     return [ln for ln in out.splitlines() if ln.startswith(_BAND_LINE_PREFIX)]
 
 
-def _cli_surface_text(matches, ws, query="some claim", scope=None, full_top=None):
+def _cli_surface_text(matches, ws, query="some claim", scope=None, full_top=None,
+                      limit=None):
     """`cmd_surface`'s text render — the module drove only its `--json` twin."""
     from mitos import cli
     config, _ = ws
@@ -971,7 +986,7 @@ def _cli_surface_text(matches, ws, query="some claim", scope=None, full_top=None
     buf = io.StringIO()
     with patch.object(cli, "MitosSyncManager", return_value=manager):
         with redirect_stdout(buf):
-            cmd_surface(config, query, scope=scope, full_top=full_top)
+            cmd_surface(config, query, scope=scope, full_top=full_top, limit=limit)
     return buf.getvalue()
 
 
@@ -1288,9 +1303,9 @@ _4A_DRIVERS = {
 def _4a_band(verb, surface, config, top_score, n):
     """The band the surfaced decisions alone earn, from the policy itself."""
     if verb == "surface":
-        return assess_surface_recall(semantic_ran=True, top_score=top_score,
+        return assess_surface_recall(lever=None, semantic_ran=True, top_score=top_score,
                                      result_count=n, scope=None, surface=surface)
-    return assess_query_recall(top_score=top_score, result_count=n, config=config,
+    return assess_query_recall(lever=None, top_score=top_score, result_count=n, config=config,
                                surface=surface)
 
 
@@ -2049,7 +2064,7 @@ def test_the_lexical_envelope_honours_full_top_by_position(ws, driver, route):
 @pytest.mark.parametrize("driver", ["mcp-surface", "cli-surface"])
 def test_the_scope_dump_honours_full_top_by_position(ws, driver):
     """R7: `surface`'s degraded scoped dump thins by list position, with key and clause.
-    The dump is still `[:5]` — 4c owns making it follow `limit`."""
+    Four decisions sit under the default window of five; 4c's rows drive `limit`."""
     config, _ = ws
     _seed_4b(ws)
     call, key, _verb, surface = _4A_DRIVERS[driver]
@@ -2187,3 +2202,433 @@ def test_every_lexical_route_forwards_full_top():
                 assert isinstance(kw.get("full_top"), ast.Name), ast.unparse(node)
                 assert kw["full_top"].id == "full_top", ast.unparse(node)
     assert seen == 12
+
+
+# --------------------------------------------------------------------------- #
+# Phase 4c — A1 (the lever): the `limit` clause on a filled weak/none window, and
+# a scope dump that follows `limit` and says how much of the scope it shows.
+#
+# The window is counted in raw POINTS (4a G9b): `_FakeVector` ignores `limit` and
+# returns its list, so a fixture's length is the window the call got back. Expected
+# strings come from `limit_clause` and the composers, never a hand copy — except the
+# two sentences whose exact words are the thing pinned (the dump's three forms and
+# the frozen partial-list sentence).
+# --------------------------------------------------------------------------- #
+
+import os.path  # noqa: E402
+import re  # noqa: E402
+
+_4C_SLUGS = ["dec-a", "dec-b", "dec-c", "dec-d", "dec-e"]
+_4C_SCORES = {
+    "strong": [0.9, 0.85, 0.8, 0.78, 0.76],
+    "weak": [0.7, 0.68, 0.66, 0.64, 0.62],
+    "none": [0.5, 0.45, 0.4, 0.35, 0.3],
+}
+
+
+def _seed_4c(ws):
+    """4b's seed (four decisions + the parked OQ) and a fifth decision."""
+    _, m = ws
+    _seed_4b(ws)
+    _rec(m, "dec-e", scope=["x"])
+
+
+def _points(band, n=5):
+    return [{"slug": s, "score": sc} for s, sc in zip(_4C_SLUGS[:n], _4C_SCORES[band][:n])]
+
+
+def _lever_clause_for(surface, limit, held):
+    return limit_clause(WindowLever(limit, held), surface=surface)
+
+
+def _lever_stem(surface, limit):
+    """What every variant of the clause at this window starts with — the absence probe."""
+    return os.path.commonprefix([_lever_clause_for(surface, limit, limit),
+                                 _lever_clause_for(surface, limit, 0)])
+
+
+def _base_note(driver, config, top_score, n):
+    """The band note the surfaced decisions earn with no lever — today's note."""
+    _call, _key, verb, surface = _4A_DRIVERS[driver]
+    return _4a_band(verb, surface, config, top_score, n)[1]
+
+
+# ---- policy ---------------------------------------------------------------- #
+
+def test_the_lever_is_a_required_keyword_on_both_composers():
+    """ADR register-selecting-keyword-is-required-on-every-axis-never-defaulted: a
+    forgotten call site is a TypeError, not a silently missing clause."""
+    with pytest.raises(TypeError, match="lever"):
+        assess_surface_recall(semantic_ran=True, top_score=0.7, result_count=1,
+                              scope=None, surface="mcp")
+    with pytest.raises(TypeError, match="lever"):
+        assess_query_recall(top_score=0.7, result_count=1, config=_StubConfig(),
+                            surface="mcp")
+
+
+@pytest.mark.parametrize("points,limit,full_top,expected", [
+    (5, 5, None, WindowLever(5, 5)),          # filled, nothing held back
+    (7, 5, None, WindowLever(5, 5)),          # over-full still counts as filled
+    (4, 5, None, None),                       # short window: wider returns nothing more
+    (0, 5, None, None),
+    (5, 5, 2, WindowLever(5, 2)),
+    (5, 5, 9, WindowLever(5, 5)),             # never a cutoff above the window
+    (5, 5, 0, WindowLever(5, 0)),             # brief / full_top=0
+    (49, 49, None, WindowLever(49, 49)),
+    (50, 50, None, None),                     # at the ceiling a higher limit clamps back
+    (60, 50, None, None),
+])
+def test_window_lever_decides_from_points_and_the_ceiling(points, limit, full_top, expected):
+    """Rows 6 and 7 at the predicate: short or at-ceiling → None; held capped at limit."""
+    assert window_lever(points=points, limit=limit, ceiling=50, full_top=full_top) == expected
+
+
+@pytest.mark.parametrize("surface", ["cli", "mcp"])
+def test_the_held_zero_clause_names_limit_only(surface):
+    """Row 7 / K7: with nothing held the clause names no full_top — naming it hands a
+    brief caller a re-send the boundary refuses."""
+    ptr = _SURFACE_POINTERS[surface]
+    held = _lever_clause_for(surface, 5, 3)
+    zero = _lever_clause_for(surface, 5, 0)
+    assert ptr["limit_arg"].format(n=5) in held and ptr["limit_arg"].format(n=5) in zero
+    assert ptr["full_top_arg"].format(n=3) in held
+    assert ptr["full_top_arg"].split("{")[0].strip() not in zero
+
+
+@pytest.mark.parametrize("held", [0, 5])
+def test_the_clause_is_register_clean_and_stays_on_its_boundary(held):
+    """Row 10: no corpus verdict, no write instruction, no claim the deeper ranks score
+    higher; MCP names argument spellings and no shell; the CLI names flags, no call form."""
+    cli = _lever_clause_for("cli", 5, held)
+    mcp = _lever_clause_for("mcp", 5, held)
+    for clause in (cli, mcp):
+        lowered = clause.casefold()
+        for banned in _QUERY_REGISTER_BANNED + ("higher score", "may hold", "precedent"):
+            assert banned not in lowered, (clause, banned)
+        assert "!" not in clause and "⚠" not in clause and "**" not in clause
+    assert "mitos " not in mcp and "-p " not in mcp and "--" not in mcp
+    assert "(" not in cli and "=" not in cli
+
+
+@pytest.mark.parametrize("lever", _4C_LEVERS)
+@pytest.mark.parametrize("label,kw", _QUERY_CASES)
+@pytest.mark.parametrize("surface", ["cli", "mcp"])
+def test_no_query_note_with_the_clause_instructs_a_write(surface, label, kw, lever):
+    """Row 10: the register lock holds with the clause riding, and neither boundary's
+    note borrows the other's call forms."""
+    note = _query_note(surface, lever=lever, **kw)
+    lowered = note.casefold()
+    for banned in _QUERY_REGISTER_BANNED:
+        assert banned not in lowered, f"{label}/{surface} note carries {banned!r}"
+    if surface == "cli":
+        assert "surface_decisions(" not in note and "list_decisions(" not in note
+    else:
+        assert "mitos surface" not in note and "-p " not in note
+
+
+def _band_forks():
+    """Every (fork, composer call) of §3.1's matrix, with whether the clause may ride."""
+    forks = []
+    for verb in ("surface", "query"):
+        for label, top, n, scope_unused, rides in (
+            ("strong", 0.9, 3, False, False),
+            ("weak", 0.65, 3, False, True),
+            ("weak-scope-unused", 0.65, 3, True, True),
+            ("none-results", 0.3, 3, False, True),
+            ("none-results-scope-unused", 0.3, 3, True, True),
+            ("none-empty", None, 0, False, False),
+            ("none-empty-scope-unused", None, 0, True, False),
+        ):
+            if verb == "query" and scope_unused:
+                continue  # the query composer has no scope arm
+            forks.append((verb, label, top, n, scope_unused, rides))
+    for label, n, total in (("degraded-dump", 3, 8), ("degraded-partial", 3, None),
+                            ("degraded-empty", 0, None)):
+        forks.append(("surface-degraded", label, None, n, total, False))
+    return forks
+
+
+@pytest.mark.parametrize("surface", ["cli", "mcp"])
+@pytest.mark.parametrize("fork", _band_forks(), ids=lambda f: f"{f[0]}-{f[1]}")
+@pytest.mark.parametrize("lever", _4C_LEVERS[1:])
+def test_the_clause_rides_exactly_the_weak_and_populated_none_forks(surface, fork, lever):
+    """Stretch: §3.1's matrix, generated — the clause appears iff the fork is weak or
+    none-with-results AND a lever was granted, and is appended after the whole note."""
+    verb, label, top, n, extra, rides = fork
+    clause = limit_clause(lever, surface=surface)
+
+    def compose(lv):
+        if verb == "query":
+            return assess_query_recall(lever=lv, top_score=top, result_count=n,
+                                       config=_StubConfig(), surface=surface)[1]
+        if verb == "surface-degraded":
+            return assess_surface_recall(lever=lv, semantic_ran=False, top_score=None,
+                                         result_count=n, scope="x", scope_total=extra,
+                                         scope_counts=_counts(("x", 8)), surface=surface)[1]
+        scope, counts = ("ghost", _counts(("x", 3))) if extra else (None, None)
+        return assess_surface_recall(lever=lv, semantic_ran=True, top_score=top,
+                                     result_count=n, scope=scope, scope_counts=counts,
+                                     surface=surface)[1]
+
+    bare, with_lever = compose(None), compose(lever)
+    if rides:
+        assert with_lever == f"{bare} {clause}"
+    else:
+        assert with_lever == bare
+        assert _lever_stem(surface, lever.limit) not in with_lever
+
+
+# ---- drivers: the clause on a filled window -------------------------------- #
+
+@pytest.mark.parametrize("band", ["weak", "none"])
+@pytest.mark.parametrize("driver", list(_4A_DRIVERS))
+def test_a_filled_weak_or_none_window_names_the_lever(ws, driver, band):
+    """Row 1: five points at the default limit → the band note, one space, the clause —
+    the same clause characters on `surface` and `query` of one boundary."""
+    config, _ = ws
+    _seed_4c(ws)
+    call, key, _verb, surface = _4A_DRIVERS[driver]
+    resp = call(_points(band), ws)
+    assert resp["confidence"] == band
+    assert len(resp[key]) == 5
+    clause = _lever_clause_for(surface, 5, 5)
+    base = _base_note(driver, config, _4C_SCORES[band][0], 5)
+    assert resp["note"] == f"{base} {clause}"
+
+
+@pytest.mark.parametrize("band", ["weak", "none"])
+@pytest.mark.parametrize("driver", list(_4A_DRIVERS))
+def test_a_short_window_answers_todays_note_byte_for_byte(ws, driver, band):
+    """Rows 2 and 16: four points at limit 5 — a wider window returns nothing more, so
+    the note is the band note alone, exactly what `4b23e68` answered."""
+    config, _ = ws
+    _seed_4c(ws)
+    call, _key, _verb, surface = _4A_DRIVERS[driver]
+    resp = call(_points(band, 4), ws)
+    assert resp["confidence"] == band
+    assert resp["note"] == _base_note(driver, config, _4C_SCORES[band][0], 4)
+    assert _lever_stem(surface, 5) not in resp["note"]
+
+
+@pytest.mark.parametrize("driver", list(_4A_DRIVERS))
+def test_a_full_window_that_surfaces_nothing_names_no_lever(ws, driver):
+    """Row 3 / G2: five points (the parked OQ and four unresolvable slugs) fill the
+    window and surface nothing — `none`'s nothing-ranked fork, where a lever exists and
+    the clause must still stay absent."""
+    config, _ = ws
+    _seed_4c(ws)
+    call, key, _verb, surface = _4A_DRIVERS[driver]
+    points = [{"slug": "oq-parked", "score": 0.7}] + [
+        {"slug": f"ghost-{i}", "score": 0.65} for i in range(4)]
+    resp = call(points, ws)
+    assert resp["confidence"] == "none"
+    assert resp[key] == []
+    assert resp["note"] == _base_note(driver, config, None, 0)
+    assert _lever_stem(surface, 5) not in resp["note"]
+
+
+@pytest.mark.parametrize("driver", list(_4A_DRIVERS))
+def test_the_window_counts_points_not_decisions(ws, driver):
+    """Row 4 / G9b: the OQ takes one of five slots, four decisions surface, the band is
+    weak — the window was full, so the lever is named."""
+    config, _ = ws
+    _seed_4b(ws)
+    call, key, _verb, surface = _4A_DRIVERS[driver]
+    points = [{"slug": "oq-parked", "score": 0.72}] + _points("weak", 4)
+    resp = call(points, ws)
+    assert resp["confidence"] == "weak"
+    assert [h["slug"] for h in resp[key]] == _4B_SLUGS
+    assert resp["note"] == (f"{_base_note(driver, config, 0.7, 4)} "
+                            f"{_lever_clause_for(surface, 5, 5)}")
+
+
+@pytest.mark.parametrize("driver", list(_4A_DRIVERS))
+def test_a_strong_filled_window_names_no_lever(ws, driver):
+    """Row 5: the clause is for the weaker bands only."""
+    config, _ = ws
+    _seed_4c(ws)
+    call, _key, _verb, surface = _4A_DRIVERS[driver]
+    resp = call(_points("strong"), ws)
+    assert resp["confidence"] == "strong"
+    assert resp["note"] == _base_note(driver, config, 0.9, 5)
+
+
+@pytest.mark.parametrize("route", ["no providers", "mid-query fault"])
+@pytest.mark.parametrize("driver", list(_4A_DRIVERS))
+def test_no_degraded_envelope_names_the_lever(ws, driver, route):
+    """Row 5: the lexical envelopes carry no band and no clause, on every route; the
+    scope dump (surface only) neither."""
+    _seed_4c(ws)
+    call, _key, verb, surface = _4A_DRIVERS[driver]
+    matches = None if route == "no providers" else _Boom()
+    resp = call(matches, ws, query="axiom", limit=3)
+    assert resp["degraded"] == "lexical"
+    assert _lever_stem(surface, 3) not in resp["note"]
+    if verb == "surface":
+        dump = call(matches, ws, scope="x", limit=3)
+        assert "degraded" not in dump and len(dump["active_decisions"]) == 3
+        assert "confidence" not in dump
+        assert _lever_stem(surface, 3) not in dump["note"]
+
+
+@pytest.mark.parametrize("driver", list(_4A_DRIVERS))
+def test_no_lever_at_the_clamp_ceiling(ws, driver):
+    """Row 6 / D2: 50 raw points at limit=50 — a higher limit clamps back to 50, so the
+    clause is absent. At 49 the same shape names it (the row is not vacuous)."""
+    config, _ = ws
+    _seed_4c(ws)
+    call, _key, _verb, surface = _4A_DRIVERS[driver]
+    for limit, present in ((50, False), (49, True)):
+        points = [{"slug": "dec-a", "score": 0.7}] + [
+            {"slug": f"ghost-{i}", "score": 0.61} for i in range(limit - 1)]
+        resp = call(points, ws, limit=limit)
+        assert resp["confidence"] == "weak"
+        base = _base_note(driver, config, 0.7, 1)
+        if present:
+            assert resp["note"] == f"{base} {_lever_clause_for(surface, limit, limit)}"
+        else:
+            assert resp["note"] == base
+
+
+@pytest.mark.parametrize("depth,held", [({"full_top": 2}, 2), ({"full_top": 9}, 5),
+                                        ({"full_top": 0}, 0), ({"brief": True}, 0)])
+@pytest.mark.parametrize("driver", list(_4A_DRIVERS))
+def test_the_clause_holds_the_effective_full_top(ws, driver, depth, held):
+    """Row 7 through the boundaries: the held count is the post-normalisation
+    `full_top`, capped at the window; brief and full_top=0 get the limit-only form."""
+    _seed_4c(ws)
+    call, _key, _verb, surface = _4A_DRIVERS[driver]
+    resp = call(_points("weak"), ws, **depth)
+    clause = _lever_clause_for(surface, 5, held)
+    assert clause in resp["note"]
+    if held == 0:
+        assert _SURFACE_POINTERS[surface]["full_top_arg"].split("{")[0].strip() \
+            not in resp["note"]
+
+
+@pytest.mark.parametrize("driver", list(_4A_DRIVERS))
+def test_the_lever_clause_sits_between_the_band_note_and_the_withheld_clause(ws, driver):
+    """Row 8 / §3.3: band note → limit clause (inside the composer) → withheld clause
+    (appended by the call site after every override)."""
+    config, _ = ws
+    _seed_4c(ws)
+    call, _key, _verb, surface = _4A_DRIVERS[driver]
+    resp = call(_points("weak"), ws, full_top=2)
+    lever = _lever_clause_for(surface, 5, 2)
+    withheld = _clause_for(surface, config, 3)
+    assert resp["rejected_paths_withheld"] == 3
+    assert resp["note"] == f"{_base_note(driver, config, 0.7, 5)} {lever} {withheld}"
+    assert resp["note"].index(lever) < resp["note"].index(withheld)
+
+
+@pytest.mark.parametrize("verb", ["surface", "query"])
+def test_the_printed_cli_flags_parse_on_both_verbs(ws, verb):
+    """Row 9: the flags the text render prints, spliced into a real argv on each verb,
+    parse through the real parser to the window and the held count they name."""
+    _seed_4c(ws)
+    if verb == "surface":
+        out = _cli_surface_text(_points("weak"), ws, full_top=2)
+    else:
+        out = _cli_query(_points("weak"), ws, full_top=2)
+    line = next(ln for ln in out.splitlines() if _lever_stem("cli", 5) in ln)
+    limit_m = re.search(r"--limit (\d+)", line)
+    held_m = re.search(r"--full-top (\d+)", line)
+    fragment = [*limit_m.group(0).split(), *held_m.group(0).split()]
+    for target in ("surface", "query"):
+        args = _cli._build_parser().parse_args([target, "-p", "x", "q", *fragment])
+        assert args.limit == int(limit_m.group(1)) == 5
+        assert args.full_top == int(held_m.group(1)) == 2
+
+
+def test_the_lever_pointer_keys_exist_under_both_outer_keys():
+    """Row 12 / K8: a one-sided key is a KeyError on the other boundary."""
+    for key in ("limit_arg", "full_top_arg"):
+        for side in ("cli", "mcp"):
+            assert "{n}" in _SURFACE_POINTERS[side][key], (side, key)
+
+
+# ---- the scope dump -------------------------------------------------------- #
+
+_DUMP_SLUGS = [f"dump-{i}" for i in range(1, 9)]
+
+
+def _seed_dump(ws):
+    """Eight active decisions in scope 'y', and one in scope 'solo'."""
+    _, m = ws
+    for slug in _DUMP_SLUGS:
+        _rec(m, slug, scope=["y"])
+    _rec(m, "only-one", scope=["solo"])
+
+
+def _dump_note(surface, shown, total, scope="y"):
+    return assess_surface_recall(lever=None, semantic_ran=False, top_score=None,
+                                 result_count=shown, scope=scope, scope_total=total,
+                                 surface=surface)[1]
+
+
+def test_the_dump_sentence_names_how_much_of_the_scope_it_shows():
+    """Row 14's words, pinned once here: part, all, and the singular — with the head
+    7a replaces kept verbatim and today's complete_hint tail."""
+    head = "Semantic recall unavailable (embeddings/Qdrant down) — showing "
+    tail = (" as a fallback, NOT a relevance ranking. For the authoritative set use "
+            "list_decisions(scope='y') (pure graph read).")
+    assert _dump_note("mcp", 7, 8) == f"{head}7 of the 8 active decisions in scope 'y'{tail}"
+    assert _dump_note("mcp", 8, 8) == f"{head}all 8 active decisions in scope 'y'{tail}"
+    assert _dump_note("mcp", 1, 1) == f"{head}the one active decision in scope 'y'{tail}"
+
+
+def test_the_partial_list_sentence_is_byte_identical_to_4b():
+    """Row 14's other half / K5: without a scope_total (the G9a partial ranked list)
+    the shared sentence is untouched — frozen here from `4b23e68`, and a lever on
+    that degraded arm is ignored."""
+    frozen = ("Semantic recall unavailable (embeddings/Qdrant down) — showing the "
+              "active decisions in scope 'x' as a fallback, NOT a relevance ranking. "
+              "For the authoritative set use list_decisions(scope='x') (pure graph read).")
+    for lever in (None, WindowLever(5, 5)):
+        assert assess_surface_recall(lever=lever, semantic_ran=False, top_score=None,
+                                     result_count=2, scope="x", scope_total=None,
+                                     surface="mcp")[1] == frozen
+
+
+@pytest.mark.parametrize("route", ["no providers", "mid-query fault"])
+@pytest.mark.parametrize("limit,shown", [(7, 7), (None, 5), (20, 8)])
+def test_the_dump_follows_limit_and_counts_on_both_surfaces(ws, limit, shown, route):
+    """Rows 13 and 14 / K4, K5: the dump shows the clamped limit's worth of the scope,
+    its note says how many of how many, and CLI⇄MCP differ only in call forms."""
+    _seed_dump(ws)
+    matches = None if route == "no providers" else _Boom()
+    got = {}
+    for surface, call in (("mcp", _surface_with), ("cli", _cli_surface_json)):
+        resp = call(matches, ws, scope="y", limit=limit)
+        assert "degraded" not in resp and "confidence" not in resp
+        assert len(resp["active_decisions"]) == shown
+        assert set(h["slug"] for h in resp["active_decisions"]) <= set(_DUMP_SLUGS)
+        assert resp["note"] == _dump_note(surface, shown, 8)
+        got[surface] = resp
+    assert ([h["slug"] for h in got["mcp"]["active_decisions"]]
+            == [h["slug"] for h in got["cli"]["active_decisions"]])
+    cli_hint = _SURFACE_POINTERS["cli"]["complete_scope"].format(scope="y")
+    mcp_hint = _SURFACE_POINTERS["mcp"]["complete_scope"].format(scope="y")
+    assert got["mcp"]["note"].replace(mcp_hint, cli_hint) == got["cli"]["note"]
+
+
+@pytest.mark.parametrize("driver", ["mcp-surface", "cli-surface"])
+def test_a_one_decision_scope_dump_reads_singular(ws, driver):
+    """Row 14: singular grammar at a one-decision scope."""
+    _seed_dump(ws)
+    call, _key, _verb, surface = _4A_DRIVERS[driver]
+    resp = call(None, ws, scope="solo")
+    assert [h["slug"] for h in resp["active_decisions"]] == ["only-one"]
+    assert resp["note"] == _dump_note(surface, 1, 1, scope="solo")
+
+
+@pytest.mark.parametrize("driver", ["mcp-surface", "cli-surface"])
+def test_the_dump_thins_by_position_at_a_wider_limit(ws, driver):
+    """Row 15: 4b's rank-by-position thinning is unchanged on a seven-wide dump."""
+    config, _ = ws
+    _seed_dump(ws)
+    call, _key, _verb, surface = _4A_DRIVERS[driver]
+    resp = call(None, ws, scope="y", limit=7, full_top=2)
+    assert _whole(resp["active_decisions"]) == [True, True] + [False] * 5
+    assert resp["rejected_paths_withheld"] == 5
+    assert resp["note"] == f"{_dump_note(surface, 7, 8)} {_clause_for(surface, config, 5)}"
