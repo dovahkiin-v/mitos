@@ -101,7 +101,7 @@ from mitos.recall import (assess_query_recall, assess_surface_recall,
 from mitos.sync import (MitosSyncManager, run_ambient_capture, _SLUG_MAX_LEN,
                         _ENTRIES_MARKER, _NEIGHBOR_REVIEW_THRESHOLD,
                         _PAUSE_RESOLVING_RELATIONS, _declared_echo_lines, _split_relation_slugs,
-                        PAUSE_HELD_CLAUSE,
+                        EXISTS_NO_OP_FACT, PAUSE_HELD_CLAUSE,
                         ROTATION_FAILED, ROTATION_REASON_DUPLICATED, ROTATION_ROTATED,
                         ROTATION_SKIPPED, ROTATION_STAGE_FILE, ROTATION_STAGE_LOCK)
 from mitos._agent_block import agent_block, agent_block_drift, AGENT_GUIDE_VERSION
@@ -2200,8 +2200,10 @@ def cmd_record(
     # exists to prevent, on the write itself rather than on the review.
     _echo_corpus(config)
     no_op = result.get("no_op_reason")
+    # Branched on the key, but the dict's text is never printed: it is MCP-worded, and
+    # this boundary composes its own recovery below (`_exists_recovery_lines`).
     if no_op:
-        print(f"Decision '{result['slug']}' {no_op}")
+        print(f"Decision '{result['slug']}' {EXISTS_NO_OP_FACT}")
     else:
         print(f"Recorded decision '{result['slug']}' ({result['status']}) ✓")
     print(f"  ID:        {result['id']}")
@@ -2227,7 +2229,10 @@ def cmd_record(
         # AX round 10's ask, verbatim: *say what it ignored*. Named BEFORE the handle
         # line, because on a no-op this is the actionable part of the receipt.
         print(f"  Ignored:   this call carried different {', '.join(differs)} than the "
-              f"graph holds — run `mitos sync` to reconcile the entry in decisions.md.")
+              f"graph holds — nothing was saved; see below.")
+    if no_op:
+        for line in _exists_recovery_lines(result, config):
+            print(line)
     print(f"  Handle:    '{result['slug']}' — pass this to --supersedes/--amends/--depends-on/… to link future decisions.")
     # Read back from the committed node (NOT an echo of the flags): the edges the
     # commit actually wired, each naming what it hit, scope as stored, and
@@ -2286,7 +2291,7 @@ def cmd_record(
     # FIELD, which sync sets on the `created` return alone: this text tail is shared
     # with the `exists` exit (it branches only on the headline and the path label),
     # and a no-op incurs no audit debt — an unconditional print would also put a
-    # second recipe on a receipt that already carries the `mitos sync` one. Same
+    # further recipe on a receipt that already carries its own recovery lines. Same
     # flush-first shape as the two riders above; the `--json` branch returned long
     # ago, which is why the recovery clause is text-only by construction rather than
     # by a condition.
@@ -2294,6 +2299,53 @@ def cmd_record(
     if coherence:
         sys.stdout.flush()
         print(f"\n{coherence} {_coherence_audit_hint(config)}", file=sys.stderr)
+
+
+def _cli_flag(flag: str, value: str) -> str:
+    """Renders ``--flag 'value'``, or ``--flag='-value'`` when the value looks like a flag.
+
+    A hand-authored ``### -foo`` keeps its leading dash through the parser, and
+    argparse reads a separate ``-foo`` as an option; the ``=`` form binds it.
+    """
+    return f"{flag}={value!r}" if value.startswith("-") else f"{flag} {value!r}"
+
+
+def _exists_recovery_lines(result: Dict[str, Any], config: MitosConfig) -> List[str]:
+    """Composes the CLI's recovery for an ``exists`` no-op — this boundary's alone.
+
+    The fact is ``EXISTS_NO_OP_FACT``, shared with the dict. The dict's own recovery
+    is MCP-worded (it names the ``amend_commentary`` tool and no command), so this
+    renderer names the selectored recipes the person at the terminal runs (ADR
+    receipt-dict-strings-are-mcp-boundary-so-recovery-splits-per-renderer). The two
+    states the verb cannot reach are conditionals: the receipt does not know which,
+    if either, holds.
+
+    Args:
+        result: The ``exists`` receipt dict.
+        config: The workspace config; its ``project`` selects every recipe.
+
+    Returns:
+        The recovery lines, each indented for the receipt.
+    """
+    project = config.project
+    slug = result["slug"]
+    # The handle leads the flags the reader appends (`--scope` eats every word after
+    # it), and no `--` guards it, so a dash-led slug falls back to the id.
+    handle = result["id"] if slug.startswith("-") else slug
+    return [
+        f"  → To change its commentary: `mitos amend-commentary -p {project!r} {handle!r}` "
+        "with a flag per field (--rejected, --scope, --invalidates-if, --context, "
+        "--new-slug); it edits in place and keeps the id.",
+        "  → Relations are not commentary: edit the relation line in decisions.md, then "
+        f"apply it with `mitos sync -p {project!r} {_cli_flag('--reconcile-entry', slug)}`.",
+        "  → amend-commentary reaches an entry only while its `### ` block is in decisions.md. If "
+        f"the node has no block, `mitos restore-source -p {project!r} "
+        f"{_cli_flag('--slug', slug)}` re-materializes one first; if the entry has "
+        "rotated into decisions/archive/, edit it there, then run "
+        f"`mitos rebuild -p {project!r}`.",
+        "  → To record a changed decision, write a new one with --supersedes or --amends "
+        "naming this slug.",
+    ]
 
 
 def _rotation_receipt_lines(report: Dict[str, Any]) -> List[str]:

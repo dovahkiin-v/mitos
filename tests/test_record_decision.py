@@ -9,7 +9,10 @@ every error path leaves decisions.md byte-for-byte unchanged.
 """
 
 import os
+import inspect
 import json
+import re
+import shlex
 import shutil
 import sys
 import tempfile
@@ -826,6 +829,24 @@ def test_mcp_receipt_carries_edges_and_fields(ws) -> None:
     assert res["scope"] == ["db"] and res["mechanisms"] == ["sqlite"]
 
 
+#: What an MCP string may never carry: a `mitos <verb>` command, a `-p` selector in a
+#: code span, the two repair verbs, a CLI flag. Token-level, so a sentence ending in
+#: "mitos" or the tool's own backticked name cannot pass or fail it by accident.
+_SHELL_TOKEN_PATTERNS = (r"\bmitos\s+[a-z-]+", r"`[^`]*\s-p\b[^`]*`", r"restore-source",
+                         r"\brebuild\b", r"--")
+
+
+def _shell_tokens(text: str) -> list:
+    """Returns the shell-token patterns ``text`` matches; empty means MCP-clean."""
+    return [pat for pat in _SHELL_TOKEN_PATTERNS if re.search(pat, text)]
+
+
+def _names_the_unreachable_pair(note: str) -> bool:
+    """Both states the tool cannot reach, as facts, alike to the tool, a person next."""
+    return ("no source block" in note and "decisions/archive/" in note
+            and "cannot tell the two apart" in note and "a person" in note)
+
+
 def test_exists_receipt_reports_the_no_op_without_dropping_the_pointer(ws) -> None:
     """A re-record writes nothing and must say so — while still pointing at the entry.
 
@@ -847,25 +868,21 @@ def test_exists_receipt_reports_the_no_op_without_dropping_the_pointer(ws) -> No
     assert r2["status"] == "exists"
     assert r2["path"] == config.decisions_file, "the pointer stays (#5b)"
     assert r2.get("no_op_reason"), "a no-op must say so in-band"
-    # INVERTED, deliberately and only now: `mitos sync` reconciles a diverged committed
-    # entry as of the C′ release, so the note finally names a path that WORKS. Before
-    # that it pointed at a silent no-op, and this assertion was what kept the receipt
-    # honest in the meantime — the exact bug class the divergence work exists to kill,
-    # held off for three releases until the capability was real.
-    assert "mitos sync" in r2["no_op_reason"]
-    assert "restore-source" in r2["no_op_reason"], (
-        "a graph-only node has no entry to edit — the note must name the verb that "
-        "re-materializes one"
-    )
+    # Inverted twice. From the C′ release the note named `mitos sync`, the first path
+    # that worked; 0.18.0 shipped the tool built for this, and the dict is an MCP
+    # boundary (`record --json` emits it verbatim), so it now names that tool and no
+    # shell command. The CLI's recipes are its own (see the exists-recovery rows).
+    assert "amend_commentary" in r2["no_op_reason"]
+    assert _shell_tokens(r2["no_op_reason"]) == [], r2["no_op_reason"]
 
 
-def test_exists_no_op_note_covers_the_graph_only_case(ws) -> None:
-    """The note distinguishes "edit the entry" from "there is no entry to edit".
+def test_exists_no_op_note_states_the_unreachable_pair_and_claims_neither(ws) -> None:
+    """The two states the tool cannot reach are a pair of facts, with a person next.
 
-    Both halves are reachable, and they need different verbs: a buffer entry is
-    reconciled by `mitos sync`, while a node with no `### ` block has nothing to edit
-    until `mitos restore-source` re-materializes it. Sending a caller to edit an entry
-    that does not exist is the failure this replaced.
+    A node with no source block and an entry rotated into decisions/archive/ both answer
+    `archived` from `amend_commentary`, which cannot tell them apart — and the receipt
+    does not know either, so it names both and claims neither for this entry. No verb
+    for the repair: on MCP a command is one the agent runs.
     """
     config, m = ws
     m.record_decision_entry("Pin the digest length.", "Leave it to the implementer.",
@@ -873,8 +890,12 @@ def test_exists_no_op_note_covers_the_graph_only_case(ws) -> None:
     note = m.record_decision_entry("Pin the digest length.", "CORRECTED rejected text.",
                                    [], slug="pin-digest-length")["no_op_reason"]
 
-    assert "no `### ` block" in note, "the graph-only case must be named"
-    assert "restore-source" in note, "and pointed at its verb"
+    assert _names_the_unreachable_pair(note), note
+    lowered = note.casefold()
+    for claim in ("this entry is archived", "this entry is in decisions/archive",
+                  "this node has no", "it sits in decisions/archive"):
+        assert claim not in lowered, claim
+    assert "rebuild" not in lowered and "restore-source" not in lowered
 
 
 def test_exists_receipt_names_the_fields_it_ignored(ws) -> None:
@@ -928,10 +949,214 @@ def test_exists_no_op_leaves_a_missing_source_block_missing(ws) -> None:
     res = m.record_decision_entry("Restore me later.", "Nothing.", [], slug="graph-only-node")
     assert res["status"] == "exists"
     assert "### graph-only-node" not in _read(config), "re-record must not be believed to restore"
-    # The note names the VERB that restores it, not merely the possibility — a
-    # re-record cannot, and until `restore-source` shipped there was nothing that could.
-    assert "restore-source" in res["no_op_reason"]
-    assert "no `### ` block" in res["no_op_reason"]
+    # The dict states the pair as facts; the verb that restores it is the CLI's to
+    # name (test_exists_cli_recipes_parse runs this same graph-only state).
+    assert _names_the_unreachable_pair(res["no_op_reason"])
+
+
+# --------------------------------------------------------------------------- #
+# The exists recovery, per boundary (B11): the dict speaks MCP, the CLI text its own
+# --------------------------------------------------------------------------- #
+
+def _replay_text(config, m, *, axiom="Pin the digest length.", slug="pin-digest-length",
+                 rejected="CORRECTED reasoning.", capsys) -> str:
+    """Records once through the manager, replays through the CLI text; returns stdout."""
+    from mitos.cli import cmd_record
+    m.record_decision_entry(axiom, "The original reasoning.", [], slug=slug)
+    capsys.readouterr()
+    cmd_record(config, axiom=axiom, rejected=rejected, slug=slug,
+               acknowledge_neighbors=True)
+    out, err = capsys.readouterr()
+    assert err == "", err
+    return out
+
+
+def test_mcp_exists_note_names_the_tool_and_no_shell_command(ws) -> None:
+    """R1: the real MCP entry's replay names `amend_commentary`, in real argument names."""
+    from mitos import mcp_server
+    config, _ = ws
+    with patch("mitos.mcp_server.MitosConfig", return_value=config):
+        json.loads(mcp_server.record_decision(
+            "Pin the digest length.", "rej", ["db"], slug="pin-digest-length",
+            project=config.workspace_dir))
+        res = json.loads(mcp_server.record_decision(
+            "Pin the digest length.", "CORRECTED rej", ["db"], slug="pin-digest-length",
+            project=config.workspace_dir))
+    assert res["status"] == "exists"
+    note = res["no_op_reason"]
+    assert "`amend_commentary`" in note
+    assert _shell_tokens(note) == [], note
+    assert "supersedes or amends" in note, "bare argument names, not CLI flags"
+
+    amend_params = set(inspect.signature(mcp_server.amend_commentary).parameters)
+    record_params = set(inspect.signature(mcp_server.record_decision).parameters)
+    for name in ("rejected_paths", "scope", "invalidates_if", "context", "new_slug"):
+        assert re.search(rf"\b{name}\b", note) and name in amend_params, name
+    for name in ("supersedes", "amends"):
+        assert re.search(rf"\b{name}\b", note) and name in record_params, name
+    # Every snake_case word it cites is a real argument, or the tool's own name.
+    cited = set(re.findall(r"\b[a-z]+(?:_[a-z]+)+\b", note))
+    assert cited <= amend_params | record_params | {"amend_commentary"}, cited
+
+
+def test_json_exists_receipt_carries_the_dict_note_verbatim(ws, capsys) -> None:
+    """R2: `record --json` is the dict, so it carries the MCP wording (D1)."""
+    from mitos.cli import cmd_record
+    from mitos.sync import _EXISTS_NO_OP_NOTE
+    config, m = ws
+    m.record_decision_entry("Pin the digest length.", "rej", [], slug="pin-digest-length")
+    capsys.readouterr()
+    cmd_record(config, axiom="Pin the digest length.", rejected="other", slug="pin-digest-length",
+               acknowledge_neighbors=True, as_json=True)
+    res = json.loads(capsys.readouterr().out)
+    assert res["status"] == "exists"
+    assert res["no_op_reason"] == _EXISTS_NO_OP_NOTE
+    assert _shell_tokens(res["no_op_reason"]) == []
+
+
+def _excise_block(config, slug: str) -> None:
+    """Cuts ``### slug``'s block from decisions.md, leaving the node graph-only."""
+    text = _read(config)
+    head, _, tail = text.partition(f"### {slug}")
+    with open(config.decisions_file, "w", encoding="utf-8") as f:
+        f.write(head + tail.partition("\n### ")[1] + tail.partition("\n### ")[2])
+
+
+@pytest.mark.parametrize("state", ["buffer", "graph-only"])
+@pytest.mark.parametrize("project", [None, "my proj", "vinga's proj"])
+def test_exists_cli_recipes_parse(ws, capsys, project, state) -> None:
+    """R3: every recipe the text receipt prints parses through the real parser, selectored.
+
+    Read off the printed stdout, so a plant that changes what is printed is what reds.
+    The graph-only state is the one `restore-source` heals; the receipt prints the
+    same recipes on it, as conditionals.
+    """
+    from mitos import cli
+    config, m = ws
+    if project is not None:
+        config.project = project
+    if state == "graph-only":
+        m.record_decision_entry("Pin the digest length.", "The original reasoning.", [],
+                                slug="pin-digest-length")
+        _excise_block(config, "pin-digest-length")
+    out = _replay_text(config, m, capsys=capsys)
+    if state == "graph-only":
+        assert "### pin-digest-length" not in _read(config)
+
+    spans = re.findall(r"`(mitos [^`]+)`", out)
+    verbs = set()
+    for span in spans:
+        args = cli._build_parser().parse_args(shlex.split(span)[1:])
+        verbs.add(args.command)
+        assert args.project_post == config.project, span
+        if args.command == "amend-commentary":
+            assert args.handle == "pin-digest-length"
+        elif args.command == "restore-source":
+            assert args.slug == "pin-digest-length"
+        elif args.command == "sync":
+            assert args.reconcile_entry == ["pin-digest-length"]
+    assert verbs == {"amend-commentary", "sync", "restore-source", "rebuild"}, spans
+    # The field flags the amend line lists are read off the real subparser, not trusted.
+    amend_line = next(line for line in out.splitlines() if "mitos amend-commentary" in line)
+    listed = re.findall(r"--[a-z-]+", amend_line.split("`")[2])
+    subparsers = next(a for a in cli._build_parser()._actions
+                      if hasattr(a, "choices") and isinstance(a.choices, dict))
+    real = set(subparsers.choices["amend-commentary"]._option_string_actions)
+    assert listed and set(listed) <= real, (listed, sorted(real))
+
+
+def test_exists_cli_recipes_bind_a_dash_led_slug(ws, capsys) -> None:
+    """A hand-authored `### -foo` keeps its dash, and argparse reads `-foo` as a flag.
+
+    The amend recipe falls back to the id (never dash-led); the flag recipes use `=`.
+    """
+    from mitos import cli
+    from mitos.cli import cmd_record
+    config, m = ws
+    m.store.commit_parsed_entry(_mk_entry("A dash-led decision.", "-dash-led"))
+    capsys.readouterr()
+    cmd_record(config, axiom="A dash-led decision.", rejected="setup rejection",
+               slug="dash-led", acknowledge_neighbors=True)
+    out = capsys.readouterr().out
+    assert "Decision '-dash-led' already recorded" in out, out
+    node_id = re.search(r"ID:\s+([0-9a-f]+)", out).group(1)
+    parsed = {a.command: a for a in (cli._build_parser().parse_args(shlex.split(s)[1:])
+                                     for s in re.findall(r"`(mitos [^`]+)`", out))}
+    assert parsed["amend-commentary"].handle == node_id
+    assert parsed["restore-source"].slug == "-dash-led"
+    assert parsed["sync"].reconcile_entry == ["-dash-led"]
+
+
+@pytest.mark.parametrize("rejected", ["The original reasoning.", "CORRECTED reasoning."])
+def test_exists_cli_names_amend_commentary_exactly_once(ws, capsys, rejected) -> None:
+    """R4: one recipe per receipt, with or without `differs`; `Ignored:` names no command."""
+    config, m = ws
+    out = _replay_text(config, m, rejected=rejected, capsys=capsys)
+    assert out.count("mitos amend-commentary") == 1, out
+    ignored = [line for line in out.splitlines() if "Ignored:" in line]
+    if rejected.startswith("CORRECTED"):
+        assert len(ignored) == 1 and "rejected_paths" in ignored[0]
+        assert not re.search(r"\bmitos\s+[a-z-]+", ignored[0]), ignored[0]
+    else:
+        assert ignored == []
+
+
+def test_exists_cli_headline_prints_the_shared_fact_not_the_dict_note(ws, capsys) -> None:
+    """R5: the CLI prints `EXISTS_NO_OP_FACT` and composes its own recovery."""
+    from mitos.sync import EXISTS_NO_OP_FACT, _EXISTS_NO_OP_NOTE
+    config, m = ws
+    out = _replay_text(config, m, capsys=capsys)
+    assert f"Decision 'pin-digest-length' {EXISTS_NO_OP_FACT}" in out
+    mcp_recovery = _EXISTS_NO_OP_NOTE[len(EXISTS_NO_OP_FACT):].strip()
+    assert mcp_recovery[:60] not in out
+    assert "amend_commentary" not in out, "the tool's name is the dict's, not this boundary's"
+
+
+def test_created_receipt_prints_no_exists_recovery(ws, capsys) -> None:
+    """R6: the text tail is shared, and a `created` receipt carries none of it."""
+    from mitos.cli import cmd_record
+    config, _ = ws
+    cmd_record(config, axiom="A fresh decision.", rejected="rej", slug="fresh")
+    out, err = capsys.readouterr()
+    assert "Recorded decision 'fresh'" in out
+    for token in ("amend-commentary", "restore-source", "rebuild", "already recorded"):
+        assert token not in out + err, token
+
+
+def test_toctou_exists_twin_carries_the_same_note(ws) -> None:
+    """R7: the Phase-B `exists` return carries the gate-3 note byte for byte.
+
+    A racer commits the same node between the fast-fail and the in-lock recheck, so
+    only the twin can answer.
+    """
+    config, m = ws
+    other = MitosSyncManager(config)
+    real_lock = m.lock
+    raced = []
+
+    class InjectingLock:
+        def __enter__(self):
+            if not raced:
+                other.store.commit_parsed_entry(_mk_entry("Raced axiom.", "raced"))
+                raced.append(True)
+            return real_lock.__enter__()
+
+        def __exit__(self, *exc):
+            return real_lock.__exit__(*exc)
+
+    m.lock = InjectingLock()
+    twin = m.record_decision_entry("Raced axiom.", "setup rejection", [], slug="raced")
+    assert raced and twin["status"] == "exists", twin
+    gate3 = m.record_decision_entry("Raced axiom.", "setup rejection", [], slug="raced")
+    assert gate3["status"] == "exists"
+    assert twin["no_op_reason"] == gate3["no_op_reason"]
+
+
+def test_exists_note_starts_with_the_shared_fact() -> None:
+    """R8: one fact, two boundaries — the dict's note is the fact plus its recovery."""
+    from mitos.sync import EXISTS_NO_OP_FACT, _EXISTS_NO_OP_NOTE
+    assert _EXISTS_NO_OP_NOTE.startswith(EXISTS_NO_OP_FACT)
+    assert "already recorded" in EXISTS_NO_OP_FACT
 
 
 # --------------------------------------------------------------------------- #

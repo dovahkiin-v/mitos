@@ -560,13 +560,6 @@ def _mechanisms_fold_map(authored: List[str]) -> Dict[str, str]:
     return folded
 
 
-# Returned on the two "exists" short-circuits, which write nothing at all. The
-# no-op is deliberate (a committed canonical core is immutable, M1) — what was
-# NOT deliberate is that the receipt used to report the buffer path, so a
-# re-record aimed at correcting commentary, or at restoring a source block for a
-# graph-only node, reported success while changing nothing. The note names the
-# path that does work; `mitos sync` does not, since it re-commits nothing for a
-# node already in the graph.
 def _edge_state_labels(pairs: List[Dict[str, str]]) -> List[str]:
     """Renders edges as a sorted ``["kind:target", ...]`` state list for the audit row.
 
@@ -580,19 +573,34 @@ def _edge_state_labels(pairs: List[Dict[str, str]]) -> List[str]:
                    if p.get("target")})
 
 
-_EXISTS_NO_OP_NOTE = (
+# Returned on the two "exists" short-circuits, which write nothing at all. The
+# no-op is deliberate (a committed canonical core is immutable, M1); what was not
+# deliberate is that the receipt once reported the buffer path as a write, so a
+# re-record aimed at correcting commentary read as success while changing nothing
+# (#5b). The fact is shared: the CLI imports it for its headline. The note is the
+# dict's, and the dict is an MCP boundary (`record --json` emits it verbatim), so its
+# recovery names the `amend_commentary` tool and no shell command; the CLI text
+# composes its own selectored recipes (ADR
+# receipt-dict-strings-are-mcp-boundary-so-recovery-splits-per-renderer). The two
+# states the tool cannot reach both answer `archived` there, so the note states
+# them as a pair and claims neither.
+EXISTS_NO_OP_FACT = (
     "already recorded — this call wrote nothing, to the buffer or the graph. "
     "A committed decision's axiom and mechanisms are immutable (M1): re-recording "
-    "them is a no-op. To correct its commentary (rejected_paths, scope, "
-    "invalidates_if, context), edit the entry in decisions.md and run `mitos sync` — "
-    "it reconciles a diverged committed entry, printing the field diff first. "
-    "Two states sync cannot reach: a node with no `### ` block (run "
-    "`mitos restore-source --slug <slug>` first), and an entry already rotated into "
-    "decisions/archive/ — sync reads only the buffer, so that one's reconciler is "
-    "`mitos rebuild`, which can refuse the swap and which re-mints confirmation "
-    "metadata, so correct it while it is still in the buffer if you can. "
-    "To record a CHANGED decision, write a new one with --supersedes/--amends "
-    "pointing at this slug."
+    "them is a no-op."
+)
+_EXISTS_NO_OP_NOTE = (
+    EXISTS_NO_OP_FACT + " "
+    "To change its commentary (rejected_paths, scope, invalidates_if, context, or its "
+    "slug with new_slug), call the `amend_commentary` tool on this same project with "
+    "this slug; it edits the entry in place and keeps the id. Relations are not "
+    "commentary and that tool refuses them: relation lines are edited in decisions.md "
+    "and applied by a sync reconcile, which no tool here performs — a person with a "
+    "shell in that project runs it. The tool reaches an entry only while its `### ` "
+    "block is in decisions.md. A node with no source block and an entry already "
+    "rotated into decisions/archive/ both answer `archived` from it, and the tool cannot "
+    "tell the two apart; either one is repaired by a person. To record a changed "
+    "decision, record a new one with supersedes or amends naming this slug."
 )
 
 # The standing coherence debt, stated without a number: the `created` receipt's

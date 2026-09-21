@@ -216,7 +216,8 @@ def test_cli_record_exists_does_not_label_the_path_as_written(ws, capsys):
     assert "Written:" not in out, "nothing was written on the exists path"
     assert "Recorded decision" not in out, "a no-op must not borrow the success headline"
     assert "wrote nothing" in out
-    # The note names a repair per reachable state: `sync` for a buffer entry (as of the
-    # reconcile release), `restore-source` for a node with no block, `rebuild` for one
-    # that has rotated into an archive.
-    assert "mitos sync" in out and "restore-source" in out and "mitos rebuild" in out
+    # The text receipt names its own recipes (B11): `amend-commentary` for commentary,
+    # `sync --reconcile-entry` for relations, `restore-source` for a node with no block,
+    # `rebuild` for one that has rotated into an archive.
+    assert "mitos amend-commentary" in out and "mitos sync" in out
+    assert "restore-source" in out and "mitos rebuild" in out
