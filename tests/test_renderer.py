@@ -137,13 +137,75 @@ def test_estimate_tokens_heuristic() -> None:
     assert estimate_tokens(401) == 100  # floor division
 
 
+def _over(name: str, chars: int, threshold: int, scope=None) -> dict:
+    """An ``_overflow_entry``-shaped record (only the keys the nudge reads matter)."""
+    return {"name": name, "scope": scope, "chars": chars, "est_tokens": chars // 4,
+            "threshold_chars": threshold, "top_decisions": []}
+
+
 def test_summarize_overflows_none_singular_plural() -> None:
-    """summarize_overflows is None when clean, and pluralises + points at `mitos status`."""
+    """summarize_overflows is None when clean, pluralises, and names no command (G1
+    inverted: the string reaches MCP verbatim, so the recipe is the CLI text's to add)."""
     assert summarize_overflows([]) is None
-    one = summarize_overflows([{"name": "substrate.md"}])
-    assert one is not None and "1 rendered axiom file " in one and "mitos status" in one
-    two = summarize_overflows([{"name": "a.md"}, {"name": "b.md"}])
-    assert "2 rendered axiom files " in two
+    one = summarize_overflows([_over("substrate.md", 20_500, 20_000, "substrate")])
+    assert one is not None and "1 rendered axiom file over its size ceiling" in one
+    assert "mitos " not in one and "`" not in one
+    two = summarize_overflows([_over("a.md", 30_000, 20_000, "a"),
+                               _over("b.md", 21_000, 20_000, "b")])
+    assert "2 rendered axiom files over their size ceiling" in two
+
+
+def test_summarize_overflows_names_files_sizes_and_ceilings_largest_first() -> None:
+    """R1: each file is named with its size and its own ceiling, comma-formatted,
+    largest first even when the input is in write order (global first)."""
+    records = [_over("live_axioms.md", 50_400, 50_000),
+               _over("ax.md", 31_485, 20_000, "ax")]
+    line = summarize_overflows(records)
+    assert "live_axioms.md 50,400 chars (ceiling 50,000)" in line
+    assert "ax.md 31,485 chars (ceiling 20,000)" in line
+    assert line.index("live_axioms.md") < line.index("ax.md")
+    line = summarize_overflows([_over("small.md", 20_100, 20_000, "s"),
+                                _over("live_axioms.md", 70_077, 50_000)])
+    assert line.index("live_axioms.md") < line.index("small.md")
+    assert "\n" not in line
+    # The input is not reordered (G4: `renderer.overflows` keeps write order).
+    assert [r["name"] for r in records] == ["live_axioms.md", "ax.md"]
+
+
+def test_summarize_overflows_caps_the_named_files_and_counts_the_rest() -> None:
+    """R2: exactly the cap is named, the largest ones, and the rest are counted."""
+    cap = R.OVERFLOW_NUDGE_FILE_CAP
+    records = [_over(f"s{i}.md", 30_000 - i, 20_000, f"s{i}") for i in range(cap + 2)]
+    line = summarize_overflows(records)
+    named = [r["name"] for r in records if f"{r['name']} " in line]
+    assert named == [f"s{i}.md" for i in range(cap)]
+    assert "and 2 more" in line
+    assert f"{cap + 2} rendered axiom files" in line
+
+
+def test_summarize_overflows_states_its_cadence() -> None:
+    """R3: the window, its scope, and that absence does not mean resolved."""
+    line = summarize_overflows([_over("live_axioms.md", 60_000, 50_000)])
+    assert "once a day per workspace" in line
+    assert "does not mean the files shrank" in line
+
+
+def test_overflow_cadence_sentence_is_pinned_to_the_window_constant() -> None:
+    """R4: "once a day" is 86,400 s, and the write path's `hint_due` call passes the
+    constant by name — change the window and this row forces a look at the sentence."""
+    import ast
+    import mitos.sync as sync_mod
+    assert R.OVERFLOW_HINT_WINDOW_SECONDS == 86_400
+    assert "once a day" in summarize_overflows([_over("live_axioms.md", 60_000, 50_000)])
+    tree = ast.parse(inspect.getsource(sync_mod))
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+             and isinstance(n.func, ast.Name) and n.func.id == "hint_due"
+             and isinstance(n.args[0], ast.Constant)
+             and n.args[0].value == "scope_overflow_hint.json"]
+    assert len(calls) == 1
+    window = calls[0].args[2]
+    assert isinstance(window, ast.Name) and window.id == "OVERFLOW_HINT_WINDOW_SECONDS"
+    assert sync_mod.OVERFLOW_HINT_WINDOW_SECONDS is R.OVERFLOW_HINT_WINDOW_SECONDS
 
 
 def test_assemble_render_matches_disk(temp_workspace: Tuple[GraphStore, str]) -> None:

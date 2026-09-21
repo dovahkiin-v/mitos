@@ -93,7 +93,7 @@ from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.provider_cause import describe_embed_failure
 from mitos.tool_markup import field_values, find_tool_call_markup
 from mitos.vector_store import QdrantVectorStore, hash_to_uuid
-from mitos.renderer import MitosRenderer, summarize_overflows
+from mitos.renderer import MitosRenderer, OVERFLOW_HINT_WINDOW_SECONDS, summarize_overflows
 from mitos.restore import BufferFidelityError, verify_amended_buffer
 
 
@@ -4619,7 +4619,8 @@ class MitosSyncManager:
             renderer = MitosRenderer(self.config.workspace_dir)
             renderer.render_all(self.store)
             if renderer.overflows and hint_due(
-                "scope_overflow_hint.json", self.config.workspace_dir, 24 * 60 * 60
+                "scope_overflow_hint.json", self.config.workspace_dir,
+                OVERFLOW_HINT_WINDOW_SECONDS,
             ):
                 overflow_summary = summarize_overflows(renderer.overflows)
         except Exception as e:
@@ -4692,9 +4693,10 @@ class MitosSyncManager:
         # (never on clean-empty, unconfigured, or acknowledged-past records).
         if review_unavailable:
             result["neighbor_review_unavailable"] = review_unavailable
-        # Debounced, presentation-only: a one-line "N files over the size ceiling — run
-        # `mitos status`" nudge, never on the burying-the-receipt critical path. Shared
-        # by both surfaces (CLI prints it after the receipt; MCP returns it structured).
+        # Debounced, presentation-only: a one-line nudge naming the over-ceiling files,
+        # their ceilings and its own once-a-day cadence, and no command — it is shared
+        # by both surfaces (MCP returns it verbatim; CLI text prints it after the
+        # receipt and adds its own selectored `mitos status -p` recipe line).
         if overflow_summary:
             result["scope_overflow"] = overflow_summary
         # What this call's rotation did, only when it moved, skipped or failed — never

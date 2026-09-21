@@ -25,6 +25,8 @@ from mitos.cli import cmd_init, cmd_query, cmd_surface
 from mitos.errors import (CollectionMissingError, DatabaseError, EmbeddingError,
                           VectorStoreError)
 from mitos.lexical import (
+    DISPLAY_STOPWORDS,
+    LEXICAL_MIN_TERM_LEN,
     degraded_reason_from_error,
     lexical_fallback,
     _query_terms,
@@ -202,6 +204,120 @@ class TestLexicalFallbackCore:
 
 
 # ---------------------------------------------------------------------------
+# F2 — display stopwords: dropped from `matched_terms`, counted, never re-ranked
+# ---------------------------------------------------------------------------
+
+# The EC's own query (F2, live): mostly function words around three content terms.
+_EC_QUERY = "how does the pause decide which neighbours to show to the author"
+_CLEAN_QUERY = "cache strategy redis eviction"
+
+_GOLDEN_CORPUS = [
+    ("pause-display-rule", "How the review pause does show which entries matter."),
+    ("which-way-does-the-flow-go", "How does the thing work, and which way."),
+    ("cache-strategy", "The cache strategy decides where results live."),
+    ("author-credit", "Author credit lines are kept."),
+    ("redis-eviction", "Redis eviction runs nightly."),
+    ("unrelated", "Totally different."),
+]
+
+# Captured on `9ef2f8a` (7c), before F2 touched `lexical.py`: `lexical_fallback(q,
+# corpus_paths=[<_GOLDEN_CORPUS>], reason="golden", store=None)`, `json.dumps` with
+# default separators and `ensure_ascii=False`. The pre-change envelopes F2 is held to.
+_GOLDEN_NOTE = (
+    "Semantic recall unavailable (golden) — deterministic text match over the markdown "
+    "corpus (decisions.md + decisions/archive/) (degraded): Graph unavailable — "
+    "state/modifier stamps not applied; entries come straight from the markdown corpus "
+    "and may include superseded ones."
+)
+_GOLDEN_EC = (
+    '{"degraded": "lexical", "degraded_reason": "golden", "matches": ['
+    '{"slug": "pause-display-rule", "axiom": "How the review pause does show which '
+    'entries matter.", "scope": [], "matched_terms": ["how", "does", "the", "pause", '
+    '"which", "show"], "rejected_paths": "none."}, '
+    '{"slug": "which-way-does-the-flow-go", "axiom": "How does the thing work, and '
+    'which way.", "scope": [], "matched_terms": ["how", "does", "the", "which"], '
+    '"rejected_paths": "none."}, '
+    '{"slug": "cache-strategy", "axiom": "The cache strategy decides where results '
+    'live.", "scope": [], "matched_terms": ["the", "decide"], "rejected_paths": '
+    '"none."}, '
+    '{"slug": "author-credit", "axiom": "Author credit lines are kept.", "scope": [], '
+    '"matched_terms": ["author"], "rejected_paths": "none."}], '
+    '"stamps_unavailable": true, "note": ' + json.dumps(_GOLDEN_NOTE, ensure_ascii=False)
+    + '}'
+)
+_GOLDEN_CLEAN = (
+    '{"degraded": "lexical", "degraded_reason": "golden", "matches": ['
+    '{"slug": "cache-strategy", "axiom": "The cache strategy decides where results '
+    'live.", "scope": [], "matched_terms": ["cache", "strategy"], "rejected_paths": '
+    '"none."}, '
+    '{"slug": "redis-eviction", "axiom": "Redis eviction runs nightly.", "scope": [], '
+    '"matched_terms": ["redis", "eviction"], "rejected_paths": "none."}], '
+    '"stamps_unavailable": true, "note": ' + json.dumps(_GOLDEN_NOTE, ensure_ascii=False)
+    + '}'
+)
+
+
+class TestDisplayStopwords:
+    def _run(self, tmp_path, query, entries=_GOLDEN_CORPUS):
+        path = TestLexicalFallbackCore()._md(tmp_path, entries)
+        return lexical_fallback(query, corpus_paths=[path], reason="golden", store=None)
+
+    def test_stopwords_dropped_and_counted_in_query_order(self, tmp_path):
+        """R9: the EC's noise leaves the display, is counted, and order is kept."""
+        m = self._run(tmp_path, _EC_QUERY)["matches"][0]
+        assert m["slug"] == "pause-display-rule"
+        assert m["matched_terms"] == ["pause", "show"]
+        assert m["stopwords_dropped"] == 4
+
+    def test_a_stopword_only_hit_is_still_returned_with_its_count(self, tmp_path):
+        """R10: an empty display list carries a non-zero count; the hit stays."""
+        env = self._run(tmp_path, _EC_QUERY)
+        [m] = [m for m in env["matches"] if m["slug"] == "which-way-does-the-flow-go"]
+        assert m["matched_terms"] == []
+        assert m["stopwords_dropped"] == 4
+
+    def test_rank_still_counts_every_matched_term(self, tmp_path):
+        """R11: three stopwords outrank one content term — the display filter is not
+        a scoring filter, so the first hit explains itself by its count alone."""
+        env = self._run(tmp_path, "which does the author", [
+            ("author-note", "Author notes."),
+            ("which-does-the", "Which does the job."),
+        ])
+        first, second = env["matches"]
+        assert first["slug"] == "which-does-the"
+        assert first["matched_terms"] == [] and first["stopwords_dropped"] == 3
+        assert second["slug"] == "author-note" and second["matched_terms"] == ["author"]
+        assert "stopwords_dropped" not in second
+
+    def test_order_and_matches_equal_the_pre_change_golden(self, tmp_path):
+        """R12: same slugs in the same order; each match is the golden's once its
+        stopwords are removed from `matched_terms` and the count is dropped."""
+        env = self._run(tmp_path, _EC_QUERY)
+        golden = json.loads(_GOLDEN_EC)
+        assert [m["slug"] for m in env["matches"]] == [m["slug"] for m in golden["matches"]]
+        for got, was in zip(env["matches"], golden["matches"]):
+            got = dict(got)
+            dropped = got.pop("stopwords_dropped", 0)
+            filtered = [t for t in was["matched_terms"] if t not in DISPLAY_STOPWORDS]
+            assert dropped == len(was["matched_terms"]) - len(filtered)
+            assert got == {**was, "matched_terms": filtered}
+
+    def test_absent_when_zero_the_envelope_is_byte_identical(self, tmp_path):
+        """R13: a query with no stopword among its hits returns today's bytes."""
+        env = self._run(tmp_path, _CLEAN_QUERY)
+        assert json.dumps(env, ensure_ascii=False) == _GOLDEN_CLEAN
+        assert all("stopwords_dropped" not in m for m in env["matches"])
+
+    def test_list_hygiene(self):
+        """R14: no dead entries, casefolded, the EC's noise in, `show` out."""
+        for word in DISPLAY_STOPWORDS:
+            assert word == word.casefold()
+            assert len(word) >= LEXICAL_MIN_TERM_LEN, word
+        assert {"how", "does", "the", "which"} <= DISPLAY_STOPWORDS
+        assert "show" not in DISPLAY_STOPWORDS
+
+
+# ---------------------------------------------------------------------------
 # CLI wiring — each failure mode routes to the fallback
 # ---------------------------------------------------------------------------
 
@@ -230,6 +346,21 @@ class TestCliFailureModes:
         assert "deterministic text match over the markdown corpus" in out
         assert "cache-strategy" in out
         assert "No active precedents found" not in out
+
+    def test_text_never_prints_terms_while_json_carries_both_keys(self, ws):
+        """R15: two queries over one entry that differ only in their matched terms
+        and dropped count print the same text; `--json` carries both keys."""
+        config, m = ws
+        _rec(m, "pause-display-rule", "How the review pause does show which entries matter.")
+        noisy = _capture(cmd_surface, config, "the pause show")
+        plain = _capture(cmd_surface, config, "pause")
+        assert "pause-display-rule" in noisy
+        assert noisy == plain
+        assert "stopwords_dropped" not in noisy and "matched_terms" not in noisy
+        match = json.loads(_capture(cmd_surface, config, "the pause show",
+                                    as_json=True))["matches"][0]
+        assert match["matched_terms"] == ["pause", "show"]
+        assert match["stopwords_dropped"] == 1
 
     def test_surface_json_degraded_marker(self, ws):
         config, m = ws
@@ -358,6 +489,26 @@ class TestMcpParity:
         assert "RESOURCE_EXHAUSTED" not in out["degraded_reason"]
         assert out["matches"][0]["slug"] == "cache-strategy"
         assert "confidence" not in out
+
+    def test_mcp_matches_carry_the_cli_json_terms_and_count(self, ws):
+        """R15, MCP twin: per match, the same `matched_terms` and `stopwords_dropped`
+        as CLI `--json` over the same corpus and query."""
+        config, m = ws
+        _rec(m, "pause-display-rule", "How the review pause does show which entries matter.")
+        _rec(m, "which-does-the", "Which does the job.")
+        from mitos import mcp_server
+        cli_env = json.loads(_capture(cmd_surface, config, _EC_QUERY, as_json=True))
+        with patch.object(mcp_server, "get_workspace_components",
+                          return_value=self._components(config)):
+            mcp_env = json.loads(mcp_server.surface_decisions(
+                _EC_QUERY, project=config.workspace_dir))
+        assert mcp_env["degraded"] == "lexical"
+
+        def evidence(env):
+            return [(d["slug"], d["matched_terms"], d.get("stopwords_dropped"))
+                    for d in env["matches"]]
+        assert evidence(mcp_env) == evidence(cli_env)
+        assert ("which-does-the", [], 3) in evidence(mcp_env)
 
     def test_mcp_surface_pre_v1a(self, ws):
         config, m = ws

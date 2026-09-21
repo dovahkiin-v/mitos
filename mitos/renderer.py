@@ -25,6 +25,15 @@ GLOBAL_OVERFLOW_WARN_CHARS = 50_000
 SCOPE_OVERFLOW_WARN_CHARS = 20_000
 _CHARS_PER_TOKEN = 4
 
+# The write-path overflow nudge's cadence: ``summarize_overflows`` says "once a day",
+# and the write path passes this window to ``config.hint_due`` — one source, so the
+# sentence and the debounce cannot drift apart silently (a row pins the pair).
+OVERFLOW_HINT_WINDOW_SECONDS = 24 * 60 * 60
+# How many over-ceiling files the nudge names (largest first); the rest are counted.
+# The full list is ``mitos status``'s; a once-a-day line must not become the wall of
+# per-file lines the debounce retired.
+OVERFLOW_NUDGE_FILE_CAP = 5
+
 # Width of the truncated axiom in a secondary-scope pointer line (chars).
 POINTER_AXIOM_CHARS = 70
 
@@ -788,13 +797,16 @@ def summarize_overflows(overflows: List[Dict[str, Any]]) -> Optional[str]:
     """One-line write-path summary of files over their size ceiling, or None.
 
     Returns ``None`` when nothing is over threshold, so the caller can print a clean
-    success receipt and only append a warning when there is genuinely one to show. The
-    detail (which files, which decisions) lives on ``mitos status`` — this is the
-    debounced nudge that points there, replacing the per-file wall of lines that used
-    to print on every write.
+    success receipt and only append a warning when there is genuinely one to show.
+    Names each over-ceiling file with its size and its own ceiling (largest first, up
+    to ``OVERFLOW_NUDGE_FILE_CAP``, the rest counted) and states the debounce, so an
+    absent nudge on a later receipt is not read as the files having shrunk. It names
+    no command: the string reaches MCP verbatim, and the CLI text receipt adds its own
+    selectored recipe line.
 
     Args:
-        overflows: The overflow records (e.g. from ``MitosRenderer.overflows``).
+        overflows: The overflow records (e.g. from ``MitosRenderer.overflows``, which
+            is in write order — a sorted copy is used, the list is not reordered).
 
     Returns:
         A one-line summary, or None.
@@ -802,9 +814,16 @@ def summarize_overflows(overflows: List[Dict[str, Any]]) -> Optional[str]:
     if not overflows:
         return None
     n = len(overflows)
-    noun = "file" if n == 1 else "files"
-    return (f"⚠ {n} rendered axiom {noun} over the size ceiling "
-            f"— run `mitos status` for the breakdown.")
+    noun, their = ("file", "its") if n == 1 else ("files", "their")
+    ordered = sorted(overflows, key=lambda e: e["chars"], reverse=True)
+    named = [f"{e['name']} {e['chars']:,} chars (ceiling {e['threshold_chars']:,})"
+             for e in ordered[:OVERFLOW_NUDGE_FILE_CAP]]
+    rest = n - len(named)
+    if rest:
+        named.append(f"and {rest} more")
+    return (f"⚠ {n} rendered axiom {noun} over {their} size ceiling: {', '.join(named)}. "
+            f"This notice is debounced to once a day per workspace, so a later receipt "
+            f"without it does not mean the files shrank.")
 
 
 class MitosRenderer:
@@ -840,9 +859,9 @@ class MitosRenderer:
         every other file is still written.
 
         Size-ceiling overflows are recorded on ``self.overflows`` (not printed), so the
-        write path can present a single debounced summary AFTER its success receipt and
-        route the full breakdown to ``mitos status`` — see ``summarize_overflows`` and
-        ``overflow_report``.
+        write path can present a single debounced summary AFTER its success receipt,
+        while the full breakdown stays on ``mitos status`` — see ``summarize_overflows``
+        and ``overflow_report``.
 
         Args:
             store: The initialized GraphStore database.

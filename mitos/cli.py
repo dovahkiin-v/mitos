@@ -2288,6 +2288,10 @@ def cmd_record(
     if overflow:
         sys.stdout.flush()
         print(f"\n{overflow}", file=sys.stderr)
+        # The shared string names no command (it reaches MCP verbatim); the text
+        # surface adds the recipe. `config.project` is never None here.
+        print(f"  Per-file breakdown: `mitos status -p {config.project!r}`",
+              file=sys.stderr)
     # Degraded-check notice — same post-receipt stderr shape: the commit succeeded,
     # but the near-dup review could not run, and silence would read as "checked, clean".
     review_notice = result.get("neighbor_review_unavailable")

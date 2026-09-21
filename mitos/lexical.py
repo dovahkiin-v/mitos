@@ -34,8 +34,32 @@ from mitos.parser import parse_decisions_file
 from mitos.provider_cause import QUOTA, classify_provider_error, provider_cause_phrase
 
 # Terms shorter than this are dropped from the query before matching — they are
-# stop-word noise ("a", "of", "to") that would match nearly every entry.
+# stop-word noise ("a", "of", "to") that would match nearly every entry. Longer
+# stop-words still match and still rank; ``DISPLAY_STOPWORDS`` below only hides them.
 LEXICAL_MIN_TERM_LEN: int = 3
+
+# English function words hidden from each match's displayed ``matched_terms`` —
+# display only, and counted: the match carries ``stopwords_dropped`` for what was
+# hidden, and ranking still counts every matched term, so a hit ranked on these
+# words alone shows an empty list beside a non-zero count rather than vanishing.
+# English because the list is; the corpus need not be (P9) — a non-English query
+# loses nothing, it just drops nothing. Source: the NLTK English stop-word list,
+# less contractions and entries shorter than ``LEXICAL_MIN_TERM_LEN`` (they never
+# reach a match). Content-bearing common words (``show``) are deliberately absent.
+DISPLAY_STOPWORDS: frozenset[str] = frozenset({
+    "about", "above", "after", "again", "against", "all", "and", "any", "are",
+    "because", "been", "before", "being", "below", "between", "both", "but",
+    "can", "did", "does", "doing", "down", "during", "each", "few", "for",
+    "from", "further", "had", "has", "have", "having", "her", "here", "hers",
+    "herself", "him", "himself", "his", "how", "into", "its", "itself", "just",
+    "more", "most", "myself", "nor", "not", "now", "off", "once", "only",
+    "other", "our", "ours", "ourselves", "out", "over", "own", "same", "she",
+    "should", "some", "such", "than", "that", "the", "their", "theirs", "them",
+    "themselves", "then", "there", "these", "they", "this", "those", "through",
+    "too", "under", "until", "very", "was", "were", "what", "when", "where",
+    "which", "while", "who", "whom", "why", "will", "with", "you", "your",
+    "yours", "yourself", "yourselves",
+})
 
 # Default result cap when the caller passes no limit. Mirrors the spirit of the
 # ranked verbs' clamp without importing their ceiling — a grep needs no 50-row
@@ -191,7 +215,9 @@ def lexical_fallback(
         ``{degraded: "lexical", degraded_reason, matches: [...], note}`` — each
         match a Letter-shaped dict (slug, axiom, scope, rejected_paths unless
         thinned by ``full_top``, matched_terms) plus state + modifier stamps when the graph is
-        readable. ``stamps_unavailable: True`` is set when it is not, and
+        readable. ``matched_terms`` omits ``DISPLAY_STOPWORDS``; ``stopwords_dropped``
+        counts the omitted terms and is present only when non-zero.
+        ``stamps_unavailable: True`` is set when the graph is not readable, and
         ``unread_files`` (basenames) only when some corpus file could not be read.
 
     Raises:
@@ -246,8 +272,12 @@ def lexical_fallback(
             "slug": entry.slug,
             "axiom": entry.core_axiom or entry.axiom or "",
             "scope": entry.scope,
-            "matched_terms": hit,
+            # Display only: ``hit`` above ranked the entry and stays whole there.
+            "matched_terms": [t for t in hit if t not in DISPLAY_STOPWORDS],
         }
+        dropped = len(hit) - len(payload["matched_terms"])
+        if dropped:
+            payload["stopwords_dropped"] = dropped
         # Rank among the matches returned: nothing is appended between here and
         # the append below, and a filtered entry never reaches it.
         if full_top is None or len(matches) + 1 <= full_top:

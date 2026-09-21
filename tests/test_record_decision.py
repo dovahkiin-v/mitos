@@ -485,8 +485,9 @@ def test_scope_overflow_summary_after_receipt_then_debounced(mock_provider, mock
 
     Reproduces the AX complaint and pins the fix end-to-end on the shared write path
     (so both the CLI and MCP surfaces inherit it): the receipt fields are always intact,
-    the size nudge is a single line pointing at `mitos status` (not the per-write wall),
-    and a second record in the same workspace within the window is silent.
+    the size nudge is a single line naming the files and ceilings and no command (not
+    the per-write wall), and a second record in the same workspace within the window
+    is silent.
 
     Since the per-scope degrade (2c) an over-ceiling scope file becomes an index, and at
     the default ceilings this one decision's index fits, so nothing would be over. The
@@ -506,15 +507,72 @@ def test_scope_overflow_summary_after_receipt_then_debounced(mock_provider, mock
     assert "error" not in first and first["status"] == "created"
     # Receipt fields are present and intact — never buried or dropped.
     assert first["slug"] == "huge-one" and first["state"] == "active"
-    # Exactly one debounced summary line, pointing at the health surface for detail.
-    assert "scope_overflow" in first
-    assert "mitos status" in first["scope_overflow"]
+    # Exactly one debounced summary line naming the file and its (patched) ceiling,
+    # and no command — the string reaches MCP verbatim (R6; G1 inverted).
+    nudge = first["scope_overflow"]
+    assert "\n" not in nudge
+    assert "mitos " not in nudge and "`" not in nudge
+    assert "substrate.md " in nudge and f"(ceiling {R.SCOPE_OVERFLOW_WARN_CHARS:,})" in nudge
+    # Stretch: the write path names exactly the files the status surface reports.
+    from mitos.renderer import overflow_report
+    status_names = [e["name"] for e in overflow_report(m.store)]
+    assert status_names and all(f"{name} " in nudge for name in status_names)
 
     # A second record in the same workspace within the 24h window is silent (debounced),
     # even though the corpus is still over the ceiling.
     second = m.record_decision_entry("A small follow-up axiom.", "Nothing.", ["substrate"], slug="small-two")
     assert "error" not in second
     assert "scope_overflow" not in second
+
+
+def _over_ceiling_manager(monkeypatch) -> Tuple[MitosConfig, MitosSyncManager]:
+    """A fresh workspace whose every record renders over a squeezed ceiling."""
+    import mitos.renderer as R
+    monkeypatch.setattr(R, "SCOPE_OVERFLOW_WARN_CHARS", 100)
+    monkeypatch.setattr(R, "GLOBAL_OVERFLOW_WARN_CHARS", 100)
+    tmp = tempfile.mkdtemp()
+    config = MitosConfig(tmp)
+    cmd_init(config)
+    return config, MitosSyncManager(config)
+
+
+@patch("mitos.sync.QdrantVectorStore")
+@patch("mitos.sync.GeminiEmbeddingProvider")
+def test_scope_overflow_debounce_is_keyed_per_workspace(mock_provider, mock_vector,
+                                                        monkeypatch) -> None:
+    """R5: one shared cache file, two workspaces — A's nudge does not silence B's."""
+    mock_provider.side_effect = Exception("provider down")
+    mock_vector.side_effect = Exception("qdrant down")
+    (a_cfg, a), (b_cfg, b) = _over_ceiling_manager(monkeypatch), _over_ceiling_manager(monkeypatch)
+    try:
+        assert "scope_overflow" in a.record_decision_entry(
+            "A first axiom.", "No.", ["substrate"], slug="a-one")
+        assert "scope_overflow" not in a.record_decision_entry(
+            "A second axiom.", "No.", ["substrate"], slug="a-two")
+        assert "scope_overflow" in b.record_decision_entry(
+            "B first axiom.", "No.", ["substrate"], slug="b-one")
+    finally:
+        for cfg in (a_cfg, b_cfg):
+            shutil.rmtree(cfg.workspace_dir, ignore_errors=True)
+
+
+@patch("mitos.sync.QdrantVectorStore")
+@patch("mitos.sync.GeminiEmbeddingProvider")
+def test_scope_overflow_window_is_the_named_constant(mock_provider, mock_vector,
+                                                     monkeypatch) -> None:
+    """R4, behavioural half: the write path reads the window from the constant it
+    imported (patched in `mitos.sync`'s namespace, where the call looks it up)."""
+    mock_provider.side_effect = Exception("provider down")
+    mock_vector.side_effect = Exception("qdrant down")
+    monkeypatch.setattr("mitos.sync.OVERFLOW_HINT_WINDOW_SECONDS", 0)
+    config, m = _over_ceiling_manager(monkeypatch)
+    try:
+        assert "scope_overflow" in m.record_decision_entry(
+            "A first axiom.", "No.", ["substrate"], slug="w-one")
+        assert "scope_overflow" in m.record_decision_entry(
+            "A second axiom.", "No.", ["substrate"], slug="w-two")
+    finally:
+        shutil.rmtree(config.workspace_dir, ignore_errors=True)
 
 
 @patch("mitos.sync.QdrantVectorStore")
