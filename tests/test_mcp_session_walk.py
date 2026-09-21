@@ -283,6 +283,7 @@ async def test_an_mcp_agent_reads_every_section_one_key_from_the_payload(tmp_pat
         # S9 — an undeclared argument is refused in mitos's voice, on the same session.
         s9 = await server.session.call_tool("list_decisions",
                                             {"project": project, "bogus_param": 1})
+        texts.append(s9.content[0].text)
         assert s9.isError is True, f"S9: {s9.content}"
         assert s9.content[0].text.startswith("list_decisions was not run: "), f"S9: {s9.content}"
         assert "`bogus_param` is not an argument of list_decisions." in s9.content[0].text, (
