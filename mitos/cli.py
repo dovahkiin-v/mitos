@@ -1311,11 +1311,13 @@ def _coherence_audit_hint(config: MitosConfig) -> str:
     """Composes the CLI's coherence-audit recovery clause — this boundary's alone.
 
     The *fact* (a standing, corpus-wide contradiction-check debt) lives once, on
-    ``sync._COHERENCE_AUDIT_NOTE``, and reaches all three encodings on the shared
-    receipt dict. Only the *recovery* is composed here, for the same reason
-    :func:`_show_not_found_hint` is: MCP may name no shell command (an agent handed
-    one runs it), the CLI reader's actual repair *is* ``mitos check``, and a shared
-    body could only be the intersection — which is empty of recovery.
+    the receipt's ``coherence_audit`` field, composed in ``sync`` (the counted
+    line, or ``_COHERENCE_AUDIT_NOTE`` when the count cannot be read), and reaches
+    all three encodings on the shared receipt dict. Only the *recovery* is
+    composed here, for the same reason :func:`_show_not_found_hint` is: MCP may
+    name no shell command (an agent handed one runs it), the CLI reader's actual
+    repair *is* ``mitos check``, and a shared body could only be the intersection
+    — which is empty of recovery.
 
     It names the selector because a bare ``mitos check`` has had no target since the
     0.15.0 flip, and it renders ``config.project`` through ``repr`` for the reason

@@ -944,6 +944,8 @@ _PLANTED_NOTE_VIOLATIONS = (
     "This decision committed without a contradiction check.",             # per-entry
     "Contradiction coverage is stale — audit this corpus now.",           # "now"
     "You should check the corpus for contradictions.",                    # "you should"
+    "3 decisions have not had a full contradiction check.",                # "full"
+    "3 decisions have not been checked since the last audit.",            # "since"
 )
 
 #: Substrings forbidden anywhere in the shared field, casefolded.
@@ -951,7 +953,9 @@ _NOTE_FORBIDDEN_SUBSTRINGS = ("mitos ", "this decision", "this entry",
                               "audit this", "you should")
 #: Forbidden as WORDS — a bare `"now" in text` reds on "known" (1a's casefold lesson,
 #: one class over), so these match on word boundaries only.
-_NOTE_FORBIDDEN_WORDS = ("run", "now")
+#: "full" and "since" are A4's: a check row cannot tell a scoped sweep from a whole
+#: one, and after an upgrade the count holds decisions older than any check.
+_NOTE_FORBIDDEN_WORDS = ("run", "now", "full", "since")
 
 
 def register_violations(text: str, *, substrings=(), words=()):
@@ -1017,16 +1021,23 @@ def test_created_receipt_carries_a_non_empty_coherence_audit_string(ws) -> None:
 def test_coherence_note_states_a_standing_corpus_wide_debt(ws) -> None:
     """The register, asserted: no command, no imperative, no per-entry referent.
 
-    Non-vacuity is proved in-row — every shape in ``_PLANTED_NOTE_VIOLATIONS`` is
-    fed to the same checker and must be caught. Without that, a checker whose regex
-    silently stopped matching would pass this row forever.
+    Checked over every shape the field can take: the shipped receipt's line, the
+    composer's line at several (N, M, K) points (the K clause and N = 0 included)
+    and the unreadable fallback. Non-vacuity is proved in-row — every shape in
+    ``_PLANTED_NOTE_VIOLATIONS`` is fed to the same checker and must be caught.
+    Without that, a checker whose regex silently stopped matching would pass this
+    row forever.
     """
+    from mitos.sync import _COHERENCE_AUDIT_NOTE, _audit_debt_line
     config, m = ws
-    note = _created(m, "The register is enforced by a row.", "coh-register")["coherence_audit"]
+    shipped = _created(m, "The register is enforced by a row.", "coh-register")["coherence_audit"]
+    rendered = [_audit_debt_line(n, total, k)
+                for n, total, k in ((1, 1, 0), (1, 12, 0), (3, 12, 1), (0, 12, 0))]
 
-    assert _coherence_note_violations(note) == [], note
-    # Wider than the entry it rides — the debt is the corpus's, not this write's.
-    assert "corpus" in note.casefold(), note
+    for note in [shipped, *rendered, _COHERENCE_AUDIT_NOTE]:
+        assert _coherence_note_violations(note) == [], note
+        # Wider than the entry it rides — the debt is the corpus's, not this write's.
+        assert "corpus" in note.casefold(), note
 
     # The injection proof: each planted shape must be caught by the same checker.
     for planted in _PLANTED_NOTE_VIOLATIONS:
@@ -1051,6 +1062,7 @@ def test_exists_receipt_carries_neither_the_field_nor_the_line(ws, capsys) -> No
                                   slug="coh-exists", acknowledge_neighbors=True)
     assert res["status"] == "exists"
     assert "coherence_audit" not in res
+    assert "audit_debt" not in res
 
     capsys.readouterr()
     cmd_record(config, axiom="A decision recorded once.", rejected="rej",
@@ -1073,24 +1085,26 @@ def test_pause_and_error_exits_carry_no_coherence_audit(ws) -> None:
                                          "rej", ["s"], slug="coh-paused")
     assert paused["status"] == "needs_review"
     assert "coherence_audit" not in paused
+    assert "audit_debt" not in paused
 
     failed = m.record_decision_entry("An axiom pointing nowhere.", "rej", ["s"],
                                      slug="coh-dangling", supersedes="no-such-slug")
     assert "error" in failed
     assert "coherence_audit" not in failed
+    assert "audit_debt" not in failed
 
 
-def test_both_machine_encodings_carry_the_identical_coherence_audit(ws, capsys) -> None:
-    """`record --json` and MCP `record_decision` return the same object's field.
+def _record_on_both_encodings(config, capsys) -> Tuple[dict, dict]:
+    """One `record --json` write, then one MCP write, as their parsed payloads.
 
     Distinct slugs deliberately: the CLI call COMMITS, so an MCP call replaying the
-    same axiom would return `exists` (which carries no field at all) and the row
-    would compare a string against nothing.
+    same axiom would return `exists` (which carries neither field) and the row
+    would compare a receipt against nothing.
     """
     from mitos import mcp_server
     from mitos.cli import cmd_record
-    config, m = ws
 
+    capsys.readouterr()
     cmd_record(config, axiom="The CLI encoding of the receipt.", rejected="rej",
                slug="coh-cli", acknowledge_neighbors=True, as_json=True)
     cli_payload = json.loads(capsys.readouterr().out)
@@ -1101,17 +1115,211 @@ def test_both_machine_encodings_carry_the_identical_coherence_audit(ws, capsys) 
             acknowledge_neighbors=True, project=config.workspace_dir))
 
     assert cli_payload["status"] == "created" and mcp_payload["status"] == "created"
-    assert cli_payload["coherence_audit"] == mcp_payload["coherence_audit"]
-    # And identical because they are ONE source rendered twice, not two strings that
-    # happen to agree — the single-sourcing is the parity mechanism, and a row that
-    # only compared the two payloads would stay green through a hand-copied second
-    # spelling on either surface.
-    from mitos.sync import _COHERENCE_AUDIT_NOTE
-    assert cli_payload["coherence_audit"] == _COHERENCE_AUDIT_NOTE
+    return cli_payload, mcp_payload
+
+
+def test_both_machine_encodings_compose_the_coherence_audit_from_one_source(ws, capsys) -> None:
+    """`record --json` and MCP `record_decision` carry the same composer's output.
+
+    The two payloads come from two different writes, so they are NOT equal: the
+    MCP write sees one more decision, and both its ``uncovered`` and ``total`` are
+    the CLI's +1. ``==`` on the sentences would red on correct code. The parity
+    proof is the transition plus single-sourcing: each field equals
+    ``_audit_debt_line`` applied to its own payload's ``audit_debt``, so a
+    hand-copied second spelling on either surface reds here.
+    """
+    from mitos.sync import _audit_debt_line
+    config, _ = ws
+    cli_payload, mcp_payload = _record_on_both_encodings(config, capsys)
+
+    assert set(cli_payload) == set(mcp_payload)
+    cli_debt, mcp_debt = cli_payload["audit_debt"], mcp_payload["audit_debt"]
+    assert isinstance(cli_debt, dict) and isinstance(mcp_debt, dict)
+    assert mcp_debt == {**cli_debt, "uncovered": cli_debt["uncovered"] + 1,
+                        "total": cli_debt["total"] + 1}
+    for payload in (cli_payload, mcp_payload):
+        assert payload["coherence_audit"] == _audit_debt_line(**payload["audit_debt"])
+    assert cli_payload["coherence_audit"] != mcp_payload["coherence_audit"]
     # And neither machine surface carries the recovery — the command is the CLI text
     # renderer's alone, because an agent handed a shell command runs it.
     assert "mitos" not in cli_payload["coherence_audit"]
     assert "mitos" not in mcp_payload["coherence_audit"]
+
+
+def test_both_machine_encodings_carry_null_when_the_debt_is_unreadable(ws, capsys) -> None:
+    """Unreadable reaches both encodings the same way: the fallback and JSON ``null``.
+
+    Here the two fields ARE the one constant, so ``==`` is the honest assertion.
+    The key is present with ``None``, never absent and never zeros.
+    """
+    from mitos.audit_debt import DebtUnreadable
+    from mitos.sync import _COHERENCE_AUDIT_NOTE
+    config, _ = ws
+    with patch("mitos.sync.derive_audit_debt",
+               return_value=DebtUnreadable("telemetry", "planted")):
+        cli_payload, mcp_payload = _record_on_both_encodings(config, capsys)
+
+    for payload in (cli_payload, mcp_payload):
+        assert "audit_debt" in payload and payload["audit_debt"] is None
+        assert payload["coherence_audit"] == _COHERENCE_AUDIT_NOTE
+    assert cli_payload["coherence_audit"] == mcp_payload["coherence_audit"]
+
+
+# --------------------------------------------------------------------------- #
+# The audit-debt count (A4 / T3)
+# --------------------------------------------------------------------------- #
+#
+# Every row runs in ``ws``, which has no telemetry file (``cmd_init`` builds no
+# ``TelemetryStore``), so an unmarked corpus reads N = M. Rows that need coverage
+# write it through the real run-end seam themselves (``_mark``); none imports
+# either ``workspace`` fixture.
+
+def _mark(config: MitosConfig, run_id: str, covered=(), excluded=()) -> None:
+    """Writes one undegraded run's coverage through ``record_run_end``, no SQL.
+
+    Builds the telemetry store, so the row calling it owns a telemetry file.
+    """
+    from mitos.telemetry import CoverageMarks, TelemetryStore
+    from test_check_coverage import _check_run_row
+    row = _check_run_row(run_id)
+    TelemetryStore(config.telemetry_path).record_run_end(
+        row, coverage=CoverageMarks(run_id=run_id, marked_at=row.ended_at,
+                                    covered=tuple(covered), excluded=tuple(excluded)))
+
+
+def test_every_created_receipt_counts_the_corpus(ws) -> None:
+    """With no coverage, each write's receipt reads N = M = the decisions so far.
+
+    Two consecutive receipts therefore differ — the defect A4 logged was forty
+    byte-identical ones. The key set is pinned to the vision's names, so a rename
+    reds here rather than in a later consumer.
+    """
+    from mitos.sync import _audit_debt_line
+    config, m = ws
+    for k in range(3):
+        res = _created(m, f"Counted decision number {k}.", f"coh-count-{k}")
+        assert set(res["audit_debt"]) == {"uncovered", "total", "excluded"}
+        assert res["audit_debt"] == {"uncovered": k + 1, "total": k + 1, "excluded": 0}
+        assert res["audit_debt"]["uncovered"] >= 1
+        assert res["coherence_audit"] == _audit_debt_line(**res["audit_debt"])
+        assert ";" not in res["coherence_audit"]
+
+
+def test_the_line_inflects_on_its_own_counts() -> None:
+    """The verb agrees with N and the noun with M; the K clause does not inflect.
+
+    N = 1 is the common case (a covered corpus plus the write just made), and
+    "1 … have" is the first thing an agent would quote back.
+    """
+    from mitos.sync import _audit_debt_line
+    assert _audit_debt_line(1, 1, 0) == (
+        "1 of this corpus's 1 decision has not been covered by a completed "
+        "contradiction check.")
+    assert _audit_debt_line(1, 12, 0) == (
+        "1 of this corpus's 12 decisions has not been covered by a completed "
+        "contradiction check.")
+    assert _audit_debt_line(3, 12, 1) == (
+        "3 of this corpus's 12 decisions have not been covered by a completed "
+        "contradiction check; 1 more could not be audited (not embedded).")
+    assert _audit_debt_line(0, 12, 0) == (
+        "0 of this corpus's 12 decisions have not been covered by a completed "
+        "contradiction check.")
+
+
+def test_coverage_through_the_run_end_seam_drops_the_count(ws) -> None:
+    """A transition: N = M, then an undegraded run covers every prior, then N = 1.
+
+    Route (i): the marks go through ``TelemetryStore.record_run_end``, the seam a
+    real ``mitos check`` writes, with the ids of decisions actually recorded. That
+    is lighter than driving ``cmd_check`` with both seams wired, and 2a's module
+    already proves the check → coverage half. The exact figures matter: an
+    assertion of only ``N < M`` passes against a wrong M.
+    """
+    config, m = ws
+    prior = [_created(m, f"Prior decision {i}.", f"coh-prior-{i}") for i in range(3)]
+    assert prior[-1]["audit_debt"] == {"uncovered": 3, "total": 3, "excluded": 0}
+
+    _mark(config, "run-cover", covered=[r["id"] for r in prior])
+    res = _created(m, "The write after the audit.", "coh-after")
+    assert res["audit_debt"] == {"uncovered": 1, "total": 4, "excluded": 0}
+    assert res["coherence_audit"].startswith("1 of this corpus's 4 decisions has not")
+
+
+def test_an_excluded_active_decision_adds_the_k_clause(ws) -> None:
+    """K counts active decisions a check saw but could not audit, beside N."""
+    config, m = ws
+    covered = _created(m, "A decision the check covered.", "coh-covered")
+    excluded = _created(m, "A decision the check could not embed.", "coh-excluded")
+
+    _mark(config, "run-k", covered=[covered["id"]], excluded=[excluded["id"]])
+    res = _created(m, "The write after a partial audit.", "coh-after-k")
+    assert res["audit_debt"] == {"uncovered": 1, "total": 3, "excluded": 1}
+    assert res["coherence_audit"].endswith(
+        "; 1 more could not be audited (not embedded).")
+
+
+def test_unreadable_telemetry_renders_the_fallback_and_null(ws) -> None:
+    """A telemetry file that exists and cannot be read: fallback + ``None``.
+
+    And the split beside it: a 0-byte file reads below the coverage rung, which
+    is *absent*, so it gives a real count with N = M — never the fallback.
+    """
+    from mitos.sync import _COHERENCE_AUDIT_NOTE
+    config, m = ws
+    with open(config.telemetry_path, "wb") as f:
+        f.write(b"this is not a sqlite database at all" * 40)
+    res = _created(m, "A write beside a broken telemetry file.", "coh-garbage")
+    assert res["coherence_audit"] == _COHERENCE_AUDIT_NOTE
+    assert "audit_debt" in res and res["audit_debt"] is None
+
+    open(config.telemetry_path, "wb").close()
+    res = _created(m, "A write beside an empty telemetry file.", "coh-empty")
+    assert res["audit_debt"] == {"uncovered": 2, "total": 2, "excluded": 0}
+
+
+def test_a_raising_derivation_still_returns_created(ws, capsys) -> None:
+    """The derivation raising cannot fail the write: fallback, ``None``, one warning.
+
+    The patch targets ``mitos.sync.derive_audit_debt``, the name sync looks up at
+    call time; patching ``mitos.audit_debt.derive_audit_debt`` would miss it and
+    leave this row vacuous.
+    """
+    from mitos.sync import _COHERENCE_AUDIT_NOTE
+    config, m = ws
+    capsys.readouterr()
+    with patch("mitos.sync.derive_audit_debt", side_effect=RuntimeError("planted")):
+        res = _created(m, "A write whose audit read breaks.", "coh-raises")
+    assert res["coherence_audit"] == _COHERENCE_AUDIT_NOTE
+    assert res["audit_debt"] is None
+    assert res["id"] in GraphStore(config.db_path, read_only=True).get_active_decision_ids()
+
+    err = capsys.readouterr().err
+    warnings = [line for line in err.splitlines() if "Audit-debt" in line]
+    assert warnings == ["[Warning] Audit-debt read failed for 'coh-raises': planted"], err
+
+
+def test_the_record_path_creates_no_telemetry_file(ws, capsys) -> None:
+    """Reading the debt never builds telemetry, on any surface.
+
+    ``ws`` starts with no telemetry file; a write through the manager, the CLI
+    text and ``--json`` encodings and MCP must each leave it absent.
+    """
+    from mitos import mcp_server
+    from mitos.cli import cmd_record
+    config, m = ws
+    assert not os.path.exists(config.telemetry_path)
+
+    assert _created(m, "Recorded through the manager.", "coh-nt-mgr")["audit_debt"]
+    cmd_record(config, axiom="Recorded through CLI text.", rejected="rej",
+               slug="coh-nt-text", acknowledge_neighbors=True)
+    cmd_record(config, axiom="Recorded through CLI JSON.", rejected="rej",
+               slug="coh-nt-json", acknowledge_neighbors=True, as_json=True)
+    with patch("mitos.mcp_server.MitosConfig", return_value=config):
+        payload = json.loads(mcp_server.record_decision(
+            "Recorded through MCP.", "rej", ["s"], slug="coh-nt-mcp",
+            acknowledge_neighbors=True, project=config.workspace_dir))
+    assert payload["audit_debt"] == {"uncovered": 4, "total": 4, "excluded": 0}
+    assert not os.path.exists(config.telemetry_path)
 
 
 def test_json_created_exit_keeps_b2s_text_off_stderr(ws, capsys) -> None:

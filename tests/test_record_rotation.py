@@ -679,4 +679,4 @@ def test_the_failure_line_reaches_a_combined_pipe_after_the_receipt(tmp_path) ->
     assert done.returncode == 0, combined
     assert f"{FAILURE_PREFIX} (file): NotADirectoryError" in combined, combined
     failure = combined.index(FAILURE_PREFIX)
-    assert combined.index("Handle:") < failure < combined.index("Coherence audit"), combined
+    assert combined.index("Handle:") < failure < combined.index("mitos check"), combined

@@ -43,6 +43,7 @@ from mitos.conflict import (
 )
 from mitos.telemetry import (CommentaryAuditRow, ConflictCheckRow, JudgmentBatch,
                             TelemetryStore)
+from mitos.audit_debt import AuditDebt, derive_audit_debt
 from mitos.divergence import declared_edges, entry_divergence, is_reconcilable
 from mitos.errors import (
     CollectionMissingError,
@@ -450,16 +451,18 @@ _EXISTS_NO_OP_NOTE = (
     "pointing at this slug."
 )
 
-# The standing coherence debt a successful write incurs, stated on every `created`
-# receipt. The REGISTER is the mechanism, not the presence: `mitos check` reuses
-# prior verdicts (a reused pair never enters a batch), so one deferred run after N
-# writes covers the same ground as N runs for less — and `_confirm_spend` only fires
-# above CHECK_CONFIRM_BATCHES fresh groups, so a caller auditing per write presents
-# ~1 fresh group forever and the tree's only spend ring never fires. A line reading
-# "audit this write" therefore converts one owed run into N and fragments the
-# amortization (ADR `record-receipt-states-cumulative-audit-debt-not-per-write-work`).
-# So: cumulative and corpus-wide, no imperative, no per-entry referent — and no
-# command, because this string is an MCP-visible payload field, not a CLI line (ADR
+# The standing coherence debt, stated without a number: the `created` receipt's
+# fallback when the audit-debt count cannot be read (`_audit_debt_line` states it with
+# one; `MitosSyncManager._audit_debt_fields` picks). The REGISTER is the mechanism,
+# not the presence: `mitos check` reuses prior verdicts (a reused pair never enters a
+# batch), so one deferred run after N writes covers the same ground as N runs for less
+# — and `_confirm_spend` only fires above CHECK_CONFIRM_BATCHES fresh groups, so a
+# caller auditing per write presents ~1 fresh group forever and the tree's only spend
+# ring never fires. A line reading "audit this write" therefore converts one owed run
+# into N and fragments the amortization (ADR
+# `record-receipt-states-cumulative-audit-debt-not-per-write-work`). So: cumulative
+# and corpus-wide, no imperative, no per-entry referent — and no command, because this
+# string is an MCP-visible payload field, not a CLI line (ADR
 # `receipt-dict-strings-are-mcp-boundary-so-recovery-splits-per-renderer`). The
 # recovery clause is each renderer's own; `cli._coherence_audit_hint` composes the
 # CLI's. Enforced by test rather than by emphasis (tests/test_record_decision.py).
@@ -467,6 +470,37 @@ _COHERENCE_AUDIT_NOTE = (
     "Coherence audit is cumulative and corpus-wide: this corpus holds recorded "
     "decisions that no contradiction check has covered yet."
 )
+
+
+def _audit_debt_line(uncovered: int, total: int, excluded: int) -> str:
+    """Composes the `created` receipt's ``coherence_audit`` from the three counts.
+
+    The one composer, so the MCP payload, ``record --json`` and the CLI text tail
+    read the same string off the receipt. Its keyword names are the ``audit_debt``
+    key names, so ``_audit_debt_line(**receipt["audit_debt"])`` rebuilds the field
+    from the payload's own dict. The verb agrees with ``uncovered`` and the noun
+    with ``total``. Total over non-negative counts: 0 uncovered is true when a
+    check lands between the commit and this read, and it is rendered, not clamped.
+    The register rules above apply, plus two more words it never uses: "full" (a
+    check row cannot tell a scoped sweep from a whole one) and "since" (after an
+    upgrade the count includes decisions older than any check).
+
+    Args:
+        uncovered: Active decisions no completed check has covered (N).
+        total: The corpus's active decisions (M).
+        excluded: Active decisions a check saw but could not audit (K).
+
+    Returns:
+        One sentence ending in a period, with the corpus as its referent.
+    """
+    noun = "decision" if total == 1 else "decisions"
+    verb = "has" if uncovered == 1 else "have"
+    line = (f"{uncovered} of this corpus's {total} {noun} {verb} not been covered "
+            f"by a completed contradiction check")
+    if excluded > 0:
+        line += f"; {excluded} more could not be audited (not embedded)"
+    return line + "."
+
 
 # The `rotation` field of a `created` receipt: what this write's one bounded rotation
 # did. Runtime-only and never persisted; it crosses the JSON boundary on MCP
@@ -2883,6 +2917,39 @@ class MitosSyncManager:
             pass
         return "indexed"
 
+    def _audit_debt_fields(self, slug: str) -> Tuple[str, Optional[Dict[str, int]]]:
+        """Reads the corpus's audit debt for a `created` receipt, never raising.
+
+        Called after the commit and after the lock is released, so a telemetry
+        fault can neither lengthen the lock hold nor touch the write. Unreadable
+        telemetry (or no graph) gives the numberless note and ``None``, silently:
+        that is an honest state, and `mitos status` owns its diagnosis. An
+        unexpected exception gives the same pair plus one stderr warning, because
+        a bug hidden behind a healthy-looking sentence would stay hidden. ADRs
+        `record-receipt-states-cumulative-audit-debt-not-per-write-work`,
+        `coverage-table-ends-the-coherence-gate-deferral` and
+        `telemetry-readers-outside-check-open-read-only-absent-is-empty-not-unreadable`.
+
+        Args:
+            slug: The recorded entry's slug, named in the warning.
+
+        Returns:
+            ``(coherence_audit, audit_debt)``: the line and its three counts, or
+            ``_COHERENCE_AUDIT_NOTE`` and ``None``.
+        """
+        try:
+            debt = derive_audit_debt(self.config.db_path, self.config.telemetry_path)
+        except Exception as e:
+            # stderr: the MCP write tool shares this path and uses stdout for JSON-RPC.
+            print(f"[Warning] Audit-debt read failed for '{slug}': {str(e)}",
+                  file=sys.stderr)
+            return _COHERENCE_AUDIT_NOTE, None
+        if not isinstance(debt, AuditDebt):  # DebtUnreadable, or NoGraph
+            return _COHERENCE_AUDIT_NOTE, None
+        counts = {"uncovered": debt.uncovered, "total": debt.total,
+                  "excluded": debt.excluded}
+        return _audit_debt_line(**counts), counts
+
     def _exists_receipt_extras(
         self, entry: ParsedEntry, existing: Dict[str, Any], node_id: str
     ) -> Dict[str, Any]:
@@ -3590,8 +3657,12 @@ class MitosSyncManager:
             unchecked; the notice names the cause and no command, each surface
             composing its own recovery), plus an always-present
             ``coherence_audit`` statement of the corpus's standing, cumulative
-            contradiction-check debt, plus an optional ``rotation`` report of the one
-            bounded rotation this write ran once its buffer reached
+            contradiction-check debt ("N of this corpus's M decisions have not
+            been covered…", or the numberless ``_COHERENCE_AUDIT_NOTE`` when the
+            count cannot be read) and an always-present ``audit_debt``
+            (``{uncovered, total, excluded}``, or ``None`` when unreadable), plus
+            an optional ``rotation`` report of the one bounded rotation this
+            write ran once its buffer reached
             ``rotation_volume_threshold_entries``: ``outcome`` "rotated" (the
             ``archives`` written, each ``{path, entries, slugs}``, and any
             ``skipped``), "skipped" (nothing moved; each ``skipped`` element names
@@ -4056,6 +4127,10 @@ class MitosSyncManager:
             # stderr: the MCP write tool shares this path and uses stdout for JSON-RPC.
             print(f"[Warning] Failed to render active axioms: {str(e)}", file=sys.stderr)
 
+        # 9b. The corpus's audit debt, read after the commit and outside the lock
+        #     (it adds nothing to the §7.3 hold), and never able to fail the write.
+        coherence_audit, audit_debt = self._audit_debt_fields(entry.slug)
+
         # 10. Return. A freshly recorded decision is always active. Everything below is
         #     post-commit read-back — the write contract is untouched (the commit
         #     already succeeded above).
@@ -4079,7 +4154,10 @@ class MitosSyncManager:
             # nothing. Carrying the FACT on the field (rather than leaving the CLI
             # renderer to decide) is what keeps the shared text tail from leaking
             # the line onto a no-op — the renderer gates on the key's presence.
-            "coherence_audit": _COHERENCE_AUDIT_NOTE,
+            # `audit_debt` carries the same counts so no agent parses the sentence;
+            # None means unreadable, never zero.
+            "coherence_audit": coherence_audit,
+            "audit_debt": audit_debt,
         }
         # Honest degradation (KDD-4): when the pre-commit near-dup check could not run,
         # say so on the receipt — one calm sentence, only on a genuinely failed check
