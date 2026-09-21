@@ -114,6 +114,7 @@ from mitos.models import get_model_id
 from mitos.telemetry import (
     CheckRunRow,
     ConflictCheckRow,
+    CoverageMarks,
     JudgmentBatch,
     ReuseIndex,
     ReuseUnavailable,
@@ -954,6 +955,10 @@ class CheckPlan:
             re-confirmation of a standing finding stays "known".
         nodes_total: ``len(snapshot.nodes)`` — the swept-vs-skipped denominator.
         nodes_swept: Healthy sweeps consumed before any trip.
+        swept_node_ids: The ids of those healthy sweeps (``len`` equals
+            ``nodes_swept``), in snapshot order, which is not a contract. The
+            coverage marks derive from these, never from a store re-read at run
+            end, so a decision recorded while the check ran stays uncovered.
         sweep_degraded: The tripping sweep degradation, if any (KD2 — the partial
             plan still executes; the substrates are disjoint).
         pairs: Every deduped oriented pair, pair-key-sorted.
@@ -983,6 +988,7 @@ class CheckPlan:
     fresh: bool
     nodes_total: int
     nodes_swept: int
+    swept_node_ids: Tuple[str, ...]
     sweep_degraded: Optional[Unavailable]
     pairs: Tuple[CorpusPair, ...]
     reused: Tuple[ReusedPair, ...]
@@ -1048,6 +1054,8 @@ class CheckRunResult:
         ended_at: The MI-10 stamp taken at execute exit.
         nodes_total: Echoed plan accounting.
         nodes_swept: Echoed plan accounting.
+        swept_node_ids: Echoed plan ids — what the sweep actually saw, the
+            authority :func:`coverage_marks_from_result` bounds its marks by.
         sweep_degraded: Echoed plan-stage trip, if any.
         findings: Every reported finding, pair-key-ordered; the novelty partition
             rides ``.novelty``.
@@ -1089,6 +1097,7 @@ class CheckRunResult:
     ended_at: str
     nodes_total: int
     nodes_swept: int
+    swept_node_ids: Tuple[str, ...]
     sweep_degraded: Optional[Unavailable]
     findings: Tuple[CheckFinding, ...]
     pairs_judged_fresh: int
@@ -1280,6 +1289,12 @@ def plan_corpus_check(
             sweep_degraded = sweep.result
             break
     nodes_swept = len(consumed) - (1 if sweep_degraded is not None else 0)
+    # Only the last consumed sweep can be Unavailable (the loop breaks on it).
+    swept_node_ids = tuple(
+        sweep.node["id"]
+        for sweep in consumed
+        if not isinstance(sweep.result, Unavailable)
+    )
 
     pairs = tuple(dedup_oriented_pairs(consumed))
 
@@ -1314,6 +1329,7 @@ def plan_corpus_check(
         fresh=fresh,
         nodes_total=len(snapshot.nodes),
         nodes_swept=nodes_swept,
+        swept_node_ids=swept_node_ids,
         sweep_degraded=sweep_degraded,
         pairs=pairs,
         reused=tuple(reused),
@@ -1630,6 +1646,7 @@ def execute_corpus_check(
         ended_at=_utc_now_iso(),
         nodes_total=plan.nodes_total,
         nodes_swept=plan.nodes_swept,
+        swept_node_ids=plan.swept_node_ids,
         sweep_degraded=plan.sweep_degraded,
         findings=tuple(findings),
         pairs_judged_fresh=pairs_judged_fresh,
@@ -1808,9 +1825,10 @@ def check_run_row_from_result(
     ``reuse_unavailable`` stays a TRUE zero: the run genuinely reused nothing.
 
     The seam order, pinned for 3a (KD5): compute ``exit_code_for(result)`` →
-    build this row → ``TelemetryStore.record_check_run`` LAST, so a write
-    failure can only move the exit toward 2 and a persisted row's ``exit_code``
-    always equals the actual process exit. 3b hand-builds its staged row
+    build this row and :func:`coverage_marks_from_result` →
+    ``TelemetryStore.record_run_end`` LAST, so a write failure can only move
+    the exit toward 2 and a persisted row's ``exit_code`` always equals the
+    actual process exit. 3b hand-builds its staged row
     instead of calling this (staged accounting is not a :class:`CheckRunResult`).
 
     Args:
@@ -1859,4 +1877,44 @@ def check_run_row_from_result(
         coverage_exclusions=coverage_exclusions,
         degraded_reason=",".join(run_degradations(result)) or None,
         mitos_version=__version__,
+    )
+
+
+def coverage_marks_from_result(result: CheckRunResult) -> Optional[CoverageMarks]:
+    """Assembles the coverage marks one corpus run writes, or ``None`` for none.
+
+    Beside :func:`check_run_row_from_result` and read off the same result, so the
+    row and the marks can never disagree. "Undegraded" is
+    ``run_degradations(result) == ()``, never an exit code: an undegraded run that
+    found a new contradiction exits 1 and covers, since finding something is not
+    failing to look. Any degradation token returns ``None`` and the run covers
+    nothing. Poison backlog rows produce no token, so a run with only exclusions
+    still covers.
+
+    Marks are bounded by what the run swept. The exclusion ids come from the
+    backlog probes, which are corpus-wide and kind-blind: they can name an open
+    question, a retired node, or a decision outside a ``--scope``. A run has no
+    authority over a node it did not see, so an exclusion id outside
+    ``swept_node_ids`` gets no mark at all. A stuck active decision loses nothing
+    by this, because the sweep takes it as a proposal (only its vector is
+    missing) and an unscoped run therefore sweeps and excludes it.
+
+    Args:
+        result: The typed run outcome (the same object the report reads).
+
+    Returns:
+        The run's :class:`~mitos.telemetry.CoverageMarks` (``covered`` = swept
+        minus exclusions, ``excluded`` = swept ∩ exclusions, both sorted), or
+        ``None`` when the run degraded.
+    """
+    if run_degradations(result):
+        return None
+    swept = set(result.swept_node_ids)
+    excluded = sorted(swept & set(coverage_exclusion_ids(result)))
+    covered = sorted(swept - set(excluded))
+    return CoverageMarks(
+        run_id=result.run_id,
+        marked_at=result.ended_at,
+        covered=tuple(covered),
+        excluded=tuple(excluded),
     )

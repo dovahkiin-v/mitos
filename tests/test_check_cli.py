@@ -153,7 +153,11 @@ class _FaultStore:
 
 
 class _FailingWriteTelemetry:
-    """Wraps a real telemetry store; only ``record_check_run`` raises (KD5 write-fault seam)."""
+    """Wraps a real telemetry store; only ``record_run_end`` raises (KD5 write-fault seam).
+
+    ``record_run_end`` is the corpus path's run-end seam; ``record_check_run`` is
+    now the staged path's writer and is left alone here.
+    """
 
     def __init__(self, inner: TelemetryStore) -> None:
         self._inner = inner
@@ -161,7 +165,7 @@ class _FailingWriteTelemetry:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
 
-    def record_check_run(self, row: Any) -> None:
+    def record_run_end(self, row: Any, *, coverage: Any) -> None:
         raise DatabaseError("provoked summary-row write fault")
 
 
@@ -549,6 +553,11 @@ def test_record_check_run_failure_exits_2_no_row(workspace, monkeypatch, capsys)
     obj = json.loads(capsys.readouterr().out)
     assert obj["summary_row_written"] is False
     assert _read_check_runs(config) == []
+    conn = sqlite3.connect(config.telemetry_path)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM check_coverage").fetchone()[0] == 0
+    finally:
+        conn.close()
 
 
 def test_poison_exclusion_disclosed_exits_0(workspace, monkeypatch, capsys):

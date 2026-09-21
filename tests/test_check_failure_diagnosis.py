@@ -50,6 +50,7 @@ def _result(
         ended_at="2026-09-18T11:28:02+00:00",
         nodes_total=444,
         nodes_swept=444,
+        swept_node_ids=(),
         sweep_degraded=None,
         findings=(),
         pairs_judged_fresh=151,

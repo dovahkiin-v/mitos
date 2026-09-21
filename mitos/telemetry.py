@@ -16,17 +16,28 @@ rebuildable graph (P7 bulkhead): the swap/backup machinery in ``cutover.py`` onl
 ever touches ``graph.sqlite``-derived paths, so a different basename survives the
 truth-rebuild untouched (CONF-D8; the T8 guarantee).
 
-This module pairs two append-only whole-row **writers** (``record_judged_batch``,
-the per-batch judgment grain; ``record_check_run``, the per-run summary grain —
-the CHK-D7 run memory) with one non-mutating bulk **reader** —
-``load_reuse_index``, the corpus's first in-tool consumer (verdict
-reuse + novelty; CHK-D3/D10). The reader opens the sibling DB ``mode=ro`` so it
-*physically* cannot mutate the corpus, and it never chains derived state (it reads
-the primary judged rows verbatim, M8). There is still no retention, decay, or
-pruning (P4 deferred), and the full CONF-C1 ``edges ⋈ conflict_checks`` corpus join
-still belongs to a future vision. Every judged row lands **whole and uncapped** —
-the longest, thorniest contradiction is exactly the example the future classifier
-will most need (CONF-D8 verbatim-and-whole).
+The judgment corpus is written by an append-only whole-row writer
+(``record_judged_batch``, the per-batch judgment grain) and read by one
+non-mutating bulk **reader** — ``load_reuse_index``, the corpus's first in-tool
+consumer (verdict reuse + novelty; CHK-D3/D10). The reader opens the sibling DB
+``mode=ro`` so it *physically* cannot mutate the corpus, and it never chains
+derived state (it reads the primary judged rows verbatim, M8). There is still no
+retention, decay, or pruning (P4 deferred), and the full CONF-C1 ``edges ⋈
+conflict_checks`` corpus join still belongs to a future vision. Every judged row
+lands **whole and uncapped** — the longest, thorniest contradiction is exactly the
+example the future classifier will most need (CONF-D8 verbatim-and-whole).
+
+The module is **not** append-only throughout. A corpus check ends at one run-end
+seam, ``record_run_end``, which writes the append-only ``check_runs`` summary row
+(the CHK-D7 run memory) and, for an undegraded run, upserts ``check_coverage`` in
+the same transaction. Coverage is a per-node **state** table: one row per node id
+an undegraded sweep has seen, marked ``covered`` or ``excluded``, overwritten by
+the next undegraded run that sweeps the node. It is not a per-run log, because
+nothing reads a per-run swept set; readers ask only "has this node been seen".
+Its size is bounded by the nodes the corpus has ever held. Readers outside the
+check verb reach it through the module-level ``read_coverage``, which opens
+read-only and never creates or migrates the file (``TelemetryStore``'s
+constructor does both).
 
 Tier 2 (logic/store): it reuses ``store.open_connection`` (the MI-8 connection
 chokepoint) and ``migrations.run_migrations`` (the ladder primitive) rather than
@@ -42,7 +53,7 @@ import json
 import os
 import sqlite3
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, FrozenSet, Iterator, List, Optional, Tuple
 
 from mitos.errors import DatabaseError
 from mitos.migrations import MigrationStep, run_migrations
@@ -491,21 +502,18 @@ _JUDGMENT_BATCHES_ADD_MODEL_ID = """
 
 # ``check_runs`` — one summary row per check run: the run-level repetition memory
 # (P18: standing-count trend, time-to-resolution/nag-count per finding, the
-# long-standing-unresolved FP-suspect list). Written best-effort at run end by
-# ``TelemetryStore.record_check_run``, which ships and is called from both
-# ``cli.cmd_check`` and ``cli._run_staged_check`` — so a workspace `mitos check` has
-# run in carries a row per run, save the runs whose telemetry store could not be
-# constructed at all (``cli._build_check_telemetry`` returns None: the engine's
-# documented ``reuse_read`` degradation, where the KD5 seam records nothing). That
-# is the honest bound on "best-effort" and it is narrow — every ordinary run writes.
-# (Named by function rather than by line number: the two call sites drift with every
-# phase that edits ``cli.py``.)
-# Check-freshness state therefore EXISTS on disk today; the conditional
-# coherence-freshness gate is deferred on what a row MEANS — a run happened, not
-# that given writes are covered — never on the state being unavailable. See ADR
-# ``coherence-pointer-deferral-rests-on-check-runs-semantics-not-impossibility``,
-# which names this comment as the artifact a reader re-deriving the old
-# impossibility claim would land on.
+# long-standing-unresolved FP-suspect list). A corpus run writes it at the run-end
+# seam, ``TelemetryStore.record_run_end``, in ONE transaction with that run's
+# ``check_coverage`` rows; a staged run writes it alone through
+# ``record_check_run``. A row means a run reached the seam, not that it covered
+# anything: a degraded run still writes its row and writes no coverage.
+# Many runs write no row at all and exit 2: no embedding provider over a non-empty
+# corpus, a store fault caught at ``cmd_check``'s boundary, an exception escaping to
+# ``main()``, a refused spend confirmation, telemetry that could not be constructed
+# (``cli._build_check_telemetry`` returns None), and a failed run-end write.
+# So "did the corpus get audited" is read from ``check_coverage``, never from here.
+# See ADR ``coverage-table-ends-the-coherence-gate-deferral``, which supersedes the
+# deferral this comment used to cite.
 # Nullability is the semantic line, pinned NOW because SQLite constraints are
 # rebuild-only to change: NOT NULL = the run always knows it at run end; NULL =
 # "value not computable this run", deliberately distinct from a genuine zero
@@ -637,11 +645,62 @@ def _judgment_batches_add_stop_reason(conn: "sqlite3.Connection") -> None:
     )
 
 
+# --- Rung 5: check coverage — which nodes an undegraded sweep has seen --------
+#
+# The primary record behind "how much of this corpus has never been checked for
+# contradictions". ``check_runs`` holds counts; nothing else persists which nodes a
+# sweep saw, and nothing can recompute it. It is a record of what one sweep saw, not
+# node state: node state stays computed from edges (M3).
+#
+# ``mark`` is closed in code, not by CHECK: a later mark (an incremental sweep's,
+# say) is then a release, not a table rebuild. The writer validates the set before
+# any connection opens. There is no prompt/model pin and no content fingerprint:
+# coverage is pin-blind and amend-blind on purpose, so a judge-pin change does not
+# turn the whole corpus uncovered.
+_CHECK_COVERAGE_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS check_coverage (
+        node_id TEXT NOT NULL,    -- content-hash id; a PLAIN COLUMN, NOT an FK (the
+                                  -- graph is another, disposable file)
+        mark TEXT NOT NULL,       -- 'covered' | 'excluded', closed in code
+        run_id TEXT NOT NULL,     -- the check_runs.run_id that set this mark (same
+                                  -- transaction, so it always joins)
+        marked_at TEXT NOT NULL,  -- that run's ended_at, application-supplied (MI-10)
+        PRIMARY KEY (node_id)
+    ) STRICT;
+"""
+
+# The rung the coverage reader needs. The ladder literal below uses it too, so the
+# writer's rung and the reader's requirement are one number.
+COVERAGE_RUNG = 5
+
+
+def _check_coverage_schema(conn: sqlite3.Connection) -> None:
+    """Migration step 5: the per-node check coverage table.
+
+    A plain additive rung: one CREATE, nothing to back-fill. A workspace that has
+    never run a check since upgrading holds no rows, which reads as "nothing
+    covered", the honest answer. Does NOT touch ``user_version`` or manage the
+    transaction; ``run_migrations`` owns both.
+
+    **Death story (P4).** Rows are never pruned, and the table does not grow without
+    bound: it holds at most one row per node id the corpus has ever held, because
+    each run upserts on ``node_id``. A row for an id that has since left the graph is
+    harmless, since readers intersect with the live active set. Retention belongs to
+    the ROADMAP's telemetry-retention item, like the rest of this file.
+
+    Args:
+        conn: An open, writable SQLite connection inside the runner's transaction
+            (opened via ``store.open_connection``, MI-8).
+    """
+    conn.execute(_CHECK_COVERAGE_SCHEMA)
+
+
 TELEMETRY_MIGRATION_STEPS: List[MigrationStep] = [
     (1, _conflict_checks_schema),
     (2, _check_attribution_schema),
     (3, _commentary_audit_schema),
     (4, _judgment_batches_add_stop_reason),
+    (COVERAGE_RUNG, _check_coverage_schema),
 ]
 
 
@@ -723,6 +782,77 @@ def _insert_sql(table: str, columns: Tuple[str, ...]) -> str:
 _INSERT_CONFLICT_CHECK_SQL = _insert_sql("conflict_checks", _CONFLICT_CHECKS_COLUMNS)
 _INSERT_JUDGMENT_BATCH_SQL = _insert_sql("judgment_batches", _JUDGMENT_BATCHES_COLUMNS)
 _INSERT_CHECK_RUN_SQL = _insert_sql("check_runs", _CHECK_RUNS_COLUMNS)
+
+# The last undegraded run that swept a node wins, including a demotion from
+# ``covered`` to ``excluded`` (a node whose embedding is stuck NOW cannot be found by
+# other nodes' gathers now). ``excluded.`` here is SQLite's pseudo-table for the
+# proposed row, unrelated to the mark value ``'excluded'``. Read by module-global
+# name inside ``record_run_end``, so a test can swap it to fault the transaction.
+_UPSERT_COVERAGE_SQL = (
+    "INSERT INTO check_coverage (node_id, mark, run_id, marked_at) "
+    "VALUES (?, ?, ?, ?) "
+    "ON CONFLICT(node_id) DO UPDATE SET mark = excluded.mark, "
+    "run_id = excluded.run_id, marked_at = excluded.marked_at"
+)
+
+_SELECT_COVERAGE_SQL = "SELECT node_id, mark FROM check_coverage"
+
+# The closed mark set. A row read back with any other mark is a newer build's and
+# is ignored (the ladder accepts a database ahead of the code; so does the reader).
+COVERAGE_MARK_COVERED = "covered"
+COVERAGE_MARK_EXCLUDED = "excluded"
+
+
+@dataclass(frozen=True)
+class CoverageMarks:
+    """The coverage one undegraded corpus run writes at its run-end seam.
+
+    A dumb boundary shape, like :class:`CheckRunRow`: which ids are covered and
+    which excluded is the check engine's decision
+    (``check.coverage_marks_from_result``). Defaultless on purpose. The one rule
+    enforced here is structural: a node carries one mark, so an id in both tuples
+    raises at construction, before any connection opens.
+
+    Attributes:
+        run_id: The run that sets these marks; the same ``run_id`` as the
+            ``check_runs`` row written in the same transaction.
+        marked_at: That run's ``ended_at`` (UTC ISO-8601, MI-10).
+        covered: Node ids the run swept and could audit.
+        excluded: Node ids the run swept whose embedding was stuck (a poison
+            backlog row), so other nodes' gathers could not reach them.
+    """
+
+    run_id: str
+    marked_at: str
+    covered: Tuple[str, ...]
+    excluded: Tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        """Rejects an id marked both covered and excluded.
+
+        Raises:
+            ValueError: If the two tuples share an id.
+        """
+        overlap = set(self.covered) & set(self.excluded)
+        if overlap:
+            raise ValueError(
+                f"a node carries one coverage mark, but {sorted(overlap)!r} are in "
+                "both covered and excluded"
+            )
+
+    def to_params(self) -> List[Tuple[str, str, str, str]]:
+        """Produces one upsert parameter tuple per id, covered first.
+
+        Returns:
+            ``(node_id, mark, run_id, marked_at)`` tuples for ``executemany``.
+        """
+        return [
+            (node_id, COVERAGE_MARK_COVERED, self.run_id, self.marked_at)
+            for node_id in self.covered
+        ] + [
+            (node_id, COVERAGE_MARK_EXCLUDED, self.run_id, self.marked_at)
+            for node_id in self.excluded
+        ]
 
 
 # --- Read-side boundary shapes (verdict-reuse / novelty projection) -----------
@@ -901,17 +1031,21 @@ _SELECT_COMMENTARY_AUDIT_SQL = (
 
 
 class TelemetryStore:
-    """Append-only sibling store for the Conflict sensor's judged batches.
+    """Sibling store for the check family's non-rebuildable telemetry.
 
     Boots its own migration ladder on construction (mirroring
     ``GraphStore.__init__``'s boot-on-init shape) and is otherwise
     connection-stateless: every operation opens its own connection through the MI-8
-    chokepoint and closes it, holding no long-lived handle. It pairs two append-only
-    writers (``record_judged_batch`` — the per-batch grain; ``record_check_run`` —
-    the per-run summary grain) with one read-only bulk projection
-    (``load_reuse_index``, the sibling's first consumer-facing read surface) — the
-    reader opens ``mode=ro``, so "no writes on the read path" is structural, not
-    disciplinary.
+    chokepoint and closes it, holding no long-lived handle. Writers:
+    ``record_judged_batch`` (the per-batch judgment grain, append-only),
+    ``record_run_end`` (a corpus run's summary row plus its coverage upsert, one
+    transaction) and ``record_check_run`` (the summary row alone, for staged runs).
+    ``check_coverage`` is the one table here that is updated in place: a per-node
+    state table, bounded by the nodes the corpus has ever held, not a per-run log.
+    Its bulk reader ``load_reuse_index`` opens ``mode=ro``, so "no writes on the
+    read path" is structural, not disciplinary. Because construction creates and
+    migrates the file, readers outside the check verb use the module-level
+    ``read_coverage`` instead of this class.
     """
 
     def __init__(self, telemetry_path: str) -> None:
@@ -930,8 +1064,8 @@ class TelemetryStore:
         if db_dir:
             os.makedirs(db_dir, exist_ok=True)
         # Bare boot: open the MI-8 chokepoint, run telemetry's OWN ladder, close.
-        # No prototype guard, no pre-ladder snapshot — a single append-only store
-        # with no risky rebuild needs none of the graph's ``_boot_migrations``
+        # No prototype guard, no pre-ladder snapshot — a sibling store whose rungs
+        # are all additive (no risky rebuild) needs none of the graph's ``_boot_migrations``
         # machinery (D2). ``run_migrations`` sets this connection to autocommit; it
         # is closed here, so the write path opens a fresh deferred-isolation
         # connection of its own (see ``record_judged_batch``).
@@ -1115,39 +1249,66 @@ class TelemetryStore:
             out.append(record)
         return out
 
-    def record_check_run(self, row: CheckRunRow) -> None:
-        """Persists one check run's summary row — the CHK-D7 run memory (W7).
+    def record_run_end(
+        self, row: CheckRunRow, *, coverage: Optional[CoverageMarks]
+    ) -> None:
+        """Persists a check run's summary row and its coverage in one transaction.
 
-        Mirrors :meth:`record_judged_batch`'s manners exactly: its own fresh
-        deferred-isolation connection, one INSERT under ``with conn:``,
-        append-only (never UPDATE/DELETE), no wall-clock read — the row carries
-        the caller's MI-10 stamps. ``run_id`` is the table PK, so a second write
-        for the same run raises (one summary row per run is structural).
+        The run-end seam. One fresh deferred-isolation connection, one
+        ``with conn:`` holding the ``check_runs`` INSERT and then the coverage
+        upsert, so the two commit together or not at all: a run can never read
+        degraded in one table and covered in the other, and a failure lands
+        nothing. No wall-clock read; both carry the caller's MI-10 stamps.
+        ``run_id`` is the ``check_runs`` PK, so a second write for the same run
+        raises and rolls its coverage back with it.
 
-        This writer is a dumb sink (the 1b sibling-store bulkhead): the scalars'
-        semantics — NULL rules, degradation tokens, novelty counts — are the
-        check engine's, computed in ``check.check_run_row_from_result`` from the
-        same result object the run report reads. The seam order is the CLI's
-        (3a): compute the exit code → build the row → this write, LAST, so a
-        failure here can only move the exit toward 2 and a persisted row's
+        A dumb sink (the sibling-store bulkhead): which runs cover and which ids
+        are covered or excluded is the engine's call
+        (``check.coverage_marks_from_result``), as the row's scalars are
+        (``check.check_run_row_from_result``). The seam order is the CLI's:
+        compute the exit code → build the row and the marks → this write, LAST,
+        so a failure here can only move the exit toward 2 and a persisted row's
         ``exit_code`` always equals the actual process exit.
+
+        Args:
+            row: The assembled summary row, verbatim.
+            coverage: The run's coverage marks, or ``None`` to write the row alone
+                (a degraded run, or a staged run). Keyword-only: further run-end
+                writes join this same transaction as further keywords.
+
+        Raises:
+            DatabaseError: If anything cannot be persisted (duplicate ``run_id``,
+                a CHECK/NOT NULL breach, or any other SQLite error). The whole
+                transaction has rolled back first; never swallowed, the caller
+                owns the disclose-and-exit disposition.
+        """
+        conn = open_connection(self.telemetry_path)
+        try:
+            with conn:
+                conn.execute(_INSERT_CHECK_RUN_SQL, row.to_params())
+                if coverage is not None:
+                    conn.executemany(_UPSERT_COVERAGE_SQL, coverage.to_params())
+        except sqlite3.Error as e:
+            raise DatabaseError(f"Failed to persist check run: {e}") from e
+        finally:
+            conn.close()
+
+    def record_check_run(self, row: CheckRunRow) -> None:
+        """Persists one check run's summary row alone — the staged path's writer.
+
+        ``cli._run_staged_check`` writes through here; staged runs write no
+        coverage. The corpus path writes through :meth:`record_run_end`. Same
+        transaction manners and failure contract, because it is that method with
+        ``coverage=None``.
 
         Args:
             row: The assembled summary row, verbatim.
 
         Raises:
             DatabaseError: If the row cannot be persisted (duplicate ``run_id``,
-                a CHECK/NOT NULL breach, or any other SQLite error) — never
-                swallowed; the caller owns the disclose-and-exit disposition.
+                a CHECK/NOT NULL breach, or any other SQLite error).
         """
-        conn = open_connection(self.telemetry_path)
-        try:
-            with conn:
-                conn.execute(_INSERT_CHECK_RUN_SQL, row.to_params())
-        except sqlite3.Error as e:
-            raise DatabaseError(f"Failed to persist check run: {e}") from e
-        finally:
-            conn.close()
+        self.record_run_end(row, coverage=None)
 
     def load_reuse_index(
         self, *, prompt_version: str, model_alias: str
@@ -1211,3 +1372,134 @@ class TelemetryStore:
         finally:
             if conn is not None:
                 conn.close()
+
+
+# --- Read-only access from outside the check verb -----------------------------
+#
+# ``TelemetryStore(...)`` creates the file and migrates it, so nothing on a read
+# path may construct it. These module-level readers open ``mode=ro`` and hand back
+# one of three typed results: data, :class:`TelemetryAbsent` (holds nothing; every
+# consumer reads it as empty) or :class:`TelemetryUnreadable` (a fault; never an
+# empty set). ADR ``telemetry-readers-outside-check-open-read-only-absent-is-empty-not-unreadable``.
+
+
+@dataclass(frozen=True)
+class TelemetryAbsent:
+    """The telemetry file holds no data this reader needs.
+
+    Either there is no file, or its ``user_version`` is below the rung the reader
+    needs (a workspace that has not run a check since upgrading). Both mean
+    "nothing recorded", which is different in type from a present, empty table.
+
+    Attributes:
+        reason: ``"no_file"`` or ``"below_rung"``. Diagnostic only; consumers
+            treat both the same.
+    """
+
+    reason: str
+
+
+@dataclass(frozen=True)
+class TelemetryUnreadable:
+    """The telemetry file exists and could not be read.
+
+    A corrupt image, a permission fault, a path that is a directory. Returned,
+    never raised, and never collapsed into an empty result.
+
+    Attributes:
+        detail: The underlying exception message, for diagnostics.
+    """
+
+    detail: str
+
+
+@dataclass(frozen=True)
+class CoverageRead:
+    """The coverage marks as read from ``check_coverage``.
+
+    Two empty sets mean the table exists and holds no rows, which is a different
+    type from :class:`TelemetryAbsent`.
+
+    Attributes:
+        covered: Node ids an undegraded sweep has seen and could audit.
+        excluded: Node ids an undegraded sweep has seen but could not audit
+            (stuck embedding).
+    """
+
+    covered: FrozenSet[str]
+    excluded: FrozenSet[str]
+
+
+def _open_read_only(
+    telemetry_path: str, *, required_rung: int
+) -> "sqlite3.Connection | TelemetryAbsent | TelemetryUnreadable":
+    """Opens the telemetry file read-only, if it holds the rung a reader needs.
+
+    Order matters. A missing path is answered from ``os.path.exists`` without
+    touching SQLite: a ``mode=ro`` connect on a missing path raises, and that
+    must not read as *unreadable*. The ``user_version`` check sits inside the same
+    ``try`` as the connect, because a corrupt file connects fine and fails at its
+    first statement. Never creates, never migrates, never raises. (A read-only
+    open of a WAL file may still leave ``-shm``/``-wal`` siblings; the database
+    file itself is untouched.)
+
+    Args:
+        telemetry_path: Path to ``telemetry.sqlite``.
+        required_rung: The lowest ``user_version`` holding the table to be read.
+
+    Returns:
+        An open read-only connection (the caller closes it), or
+        :class:`TelemetryAbsent` (``"no_file"`` / ``"below_rung"``), or
+        :class:`TelemetryUnreadable`.
+    """
+    if not os.path.exists(telemetry_path):
+        return TelemetryAbsent("no_file")
+    conn = None
+    try:
+        conn = open_connection(telemetry_path, read_only=True)
+        version = conn.execute("PRAGMA user_version;").fetchone()[0]
+    except (sqlite3.Error, DatabaseError) as e:
+        # A connect failure arrives wrapped (``DatabaseError``); a corrupt image
+        # raises raw ``sqlite3.DatabaseError`` at the PRAGMA. Catch both.
+        if conn is not None:
+            conn.close()
+        return TelemetryUnreadable(str(e))
+    if version < required_rung:
+        conn.close()
+        return TelemetryAbsent("below_rung")
+    return conn
+
+
+def read_coverage(
+    telemetry_path: str,
+) -> "CoverageRead | TelemetryAbsent | TelemetryUnreadable":
+    """Reads the check coverage marks without creating or migrating anything.
+
+    Args:
+        telemetry_path: Path to ``telemetry.sqlite`` (typically
+            ``config.telemetry_path``).
+
+    Returns:
+        A :class:`CoverageRead` (possibly two empty sets), or
+        :class:`TelemetryAbsent` when there is no file or it predates the coverage
+        rung, or :class:`TelemetryUnreadable` when the file exists and a read
+        failed. A row with a mark outside the closed set (a newer build's) is
+        ignored. Never raises on a bad file.
+    """
+    opened = _open_read_only(telemetry_path, required_rung=COVERAGE_RUNG)
+    if not isinstance(opened, sqlite3.Connection):
+        return opened
+    covered: set = set()
+    excluded: set = set()
+    try:
+        for row in opened.execute(_SELECT_COVERAGE_SQL):
+            if row["mark"] == COVERAGE_MARK_COVERED:
+                covered.add(row["node_id"])
+            elif row["mark"] == COVERAGE_MARK_EXCLUDED:
+                excluded.add(row["node_id"])
+    except sqlite3.Error as e:
+        # Deeper page corruption surfaces only at query time.
+        return TelemetryUnreadable(str(e))
+    finally:
+        opened.close()
+    return CoverageRead(covered=frozenset(covered), excluded=frozenset(excluded))

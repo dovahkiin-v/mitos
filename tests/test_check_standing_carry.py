@@ -453,6 +453,7 @@ def _result(departed: Tuple[DepartedFinding, ...]) -> Any:
         ended_at="2026-09-18T12:01:00+00:00",
         nodes_total=2,
         nodes_swept=2,
+        swept_node_ids=(),
         sweep_degraded=None,
         findings=(),
         pairs_judged_fresh=0,

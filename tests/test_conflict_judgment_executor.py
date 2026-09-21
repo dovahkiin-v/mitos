@@ -500,6 +500,7 @@ def test_t10_check_run_judgment_requests_carry_no_cache_control() -> None:
         fresh=False,
         nodes_total=2,
         nodes_swept=2,
+        swept_node_ids=(proposal["id"], partner["id"]),
         sweep_degraded=None,
         pairs=(pair,),
         reused=(),

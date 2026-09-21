@@ -5153,10 +5153,10 @@ def cmd_check(
     The one sequence (each step's contract in the phase plan §4): build substrate →
     provider-absent disposition (KD2) → ``plan_corpus_check`` → CHK-D5 confirm (KD3)
     → build judge iff fresh groups (KD6) → ``execute_corpus_check`` → build the full
-    display model → the run-end seam (``exit_code_for`` → row → ``record_check_run``
-    LAST, KD5) → emit. ``cmd_check`` owns its error boundary (KD1a): store faults
-    around plan/execute/display map to a calm exit-2 vector message, never a traceback
-    read by CI as "new findings".
+    display model → the run-end seam (``exit_code_for`` → row + coverage marks →
+    ``record_run_end`` LAST, one transaction, KD5) → emit. ``cmd_check`` owns its
+    error boundary (KD1a): store faults around plan/execute/display map to a calm
+    exit-2 vector message, never a traceback read by CI as "new findings".
 
     Args:
         config: The active workspace config.
@@ -5261,15 +5261,17 @@ def cmd_check(
             # not carry (plan.nodes_total is already scope-filtered).
             denominator = len(store.get_active_decisions())
 
-        # Run-end seam (KD5): exit → row → write LAST. Build the row unconditionally
-        # (pure) so the JSON scalars derive from the one source; write it only when
-        # telemetry exists.
+        # Run-end seam (KD5): exit → row + coverage → write LAST. Build both
+        # unconditionally (pure) so the JSON scalars derive from the one source; write
+        # them only when telemetry exists, in one transaction (a degraded run's
+        # coverage is None, so it writes its row alone).
         exit_code = check.exit_code_for(result)
         row = check.check_run_row_from_result(result, mode="corpus", exit_code=exit_code)
+        coverage = check.coverage_marks_from_result(result)
         row_written = False
         if telemetry is not None:
             try:
-                telemetry.record_check_run(row)
+                telemetry.record_run_end(row, coverage=coverage)
                 row_written = True
             except DatabaseError:
                 # The write is the last fallible act: a failure only moves toward 2.
