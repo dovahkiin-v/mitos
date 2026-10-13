@@ -85,8 +85,9 @@ def _mk_entry(axiom: str, slug: str):
 # --------------------------------------------------------------------------- #
 # ② Slug ergonomics — explicit slugs are validated, not truncated
 #
-# The slug is now mandatory + explicit on record, and it is folded into the
-# canonical-core identity (permanent once committed). So the write path NORMALISES an
+# The slug is now mandatory + explicit on record, and it is the handle other decisions
+# cite (not part of the canonical-core identity, which is slug-free — and
+# amend_commentary can rename it). So the write path NORMALISES an
 # explicit slug (case/separators) but REJECTS an over-length one with an exact char
 # count — never silently truncating it (a silent trim diverges the stored handle from
 # the one the author already cited: self-inflicted citation rot). `_slugify` keeps its
@@ -160,6 +161,27 @@ def test_record_over_length_slug_rejected_with_exact_count(ws):
     # Nothing written — the contract holds.
     assert _read(config) == before
     assert len(GraphStore(config.db_path).get_all_nodes()) == 0
+
+
+#: B13 — what neither over-length message may say any more: a slug is a mutable
+#: handle, not an identity input, and "NOT" was the prompt-style rule's shouting.
+SLUG_MESSAGE_FORBIDDEN_WORDS = ("permanent", "identity", "not")
+
+
+def test_record_over_length_slug_gives_the_true_reason(ws):
+    """B13 row 15 — the record path's refusal carries the shared reason clause and
+    none of the stale claims; the planted stale message proves the checker live."""
+    from mitos.identity import SLUG_LENGTH_REASON
+    from test_record_decision import register_violations
+    config, m = ws
+    res = m.record_decision_entry("Some decision.", "rej", ["s"], slug="a-very-" * 20)
+    assert res["code"] == "slug_too_long"
+    assert SLUG_LENGTH_REASON in res["error"]
+    assert register_violations(res["error"], words=SLUG_MESSAGE_FORBIDDEN_WORDS) == []
+    stale = ("The slug is the permanent citation handle (it is folded into the "
+             "decision's identity), so it is NOT silently truncated.")
+    assert register_violations(stale, words=SLUG_MESSAGE_FORBIDDEN_WORDS) == list(
+        sorted(SLUG_MESSAGE_FORBIDDEN_WORDS))
 
 
 # --------------------------------------------------------------------------- #

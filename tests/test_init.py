@@ -8,6 +8,8 @@ filesystem + idempotency + pre-V1a-refusal outcomes (no external services; the
 """
 
 import os
+import re
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -724,3 +726,30 @@ def test_the_success_line_reaches_a_captured_stream_before_the_refusal(tmp_path)
     assert combined.index("Initialized Mitos workspace") < combined.index("Error:"), (
         f"the refusal overtook the success line it follows:\n{combined}"
     )
+
+
+# --- 3f: the scaffolded .env comment -----------------------------------------
+
+def test_scaffolded_env_describes_the_anthropic_key_truthfully(tmp_path, monkeypatch):
+    """The Anthropic key runs the check and arms the commit gate; its recipes parse.
+
+    Each backticked ``mitos …`` recipe is taken from the written file, parsed, and
+    resolved: ``-p .`` names the workspace the file lives in, so it is resolved
+    from that directory.
+    """
+    _init(tmp_path)
+    env_body = _read(tmp_path / ".env")
+    anthropic = env_body[env_body.index("# Anthropic"):]
+    assert "Only used by" not in env_body
+    assert "commit gate" in anthropic and "contradiction check" in anthropic
+    assert "ANTHROPIC_API_KEY=" in env_body.splitlines()
+
+    recipes = [span for span in re.findall(r"`([^`]*)`", anthropic)
+               if span.startswith("mitos ")]
+    assert {shlex.split(r)[1] for r in recipes} == {"check", "hook-install"}
+    monkeypatch.chdir(tmp_path)
+    for recipe in recipes:
+        args = cli._build_parser().parse_args(shlex.split(recipe)[1:])
+        assert args.project_post == "."
+        resolved = cli._resolve_selector(cli._selector_from_args(args), args.command)
+        assert os.path.realpath(resolved.root) == os.path.realpath(tmp_path)

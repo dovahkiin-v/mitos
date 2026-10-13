@@ -1,8 +1,9 @@
 """Deterministic lexical fallback for the semantic read verbs.
 
-When semantic recall or the graph is unavailable *for any reason* — embedding
-provider errors (a 429 mid-loop), Qdrant down or the collection missing, or a
-pre-V1a graph that takes SQLite reads down with it — ``mitos surface`` and
+When semantic recall or the graph is unavailable *for any reason* — an
+embedding provider failure (classified by ``provider_cause``: a refused key, a 429
+mid-loop, a transient outage, or an unknown error), Qdrant down or the collection
+missing, or a pre-V1a graph that takes SQLite reads down with it — ``mitos surface`` and
 ``mitos query`` degrade to a case-insensitive term-match over the entries of the
 markdown corpus — ``decisions.md`` and ``decisions/archive/`` — (slug + axiom)
 instead of dead-ending (ADR
@@ -28,11 +29,37 @@ stamps — entries come straight from markdown and may include superseded ones.
 import os
 from typing import Any, Dict, List, Optional, Sequence, Set
 
+from mitos.errors import CollectionMissingError, EmbeddingError, VectorStoreError
 from mitos.parser import parse_decisions_file
+from mitos.provider_cause import QUOTA, classify_provider_error, provider_cause_phrase
 
 # Terms shorter than this are dropped from the query before matching — they are
-# stop-word noise ("a", "of", "to") that would match nearly every entry.
+# stop-word noise ("a", "of", "to") that would match nearly every entry. Longer
+# stop-words still match and still rank; ``DISPLAY_STOPWORDS`` below only hides them.
 LEXICAL_MIN_TERM_LEN: int = 3
+
+# English function words hidden from each match's displayed ``matched_terms`` —
+# display only, and counted: the match carries ``stopwords_dropped`` for what was
+# hidden, and ranking still counts every matched term, so a hit ranked on these
+# words alone shows an empty list beside a non-zero count rather than vanishing.
+# English because the list is; the corpus need not be (P9) — a non-English query
+# loses nothing, it just drops nothing. Source: the NLTK English stop-word list,
+# less contractions and entries shorter than ``LEXICAL_MIN_TERM_LEN`` (they never
+# reach a match). Content-bearing common words (``show``) are deliberately absent.
+DISPLAY_STOPWORDS: frozenset[str] = frozenset({
+    "about", "above", "after", "again", "against", "all", "and", "any", "are",
+    "because", "been", "before", "being", "below", "between", "both", "but",
+    "can", "did", "does", "doing", "down", "during", "each", "few", "for",
+    "from", "further", "had", "has", "have", "having", "her", "here", "hers",
+    "herself", "him", "himself", "his", "how", "into", "its", "itself", "just",
+    "more", "most", "myself", "nor", "not", "now", "off", "once", "only",
+    "other", "our", "ours", "ourselves", "out", "over", "own", "same", "she",
+    "should", "some", "such", "than", "that", "the", "their", "theirs", "them",
+    "themselves", "then", "there", "these", "they", "this", "those", "through",
+    "too", "under", "until", "very", "was", "were", "what", "when", "where",
+    "which", "while", "who", "whom", "why", "will", "with", "you", "your",
+    "yours", "yourself", "yourselves",
+})
 
 # Default result cap when the caller passes no limit. Mirrors the spirit of the
 # ranked verbs' clamp without importing their ceiling — a grep needs no 50-row
@@ -50,39 +77,77 @@ _NO_MATCH_LINE = (
 )
 
 
-def degraded_reason_from_error(exc: Optional[BaseException]) -> str:
+# Per-surface recovery clauses for the two degraded causes that have a heal, on the
+# ``recall._SURFACE_POINTERS`` idiom: the classifier states the cause, each surface
+# supplies its own closing clause. The CLI names the command with its selector,
+# ``project`` rendered through ``repr`` at composition, because a registered name may
+# carry a space and an unregistered target's ``project`` is a path. The MCP clause
+# names no command and no tool — it states the fact and a person with a shell as the
+# next actor (``recall.MISSING_GRAPH_POINTERS["mcp"]``'s register), because an agent
+# handed a shell command runs it, and neither heal is a tool.
+_RECOVERY_CLAUSES: Dict[str, Dict[str, str]] = {
+    "cli": {
+        "cutover": "run `mitos cutover -p {project}`",
+        "reconcile": "run `mitos reconcile -p {project}`",
+    },
+    "mcp": {
+        "cutover": (
+            "only a cutover migrates it, which no tool on this surface performs — "
+            "a person with a shell in that project runs it"
+        ),
+        "reconcile": (
+            "only a reconcile re-creates it and re-embeds the active decisions, which "
+            "no tool on this surface performs — a person with a shell in that project "
+            "runs it"
+        ),
+    },
+}
+
+
+def degraded_reason_from_error(
+    exc: Optional[BaseException], *, surface: str, project: str
+) -> str:
     """Classifies a recall failure into one calm human-readable cause.
 
-    Never returns the raw provider blob — a Gemini 429 dumps a JSON error body
-    into ``str(exc)``, and re-printing that is exactly the AX failure the
-    fallback exists to replace.
+    Never returns the raw provider blob — a Gemini error dumps a JSON body into
+    ``str(exc)``, and re-printing that is exactly the AX failure the fallback
+    exists to replace. An embedding-provider failure is named by
+    ``provider_cause``'s closed classifier, the same phrase the scope-dump note
+    and the write-path warning carry.
+
+    The arm order is load-bearing: the pre-V1a text first, then the 429 text
+    (an ``EmbeddingError`` often wraps a 429), then the typed arms, with
+    ``CollectionMissingError`` before the ``VectorStoreError`` it subclasses.
 
     Args:
         exc: The exception that broke semantic recall, or None when recall was
             never attempted (no provider/vector store wired).
+        surface: ``"cli"`` or ``"mcp"`` — selects the recovery clause's register.
+            Required, never defaulted: the MCP register must be unable to emit a
+            shell command.
+        project: The target's ``config.project``, read only by the CLI recipes.
 
     Returns:
         A short cause phrase for the degraded header.
     """
+    recovery = _RECOVERY_CLAUSES[surface]
     if exc is None:
         return "embeddings/Qdrant unavailable"
     text = str(exc)
     if "predates the V1a schema" in text:
-        return "graph predates the V1a schema — run `mitos cutover`"
-    if "RESOURCE_EXHAUSTED" in text or "429" in text:
-        return "embedding provider rate-limited (429)"
-    # Late import avoided — errors.py is a leaf, safe at module level, but the
-    # string checks above must win first (an EmbeddingError often wraps a 429).
-    from mitos.errors import CollectionMissingError, EmbeddingError, VectorStoreError
-
+        return "graph predates the V1a schema — " + recovery["cutover"].format(
+            project=repr(project))
+    if classify_provider_error(exc) == QUOTA:
+        return provider_cause_phrase(QUOTA)
     if isinstance(exc, EmbeddingError):
-        return "embedding provider error"
+        return provider_cause_phrase(classify_provider_error(exc))
     # Before the VectorStoreError arm, which it subclasses — otherwise the most-used
     # read verb answers a missing collection with "Qdrant unavailable", the exact
     # blame-the-infrastructure phrase the typed error exists to replace.
     if isinstance(exc, CollectionMissingError):
         named = f" '{exc.collection}'" if exc.collection else ""
-        return f"vector collection{named} missing — run `mitos reconcile`"
+        return f"vector collection{named} missing — " + recovery["reconcile"].format(
+            project=repr(project))
     if isinstance(exc, VectorStoreError):
         return "Qdrant unavailable"
     lowered = text.lower()
@@ -116,7 +181,7 @@ def lexical_fallback(
     reason: str,
     store: Optional[Any] = None,
     limit: Optional[int] = None,
-    brief: bool = False,
+    full_top: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Runs the deterministic lexical fallback over the markdown corpus.
 
@@ -141,13 +206,18 @@ def lexical_fallback(
             match is modifier-stamped; when None, a stamps-unavailable
             disclosure rides the note instead.
         limit: Max matches to return; None ⇒ ``LEXICAL_DEFAULT_LIMIT``.
-        brief: Omit ``rejected_paths`` from each match.
+        full_top: How many top matches keep ``rejected_paths``, by position among
+            the matches returned; the rest are axiom-only. None ⇒ every match whole,
+            0 ⇒ none (the boundaries' ``brief``). The count and its note clause are
+            the boundaries' to add — this leaf has no surface.
 
     Returns:
         ``{degraded: "lexical", degraded_reason, matches: [...], note}`` — each
         match a Letter-shaped dict (slug, axiom, scope, rejected_paths unless
-        brief, matched_terms) plus state + modifier stamps when the graph is
-        readable. ``stamps_unavailable: True`` is set when it is not, and
+        thinned by ``full_top``, matched_terms) plus state + modifier stamps when the graph is
+        readable. ``matched_terms`` omits ``DISPLAY_STOPWORDS``; ``stopwords_dropped``
+        counts the omitted terms and is present only when non-zero.
+        ``stamps_unavailable: True`` is set when the graph is not readable, and
         ``unread_files`` (basenames) only when some corpus file could not be read.
 
     Raises:
@@ -202,9 +272,15 @@ def lexical_fallback(
             "slug": entry.slug,
             "axiom": entry.core_axiom or entry.axiom or "",
             "scope": entry.scope,
-            "matched_terms": hit,
+            # Display only: ``hit`` above ranked the entry and stays whole there.
+            "matched_terms": [t for t in hit if t not in DISPLAY_STOPWORDS],
         }
-        if not brief:
+        dropped = len(hit) - len(payload["matched_terms"])
+        if dropped:
+            payload["stopwords_dropped"] = dropped
+        # Rank among the matches returned: nothing is appended between here and
+        # the append below, and a filtered entry never reaches it.
+        if full_top is None or len(matches) + 1 <= full_top:
             payload["rejected_paths"] = entry.rejected_paths
         if store is not None:
             # Graph readable: filter to active, stamp modifiers. An entry the

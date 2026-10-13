@@ -10,7 +10,7 @@ import os
 import hashlib
 import logging
 from datetime import datetime, timezone
-from typing import List, Dict, Optional, Any, Sequence, Set, Tuple
+from typing import List, Dict, Optional, Any, FrozenSet, Sequence, Set, Tuple
 from mitos.errors import (
     DatabaseError,
     ValidationError,
@@ -376,6 +376,39 @@ def _computed_oq_state(is_resolved: int) -> str:
         The computed Stage-2 state string (``"resolved"`` / ``"parked"``).
     """
     return "resolved" if is_resolved else "parked"
+
+
+def _computed_node_state(
+    kind: str, killer_type: Optional[str], is_drifted: bool, is_resolved: int
+) -> str:
+    """Derives one node's state in the vocabulary of its own kind (M3).
+
+    The one kind-aware ladder, shared by the receipt's identification echo
+    (:meth:`GraphStore.get_outgoing_edge_targets`) and the by-handle reads
+    (:meth:`GraphStore.get_handle_state`). The kill check comes first for both
+    kinds, because Stage 1 precedes Stage 2: a killed node reads ``superseded`` /
+    ``corrected`` whatever its kind. An unkilled open question then reads its
+    Stage-2 ``resolved`` / ``parked`` and takes no drift, as
+    :meth:`GraphStore.get_open_questions` does. An unkilled decision reads
+    ``drifted`` when a drifted signal is set, else ``active``.
+
+    Args:
+        kind: The node's ``kind`` (``"decision"`` or ``"open_question"``).
+        killer_type: The incoming kill-edge type, or None when there is none.
+        is_drifted: Whether a drifted signal is set on the node.
+        is_resolved: The ``is_resolved`` derived column; read for an open
+            question only.
+
+    Returns:
+        The computed state string.
+    """
+    if killer_type is not None:
+        return _computed_decision_state(killer_type)
+    if kind == "open_question":
+        return _computed_oq_state(is_resolved)
+    if is_drifted:
+        return "drifted"
+    return "active"
 
 
 def compute_hash(
@@ -1276,11 +1309,12 @@ class GraphStore:
         vector, P3).
 
         The state is **decision-centric** (``active`` / ``superseded`` /
-        ``corrected`` / ``drifted``). Open-question resolution state
-        (``parked`` / ``resolved``) rides the ``resolves`` edge — that edge commits
-        as of V1b 2a, but deriving the OQ ``parked`` / ``resolved`` state from it is
-        a later V1b phase — so an open_question resolves to its kill-edge state here,
-        never ``parked`` / ``resolved`` (G7; V1b owns OQ resolution).
+        ``corrected`` / ``drifted``), and an open_question resolves to its
+        kill-edge state here, never ``parked`` / ``resolved``. Its callers — the
+        ranked loops, the list text, the conflict gather, the ``exists`` receipts —
+        expect decision vocabulary. An open question's Stage-2 state is read by
+        :meth:`get_open_questions` on the list surfaces and by
+        :meth:`get_handle_state` on the by-handle reads.
 
         Args:
             node_id: The content-hash id of the node to derive state for.
@@ -1300,6 +1334,46 @@ class GraphStore:
             if row["killer_type"] is None and row["is_drifted"]:
                 return "drifted"
             return _computed_decision_state(row["killer_type"])
+        finally:
+            conn.close()
+
+    def get_handle_state(self, node_id: str) -> str:
+        """Computes one node's state in its own kind's vocabulary, for a by-handle read.
+
+        The state behind ``show_node`` and ``mitos show``, which dereference a handle
+        that may name an open question. A decision reads what :meth:`get_node_state`
+        gives. An open question reads its kill state if it has an incoming kill
+        edge, else ``resolved`` / ``parked`` — the same state the receipt's
+        identification echo reports, through the same :func:`_computed_node_state`.
+
+        :meth:`get_node_state` stays decision-centric because every other caller
+        expects decision vocabulary; this read has exactly the two by-handle callers.
+        One SELECT serves both kinds: ``_OQ_RESOLVED_SQL`` yields 0 on a decision
+        row. ``FROM nodes`` stays unaliased, because all three fragments correlate on
+        the bare ``nodes`` (the §4.3 alias trap). An absent node defaults to
+        ``"active"``, as :meth:`get_node_state` does, for the same defensive reason.
+
+        Args:
+            node_id: The content-hash id of the node to derive state for.
+
+        Returns:
+            The computed state string.
+        """
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                f"SELECT nodes.kind, {_IS_DRIFTED_SQL}, {_KILLER_TYPE_SQL}, "
+                f"{_OQ_RESOLVED_SQL} FROM nodes WHERE nodes.id = ?",
+                (node_id,),
+            ).fetchone()
+            if row is None:
+                return "active"
+            return _computed_node_state(
+                row["kind"],
+                row["killer_type"],
+                bool(row["is_drifted"]),
+                row["is_resolved"],
+            )
         finally:
             conn.close()
 
@@ -1438,9 +1512,9 @@ class GraphStore:
         # ``-O`` flag (the 2a IMPL_NOTES precedent: a vector error is durable).
         #
         # Slug-length backstop (both kinds): the parser gates this on every file route
-        # and the record path gates it early, but the slug is the permanent citation
-        # handle — an over-length one reaching the store means a caller bypassed the
-        # parser, so fence it here too (unbypassable identity invariant, MI-11 spirit).
+        # and the record path gates it early, but the slug is the handle other
+        # decisions cite — an over-length one reaching the store means a caller bypassed
+        # the parser, so fence it here too (an unbypassable format invariant, MI-11 spirit).
         if len(parsed.slug) > SLUG_MAX_LEN:
             raise ValidationError(
                 f"Slug '{parsed.slug}' reached the store at {len(parsed.slug)} "
@@ -2314,6 +2388,38 @@ class GraphStore:
         finally:
             conn.close()
 
+    def get_active_decision_ids(self) -> FrozenSet[str]:
+        """Returns the ids of the active-view decisions, unhydrated.
+
+        The same population :meth:`get_active_decisions` returns (and so the same
+        one ``check`` sweeps), read as ids only for the uncovered-decision
+        derivation (``mitos.audit_debt``): no ``_IS_DRIFTED_SQL``, no
+        ``_hydrate_rows``. A drifted decision stays in, because the predicate does
+        not retire it and neither does the sweep. Unscoped on purpose: the gate's
+        population is the whole corpus.
+
+        The two reads must never disagree, so this binds the shipped
+        ``_ACTIVE_VIEW_PREDICATE`` rather than re-encoding it, and ``nodes`` stays
+        UNALIASED so the correlated predicate binds (the alias trap the constant's
+        own comment warns about). ``tests/test_audit_debt.py`` pins the agreement
+        over a fixture matrix (superseded, corrected, drifted, open questions).
+
+        Store faults propagate (``DatabaseError`` / ``sqlite3.Error``); the
+        derivation is what turns them into a result.
+
+        Returns:
+            The active decision node ids.
+        """
+        conn = self._get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT nodes.id FROM nodes "
+                f"WHERE nodes.kind = 'decision' AND {_ACTIVE_VIEW_PREDICATE}"
+            ).fetchall()
+            return frozenset(row[0] for row in rows)
+        finally:
+            conn.close()
+
     def get_all_scopes(self) -> List[str]:
         """Returns a sorted list of all unique scope tags currently in use."""
         conn = self._get_connection()
@@ -2783,9 +2889,12 @@ class GraphStore:
         """Lists the committed outgoing edges of a node as write facts.
 
         Returns each edge as ``{"kind": edge_type, "target": <target's current
-        slug>}`` in insertion order. This reads what the commit actually wired
-        (the receipt's ``edges_created`` source of truth), never a re-derivation
-        from author input.
+        slug>}`` in insertion order. This reads what the commit actually wired,
+        never a re-derivation from author input. The repair, amend, divergence,
+        restore and settledness paths read it, and the ``created`` receipt falls
+        back to it when
+        :meth:`get_outgoing_edge_targets` (its healthy-path read) fails, so the
+        edges survive with null target keys.
 
         Args:
             node_id: The source node's id.
@@ -2806,6 +2915,69 @@ class GraphStore:
             return [{"kind": r["edge_type"], "target": r["slug"]} for r in rows]
         finally:
             conn.close()
+
+    def get_outgoing_edge_targets(self, node_id: str) -> List[Dict[str, Any]]:
+        """Lists a node's outgoing edges with each target hydrated, stamped and stated.
+
+        The read behind the ``created`` receipt's identification echo (B4): one
+        query over the node's outgoing edges joined to their targets, then ONE bulk
+        scope fetch and ONE bulk modifier stamp via :meth:`_hydrate_rows` — never a
+        per-edge ``get_node`` loop (P11). The state is computed here, at read time
+        (M3), in the vocabulary of the target's kind:
+
+          - a decision reads ``superseded`` / ``corrected`` from its incoming
+            kill-edge, else ``drifted`` when a drifted signal is set, else
+            ``active`` — :meth:`get_node_state`'s logic through the same fragments;
+          - an open question reads its kill state if it has one, else its Stage-2
+            ``resolved`` / ``parked`` — :meth:`get_open_questions`' logic, so a
+            ``resolves`` the caller just wrote is visible in its own read-back.
+            (:meth:`get_node_state` is kill-edge-only for an OQ, so it is not used.)
+
+        Both kinds go through :func:`_computed_node_state`, the ladder
+        :meth:`get_handle_state` shares.
+
+        The joined ``nodes`` is deliberately UNALIASED and the edges table is
+        aliased ``e``: ``_KILLER_TYPE_SQL``, ``_IS_DRIFTED_SQL`` and
+        ``_OQ_RESOLVED_SQL`` correlate on the bare ``nodes`` (the §4.3 alias trap).
+
+        Args:
+            node_id: The source node's id.
+
+        Returns:
+            One dict per edge in insertion order: ``{"kind": edge_type, "target":
+            <target's current slug>, "node": <hydrated, modifier-stamped target>,
+            "state": <computed state>}``. Empty when the node has no outgoing edges.
+        """
+        conn = self._get_connection()
+        try:
+            rows = conn.execute(
+                f"SELECT nodes.*, {_IS_DRIFTED_SQL}, {_KILLER_TYPE_SQL}, "
+                f"{_OQ_RESOLVED_SQL}, e.edge_type AS echo_edge_type "
+                "FROM edges e JOIN nodes ON nodes.id = e.target_id "
+                "WHERE e.source_id = ? ORDER BY e.rowid",
+                (node_id,),
+            ).fetchall()
+            nodes = self._hydrate_rows(conn, rows)
+        finally:
+            conn.close()
+        result: List[Dict[str, Any]] = []
+        # _hydrate_rows preserves row order and pops killer_type / is_resolved, so
+        # both are read off the raw row; the edge alias is popped so it never rides
+        # the hydrated target.
+        for node, row in zip(nodes, rows):
+            node.pop("echo_edge_type", None)
+            state = _computed_node_state(
+                node["kind"], row["killer_type"], node["is_drifted"], row["is_resolved"]
+            )
+            result.append(
+                {
+                    "kind": row["echo_edge_type"],
+                    "target": node["slug"],
+                    "node": node,
+                    "state": state,
+                }
+            )
+        return result
 
     def get_incoming_edges(self, node_id: str) -> List[Dict[str, str]]:
         """Lists the committed edges that point AT a node, as write facts.

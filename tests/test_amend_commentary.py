@@ -270,6 +270,56 @@ def test_other_refusals_are_in_band_and_write_nothing(ws, changes, reason) -> No
 
 
 # --------------------------------------------------------------------------- #
+# 7b — tool-call markup is refused in what is sent, and only there (B2)
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("field", ["rejected_paths", "invalidates_if", "context", "slug",
+                                   "scope"])
+def test_markup_in_each_sent_field_is_refused_end_to_end_and_writes_nothing(ws, field) -> None:
+    """R2, manager half — the refusal passes through with `slug` added; buffer untouched."""
+    from test_amend import MARKUP, markup_changes
+    config, m = ws
+    _record(m, "target")
+    sha = _sha(config)
+    result = _amend(m, "target", markup_changes(field, MARKUP["parameter"]))
+    assert (result["status"], result["reason"], result["fields"], result["slug"]) == (
+        "refused", amend.REASON_TOOL_CALL_MARKUP, [field], "target")
+    assert result["markup_spans"][0]["span"] == "</parameter>"
+    assert _sha(config) == sha and _audit(config) == []
+
+
+def test_backticked_markup_is_amended_byte_exact(ws) -> None:
+    """R3 — the exemption holds on the amend verb too."""
+    config, m = ws
+    _record(m, "target")
+    prose = "Mention `</context>` and `<parameter name=\"x\">` as prose."
+    result = _amend(m, "target", {"context": prose})
+    assert result["status"] == "amended", result
+    assert m.store.get_node(result["id"])["context"] == prose
+    assert f"**Context:** {prose}\n" in _buffer(config)
+
+
+def test_an_entry_already_holding_markup_stays_repairable(ws) -> None:
+    """R9 — amend scans only the values sent, never the target's untouched fields."""
+    config, m = ws
+    block = ("### damaged\n\n"
+             "**Decided:** Axiom for damaged.\n"
+             "**Rejected:** Rejected alternative for damaged.\n"
+             "**Context:** The recipe read is live on every send.\n"
+             "Whatever the grade. </context>\n"
+             "</invoke>\n"
+             "**Scope:** mail\n")
+    _write_buffer(config, _buffer(config).replace(
+        _ENTRIES_MARKER, f"{_ENTRIES_MARKER}\n\n{block}", 1))
+    (entry,) = parse_entry_stream(block, "decision")
+    GraphStore(config.db_path).commit_parsed_entry(entry)
+    result = _amend(m, "damaged", {"context": "clean text"})
+    assert result["status"] == "amended", result
+    assert m.store.get_node(result["id"])["context"] == "clean text"
+    assert "</invoke>" not in _buffer(config)
+
+
+# --------------------------------------------------------------------------- #
 # A4 — the fence is the only raise, and it rolls back
 # --------------------------------------------------------------------------- #
 

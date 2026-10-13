@@ -5,6 +5,8 @@ concurrency file locks, LLM capture enrichment, user reviews, and content-aware
 archive rotation.
 """
 
+import hashlib
+import math
 import os
 import sys
 import shutil
@@ -13,6 +15,7 @@ import json
 import sqlite3
 import uuid
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_FLOOR
 from typing import TYPE_CHECKING, List, Dict, Mapping, Optional, Any, Set, Tuple, Callable
 from filelock import FileLock, Timeout
 
@@ -26,9 +29,10 @@ from mitos import amend
 from mitos import atomic_file
 from mitos import rotation
 from mitos import settledness
-from mitos.config import MitosConfig, hint_due
+from mitos.config import MitosConfig, hint_due, judge_api_key
 from mitos.conflict import (
     CONFLICT_CANDIDATE_SOURCE,
+    CONFLICT_OVERFETCH_LIMIT,
     CONFLICT_PROMPT_VERSION,
     CONFLICT_TOP_K,
     ConflictCheckResult,
@@ -42,8 +46,13 @@ from mitos.conflict import (
     screen_candidates,
 )
 from mitos.telemetry import (CommentaryAuditRow, ConflictCheckRow, JudgmentBatch,
-                            TelemetryStore)
-from mitos.divergence import declared_edges, entry_divergence, is_reconcilable
+                            TelemetryStore, read_last_attempt)
+from mitos.check_notice import compose_check_notice
+from mitos.audit_debt import AuditDebt, derive_audit_debt
+from mitos.divergence import (
+    code_point_names, declared_edges, differing_span, entry_divergence, is_reconcilable,
+    judged_text, needs_code_points,
+)
 from mitos.errors import (
     CollectionMissingError,
     MitosError,
@@ -60,8 +69,8 @@ from mitos.errors import (
     STORE_SLUG_COLLISION,
 )
 from mitos.models import get_embedding_model_id, get_model_id
-from mitos.parser import (ParsedEntry, mask_inline_code, parse_entry_stream,
-                          parse_file_reversed)
+from mitos.parser import (ParsedEntry, load_format_spec, mask_inline_code,
+                          parse_entry_stream, parse_file_reversed)
 from mitos.replay import commit_quarantine_fixpoint
 from mitos.store import (
     GraphStore,
@@ -70,12 +79,21 @@ from mitos.store import (
     _strip_citation,
     _EDGE_KIND_REQUIREMENT,
     _KILL_EDGE_FIELDS,
+    MODIFIER_EDGE_KEYS,
     edge_kind_is_legal,
 )
-from mitos.identity import SLUG_MAX_LEN, compute_node_id, embedding_text
+from mitos.identity import (
+    SLUG_LENGTH_REASON,
+    SLUG_MAX_LEN,
+    compute_node_id,
+    embedding_text,
+    mechanism_canonical_norm,
+)
 from mitos.embeddings import GeminiEmbeddingProvider
+from mitos.provider_cause import describe_embed_failure
+from mitos.tool_markup import field_values, find_tool_call_markup
 from mitos.vector_store import QdrantVectorStore, hash_to_uuid
-from mitos.renderer import MitosRenderer, summarize_overflows
+from mitos.renderer import MitosRenderer, OVERFLOW_HINT_WINDOW_SECONDS, summarize_overflows
 from mitos.restore import BufferFidelityError, verify_amended_buffer
 
 
@@ -266,7 +284,7 @@ _ERROR_MESSAGES: Dict[str, str] = {
     "not_initialized": "No Mitos workspace found here. Run 'mitos init' before recording decisions.",
     "empty_axiom": "'axiom' is empty. Provide the decision as a single clear sentence that is true going forward.",
     "empty_slug": "'slug' is empty. Provide a short, explicit, hyphenated handle (e.g. 'sqlite-wal-mode').",
-    "slug_too_long": "slug '{slug}' is {length} characters — {over} over the {max}-character limit. The slug is the permanent citation handle (it is folded into the decision's identity), so it is NOT silently truncated. Pass a shorter 'slug' of at most {max} characters.",
+    "slug_too_long": "slug '{slug}' is {length} characters — {over} over the {max}-character limit. " + SLUG_LENGTH_REASON + ". Pass a shorter 'slug' of at most {max} characters.",
     "missing_rejected_paths": "'rejected_paths' is required: state the alternatives you considered and why you ruled them out — this is what stops you or another agent from re-proposing them later.",
     "parse_failed": "The decision could not be serialised into a valid entry — most likely a structural token in axiom/rejected_paths/context: a line beginning with '##' or '###' (indent it or use '#'/'####' instead), a line shaped like '**Something:**', or a '[DECISION_TRANSCRIPT]' / '[DECISION_PARKED:' / 'BEGIN ENTRIES' / '[NOTE:' / '[PARKED:' marker. Remove or rephrase that line and retry — or, to mention a marker as prose, wrap it in backticks (`...`): inline-code spans are exempt.",
     "slug_collision": "A different decision already uses the slug '{slug}'. Give this one a distinct 'slug'; and if it is meant to replace the existing decision, also set supersedes='{slug}' (the new decision must still have its own slug — two decisions cannot share one).",
@@ -278,6 +296,9 @@ _ERROR_MESSAGES: Dict[str, str] = {
     "relation_target_ambiguous": "{relation}='{target}' matches more than one decision. Use query_decisions to find the exact, full slug and pass that.",
     "commit_failed": "The decision validated but the commit failed and nothing was written: {reason}. Retry; if it persists, the workspace store may be locked or corrupt.",
     "derives_from_on_decision": "derives_from is not valid when recording a decision: a derives_from edge originates from an open question (open_question -> decision), so a decision can never be its source. If you mean 'this decision builds on that one', use cites instead.",
+    "draft_drifted": "This re-send's {fields} changed from the draft its draft_digest came from — the values of the call that paused, not your latest send. Restore those values and re-send with the same draft_digest, or omit draft_digest (which always clears this comparison) to record the draft as it is now.",
+    "tool_call_markup": "{field!r} holds tool-call markup: {span!r} at character {offset}{more}. That is syntax from the tool call itself, not part of the decision, so nothing was recorded. Remove it and send the call again — or, to mention such a tag as prose, wrap it in backticks (`...`): inline-code spans are exempt.",
+    "draft_digest_unreadable": "draft_digest is not a value a pause returned, so this re-send cannot be compared with its draft. Pass the pause's draft_digest exactly as it came, or omit draft_digest (which always clears this comparison).",
 }
 
 # The user-facing typed relations beyond `supersedes` (which is special: it changes
@@ -294,6 +315,19 @@ _EXTRA_RELATIONS = (
     ("derives_from", "Derives-From"),
     ("cites", "Cites"),
 )
+
+# The `created` receipt's identification echo (B4): which relations carry the
+# target's identifying text beside its state and stamps. Named as the sets of
+# relations that ACT on their target — a wrong-but-existing slug there changes the
+# wrong decision, and the receipt is the only read-back of what was hit — never as
+# "all but cites/depends_on", so a future relation carries no text until someone
+# decides it acts. ADR
+# `record-receipt-edges-are-a-stamped-read-surface-axiom-rides-acting-relations-only`.
+_ECHO_AXIOM_RELATIONS: frozenset = frozenset(
+    {"supersedes", "corrects", "amends", "narrows", "contradicts"}
+)
+# `resolves` targets an open question, whose identifying text is its Topic field.
+_ECHO_TOPIC_RELATIONS: frozenset = frozenset({"resolves"})
 
 
 def _split_relation_slugs(raw: Optional[str]) -> List[str]:
@@ -321,6 +355,168 @@ def _split_relation_slugs(raw: Optional[str]) -> List[str]:
 def _record_error(code: str, **fields: Any) -> Dict[str, str]:
     """Builds a structured {error, code} dict using the canonical message for ``code``."""
     return {"error": _ERROR_MESSAGES[code].format(**fields), "code": code}
+
+
+# The pause's draft digest (A3). mitos holds nothing between calls, so the digest
+# travels with the caller: a version tag, then one short hash per field in this fixed
+# order, so a re-send that passes it back can be told WHICH fields drifted. The names
+# are the record_decision argument names, so a drifted field maps straight back to the
+# argument the caller sent. Never stored, never an identity input (MI-1/MI-7).
+DRAFT_DIGEST_FIELDS = ("slug", "axiom", "rejected_paths", "context", "scope", "mechanisms")
+_DRAFT_DIGEST_TAG = "d1"
+_DRAFT_DIGEST_WIDTH = 10  # hex chars per field: 40 bits against accidental drift, not a MAC
+_DRAFT_DIGEST_RE = re.compile(
+    rf"{_DRAFT_DIGEST_TAG}(\.[0-9a-f]{{{_DRAFT_DIGEST_WIDTH}}}){{{len(DRAFT_DIGEST_FIELDS)}}}")
+
+# The pause's "nothing is held" clause, single-sourced: the message appends the digest
+# clause to it; the CLI text pause prints it alone (its render carries no digest).
+PAUSE_HELD_CLAUSE = ("Nothing is held between calls: re-send the same values, "
+                     "declarations included, with the relation or acknowledgement added")
+_PAUSE_DIGEST_CLAUSE = ("; pass this pause's draft_digest with them to have the re-send "
+                        "compared with this draft, or omit it if you changed the draft "
+                        "on purpose.")
+
+
+def _draft_digest_segment(value: Any) -> str:
+    """Hashes one draft field's value to its short digest segment.
+
+    ``ensure_ascii=True`` is deliberate and the opposite of
+    ``identity.canonical_core_json_form``: a lone surrogate becomes a ``\\udc80``
+    escape rather than a UTF-8 encode, so this can never raise. Don't harmonise the two.
+
+    Args:
+        value: The field as the built entry holds it (a string, ``None``, or a list).
+
+    Returns:
+        The first ``_DRAFT_DIGEST_WIDTH`` hex characters of the value's SHA-256.
+    """
+    blob = json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    return hashlib.sha256(blob).hexdigest()[:_DRAFT_DIGEST_WIDTH]
+
+
+def _draft_digest(entry: ParsedEntry) -> str:
+    """Computes the draft digest a pause returns, over the built entry.
+
+    Reads the entry ``parse_entry_stream`` built, never the raw arguments, so the digest
+    canonicalises exactly as the write does and adds no normalisation of its own
+    (case-folded scope compares equal; reordered scope is drift, MI-9).
+
+    Args:
+        entry: The built entry of the call being paused or compared.
+
+    Returns:
+        ``d1.<slug>.<axiom>.<rejected_paths>.<context>.<scope>.<mechanisms>`` segments.
+    """
+    return ".".join([_DRAFT_DIGEST_TAG] + [
+        _draft_digest_segment(getattr(entry, field)) for field in DRAFT_DIGEST_FIELDS])
+
+
+def _readable_fields(fields: List[str]) -> str:
+    """Joins field names as prose: ``a``, ``a and b``, ``a, b and c``."""
+    return fields[0] if len(fields) == 1 else f"{', '.join(fields[:-1])} and {fields[-1]}"
+
+
+def _draft_drift(entry: ParsedEntry, draft_digest: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Compares a re-send's built entry with the draft its digest came from.
+
+    Pure and in memory: no store read, no raise. An absent or blank digest is omitted
+    (the call behaves exactly as without one). A value this build cannot read is refused
+    with its own code, never read as drift of all six fields.
+
+    Args:
+        entry: The re-send's built entry.
+        draft_digest: The digest the caller passed back, or ``None``.
+
+    Returns:
+        ``None`` when there is nothing to refuse; otherwise a ``draft_digest_unreadable``
+        refusal, or a ``draft_drifted`` refusal carrying ``drifted_fields`` (a list, in
+        :data:`DRAFT_DIGEST_FIELDS` order).
+    """
+    if draft_digest is None:
+        return None
+    if not isinstance(draft_digest, str):
+        return _record_error("draft_digest_unreadable")
+    given = draft_digest.strip().lower()
+    if not given:
+        return None  # blank is omitted, as for the relation arguments
+    if not _DRAFT_DIGEST_RE.fullmatch(given):
+        return _record_error("draft_digest_unreadable")
+    current = _draft_digest(entry).split(".")[1:]
+    drifted = [field for field, now, then in zip(DRAFT_DIGEST_FIELDS, current,
+                                                  given.split(".")[1:])
+               if now != then]
+    if not drifted:
+        return None
+    return {**_record_error("draft_drifted", fields=_readable_fields(drifted)),
+            "drifted_fields": drifted}
+
+
+def _tool_call_markup_refusal(arguments: List[Tuple[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Refuses a record call that would write tool-call markup.
+
+    Pure and in memory: no store read, no raise (the scanner skips non-strings).
+
+    Args:
+        arguments: ``(name, value)`` for every argument the call writes; a list value
+            is scanned element by element as ``name[i]``.
+
+    Returns:
+        ``None`` when nothing is found; otherwise a ``tool_call_markup`` refusal
+        carrying ``markup_spans`` (every hit, ``{field, span, offset}``).
+    """
+    hits = find_tool_call_markup(
+        pair for name, value in arguments for pair in field_values(name, value))
+    if not hits:
+        return None
+    first, rest = hits[0], len(hits) - 1
+    more = f", plus {rest} more span{'s' if rest > 1 else ''}" if rest else ""
+    return {**_record_error("tool_call_markup", field=first["field"], span=first["span"],
+                            offset=first["offset"], more=more),
+            "markup_spans": hits}
+
+
+def _divergence_field_lines(field: str, graph_raw: Optional[str],
+                            markdown_raw: Optional[str], *, full: bool) -> List[str]:
+    """Renders one diverged commentary field for the reconcile report.
+
+    The span is located on the judged values (``judged_text``), never on the raw
+    reprs: the comparator strips and casefolds a slug, so a raw diff can point at a
+    difference it ignored. The span is printed whole and with ``repr``, which shows
+    whitespace and invisible characters but not a homoglyph, so a span holding
+    anything outside printable ASCII also names its code points, on both sides.
+
+    Args:
+        field: The ``COMMENTARY_FIELDS`` name ``entry_divergence`` listed.
+        graph_raw: The stored value, as read from the node.
+        markdown_raw: The parsed value, as read from the entry.
+        full: ``--full``: the two whole raw values, byte for byte as before the span
+            report existed.
+
+    Returns:
+        The field's lines, unterminated.
+    """
+    span = None if full else differing_span(judged_text(field, graph_raw),
+                                            judged_text(field, markdown_raw))
+    if span is None:
+        # `--full`, or a listed field whose judged values agree. The second cannot
+        # happen while the comparator and `judged_text` agree (a test pins that);
+        # if they ever drift, both whole sides is honest and "no difference" under a
+        # divergence header is not.
+        return [f"  {field}:",
+                f"    graph:    {graph_raw!r}",
+                f"    markdown: {markdown_raw!r}"]
+    label = f"{field} (compared casefolded)" if field == "slug" else field
+    lines = [
+        f"  {label}: parts after {span['offset']} shared characters "
+        f"(graph {span['graph_len']}, markdown {span['markdown_len']}; "
+        f"{span['shared_after']} shared at the end)",
+        f"    graph:       {span['graph']!r}",
+        f"    markdown:    {span['markdown']!r}",
+    ]
+    if needs_code_points(span["graph"], span["markdown"]):
+        lines.append(f"    code points: graph {code_point_names(span['graph'])}; "
+                     f"markdown {code_point_names(span['markdown'])}")
+    return lines
 
 
 class _AmendAnswer(Exception):
@@ -403,9 +599,9 @@ def _contains_structural_token(text: str) -> bool:
     return False
 
 
-# The citation-handle length cap. The slug is folded into the canonical-core identity
-# (V1-D2), so it is permanent once committed — generous enough for a descriptive
-# multi-word handle (real corpus handles top out ~68 chars), firm enough to keep one
+# The citation-handle length cap. The slug is the handle other decisions cite (it is
+# not part of the canonical-core identity, V1-D2, and can be renamed) — generous
+# enough for a descriptive multi-word handle (real corpus handles top out ~68 chars), firm enough to keep one
 # from running away. An *explicit* slug over this is REJECTED with an exact char count
 # (never silently truncated — a silent trim diverges the stored handle from the one the
 # author already cited: self-inflicted citation rot). Auto-derived slugs still trim to it.
@@ -415,13 +611,29 @@ def _contains_structural_token(text: str) -> bool:
 _SLUG_MAX_LEN = SLUG_MAX_LEN  # shared source of truth in identity.py (re-exported here for cli.py + the record path)
 _SLUG_MIN_LEN = 32  # auto-derive only: don't trim a word boundary back past here — hard-cap instead
 
-# Returned on the two "exists" short-circuits, which write nothing at all. The
-# no-op is deliberate (a committed canonical core is immutable, M1) — what was
-# NOT deliberate is that the receipt used to report the buffer path, so a
-# re-record aimed at correcting commentary, or at restoring a source block for a
-# graph-only node, reported success while changing nothing. The note names the
-# path that does work; `mitos sync` does not, since it re-commits nothing for a
-# node already in the graph.
+
+def _mechanisms_fold_map(authored: List[str]) -> Dict[str, str]:
+    """Maps each authored mechanism token the identity fold changes to its folded form.
+
+    Tokens the fold leaves byte-identical are omitted, so the map is ``{}`` when
+    nothing changed. Keys keep first-occurrence authored order. Pure and total: it
+    only reads :func:`~mitos.identity.mechanism_canonical_norm`, the fold that keys
+    the mechanism registry and feeds the node id.
+
+    Args:
+        authored: The mechanism tokens as ``decisions.md`` holds them.
+
+    Returns:
+        ``{authored: folded}`` for every token whose folded form differs.
+    """
+    folded: Dict[str, str] = {}
+    for token in authored:
+        canon = mechanism_canonical_norm(token)
+        if canon != token:
+            folded.setdefault(token, canon)
+    return folded
+
+
 def _edge_state_labels(pairs: List[Dict[str, str]]) -> List[str]:
     """Renders edges as a sorted ``["kind:target", ...]`` state list for the audit row.
 
@@ -435,31 +647,48 @@ def _edge_state_labels(pairs: List[Dict[str, str]]) -> List[str]:
                    if p.get("target")})
 
 
-_EXISTS_NO_OP_NOTE = (
+# Returned on the two "exists" short-circuits, which write nothing at all. The
+# no-op is deliberate (a committed canonical core is immutable, M1); what was not
+# deliberate is that the receipt once reported the buffer path as a write, so a
+# re-record aimed at correcting commentary read as success while changing nothing
+# (#5b). The fact is shared: the CLI imports it for its headline. The note is the
+# dict's, and the dict is an MCP boundary (`record --json` emits it verbatim), so its
+# recovery names the `amend_commentary` tool and no shell command; the CLI text
+# composes its own selectored recipes (ADR
+# receipt-dict-strings-are-mcp-boundary-so-recovery-splits-per-renderer). The two
+# states the tool cannot reach both answer `archived` there, so the note states
+# them as a pair and claims neither.
+EXISTS_NO_OP_FACT = (
     "already recorded — this call wrote nothing, to the buffer or the graph. "
     "A committed decision's axiom and mechanisms are immutable (M1): re-recording "
-    "them is a no-op. To correct its commentary (rejected_paths, scope, "
-    "invalidates_if, context), edit the entry in decisions.md and run `mitos sync` — "
-    "it reconciles a diverged committed entry, printing the field diff first. "
-    "Two states sync cannot reach: a node with no `### ` block (run "
-    "`mitos restore-source --slug <slug>` first), and an entry already rotated into "
-    "decisions/archive/ — sync reads only the buffer, so that one's reconciler is "
-    "`mitos rebuild`, which can refuse the swap and which re-mints confirmation "
-    "metadata, so correct it while it is still in the buffer if you can. "
-    "To record a CHANGED decision, write a new one with --supersedes/--amends "
-    "pointing at this slug."
+    "them is a no-op."
+)
+_EXISTS_NO_OP_NOTE = (
+    EXISTS_NO_OP_FACT + " "
+    "To change its commentary (rejected_paths, scope, invalidates_if, context, or its "
+    "slug with new_slug), call the `amend_commentary` tool on this same project with "
+    "this slug; it edits the entry in place and keeps the id. Relations are not "
+    "commentary and that tool refuses them: relation lines are edited in decisions.md "
+    "and applied by a sync reconcile, which no tool here performs — a person with a "
+    "shell in that project runs it. The tool reaches an entry only while its `### ` "
+    "block is in decisions.md. A node with no source block and an entry already "
+    "rotated into decisions/archive/ both answer `archived` from it, and the tool cannot "
+    "tell the two apart; either one is repaired by a person. To record a changed "
+    "decision, record a new one with supersedes or amends naming this slug."
 )
 
-# The standing coherence debt a successful write incurs, stated on every `created`
-# receipt. The REGISTER is the mechanism, not the presence: `mitos check` reuses
-# prior verdicts (a reused pair never enters a batch), so one deferred run after N
-# writes covers the same ground as N runs for less — and `_confirm_spend` only fires
-# above CHECK_CONFIRM_BATCHES fresh groups, so a caller auditing per write presents
-# ~1 fresh group forever and the tree's only spend ring never fires. A line reading
-# "audit this write" therefore converts one owed run into N and fragments the
-# amortization (ADR `record-receipt-states-cumulative-audit-debt-not-per-write-work`).
-# So: cumulative and corpus-wide, no imperative, no per-entry referent — and no
-# command, because this string is an MCP-visible payload field, not a CLI line (ADR
+# The standing coherence debt, stated without a number: the `created` receipt's
+# fallback when the audit-debt count cannot be read (`_audit_debt_line` states it with
+# one; `MitosSyncManager._audit_debt_fields` picks). The REGISTER is the mechanism,
+# not the presence: `mitos check` reuses prior verdicts (a reused pair never enters a
+# batch), so one deferred run after N writes covers the same ground as N runs for less
+# — and `_confirm_spend` only fires above CHECK_CONFIRM_BATCHES fresh groups, so a
+# caller auditing per write presents ~1 fresh group forever and the tree's only spend
+# ring never fires. A line reading "audit this write" therefore converts one owed run
+# into N and fragments the amortization (ADR
+# `record-receipt-states-cumulative-audit-debt-not-per-write-work`). So: cumulative
+# and corpus-wide, no imperative, no per-entry referent — and no command, because this
+# string is an MCP-visible payload field, not a CLI line (ADR
 # `receipt-dict-strings-are-mcp-boundary-so-recovery-splits-per-renderer`). The
 # recovery clause is each renderer's own; `cli._coherence_audit_hint` composes the
 # CLI's. Enforced by test rather than by emphasis (tests/test_record_decision.py).
@@ -467,6 +696,37 @@ _COHERENCE_AUDIT_NOTE = (
     "Coherence audit is cumulative and corpus-wide: this corpus holds recorded "
     "decisions that no contradiction check has covered yet."
 )
+
+
+def _audit_debt_line(uncovered: int, total: int, excluded: int) -> str:
+    """Composes the `created` receipt's ``coherence_audit`` from the three counts.
+
+    The one composer, so the MCP payload, ``record --json`` and the CLI text tail
+    read the same string off the receipt. Its keyword names are the ``audit_debt``
+    key names, so ``_audit_debt_line(**receipt["audit_debt"])`` rebuilds the field
+    from the payload's own dict. The verb agrees with ``uncovered`` and the noun
+    with ``total``. Total over non-negative counts: 0 uncovered is true when a
+    check lands between the commit and this read, and it is rendered, not clamped.
+    The register rules above apply, plus two more words it never uses: "full" (a
+    check row cannot tell a scoped sweep from a whole one) and "since" (after an
+    upgrade the count includes decisions older than any check).
+
+    Args:
+        uncovered: Active decisions no completed check has covered (N).
+        total: The corpus's active decisions (M).
+        excluded: Active decisions a check saw but could not audit (K).
+
+    Returns:
+        One sentence ending in a period, with the corpus as its referent.
+    """
+    noun = "decision" if total == 1 else "decisions"
+    verb = "has" if uncovered == 1 else "have"
+    line = (f"{uncovered} of this corpus's {total} {noun} {verb} not been covered "
+            f"by a completed contradiction check")
+    if excluded > 0:
+        line += f"; {excluded} more could not be audited (not embedded)"
+    return line + "."
+
 
 # The `rotation` field of a `created` receipt: what this write's one bounded rotation
 # did. Runtime-only and never persisted; it crosses the JSON boundary on MCP
@@ -801,11 +1061,19 @@ def _declared_echo_lines(payload: Dict[str, Any]) -> List[str]:
     count renders only on a collapse — rendered unconditionally it is the aggregate
     claim this surface is designed not to make.
 
+    The second group says what a declaration there is — valid, and not the relation
+    that resolves this pause — and states the floor its score sits below. A third
+    sentence, rendered whenever either group rendered, asks for every declaration
+    again on the re-record. It is one sentence for both groups on purpose: a clause
+    on the second group alone would make the pair say the first group need not be
+    sent again, which is the landed-edge reading the register floor forbids.
+
     Args:
         payload: The pause dict (or the echo keys alone).
 
     Returns:
-        Zero, one or two sentences without trailing punctuation, group one first.
+        Zero to three sentences without trailing punctuation: group one, group two,
+        then the re-send sentence.
     """
     lines: List[str] = []
 
@@ -822,15 +1090,45 @@ def _declared_echo_lines(payload: Dict[str, Any]) -> List[str]:
         rendered = []
         for item in no_match:
             score = item.get("score")
-            rendered.append(item["slug"] if score is None
-                            else f"{item['slug']} ({score:.2f}, below floor)")
+            rendered.append(
+                item["slug"] if score is None
+                else f"{item['slug']} ({_floored_score_text(score)}, below the "
+                     f"{_NEIGHBOR_REVIEW_THRESHOLD:.2f} floor)"
+            )
         line = "Declared, not a near neighbour here: " + ", ".join(rendered)
         total = payload.get("declared_no_near_match_total")
         if total is not None:
             line += f" ({total} total)"
+        # Singular or plural by every member the line is about, elided ones included.
+        members = total if total is not None else len(no_match)
+        line += (" — a valid declaration that does not resolve this pause"
+                 if members == 1
+                 else " — valid declarations that do not resolve this pause")
         lines.append(line)
 
+    if lines:
+        lines.append("Pass every declaration again when you re-record")
+
     return lines
+
+
+def _floored_score_text(score: float) -> str:
+    """Renders a below-floor score to two places, rounded down.
+
+    Rounding to nearest would print 0.7967 as ``0.80`` beside a stated 0.80 floor it
+    is below. ``Decimal`` over the shortest repr floors exactly, where float
+    arithmetic turns 0.29 into 0.28. Display only: the payload keeps the raw float.
+
+    Args:
+        score: The cosine score of a declared target that was gathered.
+
+    Returns:
+        The score floored to two decimal places, e.g. ``"0.79"``.
+    """
+    score = float(score)
+    if not math.isfinite(score):
+        return str(score)       # quantize raises on inf; no rounding to fix there
+    return str(Decimal(str(score)).quantize(Decimal("0.01"), rounding=ROUND_FLOOR))
 
 
 def _normalize_slug(text: str) -> str:
@@ -838,8 +1136,8 @@ def _normalize_slug(text: str) -> str:
 
     The character-normalisation half of :func:`_slugify`, factored out so the write
     path can validate an explicit slug's *length* without silently truncating it: an
-    over-length explicit slug is the author's permanent citation handle, so the right
-    move is to reject (and ask for a shorter one), not to mangle it down to fit.
+    over-length explicit slug is the handle the author will cite, so the right move is
+    to reject (and ask for a shorter one), not to mangle it down to fit.
 
     Args:
         text: Free text — an explicit slug, or an axiom for auto-derivation.
@@ -1152,7 +1450,6 @@ class MitosSyncManager:
             return
 
         # Load canonical format spec from package single source of truth
-        from mitos.cli import load_format_spec
         try:
             format_spec_content = load_format_spec()
         except Exception:
@@ -1200,7 +1497,8 @@ class MitosSyncManager:
                       "marker ✓", file=sys.stderr)
 
     def perform_sync(self, auto_accept: bool = False, verbose: bool = False,
-                     repair_targets: Optional[List[str]] = None) -> List[str]:
+                     repair_targets: Optional[List[str]] = None,
+                     full: bool = False) -> List[str]:
         """Executes the complete transactional sync flow.
 
         The repair ledger is built and reported HERE rather than inside
@@ -1217,6 +1515,8 @@ class MitosSyncManager:
             repair_targets: Handles named by ``--reconcile-entry``, in the caller's
                 verbatim spelling. ``None`` (no flag) and ``[]`` mean the same
                 thing here — nothing was named, so the ledger is inert.
+            full: ``--full``: the divergence report prints each diverged commentary
+                field whole on both sides instead of its differing span.
 
         Returns:
             The named targets that did NOT end in the state their markdown
@@ -1230,7 +1530,8 @@ class MitosSyncManager:
         questions_snapshot_path = os.path.join(self.config.mitos_dir, "questions_snapshot.md")
         try:
             self._perform_sync_internal(
-                snapshot_path, questions_snapshot_path, auto_accept, verbose, ledger
+                snapshot_path, questions_snapshot_path, auto_accept, verbose, ledger,
+                full=full,
             )
         finally:
             for path in (snapshot_path, questions_snapshot_path):
@@ -1241,7 +1542,7 @@ class MitosSyncManager:
                         pass
         return ledger.report()
 
-    def _perform_sync_internal(self, snapshot_path: str, questions_snapshot_path: str, auto_accept: bool = False, verbose: bool = False, ledger: Optional["_RepairLedger"] = None) -> None:
+    def _perform_sync_internal(self, snapshot_path: str, questions_snapshot_path: str, auto_accept: bool = False, verbose: bool = False, ledger: Optional["_RepairLedger"] = None, full: bool = False) -> None:
         """Executes the internal transactional sync flow.
 
         ``ledger`` is defaulted so the sole production caller stays the only site
@@ -1456,7 +1757,7 @@ class MitosSyncManager:
 
                 if not self._apply_commentary_reconcile(
                     entry, existing, node_id, divergence, auto_accept,
-                    authorized=ledger.authorizes(entry),
+                    authorized=ledger.authorizes(entry), full=full,
                 ):
                     ledger.note(entry, "reconcile_refused")
                     continue
@@ -1726,7 +2027,7 @@ class MitosSyncManager:
         try:
             self.drain_pending_embeddings()
         except Exception as e:
-            print(f"[Warning] Outbox queue drain failed: {str(e)}")
+            print(f"[Warning] Outbox queue drain failed: {describe_embed_failure(e)}")
 
         # 7. Surplus hit/miss stats observability (4.D)
         if verbose and self.embed_provider:
@@ -1934,8 +2235,8 @@ class MitosSyncManager:
         """
         if self.embed_provider is None or self.vector_store is None:
             return None
-        api_key = self.config.env.get("ANTHROPIC_API_KEY")
-        if not api_key:
+        api_key = judge_api_key(self.config)
+        if api_key is None:
             return None
         # Lazy import (CONF-D4/§8, load-bearing): `conflict_judgment` is the sole
         # module-scope `import anthropic` in the conflict pipeline. Importing it here keeps
@@ -2417,7 +2718,7 @@ class MitosSyncManager:
         except Exception as e:
             # The commit already enqueued this node (C2); leave the row for the next
             # drain. stderr — shared with the MCP write tool's JSON-RPC stdout channel.
-            print(f"[Warning] Embedding upsert deferred for '{entry.slug}': {str(e)}", file=sys.stderr)
+            print(f"[Warning] Embedding upsert deferred for '{entry.slug}': {describe_embed_failure(e)}", file=sys.stderr)
             return None
 
     def drain_pending_embeddings(self) -> None:
@@ -2561,7 +2862,7 @@ class MitosSyncManager:
                             self.store.increment_pending_attempts(node_id)
                         except Exception:
                             pass
-                        print(f"[Warning] Failed to drain embedding for '{node['slug']}': {str(e)}")
+                        print(f"[Warning] Failed to drain embedding for '{node['slug']}': {describe_embed_failure(e)}")
 
                 # The refusal escapes the claim-batch loop too — the inner `break` only
                 # left the per-item one, and re-claiming would meet the same absent
@@ -2726,6 +3027,7 @@ class MitosSyncManager:
 
     def _review_neighbors(self, entry: ParsedEntry, declared_targets: set, *,
                           gathered_index: Optional[Dict[str, Tuple[str, float]]] = None,
+                          top_k: int = CONFLICT_TOP_K,
                           ) -> "List[Dict[str, Any]] | Unavailable":
         """Pre-commit: existing live decisions too similar to ``entry`` to ignore (P4).
 
@@ -2734,7 +3036,7 @@ class MitosSyncManager:
         over-fetches one bounded KNN window, and keeps only live *decisions* — an
         open question in the window is screened by kind, never crashed on — then
         :func:`screen_candidates` drops declared/self, floors at
-        ``_NEIGHBOR_REVIEW_THRESHOLD``, and truncates to ``CONFLICT_TOP_K``.
+        ``_NEIGHBOR_REVIEW_THRESHOLD``, and truncates to ``top_k``.
         Surfacing survivors BEFORE the write is the whole point: after the commit the
         author can no longer point an amends/supersedes at them (a re-record is a no-op).
 
@@ -2759,6 +3061,12 @@ class MitosSyncManager:
                 fell short are indistinguishable there. A sink rather than a widened
                 return type, so the eight ``patch.object`` sites binding this method by
                 string stay green.
+            top_k: How many screened survivors to keep. The pause uses the default,
+                ``CONFLICT_TOP_K``, which is what it displays. The acknowledged path
+                (:meth:`_acknowledged_neighbors_field`) passes
+                ``CONFLICT_OVERFETCH_LIMIT``, the whole gather window, because an
+                acknowledgement covers every neighbour the gate would have held the
+                write for, not only the ones a pause would show.
 
         Returns:
             A list of :func:`~mitos.conflict.candidate_payload` dicts for
@@ -2792,7 +3100,7 @@ class MitosSyncManager:
             declared_targets=declared_targets,
             own_slug=entry.slug,
             floor=_NEIGHBOR_REVIEW_THRESHOLD,
-            top_k=CONFLICT_TOP_K,
+            top_k=top_k,
         )
         return [candidate_payload(c) for c in screened]
 
@@ -2869,6 +3177,103 @@ class MitosSyncManager:
                 suppressed.add(ancestor["slug"].casefold())
         return suppressed
 
+    def _review_declared_targets(self, supersedes: Optional[str],
+                                 corrects: Optional[str],
+                                 extra_relations: Dict[str, str]) -> set[str]:
+        """Builds the neighbour review's suppression set from the raw relation args.
+
+        The one source for both callers: the pre-commit pause and the acknowledged
+        path's post-commit gather (:meth:`_acknowledged_neighbors_field`). Two copies
+        would drift, and the first drift would name a neighbour the caller had linked.
+        The set is every declared relation target, casefolded, plus the transitive
+        mutation lineage of the ``supersedes``/``amends``/``narrows`` targets (3b).
+        The lineage walk is skipped without providers: the gate is then a no-op
+        (:meth:`_review_neighbors` returns ``[]``), and the walk only ever grows the
+        set, so direct suppression of all nine types holds either way (DoD #13b). It
+        is suppression-only and re-declares nothing, so a bridged predecessor still
+        reads un-amended (§6.2).
+
+        It reads the raw args and writes nothing back: Phase B writes edges from the
+        same raw args, and normalising them here would drop declared edges under
+        ``acknowledge_neighbors`` (``test_mixed_neighbors_declared_edge_survives_acknowledge_bypass``).
+
+        Args:
+            supersedes: The raw ``supersedes`` argument.
+            corrects: The raw ``corrects`` argument.
+            extra_relations: The seven non-kill relations, stripped, non-empty only.
+
+        Returns:
+            The casefolded slugs the review must not flag. Graph-store faults from the
+            lineage walk propagate; each caller owns its disposition.
+        """
+        declared = {
+            t.casefold()
+            for raw in ([supersedes, corrects] + list(extra_relations.values()))
+            for t in _split_relation_slugs(raw)
+        }
+        if self.embed_provider and self.vector_store:
+            declared |= self._lineage_suppression_slugs(
+                _split_relation_slugs(supersedes)
+                + _split_relation_slugs(extra_relations.get("amends"))
+                + _split_relation_slugs(extra_relations.get("narrows"))
+            )
+        return declared
+
+    def _acknowledged_neighbors_field(self, entry: ParsedEntry,
+                                      supersedes: Optional[str],
+                                      corrects: Optional[str],
+                                      extra_relations: Dict[str, str],
+                                      ) -> Optional[List[str]]:
+        """Names the neighbours an acknowledged write went past, never raising (F10).
+
+        ``acknowledge_neighbors=True`` skips the pause, and mitos holds nothing between
+        calls, so a pause cleared on a re-send and a flag passed blind on the first
+        call look the same. This lists the neighbours for both. It re-runs the pause's
+        own gather after the commit and the embed, so the axiom's vector is already in
+        the embedding cache and the gather adds one vector query, no embedding call.
+        The list is not cut to the pause's ``CONFLICT_TOP_K``: an acknowledgement
+        covers every neighbour the gate would have held the write for, bounded only by
+        the gather window (``CONFLICT_OVERFETCH_LIMIT``). The new node's own vector is
+        in that window, and the own-slug screen drops it.
+
+        Called after the commit and outside the lock, like :meth:`_audit_debt_fields`.
+        ``None`` means nothing is claimed: no embedding provider or vector store (where
+        :meth:`_review_neighbors` would answer a healthy ``[]`` for a gather that never
+        ran), a typed :class:`Unavailable`, or any exception, which also writes one
+        stderr warning. The write has landed, so nothing here may escape (§7).
+
+        Args:
+            entry: The committed entry.
+            supersedes: The raw ``supersedes`` argument.
+            corrects: The raw ``corrects`` argument.
+            extra_relations: The seven non-kill relations, as the pause reads them.
+
+        Returns:
+            The neighbours' stored slugs, most similar first; ``[]`` when the gather
+            ran and found none; ``None`` when it could not run.
+        """
+        if not self.embed_provider or not self.vector_store:
+            return None
+        # Step 8 met a missing collection it could not create: the gather would meet
+        # it too, and with the new node live `missing_index_is_a_gap` says True, so it
+        # would answer Unavailable. Same None, one round trip fewer. A first write
+        # (may_create) never sets the latch, so a fresh workspace still gathers.
+        if self._collection_absent:
+            return None
+        try:
+            declared = self._review_declared_targets(supersedes, corrects,
+                                                     extra_relations)
+            reviewed = self._review_neighbors(entry, declared,
+                                              top_k=CONFLICT_OVERFETCH_LIMIT)
+        except Exception as e:
+            # stderr: the MCP write tool shares this path and uses stdout for JSON-RPC.
+            print(f"[Warning] Acknowledged-neighbour read failed for '{entry.slug}': "
+                  f"{str(e)}", file=sys.stderr)
+            return None
+        if isinstance(reviewed, Unavailable):
+            return None
+        return [n["slug"] for n in reviewed]
+
     def _node_state(self, node_id: str) -> str:
         """Returns the computed state of a node ('active'/'superseded'/'corrected'/'drifted')."""
         return self.store.get_node_state(node_id)
@@ -2882,6 +3287,121 @@ class MitosSyncManager:
         except Exception:
             pass
         return "indexed"
+
+    def _audit_debt_fields(self, slug: str) -> Tuple[str, Optional[Dict[str, int]]]:
+        """Reads the corpus's audit debt for a `created` receipt, never raising.
+
+        Called after the commit and after the lock is released, so a telemetry
+        fault can neither lengthen the lock hold nor touch the write. Unreadable
+        telemetry (or no graph) gives the numberless note and ``None``, silently:
+        that is an honest state, and `mitos status` owns its diagnosis. An
+        unexpected exception gives the same pair plus one stderr warning, because
+        a bug hidden behind a healthy-looking sentence would stay hidden. ADRs
+        `record-receipt-states-cumulative-audit-debt-not-per-write-work`,
+        `coverage-table-ends-the-coherence-gate-deferral` and
+        `telemetry-readers-outside-check-open-read-only-absent-is-empty-not-unreadable`.
+
+        Args:
+            slug: The recorded entry's slug, named in the warning.
+
+        Returns:
+            ``(coherence_audit, audit_debt)``: the line and its three counts, or
+            ``_COHERENCE_AUDIT_NOTE`` and ``None``.
+        """
+        try:
+            debt = derive_audit_debt(self.config.db_path, self.config.telemetry_path)
+        except Exception as e:
+            # stderr: the MCP write tool shares this path and uses stdout for JSON-RPC.
+            print(f"[Warning] Audit-debt read failed for '{slug}': {str(e)}",
+                  file=sys.stderr)
+            return _COHERENCE_AUDIT_NOTE, None
+        if not isinstance(debt, AuditDebt):  # DebtUnreadable, or NoGraph
+            return _COHERENCE_AUDIT_NOTE, None
+        counts = {"uncovered": debt.uncovered, "total": debt.total,
+                  "excluded": debt.excluded}
+        return _audit_debt_line(**counts), counts
+
+    def _check_notice_field(self) -> Optional[Dict[str, Any]]:
+        """Composes the `created` receipt's standing check notice, never raising.
+
+        Called after the commit and outside the lock, like
+        :meth:`_audit_debt_fields`. The composer is total: it returns None for a
+        keyless workspace, an absent or unreadable record, or a healthy outcome,
+        and writes its own stderr warning on an unexpected fault.
+
+        Returns:
+            The ``check_notice`` payload, or None.
+        """
+        return compose_check_notice(
+            self.config, read_attempt=read_last_attempt, get_node=self.store.get_node
+        )
+
+    def _edges_created_field(
+        self, node_id: str, slug: str
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Composes the `created` receipt's `edges_created` echo, never raising.
+
+        Each committed edge names its target's state computed now, its modifier
+        stamps, and — on an acting relation — the target's whole axiom (the open
+        question's topic on ``resolves``). The key set is decided by the relation,
+        never by the value. Called after the commit and outside the lock, like
+        :meth:`_audit_debt_fields`: a raise here would report a committed write as
+        failed, and the caller's retry would answer ``exists``. So a failed echo
+        read falls back to the base edge read with the target keys ``null``, and a
+        failure of that read too gives ``None``. Each failed read writes one stderr
+        warning. ADRs
+        `record-receipt-edges-are-a-stamped-read-surface-axiom-rides-acting-relations-only`
+        and `identification-echo-is-stamped-but-sub-letter-letter-default-governs-precedent-reads`.
+
+        Args:
+            node_id: The committed node's id.
+            slug: The recorded entry's slug, named in the warnings.
+
+        Returns:
+            One entry per edge in insertion order, ``[]`` for a node with no edges,
+            or None when the edges could not be read back.
+        """
+        try:
+            entries: List[Dict[str, Any]] = []
+            for t in self.store.get_outgoing_edge_targets(node_id):
+                node = t["node"]
+                entry: Dict[str, Any] = {
+                    "kind": t["kind"],
+                    "target": t["target"],
+                    "target_state": t["state"],
+                    "target_stamps": {
+                        key: node[key]
+                        for key in MODIFIER_EDGE_KEYS.values() if key in node
+                    },
+                }
+                if t["kind"] in _ECHO_AXIOM_RELATIONS:
+                    entry["target_axiom"] = node["core_axiom"]
+                elif t["kind"] in _ECHO_TOPIC_RELATIONS:
+                    entry["target_topic"] = node["topic"]
+                entries.append(entry)
+            return entries
+        except Exception as e:
+            # stderr: the MCP write tool shares this path and uses stdout for JSON-RPC.
+            print(f"[Warning] Edge echo read failed for '{slug}': {str(e)}",
+                  file=sys.stderr)
+        # The fallback keeps the edges when only the echo failed: the base read,
+        # with every target key the relation carries set to null (not absent).
+        try:
+            base = self.store.get_outgoing_edges(node_id)
+        except Exception as e:
+            print(f"[Warning] Edge read failed for '{slug}': {str(e)}",
+                  file=sys.stderr)
+            return None
+        degraded: List[Dict[str, Any]] = []
+        for b in base:
+            entry = {"kind": b["kind"], "target": b["target"],
+                     "target_state": None, "target_stamps": None}
+            if b["kind"] in _ECHO_AXIOM_RELATIONS:
+                entry["target_axiom"] = None
+            elif b["kind"] in _ECHO_TOPIC_RELATIONS:
+                entry["target_topic"] = None
+            degraded.append(entry)
+        return degraded
 
     def _exists_receipt_extras(
         self, entry: ParsedEntry, existing: Dict[str, Any], node_id: str
@@ -2989,6 +3509,7 @@ class MitosSyncManager:
         auto_accept: bool,
         *,
         authorized: bool = False,
+        full: bool = False,
     ) -> bool:
         """Applies one commentary reconcile, or reports why it was skipped.
 
@@ -3012,6 +3533,8 @@ class MitosSyncManager:
                 mid-reconcile leaves exactly the state a confirmed reconcile leaves
                 today. The named-target test lives at the call site, so this
                 function stays ignorant of the flag's vocabulary.
+            full: ``--full``: print each diverged commentary field whole on both
+                sides, and no pointer to the flag.
 
         Returns:
             True if the reconcile was applied.
@@ -3020,10 +3543,12 @@ class MitosSyncManager:
         removals = edges.get("removed") or []
 
         print(f"\n[Divergence] '{existing.get('slug')}' — the corpus and graph disagree.")
-        for field in divergence.get("commentary") or []:
-            print(f"  {field}:")
-            print(f"    graph:    {existing.get(field)!r}")
-            print(f"    markdown: {getattr(entry, field, None)!r}")
+        commentary = divergence.get("commentary") or []
+        for field in commentary:
+            for line in _divergence_field_lines(
+                field, existing.get(field), getattr(entry, field, None), full=full,
+            ):
+                print(line)
         if divergence.get("scope"):
             print(f"  scope:      graph {divergence['scope']['graph']} → "
                   f"markdown {divergence['scope']['markdown']}")
@@ -3033,6 +3558,11 @@ class MitosSyncManager:
             # Printed explicitly, and named as a deletion, because a re-commit mirrors
             # edges declaratively: a line removed from the markdown DELETES that edge.
             print(f"  edge DELETED: {removed}")
+        if commentary and not full:
+            # After the edge lines and before any refusal, so this recipe never sits
+            # beside a `--reconcile-entry` one where the two could be mistaken.
+            print("  Only the differing spans are shown. For the whole values:")
+            print(f"    mitos sync -p {self.config.project!r} --full")
 
         # `authorized` satisfies BOTH branches below for the entry the caller named,
         # and nothing else: the fall-through is the shipped one, not a second route.
@@ -3352,7 +3882,8 @@ class MitosSyncManager:
             A JSON-safe dict whose ``status`` is ``amended`` (``id``, ``fields_changed``,
             ``embedding``, ``path``, and ``rename`` = ``{"from", "to", "incoming"}`` on a
             rename), ``unchanged`` (``id``), ``refused`` (``reason``, ``fields``,
-            ``routes`` for ``canonical_core``), ``not_found``, ``archived`` (``id``) or
+            ``routes`` for ``canonical_core``, ``markup_spans`` for
+            ``tool_call_markup``), ``not_found``, ``archived`` (``id``) or
             ``uncommitted``; or a fault ``{"error", "code", "slug"}`` with code
             ``slug_collision``, ``commit_failed`` (also a graph read that failed under
             the lock), ``audit_unavailable``,
@@ -3510,7 +4041,7 @@ class MitosSyncManager:
         try:
             self._best_effort_embed(delta, entry)
         except Exception as e:
-            print(f"[Warning] Embedding step failed for '{entry.slug}': {e}", file=sys.stderr)
+            print(f"[Warning] Embedding step failed for '{entry.slug}': {describe_embed_failure(e)}", file=sys.stderr)
         try:
             # Unfiltered, so a vacated scope's file is swept and a moved primary follows.
             MitosRenderer(self.config.workspace_dir).render_all(self.store)
@@ -3540,6 +4071,7 @@ class MitosSyncManager:
         slug: Optional[str] = None,
         actor: str = "agent",
         acknowledge_neighbors: bool = False,
+        draft_digest: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Records a single decision into the buffer and graph, non-interactively.
 
@@ -3577,30 +4109,54 @@ class MitosSyncManager:
             acknowledge_neighbors: Skip the pre-commit near-duplicate review and record
                 even when a highly-similar unreferenced decision exists (P4). Pass True
                 to commit a genuinely independent decision past the pause.
+            draft_digest: Optional; the ``draft_digest`` a pause returned. The built
+                draft is compared with it, field by field, before any store read — a
+                drifted field refuses the call, under ``acknowledge_neighbors`` too.
+                ``None`` or blank skips the comparison.
 
         Returns:
             A success dict ``{slug, id, state, embedding, status}`` (status
             "created"|"exists"); on the "created" path it also carries
-            ``edges_created`` (the edges the commit actually wired, each
-            ``{kind, target}`` — write facts read back from the store, not an
-            echo of the input args), the resolved ``scope`` and ``mechanisms``
-            as committed, plus an optional
+            ``edges_created`` (the edges the commit actually wired, read back
+            from the store and not echoed from the input args, each ``{kind,
+            target, target_state, target_stamps}`` plus the target's whole
+            ``target_axiom`` on an acting relation or its ``target_topic`` on
+            ``resolves`` — an identification echo, never the target's reasoning;
+            the target keys are ``null`` when the echo read failed, and the list
+            is ``None`` when the edges could not be read back), the resolved ``scope`` as committed (the
+            graph's casefolded form), ``mechanisms`` as authored — the spelling
+            and order ``decisions.md`` now holds, read back from the parsed
+            entry — and ``mechanisms_normalized``, mapping each authored token
+            the fold changed to its folded form (the form the graph and the node
+            id hold; ``{}`` when none changed), plus an optional
             ``neighbor_review_unavailable`` notice when the pre-commit near-dup
             check could not run (the record fails open — the commit proceeds
             unchecked; the notice names the cause and no command, each surface
             composing its own recovery), plus an always-present
             ``coherence_audit`` statement of the corpus's standing, cumulative
-            contradiction-check debt, plus an optional ``rotation`` report of the one
-            bounded rotation this write ran once its buffer reached
+            contradiction-check debt ("N of this corpus's M decisions have not
+            been covered…", or the numberless ``_COHERENCE_AUDIT_NOTE`` when the
+            count cannot be read) and an always-present ``audit_debt``
+            (``{uncovered, total, excluded}``, or ``None`` when unreadable), plus
+            an optional ``rotation`` report of the one bounded rotation this
+            write ran once its buffer reached
             ``rotation_volume_threshold_entries``: ``outcome`` "rotated" (the
             ``archives`` written, each ``{path, entries, slugs}``, and any
             ``skipped``), "skipped" (nothing moved; each ``skipped`` element names
             its slug and reason) or "failed" (``stage``/``error``/``note``; the write
             still stands, and the field names no command); absent when nothing was
-            eligible; OR, when a highly-similar unreferenced decision exists and
+            eligible; plus an optional ``check_notice`` (the last contradiction
+            check's outcome, :func:`~mitos.check_notice.compose_check_notice`),
+            present only while a judge key is set and that outcome is not
+            ``no_new_findings``; plus, only when ``acknowledge_neighbors`` was
+            passed, ``acknowledged_neighbors`` (:meth:`_acknowledged_neighbors_field`):
+            the stored slugs of every unlinked live decision at or above the floor
+            that the write went past, most similar first, ``[]`` when there were
+            none, or ``None`` when the gather could not run; OR, when a highly-similar unreferenced decision exists and
             ``acknowledge_neighbors`` is False, a ``{status: "needs_review", code:
-            "similar_decision_exists", slug, neighbors, message}`` pause that wrote
-            NOTHING —
+            "similar_decision_exists", slug, neighbors, message, draft_digest}`` pause
+            that wrote NOTHING — ``draft_digest`` (:func:`_draft_digest`) is what a
+            re-send passes back to be compared with this draft;
             each ``neighbors`` element is an enriched, modifier-stamped decision-read
             payload (:func:`~mitos.conflict.candidate_payload`: ``slug`` / ``axiom`` /
             ``scope`` / ``score`` / ``rejected_paths`` plus any ``amended_by``/
@@ -3612,7 +4168,11 @@ class MitosSyncManager:
             declarations that moved nothing on this call), each with a
             ``*_total`` sibling count when the group collapsed at
             :data:`_DECLARED_ECHO_BOUND`;
-            OR a structured ``{error, code}`` failure (see spec §5).
+            OR a structured ``{error, code}`` failure (see spec §5) — a
+            ``draft_drifted`` one also carries ``drifted_fields``, and a
+            ``tool_call_markup`` one carries ``markup_spans`` (every hit, ``{field,
+            span, offset}``; a list element's field reads ``name[i]``, and a prose
+            field's offset counts characters of its CRLF-normalised value).
         """
         # === Phase A — validate everything in memory (no writes) ===
 
@@ -3632,6 +4192,19 @@ class MitosSyncManager:
             return _record_error("empty_axiom")
         if not rejected_paths.strip():
             return _record_error("missing_rejected_paths")
+
+        # 2b. Refuse (never strip) tool-call markup in every value this call writes,
+        #     before any strip, slug fold, mechanism fold or hash can hide it. The prose
+        #     fields are scanned CRLF-normalised; everything else raw.
+        markup = _tool_call_markup_refusal([
+            ("axiom", axiom), ("rejected_paths", rejected_paths), ("context", context),
+            ("slug", slug), ("scope", scope), ("mechanisms", mechanisms),
+            ("supersedes", supersedes), ("corrects", corrects), ("amends", amends),
+            ("narrows", narrows), ("depends_on", depends_on), ("resolves", resolves),
+            ("contradicts", contradicts), ("derives_from", derives_from), ("cites", cites),
+        ])
+        if markup is not None:
+            return markup
 
         # 3. Reject (do NOT sanitise) content fields carrying structural tokens.
         #    Check the NON-stripped values: a leading-whitespace `  ## heading` is
@@ -3674,8 +4247,8 @@ class MitosSyncManager:
             return _record_error("derives_from_on_decision")
 
         # 4. Slug — validate, don't mangle. The slug is now mandatory and explicit, and
-        #    it is folded into the canonical-core identity (V1-D2), so it is permanent
-        #    once committed. Normalise case/separators, but REJECT an over-length slug
+        #    it is the handle other decisions cite (not part of the canonical-core
+        #    identity, V1-D2). Normalise case/separators, but REJECT an over-length slug
         #    with an exact char count rather than silently truncating it — a silent trim
         #    would diverge the stored handle from the one the author already cited
         #    (self-inflicted citation rot, the exact failure the handle subsystem exists
@@ -3720,6 +4293,15 @@ class MitosSyncManager:
         if len(parsed) != 1:
             return _record_error("parse_failed")
         entry = parsed[0]
+
+        # A re-send carrying the pause's draft_digest is compared here: after the
+        # entry is built (so it canonicalises exactly as the write does) and before any
+        # store read, so a drifted draft is refused ahead of the exists short-circuit
+        # (which would hide it) and under acknowledge_neighbors (which skips the review
+        # a drifted draft would otherwise commit past). Pure; it can never raise.
+        drift = _draft_drift(entry, draft_digest)
+        if drift:
+            return drift
 
         # Pre-validate supersedes with an EXACT match — comma-separated for a
         # multi-target supersede (each slug resolved independently; a lone slug is the
@@ -3778,8 +4360,9 @@ class MitosSyncManager:
 
         # Identity (slug-free canonical-core hash — V1-D2). Computed over the SAME
         # fields commit_parsed_entry hashes, so this pre-commit idempotency id equals
-        # the commit id: a same-core re-record with a new --slug is an in-place UPDATE
-        # (slug rename), never a spurious slug_collision (G3, V1-D16).
+        # the commit id: a same-core re-record with a new --slug answers `exists` below
+        # and renames nothing, never a spurious slug_collision (G3, V1-D16). A rename
+        # is amend_commentary's `new_slug`.
         node_id = compute_node_id(
             kind=entry.kind,
             axiom=entry.axiom,
@@ -3834,8 +4417,8 @@ class MitosSyncManager:
         if not acknowledge_neighbors:
             neighbors: List[Dict[str, Any]] = []
             # The caller's own declarations, per relation, for the pause echo — built
-            # BESIDE the declared_targets comprehension below, which folds the relation
-            # name away. Purely additive: nothing that Phase B reads moves in here.
+            # BESIDE the declared-targets set below (_review_declared_targets), which
+            # folds the relation name away. Purely additive: nothing that Phase B reads moves in here.
             # `test_mixed_neighbors_declared_edge_survives_acknowledge_bypass` documents
             # why that matters — this whole block is skipped under acknowledge_neighbors
             # while Phase B still writes edges from the raw relation args, so relocating
@@ -3848,27 +4431,11 @@ class MitosSyncManager:
             # input to the partition (M8); empty when the sweep never ran.
             gathered_index: Dict[str, Tuple[str, float]] = {}
             try:
-                declared_targets = {
-                    t.casefold()
-                    for raw in ([supersedes, corrects] + list(extra_relations.values()))
-                    for t in _split_relation_slugs(raw)
-                }
-                # Transitive-lineage suppression (3b): also suppress the pause for the
-                # OLDER members of an amends/narrows/supersedes chain reachable through a
-                # declared mutation edge — by naming the chain head the author has
-                # acknowledged the whole lineage (consuming get_lineage from 3a). Seed only
-                # the mutation three (corrects + the other five stay direct-only). Skip the
-                # walk when the gate is a no-op (offline → _review_neighbors returns []);
-                # the augmentation only ever GROWS the set, so direct suppression of all
-                # nine types is preserved (DoD #13b). The walk is suppression-only: it does
-                # NOT re-declare amends/narrows (that serves modifier stamping, a different
-                # consumer — §6.2), so a bridged predecessor still reads un-amended.
-                if self.embed_provider and self.vector_store:
-                    declared_targets |= self._lineage_suppression_slugs(
-                        _split_relation_slugs(supersedes)
-                        + _split_relation_slugs(extra_relations.get("amends"))
-                        + _split_relation_slugs(extra_relations.get("narrows"))
-                    )
+                # Declared targets plus their transitive mutation lineage (3b): by
+                # naming a chain head the author has acknowledged the whole lineage.
+                # One source with the acknowledged path's post-commit gather.
+                declared_targets = self._review_declared_targets(
+                    supersedes, corrects, extra_relations)
                 reviewed = self._review_neighbors(entry, declared_targets,
                                                   gathered_index=gathered_index)
             except (DatabaseError, ValidationError) as exc:
@@ -3917,10 +4484,13 @@ class MitosSyncManager:
                         "neighbour this decision genuinely relates to, "
                         "acknowledge_neighbors=True for neighbours that stand "
                         "independently alongside it — or both at once for a mixed "
-                        "set. An amended_by/narrowed_by stamp means the neighbour "
-                        f"has moved on — dereference that slug before linking. {echo_prose}"
+                        "set. If you go on to supersede or amend a neighbour, an "
+                        "amended_by/narrowed_by stamp on it means it has moved on — "
+                        "dereference that slug before linking. "
+                        f"{PAUSE_HELD_CLAUSE}{_PAUSE_DIGEST_CLAUSE} {echo_prose}"
                         "Nothing was written."
                     ),
+                    "draft_digest": _draft_digest(entry),
                     **echo,
                 }
 
@@ -4038,7 +4608,7 @@ class MitosSyncManager:
             self._best_effort_embed(delta, entry)
         except Exception as e:
             # stderr: the MCP write tool shares this path and uses stdout for JSON-RPC.
-            print(f"[Warning] Embedding step failed for '{entry.slug}': {str(e)}", file=sys.stderr)
+            print(f"[Warning] Embedding step failed for '{entry.slug}': {describe_embed_failure(e)}", file=sys.stderr)
 
         # 9. Re-render live_axioms.md (a render failure must not fail the commit).
         #    The renderer records size-ceiling overflows on `.overflows` instead of
@@ -4049,12 +4619,35 @@ class MitosSyncManager:
             renderer = MitosRenderer(self.config.workspace_dir)
             renderer.render_all(self.store)
             if renderer.overflows and hint_due(
-                "scope_overflow_hint.json", self.config.workspace_dir, 24 * 60 * 60
+                "scope_overflow_hint.json", self.config.workspace_dir,
+                OVERFLOW_HINT_WINDOW_SECONDS,
             ):
                 overflow_summary = summarize_overflows(renderer.overflows)
         except Exception as e:
             # stderr: the MCP write tool shares this path and uses stdout for JSON-RPC.
             print(f"[Warning] Failed to render active axioms: {str(e)}", file=sys.stderr)
+
+        # 9b. The corpus's audit debt, read after the commit and outside the lock
+        #     (it adds nothing to the §7.3 hold), and never able to fail the write.
+        coherence_audit, audit_debt = self._audit_debt_fields(entry.slug)
+
+        # 9c. The standing check notice: the last contradiction check's outcome, for
+        #     an agent that was not there. Same place and same never-raising shape
+        #     as 9b; None on a keyless workspace or a healthy record.
+        check_notice = self._check_notice_field()
+
+        # 9d. Under acknowledge_neighbors, the neighbours this write went past (F10):
+        #     the pause's gather re-run after the embed, so it hits the embedding
+        #     cache. Same never-raising shape as 9b/9c; None when it could not run.
+        acknowledged: Optional[List[str]] = None
+        if acknowledge_neighbors:
+            acknowledged = self._acknowledged_neighbors_field(
+                entry, supersedes, corrects, extra_relations)
+
+        # 9e. The edges this write wired, each naming what it hit (B4). Same
+        #     never-raising shape as 9b/9c/9d, so the literal below holds a value
+        #     and no live store read.
+        edges_created = self._edges_created_field(node_id, entry.slug)
 
         # 10. Return. A freshly recorded decision is always active. Everything below is
         #     post-commit read-back — the write contract is untouched (the commit
@@ -4066,33 +4659,56 @@ class MitosSyncManager:
             "embedding": self._embedding_status(node_id),
             "status": "created",
             "path": self.config.decisions_file,
-            # Write FACTS read back from the committed node — what the commit actually
-            # wired/stored, never re-derived from the author's input args. Deliberately
-            # unstamped: write facts are not a decision-read surface — a reader acting on
-            # a target dereferences it by slug. (Contrast the pause `neighbors`, which IS
-            # stamped: ADR `record-pause-neighbors-are-stamped-decision-read-surface`.)
-            "edges_created": self.store.get_outgoing_edges(node_id),
+            # A stamped identification echo, read back from the committed graph and
+            # never re-derived from the author's input args: each edge names its
+            # target's state, computed at receipt time (M3), and its modifier stamps,
+            # plus the whole axiom on a relation that acts on its target (the topic on
+            # `resolves`). It identifies what the write hit and is not a precedent
+            # read, so no reasoning rides — a reader who needs the target's reasoning
+            # dereferences it by slug. `null` target keys mean the read failed; `{}`
+            # stamps mean it was read and held none. ADRs
+            # `record-receipt-edges-are-a-stamped-read-surface-axiom-rides-acting-relations-only`
+            # and `identification-echo-is-stamped-but-sub-letter-letter-default-governs-precedent-reads`.
+            "edges_created": edges_created,
             "scope": entry.scope,
-            "mechanisms": entry.mechanisms,
+            # `mechanisms` is the gold source's authored form, read from the entry
+            # step 6 parsed back from the serialised text (so an element carrying a
+            # comma echoes as the split the markdown holds), never from the argument.
+            # `mechanisms_normalized` names the fold, unconditionally — `{}` when
+            # nothing changed, so an absent key never has to be interpreted.
+            "mechanisms": list(entry.mechanisms_authored),
+            "mechanisms_normalized": _mechanisms_fold_map(entry.mechanisms_authored),
             # Unconditional, and only here: a write that landed incurred coherence
             # debt, while `exists`/`needs_review`/every error wrote nothing and owe
             # nothing. Carrying the FACT on the field (rather than leaving the CLI
             # renderer to decide) is what keeps the shared text tail from leaking
             # the line onto a no-op — the renderer gates on the key's presence.
-            "coherence_audit": _COHERENCE_AUDIT_NOTE,
+            # `audit_debt` carries the same counts so no agent parses the sentence;
+            # None means unreadable, never zero.
+            "coherence_audit": coherence_audit,
+            "audit_debt": audit_debt,
         }
         # Honest degradation (KDD-4): when the pre-commit near-dup check could not run,
         # say so on the receipt — one calm sentence, only on a genuinely failed check
         # (never on clean-empty, unconfigured, or acknowledged-past records).
         if review_unavailable:
             result["neighbor_review_unavailable"] = review_unavailable
-        # Debounced, presentation-only: a one-line "N files over the size ceiling — run
-        # `mitos status`" nudge, never on the burying-the-receipt critical path. Shared
-        # by both surfaces (CLI prints it after the receipt; MCP returns it structured).
+        # Debounced, presentation-only: a one-line nudge naming the over-ceiling files,
+        # their ceilings and its own once-a-day cadence, and no command — it is shared
+        # by both surfaces (MCP returns it verbatim; CLI text prints it after the
+        # receipt and adds its own selectored `mitos status -p` recipe line).
         if overflow_summary:
             result["scope_overflow"] = overflow_summary
         # What this call's rotation did, only when it moved, skipped or failed — never
         # the buffer's standing size, which is `mitos status`'s to report.
         if rotation_report:
             result["rotation"] = rotation_report
+        # Present only when shown, so a healthy corpus pays zero bytes. The fact
+        # alone: each renderer decides whether a recovery clause follows it.
+        if check_notice:
+            result["check_notice"] = check_notice
+        # Keyed on the flag, not the value: None ("could not look") and [] ("looked,
+        # none") are both answers, and the key's absence means the flag was not passed.
+        if acknowledge_neighbors:
+            result["acknowledged_neighbors"] = acknowledged
         return result

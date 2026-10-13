@@ -4,13 +4,17 @@ This module implements the MCP Server (F) and the C4 integration contract,
 exposing surface_decisions and query_decisions tools to LLM clients.
 """
 
+import difflib
+import json
 import os
 import sys
 from typing import Optional, List, Dict, Any, Tuple
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.utilities.func_metadata import FuncMetadata, func_metadata
+from pydantic import ValidationError
 
 from mitos import amend, registry, routing
-from mitos.display import blackout_note, clamp_limit, dumps_display, letter_payload, oneline_payload, order_scope_counts, projects_payload, scope_report, show_payload
+from mitos.display import RANKED_LIMIT_CEILING, blackout_note, clamp_limit, dumps_display, letter_payload, oneline_payload, order_scope_counts, projects_payload, scope_report, show_payload
 from mitos.config import MitosConfig
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS
 from mitos.embeddings import GeminiEmbeddingProvider
@@ -27,6 +31,8 @@ from mitos.errors import (
     TARGET_UNKNOWN_NAME,
 )
 from mitos.lexical import degraded_reason_from_error, lexical_fallback
+from mitos.check_notice import compose_check_notice
+from mitos.telemetry import read_last_attempt
 from mitos.divergence import _corpus_files, corpus_holds_entries
 # Module level on purpose: `amend` and `restore` close over no `cli`/`sync`/`store`
 # (measured at planning), so unlike `MitosSyncManager` neither needs deferring.
@@ -34,10 +40,8 @@ from mitos.restore import BufferFidelityError
 from mitos.recall import (assess_query_recall, assess_surface_recall,
                           corpus_provenance, missing_graph_is_a_gap,
                           missing_graph_note, missing_index_is_a_gap,
-                          scope_filter_recovery)
-
-# Create FastMCP server instance
-mcp = FastMCP("Mitos")
+                          scope_filter_recovery, count_withheld, window_lever,
+                          withheld_clause)
 
 # No cross-call "seen" dedup state — deliberately. An earlier design cached
 # already-surfaced slugs in a process-global set and trimmed `rejected_paths` (the
@@ -48,8 +52,8 @@ mcp = FastMCP("Mitos")
 # exactly the field it needed, with no way to tell it was being short-changed. No
 # connection/session key is fully correct either (a bare `/clear` keeps the connection
 # while resetting the agent's context), so the only correct shape is to hold no
-# cross-call state at all. A caller who wants a lightweight scan passes `brief=True` —
-# explicit, per-call, stateless. (V5 owns the rebuilt MCP server; carry this forward.)
+# cross-call state at all. A caller who wants a lightweight scan passes `brief=True`
+# (or `full_top=N` to keep the top N whole) — explicit, per-call, stateless. (V5 owns the rebuilt MCP server; carry this forward.)
 
 
 def _attach_modifiers(payload: Dict[str, Any], node: Dict[str, Any], store: GraphStore) -> Dict[str, Any]:
@@ -97,13 +101,22 @@ def _retired_handle(store: GraphStore, slug: str) -> Optional[Dict[str, Any]]:
         slug: The slug of the superseded-filtered match.
 
     Returns:
-        The retired-handle dict, or ``None`` if the slug does not resolve.
+        The retired-handle dict, or ``None`` if the slug does not resolve or names
+        no decision (a superseded open question is not a retired precedent).
     """
     try:
         node_ids = store.resolve_slug(slug)
     except Exception:
         return None
     if not node_ids:
+        return None
+    # A retired open question is not a retired precedent: only a slug that names a
+    # decision is offered (a `supersedes` lineage is same-kind, so "any decision"
+    # never keeps a mixed handle).
+    try:
+        if "decision" not in store.resolve_slug_kinds(slug):
+            return None
+    except Exception:
         return None
     node_id = node_ids[0]
     try:
@@ -145,12 +158,14 @@ def _decision_payload(node: Dict[str, Any], score: float, *, brief: bool,
     return payload
 
 class _RenderedToolError(Exception):
-    """An addressing failure already rendered for delivery. ``str()`` IS the body.
+    """A failure already rendered for delivery. ``str()`` IS the body.
 
-    Two classes ride it since 6c — the **targeting** anatomy and the **registry**
-    class's located cause plus escape hatch — and the shape is the same for both
-    because the delivery constraint below is a property of the transport, not of
-    either message.
+    Three bodies ride it: the **targeting** anatomy and the **registry** class's
+    located cause plus escape hatch (both since 6c, raised inside a tool), and the
+    **argument-fault** body (AX-3 6b, raised from the ``_MitosFastMCP.call_tool``
+    boundary before any tool runs). The shape is the same for all three because
+    the delivery constraint below is a property of the transport, not of any one
+    message.
 
     Module-private, and it never leaves this file. Its whole purpose is to be the
     thing a tool **raises** once the body has been composed, because that is
@@ -166,17 +181,244 @@ class _RenderedToolError(Exception):
     * ``return <anatomy>`` → an ordinary **success**, which an addressing-class
       failure is not.
 
-    ``Tool.run`` wraps whatever a tool raises as ``ToolError(f"Error executing
-    tool {name}: {e}")``, and the low-level server renders *that* through
-    ``_make_error_result(str(err))`` — so the delivered body is ``str()`` of what
-    was raised. FastMCP's prefix is kept rather than fought: it names the failing
-    tool, which the body would otherwise have to repeat.
+    The two delivery paths differ in one prefix:
+
+    * **Raised inside a tool** — ``Tool.run`` wraps it as ``ToolError(f"Error
+      executing tool {name}: {e}")``, and the low-level server renders *that*
+      through ``_make_error_result(str(err))``. FastMCP's prefix is kept rather
+      than fought: it names the failing tool, which the body would otherwise have
+      to repeat.
+    * **Raised from the boundary override** — nothing wraps it, so it arrives
+      bare (6a's S2/S3). That body names its tool on its first line itself.
 
     Deliberately **not** a ``MitosError`` and deliberately not a field on
     ``ProjectTargetingError``: a finished presentation string living on a shared
     error type is exactly the leak the composition locus forbids — it would put
     MCP call syntax one attribute away from the CLI boundary.
     """
+
+
+# The longest echo of a mistyped value, in characters of its JSON encoding. An
+# echo exists so the caller can see what arrived, not to reproduce a prose blob.
+ARGUMENT_ECHO_MAX = 80
+# `difflib`'s default 0.6 suggested `limit` for `claim` (ratio 0.60): a confident
+# wrong suggestion teaches less than none, since the parameter line already
+# lists the real names.
+ARGUMENT_DIDYOUMEAN_CUTOFF = 0.75
+ARGUMENT_DIDYOUMEAN_MAX = 2
+# A containment match needs both names at least this long, so `s` or `e` does
+# not "contain"-match nearly every parameter; `id` → `ident` still qualifies.
+_ARGUMENT_CONTAINMENT_MIN = 2
+
+# Closed table: the schema shapes mitos's tools declare, in words. Anything else
+# falls back to pydantic's own `msg`, which is plain English.
+_SCHEMA_TYPE_WORDS = {
+    "string": "a string",
+    "integer": "a whole number",
+    "boolean": "true or false",
+}
+
+
+def _expected_words(schema: Dict[str, Any]) -> Optional[str]:
+    """Says in words what one argument's schema accepts, or None off the table.
+
+    An ``anyOf`` with ``null`` reads as its non-null member: sending nothing is
+    what the optional form allows, and the words describe what to send.
+    """
+    if "anyOf" in schema:
+        members = [m for m in schema["anyOf"] if m.get("type") != "null"]
+        return _expected_words(members[0]) if len(members) == 1 else None
+    kind = schema.get("type")
+    if kind == "array":
+        item = schema.get("items", {}).get("type")
+        return "a list of strings" if item == "string" else None
+    return _SCHEMA_TYPE_WORDS.get(kind)
+
+
+def _received_words(value: Any) -> str:
+    """Renders a raw argument value as it arrived: its JSON kind, then its JSON.
+
+    Truncated at ``ARGUMENT_ECHO_MAX`` characters with an ellipsis.
+    """
+    text = json.dumps(value, ensure_ascii=False, default=repr)
+    if len(text) > ARGUMENT_ECHO_MAX:
+        text = text[:ARGUMENT_ECHO_MAX - 1] + "…"
+    if value is None or isinstance(value, bool):
+        return text
+    if isinstance(value, str):
+        return f"the string {text}"
+    if isinstance(value, (int, float)):
+        return f"the number {text}"
+    if isinstance(value, list):
+        return f"the list {text}"
+    if isinstance(value, dict):
+        return f"the object {text}"
+    return text
+
+
+def _close_names(unknown: str, candidates: List[str]) -> List[str]:
+    """Picks up to ``ARGUMENT_DIDYOUMEAN_MAX`` declared names close to an unknown.
+
+    Close means one name contains the other (``id`` → ``ident``,
+    ``axiom_scope`` → ``axiom``, ``scope``) or ``difflib`` rates them at
+    ``ARGUMENT_DIDYOUMEAN_CUTOFF`` or better (``fulltop`` → ``full_top``). The
+    closest come first, by ``SequenceMatcher`` ratio, ties in signature order.
+    """
+    folded = unknown.lower()
+    close = set(difflib.get_close_matches(folded, candidates, n=ARGUMENT_DIDYOUMEAN_MAX,
+                                          cutoff=ARGUMENT_DIDYOUMEAN_CUTOFF))
+    if len(folded) >= _ARGUMENT_CONTAINMENT_MIN:
+        close.update(c for c in candidates
+                     if len(c) >= _ARGUMENT_CONTAINMENT_MIN and (folded in c or c in folded))
+    ranked = sorted(close, key=lambda c: (-difflib.SequenceMatcher(None, folded, c).ratio(),
+                                          candidates.index(c)))
+    return ranked[:ARGUMENT_DIDYOUMEAN_MAX]
+
+
+def _render_argument_faults(tool: str, properties: Dict[str, Dict[str, Any]],
+                            arguments: Dict[str, Any], pre_parsed: Dict[str, Any],
+                            unknowns: List[str], errors: List[Dict[str, Any]]) -> str:
+    """Composes the boundary's one answer to a call whose arguments do not fit.
+
+    The anatomy: a first line naming the tool and the count of faulted
+    arguments; one indented line per faulted argument, unknowns first, then
+    missing, then mistyped; and a last line listing what the tool takes, in
+    signature order. The first line names the tool because nothing else will —
+    a body raised from the boundary arrives without FastMCP's prefix.
+
+    Like ``_render_targeting_error`` it reads nothing and never calls
+    ``str()`` on pydantic's error, whose wall (model title, error URL) is what
+    this replaces. It never echoes an unknown argument's value — the name is
+    the fault, and the value may be a prose blob — and it never marks a
+    parameter required: ``project`` is documented-required but not
+    schema-required, and a list that said otherwise would contradict the
+    description.
+
+    Args:
+        tool: The tool that was called.
+        properties: The tool's schema properties, in signature order.
+        arguments: The arguments exactly as they arrived.
+        pre_parsed: The known arguments after FastMCP's ``pre_parse_json``, so a
+            string rewritten as JSON can be told apart from one sent as a list.
+        unknowns: The arguments the tool does not declare, in the order sent.
+        errors: pydantic's ``errors()`` for the known arguments.
+
+    Returns:
+        The multi-line body.
+    """
+    declared = list(properties)
+    candidates = [name for name in declared if name not in arguments]
+    missing: List[str] = []
+    mistyped: Dict[str, List[Dict[str, Any]]] = {}
+    for error in errors:
+        field = str(error["loc"][0]) if error["loc"] else ""
+        if error["type"] == "missing" and len(error["loc"]) == 1:
+            missing.append(field)
+        else:
+            mistyped.setdefault(field, []).append(error)
+
+    lines = []
+    for name in unknowns:
+        line = f"  `{name}` is not an argument of {tool}"
+        close = _close_names(name, candidates)
+        if close:
+            line += f" — did you mean {' or '.join(f'`{c}`' for c in close)}?"
+        lines.append(line + ("" if close else "."))
+    for name in sorted(missing, key=lambda n: declared.index(n) if n in declared else len(declared)):
+        lines.append(f"  `{name}` is required and was not sent.")
+    for name in sorted(mistyped, key=lambda n: declared.index(n) if n in declared else len(declared)):
+        faults = mistyped[name]
+        expected = _expected_words(properties.get(name, {}))
+        raw = arguments.get(name)
+        line = (f"  `{name}` expects {expected}" if expected
+                else f"  `{name}`: {faults[0]['msg'].rstrip('.')}")
+        line += f"; it received {_received_words(raw)}"
+        if isinstance(raw, str) and pre_parsed.get(name) is not raw:
+            taken = {list: "a list", dict: "an object"}.get(type(pre_parsed.get(name)), "null")
+            line += f", which reads as JSON and was taken as {taken}"
+        items = [str(f["loc"][1]) for f in faults if len(f["loc"]) > 1]
+        if items:
+            line += (f" (the fault is at item {items[0]})" if len(items) == 1
+                     else f" (the faults are at items {', '.join(items)})")
+        lines.append(line + ".")
+
+    count = len(lines)
+    head = f"{tool} was not run: {count} argument fault{'' if count == 1 else 's'}."
+    tail = (f"  {tool} takes: {', '.join(declared)}." if declared
+            else f"  {tool} takes no arguments.")
+    return "\n".join([head, *lines, tail])
+
+
+class _CapturedArguments:
+    """One tool's argument model and its declared properties, read once at capture."""
+
+    def __init__(self, metadata: FuncMetadata) -> None:
+        self.metadata = metadata
+        self.properties: Dict[str, Dict[str, Any]] = (
+            metadata.arg_model.model_json_schema(by_alias=True).get("properties", {}))
+
+
+class _MitosFastMCP(FastMCP):
+    """FastMCP with an argument boundary: a bad call is refused before any tool runs.
+
+    FastMCP ignores an argument a tool does not declare, so a write could
+    succeed with part of the caller's intent silently gone, and it answers a
+    missing or mistyped argument with pydantic's raw wall. This boundary refuses
+    the undeclared argument and answers every argument fault of the call at
+    once, in mitos's voice (``_render_argument_faults``).
+
+    It validates before delegating rather than translating ``super()``'s
+    ``ToolError``: a mixed call (an unknown beside a valid set) would otherwise
+    have to *run the tool* to learn about the rest, and a translation would have
+    to tell FastMCP's argument error apart from a pydantic error raised inside a
+    tool body. A ``ToolError`` from ``super()`` is therefore always the tool's
+    own, and passes untouched — prefix and all.
+
+    The model is ``func_metadata(fn)``, the builder ``Tool.from_function`` uses,
+    captured in ``add_tool`` — the method ``FastMCP.tool()`` registers through.
+    ``tests/test_mcp_seam.py`` S7 and the parity row in
+    ``tests/test_mcp_argument_faults.py`` pin that it is the model FastMCP
+    registered. (No mitos tool takes a ``Context`` parameter, so nothing is
+    skipped; one that did would red the parity row.)
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self._captured_arguments: Dict[str, _CapturedArguments] = {}
+        super().__init__(*args, **kwargs)
+
+    def add_tool(self, fn: Any, *args: Any, **kwargs: Any) -> None:
+        """Registers the tool as FastMCP does, then captures its argument model."""
+        super().add_tool(fn, *args, **kwargs)
+        name = (args[0] if args else None) or kwargs.get("name") or fn.__name__
+        self._captured_arguments[name] = _CapturedArguments(func_metadata(fn))
+
+    async def call_tool(self, name: str, arguments: Dict[str, Any]) -> Any:
+        """Refuses a call whose arguments do not fit, else runs it as FastMCP does.
+
+        Raises:
+            _RenderedToolError: With the rendered body, when the call carries an
+                undeclared argument or pydantic refuses a declared one. It
+                arrives at the client bare, as ``isError``.
+        """
+        captured = self._captured_arguments.get(name)
+        if captured is None:
+            return await super().call_tool(name, arguments)
+        raw = arguments or {}
+        unknowns = [key for key in raw if key not in captured.properties]
+        known = {key: value for key, value in raw.items() if key in captured.properties}
+        pre_parsed = captured.metadata.pre_parse_json(known)
+        try:
+            captured.metadata.arg_model.model_validate(pre_parsed)
+            errors: List[Dict[str, Any]] = []
+        except ValidationError as exc:
+            errors = [dict(e) for e in exc.errors()]
+        if unknowns or errors:
+            raise _RenderedToolError(_render_argument_faults(
+                name, captured.properties, raw, pre_parsed, unknowns, errors))
+        return await super().call_tool(name, arguments)
+
+
+mcp = _MitosFastMCP("Mitos")
 
 
 def _example_project_name(err: ProjectTargetingError) -> Optional[str]:
@@ -571,9 +813,10 @@ def get_workspace_components(config: MitosConfig) -> Tuple[GraphStore, Optional[
 
 
 def _lexical_degraded_response(query: str, *, config: MitosConfig, reason: str,
-                               store: Optional[GraphStore], brief: bool,
-                               limit: int,
-                               open_questions: Optional[List[Dict[str, Any]]] = None) -> str:
+                               store: Optional[GraphStore],
+                               full_top: Optional[int], limit: int,
+                               open_questions: Optional[List[Dict[str, Any]]] = None,
+                               check_notice: Optional[Dict[str, Any]] = None) -> str:
     """Builds the degraded lexical-fallback JSON for the MCP read tools.
 
     The MCP twin of ``cli._emit_lexical_degraded`` (ADR
@@ -594,22 +837,34 @@ def _lexical_degraded_response(query: str, *, config: MitosConfig, reason: str,
         reason: One-line cause phrase (see ``degraded_reason_from_error``).
         store: A readable graph store for active-filtering + modifier stamps,
             or None when the graph itself is down (pre-V1a).
-        brief: Omit ``rejected_paths`` from each match.
+        full_top: How many top matches keep ``rejected_paths`` (None ⇒ all, 0 ⇒
+            none — the tool's ``brief``). A thinned answer says so by
+            ``rejected_paths_withheld`` and a note clause.
         limit: Max matches to return.
         open_questions: An already-computed scoped parked-OQ list to carry on
             the envelope (present-if-scanned semantics — None means omitted).
+        check_notice: The standing check notice ``surface_decisions`` composed,
+            carried verbatim; None (``query_decisions`` always) means omitted.
 
     Returns:
         The degraded envelope as a JSON string.
     """
     envelope = lexical_fallback(
         query, corpus_paths=_corpus_files(config), reason=reason, store=store,
-        limit=limit, brief=brief,
+        limit=limit, full_top=full_top,
     )
     envelope["query"] = query
     envelope.update(corpus_provenance(config))
+    withheld = count_withheld(envelope["matches"])
+    if withheld:
+        envelope["note"] = (
+            f"{envelope['note']} {withheld_clause(withheld, surface='mcp', config=config)}"
+        )
+        envelope["rejected_paths_withheld"] = withheld
     if open_questions is not None:
         envelope["open_questions"] = open_questions
+    if check_notice is not None:
+        envelope["check_notice"] = check_notice
     return dumps_display(envelope, ensure_ascii=False, indent=2)
 
 
@@ -639,9 +894,36 @@ def _oq_payload(oq: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
+def _full_top_fault(brief: bool, full_top: Optional[int]) -> Optional[str]:
+    """Answers the ranked reads' depth-argument fault, or None when there is none.
+
+    The bare read-tool refusal ``list_decisions`` gives ``brief and oneline``: an
+    argument fault, answered before any project is resolved, with no provenance.
+
+    Args:
+        brief: The call's ``brief``.
+        full_top: The call's ``full_top``.
+
+    Returns:
+        The refusal as a JSON string, or None when the pair is valid.
+    """
+    if brief and full_top is not None:
+        msg = "brief and full_top are mutually exclusive — brief is full_top=0; pass one."
+    elif full_top is not None and full_top < 0:
+        msg = "full_top must be 0 or more: the number of top ranks that keep rejected_paths."
+    else:
+        return None
+    return dumps_display({"error": msg}, ensure_ascii=False, indent=None)
+
+
+def _rank_thinned(rank: int, full_top: Optional[int]) -> bool:
+    """Says whether the hit at 1-based ``rank`` among returned decisions is thinned."""
+    return full_top is not None and rank > full_top
+
+
 @mcp.tool()
 def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = False, limit: int = 5,
-                      project: Optional[str] = None) -> str:
+                      project: Optional[str] = None, full_top: Optional[int] = None) -> str:
     """Surface active precedents for a CLAIM before you decide — the recall loop, use first.
 
     The broad "is there a settled decision near this?" scan: a ranked, capped (top
@@ -650,33 +932,38 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
     look up a SPECIFIC slug or claim (its band rates that ranking, not the corpus),
     and list_decisions for the EXHAUSTIVE set in a scope. Every hit carries its full
     `rejected_paths` — why alternatives were ruled out, the field that actually
-    stops relitigation — unless you pass `brief=True`. Closing the loop: after you
+    stops relitigation — unless you pass `brief=True` or `full_top`. Closing the loop: after you
     decide, `record_decision` the outcome so the next agent inherits it instead of
     relitigating.
 
     Args:
         query: The semantic claim or topic string (e.g. 'cache strategy').
-        scope: Optional scope hint — does NOT filter the semantic search. Recall is
-            scope-blind by design, so a mis-guessed tag can't hide cross-scope
-            precedent; scope only narrows the `open_questions` scan and shapes the
-            recall `note` (incl. the "unused tag → valid scopes" redirect). For
-            scope-RESTRICTED retrieval use list_decisions(scope=...) — the only
-            surface that hard-filters by scope.
-        brief: If True, omit `rejected_paths` from every result (axiom-only — a quick
-            "is there anything nearby?" scan). Default False keeps the full reasoning.
-        limit: Ranked top-k to retrieve (default 5; clamped to 1–50). Raise it to dig
-            deeper, lower it to save context — a context-budget dial, not a cap at 5.
         project: Which project this call is about — REQUIRED on every call: a
             registered project name (e.g. 'mitos') or the absolute path of a
             workspace. Call `list_projects()` if you do not know the names.
             Distinct from `scope`: `project` picks the corpus, `scope` filters
             within it.
+        scope: Optional scope hint, one tag as a string — does NOT filter the
+            semantic search. Recall is scope-blind by design, so a mis-guessed tag
+            can't hide cross-scope precedent; scope only narrows the
+            `open_questions` scan and shapes the recall `note` (incl. the "unused
+            tag → valid scopes" redirect). For scope-RESTRICTED retrieval use
+            list_decisions(scope=...) — the only surface that hard-filters by scope.
+        brief: An existence screen — "is there anything nearby?" — after which you
+            dereference the hits that matter by slug (show_node). If True, every
+            result is axiom-only (no `rejected_paths`). Default False keeps the full
+            reasoning.
+        limit: Ranked top-k to retrieve (default 5; clamped to 1–50). Raise it to dig
+            deeper, lower it to save context — a context-budget dial, not a cap at 5.
+        full_top: Keep `rejected_paths` on ranks 1..N only; lower ranks are
+            axiom-only. Default: every rank whole. `full_top=0` is `brief=True`;
+            passing both is refused.
 
     Returns:
         A JSON string with `active_decisions` (ranked, Letter-mode), plus
         `open_questions` ONLY when a scope was given (absent = not scanned, [] = none
         parked in that scope). Each decision: slug, axiom, scope, score, and
-        rejected_paths unless brief. A precedent a later decision has moved on from
+        rejected_paths unless brief or full_top. A precedent a later decision has moved on from
         also carries the modifying slugs under
         `superseded_by`/`amended_by`/`narrowed_by`/`corrected_by` (always present when
         they apply, even on a brief scan) — chase those before treating its axiom as
@@ -690,6 +977,14 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         `superseded_by` successor when known) with the `note` naming them — that is a
         recoverable "it was settled before, go read the history", not a true miss.
     """
+    # An argument fault is answered before any project is resolved — see
+    # list_decisions for why the ordering is deliberate.
+    fault = _full_top_fault(brief, full_top)
+    if fault:
+        return fault
+    # One effective depth value from here down: `brief` is `full_top=0`.
+    if brief:
+        full_top = 0
     top_k = clamp_limit(limit)
     # Resolve BEFORE the `try` below, never inside it. That `except Exception`
     # exists to degrade a broken *graph* to the lexical fallback; a targeting
@@ -702,10 +997,27 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
     try:
         store, embed_provider, vector_store = get_workspace_components(config)
     except Exception as e:
+        # Telemetry does not depend on the graph, so the notice still rides. Its
+        # pair handles resolve nothing (whole ids): no second store is opened on
+        # a path whose graph just failed to open. Composed in the handler, not
+        # the `try` body, so a raise at this call propagates.
         return _lexical_degraded_response(
-            query, config=config, reason=degraded_reason_from_error(e), store=None,
-            brief=brief, limit=top_k,
+            query, config=config,
+            reason=degraded_reason_from_error(e, surface="mcp", project=config.project),
+            store=None, full_top=full_top, limit=top_k,
+            check_notice=compose_check_notice(
+                config, read_attempt=read_last_attempt, get_node=lambda _id: None
+            ),
         )
+
+    # The standing check notice, composed once for every exit below. Outside the
+    # ranked `try` on purpose: the composer is total, so the only raise here is a
+    # defect at this call, and that `except Exception` would render it as
+    # degraded recall on a healthy read. No `try` of its own either — a broken
+    # call must be loud, never a notice that silently stops showing.
+    notice = compose_check_notice(
+        config, read_attempt=read_last_attempt, get_node=store.get_node
+    )
 
     results: Dict[str, Any] = {"active_decisions": []}
     results.update(corpus_provenance(config))
@@ -713,6 +1025,8 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
     top_score: Optional[float] = None
     retired: List[Dict[str, Any]] = []
     degraded_error: Optional[Exception] = None
+    lever = None
+    dump_total: Optional[int] = None
 
     # 1. Semantic search if embeddings and vector store are active
     if embed_provider and vector_store:
@@ -721,6 +1035,9 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
             q_vector = embed_provider.get_embedding(query, is_query=True)
             matches = vector_store.query(q_vector, limit=top_k)
             semantic_ran = True
+            # Raw points, not surfaced decisions: the lever reads retrieval depth.
+            lever = window_lever(points=len(matches), limit=top_k,
+                                 ceiling=RANKED_LIMIT_CEILING, full_top=full_top)
 
             for m in matches:
                 slug = m["slug"]
@@ -729,6 +1046,10 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
                     handle = _retired_handle(store, slug)
                     if handle:
                         retired.append(handle)
+                    continue
+                if node["kind"] != "decision":
+                    # An open question: never embedding-ranked (C4), not retired —
+                    # skipped before the band sees its score.
                     continue
 
                 # Verify computed active status in SQLite (M3 computed state is source-of-truth)
@@ -740,8 +1061,12 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
                         retired.append(handle)
                     continue
 
+                # Rank among the decisions returned, taken at append time — never
+                # the index into `matches`, whose skipped entries consume no rank.
+                rank = len(results["active_decisions"]) + 1
                 results["active_decisions"].append(
-                    _decision_payload(node, m["score"], brief=brief, store=store)
+                    _decision_payload(node, m["score"],
+                                      brief=_rank_thinned(rank, full_top), store=store)
                 )
                 if top_score is None or m["score"] > top_score:
                     top_score = m["score"]
@@ -751,7 +1076,7 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
             # `semantic_ran` True so this renders "ran and found nothing" (which is
             # also what suppresses the degraded-only unranked scope dump below).
             # Over a populated graph it is a real hole in recall and degrades, with
-            # the header naming the collection and `mitos reconcile`.
+            # the header naming the collection and its heal.
             if missing_index_is_a_gap(store):
                 semantic_ran = False
                 degraded_error = e
@@ -768,12 +1093,21 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
     if not semantic_ran and not results["active_decisions"] and scope:
         try:
             active_decs = store.get_active_decisions(scope=scope)
-            for d in active_decs[:5]:
+            dump_total = len(active_decs)
+            for d in active_decs[:top_k]:
+                rank = len(results["active_decisions"]) + 1
                 results["active_decisions"].append(
-                    _decision_payload(d, 1.0, brief=brief, store=store)
+                    _decision_payload(d, 1.0, brief=_rank_thinned(rank, full_top),
+                                      store=store)
                 )
         except Exception:
             pass
+
+    # The degraded cause, computed once and handed to both the lexical exit's header
+    # and the scope-dump / partial-list note, so the two cannot name different causes.
+    reason = (degraded_reason_from_error(degraded_error, surface="mcp",
+                                         project=config.project)
+              if not semantic_ran else None)
 
     # 3. Append Open Questions ONLY when a scope was given (C4 resolves clause).
     #    Omitting the key when no scope disambiguates "not scanned" from "none here".
@@ -794,9 +1128,10 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
     # along on the degraded envelope.
     if not semantic_ran and not results["active_decisions"]:
         return _lexical_degraded_response(
-            query, config=config, reason=degraded_reason_from_error(degraded_error),
-            store=store, brief=brief, limit=top_k,
+            query, config=config, reason=reason,
+            store=store, full_top=full_top, limit=top_k,
             open_questions=results.get("open_questions"),
+            check_notice=notice,
         )
 
     # Confidence signal — let the agent tell a settled precedent from loose neighbours
@@ -818,6 +1153,9 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         scope=scope,
         scope_counts=scope_counts,
         surface="mcp",
+        lever=lever,
+        scope_total=dump_total,
+        degraded_reason=reason,
     )
     if confidence is not None:
         results["confidence"] = confidence
@@ -844,6 +1182,20 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
     ):
         results["note"] = missing_graph_note("mcp", config)
 
+    # A thinned answer says so by a count and a clause, after every note override
+    # (they need zero hits, so none can co-occur with a count) and before the notice.
+    # Absent at zero, so a default answer is byte-identical.
+    withheld = count_withheld(results["active_decisions"])
+    if withheld:
+        results["note"] = (
+            f"{results['note']} {withheld_clause(withheld, surface='mcp', config=config)}"
+        )
+        results["rejected_paths_withheld"] = withheld
+
+    # After the recall answer's own keys; absent (never null) when not shown.
+    if notice:
+        results["check_notice"] = notice
+
     return dumps_display(results, ensure_ascii=False, indent=2)
 
 
@@ -863,9 +1215,14 @@ def list_decisions(scope: Optional[str] = None, state: str = "active", brief: bo
     when you want results restricted to a scope, this is the verb.
 
     Args:
-        scope: Optional scope tag filter (e.g. 'auth') — a true hard filter (this is
-            the only retrieval surface that restricts by scope). Omit for the whole
-            project.
+        project: Which project this call is about — REQUIRED on every call: a
+            registered project name (e.g. 'mitos') or the absolute path of a
+            workspace. Call `list_projects()` if you do not know the names.
+            Distinct from `scope`: `project` picks the corpus, `scope` filters
+            within it.
+        scope: Optional scope tag filter, one tag as a string (e.g. 'auth') — a
+            true hard filter (this is the only retrieval surface that restricts by
+            scope). Omit for the whole project.
         state: 'active' (default) returns the live set (active + drifted); 'all'
             returns every decision regardless of state (including superseded); any
             other value is an exact computed-state match (e.g. 'superseded').
@@ -878,11 +1235,6 @@ def list_decisions(scope: Optional[str] = None, state: str = "active", brief: bo
             scan the map here, then dereference the few that matter with query/show.
             Letter-complete stays the default depth; this is an explicit opt-down,
             never a default. Mutually exclusive with brief.
-        project: Which project this call is about — REQUIRED on every call: a
-            registered project name (e.g. 'mitos') or the absolute path of a
-            workspace. Call `list_projects()` if you do not know the names.
-            Distinct from `scope`: `project` picks the corpus, `scope` filters
-            within it.
 
     Returns:
         A JSON string: {decisions, open_questions, total, scope, state}. Each
@@ -925,14 +1277,19 @@ def list_decisions(scope: Optional[str] = None, state: str = "active", brief: bo
     except Exception:
         pass
 
-    payload = {
+    payload: Dict[str, Any] = {
         "decisions": decisions,
         "open_questions": open_questions,
         "total": len(decisions),
         "scope": scope,
         "state": state,
-        **corpus_provenance(config),
     }
+    # The brief and oneline tiers withhold the field on every decision; the count
+    # says so (no clause: list has no note). Absent at zero, before provenance.
+    withheld = count_withheld(decisions)
+    if withheld:
+        payload["rejected_paths_withheld"] = withheld
+    payload.update(corpus_provenance(config))
 
     # On an empty scoped read, distinguish a genuinely-fresh scope from a misspelled one:
     # an absent-from-live scope rides two additive, in-band fields (never an error object
@@ -981,15 +1338,15 @@ def list_scopes(include_archived: bool = False, project: Optional[str] = None) -
     person runs it.
 
     Args:
+        project: Which project this call is about — REQUIRED on every call: a
+            registered project name (e.g. 'mitos') or the absolute path of a
+            workspace. Call `list_projects()` if you do not know the names.
         include_archived: When False (default), returns only live domains (≥1 active
             decision OR ≥1 parked open question). When True, additionally includes
             the tags whose decisions are all retired and whose open questions are
             all resolved, at a `{active_decisions: 0, parked_open_questions: 0}`
             floor — the scope-level parallel of list_decisions(state="all"). A tag
             no decision or question carries any more is not listed.
-        project: Which project this call is about — REQUIRED on every call: a
-            registered project name (e.g. 'mitos') or the absolute path of a
-            workspace. Call `list_projects()` if you do not know the names.
 
     Returns:
         A JSON string: `{scopes, project, collection, workspace}`. `scopes` is an
@@ -1050,7 +1407,10 @@ def show_node(ident: str, project: Optional[str] = None) -> str:
         unsynced draft as the other possibility. Both shapes carry the
         trailing `project`/`collection`/`workspace` provenance — most valuable on
         the absent one, which is otherwise ambiguous between "no such handle
-        here" and "you are asking the wrong project".
+        here" and "you are asking the wrong project". `mechanisms` is the folded
+        identity form the graph stores. No by-handle read returns transcripts
+        (they stay in `decisions.md`), graph-primary provenance (`source`,
+        `created_at`, `confirmed_by`/`confirmed_at`) or outgoing edges.
     """
     config = _target_config(project, "show_node")
     store, _embed, _vec = get_workspace_components(config)
@@ -1070,11 +1430,13 @@ def show_node(ident: str, project: Optional[str] = None) -> str:
         missing.update(corpus_provenance(config))
         return dumps_display(missing, ensure_ascii=False, indent=2)
 
-    # state from the separate computed-state read (never node.get("state") —
-    # absent on the resolved dict); modifiers are the one kind-agnostic stamp
-    # source. Stamping is LOAD-BEARING: surfacing the superseded is this tool's
-    # whole job, so the superseded_by stamp is not decoration.
-    state = store.get_node_state(node["id"])
+    # state from the separate kind-aware computed-state read (never
+    # node.get("state") — absent on the resolved dict), the one cmd_show calls, so
+    # an open question reads parked/resolved here as it does on the receipt echo;
+    # modifiers are the one kind-agnostic stamp source. Stamping is LOAD-BEARING:
+    # surfacing the superseded is this tool's whole job, so the superseded_by
+    # stamp is not decoration.
+    state = store.get_handle_state(node["id"])
     modifiers = store.get_modifiers(node["id"])
     payload = show_payload(node, state=state, modifiers=modifiers)
     payload.update(corpus_provenance(config))
@@ -1083,7 +1445,7 @@ def show_node(ident: str, project: Optional[str] = None) -> str:
 
 @mcp.tool()
 def query_decisions(query: str, depth: str = "letter", brief: bool = False, limit: int = 5,
-                    project: Optional[str] = None) -> str:
+                    project: Optional[str] = None, full_top: Optional[int] = None) -> str:
     """Look up a SPECIFIC decision by slug or claim — the targeted lookup.
 
     Use this when you know roughly what you're after (a slug you're carrying, or a
@@ -1099,10 +1461,14 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
     Args:
         query: Unique decision slug identifier OR a semantic claim search query.
         depth: The retrieval depth (e.g. 'letter'). v0.1 enforces Letter mode.
-        brief: If True, omit `rejected_paths` from ranked semantic matches
-            (an exact-slug hit is always returned in full — you asked for that one).
+        brief: An existence screen over the ranked matches, to dereference from
+            by slug: if True, they omit `rejected_paths` (an exact-slug hit is
+            always returned in full — you asked for that one).
         limit: Ranked top-k for the SEMANTIC branch (default 5; clamped to 1–50).
             Ignored by an exact-slug hit.
+        full_top: Keep `rejected_paths` on ranked matches 1..N only; lower ranks
+            are axiom-only. Default: all whole. `full_top=0` is `brief=True`;
+            passing both is refused. An exact-slug hit is always whole.
         project: Which project this call is about — REQUIRED on every call: a
             registered project name (e.g. 'mitos') or the absolute path of a
             workspace. Call `list_projects()` if you do not know the names.
@@ -1115,12 +1481,27 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
         chase these before trusting its axiom's mechanism. When every retrieved
         precedent is superseded (a blackout), `matches` stays empty and a sibling
         `all_superseded` list carries the retired handles — settled before, not a
-        true miss; read the history with list_decisions(state="all").
+        true miss; read the history with list_decisions(state="all"). An
+        exact-slug hit's `mechanisms` is the folded identity form the graph
+        stores; no by-handle read returns transcripts (they stay in
+        `decisions.md`), graph-primary provenance (`source`, `created_at`,
+        `confirmed_by`/`confirmed_at`) or outgoing edges.
     """
+    # No standing check notice on any exit of this verb, deliberately (vision §4.3):
+    # `surface_decisions` is the read put before a write and carries it; a second
+    # telemetry read on this hotter loop buys nothing. Parity pressure is not a
+    # reason to add one — `mitos query` is silent for the same reason.
+    #
     # The argument fault is answered before any project is resolved — see
     # list_decisions for why the ordering is deliberate.
     if depth != "letter":
         return dumps_display({"error": f"Depth mode '{depth}' is not yet implemented in v0.1 (Letter-only retrieval)."}, ensure_ascii=False, indent=None)
+    fault = _full_top_fault(brief, full_top)
+    if fault:
+        return fault
+    # One effective depth value from here down; the exact-slug branch ignores it.
+    if brief:
+        full_top = 0
 
     # Resolved BEFORE the `try` — see surface_decisions: that `except Exception`
     # would swallow a targeting failure into the lexical-degraded envelope.
@@ -1131,34 +1512,46 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
         store, embed_provider, vector_store = get_workspace_components(config)
     except Exception as e:
         return _lexical_degraded_response(
-            query, config=config, reason=degraded_reason_from_error(e), store=None,
-            brief=brief, limit=clamp_limit(limit),
+            query, config=config, reason=degraded_reason_from_error(
+                e, surface="mcp", project=config.project), store=None,
+            full_top=full_top, limit=clamp_limit(limit),
         )
 
-    # 1. Try resolving query as direct slug first
+    # 1. Try resolving query as direct slug first. The `try` covers the store reads
+    #    only: a failed lookup falls through to the ranked search, as does a slug
+    #    that names no decision (an open question's slug is not a dereference — its
+    #    kind decides that, not a swallowed KeyError). Composition sits outside, so
+    #    a malformed decision fails loudly instead of posing as a ranked search.
     try:
         node = store.get_node_by_slug(query)
-        if node:
+        hit = node is not None and node["kind"] == "decision"
+        if hit:
             state = store.get_node_state(node["id"])
-
-            output = {
-                "slug": node["slug"],
-                "axiom": node["core_axiom"],
-                "rejected_paths": node["rejected_paths"],
-                "scope": node["scope"],
-                "state": state,
-                "depth_mode": "letter"
-            }
-            output.update(store.get_modifiers(node["id"]))
-            # Provenance last, after the payload's own content fields — show_node's
-            # rule, one screen up, applied to the other dereference exit. Most
-            # valuable here: this is the answer an agent acts on directly, so a hit
-            # from the wrong corpus is the one that never looks wrong.
-            output.update(corpus_provenance(config))
-            return dumps_display(output, ensure_ascii=False, indent=2)
+            modifiers = store.get_modifiers(node["id"])
     except Exception:
-        # Not a slug collision or lookup failed; proceed to semantic claim lookup
-        pass
+        hit = False
+    if hit:
+        output = {
+            "slug": node["slug"],
+            "axiom": node["core_axiom"],
+            "rejected_paths": node["rejected_paths"],
+            "scope": node["scope"],
+            "state": state,
+            "depth_mode": "letter",
+            # The by-handle read returns what is stored, whole and present when
+            # empty (show_payload's rule). Indexed, not `.get`: a decision missing
+            # a stored key fails loudly here, outside the `try`.
+            "mechanisms": node["mechanisms"],
+            "invalidates_if": node["invalidates_if"],
+            "context": node["context"],
+        }
+        output.update(modifiers)
+        # Provenance last, after the payload's own content fields — show_node's
+        # rule, one screen up, applied to the other dereference exit. Most
+        # valuable here: this is the answer an agent acts on directly, so a hit
+        # from the wrong corpus is the one that never looks wrong.
+        output.update(corpus_provenance(config))
+        return dumps_display(output, ensure_ascii=False, indent=2)
 
     # 2. Perform ranked semantic claim search
     if embed_provider and vector_store:
@@ -1171,6 +1564,9 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             top_k = clamp_limit(limit)
             q_vector = embed_provider.get_embedding(query, is_query=True)
             matches = vector_store.query(q_vector, limit=top_k)
+            # Raw points, not surfaced matches — see surface_decisions.
+            lever = window_lever(points=len(matches), limit=top_k,
+                                 ceiling=RANKED_LIMIT_CEILING, full_top=full_top)
 
             output_list = []
             retired: List[Dict[str, Any]] = []
@@ -1182,6 +1578,9 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
                     if handle:
                         retired.append(handle)
                     continue
+                if node["kind"] != "decision":
+                    # An open question: never embedding-ranked (C4), not retired.
+                    continue
 
                 node_state = store.get_node_state(node["id"])
                 if node_state not in ("active", "drifted"):
@@ -1190,9 +1589,11 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
                         retired.append(handle)
                     continue
 
+                # Rank among the decisions returned, at append time (see
+                # surface_decisions).
                 match = letter_payload(
                     node,
-                    brief=brief,
+                    brief=_rank_thinned(len(output_list) + 1, full_top),
                     extras={"state": node_state, "score": m["score"], "depth_mode": "letter"},
                 )
                 match.update(store.get_modifiers(node["id"]))
@@ -1217,6 +1618,7 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
                 result_count=len(output_list),
                 config=config,
                 surface="mcp",
+                lever=lever,
             )
             envelope["confidence"] = confidence
             envelope["note"] = note
@@ -1237,6 +1639,15 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
                 store, config, corpus_scan=corpus_holds_entries
             ):
                 envelope["note"] = missing_graph_note("mcp", config)
+            # See surface_decisions. Pure formatting, so it cannot raise into the
+            # `except Exception` below and pose as degraded recall.
+            withheld = count_withheld(output_list)
+            if withheld:
+                envelope["note"] = (
+                    f"{envelope['note']} "
+                    f"{withheld_clause(withheld, surface='mcp', config=config)}"
+                )
+                envelope["rejected_paths_withheld"] = withheld
             return dumps_display(envelope, ensure_ascii=False, indent=2)
         except CollectionMissingError as e:
             # I8 — see surface_decisions. The healthy-empty envelope is BUILT here
@@ -1245,8 +1656,9 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             # empty path to fall through to at all.
             if missing_index_is_a_gap(store):
                 return _lexical_degraded_response(
-                    query, config=config, reason=degraded_reason_from_error(e),
-                    store=store, brief=brief, limit=clamp_limit(limit),
+                    query, config=config, reason=degraded_reason_from_error(
+                        e, surface="mcp", project=config.project),
+                    store=store, full_top=full_top, limit=clamp_limit(limit),
                 )
             empty: Dict[str, Any] = {
                 "query": query, "depth_mode": "letter", "matches": [],
@@ -1255,8 +1667,10 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             # This is the healthy-empty arm, not a degraded one: ranking ran and
             # matched nothing, so it takes the band exactly like the envelope above.
             # (Its degraded sibling, ten lines up, returns before assessment.)
+            # No lever: the query raised before any window came back.
             confidence, note = assess_query_recall(
                 top_score=top_score, result_count=0, config=config, surface="mcp",
+                lever=None,
             )
             empty["confidence"] = confidence
             empty["note"] = note
@@ -1275,14 +1689,16 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             # Embedding/Qdrant failure mid-query (e.g. a 429): never the raw
             # provider blob — the deterministic lexical fallback instead.
             return _lexical_degraded_response(
-                query, config=config, reason=degraded_reason_from_error(e),
-                store=store, brief=brief, limit=clamp_limit(limit),
+                query, config=config, reason=degraded_reason_from_error(
+                    e, surface="mcp", project=config.project),
+                store=store, full_top=full_top, limit=clamp_limit(limit),
             )
 
     # No embedding provider / vector store wired at all — degrade lexically.
     return _lexical_degraded_response(
-        query, config=config, reason=degraded_reason_from_error(None), store=store,
-        brief=brief, limit=clamp_limit(limit),
+        query, config=config, reason=degraded_reason_from_error(
+            None, surface="mcp", project=config.project), store=store,
+        full_top=full_top, limit=clamp_limit(limit),
     )
 
 
@@ -1305,13 +1721,15 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
                     resolves: Optional[str] = None, contradicts: Optional[str] = None,
                     derives_from: Optional[str] = None, cites: Optional[str] = None,
                     acknowledge_neighbors: bool = False,
+                    draft_digest: Optional[str] = None,
                     project: Optional[str] = None) -> str:
-    """Record a decision you just made, with the alternatives you rejected and why,
-    so future sessions and other agents inherit it instead of relitigating it.
+    """Record a decision the moment you commit to a foundational choice — a schema,
+    a library, a pattern, a path abandoned — with the alternatives you rejected and
+    why, so future sessions and other agents inherit it instead of relitigating it.
 
     Relation args — pass the EXACT slug of an existing decision (look it up first
     with surface_decisions/query_decisions; each is validated to point at a real
-    decision, and each accepts a comma-separated list, e.g. supersedes="a, b"):
+    decision, and each is one string of comma-separated slugs, e.g. supersedes="a, b"):
       supersedes:   that decision is REPLACED — outgrown; it leaves the active view.
       corrects:     that decision was WRONG — also retires it (wrong, not outgrown).
       amends:       that decision still stands; this modifies part of it
@@ -1326,47 +1744,43 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
       derives_from: NOT valid when recording a decision — that edge originates from
                     an open question; use cites for a decision this one builds on.
 
-    Call this the moment you commit to a foundational choice — a schema, a library,
-    a pattern, or a path you've decided to abandon. `rejected_paths` is REQUIRED:
-    recording WHY you ruled options out is what stops you (or the next agent) from
-    re-proposing them.
-
     Args:
         axiom: The decision as a single clear sentence true going forward.
         rejected_paths: The alternatives considered and rejected, and why. REQUIRED.
-            One "(N) <option>: REJECTED — <reason>" per line scans best.
-        scope: Area tags, e.g. ["database", "auth"].
-        mechanisms: Concrete technologies/entities involved, e.g. ["sqlite", "wal-mode"].
+        scope: A list of area tags, e.g. ["database", "auth"].
+        slug: A short, descriptive handle (e.g. 'sqlite-wal-mode'), at most 100 characters.
+        project: Required on every call: a registered project name (e.g. 'mitos')
+            or a workspace's absolute path; `list_projects()` lists the names.
+        mechanisms: A list of the technologies/entities involved, e.g. ["sqlite"].
+            Folded for identity (case; ASCII punctuation/whitespace runs to "-"): _FOO and FOO are one.
         context: Optional background on why this was decided.
-        slug: The short, descriptive handle for the decision (e.g. 'sqlite-wal-mode').
-            At most 100 characters — it is the permanent citation handle, so an
-            over-length one is rejected (not silently truncated).
-        acknowledge_neighbors: Record past the near-duplicate review after inspecting
-            the flagged neighbours and judging this decision genuinely independent.
-            Leave False (default) on the first attempt. Combines with the relation
-            args — declared edges are still written.
-        project: Which project this decision belongs to — REQUIRED on every
-            call: a registered project name (e.g. 'mitos') or the absolute path of
-            a workspace. Call `list_projects()` if you do not know the names.
-            Distinct from `scope`: `project` picks the corpus, `scope` filters
-            within it. This is the write — a mis-aimed call lands a real entry in
-            another project's corpus.
+        acknowledge_neighbors: Leave False on the first attempt; set True to record
+            past a near-duplicate pause for neighbours you judged independent.
+        draft_digest: Optional; pass back a pause's draft_digest to compare this
+            re-send with that draft. Omit it after a deliberate edit.
+
+    `rejected_paths` is what stops the next agent re-proposing a ruled-out option;
+    one "(N) <option>: REJECTED — <reason>" per line scans best. A slug is the
+    handle other decisions cite, so an over-length one is refused, not silently
+    shortened. `project` picks the corpus, `scope` filters within it; this is the
+    write, so a mis-aimed call lands a real entry in another project's corpus.
 
     Returns:
         A JSON string: {slug, id, state, embedding, status} or {error, code}, every
         outcome carrying a trailing {project, collection, workspace} echo naming
         the corpus this write landed in — check it. Only a top-level {error, code}
         is a failure. status="created": newly recorded, with `edges_created` write
-        facts (each {kind, target}, read back from the committed graph — empty
-        means no edge landed) and the committed scope/mechanisms. status="exists":
-        a SUCCESS no-op, not an error — the identical decision (identity = slug +
-        axiom + mechanisms) is already recorded; changed commentary/relations are
-        NOT saved and are listed under `differs`; record a NEW decision (a distinct
+        facts (read back from the committed graph — empty means no edge landed)
+        and the committed scope, plus mechanisms as authored. status="exists": a
+        SUCCESS no-op, not an error — the same axiom and mechanisms are already recorded, whatever the
+        slug; changed commentary/relations are NOT saved and are listed under
+        `differs`; record a NEW decision (a distinct
         axiom) for new reasoning. status="needs_review" (code
         "similar_decision_exists"): a PAUSE, not a failure — nothing was written;
         the response lists ≥0.80-similar unlinked `neighbors`, each with its axiom,
-        rejected_paths, scope, score and modifier stamps (an amended_by/narrowed_by
-        stamp means that neighbour has moved on — dereference before linking).
+        rejected_paths, scope, score and modifier stamps (if you go on to
+        supersede or amend a neighbour, an amended_by/narrowed_by stamp on it
+        means it has moved on — dereference that slug before linking).
         Judge each, then re-record with that judgment: a relation arg
         (amends/narrows/supersedes/corrects/contradicts/cites) pointing at any
         neighbour this decision genuinely relates to, acknowledge_neighbors=True
@@ -1374,10 +1788,8 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
         result MAY carry `neighbor_review_unavailable` (the near-dup review could
         not run; absent neighbours are not checked-clean) or a debounced
         `scope_overflow` health nudge (not about this decision). It MAY carry
-        `rotation`: OLDER settled entries this call moved to an archive
-        (outcome "rotated", `archives`; blocks kept in place in `skipped`,
-        outcome "skipped" if none moved), or outcome "failed" with `stage`,
-        `error` and `recovery` — the write still stands.
+        `rotation`: older settled entries this call moved to an archive, with its
+        own `outcome`; a failed rotation leaves the write standing.
     """
     config = _target_config(project, "record_decision")
     # Build our own writable manager — do NOT reuse get_workspace_components()
@@ -1404,6 +1816,7 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
         cites=cites,
         slug=slug,
         acknowledge_neighbors=acknowledge_neighbors,
+        draft_digest=draft_digest,
     )
     # A rotation failure leaves the write standing. The receipt carries the cause;
     # this boundary adds its own recovery (no command — an agent handed one runs it)
@@ -1423,9 +1836,9 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
     # Stamped HERE, at the boundary that serializes it, never inside
     # `record_decision_entry`: the buffer-first + rollback contract is not the
     # place for a routing concern, and the receipt keys it emits (slug/id/state/
-    # embedding/status/code/neighbors/message/error/edges_created/scope/
-    # mechanisms/…) contain none of these three, so the update adds and never
-    # overwrites.
+    # embedding/status/code/neighbors/message/draft_digest/drifted_fields/error/
+    # edges_created/scope/mechanisms/mechanisms_normalized/…) contain none of
+    # these three, so the update adds and never overwrites.
     result.update(corpus_provenance(config))
     return dumps_display(result, ensure_ascii=False, indent=None)
 
@@ -1502,6 +1915,26 @@ def _amend_canonical_core_recovery(result: Dict[str, Any]) -> str:
             f"relation that says why this one moved: {routes}.")
 
 
+def _markup_first_hit(result: Dict[str, Any]) -> str:
+    """Names a markup refusal's first span, with a count of the rest; ``""`` for none."""
+    spans = result.get("markup_spans") or []
+    if not spans:
+        return ""
+    first, rest = spans[0], len(spans) - 1
+    more = f", plus {rest} more" if rest else ""
+    return f" ({first['span']!r} at character {first['offset']} of {first['field']!r}{more})"
+
+
+def _amend_tool_call_markup_recovery(result: Dict[str, Any]) -> str:
+    """States the cause and the backtick exemption; a new slug is reported as ``slug``."""
+    fields = result["fields"]
+    return (f"{_amend_fields(fields)} {_amend_verb(fields, 'holds', 'hold')} tool-call "
+            f"markup{_markup_first_hit(result)} — syntax from the tool call itself, not "
+            "part of the entry — so nothing was written. Remove it and call again; to "
+            "mention such a tag as prose, wrap it in backticks: inline-code spans are "
+            "exempt.")
+
+
 #: One clause per refusal reason, keyed by 4a's constants and fenced by a reflection
 #: row, so a new reason reds there rather than returning without a clause.
 _AMEND_RECOVERY_BY_REASON: Dict[str, Any] = {
@@ -1539,6 +1972,7 @@ _AMEND_RECOVERY_BY_REASON: Dict[str, Any] = {
         f"of a decision entry; {_AMEND_ARGUMENTS_POINTER}"),
     amend.REASON_NO_CHANGES: lambda result: (
         f"No field to change was given; {_AMEND_ARGUMENTS_POINTER}"),
+    amend.REASON_TOOL_CALL_MARKUP: _amend_tool_call_markup_recovery,
 }
 
 
@@ -1642,23 +2076,24 @@ def amend_commentary(slug: str,
 
     Args:
         slug: The decision to repair — its slug or content-hash id.
+        project: Which project this call is about — REQUIRED on every call: a
+            registered project name (e.g. 'mitos') or the absolute path of a
+            workspace. Call `list_projects()` if you do not know the names.
         rejected_paths: Replacement rejected paths. A required field: it can be
             replaced, never cleared.
         invalidates_if: Replacement invalidates-if text.
         context: Replacement context prose.
-        scope: Replacement scope tags, in authored order (the first is primary).
+        scope: A list of replacement scope tags, in authored order (the first is
+            primary).
         new_slug: Rename the decision. Entries citing the old slug then read as
             diverged until their relation lines in decisions.md name the new one;
             the result lists them under `rename.incoming`.
-        clear: Field names to REMOVE, e.g. ["context"] or ["scope"]. An empty
-            string or an empty list is refused rather than read as a removal, so
-            a removal is always named here.
+        clear: A list of field names to REMOVE, e.g. ["context"] or ["scope"]. An
+            empty string or an empty list is refused rather than read as a
+            removal, so a removal is always named here.
         axiom: Declared, with mechanisms and the relation arguments (named as
             record_decision names them), only to be refused: the decision itself
             and its relations are not commentary, and the result names the route.
-        project: Which project this call is about — REQUIRED on every call: a
-            registered project name (e.g. 'mitos') or the absolute path of a
-            workspace. Call `list_projects()` if you do not know the names.
 
     Returns:
         A JSON string. `status` is amended (`fields_changed`, plus `rename` on a
@@ -1692,8 +2127,9 @@ def amend_commentary(slug: str,
     if new_slug is not None:
         changes["slug"] = new_slug
 
-    # Refusal-carrying: FastMCP drops an undeclared argument silently, so an `axiom`
-    # beside a `context` would otherwise return `amended` with the axiom ignored.
+    # Refusal-carrying: declared only so that the core's refusal can name the route
+    # that does change them. Undeclared, the boundary would still refuse `axiom`, but
+    # as "not an argument", which teaches less than naming the new-decision route.
     if axiom is not None:
         changes["axiom"] = axiom
     if mechanisms is not None:

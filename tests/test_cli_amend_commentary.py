@@ -644,3 +644,26 @@ def test_the_help_states_the_reach() -> None:
         flat = " ".join(text.split())
         assert "still in decisions.md" in flat and "mitos rebuild" in flat
         assert "madr" not in flat.lower() and "amend_commentary" not in flat
+
+
+# --------------------------------------------------------------------------- #
+# 7b — the tool-call markup refusal on the CLI (R8)
+# --------------------------------------------------------------------------- #
+
+def test_a_markup_refusal_names_the_field_and_span_and_json_carries_the_spans(ws, capsys) -> None:
+    config, m = ws
+    _plain(config, m)
+    sha = _sha(config)
+    code, out, err = _amend(capsys, "target", "--context", "x </parameter>")
+    assert code == 1 and out == ""
+    assert ("Amend refused [tool_call_markup]: the value given for 'context' holds "
+            "tool-call markup ('</parameter>' at character 2 of 'context')") in err
+    assert "backticks" in err
+    code, out, _err = _amend(capsys, "target", "--new-slug", "t</invoke>", "--json")
+    assert code == 1
+    payload = json.loads(out)
+    assert (payload["reason"], payload["fields"]) == ("tool_call_markup", ["slug"])
+    assert payload["markup_spans"] == [{"field": "slug", "span": "</invoke>", "offset": 1}]
+    code, _out, err = _amend(capsys, "target", "--context", "a</context>", "--new-slug", "b</invoke>")
+    assert "the values given for 'context', 'slug' hold tool-call markup" in err
+    assert _sha(config) == sha

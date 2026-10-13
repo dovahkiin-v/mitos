@@ -1163,3 +1163,136 @@ def test_the_cli_invoked_from_inside_A_reports_Bs_own_tier(tmp_path):
     line = _status_key_line(tmp_path, ws_b, cwd=ws_a, env=env)
     assert f"(from {TIER_GLOBAL_ENV})" in line
     assert TIER_PROJECT_ENV not in line
+
+
+# --- A7 (AX-3 6b): the argument boundary over a real `mitos serve` --------------------
+#
+# Every refusal below fires before any project is resolved, so no workspace is
+# needed and none is made: the launch directory is a bare `tmp_path` subdirectory,
+# and a `project` that names nothing is harmless because nothing reads it.
+
+#: One near-miss per tool (the stretch row): what an agent plausibly types, and the
+#: declared name the boundary should offer back. `list_projects` takes nothing, so
+#: its near-miss has no suggestion.
+_NEAR_MISSES = {
+    "surface_decisions": ("querry", "query"),
+    "list_decisions": ("sate", "state"),
+    "list_scopes": ("include_archive", "include_archived"),
+    "show_node": ("id", "ident"),
+    "query_decisions": ("depht", "depth"),
+    "record_decision": ("supersede", "supersedes"),
+    "amend_commentary": ("new_name", None),
+    "list_projects": ("project", None),
+}
+
+
+def _bare_dir(tmp_path):
+    launch = tmp_path / "launch"
+    launch.mkdir()
+    return launch
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_argument_is_refused_on_every_tool(tmp_path):
+    """Row 8 — `bogus_param` on each of the eight tools, in one session: `isError`,
+    a body naming the tool and the argument, the parameter line, no prefix. Then
+    each tool's own near-miss, answered with its did-you-mean."""
+    env = harness_env(tmp_path)
+    async with mitos_server(cwd=_bare_dir(tmp_path), env=env) as server:
+        tools = {tool.name: tool.inputSchema for tool in (await server.session.list_tools()).tools}
+        assert set(tools) == EXPECTED_TOOLS
+        bogus, near = {}, {}
+        for name in sorted(EXPECTED_TOOLS):
+            bogus[name] = await server.session.call_tool(name, {"bogus_param": 1})
+            near[name] = await server.session.call_tool(name, {_NEAR_MISSES[name][0]: "x"})
+
+    for name, result in bogus.items():
+        assert result.isError is True, name
+        body = result.content[0].text
+        assert body.startswith(f"{name} was not run: "), body
+        assert f"`bogus_param` is not an argument of {name}." in body
+        assert "Error executing tool" not in body
+        declared = list(tools[name].get("properties", {}))
+        tail = (f"  {name} takes: {', '.join(declared)}." if declared
+                else f"  {name} takes no arguments.")
+        assert body.split("\n")[-1] == tail, body
+    assert bogus["list_projects"].content[0].text.endswith("list_projects takes no arguments.")
+
+    for name, result in near.items():
+        sent, meant = _NEAR_MISSES[name]
+        body = result.content[0].text
+        assert result.isError is True, name
+        if meant:
+            assert f"`{sent}` is not an argument of {name} — did you mean `{meant}`?" in body
+        else:
+            assert f"`{sent}` is not an argument of {name}." in body
+
+
+@pytest.mark.asyncio
+async def test_a_missing_and_a_mistyped_argument_come_back_in_one_body(tmp_path):
+    """Row 9 — `surface_decisions(limit="many")`, no `query`: both lines, one answer."""
+    env = harness_env(tmp_path)
+    async with mitos_server(cwd=_bare_dir(tmp_path), env=env) as server:
+        result = await server.session.call_tool("surface_decisions", {"limit": "many"})
+    assert result.isError is True
+    body = result.content[0].text
+    assert body.startswith("surface_decisions was not run: 2 argument faults.\n")
+    assert "`query` is required and was not sent." in body
+    assert '`limit` expects a whole number; it received the string "many".' in body
+    assert "errors.pydantic.dev" not in body and "Arguments" not in body
+
+
+@pytest.mark.asyncio
+async def test_a_json_rewritten_string_is_shown_as_it_arrived(tmp_path):
+    """Row 10 — `supersedes='["a","b"]'` names the string sent, not pydantic's list."""
+    env = harness_env(tmp_path)
+    async with mitos_server(cwd=_bare_dir(tmp_path), env=env) as server:
+        result = await server.session.call_tool("record_decision", {
+            "axiom": "a", "rejected_paths": "r", "scope": ["t"], "slug": "s",
+            "supersedes": '["a","b"]', "project": "nowhere"})
+    assert result.isError is True
+    body = result.content[0].text
+    assert ('`supersedes` expects a string; it received the string "[\\"a\\",\\"b\\"]", '
+            "which reads as JSON and was taken as a list.") in body
+    assert "['a', 'b']" not in body
+
+
+@pytest.mark.asyncio
+async def test_the_tools_own_returned_refusals_keep_their_shapes(tmp_path):
+    """Row 11 — typed-valid calls pass the boundary and reach each tool's own
+    returned refusal: non-`isError`, the same JSON keys as before 6b."""
+    env = harness_env(tmp_path)
+    async with mitos_server(cwd=_bare_dir(tmp_path), env=env) as server:
+        call = server.session.call_tool
+        listed = await call("list_decisions", {"brief": True, "oneline": True,
+                                               "project": "nowhere"})
+        queried = await call("query_decisions", {"query": "x", "depth": "vibe",
+                                                 "project": "nowhere"})
+        amended = await call("amend_commentary", {"slug": "s", "context": "",
+                                                  "project": "nowhere"})
+        surfaced = await call("surface_decisions", {"query": "x", "brief": True,
+                                                    "full_top": 1, "project": "nowhere"})
+
+    for result in (listed, queried, amended, surfaced):
+        assert result.isError is False, result.content
+    listed, queried, amended, surfaced = (
+        json.loads(r.content[0].text) for r in (listed, queried, amended, surfaced))
+    assert set(listed) == {"error"}
+    assert listed["error"].startswith("brief and oneline are mutually exclusive")
+    assert set(queried) == {"error"} and "is not yet implemented in v0.1" in queried["error"]
+    assert set(amended) == {"error", "code", "slug"} and amended["code"] == "empty_value"
+    assert set(surfaced) == {"error"}
+    assert surfaced["error"].startswith("brief and full_top are mutually exclusive")
+
+
+@pytest.mark.asyncio
+async def test_a_missing_project_still_reaches_the_targeting_anatomy(tmp_path):
+    """Row 12 — D5: `project` is not schema-required, so the boundary lets the call
+    through and the tool's own targeting refusal answers, prefixed as before (G4)."""
+    env = harness_env(tmp_path)
+    async with mitos_server(cwd=_bare_dir(tmp_path), env=env) as server:
+        result = await server.session.call_tool("show_node", {"ident": "x"})
+    assert result.isError is True
+    body = result.content[0].text
+    assert body.startswith("Error executing tool show_node: ")
+    assert "no project was named" in body and "was not run" not in body

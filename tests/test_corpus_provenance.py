@@ -478,6 +478,10 @@ def test_the_exact_slug_exit_carries_the_envelope(tmp_path, offline, monkeypatch
     # both the ranked envelope and the lexical-degraded one carry `matches`.
     assert payload["slug"] == "the-cli-echo-names-its-corpus"
     assert "state" in payload
+    # 5d: the dereference exit returns the three stored fields, present when empty.
+    assert "mechanisms" in payload
+    assert "invalidates_if" in payload
+    assert "context" in payload
     assert "matches" not in payload
 
     assert payload["project"] == name
@@ -499,6 +503,10 @@ def test_the_exact_slug_exit_carries_the_envelope(tmp_path, offline, monkeypatch
 @pytest.mark.parametrize("tool,kwargs", [
     ("query_decisions", {"query": "q", "depth": "trace"}),
     ("list_decisions", {"brief": True, "oneline": True}),
+    ("surface_decisions", {"query": "q", "brief": True, "full_top": 2}),
+    ("surface_decisions", {"query": "q", "full_top": -1}),
+    ("query_decisions", {"query": "q", "brief": True, "full_top": 2}),
+    ("query_decisions", {"query": "q", "full_top": -1}),
 ])
 def test_an_argument_fault_carries_no_envelope(tool, kwargs, tmp_path, offline, monkeypatch):
     """The two deliberate non-stamps, asserted as rows rather than left as silences.
@@ -635,6 +643,8 @@ CLI_VERB_ARGS = {
     "capture": ["a raw architectural thought"],   # keyless refusal, on stdout
     "check": [],                           # embed absent + live decisions ⇒ fail-closed, on stderr
     "cutover": [],                         # already-V1a graph ⇒ the cheap no-op
+    "hook-install": [],                    # git capped at tmp_path ⇒ "not inside a git
+                                           # work tree", after the echo; never writes
     "import": ["legacy.md"],               # a cwd-rooted FILE, not a selector (3b)
     "list": [],
     "list_decisions": [],
@@ -665,7 +675,17 @@ CLI_VERB_ARGS = {
 #: the header gaining the registered name. Carved out by NAME and reason, exactly as
 #: 3d's MCP row carves out `list_projects`, so the gap is a row rather than a
 #: silence.
-CLI_ECHO_CARVE_OUTS = {"status"}
+#:
+#: `hook-run` is carved out for the obligation, not the channel (ADR
+#: `hook-run-is-a-third-echo-carve-out-of-the-obligation-kind`, amending
+#: `cli-echo-obligation-is-a-handler-locus-rule-with-two-distinct-carve-outs`):
+#: offline it lands on the commit gate's keyless row and prints nothing, which the
+#: echo row would read as a missing echo, and its quiet passes must stay silent on
+#: every commit. The answers it gives inside the handler — the block and the
+#: unreadable row — do echo, on stderr; its boundary's pre-dispatch one-liners carry
+#: none, as `main()`'s fault arms carry none. Moving it into `CLI_VERB_ARGS` turns
+#: the echo row red on that silence (observed once, 3c2).
+CLI_ECHO_CARVE_OUTS = {"status", "hook-run"}
 
 
 def _register_workspace(tmp_path, monkeypatch, *, name="named", decisions=True):
@@ -738,6 +758,12 @@ class TestTheCliRequireList:
         name, target = _register_workspace(tmp_path, monkeypatch)
         (tmp_path / "legacy.md").write_text("no headings here\n", encoding="utf-8")
         config = MitosConfig(target, project=name)
+        # For every verb, harmless for all but one: git discovery stops at tmp_path
+        # and machine config is masked, so `hook-install` can never find (and write
+        # into) a repository that happens to enclose the test's TMPDIR.
+        monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+        monkeypatch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
         capsys.readouterr()
 
         _run(["-p", name, verb, *CLI_VERB_ARGS[verb]])

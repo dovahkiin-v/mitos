@@ -483,7 +483,8 @@ def default_collection_name(workspace_dir: str) -> str:
 class MitosConfig:
     """Represents the configuration state for the active Mitos workspace."""
 
-    def __init__(self, workspace_dir: str, *, project: Optional[str] = None) -> None:
+    def __init__(self, workspace_dir: str, *, project: Optional[str] = None,
+                 warn_unknown_keys: bool = True) -> None:
         self.workspace_dir = os.path.abspath(workspace_dir)
         self.mitos_dir = os.path.join(self.workspace_dir, ".mitos")
 
@@ -601,6 +602,10 @@ class MitosConfig:
         # no config author is present on that surface.
         self.deprecated_rotation_mode: Optional[str] = None
 
+        # `False` silences the loader's unknown-key line and changes nothing else:
+        # `mitos hook-run` speaks on every commit, and a config-hygiene warning
+        # there is noise every other verb already delivers.
+        self._warn_unknown_keys = warn_unknown_keys
         self._load_config_file()
 
         # The resolved env wins over the config file for the Qdrant URL — the same
@@ -681,7 +686,7 @@ class MitosConfig:
                     # Remembered, not applied: a printing surface can name it as
                     # inert legacy config beside the value it claims to set.
                     self.inert_file_keys[key] = val
-                else:
+                elif self._warn_unknown_keys:
                     print(
                         f"Warning: ignoring unrecognized config key "
                         f"'{key}' in {config_path}",
@@ -762,3 +767,30 @@ class MitosConfig:
         for key in CONFIG_DEFAULTS:
             result[key] = getattr(self, key)
         return result
+
+
+def judge_api_key(config: MitosConfig) -> Optional[str]:
+    """Returns the judge's key off the workspace's resolved env, or None when none is configured.
+
+    The one spelling of "is a contradiction judge configured here?". ``check``'s
+    judge builder and the commit gate's keyless row both ask it, so the two
+    cannot disagree about a workspace; the status row and the record notice ask
+    it the same way. It returns the value rather than a bool because the builder
+    needs the key itself. An empty string counts as keyless, as it always has in
+    the builder: an exported-empty ``ANTHROPIC_API_KEY`` masks both ``.env``
+    files and leaves no key.
+
+    It lives here, not beside the builder, so a caller can ask without importing
+    ``cli`` or an LLM SDK.
+
+    Args:
+        config: The target workspace's config; the key comes off its ``env``,
+            never the process environment.
+
+    Returns:
+        The non-empty ``ANTHROPIC_API_KEY`` value, or ``None``.
+    """
+    api_key = config.env.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return None
+    return api_key

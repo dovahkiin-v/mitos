@@ -408,6 +408,25 @@ def test_a_refused_clear_says_what_cannot_be_cleared_and_verbs_agree(ws) -> None
     assert "'context', 'scope' were both given" in both["error"]
 
 
+def test_a_markup_refusal_carries_its_spans_and_a_clause_naming_no_command(ws) -> None:
+    """R8 — in-band, with provenance; a new slug is reported as `slug` (G6)."""
+    config, m = ws
+    _plain(config, m)
+    sha = _sha(config)
+    payload = _call(slug="target", context="x </context>", new_slug="t</invoke>")
+    assert (payload["status"], payload["reason"], payload["fields"]) == (
+        "refused", amend.REASON_TOOL_CALL_MARKUP, ["context", "slug"])
+    assert payload["markup_spans"] == [
+        {"field": "context", "span": "</context>", "offset": 2},
+        {"field": "slug", "span": "</invoke>", "offset": 1}]
+    clause = payload["recovery"]
+    assert "'context', 'slug' hold tool-call markup ('</context>' at character 2 of " \
+           "'context', plus 1 more)" in clause
+    assert "backticks" in clause and "mitos " not in clause
+    assert all(payload[key] for key in PROVENANCE)
+    assert _sha(config) == sha
+
+
 def test_the_description_is_terse_true_and_names_no_command() -> None:
     """M5 + D-4c-6 — no shell syntax, no count, no future capability; the channel is stated."""
     desc = _flat(_tools()["amend_commentary"].description)
@@ -501,7 +520,7 @@ def test_the_refusal_arguments_equal_the_relation_set_and_records_types() -> Non
     own = {"slug", "rejected_paths", "invalidates_if", "context", "scope", "new_slug",
            "clear", "axiom", "mechanisms", "project"}
     record_own = {"axiom", "rejected_paths", "scope", "slug", "mechanisms", "context",
-                  "acknowledge_neighbors", "project"}
+                  "acknowledge_neighbors", "draft_digest", "project"}
     assert set(amend_props) - own == set(RELATIONSHIP_FIELDS) == set(record_props) - record_own
     for name in RELATIONSHIP_FIELDS:
         assert amend_props[name] == record_props[name], name
@@ -557,13 +576,14 @@ def _served_workspace(tmp_path, env):
 async def test_a_real_serve_returns_the_misses_and_raises_only_the_fidelity_refusal(tmp_path):
     """S1 + S3 — `isError` per class over the wire; the undeclared-argument measurement.
 
-    M9, measured and pinned: FastMCP registers its handler with `validate_input=False`
-    and its argument model sets no `extra`, so an undeclared key is DROPPED silently —
-    `rationale=` beside `context=` amends the context and says nothing about the
-    rationale. That behaviour is framework-wide (every tool shares it). It is why
-    `axiom`, `mechanisms` and the relations are declared: undeclared, `axiom=` beside
-    `context=` would return `amended` with the axiom ignored. Declared, it refuses and
-    writes nothing.
+    M9: FastMCP registers its handler with `validate_input=False` and its argument
+    model sets no `extra`, so an undeclared key was measured DROPPED silently —
+    `rationale=` beside `context=` amended the context and said nothing about the
+    rationale. Since AX-3 6b mitos's boundary refuses it before the tool runs: an
+    `isError` naming `rationale`, and the buffer byte-unchanged. `axiom`,
+    `mechanisms` and the relations stay declared so that their refusal names the
+    route that does change them, which "not an argument" would not; `axiom=` beside
+    `context=` refuses with `canonical_core` and writes nothing.
     """
     env = _scaffold_env(tmp_path)
     ws, archived = _served_workspace(tmp_path, env)
@@ -583,8 +603,8 @@ async def test_a_real_serve_returns_the_misses_and_raises_only_the_fidelity_refu
         fidelity = await call(slug="fresh-write", context=PHANTOM)
         after_fidelity = buffer.read_bytes()
 
-        dropped = _tool_json(await call(slug="fresh-write", context="Another context.",
-                                        rationale="an undeclared argument"))
+        dropped = await call(slug="fresh-write", context="Another context.",
+                             rationale="an undeclared argument")
         before_silent = buffer.read_bytes()
         silent = _tool_json(await call(slug="fresh-write", context="Yet another.",
                                        axiom="A different axiom."))
@@ -603,7 +623,11 @@ async def test_a_real_serve_returns_the_misses_and_raises_only_the_fidelity_refu
     assert "object at 0x" not in body and "mitos " not in body
     assert after_fidelity == before
 
-    assert dropped["status"] == amend.STATUS_AMENDED, "an undeclared argument is dropped"
+    assert dropped.isError is True, "an undeclared argument is refused, not dropped"
+    refusal = dropped.content[0].text
+    assert refusal.startswith("amend_commentary was not run: 1 argument fault.")
+    assert "`rationale`" in refusal and "Another context." not in refusal
+    assert before_silent == after_fidelity, "the refused call wrote nothing"
     assert (silent["status"], silent["reason"]) == (amend.STATUS_REFUSED,
                                                     amend.REASON_CANONICAL_CORE)
     assert after_silent == before_silent

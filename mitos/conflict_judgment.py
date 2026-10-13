@@ -17,7 +17,9 @@ The executor's job is narrow (plan D2): make the one batched tenability call via
 :class:`~mitos.conflict.JudgmentExecution` (serialized verdict array + batch_id + usage +
 elapsed) — or a typed :class:`~mitos.conflict.Unavailable` on a timeout, any Anthropic
 error, or a truncated response (**fail-open**: it never raises past the seam, never blocks
-a commit). The verdict array is serialized into ``raw_text`` as JSON, so both
+a commit). A failure decided from a response that arrived and was billed comes back as a
+:class:`BilledUnavailable`, which carries that response's usage so the corpus check can
+record the spend (B7). The verdict array is serialized into ``raw_text`` as JSON, so both
 ``parse_judgment_response`` consumers are untouched.
 """
 
@@ -26,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 from uuid import uuid4
 
@@ -46,6 +49,63 @@ from mitos.models import accepts_temperature, get_model_id
 _JUDGMENT_MODEL_ALIAS = "SONNET"
 
 _log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class BilledUnavailable(Unavailable):
+    """A judgment failure decided from a response that arrived and was billed.
+
+    Returned for a truncated response, a response with no ``tool_use`` block, and a
+    tool call without its ``verdicts`` key. ``reason`` and ``detail`` are exactly what a
+    plain :class:`~mitos.conflict.Unavailable` would carry, so every consumer that tests
+    ``isinstance(result, Unavailable)`` and switches on ``reason`` is unchanged. The
+    exhausted ladder and a refusal stay plain: no usage object came back for either.
+
+    The corpus check reads ``billed`` by that attribute name without importing this
+    module (``check._billed_execution``), so the name is a join key across modules.
+
+    Attributes:
+        billed: The response's usage, ``stop_reason``, ``batch_id`` and alias, as a
+            :class:`~mitos.conflict.JudgmentExecution`. Its ``raw_text`` is ``""``: it
+            rides only inside this failure, which the corpus loop's ``Unavailable``
+            branch takes first, so it never reaches the parser.
+    """
+
+    billed: JudgmentExecution
+
+
+def _execution_from(
+    message: Any, *, raw_text: str, batch_id: str, elapsed_ms: int
+) -> JudgmentExecution:
+    """Builds the execution record for a response that arrived, success or failure.
+
+    The one usage read, so the success path and the billed failures cannot drift. A
+    ``None`` usage field reads as 0: a response did arrive, so an absent cache field is
+    caching off, a true zero. A fake message must set ``usage`` to real ints; a
+    ``MagicMock`` usage would put mocks in the token fields.
+
+    Args:
+        message: The Anthropic ``Message`` that came back.
+        raw_text: The serialized verdict array, or ``""`` for a billed failure.
+        batch_id: The executor's minted batch id.
+        elapsed_ms: The call's wall-clock time across the ladder.
+
+    Returns:
+        The :class:`~mitos.conflict.JudgmentExecution` for that response.
+    """
+    usage = message.usage
+    return JudgmentExecution(
+        raw_text=raw_text,
+        batch_id=batch_id,
+        model_alias=_JUDGMENT_MODEL_ALIAS,
+        token_input=getattr(usage, "input_tokens", 0) or 0,
+        token_output=getattr(usage, "output_tokens", 0) or 0,
+        token_cache_read=getattr(usage, "cache_read_input_tokens", 0) or 0,
+        token_cache_creation=getattr(usage, "cache_creation_input_tokens", 0) or 0,
+        elapsed_ms=elapsed_ms,
+        stop_reason=message.stop_reason,
+    )
+
 
 # Escalating backoff for transient API errors (429, 5xx, timeouts). Three fast
 # retries, then slower ones to wait out rate-limit windows. The last two 60s
@@ -206,7 +266,8 @@ def execute_judgment(
         on success, or an :class:`~mitos.conflict.Unavailable` naming why not —
         ``JUDGMENT_TIMEOUT`` (ladder exhausted), ``JUDGMENT_REJECTED`` (the request
         was refused), ``JUDGMENT_TRUNCATED`` or ``JUDGMENT`` (the one response that
-        came back was unusable).
+        came back was unusable). The last two are a :class:`BilledUnavailable`
+        carrying that response's usage; the first two are plain.
 
     Raises:
         ValueError: If ``prompt.candidate_slugs`` cannot be fenced (empty, or a
@@ -282,15 +343,21 @@ def execute_judgment(
             ),
         )
 
+    def billed() -> JudgmentExecution:
+        return _execution_from(
+            message, raw_text="", batch_id=batch_id, elapsed_ms=elapsed_ms
+        )
+
     # Truncation check BEFORE touching content — a forced-tool response truncated at
     # max_tokens can carry an incomplete or absent tool_use block.
     if message.stop_reason == "max_tokens":
-        return Unavailable(
+        return BilledUnavailable(
             reason=ConflictUnavailableReason.JUDGMENT_TRUNCATED,
             detail=(
                 f"judgment truncated: stop_reason='max_tokens' "
                 f"(budget={_JUDGMENT_MAX_TOKENS})"
             ),
+            billed=billed(),
         )
 
     # Extract the tool_use block by type, not by position.
@@ -300,34 +367,26 @@ def execute_judgment(
             tool_block = block
             break
     if tool_block is None:
-        return Unavailable(
+        return BilledUnavailable(
             reason=ConflictUnavailableReason.JUDGMENT,
             detail="no tool_use block in response",
+            billed=billed(),
         )
 
     # A forced tool call is not a guarantee of the schema's required key; a payload
     # without it is a malformed batch, returned typed like the absent block above.
     if "verdicts" not in (tool_block.input or {}):
-        return Unavailable(
+        return BilledUnavailable(
             reason=ConflictUnavailableReason.JUDGMENT,
             detail="tool_use block carries no 'verdicts' key",
+            billed=billed(),
         )
 
     # Serialize the verdicts array into raw_text so both parse_judgment_response
     # consumers (check.py corpus path AND conflict.py sync path) are untouched.
     raw_text = json.dumps(tool_block.input["verdicts"])
-
-    usage = message.usage
-    return JudgmentExecution(
-        raw_text=raw_text,
-        batch_id=batch_id,
-        model_alias=_JUDGMENT_MODEL_ALIAS,
-        token_input=getattr(usage, "input_tokens", 0) or 0,
-        token_output=getattr(usage, "output_tokens", 0) or 0,
-        token_cache_read=getattr(usage, "cache_read_input_tokens", 0) or 0,
-        token_cache_creation=getattr(usage, "cache_creation_input_tokens", 0) or 0,
-        elapsed_ms=elapsed_ms,
-        stop_reason=message.stop_reason,
+    return _execution_from(
+        message, raw_text=raw_text, batch_id=batch_id, elapsed_ms=elapsed_ms
     )
 
 

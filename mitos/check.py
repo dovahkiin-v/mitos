@@ -112,8 +112,14 @@ from mitos.conflict import (
 from mitos.errors import DatabaseError
 from mitos.models import get_model_id
 from mitos.telemetry import (
+    ATTEMPT_COULD_NOT_COMPLETE,
+    ATTEMPT_NEW_FINDINGS,
+    ATTEMPT_NO_NEW_FINDINGS,
+    AttemptOutcome,
     CheckRunRow,
     ConflictCheckRow,
+    CoverageMarks,
+    FailedJudgmentBatch,
     JudgmentBatch,
     ReuseIndex,
     ReuseUnavailable,
@@ -768,6 +774,76 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _billed_execution(failure: Unavailable) -> Optional[JudgmentExecution]:
+    """Reads the billed response a judgment failure carries, if it carries one.
+
+    The executor returns a subclass of :class:`Unavailable` with a ``billed``
+    attribute when the failure was decided from a response that arrived. This module
+    must not import the executor (that would pull ``anthropic`` into the check
+    family's closure), so it reads the attribute by name; the name is the join key.
+
+    Args:
+        failure: A batch-level judgment failure.
+
+    Returns:
+        The carried :class:`JudgmentExecution`, or ``None`` when no response arrived.
+    """
+    carried = getattr(failure, "billed", None)
+    return carried if isinstance(carried, JudgmentExecution) else None
+
+
+def _failed_batch_row(
+    failure: Unavailable,
+    *,
+    group: "JudgmentGroup",
+    billed: Optional[JudgmentExecution],
+    plan: "CheckPlan",
+    env: Optional[Mapping[str, str]],
+    created_at: str,
+) -> FailedJudgmentBatch:
+    """Builds the row for one failed batch — its pairs, its pin and its spend.
+
+    Usage comes from ``billed`` when a response arrived and is ``None`` throughout
+    when none did, never 0. The pin is the plan's: the batch was partitioned and
+    rendered at it, and for a parse failure the KD5 alias check has already proved
+    the execution's alias equal. ``failure.detail`` is not stored.
+
+    Args:
+        failure: The batch's failure; its reason value is stored.
+        group: The failed batch's group; its hashes are the row's node ids.
+        billed: The response that arrived, or ``None``.
+        plan: The run's plan (run id and pin).
+        env: The workspace env the model id resolves against.
+        created_at: The UTC ISO-8601 stamp taken at the failure (MI-10).
+
+    Returns:
+        The :class:`FailedJudgmentBatch` for the result carry and the telemetry row.
+    """
+    try:
+        model_id: Optional[str] = get_model_id(plan.model_alias, env)
+    except ValueError:
+        model_id = None  # provenance-only, as on the judged path
+    return FailedJudgmentBatch(
+        batch_id=billed.batch_id if billed is not None else uuid4().hex,
+        run_id=plan.run_id,
+        created_at=created_at,
+        reason=failure.reason.value,
+        proposal_id=group.proposal_hash,
+        partner_ids=[pair.partner_hash for pair in group.pairs],
+        token_input=billed.token_input if billed is not None else None,
+        token_output=billed.token_output if billed is not None else None,
+        token_cache_read=billed.token_cache_read if billed is not None else None,
+        token_cache_creation=(
+            billed.token_cache_creation if billed is not None else None
+        ),
+        stop_reason=billed.stop_reason if billed is not None else None,
+        model_id=model_id,
+        model_alias=plan.model_alias,
+        prompt_version=plan.prompt_version,
+        mitos_version=__version__,
+    )
+
+
 def _is_finding(tenable: bool, confidence: float) -> bool:
     """The ONE gate site (KD4): is a raw verdict a reportable finding?
 
@@ -954,6 +1030,10 @@ class CheckPlan:
             re-confirmation of a standing finding stays "known".
         nodes_total: ``len(snapshot.nodes)`` — the swept-vs-skipped denominator.
         nodes_swept: Healthy sweeps consumed before any trip.
+        swept_node_ids: The ids of those healthy sweeps (``len`` equals
+            ``nodes_swept``), in snapshot order, which is not a contract. The
+            coverage marks derive from these, never from a store re-read at run
+            end, so a decision recorded while the check ran stays uncovered.
         sweep_degraded: The tripping sweep degradation, if any (KD2 — the partial
             plan still executes; the substrates are disjoint).
         pairs: Every deduped oriented pair, pair-key-sorted.
@@ -983,6 +1063,7 @@ class CheckPlan:
     fresh: bool
     nodes_total: int
     nodes_swept: int
+    swept_node_ids: Tuple[str, ...]
     sweep_degraded: Optional[Unavailable]
     pairs: Tuple[CorpusPair, ...]
     reused: Tuple[ReusedPair, ...]
@@ -992,6 +1073,20 @@ class CheckPlan:
     start_probe: StaleProbe
     carried: Tuple[CarriedFinding, ...] = ()
     departed: Tuple[DepartedFinding, ...] = ()
+
+
+@dataclass(frozen=True)
+class JudgeNotConfigured(Unavailable):
+    """The corpus run's no-judge abort: fresh work existed, no judge was built, nothing was billed.
+
+    ``reason`` stays ``ConflictUnavailableReason.JUDGMENT`` and ``detail`` is what a
+    plain :class:`~mitos.conflict.Unavailable` would carry, so every consumer that
+    switches on ``reason`` is unchanged (``run_degradations``, ``exit_code_for``, the
+    row's ``degraded_reason``, ``--json``'s ``judgment_failure_reasons``). The tag is
+    set at the one line that knows the truth, so the report asks a typed question
+    (``isinstance``) instead of inferring "no judge" from ``batches_executed == 0``.
+    It lives here, not as an enum member, because ``conflict.py`` is fenced.
+    """
 
 
 @dataclass(frozen=True)
@@ -1048,6 +1143,8 @@ class CheckRunResult:
         ended_at: The MI-10 stamp taken at execute exit.
         nodes_total: Echoed plan accounting.
         nodes_swept: Echoed plan accounting.
+        swept_node_ids: Echoed plan ids — what the sweep actually saw, the
+            authority :func:`coverage_marks_from_result` bounds its marks by.
         sweep_degraded: Echoed plan-stage trip, if any.
         findings: Every reported finding, pair-key-ordered; the novelty partition
             rides ``.novelty``.
@@ -1055,8 +1152,8 @@ class CheckRunResult:
         pairs_reused: ``len(plan.reused)``.
         batches_planned: ``len(plan.fresh_groups)``.
         batches_executed: Batches on which a judge call was fired — includes a
-            batch whose execution or parse then failed (billed but unpersisted is
-            a named cost, not a silent drop).
+            batch whose execution or parse then failed (its verdicts unpersisted;
+            its spend, where a response arrived, is in ``failed_batches``).
         batches_failed: Executed batches that persisted no verdicts — the isolated
             failures plus the aborting one. ``batches_executed - batches_failed``
             is the coverage numerator (:attr:`batches_judged`).
@@ -1064,7 +1161,8 @@ class CheckRunResult:
             failure stopped the remainder.
         judgment_failures: EVERY judgment-stage degradation this run recorded, in
             occurrence order — the isolated per-batch failures, the aborting one,
-            and the judge-absent degradation. Non-empty ⇒ the run is degraded
+            and the judge-absent degradation (a :class:`JudgeNotConfigured`, so
+            the report can word it). Non-empty ⇒ the run is degraded
             (:func:`run_degradations` reads it), whether or not it aborted.
         judgment_abort: The failure that stopped the remaining batches, or ``None``
             when the loop ran to the end. Always the LAST element of
@@ -1082,6 +1180,11 @@ class CheckRunResult:
         departed: Finding-grade priors that stopped standing this run, echoed from
             the plan with their derived reason. The surface prints counts by
             reason; the identities ride the JSON.
+        failed_batches: One row per failed batch, in occurrence order, so
+            ``len(failed_batches) == batches_failed``: its pairs, pin and usage
+            (``None`` where no response arrived). The same rows land in
+            telemetry's ``failed_judgment_batches``. The no-judge abort and
+            skipped batches add none; nothing was attempted.
     """
 
     run_id: str
@@ -1089,6 +1192,7 @@ class CheckRunResult:
     ended_at: str
     nodes_total: int
     nodes_swept: int
+    swept_node_ids: Tuple[str, ...]
     sweep_degraded: Optional[Unavailable]
     findings: Tuple[CheckFinding, ...]
     pairs_judged_fresh: int
@@ -1104,6 +1208,7 @@ class CheckRunResult:
     start_probe: StaleProbe
     end_probe: "StaleProbe | ProbeUnavailable"
     departed: Tuple[DepartedFinding, ...] = ()
+    failed_batches: Tuple[FailedJudgmentBatch, ...] = ()
 
     @property
     def judgment_degraded(self) -> Optional[Unavailable]:
@@ -1280,6 +1385,12 @@ def plan_corpus_check(
             sweep_degraded = sweep.result
             break
     nodes_swept = len(consumed) - (1 if sweep_degraded is not None else 0)
+    # Only the last consumed sweep can be Unavailable (the loop breaks on it).
+    swept_node_ids = tuple(
+        sweep.node["id"]
+        for sweep in consumed
+        if not isinstance(sweep.result, Unavailable)
+    )
 
     pairs = tuple(dedup_oriented_pairs(consumed))
 
@@ -1314,6 +1425,7 @@ def plan_corpus_check(
         fresh=fresh,
         nodes_total=len(snapshot.nodes),
         nodes_swept=nodes_swept,
+        swept_node_ids=swept_node_ids,
         sweep_degraded=sweep_degraded,
         pairs=pairs,
         reused=tuple(reused),
@@ -1344,8 +1456,10 @@ def execute_corpus_check(
 
     A batch-level :class:`Unavailable` — an executor error/timeout OR an
     all-or-nothing parse malformation — is dispositioned by CLASS, on how much the
-    failure says about the batches after it (a malformed batch is billed but
-    unpersisted either way, a named cost):
+    failure says about the batches after it. Either way the batch's verdicts are
+    unpersisted, and the failure leaves a :class:`FailedJudgmentBatch` on the
+    result and in telemetry, written at the failure site, with the spend where a
+    response arrived:
 
     * A reason in ``conflict.FIRST_ATTEMPT_JUDGMENT_REASONS`` is **isolated**: the
       batch is counted in ``batches_failed``, the run is degraded, and the loop
@@ -1427,10 +1541,38 @@ def execute_corpus_check(
     batches_failed = 0
     batches_skipped = 0
     pairs_judged_fresh = 0
+    failed_batches: List[FailedJudgmentBatch] = []
 
-    def record_batch_failure(failure: Unavailable) -> None:
-        """Files one batch failure — isolating it, or tripping the abort."""
+    def record_batch_failure(
+        failure: Unavailable,
+        *,
+        group: JudgmentGroup,
+        billed: Optional[JudgmentExecution],
+    ) -> None:
+        """Files one batch failure — records it, then isolates it or trips the abort."""
         nonlocal judgment_abort, batches_failed, consecutive_failures
+        # The row first, and written now (a killed run keeps what was billed). The
+        # write degrades like a judged batch's (KD6); it never skips the abort check.
+        row = _failed_batch_row(
+            failure,
+            group=group,
+            billed=billed,
+            plan=plan,
+            env=env,
+            created_at=_utc_now_iso(),
+        )
+        failed_batches.append(row)
+        if telemetry is None:
+            write_failures.append(
+                f"failed batch {row.batch_id}: telemetry store unavailable "
+                "(never constructed)"
+            )
+        else:
+            try:
+                telemetry.record_failed_batch(row)
+            except Exception as exc:
+                write_failures.append(f"failed batch {row.batch_id}: {exc}")
+
         judgment_failures.append(failure)
         batches_failed += 1
         consecutive_failures += 1
@@ -1482,7 +1624,7 @@ def execute_corpus_check(
     if judge is None and plan.fresh_groups:
         # Not a batch failure — no batch was ever attempted, so it bypasses
         # `record_batch_failure` (nothing to isolate) and aborts outright.
-        judgment_abort = Unavailable(
+        judgment_abort = JudgeNotConfigured(
             reason=ConflictUnavailableReason.JUDGMENT,
             detail=(
                 f"no judge available for {len(plan.fresh_groups)} pending fresh "
@@ -1516,7 +1658,9 @@ def execute_corpus_check(
         execution = judge(prompt)
         batches_executed += 1
         if isinstance(execution, Unavailable):
-            record_batch_failure(execution)  # isolated, or the abort — by class
+            record_batch_failure(  # isolated, or the abort — by class
+                execution, group=group, billed=_billed_execution(execution)
+            )
             continue
         # KD5, alias half — before parse/persist: rows at a pin the partition was
         # not computed at would poison every later run's reuse join.
@@ -1529,7 +1673,8 @@ def execute_corpus_check(
 
         judgments = parse_judgment_response(execution.raw_text, partner_slugs)
         if isinstance(judgments, Unavailable):
-            record_batch_failure(judgments)  # billed but unpersisted — a named cost
+            # Billed and recorded as a failed batch; its verdicts are unpersisted.
+            record_batch_failure(judgments, group=group, billed=execution)
             continue
 
         consecutive_failures = 0  # a judged batch clears the streak
@@ -1630,6 +1775,7 @@ def execute_corpus_check(
         ended_at=_utc_now_iso(),
         nodes_total=plan.nodes_total,
         nodes_swept=plan.nodes_swept,
+        swept_node_ids=plan.swept_node_ids,
         sweep_degraded=plan.sweep_degraded,
         findings=tuple(findings),
         pairs_judged_fresh=pairs_judged_fresh,
@@ -1645,6 +1791,7 @@ def execute_corpus_check(
         start_probe=plan.start_probe,
         end_probe=end_probe,
         departed=plan.departed,
+        failed_batches=tuple(failed_batches),
     )
 
 
@@ -1808,10 +1955,11 @@ def check_run_row_from_result(
     ``reuse_unavailable`` stays a TRUE zero: the run genuinely reused nothing.
 
     The seam order, pinned for 3a (KD5): compute ``exit_code_for(result)`` →
-    build this row → ``TelemetryStore.record_check_run`` LAST, so a write
-    failure can only move the exit toward 2 and a persisted row's ``exit_code``
-    always equals the actual process exit. 3b hand-builds its staged row
-    instead of calling this (staged accounting is not a :class:`CheckRunResult`).
+    build this row, :func:`coverage_marks_from_result` and
+    :func:`attempt_outcome_from_result` → ``TelemetryStore.record_run_end``
+    LAST, so a write failure can only move the exit toward 2 and a persisted
+    row's ``exit_code`` always equals the actual process exit. 3b hand-builds its
+    staged row instead of calling this (staged accounting is not a :class:`CheckRunResult`).
 
     Args:
         result: The typed run outcome (the same object the report reads).
@@ -1859,4 +2007,96 @@ def check_run_row_from_result(
         coverage_exclusions=coverage_exclusions,
         degraded_reason=",".join(run_degradations(result)) or None,
         mitos_version=__version__,
+    )
+
+
+def coverage_marks_from_result(result: CheckRunResult) -> Optional[CoverageMarks]:
+    """Assembles the coverage marks one corpus run writes, or ``None`` for none.
+
+    Beside :func:`check_run_row_from_result` and read off the same result, so the
+    row and the marks can never disagree. "Undegraded" is
+    ``run_degradations(result) == ()``, never an exit code: an undegraded run that
+    found a new contradiction exits 1 and covers, since finding something is not
+    failing to look. Any degradation token returns ``None`` and the run covers
+    nothing. Poison backlog rows produce no token, so a run with only exclusions
+    still covers.
+
+    Marks are bounded by what the run swept. The exclusion ids come from the
+    backlog probes, which are corpus-wide and kind-blind: they can name an open
+    question, a retired node, or a decision outside a ``--scope``. A run has no
+    authority over a node it did not see, so an exclusion id outside
+    ``swept_node_ids`` gets no mark at all. A stuck active decision loses nothing
+    by this, because the sweep takes it as a proposal (only its vector is
+    missing) and an unscoped run therefore sweeps and excludes it.
+
+    Args:
+        result: The typed run outcome (the same object the report reads).
+
+    Returns:
+        The run's :class:`~mitos.telemetry.CoverageMarks` (``covered`` = swept
+        minus exclusions, ``excluded`` = swept ∩ exclusions, both sorted), or
+        ``None`` when the run degraded.
+    """
+    if run_degradations(result):
+        return None
+    swept = set(result.swept_node_ids)
+    excluded = sorted(swept & set(coverage_exclusion_ids(result)))
+    covered = sorted(swept - set(excluded))
+    return CoverageMarks(
+        run_id=result.run_id,
+        marked_at=result.ended_at,
+        covered=tuple(covered),
+        excluded=tuple(excluded),
+    )
+
+
+def attempt_outcome_from_result(
+    result: CheckRunResult, *, attempt_id: str
+) -> AttemptOutcome:
+    """Assembles the attempt outcome one unscoped corpus run writes at its seam.
+
+    Beside :func:`coverage_marks_from_result` and read off the same result. The
+    state does not mirror the exit code. Degraded dominates the exit code and
+    never the record: any degradation token gives ``could_not_complete`` and the
+    record still carries the run's new pairs, because on this corpus every new
+    finding ever recorded arrived inside a degraded run, and the next run reports
+    those pairs as known (ADR
+    ``degraded-check-attempt-keeps-its-new-pairs-the-record-does-not-mirror-the-exit-code``).
+    Otherwise a new finding gives ``new_findings``, and none gives
+    ``no_new_findings``. A finding whose novelty is ``None`` (the reuse index was
+    unreadable) is never new.
+
+    Args:
+        result: The typed run outcome (the same object the report reads).
+        attempt_id: The key the attempt's entry write used.
+
+    Returns:
+        The run's :class:`~mitos.telemetry.AttemptOutcome`. Pairs are
+        ``(proposal_hash, partner_hash)`` node ids in the result's pair-key order;
+        ``findings_known`` follows :func:`check_run_row_from_result`'s NULL rule.
+    """
+    tokens = run_degradations(result)
+    new_pairs = tuple(
+        (f.proposal_hash, f.partner_hash)
+        for f in result.findings
+        if f.novelty == "new"
+    )
+    if tokens:
+        state = ATTEMPT_COULD_NOT_COMPLETE
+    elif new_pairs:
+        state = ATTEMPT_NEW_FINDINGS
+    else:
+        state = ATTEMPT_NO_NEW_FINDINGS
+    if result.reuse_unavailable is not None:
+        findings_known: Optional[int] = None
+    else:
+        findings_known = sum(1 for f in result.findings if f.novelty == "known")
+    return AttemptOutcome(
+        attempt_id=attempt_id,
+        state=state,
+        run_id=result.run_id,
+        outcome_at=result.ended_at,
+        degradation_tokens=tokens,
+        new_pairs=new_pairs,
+        findings_known=findings_known,
     )

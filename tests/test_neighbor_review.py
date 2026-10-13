@@ -28,8 +28,9 @@ from mitos.conflict import ConflictUnavailableReason, Unavailable
 from mitos.errors import DatabaseError, EmbeddingError, VectorStoreError
 from mitos.parser import ParsedEntry
 from mitos.store import GraphStore
-from mitos.sync import (MitosSyncManager, _NEIGHBOR_REVIEW_THRESHOLD,
-                        _PAUSE_RESOLVING_RELATIONS)
+from mitos.sync import (DRAFT_DIGEST_FIELDS, MitosSyncManager, PAUSE_HELD_CLAUSE,
+                        _NEIGHBOR_REVIEW_THRESHOLD, _PAUSE_DIGEST_CLAUSE,
+                        _PAUSE_RESOLVING_RELATIONS, _draft_digest)
 
 
 @pytest.fixture
@@ -286,7 +287,8 @@ def test_mcp_record_decision_pauses(ws):
 def test_mcp_record_decision_acknowledge_commits(ws):
     from mitos import mcp_server
     config, _ = ws
-    # _review_neighbors must NOT even be consulted when acknowledged.
+    # The pause never consults _review_neighbors when acknowledged. The post-commit
+    # gather (F10) would, but this manager is offline, so it answers None first.
     with patch("mitos.mcp_server.MitosConfig", return_value=config), \
          patch.object(MitosSyncManager, "_review_neighbors", return_value=_FLAGGED):
         res = json.loads(mcp_server.record_decision("A new call.", "rej", ["s"],
@@ -852,7 +854,7 @@ def test_graph_fault_during_pause_read_commits_with_notice(ws):
 
     gather_candidates propagates graph-store faults by design; the record call site
     catches exactly (DatabaseError, ValidationError). Phase B uses get_node /
-    commit_parsed_entry / get_outgoing_edges — none of them the patched read — so the
+    commit_parsed_entry / get_outgoing_edge_targets — none of them the patched read — so the
     commit proceeds. (Nothing post-commit calls the patched method anymore: the
     `related` echo and its blanket-catch scan were deleted.)
     """
@@ -892,8 +894,10 @@ def test_offline_unconfigured_carries_no_notice(ws):
 
 
 def test_acknowledge_bypass_carries_no_notice(ws):
-    """A declined check is not a failed one: acknowledge_neighbors=True runs no gather,
-    so even a broken embed provider yields a clean receipt with no notice."""
+    """A declined check is not a failed one: acknowledge_neighbors=True skips the
+    pre-commit review, so a broken embed provider yields no notice. The post-commit
+    gather (F10) does run, meets the same broken provider, and says so on its own
+    key: `acknowledged_neighbors` is None, never the notice."""
     config, m = ws
     m.embed_provider = _RaisingEmbed(EmbeddingError("would raise if consulted"))
     m.vector_store = _FakeVector([])
@@ -901,6 +905,7 @@ def test_acknowledge_bypass_carries_no_notice(ws):
                                   slug="ack-clean", acknowledge_neighbors=True)
     assert res["status"] == "created"
     assert "neighbor_review_unavailable" not in res
+    assert res["acknowledged_neighbors"] is None
 
 
 def test_mixed_neighbors_declared_edge_survives_acknowledge_bypass(ws):
@@ -962,6 +967,8 @@ def test_created_receipt_carries_no_related_echo(ws):
                                   acknowledge_neighbors=True)
     assert res["status"] == "created"
     assert "related" not in res
+    # The acknowledged path's own key (F10) names the neighbour and invites nothing.
+    assert res["acknowledged_neighbors"] == ["echo-prior"]
 
 
 def test_cli_record_renders_degraded_notice(ws, capsys):
@@ -1086,7 +1093,8 @@ def test_pause_that_declared_nothing_is_byte_identical(ws, capsys):
     """No declarations at all → no echo anywhere, and the pause body is unchanged.
 
     The majority path pays nothing for the echo: neither key, and sync's `message`
-    still closes `…before linking. Nothing was written.` with no sentence between. The
+    still closes `…before linking. <held sentence> Nothing was written.` with no echo
+    sentence between (4e's held sentence is the one addition, and it is pinned whole). The
     exact-substring assertion is the point — an empty-group render (`Declared: none`,
     or a bare stem) would slip past a key-absence check while shipping a wall on the
     quiet path.
@@ -1096,7 +1104,8 @@ def test_pause_that_declared_nothing_is_byte_identical(ws, capsys):
     res = _echo_pause(m, _ECHO_GATHERED)
     assert "declared" not in res and "declared_no_near_match" not in res
     assert res["message"].endswith(
-        "dereference that slug before linking. Nothing was written.")
+        "dereference that slug before linking. "
+        f"{PAUSE_HELD_CLAUSE}{_PAUSE_DIGEST_CLAUSE} Nothing was written.")
     assert "Declared" not in res["message"]
 
     factory = _armed_real_manager_factory(_ECHO_GATHERED)
@@ -1269,7 +1278,7 @@ def test_empty_group_one_renders_no_key_and_no_none(ws, capsys):
     assert res["declared_no_near_match"] == [{"slug": "echo-x"}]
 
     sentences = _echo_sentences(res["message"])
-    assert len(sentences) == 1, res["message"]      # the lift is not vacuous
+    assert len(sentences) == 2, res["message"]      # group two + the re-send sentence
     for line in sentences:
         assert "none" not in line.casefold(), line
 
@@ -1279,7 +1288,11 @@ def test_empty_group_one_renders_no_key_and_no_none(ws, capsys):
             cmd_record(config, axiom=_ECHO_AXIOM, rejected="rej", scope=["s"],
                        slug="echo-new", cites="echo-x")
     rendered = _cli_echo_lines(capsys.readouterr().err)
-    assert rendered == ["Declared, not a near neighbour here: echo-x"]
+    assert rendered == [
+        "Declared, not a near neighbour here: echo-x — a valid declaration that "
+        "does not resolve this pause",
+        _RESEND,
+    ]
 
 
 def test_echo_sits_after_the_neighbours_and_before_the_closing_sentence(ws, capsys):
@@ -1312,13 +1325,13 @@ def test_echo_sits_after_the_neighbours_and_before_the_closing_sentence(ws, caps
     neighbour = max(i for i, line in enumerate(lines) if line.startswith("↔ "))
     menu = next(i for i, line in enumerate(lines) if line.startswith("→ "))
     echo = [i for i, line in enumerate(lines) if line.startswith(_ECHO_STEMS)]
-    assert len(echo) == 2, lines
+    assert len(echo) == 3, lines                    # group one, group two, re-send
     assert neighbour < min(echo) and max(echo) < menu, lines
 
     message = _echo_pause(m, _ECHO_GATHERED, cites="echo-b, echo-d")["message"]
     assert message.endswith("Nothing was written.")
     sentences = _echo_sentences(message)
-    assert len(sentences) == 2, message
+    assert len(sentences) == 3, message
     for sentence in sentences:
         assert message.index(sentence) < message.index("Nothing was written.")
 
@@ -1334,8 +1347,13 @@ def test_echo_sits_after_the_neighbours_and_before_the_closing_sentence(ws, caps
 # red on shipped text, and one relaxed until it stopped doing so would pin nothing.
 # --------------------------------------------------------------------------- #
 
-#: The echo's two sentence stems — the only prose this phase authored.
-_ECHO_STEMS = ("Declared: ", "Declared, not a near neighbour here: ")
+#: The echo's sentence stems: its two groups, then the re-send sentence (4d) that
+#: renders whenever either group did.
+_ECHO_STEMS = ("Declared: ", "Declared, not a near neighbour here: ",
+               "Pass every declaration again")
+
+#: The re-send sentence whole, as `_declared_echo_lines` returns it (no period).
+_RESEND = "Pass every declaration again when you re-record"
 
 
 def _echo_sentences(message: str):
@@ -1376,7 +1394,7 @@ def test_uncollapsed_echo_carries_no_count_anywhere(ws, capsys):
     assert "declared_no_near_match_total" not in res
 
     sentences = _echo_sentences(res["message"])
-    assert len(sentences) == 2, res["message"]
+    assert len(sentences) == 3, res["message"]
     for line in sentences:
         assert _count_markers(line) == [], line
 
@@ -1386,7 +1404,7 @@ def test_uncollapsed_echo_carries_no_count_anywhere(ws, capsys):
             cmd_record(config, axiom=_ECHO_AXIOM, rejected="rej", scope=["s"],
                        slug="echo-new", cites="echo-b, echo-d")
     rendered = _cli_echo_lines(capsys.readouterr().err)
-    assert len(rendered) == 2, rendered
+    assert len(rendered) == 3, rendered
     for line in rendered:
         assert _count_markers(line) == [], line
 
@@ -1413,12 +1431,30 @@ _PLANTED_ECHO_VIOLATIONS = (
     "Declared but unresolved: echo-x",                # a failure reading
     "Declared, missing from the sweep: echo-x",        # a not-valid reading
     "edges_created_no_near_match",                    # the claim in a key name
+    # 4d: one shape per word weighed for the new wording and refused.
+    "Declared; kept: echo-b",
+    "Declared, and the declaration stands: echo-b",
+    "Your declaration is recorded: echo-b",
+    "Declared, accepted, not a near neighbour here: echo-x",
+    "Declared, retained: echo-b",
+    "Declared, not a near neighbour here: echo-x — dropped",
+    "Declared, not a near neighbour here: echo-x — ignored by this pause",
+    "Declared, not a near neighbour here: echo-x — discarded",
+    "Pass every declaration again — nothing is lost",
+    "An unusual declaration: echo-x",
+    "An unexpected declaration: echo-x",
+    "An exception to the partition: echo-x",
 )
 
 #: Forbidden anywhere in a group label, a key name or an echo sentence (§3.5).
 _ECHO_FORBIDDEN = ("registered", "committed", "created", "saved", "applied",
                    "landed", "failed", "invalid", "unresolved", "warning",
-                   "error", "missing", "skipped", "rejected", "orphan")
+                   "error", "missing", "skipped", "rejected", "orphan",
+                   # 4d's refusal set: weighed for the group-two and re-send wording
+                   # and turned down (commit axis, then exception axis).
+                   "kept", "stands", "recorded", "accepted", "retained", "dropped",
+                   "ignored", "discarded", "lost", "unusual", "unexpected",
+                   "exception")
 
 
 def _echo_register_violations(text: str):
@@ -1457,7 +1493,7 @@ def test_echo_labels_and_key_names_claim_no_commitment(ws, capsys):
         assert _echo_register_violations(key) == [], key
 
     sentences = _echo_sentences(res["message"])
-    assert len(sentences) == 2, res["message"]      # the lift is not vacuous
+    assert len(sentences) == 3, res["message"]      # the lift is not vacuous
     for line in sentences:
         assert _echo_register_violations(line) == [], line
 
@@ -1467,7 +1503,7 @@ def test_echo_labels_and_key_names_claim_no_commitment(ws, capsys):
             cmd_record(config, axiom=_ECHO_AXIOM, rejected="rej", scope=["s"],
                        slug="echo-new", cites="echo-b, echo-d")
     rendered = _cli_echo_lines(capsys.readouterr().err)
-    assert len(rendered) == 2, rendered
+    assert len(rendered) == 3, rendered
     for line in rendered:
         assert _echo_register_violations(line) == [], line
 
@@ -1614,9 +1650,1044 @@ def test_both_groups_collapse_independently_at_the_bound(ws, capsys, monkeypatch
         with pytest.raises(SystemExit):
             main()
     rendered = _cli_echo_lines(capsys.readouterr().err)
-    assert len(rendered) == 2, rendered
+    assert len(rendered) == 3, rendered              # group one, group two, re-send
     assert rendered[0].startswith("Declared: dep-00, dep-01,")
     assert rendered[0].endswith("dep-19 (25 total)")
     assert "dep-20" not in rendered[0]
-    assert rendered[1].endswith("cit-19 (25 total)")
+    # The marker sits before group two's suffix, and the plural reads the TOTAL.
+    assert rendered[1].endswith("cit-19 (25 total) — valid declarations that do not "
+                                "resolve this pause")
     assert "cit-20" not in rendered[1]
+    assert rendered[2] == _RESEND
+
+
+# --------------------------------------------------------------------------- #
+# What the pause renders and says (Phase 4d: A2 + B3 + B9)
+#
+# The payload is untouched; these rows pin the TEXT. The CLI render rows inject
+# neighbours through `_review_neighbors` (the `_FLAGGED` idiom) because the render is
+# their subject; the echo rows run the real gather through `_echo_pause` / the armed
+# factory, since the score and partition come from there. Every words assertion is a
+# literal, not a re-render through `_declared_echo_lines` — a row deriving its
+# expectation from the composer cannot catch the composer.
+# --------------------------------------------------------------------------- #
+
+_LONG_AXIOM = ("The pause prints each neighbour's axiom whole, because the axiom is "
+               "the one field the author judges a near restatement by, and a cut "
+               "one reads as a different decision from the one the graph holds "
+               "today in its active view.")
+_LONG_REJECTED = ("Rejected a sixty-character preview: the tail of a rejected path is "
+                  "usually where the reason lives, and an unnamed cut hides that.")
+_SHORT_REJECTED = "Rejected the obvious alternative, with reasons."
+
+
+def _neighbour(slug, axiom="An existing decision.", rejected=_SHORT_REJECTED):
+    return {"slug": slug, "axiom": axiom, "scope": ["s"], "score": 0.9,
+            "rejected_paths": rejected}
+
+
+def _cli_pause(config, neighbours, capsys):
+    """The CLI text pause over injected neighbours; returns its stderr."""
+    capsys.readouterr()
+    with patch.object(MitosSyncManager, "_review_neighbors", return_value=neighbours):
+        with pytest.raises(SystemExit) as exc:
+            cmd_record(config, axiom="A new call.", rejected="rej", slug="newcall")
+    assert exc.value.code == 2
+    return capsys.readouterr().err
+
+
+def _recipes(err):
+    return [r for r in err.split("`")[1::2] if r.startswith("mitos show")]
+
+
+def test_cli_pause_prints_the_neighbour_axiom_whole(ws, capsys):
+    """R-1 — the axiom is what the author judges by, so the text pause never cuts it."""
+    config, _ = ws
+    assert len(_LONG_AXIOM) > 150
+    err = _cli_pause(config, [_neighbour("long-axiom", axiom=_LONG_AXIOM)], capsys)
+    line = next(line for line in err.splitlines() if "The pause prints" in line)
+    assert line.strip() == _LONG_AXIOM
+    assert "…" not in line
+
+
+def test_cli_pause_names_a_shortened_rejected_paths_per_neighbour(ws, capsys):
+    """R-2 — a cut rejected_paths says it was shortened and names its own recipe."""
+    config, _ = ws
+    assert len(_LONG_REJECTED) > 80
+    err = _cli_pause(config, [_neighbour("first-long", rejected=_LONG_REJECTED),
+                              _neighbour("second-long", rejected=_LONG_REJECTED)],
+                     capsys)
+    assert err.count("rejected (shortened): Rejected a sixty-character") == 2
+    assert _LONG_REJECTED not in err                 # the terminal preview is cut
+    recipes = _recipes(err)
+    assert len(recipes) == 2
+    assert "'first-long'" in recipes[0] and "'second-long'" in recipes[1]
+
+
+def test_cli_pause_prints_a_short_rejected_paths_whole_with_no_pointer(ws, capsys):
+    """R-3 — nothing cut, so nothing is named cut: a pointer here is a false claim.
+
+    The positive control sits in the same call: one long neighbour beside the short
+    one proves this render does name a cut when there is one.
+    """
+    config, _ = ws
+    err = _cli_pause(config, [_neighbour("short-one"),
+                              _neighbour("long-one", rejected=_LONG_REJECTED)], capsys)
+    assert f"rejected: {_SHORT_REJECTED}" in err
+    assert err.count("shortened") == 1
+    recipes = _recipes(err)
+    assert len(recipes) == 1 and "'long-one'" in recipes[0]
+
+
+@pytest.mark.parametrize("project", [None, "my proj"], ids=["path", "name-with-space"])
+def test_cli_pause_rejected_recipe_parses(ws, capsys, project):
+    """R-3b — the printed recipe is a command a person can paste, selectored."""
+    import shlex
+    from mitos import cli
+    config, _ = ws
+    if project is not None:
+        config = MitosConfig(config.workspace_dir, project=project)
+    err = _cli_pause(config, [_neighbour("-dash-slug", rejected=_LONG_REJECTED)],
+                     capsys)
+    (recipe,) = _recipes(err)
+    args = cli._build_parser().parse_args(shlex.split(recipe)[1:])
+    assert args.command == "show"
+    assert args.ident == "-dash-slug"
+    assert args.project_post == config.project
+
+
+def test_cli_pause_header_states_the_floor_and_the_count(ws, capsys):
+    """R-4 — the header says the same thing the message does, floor included."""
+    config, _ = ws
+    err = _cli_pause(config, [_neighbour("one"), _neighbour("two")], capsys)
+    header = next(line for line in err.splitlines() if line.startswith("⚠ Paused"))
+    assert (f"is ≥{_NEIGHBOR_REVIEW_THRESHOLD:.2f} similar to 2 existing "
+            "decision(s) you did not reference") in header
+    assert header.endswith("Nothing written.")
+
+
+def test_below_floor_score_never_prints_as_the_floor(ws, capsys):
+    """R-5 — 0.7967 rounds to 0.80 beside a stated 0.80 floor; it must read 0.79."""
+    config, m = ws
+    _seed_echo_corpus(m)
+    gathered = [{"slug": "echo-c", "score": 0.84}, {"slug": "echo-d", "score": 0.7967}]
+    res = _echo_pause(m, gathered, cites="echo-d")
+    assert res["declared_no_near_match"] == [{"slug": "echo-d", "score": 0.7967}]
+    (group_two,) = [s for s in _echo_sentences(res["message"])
+                    if s.startswith("Declared, not")]
+    assert "echo-d (0.79, below the 0.80 floor)" in group_two
+    assert "(0.80" not in " ".join(_echo_sentences(res["message"]))
+
+    factory = _armed_real_manager_factory(gathered)
+    capsys.readouterr()
+    with patch("mitos.cli.MitosSyncManager", side_effect=factory):
+        with pytest.raises(SystemExit):
+            cmd_record(config, axiom=_ECHO_AXIOM, rejected="rej", scope=["s"],
+                       slug="echo-new", cites="echo-d")
+    rendered = _cli_echo_lines(capsys.readouterr().err)
+    assert "echo-d (0.79, below the 0.80 floor)" in rendered[0]
+    assert "(0.80" not in " ".join(rendered)
+
+
+@pytest.mark.parametrize("score", [0.0, 0.29, 0.5, 0.7949, 0.795, 0.7967, 0.79999999])
+def test_floored_score_text_stays_below_the_floor(score):
+    """R-5 sweep — floored, never rounded up; 0.29 is the float-arithmetic trap."""
+    from mitos.sync import _floored_score_text
+    text = _floored_score_text(score)
+    assert float(text) < _NEIGHBOR_REVIEW_THRESHOLD
+    assert float(text) <= score
+    if score == 0.29:
+        assert text == "0.29"
+
+
+def test_floored_score_text_survives_a_non_finite_score():
+    """The helper renders any float; `Decimal.quantize` alone raises on inf."""
+    from mitos.sync import _floored_score_text
+    assert _floored_score_text(float("-inf")) == "-inf"
+    assert _floored_score_text(float("nan")) == "nan"
+
+
+def test_group_two_clause_is_singular_or_plural_by_its_members(ws):
+    """R-6 — one member reads singular, several plural, the words pinned literally."""
+    config, m = ws
+    _seed_echo_corpus(m)
+    one = _echo_sentences(_echo_pause(m, _ECHO_GATHERED, cites="echo-x")["message"])
+    assert one[0] == ("Declared, not a near neighbour here: echo-x — a valid "
+                      "declaration that does not resolve this pause.")
+    two = _echo_sentences(_echo_pause(m, _ECHO_GATHERED,
+                                      cites="echo-x, echo-d")["message"])
+    assert two[0] == ("Declared, not a near neighbour here: echo-x, echo-d (0.62, "
+                      "below the 0.80 floor) — valid declarations that do not "
+                      "resolve this pause.")
+
+
+def test_group_two_clause_reads_the_total_on_a_collapse(ws, monkeypatch):
+    """R-6 collapsed — the switch counts elided members too (K11's target).
+
+    A bound of 1 over two declarations renders one member beside `(2 total)`; a
+    switch reading the rendered slice would call that line singular.
+    """
+    import mitos.sync
+    config, m = ws
+    _seed_echo_corpus(m)
+    monkeypatch.setattr(mitos.sync, "_DECLARED_ECHO_BOUND", 1)
+    res = _echo_pause(m, _ECHO_GATHERED, cites="echo-x, echo-d")
+    assert res["declared_no_near_match_total"] == 2
+    (group_two,) = [s for s in _echo_sentences(res["message"])
+                    if s.startswith("Declared, not")]
+    assert group_two == ("Declared, not a near neighbour here: echo-x (2 total) — "
+                         "valid declarations that do not resolve this pause.")
+
+
+@pytest.mark.parametrize("cites,groups", [
+    ("echo-b", ["declared"]),
+    ("echo-x", ["declared_no_near_match"]),
+    ("echo-b, echo-d", ["declared", "declared_no_near_match"]),
+], ids=["group-one-only", "group-two-only", "both"])
+def test_resend_sentence_covers_every_declaration(ws, capsys, cites, groups):
+    """R-7 — one sentence for both groups, last in the echo, on both text surfaces.
+
+    Attached to group two alone it would make the pair say group one need not go
+    again — the landed-edge reading; the group-one-only cell is the one that sees it.
+    """
+    config, m = ws
+    _seed_echo_corpus(m)
+    res = _echo_pause(m, _ECHO_GATHERED, cites=cites)
+    assert sorted(k for k in res if k.startswith("declared")) == groups
+    sentences = _echo_sentences(res["message"])
+    assert sentences[-1] == _RESEND + "."
+    assert res["message"].endswith(f"{_RESEND}. Nothing was written.")
+
+    factory = _armed_real_manager_factory(_ECHO_GATHERED)
+    capsys.readouterr()
+    with patch("mitos.cli.MitosSyncManager", side_effect=factory):
+        with pytest.raises(SystemExit):
+            cmd_record(config, axiom=_ECHO_AXIOM, rejected="rej", scope=["s"],
+                       slug="echo-new", cites=cites)
+    rendered = _cli_echo_lines(capsys.readouterr().err)
+    assert rendered[-1] == _RESEND
+    assert len(rendered) == len(groups) + 1
+
+
+def test_resend_sentence_is_absent_when_nothing_was_declared(ws, capsys):
+    """R-7 negative, with its positive control under the same armed factory."""
+    config, m = ws
+    _seed_echo_corpus(m)
+    factory = _armed_real_manager_factory(_ECHO_GATHERED)
+    for cites, expected in ((None, False), ("echo-b", True)):
+        capsys.readouterr()
+        with patch("mitos.cli.MitosSyncManager", side_effect=factory):
+            with pytest.raises(SystemExit):
+                cmd_record(config, axiom=_ECHO_AXIOM, rejected="rej", scope=["s"],
+                           slug="echo-new", cites=cites)
+        err = capsys.readouterr().err
+        assert ("Pass every declaration" in err) is expected, err
+
+
+def test_held_is_deliberately_off_the_echo_forbidden_list():
+    """R-8 — `held` was weighed for 4d's wording and refused, but stays OFF the list.
+
+    4e's tripwire applies this list to its own "nothing is held" sentence, where the
+    word is used in its negated, correct direction; adding it here would force 4e to
+    drop the vision's wording or weaken this list (plan p4d D4).
+    """
+    assert "held" not in _ECHO_FORBIDDEN and "hold" not in _ECHO_FORBIDDEN
+    assert _echo_register_violations(_RESEND) == []
+
+
+# --- B9: the stamp sentence carries its condition in all three shipped copies ---
+
+_STAMP_ANCHOR = "amended_by/narrowed_by stamp"
+
+
+def _normalised(text):
+    return " ".join(text.replace("`", "").split()).casefold()
+
+
+def _stamp_spans(text, *, parenthesis=False):
+    """Each sentence (or parenthesis) of the normalised text that holds the anchor."""
+    import re
+    flat = _normalised(text)
+    pieces = (re.findall(r"\([^()]*\)", flat) if parenthesis
+              else re.split(r"(?<=[.]) ", flat))
+    return [p for p in pieces if _STAMP_ANCHOR in p]
+
+
+def _stamp_copy(ws, where):
+    import pathlib
+    if where == "message":
+        config, m = ws
+        _seed_echo_corpus(m)
+        return _stamp_spans(_echo_pause(m, _ECHO_GATHERED)["message"])
+    if where == "description":
+        from test_description_budget import _descriptions, _flat
+        return _stamp_spans(_flat(_descriptions()["record_decision"]),
+                            parenthesis=True)
+    setup = pathlib.Path(__file__).resolve().parent.parent / "SETUP.md"
+    return _stamp_spans(setup.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("where", ["message", "description", "setup_md"])
+def test_stamp_sentence_carries_its_condition(ws, where):
+    """R-9 — the pause cannot know which relation the caller will draw, so the
+    condition lives in the wording: a caller that only cites is not sent to
+    dereference. One span per copy, found by a normalised anchor (the copies differ
+    in backticks and wrap)."""
+    (span,) = _stamp_copy(ws, where)
+    assert "supersede or amend" in span
+
+
+def test_stamp_sentence_in_the_pause_and_setup_agree_word_for_word(ws):
+    """R-9b — SETUP.md teaches the sentence the pause says; the description is a
+    paraphrase and exempt."""
+    assert _stamp_copy(ws, "message") == _stamp_copy(ws, "setup_md")
+
+
+# --------------------------------------------------------------------------- #
+# 4e — A3: the pause's `draft_digest`, and the "nothing is held" sentence.
+#
+# mitos holds nothing between calls, so the pause returns a digest the caller
+# carries back; a re-send that passes it is compared with the paused draft field by
+# field BEFORE any store read, and a drifted field refuses the write. The digest is
+# computed over the built entry, so it canonicalises exactly as the write does:
+# case-only scope is not drift, reordered scope is (MI-9), folded mechanisms are not.
+# --------------------------------------------------------------------------- #
+
+_DIGEST_SHAPE = r"d1(\.[0-9a-f]{10}){6}"
+
+#: The paused draft the digest rows share: a near-dup of the seeded `use-sqlite`.
+_DRAFT = {"axiom": "Adopt SQLite as the storage engine.", "rejected_paths": "rej",
+          "scope": ["db"], "slug": "adopt-sqlite"}
+
+#: One drifted value per digest field, against `_DRAFT` (mechanisms/context absent).
+_DRIFTS = {
+    "slug": {"slug": "adopt-sqlite-now"},
+    "axiom": {"axiom": "Adopt SQLite as the only storage engine."},
+    "rejected_paths": {"rejected_paths": "rej, and Postgres too heavy"},
+    "context": {"context": "Chosen for the single-file deploy."},
+    "scope": {"scope": ["db", "store"]},
+    "mechanisms": {"mechanisms": ["sqlite"]},
+}
+
+
+def _digest_pause(m, **overrides):
+    """Seed the one neighbour, arm the sweep, pause `_DRAFT` (+ overrides); the digest."""
+    if GraphStore(m.config.db_path).get_node_by_slug("use-sqlite") is None:
+        _seed(m, "use-sqlite", "Use SQLite for the store.")
+    _arm(m, [{"slug": "use-sqlite", "score": 0.9}])
+    res = m.record_decision_entry(**{**_DRAFT, **overrides})
+    assert res["status"] == "needs_review", res
+    return res["draft_digest"]
+
+
+def _buffer(config):
+    with open(config.decisions_file, "rb") as f:
+        return f.read()
+
+
+def test_pause_carries_a_well_formed_digest_equal_on_every_encoding(ws, capsys):
+    """Row 1 — sync dict, MCP and `record --json` carry one digest, and the
+    MCP ⇄ `--json` pause dicts stay equal with the new key riding both."""
+    import re
+    from mitos import mcp_server
+    config, m = ws
+    sync_digest = _digest_pause(m)
+    assert re.fullmatch(_DIGEST_SHAPE, sync_digest)
+
+    factory = _armed_real_manager_factory([{"slug": "use-sqlite", "score": 0.9}])
+    with patch("mitos.cli.MitosSyncManager", side_effect=factory), \
+         patch("mitos.sync.MitosSyncManager", side_effect=factory), \
+         patch("mitos.mcp_server.MitosConfig", return_value=config):
+        capsys.readouterr()
+        with pytest.raises(SystemExit) as exc:
+            cmd_record(config, axiom=_DRAFT["axiom"], rejected="rej", scope=["db"],
+                       slug="adopt-sqlite", as_json=True)
+        assert exc.value.code == 2
+        cli_payload = json.loads(capsys.readouterr().out)
+        mcp_payload = json.loads(mcp_server.record_decision(
+            _DRAFT["axiom"], "rej", ["db"], slug="adopt-sqlite",
+            project=config.workspace_dir))
+
+    assert cli_payload["draft_digest"] == mcp_payload["draft_digest"] == sync_digest
+    assert cli_payload == mcp_payload
+
+
+def test_pause_message_places_the_held_sentence_between_b9_and_the_echo(ws, capsys):
+    """Row 2 — B9 → held sentence → echo → `Nothing was written.` last; the CLI text
+    pause prints the held clause but neither the digest clause nor the digest."""
+    config, m = ws
+    _seed_echo_corpus(m)
+    res = _echo_pause(m, _ECHO_GATHERED, cites="echo-b, echo-d")
+    msg = res["message"]
+    held = f"{PAUSE_HELD_CLAUSE}{_PAUSE_DIGEST_CLAUSE}"
+    assert msg.count(held) == 1
+    b9_end = msg.index("dereference that slug before linking. ")
+    first_echo = min(msg.index(s) for s in _echo_sentences(msg))
+    assert b9_end < msg.index(held) < first_echo
+    assert msg.endswith("Nothing was written.")
+    assert msg.index(held) + len(held) < msg.index("Nothing was written.")
+
+    factory = _armed_real_manager_factory(_ECHO_GATHERED)
+    capsys.readouterr()
+    with patch("mitos.cli.MitosSyncManager", side_effect=factory):
+        with pytest.raises(SystemExit):
+            cmd_record(config, axiom=_ECHO_AXIOM, rejected="rej", scope=["s"],
+                       slug="echo-new", cites="echo-b, echo-d")
+    err = capsys.readouterr().err
+    lines = [line.strip() for line in err.splitlines()]
+    assert f"→ {PAUSE_HELD_CLAUSE}." in lines
+    assert "draft_digest" not in err
+    assert res["draft_digest"] not in err
+    menu = next(i for i, line in enumerate(lines) if line.startswith("→ Judge"))
+    assert lines.index(f"→ {PAUSE_HELD_CLAUSE}.") == menu + 1
+
+
+@pytest.mark.parametrize("resolve", [{"amends": "use-sqlite"},
+                                     {"acknowledge_neighbors": True}],
+                         ids=["relation", "acknowledge"])
+def test_clean_resend_with_the_digest_commits(ws, resolve):
+    """Row 3 — the same six values plus the judgment and the digest → created."""
+    config, m = ws
+    digest = _digest_pause(m)
+    res = m.record_decision_entry(**_DRAFT, draft_digest=digest, **resolve)
+    assert res["status"] == "created", res
+
+
+@pytest.mark.parametrize("field", DRAFT_DIGEST_FIELDS)
+def test_each_drifted_field_is_refused_by_name_and_writes_nothing(ws, field):
+    """Row 4 (and 7's drifted half) — one field changed on a digest-carrying re-send →
+    `draft_drifted` naming exactly that field; buffer and graph unchanged. Driven under
+    acknowledge_neighbors=True, the case the digest earns its place on."""
+    config, m = ws
+    digest = _digest_pause(m)
+    before = _buffer(config)
+    drifted = {**_DRAFT, **_DRIFTS[field]}
+    res = m.record_decision_entry(**drifted, draft_digest=digest,
+                                  acknowledge_neighbors=True)
+    assert res["code"] == "draft_drifted", res
+    assert res["drifted_fields"] == [field]
+    assert f"re-send's {field} changed" in res["error"]
+    assert _buffer(config) == before
+    store = GraphStore(config.db_path)
+    assert store.get_node_by_slug(drifted["slug"]) is None
+
+
+def test_several_drifted_fields_are_listed_in_fixed_order(ws):
+    """Row 4 (multi) — the list follows DRAFT_DIGEST_FIELDS, whatever changed first."""
+    config, m = ws
+    digest = _digest_pause(m)
+    res = m.record_decision_entry(**{**_DRAFT, **_DRIFTS["scope"], **_DRIFTS["slug"],
+                                     **_DRIFTS["axiom"]},
+                                  draft_digest=digest, acknowledge_neighbors=True)
+    assert res["drifted_fields"] == ["slug", "axiom", "scope"]
+    assert "re-send's slug, axiom and scope changed" in res["error"]
+    assert json.loads(json.dumps(res))["drifted_fields"] == res["drifted_fields"]
+
+
+@pytest.mark.parametrize("paused, resent, drift", [
+    ({"scope": ["db", "store"]}, {"scope": ["DB", "Store"]}, None),
+    ({"scope": ["db", "store"]}, {"scope": ["store", "db"]}, ["scope"]),
+    ({"scope": []}, {"scope": None}, None),
+    ({"mechanisms": ["sqlite", "WAL Mode"]}, {"mechanisms": ["wal-mode", "SQLite"]}, None),
+], ids=["scope-case-only", "scope-reorder", "scope-none-vs-empty", "mechanisms-fold"])
+def test_the_digest_canonicalises_exactly_as_the_write_does(ws, paused, resent, drift):
+    """Row 5 — no normalisation of its own: what the built entry folds compares equal;
+    a reorder the markdown stores (MI-9) is drift."""
+    config, m = ws
+    digest = _digest_pause(m, **paused)
+    res = m.record_decision_entry(**{**_DRAFT, **resent}, draft_digest=digest,
+                                  acknowledge_neighbors=True)
+    if drift is None:
+        assert res["status"] == "created", res
+    else:
+        assert res["drifted_fields"] == drift
+
+
+def test_a_drifted_draft_matching_an_existing_core_is_refused_not_exists(ws):
+    """D1 — the compare precedes the `exists` short-circuit, which would otherwise
+    answer a drifted re-send whose axiom happens to match a committed decision."""
+    config, m = ws
+    digest = _digest_pause(m)
+    res = m.record_decision_entry(**{**_DRAFT, "axiom": "Use SQLite for the store."},
+                                  draft_digest=digest, acknowledge_neighbors=True)
+    assert res.get("code") == "draft_drifted", res
+    assert res["drifted_fields"] == ["axiom"]
+    without = m.record_decision_entry(**{**_DRAFT, "axiom": "Use SQLite for the store."},
+                                      acknowledge_neighbors=True)
+    assert without["status"] == "exists"      # the path the compare must precede
+
+
+def test_an_omitted_digest_behaves_exactly_as_today(ws):
+    """Row 6 — a drifted re-send without the digest commits: the guard is opt-in."""
+    config, m = ws
+    _digest_pause(m)
+    res = m.record_decision_entry(**{**_DRAFT, **_DRIFTS["rejected_paths"]},
+                                  acknowledge_neighbors=True)
+    assert res["status"] == "created", res
+
+
+def test_the_digest_is_compared_under_acknowledge_neighbors(ws):
+    """Row 7 — acknowledgement skips the review, never the comparison."""
+    config, m = ws
+    digest = _digest_pause(m)
+    refused = m.record_decision_entry(**{**_DRAFT, **_DRIFTS["context"]},
+                                      draft_digest=digest, acknowledge_neighbors=True)
+    assert refused["code"] == "draft_drifted"
+    created = m.record_decision_entry(**_DRAFT, draft_digest=digest,
+                                      acknowledge_neighbors=True)
+    assert created["status"] == "created", created
+
+
+def _unreadable_variants(digest):
+    return {
+        "truncated": digest[:-3],
+        "wrong-tag": "d2" + digest[2:],
+        "non-hex": digest[:-1] + "z",
+        "one-segment-short": digest.rsplit(".", 1)[0],
+    }
+
+
+@pytest.mark.parametrize("variant", ["truncated", "wrong-tag", "non-hex",
+                                     "one-segment-short"])
+def test_an_unreadable_digest_has_its_own_code(ws, variant):
+    """Row 8 — never read as drift of all six fields; nothing written."""
+    config, m = ws
+    digest = _digest_pause(m)
+    before = _buffer(config)
+    res = m.record_decision_entry(**_DRAFT, acknowledge_neighbors=True,
+                                  draft_digest=_unreadable_variants(digest)[variant])
+    assert res["code"] == "draft_digest_unreadable", res
+    assert "drifted_fields" not in res
+    assert _buffer(config) == before
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_a_blank_digest_is_omitted(ws, blank):
+    """Row 8 — blank is omitted (the relation arguments' convention): drift commits."""
+    config, m = ws
+    _digest_pause(m)
+    res = m.record_decision_entry(**{**_DRAFT, **_DRIFTS["axiom"]}, draft_digest=blank,
+                                  acknowledge_neighbors=True)
+    assert res["status"] == "created", res
+
+
+def test_a_digest_is_read_leniently(ws):
+    """Row 8 — surrounding whitespace and upper-case hex are the same digest."""
+    config, m = ws
+    digest = _digest_pause(m)
+    res = m.record_decision_entry(**_DRAFT, draft_digest=f"  {digest.upper()}\n",
+                                  acknowledge_neighbors=True)
+    assert res["status"] == "created", res
+
+
+@pytest.mark.parametrize("field", ["rejected_paths", "context"])
+def test_a_lone_surrogate_never_raises_in_the_digest(ws, field):
+    """Row 9 — the pause returns a digest over a surrogate-bearing field, and a re-send
+    that changes only the axiom is refused naming `axiom` alone: the surrogate field
+    was hashed on both calls and compared clean. (No clean commit here: the buffer
+    write's own surrogate raise is vision §7's separate pass.)"""
+    config, m = ws
+    digest = _digest_pause(m, **{field: "reasoning \udc80 here"})
+    res = m.record_decision_entry(**{**_DRAFT, field: "reasoning \udc80 here",
+                                     **_DRIFTS["axiom"]},
+                                  draft_digest=digest, acknowledge_neighbors=True)
+    assert res["drifted_fields"] == ["axiom"], res
+
+
+def test_the_refusals_name_their_recovery_and_no_command(ws):
+    """Row 10 — against the paused call, not the latest send; omitting always works;
+    no shell command (the same strings reach MCP)."""
+    config, m = ws
+    digest = _digest_pause(m)
+    drifted = m.record_decision_entry(**{**_DRAFT, **_DRIFTS["scope"]},
+                                      draft_digest=digest, acknowledge_neighbors=True)
+    unreadable = m.record_decision_entry(**_DRAFT, draft_digest="d1.nope",
+                                         acknowledge_neighbors=True)
+    assert "the values of the call that paused, not your latest send" in drifted["error"]
+    for res in (drifted, unreadable):
+        assert "omit draft_digest (which always clears this comparison)" in res["error"]
+        assert "mitos " not in res["error"] and "`" not in res["error"]
+        assert "Nothing was written" not in res["error"]
+
+
+# --- 6b: T15 through the outer boundaries -------------------------------------
+
+def _boundary_pause(config, capsys, surface):
+    """Pause `_DRAFT` through one surface; the digest as that surface emitted it."""
+    from mitos import mcp_server
+    if surface == "mcp":
+        payload = json.loads(mcp_server.record_decision(
+            _DRAFT["axiom"], "rej", ["db"], slug="adopt-sqlite",
+            project=config.workspace_dir))
+    else:
+        capsys.readouterr()
+        with pytest.raises(SystemExit):
+            cmd_record(config, axiom=_DRAFT["axiom"], rejected="rej", scope=["db"],
+                       slug="adopt-sqlite", as_json=True)
+        payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "needs_review"
+    return payload["draft_digest"]
+
+
+def _boundary_resend(config, capsys, surface, *, rejected="rej", digest=None):
+    """Re-send through the same surface with acknowledge; (payload, exit code)."""
+    from mitos import mcp_server
+    if surface == "mcp":
+        return json.loads(mcp_server.record_decision(
+            _DRAFT["axiom"], rejected, ["db"], slug="adopt-sqlite",
+            acknowledge_neighbors=True, draft_digest=digest,
+            project=config.workspace_dir)), None
+    capsys.readouterr()
+    code = 0
+    try:
+        cmd_record(config, axiom=_DRAFT["axiom"], rejected=rejected, scope=["db"],
+                   slug="adopt-sqlite", acknowledge_neighbors=True,
+                   draft_digest=digest, as_json=True)
+    except SystemExit as exc:
+        code = exc.code
+    return json.loads(capsys.readouterr().out), code
+
+
+@pytest.mark.parametrize("surface", ["mcp", "cli-json"])
+@pytest.mark.parametrize("case", ["clean", "drifted", "omitted"])
+def test_the_digest_round_trips_through_each_boundary(ws, capsys, surface, case):
+    """Row 6b (T15) — pause, copy `draft_digest` out of the emitted JSON, re-send."""
+    config, m = ws
+    _seed(m, "use-sqlite", "Use SQLite for the store.")
+    factory = _armed_real_manager_factory([{"slug": "use-sqlite", "score": 0.9}])
+    with patch("mitos.cli.MitosSyncManager", side_effect=factory), \
+         patch("mitos.sync.MitosSyncManager", side_effect=factory), \
+         patch("mitos.mcp_server.MitosConfig", return_value=config):
+        digest = _boundary_pause(config, capsys, surface)
+        rejected = "rej" if case == "clean" else "rej, edited"
+        payload, code = _boundary_resend(
+            config, capsys, surface, rejected=rejected,
+            digest=None if case == "omitted" else digest)
+
+    assert payload["workspace"] == config.workspace_dir   # provenance on every outcome
+    if case == "drifted":
+        assert payload["code"] == "draft_drifted"
+        assert payload["drifted_fields"] == ["rejected_paths"]
+        assert code in (None, 1)
+    else:
+        assert payload["status"] == "created", payload
+        assert code in (None, 0)
+
+
+def test_a_drift_refusal_on_the_cli_text_surface(ws, capsys):
+    """The text error branch carries the named fields (exit 1), unchanged code."""
+    config, m = ws
+    digest = _digest_pause(m)
+    capsys.readouterr()
+    with patch("mitos.cli.MitosSyncManager", return_value=m):
+        with pytest.raises(SystemExit) as exc:
+            cmd_record(config, axiom=_DRAFT["axiom"], rejected="rej",
+                       scope=["db", "store"], slug="adopt-sqlite",
+                       acknowledge_neighbors=True, draft_digest=digest)
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "Record failed [draft_drifted]: This re-send's scope changed" in err
+
+
+# --- 11: the tripwire — the echo and the held sentence meet both lists ---------
+
+#: The hold axis (4e): no word may say mitos kept anything between calls or that a
+#: re-send resumes something. `held` stays off — the sentence negates it.
+_HELD_FORBIDDEN = ("stored", "remember", "pending", "cached", "resume", "token",
+                   "queued", "draft id", "on file",
+                   # 4e's refusal set, weighed for the held sentence and turned down.
+                   "persist", "retrieve", "continue", "picks up", "session", "later")
+
+_PLANTED_HELD_VIOLATIONS = (
+    "Your draft is stored until you re-send",
+    "mitos will remember these values",
+    "The pending draft resumes on re-send",
+    "Re-send with the token",
+    "The draft persists between calls",
+    "Re-send later and the call continues",
+)
+
+
+def _held_register_violations(text: str):
+    from test_record_decision import register_violations
+    return register_violations(text, substrings=_HELD_FORBIDDEN)
+
+
+def test_the_echo_and_the_held_sentence_agree_across_both_lists(ws, capsys):
+    """Row 11 — 4d's echo lines and 4e's held sentence (message form and CLI form)
+    each carry no word from either list; each list proven live by a planted string.
+    Scoped per sentence: the judge sentence legitimately says `rejected_paths`."""
+    config, m = ws
+    _seed_echo_corpus(m)
+    res = _echo_pause(m, _ECHO_GATHERED, cites="echo-b, echo-d")
+    message_held = f"{PAUSE_HELD_CLAUSE}{_PAUSE_DIGEST_CLAUSE}"
+    assert message_held in res["message"]
+
+    factory = _armed_real_manager_factory(_ECHO_GATHERED)
+    capsys.readouterr()
+    with patch("mitos.cli.MitosSyncManager", side_effect=factory):
+        with pytest.raises(SystemExit):
+            cmd_record(config, axiom=_ECHO_AXIOM, rejected="rej", scope=["s"],
+                       slug="echo-new", cites="echo-b, echo-d")
+    err = capsys.readouterr().err
+    (cli_held,) = [line.strip() for line in err.splitlines()
+                   if line.strip().startswith(f"→ {PAUSE_HELD_CLAUSE[:20]}")]
+
+    echo = _echo_sentences(res["message"]) + _cli_echo_lines(err)
+    assert len(echo) == 6, echo
+    for sentence in [message_held, cli_held] + echo:
+        assert _echo_register_violations(sentence) == [], sentence
+        assert _held_register_violations(sentence) == [], sentence
+
+    for planted in _PLANTED_HELD_VIOLATIONS:
+        assert _held_register_violations(planted), planted
+    for planted in _PLANTED_ECHO_VIOLATIONS:
+        assert _echo_register_violations(planted), planted
+
+
+# --- 12: the CLI flag parses and reaches the manager --------------------------
+
+def test_draft_digest_flag_parses_and_reaches_the_manager(tmp_path, monkeypatch):
+    """Row 12 — `record --draft-digest` through the real parser and dispatch."""
+    from mitos import cli
+    from conftest import make_workspace
+    workspace = make_workspace(tmp_path / "ws")
+    argv = ["mitos", "-p", workspace, "record", "An axiom.", "--rejected", "r",
+            "--slug", "s", "--draft-digest", "d1.abc"]
+    args = cli._build_parser().parse_args(argv[1:])
+    assert args.draft_digest == "d1.abc"
+
+    monkeypatch.setattr(sys, "argv", argv)
+    with patch.object(MitosSyncManager, "record_decision_entry",
+                      return_value={"error": "x", "code": "y"}) as spy:
+        with pytest.raises(SystemExit):
+            cli.main()
+    assert spy.call_args.kwargs["draft_digest"] == "d1.abc"
+
+
+# --------------------------------------------------------------------------- #
+# F10 (4f): an acknowledgement names the neighbours it covered
+#
+# `acknowledge_neighbors=True` skips the pause, and mitos holds nothing between
+# calls, so a cleared pause and a blind pre-disarm look the same. The `created`
+# receipt lists, under `acknowledged_neighbors`, every unlinked live decision at
+# or above the floor the write went past: the pause's gather re-run after the
+# commit and the embed, uncapped by the pause's top 5. [] means it looked and
+# found none; None means it could not look; the key is absent without the flag.
+# --------------------------------------------------------------------------- #
+
+from mitos.cli import _acknowledged_line
+from mitos.conflict import CONFLICT_OVERFETCH_LIMIT, CONFLICT_TOP_K
+from mitos.errors import CollectionMissingError, ValidationError
+
+#: No rendered form may claim the caller looked at anything (§3.3). The last
+#: words were weighed for the gloss and refused.
+_ACK_FORBIDDEN = ("reviewed", "judged", "checked", "cleared", "confirmed", "safe",
+                  "clean", "independent", "seen", "considered", "approved",
+                  "verified", "accepted", "dismissed")
+
+
+def _ack(m, slug, axiom="Adopt SQLite as the storage engine.", **kw):
+    res = m.record_decision_entry(axiom, "rej", ["s"], slug=slug,
+                                  acknowledge_neighbors=True, **kw)
+    assert res["status"] == "created", res
+    return res
+
+
+def test_f10_an_acknowledged_write_lists_the_neighbour_it_went_past(ws):
+    """Row 1 — the list state, and the write lands as it always did."""
+    config, m = ws
+    _seed(m, "use-sqlite", "Use SQLite for the store.")
+    _arm(m, [{"slug": "use-sqlite", "score": 0.9}])
+    res = _ack(m, "adopt-sqlite")
+    assert res["acknowledged_neighbors"] == ["use-sqlite"]
+    assert GraphStore(config.db_path).get_node_by_slug("adopt-sqlite") is not None
+
+
+def test_f10_an_empty_window_reads_empty_not_null(ws):
+    """Row 2 — the gather ran and found none: present, and []."""
+    config, m = ws
+    _arm(m, [])
+    res = _ack(m, "lonely")
+    assert "acknowledged_neighbors" in res and res["acknowledged_neighbors"] == []
+
+
+@pytest.mark.parametrize("score,listed", [(0.79, False), (0.80, True)])
+def test_f10_the_floor_is_the_pauses_and_inclusive(ws, score, listed):
+    """Row 3 — 0.79 is below the floor, exactly 0.80 is at it."""
+    config, m = ws
+    _seed(m, "use-sqlite", "Use SQLite for the store.")
+    _arm(m, [{"slug": "use-sqlite", "score": score}])
+    res = _ack(m, "adopt-sqlite")
+    assert res["acknowledged_neighbors"] == (["use-sqlite"] if listed else [])
+
+
+def test_f10_no_provider_reads_null_without_consulting_the_review(ws):
+    """Row 4 — an offline manager: present and None, and no gather is attempted.
+
+    `_review_neighbors` answers a healthy [] without providers; calling it here
+    would claim a gather that never ran.
+    """
+    config, m = ws
+    assert m.embed_provider is None or m.vector_store is None
+    with patch.object(MitosSyncManager, "_review_neighbors", autospec=True,
+                      return_value=[]) as spy:
+        res = _ack(m, "offline-ack")
+    assert "acknowledged_neighbors" in res and res["acknowledged_neighbors"] is None
+    assert spy.call_count == 0
+
+
+@pytest.mark.parametrize("embed,vector", [
+    (_RaisingEmbed(EmbeddingError("embed down")), _FakeVector([])),
+    (_FakeEmbed(), _RaisingVector(VectorStoreError("qdrant down"))),
+], ids=["embedding", "vector-store"])
+def test_f10_an_unavailable_gather_reads_null_and_raises_no_notice(ws, embed, vector):
+    """Row 5 — a typed Unavailable is None; the pre-commit notice stays unset."""
+    config, m = ws
+    m.embed_provider, m.vector_store = embed, vector
+    res = _ack(m, "degraded-ack")
+    assert res["acknowledged_neighbors"] is None
+    assert "neighbor_review_unavailable" not in res
+
+
+@pytest.mark.parametrize("exc", [DatabaseError("db gone"), ValidationError("bad row"),
+                                 RuntimeError("bug"), KeyError("slug")],
+                         ids=["DatabaseError", "ValidationError", "RuntimeError",
+                              "KeyError"])
+def test_f10_a_raising_gather_degrades_its_key_and_never_the_write(ws, capsys, exc):
+    """Row 6 — standing rule 2's degrade proof. RuntimeError and KeyError are the
+    faults the pause's narrow arm would let through; after the commit none may."""
+    config, m = ws
+    _arm(m, [])
+    capsys.readouterr()
+    with patch.object(MitosSyncManager, "_review_neighbors", side_effect=exc):
+        res = _ack(m, "raised-ack")
+    assert res["acknowledged_neighbors"] is None
+    err = capsys.readouterr().err
+    assert err.count("[Warning]") == 1, err
+    (line,) = [ln for ln in err.splitlines() if "[Warning]" in ln]
+    assert "'raised-ack'" in line
+    assert GraphStore(config.db_path).get_node_by_slug("raised-ack") is not None
+    with open(config.decisions_file, encoding="utf-8") as f:
+        assert "raised-ack" in f.read()
+
+
+def test_f10_the_key_is_absent_on_every_other_exit(ws):
+    """Row 7 — created without the flag, exists, needs_review, slug_collision and
+    draft_drifted under the flag: none carries the key."""
+    config, m = ws
+    _arm(m, [])
+    plain = m.record_decision_entry("A plain decision.", "rej", ["s"], slug="plain")
+    assert plain["status"] == "created"
+    exists = m.record_decision_entry("A plain decision.", "rej", ["s"], slug="plain",
+                                     acknowledge_neighbors=True)
+    assert exists["status"] == "exists"
+    collision = m.record_decision_entry("A different decision.", "rej", ["s"],
+                                        slug="plain", acknowledge_neighbors=True)
+    assert collision.get("code") == "slug_collision", collision
+    digest = _digest_pause(m)
+    paused = m.record_decision_entry(**_DRAFT)
+    assert paused["status"] == "needs_review"
+    drifted = m.record_decision_entry(**{**_DRAFT, **_DRIFTS["axiom"]},
+                                      draft_digest=digest, acknowledge_neighbors=True)
+    assert drifted.get("code") == "draft_drifted", drifted
+    for res in (plain, exists, collision, paused, drifted):
+        assert "acknowledged_neighbors" not in res, res
+
+
+def test_f10_a_declared_neighbour_is_not_listed(ws):
+    """Row 8 — `cites` resolved one neighbour; only the other was gone past."""
+    config, m = ws
+    _seed(m, "mixed-related", "Divergence is reported on status as an informational rung.")
+    _seed(m, "mixed-unrelated", "Scope discovery lists the live subset, not the full spine.")
+    _arm(m, [{"slug": "mixed-related", "score": 0.82},
+             {"slug": "mixed-unrelated", "score": 0.80}])
+    res = _ack(m, "mixed-new", "Reads distinguish empty from unbuilt.",
+               cites="mixed-related")
+    assert res["acknowledged_neighbors"] == ["mixed-unrelated"]
+
+
+def test_f10_an_ancestor_behind_a_declared_chain_head_is_not_listed(ws):
+    """Row 9 — amends the chain head covers its lineage, as it does for the pause."""
+    config, m = ws
+    _seed(m, "chain-c1", "The store uses SQLite for persistence.")
+    _seed(m, "chain-c2", "The store uses SQLite with a single connection.", amends="chain-c1")
+    _seed(m, "chain-c3", "The store uses SQLite with WAL journaling.", amends="chain-c2")
+    _seed(m, "chain-other", "The renderer emits MADR markdown files per decision.")
+    _arm(m, [{"slug": "chain-c1", "score": 0.9}, {"slug": "chain-other", "score": 0.85}])
+    res = _ack(m, "chain-c4", "The store uses SQLite with WAL and a busy timeout.",
+               amends="chain-c3")
+    assert res["acknowledged_neighbors"] == ["chain-other"]
+
+
+def test_f10_the_write_never_lists_itself(ws):
+    """Row 10 — the new node's own vector sits in the post-commit window."""
+    config, m = ws
+    _seed(m, "use-sqlite", "Use SQLite for the store.")
+    _arm(m, [{"slug": "adopt-sqlite", "score": 0.99},
+             {"slug": "use-sqlite", "score": 0.9}])
+    res = _ack(m, "adopt-sqlite")
+    assert res["acknowledged_neighbors"] == ["use-sqlite"]
+
+
+def test_f10_covered_is_the_gates_set_uncapped(ws):
+    """Row 11 (D1) — seven neighbours: the pause shows five, the acknowledgement
+    lists all seven, most similar first, with the pause's slugs as its prefix; with
+    three the two lists are equal."""
+    config, m = ws
+    slugs = [f"near-{i}" for i in range(7)]
+    for i, slug in enumerate(slugs):
+        _seed(m, slug, f"Near-neighbour decision number {i} about the store.")
+    # Armed out of order, so the ranking is the gather's and not the fixture's.
+    scores = [0.83, 0.97, 0.80, 0.91, 0.88, 0.95, 0.86]
+    _arm(m, [{"slug": s, "score": sc} for s, sc in zip(slugs, scores)])
+    ranked = [s for _, s in sorted(zip(scores, slugs), reverse=True)]
+
+    paused = m.record_decision_entry("The store is a near-twin.", "rej", ["s"],
+                                     slug="crowded")
+    assert paused["status"] == "needs_review"
+    shown = [n["slug"] for n in paused["neighbors"]]
+    assert len(shown) == CONFLICT_TOP_K
+    listed = _ack(m, "crowded", "The store is a near-twin.")["acknowledged_neighbors"]
+    assert listed == ranked
+    assert len(listed) == 7 <= CONFLICT_OVERFETCH_LIMIT
+    assert listed[:CONFLICT_TOP_K] == shown
+
+    three = [{"slug": s, "score": sc} for s, sc in zip(slugs[:3], scores[:3])]
+    _arm(m, three)
+    paused3 = m.record_decision_entry("A second near-twin.", "rej", ["s"], slug="sparse")
+    shown3 = [n["slug"] for n in paused3["neighbors"]]
+    listed3 = _ack(m, "sparse", "A second near-twin.")["acknowledged_neighbors"]
+    assert len(shown3) == 3 and listed3 == shown3
+
+
+def test_f10_both_machine_encodings_carry_the_same_list(ws, capsys):
+    """Row 12 — `record --json` and MCP `record_decision`, over one armed window."""
+    from mitos import mcp_server
+    config, m = ws
+    _seed(m, "par-seed", "Use SQLite for the store.")
+    factory = _armed_real_manager_factory([{"slug": "par-seed", "score": 0.9}])
+    with patch("mitos.cli.MitosSyncManager", side_effect=factory), \
+         patch("mitos.sync.MitosSyncManager", side_effect=factory), \
+         patch("mitos.mcp_server.MitosConfig", return_value=config):
+        capsys.readouterr()
+        cmd_record(config, axiom="The CLI twin of the store decision.", rejected="rej",
+                   slug="par-cli", acknowledge_neighbors=True, as_json=True)
+        cli_payload = json.loads(capsys.readouterr().out)
+        mcp_payload = json.loads(mcp_server.record_decision(
+            "The MCP twin of the store decision.", "rej", ["s"], slug="par-mcp",
+            acknowledge_neighbors=True, project=config.workspace_dir))
+    assert cli_payload["acknowledged_neighbors"] == ["par-seed"]
+    assert mcp_payload["acknowledged_neighbors"] == ["par-seed"]
+    assert set(cli_payload) == set(mcp_payload)
+
+
+def _ack_lines(out):
+    return [ln for ln in out.splitlines() if ln.strip().startswith("Acknowledged:")]
+
+
+def test_f10_the_text_receipt_prints_one_line_per_form(ws, capsys):
+    """Row 13 — the three forms through `cmd_record`, and none without the flag."""
+    config, m = ws
+    _seed(m, "txt-seed", "Use SQLite for the store.")
+    floor = f"{_NEIGHBOR_REVIEW_THRESHOLD:.2f}"
+
+    def record(slug, matches, **kw):
+        capsys.readouterr()
+        if matches is None:
+            cmd_record(config, axiom=f"Decision {slug}.", rejected="rej", slug=slug, **kw)
+        else:
+            with patch("mitos.cli.MitosSyncManager",
+                       side_effect=_armed_real_manager_factory(matches)):
+                cmd_record(config, axiom=f"Decision {slug}.", rejected="rej",
+                           slug=slug, **kw)
+        return _ack_lines(capsys.readouterr().out)
+
+    (listed,) = record("txt-list", [{"slug": "txt-seed", "score": 0.9}],
+                       acknowledge_neighbors=True)
+    (empty,) = record("txt-empty", [], acknowledge_neighbors=True)
+    (null,) = record("txt-null", None, acknowledge_neighbors=True)
+    assert record("txt-plain", [], ) == []
+    assert record("txt-plain-offline", None) == []
+
+    assert "txt-seed" in listed and floor in listed and floor in empty
+    assert null != empty
+    for line in (listed, empty, null):
+        assert "None" not in line and "[]" not in line, line
+        bare = line.replace("txt-seed", "")
+        assert "`" not in bare and "mitos" not in bare, line
+    for line in (listed, empty, null):
+        lowered = line.casefold()
+        assert [w for w in _ACK_FORBIDDEN if w in lowered] == [], line
+
+
+def test_f10_the_forbidden_sweep_catches_a_planted_word():
+    """Row 13's register cell has teeth: each planted word is caught."""
+    base = _acknowledged_line(["a-slug"])
+    for word in _ACK_FORBIDDEN:
+        assert word in f"{base} {word}".casefold()
+    assert _acknowledged_line(None) != _acknowledged_line([])
+
+
+def test_f10_the_write_embeds_once(ws, tmp_path):
+    """Row 14 — the post-commit gather hits the cache step 8 filled: one provider
+    call for an acknowledged write, and one in total for a pause plus its
+    acknowledged re-send."""
+    from mitos.embeddings import GeminiEmbeddingProvider
+    from unittest.mock import MagicMock
+    config, m = ws
+    _seed(m, "use-sqlite", "Use SQLite for the store.")
+    with patch("google.genai.Client") as client:
+        emb = MagicMock()
+        emb.values = [0.1, 0.2, 0.3]
+        client.return_value.models.embed_content.return_value.embeddings = [emb]
+        calls = client.return_value.models.embed_content
+        m.embed_provider = GeminiEmbeddingProvider(str(tmp_path / "cache.sqlite"),
+                                                   api_key="mock_key")
+        m.vector_store = _FakeVector([{"slug": "use-sqlite", "score": 0.9}])
+
+        res = _ack(m, "blind-ack", "A blind acknowledged decision.")
+        assert res["acknowledged_neighbors"] == ["use-sqlite"]
+        assert calls.call_count == 1
+
+        calls.reset_mock()
+        paused = m.record_decision_entry("Adopt SQLite as the storage engine.", "rej",
+                                         ["s"], slug="adopt-sqlite")
+        assert paused["status"] == "needs_review"
+        res = _ack(m, "adopt-sqlite")
+        assert res["acknowledged_neighbors"] == ["use-sqlite"]
+        assert calls.call_count == 1
+
+
+def test_f10_record_decision_entry_docstring_names_the_key():
+    """Row 15 — the Returns block says when the key is there and what it holds."""
+    doc = MitosSyncManager.record_decision_entry.__doc__
+    assert "acknowledged_neighbors" in doc
+
+
+class _CreatableVector:
+    """A collection that is absent until the first `upsert(..., may_create=True)`."""
+
+    def __init__(self):
+        self.exists = False
+
+    def query(self, vector, limit=5):
+        if not self.exists:
+            raise CollectionMissingError("absent")
+        return []
+
+    def upsert(self, node_id, vector, payload, may_create=False):
+        if not self.exists:
+            if not may_create:
+                raise CollectionMissingError("absent")
+            self.exists = True
+
+
+def test_f10_a_fresh_workspace_reads_empty_not_null(ws):
+    """Row 16 (D2) — the gather runs after step 8 has created the collection, so the
+    first-ever write answers [] instead of meeting an absent collection."""
+    config, m = ws
+    m.embed_provider, m.vector_store = _FakeEmbed(), _CreatableVector()
+    res = _ack(m, "first-ever")
+    assert m.vector_store.exists
+    assert res["acknowledged_neighbors"] == []

@@ -317,7 +317,15 @@ def test_a_v2_paste_is_outdated_to_agent_block_check(tmp_path, capsys):
     capsys.readouterr()
 
     assert cli.cmd_agent_block(str(ws), check=True) == 1
-    assert "outdated" in capsys.readouterr().out
+    # The rendered line, never a word like "outdated": the report's header prints
+    # the workspace path, and pytest names tmp_path after the test.
+    stale_line = f"⚠ AGENTS.md  (guide v2 → v{AGENT_GUIDE_VERSION})"
+    assert stale_line in capsys.readouterr().out
+
+    # Non-vacuity: the same check over a current paste does not print it.
+    (ws / "AGENTS.md").write_text(agent_block(), encoding="utf-8")
+    assert cli.cmd_agent_block(str(ws), check=True) == 0
+    assert "⚠ AGENTS.md" not in capsys.readouterr().out
 
 
 def test_a_v2_paste_is_outdated_to_status(tmp_path, monkeypatch, capsys):
@@ -341,8 +349,34 @@ def test_a_v2_paste_is_outdated_to_status(tmp_path, monkeypatch, capsys):
 
     cli.cmd_status(str(ws), as_json=True)
     data = json.loads(capsys.readouterr().out)
-    assert data["agent_guide_version"] == 3 == AGENT_GUIDE_VERSION
+    assert data["agent_guide_version"] == 4 == AGENT_GUIDE_VERSION
     assert [f["marker_version"] for f in data["agent_files"]] == [2]
+    assert [f["status"] for f in data["agent_files"]] == ["outdated"]
+
+
+_V3_PASTE = _V2_PASTE.replace("mitos-agent-guide: v2", "mitos-agent-guide: v3")
+
+
+def test_a_v3_paste_is_outdated_to_both_consumers(tmp_path, monkeypatch, capsys):
+    """3i R16: the `v3` block pasted before the habit line changed reads stale.
+
+    A literal `3`, like the `v2` rows and for their reason: a v3 copy exists in the
+    wild today, and a self-adjusting spelling would stay green through a missing bump.
+    """
+    ws = tmp_path / "pasted"
+    ws.mkdir()
+    _init(ws)
+    (ws / "AGENTS.md").write_text(_V3_PASTE, encoding="utf-8")
+    monkeypatch.setenv("GEMINI_API_KEY", "testkey")
+    monkeypatch.setattr(cli, "_check_qdrant", _qdrant(True, False))
+    capsys.readouterr()
+
+    assert cli.cmd_agent_block(str(ws), check=True) == 1
+    assert f"⚠ AGENTS.md  (guide v3 → v{AGENT_GUIDE_VERSION})" in capsys.readouterr().out
+
+    cli.cmd_status(str(ws), as_json=True)
+    data = json.loads(capsys.readouterr().out)
+    assert [f["marker_version"] for f in data["agent_files"]] == [3]
     assert [f["status"] for f in data["agent_files"]] == ["outdated"]
 
 

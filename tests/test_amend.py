@@ -13,6 +13,7 @@ import pytest
 
 from mitos.amend import (
     EDITABLE_FIELDS,
+    REASON_TOOL_CALL_MARKUP,
     FIELD_LABELS,
     ROUTES,
     Miss,
@@ -144,6 +145,68 @@ def test_a_well_formed_request_passes_validation() -> None:
         "slug": "x" * SLUG_MAX_LEN,
     }) is None
     assert validate_changes({"slug": "Target", "context": "closed <!-- ok --> comment"}) is None
+
+
+# --- 7b: tool-call markup (B2) ----------------------------------------------------------
+
+_NS = "ant" + "ml:"  # built by concatenation: the tooling writing this parses the literal
+#: Whitespace-free shapes, so a slug cell reaches the markup pass (an opener with
+#: ` name=` in a slug is refused as `invalid_value` first; see the precedence row).
+MARKUP = {
+    "function_calls": "<function_calls>",
+    "invoke": "</invoke>",
+    "parameter": "</parameter>",
+    "antml": "</" + _NS + "invoke>",
+    "field_closer": "</context>",
+}
+MARKUP_FIELDS = ("rejected_paths", "invalidates_if", "context", "slug", "scope")
+
+
+def markup_changes(field: str, shape: str) -> Dict:
+    """One request carrying ``shape`` in ``field``, at character 4 of its value."""
+    value = f"lead{shape}tail"
+    return {field: ["ok", value]} if field == "scope" else {field: value}
+
+
+@pytest.mark.parametrize("label", sorted(MARKUP))
+@pytest.mark.parametrize("field", MARKUP_FIELDS)
+def test_tool_call_markup_in_any_sent_value_is_refused(field, label) -> None:
+    """R2 — base names in `fields`, the element label and offset in `markup_spans`."""
+    result = validate_changes(markup_changes(field, MARKUP[label]))
+    assert result == {
+        "status": "refused", "reason": REASON_TOOL_CALL_MARKUP, "fields": [field],
+        "markup_spans": [{"field": "scope[1]" if field == "scope" else field,
+                          "span": MARKUP[label], "offset": 4}],
+    }
+    assert json.loads(json.dumps(result)) == result
+
+
+def test_markup_in_several_fields_is_every_hit_in_request_order() -> None:
+    result = validate_changes({"scope": ("a</scope>",), "context": "c</invoke> </context>"})
+    assert result["fields"] == ["context", "scope"]
+    assert [(h["field"], h["span"]) for h in result["markup_spans"]] == [
+        ("scope[0]", "</scope>"), ("context", "</invoke>"), ("context", "</context>")]
+
+
+@pytest.mark.parametrize("changes, reason", [
+    ({"axiom": "x", "context": "c</context>"}, "canonical_core"),
+    ({"cites": "x", "context": "c</context>"}, "edges"),
+    ({"context": 3, "invalidates_if": "c</invoke>"}, "invalid_value"),
+    ({"slug": 'a<parameter name="x">'}, "invalid_value"),
+    ({"scope": ["a,</scope>"]}, "invalid_value"),
+])
+def test_markup_is_the_last_refusal_in_precedence(changes, reason) -> None:
+    """R5 — every earlier refusal outranks markup."""
+    assert validate_changes(changes)["reason"] == reason
+
+
+def test_backticked_markup_passes_validation() -> None:
+    """R3 — inline-code spans are exempt; clears have nothing to scan."""
+    assert validate_changes({
+        "context": "Mention `</context>` and `" + MARKUP["antml"] + "`.",
+        "rejected_paths": "`<parameter name=\"x\">` as prose", "invalidates_if": None,
+        "scope": ["`</scope>`"],
+    }) is None
 
 
 # --- P3: classification --------------------------------------------------------------

@@ -14,9 +14,14 @@ from mitos import divergence
 from mitos.divergence import (
     COMMENTARY_FIELDS,
     RELATIONSHIP_FIELDS,
+    SPAN_CODEPOINT_CAP,
+    code_point_names,
+    differing_span,
     entry_divergence,
     has_divergence,
     is_reconcilable,
+    judged_text,
+    needs_code_points,
     strip_citation,
 )
 from mitos.parser import ParsedEntry
@@ -129,6 +134,110 @@ def test_slug_case_alone_is_not_divergence() -> None:
     """MI-13's identity is the casefolded slug, so case-only differs are not repairable."""
     report = entry_divergence(_entry(slug="Probe-Slug"), _node(slug="probe-slug"), _SCOPES, _EDGES)
     assert report["commentary"] == []
+
+
+# --- the span the report prints (B5) ----------------------------------------------
+
+# (a, b) pairs the comparator judges; each runs for every commentary field on both
+# sides, so a field added to COMMENTARY_FIELDS later is covered without a new row.
+_JUDGED_PAIRS = [
+    ("same-value", "same-value"),
+    ("same-value", "  same-value \n"),
+    (None, ""),
+    (None, "   "),
+    (None, "some text"),
+    ("Same-Value", "same-value"),
+    ("stra\u00dfe", "strasse"),
+    ("same-value", "s\u0430me-value"),  # Cyrillic а
+    ("the old middle text", "the new middle text"),
+]
+
+
+@pytest.mark.parametrize("field", COMMENTARY_FIELDS)
+@pytest.mark.parametrize("a, b", _JUDGED_PAIRS)
+def test_judged_text_agrees_with_the_comparator(field: str, a, b) -> None:
+    """A field is listed exactly when its judged values differ.
+
+    The span report restates the comparator's rule rather than sharing it (the
+    comparator is not edited to call `judged_text`), so this row is the only thing
+    holding the two together. The `ß`/`ss` and case-only cells are the slug's: equal
+    under casefold there, different everywhere else.
+    """
+    listed = field in entry_divergence(
+        _entry(**{field: a}), _node(**{field: b}), _SCOPES, _EDGES)["commentary"]
+    assert listed == (judged_text(field, a) != judged_text(field, b))
+
+
+def _reassembles(a: str, b: str, span: dict) -> None:
+    """Asserts the prefix, span and suffix put both inputs back together."""
+    o, k = span["offset"], span["shared_after"]
+    assert a[:o] == b[:o]
+    assert a[len(a) - k:] == b[len(b) - k:]
+    assert a[:o] + span["graph"] + a[len(a) - k:] == a
+    assert b[:o] + span["markdown"] + b[len(b) - k:] == b
+    assert (span["graph_len"], span["markdown_len"]) == (len(a), len(b))
+
+
+@pytest.mark.parametrize("a, b, offset, shared_after, g, m", [
+    ("the quick fox", "the quack fox", 6, 6, "i", "a"),
+    ("abcdef", "abcXYdef", 3, 3, "", "XY"),
+    ("abcdef", "abc", 3, 0, "def", ""),
+    ("abc", "abcabc", 3, 0, "", "abc"),
+    ("abcabc", "abc", 3, 0, "abc", ""),
+    ("aaa", "aaaa", 3, 0, "", "a"),
+    ("xyz", "pqr", 0, 0, "xyz", "pqr"),
+])
+def test_differing_span_arithmetic(a, b, offset, shared_after, g, m) -> None:
+    """The prefix is counted first and bounds the suffix, so the two never overlap.
+
+    Unbounded, `"abc"` against `"abcabc"` counts the shared `"abc"` at both ends and
+    slices a negative-width span.
+    """
+    span = differing_span(a, b)
+    assert (span["offset"], span["shared_after"], span["graph"], span["markdown"]) == (
+        offset, shared_after, g, m)
+    _reassembles(a, b, span)
+
+
+def test_equal_values_have_no_span() -> None:
+    assert differing_span("same", "same") is None
+    assert differing_span("", "") is None
+
+
+def test_offsets_count_characters_not_bytes() -> None:
+    """Nine Lithuanian letters, two UTF-8 bytes each, then a hyphen: offset 10, not 19."""
+    span = differing_span("ąčęėįšųūž-x", "ąčęėįšųūž-y")
+    assert span["offset"] == 10
+    assert (span["graph"], span["markdown"]) == ("x", "y")
+
+
+def test_a_homoglyph_names_both_code_points() -> None:
+    """A Cyrillic `а` renders like a Latin `a`; naming one side alone leaves a guess."""
+    span = differing_span(judged_text("context", "same-value"),
+                          judged_text("context", "s\u0430me-value"))
+    assert needs_code_points(span["graph"], span["markdown"])
+    assert code_point_names(span["graph"]) == "U+0061 LATIN SMALL LETTER A"
+    assert code_point_names(span["markdown"]) == "U+0430 CYRILLIC SMALL LETTER A"
+
+
+def test_a_printable_ascii_span_names_no_code_points() -> None:
+    assert not needs_code_points("quick", "quack")
+    assert not needs_code_points("", "~ !")
+
+
+def test_whitespace_and_control_characters_are_named() -> None:
+    """A tab and a space render alike, and a control character has no Unicode name."""
+    assert needs_code_points("\t", " ")
+    assert code_point_names("\t") == "U+0009"
+    assert code_point_names("") == "(none)"
+
+
+def test_code_point_names_are_capped() -> None:
+    span = "ą" * (SPAN_CODEPOINT_CAP + 5)
+    names = code_point_names(span)
+    assert names.endswith(" (+5 more)")
+    assert names.count("U+0105") == SPAN_CODEPOINT_CAP
+    assert "more" not in code_point_names("ą" * SPAN_CODEPOINT_CAP)
 
 
 # --- S2: scope -------------------------------------------------------------------
@@ -283,7 +392,9 @@ def test_the_pure_half_does_no_io() -> None:
     import inspect
 
     pure = ("entry_divergence", "declared_edges", "strip_citation",
-            "has_divergence", "is_reconcilable", "_normalized_text", "_edge_key_set")
+            "has_divergence", "is_reconcilable", "_normalized_text", "_edge_key_set",
+            "judged_text", "differing_span", "_is_printable_ascii",
+            "needs_code_points", "code_point_names")
     forbidden = {"open", "read_text", "listdir", "makedirs", "stat", "remove"}
     for name in pure:
         tree = ast.parse(inspect.getsource(getattr(divergence, name)))

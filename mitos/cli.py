@@ -8,6 +8,8 @@ MCP serving.
 import sys
 import os
 import re
+import shlex
+import shutil
 import time
 import json
 import uuid
@@ -15,6 +17,7 @@ import sqlite3
 import hashlib
 import argparse
 from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Callable, List, Mapping, Optional, Dict, Any, Sequence, Set, Tuple
@@ -28,11 +31,14 @@ from mitos import registry
 from mitos import routing
 from mitos import settledness
 from mitos.display import (
+    RANKED_LIMIT_CEILING,
     apply_stdout_text_safety,
     blackout_note,
     clamp_limit,
     dumps_display,
+    handle_text,
     letter_payload,
+    node_handles,
     oneline_axiom,
     oneline_payload,
     order_scope_counts,
@@ -47,6 +53,7 @@ from mitos.config import (
     CONFIG_DEFAULTS,
     default_collection_name,
     global_env_path,
+    judge_api_key,
     toml_scalar,
 )
 from mitos.errors import (
@@ -55,7 +62,7 @@ from mitos.errors import (
     ProjectTargetingError, RegistryError,
     EXEMPT_CREATES_REGISTRATION, EXEMPT_EXPLICITLY_GLOBAL, EXEMPT_NO_WORKSPACE,
     TARGET_EXEMPT_VERB, TARGET_MISSING, TARGET_PATH_NOT_A_WORKSPACE,
-    TARGET_RELATIVE_PATH, TARGET_UNKNOWN_NAME,
+    TARGET_REGISTERED_UNREACHABLE, TARGET_RELATIVE_PATH, TARGET_UNKNOWN_NAME,
 )
 from mitos.divergence import (RELATIONSHIP_FIELDS, _corpus_files, corpus_graph_divergence,
                               corpus_holds_entries, divergence_total)
@@ -63,10 +70,22 @@ from mitos.restore import BufferFidelityError
 from mitos.env import resolve_key
 from mitos.vector_store import scroll_point_ids, hash_to_uuid, QdrantVectorStore
 from mitos.embeddings import GeminiEmbeddingProvider
-from mitos.telemetry import TelemetryStore, ConflictCheckRow, JudgmentBatch
+from mitos.telemetry import (
+    AttemptRefusal, AttemptStart, TelemetryStore, ConflictCheckRow, JudgmentBatch,
+    ATTEMPT_COULD_NOT_COMPLETE, ATTEMPT_NEW_FINDINGS, ATTEMPT_NO_NEW_FINDINGS,
+    ATTEMPT_SPEND_NOT_AUTHORIZED, ATTEMPT_STARTED, LastAttempt, TelemetryUnreadable,
+    read_last_attempt,
+)
+from mitos.audit_debt import AuditDebt, NoGraph, derive_audit_debt
+from mitos.check_notice import compose_check_notice
+from mitos.commit_gate import (CAUSE_GRAPH, CAUSE_NO_GRAPH, CAUSE_TELEMETRY, GATE_BLOCKED,
+                               GATE_UNREADABLE, HOOK_ABSENT, HOOK_BLOCK_EXIT, HOOK_FOREIGN,
+                               HOOK_FOREIGN_WITH_BLOCK, HOOK_OURS, HOOK_UNREADABLE,
+                               classify_hook_file, evaluate_gate, render_hook_block,
+                               render_hook_script, unsafe_shell_path)
 from mitos.identity import compute_node_id
 from mitos.models import get_embedding_model_id, get_model_id
-from mitos.parser import (ParsedEntry, parse_entry_stream,
+from mitos.parser import (ParsedEntry, load_format_spec, parse_entry_stream,
                           read_text_or_none)
 from mitos.conflict import (run_conflict_check, ConflictUnavailableReason,
                             SEMANTIC_SUBSTRATE_REASONS)
@@ -77,10 +96,12 @@ from mitos.lexical import degraded_reason_from_error, lexical_fallback
 from mitos.recall import (assess_query_recall, assess_surface_recall,
                           corpus_provenance, missing_graph_is_a_gap,
                           missing_graph_note, missing_index_is_a_gap,
-                          provenance_line, scope_filter_recovery)
+                          provenance_line, scope_filter_recovery,
+                          count_withheld, window_lever, withheld_clause)
 from mitos.sync import (MitosSyncManager, run_ambient_capture, _SLUG_MAX_LEN,
-                        _ENTRIES_MARKER, _PAUSE_RESOLVING_RELATIONS,
-                        _declared_echo_lines, _split_relation_slugs,
+                        _ENTRIES_MARKER, _NEIGHBOR_REVIEW_THRESHOLD,
+                        _PAUSE_RESOLVING_RELATIONS, _declared_echo_lines, _split_relation_slugs,
+                        EXISTS_NO_OP_FACT, PAUSE_HELD_CLAUSE,
                         ROTATION_FAILED, ROTATION_REASON_DUPLICATED, ROTATION_ROTATED,
                         ROTATION_SKIPPED, ROTATION_STAGE_FILE, ROTATION_STAGE_LOCK)
 from mitos._agent_block import agent_block, agent_block_drift, AGENT_GUIDE_VERSION
@@ -262,13 +283,6 @@ def _oq_payload(oq: Dict[str, Any]) -> Dict[str, Any]:
     """
     return {"topic": oq["slug"], "questions_raised": oq["questions_raised"],
             "park_reason": oq.get("park_reason"), **_oq_modifiers(oq)}
-
-
-def load_format_spec() -> str:
-    """Loads the canonical format specification from the package's single source of truth."""
-    spec_path = os.path.join(os.path.dirname(__file__), "format-spec.md")
-    with open(spec_path, "r", encoding="utf-8") as f:
-        return f.read()
 
 
 def _ensure_gitignore_entry(gitignore_path: str, entry: str) -> None:
@@ -523,11 +537,11 @@ def _skill_md_text(format_spec_content: str) -> str:
         "## Recording & recall — MCP tools (preferred) or CLI fallback\n"
         "If the Mitos MCP server is wired into your agent, call these tools directly — best experience: structured args, no shell-quoting. If it is NOT wired, each maps to a CLI verb (and the CLI also accepts five of the long names as aliases, e.g. `mitos record_decision -p .`):\n"
         "- `record_decision`  (CLI: `mitos record -p .`) — the moment you commit to a foundational choice (a schema, a library, a pattern, a path you're abandoning), persist it WITH the alternatives you rejected and why, so future sessions inherit it instead of relitigating. Recording rich prose via the CLI? Use `--axiom-file -` / `--rejected-file -` / `--context-file -` to read from stdin and avoid shell-quoting.\n"
-        "- `surface_decisions` (CLI: `mitos surface -p .`) — surface active precedents for a claim/scope BEFORE you decide, so you don't relitigate a settled call. This is the recall loop — use it first. Every hit carries its full `rejected_paths`; pass `brief=True` (CLI `--brief`) for an axiom-only scan.\n"
+        "- `surface_decisions` (CLI: `mitos surface -p .`) — surface active precedents for a claim/scope BEFORE you decide, so you don't relitigate a settled call. This is the recall loop — use it first. Every hit carries its full `rejected_paths` by default. `brief=True` (CLI `--brief`) is an existence screen: scan the axioms, then read the hits that matter whole with `show_node`. `full_top=N` (CLI `--full-top N`) keeps the reasoning on the top N ranks only.\n"
         "- `query_decisions`   (CLI: `mitos query -p .`) — the TARGETED lookup: a slug you are carrying, or a pointed claim. Its confidence band rates how well the ranking matched what you named, not whether precedent exists — `surface_decisions` answers that one.\n"
         "- `list_decisions`    (CLI: `mitos list -p .`) — the EXHAUSTIVE recall path. surface/query are semantic and capped at the top few matches; this returns EVERY decision in a scope, deterministically, so a completeness pass or audit doesn't miss anything below the relevance cliff. Needs no key or Qdrant.\n"
         "- `list_scopes`       (CLI: `mitos scopes -p .`) — the scope vocabulary with a count per tag. Read it before a scope-filtered read, or before tagging a new decision, so you reuse a tag that exists instead of minting a near-duplicate.\n"
-        "- `show_node`         (CLI: `mitos show -p . -- <slug>`) — dereference one exact handle (slug or id) to its full node, including a node that has been superseded.\n"
+        "- `show_node`         (CLI: `mitos show -p . -- <slug>`) — dereference one exact handle (slug or id) to its stored fields, including a node that has been superseded; transcripts, provenance and outgoing edges are left out.\n"
         "- `amend_commentary`  (CLI: `mitos amend-commentary -p . <slug> …`) — fix a committed entry's commentary in place: `rejected_paths`, `invalidates_if`, `context`, `scope`, or its slug (`new_slug`). On the tool, `clear=[…]` empties `invalidates_if`, `context` or `scope`. It refuses a change to the axiom or mechanisms: that is a new decision, recorded with `corrects` / `supersedes` / `amends`. It reaches only entries still in `decisions.md`; an entry already rotated into an archive answers `archived`.\n"
         "- `list_projects`     (CLI: `mitos projects`) — the project names registered on this machine. It takes no selector.\n\n"
         "## When to record — the capture trigger (YOUR judgement; Mitos stores, it does not decide what is worth storing)\n"
@@ -668,8 +682,12 @@ def cmd_init(config: MitosConfig, name: Optional[str] = None, force: bool = Fals
                 "# or drop a project-specific key on the line below to override it.\n"
                 "# Get one: https://aistudio.google.com/app/apikey\n"
                 "GEMINI_API_KEY=\n\n"
-                "# Anthropic (Claude) API key — OPTIONAL. Only used by\n"
-                "# `mitos import --llm-extract` to convert legacy prose ADRs.\n"
+                "# Anthropic (Claude) API key — OPTIONAL, but recommended. It runs\n"
+                "# the contradiction check (`mitos check -p .`) and the conflict\n"
+                "# notice at sync, and it arms the commit gate\n"
+                "# (`mitos hook-install -p .`). Without it no pair is judged and the\n"
+                "# gate stays inactive; mitos still records and searches. The import\n"
+                "# verb's --llm-extract (converting legacy prose ADRs) uses it too.\n"
                 "# Get one: https://console.anthropic.com/settings/keys\n"
                 "ANTHROPIC_API_KEY=\n"
             )
@@ -751,18 +769,30 @@ def cmd_init(config: MitosConfig, name: Optional[str] = None, force: bool = Fals
     #    every verb returns.
     for line in _collection_echo_lines(config, outcome):
         print(line)
+    # 7. Name the commit gate, never install it: a stray `init` must not write
+    #    outside its workspace. Git is asked about the directory being
+    #    initialised, not the cwd; `status` keeps a ⚠ row until the gate exists.
+    #    Function-local, 3d's rule: `subprocess` stays off every other verb's path.
+    from mitos import _git
+    if isinstance(_git.locate_repository(config.workspace_dir), _git.GitLocation):
+        print(f"In a git repository: `mitos hook-install -p {outcome.name!r}` installs "
+              f"the commit gate, which holds a commit until a contradiction check "
+              f"is attempted.")
     sys.stdout.flush()
 
 
 def cmd_sync(config: MitosConfig, auto_accept: bool = False, embed_only: bool = False,
-             verbose: bool = False, repair_targets: Optional[List[str]] = None) -> None:
+             verbose: bool = False, repair_targets: Optional[List[str]] = None,
+             full: bool = False) -> None:
     """Synchronizes the decisions write buffer with the graph store.
 
     The report itself is ``perform_sync``'s, so the corpus echo leads its stdout
     report from here. What the handler prints on its own is refusals — the two
-    aborts and the two ``--reconcile-entry`` compositions below — and each carries
+    aborts, the two ``--reconcile-entry`` compositions and ``--full`` with
+    ``--embed-only`` below — and each carries
     its own echo on stderr, because an echo pinned to stdout is invisible to a
-    caller reading the refusal.
+    caller reading the refusal. The one other line is the standing check notice
+    (``check_notice.compose_check_notice``), on stderr after either branch returns.
 
     The shortfall exit is the handler's too: exiting from inside the loop would
     truncate the run before ``render_all`` and the outbox drain, so ``perform_sync``
@@ -777,6 +807,8 @@ def cmd_sync(config: MitosConfig, auto_accept: bool = False, embed_only: bool = 
             means the flag was absent; ``[]`` means it was supplied and named
             nothing, which is a refusal rather than a fallback — the same rule the
             selector follows (``-p ""`` renders, it does not fall back to cwd).
+        full: ``--full`` — the divergence report prints each diverged commentary
+            field whole on both sides instead of its differing span.
     """
     _echo_corpus(config)
     # Refused here rather than at the parser. `add_mutually_exclusive_group` would
@@ -802,14 +834,24 @@ def cmd_sync(config: MitosConfig, auto_accept: bool = False, embed_only: bool = 
                   "diverged buffer entry, as `mitos status` reports it.",
                   file=sys.stderr)
             sys.exit(1)
+    # The same silent no-op, the same register: `--full` changes only what the
+    # reconcile prints, and `--embed-only` never reaches the reconcile.
+    if full and embed_only:
+        sys.stdout.flush()
+        _echo_corpus(config, file=sys.stderr)
+        print("--full shows a full sync's divergence report: --embed-only drains the "
+              "pending embeddings queue and reads no buffer entries. Re-run without "
+              "--embed-only.", file=sys.stderr)
+        sys.exit(1)
     manager = MitosSyncManager(config)
+    shortfall: List[str] = []
     if embed_only:
         manager.drain_pending_embeddings()
     else:
         try:
             shortfall = manager.perform_sync(
                 auto_accept=auto_accept, verbose=verbose,
-                repair_targets=repair_targets,
+                repair_targets=repair_targets, full=full,
             )
         except ParseError as e:
             sys.stdout.flush()
@@ -821,12 +863,19 @@ def cmd_sync(config: MitosConfig, auto_accept: bool = False, embed_only: bool = 
             _echo_corpus(config, file=sys.stderr)
             print(f"Sync Aborted: Validation error.\n{str(e)}", file=sys.stderr)
             sys.exit(1)
-        if shortfall:
-            # 1, matching the verb's two aborts — no new code vocabulary. The
-            # contract binds only the caller who typed the flag; a bare `mitos sync`
-            # returns an empty list and is untouched. This exit prints nothing
-            # itself (the report's lines came from `sync.py`), so it owes no echo.
-            sys.exit(1)
+    # The standing check notice closes both branches, on stderr: stdout is the
+    # sync's own report, and the notice is not its result. Before the shortfall
+    # exit, so a failed repair still shows it. It carries its own recovery clause
+    # because nothing else on this output names `mitos check`.
+    _print_check_notice(config, compose_check_notice(
+        config, read_attempt=read_last_attempt, get_node=manager.store.get_node
+    ))
+    if shortfall:
+        # 1, matching the verb's two aborts — no new code vocabulary. The
+        # contract binds only the caller who typed the flag; a bare `mitos sync`
+        # returns an empty list and is untouched. This exit prints nothing
+        # itself (the report's lines came from `sync.py`), so it owes no echo.
+        sys.exit(1)
 
 
 def cmd_reconcile(config: MitosConfig, as_json: bool = False) -> int:
@@ -843,7 +892,8 @@ def cmd_reconcile(config: MitosConfig, as_json: bool = False) -> int:
         as_json: Whether to emit the result as a JSON object.
 
     Returns:
-        Process exit code (0 on success, 1 if Qdrant/embedding provider is down).
+        Process exit code (0 on success, 1 if Qdrant is down). An absent
+        or failing embedding provider is reported as a warning and still exits 0.
     """
     manager = MitosSyncManager(config)
     # Ahead of the call, not ahead of the report: `reconcile_embeddings` writes its
@@ -854,7 +904,7 @@ def cmd_reconcile(config: MitosConfig, as_json: bool = False) -> int:
     try:
         result = manager.reconcile_embeddings()
     except VectorStoreError as e:
-        msg = f"Reconcile unavailable — Qdrant or embedding provider down: {str(e)}"
+        msg = f"Reconcile unavailable — Qdrant down: {str(e)}"
         if as_json:
             print(json.dumps({"error": msg, **corpus_provenance(config)}))
         else:
@@ -946,13 +996,22 @@ def _retired_handle(store: GraphStore, slug: str) -> Optional[Dict[str, Any]]:
         slug: The slug of the superseded-filtered match.
 
     Returns:
-        The retired-handle dict, or ``None`` if the slug does not resolve.
+        The retired-handle dict, or ``None`` if the slug does not resolve or names
+        no decision (a superseded open question is not a retired precedent).
     """
     try:
         node_ids = store.resolve_slug(slug)
     except Exception:
         return None
     if not node_ids:
+        return None
+    # A retired open question is not a retired precedent: only a slug that names a
+    # decision is offered (a `supersedes` lineage is same-kind, so "any decision"
+    # never keeps a mixed handle).
+    try:
+        if "decision" not in store.resolve_slug_kinds(slug):
+            return None
+    except Exception:
         return None
     node_id = node_ids[0]
     try:
@@ -969,10 +1028,19 @@ def _retired_handle(store: GraphStore, slug: str) -> Optional[Dict[str, Any]]:
     return handle
 
 
+def _rank_thinned(rank: int, full_top: Optional[int]) -> bool:
+    """Says whether the hit at 1-based ``rank`` among returned decisions is thinned.
+
+    The rule ``mcp_server._rank_thinned`` applies on the other boundary.
+    """
+    return full_top is not None and rank > full_top
+
+
 def _emit_lexical_degraded(config: MitosConfig, query: str, *, reason: str,
                            store: Optional[GraphStore], as_json: bool,
-                           brief: bool, limit: Optional[int],
-                           open_questions: Optional[List[Dict[str, Any]]] = None) -> None:
+                           full_top: Optional[int], limit: Optional[int],
+                           open_questions: Optional[List[Dict[str, Any]]] = None,
+                           check_notice: Optional[Dict[str, Any]] = None) -> None:
     """Runs the deterministic lexical fallback and renders it on the CLI.
 
     The shared degraded exit for ``surface``/``query`` (ADR
@@ -989,19 +1057,33 @@ def _emit_lexical_degraded(config: MitosConfig, query: str, *, reason: str,
         store: A readable graph store for active-filtering + modifier stamps,
             or None when the graph itself is down (pre-V1a).
         as_json: Emit the degraded JSON envelope instead of text.
-        brief: Omit ``rejected_paths`` from each match.
+        full_top: How many top matches keep ``rejected_paths`` (None ⇒ all, 0 ⇒
+            none — the verb's ``--brief``). A thinned answer says so by
+            ``rejected_paths_withheld`` and a note clause, on both encodings.
         limit: Max matches; None ⇒ the lexical default.
         open_questions: An already-computed scoped parked-OQ list to carry on
             the envelope (present-if-scanned semantics — None means omitted).
+        check_notice: The standing check notice ``cmd_surface`` composed: the key
+            on JSON, the line plus its recovery clause last on text. None
+            (``cmd_query`` always) means omitted.
     """
     envelope = lexical_fallback(
         query, corpus_paths=_corpus_files(config), reason=reason, store=store,
-        limit=limit, brief=brief,
+        limit=limit, full_top=full_top,
     )
     envelope["query"] = query
     envelope.update(corpus_provenance(config))
+    # Before the `as_json` split, so the printed note and the envelope's agree.
+    withheld = count_withheld(envelope["matches"])
+    if withheld:
+        envelope["note"] = (
+            f"{envelope['note']} {withheld_clause(withheld, surface='cli', config=config)}"
+        )
+        envelope["rejected_paths_withheld"] = withheld
     if open_questions is not None:
         envelope["open_questions"] = open_questions
+    if check_notice is not None:
+        envelope["check_notice"] = check_notice
     if as_json:
         _emit_json(envelope)
         return
@@ -1020,11 +1102,12 @@ def _emit_lexical_degraded(config: MitosConfig, query: str, *, reason: str,
         print()
     for oq in envelope.get("open_questions", []):
         print(f"[open question in scope] {oq['topic']}")
+    _print_check_notice(config, check_notice)
 
 
 def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
               as_json: bool = False, brief: bool = False,
-              limit: Optional[int] = None) -> None:
+              limit: Optional[int] = None, full_top: Optional[int] = None) -> None:
     """Queries the vector store semantically for similar decisions — the CLI twin
     of the MCP ``query_decisions`` tool's *ranked* branch.
 
@@ -1046,10 +1129,16 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         depth: The retrieval depth; v0.1 enforces ``letter``.
         as_json: Emit the machine-readable ranked JSON envelope instead of text.
         brief: Omit ``rejected_paths`` (axiom-only) — never sheds a modifier stamp.
+            The same as ``full_top=0``; argparse refuses the two together.
         limit: Ranked top-k to retrieve; ``None`` ⇒ the default 5. SETS the count
             (raises or lowers it), clamped to ``[1, RANKED_LIMIT_CEILING]`` — not a
             ``min(default, N)`` truncation.
+        full_top: Keep ``rejected_paths`` on ranks 1..N among the returned
+            decisions only; None ⇒ every rank whole.
     """
+    # One effective depth value from here down: `brief` is `full_top=0`.
+    if brief:
+        full_top = 0
     if depth != "letter":
         msg = f"Depth mode '{depth}' is not yet implemented in v0.1 (Letter-only retrieval)."
         if as_json:
@@ -1061,21 +1150,28 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
             return
         raise ValueError(msg)
 
+    # No standing check notice on any exit of this verb, deliberately (vision §4.3):
+    # `surface` is the read put before a write and carries it; a second telemetry
+    # read on this hotter loop buys nothing. Parity pressure is not a reason to add
+    # one — `query_decisions` is silent for the same reason.
+    #
     # A pre-V1a graph raises at store construction — the SQLite graph is unusable,
     # so the fallback parses the markdown corpus directly and must not touch the graph.
     try:
         manager = MitosSyncManager(config)
     except Exception as e:
         _emit_lexical_degraded(
-            config, query_text, reason=degraded_reason_from_error(e),
-            store=None, as_json=as_json, brief=brief, limit=limit,
+            config, query_text, reason=degraded_reason_from_error(
+                e, surface="cli", project=config.project),
+            store=None, as_json=as_json, full_top=full_top, limit=limit,
         )
         return
 
     if not manager.embed_provider or not manager.vector_store:
         _emit_lexical_degraded(
-            config, query_text, reason=degraded_reason_from_error(None),
-            store=manager.store, as_json=as_json, brief=brief, limit=limit,
+            config, query_text, reason=degraded_reason_from_error(
+                None, surface="cli", project=config.project),
+            store=manager.store, as_json=as_json, full_top=full_top, limit=limit,
         )
         return
 
@@ -1085,10 +1181,16 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
     # comment gives below: that arm constructs the empty result rather than falling
     # through, so a `top_score` bound inside the loop would be an unbound local on
     # exactly the state (empty graph + absent collection) nobody reaches by hand.
+    # `lever` for the same reason: that arm falls through to the assessment below.
     top_score: Optional[float] = None
+    lever = None
     try:
         q_vector = manager.embed_provider.get_embedding(query_text, is_query=True)
         raw_matches = manager.vector_store.query(q_vector, limit=top_k)
+        # `raw_matches`, not `matches`: the lever reads retrieval depth, and
+        # `matches` below is the surfaced list.
+        lever = window_lever(points=len(raw_matches), limit=top_k,
+                             ceiling=RANKED_LIMIT_CEILING, full_top=full_top)
 
         # Filter superseded first, then stamp + Letter — mirrors the ranked loop in
         # mcp_server.query_decisions byte-for-byte (T4 parity). A superseded-not-reused
@@ -1104,15 +1206,21 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
                 if handle:
                     retired.append(handle)
                 continue
+            if node["kind"] != "decision":
+                # An open question: never embedding-ranked (C4), not retired —
+                # skipped before the band sees its score.
+                continue
             node_state = store.get_node_state(node["id"])
             if node_state not in ("active", "drifted"):
                 handle = _retired_handle(store, m["slug"])
                 if handle:
                     retired.append(handle)
                 continue
+            # Rank among the decisions returned, at append time — never the index
+            # into `raw_matches`, whose skipped entries consume no rank.
             match = letter_payload(
                 node,
-                brief=brief,
+                brief=_rank_thinned(len(matches) + 1, full_top),
                 extras={"state": node_state, "score": m["score"], "depth_mode": "letter"},
             )
             match.update(store.get_modifiers(node["id"]))
@@ -1133,8 +1241,9 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         # graph + absent collection) nobody reaches by hand.
         if missing_index_is_a_gap(store):
             _emit_lexical_degraded(
-                config, query_text, reason=degraded_reason_from_error(e),
-                store=store, as_json=as_json, brief=brief, limit=limit,
+                config, query_text, reason=degraded_reason_from_error(
+                    e, surface="cli", project=config.project),
+                store=store, as_json=as_json, full_top=full_top, limit=limit,
             )
             return
         matches = []
@@ -1143,8 +1252,9 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         # Embedding/Qdrant failure mid-query (e.g. a 429): never the raw
         # provider blob — one calm cause line + the deterministic fallback.
         _emit_lexical_degraded(
-            config, query_text, reason=degraded_reason_from_error(e),
-            store=store, as_json=as_json, brief=brief, limit=limit,
+            config, query_text, reason=degraded_reason_from_error(
+                e, surface="cli", project=config.project),
+            store=store, as_json=as_json, full_top=full_top, limit=limit,
         )
         return
 
@@ -1174,7 +1284,14 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         result_count=len(matches),
         config=config,
         surface="cli",
+        lever=lever,
     )
+    # A thinned answer says so, on both encodings: the clause joins the local note
+    # the text render prints and the envelope carries. The blackout and unbuilt
+    # overrides below need zero matches, so neither can co-occur with a count.
+    withheld = count_withheld(matches)
+    if withheld:
+        note = f"{note} {withheld_clause(withheld, surface='cli', config=config)}"
 
     # Build the per-match list once, then branch the two renderings over it.
     if as_json:
@@ -1193,6 +1310,8 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
             envelope["note"] = blackout_note(retired)
         if unbuilt:
             envelope["note"] = missing_graph_note("cli", config)
+        if withheld:
+            envelope["rejected_paths_withheld"] = withheld
         _emit_json(envelope)
         return
 
@@ -1311,11 +1430,13 @@ def _coherence_audit_hint(config: MitosConfig) -> str:
     """Composes the CLI's coherence-audit recovery clause — this boundary's alone.
 
     The *fact* (a standing, corpus-wide contradiction-check debt) lives once, on
-    ``sync._COHERENCE_AUDIT_NOTE``, and reaches all three encodings on the shared
-    receipt dict. Only the *recovery* is composed here, for the same reason
-    :func:`_show_not_found_hint` is: MCP may name no shell command (an agent handed
-    one runs it), the CLI reader's actual repair *is* ``mitos check``, and a shared
-    body could only be the intersection — which is empty of recovery.
+    the receipt's ``coherence_audit`` field, composed in ``sync`` (the counted
+    line, or ``_COHERENCE_AUDIT_NOTE`` when the count cannot be read), and reaches
+    all three encodings on the shared receipt dict. Only the *recovery* is
+    composed here, for the same reason :func:`_show_not_found_hint` is: MCP may
+    name no shell command (an agent handed one runs it), the CLI reader's actual
+    repair *is* ``mitos check``, and a shared body could only be the intersection
+    — which is empty of recovery.
 
     It names the selector because a bare ``mitos check`` has had no target since the
     0.15.0 flip, and it renders ``config.project`` through ``repr`` for the reason
@@ -1337,6 +1458,48 @@ def _coherence_audit_hint(config: MitosConfig) -> str:
         The recovery sentence, naming ``mitos check`` exactly once.
     """
     return f"The audit is `mitos check -p {config.project!r}` — one pass, whole corpus."
+
+
+def _print_check_notice(config: MitosConfig, notice: Optional[Mapping[str, Any]]) -> None:
+    """Prints the standing check notice, when one is shown, on a CLI text exit.
+
+    The one print site for ``mitos sync`` and every ``surface`` text exit: stdout
+    is flushed first, so the notice lands after the answer it rides, then the line
+    and :func:`_check_notice_recovery`'s clause go to stderr. Prints nothing for
+    ``None``.
+
+    Args:
+        config: The resolved workspace config, for the recovery clause.
+        notice: The composed ``check_notice`` payload, or None.
+    """
+    if not notice:
+        return
+    sys.stdout.flush()
+    print(f"\n{notice['line']}{_check_notice_recovery(config, notice)}", file=sys.stderr)
+
+
+def _check_notice_recovery(config: MitosConfig, notice: Mapping[str, Any]) -> str:
+    """Composes the CLI's recovery clause for the standing check notice.
+
+    The notice's line (``check_notice.check_notice_line``) states what the last
+    check did and names no command, because MCP shares it. This is the CLI's own
+    addition, appended where no other line already carries the recipe: on
+    ``mitos sync``, not on the ``created`` receipt, whose coherence line names
+    ``mitos check`` once. A refused spend names a person at a terminal, never the
+    waiver flag. The command is the running build and the selector is
+    ``config.project`` through ``repr``.
+
+    Args:
+        config: The resolved workspace config, carrying ``project``.
+        notice: The ``check_notice`` payload; only its ``state`` is read.
+
+    Returns:
+        The clause, with a leading space and its own terminal punctuation.
+    """
+    recipe = f"`{_running_mitos_command()} check -p {config.project!r}`"
+    if notice.get("state") == ATTEMPT_SPEND_NOT_AUTHORIZED:
+        return f" A person runs {recipe} at a terminal and confirms the prompt."
+    return f" {recipe} attempts it again."
 
 
 def cmd_show(config: MitosConfig, ident: str, as_json: bool = False) -> None:
@@ -1391,8 +1554,10 @@ def cmd_show(config: MitosConfig, ident: str, as_json: bool = False) -> None:
         print(f"Node with ID or Slug '{ident}' not found — {hint}.")
         return
 
-    # Compute current active/superseded state (single-node V1a derivation, 8a)
-    state = store.get_node_state(node["id"])
+    # Compute the node's state in its own kind's vocabulary — the kind-aware read
+    # `show_node` calls too, so an open question reads parked/resolved (or a kill
+    # state) on both surfaces, as it does on the record receipt's echo.
+    state = store.get_handle_state(node["id"])
 
     # One stamp source for both the text and the --json branch (kind-agnostic — an OQ
     # carries only amended_by/narrowed_by). A superseded show that omits its modifier
@@ -1450,6 +1615,7 @@ def cmd_show(config: MitosConfig, ident: str, as_json: bool = False) -> None:
         if node.get("context"):
             print(f"Context:      {node['context']}")
     else:
+        print(f"Topic:        {node['topic']}")
         print(f"Park Reason:  {node.get('park_reason') or 'None'}")
         print("Questions Raised:")
         for q in node["questions_raised"]:
@@ -1522,14 +1688,19 @@ def cmd_list(config: MitosConfig, scope: Optional[str] = None,
         )
 
     if as_json:
-        payload = {
+        payload: Dict[str, Any] = {
             "decisions": [_list_item(d) for d in decisions],
             "open_questions": [_oq_payload(oq) for oq in parked],
             "total": len(decisions),
             "scope": scope,
             "state": effective_state,
-            **corpus_provenance(config),
         }
+        # The brief and oneline tiers withhold the field on every decision; the count
+        # says so (no clause: list has no note). Absent at zero, before provenance.
+        withheld = count_withheld(payload["decisions"])
+        if withheld:
+            payload["rejected_paths_withheld"] = withheld
+        payload.update(corpus_provenance(config))
         if recovery:
             payload["scope_known"] = False
             payload["scope_recovery"] = recovery["note"]
@@ -1827,6 +1998,82 @@ def cmd_render(config: MitosConfig, scope: Optional[str] = None, render_format: 
         print(f"  - {path}")
 
 
+# The text pause's terminal preview of a neighbour's rejected_paths, in characters.
+# The axiom prints whole (it is what the author judges by); a longer rejected_paths
+# is cut here and the cut is named, with a recipe for the whole field. The --json
+# and MCP payloads carry both fields whole.
+_PAUSE_REJECTED_PREVIEW = 80
+
+
+# The indent of an edge's second and later lines: under the first edge's text,
+# past the `  Edges:     ` label column.
+_EDGE_LINE_INDENT = " " * 13
+
+
+def _edge_echo_lines(edges: List[Dict[str, Any]]) -> List[str]:
+    """Renders the `created` receipt's ``edges_created`` echo as text lines (B4).
+
+    One line per edge carries its kind, target, the target's state and each
+    modifier stamp with the slugs it names. An acting relation adds an indented
+    line with the target's whole axiom (``resolves`` its topic), every line of it
+    indented, because this is where a human spots a mis-aimed slug. A target key
+    that is ``None`` could not be read and says so in words. No recipe rides: these
+    are receipt lines.
+
+    Args:
+        edges: The ``edges_created`` entries (possibly empty).
+
+    Returns:
+        The lines, without trailing newlines; the first begins ``  Edges:``.
+    """
+    lines: List[str] = []
+    for i, e in enumerate(edges):
+        label = "  Edges:     " if i == 0 else _EDGE_LINE_INDENT
+        state = e.get("target_state")
+        if state is None:
+            status = "state could not be read"
+        else:
+            stamps = e.get("target_stamps") or {}
+            status = "; ".join(
+                [state] + [f"{key.replace('_', ' ')}: {', '.join(slugs)}"
+                           for key, slugs in stamps.items()])
+        lines.append(f"{label}{e['kind']} → {e['target']}  [{status}]")
+        for key, word in (("target_axiom", "axiom"), ("target_topic", "topic")):
+            if key not in e:
+                continue
+            indent = _EDGE_LINE_INDENT + "  "
+            if e[key] is None:
+                lines.append(f"{indent}{word} could not be read")
+            else:
+                text = f"\n{indent}".join(e[key].splitlines())
+                lines.append(f"{indent}{word}: {text}")
+    return lines
+
+
+def _acknowledged_line(value: Optional[List[str]]) -> str:
+    """Renders the `created` receipt's ``acknowledged_neighbors`` as one line (F10).
+
+    The key is there only when the record passed ``--acknowledge-neighbors``, and a
+    slug is listed for a pause the caller saw and for a flag passed blind alike, so
+    no form says the caller looked at anything. ``None`` means the gather could not
+    run and must not read as an empty list.
+
+    Args:
+        value: The key's value: slugs, ``[]``, or ``None``.
+
+    Returns:
+        The receipt line, without a trailing newline.
+    """
+    floor = f"{_NEIGHBOR_REVIEW_THRESHOLD:.2f}"
+    if value is None:
+        return ("  Acknowledged: unknown — the neighbours this record went past "
+                "could not be gathered")
+    if not value:
+        return f"  Acknowledged: no unlinked decision at or above {floor} similarity"
+    return (f"  Acknowledged: {', '.join(value)} — the unlinked decisions at or above "
+            f"{floor} similarity this record went past")
+
+
 def cmd_record(
     config: MitosConfig,
     axiom: str,
@@ -1846,6 +2093,7 @@ def cmd_record(
     *,
     slug: str,
     acknowledge_neighbors: bool = False,
+    draft_digest: Optional[str] = None,
     as_json: bool = False,
 ) -> None:
     """Records a decision directly to the write-buffer and graph (thin wrapper).
@@ -1881,6 +2129,7 @@ def cmd_record(
         cites=cites,
         slug=slug,
         acknowledge_neighbors=acknowledge_neighbors,
+        draft_digest=draft_digest,
     )
 
     if as_json:
@@ -1888,7 +2137,9 @@ def cmd_record(
         # The receipt is already the structured dict — emit it verbatim, no reshaping
         # (the pause's `neighbors` is a stamped decision-read surface: each entry is
         # the enriched candidate_payload, modifier stamps included; the created
-        # receipt's write-facts stay unstamped write results). scope_overflow, when
+        # receipt's `edges_created` is a stamped identification echo — each target's
+        # state and stamps, and its whole axiom on an acting relation, never its
+        # reasoning). scope_overflow, when
         # present, is already inside `result`. The one addition is the trailing
         # provenance, naming the corpus the write landed in — stamped here at the
         # boundary, never inside `record_decision_entry`, so the buffer-first +
@@ -1915,7 +2166,9 @@ def cmd_record(
         # rejected_paths, scope, modifier stamps) so the author can judge and link
         # without a dereference round-trip. Enrichment keys via .get(): production
         # always sends the full candidate_payload shape, but leaner dicts reach this
-        # render from canned fixtures.
+        # render from canned fixtures. The header states the floor, as the message
+        # does; the axiom prints whole; a rejected_paths past the preview width says
+        # it was shortened and names the `mitos show` recipe for the whole field.
         #
         # Then the caller's own declared targets, partitioned (A2) — after the
         # neighbour blocks and before the recovery menu. In front of the payload it
@@ -1923,8 +2176,9 @@ def cmd_record(
         # tenability from; the sentences are `_declared_echo_lines` over this same
         # dict's keys, so this render and the two machine encodings cannot disagree.
         _echo_corpus(config, file=sys.stderr)
-        print(f"⚠ Paused — '{result['slug']}' looks like an existing decision. Nothing written.",
-              file=sys.stderr)
+        print(f"⚠ Paused — '{result['slug']}' is ≥{_NEIGHBOR_REVIEW_THRESHOLD:.2f} "
+              f"similar to {len(result.get('neighbors', []))} existing decision(s) you "
+              "did not reference. Nothing written.", file=sys.stderr)
         for n in result.get("neighbors", []):
             score = n.get("score")
             score_s = f"{score:.2f}" if isinstance(score, (int, float)) else "?"
@@ -1933,10 +2187,18 @@ def cmd_record(
                 for key in ("amended_by", "narrowed_by") if n.get(key))
             print(f"  ↔ {n['slug']}  ({score_s}){stamps}", file=sys.stderr)
             if n.get("axiom"):
-                print(f"      {truncate_words(n['axiom'], 60)}", file=sys.stderr)
-            if n.get("rejected_paths"):
-                print(f"      rejected: {truncate_words(n['rejected_paths'], 80)}",
+                axiom = "\n      ".join(n["axiom"].splitlines())
+                print(f"      {axiom}", file=sys.stderr)
+            rejected = n.get("rejected_paths")
+            if rejected and len(rejected) > _PAUSE_REJECTED_PREVIEW:
+                print(f"      rejected (shortened): "
+                      f"{truncate_words(rejected, _PAUSE_REJECTED_PREVIEW)}",
                       file=sys.stderr)
+                print(f"      read it whole with "
+                      f"`mitos show -p {config.project!r} -- {n['slug']!r}`",
+                      file=sys.stderr)
+            elif rejected:
+                print(f"      rejected: {rejected}", file=sys.stderr)
             if n.get("scope"):
                 print(f"      scope: {', '.join(n['scope'])}", file=sys.stderr)
         for line in _declared_echo_lines(result):
@@ -1948,6 +2210,9 @@ def cmd_record(
               "<slug> at any neighbour this decision relates to, "
               "--acknowledge-neighbors for neighbours that stand independently — or "
               "both at once for a mixed set.", file=sys.stderr)
+        # The message's held clause without its digest half: this render carries no
+        # draft_digest, and pointing at a key the reader cannot see would be false.
+        print(f"  → {PAUSE_HELD_CLAUSE}.", file=sys.stderr)
         sys.exit(2)
 
     # The "exists" short-circuit writes nothing, so it must not borrow the
@@ -1956,8 +2221,10 @@ def cmd_record(
     # exists to prevent, on the write itself rather than on the review.
     _echo_corpus(config)
     no_op = result.get("no_op_reason")
+    # Branched on the key, but the dict's text is never printed: it is MCP-worded, and
+    # this boundary composes its own recovery below (`_exists_recovery_lines`).
     if no_op:
-        print(f"Decision '{result['slug']}' {no_op}")
+        print(f"Decision '{result['slug']}' {EXISTS_NO_OP_FACT}")
     else:
         print(f"Recorded decision '{result['slug']}' ({result['status']}) ✓")
     print(f"  ID:        {result['id']}")
@@ -1983,19 +2250,36 @@ def cmd_record(
         # AX round 10's ask, verbatim: *say what it ignored*. Named BEFORE the handle
         # line, because on a no-op this is the actionable part of the receipt.
         print(f"  Ignored:   this call carried different {', '.join(differs)} than the "
-              f"graph holds — run `mitos sync` to reconcile the entry in decisions.md.")
+              f"graph holds — nothing was saved; see below.")
+    if no_op:
+        for line in _exists_recovery_lines(result, config):
+            print(line)
     print(f"  Handle:    '{result['slug']}' — pass this to --supersedes/--amends/--depends-on/… to link future decisions.")
-    # Write facts read back from the committed node (NOT an echo of the flags):
-    # the edges the commit actually wired, and scope/mechanisms as stored. Lines
-    # are omitted when empty — a bare decision keeps a bare receipt.
-    edges = result.get("edges_created")
-    if edges:
-        edges_s = ", ".join(f"{e['kind']} → {e['target']}" for e in edges)
-        print(f"  Edges:     {edges_s}")
+    # Read back from the committed node (NOT an echo of the flags): the edges the
+    # commit actually wired, each naming what it hit, scope as stored, and
+    # mechanisms as authored in decisions.md, followed by the fold line when the
+    # identity fold changed any of them. Lines are omitted when empty — a bare
+    # decision keeps a bare receipt.
+    # Keyed on presence for the unknown line: this tail is shared with the
+    # `exists` exit, which carries no `edges_created` at all; only a created
+    # receipt's None means the edges could not be read back.
+    if "edges_created" in result and result["edges_created"] is None:
+        print("  Edges:     unknown — the edges this record wired could not be read back")
+    for line in _edge_echo_lines(result.get("edges_created") or []):
+        print(line)
     if result.get("scope"):
         print(f"  Scope:     {', '.join(result['scope'])}")
     if result.get("mechanisms"):
         print(f"  Mechanisms: {', '.join(result['mechanisms'])}")
+    # Keyed on truthiness, not presence: `{}` rides every created receipt and
+    # means nothing folded, so it prints nothing.
+    folds = result.get("mechanisms_normalized")
+    if folds:
+        folds_s = ", ".join(f"{a} → {c}" for a, c in folds.items())
+        print(f"  Folded:     {folds_s} (the form the graph holds)")
+    # Keyed on presence: [] and None are both answers, only the flag's absence isn't.
+    if "acknowledged_neighbors" in result:
+        print(_acknowledged_line(result["acknowledged_neighbors"]))
     # Debounced size-ceiling nudge — AFTER the receipt, on stderr (an ancillary health
     # hint, never the receipt itself), so a healthy growing corpus can't bury "Recorded ✓".
     # Flush stdout first so the receipt lands before the nudge even when stdout is piped
@@ -2004,6 +2288,10 @@ def cmd_record(
     if overflow:
         sys.stdout.flush()
         print(f"\n{overflow}", file=sys.stderr)
+        # The shared string names no command (it reaches MCP verbatim); the text
+        # surface adds the recipe. `config.project` is never None here.
+        print(f"  Per-file breakdown: `mitos status -p {config.project!r}`",
+              file=sys.stderr)
     # Degraded-check notice — same post-receipt stderr shape: the commit succeeded,
     # but the near-dup review could not run, and silence would read as "checked, clean".
     review_notice = result.get("neighbor_review_unavailable")
@@ -2015,12 +2303,20 @@ def cmd_record(
     if rotated and rotated.get("outcome") == ROTATION_FAILED:
         sys.stdout.flush()
         print(f"\n{_rotation_failure_line(config, rotated)}", file=sys.stderr)
-    # The standing coherence debt, last — so it reads as the answer to the notice
-    # above it, which after the split carries no recovery of its own. Gated on the
+    # The standing check notice: the last contradiction check's outcome, `created`
+    # only (sync sets the key on that return alone). No recovery clause here: the
+    # coherence line below names `mitos check` once, and this line sits directly
+    # above it so the one recipe answers both.
+    check_notice = result.get("check_notice")
+    if check_notice:
+        sys.stdout.flush()
+        print(f"\n{check_notice['line']}", file=sys.stderr)
+    # The standing coherence debt, last — so it reads as the answer to the notices
+    # above it, which after the split carry no recovery of their own. Gated on the
     # FIELD, which sync sets on the `created` return alone: this text tail is shared
     # with the `exists` exit (it branches only on the headline and the path label),
     # and a no-op incurs no audit debt — an unconditional print would also put a
-    # second recipe on a receipt that already carries the `mitos sync` one. Same
+    # further recipe on a receipt that already carries its own recovery lines. Same
     # flush-first shape as the two riders above; the `--json` branch returned long
     # ago, which is why the recovery clause is text-only by construction rather than
     # by a condition.
@@ -2028,6 +2324,53 @@ def cmd_record(
     if coherence:
         sys.stdout.flush()
         print(f"\n{coherence} {_coherence_audit_hint(config)}", file=sys.stderr)
+
+
+def _cli_flag(flag: str, value: str) -> str:
+    """Renders ``--flag 'value'``, or ``--flag='-value'`` when the value looks like a flag.
+
+    A hand-authored ``### -foo`` keeps its leading dash through the parser, and
+    argparse reads a separate ``-foo`` as an option; the ``=`` form binds it.
+    """
+    return f"{flag}={value!r}" if value.startswith("-") else f"{flag} {value!r}"
+
+
+def _exists_recovery_lines(result: Dict[str, Any], config: MitosConfig) -> List[str]:
+    """Composes the CLI's recovery for an ``exists`` no-op — this boundary's alone.
+
+    The fact is ``EXISTS_NO_OP_FACT``, shared with the dict. The dict's own recovery
+    is MCP-worded (it names the ``amend_commentary`` tool and no command), so this
+    renderer names the selectored recipes the person at the terminal runs (ADR
+    receipt-dict-strings-are-mcp-boundary-so-recovery-splits-per-renderer). The two
+    states the verb cannot reach are conditionals: the receipt does not know which,
+    if either, holds.
+
+    Args:
+        result: The ``exists`` receipt dict.
+        config: The workspace config; its ``project`` selects every recipe.
+
+    Returns:
+        The recovery lines, each indented for the receipt.
+    """
+    project = config.project
+    slug = result["slug"]
+    # The handle leads the flags the reader appends (`--scope` eats every word after
+    # it), and no `--` guards it, so a dash-led slug falls back to the id.
+    handle = result["id"] if slug.startswith("-") else slug
+    return [
+        f"  → To change its commentary: `mitos amend-commentary -p {project!r} {handle!r}` "
+        "with a flag per field (--rejected, --scope, --invalidates-if, --context, "
+        "--new-slug); it edits in place and keeps the id.",
+        "  → Relations are not commentary: edit the relation line in decisions.md, then "
+        f"apply it with `mitos sync -p {project!r} {_cli_flag('--reconcile-entry', slug)}`.",
+        "  → amend-commentary reaches an entry only while its `### ` block is in decisions.md. If "
+        f"the node has no block, `mitos restore-source -p {project!r} "
+        f"{_cli_flag('--slug', slug)}` re-materializes one first; if the entry has "
+        "rotated into decisions/archive/, edit it there, then run "
+        f"`mitos rebuild -p {project!r}`.",
+        "  → To record a changed decision, write a new one with --supersedes or --amends "
+        "naming this slug.",
+    ]
 
 
 def _rotation_receipt_lines(report: Dict[str, Any]) -> List[str]:
@@ -2092,6 +2435,35 @@ def _read_text_arg(inline: Optional[str], file_path: Optional[str]) -> Optional[
     return inline
 
 
+def _read_record_text_arg(inline: Optional[str], file_path: Optional[str], flag: str,
+                          *, as_json: bool) -> Optional[str]:
+    """Reads one of ``record``'s text arguments, refusing an unreadable file with exit 2.
+
+    The ``record`` dispatch's twin of ``_amend_changes_from_args``' guard: the same
+    words and code (``AMEND_CODE_UNREADABLE_FILE``), so an unreadable file is a located
+    usage refusal — one ``{error, code}`` object under ``--json`` — never ``main()``'s
+    bare crash line. Pre-dispatch, so no corpus echo (like ``multiple_stdin_args``).
+
+    Args:
+        inline: The value passed directly on the command line, if any.
+        file_path: A file path to read instead, or ``"-"`` for stdin.
+        flag: The file flag named in the refusal, e.g. ``"--axiom-file"``.
+        as_json: Whether the refusal speaks JSON on stdout.
+
+    Returns:
+        The resolved text, or None if neither source was provided.
+    """
+    try:
+        return _read_text_arg(inline, file_path)
+    except (OSError, UnicodeDecodeError) as exc:
+        msg = f"{flag} could not be read: {exc}"
+        if as_json:
+            _emit_json({"error": msg, "code": AMEND_CODE_UNREADABLE_FILE})
+        else:
+            print(msg, file=sys.stderr)
+        sys.exit(2)
+
+
 def _join_relation_flag(values: Optional[List[str]]) -> Optional[str]:
     """Comma-joins a repeatable relation flag back into the shared string form.
 
@@ -2119,7 +2491,7 @@ def _join_relation_flag(values: Optional[List[str]]) -> Optional[str]:
 
 def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
                 as_json: bool = False, brief: bool = False,
-                limit: Optional[int] = None) -> None:
+                limit: Optional[int] = None, full_top: Optional[int] = None) -> None:
     """Surfaces active decisions relevant to a query — the CLI twin of the MCP
     ``surface_decisions`` tool (the precedent-recall half of Mitos).
 
@@ -2128,7 +2500,7 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     ``scope`` only narrows the parked open questions and the recall note (plus the
     degraded fallback when semantic recall is down). For scope-RESTRICTED retrieval
     use ``mitos list --scope`` — the only surface that hard-filters by scope. (Both
-    surfaces return full ``rejected_paths``; pass ``--brief`` for a lighter scan.)
+    surfaces return full ``rejected_paths``; pass ``--brief`` or ``--full-top`` for a lighter scan.)
 
     Args:
         config: The active workspace configuration.
@@ -2138,25 +2510,47 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
             hard-filter by scope.
         as_json: Emit a machine-readable JSON report (for agents) instead of text.
         brief: Omit ``rejected_paths`` (axiom-only — a quick "anything nearby?" scan).
+            The same as ``full_top=0``; argparse refuses the two together.
         limit: Ranked top-k to retrieve; ``None`` ⇒ the default 5. SETS the count,
             clamped to ``[1, RANKED_LIMIT_CEILING]`` — not a ``min(default, N)`` clamp.
+        full_top: Keep ``rejected_paths`` on ranks 1..N among the returned
+            decisions only; None ⇒ every rank whole.
     """
+    # One effective depth value from here down: `brief` is `full_top=0`.
+    if brief:
+        full_top = 0
     # A pre-V1a graph raises at store construction — the graph is unusable, so
     # the lexical fallback parses decisions.md directly (no graph access).
     try:
         manager = MitosSyncManager(config)
     except Exception as e:
+        # Telemetry does not depend on the graph, so the notice still rides; its
+        # pair handles resolve nothing (whole ids) rather than open a second store
+        # on a path whose graph just failed. Composed in the handler, not the
+        # `try` body, so a raise at this call propagates.
         _emit_lexical_degraded(
-            config, query, reason=degraded_reason_from_error(e),
-            store=None, as_json=as_json, brief=brief, limit=limit,
+            config, query, reason=degraded_reason_from_error(
+                e, surface="cli", project=config.project),
+            store=None, as_json=as_json, full_top=full_top, limit=limit,
+            check_notice=compose_check_notice(
+                config, read_attempt=read_last_attempt, get_node=lambda _id: None
+            ),
         )
         return
 
     store = manager.store
+    # The standing check notice, composed once for every exit below. Outside the
+    # ranked `try` on purpose: the composer is total, so the only raise here is a
+    # defect at this call, and that `except Exception` would render it as
+    # degraded recall on a healthy read. No `try` of its own either — a broken
+    # call must be loud, never a notice that silently stops showing.
+    notice = compose_check_notice(
+        config, read_attempt=read_last_attempt, get_node=store.get_node
+    )
     top_k = clamp_limit(limit)
 
-    def _shape(node, score):
-        d = letter_payload(node, brief=brief, extras={"score": score})
+    def _shape(node, score, thinned):
+        d = letter_payload(node, brief=thinned, extras={"score": score})
         d.update(store.get_modifiers(node["id"]))
         return d
 
@@ -2166,12 +2560,17 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     top_score: Optional[float] = None
     retired: List[Dict[str, Any]] = []
     degraded_error: Optional[Exception] = None
+    lever = None
+    dump_total: Optional[int] = None
 
     if manager.embed_provider and manager.vector_store:
         try:
             q_vector = manager.embed_provider.get_embedding(query, is_query=True)
             matches = manager.vector_store.query(q_vector, limit=top_k)
             semantic_ran = True
+            # Raw points, not surfaced decisions: the lever reads retrieval depth.
+            lever = window_lever(points=len(matches), limit=top_k,
+                                 ceiling=RANKED_LIMIT_CEILING, full_top=full_top)
             for m in matches:
                 node = store.get_node_by_slug(m["slug"])
                 if not node:
@@ -2179,13 +2578,21 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
                     if handle:
                         retired.append(handle)
                     continue
+                if node["kind"] != "decision":
+                    # An open question: never embedding-ranked (C4), not retired.
+                    continue
                 state = store.get_node_state(node["id"])
                 if state not in ("active", "drifted"):
                     handle = _retired_handle(store, m["slug"])
                     if handle:
                         retired.append(handle)
                     continue
-                results["active_decisions"].append(_shape(node, m["score"]))
+                # Rank among the decisions returned, at append time — never the
+                # index into `matches`, whose skipped entries consume no rank.
+                rank = len(results["active_decisions"]) + 1
+                results["active_decisions"].append(
+                    _shape(node, m["score"], _rank_thinned(rank, full_top))
+                )
                 if top_score is None or m["score"] > top_score:
                     top_score = m["score"]
         except CollectionMissingError as e:
@@ -2206,10 +2613,21 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     # semantic run that found nothing must not masquerade as an unranked scope dump.
     if not semantic_ran and not results["active_decisions"] and scope:
         try:
-            for d in store.get_active_decisions(scope=scope)[:5]:
-                results["active_decisions"].append(_shape(d, 1.0))
+            active_decs = store.get_active_decisions(scope=scope)
+            dump_total = len(active_decs)
+            for d in active_decs[:top_k]:
+                rank = len(results["active_decisions"]) + 1
+                results["active_decisions"].append(
+                    _shape(d, 1.0, _rank_thinned(rank, full_top))
+                )
         except Exception:
             pass
+
+    # The degraded cause, computed once and handed to both the lexical exit's header
+    # and the scope-dump / partial-list note, so the two cannot name different causes.
+    reason = (degraded_reason_from_error(degraded_error, surface="cli",
+                                         project=config.project)
+              if not semantic_ran else None)
 
     # Open questions only when a scope was given (absent = not scanned, [] = none here).
     if scope:
@@ -2232,9 +2650,10 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     # survived) rides along on the degraded output.
     if not semantic_ran and not results["active_decisions"]:
         _emit_lexical_degraded(
-            config, query, reason=degraded_reason_from_error(degraded_error),
-            store=store, as_json=as_json, brief=brief, limit=limit,
+            config, query, reason=reason,
+            store=store, as_json=as_json, full_top=full_top, limit=limit,
             open_questions=results.get("open_questions"),
+            check_notice=notice,
         )
         return
 
@@ -2255,6 +2674,9 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         scope=scope,
         scope_counts=scope_counts,
         surface="cli",
+        lever=lever,
+        scope_total=dump_total,
+        degraded_reason=reason,
     )
     if confidence is not None:
         results["confidence"] = confidence
@@ -2282,6 +2704,18 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         results["note"] = missing_graph_note("cli", config)
         note = results["note"]
 
+    # A thinned answer says so by a count and a clause, after every note override
+    # (they need zero hits) and before the notice; the printed note follows.
+    withheld = count_withheld(results["active_decisions"])
+    if withheld:
+        results["note"] = f"{note} {withheld_clause(withheld, surface='cli', config=config)}"
+        note = results["note"]
+        results["rejected_paths_withheld"] = withheld
+
+    # After the recall answer's own keys; absent (never null) when not shown.
+    if notice:
+        results["check_notice"] = notice
+
     if as_json:
         _emit_json(results)
         return
@@ -2299,6 +2733,7 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
             print(provenance_line(config))
             print(f"No active precedents found for: '{query}'{scope_note}")
         print(f"→ {note}")
+        _print_check_notice(config, notice)
         return
     print(f"\nPrecedents for: '{query}'" + (f"  (scope: {scope})" if scope else "")
           + f"  [{provenance_line(config)}]")
@@ -2324,6 +2759,7 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         if marker:
             print(f"   {marker}")
     print(f"\n→ {note}")
+    _print_check_notice(config, notice)
 
 
 def cmd_serve() -> None:
@@ -2930,6 +3366,200 @@ def _skill_md_state(mitos_dir: str) -> str:
     return "differs"
 
 
+# The commit gate row's states, first match wins: the `commit_gate.state` token on
+# `status --json`. A payload contract, additive-only from the day it shipped, so a
+# row pins this tuple's exact value and that the renderer covers exactly it.
+_COMMIT_GATE_STATES: Tuple[str, ...] = (
+    "git_unavailable", "outside_work_tree", "keyless", "no_hook", "unreadable",
+    "foreign", "foreign_with_block", "installed",
+)
+# `classify_hook_file`'s kinds → the row's state. Spelled from the constants.
+_COMMIT_GATE_STATE_OF_KIND: Dict[str, str] = {
+    HOOK_ABSENT: "no_hook",
+    HOOK_UNREADABLE: "unreadable",
+    HOOK_FOREIGN: "foreign",
+    HOOK_FOREIGN_WITH_BLOCK: "foreign_with_block",
+    HOOK_OURS: "installed",
+}
+# The glyph and headline for each state, formatted from the row's own keys. The
+# `installed` glyph turns ⚠ when the hook does not serve this workspace. Never ✗:
+# the row is informational and blocks nothing, and ✗ means a real blocker.
+_COMMIT_GATE_WORDS: Dict[str, Tuple[str, str]] = {
+    "git_unavailable": ("—", "git was not found, so status cannot tell whether a "
+                             "repository holds this workspace"),
+    "outside_work_tree": ("—", "this workspace is not inside a git work tree"),
+    "keyless": ("—", "inactive: no judge key (ANTHROPIC_API_KEY) is configured, so "
+                     "no commit is gated"),
+    "no_hook": ("⚠", "no pre-commit in {hooks_dir}"),
+    "unreadable": ("⚠", "{hook_file} could not be read, so status cannot tell what "
+                        "it runs"),
+    "foreign": ("⚠", "{hook_file} exists; mitos did not write it, and it does not "
+                     "carry the gate block's marker"),
+    "foreign_with_block": ("•", "{hook_file} carries the pasted gate block's marker; "
+                                "mitos did not write the file, and the marker is all "
+                                "status checked"),
+    "installed": ("✓", "installed at {hook_file}"),
+}
+_COMMIT_GATE_KEYS: Tuple[str, ...] = (
+    "state", "hooks_dir", "hooks_dir_shared", "hook_file", "serves",
+    "serves_this_workspace", "last_attempt_status", "last_attempt", "debt_status",
+    "uncovered", "excluded",
+)
+
+
+def _commit_gate_row(config: MitosConfig) -> Dict[str, Any]:
+    """Reads what stands between this workspace's commits and its gate, as ``status --json``'s ``commit_gate``.
+
+    Git first, then the key, then the hook file: the more basic truth wins, and
+    no store is opened before the key test passes (keyless reads identically
+    with or without a hook). Telemetry and the graph are read only for a hook
+    mitos wrote. Every reader is total on file faults, so nothing here catches:
+    a programming error propagates rather than becoming a quietly wrong row.
+
+    Args:
+        config: The workspace's config; git is asked from its directory.
+
+    Returns:
+        The row, with every key of ``_COMMIT_GATE_KEYS`` in every state. A key
+        the row never reached is ``None``.
+    """
+    # Function-local, 3d's rule: `subprocess` stays off every other verb's path.
+    from mitos import _git
+
+    row: Dict[str, Any] = dict.fromkeys(_COMMIT_GATE_KEYS)
+    location = _git.locate_repository(config.workspace_dir)
+    if isinstance(location, _git.NotAWorkTree):
+        row["state"] = {_git.REASON_GIT_UNAVAILABLE: "git_unavailable",
+                        _git.REASON_OUTSIDE_WORK_TREE: "outside_work_tree"}[location.reason]
+        return row
+    if judge_api_key(config) is None:
+        row["state"] = "keyless"
+        return row
+
+    # The same two paths `hook-install` uses. A shared directory's `pre-commit`
+    # is still read: that is where a hand-pasted block lives.
+    hooks_dir = location.hooks_dir
+    hook_file = os.path.join(hooks_dir, "pre-commit")
+    hook = classify_hook_file(hook_file)
+    row.update(state=_COMMIT_GATE_STATE_OF_KIND[hook.kind], hooks_dir=hooks_dir,
+               hooks_dir_shared=not _git.is_within(hooks_dir, location.common_dir),
+               hook_file=hook_file)
+    if hook.kind != HOOK_OURS:
+        return row
+
+    served = hook.served_workspace
+    row["serves"] = served
+    # Realpath on both sides: the hook bakes the spelling it was installed by.
+    row["serves_this_workspace"] = (
+        served is not None
+        and os.path.realpath(served) == os.path.realpath(config.workspace_dir)
+    )
+    attempt = read_last_attempt(config.telemetry_path)
+    if isinstance(attempt, LastAttempt):
+        row["last_attempt_status"] = "on_record"
+        row["last_attempt"] = {
+            "started_at": attempt.started_at,
+            "state": attempt.state,
+            "outcome_at": attempt.outcome_at,
+            "findings_known": attempt.findings_known,
+            # A count: the notice owns naming pairs (mitos/check_notice.py).
+            "new_pairs": None if attempt.new_pairs is None else len(attempt.new_pairs),
+            "batches_planned": attempt.batches_planned,
+        }
+    elif isinstance(attempt, TelemetryUnreadable):
+        row["last_attempt_status"] = "unreadable"
+    else:
+        # No row, no file, or a ladder below the attempt rung: never attempted.
+        row["last_attempt_status"] = "none"
+    debt = derive_audit_debt(config.db_path, config.telemetry_path)
+    if isinstance(debt, AuditDebt):
+        row.update(debt_status="read", uncovered=debt.uncovered, excluded=debt.excluded)
+    elif isinstance(debt, NoGraph):
+        row["debt_status"] = "no_graph"
+    else:
+        row["debt_status"] = "unreadable"
+    return row
+
+
+def _commit_gate_attempt_words(attempt: Dict[str, Any]) -> str:
+    """Describes an on-record attempt from the row's ``last_attempt`` object alone."""
+    state = attempt["state"]
+    if state == ATTEMPT_STARTED:
+        return f"{attempt['started_at']}, started, no outcome recorded"
+    words = f"{attempt['started_at']}, {state.replace('_', ' ')}"
+    if state == ATTEMPT_NO_NEW_FINDINGS:
+        known = attempt["findings_known"]
+        return words + (" (known findings: unknown)" if known is None
+                        else f" ({known} known finding(s))")
+    if state in (ATTEMPT_NEW_FINDINGS, ATTEMPT_COULD_NOT_COMPLETE):
+        pairs = attempt["new_pairs"]
+        return words + (f" ({pairs} new pair(s))" if pairs else "")
+    if state == ATTEMPT_SPEND_NOT_AUTHORIZED:
+        # The writer insists on an int ≥ 1 but the reader does not, so a
+        # hand-edited NULL says "unknown" rather than printing "None".
+        batches = attempt["batches_planned"]
+        planned = ("planned batches: unknown" if batches is None
+                   else f"{batches} planned batch(es)")
+        return words + f" ({planned}; a person authorizes that spend)"
+    # A newer build's state: shown as stored.
+    return f"{attempt['started_at']}, {state}"
+
+
+def _commit_gate_lines(row: Dict[str, Any], *, project: str) -> List[str]:
+    """Renders the commit gate row's text from the ``--json`` object alone.
+
+    Args:
+        row: ``_commit_gate_row``'s result.
+        project: The selector the recipe names (``config.project``).
+
+    Returns:
+        The row's lines, headline first.
+    """
+    state = row["state"]
+    glyph, headline = _COMMIT_GATE_WORDS[state]
+    if state == "installed" and not row["serves_this_workspace"]:
+        glyph = "⚠"
+    line = f"  {glyph} commit gate: {headline.format(**row)}"
+    recipe = f"`mitos hook-install -p {project!r}`"
+    lines = []
+    if state == "no_hook":
+        lines.append(f"{line}   → {recipe}")
+        if row["hooks_dir_shared"]:
+            lines.append("      that hooks directory is shared, so hook-install prints "
+                         "a block to paste there instead of writing a file")
+    elif state == "foreign":
+        lines.append(f"{line}   → {recipe}")
+        lines.append("      a hook manager may still run the gate from configuration "
+                     "status cannot see; hook-install prints the block to paste")
+    elif state == "installed":
+        lines.append(line)
+        if row["serves"] is None:
+            lines.append("      serves: could not be read (written by mitos, but its "
+                         "workspace line is missing or malformed)")
+        elif row["serves_this_workspace"]:
+            lines.append("      serves: this workspace")
+        else:
+            lines.append(f"      serves: another workspace, {row['serves']}")
+        if row["last_attempt_status"] == "on_record":
+            attempt = _commit_gate_attempt_words(row["last_attempt"])
+        elif row["last_attempt_status"] == "unreadable":
+            attempt = "the last attempt could not be read"
+        else:
+            attempt = "no attempt on record"
+        lines.append(f"      last check attempt: {attempt}")
+        if row["debt_status"] == "read":
+            lines.append(f"      uncovered decisions: {row['uncovered']}, "
+                         f"excluded: {row['excluded']}")
+        elif row["debt_status"] == "no_graph":
+            lines.append("      uncovered decisions: no graph yet")
+        else:
+            lines.append("      uncovered decisions: the count could not be read")
+        lines.append(f"      to remove the gate, delete {row['hook_file']}")
+    else:
+        lines.append(line)
+    return lines
+
+
 def cmd_status(workspace_dir: str, as_json: bool = False, *,
                project: Optional[str] = None, verbose: bool = False) -> int:
     """Reports whether Mitos is set up for a project, and what (if anything) is missing.
@@ -3055,6 +3685,9 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
                 f" — rotation archives settled entries once "
                 f"{config.rotation_volume_threshold_entries} or more are buffered"
             )
+    # Presence only: status makes no provider call, so it cannot know the key works
+    # (a revoked or mistyped key is present). The row's label says what was checked,
+    # and `--json`'s `gemini_api_key` bool has always meant exactly this.
     key_source = _gemini_key_source(workspace_dir)
     key_ok = key_source is not None
     q = _check_qdrant(config.qdrant_url, config.qdrant_collection)
@@ -3198,6 +3831,11 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
     # so the shipped middle value (NEEDS ATTENTION ⚠) already fits.
     ready = (initialized and key_ok and q["reachable"]
              and not pre_v1a and not graph_unbuilt)
+    # The commit gate row: computed after `ready` is bound and never feeding it —
+    # an informational row that always prints for an initialized workspace, so a
+    # missing gate keeps saying so on every readiness check. `None` when not
+    # initialized (the `skill_md` precedent: no claim about what was never looked at).
+    commit_gate = _commit_gate_row(config) if initialized else None
 
     if as_json:
         _emit_json({
@@ -3233,7 +3871,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
                 "decisions_buffer_entries": buffer_entries,
                 "decisions_buffer_chars": buffer_chars,
                 "format_spec": spec_ok,
-                "gemini_api_key": key_ok,
+                "gemini_api_key": key_ok,  # present, not verified against the provider
                 "qdrant_reachable": q["reachable"],
                 "collection_exists": q["collection_exists"],
                 "collection_points": q["points"],
@@ -3273,6 +3911,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
             "skill_md": (
                 None if skill_md_state is None else {"status": skill_md_state}
             ),
+            "commit_gate": commit_gate,
         })
         return 0 if ready else 1
 
@@ -3293,7 +3932,8 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
         # below carries the detail); still neutral, never a readiness ✗.
         coll_mark, coll_hint = (
             None,
-            f"missing — {len(active_ids)} active node(s) have no vectors; run `mitos reconcile`",
+            f"missing — {len(active_ids)} active node(s) have no vectors; "
+            f"run `mitos reconcile -p {config.project!r}`",
         )
     elif graph_unbuilt:
         # The calm fresh-project sentence below is FALSE over a corpus of hundreds,
@@ -3326,7 +3966,9 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
         ("format-spec.md", True if spec_ok else None,
          "an optional reference for humans and agents — the parser reads the copy "
          "bundled with mitos, and `mitos init` writes one here"),
-        ("GEMINI_API_KEY" + (f" (from {key_source})" if key_source else ""), key_ok,
+        ("GEMINI_API_KEY"
+         + (f" (from {key_source}) — present, not checked against the provider"
+            if key_source else ""), key_ok,
          "set it once for all projects: `mitos set-key --global <KEY>`"),
         (f"Qdrant reachable ({config.qdrant_url})", q["reachable"],
          "start it: `docker compose up -d` in the mitos repo"),
@@ -3388,6 +4030,9 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
     print(f"  • graph: {config.db_path}")
     if graph_nodes is not None:
         print(f"  • graph holds {graph_nodes} node(s)")
+    if commit_gate is not None:
+        for line in _commit_gate_lines(commit_gate, project=config.project):
+            print(line)
     # The unbuilt graph (W31). A blocker, not a rung readers learn to skip: every
     # semantic read over this workspace answers cleanly empty while the corpus holds
     # entries, so the caller is told "no precedent" for a project that has them.
@@ -3424,22 +4069,25 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
     if scroll_failed:
         print(
             "\n  ⚠ could not verify vector completeness — Qdrant scroll failed; "
-            "run `mitos status` again when Qdrant is reachable."
+            f"run `mitos status -p {config.project!r}` again when Qdrant is reachable."
         )
     elif missing_active_slugs:
         n = len(missing_active_slugs)
         print(
             f"\n  ⚠ vector index incomplete — {n} active node(s) have no vector "
-            f"and are invisible to semantic surface/query. Run `mitos reconcile` "
-            f"to re-embed them (or `mitos sync` if the outbox is non-empty) — "
-            f"informational, not a readiness blocker."
+            f"and are invisible to semantic surface/query. Run "
+            f"`mitos reconcile -p {config.project!r}` to re-embed them (or "
+            f"`mitos sync -p {config.project!r}` if the outbox is non-empty) — either "
+            f"needs the embedding provider to answer, which this report does not "
+            f"check. Informational, not a readiness blocker."
         )
         if embedding_seed:
             # Which of the two heals applies is knowable here, so say it rather than
             # leaving the operator to infer it from "if the outbox is non-empty".
             print(
                 f"      the embedding queue was seeded by `{embedding_seed['established_by']}` "
-                f"at {embedding_seed['established_at']} — `mitos sync` restores search"
+                f"at {embedding_seed['established_at']} — `mitos sync -p {config.project!r}` "
+                f"restores search once the embedding provider answers"
             )
         if n <= 5:
             for slug in missing_active_slugs:
@@ -3483,7 +4131,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
             if f["status"] in ("outdated", "unversioned")
         )
         print(f"  ⚠ agent-file mitos note out of date ({stale_files}) "
-              f"— refresh with `mitos agent-block`")
+              f"— refresh with `mitos agent-block -p {config.project!r}`")
     if skill_md_state == "differs":
         # "differs", never "outdated": a committed skill.md can be newer than this
         # install. `absent` stays silent (a clone that does not commit skill.md is
@@ -4047,6 +4695,22 @@ def _amend_refused_invalid_value(result: Dict[str, Any], config: MitosConfig) ->
             f"{_amend_fields(result['fields'])} cannot be written into the entry."]
 
 
+def _amend_refused_tool_call_markup(result: Dict[str, Any], config: MitosConfig) -> List[str]:
+    spans = result.get("markup_spans") or []
+    where = ""
+    if spans:
+        first, rest = spans[0], len(spans) - 1
+        more = f", plus {rest} more" if rest else ""
+        where = f" ({first['span']!r} at character {first['offset']} of {first['field']!r}{more})"
+    fields = result["fields"]
+    value, holds = ("values", "hold") if len(fields) > 1 else ("value", "holds")
+    return [f"Amend refused [tool_call_markup]: the {value} given for "
+            f"{_amend_fields(fields)} {holds} tool-call markup{where}, syntax from "
+            "the tool call itself; nothing was written.",
+            "  Remove it, or wrap a tag meant as prose in backticks: inline-code spans "
+            "are exempt."]
+
+
 def _amend_refused_not_editable(result: Dict[str, Any], config: MitosConfig) -> List[str]:
     return [f"Amend refused [not_editable]: {_amend_fields(result['fields'])} is not an "
             "editable part of a committed entry."]
@@ -4118,6 +4782,7 @@ _AMEND_REFUSAL_RENDERERS = {
     amend.REASON_OPEN_QUESTION: _amend_refused_open_question,
     amend.REASON_UNPARSEABLE: _amend_refused_unparseable,
     amend.REASON_DIVERGED: _amend_refused_diverged,
+    amend.REASON_TOOL_CALL_MARKUP: _amend_refused_tool_call_markup,
 }
 
 # The recovery clause per error code, where the code has an action; the fact alone
@@ -4208,7 +4873,8 @@ def cmd_amend_commentary(
     return exit_code
 
 
-def cmd_agent_block(workspace_dir: str, check: bool = False) -> int:
+def cmd_agent_block(workspace_dir: str, check: bool = False, *,
+                    project: Optional[str] = None) -> int:
     """Prints the canonical agent-file block, or checks pasted copies for drift.
 
     The block is the thin, versioned pointer a project pastes into its agent files
@@ -4220,6 +4886,9 @@ def cmd_agent_block(workspace_dir: str, check: bool = False) -> int:
     Args:
         workspace_dir: The project root (only used by ``--check``).
         check: Report drift in the project's agent files instead of printing the block.
+        project: The selector the printed refresh recipes name — the registered
+            name when the caller addressed one. ``None`` falls back to the
+            workspace's absolute path, which parses and resolves just the same.
 
     Returns:
         ``0`` on a plain print, or when ``--check`` finds no stale copy; ``1`` when
@@ -4230,23 +4899,24 @@ def cmd_agent_block(workspace_dir: str, check: bool = False) -> int:
         return 0
 
     workspace_dir = os.path.abspath(workspace_dir)
+    recipe = f"`mitos agent-block -p {(project or workspace_dir)!r}`"
     report = agent_block_drift(workspace_dir)
     files = report["files"]
     print(f"\nAgent-file mitos note (current guide: v{AGENT_GUIDE_VERSION}) for {workspace_dir}\n")
     if not files:
         print("  — no agent file references mitos yet.")
-        print("    Paste `mitos agent-block` into your AGENTS.md / CLAUDE.md / GEMINI.md so")
-        print("    the next agent knows mitos is set up here.\n")
+        print(f"    Paste what {recipe} prints into your AGENTS.md /")
+        print("    CLAUDE.md / GEMINI.md so the next agent knows mitos is set up here.\n")
         return 0
     for f in files:
         if f["status"] == "current":
             print(f"  ✓ {f['file']}  (guide v{f['marker_version']})")
         elif f["status"] == "outdated":
             print(f"  ⚠ {f['file']}  (guide v{f['marker_version']} → v{AGENT_GUIDE_VERSION}) "
-                  f"— refresh with `mitos agent-block`")
+                  f"— refresh with {recipe}")
         else:  # unversioned
             print(f"  ⚠ {f['file']}  (mitos note with no version marker) "
-                  f"— refresh with `mitos agent-block`")
+                  f"— refresh with {recipe}")
     print()
     return 1 if report["stale"] else 0
 
@@ -4657,7 +5327,31 @@ _CHECK_TOKENS_PER_BATCH_ESTIMATE = 3000
 _CHECK_MODIFIER_STAMP_KEYS: Tuple[str, ...] = tuple(MODIFIER_EDGE_KEYS.values())
 
 
-def _confirm_spend(n: int, *, assume_yes: bool, as_json: bool) -> Optional[int]:
+@dataclass(frozen=True)
+class _RefusalAddendum:
+    """What the corpus site adds to a spend refusal. Composed at that site only.
+
+    ``_confirm_spend`` prints and merges these and composes none of them, so the
+    words about the corpus check's attempt never reach ``--staged``.
+
+    Attributes:
+        line: Printed after the refusal, on the refusal's own text stream.
+        error_suffix: Appended, after one space, to the ``--json`` ``error`` sentence.
+        fields: Merged into the ``--json`` refusal object.
+    """
+
+    line: Optional[str]
+    error_suffix: Optional[str]
+    fields: Mapping[str, Any]
+
+
+def _confirm_spend(
+    n: int,
+    *,
+    assume_yes: bool,
+    as_json: bool,
+    addendum: Optional[_RefusalAddendum] = None,
+) -> Optional[int]:
     """The shared CHK-D5 spend confirm — corpus + staged (KD4).
 
     The single gate both ``check`` modes pass ``n`` (corpus: fresh judgment groups;
@@ -4667,36 +5361,52 @@ def _confirm_spend(n: int, *, assume_yes: bool, as_json: bool) -> Optional[int]:
     monkeypatch is seen); at/below the threshold or with ``assume_yes`` it returns
     ``None`` (proceed) without prompting. All three refusals return exit ``2``, zero
     spend: ``--json`` emits an error object (automation never prompts), a non-TTY
-    prints the vector message, an interactive decline prints "nothing spent".
+    prints the vector message, an interactive decline prints "nothing spent". The
+    two machine-facing forms name a person as the one who authorizes the spend and
+    never name the waiver flag: an agent reading them does not waive the spend on
+    its own (P15).
 
     Args:
         n: The disclosure unit — the count of pending judgment batches.
         assume_yes: Waive the confirm (the ``--yes`` opt-in).
         as_json: Automation surface — emit an error object instead of prompting.
+        addendum: The corpus site's additions to a refusal, or ``None``
+            (``--staged``). Printed or merged here, never composed here.
 
     Returns:
         A refusal exit code (``2``) when the spend is declined, or ``None`` to proceed.
     """
     if n <= check.CHECK_CONFIRM_BATCHES or assume_yes:
         return None
+    refused = (
+        f"{n} judgment batches pending — nothing was spent. A spend above "
+        f"{check.CHECK_CONFIRM_BATCHES} batches needs a person's authorization: "
+        f"they run this check at a terminal and confirm the prompt."
+    )
     if as_json:
         # Automation never prompts (a prompt would also corrupt the object).
+        error = refused
+        if addendum is not None and addendum.error_suffix:
+            error = f"{refused} {addendum.error_suffix}"
         _emit_json({
-            "error": (f"{n} judgment batches pending — re-run with --yes to "
-                      f"authorize the spend."),
+            "error": error,
             "code": "confirmation_required",
             "batches_planned": n,
+            **(addendum.fields if addendum is not None else {}),
         })
         return 2
     if not sys.stdin.isatty():
-        print(f"{n} judgment batches pending — re-run with --yes to authorize "
-              f"the spend.", file=sys.stderr)
+        print(refused, file=sys.stderr)
+        if addendum is not None and addendum.line:
+            print(addendum.line, file=sys.stderr)
         return 2
     estimate = n * _CHECK_TOKENS_PER_BATCH_ESTIMATE
     print(f"{n} judgment batches pending (≈{estimate:,} tokens) — this run "
           f"will call the judge model.")
     if input("Proceed with the spend? [y/N] ").strip().lower() not in ("y", "yes"):
         print("Aborted — nothing spent.")
+        if addendum is not None and addendum.line:
+            print(addendum.line)
         return 2
     return None
 
@@ -4763,6 +5473,212 @@ def _build_check_telemetry(config: MitosConfig) -> Optional[TelemetryStore]:
         return None
 
 
+# Why an unscoped corpus check's entry write left no attempt on record. Held by
+# ``cmd_check``; ``_ATTEMPT_UNRECORDED_WORDS`` words each one for the report and
+# ``--json``.
+_ATTEMPT_UNRECORDED_CAUSES: Tuple[str, ...] = (
+    "telemetry_unavailable",   # the telemetry store could not be constructed
+    "fingerprint_unreadable",  # the uncovered set could not be derived
+    "write_failed",            # the entry write raised
+)
+
+
+@dataclass(frozen=True)
+class _AttemptOnRecord:
+    """The entry write landed; the run-end seam updates this attempt's record.
+
+    Attributes:
+        attempt_id: The key the entry write used.
+    """
+
+    attempt_id: str
+
+
+@dataclass(frozen=True)
+class _AttemptUnrecorded:
+    """The entry write did not land; the run-end seam writes no outcome.
+
+    Attributes:
+        cause: One of :data:`_ATTEMPT_UNRECORDED_CAUSES`.
+    """
+
+    cause: str
+
+
+# One phrase per cause, closed over ``_ATTEMPT_UNRECORDED_CAUSES`` (a row pins the
+# keys equal).
+_ATTEMPT_UNRECORDED_WORDS: Dict[str, str] = {
+    "telemetry_unavailable": "telemetry.sqlite could not be opened",
+    "fingerprint_unreadable": "the set of uncovered decisions could not be read",
+    "write_failed": "the attempt could not be written to telemetry.sqlite",
+}
+
+# Said on an unscoped refusal whose entry write landed. Its truth rests on that
+# write, not on the refusal write after it: whatever state the record holds, it
+# carries this set's fingerprint, which is what the commit gate reads. The fact
+# leads, because a newer overlapping attempt can replace the record and make the
+# consequence overclaim.
+_ATTEMPT_ON_RECORD_CLAUSE = (
+    "This check attempt is on record, so a commit that mitos's commit gate "
+    "blocked will now pass."
+)
+
+
+def _attempt_unrecorded_message(attempt: object) -> Optional[str]:
+    """Composes the disclosure for an attempt that was not recorded, else ``None``.
+
+    The single source for the text line and the ``--json`` ``message``. The
+    consequence is conditional: where the gate cannot read telemetry either it
+    passes, and a project may have no gate installed, so "will block again" would
+    be false in those cases.
+
+    Args:
+        attempt: The run's attempt value (``None`` for a scoped run).
+
+    Returns:
+        The one-sentence disclosure, or ``None`` unless the attempt is unrecorded.
+    """
+    if not isinstance(attempt, _AttemptUnrecorded):
+        return None
+    return (
+        f"This check attempt was not recorded: "
+        f"{_ATTEMPT_UNRECORDED_WORDS[attempt.cause]}. mitos's commit gate cannot "
+        f"see it; if the gate blocks a commit, a check that also cannot record its "
+        f"attempt will not open it, and `git commit --no-verify` is the way past."
+    )
+
+
+def _attempt_unrecorded_json(attempt: object) -> Optional[Dict[str, str]]:
+    """Builds the ``attempt_unrecorded`` ``--json`` value.
+
+    Args:
+        attempt: The run's attempt value (``None`` for a scoped run).
+
+    Returns:
+        ``{"cause", "message"}`` for an unrecorded attempt, else ``None``.
+    """
+    message = _attempt_unrecorded_message(attempt)
+    if message is None:
+        return None
+    return {"cause": attempt.cause, "message": message}
+
+
+def _attempt_unrecorded_line(attempt: object) -> Optional[str]:
+    """Builds the text twin of ``attempt_unrecorded``: the same sentence.
+
+    Args:
+        attempt: The run's attempt value (``None`` for a scoped run).
+
+    Returns:
+        The disclosure line, or ``None``.
+    """
+    return _attempt_unrecorded_message(attempt)
+
+
+def _refusal_addendum(attempt: object) -> _RefusalAddendum:
+    """Composes the corpus site's additions to a spend refusal.
+
+    On record: the on-record clause. Unrecorded: the disclosure. Scoped
+    (``None``): nothing but the ``attempt_unrecorded: null`` key.
+
+    Args:
+        attempt: The run's attempt value.
+
+    Returns:
+        The addendum ``_confirm_spend`` prints and merges.
+    """
+    fields = {"attempt_unrecorded": _attempt_unrecorded_json(attempt)}
+    if isinstance(attempt, _AttemptOnRecord):
+        return _RefusalAddendum(
+            line=_ATTEMPT_ON_RECORD_CLAUSE,
+            error_suffix=_ATTEMPT_ON_RECORD_CLAUSE,
+            fields=fields,
+        )
+    return _RefusalAddendum(
+        line=_attempt_unrecorded_line(attempt), error_suffix=None, fields=fields
+    )
+
+
+def _record_spend_refusal(
+    telemetry: Optional[TelemetryStore], attempt: object, batches_planned: int
+) -> None:
+    """Marks this attempt's record ``spend_not_authorized``. Never raises.
+
+    Only an attempt on record is written; a scoped or unrecorded run writes
+    nothing. It runs after the refusal has been emitted, so nothing may escape: a
+    fault the write path knows about is swallowed silently, and any other
+    exception prints one warning line on stderr (never stdout, which may already
+    hold the one ``--json`` object).
+
+    Args:
+        telemetry: The run's telemetry store, or ``None``.
+        attempt: The run's attempt value.
+        batches_planned: The batch count the refused spend would have judged.
+    """
+    if telemetry is None or not isinstance(attempt, _AttemptOnRecord):
+        return
+    try:
+        telemetry.record_attempt_refusal(AttemptRefusal(
+            attempt_id=attempt.attempt_id,
+            refused_at=datetime.now(timezone.utc).isoformat(),
+            batches_planned=batches_planned,
+        ))
+    except (sqlite3.Error, DatabaseError):
+        return
+    except Exception as e:
+        print(f"[Warning] Check refusal write failed: {str(e)}", file=sys.stderr)
+
+
+def _begin_check_attempt(
+    config: MitosConfig, telemetry: Optional[TelemetryStore]
+) -> "_AttemptOnRecord | _AttemptUnrecorded":
+    """Writes an unscoped corpus check's ``started`` record. Never raises.
+
+    Mints the attempt's key and time, derives the fingerprint of the uncovered set
+    through the audit-debt leaf (``commit_gate.evaluate_gate`` compares against it
+    and derives through the same leaf, so the join key has one recipe), and
+    replaces the last-attempt record. Best effort: an entry write can never fail
+    the check (ADR
+    ``check-run-end-writes-commit-together-a-seam-failure-covers-nothing``,
+    rejected path 5). A fault the write path knows about is remembered silently; any
+    other exception is a bug, so it also prints one warning line on stderr rather
+    than hiding behind the swallow.
+
+    A decision recorded between the derive and the write leaves the stored
+    fingerprint older than the set. A reader comparing fingerprints then sees the
+    set as changed since the attempt, which is the safe direction, so it is not
+    worth a lock.
+
+    Args:
+        config: The active workspace config.
+        telemetry: The run's telemetry store, or ``None`` when it could not be
+            constructed.
+
+    Returns:
+        :class:`_AttemptOnRecord` when the record landed, else
+        :class:`_AttemptUnrecorded` naming why.
+    """
+    if telemetry is None:
+        return _AttemptUnrecorded("telemetry_unavailable")
+    try:
+        debt = derive_audit_debt(config.db_path, config.telemetry_path)
+        if not isinstance(debt, AuditDebt):
+            # DebtUnreadable, or NoGraph in a race. No sentinel fingerprint is written.
+            return _AttemptUnrecorded("fingerprint_unreadable")
+        attempt_id = uuid.uuid4().hex
+        telemetry.record_attempt_start(AttemptStart(
+            attempt_id=attempt_id,
+            started_at=datetime.now(timezone.utc).isoformat(),
+            fingerprint=debt.fingerprint,
+        ))
+    except (sqlite3.Error, DatabaseError):
+        return _AttemptUnrecorded("write_failed")
+    except Exception as e:
+        print(f"[Warning] Check attempt write failed: {str(e)}", file=sys.stderr)
+        return _AttemptUnrecorded("write_failed")
+    return _AttemptOnRecord(attempt_id)
+
+
 def _build_check_judge(config: MitosConfig) -> Optional[Callable]:
     """Builds the bound conflict-judgment executor, or ``None`` when keyless (KD6).
 
@@ -4787,8 +5703,8 @@ def _build_check_judge(config: MitosConfig) -> Optional[Callable]:
         The bound one-arg ``judge`` callable, or ``None`` when ``ANTHROPIC_API_KEY``
         is absent.
     """
-    api_key = config.env.get("ANTHROPIC_API_KEY")
-    if not api_key:
+    api_key = judge_api_key(config)
+    if api_key is None:
         return None
     import anthropic
     from mitos.conflict_judgment import (_JUDGMENT_MODEL_ALIAS,
@@ -4845,8 +5761,9 @@ _CHECK_DEPARTURE_WORDS: Dict[str, str] = {
 #
 # Total over ``ConflictUnavailableReason`` on purpose, so a member added later cannot
 # KeyError this renderer mid-report — pinned by an exhaustiveness row in
-# tests/test_check_cli.py. The semantic-substrate reasons are unreachable from the
-# judgment stage today and are worded anyway rather than left to a fallback.
+# tests/test_check_failure_diagnosis.py. The semantic-substrate reasons are
+# unreachable from the judgment stage today and are worded anyway rather than left to
+# a fallback.
 _JUDGMENT_FAILURE_WORDS: Dict[str, str] = {
     "judgment_timeout": "the judge timed out or returned an error",
     "judgment_rejected": "the judge API rejected the request (key, model id or parameters)",
@@ -4857,6 +5774,18 @@ _JUDGMENT_FAILURE_WORDS: Dict[str, str] = {
     "collection_missing": "the vector collection does not exist",
 }
 
+# The keyless abort's own clause. Outside the map above on purpose: that map is total
+# over the enum, and "no judge was built" is not an enum member — it is told apart by
+# the `check.JudgeNotConfigured` tag. Uncounted ("1 ×" would read as a batch that
+# failed), and a constant, never built from the tag's `detail` (see above).
+_NO_JUDGE_WORDS = ("no judge is configured (ANTHROPIC_API_KEY is not set), so the "
+                   "fresh pairs were not judged")
+
+# How many failed batches the text report names before it counts the rest. `--json`
+# carries every one. A batch line holds a proposal and a group's partners, so this
+# counts a longer unit than a single-pair `A ✗ B` cap would, and borrows no such cap.
+_FAILED_BATCHES_SHOWN = 3
+
 
 def _judgment_failure_breakdown(failures: Sequence[Any]) -> str:
     """Words the judgment failures as grouped counts, in the vocabulary's own order.
@@ -4866,15 +5795,22 @@ def _judgment_failure_breakdown(failures: Sequence[Any]) -> str:
     map and nothing else read it, so a report could say a batch failed and never say
     why. Grouped rather than listed: 400 timeouts are one fact, not 400 lines.
 
+    The keyless abort (:class:`check.JudgeNotConfigured`) is not a batch that failed:
+    it is not counted, and its own clause comes first, so the report keeps one
+    ``Why:`` line. The tag decides, never a count such as ``batches_executed == 0``.
+
     Args:
         failures: The run's ``Unavailable`` judgment failures.
 
     Returns:
-        A human clause such as ``"1 the judge timed out or returned an error"``'s
-        grouped form, or ``""`` when there is nothing to say.
+        A human clause such as ``"1 × the judge timed out or returned an error"``,
+        or ``""`` when there is nothing to say. No trailing period: the caller adds it.
     """
-    counted = Counter(f.reason.value for f in failures)
-    parts = [
+    keyless = any(isinstance(f, check.JudgeNotConfigured) for f in failures)
+    counted = Counter(f.reason.value for f in failures
+                      if not isinstance(f, check.JudgeNotConfigured))
+    parts = [_NO_JUDGE_WORDS] if keyless else []
+    parts += [
         f"{counted[reason]} × {words}"
         for reason, words in _JUDGMENT_FAILURE_WORDS.items()
         if counted.get(reason)
@@ -4919,12 +5855,34 @@ def _resolve_exclusion_display(
     ``coverage_exclusion_ids`` returns content hashes; ``get_node`` is
     state-agnostic (a since-superseded node still resolves), so the raw-id fallback
     covers only a genuinely absent node (``None`` → ``slug`` ``None``). These reads
-    sit in the display-model build, before the write seam.
+    sit in the display-model build, before the write seam. The rule lives in
+    :func:`~mitos.display.node_handles`.
     """
+    return node_handles(ids, store.get_node)
+
+
+def _failed_batch_display(
+    store: GraphStore, batches: Sequence["check.FailedJudgmentBatch"]
+) -> List[Dict[str, Any]]:
+    """Builds the failed-batch display model, one dict per batch in occurrence order.
+
+    The same list feeds the text report and ``--json``'s ``judgment_failed_batches``,
+    so the two encodings cannot disagree. Every id resolves in one
+    :func:`~mitos.display.node_handles` call (one read per distinct id); the reads
+    sit in the display-model build, before the write seam, and a store fault
+    propagates to ``cmd_check``'s boundary. Each batch keeps its own ``reason``.
+    """
+    ids: List[str] = []
+    for batch in batches:
+        ids.append(batch.proposal_id)
+        ids.extend(batch.partner_ids)
+    handles = iter(node_handles(ids, store.get_node))
     out: List[Dict[str, Any]] = []
-    for node_id in ids:
-        node = store.get_node(node_id)
-        out.append({"id": node_id, "slug": node.get("slug") if node else None})
+    for batch in batches:
+        proposal = next(handles)
+        partners = [next(handles) for _ in batch.partner_ids]
+        out.append({"batch_id": batch.batch_id, "reason": batch.reason,
+                    "proposal": proposal, "partners": partners})
     return out
 
 
@@ -4941,11 +5899,13 @@ def _check_json_object(
     row: "check.CheckRunRow",
     *,
     exclusions: List[Dict[str, Any]],
+    failed_batches: List[Dict[str, Any]],
     exit_code: int,
     row_written: bool,
     scope: Optional[str],
     fresh: bool,
     transient_count: int,
+    attempt_unrecorded: Optional[Dict[str, str]],
 ) -> Dict[str, Any]:
     """Assembles the single §8 ``--json`` object (a shipped API — additive only).
 
@@ -4983,9 +5943,14 @@ def _check_json_object(
         # The typed reasons behind `degradations: ["judgment"]`. Reasons only — never
         # `Unavailable.detail`, which is logging/telemetry and not user-rendered.
         "judgment_failure_reasons": [f.reason.value for f in result.judgment_failures],
+        # Every failed batch's pairs, uncut (the text names the first few), from the
+        # same display model the text renders.
+        "judgment_failed_batches": failed_batches,
         "coverage_exclusions": exclusions,
         "index_backlog_transient": transient_count,
         "summary_row_written": row_written,
+        # Always present: null unless this unscoped run's entry write failed.
+        "attempt_unrecorded": attempt_unrecorded,
     })
     return obj
 
@@ -5013,18 +5978,25 @@ def _print_full_finding(finding: "check.CheckFinding") -> None:
     print(f"        {finding.rationale}   (confidence {finding.confidence:.2f})")
 
 
-def _check_degradation_summary(degradations: Tuple[str, ...]) -> str:
+def _check_degradation_summary(degradations: Tuple[str, ...], *, project: str) -> str:
     """Renders the degradation tokens as calm human wording (KD4 — from tokens, never
-    by re-parsing ``degraded_reason``)."""
+    by re-parsing ``degraded_reason``). ``project`` goes into the one recipe here.
+
+    ``stale_index`` carries no recipe: the transient line, which always prints
+    beside it, carries the ``mitos sync`` one."""
     words = {
         "sweep": "the corpus sweep degraded mid-run",
         "judgment": "some judgment batches did not complete",
         "reuse_read": "prior-verdict history was unreadable (findings shown unpartitioned)",
         "telemetry_write": "some per-batch results could not be recorded",
-        "stale_index": "the vector index is behind (recall may be thinned)",
+        "stale_index": (
+            "embeddings are queued and not yet in the vector index (recall may be "
+            "thinned; they drain on sync)"
+        ),
         "probe_read": "completeness could not be certified (the index probe was unreadable)",
         "collection_missing": (
-            "the vector collection does not exist — run `mitos reconcile` to rebuild it"
+            f"the vector collection does not exist — run "
+            f"`mitos reconcile -p {project!r}` to rebuild it"
         ),
         "judgment_truncated": (
             "the judge's response was truncated (max_tokens exceeded)"
@@ -5037,10 +6009,13 @@ def _print_check_report(
     result: "check.CheckRunResult",
     *,
     exclusions: List[Dict[str, Any]],
+    failed_batches: List[Dict[str, Any]],
     denominator: Optional[int],
     scope: Optional[str],
     row_written: bool,
     transient_count: int,
+    project: str,
+    attempt_unrecorded: Optional[str],
 ) -> None:
     """Renders the human report to stdout (findings + disposition), calm ASCII (P9).
 
@@ -5090,7 +6065,7 @@ def _print_check_report(
 
     if degradations:
         print(f"\n[partial] This check could not fully run "
-              f"({_check_degradation_summary(degradations)}).")
+              f"({_check_degradation_summary(degradations, project=project)}).")
         print(f"  Swept {result.nodes_swept} of {result.nodes_total} decisions; any "
               f"findings above are labeled partial, not certified complete.")
         # Coverage is a NUMBER whenever judgment fell short of the plan — a partial
@@ -5111,21 +6086,40 @@ def _print_check_report(
             breakdown = _judgment_failure_breakdown(result.judgment_failures)
             if breakdown:
                 print(f"    Why: {breakdown}.")
+            # Which pairs went unjudged. From the failed-batch rows, never zipped with
+            # `judgment_failures` (that list also holds the keyless abort, which
+            # attempted nothing and has no row). Each line carries its own reason:
+            # the Why line groups them and cannot say which batch had which.
+            if failed_batches:
+                print("    Unjudged pairs, by failed batch:")
+                for item in failed_batches[:_FAILED_BATCHES_SHOWN]:
+                    partners = ", ".join(handle_text(p) for p in item["partners"])
+                    print(f"      {handle_text(item['proposal'])} — {partners}   "
+                          f"({_JUDGMENT_FAILURE_WORDS[item['reason']]})")
+                rest = len(failed_batches) - _FAILED_BATCHES_SHOWN
+                if rest > 0:
+                    noun = "batch" if rest == 1 else "batches"
+                    print(f"      …and {rest} more failed {noun}.")
 
     if not row_written:
         print("  Note: this run was not recorded to check history "
               "(the summary row could not be written).")
 
+    # Its own line and its own fact: the check-history note above is about
+    # `check_runs`, this one is about the attempt record the commit gate reads.
+    if attempt_unrecorded is not None:
+        print(f"  {attempt_unrecorded}")
+
     if exclusions:
         print("\nCoverage exclusions (chronically un-embedded — NOT audited):")
         for item in exclusions:
-            print(f"  - {item['slug'] or item['id']}")
+            print(f"  - {handle_text(item)}")
         print("  These keep failing to embed; the durable fix is outbox quarantine "
-              "(substrate-owned). Re-run `mitos sync` to retry.")
+              f"(substrate-owned). Re-run `mitos sync -p {project!r}` to retry.")
 
     if transient_count:
         print(f"\n{transient_count} decision(s) are behind the vector index — recall "
-              f"may be thinned. Run `mitos sync` to catch up.")
+              f"may be thinned. Run `mitos sync -p {project!r}` to catch up.")
 
     if not result.findings and not degradations:
         if scope is not None and result.nodes_total == 0:
@@ -5139,6 +6133,478 @@ def _print_check_report(
                   f"no contradictions found.")
 
 
+#: The directory of the ``mitos`` package, which ``python -m mitos`` (and
+#: ``python -m mitos.cli``) runs a file from.
+_MITOS_PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _running_mitos_command_from(argv0: str, executable: str,
+                                which: Callable[[str], Optional[str]],
+                                package_dir: str) -> str:
+    """Spells the command that runs this build, from injected process facts.
+
+    A recipe that names bare ``mitos`` can run a different build from the one that
+    printed it — an older ``mitos`` on ``PATH`` whose ``check`` records nothing, so
+    a gate waiting on that record never opens. So bare ``mitos`` is printed only
+    when it is this executable:
+
+    - ``argv0`` has no path separator: the process was reached by a ``PATH``
+      lookup (or a harness spelled it so).
+    - ``argv0`` is a file inside the ``mitos`` package: the process runs under
+      ``python -m``, and the interpreter is the handle. Residue: under ``-m``,
+      ``sys.path[0]`` is the working directory, so the recipe run from elsewhere
+      may import another installed ``mitos``. Printing bare ``mitos`` instead would
+      be the two-build trap itself.
+    - ``PATH``'s ``mitos`` has the same ``realpath`` as ``argv0``: bare ``mitos``.
+      Real paths, because pipx's ``~/.local/bin/mitos`` is a symlink.
+    - Otherwise the invoked path, made absolute and shell-quoted. Not the realpath:
+      a venv's ``bin/mitos`` is the stable handle, and a pipx venv path is uglier.
+
+    Args:
+        argv0: ``sys.argv[0]``.
+        executable: ``sys.executable``.
+        which: ``shutil.which``, or a stand-in.
+        package_dir: The ``mitos`` package directory.
+
+    Returns:
+        A shell-ready command prefix: ``mitos``, a quoted path, or
+        ``'<python>' -m mitos``.
+    """
+    if os.sep not in argv0 and not (os.altsep and os.altsep in argv0):
+        return "mitos"
+    invoked = os.path.abspath(argv0)
+    real = os.path.realpath(invoked)
+    if os.path.dirname(real) == os.path.realpath(package_dir):
+        return f"{shlex.quote(executable)} -m mitos"
+    on_path = which("mitos")
+    if on_path and os.path.realpath(on_path) == real:
+        return "mitos"
+    return shlex.quote(invoked)
+
+
+def _running_mitos_command() -> str:
+    """Spells the command that runs this build (see ``_running_mitos_command_from``).
+
+    Returns:
+        A shell-ready command prefix for a recipe.
+    """
+    return _running_mitos_command_from(sys.argv[0], sys.executable, shutil.which,
+                                       _MITOS_PACKAGE_DIR)
+
+
+def _hook_command_from(argv0: str, executable: str,
+                       which: Callable[[str], Optional[str]],
+                       package_dir: str) -> Optional[List[str]]:
+    """Names the running build as an absolute argv prefix, for baking into a hook.
+
+    The sibling of ``_running_mitos_command_from``, with the same injected facts and
+    arms, but never bare ``mitos`` and never relative: a hook runs from the
+    work-tree root on every commit, long after this process has gone.
+
+    - ``argv0`` has no path separator: ``which(argv0)`` made absolute. Residue, the
+      sibling's: a bare ``argv0`` is taken to be what ``PATH`` found. A
+      shebang-launched console script always carries a separator (the kernel passes
+      the resolved path), so this arm serves harnesses.
+    - ``argv0`` is a file inside the ``mitos`` package: ``[executable, "-m",
+      "mitos"]``. Residue, as 3c2 documented: under ``-m``, ``sys.path[0]`` is the
+      hook's working directory, so a repository whose root holds a ``mitos/``
+      package can shadow this one.
+    - Otherwise ``abspath(argv0)``, not the realpath: a venv's ``bin/mitos`` or
+      pipx's ``~/.local/bin/mitos`` is the handle that survives upgrades.
+
+    Args:
+        argv0: ``sys.argv[0]``.
+        executable: ``sys.executable``.
+        which: ``shutil.which``, or a stand-in.
+        package_dir: The ``mitos`` package directory.
+
+    Returns:
+        The argv prefix, or ``None`` when a bare ``argv0`` is not on ``PATH``, so
+        the running executable cannot be named.
+    """
+    if os.sep not in argv0 and not (os.altsep and os.altsep in argv0):
+        found = which(argv0)
+        return [os.path.abspath(found)] if found else None
+    invoked = os.path.abspath(argv0)
+    if os.path.dirname(os.path.realpath(invoked)) == os.path.realpath(package_dir):
+        return [executable, "-m", "mitos"]
+    return [invoked]
+
+
+def _hook_command() -> Optional[List[str]]:
+    """Names the running build for a hook (see ``_hook_command_from``).
+
+    Returns:
+        The absolute argv prefix, or ``None``.
+    """
+    return _hook_command_from(sys.argv[0], sys.executable, shutil.which,
+                              _MITOS_PACKAGE_DIR)
+
+
+def _hook_block_recipe(config: MitosConfig) -> str:
+    """Composes the command the commit gate's block names: the one place it is spelled.
+
+    Selectored and ``repr``-rendered like every recipe on this surface, so the
+    agent that reads it runs the check against the corpus the hook gated, and led
+    by the running build's own spelling, so the check it runs is one that records
+    the attempt this gate reads.
+
+    Args:
+        config: The gated workspace's config.
+
+    Returns:
+        The backticked ``… check -p …`` recipe.
+    """
+    return f"`{_running_mitos_command()} check -p {config.project!r}`"
+
+
+def _hook_block_message(config: MitosConfig, uncovered: int) -> str:
+    """Composes the commit gate's block message, with number agreement.
+
+    Args:
+        config: The gated workspace's config.
+        uncovered: N, the uncovered count (always > 0 on a block).
+
+    Returns:
+        The one-line message.
+    """
+    subject = ("1 decision has" if uncovered == 1
+               else f"{uncovered} decisions have")
+    return (f"{subject} not been covered by a contradiction check. Run "
+            f"{_hook_block_recipe(config)} and read what it reports, then commit "
+            f"again — the gate asks only that the check was attempted.")
+
+
+#: Row 1's one line per cause. Each names the fact and no command: the commit
+#: passed, and a recipe here would owe the parser proof and the running-build rule.
+_HOOK_UNREADABLE_LINES: Dict[str, str] = {
+    CAUSE_NO_GRAPH: ("mitos commit gate: this workspace has no graph yet, so there "
+                     "is nothing to gate; the commit was let through."),
+    CAUSE_GRAPH: ("mitos commit gate: the graph could not be read, so the gate "
+                  "could not decide; the commit was let through."),
+    CAUSE_TELEMETRY: ("mitos commit gate: the check telemetry could not be read, "
+                      "so the gate could not decide; the commit was let through."),
+}
+
+
+def cmd_hook_run(config: MitosConfig) -> int:
+    """Runs the commit gate a git pre-commit hook calls. No judge, no spend, no network.
+
+    Evaluates :func:`mitos.commit_gate.evaluate_gate` and maps the verdict to the
+    hook's exit status. A block and an unreadable row print the corpus echo and
+    then answer on stderr; the three quiet passes print nothing, so a commit that
+    is fine stays silent. Reached only through :func:`_run_hook_boundary`.
+
+    Args:
+        config: The target workspace's config.
+
+    Returns:
+        ``HOOK_BLOCK_EXIT`` when the commit is blocked, else 0.
+    """
+    verdict = evaluate_gate(config)
+    if verdict.row == GATE_UNREADABLE:
+        _echo_corpus(config, file=sys.stderr)
+        print(_HOOK_UNREADABLE_LINES[verdict.cause], file=sys.stderr)
+        return 0
+    if verdict.row != GATE_BLOCKED:
+        return 0
+    _echo_corpus(config, file=sys.stderr)
+    print(_hook_block_message(config, verdict.uncovered), file=sys.stderr)
+    return HOOK_BLOCK_EXIT
+
+
+#: The hook boundary's pre-dispatch one-liners, keyed by where the fault arose.
+#: Fixed sentences with the caller's values in ``repr`` form, so a newline in a
+#: value cannot break the one line; never ``str(e)``, whose bodies are
+#: multi-line or name commands. Like ``_HOOK_UNREADABLE_LINES`` they name no
+#: command, and carry no echo: no config was resolved, or the config is the fault.
+_HOOK_BOUNDARY_LINES: Dict[str, str] = {
+    "directory": ("mitos commit gate: the -C directory {directory} could not be "
+                  "entered, so there is nothing to gate; the commit was let through."),
+    "selector": ("mitos commit gate: the project was named twice, so the gate "
+                 "could not tell which to check; the commit was let through."),
+    TARGET_MISSING: ("mitos commit gate: no project selector was given, so the gate "
+                     "could not tell which workspace to check; the commit was let "
+                     "through."),
+    TARGET_UNKNOWN_NAME: ("mitos commit gate: no project named {selector} is "
+                          "registered, so there is nothing to gate; the commit was "
+                          "let through."),
+    TARGET_RELATIVE_PATH: ("mitos commit gate: the project selector {selector} is "
+                           "neither a name nor an absolute path, so the gate could "
+                           "not tell which workspace to check; the commit was let "
+                           "through."),
+    TARGET_PATH_NOT_A_WORKSPACE: ("mitos commit gate: no Mitos workspace at {path} "
+                                  "(project selector {selector}), so there is "
+                                  "nothing to gate; the commit was let through."),
+    TARGET_REGISTERED_UNREACHABLE: ("mitos commit gate: the project {selector} is "
+                                    "registered at {path}, but no Mitos workspace "
+                                    "is there, so there is nothing to gate; the "
+                                    "commit was let through."),
+    "targeting": ("mitos commit gate: the project selector {selector} could not be "
+                  "resolved, so the gate could not decide; the commit was let "
+                  "through."),
+    "registry": ("mitos commit gate: the project registry could not be read, so the "
+                 "gate could not decide; the commit was let through."),
+    "config": ("mitos commit gate: the config at {path} could not be read, so the "
+               "gate could not decide; the commit was let through."),
+    "fault": ("mitos commit gate: the gate could not decide; the commit was let "
+              "through."),
+    "unexpected": ("mitos commit gate: an unexpected {error} stopped the gate, so it "
+                   "could not decide; the commit was let through."),
+    # Only with `--hook-file`, which the script `hook-install` writes passes: the
+    # file names itself, so the way out is concrete. The pasted blocks pass no
+    # flag and keep the TARGET_PATH_NOT_A_WORKSPACE line above.
+    "stale_hook": ("mitos commit gate: the hook {hook_file} gates {path}, which is no "
+                   "longer a Mitos workspace, so the commit was let through; install "
+                   "the hook again for the workspace's new location, or delete "
+                   "{hook_file}."),
+}
+
+
+def _run_hook_boundary(args: argparse.Namespace) -> int:
+    """Runs ``hook-run`` behind a boundary of its own; ``main()`` exits with its result.
+
+    Repeats ``main()``'s ordering contract — ``-C`` first, then the selector, then
+    resolution, then the config — and answers every fault on the way with one
+    stderr line and exit 0: a hook that cannot decide lets the commit through. An
+    unexpected exception is one line naming its class and exit 1, which the
+    installed script also treats as a pass but which stays distinguishable from a
+    fault the gate expects.
+
+    ``main()`` routes here before its ``try``, so its ``finally`` never runs: the
+    update-notice exemption is structural, and so is the absence of ``main()``'s
+    multi-line fault anatomy. The config is built with ``warn_unknown_keys=False``
+    and the deprecated-``rotation_mode`` warner is never called, so no row prints a
+    config-hygiene warning. A missing selector is a fault like any other here: the
+    gate never falls back to the working directory, it passes the commit.
+
+    Args:
+        args: The parsed command line (``args.command == "hook-run"``).
+
+    Returns:
+        0, 1 or ``HOOK_BLOCK_EXIT``. Never raises.
+    """
+    stage = "directory"
+    selector: Optional[str] = None
+    root: Optional[str] = None
+    try:
+        _enter_target_directory(args.directory)
+        stage = "selector"
+        selector = _selector_from_args(args)
+        stage = "resolve"
+        target = _resolve_selector(selector, args.command)
+        root = target.root
+        stage = "config"
+        config = MitosConfig(target.root, project=target.name,
+                             warn_unknown_keys=False)
+        stage = "gate"
+        return cmd_hook_run(config)
+    except ProjectTargetingError as e:
+        hook_file = getattr(args, "hook_file", None)
+        if e.discriminator == TARGET_PATH_NOT_A_WORKSPACE and hook_file:
+            # Its own branch, not one more key through the shared `.format`: that
+            # call passes no `hook_file`, and a KeyError here would escape the
+            # boundary as a traceback.
+            line = _HOOK_BOUNDARY_LINES["stale_hook"].format(
+                hook_file=repr(hook_file), path=repr(e.path))
+        else:
+            template = _HOOK_BOUNDARY_LINES.get(e.discriminator,
+                                                _HOOK_BOUNDARY_LINES["targeting"])
+            line = template.format(selector=repr(e.selector), path=repr(e.path))
+        code = 0
+    except RegistryError:
+        line = _HOOK_BOUNDARY_LINES["registry"]
+        code = 0
+    except MitosError:
+        if stage == "config" and root is not None:
+            line = _HOOK_BOUNDARY_LINES["config"].format(
+                path=repr(os.path.join(root, ".mitos", "config.toml")))
+        elif stage in ("directory", "selector"):
+            line = _HOOK_BOUNDARY_LINES[stage].format(directory=repr(args.directory))
+        else:
+            line = _HOOK_BOUNDARY_LINES["fault"]
+        code = 0
+    except Exception as e:
+        if stage == "directory" and isinstance(e, OSError):
+            # `os.chdir` refusing an existing -C target (a permission, say) is a -C
+            # fault like an absent one, not a bug.
+            line = _HOOK_BOUNDARY_LINES["directory"].format(
+                directory=repr(args.directory))
+            code = 0
+        else:
+            line = _HOOK_BOUNDARY_LINES["unexpected"].format(error=type(e).__name__)
+            code = 1
+    print(line, file=sys.stderr)
+    return code
+
+
+def _hook_install_report(config: MitosConfig, *, hook_file: str,
+                         command: List[str], previous: Optional[str],
+                         replaced_ours: bool) -> None:
+    """Prints ``hook-install``'s success report on stdout, one statement per line.
+
+    Args:
+        config: The served workspace's config.
+        hook_file: The file written.
+        command: The baked argv prefix.
+        previous: The workspace a replaced mitos hook served, when readable.
+        replaced_ours: Whether a mitos-written hook was replaced.
+    """
+    workspace = config.workspace_dir
+    print(f"Wrote the commit gate hook to {hook_file}.")
+    print(f"It gates the workspace at {workspace}.")
+    print(f"It runs {' '.join(shlex.quote(part) for part in command)}.")
+    on_path = shutil.which("mitos")
+    if not on_path or os.path.realpath(on_path) != os.path.realpath(command[0]):
+        print("That is this build, not the mitos on your PATH, so install the hook "
+              "again if this build is moved or removed.")
+    if replaced_ours:
+        if previous is None:
+            print("It replaces a mitos hook whose workspace could not be read.")
+        elif os.path.realpath(previous) != os.path.realpath(workspace):
+            print(f"Previously served {previous}.")
+    if judge_api_key(config) is None:
+        # Keyless first, and no store is opened on this path: 3c1's rule.
+        print("No judge key is configured, so the gate stays inactive and every "
+              "commit passes until one is.")
+    else:
+        debt = derive_audit_debt(config.db_path, config.telemetry_path)
+        if not isinstance(debt, AuditDebt):
+            print("The uncovered count could not be read; the gate reads it again "
+                  "on every commit.")
+        elif debt.uncovered == 0:
+            print("The gate is armed, and no decision is uncovered.")
+        else:
+            subject = ("1 decision is" if debt.uncovered == 1
+                       else f"{debt.uncovered} decisions are")
+            print(f"{subject} not yet covered by a contradiction check; the next "
+                  f"commit is blocked once until {_hook_block_recipe(config)} has "
+                  f"been attempted.")
+    print(f"To remove the gate, delete {hook_file}.")
+
+
+def cmd_hook_install(config: MitosConfig) -> int:
+    """Writes the commit gate's ``pre-commit`` into the repository's own git directory.
+
+    The first thing mitos writes outside its workspace, into a directory that
+    belongs to git and often to other people, so every step refuses rather than
+    guesses (ADR ``hook-install-writes-only-the-repos-own-git-dir-marker-means-whole-file``):
+
+    1. The echo, first, so it precedes a refusal too.
+    2. Git is asked from the workspace's own directory, never the caller's.
+    3. The hooks directory must lie within the repository's common git directory.
+       That test comes first, because the default ``.git/hooks`` is inside the work
+       tree too. Anything else is shared — tracked with collaborators when inside
+       the work tree, with other repositories when outside both — and gets the
+       block with no machine path.
+    4. A ``pre-commit`` mitos did not write is never overwritten or appended to; a
+       foreign one gets the absolute block on stdout.
+    5. Every baked path must quote safely, and the running executable must be
+       nameable.
+    6. The write is durable, then ``chmod 0o755``: a new file lands non-executable,
+       and git skips such a hook with only a hint.
+
+    Serves one workspace (ADR
+    ``repo-hook-serves-one-workspace-several-deferred-runtime-discovery-rejected``).
+
+    Args:
+        config: The workspace the hook will gate.
+
+    Returns:
+        0 when written (keyless included), 1 when refused.
+    """
+    # Function-local, 3d's rule: `subprocess` stays off every other verb's path.
+    from mitos import _git
+
+    _echo_corpus(config)
+    workspace = config.workspace_dir
+    # Before git is asked: a newline in the top level would read as "not a work
+    # tree", hiding the reason that is actually true.
+    reason = unsafe_shell_path(workspace)
+    if reason is not None:
+        print(f"The workspace path {workspace!r} cannot be written into a hook "
+              f"safely ({reason}); nothing was written.", file=sys.stderr)
+        return 1
+    location = _git.locate_repository(workspace)
+    if isinstance(location, _git.NotAWorkTree):
+        if location.reason == _git.REASON_GIT_UNAVAILABLE:
+            print("git was not found, so hook-install cannot tell which repository "
+                  "this workspace belongs to; nothing was written.", file=sys.stderr)
+        else:
+            print(f"The workspace at {workspace} is not inside a git work tree, so "
+                  f"there is no repository to install a hook into; nothing was "
+                  f"written.", file=sys.stderr)
+        return 1
+
+    hooks_dir = location.hooks_dir
+    if not _git.is_within(hooks_dir, location.common_dir):
+        relative = os.path.relpath(os.path.realpath(workspace), location.top_level)
+        if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+            print(f"The workspace at {workspace} does not lie under the work tree "
+                  f"{location.top_level}, so no relative path can name it; nothing "
+                  f"was written.", file=sys.stderr)
+            return 1
+        selector = "." if relative == os.curdir else "./" + relative
+        if _git.is_within(hooks_dir, location.top_level):
+            where = ("is inside this repository's work tree, so it is tracked and "
+                     "shared with collaborators")
+        else:
+            where = ("is outside this repository, such as a core.hooksPath in global "
+                     "git configuration, so other repositories share it")
+        print(f"Git's hooks directory {hooks_dir} {where}; hook-install writes only "
+              f"into the repository's own git directory, so nothing was written. "
+              f"To gate commits there, paste this block into its pre-commit:",
+              file=sys.stderr)
+        print(render_hook_block(command=None, selector=selector,
+                                guard_dir=selector + "/.mitos"), end="")
+        return 1
+
+    hook_file = os.path.join(hooks_dir, "pre-commit")
+    state = classify_hook_file(hook_file)
+    if state.kind == HOOK_UNREADABLE:
+        print(f"{hook_file} could not be read, so hook-install cannot tell who wrote "
+              f"it; nothing was written.", file=sys.stderr)
+        return 1
+    if state.kind == HOOK_FOREIGN_WITH_BLOCK:
+        print(f"{hook_file} already carries a mitos commit gate block, so hook-install "
+              f"changes nothing.", file=sys.stderr)
+        return 1
+
+    command = _hook_command()
+    if command is None:
+        print("hook-install cannot tell which mitos executable is running, so it "
+              "cannot name one in a hook; nothing was written.", file=sys.stderr)
+        return 1
+    for path in (command[0], hook_file):
+        reason = unsafe_shell_path(path)
+        if reason is not None:
+            print(f"The path {path!r} cannot be written into a hook safely "
+                  f"({reason}); nothing was written.", file=sys.stderr)
+            return 1
+
+    if state.kind == HOOK_FOREIGN:
+        print(f"{hook_file} exists and mitos did not write it, so hook-install leaves "
+              f"it unchanged. To add the gate, paste this block into it:",
+              file=sys.stderr)
+        print(render_hook_block(command=command, selector=workspace,
+                                guard_dir=None), end="")
+        return 1
+
+    script = render_hook_script(command=command, workspace=workspace,
+                                hook_file=hook_file)
+    try:
+        atomic_file.ensure_parent_directory(hook_file)
+        atomic_file.write_source(hook_file, script)
+        os.chmod(hook_file, 0o755)
+    except OSError as e:
+        print(f"Could not write {hook_file}: {e.strerror or e}.", file=sys.stderr)
+        return 1
+    _hook_install_report(config, hook_file=hook_file, command=command,
+                         previous=state.served_workspace,
+                         replaced_ours=state.kind == HOOK_OURS)
+    return 0
+
+
 def cmd_check(
     config: MitosConfig,
     *,
@@ -5150,18 +6616,21 @@ def cmd_check(
 ) -> int:
     """Audits the live corpus for undeclared contradictions (read-only) → exit 0/1/2.
 
-    The one sequence (each step's contract in the phase plan §4): build substrate →
-    provider-absent disposition (KD2) → ``plan_corpus_check`` → CHK-D5 confirm (KD3)
-    → build judge iff fresh groups (KD6) → ``execute_corpus_check`` → build the full
-    display model → the run-end seam (``exit_code_for`` → row → ``record_check_run``
-    LAST, KD5) → emit. ``cmd_check`` owns its error boundary (KD1a): store faults
-    around plan/execute/display map to a calm exit-2 vector message, never a traceback
-    read by CI as "new findings".
+    The one sequence (each step's contract in the phase plan §4): open the graph →
+    build telemetry → the attempt's ``started`` entry write (unscoped only) → build
+    substrate → provider-absent disposition (KD2) → ``plan_corpus_check`` → CHK-D5
+    confirm (KD3; a refusal marks the attempt ``spend_not_authorized``) → build
+    judge iff fresh groups (KD6) → ``execute_corpus_check`` →
+    build the full display model → the run-end seam (``exit_code_for`` → row +
+    coverage marks + attempt outcome → ``record_run_end`` LAST, one transaction,
+    KD5) → emit. ``cmd_check`` owns its
+    error boundary (KD1a): store faults around plan/execute/display map to a calm
+    exit-2 vector message, never a traceback read by CI as "new findings".
 
     Args:
         config: The active workspace config.
-        staged: Gate the pending buffer instead of sweeping the live corpus (the
-            pre-commit / CI gate mode — a self-contained sequence, Phase 3b).
+        staged: Judge the entries still pending in ``decisions.md`` instead of
+            sweeping the live corpus (a self-contained sequence, Phase 3b).
         scope: Optional scope tag filtering the audited (proposal) set (candidate
             recall stays scope-blind, CONF-D2).
         fresh: Re-judge every pair, bypassing verdict reuse (never the novelty read).
@@ -5198,10 +6667,29 @@ def cmd_check(
     # `conflict_judgment` module-scope would drag `anthropic` onto every other verb.
     from mitos.conflict_judgment import _JUDGMENT_MODEL_ALIAS
 
+    # Bound before the try: the check_faulted arm reads it. It stays None when
+    # GraphStore raises (no attempt was made), which is not _AttemptUnrecorded
+    # (an attempt was made and not recorded).
+    attempt: "_AttemptOnRecord | _AttemptUnrecorded | None" = None
     try:
+        # GraphStore first: it migrates the graph, and the entry write's derive
+        # opens the graph read-only, so a fingerprint taken before a graph
+        # migration could fail to read. A graph that cannot open here exits
+        # check_faulted with no attempt written. That is accepted: a read-only
+        # open of the same graph, which is how any reader derives the fingerprint,
+        # would most likely fail too.
         store = GraphStore(config.db_path)
-        embed, vector, embed_detail = _build_check_substrate(config)
+        # Hoisted above the substrate: it needs only config. It creates and
+        # migrates telemetry.sqlite, as it already did before the substrate's
+        # disposition returned.
         telemetry = _build_check_telemetry(config)
+        # The entry write, before anything environmental can fail: a check that
+        # dies of a missing key, a down Qdrant or a kill has still left its attempt
+        # on record. Unscoped corpus runs only; `--scope ""` is a scoped run.
+        attempt = (
+            _begin_check_attempt(config, telemetry) if scope is None else None
+        )
+        embed, vector, embed_detail = _build_check_substrate(config)
 
         # KD2 — provider-absent disposition keys on whether the run has sweep work.
         # Only the embedding provider can be absent at this point: the vector store
@@ -5215,10 +6703,14 @@ def cmd_check(
                        f"decision(s) — embeddings ({embed_detail}) unavailable.")
                 if as_json:
                     _emit_json({"error": msg, "code": "substrate_unavailable",
+                                "attempt_unrecorded": _attempt_unrecorded_json(attempt),
                                 **corpus_provenance(config)})
                 else:
                     _echo_corpus(config, file=sys.stderr)
                     print(msg, file=sys.stderr)
+                    unrecorded = _attempt_unrecorded_line(attempt)
+                    if unrecorded is not None:
+                        print(unrecorded, file=sys.stderr)
                 return 2
             # Empty snapshot → the providers are never touched (iter_sweep is lazy
             # over zero nodes); fall through to the one healthy-empty engine path.
@@ -5234,12 +6726,19 @@ def cmd_check(
         )
 
         # CHK-D5 confirm (KD3) — strictly above the threshold; all refusals exit 2,
-        # zero spend, no row. The shared `_confirm_spend` helper (KD4) is byte-identical
-        # for corpus and staged, so the `>` comparison can never fork between the modes.
+        # zero spend, no check_runs row. The shared `_confirm_spend` helper (KD4) is
+        # byte-identical for corpus and staged, so the `>` comparison can never fork
+        # between the modes. The corpus words ride the addendum, composed here. A
+        # refusal then marks this attempt's record `spend_not_authorized` with the
+        # planned batch count (after the emission: the words rest on the entry
+        # write, not on this one, and it never raises).
+        batches_planned = len(plan.fresh_groups)
         refusal = _confirm_spend(
-            len(plan.fresh_groups), assume_yes=assume_yes, as_json=as_json
+            batches_planned, assume_yes=assume_yes, as_json=as_json,
+            addendum=_refusal_addendum(attempt),
         )
         if refusal is not None:
+            _record_spend_refusal(telemetry, attempt, batches_planned)
             return refusal
 
         # Build the judge only after the confirm passes and only when there is fresh
@@ -5254,6 +6753,7 @@ def cmd_check(
         exclusions = _resolve_exclusion_display(
             store, check.coverage_exclusion_ids(result)
         )
+        failed_batches = _failed_batch_display(store, result.failed_batches)
         transient_count = _check_transient_count(result)
         denominator: Optional[int] = None
         if scope is not None and plan.nodes_total == 0:
@@ -5261,15 +6761,24 @@ def cmd_check(
             # not carry (plan.nodes_total is already scope-filtered).
             denominator = len(store.get_active_decisions())
 
-        # Run-end seam (KD5): exit → row → write LAST. Build the row unconditionally
-        # (pure) so the JSON scalars derive from the one source; write it only when
-        # telemetry exists.
+        # Run-end seam (KD5): exit → row + coverage → write LAST. Build both
+        # unconditionally (pure) so the JSON scalars derive from the one source; write
+        # them only when telemetry exists, in one transaction (a degraded run's
+        # coverage is None, so it writes its row alone).
         exit_code = check.exit_code_for(result)
         row = check.check_run_row_from_result(result, mode="corpus", exit_code=exit_code)
+        coverage = check.coverage_marks_from_result(result)
+        # Built here, outside the try below, so a builder defect raises rather
+        # than hiding behind the seam's DatabaseError catch.
+        outcome = (
+            check.attempt_outcome_from_result(result, attempt_id=attempt.attempt_id)
+            if isinstance(attempt, _AttemptOnRecord)
+            else None
+        )
         row_written = False
         if telemetry is not None:
             try:
-                telemetry.record_check_run(row)
+                telemetry.record_run_end(row, coverage=coverage, attempt=outcome)
                 row_written = True
             except DatabaseError:
                 # The write is the last fallible act: a failure only moves toward 2.
@@ -5284,10 +6793,14 @@ def cmd_check(
         msg = f"check could not run: {exc}"
         if as_json:
             _emit_json({"error": msg, "code": "check_faulted",
+                        "attempt_unrecorded": _attempt_unrecorded_json(attempt),
                         **corpus_provenance(config)})
         else:
             _echo_corpus(config, file=sys.stderr)
             print(msg, file=sys.stderr)
+            unrecorded = _attempt_unrecorded_line(attempt)
+            if unrecorded is not None:
+                print(unrecorded, file=sys.stderr)
         return 2
 
     # Emission is pure (out of the write contract): one JSON object or the report.
@@ -5297,21 +6810,26 @@ def cmd_check(
         # no business gaining a routing parameter (the same argument D1 makes
         # against stamping inside `_emit_json`).
         _emit_json({**_check_json_object(
-            result, row, exclusions=exclusions, exit_code=exit_code,
+            result, row, exclusions=exclusions, failed_batches=failed_batches,
+            exit_code=exit_code,
             row_written=row_written, scope=scope, fresh=fresh,
             transient_count=transient_count,
+            attempt_unrecorded=_attempt_unrecorded_json(attempt),
         ), **corpus_provenance(config)})
     else:
         _echo_corpus(config)
         _print_check_report(
-            result, exclusions=exclusions, denominator=denominator, scope=scope,
+            result, exclusions=exclusions, failed_batches=failed_batches,
+            denominator=denominator, scope=scope,
             row_written=row_written, transient_count=transient_count,
+            project=config.project,
+            attempt_unrecorded=_attempt_unrecorded_line(attempt),
         )
     return exit_code
 
 
 # =========================================================================== #
-# Phase 3b — `mitos check --staged`: the pre-commit / CI gate mode.
+# Phase 3b — `mitos check --staged`: the pending-buffer gate mode.
 #
 # The proactive half of the `check` verb: it gates the PENDING (not-yet-committed)
 # decision entries of the working-tree `decisions.md` and fails CLOSED — a pending
@@ -5557,7 +7075,7 @@ def _print_staged_report(
     if exclusions:
         print("\nCoverage exclusions (chronically un-embedded — NOT audited):")
         for item in exclusions:
-            print(f"  - {item['slug'] or item['id']}")
+            print(f"  - {handle_text(item)}")
         print("  These keep failing to embed; run `mitos sync` to retry (the durable "
               "fix is outbox quarantine, substrate-owned).")
 
@@ -5959,6 +7477,10 @@ _POSITIONAL_SELECTOR_VERBS: frozenset = frozenset({"status", "agent-block"})
 # steps — SETUP.md's agent loop is built on that report — and `agent-block`'s
 # plain form prints a workspace-independent block, so refusing a pre-`init` repo
 # would block a legitimate use.
+#
+# `hook-run` is not here, and its config fault is not answered by this carve-out:
+# it has a boundary of its own (`_run_hook_boundary`). The argument does not fit
+# a gate either — for a gate, a missing workspace is a pass, not an answer.
 _WORKSPACE_OPTIONAL_VERBS: frozenset = frozenset({"status", "agent-block"})
 
 
@@ -6009,7 +7531,7 @@ def _answer_workspace_optional_verb(args: argparse.Namespace,
         # `agent-block`, whose namespace carries no `verbose`.
         return cmd_status(root, as_json=args.as_json, project=target.name,
                           verbose=getattr(args, "verbose", False))
-    return cmd_agent_block(root, check=args.check)
+    return cmd_agent_block(root, check=args.check, project=target.name or root)
 
 
 def _selector_from_args(args: argparse.Namespace) -> Optional[str]:
@@ -6340,6 +7862,35 @@ def _render_targeting_error(err: ProjectTargetingError) -> str:
     return "\n".join(lines)
 
 
+_BRIEF_HELP = ("An existence screen: axiom-only hits (no rejected_paths) to scan, then "
+               "read the ones that matter whole with `show`.")
+_FULL_TOP_HELP = ("Keep rejected_paths on the top N ranks only; lower ranks are axiom-only "
+                  "(default: all).")
+
+
+def _non_negative_int(value: str) -> int:
+    """Parses ``--full-top``'s value, refusing a negative through argparse (exit 2).
+
+    Args:
+        value: The raw command-line value.
+
+    Returns:
+        The value as an int, 0 or more.
+
+    Raises:
+        argparse.ArgumentTypeError: When it is not an integer, or is negative.
+    """
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not an integer")
+    if number < 0:
+        raise argparse.ArgumentTypeError(
+            f"{value!r} is negative — N is how many top ranks keep rejected_paths, 0 or more"
+        )
+    return number
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Builds the CLI argument parser.
 
@@ -6401,6 +7952,10 @@ def _build_parser() -> argparse.ArgumentParser:
     sync_p.add_argument("--yes", action="store_true", help="Auto-accept all parsed changes.")
     sync_p.add_argument("--embed-only", action="store_true", help="Drain the pending embeddings outbox queue only.")
     sync_p.add_argument("--verbose", action="store_true", help="Show verbose cache statistics.")
+    sync_p.add_argument(
+        "--full", action="store_true",
+        help="Print each diverged commentary field whole on both sides, instead of "
+             "where the two part.")
     # The repair door. Same arity as the nine relation flags below: `action="append"`
     # with no `nargs`, so each occurrence stays one whole value (a bare `extend`
     # iterates the string into characters; `nargs="*"` would make the space form
@@ -6436,7 +7991,11 @@ def _build_parser() -> argparse.ArgumentParser:
     q_p.add_argument("claim", help="Assertion or subsystem query.")
     q_p.add_argument("--depth", default="letter", help="Depth (default: letter).")
     q_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON.")
-    q_p.add_argument("--brief", action="store_true", help="Axiom-only (omit rejected_paths) — a quick scan.")
+    # --brief is --full-top 0 — one depth dial, so the two are refused together.
+    q_depth = q_p.add_mutually_exclusive_group()
+    q_depth.add_argument("--brief", action="store_true", help=_BRIEF_HELP)
+    q_depth.add_argument("--full-top", type=_non_negative_int, default=None, metavar="N",
+                         dest="full_top", help=_FULL_TOP_HELP)
     q_p.add_argument("--limit", type=int, default=None,
                      help="Set ranked top-k to retrieve (1–50; default 5). Raises or lowers the count — a context-budget dial.")
 
@@ -6446,7 +8005,10 @@ def _build_parser() -> argparse.ArgumentParser:
     surf_p.add_argument("query", help="The claim or topic to find precedents for.")
     surf_p.add_argument("--scope", default=None, help="Optional scope hint (does NOT filter semantic recall — scopes open-questions + note only). Use `list --scope` to hard-filter by scope.")
     surf_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON.")
-    surf_p.add_argument("--brief", action="store_true", help="Axiom-only (omit rejected_paths) — a quick scan.")
+    surf_depth = surf_p.add_mutually_exclusive_group()
+    surf_depth.add_argument("--brief", action="store_true", help=_BRIEF_HELP)
+    surf_depth.add_argument("--full-top", type=_non_negative_int, default=None, metavar="N",
+                            dest="full_top", help=_FULL_TOP_HELP)
     surf_p.add_argument("--limit", type=int, default=None,
                         help="Set ranked top-k to retrieve (1–50; default 5). Raises or lowers the count — a context-budget dial.")
 
@@ -6594,6 +8156,10 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="Record past the near-duplicate review (the decision is genuinely "
                             "independent). Combines with the relation flags — declared edges "
                             "are still written.")
+    rec_p.add_argument("--draft-digest", dest="draft_digest", metavar="DIGEST",
+                       help="The draft_digest a --json pause returned: this re-send is compared "
+                            "with that draft and refused, naming the fields, if one changed. "
+                            "Omit it after a deliberate edit.")
     rec_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON.")
 
     # serve
@@ -6655,19 +8221,65 @@ def _build_parser() -> argparse.ArgumentParser:
              "refused, or could not run.")
     check_p.add_argument("--scope", default=None,
                          help="Restrict the audited (proposal) set to one scope tag "
-                              "(candidate recall stays scope-blind).")
+                              "(candidate recall stays scope-blind). A scoped run is "
+                              "not the check attempt the commit gate reads.")
     check_p.add_argument("--fresh", action="store_true",
                          help="Re-judge every pair, bypassing verdict reuse.")
     check_p.add_argument("--yes", action="store_true",
-                         help="Authorize the LLM spend without prompting (the opt-in "
-                              "on every non-interactive surface).")
+                         help="Authorize the LLM spend without prompting: the flag "
+                              "of a person who has already decided that spend.")
     check_p.add_argument("--json", action="store_true", dest="as_json",
                          help="Emit one machine-readable JSON object (never prompts).")
     check_p.add_argument("--staged", action="store_true",
-                         help="Gate the PENDING buffer of decisions.md (the pre-commit / "
-                              "CI gate) instead of sweeping the live corpus. Fails closed: "
-                              "exit 2 when it cannot run. Not git's staging — reads the "
-                              "working-tree decisions.md. Rejects --scope/--fresh.")
+                         help="Judge the entries still PENDING in decisions.md — "
+                              "hand-authored and not yet synced — instead of sweeping the "
+                              "live corpus. Decisions recorded through record_decision are "
+                              "already in the graph, so they are not what it sees. Fails "
+                              "closed: exit 2 when it cannot run. Not git's staging — reads "
+                              "the working-tree decisions.md. Rejects --scope/--fresh.")
+
+    # hook-run — the commit gate a git pre-commit hook runs (no judge, no spend).
+    hook_run_p = subparsers.add_parser(
+        "hook-run",
+        help=f"The commit gate a git pre-commit hook runs: exits {HOOK_BLOCK_EXIT} "
+             f"(block) only when decisions have not been covered by a contradiction "
+             f"check and no check has been attempted since they changed; runs no "
+             f"judge and spends nothing.",
+        description=(
+            "The commit gate a git pre-commit hook runs. It reads the graph and the "
+            "check telemetry and asks one question: have decisions changed without "
+            "a contradiction check being attempted since? It runs no judge, spends "
+            "nothing and reaches no network."),
+        epilog=(
+            f"Exit {HOOK_BLOCK_EXIT} is the block, and the only failure status: it "
+            f"names the check to run. When all is well it prints nothing. A fault "
+            f"it meets (a moved workspace, an unreadable registry, config or graph) "
+            f"is a pass: exit 0, with one line on stderr naming it. An unexpected "
+            f"error exits 1. A hook should fail on exit {HOOK_BLOCK_EXIT} alone."))
+    hook_run_p.add_argument(
+        "--hook-file", dest="hook_file", default=None, metavar="PATH",
+        help="The hook file running this gate; the script hook-install writes passes "
+             "its own path. When the workspace is gone, the one line then names "
+             "this file and the two ways out: install again, or delete it.")
+
+    # hook-install — write that hook into the repository's own git directory.
+    subparsers.add_parser(
+        "hook-install",
+        help="Install the commit gate as the repository's pre-commit hook.",
+        description=(
+            "Writes an executable pre-commit hook that runs the commit gate "
+            "(hook-run) for this workspace. It writes only into the repository's "
+            "own git directory, the hooks directory under its common git directory, "
+            "and bakes absolute paths to this workspace and to the running mitos."),
+        epilog=(
+            "It refuses someone else's pre-commit, never overwriting or appending to "
+            "a file mitos did not write, and refuses a shared hooks directory (a "
+            "core.hooksPath inside the work tree or outside the repository); for "
+            "those two it prints a block to paste by hand, except that a pre-commit "
+            "already carrying that block is left as it is, with no second block "
+            "printed. Every refusal exits 1 and "
+            "writes nothing. Running it again replaces the hook it wrote. The hook "
+            "serves one workspace. Removing the gate is deleting the file it names."))
 
     # restore-source — re-materialize a graph-only node's `### slug` block.
     rs_p = subparsers.add_parser(
@@ -6783,7 +8395,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # Deduped by `id()` because the five aliased verbs (`query`/`query_decisions`,
     # `surface`/`surface_decisions`, `list`/`list_decisions`, `scopes`/
     # `list_scopes`, `record`/`record_decision`) are ONE parser object under two
-    # names: 28 names over 23 objects, and a second `add_argument` on the same
+    # names: 30 names over 25 objects, and a second `add_argument` on the same
     # object raises `ArgumentError: conflicting option strings`. The
     # `allow_abbrev` assignment above needs no such guard — it is idempotent — so
     # the dedupe guards only the registration. Being one object is also what makes
@@ -6814,6 +8426,11 @@ def main() -> None:
     apply_stdout_text_safety(sys.stdout)
     parser = _build_parser()
     args = parser.parse_args()
+    if args.command == "hook-run":
+        # Routed BEFORE the `try`, into a boundary of its own: a git hook speaks on
+        # every commit, so every fault it meets is one line and a pass, and the
+        # `finally`'s update notice (up to two seconds offline) never runs.
+        sys.exit(_run_hook_boundary(args))
 
     try:
         # Constructed INSIDE the try so a strict-loader ConfigError on a malformed
@@ -6914,7 +8531,7 @@ def main() -> None:
             # caller's VERBATIM spelling — never `_normalize_slug`'d, which runs on
             # the `record` path alone while the parser keeps a header slug verbatim.
             cmd_sync(config, auto_accept=args.yes, embed_only=args.embed_only,
-                     verbose=args.verbose,
+                     verbose=args.verbose, full=args.full,
                      repair_targets=(
                          None if args.reconcile_entry is None
                          else [h for v in args.reconcile_entry
@@ -6925,9 +8542,9 @@ def main() -> None:
         elif args.command == "capture":
             cmd_capture(config, args.text)
         elif args.command in ("query", "query_decisions"):
-            cmd_query(config, args.claim, depth=args.depth, as_json=args.as_json, brief=args.brief, limit=args.limit)
+            cmd_query(config, args.claim, depth=args.depth, as_json=args.as_json, brief=args.brief, limit=args.limit, full_top=args.full_top)
         elif args.command in ("surface", "surface_decisions"):
-            cmd_surface(config, args.query, scope=args.scope, as_json=args.as_json, brief=args.brief, limit=args.limit)
+            cmd_surface(config, args.query, scope=args.scope, as_json=args.as_json, brief=args.brief, limit=args.limit, full_top=args.full_top)
         elif args.command == "show":
             cmd_show(config, args.ident, as_json=args.as_json)
         elif args.command in ("list", "list_decisions"):
@@ -6986,10 +8603,12 @@ def main() -> None:
             # them is safe and `_read_text_arg`'s file-wins precedence never fires on
             # a caller who supplied both.
             _inline_axiom = args.axiom if args.axiom is not None else args.axiom_flag
-            axiom = _read_text_arg(_inline_axiom, args.axiom_file)
+            axiom = _read_record_text_arg(_inline_axiom, args.axiom_file,
+                                          "--axiom-file", as_json=args.as_json)
             if args.axiom_file is not None and axiom.endswith("\n"):
                 axiom = axiom[:-1]  # strip the single trailing newline files/heredocs add
-            rejected = _read_text_arg(args.rejected, args.rejected_file)
+            rejected = _read_record_text_arg(args.rejected, args.rejected_file,
+                                             "--rejected-file", as_json=args.as_json)
             if not (rejected and rejected.strip()):
                 msg = ("record requires --rejected or --rejected-file "
                        "(the rejected alternatives are mandatory).")
@@ -7000,7 +8619,8 @@ def main() -> None:
                 else:
                     print(msg, file=sys.stderr)
                 sys.exit(2)
-            context = _read_text_arg(args.context, args.context_file)
+            context = _read_record_text_arg(args.context, args.context_file,
+                                            "--context-file", as_json=args.as_json)
             cmd_record(
                 config,
                 axiom=axiom,
@@ -7019,6 +8639,7 @@ def main() -> None:
                 cites=_join_relation_flag(args.cites),
                 slug=args.slug,
                 acknowledge_neighbors=args.acknowledge_neighbors,
+                draft_digest=args.draft_digest,
                 as_json=args.as_json,
             )
         elif args.command == "serve":
@@ -7062,7 +8683,8 @@ def main() -> None:
             # machines" stays a structural fact rather than a discipline someone
             # could later tidy onto stdout.
             _echo_corpus(config, file=sys.stderr)
-            sys.exit(cmd_agent_block(config.workspace_dir, check=args.check))
+            sys.exit(cmd_agent_block(config.workspace_dir, check=args.check,
+                                     project=config.project))
         elif args.command == "set-key":
             # The other dispatch-site echo, for the same reason: `cmd_set_key` takes
             # a bare path, not a config, and `main()` is the only place that holds
@@ -7078,6 +8700,8 @@ def main() -> None:
         elif args.command == "rebuild":
             sys.exit(cmd_rebuild(config, allow_drops=args.allow_drops,
                                  assume_yes=args.yes, as_json=args.as_json))
+        elif args.command == "hook-install":
+            sys.exit(cmd_hook_install(config))
         elif args.command == "check":
             sys.exit(cmd_check(config, staged=args.staged, scope=args.scope,
                                fresh=args.fresh, assume_yes=args.yes,
@@ -7133,6 +8757,8 @@ def main() -> None:
         # Best-effort 'new version available' nudge, AFTER the command's own
         # output (the finally runs even on the sys.exit paths above). Skipped for
         # the long-running MCP server; fully fail-silent so it never disrupts work.
+        # `hook-run` is exempt too, structurally: it returns before the `try`, so
+        # it never reaches this arm. Folding its route back inside would lose that.
         if args.command != "serve":
             try:
                 from mitos._update import update_notice

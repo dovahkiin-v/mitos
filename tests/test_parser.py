@@ -1038,6 +1038,27 @@ def test_parse_entry_stream_code_names_pinned() -> None:
         assert codes <= PARSER_FAILURE_CODES
 
 
+def test_slug_too_long_messages_share_one_reason() -> None:
+    """B13 row 16 — the parser's twin carries the same clause as the record path's
+    `slug_too_long`, verbatim, so the two can never disagree; neither says the slug
+    is permanent or part of identity."""
+    from mitos.sync import _record_error
+    from test_record_decision import register_violations
+    from test_relations_and_adjacency import SLUG_MESSAGE_FORBIDDEN_WORDS
+    failures: list = []
+    parse_entry_stream("<!-- BEGIN ENTRIES -->\n### " + "x" * 101
+                       + "\n**Decided:** a\n**Rejected:** y\n", "decision",
+                       failures=failures)
+    (parser_msg,) = [i.message for env in failures for i in env.items
+                     if i.code == PARSER_SLUG_TOO_LONG]
+    record_msg = _record_error("slug_too_long", slug="x", length=101, over=1,
+                               max=identity.SLUG_MAX_LEN)["error"]
+    for msg in (parser_msg, record_msg):
+        assert identity.SLUG_LENGTH_REASON in msg
+        assert register_violations(msg, words=SLUG_MESSAGE_FORBIDDEN_WORDS) == [], msg
+    assert parser_msg.endswith("; shorten it in the entry.")
+
+
 def test_entry_failure_to_dict_json_roundtrip_safe() -> None:
     """Both envelope structs serialize JSON-roundtrip-safe (cross-vision boundary)."""
     import json

@@ -305,6 +305,23 @@ def test_retired_keys_silent_unknown_keys_warn(capsys: pytest.CaptureFixture) ->
         assert "Traceback" not in err
 
 
+def test_warn_unknown_keys_false_silences_only_that_line(capsys: pytest.CaptureFixture) -> None:
+    """`warn_unknown_keys=False` (the commit gate's build) prints nothing, and changes nothing else.
+
+    A transition on one file: the default build warns on the typo, the quiet build
+    does not, and both load the same values — the key still sets nothing.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _write_config(tmpdir, 'frobnicate = 1\nstale_entry_window_days = 7\n')
+        MitosConfig(tmpdir)
+        assert "frobnicate" in capsys.readouterr().err
+
+        quiet = MitosConfig(tmpdir, warn_unknown_keys=False)
+        assert capsys.readouterr() == ("", "")
+        assert quiet.stale_entry_window_days == 7
+        assert not hasattr(quiet, "frobnicate")
+
+
 # ---------------------------------------------------------------------------
 # R12 attribute surface
 # ---------------------------------------------------------------------------

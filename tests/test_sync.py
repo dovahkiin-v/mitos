@@ -1405,7 +1405,8 @@ def test_collision_never_discards_a_kill_edge_authored_at_another_slug(
 # was simply unreachable, gated away by all four callers. C′ routes one caller to it,
 # divergence-GATED so a clean corpus behaves exactly as before.
 
-def _seed_committed_buffer(config, manager, *, amends=None, slug="reconcile-me"):
+def _seed_committed_buffer(config, manager, *, amends=None, slug="reconcile-me",
+                           rejected="The original rejected reasoning.", context=None):
     """Commits one entry through `record`, leaving it IN the buffer for a re-sync.
 
     Deliberately `record_decision_entry` rather than `perform_sync`: it commits
@@ -1415,8 +1416,8 @@ def _seed_committed_buffer(config, manager, *, amends=None, slug="reconcile-me")
     sync's reach before the re-sync.
     """
     result = manager.record_decision_entry(
-        "The reconcilable axiom.", "The original rejected reasoning.",
-        ["alpha"], mechanisms=["sqlite"], slug=slug, amends=amends,
+        "The reconcilable axiom.", rejected,
+        ["alpha"], mechanisms=["sqlite"], slug=slug, amends=amends, context=context,
         acknowledge_neighbors=True,
     )
     assert result.get("state") == "active", result
@@ -1485,6 +1486,186 @@ def test_a_scope_edit_is_reconciled(
     manager.perform_sync(auto_accept=True)
 
     assert sorted(GraphStore(config.db_path).get_all_nodes()[0]["scope"]) == ["alpha", "beta"]
+
+
+# --- The divergence report shows the differing span (B5) --------------------------
+#
+# The report used to print each diverged field whole on both sides, which answered
+# "where do they differ" with two near-identical kilobyte strings — and never answered
+# it at all for a homoglyph, which renders the same on both. It now prints the span.
+
+# A long field whose distinctive opening word must NOT reach the report: the shared
+# prefix is elided, and printing it is exactly the volunteered text B5 removes.
+_LONG_REJECTED = (
+    "Zeppelinlike caching was weighed first. " + "It held up under load. " * 20
+    + "The quick path lost on cold starts. " + "Measured twice. " * 10
+)
+_LONG_EDITED = _LONG_REJECTED.replace("The quick path", "The quack path")
+
+
+def _mid_field_report(config, manager, capsys) -> str:
+    """Runs a no-TTY sync over a one-character mid-field edit and returns stdout."""
+    config.env["GEMINI_API_KEY"] = "mock_key"
+    _seed_committed_buffer(config, manager, rejected=_LONG_REJECTED)
+    _edit_buffer(config, "The quick path", "The quack path")
+    assert not sys.stdin.isatty()
+    manager.perform_sync(auto_accept=False)
+    return capsys.readouterr().out
+
+
+def _field_lines(out: str) -> str:
+    """The `[Divergence]` block's lines up to its pointer or refusal."""
+    block = out.split("[Divergence]", 1)[1]
+    return block.split("  Only the differing spans")[0].split("  Skipped")[0]
+
+
+@patch("google.genai.Client")
+def test_the_report_prints_the_differing_span_not_the_shared_text(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str],
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """One changed character in a long field: its offset and one character each side."""
+    config, manager, tmpdir = sync_env
+    out = _mid_field_report(config, manager, capsys)
+
+    offset = _LONG_REJECTED.strip().index("The quick path") + len("The qu")
+    length = len(_LONG_REJECTED.strip())
+    assert (f"  rejected_paths: parts after {offset} shared characters "
+            f"(graph {length}, markdown {length}; {length - offset - 1} shared at "
+            f"the end)") in out
+    assert "    graph:       'i'\n    markdown:    'a'\n" in out
+    assert "Zeppelinlike" not in out, "the shared prefix is elided"
+    assert "Measured twice" not in out, "the shared suffix is elided"
+    assert "code points" not in out, "an ASCII span names no code points"
+    assert f"    mitos sync -p {config.project!r} --full\n" in out
+
+
+@patch("google.genai.Client")
+def test_a_homoglyph_in_the_report_names_both_code_points(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str],
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A Cyrillic `а` for a Latin `a`: the spans print alike, the code points do not."""
+    config, manager, tmpdir = sync_env
+    config.env["GEMINI_API_KEY"] = "mock_key"
+    _seed_committed_buffer(config, manager, context="Local-first, no daemon.")
+    _edit_buffer(config, "no daemon.", "no dаemon.")
+    manager.perform_sync(auto_accept=False)
+    out = capsys.readouterr().out
+
+    assert "  context: parts after 17 shared characters" in out
+    assert ("    code points: graph U+0061 LATIN SMALL LETTER A; "
+            "markdown U+0430 CYRILLIC SMALL LETTER A\n") in out
+    assert GraphStore(config.db_path).get_all_nodes()[0]["context"] == (
+        "Local-first, no daemon."), "fail closed: no terminal, nothing applied"
+
+
+@patch("google.genai.Client")
+def test_whitespace_the_comparator_strips_produces_no_span(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str],
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """Only the field the comparator listed is reported, located on its judged value.
+
+    `context` gains trailing whitespace only (never listed); `rejected_paths` gains a
+    real mid-field change. The second half is the renderer's own fallback: a listed
+    field whose judged values agree prints both sides whole, because "no difference"
+    under a divergence header would be false.
+    """
+    from mitos.sync import _divergence_field_lines
+
+    config, manager, tmpdir = sync_env
+    config.env["GEMINI_API_KEY"] = "mock_key"
+    _seed_committed_buffer(config, manager, context="Local-first, no daemon.")
+    _edit_buffer(config, "no daemon.", "no daemon.   \t")
+    _edit_buffer(config, "original rejected", "original REJECTED")
+    manager.perform_sync(auto_accept=False)
+    fields = _field_lines(capsys.readouterr().out)
+
+    assert "  rejected_paths: parts after 13 shared characters" in fields
+    assert "    graph:       'rejected'\n    markdown:    'REJECTED'\n" in fields
+    assert "context" not in fields
+
+    assert _divergence_field_lines("context", "x ", " x\n", full=False) == [
+        "  context:", "    graph:    'x '", "    markdown: ' x\\n'",
+    ]
+    assert _divergence_field_lines("slug", "Probe", "probe", full=False) == [
+        "  slug:", "    graph:    'Probe'", "    markdown: 'probe'",
+    ]
+
+
+# Captured on `daaa3bc`, before `_apply_commentary_reconcile` learned the span: the
+# whole-value report `--full` must reproduce byte for byte. A `None` graph side, a
+# mid-field edit holding a quote and a backslash, and the scope line after the fields.
+_FULL_GOLDEN = (
+    "[Divergence] 'reconcile-me' — the corpus and graph disagree.\n"
+    "  rejected_paths:\n"
+    "    graph:    'The original rejected reasoning.'\n"
+    "    markdown: 'The original \"rejected\" back\\\\slash reasoning.'\n"
+    "  context:\n"
+    "    graph:    None\n"
+    "    markdown: \"it's new\"\n"
+    "  scope:      graph ['alpha'] → markdown ['alpha', 'beta']\n"
+)
+
+
+@patch("google.genai.Client")
+def test_full_reproduces_the_whole_value_report_byte_for_byte(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str],
+    capsys: pytest.CaptureFixture,
+) -> None:
+    config, manager, tmpdir = sync_env
+    config.env["GEMINI_API_KEY"] = "mock_key"
+    _seed_committed_buffer(config, manager)
+    _edit_buffer(config, "The original rejected reasoning.",
+                 'The original "rejected" back\\slash reasoning.')
+    _edit_buffer(config, "**Scope:** alpha", "**Context:** it's new\n**Scope:** alpha, beta")
+    manager.perform_sync(auto_accept=False, full=True)
+    out = capsys.readouterr().out
+
+    block = "[Divergence]" + out.split("[Divergence]", 1)[1]
+    assert block.split("  Skipped")[0] == _FULL_GOLDEN
+    assert "--full" not in out, "nothing was elided, so nothing points at --full"
+
+
+@patch("google.genai.Client")
+def test_the_full_pointer_parses_and_the_flag_is_syncs_alone(
+    mock_client: MagicMock, sync_env: Tuple[MitosConfig, MitosSyncManager, str],
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """The printed recipe goes through the real parser, `--full` stays `sync`'s, and
+    `--embed-only` refuses it rather than dropping it silently."""
+    import io
+    import shlex
+    from mitos import cli
+
+    config, manager, tmpdir = sync_env
+    out = _mid_field_report(config, manager, capsys)
+    recipe = next(line.strip() for line in out.splitlines()
+                  if line.strip().endswith("--full"))
+    args = cli._build_parser().parse_args(shlex.split(recipe)[1:])
+    assert args.command == "sync"
+    assert args.full is True
+    assert args.project_post == config.project
+
+    for argv in (["query", "x", "--full"], ["surface", "x", "--full"]):
+        with pytest.raises(SystemExit) as exc:
+            cli._build_parser().parse_args(argv)
+        assert exc.value.code == 2, argv
+    capsys.readouterr()
+
+    echo = io.StringIO()
+    cli._echo_corpus(config, file=echo)
+    with patch("mitos.cli.MitosSyncManager") as never_built:
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_sync(config, embed_only=True, full=True)
+    err = capsys.readouterr().err
+    assert exc.value.code == 1
+    assert never_built.call_count == 0, "refused above the drain"
+    assert err == echo.getvalue() + (
+        "--full shows a full sync's divergence report: --embed-only drains the "
+        "pending embeddings queue and reads no buffer entries. Re-run without "
+        "--embed-only.\n")
 
 
 @patch("google.genai.Client")

@@ -16,17 +16,40 @@ rebuildable graph (P7 bulkhead): the swap/backup machinery in ``cutover.py`` onl
 ever touches ``graph.sqlite``-derived paths, so a different basename survives the
 truth-rebuild untouched (CONF-D8; the T8 guarantee).
 
-This module pairs two append-only whole-row **writers** (``record_judged_batch``,
-the per-batch judgment grain; ``record_check_run``, the per-run summary grain —
-the CHK-D7 run memory) with one non-mutating bulk **reader** —
-``load_reuse_index``, the corpus's first in-tool consumer (verdict
-reuse + novelty; CHK-D3/D10). The reader opens the sibling DB ``mode=ro`` so it
-*physically* cannot mutate the corpus, and it never chains derived state (it reads
-the primary judged rows verbatim, M8). There is still no retention, decay, or
-pruning (P4 deferred), and the full CONF-C1 ``edges ⋈ conflict_checks`` corpus join
-still belongs to a future vision. Every judged row lands **whole and uncapped** —
-the longest, thorniest contradiction is exactly the example the future classifier
-will most need (CONF-D8 verbatim-and-whole).
+The judgment corpus is written by an append-only whole-row writer
+(``record_judged_batch``, the per-batch judgment grain) and read by one
+non-mutating bulk **reader** — ``load_reuse_index``, the corpus's first in-tool
+consumer (verdict reuse + novelty; CHK-D3/D10). The reader opens the sibling DB
+``mode=ro`` so it *physically* cannot mutate the corpus, and it never chains
+derived state (it reads the primary judged rows verbatim, M8). There is still no
+retention, decay, or pruning (P4 deferred), and the full CONF-C1 ``edges ⋈
+conflict_checks`` corpus join still belongs to a future vision. Every judged row
+lands **whole and uncapped** — the longest, thorniest contradiction is exactly the
+example the future classifier will most need (CONF-D8 verbatim-and-whole).
+
+The module is **not** append-only throughout. A corpus check ends at one run-end
+seam, ``record_run_end``, which writes the append-only ``check_runs`` summary row
+(the CHK-D7 run memory) and, for an undegraded run, upserts ``check_coverage`` in
+the same transaction. Coverage is a per-node **state** table: one row per node id
+an undegraded sweep has seen, marked ``covered`` or ``excluded``, overwritten by
+the next undegraded run that sweeps the node. It is not a per-run log, because
+nothing reads a per-run swept set; readers ask only "has this node been seen".
+Its size is bounded by the nodes the corpus has ever held. Readers outside the
+check verb reach it through the module-level ``read_coverage``, which opens
+read-only and never creates or migrates the file (``TelemetryStore``'s
+constructor does both).
+
+``check_attempt`` holds one row: the newest unscoped corpus check attempt, written
+``started`` at entry (``record_attempt_start``) and given its outcome at the run-end
+seam, in that seam's transaction, or ``spend_not_authorized`` and its planned batch
+count when the spend is refused (``record_attempt_refusal``). Its reader is the
+module-level ``read_last_attempt``.
+
+A corpus-check batch that fails leaves an append-only ``failed_judgment_batches``
+row (``record_failed_batch``), written at the failure site rather than at the
+run-end seam: its pairs, pin and billed usage, NULL where no response arrived.
+Total judgment spend is ``SPEND_UNION_SQL``, a ``UNION ALL`` over that table and
+``judgment_batches``.
 
 Tier 2 (logic/store): it reuses ``store.open_connection`` (the MI-8 connection
 chokepoint) and ``migrations.run_migrations`` (the ladder primitive) rather than
@@ -42,7 +65,7 @@ import json
 import os
 import sqlite3
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, FrozenSet, Iterator, List, Optional, Tuple
 
 from mitos.errors import DatabaseError
 from mitos.migrations import MigrationStep, run_migrations
@@ -50,11 +73,11 @@ from mitos.store import open_connection
 
 # --- Boundary-crossing row shapes ---------------------------------------------
 #
-# Three frozen dataclasses cross the persistence boundary (Python -> parameterized
-# INSERT -> STRICT columns -> read-back). Each carries a ``to_params()`` producing
-# a value tuple in a *fixed column order* that must match the module-level column
-# tuples below, so a single INSERT is fully parameterized (P8) and column/param
-# order cannot drift (the per-tuple length is lockstep-pinned by test).
+# The frozen row dataclasses below cross the persistence boundary (Python ->
+# parameterized INSERT -> STRICT columns -> read-back). Each carries a
+# ``to_params()`` producing a value tuple in a *fixed column order* that must match
+# the module-level column tuples below, so a single INSERT is fully parameterized
+# (P8) and column/param order cannot drift (the per-tuple length is lockstep-pinned by test).
 
 
 @dataclass(frozen=True)
@@ -182,8 +205,10 @@ class JudgmentBatch:
     pair, so they live in their own side-table keyed on ``batch_id`` (PK). That
     makes exactly-once a *structural* property — one metrics row per batch — and
     keeps the append-only writer uniform (no "is-this-the-designated-row" branch
-    over ``conflict_checks``). A naive ``SUM(token_input)`` over this table returns
-    true spend, never ``N x`` the batch size (RF-2/D1).
+    over ``conflict_checks``). A naive ``SUM(token_input)`` over this table counts
+    each judged batch's spend exactly once, never ``N x`` the batch size (RF-2/D1).
+    It is judged spend only: a failed corpus-check batch's spend lands in
+    ``failed_judgment_batches``, and total spend is :data:`SPEND_UNION_SQL`.
 
     All five metrics are caller-supplied (3b measures them from the Anthropic
     response; 1b only stores) — the writer performs zero wall-clock or API reads.
@@ -204,7 +229,8 @@ class JudgmentBatch:
         elapsed_ms: Wall-clock latency of the batched call, in milliseconds.
         stop_reason: The API ``stop_reason`` from the response (``"tool_use"``,
             ``"max_tokens"``, …). Nullable TEXT — ``None`` on pre-rung-4 rows and
-            when the executor returns ``Unavailable`` before constructing this object.
+            when the executor returns ``Unavailable`` before constructing this object
+            (a failed batch's stop reason is on its :class:`FailedJudgmentBatch`).
     """
 
     batch_id: str
@@ -367,6 +393,88 @@ class CheckRunRow:
         )
 
 
+@dataclass(frozen=True)
+class FailedJudgmentBatch:
+    """One corpus-check batch the engine filed as failed — its pairs and its spend.
+
+    The sibling of :class:`JudgmentBatch` for a batch that produced no verdicts. It is
+    spend attribution first: a truncated response or one without its tool block is
+    billed in full, and this row is the only place that bill is recorded. It is also
+    the carry on ``check.CheckRunResult.failed_batches``, so the result and the table
+    hold one shape, built once at the failure site.
+
+    Usage is whole or absent. Where a response arrived the four token fields hold its
+    counts; where none did (the exhausted ladder, a refusal) all four are ``None``,
+    never 0 — a zero would read as "billed nothing". The table's ``CHECK`` refuses a
+    half-null row. There is deliberately no ``detail`` field: an ``Unavailable``'s
+    detail can carry a request id, and it stays unstored.
+
+    Attributes:
+        batch_id: The PK. The executor's minted id when a response arrived, else
+            one ``check.py`` minted at the failure site.
+        run_id: The check run that attempted the batch (``check_runs.run_id``);
+            the row stands without that row, which a failed run-end seam never
+            writes.
+        created_at: Caller-supplied UTC ISO-8601 stamp taken at the failure (MI-10).
+        reason: The engine's ``ConflictUnavailableReason`` value.
+        proposal_id: The group's proposal node id (a content hash, never a slug).
+        partner_ids: The group's partner node ids, in the group's partner-hash
+            order. Stored as a JSON array.
+        token_input: Input tokens billed, or ``None`` when no response arrived.
+        token_output: Output tokens billed, or ``None``.
+        token_cache_read: Cache-read tokens billed, or ``None``.
+        token_cache_creation: Cache-creation tokens billed, or ``None``.
+        stop_reason: The response's API stop reason, or ``None``.
+        model_id: The resolved versioned id for ``model_alias``; ``None`` when
+            resolution failed.
+        model_alias: The pin's model alias (P19).
+        prompt_version: The pin's prompt version.
+        mitos_version: The build that ran the batch (a failed batch has no
+            ``conflict_checks`` rows to join for it).
+    """
+
+    batch_id: str
+    run_id: str
+    created_at: str
+    reason: str
+    proposal_id: str
+    partner_ids: List[str]
+    token_input: Optional[int]
+    token_output: Optional[int]
+    token_cache_read: Optional[int]
+    token_cache_creation: Optional[int]
+    stop_reason: Optional[str]
+    model_id: Optional[str]
+    model_alias: str
+    prompt_version: str
+    mitos_version: str
+
+    def to_params(self) -> Tuple:
+        """Produces the INSERT parameter tuple in ``_FAILED_JUDGMENT_BATCHES_COLUMNS`` order.
+
+        Returns:
+            A value tuple positionally matching ``_FAILED_JUDGMENT_BATCHES_COLUMNS``,
+            with ``partner_ids`` serialized as a JSON array.
+        """
+        return (
+            self.batch_id,
+            self.run_id,
+            self.created_at,
+            self.reason,
+            self.proposal_id,
+            json.dumps(list(self.partner_ids)),
+            self.token_input,
+            self.token_output,
+            self.token_cache_read,
+            self.token_cache_creation,
+            self.stop_reason,
+            self.model_id,
+            self.model_alias,
+            self.prompt_version,
+            self.mitos_version,
+        )
+
+
 # --- Schema (migration ladder step 1) -----------------------------------------
 #
 # Telemetry owns a SEPARATE migration ladder in a SEPARATE file with its OWN
@@ -491,21 +599,18 @@ _JUDGMENT_BATCHES_ADD_MODEL_ID = """
 
 # ``check_runs`` — one summary row per check run: the run-level repetition memory
 # (P18: standing-count trend, time-to-resolution/nag-count per finding, the
-# long-standing-unresolved FP-suspect list). Written best-effort at run end by
-# ``TelemetryStore.record_check_run``, which ships and is called from both
-# ``cli.cmd_check`` and ``cli._run_staged_check`` — so a workspace `mitos check` has
-# run in carries a row per run, save the runs whose telemetry store could not be
-# constructed at all (``cli._build_check_telemetry`` returns None: the engine's
-# documented ``reuse_read`` degradation, where the KD5 seam records nothing). That
-# is the honest bound on "best-effort" and it is narrow — every ordinary run writes.
-# (Named by function rather than by line number: the two call sites drift with every
-# phase that edits ``cli.py``.)
-# Check-freshness state therefore EXISTS on disk today; the conditional
-# coherence-freshness gate is deferred on what a row MEANS — a run happened, not
-# that given writes are covered — never on the state being unavailable. See ADR
-# ``coherence-pointer-deferral-rests-on-check-runs-semantics-not-impossibility``,
-# which names this comment as the artifact a reader re-deriving the old
-# impossibility claim would land on.
+# long-standing-unresolved FP-suspect list). A corpus run writes it at the run-end
+# seam, ``TelemetryStore.record_run_end``, in ONE transaction with that run's
+# ``check_coverage`` rows; a staged run writes it alone through
+# ``record_check_run``. A row means a run reached the seam, not that it covered
+# anything: a degraded run still writes its row and writes no coverage.
+# Many runs write no row at all and exit 2: no embedding provider over a non-empty
+# corpus, a store fault caught at ``cmd_check``'s boundary, an exception escaping to
+# ``main()``, a refused spend confirmation, telemetry that could not be constructed
+# (``cli._build_check_telemetry`` returns None), and a failed run-end write.
+# So "did the corpus get audited" is read from ``check_coverage``, never from here.
+# See ADR ``coverage-table-ends-the-coherence-gate-deferral``, which supersedes the
+# deferral this comment used to cite.
 # Nullability is the semantic line, pinned NOW because SQLite constraints are
 # rebuild-only to change: NOT NULL = the run always knows it at run end; NULL =
 # "value not computable this run", deliberately distinct from a genuine zero
@@ -637,11 +742,211 @@ def _judgment_batches_add_stop_reason(conn: "sqlite3.Connection") -> None:
     )
 
 
+# --- Rung 5: check coverage — which nodes an undegraded sweep has seen --------
+#
+# The primary record behind "how much of this corpus has never been checked for
+# contradictions". ``check_runs`` holds counts; nothing else persists which nodes a
+# sweep saw, and nothing can recompute it. It is a record of what one sweep saw, not
+# node state: node state stays computed from edges (M3).
+#
+# ``mark`` is closed in code, not by CHECK: a later mark (an incremental sweep's,
+# say) is then a release, not a table rebuild. The writer validates the set before
+# any connection opens. There is no prompt/model pin and no content fingerprint:
+# coverage is pin-blind and amend-blind on purpose, so a judge-pin change does not
+# turn the whole corpus uncovered.
+_CHECK_COVERAGE_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS check_coverage (
+        node_id TEXT NOT NULL,    -- content-hash id; a PLAIN COLUMN, NOT an FK (the
+                                  -- graph is another, disposable file)
+        mark TEXT NOT NULL,       -- 'covered' | 'excluded', closed in code
+        run_id TEXT NOT NULL,     -- the check_runs.run_id that set this mark (same
+                                  -- transaction, so it always joins)
+        marked_at TEXT NOT NULL,  -- that run's ended_at, application-supplied (MI-10)
+        PRIMARY KEY (node_id)
+    ) STRICT;
+"""
+
+# The rung the coverage reader needs. The ladder literal below uses it too, so the
+# writer's rung and the reader's requirement are one number.
+COVERAGE_RUNG = 5
+
+
+def _check_coverage_schema(conn: sqlite3.Connection) -> None:
+    """Migration step 5: the per-node check coverage table.
+
+    A plain additive rung: one CREATE, nothing to back-fill. A workspace that has
+    never run a check since upgrading holds no rows, which reads as "nothing
+    covered", the honest answer. Does NOT touch ``user_version`` or manage the
+    transaction; ``run_migrations`` owns both.
+
+    **Death story (P4).** Rows are never pruned, and the table does not grow without
+    bound: it holds at most one row per node id the corpus has ever held, because
+    each run upserts on ``node_id``. A row for an id that has since left the graph is
+    harmless, since readers intersect with the live active set. Retention belongs to
+    the ROADMAP's telemetry-retention item, like the rest of this file.
+
+    Args:
+        conn: An open, writable SQLite connection inside the runner's transaction
+            (opened via ``store.open_connection``, MI-8).
+    """
+    conn.execute(_CHECK_COVERAGE_SCHEMA)
+
+
+# --- Rung 6: failed judgment batches — a failed batch's pairs and spend -------
+#
+# A corpus-check batch that comes back truncated, or without its tool block, is
+# billed in full and yields no verdicts. Before this rung its spend and its pairs
+# were recorded nowhere. One row per failed batch, written at the failure site (not
+# at the run-end seam), so a killed run or a failed seam still keeps what was paid.
+#
+# Not a nullable column set on ``judgment_batches``: that table's metrics are NOT
+# NULL in a STRICT table, so a batch that got no response would store zeros, a false
+# "billed nothing". Here the four token columns are nullable together: the CHECK
+# makes usage whole or absent. There is no ``detail`` column on purpose (it can carry
+# a request id). ``proposal_id``/``partner_ids`` are node ids, never slugs (MI-2).
+#
+# Total spend reads both tables: see ``SPEND_UNION_SQL`` below.
+_FAILED_JUDGMENT_BATCHES_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS failed_judgment_batches (
+        batch_id TEXT NOT NULL,        -- executor's id when a response arrived, else minted at the failure
+        run_id TEXT NOT NULL,          -- check_runs.run_id; a PLAIN COLUMN (a failed seam writes no run row)
+        created_at TEXT NOT NULL,      -- application-supplied UTC ISO-8601 (MI-10)
+        reason TEXT NOT NULL,          -- ConflictUnavailableReason value; the engine's vocabulary
+        proposal_id TEXT NOT NULL,     -- content-hash id of the group's proposal
+        partner_ids TEXT NOT NULL,     -- JSON array of partner content-hash ids, group order
+        token_input INTEGER,           -- NULL = no response arrived, NOT a zero
+        token_output INTEGER,
+        token_cache_read INTEGER,
+        token_cache_creation INTEGER,
+        stop_reason TEXT,              -- the response's stop reason; NULL when none
+        model_id TEXT,                 -- resolved versioned id; NULL when resolution failed
+        model_alias TEXT NOT NULL,     -- the pin (P19)
+        prompt_version TEXT NOT NULL,  -- the pin
+        mitos_version TEXT NOT NULL,   -- nothing to join for it
+        PRIMARY KEY (batch_id),
+        CHECK (
+            (token_input IS NULL AND token_output IS NULL
+             AND token_cache_read IS NULL AND token_cache_creation IS NULL)
+            OR (token_input IS NOT NULL AND token_output IS NOT NULL
+                AND token_cache_read IS NOT NULL AND token_cache_creation IS NOT NULL)
+        )
+    ) STRICT;
+"""
+
+# The rung the failed-batch table lands on; the ladder literal below uses it.
+FAILED_BATCHES_RUNG = 6
+
+# Total judgment spend across both batch tables, plus how many failed batches carry
+# no usage (no response arrived, so nothing was billed that can be counted). UNION
+# ALL, never UNION: UNION drops a failed row whose counts equal a judged row's, a
+# silent undercount. Its reader today is a person's SQL; a test executes it.
+SPEND_UNION_SQL = """
+    SELECT
+        COALESCE(SUM(token_input), 0) AS token_input,
+        COALESCE(SUM(token_output), 0) AS token_output,
+        COALESCE(SUM(token_cache_read), 0) AS token_cache_read,
+        COALESCE(SUM(token_cache_creation), 0) AS token_cache_creation,
+        COALESCE(SUM(no_usage), 0) AS failed_batches_without_usage
+    FROM (
+        SELECT token_input, token_output, token_cache_read, token_cache_creation,
+               0 AS no_usage
+        FROM judgment_batches
+        UNION ALL
+        SELECT token_input, token_output, token_cache_read, token_cache_creation,
+               CASE WHEN token_input IS NULL THEN 1 ELSE 0 END AS no_usage
+        FROM failed_judgment_batches
+    )
+"""
+
+
+def _failed_judgment_batches_schema(conn: sqlite3.Connection) -> None:
+    """Migration step 6: the failed-judgment-batch table.
+
+    A plain additive rung: one CREATE, nothing to back-fill. Does NOT touch
+    ``user_version`` or manage the transaction; ``run_migrations`` owns both.
+
+    **Death story (P4).** Append-only. It grows with failures, not with runs: a few
+    hundred bytes per failed batch, and a healthy run writes nothing. Rows are never
+    pruned; retention belongs to the ROADMAP's telemetry-retention item, like the
+    rest of this file.
+
+    Args:
+        conn: An open, writable SQLite connection inside the runner's transaction
+            (opened via ``store.open_connection``, MI-8).
+    """
+    conn.execute(_FAILED_JUDGMENT_BATCHES_SCHEMA)
+
+
+# --- Rung 7: the last check attempt — newest-only, one row --------------------
+#
+# The record that answers: has an unscoped corpus check been *attempted* since the
+# uncovered set last changed? ``check_runs`` cannot answer it. Most
+# could-not-run exits write no row there, and a row written at entry would carry a
+# made-up exit code. So ``cmd_check`` writes this table twice: ``started`` at entry,
+# before the substrate is built, and then either the outcome at the run-end seam,
+# inside that seam's one transaction, or a refused spend's ``spend_not_authorized``
+# at the refusal site. On a refusal ``outcome_at`` is the refusal's own time and
+# ``run_id`` stays NULL (the DDL comments below predate the refusal and stay as
+# committed, because ``sqlite_master`` keeps the text).
+#
+# Newest-only by shape: ``slot`` is the primary key and may only be 1, and each
+# entry write replaces the row whole, so a column added later can never carry a
+# value over from the previous attempt. ``state`` is closed in code, never by
+# CHECK: a later state (3b's ``spend_not_authorized``) is a release, not a rung.
+# Every column this vision writes is here now, because a committed rung is never
+# edited: ``batches_planned`` stays NULL until the spend refusal writes it.
+# ``fingerprint`` is ``audit_debt.uncovered_fingerprint`` of the entry-time
+# uncovered set, and no later write names it. ADRs
+# ``check-attempt-state-is-a-newest-only-telemetry-table-not-a-workspace-json-file``,
+# amended by ``check-attempt-entry-state-is-started-and-later-writes-land-only-on-their-own-record``.
+_CHECK_ATTEMPT_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS check_attempt (
+        slot INTEGER NOT NULL CHECK (slot = 1),  -- newest-only by shape; never a state CHECK
+        attempt_id TEXT NOT NULL,        -- uuid4 hex minted by cmd_check; the own-record key
+        started_at TEXT NOT NULL,        -- UTC ISO-8601 µs, application-supplied (MI-10)
+        fingerprint TEXT NOT NULL,       -- uncovered-set fingerprint at entry; never rewritten
+        state TEXT NOT NULL,             -- closed in code (the ATTEMPT_* constants)
+        run_id TEXT,                     -- check_runs.run_id, a PLAIN column; NULL while started
+        outcome_at TEXT,                 -- the run's ended_at; NULL while started
+        degradation_tokens TEXT,         -- JSON array, check._DEGRADATION_TOKENS order; NULL while started
+        new_pairs TEXT,                  -- JSON array of [proposal_id, partner_id]; NULL while started
+        findings_known INTEGER,          -- NULL while started, and under reuse_read (check_runs' rule)
+        batches_planned INTEGER,         -- written by the spend refusal only
+        PRIMARY KEY (slot)
+    ) STRICT;
+"""
+
+# The rung the attempt table lands on; the ladder literal and the reader use it.
+ATTEMPT_RUNG = 7
+
+
+def _check_attempt_schema(conn: sqlite3.Connection) -> None:
+    """Migration step 7: the last-check-attempt table.
+
+    A plain additive rung: one CREATE, nothing to back-fill. A workspace that has
+    not run a check since upgrading holds no row, which reads as "no attempt on
+    record", the honest answer. Does NOT touch ``user_version`` or manage the
+    transaction; ``run_migrations`` owns both.
+
+    **Death story (P4).** It does not grow. It holds at most one row, and each
+    attempt replaces the last whole, so it needs no retention. The history of
+    completed runs stays in ``check_runs``.
+
+    Args:
+        conn: An open, writable SQLite connection inside the runner's transaction
+            (opened via ``store.open_connection``, MI-8).
+    """
+    conn.execute(_CHECK_ATTEMPT_SCHEMA)
+
+
 TELEMETRY_MIGRATION_STEPS: List[MigrationStep] = [
     (1, _conflict_checks_schema),
     (2, _check_attribution_schema),
     (3, _commentary_audit_schema),
     (4, _judgment_batches_add_stop_reason),
+    (COVERAGE_RUNG, _check_coverage_schema),
+    (FAILED_BATCHES_RUNG, _failed_judgment_batches_schema),
+    (ATTEMPT_RUNG, _check_attempt_schema),
 ]
 
 
@@ -705,6 +1010,25 @@ _CHECK_RUNS_COLUMNS: Tuple[str, ...] = (
 )
 
 
+_FAILED_JUDGMENT_BATCHES_COLUMNS: Tuple[str, ...] = (
+    "batch_id",
+    "run_id",
+    "created_at",
+    "reason",
+    "proposal_id",
+    "partner_ids",
+    "token_input",
+    "token_output",
+    "token_cache_read",
+    "token_cache_creation",
+    "stop_reason",
+    "model_id",
+    "model_alias",
+    "prompt_version",
+    "mitos_version",
+)
+
+
 def _insert_sql(table: str, columns: Tuple[str, ...]) -> str:
     """Builds a fully-parameterized INSERT over code-internal column literals.
 
@@ -723,6 +1047,289 @@ def _insert_sql(table: str, columns: Tuple[str, ...]) -> str:
 _INSERT_CONFLICT_CHECK_SQL = _insert_sql("conflict_checks", _CONFLICT_CHECKS_COLUMNS)
 _INSERT_JUDGMENT_BATCH_SQL = _insert_sql("judgment_batches", _JUDGMENT_BATCHES_COLUMNS)
 _INSERT_CHECK_RUN_SQL = _insert_sql("check_runs", _CHECK_RUNS_COLUMNS)
+_INSERT_FAILED_BATCH_SQL = _insert_sql(
+    "failed_judgment_batches", _FAILED_JUDGMENT_BATCHES_COLUMNS
+)
+
+# The last undegraded run that swept a node wins, including a demotion from
+# ``covered`` to ``excluded`` (a node whose embedding is stuck NOW cannot be found by
+# other nodes' gathers now). ``excluded.`` here is SQLite's pseudo-table for the
+# proposed row, unrelated to the mark value ``'excluded'``. Read by module-global
+# name inside ``record_run_end``, so a test can swap it to fault the transaction.
+_UPSERT_COVERAGE_SQL = (
+    "INSERT INTO check_coverage (node_id, mark, run_id, marked_at) "
+    "VALUES (?, ?, ?, ?) "
+    "ON CONFLICT(node_id) DO UPDATE SET mark = excluded.mark, "
+    "run_id = excluded.run_id, marked_at = excluded.marked_at"
+)
+
+_SELECT_COVERAGE_SQL = "SELECT node_id, mark FROM check_coverage"
+
+# The closed mark set. A row read back with any other mark is a newer build's and
+# is ignored (the ladder accepts a database ahead of the code; so does the reader).
+COVERAGE_MARK_COVERED = "covered"
+COVERAGE_MARK_EXCLUDED = "excluded"
+
+
+@dataclass(frozen=True)
+class CoverageMarks:
+    """The coverage one undegraded corpus run writes at its run-end seam.
+
+    A dumb boundary shape, like :class:`CheckRunRow`: which ids are covered and
+    which excluded is the check engine's decision
+    (``check.coverage_marks_from_result``). Defaultless on purpose. The one rule
+    enforced here is structural: a node carries one mark, so an id in both tuples
+    raises at construction, before any connection opens.
+
+    Attributes:
+        run_id: The run that sets these marks; the same ``run_id`` as the
+            ``check_runs`` row written in the same transaction.
+        marked_at: That run's ``ended_at`` (UTC ISO-8601, MI-10).
+        covered: Node ids the run swept and could audit.
+        excluded: Node ids the run swept whose embedding was stuck (a poison
+            backlog row), so other nodes' gathers could not reach them.
+    """
+
+    run_id: str
+    marked_at: str
+    covered: Tuple[str, ...]
+    excluded: Tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        """Rejects an id marked both covered and excluded.
+
+        Raises:
+            ValueError: If the two tuples share an id.
+        """
+        overlap = set(self.covered) & set(self.excluded)
+        if overlap:
+            raise ValueError(
+                f"a node carries one coverage mark, but {sorted(overlap)!r} are in "
+                "both covered and excluded"
+            )
+
+    def to_params(self) -> List[Tuple[str, str, str, str]]:
+        """Produces one upsert parameter tuple per id, covered first.
+
+        Returns:
+            ``(node_id, mark, run_id, marked_at)`` tuples for ``executemany``.
+        """
+        return [
+            (node_id, COVERAGE_MARK_COVERED, self.run_id, self.marked_at)
+            for node_id in self.covered
+        ] + [
+            (node_id, COVERAGE_MARK_EXCLUDED, self.run_id, self.marked_at)
+            for node_id in self.excluded
+        ]
+
+
+# --- The last check attempt (rung 7): states, SQL, boundary shapes -------------
+#
+# The state vocabulary, closed in code, not by CHECK. ``started`` is the entry
+# state, named for what is known: the record is read from the moment it is written,
+# and a check that is still running has not failed to finish (ADR
+# ``check-attempt-entry-state-is-started-and-later-writes-land-only-on-their-own-record``).
+# The next three are the run-end outcomes. ``spend_not_authorized`` is written only
+# by the corpus spend-refusal site (``record_attempt_refusal``), with the planned
+# batch count: the check stopped before it spent, which is not a run end. Readers
+# match states by these constants and never re-spell the strings. A state read back
+# that is none of these is a newer build's, and the reader returns it as-is.
+ATTEMPT_STARTED = "started"
+ATTEMPT_NO_NEW_FINDINGS = "no_new_findings"
+ATTEMPT_NEW_FINDINGS = "new_findings"
+ATTEMPT_COULD_NOT_COMPLETE = "could_not_complete"
+ATTEMPT_SPEND_NOT_AUTHORIZED = "spend_not_authorized"
+
+# The states the run-end seam may write. ``started`` is not one of them.
+ATTEMPT_RUN_END_STATES: Tuple[str, ...] = (
+    ATTEMPT_NO_NEW_FINDINGS,
+    ATTEMPT_NEW_FINDINGS,
+    ATTEMPT_COULD_NOT_COMPLETE,
+)
+
+# The entry write replaces the one row whole. Every column it does not name lands
+# NULL, so nothing from the previous attempt survives the replace.
+_REPLACE_ATTEMPT_SQL = (
+    "INSERT OR REPLACE INTO check_attempt "
+    "(slot, attempt_id, started_at, fingerprint, state) VALUES (?, ?, ?, ?, ?)"
+)
+
+# The run-end write lands only on the record its own attempt wrote. When a newer
+# attempt has replaced the row, zero rows update, which is the intended result and
+# is not reported. The SET list names neither ``fingerprint`` nor ``started_at``: a
+# decision recorded while the check ran was not swept and must still ask for a
+# check of its own, so the entry-time fingerprint is never rewritten (ADR
+# ``check-attempt-entry-state-is-started-and-later-writes-land-only-on-their-own-record``,
+# rejected path 4). Read by module-global name inside ``record_run_end``.
+_UPDATE_ATTEMPT_OUTCOME_SQL = (
+    "UPDATE check_attempt SET state = ?, run_id = ?, outcome_at = ?, "
+    "degradation_tokens = ?, new_pairs = ?, findings_known = ? "
+    "WHERE slot = 1 AND attempt_id = ?"
+)
+
+# The refusal write, on the same own-record rule. It names no ``run_id``: a refused
+# spend writes no ``check_runs`` row, so there is nothing to join to. The columns it
+# leaves alone stay as the entry replace wrote them.
+_UPDATE_ATTEMPT_REFUSAL_SQL = (
+    "UPDATE check_attempt SET state = ?, outcome_at = ?, batches_planned = ? "
+    "WHERE slot = 1 AND attempt_id = ?"
+)
+
+_SELECT_ATTEMPT_SQL = (
+    "SELECT attempt_id, started_at, fingerprint, state, run_id, outcome_at, "
+    "degradation_tokens, new_pairs, findings_known, batches_planned "
+    "FROM check_attempt WHERE slot = 1"
+)
+
+
+@dataclass(frozen=True)
+class AttemptStart:
+    """The entry write of one unscoped corpus check attempt.
+
+    A dumb boundary shape: the key, the time and the fingerprint are minted by
+    ``cli.cmd_check``. Each field must be a non-empty string, checked at
+    construction, before any connection opens.
+
+    Attributes:
+        attempt_id: The attempt's own key (uuid4 hex). The run-end write matches it.
+        started_at: UTC ISO-8601 with microseconds (MI-10).
+        fingerprint: ``audit_debt.uncovered_fingerprint`` of the uncovered set at
+            entry. Never rewritten.
+    """
+
+    attempt_id: str
+    started_at: str
+    fingerprint: str
+
+    def __post_init__(self) -> None:
+        """Rejects an empty or non-string field.
+
+        Raises:
+            ValueError: If any field is not a non-empty string.
+        """
+        for name in ("attempt_id", "started_at", "fingerprint"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"AttemptStart.{name} must be a non-empty string")
+
+    def to_params(self) -> Tuple[int, str, str, str, str]:
+        """Produces the replace's parameters, in ``_REPLACE_ATTEMPT_SQL`` order.
+
+        Returns:
+            ``(1, attempt_id, started_at, fingerprint, 'started')``.
+        """
+        return (1, self.attempt_id, self.started_at, self.fingerprint, ATTEMPT_STARTED)
+
+
+@dataclass(frozen=True)
+class AttemptOutcome:
+    """The run-end write of one attempt: what the run found and whether it finished.
+
+    A dumb boundary shape. The rules that pick the state live in
+    ``check.attempt_outcome_from_result``. Checked here, before any connection
+    opens: the state is a run-end state, and every pair is two strings.
+
+    Attributes:
+        attempt_id: The key the entry write used. The update matches on it.
+        state: One of :data:`ATTEMPT_RUN_END_STATES`.
+        run_id: The ``check_runs.run_id`` written in the same transaction.
+        outcome_at: The run's ``ended_at`` (UTC ISO-8601, MI-10).
+        degradation_tokens: The run's degradation tokens, in declaration order.
+        new_pairs: ``(proposal_id, partner_id)`` of every new finding, in the
+            order the result carries them. Node ids, never slugs (MI-2).
+        findings_known: The count of known findings, or ``None`` when the reuse
+            index could not be read (``check_runs``' rule).
+    """
+
+    attempt_id: str
+    state: str
+    run_id: str
+    outcome_at: str
+    degradation_tokens: Tuple[str, ...]
+    new_pairs: Tuple[Tuple[str, str], ...]
+    findings_known: Optional[int]
+
+    def __post_init__(self) -> None:
+        """Rejects a state that is not a run-end state, and a malformed pair.
+
+        Raises:
+            ValueError: If ``state`` is ``started`` or unknown, or a pair is not
+                two strings.
+        """
+        if self.state not in ATTEMPT_RUN_END_STATES:
+            raise ValueError(
+                f"an attempt's run-end state must be one of {ATTEMPT_RUN_END_STATES!r}, "
+                f"got {self.state!r}"
+            )
+        for pair in self.new_pairs:
+            if len(pair) != 2 or not all(isinstance(side, str) for side in pair):
+                raise ValueError(f"a new pair is two node ids, got {pair!r}")
+
+    def to_params(self) -> Tuple[Any, ...]:
+        """Produces the update's parameters, in ``_UPDATE_ATTEMPT_OUTCOME_SQL`` order.
+
+        Tuples persist as JSON lists (no tuple survives a JSON round trip).
+
+        Returns:
+            ``(state, run_id, outcome_at, tokens_json, pairs_json, findings_known,
+            attempt_id)``.
+        """
+        return (
+            self.state,
+            self.run_id,
+            self.outcome_at,
+            json.dumps(list(self.degradation_tokens)),
+            json.dumps([list(pair) for pair in self.new_pairs]),
+            self.findings_known,
+            self.attempt_id,
+        )
+
+
+@dataclass(frozen=True)
+class AttemptRefusal:
+    """The refusal write of one attempt: the spend was not authorized.
+
+    A dumb boundary shape, checked at construction, before any connection opens.
+
+    Attributes:
+        attempt_id: The key the entry write used. The update matches on it.
+        refused_at: The refusal's own time (UTC ISO-8601, MI-10).
+        batches_planned: The judgment batches the refused spend would have run.
+    """
+
+    attempt_id: str
+    refused_at: str
+    batches_planned: int
+
+    def __post_init__(self) -> None:
+        """Rejects an empty key or time, and a batch count below one.
+
+        Raises:
+            ValueError: If ``attempt_id`` or ``refused_at`` is not a non-empty
+                string, or ``batches_planned`` is not an ``int`` of at least 1.
+        """
+        for name in ("attempt_id", "refused_at"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"AttemptRefusal.{name} must be a non-empty string")
+        count = self.batches_planned
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            raise ValueError(
+                f"AttemptRefusal.batches_planned must be an int of at least 1, got {count!r}"
+            )
+
+    def to_params(self) -> Tuple[str, str, int, str]:
+        """Produces the update's parameters, in ``_UPDATE_ATTEMPT_REFUSAL_SQL`` order.
+
+        Returns:
+            ``('spend_not_authorized', refused_at, batches_planned, attempt_id)``.
+        """
+        return (
+            ATTEMPT_SPEND_NOT_AUTHORIZED,
+            self.refused_at,
+            self.batches_planned,
+            self.attempt_id,
+        )
 
 
 # --- Read-side boundary shapes (verdict-reuse / novelty projection) -----------
@@ -901,17 +1508,25 @@ _SELECT_COMMENTARY_AUDIT_SQL = (
 
 
 class TelemetryStore:
-    """Append-only sibling store for the Conflict sensor's judged batches.
+    """Sibling store for the check family's non-rebuildable telemetry.
 
     Boots its own migration ladder on construction (mirroring
     ``GraphStore.__init__``'s boot-on-init shape) and is otherwise
     connection-stateless: every operation opens its own connection through the MI-8
-    chokepoint and closes it, holding no long-lived handle. It pairs two append-only
-    writers (``record_judged_batch`` — the per-batch grain; ``record_check_run`` —
-    the per-run summary grain) with one read-only bulk projection
-    (``load_reuse_index``, the sibling's first consumer-facing read surface) — the
-    reader opens ``mode=ro``, so "no writes on the read path" is structural, not
-    disciplinary.
+    chokepoint and closes it, holding no long-lived handle. Writers:
+    ``record_judged_batch`` (the per-batch judgment grain, append-only),
+    ``record_failed_batch`` (a failed corpus-check batch's pairs and spend,
+    append-only), ``record_attempt_start`` (an unscoped corpus check's ``started``
+    record, replacing the last), ``record_run_end`` (a corpus run's summary row plus
+    its coverage upsert and attempt outcome, one transaction) and
+    ``record_check_run`` (the summary row alone, for staged runs). Two tables here
+    are updated in place: ``check_coverage``, a per-node state table bounded by the
+    nodes the corpus has ever held, not a per-run log; and ``check_attempt``, a
+    single row holding the newest attempt only.
+    Its bulk reader ``load_reuse_index`` opens ``mode=ro``, so "no writes on the
+    read path" is structural, not disciplinary. Because construction creates and
+    migrates the file, readers outside the check verb use the module-level
+    ``read_coverage`` and ``read_last_attempt`` instead of this class.
     """
 
     def __init__(self, telemetry_path: str) -> None:
@@ -930,8 +1545,8 @@ class TelemetryStore:
         if db_dir:
             os.makedirs(db_dir, exist_ok=True)
         # Bare boot: open the MI-8 chokepoint, run telemetry's OWN ladder, close.
-        # No prototype guard, no pre-ladder snapshot — a single append-only store
-        # with no risky rebuild needs none of the graph's ``_boot_migrations``
+        # No prototype guard, no pre-ladder snapshot — a sibling store whose rungs
+        # are all additive (no risky rebuild) needs none of the graph's ``_boot_migrations``
         # machinery (D2). ``run_migrations`` sets this connection to autocommit; it
         # is closed here, so the write path opens a fresh deferred-isolation
         # connection of its own (see ``record_judged_batch``).
@@ -987,6 +1602,31 @@ class TelemetryStore:
             # one-line ``Error: …`` under the CLI's ``except MitosError`` boundary
             # (§13; mint no new error class).
             raise DatabaseError(f"Failed to persist judged batch: {e}") from e
+        finally:
+            conn.close()
+
+    def record_failed_batch(self, row: FailedJudgmentBatch) -> None:
+        """Persists one failed corpus-check batch's row, at the failure site.
+
+        Same manners as :meth:`record_judged_batch`: its own fresh connection, one
+        ``with conn:`` transaction, an INSERT only. It does not join the run-end
+        transaction: this is a batch-grain spend fact, and a run killed mid-loop or a
+        failed run-end seam must not erase what was already billed.
+
+        Args:
+            row: The failed batch's row, verbatim.
+
+        Raises:
+            DatabaseError: If the row cannot be persisted (a duplicate ``batch_id``,
+                a half-null usage set refused by the CHECK, or any other SQLite
+                error). Nothing lands.
+        """
+        conn = open_connection(self.telemetry_path)
+        try:
+            with conn:
+                conn.execute(_INSERT_FAILED_BATCH_SQL, row.to_params())
+        except sqlite3.Error as e:
+            raise DatabaseError(f"Failed to persist failed batch: {e}") from e
         finally:
             conn.close()
 
@@ -1115,39 +1755,123 @@ class TelemetryStore:
             out.append(record)
         return out
 
-    def record_check_run(self, row: CheckRunRow) -> None:
-        """Persists one check run's summary row — the CHK-D7 run memory (W7).
+    def record_attempt_start(self, start: AttemptStart) -> None:
+        """Replaces the last-attempt record with a new attempt's ``started`` row.
 
-        Mirrors :meth:`record_judged_batch`'s manners exactly: its own fresh
-        deferred-isolation connection, one INSERT under ``with conn:``,
-        append-only (never UPDATE/DELETE), no wall-clock read — the row carries
-        the caller's MI-10 stamps. ``run_id`` is the table PK, so a second write
-        for the same run raises (one summary row per run is structural).
+        One fresh connection through the MI-8 chokepoint, one ``with conn:``, one
+        ``INSERT OR REPLACE`` of the singleton row: the previous attempt's record,
+        outcome columns included, is gone whole. Best-effort is the caller's call
+        (``cli._begin_check_attempt``); this writer raises like the others.
 
-        This writer is a dumb sink (the 1b sibling-store bulkhead): the scalars'
-        semantics — NULL rules, degradation tokens, novelty counts — are the
-        check engine's, computed in ``check.check_run_row_from_result`` from the
-        same result object the run report reads. The seam order is the CLI's
-        (3a): compute the exit code → build the row → this write, LAST, so a
-        failure here can only move the exit toward 2 and a persisted row's
+        Args:
+            start: The attempt's key, start time and entry-time fingerprint.
+
+        Raises:
+            DatabaseError: If the row cannot be persisted. Nothing lands.
+        """
+        conn = open_connection(self.telemetry_path)
+        try:
+            with conn:
+                conn.execute(_REPLACE_ATTEMPT_SQL, start.to_params())
+        except sqlite3.Error as e:
+            raise DatabaseError(f"Failed to persist check attempt: {e}") from e
+        finally:
+            conn.close()
+
+    def record_attempt_refusal(self, refusal: AttemptRefusal) -> None:
+        """Marks this attempt's record ``spend_not_authorized`` with its batch count.
+
+        One fresh connection, one ``with conn:``, one ``UPDATE`` conditioned on the
+        attempt's own key: when a newer attempt has replaced the row, nothing
+        changes. Best-effort is the caller's call (``cli._record_spend_refusal``).
+
+        Args:
+            refusal: The attempt's key, the refusal time and the planned batches.
+
+        Raises:
+            DatabaseError: If the update cannot be persisted. Nothing lands.
+        """
+        conn = open_connection(self.telemetry_path)
+        try:
+            with conn:
+                conn.execute(_UPDATE_ATTEMPT_REFUSAL_SQL, refusal.to_params())
+        except sqlite3.Error as e:
+            raise DatabaseError(f"Failed to persist check refusal: {e}") from e
+        finally:
+            conn.close()
+
+    def record_run_end(
+        self,
+        row: CheckRunRow,
+        *,
+        coverage: Optional[CoverageMarks],
+        attempt: Optional[AttemptOutcome],
+    ) -> None:
+        """Persists a check run's summary row, coverage and attempt outcome at once.
+
+        The run-end seam. One fresh deferred-isolation connection, one
+        ``with conn:`` holding the ``check_runs`` INSERT, the coverage upsert and
+        the attempt-outcome update, so all three commit together or not at all: a
+        run can never read degraded in one table and covered in the other, and a
+        failure lands nothing, which leaves the attempt ``started``. The outcome
+        update is conditioned on the attempt's own key, so when a newer attempt
+        has replaced the record it updates zero rows. That is intended and is not
+        reported. No wall-clock read; both carry the caller's MI-10 stamps.
+        ``run_id`` is the ``check_runs`` PK, so a second write for the same run
+        raises and rolls its coverage back with it.
+
+        A dumb sink (the sibling-store bulkhead): which runs cover and which ids
+        are covered or excluded is the engine's call
+        (``check.coverage_marks_from_result``), as the row's scalars are
+        (``check.check_run_row_from_result``). The seam order is the CLI's:
+        compute the exit code → build the row and the marks → this write, LAST,
+        so a failure here can only move the exit toward 2 and a persisted row's
         ``exit_code`` always equals the actual process exit.
+
+        Args:
+            row: The assembled summary row, verbatim.
+            coverage: The run's coverage marks, or ``None`` to write the row alone
+                (a degraded run, or a staged run). Keyword-only: further run-end
+                writes join this same transaction as further keywords.
+            attempt: The run's attempt outcome, or ``None`` when no attempt record
+                is this run's to update (a scoped or staged run, or an entry
+                write that did not land).
+
+        Raises:
+            DatabaseError: If anything cannot be persisted (duplicate ``run_id``,
+                a CHECK/NOT NULL breach, or any other SQLite error). The whole
+                transaction has rolled back first; never swallowed, the caller
+                owns the disclose-and-exit disposition.
+        """
+        conn = open_connection(self.telemetry_path)
+        try:
+            with conn:
+                conn.execute(_INSERT_CHECK_RUN_SQL, row.to_params())
+                if coverage is not None:
+                    conn.executemany(_UPSERT_COVERAGE_SQL, coverage.to_params())
+                if attempt is not None:
+                    conn.execute(_UPDATE_ATTEMPT_OUTCOME_SQL, attempt.to_params())
+        except sqlite3.Error as e:
+            raise DatabaseError(f"Failed to persist check run: {e}") from e
+        finally:
+            conn.close()
+
+    def record_check_run(self, row: CheckRunRow) -> None:
+        """Persists one check run's summary row alone — the staged path's writer.
+
+        ``cli._run_staged_check`` writes through here; staged runs write no
+        coverage. The corpus path writes through :meth:`record_run_end`. Same
+        transaction manners and failure contract, because it is that method with
+        ``coverage=None`` and ``attempt=None``.
 
         Args:
             row: The assembled summary row, verbatim.
 
         Raises:
             DatabaseError: If the row cannot be persisted (duplicate ``run_id``,
-                a CHECK/NOT NULL breach, or any other SQLite error) — never
-                swallowed; the caller owns the disclose-and-exit disposition.
+                a CHECK/NOT NULL breach, or any other SQLite error).
         """
-        conn = open_connection(self.telemetry_path)
-        try:
-            with conn:
-                conn.execute(_INSERT_CHECK_RUN_SQL, row.to_params())
-        except sqlite3.Error as e:
-            raise DatabaseError(f"Failed to persist check run: {e}") from e
-        finally:
-            conn.close()
+        self.record_run_end(row, coverage=None, attempt=None)
 
     def load_reuse_index(
         self, *, prompt_version: str, model_alias: str
@@ -1211,3 +1935,270 @@ class TelemetryStore:
         finally:
             if conn is not None:
                 conn.close()
+
+
+# --- Read-only access from outside the check verb -----------------------------
+#
+# ``TelemetryStore(...)`` creates the file and migrates it, so nothing on a read
+# path may construct it. These module-level readers open ``mode=ro`` and hand back
+# one of three typed results: data, :class:`TelemetryAbsent` (holds nothing; every
+# consumer reads it as empty) or :class:`TelemetryUnreadable` (a fault; never an
+# empty set). ADR ``telemetry-readers-outside-check-open-read-only-absent-is-empty-not-unreadable``.
+
+
+@dataclass(frozen=True)
+class TelemetryAbsent:
+    """The telemetry file holds no data this reader needs.
+
+    Either there is no file, or its ``user_version`` is below the rung the reader
+    needs (a workspace that has not run a check since upgrading). Both mean
+    "nothing recorded", which is different in type from a present, empty table.
+
+    Attributes:
+        reason: ``"no_file"`` or ``"below_rung"``. Diagnostic only; consumers
+            treat both the same.
+    """
+
+    reason: str
+
+
+@dataclass(frozen=True)
+class TelemetryUnreadable:
+    """The telemetry file exists and could not be read.
+
+    A corrupt image, a permission fault, a path that is a directory. Returned,
+    never raised, and never collapsed into an empty result.
+
+    Attributes:
+        detail: The underlying exception message, for diagnostics.
+    """
+
+    detail: str
+
+
+@dataclass(frozen=True)
+class CoverageRead:
+    """The coverage marks as read from ``check_coverage``.
+
+    Two empty sets mean the table exists and holds no rows, which is a different
+    type from :class:`TelemetryAbsent`.
+
+    Attributes:
+        covered: Node ids an undegraded sweep has seen and could audit.
+        excluded: Node ids an undegraded sweep has seen but could not audit
+            (stuck embedding).
+    """
+
+    covered: FrozenSet[str]
+    excluded: FrozenSet[str]
+
+
+def _open_read_only(
+    telemetry_path: str, *, required_rung: int
+) -> "sqlite3.Connection | TelemetryAbsent | TelemetryUnreadable":
+    """Opens the telemetry file read-only, if it holds the rung a reader needs.
+
+    Order matters. A missing path is answered from ``os.path.exists`` without
+    touching SQLite: a ``mode=ro`` connect on a missing path raises, and that
+    must not read as *unreadable*. The ``user_version`` check sits inside the same
+    ``try`` as the connect, because a corrupt file connects fine and fails at its
+    first statement. Never creates, never migrates, never raises. (A read-only
+    open of a WAL file may still leave ``-shm``/``-wal`` siblings; the database
+    file itself is untouched.)
+
+    Args:
+        telemetry_path: Path to ``telemetry.sqlite``.
+        required_rung: The lowest ``user_version`` holding the table to be read.
+
+    Returns:
+        An open read-only connection (the caller closes it), or
+        :class:`TelemetryAbsent` (``"no_file"`` / ``"below_rung"``), or
+        :class:`TelemetryUnreadable`.
+    """
+    if not os.path.exists(telemetry_path):
+        return TelemetryAbsent("no_file")
+    conn = None
+    try:
+        conn = open_connection(telemetry_path, read_only=True)
+        version = conn.execute("PRAGMA user_version;").fetchone()[0]
+    except (sqlite3.Error, DatabaseError) as e:
+        # A connect failure arrives wrapped (``DatabaseError``); a corrupt image
+        # raises raw ``sqlite3.DatabaseError`` at the PRAGMA. Catch both.
+        if conn is not None:
+            conn.close()
+        return TelemetryUnreadable(str(e))
+    if version < required_rung:
+        conn.close()
+        return TelemetryAbsent("below_rung")
+    return conn
+
+
+def read_coverage(
+    telemetry_path: str,
+) -> "CoverageRead | TelemetryAbsent | TelemetryUnreadable":
+    """Reads the check coverage marks without creating or migrating anything.
+
+    Args:
+        telemetry_path: Path to ``telemetry.sqlite`` (typically
+            ``config.telemetry_path``).
+
+    Returns:
+        A :class:`CoverageRead` (possibly two empty sets), or
+        :class:`TelemetryAbsent` when there is no file or it predates the coverage
+        rung, or :class:`TelemetryUnreadable` when the file exists and a read
+        failed. A row with a mark outside the closed set (a newer build's) is
+        ignored. Never raises on a bad file.
+    """
+    opened = _open_read_only(telemetry_path, required_rung=COVERAGE_RUNG)
+    if not isinstance(opened, sqlite3.Connection):
+        return opened
+    covered: set = set()
+    excluded: set = set()
+    try:
+        for row in opened.execute(_SELECT_COVERAGE_SQL):
+            if row["mark"] == COVERAGE_MARK_COVERED:
+                covered.add(row["node_id"])
+            elif row["mark"] == COVERAGE_MARK_EXCLUDED:
+                excluded.add(row["node_id"])
+    except sqlite3.Error as e:
+        # Deeper page corruption surfaces only at query time.
+        return TelemetryUnreadable(str(e))
+    finally:
+        opened.close()
+    return CoverageRead(covered=frozenset(covered), excluded=frozenset(excluded))
+
+
+@dataclass(frozen=True)
+class LastAttempt:
+    """The last-attempt record as read from ``check_attempt``.
+
+    Every column but ``slot`` (always 1). JSON columns are decoded to tuples, and a
+    NULL column is ``None``. ``state`` is returned as stored, including a state this
+    build does not know (a newer build's). An attempt is an attempt whatever its
+    state, so a consumer decides what an unknown state means; this reader never
+    rejects one.
+
+    Attributes:
+        attempt_id: The attempt's own key.
+        started_at: When the attempt began (UTC ISO-8601).
+        fingerprint: The uncovered-set fingerprint taken at entry.
+        state: ``started``, a run-end state, ``spend_not_authorized``, or a newer
+            build's state.
+        run_id: The run's ``check_runs.run_id``; ``None`` while ``started`` and
+            after a refused spend, which writes no run.
+        outcome_at: When the outcome or the refusal landed; ``None`` while
+            ``started``.
+        degradation_tokens: The run's degradation tokens; ``None`` while
+            ``started`` and after a refused spend.
+        new_pairs: ``(proposal_id, partner_id)`` of each new finding; ``None``
+            while ``started`` and after a refused spend.
+        findings_known: Known findings; ``None`` while ``started``, after a
+            refused spend, and when the reuse index could not be read.
+        batches_planned: The planned batch count of a refused spend; ``None``
+            otherwise.
+    """
+
+    attempt_id: str
+    started_at: str
+    fingerprint: str
+    state: str
+    run_id: Optional[str]
+    outcome_at: Optional[str]
+    degradation_tokens: Optional[Tuple[str, ...]]
+    new_pairs: Optional[Tuple[Tuple[str, str], ...]]
+    findings_known: Optional[int]
+    batches_planned: Optional[int]
+
+
+def _decode_tokens(raw: Optional[str]) -> Optional[Tuple[str, ...]]:
+    """Decodes the ``degradation_tokens`` column.
+
+    Args:
+        raw: The stored JSON text, or ``None``.
+
+    Returns:
+        The tokens as a tuple, or ``None`` for a NULL column.
+
+    Raises:
+        ValueError: If the text is not a JSON array of strings.
+    """
+    if raw is None:
+        return None
+    tokens = json.loads(raw)
+    if not isinstance(tokens, list) or not all(isinstance(t, str) for t in tokens):
+        raise ValueError(f"degradation_tokens is not a list of strings: {raw!r}")
+    return tuple(tokens)
+
+
+def _decode_pairs(raw: Optional[str]) -> Optional[Tuple[Tuple[str, str], ...]]:
+    """Decodes the ``new_pairs`` column.
+
+    Args:
+        raw: The stored JSON text, or ``None``.
+
+    Returns:
+        The pairs as a tuple of 2-tuples, or ``None`` for a NULL column.
+
+    Raises:
+        ValueError: If the text is not a JSON array of two-string arrays.
+    """
+    if raw is None:
+        return None
+    pairs = json.loads(raw)
+    if not isinstance(pairs, list):
+        raise ValueError(f"new_pairs is not a list: {raw!r}")
+    out = []
+    for pair in pairs:
+        if (
+            not isinstance(pair, list)
+            or len(pair) != 2
+            or not all(isinstance(side, str) for side in pair)
+        ):
+            raise ValueError(f"new_pairs holds a pair that is not two ids: {pair!r}")
+        out.append((pair[0], pair[1]))
+    return tuple(out)
+
+
+def read_last_attempt(
+    telemetry_path: str,
+) -> "LastAttempt | None | TelemetryAbsent | TelemetryUnreadable":
+    """Reads the last check attempt without creating or migrating anything.
+
+    Args:
+        telemetry_path: Path to ``telemetry.sqlite`` (typically
+            ``config.telemetry_path``).
+
+    Returns:
+        A :class:`LastAttempt`; ``None`` when the table exists and holds no row
+        (a different type from :class:`TelemetryAbsent`); :class:`TelemetryAbsent`
+        when there is no file or it predates the attempt rung; or
+        :class:`TelemetryUnreadable` when the file exists and a read failed, or a
+        JSON column does not decode (a damaged row). Never raises on a bad file.
+    """
+    opened = _open_read_only(telemetry_path, required_rung=ATTEMPT_RUNG)
+    if not isinstance(opened, sqlite3.Connection):
+        return opened
+    try:
+        row = opened.execute(_SELECT_ATTEMPT_SQL).fetchone()
+        if row is None:
+            return None
+        return LastAttempt(
+            attempt_id=row["attempt_id"],
+            started_at=row["started_at"],
+            fingerprint=row["fingerprint"],
+            state=row["state"],
+            run_id=row["run_id"],
+            outcome_at=row["outcome_at"],
+            degradation_tokens=_decode_tokens(row["degradation_tokens"]),
+            new_pairs=_decode_pairs(row["new_pairs"]),
+            findings_known=row["findings_known"],
+            batches_planned=row["batches_planned"],
+        )
+    except sqlite3.Error as e:
+        # Deeper page corruption surfaces only at query time.
+        return TelemetryUnreadable(str(e))
+    except (ValueError, TypeError) as e:
+        # A JSON column that does not decode is a damaged row, never an empty one.
+        return TelemetryUnreadable(f"check_attempt row does not decode: {e}")
+    finally:
+        opened.close()

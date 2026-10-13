@@ -91,8 +91,8 @@ _CORPUS_JSON_KEYS = {
     "batches_planned", "batches_executed", "batches_judged", "batches_failed",
     "batches_skipped", "findings",
     "findings_new", "findings_known", "departed", "degradations",
-    "judgment_failure_reasons", "coverage_exclusions",
-    "index_backlog_transient", "summary_row_written",
+    "judgment_failure_reasons", "judgment_failed_batches", "coverage_exclusions",
+    "index_backlog_transient", "summary_row_written", "attempt_unrecorded",
     "project", "collection", "workspace",
 }
 
@@ -224,11 +224,11 @@ _ACTIVE_AXIOM = "Active corpus axiom the pending entry may contradict."
 class _FailingBatchWriteTelemetry:
     """Wraps a real telemetry store; only ``record_judged_batch`` raises (per-batch fault).
 
-    The check-CLI ``_FailingWriteTelemetry`` fails the SUMMARY write (``record_check_run``);
+    The check-CLI ``_FailingWriteTelemetry`` fails the run-end write (``record_run_end``);
     this fails the PER-BATCH write mid-loop so ``execute_corpus_check`` records a
     ``telemetry_write`` degradation while the judgment still parses and reports — the KD6
     "degrade the RUN, never the loop" property driven from ``cmd_check``. Everything else
-    (``load_reuse_index``, ``record_check_run``) delegates, so the reuse partition and the
+    (``load_reuse_index``, ``record_run_end``) delegates, so the reuse partition and the
     summary row are unaffected and the degradation is isolated to the batch write.
     """
 
