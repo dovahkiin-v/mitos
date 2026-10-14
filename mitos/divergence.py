@@ -460,7 +460,11 @@ _CACHE_BASENAME: str = "divergence_cache.json"
 # "3" — scope became an ordered comparison (a reorder is now a divergence, and both
 # sides casefold through `scope_tags`), and each scope row gained `order_only`. A "2"
 # sidecar holding "no scope divergence" for a reordered entry must not be served.
-_CACHE_VERSION: str = "3"
+#
+# "4" — edge targets resolve across every node kind, so a decision→open-question
+# `Resolves:` edge is no longer a phantom `added` row. A "3" sidecar holding that false
+# divergence on an unedited corpus must not be served.
+_CACHE_VERSION: str = "4"
 
 
 def _empty_report(**overrides: Any) -> Dict[str, Any]:
@@ -725,8 +729,12 @@ def corpus_graph_divergence(store: Any, config: Any) -> Dict[str, Any]:
             # `restore-source`, which can never repair one (an open question has no
             # axiom, so the block cannot be rendered). Open questions are deliberately
             # out of scope for this detector; excluding them from one side only is
-            # strictly worse than excluding them from both.
-            all_nodes = [n for n in store.get_all_nodes() if n.get("kind") == "decision"]
+            # strictly worse than excluding them from both. Edge TARGETS are another
+            # matter: a decision's `Resolves:` names an open question by design, so the
+            # target lookup below keeps every kind — dropping the open question there
+            # dropped the committed edge and reported each legal resolution as `added`.
+            every_node = store.get_all_nodes()
+            all_nodes = [n for n in every_node if n.get("kind") == "decision"]
             all_edges = store.get_edges()
     except Timeout:
         # Another process holds the corpus lock. Report the skip, never a verdict:
@@ -737,12 +745,12 @@ def corpus_graph_divergence(store: Any, config: Any) -> Dict[str, Any]:
         return _empty_report(rotation_mode=rotation_mode, skipped="corpus busy")
 
     nodes_by_id = {n["id"]: n for n in all_nodes}
-    slug_by_id = {nid: n.get("slug") for nid, n in nodes_by_id.items()}
+    slug_by_id = {n["id"]: n.get("slug") for n in every_node}
     # Slug → every node carrying it. A slug can name a whole same-slug supersession
     # lineage (MI-13), and the verdict must consider all of them: one active legal
     # candidate makes the edge repairable even if its siblings are retired.
     nodes_by_slug: Dict[str, List[Dict[str, Any]]] = {}
-    for node in all_nodes:
+    for node in every_node:
         nodes_by_slug.setdefault((node.get("slug") or "").casefold(), []).append(node)
     edges_by_source: Dict[str, List[Dict[str, str]]] = {}
     for edge in all_edges:
