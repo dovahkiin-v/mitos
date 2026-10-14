@@ -16,6 +16,7 @@ import uuid
 import sqlite3
 import hashlib
 import argparse
+import difflib
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -7946,6 +7947,112 @@ def _non_negative_int(value: str) -> int:
     return number
 
 
+# The two global options argparse accepts only before the verb. `-p`/`--project` is
+# registered on both sides, so it is not one of them.
+_PRE_VERB_ONLY_OPTIONS = frozenset({"-C", "--directory"})
+
+
+class _TeachingParser(argparse.ArgumentParser):
+    """An ArgumentParser whose usage errors add one line naming the right form (L9).
+
+    Argparse's own message and exit 2 are kept — a script reading either keeps
+    working — and a teaching line is appended for the three walls the AX ledger
+    re-sighted for months: a global option after the verb, a positional spelled as
+    a ``--flag``, and a flag that belongs to a sibling verb. The last one used to
+    surface as ``required: ident`` (argparse checks required positionals first),
+    which names the wrong fault; a required-argument error raised while an unknown
+    flag sits in the verb's arguments is answered with the flag's lesson instead.
+
+    ``add_subparsers`` builds every verb parser from this class, so one definition
+    covers the tree. ``_mitos_root`` and ``_mitos_verb`` are set on each verb parser
+    by :func:`_build_parser`.
+    """
+
+    _mitos_root: Optional["_TeachingParser"] = None
+    _mitos_verb: Optional[str] = None
+    _mitos_args: Sequence[str] = ()
+
+    def parse_known_args(self, args=None, namespace=None):  # noqa: D401 - argparse API
+        """Records the arguments this parser was handed, for :meth:`error`."""
+        self._mitos_args = list(sys.argv[1:] if args is None else args)
+        return super().parse_known_args(args, namespace)
+
+    def parse_args(self, args=None, namespace=None):  # noqa: D401 - argparse API
+        """Parses like argparse, teaching on the arguments nothing recognized."""
+        parsed, extras = self.parse_known_args(args, namespace)
+        if extras:
+            verb = getattr(parsed, "command", None)
+            lesson = _flag_lesson(self, verb, extras)
+            message = f"unrecognized arguments: {' '.join(extras)}"
+            self.error(f"{message}\n  {lesson}" if lesson else message)
+        return parsed
+
+    def error(self, message: str):  # noqa: D401 - argparse API
+        """Exits 2 like argparse; a verb's missing-positional error may teach a flag."""
+        if (self._mitos_root is not None
+                and message.startswith("the following arguments are required")):
+            unknown = [arg for arg in self._mitos_args
+                       if arg.startswith("-") and arg != "--"
+                       and arg.split("=", 1)[0] not in self._option_string_actions]
+            if unknown:
+                lesson = _flag_lesson(self._mitos_root, self._mitos_verb, unknown)
+                if lesson:
+                    message = (f"unrecognized arguments: {' '.join(unknown)}\n"
+                               f"  {lesson}")
+        super().error(message)
+
+
+def _flag_lesson(root: argparse.ArgumentParser, verb: Optional[str],
+                 extras: Sequence[str]) -> Optional[str]:
+    """Composes the one teaching line for the first unrecognized option, if any.
+
+    Args:
+        root: The top-level parser (its subparsers are the sibling verbs).
+        verb: The verb being parsed, or ``None`` when none was reached.
+        extras: The unrecognized arguments, in order.
+
+    Returns:
+        The lesson, or ``None`` when no extra argument looks like an option.
+    """
+    flag = next((arg.split("=", 1)[0] for arg in extras
+                 if arg.startswith("-") and arg != "--"), None)
+    if flag is None or verb is None:
+        return None
+    if flag in _PRE_VERB_ONLY_OPTIONS:
+        return (f"`{flag}` is a global option and goes before the verb: "
+                f"`mitos -C <dir> {verb} …`.")
+    choices: Dict[str, argparse.ArgumentParser] = {}
+    for action in root._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            choices = action.choices
+    verb_parser = choices.get(verb)
+    if verb_parser is None:
+        return None
+    positionals = [action.dest for action in verb_parser._actions
+                   if not action.option_strings and action.dest != "help"]
+    bare = flag.lstrip("-").replace("-", "_")
+    if bare in positionals:
+        return (f"`{verb}` takes its {bare} as a positional argument, not `{flag}`: "
+                f"`mitos {verb} -p <project> <{bare}>`.")
+    own = [option for option in verb_parser._option_string_actions
+           if option.startswith("--")]
+    near = difflib.get_close_matches(flag, own, n=1, cutoff=0.75)
+    if near:
+        return f"Did you mean `{near[0]}`? (`mitos {verb} -h` lists its options.)"
+    seen: Set[int] = set()
+    takers: List[str] = []
+    for name, sibling in choices.items():
+        if id(sibling) in seen or sibling is verb_parser:
+            continue
+        seen.add(id(sibling))
+        if flag in sibling._option_string_actions:
+            takers.append(f"`mitos {name}`")
+    if takers:
+        return (f"`{flag}` is not an option of `mitos {verb}`; it belongs to "
+                f"{', '.join(takers)}. (`mitos {verb} -h` lists its options.)")
+    return f"`mitos {verb} -h` lists its options."
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Builds the CLI argument parser.
 
@@ -7956,7 +8063,7 @@ def _build_parser() -> argparse.ArgumentParser:
     Returns:
         The fully configured top-level parser, subparsers registered.
     """
-    parser = argparse.ArgumentParser(
+    parser = _TeachingParser(
         description="Mitos: Architectural Decision Substrate for LLM-native workflows.",
         epilog=_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -8463,14 +8570,18 @@ def _build_parser() -> argparse.ArgumentParser:
     # Deduped by `id()` because the five aliased verbs (`query`/`query_decisions`,
     # `surface`/`surface_decisions`, `list`/`list_decisions`, `scopes`/
     # `list_scopes`, `record`/`record_decision`) are ONE parser object under two
-    # names: 30 names over 25 objects, and a second `add_argument` on the same
+    # names: 31 names over 26 objects, and a second `add_argument` on the same
     # object raises `ArgumentError: conflicting option strings`. The
     # `allow_abbrev` assignment above needs no such guard — it is idempotent — so
     # the dedupe guards only the registration. Being one object is also what makes
     # the aliases free: covering the object once covers both names.
     _selector_registered: Set[int] = set()
-    for _verb_parser in subparsers.choices.values():
+    for _verb_name, _verb_parser in subparsers.choices.items():
         _verb_parser.allow_abbrev = False
+        _verb_parser._mitos_root = parser
+        if _verb_parser._mitos_verb is None:
+            # First name wins, so an aliased object teaches by its short verb.
+            _verb_parser._mitos_verb = _verb_name
         if id(_verb_parser) in _selector_registered:
             continue
         _selector_registered.add(id(_verb_parser))
