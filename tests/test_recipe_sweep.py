@@ -269,7 +269,7 @@ def test_the_pause_message_names_no_shell_command(tmp_path, monkeypatch) -> None
         monkeypatch.delenv(key, raising=False)
     workspace = _registered(tmp_path, "ws")
     m = MitosSyncManager(MitosConfig(str(workspace)))
-    nr._seed_echo_corpus(m)
+    nr._seed_echo_corpus(m, stamped=True)
     res = nr._echo_pause(m, nr._ECHO_GATHERED, cites="echo-b, echo-d")
     message = res["message"]
     # Every clause the census listed is present, so the row reads the whole body.

@@ -419,3 +419,28 @@ def test_state_all_dead_scope_pair(ws, capsys) -> None:
     js = json.loads(capsys.readouterr().out)
     assert js["decisions"]  # superseded nodes present
     assert "scope_known" not in js
+
+
+def test_list_text_counts_the_axioms_it_cut(ws, capsys) -> None:
+    """R-thinned-render: the row's 66-char cut is said, with the recipe to read one whole."""
+    config, m = ws
+    _record(m, "short-one", ["cli"])
+    res = m.record_decision_entry(
+        axiom="A long axiom " + "that keeps going " * 10 + "until the row must cut it.",
+        rejected_paths="rej", scope=["cli"], slug="long-one")
+    assert "error" not in res, res
+    capsys.readouterr()
+
+    cmd_list(config)
+
+    out = capsys.readouterr().out
+    assert "1 axiom was cut to fit a row (marked …)" in out
+    assert "-- <slug>` reads one whole" in out
+
+
+def test_list_text_says_nothing_when_nothing_was_cut(ws, capsys) -> None:
+    config, m = ws
+    _record(m, "short-one", ["cli"])
+    capsys.readouterr()
+    cmd_list(config)
+    assert "cut to fit" not in capsys.readouterr().out

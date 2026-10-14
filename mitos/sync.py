@@ -4482,6 +4482,15 @@ class MitosSyncManager:
                 # Ahead of the closing sentence, so the commitment retraction still
                 # closes the body.
                 echo_prose = "".join(f"{line}. " for line in _declared_echo_lines(echo))
+                # B9's dereference sentence only where it can apply: a neighbour that
+                # carries a stamp. On an unstamped set it sent the caller to chase a
+                # field no neighbour has.
+                stamp_clause = (
+                    "If you go on to supersede or amend a neighbour, an "
+                    "amended_by/narrowed_by stamp on it means it has moved on — "
+                    "dereference that slug before linking. "
+                    if any(n.get("amended_by") or n.get("narrowed_by") for n in neighbors)
+                    else "")
                 return {
                     "status": "needs_review",
                     "code": "similar_decision_exists",
@@ -4497,9 +4506,7 @@ class MitosSyncManager:
                         "neighbour this decision genuinely relates to, "
                         "acknowledge_neighbors=True for neighbours that stand "
                         "independently alongside it — or both at once for a mixed "
-                        "set. If you go on to supersede or amend a neighbour, an "
-                        "amended_by/narrowed_by stamp on it means it has moved on — "
-                        "dereference that slug before linking. "
+                        f"set. {stamp_clause}"
                         f"{PAUSE_HELD_CLAUSE}{_PAUSE_DIGEST_CLAUSE} {echo_prose}"
                         "Nothing was written."
                     ),

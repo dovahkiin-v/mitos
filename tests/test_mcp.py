@@ -114,3 +114,33 @@ def test_surface_decisions_fallback_filtering(mock_get_components: MagicMock,
     assert resp["open_questions"][0]["topic"] == "db-scaling"
     assert resp["open_questions"][0]["questions_raised"] == ["How does it shard?"]
     assert resp["open_questions"][0]["park_reason"] == "needs benchmarking"
+
+
+@pytest.mark.parametrize("thinning", [{"brief": True}, {"full_top": 0}, {"full_top": 2}])
+@patch("mitos.mcp_server.get_workspace_components")
+def test_an_exact_slug_hit_says_it_ignored_the_thinning(mock_get_components: MagicMock,
+                                                        tmp_path, thinning) -> None:
+    """N-brief-exact: `brief=True` on an exact-slug hit is returned whole, and says so."""
+    mock_store = MagicMock()
+    mock_store.get_node_by_slug.return_value = {
+        "id": "hash-abc", "slug": "auth-decision", "kind": "decision",
+        "core_axiom": "We use JWTs.", "rejected_paths": "Direct session lookups.",
+        "mechanisms": ["jwt"], "invalidates_if": None, "context": None, "scope": ["auth"],
+    }
+    mock_store.get_node_state.return_value = "active"
+    mock_store.get_modifiers.return_value = {}
+    mock_get_components.return_value = (mock_store, None, None)
+    project = make_workspace(tmp_path / "ws")
+
+    thinned = json.loads(query_decisions(query="auth-decision", project=project, **thinning))
+    plain = json.loads(query_decisions(query="auth-decision", project=project))
+
+    assert thinned["rejected_paths"] == "Direct session lookups."
+    assert "returned whole" in thinned["thinning_not_applied"]
+    assert "thinning_not_applied" not in plain
+
+
+def test_the_query_description_routes_a_slug_in_hand_to_show_node() -> None:
+    """N-route-show-node: the description says a held slug goes to show_node first."""
+    doc = query_decisions.__doc__
+    assert "A slug in hand is a dereference: call show_node with it" in doc

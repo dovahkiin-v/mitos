@@ -658,3 +658,23 @@ def test_departure_line_agrees_in_number_on_a_single_departure(
     out = _render(_result((DepartedFinding("h1", "h2", "edge-declared"),)), capsys)
 
     assert "1 previously-reported finding no longer standing" in out
+
+
+# --------------------------------------------------------------------------- #
+# R-check cost line — a healthy run names its batches and tokens (0.19.1)
+# --------------------------------------------------------------------------- #
+
+
+def test_a_healthy_run_names_its_batches_and_tokens(capsys: pytest.CaptureFixture) -> None:
+    import dataclasses
+
+    spent = dataclasses.replace(_result(()), batches_planned=3, batches_executed=3,
+                                pairs_reused=4, tokens_input=12345, tokens_output=678)
+    out = _render(spent, capsys)
+    assert "Judged 3 batches (12,345 input / 678 output tokens)" in out
+    assert "4 pair(s) answered from history at no cost" in out
+
+
+def test_a_healthy_run_that_spent_nothing_says_so(capsys: pytest.CaptureFixture) -> None:
+    out = _render(_result(()), capsys)
+    assert "Judged 0 batches — nothing was spent." in out

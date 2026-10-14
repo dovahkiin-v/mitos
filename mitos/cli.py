@@ -527,7 +527,7 @@ def _skill_md_text(format_spec_content: str) -> str:
         "## Setup — API Keys\n"
         "Mitos reads keys from a `.env` file at the workspace root (`mitos init` scaffolds it with empty slots; it is gitignored). Set exactly one required key:\n"
         "- **`GEMINI_API_KEY`** (Google Gemini) — REQUIRED for semantic `surface_decisions`/`query_decisions` and for `mitos sync -p .`. One key covers both embeddings and synthesis.\n"
-        "- `ANTHROPIC_API_KEY` — strongly recommended: it powers the LLM-judged layer (the `mitos check -p .` conflict audit, the sync-time conflict notice, `mitos import -p . --llm-extract`). Mitos runs without it, but only as a basic record-and-search store; with it, the corpus is audited for decisions that silently contradict each other. Degrades calmly when absent.\n"
+        "- `ANTHROPIC_API_KEY` — strongly recommended: it powers the LLM-judged layer (the `mitos check -p .` conflict audit — which spends up to 10 judgment batches without asking and stops for a person's confirmation above that — the sync-time conflict notice, `mitos import -p . --llm-extract`). Mitos runs without it, but only as a basic record-and-search store; with it, the corpus is audited for decisions that silently contradict each other. Degrades calmly when absent.\n"
         "Without `GEMINI_API_KEY`, `record_decision` still works (it commits to the local graph; the embedding is queued and drains on the next `mitos sync -p .` once the key is set), but semantic surface/query are unavailable. If a tool reports a missing key, tell the human to put it in `.env`.\n\n"
         "Mitos uses its own Qdrant on **:7333** (not the standard :6333), started with `docker compose up -d`. If semantic tools report Qdrant unreachable, tell the human to start it; `record_decision` still works meanwhile (embeddings queue and drain once it's up).\n\n"
         "## Addressing — every call names the project it is for\n"
@@ -686,7 +686,9 @@ def cmd_init(config: MitosConfig, name: Optional[str] = None, force: bool = Fals
                 "# Get one: https://aistudio.google.com/app/apikey\n"
                 "GEMINI_API_KEY=\n\n"
                 "# Anthropic (Claude) API key — OPTIONAL, but recommended. It runs\n"
-                "# the contradiction check (`mitos check -p .`) and the conflict\n"
+                "# the contradiction check (`mitos check -p .`, which spends up to\n"
+                "# 10 judgment batches without asking and stops for a person's\n"
+                "# confirmation above that) and the conflict\n"
                 "# notice at sync, and it arms the commit gate\n"
                 "# (`mitos hook-install -p .`). Without it no pair is judged and the\n"
                 "# gate stays inactive; mitos still records and searches. The import\n"
@@ -1726,6 +1728,7 @@ def cmd_list(config: MitosConfig, scope: Optional[str] = None,
     print(f"\nDecisions ({len(decisions)} found, state={effective_state}){scope_note}  "
           f"[{provenance_line(config)}]:")
     print("-" * 80)
+    cut = 0
     for d in decisions:
         marker = _modifier_marker(modifiers.get(d["id"], {}))
         if oneline:
@@ -1737,10 +1740,18 @@ def cmd_list(config: MitosConfig, scope: Optional[str] = None,
         scopes = f"[{', '.join(d['scope'])}]" if d["scope"] else ""
         print(f"{d['computed_state']:11} | {d['slug']:30} {scopes}")
         axiom_snip = truncate_words(d.get("core_axiom", ""), 66)
+        if axiom_snip != d.get("core_axiom", ""):
+            cut += 1
         if axiom_snip:
             print(f"              {axiom_snip}")
         if marker:
             print(f"              {marker}")
+    if cut:
+        # The row's cut is an index render by design; the count says it happened,
+        # so a reader never takes a truncated axiom for the whole one.
+        noun = "axiom was" if cut == 1 else "axioms were"
+        print(f"\n{cut} {noun} cut to fit a row (marked …); "
+              f"`mitos show {shell_flag('-p', config.project)} -- <slug>` reads one whole.")
     if parked:
         print(f"\nParked open questions ({len(parked)}):")
         for oq in parked:
@@ -6179,6 +6190,24 @@ def _print_check_report(
             noun = "decision" if result.nodes_swept == 1 else "decisions"
             print(f"Corpus coherent — {result.nodes_swept} {noun} audited, "
                   f"no contradictions found.")
+    if not degradations and result.nodes_total:
+        print(_check_cost_line(result))
+
+
+def _check_cost_line(result: "check.CheckRunResult") -> str:
+    """Names what a healthy run judged and spent — the cost a run otherwise hides.
+
+    Only the shortfall branch used to give a batch count, so a healthy run that
+    spent real money read the same as one that reused everything.
+    """
+    reused = (f"; {result.pairs_reused} pair(s) answered from history at no cost"
+              if result.pairs_reused else "")
+    if not result.batches_executed:
+        return f"Judged 0 batches — nothing was spent{reused}."
+    noun = "batch" if result.batches_executed == 1 else "batches"
+    return (f"Judged {result.batches_executed} {noun} "
+            f"({result.tokens_input:,} input / {result.tokens_output:,} output "
+            f"tokens){reused}.")
 
 
 #: The directory of the ``mitos`` package, which ``python -m mitos`` (and

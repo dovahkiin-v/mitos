@@ -1201,6 +1201,9 @@ class CheckRunResult:
         departed: Finding-grade priors that stopped standing this run, echoed from
             the plan with their derived reason. The surface prints counts by
             reason; the identities ride the JSON.
+        tokens_input: Input tokens billed across every batch a response arrived
+            for, failed ones included — the run's spend, as the provider reported it.
+        tokens_output: Output tokens, likewise.
         failed_batches: One row per failed batch, in occurrence order, so
             ``len(failed_batches) == batches_failed``: its pairs, pin and usage
             (``None`` where no response arrived). The same rows land in
@@ -1230,6 +1233,8 @@ class CheckRunResult:
     end_probe: "StaleProbe | ProbeUnavailable"
     departed: Tuple[DepartedFinding, ...] = ()
     failed_batches: Tuple[FailedJudgmentBatch, ...] = ()
+    tokens_input: int = 0
+    tokens_output: int = 0
 
     @property
     def judgment_degraded(self) -> Optional[Unavailable]:
@@ -1559,6 +1564,8 @@ def execute_corpus_check(
     judgment_abort: Optional[Unavailable] = None
     consecutive_failures = 0
     batches_executed = 0
+    tokens_input = 0
+    tokens_output = 0
     batches_failed = 0
     batches_skipped = 0
     pairs_judged_fresh = 0
@@ -1678,6 +1685,11 @@ def execute_corpus_check(
 
         execution = judge(prompt)
         batches_executed += 1
+        billed_now = (_billed_execution(execution) if isinstance(execution, Unavailable)
+                      else execution)
+        if billed_now is not None:
+            tokens_input += billed_now.token_input or 0
+            tokens_output += billed_now.token_output or 0
         if isinstance(execution, Unavailable):
             record_batch_failure(  # isolated, or the abort — by class
                 execution, group=group, billed=_billed_execution(execution)
@@ -1813,6 +1825,8 @@ def execute_corpus_check(
         end_probe=end_probe,
         departed=plan.departed,
         failed_batches=tuple(failed_batches),
+        tokens_input=tokens_input,
+        tokens_output=tokens_output,
     )
 
 

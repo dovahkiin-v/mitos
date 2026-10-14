@@ -29,7 +29,7 @@ from typing import Dict, List, Optional
 # copies to refresh. The marker embeds this number; `mitos status` compares a project's
 # pasted marker against it. (Not tied to the package __version__ — most releases don't
 # touch the block.)
-AGENT_GUIDE_VERSION = 4
+AGENT_GUIDE_VERSION = 5
 
 # The agent-instruction filenames mitos knows about (SETUP.md's list — named without
 # a section number on purpose; that file is renumbered by its own edits), checked at
@@ -94,8 +94,10 @@ def agent_block(version: int = AGENT_GUIDE_VERSION) -> str:
         "corpus for undeclared contradictions (read-only; it never edits anything). "
         "Where this project has the commit gate, a commit that follows a record waits "
         "until a check has been attempted, so checking first lets the commit pass the "
-        "first time. If the check says its spend needs a person's authorization, tell "
-        "the user and let them run it; an agent does not pass `--yes` on its own. "
+        "first time. The check spends real judge tokens: up to 10 judgment batches it "
+        "runs without asking; above that it spends nothing and says its spend needs a "
+        "person's authorization — then tell the user and let them run it; an agent "
+        "does not pass `--yes` on its own. "
         "Resolve any finding the normal way: declare the relationship in "
         "`decisions.md`.\n"
         "<!-- /mitos-agent-guide -->"

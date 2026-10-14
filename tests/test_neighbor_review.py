@@ -1067,8 +1067,12 @@ _ECHO_GATHERED = [{"slug": "echo-b", "score": 0.91},
 _ECHO_AXIOM = "The store uses SQLite with WAL journaling and a busy timeout."
 
 
-def _seed_echo_corpus(m):
+def _seed_echo_corpus(m, *, stamped=False):
     """The live nodes the echo rows declare against.
+
+    ``stamped`` adds an amendment of ``echo-c``, so the gathered ``echo-c`` carries an
+    ``amended_by`` stamp — the only state in which the pause says B9's dereference
+    sentence (0.19.1).
 
     Every declared target resolves in Phase A, so a target named in a fixture but not
     seeded fails at `relation_target_not_found` BEFORE the pause can compose — and a
@@ -1079,6 +1083,9 @@ def _seed_echo_corpus(m):
     _seed(m, "echo-c", "Scope discovery lists the live subset, not the full spine.")
     _seed(m, "echo-d", "The renderer emits MADR markdown files per decision.")
     _seed(m, "echo-x", "Retries use exponential backoff with jitter.")
+    if stamped:
+        _seed(m, "echo-c-live", "Scope discovery lists live tags with counts.",
+              amends="echo-c")
 
 
 def _echo_pause(m, matches, **rels):
@@ -1104,7 +1111,7 @@ def test_pause_that_declared_nothing_is_byte_identical(ws, capsys):
     res = _echo_pause(m, _ECHO_GATHERED)
     assert "declared" not in res and "declared_no_near_match" not in res
     assert res["message"].endswith(
-        "dereference that slug before linking. "
+        "or both at once for a mixed set. "
         f"{PAUSE_HELD_CLAUSE}{_PAUSE_DIGEST_CLAUSE} Nothing was written.")
     assert "Declared" not in res["message"]
 
@@ -1917,7 +1924,7 @@ def _stamp_copy(ws, where):
     import pathlib
     if where == "message":
         config, m = ws
-        _seed_echo_corpus(m)
+        _seed_echo_corpus(m, stamped=True)
         return _stamp_spans(_echo_pause(m, _ECHO_GATHERED)["message"])
     if where == "description":
         from test_description_budget import _descriptions, _flat
@@ -2016,7 +2023,7 @@ def test_pause_message_places_the_held_sentence_between_b9_and_the_echo(ws, caps
     """Row 2 — B9 → held sentence → echo → `Nothing was written.` last; the CLI text
     pause prints the held clause but neither the digest clause nor the digest."""
     config, m = ws
-    _seed_echo_corpus(m)
+    _seed_echo_corpus(m, stamped=True)
     res = _echo_pause(m, _ECHO_GATHERED, cites="echo-b, echo-d")
     msg = res["message"]
     held = f"{PAUSE_HELD_CLAUSE}{_PAUSE_DIGEST_CLAUSE}"
@@ -2691,3 +2698,22 @@ def test_f10_a_fresh_workspace_reads_empty_not_null(ws):
     res = _ack(m, "first-ever")
     assert m.vector_store.exists
     assert res["acknowledged_neighbors"] == []
+
+
+def test_the_stamp_sentence_is_said_only_over_a_stamped_neighbour(ws):
+    """N-B9-stamp-blind: the dereference sentence names a stamp, so it fires only when
+    a gathered neighbour carries one — on an unstamped set it sent the caller to chase
+    a field no neighbour has."""
+    config, m = ws
+    _seed_echo_corpus(m)
+    quiet = _echo_pause(m, _ECHO_GATHERED)
+    assert not any("amended_by" in n or "narrowed_by" in n for n in quiet["neighbors"])
+    assert _STAMP_ANCHOR not in quiet["message"]
+
+    written = m.record_decision_entry("The SQLite store runs in WAL mode.", "rej", ["s"],
+                                      slug="echo-b-wal", amends="echo-b",
+                                      acknowledge_neighbors=True)
+    assert written["status"] == "created", written
+    loud = _echo_pause(m, _ECHO_GATHERED)
+    assert any(n.get("amended_by") for n in loud["neighbors"])
+    assert loud["message"].count(_STAMP_ANCHOR) == 1

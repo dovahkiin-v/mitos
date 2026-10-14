@@ -1454,8 +1454,10 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
                     project: Optional[str] = None, full_top: Optional[int] = None) -> str:
     """Look up a SPECIFIC decision by slug or claim — the targeted lookup.
 
-    Use this when you know roughly what you're after (a slug you're carrying, or a
-    pointed claim). For the broad "is there precedent near this?" scan before
+    Use this when you know roughly what you're after (a pointed claim, or a slug
+    you're carrying). A slug in hand is a dereference: call show_node with it
+    first — it answers for superseded nodes too, where this verb's slug branch
+    sees the active view only. For the broad "is there precedent near this?" scan before
     deciding, use surface_decisions — its `confidence` says whether precedent
     exists, where this verb's rates only the ranking; for the EXHAUSTIVE set in a
     scope, list_decisions. If query matches a unique slug exactly, returns that one
@@ -1469,7 +1471,8 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
         depth: The retrieval depth (e.g. 'letter'). v0.1 enforces Letter mode.
         brief: An existence screen over the ranked matches, to dereference from
             by slug: if True, they omit `rejected_paths` (an exact-slug hit is
-            always returned in full — you asked for that one).
+            always returned in full — you asked for that one — and says so in
+            `thinning_not_applied`).
         limit: Ranked top-k for the SEMANTIC branch (default 5; clamped to 1–50).
             Ignored by an exact-slug hit.
         full_top: Keep `rejected_paths` on ranked matches 1..N only; lower ranks
@@ -1552,6 +1555,14 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             "context": node["context"],
         }
         output.update(modifiers)
+        if full_top is not None:
+            # `brief`/`full_top` thin RANKED matches; an exact-slug hit is the one
+            # the caller named, returned whole. Said in the payload, not only in
+            # the description, so a caller who asked for a thinned read is not left
+            # wondering why `rejected_paths` arrived.
+            output["thinning_not_applied"] = (
+                "exact-slug hit — returned whole; brief/full_top thin ranked "
+                "matches only")
         # Provenance last, after the payload's own content fields — show_node's
         # rule, one screen up, applied to the other dereference exit. Most
         # valuable here: this is the answer an agent acts on directly, so a hit

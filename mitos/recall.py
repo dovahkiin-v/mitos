@@ -44,11 +44,13 @@ from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 from mitos.shell_quote import shell_flag
 
-# Top semantic score at/above which a match is treated as a real precedent rather than
-# a loose neighbour. Calibrated to observed Gemini-embedding scores: settled precedents
-# land >0.82, adjacent-but-unrelated neighbours <0.72, so 0.80 is the strong/weak
-# boundary. It gates a *hint* to the agent, never correctness — the agent always has the
-# raw scores and ``list_decisions`` for certainty. Tune here only.
+# The confidence bands over the top semantic score: ``strong`` at/above 0.75, ``weak``
+# at/above 0.60, ``none`` below. The first calibration (observed Gemini-embedding
+# scores: settled precedents >0.82, adjacent-but-unrelated neighbours <0.72) put a
+# single strong/weak boundary at 0.80; ``2bf3cae`` (2026-06-19) lowered it to these two
+# values, and this comment kept saying 0.80 until 0.19.1. The bands gate a *hint* to
+# the agent, never correctness — the agent always has the raw scores and
+# ``list_decisions`` for certainty. Tune here only.
 SURFACE_STRONG_THRESHOLD: float = 0.75
 SURFACE_WEAK_THRESHOLD: float = 0.60
 
