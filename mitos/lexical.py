@@ -32,6 +32,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set
 from mitos.errors import CollectionMissingError, EmbeddingError, VectorStoreError
 from mitos.parser import parse_decisions_file
 from mitos.provider_cause import QUOTA, classify_provider_error, provider_cause_phrase
+from mitos.shell_quote import shell_flag
 
 # Terms shorter than this are dropped from the query before matching — they are
 # stop-word noise ("a", "of", "to") that would match nearly every entry. Longer
@@ -79,16 +80,16 @@ _NO_MATCH_LINE = (
 
 # Per-surface recovery clauses for the two degraded causes that have a heal, on the
 # ``recall._SURFACE_POINTERS`` idiom: the classifier states the cause, each surface
-# supplies its own closing clause. The CLI names the command with its selector,
-# ``project`` rendered through ``repr`` at composition, because a registered name may
+# supplies its own closing clause. The CLI names the command with its selector, the
+# ``{selector}`` slot filled by ``shell_quote.shell_flag`` at composition, because a registered name may
 # carry a space and an unregistered target's ``project`` is a path. The MCP clause
 # names no command and no tool — it states the fact and a person with a shell as the
 # next actor (``recall.MISSING_GRAPH_POINTERS["mcp"]``'s register), because an agent
 # handed a shell command runs it, and neither heal is a tool.
 _RECOVERY_CLAUSES: Dict[str, Dict[str, str]] = {
     "cli": {
-        "cutover": "run `mitos cutover -p {project}`",
-        "reconcile": "run `mitos reconcile -p {project}`",
+        "cutover": "run `mitos cutover {selector}`",
+        "reconcile": "run `mitos reconcile {selector}`",
     },
     "mcp": {
         "cutover": (
@@ -138,7 +139,7 @@ def degraded_reason_from_error(
     text = str(exc)
     if "predates the V1a schema" in text:
         return "graph predates the V1a schema — " + recovery["cutover"].format(
-            project=repr(project))
+            selector=shell_flag("-p", project))
     # Before the VectorStoreError arm, which it subclasses — otherwise the most-used
     # read verb answers a missing collection with "Qdrant unavailable", the exact
     # blame-the-infrastructure phrase the typed error exists to replace. And before
@@ -147,7 +148,7 @@ def degraded_reason_from_error(
     if isinstance(exc, CollectionMissingError):
         named = f" '{exc.collection}'" if exc.collection else ""
         return f"vector collection{named} missing — " + recovery["reconcile"].format(
-            project=repr(project))
+            selector=shell_flag("-p", project))
     if classify_provider_error(exc) == QUOTA:
         return provider_cause_phrase(QUOTA)
     if isinstance(exc, EmbeddingError):

@@ -666,11 +666,16 @@ def test_dod6_discovery_covers_the_check_family_and_respects_the_boundary() -> N
     Tier-1 leaf that reads one method off a duck-typed store and writes nothing, so
     it passes the no-write lint below and widening the fence to cover it is the
     point of a mechanically-discovered family. This pin did its job: the import was
-    adjudicated here rather than landing unnoticed."""
+    adjudicated here rather than landing unnoticed.
+
+    ``shell_quote.py`` joined the same way (the 0.19.1 fix pass): ``recall.py``'s CLI
+    recipes quote the project through it, so ``-p '<name>'`` survives a dash-led name
+    and both quote kinds. A ninth member — import-free, two pure string functions,
+    no write — adjudicated here for the same reason as the eighth."""
     names = {os.path.basename(path) for path in _check_family_closure()}
     assert names == {
         "check.py", "conflict.py", "display.py", "errors.py",
-        "identity.py", "models.py", "recall.py", "__init__.py",
+        "identity.py", "models.py", "recall.py", "shell_quote.py", "__init__.py",
     }
     # The boundary + everything only reachable through it stay out (belt-and-suspenders
     # over the exact-set pin: a regression names the offender, not just a set diff).

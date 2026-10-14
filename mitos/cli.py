@@ -30,6 +30,7 @@ from mitos import overview
 from mitos import registry
 from mitos import routing
 from mitos import settledness
+from mitos.shell_quote import shell_arg, shell_flag
 from mitos.display import (
     RANKED_LIMIT_CEILING,
     apply_stdout_text_safety,
@@ -776,7 +777,7 @@ def cmd_init(config: MitosConfig, name: Optional[str] = None, force: bool = Fals
     #    Function-local, 3d's rule: `subprocess` stays off every other verb's path.
     from mitos import _git
     if isinstance(_git.locate_repository(config.workspace_dir), _git.GitLocation):
-        print(f"In a git repository: `mitos hook-install -p {outcome.name!r}` installs "
+        print(f"In a git repository: `mitos hook-install {shell_flag('-p', outcome.name)}` installs "
               f"the commit gate, which holds a commit until a contradiction check "
               f"is attempted.")
     sys.stdout.flush()
@@ -1424,7 +1425,7 @@ def _show_not_found_hint(config: MitosConfig) -> str:
         own punctuation.
     """
     return (f"not in graph — if you just authored it in decisions.md/questions.md, "
-            f"run `mitos sync -p {config.project!r}`")
+            f"run `mitos sync {shell_flag('-p', config.project)}`")
 
 
 def _coherence_audit_hint(config: MitosConfig) -> str:
@@ -1458,7 +1459,7 @@ def _coherence_audit_hint(config: MitosConfig) -> str:
     Returns:
         The recovery sentence, naming ``mitos check`` exactly once.
     """
-    return f"The audit is `mitos check -p {config.project!r}` — one pass, whole corpus."
+    return f"The audit is `mitos check {shell_flag('-p', config.project)}` — one pass, whole corpus."
 
 
 def _print_check_notice(config: MitosConfig, notice: Optional[Mapping[str, Any]]) -> None:
@@ -1497,7 +1498,7 @@ def _check_notice_recovery(config: MitosConfig, notice: Mapping[str, Any]) -> st
     Returns:
         The clause, with a leading space and its own terminal punctuation.
     """
-    recipe = f"`{_running_mitos_command()} check -p {config.project!r}`"
+    recipe = f"`{_running_mitos_command()} check {shell_flag('-p', config.project)}`"
     if notice.get("state") == ATTEMPT_SPEND_NOT_AUTHORIZED:
         return f" A person runs {recipe} at a terminal and confirms the prompt."
     return f" {recipe} attempts it again."
@@ -1908,9 +1909,9 @@ def cmd_scopes(config: MitosConfig, as_json: bool = False, archived: bool = Fals
           "whose source sits in decisions/archive/, and list only tags the graph "
           "still carries.")
     print("A **Scope:** change to an entry still in decisions.md goes through "
-          f"`mitos amend-commentary -p {config.project!r} <slug> --scope …`; one whose "
+          f"`mitos amend-commentary {shell_flag('-p', config.project)} <slug> --scope …`; one whose "
           "source sits in decisions/archive/ reaches the graph only through "
-          f"`mitos rebuild -p {config.project!r}`.")
+          f"`mitos rebuild {shell_flag('-p', config.project)}`.")
 
 
 def cmd_projects(as_json: bool = False, show_all: bool = False) -> None:
@@ -2250,7 +2251,7 @@ def cmd_record(
                       f"{truncate_words(rejected, _PAUSE_REJECTED_PREVIEW)}",
                       file=sys.stderr)
                 print(f"      read it whole with "
-                      f"`mitos show -p {config.project!r} -- {n['slug']!r}`",
+                      f"`mitos show {shell_flag('-p', config.project)} -- {shell_arg(n['slug'])}`",
                       file=sys.stderr)
             elif rejected:
                 print(f"      rejected: {rejected}", file=sys.stderr)
@@ -2345,7 +2346,7 @@ def cmd_record(
         print(f"\n{overflow}", file=sys.stderr)
         # The shared string names no command (it reaches MCP verbatim); the text
         # surface adds the recipe. `config.project` is never None here.
-        print(f"  Per-file breakdown: `mitos status -p {config.project!r}`",
+        print(f"  Per-file breakdown: `mitos status {shell_flag('-p', config.project)}`",
               file=sys.stderr)
     # Degraded-check notice — same post-receipt stderr shape: the commit succeeded,
     # but the near-dup review could not run, and silence would read as "checked, clean".
@@ -2381,15 +2382,6 @@ def cmd_record(
         print(f"\n{coherence} {_coherence_audit_hint(config)}", file=sys.stderr)
 
 
-def _cli_flag(flag: str, value: str) -> str:
-    """Renders ``--flag 'value'``, or ``--flag='-value'`` when the value looks like a flag.
-
-    A hand-authored ``### -foo`` keeps its leading dash through the parser, and
-    argparse reads a separate ``-foo`` as an option; the ``=`` form binds it.
-    """
-    return f"{flag}={value!r}" if value.startswith("-") else f"{flag} {value!r}"
-
-
 def _exists_recovery_lines(result: Dict[str, Any], config: MitosConfig) -> List[str]:
     """Composes the CLI's recovery for an ``exists`` no-op — this boundary's alone.
 
@@ -2413,16 +2405,16 @@ def _exists_recovery_lines(result: Dict[str, Any], config: MitosConfig) -> List[
     # it), and no `--` guards it, so a dash-led slug falls back to the id.
     handle = result["id"] if slug.startswith("-") else slug
     return [
-        f"  → To change its commentary: `mitos amend-commentary -p {project!r} {handle!r}` "
+        f"  → To change its commentary: `mitos amend-commentary {shell_flag('-p', project)} {shell_arg(handle)}` "
         "with a flag per field (--rejected, --scope, --invalidates-if, --context, "
         "--new-slug); it edits in place and keeps the id.",
         "  → Relations are not commentary: edit the relation line in decisions.md, then "
-        f"apply it with `mitos sync -p {project!r} {_cli_flag('--reconcile-entry', slug)}`.",
+        f"apply it with `mitos sync {shell_flag('-p', project)} {shell_flag('--reconcile-entry', slug)}`.",
         "  → amend-commentary reaches an entry only while its `### ` block is in decisions.md. If "
-        f"the node has no block, `mitos restore-source -p {project!r} "
-        f"{_cli_flag('--slug', slug)}` re-materializes one first; if the entry has "
+        f"the node has no block, `mitos restore-source {shell_flag('-p', project)} "
+        f"{shell_flag('--slug', slug)}` re-materializes one first; if the entry has "
         "rotated into decisions/archive/, edit it there, then run "
-        f"`mitos rebuild -p {project!r}`.",
+        f"`mitos rebuild {shell_flag('-p', project)}`.",
         "  → To record a changed decision, write a new one with --supersedes or --amends "
         "naming this slug.",
     ]
@@ -2458,7 +2450,7 @@ def _rotation_failure_line(config: MitosConfig, report: Dict[str, Any]) -> str:
     line = (
         f"[Warning] Archive rotation failed ({report['stage']}): {report['error']}. "
         f"{report['note']} Nothing needs re-running: the next "
-        f"`mitos -p {config.project!r} record` that finds the buffer at its rotation "
+        f"`mitos {shell_flag('-p', config.project)} record` that finds the buffer at its rotation "
         f"threshold tries again."
     )
     if report["stage"] == ROTATION_STAGE_FILE:
@@ -3093,11 +3085,11 @@ def _print_overflow_detail(overflows: List[Dict[str, Any]], *,
         print("    Re-run with `-v` for the longest rows in each file.")
     # `--scope=` and `--` keep a tag or slug that starts with `-` from reading as an
     # option, the same spellings the generated files use.
-    selector = repr(project) if project is not None else "<project>"
+    selector = shell_flag("-p", project) if project is not None else "-p <project>"
     print("    Each file listed is an index with nowhere further to degrade, and no "
           "rendered file names it as a destination for full entries. Read a scope one "
-          f"line per decision with `mitos list --scope=<scope> --oneline -p {selector}`, "
-          f"or one decision in full with `mitos show -p {selector} -- <slug>`.")
+          f"line per decision with `mitos list --scope=<scope> --oneline {selector}`, "
+          f"or one decision in full with `mitos show {selector} -- <slug>`.")
 
 
 def _graph_behind_buffer(db_path: str) -> bool:
@@ -3575,7 +3567,7 @@ def _commit_gate_lines(row: Dict[str, Any], *, project: str) -> List[str]:
     if state == "installed" and not row["serves_this_workspace"]:
         glyph = "⚠"
     line = f"  {glyph} commit gate: {headline.format(**row)}"
-    recipe = f"`mitos hook-install -p {project!r}`"
+    recipe = f"`mitos hook-install {shell_flag('-p', project)}`"
     lines = []
     if state == "no_hook":
         lines.append(f"{line}   → {recipe}")
@@ -3988,7 +3980,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
         coll_mark, coll_hint = (
             None,
             f"missing — {len(active_ids)} active node(s) have no vectors; "
-            f"run `mitos reconcile -p {config.project!r}`",
+            f"run `mitos reconcile {shell_flag('-p', config.project)}`",
         )
     elif graph_unbuilt:
         # The calm fresh-project sentence below is FALSE over a corpus of hundreds,
@@ -4105,7 +4097,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
             "\n  ⚠ the graph is unbuilt — the markdown corpus (decisions.md and "
             "decisions/archive/) holds entries but the graph holds no nodes, so every "
             "read answers empty and reads as 'no precedent'. "
-            f"Run `mitos rebuild -p {config.project!r}` to build it from the corpus "
+            f"Run `mitos rebuild {shell_flag('-p', config.project)}` to build it from the corpus "
             "(usually a clone: the graph is gitignored, the corpus is not)."
         )
     # Vector-completeness verdict from the exact id-diff computed above (not a
@@ -4124,15 +4116,15 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
     if scroll_failed:
         print(
             "\n  ⚠ could not verify vector completeness — Qdrant scroll failed; "
-            f"run `mitos status -p {config.project!r}` again when Qdrant is reachable."
+            f"run `mitos status {shell_flag('-p', config.project)}` again when Qdrant is reachable."
         )
     elif missing_active_slugs:
         n = len(missing_active_slugs)
         print(
             f"\n  ⚠ vector index incomplete — {n} active node(s) have no vector "
             f"and are invisible to semantic surface/query. Run "
-            f"`mitos reconcile -p {config.project!r}` to re-embed them (or "
-            f"`mitos sync -p {config.project!r}` if the outbox is non-empty) — either "
+            f"`mitos reconcile {shell_flag('-p', config.project)}` to re-embed them (or "
+            f"`mitos sync {shell_flag('-p', config.project)}` if the outbox is non-empty) — either "
             f"needs the embedding provider to answer, which this report does not "
             f"check. Informational, not a readiness blocker."
         )
@@ -4141,7 +4133,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
             # leaving the operator to infer it from "if the outbox is non-empty".
             print(
                 f"      the embedding queue was seeded by `{embedding_seed['established_by']}` "
-                f"at {embedding_seed['established_at']} — `mitos sync -p {config.project!r}` "
+                f"at {embedding_seed['established_at']} — `mitos sync {shell_flag('-p', config.project)}` "
                 f"restores search once the embedding provider answers"
             )
         if n <= 5:
@@ -4186,7 +4178,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
             if f["status"] in ("outdated", "unversioned")
         )
         print(f"  ⚠ agent-file mitos note out of date ({stale_files}) "
-              f"— refresh with `mitos agent-block -p {config.project!r}`")
+              f"— refresh with `mitos agent-block {shell_flag('-p', config.project)}`")
     if skill_md_state == "differs":
         # "differs", never "outdated": a committed skill.md can be newer than this
         # install. `absent` stays silent (a clone that does not commit skill.md is
@@ -4196,9 +4188,9 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
         # bare re-run in a directory registered under another name refreshes the
         # file and then refuses. `project` is the boundary value (see docstring),
         # never `config.project`, which is a path for an unregistered route.
-        refresh = f"mitos -C {workspace_dir!r} init"
+        refresh = f"mitos -C {shell_arg(workspace_dir)} init"
         if project is not None:
-            refresh += f" --name {project!r}"
+            refresh += f" {shell_flag('--name', project)}"
         print(f"  ⚠ .mitos/skill.md differs from what this mitos writes "
               f"— refresh it with `{refresh}`")
     print()
@@ -4216,7 +4208,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
             print(f"  {n}. Start Mitos's Qdrant: `docker compose up -d` from the mitos repo"); n += 1
         if graph_unbuilt:
             print(f"  {n}. Build the graph from your corpus: "
-                  f"`mitos rebuild -p {config.project!r}` "
+                  f"`mitos rebuild {shell_flag('-p', config.project)}` "
                   f"(the graph is derivative — the markdown corpus is the source)"); n += 1
         print("  Full walkthrough → SETUP.md "
               "(https://github.com/dovahkiin-v/mitos/blob/main/SETUP.md)")
@@ -4282,8 +4274,8 @@ def _print_divergence_rung(report: Dict[str, Any], *, project: str) -> None:
     order_only = [row for row in scope if row.get("order_only")]
     if membership:
         print(f"      • {len(membership)} entry(s) whose scope tags differ — a "
-              f"FINDABILITY defect: scope-filtered reads and `mitos scopes -p "
-              f"{project!r}` miss them")
+              f"FINDABILITY defect: scope-filtered reads and `mitos scopes "
+              f"{shell_flag('-p', project)}` miss them")
         for row in membership[:5]:
             print(f"          - {row.get('slug')}: graph {row.get('graph')} vs "
                   f"markdown {row.get('markdown')}")
@@ -4304,14 +4296,14 @@ def _print_divergence_rung(report: Dict[str, Any], *, project: str) -> None:
         verdicts = report.get("edge_verdicts") or {}
         if verdicts.get("repairable"):
             print(f"          - {verdicts['repairable']} declared edge(s) whose target "
-                  f"is active and legal — `mitos rebuild -p {project!r}` replays them")
+                  f"is active and legal — `mitos rebuild {shell_flag('-p', project)}` replays them")
         if verdicts.get("target_retired"):
             print(f"          - {verdicts['target_retired']} point at a since-retired "
                   f"target — legal, but a replay must reach them in COMMIT order "
                   f"(citations resolve against the active view)")
         if verdicts.get("unresolvable"):
             print(f"          - {verdicts['unresolvable']} name no entry in the graph "
-                  f"— fix the citation, or `mitos restore-source -p {project!r}` if its "
+                  f"— fix the citation, or `mitos restore-source {shell_flag('-p', project)}` if its "
                   f"block went missing")
         if verdicts.get("illegal"):
             offenders = report.get("illegal_edge_types") or []
@@ -4327,22 +4319,22 @@ def _print_divergence_rung(report: Dict[str, Any], *, project: str) -> None:
     if report.get("graph_only"):
         active = sum(1 for row in report["graph_only"] if row.get("active"))
         print(f"      • {len(report['graph_only'])} node(s) have NO `### ` block in "
-              f"the corpus ({active} active) — `mitos rebuild -p {project!r}` cannot "
+              f"the corpus ({active} active) — `mitos rebuild {shell_flag('-p', project)}` cannot "
               f"reconstruct them, so its completeness gate refuses. Run "
-              f"`mitos restore-source -p {project!r} --all-graph-only --dry-run` to "
+              f"`mitos restore-source {shell_flag('-p', project)} --all-graph-only --dry-run` to "
               f"review.")
 
     reconcilable = report.get("reconcilable") or 0
     if reconcilable:
-        print(f"      → {reconcilable} of these can be repaired now: `mitos sync -p "
-              f"{project!r}` reconciles a diverged buffer entry, printing the field "
+        print(f"      → {reconcilable} of these can be repaired now: `mitos sync "
+              f"{shell_flag('-p', project)}` reconciles a diverged buffer entry, printing the field "
               f"diff first (add `--yes` to apply without prompting, or "
               f"`--reconcile-entry <slug>` to apply one named entry's whole "
               f"reconcile — the only way to apply an edge DELETION unattended).")
     if report.get("archived_drift"):
         print(f"      ({report['archived_drift']} of these sit in an ARCHIVE file — "
               f"`sync` reads only the buffer, so their reconciler is "
-              f"`mitos rebuild -p {project!r}`.)")
+              f"`mitos rebuild {shell_flag('-p', project)}`.)")
 
 
 def cmd_restore_source(
@@ -4710,10 +4702,10 @@ def _amend_refused_canonical_core(result: Dict[str, Any], config: MitosConfig) -
     lines = [f"Amend refused [canonical_core]: {_amend_fields(result['fields'])} — Decided "
              "and Mechanisms are what a decision is (its id is computed from them), so "
              "changing them records a new decision rather than editing this one.",
-             f"  Record the new decision with `mitos record -p {config.project!r}`, naming "
+             f"  Record the new decision with `mitos record {shell_flag('-p', config.project)}`, naming "
              "the relation that says why this one moved:"]
     # Every route, by the distinction — never one door.
-    flags = {intent: f"--{relation} {handle!r}" for intent, relation in result["routes"].items()}
+    flags = {intent: shell_flag(f"--{relation}", handle) for intent, relation in result["routes"].items()}
     width = max((len(flag) for flag in flags.values()), default=0)
     for intent, flag in flags.items():
         lines.append(f"    {flag:{width}}  {_AMEND_ROUTE_INTENTS.get(intent, intent)}")
@@ -4724,14 +4716,14 @@ def _amend_refused_edges(result: Dict[str, Any], config: MitosConfig) -> List[st
     return [f"Amend refused [edges]: {_amend_fields(result['fields'])} — a relation change "
             "can retire or resurrect a decision, so this verb does not make it.",
             "  Edit the relation line in decisions.md, then apply it with "
-            f"`mitos sync -p {config.project!r} --reconcile-entry {result['slug']!r}`."]
+            f"`mitos sync {shell_flag('-p', config.project)} {shell_flag('--reconcile-entry', result['slug'])}`."]
 
 
 def _amend_refused_diverged(result: Dict[str, Any], config: MitosConfig) -> List[str]:
     return [f"Amend refused [diverged]: the entry for {result['slug']!r} in decisions.md "
             f"already differs from the graph in {_amend_fields(result['fields'])}.",
-            f"  Apply that edit with `mitos sync -p {config.project!r} --reconcile-entry "
-            f"{result['slug']!r}`, or undo it in decisions.md, then amend."]
+            f"  Apply that edit with `mitos sync {shell_flag('-p', config.project)} "
+            f"{shell_flag('--reconcile-entry', result['slug'])}`, or undo it in decisions.md, then amend."]
 
 
 def _amend_refused_unparseable(result: Dict[str, Any], config: MitosConfig) -> List[str]:
@@ -4788,7 +4780,7 @@ def _amend_archived_lines(result: Dict[str, Any], config: MitosConfig) -> List[s
     return [f"{result['slug']!r} is archived — its entry sits in decisions/archive/, and "
             "this verb edits decisions.md only.",
             "  `sync` reads only the buffer, so an archived entry's reconciler is "
-            f"`mitos rebuild -p {config.project!r}`: edit the entry in its archive file, "
+            f"`mitos rebuild {shell_flag('-p', config.project)}`: edit the entry in its archive file, "
             "then rebuild."]
 
 
@@ -4803,8 +4795,8 @@ def _amend_not_found_lines(result: Dict[str, Any], config: MitosConfig) -> List[
     # reads no buffer, and this one just read decisions.md and found no such entry.
     handle = result["slug"]
     return [f"{handle!r} names no decision in the graph and no entry in decisions.md.",
-            f"  Find the handle with `mitos list -p {config.project!r} --oneline`, or "
-            f"`mitos show -p {config.project!r} -- {handle!r}`."]
+            f"  Find the handle with `mitos list {shell_flag('-p', config.project)} --oneline`, or "
+            f"`mitos show {shell_flag('-p', config.project)} -- {shell_arg(handle)}`."]
 
 
 def _amend_refused_lines(result: Dict[str, Any], config: MitosConfig) -> List[str]:
@@ -4954,7 +4946,7 @@ def cmd_agent_block(workspace_dir: str, check: bool = False, *,
         return 0
 
     workspace_dir = os.path.abspath(workspace_dir)
-    recipe = f"`mitos agent-block -p {(project or workspace_dir)!r}`"
+    recipe = f"`mitos agent-block {shell_flag('-p', project or workspace_dir)}`"
     report = agent_block_drift(workspace_dir)
     files = report["files"]
     print(f"\nAgent-file mitos note (current guide: v{AGENT_GUIDE_VERSION}) for {workspace_dir}\n")
@@ -6051,7 +6043,7 @@ def _check_degradation_summary(degradations: Tuple[str, ...], *, project: str) -
         "probe_read": "completeness could not be certified (the index probe was unreadable)",
         "collection_missing": (
             f"the vector collection does not exist — run "
-            f"`mitos reconcile -p {project!r}` to rebuild it"
+            f"`mitos reconcile {shell_flag('-p', project)}` to rebuild it"
         ),
         "judgment_truncated": (
             "the judge's response was truncated (max_tokens exceeded)"
@@ -6170,11 +6162,11 @@ def _print_check_report(
         for item in exclusions:
             print(f"  - {handle_text(item)}")
         print("  These keep failing to embed; the durable fix is outbox quarantine "
-              f"(substrate-owned). Re-run `mitos sync -p {project!r}` to retry.")
+              f"(substrate-owned). Re-run `mitos sync {shell_flag('-p', project)}` to retry.")
 
     if transient_count:
         print(f"\n{transient_count} decision(s) are behind the vector index — recall "
-              f"may be thinned. Run `mitos sync -p {project!r}` to catch up.")
+              f"may be thinned. Run `mitos sync {shell_flag('-p', project)}` to catch up.")
 
     if not result.findings and not degradations:
         if scope is not None and result.nodes_total == 0:
@@ -6310,7 +6302,7 @@ def _hook_block_recipe(config: MitosConfig) -> str:
     Returns:
         The backticked ``… check -p …`` recipe.
     """
-    return f"`{_running_mitos_command()} check -p {config.project!r}`"
+    return f"`{_running_mitos_command()} check {shell_flag('-p', config.project)}`"
 
 
 def _hook_block_message(config: MitosConfig, uncovered: int) -> str:

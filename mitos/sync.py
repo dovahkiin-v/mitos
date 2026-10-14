@@ -91,6 +91,7 @@ from mitos.identity import (
 )
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.provider_cause import describe_embed_failure
+from mitos.shell_quote import shell_flag
 from mitos.tool_markup import field_values, find_tool_call_markup
 from mitos.vector_store import QdrantVectorStore, hash_to_uuid
 from mitos.renderer import MitosRenderer, OVERFLOW_HINT_WINDOW_SECONDS, summarize_overflows
@@ -3574,7 +3575,7 @@ class MitosSyncManager:
             # After the edge lines and before any refusal, so this recipe never sits
             # beside a `--reconcile-entry` one where the two could be mistaken.
             print("  Only the differing spans are shown. For the whole values:")
-            print(f"    mitos sync -p {self.config.project!r} --full")
+            print(f"    mitos sync {shell_flag('-p', self.config.project)} --full")
 
         # `authorized` satisfies BOTH branches below for the entry the caller named,
         # and nothing else: the fall-through is the shipped one, not a second route.
@@ -3597,8 +3598,8 @@ class MitosSyncManager:
                 # RENAME the graph's slug is the one string this recipe must not carry
                 # — a caller copying it would name an entry no parsed block matches and
                 # get the never-seen refusal on a target sitting in front of them.
-                print(f"    mitos sync -p {self.config.project!r} "
-                      f"--reconcile-entry {entry.slug!r}")
+                print(f"    mitos sync {shell_flag('-p', self.config.project)} "
+                      f"{shell_flag('--reconcile-entry', entry.slug)}")
                 print("  Or restore the relation line in decisions.md to reconcile "
                       "the commentary alone.")
                 return False
@@ -3618,8 +3619,8 @@ class MitosSyncManager:
                           "authorized no repair for this entry. To apply it "
                           "non-interactively, name it:")
                     # The markdown slug, for the reason the sibling refusal states.
-                    print(f"    mitos sync -p {self.config.project!r} "
-                          f"--reconcile-entry {entry.slug!r}")
+                    print(f"    mitos sync {shell_flag('-p', self.config.project)} "
+                          f"{shell_flag('--reconcile-entry', entry.slug)}")
                     return False
                 choice = input("Reconcile the graph to the markdown? "
                                "[r]econcile / [s]kip: ").strip().lower()

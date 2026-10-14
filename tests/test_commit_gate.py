@@ -45,6 +45,7 @@ from conftest import make_workspace
 from mitos import check, cli, registry, telemetry
 from mitos.audit_debt import AuditDebt, derive_audit_debt
 from mitos.check import CheckFinding
+from mitos.shell_quote import shell_flag
 from mitos.cli import cmd_init
 from mitos.commit_gate import (
     GATE_ATTEMPTED,
@@ -2752,7 +2753,7 @@ def test_sync_closes_with_the_notice_and_a_recipe_that_parses(sync_workspace, mo
     err = capsys.readouterr().err
     (line,) = _notice_lines(err)
     assert err.rstrip().endswith(line)
-    assert line.endswith(f" `mitos check -p {config.project!r}` attempts it again.")
+    assert line.endswith(f" `mitos check {shell_flag('-p', config.project)}` attempts it again.")
     recipe = _last_backticked(line)
     assert "--yes" not in recipe
     _resolves_to(recipe, config)
@@ -2767,7 +2768,7 @@ def test_sync_names_a_person_for_a_refused_spend(sync_workspace, monkeypatch, ca
 
     assert _sync(config) == 0
     (line,) = _notice_lines(capsys.readouterr().err)
-    assert line.endswith(f" A person runs `mitos check -p {config.project!r}` at a "
+    assert line.endswith(f" A person runs `mitos check {shell_flag('-p', config.project)}` at a "
                          f"terminal and confirms the prompt.")
     assert "--yes" not in line
     _resolves_to(_last_backticked(line), config)
