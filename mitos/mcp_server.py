@@ -561,9 +561,10 @@ def _render_registry_error(err: RegistryError) -> str:
 
     The escape-hatch clause is gated on ``file_unusable``: it is the answer to a
     broken routing *file*, and offering it for a registration refusal would be
-    advice about a fault this surface cannot even reach (no MCP tool writes the
-    registry). The gate is here rather than assumed, so the renderer stays correct
-    if a future tool does.
+    advice about a fault this surface cannot reach through a refusal: the one MCP
+    tool that writes the registry, ``unregister_project``, only removes, and its
+    refusals (an unknown name, an entry the line surgery cannot remove) are not
+    repaired by a path selector.
 
     Args:
         err: The typed error, carrying the located cause as its message.
@@ -2176,7 +2177,7 @@ def amend_commentary(slug: str,
 
 @mcp.tool()
 def list_projects() -> str:
-    """List every Mitos project registered on this machine, with its workspace path.
+    """List the Mitos projects registered on this machine, with their workspace paths.
 
     The discovery primitive behind every other tool's `project` argument: this is
     where the vocabulary comes from. Call it when you do not know a project's
@@ -2184,8 +2185,11 @@ def list_projects() -> str:
     registered, or once at the start of a session to learn what this machine
     holds. One round trip, and every later call can name its target.
 
-    It reports registrations, not health — whether a registered path still holds
-    a usable workspace is a question for the tool you actually want to call.
+    It reports registrations, not health — with one exception, absence: a
+    registration whose workspace directory no longer exists cannot be a target, so
+    it is hidden and counted in `hidden_missing` instead of listed. Whether an
+    existing path still holds a usable workspace is a question for the tool you
+    actually want to call.
 
     An empty result is a healthy state, not a failure: nothing is registered on
     this machine yet. A workspace can still be targeted by passing its absolute
@@ -2196,9 +2200,10 @@ def list_projects() -> str:
     for one workspace.
 
     Returns:
-        A JSON string: {registry_path, count, projects}, where each entry in
-        `projects` is {name, path} — `name` is what you pass as `project`, `path`
-        is the workspace it reaches. The order is the registry's own document
+        A JSON string: {registry_path, count, hidden_missing, projects}, where each
+        entry in `projects` is {name, path} — `name` is what you pass as
+        `project`, `path` is the workspace it reaches. `count` is the listed
+        entries; `hidden_missing` is how many were hidden as gone. The order is the registry's own document
         order, never sorted: it is the order a path lookup resolves its first
         match in, so it is the order that actually decides. `registry_path` names
         the file the registrations live in, and is reported whether or not that
@@ -2215,7 +2220,43 @@ def list_projects() -> str:
     except RegistryError as err:
         raise _RenderedToolError(_render_registry_error(err)) from err
     return dumps_display(
-        projects_payload(registered, registry.registry_path()),
+        projects_payload(
+            registered, registry.registry_path(),
+            missing=routing.missing_registrations(registered),
+        ),
         ensure_ascii=False,
         indent=2,
+    )
+
+
+@mcp.tool()
+def unregister_project(name: str) -> str:
+    """Remove one project's registration from this machine's registry — routing only.
+
+    The registry maps names to workspace paths; this deletes one name. The
+    workspace itself — its decisions, graph and vectors — is never read or
+    touched, and stays reachable by passing its absolute path as `project`. Use it
+    for registrations that should not be there, such as a throwaway or test
+    workspace that `list_projects` still shows. Do not use it to
+    "reset" a real project; nothing about the project changes except that its
+    name stops resolving.
+
+    Args:
+        name: The registered name to remove, exactly as `list_projects` shows it
+            (case included). This tool takes no `project`: it edits the
+            machine-wide registry, not one workspace.
+
+    Returns:
+        A JSON string: {unregistered, path, workspace_untouched: true}, where
+        `path` is the workspace the removed name pointed at. An unknown name is an
+        error and removes nothing.
+    """
+    try:
+        removed = registry.unregister(name)
+    except RegistryError as err:
+        raise _RenderedToolError(_render_registry_error(err)) from err
+    return dumps_display(
+        {"unregistered": name, "path": removed, "workspace_untouched": True},
+        ensure_ascii=False,
+        indent=None,
     )

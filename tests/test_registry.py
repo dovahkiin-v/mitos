@@ -764,3 +764,86 @@ def test_a_workspace_path_with_non_utf_8_bytes_refuses_and_touches_nothing(tmp_p
     assert "UTF-8" in str(exc.value)
     assert _read_registry() == before
     assert registry.load() == {"alpha": "/ws/alpha"}
+
+
+# --- unregister: the registry's one remover (0.19.1) ------------------------
+
+def test_unregister_removes_only_the_named_line_and_keeps_every_other_byte(tmp_path):
+    """The remover is the writer's mirror: single-line surgery, comments survive."""
+    keep = os.path.realpath(tmp_path / "keep")
+    gone = os.path.realpath(tmp_path / "gone")
+    _write_registry(
+        "# hand-kept header\n"
+        f'"keep" = "{keep}"\n'
+        "\n"
+        f'"gone" = "{gone}"  # a trailing note\n'
+        "# footer\n"
+    )
+
+    removed = registry.unregister("gone")
+
+    assert removed == gone
+    assert _read_registry() == (
+        "# hand-kept header\n"
+        f'"keep" = "{keep}"\n'
+        "\n"
+        "# footer\n"
+    )
+    assert registry.load() == {"keep": keep}
+
+
+def test_unregister_matches_the_name_exactly_never_by_case():
+    """Lookup is exact-match everywhere in the registry; the remover is no looser."""
+    _write_registry('"Mitos" = "/somewhere/mitos"\n')
+    with pytest.raises(RegistryError) as excinfo:
+        registry.unregister("mitos")
+    assert "'mitos'" in str(excinfo.value)
+    assert registry.load() == {"Mitos": "/somewhere/mitos"}
+
+
+def test_unregister_an_unknown_name_raises_and_writes_nothing():
+    """An absent name is a calm error, and the file is byte-identical afterwards."""
+    text = '"keep" = "/a/keep"\n'
+    _write_registry(text)
+    with pytest.raises(RegistryError, match="no project named 'nosuch'"):
+        registry.unregister("nosuch")
+    assert _read_registry() == text
+
+
+def test_unregister_on_an_absent_registry_is_an_unknown_name():
+    """No file is the empty registry — nothing to remove, and nothing gets created."""
+    with pytest.raises(RegistryError):
+        registry.unregister("anything")
+    assert not os.path.exists(registry.registry_path())
+
+
+def test_unregister_never_touches_the_workspace(tmp_path):
+    """Routing only: removing a registration leaves the workspace directory as it was."""
+    ws = tmp_path / "ws"
+    (ws / ".mitos").mkdir(parents=True)
+    (ws / "decisions.md").write_text("gold\n", encoding="utf-8")
+    registry.register(str(ws), "ws")
+
+    registry.unregister("ws")
+
+    assert (ws / "decisions.md").read_text(encoding="utf-8") == "gold\n"
+    assert (ws / ".mitos").is_dir()
+    assert registry.load() == {}
+
+
+def test_missing_registrations_names_the_entries_whose_path_is_gone(tmp_path):
+    """The callers' existence probe: registry order, absent directories only.
+
+    Homed in ``routing``, never here — the registry leaf never probes the
+    filesystem, and "is that path still there?" belongs to the caller asking it.
+    """
+    from mitos import routing
+
+    alive = tmp_path / "alive"
+    alive.mkdir()
+    _write_registry(
+        f'"first-gone" = "{tmp_path / "nope1"}"\n'
+        f'"alive" = "{os.path.realpath(alive)}"\n'
+        f'"second-gone" = "{tmp_path / "nope2"}"\n'
+    )
+    assert routing.missing_registrations(registry.load()) == ["first-gone", "second-gone"]

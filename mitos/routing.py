@@ -194,6 +194,24 @@ def is_workspace(root: str) -> bool:
     )
 
 
+def missing_registrations(reg: Dict[str, str]) -> List[str]:
+    """Names the registrations whose workspace directory no longer exists.
+
+    The registry leaf never probes the filesystem, so the question lives here,
+    beside :func:`is_workspace`. Deliberately *absence*, not "is no longer a valid
+    workspace": a directory that exists but is broken is still a target worth
+    showing, because ``mitos status`` can diagnose it — a gone directory cannot be
+    a target at all. One ``stat`` per entry; nothing is read.
+
+    Args:
+        reg: An already-loaded registry, in document order.
+
+    Returns:
+        The names whose path is not an existing directory, in registry order.
+    """
+    return [name for name, path in reg.items() if not os.path.isdir(path)]
+
+
 def nearest_registered_ancestor(start_dir: str, reg: Dict[str, str]) -> Optional[str]:
     """Names the registered project a directory sits inside, if any.
 

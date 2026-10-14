@@ -44,7 +44,8 @@ DEAD_QDRANT_URL = "http://127.0.0.1:9"
 #: `mitos.mcp_server`, which would make the row tautological. Phase 3c widened it
 #: by one (`list_projects`, the discovery twin of CLI `projects`), and
 #: surface-entropy 4c by another (`amend_commentary`, the twin of CLI
-#: `amend-commentary`); a later phase that adds a tool widens it again rather than
+#: `amend-commentary`), and the 0.19.1 fix pass by a third (`unregister_project`,
+#: the twin of CLI `unregister`); a later phase that adds a tool widens it again rather than
 #: deleting the row.
 EXPECTED_TOOLS = {
     "amend_commentary",
@@ -54,6 +55,7 @@ EXPECTED_TOOLS = {
     "query_decisions",
     "record_decision",
     "show_node",
+    "unregister_project",
     "surface_decisions",
 }
 
@@ -415,7 +417,8 @@ async def test_a_named_project_retargets_a_server_launched_somewhere_else(tmp_pa
     assert "no project was named" in refused.content[0].text
     assert "alpha" not in refused.content[0].text
     assert listed["projects"] == [{"name": "bee", "path": str(ws_b)}]
-    assert empty == {"registry_path": str(registry_file), "count": 0, "projects": []}
+    assert empty == {"registry_path": str(registry_file), "count": 0, "hidden_missing": 0,
+                     "projects": []}
 
     # Criterion 5, over the same real server: the answer names the project back.
     # A registered NAME echoes the name; the same workspace reached by its
@@ -1183,6 +1186,7 @@ _NEAR_MISSES = {
     "record_decision": ("supersede", "supersedes"),
     "amend_commentary": ("new_name", None),
     "list_projects": ("project", None),
+    "unregister_project": ("names", "name"),
 }
 
 
@@ -1194,7 +1198,7 @@ def _bare_dir(tmp_path):
 
 @pytest.mark.asyncio
 async def test_an_unknown_argument_is_refused_on_every_tool(tmp_path):
-    """Row 8 — `bogus_param` on each of the eight tools, in one session: `isError`,
+    """Row 8 — `bogus_param` on each of the nine tools, in one session: `isError`,
     a body naming the tool and the argument, the parameter line, no prefix. Then
     each tool's own near-miss, answered with its did-you-mean."""
     env = harness_env(tmp_path)

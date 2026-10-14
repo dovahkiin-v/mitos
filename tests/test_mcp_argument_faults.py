@@ -23,7 +23,8 @@ from mitos.mcp_server import (ARGUMENT_ECHO_MAX, _RenderedToolError,
 from tests.test_mcp_selector import FORBIDDEN_SYNTAX
 
 TOOL_NAMES = ("surface_decisions", "list_decisions", "list_scopes", "show_node",
-              "query_decisions", "record_decision", "amend_commentary", "list_projects")
+              "query_decisions", "record_decision", "amend_commentary", "list_projects",
+              "unregister_project")
 
 # What no argument-fault body may carry: a shell command (CC-6), pydantic's wall
 # (its URL and the `…Arguments` model title), and FastMCP's prefix, which this
@@ -207,7 +208,7 @@ def test_no_body_carries_a_shell_command_pydantics_wall_or_the_framework_prefix(
 
 @pytest.mark.asyncio
 async def test_the_captured_models_are_the_ones_fastmcp_registered():
-    """Row 5 — parity (D2) over all eight real tools: names, schemas, and a bad
+    """Row 5 — parity (D2) over all nine real tools: names, schemas, and a bad
     call's ``errors()`` against FastMCP's own validation on a throwaway instance."""
     registered = {tool.name: tool.inputSchema for tool in await mcp.list_tools()}
     assert set(registered) == set(TOOL_NAMES)

@@ -296,6 +296,10 @@ CLASSIFIED = {
     ("cli", "clear"): _to("amend_commentary"),  # skill text: `clear=[…]`
     ("cli", "state"): _not_a_call_form("the `mitos list` text header"),
     ("conflict", "slug"): _not_a_call_form("an internal ValueError message"),
+    # `name` became a tool parameter with `unregister_project` (0.19.1), which
+    # brought two long-standing non-call `name=` spellings into the scan.
+    ("migrations", "name"): _not_a_call_form("SQLite's `sqlite_master` WHERE clause"),
+    ("tool_markup", "name"): _not_a_call_form("a regex over leaked tool-call markup"),
     ("mcp_server", "clear"): _to("amend_commentary"),  # the removal hints
     ("mcp_server", "full_top"): _to(*_RANKED),  # "brief is full_top=0"
     ("mcp_server", "oneline"): _to("list_decisions"),  # amend's not-found recovery

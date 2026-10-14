@@ -242,8 +242,8 @@ def test_skill_md_pairs_every_tool_with_a_selectored_cli_twin(two_workspaces):
     """The list is the CLI-fallback map, so each tool line must carry a runnable twin.
 
     One line per live tool, each `(CLI: `mitos …`)`, and every twin names its
-    project with `-p .` — except `mitos projects`, which is selector-exempt and
-    correctly bare (the no-bare-recipe row above sweeps the other direction).
+    project with `-p .` — except `mitos projects` and `mitos unregister`, which are
+    selector-exempt and correctly bare (the no-bare-recipe row above sweeps the other direction).
     """
     tools = _tool_names()
     assert len(tools) >= 8   # non-vacuity
@@ -251,7 +251,7 @@ def test_skill_md_pairs_every_tool_with_a_selectored_cli_twin(two_workspaces):
     lines = dict(_TOOL_LINE.findall(text))
     assert set(lines) == tools
     for name, recipe in lines.items():
-        if recipe == "mitos projects":
+        if recipe in ("mitos projects", "mitos unregister <name>"):
             continue
         assert " -p ." in recipe, f"{name}'s CLI twin {recipe!r} names no project"
 

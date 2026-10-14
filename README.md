@@ -52,7 +52,7 @@ The same steps by hand — full detail in **[SETUP.md](SETUP.md)**:
 
 `mitos status .` is the compass throughout: it says exactly what's done, what's missing, and what to do next for that project. With no project named, `mitos status` answers the other question — what does this machine have — listing every registered project and checking Qdrant.
 
-**Every command names its project.** There is no default target: `mitos init` registers the project by name, and from then on each verb takes `-p <name>`, `-p <absolute path>`, or `-p .` from the project root (agents pass the same thing as a `project` argument). `mitos projects` lists what's registered. That is what lets one install and one MCP server serve every project on the machine without a call ever landing in the wrong corpus.
+**Every command names its project.** There is no default target: `mitos init` registers the project by name, and from then on each verb takes `-p <name>`, `-p <absolute path>`, or `-p .` from the project root (agents pass the same thing as a `project` argument). `mitos projects` lists what's registered, and `mitos unregister <name>` removes a registration (the workspace stays as it is). That is what lets one install and one MCP server serve every project on the machine without a call ever landing in the wrong corpus.
 
 ## How it runs
 

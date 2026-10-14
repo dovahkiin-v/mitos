@@ -382,6 +382,64 @@ def register(
     return RegistrationOutcome(name=resolved, path=path, action="created")
 
 
+def unregister(name: str) -> str:
+    """Removes one registration, the registry's only remover.
+
+    Routing only: the workspace the entry pointed at is never read or touched, and
+    its collection is derived from its path, never from this entry, so removing a
+    registration cannot move or lose a vector. The workspace stays reachable by its
+    absolute path, and re-running ``init`` there registers it again.
+
+    The mirror of :func:`_write_entry`'s single-line surgery — the one line that
+    defines ``name`` is dropped and every other byte (comments, blank lines, order)
+    survives. The name matches exactly, as every registry lookup does; a case
+    variant is a different name.
+
+    Args:
+        name: The registered name to remove, exactly as registered.
+
+    Returns:
+        The workspace path the removed entry pointed at.
+
+    Raises:
+        RegistryError: On an unusable registry file (see :func:`load`), a name that
+            is not registered, an entry written in a shape the line surgery cannot
+            remove, or an unwritable registry.
+    """
+    reg = load()
+    target = registry_path()
+    if name not in reg:
+        raise RegistryError(
+            f"no project named {name!r} is registered in {target}, so nothing was "
+            f"removed. Names match exactly, case included."
+        )
+    removed_path = reg[name]
+
+    try:
+        with open(target, "r", encoding="utf-8") as f:
+            existing = f.read()
+    except OSError as e:
+        raise RegistryError(_unwritable_message(target, e)) from e
+
+    lines = existing.splitlines(keepends=True)
+    kept = [line for line in lines if not _line_defines_key(line, name)]
+    content = "".join(kept)
+    expected = {key: value for key, value in reg.items() if key != name}
+    try:
+        parsed = tomllib.loads(content)
+    except tomllib.TOMLDecodeError:
+        parsed = None
+    if parsed != expected:
+        raise RegistryError(
+            f"removing the entry for {name!r} from {target} would not leave the "
+            f"other registrations intact — the entry is written in a shape this "
+            f"single-line removal cannot handle (a multi-line value, most likely). "
+            f"Nothing was written; delete that entry from the file by hand."
+        )
+    _atomic_write(target, content)
+    return removed_path
+
+
 def _line_defines_key(line: str, name: str) -> bool:
     """Reports whether one raw registry line is the definition of ``name``.
 

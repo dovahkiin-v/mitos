@@ -11,12 +11,20 @@ per test, so each row gets its own registry file.
 import json
 import os
 import sys
+import tempfile
 from unittest.mock import patch
 
 import pytest
 
 from mitos import registry
 from mitos.cli import main
+
+# A real directory standing in for "some workspace": since 0.19.1 `projects` hides a
+# registration whose directory no longer exists, so a fixture path must exist to be
+# listed. Created once per session; `deleted-long-ago` is deliberately never made.
+WS = os.path.realpath(tempfile.mkdtemp(prefix="mitos-projects-verb-"))
+for _name in ("zulu", "alpha", "beta", "oak", "one", "two"):
+    os.makedirs(os.path.join(WS, _name), exist_ok=True)
 
 
 def _run_projects(*flags):
@@ -43,35 +51,148 @@ def test_text_form_lists_every_project_in_registry_order(capsys):
     The resolved path is printed rather than a literal ``~/.config/…`` so the line
     stays true under an ``XDG_CONFIG_HOME`` that points elsewhere.
     """
-    _write_registry('"zulu" = "/ws/zulu"\n"alpha" = "/ws/alpha"\n')
+    _write_registry(f'"zulu" = "{WS}/zulu"\n"alpha" = "{WS}/alpha"\n')
 
     _run_projects()
 
     out = capsys.readouterr().out
-    assert "zulu" in out and "/ws/zulu" in out
-    assert "alpha" in out and "/ws/alpha" in out
+    assert "zulu" in out and f"{WS}/zulu" in out
+    assert "alpha" in out and f"{WS}/alpha" in out
     assert out.index("zulu") < out.index("alpha")   # registry order, not alphabetical
     assert registry.registry_path() in out
     assert "2 registered" in out
 
 
-def test_text_form_carries_no_health_verdict(capsys):
-    """The listing reports registrations, not reachability.
+def test_text_form_carries_no_health_verdict_beyond_absence(capsys):
+    """The listing reports registrations, not validity — absence is the one exception.
 
-    Whether a recorded path still holds a valid workspace is ``mitos status``'s
-    question. A flag here would be a second source of that answer, and two sources
-    drift — so this verb must not probe the filesystem at all.
+    Whether an existing path still holds a valid workspace is ``mitos status``'s
+    question, so no ✓/✗ verdict appears. A *gone* directory is different (inverted
+    0.19.1, ROADMAP's registry-leak ruling): it cannot be a target, so it is hidden
+    and counted rather than listed — 176 registrations, ~165 dead, buried the real
+    names for every agent that called the discovery tool.
     """
-    _write_registry('"gone" = "/ws/deleted-long-ago"\n')
+    _write_registry(f'"gone" = "{WS}/deleted-long-ago"\n"alpha" = "{WS}/alpha"\n')
 
     _run_projects()
 
     out = capsys.readouterr().out
-    assert "/ws/deleted-long-ago" in out  # listed exactly as recorded, unjudged
-    for verdict in ("missing", "not found", "invalid", "unreachable", "✗", "✓"):
+    assert f"{WS}/deleted-long-ago" not in out, "a gone workspace must not be listed"
+    assert f"{WS}/alpha" in out
+    assert "1 registered" in out
+    assert "1 registration(s) whose workspace no longer exists are hidden" in out
+    assert "`mitos projects --all`" in out and "`mitos unregister --missing`" in out
+    for verdict in ("not found", "invalid", "unreachable", "✗", "✓"):
         assert verdict not in out.lower(), (
             f"health verdict {verdict!r} leaked into `projects` — health is `status`'s"
         )
+
+
+def test_all_lists_the_gone_registrations_marked_and_hides_nothing(capsys):
+    """``--all`` is the way to see what was hidden — marked, never silently mixed in."""
+    _write_registry(f'"gone" = "{WS}/deleted-long-ago"\n"alpha" = "{WS}/alpha"\n')
+
+    _run_projects("--all")
+    out = capsys.readouterr().out
+    assert f"{WS}/deleted-long-ago" in out and "(workspace no longer exists)" in out
+    assert "hidden" not in out
+
+    _run_projects("--all", "--json")
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["hidden_missing"] == 0
+    assert payload["projects"] == [
+        {"name": "gone", "path": f"{WS}/deleted-long-ago", "missing": True},
+        {"name": "alpha", "path": f"{WS}/alpha"},
+    ]
+
+
+def test_json_counts_the_hidden_registrations(capsys):
+    """The count is the agent's notice that something was hidden."""
+    _write_registry(f'"gone" = "{WS}/deleted-long-ago"\n')
+
+    _run_projects("--json")
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 0 and payload["projects"] == []
+    assert payload["hidden_missing"] == 1
+
+
+def test_only_gone_registrations_still_read_as_empty_plus_the_count(capsys):
+    """Nothing listable is the healthy empty state — with the hidden count beside it."""
+    _write_registry(f'"gone" = "{WS}/deleted-long-ago"\n')
+
+    _run_projects()
+
+    out = capsys.readouterr().out
+    assert "No projects registered yet" in out
+    assert "1 registration(s) whose workspace no longer exists are hidden" in out
+
+
+# --- unregister ---------------------------------------------------------------
+
+def _run_unregister(*args):
+    with patch.object(sys, "argv", ["mitos", "unregister", *args]):
+        main()
+
+
+def test_unregister_removes_one_name_and_says_the_workspace_is_untouched(capsys):
+    _write_registry(f'"alpha" = "{WS}/alpha"\n"beta" = "{WS}/beta"\n')
+
+    _run_unregister("alpha")
+
+    out = capsys.readouterr().out
+    assert "Unregistered 'alpha'" in out and "untouched" in out
+    assert registry.load() == {"beta": f"{WS}/beta"}
+    assert os.path.isdir(f"{WS}/alpha")
+
+
+def test_unregister_missing_removes_every_gone_registration_and_only_those(capsys):
+    _write_registry(
+        f'"gone1" = "{WS}/deleted-long-ago"\n"alpha" = "{WS}/alpha"\n'
+        f'"gone2" = "{WS}/also-deleted"\n'
+    )
+
+    _run_unregister("--missing")
+
+    out = capsys.readouterr().out
+    assert "Removed 2 registration(s)" in out
+    assert registry.load() == {"alpha": f"{WS}/alpha"}
+
+
+def test_unregister_missing_on_a_clean_registry_is_a_calm_no_op(capsys):
+    _write_registry(f'"alpha" = "{WS}/alpha"\n')
+    _run_unregister("--missing")
+    assert "nothing to remove" in capsys.readouterr().out
+    assert registry.load() == {"alpha": f"{WS}/alpha"}
+
+
+def test_unregister_an_unknown_name_is_one_calm_line_at_exit_1(capsys):
+    _write_registry(f'"alpha" = "{WS}/alpha"\n')
+    with pytest.raises(SystemExit) as excinfo:
+        _run_unregister("nosuch")
+    assert excinfo.value.code == 1
+    err = capsys.readouterr().err
+    assert "no project named 'nosuch'" in err
+    assert "Traceback" not in err
+
+
+def test_unregister_takes_a_name_or_missing_never_both_never_neither():
+    for argv in ((), ("alpha", "--missing")):
+        with pytest.raises(SystemExit) as excinfo:
+            _run_unregister(*argv)
+        assert excinfo.value.code == 2
+
+
+def test_unregister_refuses_a_project_selector(capsys):
+    """Global like `projects`: it names a registration, so `-p` is a category error."""
+    _write_registry(f'"alpha" = "{WS}/alpha"\n')
+    with pytest.raises(SystemExit) as excinfo:
+        with patch.object(sys, "argv", ["mitos", "-p", "alpha", "unregister", "alpha"]):
+            main()
+    assert excinfo.value.code == 1
+    err = capsys.readouterr().err
+    assert "`unregister`" in err and "unknown project" not in err
+    assert registry.load() == {"alpha": f"{WS}/alpha"}
 
 
 def test_json_form_emits_the_documented_payload(capsys):
@@ -81,7 +202,7 @@ def test_json_form_emits_the_documented_payload(capsys):
     twin, so it stays JSON-native: plain dicts, no ``None``s, and no presentation
     strings an agent surface could inherit.
     """
-    _write_registry('"alpha" = "/ws/alpha"\n"beta" = "/ws/beta"\n')
+    _write_registry(f'"alpha" = "{WS}/alpha"\n"beta" = "{WS}/beta"\n')
 
     _run_projects("--json")
 
@@ -89,9 +210,10 @@ def test_json_form_emits_the_documented_payload(capsys):
     assert payload == {
         "registry_path": registry.registry_path(),
         "count": 2,
+        "hidden_missing": 0,
         "projects": [
-            {"name": "alpha", "path": "/ws/alpha"},
-            {"name": "beta", "path": "/ws/beta"},
+            {"name": "alpha", "path": f"{WS}/alpha"},
+            {"name": "beta", "path": f"{WS}/beta"},
         ],
     }
     assert payload["count"] == len(payload["projects"])
@@ -99,12 +221,12 @@ def test_json_form_emits_the_documented_payload(capsys):
 
 def test_json_form_round_trips_a_non_ascii_name(capsys):
     """A non-ASCII project name survives to the JSON payload unchanged (P9)."""
-    _write_registry('"ąžuolas" = "/ws/oak"\n')
+    _write_registry(f'"ąžuolas" = "{WS}/oak"\n')
 
     _run_projects("--json")
 
     payload = json.loads(capsys.readouterr().out)
-    assert payload["projects"] == [{"name": "ąžuolas", "path": "/ws/oak"}]
+    assert payload["projects"] == [{"name": "ąžuolas", "path": f"{WS}/oak"}]
 
 
 def test_a_registry_name_carrying_a_control_character_renders_escaped(capsys):
@@ -122,7 +244,7 @@ def test_a_registry_name_carrying_a_control_character_renders_escaped(capsys):
     computed off the name, so escaping the render without escaping the measurement
     misaligns every row while every substring assertion above stays green.
     """
-    _write_registry('"line\\nbreak" = "/ws/one"\n"b" = "/ws/two"\n')
+    _write_registry(f'"line\\nbreak" = "{WS}/one"\n"b" = "{WS}/two"\n')
 
     _run_projects()
 
@@ -130,10 +252,10 @@ def test_a_registry_name_carrying_a_control_character_renders_escaped(capsys):
     assert "line\nbreak" not in out                 # cannot break the table
     assert repr("line\nbreak") in out
     # One row per registration still, despite the newline in the data.
-    rows = [line for line in out.splitlines() if "/ws/" in line]
+    rows = [line for line in out.splitlines() if f"{WS}/" in line]
     assert len(rows) == 2
     # Width measured off the escaped spelling: both paths start at one column.
-    assert rows[0].index("/ws/one") == rows[1].index("/ws/two")
+    assert rows[0].index(f"{WS}/one") == rows[1].index(f"{WS}/two")
 
 
 def test_the_json_payload_keeps_the_raw_name_escaping_is_a_render_concern(capsys):
@@ -144,12 +266,12 @@ def test_the_json_payload_keeps_the_raw_name_escaping_is_a_render_concern(capsys
     is a data leaf, so putting `repr` in it would corrupt the payload to tidy a
     table.
     """
-    _write_registry('"line\\nbreak" = "/ws/one"\n')
+    _write_registry(f'"line\\nbreak" = "{WS}/one"\n')
 
     _run_projects("--json")
 
     payload = json.loads(capsys.readouterr().out)
-    assert payload["projects"] == [{"name": "line\nbreak", "path": "/ws/one"}]
+    assert payload["projects"] == [{"name": "line\nbreak", "path": f"{WS}/one"}]
 
 
 # --- healthy and empty -----------------------------------------------------
@@ -192,6 +314,7 @@ def test_json_on_an_empty_registry_returns_the_empty_payload_not_the_prose(capsy
     assert payload == {
         "registry_path": registry.registry_path(),
         "count": 0,
+        "hidden_missing": 0,
         "projects": [],
     }
 
@@ -208,7 +331,7 @@ def test_projects_works_where_there_is_no_workspace_at_all(capsys, tmp_path, mon
     bare = tmp_path / "not-a-workspace"
     bare.mkdir()
     monkeypatch.chdir(bare)
-    _write_registry('"alpha" = "/ws/alpha"\n')
+    _write_registry(f'"alpha" = "{WS}/alpha"\n')
 
     _run_projects()
 

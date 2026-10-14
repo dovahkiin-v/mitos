@@ -134,7 +134,7 @@ def test_every_registered_subparser_carries_the_project_option() -> None:
 
 
 def test_the_aliased_verbs_are_one_parser_object_registered_once() -> None:
-    """30 names over 25 objects — the reason the registration loop must dedupe by id().
+    """31 names over 26 objects — the reason the registration loop must dedupe by id().
 
     A second ``add_argument`` on the same object raises ``ArgumentError:
     conflicting option strings``, so this row is also what pins that the five
@@ -142,8 +142,8 @@ def test_the_aliased_verbs_are_one_parser_object_registered_once() -> None:
     ``list_scopes``, ``record_decision``) are free rather than forgotten.
     """
     choices = _subparsers(_build_parser())
-    assert len(choices) == 30
-    assert len({id(sub) for sub in choices.values()}) == 25
+    assert len(choices) == 31
+    assert len({id(sub) for sub in choices.values()}) == 26
     for alias, canonical in (("query_decisions", "query"),
                              ("surface_decisions", "surface"),
                              ("list_decisions", "list"),
@@ -415,7 +415,7 @@ def test_the_workspace_optional_carve_out_is_two_verbs_wide() -> None:
 def test_status_is_not_an_exempt_verb() -> None:
     """`status <project>` is a supported targeting form, so `-p X status` is its twin."""
     assert "status" not in _SELECTOR_EXEMPT_VERBS
-    assert set(_SELECTOR_EXEMPT_VERBS) == {"init", "serve", "projects"}
+    assert set(_SELECTOR_EXEMPT_VERBS) == {"init", "serve", "projects", "unregister"}
 
 
 def test_every_exempt_verb_owns_its_own_recovery_sentence() -> None:

@@ -543,7 +543,8 @@ def _skill_md_text(format_spec_content: str) -> str:
         "- `list_scopes`       (CLI: `mitos scopes -p .`) — the scope vocabulary with a count per tag. Read it before a scope-filtered read, or before tagging a new decision, so you reuse a tag that exists instead of minting a near-duplicate.\n"
         "- `show_node`         (CLI: `mitos show -p . -- <slug>`) — dereference one exact handle (slug or id) to its stored fields, including a node that has been superseded; transcripts, provenance and outgoing edges are left out.\n"
         "- `amend_commentary`  (CLI: `mitos amend-commentary -p . <slug> …`) — fix a committed entry's commentary in place: `rejected_paths`, `invalidates_if`, `context`, `scope`, or its slug (`new_slug`). On the tool, `clear=[…]` empties `invalidates_if`, `context` or `scope`. It refuses a change to the axiom or mechanisms: that is a new decision, recorded with `corrects` / `supersedes` / `amends`. It reaches only entries still in `decisions.md`; an entry already rotated into an archive answers `archived`.\n"
-        "- `list_projects`     (CLI: `mitos projects`) — the project names registered on this machine. It takes no selector.\n\n"
+        "- `list_projects`     (CLI: `mitos projects`) — the project names registered on this machine. It takes no selector. A registration whose workspace no longer exists is hidden and counted in `hidden_missing`.\n"
+        "- `unregister_project` (CLI: `mitos unregister <name>`) — remove one registration that should not be there (a throwaway or test workspace). Routing only: the workspace itself is untouched. It takes `name`, not `project`.\n\n"
         "## When to record — the capture trigger (YOUR judgement; Mitos stores, it does not decide what is worth storing)\n"
         "Recall is easy to ask for; knowing WHAT is worth recording is the real call, and it falls to you. Record a decision when it:\n"
         "- sets a pattern future work must follow, or\n"
@@ -1912,7 +1913,7 @@ def cmd_scopes(config: MitosConfig, as_json: bool = False, archived: bool = Fals
           f"`mitos rebuild -p {config.project!r}`.")
 
 
-def cmd_projects(as_json: bool = False) -> None:
+def cmd_projects(as_json: bool = False, show_all: bool = False) -> None:
     """Lists the Mitos projects registered on this machine.
 
     The discovery read over the global registry: which project names exist and
@@ -1920,13 +1921,16 @@ def cmd_projects(as_json: bool = False) -> None:
     config and works from anywhere, including a machine with no Mitos workspace at
     all, which is the state it is most likely to be met in.
 
-    It reports registrations, not health. Whether a registered path still holds a
-    valid workspace is ``mitos status``'s question; answering it here too would be
-    a second source that drifts from the first.
+    It reports registrations, not health — with one exception, absence: a
+    registration whose workspace directory no longer exists is hidden and counted
+    (``--all`` lists it), because a gone directory cannot be a target and leaked
+    throwaway registrations otherwise bury the real ones. Whether an existing path
+    still holds a *valid* workspace stays ``mitos status``'s question.
 
     Args:
         as_json: Emit the machine-readable payload (``registry_path``, ``count``,
-            ``projects``) instead of the text table.
+            ``hidden_missing``, ``projects``) instead of the text table.
+        show_all: List registrations whose workspace no longer exists too.
 
     Returns:
         None.
@@ -1939,9 +1943,14 @@ def cmd_projects(as_json: bool = False) -> None:
     # twin), so the two surfaces cannot drift. Built once and read by BOTH
     # branches: routing only the `--json` branch through the leaf would fork the
     # text table off a second, hand-built list.
-    payload = projects_payload(registry.load(), registry.registry_path())
+    reg = registry.load()
+    payload = projects_payload(
+        reg, registry.registry_path(),
+        missing=routing.missing_registrations(reg), show_missing=show_all,
+    )
     path = payload["registry_path"]
     projects = payload["projects"]
+    hidden = payload["hidden_missing"]
 
     if as_json:
         _emit_json(payload)
@@ -1951,6 +1960,8 @@ def cmd_projects(as_json: bool = False) -> None:
         # Empty/fresh is first-class: a machine with nothing registered yet is
         # healthy, and an absent registry file is the same healthy state.
         print(f"No projects registered yet — `mitos init` introduces one ({path}).")
+        if hidden:
+            print(_hidden_missing_line(hidden))
         return
 
     # File order throughout, never sorted: it is the order a reverse lookup
@@ -1968,8 +1979,52 @@ def cmd_projects(as_json: bool = False) -> None:
     print("-" * (name_w + 30))
     print(f"{'project':{name_w}}   workspace")
     for project in projects:
-        print(f"{project['name']!r:{name_w}}   {project['path']}")
+        gone = "   (workspace no longer exists)" if project.get("missing") else ""
+        print(f"{project['name']!r:{name_w}}   {project['path']}{gone}")
+    if hidden:
+        print(_hidden_missing_line(hidden))
     print()
+
+
+def _hidden_missing_line(hidden: int) -> str:
+    """Words the hidden-registrations count with its two recipes."""
+    return (f"{hidden} registration(s) whose workspace no longer exists are hidden — "
+            f"`mitos projects --all` lists them, `mitos unregister --missing` "
+            f"removes them.")
+
+
+def cmd_unregister(name: Optional[str], *, missing: bool = False) -> None:
+    """Removes registrations from the machine-wide registry.
+
+    Routing only, never the workspace: a removed project's directory, corpus,
+    graph and vectors are untouched, it stays reachable by its absolute path, and
+    re-running ``mitos init`` there registers it again. A **global** verb, like
+    ``projects`` — it names a registration, not a workspace, so it works on one
+    whose directory is gone.
+
+    Args:
+        name: The registered name to remove, exactly as registered; ``None`` with
+            ``missing``.
+        missing: Remove every registration whose workspace directory no longer
+            exists, instead of one name.
+
+    Raises:
+        RegistryError: On an unusable registry file, an unknown name, or an
+            unwritable registry.
+    """
+    if not missing:
+        removed = registry.unregister(name)
+        print(f"Unregistered {name!r} ({removed}) ✓ — the workspace itself is "
+              f"untouched; `mitos init` there registers it again.")
+        return
+    gone = routing.missing_registrations(registry.load())
+    if not gone:
+        print("No registration points at a missing workspace — nothing to remove.")
+        return
+    for each in gone:
+        removed = registry.unregister(each)
+        print(f"Unregistered {each!r} ({removed})")
+    print(f"Removed {len(gone)} registration(s) whose workspace no longer exists ✓")
 
 
 def cmd_import(config: MitosConfig, filepath: str, use_llm_extract: bool = False) -> None:
@@ -7449,6 +7504,7 @@ _SELECTOR_EXEMPT_VERBS: Dict[str, str] = {
     "init": EXEMPT_CREATES_REGISTRATION,
     "serve": EXEMPT_NO_WORKSPACE,
     "projects": EXEMPT_EXPLICITLY_GLOBAL,
+    "unregister": EXEMPT_EXPLICITLY_GLOBAL,
 }
 
 # Why each of them is global, in this surface's words. Keyed by VERB rather than
@@ -7462,6 +7518,8 @@ _EXEMPT_VERB_NOTES: Dict[str, str] = {
               "launch it plainly: `mitos serve`."),
     "projects": ("`projects` reads the machine-wide registry and targets no single "
                  "workspace — it works from anywhere."),
+    "unregister": ("`unregister` edits the machine-wide registry and names its "
+                   "registration positionally — `mitos unregister <name>`."),
     "set-key": ("`set-key --global` writes the machine-wide .env shared by every "
                 "project — drop `--global` to write one project's own .env."),
 }
@@ -7946,6 +8004,19 @@ def _build_parser() -> argparse.ArgumentParser:
         "projects", help="List the Mitos projects registered on this machine.")
     proj_p.add_argument("--json", action="store_true", dest="as_json",
                         help="Emit machine-readable JSON.")
+    proj_p.add_argument("--all", action="store_true", dest="show_all",
+                        help="Also list registrations whose workspace no longer exists.")
+
+    # unregister — the registry's one remover (global, like `projects`).
+    unreg_p = subparsers.add_parser(
+        "unregister",
+        help="Remove a project's registration (the workspace itself is untouched).")
+    unreg_target = unreg_p.add_mutually_exclusive_group(required=True)
+    unreg_target.add_argument("name", nargs="?", default=None,
+                              help="The registered name to remove, exactly as listed.")
+    unreg_target.add_argument("--missing", action="store_true",
+                              help="Remove every registration whose workspace no "
+                                   "longer exists.")
 
     # sync
     sync_p = subparsers.add_parser("sync", help="Sync buffer decisions to graph database.")
@@ -8523,7 +8594,9 @@ def main() -> None:
             # targeted, and a keyword here would empty that tuple.
             cmd_init(config, name=args.name, force=args.force)
         elif args.command == "projects":
-            cmd_projects(as_json=args.as_json)
+            cmd_projects(as_json=args.as_json, show_all=args.show_all)
+        elif args.command == "unregister":
+            cmd_unregister(args.name, missing=args.missing)
         elif args.command == "sync":
             # The split lives here, at the call site, exactly as 1a's join does:
             # `None` (flag absent) survives as `None` so the handler can tell it

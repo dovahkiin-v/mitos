@@ -840,7 +840,7 @@ def test_list_projects_over_an_empty_registry_is_a_clean_empty_envelope() -> Non
     path = _write_registry("")
 
     assert json.loads(mcp_server.list_projects()) == {
-        "registry_path": path, "count": 0, "projects": [],
+        "registry_path": path, "count": 0, "hidden_missing": 0, "projects": [],
     }
 
 
@@ -885,7 +885,7 @@ def test_mitos_projects_is_unchanged_on_both_of_its_branches(
 
     cmd_projects(as_json=True)
     assert json.loads(capsys.readouterr().out) == {
-        "registry_path": path, "count": 0, "projects": [],
+        "registry_path": path, "count": 0, "hidden_missing": 0, "projects": [],
     }
 
 
@@ -939,7 +939,7 @@ def test_the_shared_leaf_holds_no_wording_and_stays_a_stdlib_tier_leaf() -> None
             assert syntax not in literal, f"display.py emits {syntax!r}"
 
     assert projects_payload({}, "/p") == {
-        "registry_path": "/p", "count": 0, "projects": []}
+        "registry_path": "/p", "count": 0, "hidden_missing": 0, "projects": []}
     assert isinstance(projects_payload({"a": "/x"}, "/p")["projects"], list)
 
 
@@ -1364,3 +1364,62 @@ def test_each_surface_teaches_its_own_call_form_for_the_same_typed_error(
     assert "surface_decisions(" not in cli_body
     assert "list_projects()" not in cli_body
     assert not any(token in mcp_body for token in FORBIDDEN_SYNTAX)
+
+
+# ---------------------------------------------------------------------------
+# Registry hygiene (0.19.1) — gone workspaces hidden; `unregister_project`.
+# ---------------------------------------------------------------------------
+
+def test_list_projects_hides_gone_workspaces_and_counts_them(tmp_path) -> None:
+    """The discovery call stops paying for leaked throwaway registrations."""
+    live = os.path.realpath(str(tmp_path))
+    gone = os.path.join(live, "deleted")
+    _write_registry(f'"gone" = "{gone}"\n"live" = "{live}"\n')
+
+    payload = json.loads(mcp_server.list_projects())
+    assert payload["projects"] == [{"name": "live", "path": live}]
+    assert payload["count"] == 1 and payload["hidden_missing"] == 1
+
+
+
+def test_list_projects_hiding_matches_the_cli_twin(tmp_path, capsys) -> None:
+    """Parity holds with something hidden: the same count, the same survivors."""
+    live = os.path.realpath(str(tmp_path))
+    _write_registry(f'"gone" = "{live}/deleted"\n"live" = "{live}"\n')
+
+    cmd_projects(as_json=True)
+    assert json.loads(capsys.readouterr().out) == json.loads(mcp_server.list_projects())
+
+
+def test_unregister_project_removes_one_name_and_never_the_workspace(tmp_path) -> None:
+    live = os.path.realpath(str(tmp_path))
+    (tmp_path / "decisions.md").write_text("gold\n", encoding="utf-8")
+    _write_registry(f'"keep" = "{live}"\n"drop" = "{live}/elsewhere"\n')
+
+    receipt = json.loads(mcp_server.unregister_project("drop"))
+
+    assert receipt == {"unregistered": "drop", "path": f"{live}/elsewhere",
+                       "workspace_untouched": True}
+    assert registry.load() == {"keep": live}
+    assert (tmp_path / "decisions.md").read_text(encoding="utf-8") == "gold\n"
+
+
+def test_unregister_project_on_an_unknown_name_is_an_error_naming_no_shell_command(
+        tmp_path) -> None:
+    """A tool error, not a success envelope — and, MCP-side, no `mitos` recipe."""
+    _write_registry(f'"keep" = "{os.path.realpath(str(tmp_path))}"\n')
+
+    with pytest.raises(Exception) as excinfo:
+        mcp_server.unregister_project("nosuch")
+
+    body = str(excinfo.value)
+    assert "no project named 'nosuch'" in body
+    assert "mitos " not in body
+    assert list(registry.load()) == ["keep"]
+
+
+def test_unregister_project_takes_no_project_parameter() -> None:
+    """It edits the machine-wide registry, like `list_projects` reads it."""
+    schema = _tools()["unregister_project"].inputSchema
+    assert "project" not in schema.get("properties", {})
+    assert schema.get("required") == ["name"]

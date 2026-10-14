@@ -450,7 +450,13 @@ def show_payload(
     return payload
 
 
-def projects_payload(reg: Mapping[str, str], registry_path: str) -> Dict[str, Any]:
+def projects_payload(
+    reg: Mapping[str, str],
+    registry_path: str,
+    *,
+    missing: Sequence[str] = (),
+    show_missing: bool = False,
+) -> Dict[str, Any]:
     """Shapes the machine-local project listing, shared CLI⇄MCP.
 
     The one builder behind both ``mitos projects --json`` (``cmd_projects``) and
@@ -461,6 +467,14 @@ def projects_payload(reg: Mapping[str, str], registry_path: str) -> Dict[str, An
     Registry **document order throughout, never sorted**: that is the order a
     reverse lookup resolves its first match in, so a listing that re-ordered it
     would show something other than what actually decides.
+
+    **Registrations whose workspace directory no longer exists are hidden by
+    default and counted** (``hidden_missing``) — a gone directory cannot be a
+    target, and a leaked throwaway registration otherwise costs every agent that
+    reads this listing context it can never use. Which names are missing is the
+    caller's probe (``routing.missing_registrations``), passed in, so this leaf
+    still does no I/O. ``show_missing`` lists them too, each carrying
+    ``"missing": true``; then nothing is hidden.
 
     An empty registry is a clean ``count: 0`` envelope — a machine with nothing
     registered yet is healthy, not broken, and this leaf says nothing about it
@@ -479,18 +493,32 @@ def projects_payload(reg: Mapping[str, str], registry_path: str) -> Dict[str, An
             order (``registry.load()``).
         registry_path: The registry file's path, reported so a caller can find
             the file whether or not it exists yet.
+        missing: The names whose workspace directory no longer exists.
+        show_missing: List the missing registrations instead of hiding them.
 
     Returns:
-        ``{"registry_path": str, "count": int, "projects": [{"name", "path"}, …]}``
+        ``{"registry_path": str, "count": int, "hidden_missing": int,
+        "projects": [{"name", "path"}, …]}``
         — JSON-native throughout: ``projects`` is a **list** of dicts, never a
         list of tuples (a tuple survives in-process and becomes a list across the
         JSON round trip, so the two surfaces would disagree on shape depending on
-        how each was tested). ``count == len(projects)``.
+        how each was tested). ``count == len(projects)`` — the listed entries,
+        never the hidden ones.
     """
-    projects = [{"name": name, "path": path} for name, path in reg.items()]
+    gone = set(missing)
+    projects: List[Dict[str, Any]] = []
+    hidden = 0
+    for name, path in reg.items():
+        if name not in gone:
+            projects.append({"name": name, "path": path})
+        elif show_missing:
+            projects.append({"name": name, "path": path, "missing": True})
+        else:
+            hidden += 1
     return {
         "registry_path": registry_path,
         "count": len(projects),
+        "hidden_missing": hidden,
         "projects": projects,
     }
 

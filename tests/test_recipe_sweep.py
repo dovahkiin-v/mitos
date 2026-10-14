@@ -84,6 +84,10 @@ def test_every_skill_md_cli_twin_parses_and_names_its_workspace(tmp_path,
             args = _parse(recipe)
             assert args.command == "projects"
             continue
+        if recipe == "mitos unregister <name>":  # selector-exempt, names a registration
+            args = _parse(recipe.replace("<name>", "some-name"))
+            assert args.command == "unregister" and args.name == "some-name"
+            continue
         recipe = recipe.replace("<slug>", "my-slug").replace(" …", "")
         verb = shlex.split(recipe)[1]
         args = _parse(recipe + "".join(
