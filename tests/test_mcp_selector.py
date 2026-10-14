@@ -745,7 +745,10 @@ def test_above_the_bound_every_case_variant_is_named_past_the_didyoumean_max(
 
     assert _did_you_mean(body) == variants
     assert len(variants) > routing.PROJECT_DIDYOUMEAN_MAX
-    assert _vocabulary(body) == "11, closest to what you passed: mitos, Mitos, MITOS, MiToS."
+    # The names ride the did-you-mean line once; the vocabulary line does not
+    # repeat them (L14, inverted 0.19.1 — it used to read "11, closest to what you
+    # passed: mitos, Mitos, MITOS, MiToS.").
+    assert _vocabulary(body) == "11 — too many to enumerate here."
 
 
 def test_an_empty_registry_names_the_escape_hatch_and_never_the_setup_act(

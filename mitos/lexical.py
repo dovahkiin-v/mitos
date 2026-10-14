@@ -115,9 +115,11 @@ def degraded_reason_from_error(
     ``provider_cause``'s closed classifier, the same phrase the scope-dump note
     and the write-path warning carry.
 
-    The arm order is load-bearing: the pre-V1a text first, then the 429 text
-    (an ``EmbeddingError`` often wraps a 429), then the typed arms, with
-    ``CollectionMissingError`` before the ``VectorStoreError`` it subclasses.
+    The arm order is load-bearing: the pre-V1a text first, then
+    ``CollectionMissingError`` (its message carries a derived collection name whose
+    8-hex path hash can contain ``429``, so the quota text arm must not see it),
+    then the 429 text (an ``EmbeddingError`` often wraps a 429), then the other
+    typed arms, with ``VectorStoreError`` after the subclass above.
 
     Args:
         exc: The exception that broke semantic recall, or None when recall was
@@ -137,17 +139,19 @@ def degraded_reason_from_error(
     if "predates the V1a schema" in text:
         return "graph predates the V1a schema — " + recovery["cutover"].format(
             project=repr(project))
-    if classify_provider_error(exc) == QUOTA:
-        return provider_cause_phrase(QUOTA)
-    if isinstance(exc, EmbeddingError):
-        return provider_cause_phrase(classify_provider_error(exc))
     # Before the VectorStoreError arm, which it subclasses — otherwise the most-used
     # read verb answers a missing collection with "Qdrant unavailable", the exact
-    # blame-the-infrastructure phrase the typed error exists to replace.
+    # blame-the-infrastructure phrase the typed error exists to replace. And before
+    # the quota text arm: `mitos-foo-a4291b2c` holds "429", and a missing collection
+    # read as a rate limit sends the operator to wait instead of to `reconcile`.
     if isinstance(exc, CollectionMissingError):
         named = f" '{exc.collection}'" if exc.collection else ""
         return f"vector collection{named} missing — " + recovery["reconcile"].format(
             project=repr(project))
+    if classify_provider_error(exc) == QUOTA:
+        return provider_cause_phrase(QUOTA)
+    if isinstance(exc, EmbeddingError):
+        return provider_cause_phrase(classify_provider_error(exc))
     if isinstance(exc, VectorStoreError):
         return "Qdrant unavailable"
     lowered = text.lower()

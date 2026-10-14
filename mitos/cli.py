@@ -7776,7 +7776,8 @@ def _resolve_selector(selector: Optional[str],
         raise
 
 
-def _registered_projects_line(bounded: routing.BoundedNames) -> str:
+def _registered_projects_line(bounded: routing.BoundedNames, *,
+                              matches_shown: bool = False) -> str:
     """Renders the registered-name vocabulary, respecting the enumeration bound.
 
     Above ``routing.REGISTERED_NAMES_BOUND`` the enumeration collapses to the
@@ -7788,6 +7789,9 @@ def _registered_projects_line(bounded: routing.BoundedNames) -> str:
 
     Args:
         bounded: The policy verdict from ``routing.bounded_registered_names``.
+        matches_shown: The body already printed the close matches as a
+            did-you-mean, so a collapsed line gives the count without repeating
+            them (L14).
 
     Returns:
         One indented line for the error body.
@@ -7799,7 +7803,7 @@ def _registered_projects_line(bounded: routing.BoundedNames) -> str:
     if not bounded.collapsed:
         return (f"  Registered projects: {', '.join(bounded.names)} "
                 f"(list with `mitos projects`).")
-    if bounded.names:
+    if bounded.names and not matches_shown:
         return (f"  {bounded.total} projects registered, closest: "
                 f"{', '.join(bounded.names)} (list them all with `mitos projects`).")
     return (f"  {bounded.total} projects registered — list them with "
@@ -7851,7 +7855,8 @@ def _render_targeting_error(err: ProjectTargetingError) -> str:
             # `PROJECT_DIDYOUMEAN_MAX` — and dropping one would hide the very
             # distinction the caller needs to see.
             lines.append(f"  Did you mean: {', '.join(err.close_matches)}")
-        lines.append(_registered_projects_line(bounded))
+        lines.append(_registered_projects_line(
+            bounded, matches_shown=bool(err.close_matches)))
     elif err.discriminator == TARGET_RELATIVE_PATH:
         lines = [
             f"the project selector {err.selector!r} is not an absolute path.",

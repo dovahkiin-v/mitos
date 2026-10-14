@@ -125,6 +125,23 @@ class TestTermMatching:
             VectorStoreError("Qdrant connection refused"), surface="cli", project="p"
         ) == "Qdrant unavailable"
 
+    def test_reason_collection_missing_whose_hash_holds_429_is_not_a_rate_limit(self):
+        """ROADMAP:162 — the quota text arm read every exception's text.
+
+        A derived collection name ends in an 8-hex path hash, so about one project
+        in several hundred carries ``429`` in it, and its missing collection read
+        "embedding provider rate-limited (429)" — sending the operator to wait out
+        a rate limit when the heal is ``reconcile``. The typed arm now runs first.
+        """
+        exc = CollectionMissingError(
+            "Qdrant collection 'mitos-foo-a4291b2c' does not exist.",
+            collection="mitos-foo-a4291b2c",
+        )
+        for surface in ("cli", "mcp"):
+            reason = degraded_reason_from_error(exc, surface=surface, project="p")
+            assert "rate-limited" not in reason, reason
+            assert "mitos-foo-a4291b2c" in reason and "missing" in reason
+
     def test_reason_collection_missing_without_a_name_still_reads(self):
         """The name is an affordance, not a dependency — an unnamed instance degrades."""
         reason = degraded_reason_from_error(

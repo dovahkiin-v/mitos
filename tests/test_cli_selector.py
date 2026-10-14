@@ -981,6 +981,29 @@ def test_the_registered_name_list_collapses_above_the_bound(
     assert not any(name in err for name in names)
 
 
+def test_above_the_bound_a_did_you_mean_is_not_repeated_as_the_closest_list(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """L14: `Did you mean: mitos` and then `… registered, closest: mitos` said it twice.
+
+    Above the bound the vocabulary line collapses to the close matches — which,
+    on an unknown name, are exactly the did-you-mean line above it. The names are
+    printed once; the vocabulary line keeps the count and the pointer.
+    """
+    root = _make_workspace(tmp_path / "ws")
+    names = ["mitos"] + [f"zz-other-{i}" for i in range(routing.REGISTERED_NAMES_BOUND)]
+    _register_pairs((name, root) for name in names)
+    monkeypatch.chdir(tmp_path)
+
+    _run(["-p", "mitoss", "list"])
+
+    err = capsys.readouterr().err
+    assert "Did you mean: mitos" in err
+    assert "closest:" not in err, err
+    assert f"{len(names)} projects registered" in err
+    assert "mitos projects" in err
+
+
 def test_the_renderer_shows_every_did_you_mean_even_past_the_max(
     tmp_path, monkeypatch, capsys
 ) -> None:

@@ -472,7 +472,8 @@ def _example_call(tool: str, err: ProjectTargetingError,
     return f"`{tool}(project='{target}', …)`"
 
 
-def _registered_projects_line(bounded: routing.BoundedNames) -> str:
+def _registered_projects_line(bounded: routing.BoundedNames, *,
+                              matches_shown: bool = False) -> str:
     """Renders the registered-name vocabulary, respecting the enumeration bound.
 
     The MCP twin of ``cli._registered_projects_line`` — same policy, different
@@ -499,6 +500,9 @@ def _registered_projects_line(bounded: routing.BoundedNames) -> str:
 
     Args:
         bounded: The policy verdict from ``routing.bounded_registered_names``.
+        matches_shown: The body already printed the close matches as a
+            did-you-mean, so a collapsed line gives the count without repeating
+            them (L14).
 
     Returns:
         One indented line for the error body.
@@ -511,7 +515,7 @@ def _registered_projects_line(bounded: routing.BoundedNames) -> str:
                 "still reachable by its absolute path.")
     if not bounded.collapsed:
         return f"  Registered projects: {', '.join(bounded.names)}."
-    if bounded.names:
+    if bounded.names and not matches_shown:
         return (f"  Registered projects: {bounded.total}, closest to what you "
                 f"passed: {', '.join(bounded.names)}.")
     return f"  Registered projects: {bounded.total} — too many to enumerate here."
@@ -667,7 +671,8 @@ def _render_targeting_error(err: ProjectTargetingError, tool: str) -> str:
             f"  Retry with "
             f"{'a registered name, or with ' if err.registered_names else ''}"
             f"the absolute path of the workspace you mean — {example}.")
-        lines.append(_registered_projects_line(bounded))
+        lines.append(_registered_projects_line(
+            bounded, matches_shown=bool(err.close_matches)))
     elif err.discriminator == TARGET_RELATIVE_PATH:
         # The realistic mistake on this surface: agents reach for relative paths
         # by habit, from a world where a working directory means something. This
