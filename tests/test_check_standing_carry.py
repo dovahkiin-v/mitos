@@ -438,6 +438,132 @@ def test_planner_carries_a_standing_finding_the_sweep_returned_nothing_for(
 
 
 # --------------------------------------------------------------------------- #
+# A scoped run — the sweep set is scoped, liveness is not
+# --------------------------------------------------------------------------- #
+
+
+def _scoped_snapshot(
+    swept: List[Dict[str, Any]], live: List[Dict[str, Any]]
+) -> CorpusSnapshot:
+    """A ``--scope`` snapshot: a scoped sweep set over the corpus-wide live set."""
+    return CorpusSnapshot(
+        nodes=tuple(swept), edge_index=build_strong_edge_index([]), live=tuple(live)
+    )
+
+
+def test_a_scoped_run_carries_a_finding_whose_partner_is_outside_the_scope() -> None:
+    """The ROADMAP:139 bug: a partner out of scope is out of the SWEEP, not dead.
+
+    A scoped run sweeps only matching proposals, but their partners may be any live
+    decision (CONF-D2). Reading the scoped sweep set as the live set reported every
+    such standing finding as departed, ``side-no-longer-live``, on a pair nobody
+    touched.
+    """
+    a, b = _node("hash-a", "alpha"), _node("hash-b", "beta")
+    carried, departed = carry_standing_findings(
+        reuse_index=_index(("hash-a", "hash-b", _verdict())),
+        snapshot=_scoped_snapshot([a], [a, b]),
+        swept_pairs=[],
+    )
+
+    assert departed == [], "a live partner outside the scope is not a departure"
+    assert [(c.proposal_hash, c.partner_hash) for c in carried] == [("hash-a", "hash-b")]
+
+
+def test_a_scoped_run_says_nothing_about_a_finding_wholly_outside_its_scope() -> None:
+    """Neither side in scope: the run never reached the pair, so it neither carries
+    nor departs it — the unscoped run is where that finding stands."""
+    a, b, c = _node("hash-a", "alpha"), _node("hash-b", "beta"), _node("hash-c", "gamma")
+    carried, departed = carry_standing_findings(
+        reuse_index=_index(("hash-b", "hash-c", _verdict())),
+        snapshot=_scoped_snapshot([a], [a, b, c]),
+        swept_pairs=[],
+    )
+
+    assert carried == []
+    assert departed == []
+
+
+def test_a_scoped_run_still_departs_a_side_that_is_really_gone() -> None:
+    """Screen 2 keeps its meaning under a scope: dead is dead corpus-wide."""
+    a = _node("hash-a", "alpha")
+    carried, departed = carry_standing_findings(
+        reuse_index=_index(("hash-a", "hash-gone", _verdict())),
+        snapshot=_scoped_snapshot([a], [a]),
+        swept_pairs=[],
+    )
+
+    assert carried == []
+    assert [d.reason for d in departed] == ["side-no-longer-live"]
+
+
+def test_planner_under_a_scope_carries_a_finding_across_the_scope_line(
+    temp_store: GraphStore, temp_telemetry: TelemetryStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end through ``plan_corpus_check(scope=…)`` and a real scoped snapshot."""
+    monkeypatch.setenv("MITOS_NO_LIVE_TESTS", "1")
+    a_axiom, b_axiom = "Scoped axiom alpha.", "Scoped axiom beta."
+    entry = ParsedEntry("decision", "scoped-alpha", 1, 5)
+    entry.axiom = a_axiom
+    entry.rejected_paths = "An alternative."
+    entry.scope = ["inside"]
+    a_id = temp_store.commit_parsed_entry(entry).node_id
+    b_id = _commit(temp_store, "scoped-beta", b_axiom)
+
+    from mitos.telemetry import ConflictCheckRow, JudgmentBatch
+    from mitos import __version__
+
+    row = ConflictCheckRow(
+        batch_id="scoped-seed",
+        sync_run_id="seed-run",
+        surface="sync",
+        judged_axiom=a_axiom,
+        proposal_rejected_paths=None,
+        proposal_scope=None,
+        proposed_hash_if_any=min(a_id, b_id),
+        candidate_slug="scoped-beta",
+        candidate_hash=max(a_id, b_id),
+        candidate_rejected_paths="Seeded alternative.",
+        candidate_scope=None,
+        tenable=False,
+        confidence=0.93,
+        surfaced=True,
+        candidate_source="embedding_topk",
+        model_alias=PRODUCTION_ALIAS,
+        prompt_version=CONFLICT_PROMPT_VERSION,
+        mitos_version=__version__,
+        rationale="Seeded standing finding across the scope line.",
+    )
+    temp_telemetry.record_judged_batch(
+        JudgmentBatch(
+            batch_id="scoped-seed",
+            model_id=None,
+            token_input=1,
+            token_output=1,
+            token_cache_read=0,
+            token_cache_creation=0,
+            elapsed_ms=1,
+        ),
+        [row],
+        "2026-09-07T12:00:00+00:00",
+    )
+
+    embed, vector = _keyed_substrate({a_axiom: [], b_axiom: []})
+    plan = plan_corpus_check(
+        store=temp_store,
+        embed_provider=embed,
+        vector_store=vector,
+        telemetry=temp_telemetry,
+        model_alias=PRODUCTION_ALIAS,
+        scope="inside",
+    )
+
+    assert plan.nodes_total == 1, "precondition: the scope selects alpha alone"
+    assert plan.departed == (), "beta is live; it is only outside the scope"
+    assert len(plan.carried) == 1
+
+
+# --------------------------------------------------------------------------- #
 # The surface — the departure delta is a bounded line, never a growing wall
 # --------------------------------------------------------------------------- #
 
