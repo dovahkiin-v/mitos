@@ -10,7 +10,7 @@
 
 ### harbor-backup-nightly
 **Decided:** Harbor backs up the metadata database nightly and retains 14 days of history.
-**Rejected:** Continuous backup — operational cost unjustified at pilot scale.
+**Rejected:** (1) Continuous backup: REJECTED — operational cost unjustified at pilot scale. (2) Do nothing: REJECTED — disk redundancy survives a dead disk, not a bad migration or a dropped table. (3) Defer backups until after the pilot: REJECTED — pilot tenants' data is real data from the first day.
 **Scope:** storage
 **Resolves:** oq-harbor-backup-cadence
 
@@ -68,7 +68,7 @@
 
 ### harbor-observability-otel
 **Decided:** Harbor emits logs and metrics through a single OpenTelemetry pipeline.
-**Rejected:** Separate ad-hoc exporters per signal — divergent config and no shared trace context.
+**Rejected:** (1) Separate ad-hoc exporters per signal: REJECTED — divergent config and no shared trace context. (2) A vendor's proprietary agent: REJECTED — it ties the pipeline to one vendor's pricing and backend. (3) Defer tracing until after the pilot: REJECTED — the incidents worth tracing happen during the pilot.
 **Scope:** observability
 **Mechanisms:** otel
 **Amends:** harbor-structured-logging, harbor-prometheus-metrics
@@ -86,7 +86,7 @@
 
 ### harbor-webhook-delivery
 **Decided:** Harbor delivers change notifications to tenant webhooks with at-least-once retry.
-**Rejected:** Fire-and-forget — a transient tenant outage silently drops the notification.
+**Rejected:** (1) Fire-and-forget: REJECTED — a transient tenant outage silently drops the notification. (2) Exactly-once delivery: REJECTED — it needs a distributed transaction with every tenant endpoint, which Harbor cannot impose. (3) Tenant polling instead of webhooks: REJECTED — it pushes load and latency onto every tenant to save Harbor one retry queue. (4) Do nothing: REJECTED — tenants asked for change notifications in the pilot contract.
 **Scope:** api
 **Cites:** harbor-api-versioning
 
@@ -126,7 +126,7 @@
 
 ### harbor-api-rate-limit
 **Decided:** Harbor caps each account at 600 API requests per minute.
-**Rejected:** No limit — a single client can starve the shared node.
+**Rejected:** (1) No limit: REJECTED — a single client can starve the shared node. (2) Per-IP limits: REJECTED — tenants behind one NAT would share a budget. (3) Per-endpoint limits: REJECTED — a client can still flood the node by spreading its calls across endpoints. (4) Defer limits until after the pilot: REJECTED — the first noisy tenant arrives before the limit does.
 **Scope:** api
 
 ### harbor-blob-key-rotation-quarterly
@@ -138,7 +138,7 @@
 
 ### harbor-blob-encryption-at-rest
 **Decided:** Harbor encrypts every stored blob at rest with per-blob data keys.
-**Rejected:** Relying on disk-level encryption only — leaves blobs readable to any process on the host.
+**Rejected:** (1) Relying on disk-level encryption only: REJECTED — leaves blobs readable to any process on the host. (2) One master key for every blob: REJECTED — a single leaked key exposes the whole store, and rotating it means re-encrypting everything. (3) Keeping the status quo: REJECTED — the compliance review flags unencrypted customer data at rest.
 **Scope:** storage
 **Mechanisms:** aes-gcm
 
@@ -170,6 +170,6 @@
 
 ### harbor-storage-is-sqlite
 **Decided:** Harbor keeps file and account metadata in a single embedded SQLite database.
-**Rejected:** Postgres — operational weight unjustified for a single-node service.
+**Rejected:** (1) Postgres: REJECTED — operational weight unjustified for a single-node service. (2) A document store such as MongoDB: REJECTED — file and account metadata is relational and needs transactional joins. (3) Flat JSON files on disk: REJECTED — no atomic multi-record update, so a crash mid-write corrupts the index. (4) Keeping the status quo: REJECTED — the prototype's in-memory maps lose every change on a crash.
 **Scope:** storage
 **Mechanisms:** sqlite

@@ -40,7 +40,8 @@ RECORD_FILE = "record.json"
 RUNS_DIRNAME = "runs"
 CACHE_DIR = os.path.join(GOLDEN_DIR, ".cache")
 
-SCHEMA = 1
+# 2 (1c): a run's ``classes`` nest class -> space -> sub-block, each with ``negatives``.
+SCHEMA = 2
 CLASSES: Tuple[str, ...] = (
     "bullseye",
     "handle-words",
@@ -52,7 +53,12 @@ CLASSES: Tuple[str, ...] = (
 FORMS: Tuple[str, ...] = ("query", "draft")
 SPACE_OF_FORM: Dict[str, str] = {"query": "query", "draft": "document"}
 SPACES: Tuple[str, ...] = ("query", "document")
-MEASURES: Tuple[str, ...] = ("target", "top_live")
+MEASURES: Tuple[str, ...] = ("target", "top_live", "item")
+# How a rejection-target query meets the rejected option (vision §4.1's class table).
+REJECTION_FORMS: Tuple[str, ...] = ("own-question", "elsewhere-carries", "elsewhere-does-not-carry")
+# The two rejection-index shapes ruling 2 compares: one point per rejected option, and one
+# point per decision holding the whole field. Not ``mitos.rejections.SHAPES``.
+SHAPES: Tuple[str, ...] = ("per_item", "per_decision")
 SIDES: Tuple[str, ...] = ("higher", "lower", "dense", "unmoved")
 KINDS: Tuple[str, ...] = ("threshold", "margin")
 CORPORA: Tuple[str, ...] = ("harbor", "dense")
@@ -67,12 +73,16 @@ VALUE_BAND: float = 0.01
 THRESHOLD_SUFFIXES: Tuple[str, ...] = ("_THRESHOLD", "_FLOOR", "_MARGIN")
 
 _FIXTURE_REQUIRED = ("id", "class", "form", "text", "targets", "negatives", "measure", "notes")
-_FIXTURE_OPTIONAL = ("exclude",)
+_FIXTURE_OPTIONAL = ("exclude", "target_items", "negative_items", "rejection_form")
+_SLUG_LIST_KEYS = ("targets", "negatives", "exclude")
+_ITEM_REF_KEYS = ("target_items", "negative_items")
+_REJECTION_ONLY_KEYS = ("target_items", "negative_items", "rejection_form")
 _KEBAB_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _SUMMARY_FIELDS = ("run_id", "corpus", "embedding_model", "decision_count")
 # The shape a dense run is held to, key for key (its texts are private).
 _RUN_KEYS = ("run_id", "corpus", "decision_count", "node_count", "provenance", "fixtures", "classes")
-_CLASS_BLOCK_KEYS = ("space", "measure", "n", "absent", "values", "min", "p10", "median", "p90", "max")
+_STATS_KEYS = ("n", "absent", "values", "min", "p10", "median", "p90", "max")
+_CLASS_BLOCK_KEYS = ("measure",) + _STATS_KEYS + ("negatives",)
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +111,50 @@ def golden_cache_path(model_id: str) -> str:
 
 def _is_slug_list(value: Any) -> bool:
     return isinstance(value, list) and all(isinstance(s, str) and s for s in value)
+
+
+def _is_item_ref_list(value: Any) -> bool:
+    return isinstance(value, list) and all(
+        isinstance(r, dict) and set(r) == {"owner", "option"}
+        and all(isinstance(r[k], str) and r[k].strip() for k in ("owner", "option"))
+        for r in value
+    )
+
+
+def _validate_rejection_keys(fx: Dict[str, Any], label: str) -> None:
+    """The rejection-target rules: its measure, form and item keys, and nowhere else."""
+    rejection = fx["class"] == "rejection-target"
+    if (fx["measure"] == "item") != rejection:
+        raise ValueError(
+            f"fixture {label}: measure `item` belongs to class rejection-target and that "
+            f"class to measure `item` (class {fx['class']!r}, measure {fx['measure']!r})"
+        )
+    if not rejection:
+        stray = [k for k in _REJECTION_ONLY_KEYS if k in fx]
+        if stray:
+            raise ValueError(f"fixture {label}: {stray} belong to rejection-target fixtures only")
+        return
+    if fx["form"] != "query":
+        raise ValueError(
+            f"fixture {label}: a rejection-target fixture is a query; the draft reader reads "
+            f"no rejection shapes"
+        )
+    if fx.get("rejection_form") not in REJECTION_FORMS:
+        raise ValueError(
+            f"fixture {label}: `rejection_form` {fx.get('rejection_form')!r}; one of {list(REJECTION_FORMS)}"
+        )
+    if not fx.get("target_items"):
+        raise ValueError(f"fixture {label}: a rejection-target fixture names at least one `target_items` ref")
+    if not fx.get("negative_items"):
+        raise ValueError(f"fixture {label}: a rejection-target fixture names at least one `negative_items` ref")
+    if fx["negatives"]:
+        raise ValueError(
+            f"fixture {label}: a rejection-target fixture's negatives are `negative_items`; "
+            f"slug `negatives` must be empty"
+        )
+    owners = sorted({r["owner"] for r in fx["target_items"]} - set(fx["targets"]))
+    if owners:
+        raise ValueError(f"fixture {label}: target item owners {owners} must be in `targets`")
 
 
 def _validate_fixture(fx: Any, require_class: bool) -> None:
@@ -133,9 +187,16 @@ def _validate_fixture(fx: Any, require_class: bool) -> None:
         raise ValueError(f"fixture {label}: `text` must be a non-empty string")
     if not isinstance(fx["notes"], str) or not fx["notes"].strip():
         raise ValueError(f"fixture {label}: `notes` must say why this label holds")
-    for key in ("targets", "negatives") + _FIXTURE_OPTIONAL:
+    for key in _SLUG_LIST_KEYS:
         if key in fx and not _is_slug_list(fx[key]):
             raise ValueError(f"fixture {label}: `{key}` must be a list of slugs")
+    for key in _ITEM_REF_KEYS:
+        if key in fx and not _is_item_ref_list(fx[key]):
+            raise ValueError(
+                f"fixture {label}: `{key}` must be a list of {{owner, option}} objects, "
+                f"both non-empty strings and nothing else"
+            )
+    _validate_rejection_keys(fx, label)
     if fx["measure"] == "target" and not fx["targets"]:
         raise ValueError(f"fixture {label}: measure `target` with no targets measures nothing")
     if set(fx["targets"]) & set(fx.get("exclude", [])):
@@ -198,7 +259,9 @@ def check_fixture_slugs(fixtures: List[dict], known_slugs: Any) -> None:
     """
     known = set(known_slugs)
     for fx in fixtures:
-        named = fx["targets"] + fx["negatives"] + fx.get("exclude", [])
+        named = fx["targets"] + fx["negatives"] + fx.get("exclude", []) + [
+            r["owner"] for r in fx.get("target_items", []) + fx.get("negative_items", [])
+        ]
         unknown = sorted(s for s in named if s not in known)
         if unknown:
             raise ValueError(f"fixture {fx['id']!r}: slugs not in the graph: {unknown}")
@@ -278,7 +341,7 @@ def derive_result(
             )
         targets.append(entry)
 
-    return {
+    result = {
         "id": fixture["id"],
         "class": fixture["class"],
         "space": SPACE_OF_FORM[fixture["form"]],
@@ -290,6 +353,99 @@ def derive_result(
         "envelope_band": envelope_band,
         "pause_floor": pause_floor,
     }
+    if "rejection_form" in fixture:
+        result["rejection_form"] = fixture["rejection_form"]
+    return result
+
+
+def _collapse(hits: List[dict], per_item: bool) -> List[Dict[str, Any]]:
+    """Collapses part hits to one value per unit, best part first, re-sorted best first.
+
+    A unit is ``(owner, ordinal)`` in the per-item shape and the owner alone in the
+    per-decision shape. Ties keep the order the search returned them in.
+    """
+    best: Dict[Tuple[str, Optional[int]], Dict[str, Any]] = {}
+    order: List[Tuple[str, Optional[int]]] = []
+    for h in hits:
+        key = (h["owner"], h["ordinal"] if per_item else None)
+        if key not in best:
+            order.append(key)
+            best[key] = {"key": key, "value": h["value"]}
+        elif h["value"] > best[key]["value"]:
+            best[key]["value"] = h["value"]
+    units = [best[k] for k in order]
+    units.sort(key=lambda u: -u["value"])  # stable: equal values keep search order
+    return units
+
+
+def _item_shape(fixture: dict, hits: List[dict], refs: Dict[str, List[dict]], per_item: bool) -> Dict[str, Any]:
+    units = _collapse(hits, per_item)
+    rank_of = {u["key"]: i + 1 for i, u in enumerate(units)}
+    value_of = {u["key"]: u["value"] for u in units}
+
+    def key_of(ref: dict) -> Tuple[str, Optional[int]]:
+        # The per-decision shape values every ref at its owner's whole-field point, so a
+        # target and a negative sharing an owner get one value: the dilution it costs.
+        return (ref["owner"], ref["ordinal"] if per_item else None)
+
+    target_keys = {key_of(r) for r in refs["targets"]}
+    best_other = next((u["value"] for u in units if u["key"] not in target_keys), None)
+
+    def entry(ref: dict, margin: bool) -> Dict[str, Any]:
+        key = key_of(ref)
+        value = value_of.get(key)
+        out: Dict[str, Any] = {"owner": ref["owner"], "option": ref["option"], "value": value,
+                               "rank": rank_of.get(key), "absent": value is None}
+        if margin:
+            out["margin_vs_best_other"] = (
+                value - best_other if value is not None and best_other is not None else None
+            )
+        return out
+
+    return {
+        "hits": [dict(h) for h in hits],
+        "targets": [entry(r, True) for r in refs["targets"]],
+        "negatives": [entry(r, False) for r in refs["negatives"]],
+        "top_value": units[0]["value"] if units else None,
+    }
+
+
+def derive_item_result(
+    fixture: dict, hits_by_shape: Dict[str, List[dict]], refs: Dict[str, List[dict]]
+) -> Dict[str, Any]:
+    """Derives a rejection-target fixture's ``items`` value in both index shapes (§3.3).
+
+    ``hits_by_shape[shape]`` is the shape collection's whole ranking, best first, each hit
+    labelled by the harness from its point id: ``{point_id, owner, ordinal, part, value,
+    owner_live}`` per item part (``ordinal``/``part`` are ``None`` per decision). ``refs``
+    holds the fixture's ``target_items`` and ``negative_items`` resolved to ordinals:
+    ``{"targets": [{owner, option, ordinal}], "negatives": [...]}``.
+
+    Per item, an item's parts collapse to its best part's value *before* ranks and
+    margins, so a target's own second part never competes with it and a two-part
+    competitor costs it one rank, not two. ``margin_vs_best_other`` is the target's value
+    minus the best collapsed unit that is not a target. Per decision, every ref is valued
+    at its owner's whole-field point.
+
+    Args:
+        fixture: A validated rejection-target fixture.
+        hits_by_shape: The labelled hits per shape in ``SHAPES``.
+        refs: The resolved refs.
+
+    Returns:
+        ``{shape: {hits, targets, negatives, top_value}}``. A ref no hit carries is kept
+        with ``value: null`` and ``absent: true``.
+
+    Raises:
+        ValueError: If the fixture is not item-measured or a shape is missing.
+    """
+    if fixture["measure"] != "item":
+        raise ValueError(f"fixture {fixture['id']!r}: only an item-measured fixture has items")
+    missing = [s for s in SHAPES if s not in hits_by_shape]
+    if missing:
+        raise ValueError(f"fixture {fixture['id']!r}: no hits for shapes {missing}")
+    return {shape: _item_shape(fixture, hits_by_shape[shape], refs, shape == "per_item")
+            for shape in SHAPES}
 
 
 # ---------------------------------------------------------------------------
@@ -315,61 +471,124 @@ def nearest_rank(sorted_values: List[float], pct: float) -> Optional[float]:
     return sorted_values[rank - 1]
 
 
-def summarize_classes(results: List[dict]) -> Dict[str, Dict[str, Any]]:
-    """Builds the run's class block from per-fixture results.
+def stats(values: List[Optional[float]]) -> Dict[str, Any]:
+    """Nearest-rank statistics over values, with each ``None`` counted as ``absent``.
+
+    Returns:
+        ``{n, absent, values, min, p10, median, p90, max}``; ``n`` counts the values
+        given, present and absent.
+    """
+    present = sorted(v for v in values if v is not None)
+    return {
+        "n": len(values),
+        "absent": len(values) - len(present),
+        "values": present,
+        "min": present[0] if present else None,
+        "p10": nearest_rank(present, 10),
+        "median": nearest_rank(present, 50),
+        "p90": nearest_rank(present, 90),
+        "max": present[-1] if present else None,
+    }
+
+
+def _picks(r: dict) -> Tuple[List[Optional[float]], List[Optional[float]]]:
+    """A result's (target-side, negative-side) values under its measure; exhaustive."""
+    measure = r["measure"]
+    if measure == "target":
+        return [t["value"] for t in r["targets"]], [n["value"] for n in r["negatives"]]
+    if measure == "top_live":
+        return [r["top_live_value"]], [n["value"] for n in r["negatives"]]
+    if measure == "item":
+        shape = r["items"]["per_item"]  # the ruled index (Q2); per-decision is `shapes`' evidence
+        return [t["value"] for t in shape["targets"]], [n["value"] for n in shape["negatives"]]
+    raise ValueError(f"result {r.get('id')!r}: unknown measure {measure!r}; one of {list(MEASURES)}")
+
+
+def summarize_classes(results: List[dict]) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """Builds the run's class block from per-fixture results: class -> space -> sub-block.
+
+    The space is the sub-block's key, so a constant reads values from its own space by
+    lookup and never from the other (ADR
+    ``calibrated-thresholds-are-measured-in-the-embedding-space-they-compare``). A class
+    posed both ways (retired-precedent as a query and as a draft) has two sub-blocks.
 
     Results whose class is ``null`` (the smoke adaptation) are left out, so a smoke-only
-    run summarizes to ``{}`` and ``append_run`` refuses it. A ``target`` fixture adds each
-    present target's value; a ``top_live`` fixture adds its top live value. Each missing
-    value is counted under ``absent`` and kept out of the statistics. Percentiles are
+    run summarizes to ``{}`` and ``append_run`` refuses it. A ``target`` fixture adds
+    each target's value, a ``top_live`` fixture its top live value, an ``item`` fixture
+    each target item's per-item value. ``negatives`` summarizes the sub-block's negative
+    values: slug negatives, or the per-item ``negative_items`` for ``item``. Missing
+    values count under ``absent`` and stay out of the statistics; percentiles are
     nearest-rank (see `nearest_rank`).
 
     Args:
-        results: `derive_result` outputs.
+        results: `derive_result` outputs (with ``items`` on item-measured ones).
 
     Returns:
-        ``{class: {space, measure, n, absent, values, min, p10, median, p90, max}}``.
-        ``n`` counts the class's fixtures; ``values`` plus ``absent`` counts what they
-        measured, which is more than ``n`` when a ``target`` fixture names several.
+        ``{class: {space: {measure, n, absent, values, min, p10, median, p90, max,
+        negatives: {n, absent, values, min, p10, median, p90, max}}}}``. ``n`` counts
+        the sub-block's fixtures; ``values`` plus ``absent`` counts what they measured.
 
     Raises:
-        ValueError: If one class holds results in two spaces or under two measures.
+        ValueError: If one (class, space) holds results under two measures, or a result
+            names an unknown measure.
     """
-    grouped: Dict[str, List[dict]] = {}
+    grouped: Dict[Tuple[str, str], List[dict]] = {}
     for r in results:
         if r["class"] is not None:
-            grouped.setdefault(r["class"], []).append(r)
-    out: Dict[str, Dict[str, Any]] = {}
-    for cls in sorted(grouped):
-        members = grouped[cls]
-        spaces = sorted({r["space"] for r in members})
-        if len(spaces) > 1:
-            raise ValueError(f"class {cls!r} mixes spaces {spaces}; one class, one space")
+            grouped.setdefault((r["class"], r["space"]), []).append(r)
+    out: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for cls, space in sorted(grouped):
+        members = grouped[(cls, space)]
         measures = sorted({r["measure"] for r in members})
         if len(measures) > 1:
-            raise ValueError(f"class {cls!r} mixes measures {measures}; one class, one measure")
-        values: List[float] = []
-        absent = 0
+            raise ValueError(
+                f"class {cls!r} in {space!r} space mixes measures {measures}; one measure per (class, space)"
+            )
+        values: List[Optional[float]] = []
+        negatives: List[Optional[float]] = []
         for r in members:
-            picked = ([t["value"] for t in r["targets"]] if r["measure"] == "target"
-                      else [r["top_live_value"]])
-            for v in picked:
-                if v is None:
-                    absent += 1
-                else:
-                    values.append(v)
-        values.sort()
-        out[cls] = {
-            "space": spaces[0],
-            "measure": measures[0],
-            "n": len(members),
-            "absent": absent,
-            "values": values,
-            "min": values[0] if values else None,
-            "p10": nearest_rank(values, 10),
-            "median": nearest_rank(values, 50),
-            "p90": nearest_rank(values, 90),
-            "max": values[-1] if values else None,
+            v, n = _picks(r)
+            values += v
+            negatives += n
+        block: Dict[str, Any] = {"measure": measures[0]}
+        block.update(stats(values))
+        block["n"] = len(members)
+        block["negatives"] = stats(negatives)
+        out.setdefault(cls, {})[space] = block
+    return out
+
+
+def summarize_shapes(results: List[dict]) -> Dict[str, Dict[str, Any]]:
+    """Builds the run's ``shapes`` block from its item-measured results (ruling 2's evidence).
+
+    Per shape: ``targets`` and ``negatives`` statistics, ``targets`` again ``by_form``,
+    ``target_rank_one`` (the share of target refs ranked first, over every target ref,
+    absent ones included) and ``margin`` (statistics of ``margin_vs_best_other``).
+
+    Args:
+        results: Every fixture result of the run; only ``measure: item`` ones are read.
+
+    Returns:
+        ``{shape: {targets, negatives, by_form, target_rank_one, margin}}`` for each shape
+        in ``SHAPES``, or ``{}`` when the run holds no item-measured result.
+    """
+    items = [r for r in results if r.get("measure") == "item" and r.get("class") is not None]
+    if not items:
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for shape in SHAPES:
+        targets = [t for r in items for t in r["items"][shape]["targets"]]
+        by_form = {
+            form: stats([t["value"] for r in items if r.get("rejection_form") == form
+                         for t in r["items"][shape]["targets"]])
+            for form in REJECTION_FORMS
+        }
+        out[shape] = {
+            "targets": stats([t["value"] for t in targets]),
+            "negatives": stats([n["value"] for r in items for n in r["items"][shape]["negatives"]]),
+            "by_form": by_form,
+            "target_rank_one": (sum(1 for t in targets if t["rank"] == 1) / len(targets)) if targets else None,
+            "margin": stats([t["margin_vs_best_other"] for t in targets]),
         }
     return out
 
@@ -455,6 +674,30 @@ def make_run_id(corpus: str, timestamp: str, commit_sha: Optional[str]) -> str:
     return f"{corpus}-{day}-{(commit_sha or 'nosha')[:7]}"
 
 
+def _numeric_list(values: Any) -> bool:
+    return isinstance(values, list) and all(
+        isinstance(v, (int, float)) and not isinstance(v, bool) for v in values
+    )
+
+
+def _non_numeric_block(sub: Dict[str, Any]) -> Optional[str]:
+    """Names what in a dense sub-block is not a numeric statistic, or returns ``None``."""
+    extra = sorted(set(sub) - set(_CLASS_BLOCK_KEYS))
+    if extra:
+        return f"extra keys {extra}"
+    if not _numeric_list(sub.get("values", [])):
+        return "`values` holds a non-number"
+    negatives = sub.get("negatives", {})
+    if not isinstance(negatives, dict):
+        return "`negatives` is not a statistics object"
+    extra = sorted(set(negatives) - set(_STATS_KEYS))
+    if extra:
+        return f"`negatives` has extra keys {extra}"
+    if not _numeric_list(negatives.get("values", [])):
+        return "`negatives.values` holds a non-number"
+    return None
+
+
 def _refuse_run(run: Dict[str, Any], record: Dict[str, Any]) -> None:
     corpus = run.get("corpus")
     if corpus not in CORPORA:
@@ -468,8 +711,14 @@ def _refuse_run(run: Dict[str, Any], record: Dict[str, Any]) -> None:
     for cls, block in classes.items():
         if cls not in CLASSES:
             raise ValueError(f"run class {cls!r}; one of {list(CLASSES)}")
-        if not isinstance(block, dict) or block.get("space") not in SPACES:
-            raise ValueError(f"run class {cls!r} names no space")
+        if not isinstance(block, dict) or not block or any(
+            space not in SPACES or not isinstance(sub, dict) or sub.get("measure") not in MEASURES
+            for space, sub in block.items()
+        ):
+            raise ValueError(
+                f"run class {cls!r} must map each space in {list(SPACES)} to a sub-block "
+                f"naming its measure"
+            )
     if "fixtures" not in run:
         raise ValueError("run carries no `fixtures` key")
     if corpus == "dense":
@@ -482,15 +731,13 @@ def _refuse_run(run: Dict[str, Any], record: Dict[str, Any]) -> None:
         if extra:
             raise ValueError(f"a dense run carries keys outside the run shape: {extra}")
         for cls, block in classes.items():
-            extra = sorted(set(block) - set(_CLASS_BLOCK_KEYS))
-            values = block.get("values", [])
-            if extra or not isinstance(values, list) or not all(
-                isinstance(v, (int, float)) and not isinstance(v, bool) for v in values
-            ):
-                raise ValueError(
-                    f"dense run class {cls!r} must hold numeric statistics only"
-                    + (f"; extra keys {extra}" if extra else "")
-                )
+            for space, sub in block.items():
+                problem = _non_numeric_block(sub)
+                if problem:
+                    raise ValueError(
+                        f"dense run class {cls!r} in {space!r} space must hold numeric "
+                        f"statistics only; {problem}"
+                    )
     else:
         if not isinstance(run["fixtures"], list) or not run["fixtures"]:
             raise ValueError("a harbor run must carry its per-fixture results")
@@ -634,15 +881,20 @@ def _check_constant(
             if not isinstance(block, dict):
                 problems.append(f"{name}: class {cls!r} is absent from cited run {run_id!r}")
                 continue
-            if block.get("space") != space:
+            # The space is the sub-block's key: a constant reads its own space or nothing.
+            sub = block.get(space)
+            if not isinstance(sub, dict):
                 problems.append(
-                    f"{name}: class {cls!r} sits in {block.get('space')!r} space in run "
+                    f"{name}: class {cls!r} has no values in {space!r} space in run "
                     f"{run_id!r}; the constant compares {space!r}"
                 )
-            if block.get("min") is not None:
-                lows.append(block["min"])
-            if block.get("max") is not None:
-                highs.append(block["max"])
+                continue
+            # A floor sits between a class's negatives and its targets, so both bound it.
+            for part in (sub, sub.get("negatives") or {}):
+                if part.get("min") is not None:
+                    lows.append(part["min"])
+                if part.get("max") is not None:
+                    highs.append(part["max"])
         if kind == "threshold" and lows and highs and not (min(lows) <= boundary <= max(highs)):
             problems.append(
                 f"{name}: boundary {boundary!r} for run {run_id!r} lies outside its classes' "
@@ -796,13 +1048,45 @@ def threshold_population(mitos_dir: str) -> Dict[str, Optional[float]]:
 # Soft diff
 # ---------------------------------------------------------------------------
 
+def _item_diff(fid: str, cur: Any, base: Any, band: float) -> List[Dict[str, Any]]:
+    """Diffs two results' ``items``, per shape and role, keyed by ``(owner, option)``."""
+    out: List[Dict[str, Any]] = []
+    if not cur and not base:
+        return out
+    cur, base = cur or {}, base or {}
+    for shape in SHAPES:
+        for role in ("targets", "negatives"):
+            c_refs = {(e["owner"], e["option"]): e for e in (cur.get(shape) or {}).get(role, [])}
+            b_refs = {(e["owner"], e["option"]): e for e in (base.get(shape) or {}).get(role, [])}
+            where = {"id": fid, "shape": shape, "role": role[:-1]}
+            for owner, option in sorted(set(c_refs) - set(b_refs)):
+                out.append(dict(where, kind="item_added", owner=owner, option=option, regression=False))
+            for owner, option in sorted(set(b_refs) - set(c_refs)):
+                out.append(dict(where, kind="item_removed", owner=owner, option=option, regression=False))
+            for key in sorted(set(c_refs) & set(b_refs)):
+                was, now = b_refs[key].get("value"), c_refs[key].get("value")
+                kind = None
+                if was is None and now is not None:
+                    kind = "target_present"
+                elif was is not None and now is None:
+                    kind = "target_absent"
+                elif was is not None and abs(now - was) > band:
+                    kind = "value_moved"
+                if kind:
+                    out.append(dict(where, kind=kind, owner=key[0], option=key[1],
+                                    regression=True, baseline=was, current=now))
+    return out
+
+
 def soft_diff(current: Dict[str, Any], baseline: Dict[str, Any], band: float = VALUE_BAND) -> List[Dict[str, Any]]:
     """Compares a run with a baseline run, fixture by fixture and target by target.
 
     Reports a target value moved past ``band`` (and, for a ``top_live`` fixture, its top
     live value), a changed envelope band, and a target that became absent or present —
-    each a ``regression: true`` entry for human review. Fixtures added or removed, and
-    targets added to or removed from a fixture's list, are listed with
+    each a ``regression: true`` entry for human review. An item-measured fixture's
+    ``items`` diff the same way in each shape, targets and negatives alike, keyed by
+    ``(owner, option)`` and tagged with ``shape`` and ``role``. Fixtures added or removed,
+    and targets or item refs added to or removed from a fixture, are listed with
     ``regression: false``. Never raises and never writes.
 
     Args:
@@ -848,6 +1132,7 @@ def soft_diff(current: Dict[str, Any], baseline: Dict[str, Any], band: float = V
                 elif was is not None and abs(now - was) > band:
                     out.append({"kind": "value_moved", "id": fid, "slug": slug,
                                 "regression": True, "baseline": was, "current": now})
+            out.extend(_item_diff(fid, c.get("items"), b.get("items"), band))
     except Exception as exc:  # a malformed run is reported, never raised
         out.append({"kind": "unreadable", "id": None, "regression": True,
                     "detail": f"{type(exc).__name__}: {exc}"})

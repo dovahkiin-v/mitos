@@ -11,8 +11,13 @@ Gating mirrors ``test_retrieval_live.py``: it runs only with a Gemini key and th
 brake off, skips loudly when Qdrant does not answer, and turns an embedding quota fault
 into a named skip. No Anthropic call is made here.
 
-Hard asserts are structural only: the collection holds every node, each read makes one
-proxied call, every target has a value, and the envelope agrees with the raw hits.
+Rejection-target fixtures are also read against two more throwaway collections, the two
+rejection-index shapes (one point per rejected item part, one per decision's whole field),
+built by the module-scoped ``shape_collections`` fixture.
+
+Hard asserts are structural only: the collections hold every point they should, each read
+makes one proxied call (and one search per shape), every target has a value, and the
+envelope agrees with the raw hits.
 Values go to a gitignored report and, for labelled fixtures, into a soft diff that
 warns and never fails. A run enters the committed record only under
 ``MITOS_UPDATE_CALIBRATION=1``.
@@ -31,6 +36,7 @@ from mitos import conflict, sync
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.errors import EmbeddingError
 from mitos.models import get_embedding_model_id
+from mitos.rejections import rejection_points
 from mitos.vector_store import QdrantVectorStore, hash_to_uuid
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -113,6 +119,26 @@ def calibration_index(tmp_path_factory):
             pass  # the conftest sweep removes mitos-tmp-* as a backstop
 
 
+@pytest.fixture(scope="module")
+def shape_collections(calibration_index):
+    """Builds both rejection-index shapes over every Harbor decision; deletes both after."""
+    index = calibration_index
+    suffix = uuid.uuid4().hex[:8]
+    names = (f"mitos-tmp-golden-layerc-items-{suffix}", f"mitos-tmp-golden-layerc-fields-{suffix}")
+    items_vstore, fields_vstore = (QdrantVectorStore(QDRANT_URL, name) for name in names)
+    try:
+        with skip_on_embed_quota():
+            index.shapes = CH.populate_shape_collections(index, items_vstore, fields_vstore)
+        yield index.shapes
+    finally:
+        index.shapes = None
+        for name in names:
+            try:
+                requests.delete(f"{QDRANT_URL.rstrip('/')}/collections/{name}", timeout=5)
+            except requests.RequestException:
+                pass  # the conftest sweep removes mitos-tmp-* as a backstop
+
+
 def _read(index, fixture):
     """Reads one fixture, turning an environmental embedding fault into a named skip."""
     try:
@@ -132,9 +158,11 @@ def _stats_line(index) -> str:
 
 
 def _value_ranges(results) -> str:
+    """Decision-ranking target values per space; item-measured fixtures are left out,
+    since their slug targets are the owner and adopter, recorded as context."""
     lines = []
     for space in R.SPACES:
-        values = [t["value"] for r in results if r["space"] == space
+        values = [t["value"] for r in results if r["space"] == space and r["measure"] != "item"
                   for t in r["targets"] if t["value"] is not None]
         if values:
             lines.append(f"  {space:8} targets n={len(values)} min={min(values):.4f} max={max(values):.4f}")
@@ -157,6 +185,24 @@ def test_collection_holds_every_harbor_node(calibration_index):
         assert hash_to_uuid(by_slug[slug]["id"]) in ids, f"retired {slug} has no point"
         assert index.live_by_slug[slug] is False
     assert len(index.nodes_by_slug) == len(index.nodes), "payload slugs are not unique"
+
+
+def test_shape_collections_hold_every_rejection_point(calibration_index, shape_collections):
+    """Per item: every rejection point of every decision, retired owners included.
+    Per decision: one point per decision with a non-empty field."""
+    index = calibration_index
+    decisions = [n for n in index.nodes if n["kind"] == "decision"]
+    expected_items = set()
+    for n in decisions:
+        expected_items |= set(rejection_points(n["id"], n["rejected_paths"] or ""))
+    assert shape_collections.items_vstore.list_point_ids() == expected_items == set(shape_collections.item_points)
+    expected_fields = {hash_to_uuid(n["id"]) for n in decisions if (n["rejected_paths"] or "").strip()}
+    assert shape_collections.fields_vstore.list_point_ids() == expected_fields == set(shape_collections.field_points)
+    by_slug = {n["slug"]: n for n in decisions}
+    for slug in RETIRED_NODES:
+        owned = set(rejection_points(by_slug[slug]["id"], by_slug[slug]["rejected_paths"]))
+        assert owned and owned <= expected_items, f"retired {slug}'s items are not in the per-item shape"
+    print(f"\n[layer-c] shapes: {shape_collections.counts}\n{_stats_line(index)}")
 
 
 def test_smoke_records_values_in_both_spaces(calibration_index):
@@ -217,21 +263,65 @@ def test_retired_values_are_measured_where_the_envelope_hides_them(calibration_i
           f"band={read.result['envelope_band']}\n{_stats_line(index)}")
 
 
-def _labelled_run(index):
-    """Reads every labelled fixture and builds the run, or skips while there are none."""
+def _labelled_reads(index):
+    """Reads every labelled fixture, or skips while there are none."""
     fixtures = R.load_fixtures()
     if not fixtures:
-        pytest.skip("no Layer C fixtures yet — 1c labels them in calibration/fixtures.json")
+        pytest.skip("no Layer C fixtures yet — calibration/fixtures.json is empty")
     R.check_fixture_slugs(fixtures, index.nodes_by_slug)
-    results = [_read(index, fx).result for fx in fixtures]
-    return CH.build_run(index, results)
+    return fixtures, [_read(index, fx) for fx in fixtures]
 
 
-def test_calibration_classes(calibration_index):
+def _fmt(v):
+    return "  —   " if v is None else f"{v:.4f}"
+
+
+def _class_lines(run) -> str:
+    """One line per (class, space): targets and negatives, min / median / max."""
+    lines = []
+    for cls, spaces in run["classes"].items():
+        for space, b in spaces.items():
+            neg = b["negatives"]
+            lines.append(
+                f"  {cls:18} {space:8} {b['measure']:8} n={b['n']:2} "
+                f"targets {_fmt(b['min'])} {_fmt(b['median'])} {_fmt(b['max'])} absent={b['absent']}  "
+                f"negatives n={neg['n']:2} {_fmt(neg['min'])} {_fmt(neg['median'])} {_fmt(neg['max'])}"
+            )
+    for shape, block in run.get("shapes", {}).items():
+        t, n, m = block["targets"], block["negatives"], block["margin"]
+        lines.append(
+            f"  shape {shape:12} targets median={_fmt(t['median'])} p10={_fmt(t['p10'])}  "
+            f"negatives median={_fmt(n['median'])} p90={_fmt(n['p90'])}  "
+            f"rank-one={block['target_rank_one']:.2f} margin median={_fmt(m['median'])}"
+        )
+    return "\n".join(lines)
+
+
+def test_calibration_classes(calibration_index, shape_collections):
     """Reads the labelled fixtures, reports the class distributions, soft-diffs the record."""
-    run = _labelled_run(calibration_index)
+    index = calibration_index
+    fixtures, reads = _labelled_reads(index)
+    for fx, read in zip(fixtures, reads):
+        raw = read.calls[0][1]
+        raw_score = {h["slug"]: h["score"] for h in raw}
+        if fx["form"] == "query":
+            assert "confidence" in read.envelope, f"{fx['id']}: degraded envelope {read.envelope}"
+            for d in read.envelope["active_decisions"]:
+                assert d["score"] == raw_score.get(d["slug"]), f"{fx['id']}: envelope score for {d['slug']}"
+        if fx["measure"] == "item":
+            assert read.shape_searches == {"per_item": 1, "per_decision": 1}, fx["id"]
+            assert set(read.result["items"]) == set(R.SHAPES), fx["id"]
+            for shape in R.SHAPES:
+                refs = read.result["items"][shape]["targets"] + read.result["items"][shape]["negatives"]
+                assert all(not r["absent"] for r in refs), f"{fx['id']}: an item ref with no value in {shape}"
+        else:
+            assert read.shape_searches is None and "items" not in read.result, fx["id"]
+    run = CH.build_run(index, [read.result for read in reads])
+    expected = {(f["class"], R.SPACE_OF_FORM[f["form"]]) for f in fixtures}
+    assert {(c, s) for c, spaces in run["classes"].items() for s in spaces} == expected
+    assert set(run["shapes"]) == set(R.SHAPES)
     path = H.write_report(run, "calibration-latest")
-    print(f"\n[layer-c] classes: {json.dumps({c: [b['n'], b['min'], b['median'], b['max']] for c, b in run['classes'].items()})}\n[report] {path}")
+    print(f"\n[layer-c] classes (min median max):\n{_class_lines(run)}\n{_stats_line(index)}\n[report] {path}")
     record = R.load_record()
     baseline_id = R.latest_run_id(record, "harbor")
     if baseline_id is None:
@@ -250,8 +340,9 @@ def test_calibration_classes(calibration_index):
     os.environ.get(UPDATE_FLAG) != "1",
     reason=f"recording a run is explicit-only — set {UPDATE_FLAG}=1 to append one to the record.",
 )
-def test_record_run(calibration_index):
+def test_record_run(calibration_index, shape_collections):
     """Explicit-only: appends the labelled run to the committed record. Review before committing."""
-    run = _labelled_run(calibration_index)
+    _, reads = _labelled_reads(calibration_index)
+    run = CH.build_run(calibration_index, [read.result for read in reads])
     run_id = R.append_run(run)
     print(f"\n[layer-c] recorded run {run_id} — REVIEW before committing")

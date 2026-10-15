@@ -2,5 +2,5 @@
   "constants": {},
   "embedding_model": "gemini-embedding-2",
   "runs": [],
-  "schema": 1
+  "schema": 2
 }

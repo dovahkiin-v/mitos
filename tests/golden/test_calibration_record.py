@@ -39,17 +39,18 @@ def _hit(slug, value, kind="decision", live=True, self=False):
     return {"slug": slug, "value": value, "kind": kind, "live": live, "self": self}
 
 
-def _class_block(space, values, measure="target"):
-    values = sorted(values)
-    return {"space": space, "measure": measure, "n": len(values), "absent": 0, "values": values,
-            "min": values[0], "p10": values[0], "median": values[len(values) // 2],
-            "p90": values[-1], "max": values[-1]}
+def _class_block(values, measure="target", negatives=()):
+    """A (class, space) sub-block: the space is its key in the run, never a field (1c)."""
+    block = {"measure": measure}
+    block.update(R.stats(list(values)))
+    block["negatives"] = R.stats(list(negatives))
+    return block
 
 
 def _run(corpus="harbor", model=MODEL, decision_count=29, classes=None, fixtures="default", ts=TS):
     if classes is None:
-        classes = {"bullseye": _class_block("query", [0.78, 0.84, 0.9]),
-                   "family-neighbour": _class_block("query", [0.5, 0.62, 0.72])}
+        classes = {"bullseye": {"query": _class_block([0.78, 0.84, 0.9])},
+                   "family-neighbour": {"query": _class_block([0.5, 0.62, 0.72], "top_live")}}
     if fixtures == "default":
         fixtures = None if corpus == "dense" else [{"id": "f1", "class": "bullseye", "targets": []}]
     return {"corpus": corpus, "decision_count": decision_count, "node_count": decision_count + 2,
@@ -129,12 +130,56 @@ def test_the_pure_module_imports_from_outside_the_repo_and_only_the_stdlib(tmp_p
     ({"class": None}, "`class` is null"),
     ({"measure": "target", "targets": []}, "measures nothing"),
     ({"exclude": ["d2"]}, "both a target and excluded"),
+    # 1c: the item measure and the rejection-target keys
+    ({"measure": "item"}, "measure `item` belongs to class rejection-target"),
+    ({"target_items": [{"owner": "d2", "option": "A"}]}, "belong to rejection-target fixtures only"),
+    ({"negative_items": [{"owner": "d2", "option": "A"}]}, "belong to rejection-target fixtures only"),
+    ({"rejection_form": "own-question"}, "belong to rejection-target fixtures only"),
 ])
 def test_the_validator_refuses_a_malformed_fixture_and_names_it(over, needle):
     with pytest.raises(ValueError) as err:
         R.validate_fixtures([_fx(**over)])
     assert needle in str(err.value)
     assert repr(_fx(**over)["id"]) in str(err.value)
+
+
+def _rx(**over):
+    fx = {"id": "rejection-one", "class": "rejection-target", "form": "query", "text": "a proposal",
+          "targets": ["d2"], "negatives": [], "measure": "item", "notes": "why",
+          "target_items": [{"owner": "d2", "option": "Postgres"}],
+          "negative_items": [{"owner": "d3", "option": "Do nothing"}], "rejection_form": "own-question"}
+    fx.update(over)
+    return fx
+
+
+@pytest.mark.parametrize("over, needle", [
+    ({"measure": "target"}, "measure `item` belongs to class rejection-target"),
+    ({"form": "draft"}, "is a query"),
+    ({"rejection_form": None}, "`rejection_form`"),
+    ({"rejection_form": "elsewhere"}, "`rejection_form`"),
+    ({"target_items": []}, "at least one `target_items`"),
+    ({"negative_items": []}, "at least one `negative_items`"),
+    ({"target_items": [{"owner": "d2"}]}, "{owner, option}"),
+    ({"negative_items": [{"option": "Defer"}]}, "{owner, option}"),
+    ({"target_items": [{"owner": "d2", "option": " "}]}, "{owner, option}"),
+    ({"target_items": [{"owner": "d2", "option": "A", "ordinal": 1}]}, "{owner, option}"),
+    ({"target_items": ["d2"]}, "{owner, option}"),
+    ({"negatives": ["d4"]}, "slug `negatives` must be empty"),
+    ({"targets": ["d9"]}, "must be in `targets`"),
+])
+def test_the_validator_refuses_a_malformed_rejection_fixture(over, needle):
+    fx = _rx(**over)
+    if over.get("rejection_form", "") is None:
+        del fx["rejection_form"]
+    with pytest.raises(ValueError) as err:
+        R.validate_fixtures([fx])
+    assert needle in str(err.value) and "'rejection-one'" in str(err.value)
+
+
+def test_a_well_formed_rejection_fixture_validates_and_its_owners_are_checked():
+    assert R.validate_fixtures([_rx()])
+    with pytest.raises(ValueError, match="rejection-one.*d3"):
+        R.check_fixture_slugs([_rx()], {"d2"})
 
 
 def test_the_validator_refuses_a_duplicate_id():
@@ -234,25 +279,147 @@ def test_nearest_rank_statistics_and_the_absent_count():
     results = [R.derive_result(_fx(id=f"b{i}"), [_hit("d2", v)], "weak", None)
                for i, v in enumerate(values)]
     results.append(R.derive_result(_fx(id="b-absent"), [_hit("d1", 0.3)], "weak", None))
-    block = R.summarize_classes(results)["bullseye"]
+    # 1c: the space is the sub-block's key, so the block carries no `space` field.
+    block = R.summarize_classes(results)["bullseye"]["query"]
     assert block["values"] == sorted(values)
     assert (block["min"], block["p10"], block["median"], block["p90"], block["max"]) == (0.1, 0.1, 0.5, 0.9, 1.0)
-    assert (block["n"], block["absent"], block["space"], block["measure"]) == (11, 1, "query", "target")
+    assert (block["n"], block["absent"], block["measure"]) == (11, 1, "target")
+    assert "space" not in block
 
 
 def test_a_top_live_class_measures_the_top_live_value():
     result = R.derive_result(_fx(**{"class": "off-axis"}, targets=[], measure="top_live"), _BASE, "weak", None)
-    assert R.summarize_classes([result])["off-axis"]["values"] == [0.90]
+    assert R.summarize_classes([result])["off-axis"]["query"]["values"] == [0.90]
 
 
-def test_one_class_in_two_spaces_or_two_measures_is_refused():
-    q = R.derive_result(_fx(id="a"), _BASE, "weak", None)
-    d = R.derive_result(_fx(id="b", form="draft"), _BASE, None, 0.8)
-    with pytest.raises(ValueError, match="mixes spaces"):
-        R.summarize_classes([q, d])
+def test_two_spaces_in_one_class_are_two_sub_blocks_and_two_measures_in_one_are_refused():
+    """Inverted in 1c (was: one class in two spaces is refused).
+
+    The vision poses retired-precedent as a query and as a draft, and needs draft-form
+    bullseye and family-neighbour controls; nesting class -> space keeps the guard 1b's
+    refusal held (one block never mixes two spaces' values) as structure. Two measures
+    inside one (class, space) are still a labelling error.
+    """
+    q = R.derive_result(_fx(id="a"), [_hit("d2", 0.7)], "weak", None)
+    d = R.derive_result(_fx(id="b", form="draft"), [_hit("d2", 0.9)], None, 0.8)
+    classes = R.summarize_classes([q, d])
+    assert set(classes["bullseye"]) == {"query", "document"}
+    assert classes["bullseye"]["query"]["values"] == [0.7]
+    assert classes["bullseye"]["document"]["values"] == [0.9]
     t = R.derive_result(_fx(id="c", measure="top_live"), _BASE, "weak", None)
     with pytest.raises(ValueError, match="mixes measures"):
         R.summarize_classes([q, t])
+    # One measure per (class, space): the draft sub-block may measure differently.
+    td = R.derive_result(_fx(id="e", form="draft", measure="top_live"), _BASE, None, 0.8)
+    with pytest.raises(ValueError, match="'document' space mixes measures"):
+        R.summarize_classes([d, td])
+
+
+def test_a_sub_block_summarizes_its_negatives_with_absent_counted():
+    results = [
+        R.derive_result(_fx(id="a", negatives=["d1", "d3"]), _BASE, "weak", None),
+        R.derive_result(_fx(id="b", negatives=["d9"]), _BASE, "weak", None),
+    ]
+    neg = R.summarize_classes(results)["bullseye"]["query"]["negatives"]
+    assert (neg["n"], neg["absent"], neg["values"], neg["min"], neg["max"]) == (3, 1, [0.70, 0.90], 0.70, 0.90)
+
+
+def test_an_unknown_measure_is_refused_rather_than_read_as_top_live():
+    r = dict(R.derive_result(_fx(), _BASE, "weak", None), measure="ratio")
+    with pytest.raises(ValueError, match="unknown measure 'ratio'"):
+        R.summarize_classes([r])
+
+
+# ---------------------------------------------------------------------------
+# Item results and the shape comparison (1c)
+# ---------------------------------------------------------------------------
+
+def _ih(owner, value, ordinal=None, part=None, live=True):
+    return {"point_id": f"{owner}-{ordinal}-{part}", "owner": owner, "ordinal": ordinal, "part": part,
+            "value": value, "owner_live": live}
+
+
+def _iref(owner, option, ordinal):
+    return {"owner": owner, "option": option, "ordinal": ordinal}
+
+
+def test_parts_collapse_to_their_best_before_rank_and_margin():
+    """A two-part target's own second part never competes with it, and a two-part
+    competitor above it costs one rank, not two."""
+    per_item = [_ih("c", 0.95, 1, 0), _ih("c", 0.93, 1, 1), _ih("t", 0.90, 2, 0),
+                _ih("t", 0.88, 2, 1), _ih("x", 0.60, 1, 0)]
+    per_decision = [_ih("c", 0.8), _ih("t", 0.7), _ih("x", 0.5)]
+    refs = {"targets": [_iref("t", "Postgres", 2)], "negatives": [_iref("x", "Defer", 1)]}
+    items = R.derive_item_result(_rx(), {"per_item": per_item, "per_decision": per_decision}, refs)
+    t = items["per_item"]["targets"][0]
+    assert (t["value"], t["rank"], t["absent"]) == (0.90, 2, False)
+    assert t["margin_vs_best_other"] == pytest.approx(0.90 - 0.95)
+    assert items["per_item"]["top_value"] == 0.95
+    assert len(items["per_item"]["hits"]) == 5  # the raw parts are kept
+    n = items["per_item"]["negatives"][0]
+    assert (n["owner"], n["option"], n["value"], n["rank"]) == ("x", "Defer", 0.60, 3)
+
+
+def test_the_per_decision_shape_values_a_negative_at_its_owner_so_a_shared_owner_dilutes():
+    per_item = [_ih("o", 0.90, 1, 0), _ih("o", 0.55, 4, 0), _ih("y", 0.70, 1, 0)]
+    per_decision = [_ih("o", 0.75), _ih("y", 0.72)]
+    refs = {"targets": [_iref("o", "Postgres", 1)], "negatives": [_iref("o", "Keeping", 4)]}
+    items = R.derive_item_result(_rx(), {"per_item": per_item, "per_decision": per_decision}, refs)
+    assert [items["per_item"][r][0]["value"] for r in ("targets", "negatives")] == [0.90, 0.55]
+    pd = items["per_decision"]
+    assert pd["targets"][0]["value"] == pd["negatives"][0]["value"] == 0.75
+    assert pd["targets"][0]["option"] == "Postgres" and pd["negatives"][0]["option"] == "Keeping"
+    assert pd["targets"][0]["margin_vs_best_other"] == pytest.approx(0.75 - 0.72)
+
+
+def test_an_item_ref_no_hit_carries_is_absent_and_kept():
+    refs = {"targets": [_iref("z", "Gone", 1)], "negatives": []}
+    items = R.derive_item_result(_rx(), {"per_item": [_ih("o", 0.9, 1, 0)], "per_decision": [_ih("o", 0.8)]}, refs)
+    for shape in R.SHAPES:
+        assert items[shape]["targets"] == [{"owner": "z", "option": "Gone", "value": None, "rank": None,
+                                            "absent": True, "margin_vs_best_other": None}]
+
+
+def test_derive_item_result_refuses_a_non_item_fixture_and_a_missing_shape():
+    with pytest.raises(ValueError, match="only an item-measured"):
+        R.derive_item_result(_fx(), {"per_item": [], "per_decision": []}, {"targets": [], "negatives": []})
+    with pytest.raises(ValueError, match="no hits for shapes"):
+        R.derive_item_result(_rx(), {"per_item": []}, {"targets": [], "negatives": []})
+
+
+def _item_result(fid, form, per_item_t, per_dec_t, rank_i=1, rank_d=1, neg=0.5):
+    def shape(value, rank):
+        return {"hits": [], "top_value": value,
+                "targets": [{"owner": "o", "option": "A", "value": value, "rank": rank, "absent": value is None,
+                             "margin_vs_best_other": None if value is None else value - 0.6}],
+                "negatives": [{"owner": "g", "option": "Defer", "value": neg, "rank": 9, "absent": False}]}
+    fx = _rx(id=fid, rejection_form=form)
+    result = R.derive_result(fx, [_hit("o", 0.7)], "weak", None)
+    result["items"] = {"per_item": shape(per_item_t, rank_i), "per_decision": shape(per_dec_t, rank_d)}
+    return result
+
+
+def test_summarize_shapes_compares_both_shapes_and_counts_absent_refs_in_rank_one():
+    results = [
+        _item_result("r1", "own-question", 0.90, 0.80),
+        _item_result("r2", "elsewhere-carries", 0.85, 0.70, rank_d=3),
+        _item_result("r3", "elsewhere-does-not-carry", None, 0.60, rank_i=None, rank_d=5),
+        R.derive_result(_fx(id="b1"), _BASE, "weak", None),  # not item-measured: ignored
+    ]
+    shapes = R.summarize_shapes(results)
+    assert set(shapes) == set(R.SHAPES)
+    pi, pd = shapes["per_item"], shapes["per_decision"]
+    assert (pi["targets"]["n"], pi["targets"]["absent"], pi["targets"]["values"]) == (3, 1, [0.85, 0.90])
+    assert pi["target_rank_one"] == pytest.approx(2 / 3)  # absent counted in the denominator
+    assert pd["target_rank_one"] == pytest.approx(1 / 3)
+    assert pi["by_form"]["own-question"]["values"] == [0.90]
+    assert pi["by_form"]["elsewhere-does-not-carry"]["absent"] == 1
+    assert pi["negatives"]["values"] == [0.5, 0.5, 0.5]
+    assert pd["margin"]["values"] == pytest.approx([0.0, 0.1, 0.2])
+    classes = R.summarize_classes(results)
+    assert classes["rejection-target"]["query"]["values"] == [0.85, 0.90]  # per item, the ruled shape
+    assert classes["rejection-target"]["query"]["negatives"]["values"] == [0.5, 0.5, 0.5]
+    assert R.summarize_shapes([R.derive_result(_fx(), _BASE, "weak", None)]) == {}
 
 
 def test_unlabelled_results_summarize_to_nothing():
@@ -264,7 +431,8 @@ def test_unlabelled_results_summarize_to_nothing():
 # ---------------------------------------------------------------------------
 
 def test_new_record_and_make_run_id():
-    assert R.new_record("m") == {"schema": 1, "embedding_model": "m", "runs": [], "constants": {}}
+    # 1c: schema 2, a run's classes nest class -> space -> sub-block.
+    assert R.new_record("m") == {"schema": 2, "embedding_model": "m", "runs": [], "constants": {}}
     assert R.make_run_id("harbor", TS, SHA) == "harbor-20261016-9dd49d4"
     assert R.make_run_id("dense", TS, None) == "dense-20261016-nosha"
     # 01:30 in Vilnius on the 17th is still the 16th in UTC.
@@ -299,12 +467,21 @@ def test_append_run_never_overwrites_a_run(record_dir):
     (_run(fixtures=None), "must carry its per-fixture results"),
     (_run(corpus="dense", fixtures=[{"id": "f1", "class": "bullseye"}]), "fixtures: null"),
     (_run(decision_count=0), "at least 1"),
-    (_run(classes={"neighbour": _class_block("query", [0.5])}), "run class 'neighbour'"),
+    (_run(classes={"neighbour": {"query": _class_block([0.5])}}), "run class 'neighbour'"),
+    (_run(classes={"bullseye": _class_block([0.5])}), "must map each space"),
+    (_run(classes={"bullseye": {"vibe": _class_block([0.5])}}), "must map each space"),
+    (_run(classes={"bullseye": {"query": dict(_class_block([0.5]), measure="best")}}), "must map each space"),
     (dict(_run(corpus="dense"), queries=["a private query"]), "keys outside the run shape"),
-    (_run(corpus="dense", classes={"bullseye": dict(_class_block("query", [0.8]), slugs=["x"])}),
+    (_run(corpus="dense", classes={"bullseye": {"query": dict(_class_block([0.8]), slugs=["x"])}}),
      "numeric statistics only"),
-    (_run(corpus="dense", classes={"bullseye": dict(_class_block("query", [0.8]), values=["x"])}),
+    (_run(corpus="dense", classes={"bullseye": {"query": dict(_class_block([0.8]), values=["x"])}}),
      "numeric statistics only"),
+    (_run(corpus="dense", classes={"bullseye": {"query": dict(_class_block([0.8]), space="query")}}),
+     "numeric statistics only"),
+    (_run(corpus="dense", classes={"bullseye": {"query": _class_block([0.8], negatives=["slug-x"])}}),
+     "`negatives.values` holds a non-number"),
+    (_run(corpus="dense", classes={"bullseye": {"query": dict(
+        _class_block([0.8]), negatives=dict(R.stats([0.5]), slugs=["x"]))}}), "`negatives` has extra keys"),
 ])
 def test_append_run_refuses_and_writes_nothing(record_dir, run, needle):
     with pytest.raises(ValueError, match=None) as err:
@@ -400,10 +577,38 @@ def test_check_pins_reports_a_class_absent_from_one_of_two_cited_runs(record_dir
     assert _has(problems, f"'family-neighbour' is absent from cited run '{dense}'")
 
 
-def test_check_pins_reports_a_class_in_another_space(record_dir):
+def test_check_pins_reports_a_class_with_no_sub_block_in_the_constant_s_space(record_dir):
+    """Inverted in 1c (was: a class block naming another space is reported).
+
+    The space is now the sub-block's key, so a constant reads ``classes[cls][space]`` and
+    cannot read the other space's values; a class measured only in the other space is a
+    lookup that finds nothing, reported as such.
+    """
     record, runs, constants, _, dense = _clean(record_dir)
-    runs[dense]["classes"]["bullseye"]["space"] = "document"
-    assert _has(_problems(record, runs, constants), "sits in 'document' space")
+    block = runs[dense]["classes"]["bullseye"]
+    block["document"] = block.pop("query")
+    problems = _problems(record, runs, constants)
+    assert _has(problems, f"class 'bullseye' has no values in 'query' space in run '{dense}'")
+
+
+def _floor_record(record_dir, boundary):
+    """A record whose rejection-target class has targets 0.85-0.95 and negatives 0.70-0.78."""
+    run = R.append_run(_run(classes={"rejection-target": {"query": _class_block(
+        [0.85, 0.90, 0.95], "item", negatives=[0.70, 0.74, 0.78])}}), record_dir)
+    record = R.load_record(record_dir)
+    name = "mitos.recall.REJECTION_FLOOR"
+    record["constants"][name] = {"value": boundary, "kind": "threshold", "space": "query",
+                                 "separates": ["rejection-target"], "boundaries": {run: boundary},
+                                 "side": "higher", "set_by": "5a", "reason": "synthetic"}
+    return _problems(record, R.load_cited_runs(record, record_dir), {name: boundary})
+
+
+def test_a_floor_between_negatives_and_targets_is_inside_the_range(record_dir):
+    assert _floor_record(record_dir, 0.80) == []
+
+
+def test_a_floor_above_every_target_and_negative_is_outside_the_range(record_dir):
+    assert _has(_floor_record(record_dir, 0.97), "outside its classes' observed range [0.7, 0.95]")
 
 
 def test_check_pins_reports_a_threshold_boundary_outside_its_classes_range(record_dir):
@@ -557,3 +762,47 @@ def test_soft_diff_lists_a_fixture_s_added_and_removed_targets_as_non_regression
     diffs = R.soft_diff(run(["d2", "d3"]), run(["d2", "d4"]))
     assert {(d["kind"], d["slug"], d["regression"]) for d in diffs} == {
         ("target_added", "d3", False), ("target_removed", "d4", False)}
+
+
+def _item_diff_run(target=0.80, negative=0.50, shape_value=None):
+    def shape(t):
+        return {"targets": [{"owner": "o", "option": "A", "value": t}],
+                "negatives": [{"owner": "g", "option": "Defer", "value": negative}]}
+    return {"fixtures": [{"id": "r1", "measure": "item", "envelope_band": "weak", "top_live_value": 0.7,
+                          "targets": [{"slug": "o", "value": 0.6}],
+                          "items": {"per_item": shape(target),
+                                    "per_decision": shape(target if shape_value is None else shape_value)}}]}
+
+
+def test_soft_diff_reads_item_values_per_shape_and_role():
+    assert R.soft_diff(_item_diff_run(), _item_diff_run()) == []
+    moved = R.soft_diff(_item_diff_run(0.85), _item_diff_run(0.80))
+    assert {(d["kind"], d["shape"], d["role"], d["owner"], d["option"]) for d in moved} == {
+        ("value_moved", "per_item", "target", "o", "A"), ("value_moved", "per_decision", "target", "o", "A")}
+    assert all(d["regression"] for d in moved)
+    neg = R.soft_diff(_item_diff_run(negative=0.6), _item_diff_run())
+    assert {(d["kind"], d["role"]) for d in neg} == {("value_moved", "negative")}
+    flips = R.soft_diff(_item_diff_run(shape_value=None, target=None), _item_diff_run())
+    assert {d["kind"] for d in flips} == {"target_absent"}
+
+
+def test_soft_diff_lists_added_and_removed_item_refs_as_non_regressions():
+    base = _item_diff_run()
+    cur = _item_diff_run()
+    cur["fixtures"][0]["items"]["per_item"]["targets"][0]["option"] = "B"
+    diffs = R.soft_diff(cur, base)
+    assert {(d["kind"], d["option"], d["regression"]) for d in diffs} == {
+        ("item_added", "B", False), ("item_removed", "A", False)}
+
+
+def test_a_schema_two_run_round_trips_through_the_record(record_dir):
+    results = [
+        R.derive_result(_fx(id="q"), _BASE, "weak", None),
+        R.derive_result(_fx(id="d", form="draft"), _BASE, None, 0.8),
+        _item_result("r", "own-question", 0.9, 0.8),
+    ]
+    run = _run(classes=R.summarize_classes(results), fixtures=results)
+    run["shapes"] = R.summarize_shapes(results)
+    run_id = R.append_run(run, record_dir)
+    assert R.load_run(run_id, record_dir) == dict(run, run_id=run_id)
+    assert set(R.load_run(run_id, record_dir)["classes"]["bullseye"]) == {"query", "document"}

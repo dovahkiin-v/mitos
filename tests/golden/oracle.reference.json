@@ -27,21 +27,69 @@
       "modifiers": {},
       "lineage": [],
       "rejected_items": {
-        "shape": "prose",
+        "shape": "numbered",
         "items": [
           {
             "ordinal": 1,
             "span": [
               0,
-              68
+              83
             ],
-            "text": "Postgres — operational weight unjustified for a single-node service.",
-            "identity_text": "Postgres — operational weight unjustified for a single-node service.",
+            "text": "(1) Postgres: REJECTED — operational weight unjustified for a single-node service. ",
+            "identity_text": "Postgres: REJECTED — operational weight unjustified for a single-node service.",
             "parts": [
               {
                 "index": 0,
-                "text": "Postgres — operational weight unjustified for a single-node service.",
-                "point_id": "7382a07e-8d97-b2af-9724-76c81fc74a69"
+                "text": "Postgres: REJECTED — operational weight unjustified for a single-node service.",
+                "point_id": "b6d935bd-9865-3b03-c1c0-e1d3be5984ac"
+              }
+            ]
+          },
+          {
+            "ordinal": 2,
+            "span": [
+              83,
+              203
+            ],
+            "text": "(2) A document store such as MongoDB: REJECTED — file and account metadata is relational and needs transactional joins. ",
+            "identity_text": "A document store such as MongoDB: REJECTED — file and account metadata is relational and needs transactional joins.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "A document store such as MongoDB: REJECTED — file and account metadata is relational and needs transactional joins.",
+                "point_id": "71852092-1764-f50e-dfa9-0c973cd334ae"
+              }
+            ]
+          },
+          {
+            "ordinal": 3,
+            "span": [
+              203,
+              315
+            ],
+            "text": "(3) Flat JSON files on disk: REJECTED — no atomic multi-record update, so a crash mid-write corrupts the index. ",
+            "identity_text": "Flat JSON files on disk: REJECTED — no atomic multi-record update, so a crash mid-write corrupts the index.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "Flat JSON files on disk: REJECTED — no atomic multi-record update, so a crash mid-write corrupts the index.",
+                "point_id": "99027aaf-2836-635f-4ba9-827f4af7023f"
+              }
+            ]
+          },
+          {
+            "ordinal": 4,
+            "span": [
+              315,
+              414
+            ],
+            "text": "(4) Keeping the status quo: REJECTED — the prototype's in-memory maps lose every change on a crash.",
+            "identity_text": "Keeping the status quo: REJECTED — the prototype's in-memory maps lose every change on a crash.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "Keeping the status quo: REJECTED — the prototype's in-memory maps lose every change on a crash.",
+                "point_id": "bf054707-351b-cebb-8ca7-3ea77b7764e5"
               }
             ]
           }
@@ -194,21 +242,53 @@
       },
       "lineage": [],
       "rejected_items": {
-        "shape": "prose",
+        "shape": "numbered",
         "items": [
           {
             "ordinal": 1,
             "span": [
               0,
-              89
+              104
             ],
-            "text": "Relying on disk-level encryption only — leaves blobs readable to any process on the host.",
-            "identity_text": "Relying on disk-level encryption only — leaves blobs readable to any process on the host.",
+            "text": "(1) Relying on disk-level encryption only: REJECTED — leaves blobs readable to any process on the host. ",
+            "identity_text": "Relying on disk-level encryption only: REJECTED — leaves blobs readable to any process on the host.",
             "parts": [
               {
                 "index": 0,
-                "text": "Relying on disk-level encryption only — leaves blobs readable to any process on the host.",
-                "point_id": "47c4c826-05f4-03f3-1dbc-4c68b8b96155"
+                "text": "Relying on disk-level encryption only: REJECTED — leaves blobs readable to any process on the host.",
+                "point_id": "ed1ec364-7854-1ad5-7214-1a9580bdae46"
+              }
+            ]
+          },
+          {
+            "ordinal": 2,
+            "span": [
+              104,
+              243
+            ],
+            "text": "(2) One master key for every blob: REJECTED — a single leaked key exposes the whole store, and rotating it means re-encrypting everything. ",
+            "identity_text": "One master key for every blob: REJECTED — a single leaked key exposes the whole store, and rotating it means re-encrypting everything.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "One master key for every blob: REJECTED — a single leaked key exposes the whole store, and rotating it means re-encrypting everything.",
+                "point_id": "c19c6e85-5e7c-248a-13e5-25e913d59e9a"
+              }
+            ]
+          },
+          {
+            "ordinal": 3,
+            "span": [
+              243,
+              344
+            ],
+            "text": "(3) Keeping the status quo: REJECTED — the compliance review flags unencrypted customer data at rest.",
+            "identity_text": "Keeping the status quo: REJECTED — the compliance review flags unencrypted customer data at rest.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "Keeping the status quo: REJECTED — the compliance review flags unencrypted customer data at rest.",
+                "point_id": "16ee4a82-c0ab-dc85-7f5a-664154e97cb6"
               }
             ]
           }
@@ -261,21 +341,69 @@
       },
       "lineage": [],
       "rejected_items": {
-        "shape": "prose",
+        "shape": "numbered",
         "items": [
           {
             "ordinal": 1,
             "span": [
               0,
-              54
+              69
             ],
-            "text": "No limit — a single client can starve the shared node.",
-            "identity_text": "No limit — a single client can starve the shared node.",
+            "text": "(1) No limit: REJECTED — a single client can starve the shared node. ",
+            "identity_text": "No limit: REJECTED — a single client can starve the shared node.",
             "parts": [
               {
                 "index": 0,
-                "text": "No limit — a single client can starve the shared node.",
-                "point_id": "1bc33bf1-bd81-81c0-d1d6-a9e9636cc5c6"
+                "text": "No limit: REJECTED — a single client can starve the shared node.",
+                "point_id": "eaed8a59-fe9f-e49b-0011-cf4f295955de"
+              }
+            ]
+          },
+          {
+            "ordinal": 2,
+            "span": [
+              69,
+              144
+            ],
+            "text": "(2) Per-IP limits: REJECTED — tenants behind one NAT would share a budget. ",
+            "identity_text": "Per-IP limits: REJECTED — tenants behind one NAT would share a budget.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "Per-IP limits: REJECTED — tenants behind one NAT would share a budget.",
+                "point_id": "5936dd58-bad0-247c-3b5b-98719bdf302d"
+              }
+            ]
+          },
+          {
+            "ordinal": 3,
+            "span": [
+              144,
+              255
+            ],
+            "text": "(3) Per-endpoint limits: REJECTED — a client can still flood the node by spreading its calls across endpoints. ",
+            "identity_text": "Per-endpoint limits: REJECTED — a client can still flood the node by spreading its calls across endpoints.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "Per-endpoint limits: REJECTED — a client can still flood the node by spreading its calls across endpoints.",
+                "point_id": "50fcaf59-6293-0111-2776-ee09a222736d"
+              }
+            ]
+          },
+          {
+            "ordinal": 4,
+            "span": [
+              255,
+              359
+            ],
+            "text": "(4) Defer limits until after the pilot: REJECTED — the first noisy tenant arrives before the limit does.",
+            "identity_text": "Defer limits until after the pilot: REJECTED — the first noisy tenant arrives before the limit does.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "Defer limits until after the pilot: REJECTED — the first noisy tenant arrives before the limit does.",
+                "point_id": "fe0d0395-6149-33d7-4673-24e1d2a79ca0"
               }
             ]
           }
@@ -481,21 +609,69 @@
       "modifiers": {},
       "lineage": [],
       "rejected_items": {
-        "shape": "prose",
+        "shape": "numbered",
         "items": [
           {
             "ordinal": 1,
             "span": [
               0,
-              76
+              91
             ],
-            "text": "Fire-and-forget — a transient tenant outage silently drops the notification.",
-            "identity_text": "Fire-and-forget — a transient tenant outage silently drops the notification.",
+            "text": "(1) Fire-and-forget: REJECTED — a transient tenant outage silently drops the notification. ",
+            "identity_text": "Fire-and-forget: REJECTED — a transient tenant outage silently drops the notification.",
             "parts": [
               {
                 "index": 0,
-                "text": "Fire-and-forget — a transient tenant outage silently drops the notification.",
-                "point_id": "4e336423-7e22-b2f6-b2bf-8626c37ff50a"
+                "text": "Fire-and-forget: REJECTED — a transient tenant outage silently drops the notification.",
+                "point_id": "964e93bb-da41-44c9-a7bf-ec0ddda205c1"
+              }
+            ]
+          },
+          {
+            "ordinal": 2,
+            "span": [
+              91,
+              220
+            ],
+            "text": "(2) Exactly-once delivery: REJECTED — it needs a distributed transaction with every tenant endpoint, which Harbor cannot impose. ",
+            "identity_text": "Exactly-once delivery: REJECTED — it needs a distributed transaction with every tenant endpoint, which Harbor cannot impose.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "Exactly-once delivery: REJECTED — it needs a distributed transaction with every tenant endpoint, which Harbor cannot impose.",
+                "point_id": "a2f81b93-0735-9d3e-3c17-8f06928b7f25"
+              }
+            ]
+          },
+          {
+            "ordinal": 3,
+            "span": [
+              220,
+              348
+            ],
+            "text": "(3) Tenant polling instead of webhooks: REJECTED — it pushes load and latency onto every tenant to save Harbor one retry queue. ",
+            "identity_text": "Tenant polling instead of webhooks: REJECTED — it pushes load and latency onto every tenant to save Harbor one retry queue.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "Tenant polling instead of webhooks: REJECTED — it pushes load and latency onto every tenant to save Harbor one retry queue.",
+                "point_id": "5f828970-3c43-2061-0c85-5b15604bf3c6"
+              }
+            ]
+          },
+          {
+            "ordinal": 4,
+            "span": [
+              348,
+              436
+            ],
+            "text": "(4) Do nothing: REJECTED — tenants asked for change notifications in the pilot contract.",
+            "identity_text": "Do nothing: REJECTED — tenants asked for change notifications in the pilot contract.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "Do nothing: REJECTED — tenants asked for change notifications in the pilot contract.",
+                "point_id": "e6c6ba35-cfbd-4a81-348e-7397c51b9aa4"
               }
             ]
           }
@@ -582,21 +758,53 @@
         "harbor-structured-logging"
       ],
       "rejected_items": {
-        "shape": "prose",
+        "shape": "numbered",
         "items": [
           {
             "ordinal": 1,
             "span": [
               0,
-              84
+              99
             ],
-            "text": "Separate ad-hoc exporters per signal — divergent config and no shared trace context.",
-            "identity_text": "Separate ad-hoc exporters per signal — divergent config and no shared trace context.",
+            "text": "(1) Separate ad-hoc exporters per signal: REJECTED — divergent config and no shared trace context. ",
+            "identity_text": "Separate ad-hoc exporters per signal: REJECTED — divergent config and no shared trace context.",
             "parts": [
               {
                 "index": 0,
-                "text": "Separate ad-hoc exporters per signal — divergent config and no shared trace context.",
-                "point_id": "65880ca2-6866-4771-149f-268bac60cecf"
+                "text": "Separate ad-hoc exporters per signal: REJECTED — divergent config and no shared trace context.",
+                "point_id": "ac6b4200-a065-c8a9-fa4a-e818b5448202"
+              }
+            ]
+          },
+          {
+            "ordinal": 2,
+            "span": [
+              99,
+              202
+            ],
+            "text": "(2) A vendor's proprietary agent: REJECTED — it ties the pipeline to one vendor's pricing and backend. ",
+            "identity_text": "A vendor's proprietary agent: REJECTED — it ties the pipeline to one vendor's pricing and backend.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "A vendor's proprietary agent: REJECTED — it ties the pipeline to one vendor's pricing and backend.",
+                "point_id": "967b535e-5a0b-3e46-1220-b6ed438e6d3d"
+              }
+            ]
+          },
+          {
+            "ordinal": 3,
+            "span": [
+              202,
+              306
+            ],
+            "text": "(3) Defer tracing until after the pilot: REJECTED — the incidents worth tracing happen during the pilot.",
+            "identity_text": "Defer tracing until after the pilot: REJECTED — the incidents worth tracing happen during the pilot.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "Defer tracing until after the pilot: REJECTED — the incidents worth tracing happen during the pilot.",
+                "point_id": "f686f38b-44c6-a602-ca8e-41202ecd0670"
               }
             ]
           }
@@ -912,21 +1120,53 @@
       "modifiers": {},
       "lineage": [],
       "rejected_items": {
-        "shape": "prose",
+        "shape": "numbered",
         "items": [
           {
             "ordinal": 1,
             "span": [
               0,
-              64
+              79
             ],
-            "text": "Continuous backup — operational cost unjustified at pilot scale.",
-            "identity_text": "Continuous backup — operational cost unjustified at pilot scale.",
+            "text": "(1) Continuous backup: REJECTED — operational cost unjustified at pilot scale. ",
+            "identity_text": "Continuous backup: REJECTED — operational cost unjustified at pilot scale.",
             "parts": [
               {
                 "index": 0,
-                "text": "Continuous backup — operational cost unjustified at pilot scale.",
-                "point_id": "5b08f072-3b50-a6cc-aea5-8a5725d55228"
+                "text": "Continuous backup: REJECTED — operational cost unjustified at pilot scale.",
+                "point_id": "78340c44-73cd-499f-b2f7-75201d75e3be"
+              }
+            ]
+          },
+          {
+            "ordinal": 2,
+            "span": [
+              79,
+              184
+            ],
+            "text": "(2) Do nothing: REJECTED — disk redundancy survives a dead disk, not a bad migration or a dropped table. ",
+            "identity_text": "Do nothing: REJECTED — disk redundancy survives a dead disk, not a bad migration or a dropped table.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "Do nothing: REJECTED — disk redundancy survives a dead disk, not a bad migration or a dropped table.",
+                "point_id": "03971a9b-dad6-780e-3868-b6e7977c9cc4"
+              }
+            ]
+          },
+          {
+            "ordinal": 3,
+            "span": [
+              184,
+              288
+            ],
+            "text": "(3) Defer backups until after the pilot: REJECTED — pilot tenants' data is real data from the first day.",
+            "identity_text": "Defer backups until after the pilot: REJECTED — pilot tenants' data is real data from the first day.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "Defer backups until after the pilot: REJECTED — pilot tenants' data is real data from the first day.",
+                "point_id": "1ea79e2e-ebb7-8911-9e5a-820280e0258a"
               }
             ]
           }
