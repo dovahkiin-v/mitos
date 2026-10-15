@@ -25,7 +25,28 @@
         "storage"
       ],
       "modifiers": {},
-      "lineage": []
+      "lineage": [],
+      "rejected_items": {
+        "shape": "prose",
+        "items": [
+          {
+            "ordinal": 1,
+            "span": [
+              0,
+              68
+            ],
+            "text": "Postgres — operational weight unjustified for a single-node service.",
+            "identity_text": "Postgres — operational weight unjustified for a single-node service.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "Postgres — operational weight unjustified for a single-node service.",
+                "point_id": "7382a07e-8d97-b2af-9724-76c81fc74a69"
+              }
+            ]
+          }
+        ]
+      }
     },
     "harbor-blobs-on-s3": {
       "id": "d20a3d9cc3efe874f42dc0883adbdd8fc16690485ae6b2b48401b6e779b48b82",
@@ -34,7 +55,28 @@
         "storage"
       ],
       "modifiers": {},
-      "lineage": []
+      "lineage": [],
+      "rejected_items": {
+        "shape": "prose",
+        "items": [
+          {
+            "ordinal": 1,
+            "span": [
+              0,
+              71
+            ],
+            "text": "Blobs in SQLite — bloats the metadata DB and wrecks its cache locality.",
+            "identity_text": "Blobs in SQLite — bloats the metadata DB and wrecks its cache locality.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "Blobs in SQLite — bloats the metadata DB and wrecks its cache locality.",
+                "point_id": "09aa32e4-f77f-af26-9c96-2dd398a95168"
+              }
+            ]
+          }
+        ]
+      }
     },
     "harbor-auth-jwt-v1": {
       "id": "7d2c6fd078288d3c9c04b6e64ee5de3a0ada3d9948e7a444282d1c7e70314be4",
@@ -47,7 +89,28 @@
           "harbor-auth-jwt-v2"
         ]
       },
-      "lineage": []
+      "lineage": [],
+      "rejected_items": {
+        "shape": "prose",
+        "items": [
+          {
+            "ordinal": 1,
+            "span": [
+              0,
+              53
+            ],
+            "text": "Basic auth — credentials on every request, no expiry.",
+            "identity_text": "Basic auth — credentials on every request, no expiry.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "Basic auth — credentials on every request, no expiry.",
+                "point_id": "835c3f2d-5592-f246-847d-bafc1d95188e"
+              }
+            ]
+          }
+        ]
+      }
     },
     "harbor-auth-jwt-v2": {
       "id": "fe76a6d4df0a8d87b05267880540c645aa6afc1fa98043d854bb40f77cfb0670",
@@ -62,7 +125,28 @@
       },
       "lineage": [
         "harbor-auth-jwt-v1"
-      ]
+      ],
+      "rejected_items": {
+        "shape": "prose",
+        "items": [
+          {
+            "ordinal": 1,
+            "span": [
+              0,
+              59
+            ],
+            "text": "Long-lived JWTs — widen the blast radius of a leaked token.",
+            "identity_text": "Long-lived JWTs — widen the blast radius of a leaked token.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "Long-lived JWTs — widen the blast radius of a leaked token.",
+                "point_id": "80cf18bb-cf40-2e1f-d9cf-bf85f96e8ddc"
+              }
+            ]
+          }
+        ]
+      }
     },
     "harbor-auth-sessions-v3": {
       "id": "8105167afaa1179615e8a59f253f5d6ddc2060564c011b57ecfb687ad88f1ac6",
@@ -74,7 +158,28 @@
       "lineage": [
         "harbor-auth-jwt-v1",
         "harbor-auth-jwt-v2"
-      ]
+      ],
+      "rejected_items": {
+        "shape": "prose",
+        "items": [
+          {
+            "ordinal": 1,
+            "span": [
+              0,
+              82
+            ],
+            "text": "Sticking with stateless JWTs — no way to revoke a compromised token before expiry.",
+            "identity_text": "Sticking with stateless JWTs — no way to revoke a compromised token before expiry.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "Sticking with stateless JWTs — no way to revoke a compromised token before expiry.",
+                "point_id": "cf4a8a6d-8ea4-7e90-174a-5d3affaa3c69"
+              }
+            ]
+          }
+        ]
+      }
     },
     "harbor-blob-encryption-at-rest": {
       "id": "2fa6c80e9ebe6c7944965af2c450dae5731b46dd84d80b30b54aa67e90bdf173",
@@ -87,7 +192,28 @@
           "harbor-blob-key-rotation-quarterly"
         ]
       },
-      "lineage": []
+      "lineage": [],
+      "rejected_items": {
+        "shape": "prose",
+        "items": [
+          {
+            "ordinal": 1,
+            "span": [
+              0,
+              89
+            ],
+            "text": "Relying on disk-level encryption only — leaves blobs readable to any process on the host.",
+            "identity_text": "Relying on disk-level encryption only — leaves blobs readable to any process on the host.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "Relying on disk-level encryption only — leaves blobs readable to any process on the host.",
+                "point_id": "47c4c826-05f4-03f3-1dbc-4c68b8b96155"
+              }
+            ]
+          }
+        ]
+      }
     },
     "harbor-blob-key-rotation-quarterly": {
       "id": "603843b54c0e6025bdcf31a9e0791230420e06bbed4a6b0baa7d4a55fceefc3e",
@@ -99,7 +225,28 @@
       "modifiers": {},
       "lineage": [
         "harbor-blob-encryption-at-rest"
-      ]
+      ],
+      "rejected_items": {
+        "shape": "prose",
+        "items": [
+          {
+            "ordinal": 1,
+            "span": [
+              0,
+              80
+            ],
+            "text": "Never rotating — a leaked master key would expose the whole corpus indefinitely.",
+            "identity_text": "Never rotating — a leaked master key would expose the whole corpus indefinitely.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "Never rotating — a leaked master key would expose the whole corpus indefinitely.",
+                "point_id": "a891f505-423b-9ab6-5c30-f9869bb17986"
+              }
+            ]
+          }
+        ]
+      }
     },
     "harbor-api-rate-limit": {
       "id": "40fd45e1feee3f76227e82081fb301a2224befe054f22283685320191f69e223",
@@ -112,7 +259,28 @@
           "harbor-premium-exempt-rate-limit"
         ]
       },
-      "lineage": []
+      "lineage": [],
+      "rejected_items": {
+        "shape": "prose",
+        "items": [
+          {
+            "ordinal": 1,
+            "span": [
+              0,
+              54
+            ],
+            "text": "No limit — a single client can starve the shared node.",
+            "identity_text": "No limit — a single client can starve the shared node.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "No limit — a single client can starve the shared node.",
+                "point_id": "1bc33bf1-bd81-81c0-d1d6-a9e9636cc5c6"
+              }
+            ]
+          }
+        ]
+      }
     },
     "harbor-premium-exempt-rate-limit": {
       "id": "caacb2955500bd6189ac921852c5d8e5fd12186b3173ae80c32108eed50ee1e1",
@@ -123,7 +291,28 @@
       "modifiers": {},
       "lineage": [
         "harbor-api-rate-limit"
-      ]
+      ],
+      "rejected_items": {
+        "shape": "prose",
+        "items": [
+          {
+            "ordinal": 1,
+            "span": [
+              0,
+              105
+            ],
+            "text": "A higher fixed ceiling for everyone — still throttles the paying tenants we most want to keep responsive.",
+            "identity_text": "A higher fixed ceiling for everyone — still throttles the paying tenants we most want to keep responsive.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "A higher fixed ceiling for everyone — still throttles the paying tenants we most want to keep responsive.",
+                "point_id": "188df100-0a1a-57a5-5dfa-6c6c9e6cba5d"
+              }
+            ]
+          }
+        ]
+      }
     },
     "harbor-legacy-ftp-gateway": {
       "id": "ab1861d7e62f670d4b8bb8217ce53f9371666ff1e67261cba8e103f58ae17079",
@@ -136,7 +325,28 @@
           "harbor-drop-ftp-gateway"
         ]
       },
-      "lineage": []
+      "lineage": [],
+      "rejected_items": {
+        "shape": "prose",
+        "items": [
+          {
+            "ordinal": 1,
+            "span": [
+              0,
+              72
+            ],
+            "text": "HTTPS-only from day one — the pilot customers' scanners still spoke FTP.",
+            "identity_text": "HTTPS-only from day one — the pilot customers' scanners still spoke FTP.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "HTTPS-only from day one — the pilot customers' scanners still spoke FTP.",
+                "point_id": "9de85280-c63a-2611-c89d-785853718b46"
+              }
+            ]
+          }
+        ]
+      }
     },
     "harbor-drop-ftp-gateway": {
       "id": "6193348911908c8f0d78749d981b7f945ad06ec7d3d05ad8e51838fa9bff1b8e",
@@ -145,7 +355,28 @@
         "api"
       ],
       "modifiers": {},
-      "lineage": []
+      "lineage": [],
+      "rejected_items": {
+        "shape": "prose",
+        "items": [
+          {
+            "ordinal": 1,
+            "span": [
+              0,
+              102
+            ],
+            "text": "Keeping FTP behind a feature flag — an unauthenticated plaintext surface we would still have to patch.",
+            "identity_text": "Keeping FTP behind a feature flag — an unauthenticated plaintext surface we would still have to patch.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "Keeping FTP behind a feature flag — an unauthenticated plaintext surface we would still have to patch.",
+                "point_id": "ea32c8c8-c551-c377-e1d3-f6a989d898f4"
+              }
+            ]
+          }
+        ]
+      }
     },
     "harbor-all-endpoints-authenticated": {
       "id": "c2004c8ab6a56c1a0b05c53ff9c8b50e42dd13c7e8638a05d77031d59b2d2fab",
@@ -156,7 +387,28 @@
           "harbor-health-endpoint-public"
         ]
       },
-      "lineage": []
+      "lineage": [],
+      "rejected_items": {
+        "shape": "prose",
+        "items": [
+          {
+            "ordinal": 1,
+            "span": [
+              0,
+              77
+            ],
+            "text": "Public read endpoints — widens the unauthenticated surface for no pilot need.",
+            "identity_text": "Public read endpoints — widens the unauthenticated surface for no pilot need.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "Public read endpoints — widens the unauthenticated surface for no pilot need.",
+                "point_id": "639ce795-8437-3aa1-f8be-0380e94813ee"
+              }
+            ]
+          }
+        ]
+      }
     },
     "harbor-health-endpoint-public": {
       "id": "2fa3a29b1625b66fb39ac9f7d3f5ea63278e10e9cfc811bb7b15129ce8427968",
@@ -167,7 +419,28 @@
       "modifiers": {},
       "lineage": [
         "harbor-all-endpoints-authenticated"
-      ]
+      ],
+      "rejected_items": {
+        "shape": "prose",
+        "items": [
+          {
+            "ordinal": 1,
+            "span": [
+              0,
+              80
+            ],
+            "text": "Authenticating /health — the load balancer's probe has no credential to present.",
+            "identity_text": "Authenticating /health — the load balancer's probe has no credential to present.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "Authenticating /health — the load balancer's probe has no credential to present.",
+                "point_id": "e2513546-33ca-b04c-612a-af31b33fd5e8"
+              }
+            ]
+          }
+        ]
+      }
     },
     "harbor-api-versioning": {
       "id": "2256398196cc05fb4e0cfb594e1c30bff4eedc467656c1b382d7f06646ebb1e6",
@@ -176,7 +449,28 @@
         "api"
       ],
       "modifiers": {},
-      "lineage": []
+      "lineage": [],
+      "rejected_items": {
+        "shape": "prose",
+        "items": [
+          {
+            "ordinal": 1,
+            "span": [
+              0,
+              83
+            ],
+            "text": "Header-based version negotiation — invisible in logs and harder for clients to pin.",
+            "identity_text": "Header-based version negotiation — invisible in logs and harder for clients to pin.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "Header-based version negotiation — invisible in logs and harder for clients to pin.",
+                "point_id": "d11eada4-e7b6-7515-2a35-04db1ccab293"
+              }
+            ]
+          }
+        ]
+      }
     },
     "harbor-webhook-delivery": {
       "id": "52136625e8eeb3dcdc2c9f8400da44625587b9802bbaa711e811002442e3f097",
@@ -185,7 +479,28 @@
         "api"
       ],
       "modifiers": {},
-      "lineage": []
+      "lineage": [],
+      "rejected_items": {
+        "shape": "prose",
+        "items": [
+          {
+            "ordinal": 1,
+            "span": [
+              0,
+              76
+            ],
+            "text": "Fire-and-forget — a transient tenant outage silently drops the notification.",
+            "identity_text": "Fire-and-forget — a transient tenant outage silently drops the notification.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "Fire-and-forget — a transient tenant outage silently drops the notification.",
+                "point_id": "4e336423-7e22-b2f6-b2bf-8626c37ff50a"
+              }
+            ]
+          }
+        ]
+      }
     },
     "harbor-structured-logging": {
       "id": "be643fb8f2ab4b920e9e86d9f665de751df91807c08b73531e2c4c9a7ca523f4",
@@ -198,7 +513,28 @@
           "harbor-observability-otel"
         ]
       },
-      "lineage": []
+      "lineage": [],
+      "rejected_items": {
+        "shape": "prose",
+        "items": [
+          {
+            "ordinal": 1,
+            "span": [
+              0,
+              68
+            ],
+            "text": "Free-text logs — unparseable for the aggregation the ops team needs.",
+            "identity_text": "Free-text logs — unparseable for the aggregation the ops team needs.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "Free-text logs — unparseable for the aggregation the ops team needs.",
+                "point_id": "b55bf79a-cc68-497b-b1a2-2ccf03f3734f"
+              }
+            ]
+          }
+        ]
+      }
     },
     "harbor-prometheus-metrics": {
       "id": "e7f4c9d59cd389c38d68718d0e25d1de22ec44afccb6e90a32ec7d8cc2c1782a",
@@ -211,7 +547,28 @@
           "harbor-observability-otel"
         ]
       },
-      "lineage": []
+      "lineage": [],
+      "rejected_items": {
+        "shape": "prose",
+        "items": [
+          {
+            "ordinal": 1,
+            "span": [
+              0,
+              81
+            ],
+            "text": "Push-based metrics — needs a gateway Harbor's single-node deployment doesn't run.",
+            "identity_text": "Push-based metrics — needs a gateway Harbor's single-node deployment doesn't run.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "Push-based metrics — needs a gateway Harbor's single-node deployment doesn't run.",
+                "point_id": "657f092b-2238-a2d3-7004-e3c958c6abe8"
+              }
+            ]
+          }
+        ]
+      }
     },
     "harbor-observability-otel": {
       "id": "d9eede3cd1e4014718c218560ff9e9aca19a5cbddf16a853ea6cdf2ea47ed525",
@@ -223,7 +580,28 @@
       "lineage": [
         "harbor-prometheus-metrics",
         "harbor-structured-logging"
-      ]
+      ],
+      "rejected_items": {
+        "shape": "prose",
+        "items": [
+          {
+            "ordinal": 1,
+            "span": [
+              0,
+              84
+            ],
+            "text": "Separate ad-hoc exporters per signal — divergent config and no shared trace context.",
+            "identity_text": "Separate ad-hoc exporters per signal — divergent config and no shared trace context.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "Separate ad-hoc exporters per signal — divergent config and no shared trace context.",
+                "point_id": "65880ca2-6866-4771-149f-268bac60cecf"
+              }
+            ]
+          }
+        ]
+      }
     },
     "harbor-sync-last-write-wins": {
       "id": "42c4d47f2cfb5e35a12b075c48c10b735e577f09e88869afc357acacba243728",
@@ -232,7 +610,28 @@
         "sync"
       ],
       "modifiers": {},
-      "lineage": []
+      "lineage": [],
+      "rejected_items": {
+        "shape": "prose",
+        "items": [
+          {
+            "ordinal": 1,
+            "span": [
+              0,
+              83
+            ],
+            "text": "CRDT merge — more machinery than the pilot's single-writer-per-file workload needs.",
+            "identity_text": "CRDT merge — more machinery than the pilot's single-writer-per-file workload needs.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "CRDT merge — more machinery than the pilot's single-writer-per-file workload needs.",
+                "point_id": "d935cee5-ae13-efdf-9009-c4d45c0ad268"
+              }
+            ]
+          }
+        ]
+      }
     },
     "harbor-sync-crdt-merge": {
       "id": "93f519b9f18f2dcc7caa4aecc0efd0c8f07a490884ce8b13a1f8feee0c8d1219",
@@ -241,7 +640,28 @@
         "sync"
       ],
       "modifiers": {},
-      "lineage": []
+      "lineage": [],
+      "rejected_items": {
+        "shape": "prose",
+        "items": [
+          {
+            "ordinal": 1,
+            "span": [
+              0,
+              74
+            ],
+            "text": "Last-write-wins — silently discards one side of a genuine concurrent edit.",
+            "identity_text": "Last-write-wins — silently discards one side of a genuine concurrent edit.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "Last-write-wins — silently discards one side of a genuine concurrent edit.",
+                "point_id": "b10447df-b763-209a-bdd8-c0c54cb8f07c"
+              }
+            ]
+          }
+        ]
+      }
     },
     "harbor-delete-is-soft-30d": {
       "id": "e2c6e69e168350112a93e7a74a994c4f8c33ce3e5bfd3929bab520f0ba481f38",
@@ -250,7 +670,28 @@
         "storage"
       ],
       "modifiers": {},
-      "lineage": []
+      "lineage": [],
+      "rejected_items": {
+        "shape": "prose",
+        "items": [
+          {
+            "ordinal": 1,
+            "span": [
+              0,
+              87
+            ],
+            "text": "Immediate hard delete — one fat-fingered call loses a customer's data with no recourse.",
+            "identity_text": "Immediate hard delete — one fat-fingered call loses a customer's data with no recourse.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "Immediate hard delete — one fat-fingered call loses a customer's data with no recourse.",
+                "point_id": "47476840-6437-6629-3fee-8702f34bfa75"
+              }
+            ]
+          }
+        ]
+      }
     },
     "harbor-delete-is-immediate-hard": {
       "id": "a42c35518652475fa813de0c0caa4d1ae36d36b2fbfcacd8a59bce82b6878a44",
@@ -259,7 +700,28 @@
         "storage"
       ],
       "modifiers": {},
-      "lineage": []
+      "lineage": [],
+      "rejected_items": {
+        "shape": "prose",
+        "items": [
+          {
+            "ordinal": 1,
+            "span": [
+              0,
+              81
+            ],
+            "text": "A grace period — regulated tenants require provable immediate erasure on request.",
+            "identity_text": "A grace period — regulated tenants require provable immediate erasure on request.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "A grace period — regulated tenants require provable immediate erasure on request.",
+                "point_id": "a26333a6-ad75-f49b-b0e2-e1dc3dd08fcd"
+              }
+            ]
+          }
+        ]
+      }
     },
     "harbor-config-yaml": {
       "id": "555b9c11f624db35cd1438bc933160a651467db3e0d3ee854f6565546ed71fd6",
@@ -268,7 +730,28 @@
         "api"
       ],
       "modifiers": {},
-      "lineage": []
+      "lineage": [],
+      "rejected_items": {
+        "shape": "prose",
+        "items": [
+          {
+            "ordinal": 1,
+            "span": [
+              0,
+              73
+            ],
+            "text": "Environment variables only — unwieldy for the nested config Harbor needs.",
+            "identity_text": "Environment variables only — unwieldy for the nested config Harbor needs.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "Environment variables only — unwieldy for the nested config Harbor needs.",
+                "point_id": "97c5397e-3ef6-260d-fb1b-e39614c39242"
+              }
+            ]
+          }
+        ]
+      }
     },
     "harbor-config-yaml-strict-schema": {
       "id": "ae8c9a007b5bc204c6a0ad318800b647c4105d7893ac884c83dbac5d0f64c69f",
@@ -277,7 +760,28 @@
         "api"
       ],
       "modifiers": {},
-      "lineage": []
+      "lineage": [],
+      "rejected_items": {
+        "shape": "prose",
+        "items": [
+          {
+            "ordinal": 1,
+            "span": [
+              0,
+              84
+            ],
+            "text": "Ignoring unknown keys — silently drops a misspelled setting and boots misconfigured.",
+            "identity_text": "Ignoring unknown keys — silently drops a misspelled setting and boots misconfigured.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "Ignoring unknown keys — silently drops a misspelled setting and boots misconfigured.",
+                "point_id": "d1a52b5b-1b7f-4af9-0f8b-e51a523127be"
+              }
+            ]
+          }
+        ]
+      }
     },
     "harbor-no-global-mutable-state": {
       "id": "f5867142fdf3c9460453745e347e4815f675c6c1f562b7e05cfd8f921ec2780a",
@@ -286,7 +790,28 @@
         "architecture"
       ],
       "modifiers": {},
-      "lineage": []
+      "lineage": [],
+      "rejected_items": {
+        "shape": "prose",
+        "items": [
+          {
+            "ordinal": 1,
+            "span": [
+              0,
+              93
+            ],
+            "text": "Module-level singletons for convenience — they make request isolation and testing unreliable.",
+            "identity_text": "Module-level singletons for convenience — they make request isolation and testing unreliable.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "Module-level singletons for convenience — they make request isolation and testing unreliable.",
+                "point_id": "d565d56d-b169-54f6-53cf-11ebb1b86609"
+              }
+            ]
+          }
+        ]
+      }
     },
     "harbor-cache-is-process-singleton": {
       "id": "b336128f978de2e87b7e6106fe0374ba68e360ef3fc5ba57e705a2b12f6ced09",
@@ -295,7 +820,28 @@
         "performance"
       ],
       "modifiers": {},
-      "lineage": []
+      "lineage": [],
+      "rejected_items": {
+        "shape": "prose",
+        "items": [
+          {
+            "ordinal": 1,
+            "span": [
+              0,
+              86
+            ],
+            "text": "A per-request cache — cold on every call, defeating the point of caching hot metadata.",
+            "identity_text": "A per-request cache — cold on every call, defeating the point of caching hot metadata.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "A per-request cache — cold on every call, defeating the point of caching hot metadata.",
+                "point_id": "a0109ae7-eb9d-2f2c-be40-bcffe1f9d42f"
+              }
+            ]
+          }
+        ]
+      }
     },
     "harbor-duomenu-saugojimas-lietuvoje": {
       "id": "45296a8eebb8f90dcb6dc2264957e13315eadd85be9374a9c2388aee58ffc045",
@@ -304,7 +850,28 @@
         "compliance"
       ],
       "modifiers": {},
-      "lineage": []
+      "lineage": [],
+      "rejected_items": {
+        "shape": "prose",
+        "items": [
+          {
+            "ordinal": 1,
+            "span": [
+              0,
+              81
+            ],
+            "text": "Saugojimas bet kur ES — neatitinka nacionalinio duomenų suvereniteto reikalavimo.",
+            "identity_text": "Saugojimas bet kur ES — neatitinka nacionalinio duomenų suvereniteto reikalavimo.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "Saugojimas bet kur ES — neatitinka nacionalinio duomenų suvereniteto reikalavimo.",
+                "point_id": "fd499f8f-fe4e-9c5e-5da0-22473a287f8c"
+              }
+            ]
+          }
+        ]
+      }
     },
     "harbor-duomenys-gali-buti-es": {
       "id": "844063fba6b5a7a5279264159dd2967ec4958b73c4d1d6684dd6bf0829ba9d45",
@@ -313,7 +880,28 @@
         "compliance"
       ],
       "modifiers": {},
-      "lineage": []
+      "lineage": [],
+      "rejected_items": {
+        "shape": "prose",
+        "items": [
+          {
+            "ordinal": 1,
+            "span": [
+              0,
+              89
+            ],
+            "text": "Tik Lietuva — brangesnė infrastruktūra ir prastesnis vėlavimas kitų ES šalių naudotojams.",
+            "identity_text": "Tik Lietuva — brangesnė infrastruktūra ir prastesnis vėlavimas kitų ES šalių naudotojams.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "Tik Lietuva — brangesnė infrastruktūra ir prastesnis vėlavimas kitų ES šalių naudotojams.",
+                "point_id": "feff2d60-2973-66e0-e469-aae29ca26c19"
+              }
+            ]
+          }
+        ]
+      }
     },
     "harbor-backup-nightly": {
       "id": "427c16f4cc1373012cf23088fb7a71b43209a2fbfd4b32bf4a73a73b16283afb",
@@ -322,7 +910,28 @@
         "storage"
       ],
       "modifiers": {},
-      "lineage": []
+      "lineage": [],
+      "rejected_items": {
+        "shape": "prose",
+        "items": [
+          {
+            "ordinal": 1,
+            "span": [
+              0,
+              64
+            ],
+            "text": "Continuous backup — operational cost unjustified at pilot scale.",
+            "identity_text": "Continuous backup — operational cost unjustified at pilot scale.",
+            "parts": [
+              {
+                "index": 0,
+                "text": "Continuous backup — operational cost unjustified at pilot scale.",
+                "point_id": "5b08f072-3b50-a6cc-aea5-8a5725d55228"
+              }
+            ]
+          }
+        ]
+      }
     }
   },
   "edges": [

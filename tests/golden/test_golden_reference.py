@@ -67,6 +67,39 @@ def test_reference_snapshot_matches_oracle(tmp_path):
     assert got["active_view"] == oracle["active_view"]
 
 
+def test_rejected_items_are_in_the_oracle_and_not_vacuous(tmp_path):
+    """Harbor's enumerations joined the oracle, and a harness that wrote ``{}`` cannot pass.
+
+    Every decision carries at least one enumerated item, open questions carry none, a
+    fresh build reproduces the key exactly, and the Lithuanian identity texts are text
+    (a Lithuanian-specific letter, read through the loader and in the raw file — the
+    loader decodes ``\\uXXXX`` escapes, so only the raw file can see whether the oracle
+    was written with ``ensure_ascii=False``).
+    """
+    store = build_reference_graph(str(tmp_path / "graph.sqlite"))
+    kinds = {n["slug"]: n["kind"] for n in store.get_all_nodes()}
+    got = snapshot(store)["nodes"]
+    oracle = load_oracle()["nodes"]
+    decisions = sorted(s for s, k in kinds.items() if k == "decision")
+    assert len(decisions) == 29
+    for slug, kind in kinds.items():
+        if kind != "decision":
+            assert "rejected_items" not in oracle[slug]
+            continue
+        block = oracle[slug]["rejected_items"]
+        assert block["items"], f"'{slug}' has no enumerated rejected item"
+        assert all(part["point_id"] for item in block["items"] for part in item["parts"])
+        assert got[slug]["rejected_items"] == block
+
+    def identity_texts(slug):
+        return [i["identity_text"] for i in oracle[slug]["rejected_items"]["items"]]
+
+    assert any("\u0117" in t for t in identity_texts("harbor-duomenys-gali-buti-es"))
+    assert any("\u0173" in t for t in identity_texts("harbor-duomenu-saugojimas-lietuvoje"))
+    with open(os.path.join(os.path.dirname(__file__), "oracle.reference.json"), encoding="utf-8") as fh:
+        assert "brangesn\u0117" in fh.read()
+
+
 def test_reference_build_is_deterministic():
     """Two independent builds yield identical content-hash ids (hash + rebuild determinism)."""
     a = build_snapshot_in_tmp()
