@@ -677,6 +677,70 @@ def test_check_pins_never_raises_on_a_malformed_record(record_dir):
 
 
 # ---------------------------------------------------------------------------
+# check_runs: every indexed run, cited or not
+# ---------------------------------------------------------------------------
+
+def test_check_runs_is_silent_on_a_clean_record(record_dir):
+    record, _, _, _, _ = _clean(record_dir)
+    assert R.check_runs(record, record_dir) == []
+    assert R.check_runs(R.new_record(MODEL), record_dir + "-empty") == []
+
+
+def test_check_runs_reports_an_indexed_run_with_no_file(record_dir):
+    record, _, _, harbor, _ = _clean(record_dir)
+    os.remove(os.path.join(record_dir, R.RUNS_DIRNAME, f"{harbor}.json"))
+    assert _has(R.check_runs(record, record_dir), f"run '{harbor}' is indexed but has no run file")
+
+
+def test_check_runs_reports_a_run_file_that_does_not_parse(record_dir):
+    record, _, _, harbor, _ = _clean(record_dir)
+    with open(os.path.join(record_dir, R.RUNS_DIRNAME, f"{harbor}.json"), "w") as f:
+        f.write("{not json")
+    assert _has(R.check_runs(record, record_dir), "does not parse")
+
+
+def test_check_runs_reports_an_entry_disagreeing_with_its_file(record_dir):
+    record, _, _, _, dense = _clean(record_dir)
+    record["runs"][1]["decision_count"] = 501
+    assert _has(R.check_runs(record, record_dir),
+                f"run '{dense}' index entry says decision_count=501, its file says 500")
+
+
+def test_check_runs_reports_an_orphan_run_file(record_dir):
+    record, _, _, _, _ = _clean(record_dir)
+    with open(os.path.join(record_dir, R.RUNS_DIRNAME, "dense-19990101-0000000.json"), "w") as f:
+        json.dump(_run(corpus="dense"), f)
+    assert _has(R.check_runs(record, record_dir), "'dense-19990101-0000000.json' is not in the record's index")
+
+
+def test_check_runs_reports_a_dense_file_carrying_fixtures(record_dir):
+    record, _, _, _, dense = _clean(record_dir)
+    path = os.path.join(record_dir, R.RUNS_DIRNAME, f"{dense}.json")
+    with open(path) as f:
+        run = json.load(f)
+    run["fixtures"] = [{"id": "f1", "class": "bullseye", "text": "a private query"}]
+    with open(path, "w") as f:
+        json.dump(run, f)
+    assert _has(R.check_runs(record, record_dir), "must carry `fixtures: null`")
+
+
+def test_check_runs_stays_silent_on_old_model_history_after_a_swap(record_dir):
+    """The swap reds the constants citing old runs (check_pins), not the history itself."""
+    _clean(record_dir)
+    R.set_record_model("model-b", record_dir)
+    record = R.load_record(record_dir)
+    assert R.check_runs(record, record_dir) == []
+    pins = _problems(record, R.load_cited_runs(record, record_dir), {STRONG: 0.75}, model="model-b")
+    assert _has(pins, "was measured on 'model-a'")
+
+
+def test_check_runs_never_raises_on_a_malformed_record(record_dir):
+    assert _has(R.check_runs({}, record_dir), "no `runs` list")
+    assert _has(R.check_runs({"runs": ["x", {"run_id": "../up"}]}, record_dir), "not an object")
+    assert _has(R.check_runs({"runs": [{"run_id": None}]}, record_dir), "not a run id")
+
+
+# ---------------------------------------------------------------------------
 # The threshold population
 # ---------------------------------------------------------------------------
 

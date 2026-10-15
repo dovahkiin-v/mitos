@@ -99,6 +99,12 @@ def test_check_pins_finds_no_problem():
     assert not problems, "calibration record problems:\n" + "\n".join(f"  {p}" for p in problems)
 
 
+def test_every_indexed_run_matches_its_file():
+    """Cited or not: a baseline no constant reads yet is checked here, not in check_pins."""
+    problems = R.check_runs(R.load_record())
+    assert not problems, "calibration run problems:\n" + "\n".join(f"  {p}" for p in problems)
+
+
 def test_the_three_maps_are_disjoint():
     pending, exempt = set(PENDING), set(EXEMPT)
     assert not (CALIBRATED_CONSTANTS & pending), CALIBRATED_CONSTANTS & pending

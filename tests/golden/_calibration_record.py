@@ -979,6 +979,77 @@ def check_pins(
     return problems
 
 
+def check_runs(record: Dict[str, Any], record_dir: str = RECORD_DIR) -> List[str]:
+    """Checks every indexed run against its file, cited by a constant or not.
+
+    `check_pins` reaches run files only through a constant's citations, so an uncited
+    run (a baseline no constant reads yet) would otherwise go unchecked. For each index
+    entry this checks that ``runs/<run_id>.json`` exists and parses, passes the refusals
+    `append_run` applied when it was written, and agrees with its entry on the summary
+    fields. It also reports any file under ``runs/`` the index does not name.
+
+    A run is held to its own entry's model, not the record's: after `set_record_model`
+    the old-model runs stay as history, and the constants citing them are `check_pins`'s
+    to report.
+
+    Never raises: every problem comes back as one string, and an empty list means clean.
+
+    Args:
+        record: The parsed record.
+        record_dir: The record folder.
+
+    Returns:
+        Problems, one string each.
+    """
+    problems: List[str] = []
+    try:
+        entries = record.get("runs")
+        if not isinstance(entries, list):
+            return ["record has no `runs` list"]
+        named = set()
+        for entry in entries:
+            if not isinstance(entry, dict):
+                problems.append(f"index entry {entry!r} is not an object")
+                continue
+            run_id = entry.get("run_id")
+            named.add(run_id)
+            try:
+                path = _run_path(run_id, record_dir)
+            except ValueError as exc:
+                problems.append(f"index entry: {exc}")
+                continue
+            if not os.path.exists(path):
+                problems.append(f"run {run_id!r} is indexed but has no run file")
+                continue
+            try:
+                run = load_run(run_id, record_dir)
+            except (OSError, ValueError) as exc:
+                problems.append(f"run {run_id!r} has a run file that does not parse: {exc}")
+                continue
+            if not isinstance(run, dict):
+                problems.append(f"run {run_id!r} has a run file that is not an object")
+                continue
+            try:
+                _refuse_run(run, dict(record, embedding_model=entry.get("embedding_model")))
+            except ValueError as exc:
+                problems.append(f"run {run_id!r} would be refused today: {exc}")
+            on_file = _summary_of_file(run)
+            for field in _SUMMARY_FIELDS:
+                if entry.get(field) != on_file[field]:
+                    problems.append(
+                        f"run {run_id!r} index entry says {field}={entry.get(field)!r}, "
+                        f"its file says {on_file[field]!r}"
+                    )
+        runs_dir = os.path.join(record_dir, RUNS_DIRNAME)
+        on_disk = sorted(os.listdir(runs_dir)) if os.path.isdir(runs_dir) else []
+        for name in on_disk:
+            if name.endswith(".json") and name[: -len(".json")] not in named:
+                problems.append(f"run file {name!r} is not in the record's index")
+    except Exception as exc:  # a malformed record is a problem to report, never a crash
+        problems.append(f"runs could not be checked: {type(exc).__name__}: {exc}")
+    return problems
+
+
 # ---------------------------------------------------------------------------
 # The population that owes calibration
 # ---------------------------------------------------------------------------
