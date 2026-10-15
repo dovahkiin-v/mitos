@@ -482,6 +482,14 @@ def test_append_run_never_overwrites_a_run(record_dir):
      "`negatives.values` holds a non-number"),
     (_run(corpus="dense", classes={"bullseye": {"query": dict(
         _class_block([0.8]), negatives=dict(R.stats([0.5]), slugs=["x"]))}}), "`negatives` has extra keys"),
+    # 1c fresh eyes: a scalar statistic carries text as readily as `values` does.
+    (_run(corpus="dense", classes={"bullseye": {"query": dict(_class_block([0.8]), min="a private slug")}}),
+     "`min` is not a number"),
+    (_run(corpus="dense", classes={"bullseye": {"query": dict(_class_block([0.8]), n=True)}}),
+     "`n` is not a number"),
+    (_run(corpus="dense", classes={"bullseye": {"query": dict(
+        _class_block([0.8]), negatives=dict(R.stats([0.5]), median="a private query"))}}),
+     "`negatives.median` is not a number"),
 ])
 def test_append_run_refuses_and_writes_nothing(record_dir, run, needle):
     with pytest.raises(ValueError, match=None) as err:

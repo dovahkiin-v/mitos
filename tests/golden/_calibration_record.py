@@ -677,10 +677,27 @@ def make_run_id(corpus: str, timestamp: str, commit_sha: Optional[str]) -> str:
     return f"{corpus}-{day}-{(commit_sha or 'nosha')[:7]}"
 
 
+def _is_number(v: Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
 def _numeric_list(values: Any) -> bool:
-    return isinstance(values, list) and all(
-        isinstance(v, (int, float)) and not isinstance(v, bool) for v in values
-    )
+    return isinstance(values, list) and all(_is_number(v) for v in values)
+
+
+def _non_numeric_stats(block: Dict[str, Any], where: str) -> Optional[str]:
+    """Names the first statistic in ``block`` that is not a number, or returns ``None``.
+
+    ``values`` is a list of numbers; every other statistic is a number or ``null`` (an
+    empty sub-block has no minimum). A string in ``min`` is as much a leak as one in
+    ``values``, so the scalars are held too.
+    """
+    if not _numeric_list(block.get("values", [])):
+        return f"`{where}values` holds a non-number"
+    for key in _STATS_KEYS:
+        if key != "values" and key in block and not (block[key] is None or _is_number(block[key])):
+            return f"`{where}{key}` is not a number"
+    return None
 
 
 def _non_numeric_block(sub: Dict[str, Any]) -> Optional[str]:
@@ -688,17 +705,16 @@ def _non_numeric_block(sub: Dict[str, Any]) -> Optional[str]:
     extra = sorted(set(sub) - set(_CLASS_BLOCK_KEYS))
     if extra:
         return f"extra keys {extra}"
-    if not _numeric_list(sub.get("values", [])):
-        return "`values` holds a non-number"
+    problem = _non_numeric_stats(sub, "")
+    if problem:
+        return problem
     negatives = sub.get("negatives", {})
     if not isinstance(negatives, dict):
         return "`negatives` is not a statistics object"
     extra = sorted(set(negatives) - set(_STATS_KEYS))
     if extra:
         return f"`negatives` has extra keys {extra}"
-    if not _numeric_list(negatives.get("values", [])):
-        return "`negatives.values` holds a non-number"
-    return None
+    return _non_numeric_stats(negatives, "negatives.")
 
 
 def _refuse_run(run: Dict[str, Any], record: Dict[str, Any]) -> None:
