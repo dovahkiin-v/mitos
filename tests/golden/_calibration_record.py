@@ -12,12 +12,15 @@ can append runs with nothing but ``sys.path.insert(0, "<repo>/tests/golden")``. 
 service-touching half is ``_calibration_harness.py``; the live wiring is
 ``test_calibration_live.py``; the offline pin rows are ``test_calibrated_constants.py``.
 
-Two rules the shape makes structural rather than conventional:
+Three rules the shape makes structural rather than conventional:
 
 * A fixture names its *form* and never its space. ``query`` is embedded as a query and
   read through ``surface_decisions``; ``draft`` is embedded as a document and read through
   ``conflict.gather_candidates``. The space follows from the form (``SPACE_OF_FORM``), so a
   value is always recorded in the space its threshold compares.
+* A run's class statistics nest class -> space -> sub-block (schema 2). The space is the
+  sub-block's key, so a constant reads its own space's values by lookup and never the
+  other's; each sub-block summarizes its negatives beside its targets.
 * A dense run (a private corpus) carries ``fixtures: null`` and class aggregates only.
   ``append_run`` refuses one that carries fixtures, a top-level key outside the run
   shape, or a class block holding anything but its numeric statistics, so no private
@@ -248,7 +251,7 @@ def load_fixtures(path: str = FIXTURES_PATH) -> List[dict]:
 
 
 def check_fixture_slugs(fixtures: List[dict], known_slugs: Any) -> None:
-    """Refuses a fixture naming a slug the built graph does not hold.
+    """Refuses a fixture naming a slug the built graph does not hold, item-ref owners included.
 
     Args:
         fixtures: Validated fixtures.
