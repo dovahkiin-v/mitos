@@ -241,13 +241,33 @@ def test_renumbering_and_inserting_re_ids_only_the_changed_items() -> None:
     assert single < set(rejection_points(OWNER, "(1) A — x\n(2) B — y"))
 
 
-def test_selection_ties_go_numbered_then_bulleted_then_rejected_marker() -> None:
-    """T24 ties numbered and rejected_marker at 11 only once the marker stop is gone;
-    with it, rejected_marker starts at 15. This row pins the tie order directly."""
-    # rejected_marker begins at 0 (line start) and so does the bulleted form.
+def test_a_bullet_is_a_marker_stop_so_bulleted_begins_first() -> None:
+    """The bullet stop moves rejected_marker's option start past ``- `` (to 2), so the
+    bulleted form (0) begins first outright and each option keeps its own item."""
     enum = enumerate_rejected_paths("- A: REJECTED — x.\n- B: REJECTED — y.")
     assert enum.shape == "bulleted"
     assert [i.identity_text for i in enum.items] == ["A: REJECTED — x.", "B: REJECTED — y."]
+
+
+def test_selection_ties_go_numbered_then_bulleted_then_rejected_marker(monkeypatch) -> None:
+    """The tie order, pinned on ``_select`` directly.
+
+    With the marker stop in place no field ties two forms: a rejected_marker option
+    start on a marker's line lands after that marker, and numbered and bulleted
+    positions are distinct line starts (a 60,000-field fuzz found no tie). A field
+    cannot reach the tie rule, so it is pinned here on fabricated marker positions;
+    without the stop (plant B13), T24 is the field that reaches it.
+    """
+    def tied(_field):
+        marker = rejections._Marker(position=0, body_start=0)
+        return {"numbered": [marker, marker], "bulleted": [marker, marker],
+                "rejected_marker": [marker, marker]}
+
+    monkeypatch.setattr(rejections, "_form_markers", tied)
+    assert rejections._select("any")[0] == "numbered"
+    monkeypatch.setattr(rejections, "_form_markers",
+                        lambda f: {**tied(f), "numbered": []})
+    assert rejections._select("any")[0] == "bulleted"
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +313,7 @@ def test_t19_the_code_point_cut_counts_bytes_not_characters() -> None:
 def test_t20_a_multi_token_script_cuts_at_whitespace() -> None:
     """500 Devanagari words (18 bytes, with a virama and a vowel sign) plus spaces:
     421 words fit (421 × 19 − 1 = 7,998 bytes)."""
-    word = "\u0928\u092e\u0938\u094d\u0924\u0947"  # \u0928\u092e\u0938\u094d\u0924\u0947
+    word = "\u0928\u092e\u0938\u094d\u0924\u0947"  # "namaste": a virama and a vowel sign
     assert len(word.encode("utf-8")) == 18
     field = " ".join([word] * 500)
     assert len(field.encode("utf-8")) == 9499
