@@ -1,0 +1,18 @@
+{
+  "_doc": {
+    "what": "Layer C's labelled fixtures. Each records similarity values for one class, in the embedding space its threshold compares. Validated by _calibration_record.load_fixtures.",
+    "shape": {
+      "id": "unique kebab-case",
+      "class": "one of: bullseye, handle-words, family-neighbour, off-axis, rejection-target, retired-precedent",
+      "form": "query (embedded as a query, read through MCP surface_decisions) or draft (embedded as a document, read through conflict.gather_candidates); the space follows from the form and is never authored",
+      "text": "the query or draft axiom",
+      "targets": "Harbor slugs, possibly empty (an off-axis query has no right answer)",
+      "negatives": "Harbor slugs recorded as hard negatives",
+      "measure": "target (each target's value) or top_live (the top live hit's value, the band's input)",
+      "exclude": "optional: slugs flagged as the draft's own node and left out of every margin",
+      "notes": "one line: why this label holds"
+    },
+    "rejection-target": "Targets are slugs today. That class's targets are rejected items, not decisions; 1c extends the target shape for it."
+  },
+  "fixtures": []
+}
