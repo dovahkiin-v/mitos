@@ -279,7 +279,8 @@ uses the MCP for the decision loop and the CLI for setup/ops.
 | **Enumerate the full set in a scope (exhaustive recall)** | `mitos list` | `list_decisions` |
 | **Enumerate the scope vocabulary** | `mitos scopes` | `list_scopes` |
 | **Show one node by slug** | `mitos show` | `show_node` |
-| **List the registered projects** | `mitos projects` | `list_projects` |
+| **List the registered projects** (a gone workspace is hidden and counted) | `mitos projects` | `list_projects` |
+| **Remove a registration** (routing only — the workspace is untouched) | `mitos unregister` | `unregister_project` |
 | **Amend a committed entry's commentary (rejected paths, invalidates-if, context, scope, slug)** | `mitos amend-commentary` | `amend_commentary` |
 
 ★ **Prefer the MCP for recording and surfacing**: structured arguments mean no
@@ -298,6 +299,7 @@ too):
 | `list_scopes`       | `mitos scopes`  | `mitos list_scopes` |
 | `show_node`         | `mitos show`    | — |
 | `list_projects`     | `mitos projects`| — |
+| `unregister_project`| `mitos unregister` | — |
 | `amend_commentary`  | `mitos amend-commentary` | — |
 
 So `mitos record_decision -p . …` works (an agent's first instinct), and for long

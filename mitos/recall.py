@@ -42,11 +42,15 @@ business widening it.
 import difflib
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
-# Top semantic score at/above which a match is treated as a real precedent rather than
-# a loose neighbour. Calibrated to observed Gemini-embedding scores: settled precedents
-# land >0.82, adjacent-but-unrelated neighbours <0.72, so 0.80 is the strong/weak
-# boundary. It gates a *hint* to the agent, never correctness — the agent always has the
-# raw scores and ``list_decisions`` for certainty. Tune here only.
+from mitos.shell_quote import shell_flag
+
+# The confidence bands over the top semantic score: ``strong`` at/above 0.75, ``weak``
+# at/above 0.60, ``none`` below. The first calibration (observed Gemini-embedding
+# scores: settled precedents >0.82, adjacent-but-unrelated neighbours <0.72) put a
+# single strong/weak boundary at 0.80; ``2bf3cae`` (2026-06-19) lowered it to these two
+# values, and this comment kept saying 0.80 until 0.19.1. The bands gate a *hint* to
+# the agent, never correctness — the agent always has the raw scores and
+# ``list_decisions`` for certainty. Tune here only.
 SURFACE_STRONG_THRESHOLD: float = 0.75
 SURFACE_WEAK_THRESHOLD: float = 0.60
 
@@ -72,15 +76,16 @@ SURFACE_DIDYOUMEAN_CUTOFF: float = 0.6
 # precedent question a targeted lookup did not. It must exist under BOTH outer keys — a
 # one-sided entry ships the redirect on one boundary and raises ``KeyError`` on the other.
 # The CLI form carries a selector because a response note is read wherever the caller was
-# standing and cwd stopped being a targeting channel at the flip; the project is rendered
-# through ``repr`` at composition (``cli._show_not_found_hint``'s idiom) because a legal
+# standing and cwd stopped being a targeting channel at the flip; the ``{selector}`` slot
+# is ``shell_quote.shell_flag("-p", project)`` at composition (shell-quoted, ``=``-bound
+# when dash-led; it was ``repr`` until 0.19.1) because a legal
 # registered name may carry a space and an unregistered target's ``project`` is a path —
 # rendered bare, ``mitos surface -p /home/me/my projects/x`` fails misleadingly rather
 # than loudly. The MCP form keeps the shipped bare call-form: ``_example_call`` is where
 # addressing gets taught, and a recall note is not it.
 #
 # ``dereference`` is the by-handle read that restores what a thinned ranked answer
-# withheld (:func:`withheld_clause`). Same selector and ``repr`` rule as
+# withheld (:func:`withheld_clause`). Same selector and quoting rule as
 # ``precedent_scan``; the CLI form puts ``--`` before the slug because a hand-authored
 # slug may start with ``-`` (``renderer._show_forms``' idiom). The MCP form names a
 # read tool and no shell command.
@@ -94,11 +99,11 @@ _SURFACE_POINTERS: Dict[str, Dict[str, str]] = {
     "cli": {
         "complete": "mitos list",
         "complete_scope": "mitos list --scope '{scope}'",
-        "dereference": "`mitos show -p {project} -- <slug>`",
+        "dereference": "`mitos show {selector} -- <slug>`",
         "discovery": "mitos scopes",
         "full_top_arg": "--full-top {n}",
         "limit_arg": "--limit {n}",
-        "precedent_scan": "`mitos surface -p {project}`",
+        "precedent_scan": "`mitos surface {selector}`",
         "state_all": "mitos list --scope '{scope}' --state all",
         "sync": "mitos sync",
     },
@@ -122,7 +127,7 @@ _SURFACE_POINTERS: Dict[str, Dict[str, str]] = {
 # corpus is buffer plus archives and only ``mitos rebuild`` replays the archives —
 # ``mitos sync`` reads the buffer alone and reconstructs nothing from a rotated
 # corpus. The register differs by boundary. The CLI names the command with its
-# selector, ``project`` rendered through ``repr`` at composition (the
+# selector, ``{selector}`` filled by ``shell_flag`` at composition (the
 # ``precedent_scan`` idiom above). The MCP clause names no command and no tool: it
 # states the fact and a person as the next actor, because an agent handed a shell
 # command runs it and there is no rebuild tool to hunt for.
@@ -133,7 +138,7 @@ _SURFACE_POINTERS: Dict[str, Dict[str, str]] = {
 # recoverable state into one the operator believes they already fixed.
 MISSING_GRAPH_POINTERS: Dict[str, Dict[str, str]] = {
     "cli": {
-        "build": "run `mitos rebuild -p {project}` to build it from the corpus",
+        "build": "run `mitos rebuild {selector}` to build it from the corpus",
     },
     "mcp": {
         "build": (
@@ -597,7 +602,7 @@ def assess_query_recall(
         / ``"none"`` and is **never** None — see the degraded fence above.
     """
     pointer = _SURFACE_POINTERS[surface]["precedent_scan"].format(
-        project=repr(getattr(config, "project", ""))
+        selector=shell_flag("-p", getattr(config, "project", ""))
     )
     # Names a question, not a re-run: re-issuing this same string on the other verb
     # buys the same embedding, the same ranking and the same matches for the price
@@ -682,7 +687,7 @@ def withheld_clause(count: int, *, surface: str, config: "object") -> str:
         show_node(ident='<slug>')."``.
     """
     pointer = _SURFACE_POINTERS[surface]["dereference"].format(
-        project=repr(getattr(config, "project", ""))
+        selector=shell_flag("-p", getattr(config, "project", ""))
     )
     if count == 1:
         return f"1 hit omits rejected_paths; read it whole with {pointer}."
@@ -859,7 +864,7 @@ def missing_graph_note(surface: str, config: "object") -> str:
         The one-line note.
     """
     recovery = MISSING_GRAPH_POINTERS[surface]["build"].format(
-        project=repr(getattr(config, "project", ""))
+        selector=shell_flag("-p", getattr(config, "project", ""))
     )
     return (
         "The graph is unbuilt: the markdown corpus (`decisions.md` and "

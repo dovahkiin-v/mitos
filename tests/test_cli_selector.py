@@ -134,7 +134,7 @@ def test_every_registered_subparser_carries_the_project_option() -> None:
 
 
 def test_the_aliased_verbs_are_one_parser_object_registered_once() -> None:
-    """30 names over 25 objects — the reason the registration loop must dedupe by id().
+    """31 names over 26 objects — the reason the registration loop must dedupe by id().
 
     A second ``add_argument`` on the same object raises ``ArgumentError:
     conflicting option strings``, so this row is also what pins that the five
@@ -142,8 +142,8 @@ def test_the_aliased_verbs_are_one_parser_object_registered_once() -> None:
     ``list_scopes``, ``record_decision``) are free rather than forgotten.
     """
     choices = _subparsers(_build_parser())
-    assert len(choices) == 30
-    assert len({id(sub) for sub in choices.values()}) == 25
+    assert len(choices) == 31
+    assert len({id(sub) for sub in choices.values()}) == 26
     for alias, canonical in (("query_decisions", "query"),
                              ("surface_decisions", "surface"),
                              ("list_decisions", "list"),
@@ -415,7 +415,7 @@ def test_the_workspace_optional_carve_out_is_two_verbs_wide() -> None:
 def test_status_is_not_an_exempt_verb() -> None:
     """`status <project>` is a supported targeting form, so `-p X status` is its twin."""
     assert "status" not in _SELECTOR_EXEMPT_VERBS
-    assert set(_SELECTOR_EXEMPT_VERBS) == {"init", "serve", "projects"}
+    assert set(_SELECTOR_EXEMPT_VERBS) == {"init", "serve", "projects", "unregister"}
 
 
 def test_every_exempt_verb_owns_its_own_recovery_sentence() -> None:
@@ -979,6 +979,29 @@ def test_the_registered_name_list_collapses_above_the_bound(
     assert str(len(names)) in err
     assert "mitos projects" in err
     assert not any(name in err for name in names)
+
+
+def test_above_the_bound_a_did_you_mean_is_not_repeated_as_the_closest_list(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """L14: `Did you mean: mitos` and then `… registered, closest: mitos` said it twice.
+
+    Above the bound the vocabulary line collapses to the close matches — which,
+    on an unknown name, are exactly the did-you-mean line above it. The names are
+    printed once; the vocabulary line keeps the count and the pointer.
+    """
+    root = _make_workspace(tmp_path / "ws")
+    names = ["mitos"] + [f"zz-other-{i}" for i in range(routing.REGISTERED_NAMES_BOUND)]
+    _register_pairs((name, root) for name in names)
+    monkeypatch.chdir(tmp_path)
+
+    _run(["-p", "mitoss", "list"])
+
+    err = capsys.readouterr().err
+    assert "Did you mean: mitos" in err
+    assert "closest:" not in err, err
+    assert f"{len(names)} projects registered" in err
+    assert "mitos projects" in err
 
 
 def test_the_renderer_shows_every_did_you_mean_even_past_the_max(

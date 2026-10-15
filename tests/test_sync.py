@@ -2414,8 +2414,17 @@ def test_the_rotation_step_reads_the_clock_once_and_the_graph_only_through_the_l
         node for node in ast.walk(tree)
         if isinstance(node, ast.FunctionDef) and node.name == "_perform_sync_internal"
     ]
-    assert [n.attr for n in ast.walk(internal[0]) if isinstance(n, ast.Attribute)
-            ].count("_rotate_settled") == 1, "step 4 is the one sync caller"
+    internal_attrs = [n.attr for n in ast.walk(internal[0]) if isinstance(n, ast.Attribute)]
+    # Two sync call sites since 0.19.1 — step 4 after the commits, and the keyless
+    # floor in their place — both through the one wrapper, which is the one caller.
+    assert internal_attrs.count("_rotate_settled") == 0
+    assert internal_attrs.count("_rotate_after_sync") == 2
+    wrapper = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_rotate_after_sync"
+    ]
+    assert [n.attr for n in ast.walk(wrapper[0]) if isinstance(n, ast.Attribute)
+            ].count("_rotate_settled") == 1, "the wrapper is the one sync caller"
 
 
 @patch("google.genai.Client")

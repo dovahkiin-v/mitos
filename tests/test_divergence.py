@@ -1027,3 +1027,41 @@ def test_the_reconcile_audit_row_records_values_never_the_verdict() -> None:
     assert new_values == {"scope": ["store", "substrate"]}
     assert _json.loads(_json.dumps(new_values, sort_keys=True)) == new_values
     assert "order_only" not in _json.dumps([prior, new_values])
+
+
+def test_a_legal_decision_to_open_question_resolves_edge_is_not_divergence(tmp_path) -> None:
+    """A decision's `Resolves:` naming an open question is the edge kind's whole purpose.
+
+    The detector folds decisions only, and the graph-side edge list was built from that
+    same decisions-only node set — so the committed edge to an open-question target was
+    dropped before the compare, the corpus's declaration read as `added`, and `status`
+    reported a divergence (and a repair verb) for every legal resolution in the corpus.
+    Open questions stay out of the fold; they must not fall out of the edge targets.
+    """
+    from mitos.parser import parse_entry_stream
+
+    config = MitosConfig(str(tmp_path))
+    os.makedirs(config.mitos_dir, exist_ok=True)
+    oq_text = (_SENTINEL + "\n\n### why-sqlite\n\n"
+               "**Topic:** storage engine choice\n**Questions:**\n- Is WAL enough?\n")
+    with open(config.questions_file, "w", encoding="utf-8") as fh:
+        fh.write(oq_text)
+    decision = _block("alpha", "Alpha axiom.") + "\n**Resolves:** why-sqlite"
+    with open(config.decisions_file, "w", encoding="utf-8") as fh:
+        fh.write(_SENTINEL + "\n\n" + decision + "\n")
+
+    store = GraphStore(config.db_path)
+    for entry in parse_entry_stream(oq_text, "open_question"):
+        store.commit_parsed_entry(entry)
+    for entry in parse_entry_stream(open(config.decisions_file, encoding="utf-8").read(),
+                                    "decision"):
+        store.commit_parsed_entry(entry)
+    assert any(e["edge_type"] == "resolves" for e in store.get_edges()), (
+        "fixture must commit the decision→open-question edge"
+    )
+
+    report = _report(config)
+    assert report["edges"] == [], report["edges"]
+    assert divergence_total(report) == 0
+    assert report["reconcilable"] == 0
+    assert report["checked"] == 1, "the open question is still out of the fold"

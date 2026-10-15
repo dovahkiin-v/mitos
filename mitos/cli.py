@@ -16,6 +16,7 @@ import uuid
 import sqlite3
 import hashlib
 import argparse
+import difflib
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -30,6 +31,7 @@ from mitos import overview
 from mitos import registry
 from mitos import routing
 from mitos import settledness
+from mitos.shell_quote import shell_arg, shell_flag
 from mitos.display import (
     RANKED_LIMIT_CEILING,
     apply_stdout_text_safety,
@@ -525,7 +527,7 @@ def _skill_md_text(format_spec_content: str) -> str:
         "## Setup — API Keys\n"
         "Mitos reads keys from a `.env` file at the workspace root (`mitos init` scaffolds it with empty slots; it is gitignored). Set exactly one required key:\n"
         "- **`GEMINI_API_KEY`** (Google Gemini) — REQUIRED for semantic `surface_decisions`/`query_decisions` and for `mitos sync -p .`. One key covers both embeddings and synthesis.\n"
-        "- `ANTHROPIC_API_KEY` — strongly recommended: it powers the LLM-judged layer (the `mitos check -p .` conflict audit, the sync-time conflict notice, `mitos import -p . --llm-extract`). Mitos runs without it, but only as a basic record-and-search store; with it, the corpus is audited for decisions that silently contradict each other. Degrades calmly when absent.\n"
+        "- `ANTHROPIC_API_KEY` — strongly recommended: it powers the LLM-judged layer (the `mitos check -p .` conflict audit — which spends up to 10 judgment batches without asking and stops for a person's confirmation above that — the sync-time conflict notice, `mitos import -p . --llm-extract`). Mitos runs without it, but only as a basic record-and-search store; with it, the corpus is audited for decisions that silently contradict each other. Degrades calmly when absent.\n"
         "Without `GEMINI_API_KEY`, `record_decision` still works (it commits to the local graph; the embedding is queued and drains on the next `mitos sync -p .` once the key is set), but semantic surface/query are unavailable. If a tool reports a missing key, tell the human to put it in `.env`.\n\n"
         "Mitos uses its own Qdrant on **:7333** (not the standard :6333), started with `docker compose up -d`. If semantic tools report Qdrant unreachable, tell the human to start it; `record_decision` still works meanwhile (embeddings queue and drain once it's up).\n\n"
         "## Addressing — every call names the project it is for\n"
@@ -543,7 +545,8 @@ def _skill_md_text(format_spec_content: str) -> str:
         "- `list_scopes`       (CLI: `mitos scopes -p .`) — the scope vocabulary with a count per tag. Read it before a scope-filtered read, or before tagging a new decision, so you reuse a tag that exists instead of minting a near-duplicate.\n"
         "- `show_node`         (CLI: `mitos show -p . -- <slug>`) — dereference one exact handle (slug or id) to its stored fields, including a node that has been superseded; transcripts, provenance and outgoing edges are left out.\n"
         "- `amend_commentary`  (CLI: `mitos amend-commentary -p . <slug> …`) — fix a committed entry's commentary in place: `rejected_paths`, `invalidates_if`, `context`, `scope`, or its slug (`new_slug`). On the tool, `clear=[…]` empties `invalidates_if`, `context` or `scope`. It refuses a change to the axiom or mechanisms: that is a new decision, recorded with `corrects` / `supersedes` / `amends`. It reaches only entries still in `decisions.md`; an entry already rotated into an archive answers `archived`.\n"
-        "- `list_projects`     (CLI: `mitos projects`) — the project names registered on this machine. It takes no selector.\n\n"
+        "- `list_projects`     (CLI: `mitos projects`) — the project names registered on this machine. It takes no selector. A registration whose workspace no longer exists is hidden and counted in `hidden_missing`.\n"
+        "- `unregister_project` (CLI: `mitos unregister <name>`) — remove one registration that should not be there (a throwaway or test workspace). Routing only: the workspace itself is untouched. It takes `name`, not `project`.\n\n"
         "## When to record — the capture trigger (YOUR judgement; Mitos stores, it does not decide what is worth storing)\n"
         "Recall is easy to ask for; knowing WHAT is worth recording is the real call, and it falls to you. Record a decision when it:\n"
         "- sets a pattern future work must follow, or\n"
@@ -683,7 +686,9 @@ def cmd_init(config: MitosConfig, name: Optional[str] = None, force: bool = Fals
                 "# Get one: https://aistudio.google.com/app/apikey\n"
                 "GEMINI_API_KEY=\n\n"
                 "# Anthropic (Claude) API key — OPTIONAL, but recommended. It runs\n"
-                "# the contradiction check (`mitos check -p .`) and the conflict\n"
+                "# the contradiction check (`mitos check -p .`, which spends up to\n"
+                "# 10 judgment batches without asking and stops for a person's\n"
+                "# confirmation above that) and the conflict\n"
                 "# notice at sync, and it arms the commit gate\n"
                 "# (`mitos hook-install -p .`). Without it no pair is judged and the\n"
                 "# gate stays inactive; mitos still records and searches. The import\n"
@@ -775,7 +780,7 @@ def cmd_init(config: MitosConfig, name: Optional[str] = None, force: bool = Fals
     #    Function-local, 3d's rule: `subprocess` stays off every other verb's path.
     from mitos import _git
     if isinstance(_git.locate_repository(config.workspace_dir), _git.GitLocation):
-        print(f"In a git repository: `mitos hook-install -p {outcome.name!r}` installs "
+        print(f"In a git repository: `mitos hook-install {shell_flag('-p', outcome.name)}` installs "
               f"the commit gate, which holds a commit until a contradiction check "
               f"is attempted.")
     sys.stdout.flush()
@@ -1423,7 +1428,7 @@ def _show_not_found_hint(config: MitosConfig) -> str:
         own punctuation.
     """
     return (f"not in graph — if you just authored it in decisions.md/questions.md, "
-            f"run `mitos sync -p {config.project!r}`")
+            f"run `mitos sync {shell_flag('-p', config.project)}`")
 
 
 def _coherence_audit_hint(config: MitosConfig) -> str:
@@ -1457,7 +1462,7 @@ def _coherence_audit_hint(config: MitosConfig) -> str:
     Returns:
         The recovery sentence, naming ``mitos check`` exactly once.
     """
-    return f"The audit is `mitos check -p {config.project!r}` — one pass, whole corpus."
+    return f"The audit is `mitos check {shell_flag('-p', config.project)}` — one pass, whole corpus."
 
 
 def _print_check_notice(config: MitosConfig, notice: Optional[Mapping[str, Any]]) -> None:
@@ -1496,7 +1501,7 @@ def _check_notice_recovery(config: MitosConfig, notice: Mapping[str, Any]) -> st
     Returns:
         The clause, with a leading space and its own terminal punctuation.
     """
-    recipe = f"`{_running_mitos_command()} check -p {config.project!r}`"
+    recipe = f"`{_running_mitos_command()} check {shell_flag('-p', config.project)}`"
     if notice.get("state") == ATTEMPT_SPEND_NOT_AUTHORIZED:
         return f" A person runs {recipe} at a terminal and confirms the prompt."
     return f" {recipe} attempts it again."
@@ -1511,7 +1516,10 @@ def cmd_show(config: MitosConfig, ident: str, as_json: bool = False) -> None:
     instead of 404-ing. Only a genuinely-absent identifier reaches the not-found
     branch, whose hedged ``mitos sync`` pointer reads no buffer (truthful for both a
     typo and an authored-but-unsynced draft) and names the caller's own selector, so
-    the recipe it prints is one a post-flip shell will actually run.
+    the recipe it prints is one a post-flip shell will actually run. A miss exits 1
+    on both arms (ruled 2026-10-15, the `amend-commentary` convention): text puts
+    the line on stderr, ``--json`` still emits the ``{found: false}`` object and
+    then exits 1, so a shell reads the code and a parser reads the body.
     With ``as_json`` it emits a
     Letter-complete, modifier-stamped JSON object (the not-found case a JSON object
     too, never a bare text print) — both shapes carrying the trailing
@@ -1526,11 +1534,6 @@ def cmd_show(config: MitosConfig, ident: str, as_json: bool = False) -> None:
     Returns:
         None.
     """
-    # Both text exits (the dereferenced node and the not-found pointer) answer on
-    # stdout, so one gated leading echo covers them; the two `--json` branches
-    # carry the same three fields as keys and must not also carry a text line.
-    if not as_json:
-        _echo_corpus(config)
     store = GraphStore(config.db_path)
 
     # State-agnostic resolution: id → active slug → most-recent in lineage → None.
@@ -1547,12 +1550,27 @@ def cmd_show(config: MitosConfig, ident: str, as_json: bool = False) -> None:
             # Provenance last, exactly as the `show_node` twin stamps it: the
             # absent-handle answer is the one most in need of naming its corpus
             # ("no such handle here" vs "you asked the wrong project").
+            # The object is emitted on every exit and the code still says miss:
+            # exit 1 on both arms (ruled 2026-10-15), the convention
+            # `amend-commentary` set — a JSON object on every exit, never a
+            # miss exiting 0. `show_node`, the MCP twin, keeps returning the
+            # same object in-band; the exit code is the CLI's channel alone.
             missing = {"found": False, "ident": ident, "hint": hint}
             missing.update(corpus_provenance(config))
             _emit_json(missing)
-            return
-        print(f"Node with ID or Slug '{ident}' not found — {hint}.")
-        return
+            sys.exit(1)
+        # The text miss is an error exit: stderr, exit 1, with the corpus echo on
+        # the same channel — the rule the record and reconcile error paths keep,
+        # so a shell asking "does this handle exist" reads the code and a stdout
+        # consumer never sees a not-found line where a node was expected.
+        _echo_corpus(config, file=sys.stderr)
+        print(f"Node with ID or Slug '{ident}' not found — {hint}.", file=sys.stderr)
+        sys.exit(1)
+
+    # The text hit answers on stdout, led by the gated corpus echo; the `--json`
+    # branch carries the same three fields as keys and must not also carry a text line.
+    if not as_json:
+        _echo_corpus(config)
 
     # Compute the node's state in its own kind's vocabulary — the kind-aware read
     # `show_node` calls too, so an open question reads parked/resolved (or a kill
@@ -1723,6 +1741,7 @@ def cmd_list(config: MitosConfig, scope: Optional[str] = None,
     print(f"\nDecisions ({len(decisions)} found, state={effective_state}){scope_note}  "
           f"[{provenance_line(config)}]:")
     print("-" * 80)
+    cut = 0
     for d in decisions:
         marker = _modifier_marker(modifiers.get(d["id"], {}))
         if oneline:
@@ -1734,10 +1753,18 @@ def cmd_list(config: MitosConfig, scope: Optional[str] = None,
         scopes = f"[{', '.join(d['scope'])}]" if d["scope"] else ""
         print(f"{d['computed_state']:11} | {d['slug']:30} {scopes}")
         axiom_snip = truncate_words(d.get("core_axiom", ""), 66)
+        if axiom_snip != d.get("core_axiom", ""):
+            cut += 1
         if axiom_snip:
             print(f"              {axiom_snip}")
         if marker:
             print(f"              {marker}")
+    if cut:
+        # The row's cut is an index render by design; the count says it happened,
+        # so a reader never takes a truncated axiom for the whole one.
+        noun = "axiom was" if cut == 1 else "axioms were"
+        print(f"\n{cut} {noun} cut to fit a row (marked …); "
+              f"`mitos show {shell_flag('-p', config.project)} -- <slug>` reads one whole.")
     if parked:
         print(f"\nParked open questions ({len(parked)}):")
         for oq in parked:
@@ -1907,12 +1934,12 @@ def cmd_scopes(config: MitosConfig, as_json: bool = False, archived: bool = Fals
           "whose source sits in decisions/archive/, and list only tags the graph "
           "still carries.")
     print("A **Scope:** change to an entry still in decisions.md goes through "
-          f"`mitos amend-commentary -p {config.project!r} <slug> --scope …`; one whose "
+          f"`mitos amend-commentary {shell_flag('-p', config.project)} <slug> --scope …`; one whose "
           "source sits in decisions/archive/ reaches the graph only through "
-          f"`mitos rebuild -p {config.project!r}`.")
+          f"`mitos rebuild {shell_flag('-p', config.project)}`.")
 
 
-def cmd_projects(as_json: bool = False) -> None:
+def cmd_projects(as_json: bool = False, show_all: bool = False) -> None:
     """Lists the Mitos projects registered on this machine.
 
     The discovery read over the global registry: which project names exist and
@@ -1920,13 +1947,16 @@ def cmd_projects(as_json: bool = False) -> None:
     config and works from anywhere, including a machine with no Mitos workspace at
     all, which is the state it is most likely to be met in.
 
-    It reports registrations, not health. Whether a registered path still holds a
-    valid workspace is ``mitos status``'s question; answering it here too would be
-    a second source that drifts from the first.
+    It reports registrations, not health — with one exception, absence: a
+    registration whose workspace directory no longer exists is hidden and counted
+    (``--all`` lists it), because a gone directory cannot be a target and leaked
+    throwaway registrations otherwise bury the real ones. Whether an existing path
+    still holds a *valid* workspace stays ``mitos status``'s question.
 
     Args:
         as_json: Emit the machine-readable payload (``registry_path``, ``count``,
-            ``projects``) instead of the text table.
+            ``hidden_missing``, ``projects``) instead of the text table.
+        show_all: List registrations whose workspace no longer exists too.
 
     Returns:
         None.
@@ -1939,9 +1969,14 @@ def cmd_projects(as_json: bool = False) -> None:
     # twin), so the two surfaces cannot drift. Built once and read by BOTH
     # branches: routing only the `--json` branch through the leaf would fork the
     # text table off a second, hand-built list.
-    payload = projects_payload(registry.load(), registry.registry_path())
+    reg = registry.load()
+    payload = projects_payload(
+        reg, registry.registry_path(),
+        missing=routing.missing_registrations(reg), show_missing=show_all,
+    )
     path = payload["registry_path"]
     projects = payload["projects"]
+    hidden = payload["hidden_missing"]
 
     if as_json:
         _emit_json(payload)
@@ -1951,6 +1986,8 @@ def cmd_projects(as_json: bool = False) -> None:
         # Empty/fresh is first-class: a machine with nothing registered yet is
         # healthy, and an absent registry file is the same healthy state.
         print(f"No projects registered yet — `mitos init` introduces one ({path}).")
+        if hidden:
+            print(_hidden_missing_line(hidden))
         return
 
     # File order throughout, never sorted: it is the order a reverse lookup
@@ -1968,8 +2005,52 @@ def cmd_projects(as_json: bool = False) -> None:
     print("-" * (name_w + 30))
     print(f"{'project':{name_w}}   workspace")
     for project in projects:
-        print(f"{project['name']!r:{name_w}}   {project['path']}")
+        gone = "   (workspace no longer exists)" if project.get("missing") else ""
+        print(f"{project['name']!r:{name_w}}   {project['path']}{gone}")
+    if hidden:
+        print(_hidden_missing_line(hidden))
     print()
+
+
+def _hidden_missing_line(hidden: int) -> str:
+    """Words the hidden-registrations count with its two recipes."""
+    return (f"{hidden} registration(s) whose workspace no longer exists are hidden — "
+            f"`mitos projects --all` lists them, `mitos unregister --missing` "
+            f"removes them.")
+
+
+def cmd_unregister(name: Optional[str], *, missing: bool = False) -> None:
+    """Removes registrations from the machine-wide registry.
+
+    Routing only, never the workspace: a removed project's directory, corpus,
+    graph and vectors are untouched, it stays reachable by its absolute path, and
+    re-running ``mitos init`` there registers it again. A **global** verb, like
+    ``projects`` — it names a registration, not a workspace, so it works on one
+    whose directory is gone.
+
+    Args:
+        name: The registered name to remove, exactly as registered; ``None`` with
+            ``missing``.
+        missing: Remove every registration whose workspace directory no longer
+            exists, instead of one name.
+
+    Raises:
+        RegistryError: On an unusable registry file, an unknown name, or an
+            unwritable registry.
+    """
+    if not missing:
+        removed = registry.unregister(name)
+        print(f"Unregistered {name!r} ({removed}) ✓ — the workspace itself is "
+              f"untouched; `mitos init` there registers it again.")
+        return
+    gone = routing.missing_registrations(registry.load())
+    if not gone:
+        print("No registration points at a missing workspace — nothing to remove.")
+        return
+    for each in gone:
+        removed = registry.unregister(each)
+        print(f"Unregistered {each!r} ({removed})")
+    print(f"Removed {len(gone)} registration(s) whose workspace no longer exists ✓")
 
 
 def cmd_import(config: MitosConfig, filepath: str, use_llm_extract: bool = False) -> None:
@@ -2195,7 +2276,7 @@ def cmd_record(
                       f"{truncate_words(rejected, _PAUSE_REJECTED_PREVIEW)}",
                       file=sys.stderr)
                 print(f"      read it whole with "
-                      f"`mitos show -p {config.project!r} -- {n['slug']!r}`",
+                      f"`mitos show {shell_flag('-p', config.project)} -- {shell_arg(n['slug'])}`",
                       file=sys.stderr)
             elif rejected:
                 print(f"      rejected: {rejected}", file=sys.stderr)
@@ -2290,7 +2371,7 @@ def cmd_record(
         print(f"\n{overflow}", file=sys.stderr)
         # The shared string names no command (it reaches MCP verbatim); the text
         # surface adds the recipe. `config.project` is never None here.
-        print(f"  Per-file breakdown: `mitos status -p {config.project!r}`",
+        print(f"  Per-file breakdown: `mitos status {shell_flag('-p', config.project)}`",
               file=sys.stderr)
     # Degraded-check notice — same post-receipt stderr shape: the commit succeeded,
     # but the near-dup review could not run, and silence would read as "checked, clean".
@@ -2326,15 +2407,6 @@ def cmd_record(
         print(f"\n{coherence} {_coherence_audit_hint(config)}", file=sys.stderr)
 
 
-def _cli_flag(flag: str, value: str) -> str:
-    """Renders ``--flag 'value'``, or ``--flag='-value'`` when the value looks like a flag.
-
-    A hand-authored ``### -foo`` keeps its leading dash through the parser, and
-    argparse reads a separate ``-foo`` as an option; the ``=`` form binds it.
-    """
-    return f"{flag}={value!r}" if value.startswith("-") else f"{flag} {value!r}"
-
-
 def _exists_recovery_lines(result: Dict[str, Any], config: MitosConfig) -> List[str]:
     """Composes the CLI's recovery for an ``exists`` no-op — this boundary's alone.
 
@@ -2358,16 +2430,16 @@ def _exists_recovery_lines(result: Dict[str, Any], config: MitosConfig) -> List[
     # it), and no `--` guards it, so a dash-led slug falls back to the id.
     handle = result["id"] if slug.startswith("-") else slug
     return [
-        f"  → To change its commentary: `mitos amend-commentary -p {project!r} {handle!r}` "
+        f"  → To change its commentary: `mitos amend-commentary {shell_flag('-p', project)} {shell_arg(handle)}` "
         "with a flag per field (--rejected, --scope, --invalidates-if, --context, "
         "--new-slug); it edits in place and keeps the id.",
         "  → Relations are not commentary: edit the relation line in decisions.md, then "
-        f"apply it with `mitos sync -p {project!r} {_cli_flag('--reconcile-entry', slug)}`.",
+        f"apply it with `mitos sync {shell_flag('-p', project)} {shell_flag('--reconcile-entry', slug)}`.",
         "  → amend-commentary reaches an entry only while its `### ` block is in decisions.md. If "
-        f"the node has no block, `mitos restore-source -p {project!r} "
-        f"{_cli_flag('--slug', slug)}` re-materializes one first; if the entry has "
+        f"the node has no block, `mitos restore-source {shell_flag('-p', project)} "
+        f"{shell_flag('--slug', slug)}` re-materializes one first; if the entry has "
         "rotated into decisions/archive/, edit it there, then run "
-        f"`mitos rebuild -p {project!r}`.",
+        f"`mitos rebuild {shell_flag('-p', project)}`.",
         "  → To record a changed decision, write a new one with --supersedes or --amends "
         "naming this slug.",
     ]
@@ -2403,7 +2475,7 @@ def _rotation_failure_line(config: MitosConfig, report: Dict[str, Any]) -> str:
     line = (
         f"[Warning] Archive rotation failed ({report['stage']}): {report['error']}. "
         f"{report['note']} Nothing needs re-running: the next "
-        f"`mitos -p {config.project!r} record` that finds the buffer at its rotation "
+        f"`mitos {shell_flag('-p', config.project)} record` that finds the buffer at its rotation "
         f"threshold tries again."
     )
     if report["stage"] == ROTATION_STAGE_FILE:
@@ -3038,11 +3110,11 @@ def _print_overflow_detail(overflows: List[Dict[str, Any]], *,
         print("    Re-run with `-v` for the longest rows in each file.")
     # `--scope=` and `--` keep a tag or slug that starts with `-` from reading as an
     # option, the same spellings the generated files use.
-    selector = repr(project) if project is not None else "<project>"
+    selector = shell_flag("-p", project) if project is not None else "-p <project>"
     print("    Each file listed is an index with nowhere further to degrade, and no "
           "rendered file names it as a destination for full entries. Read a scope one "
-          f"line per decision with `mitos list --scope=<scope> --oneline -p {selector}`, "
-          f"or one decision in full with `mitos show -p {selector} -- <slug>`.")
+          f"line per decision with `mitos list --scope=<scope> --oneline {selector}`, "
+          f"or one decision in full with `mitos show {selector} -- <slug>`.")
 
 
 def _graph_behind_buffer(db_path: str) -> bool:
@@ -3520,7 +3592,7 @@ def _commit_gate_lines(row: Dict[str, Any], *, project: str) -> List[str]:
     if state == "installed" and not row["serves_this_workspace"]:
         glyph = "⚠"
     line = f"  {glyph} commit gate: {headline.format(**row)}"
-    recipe = f"`mitos hook-install -p {project!r}`"
+    recipe = f"`mitos hook-install {shell_flag('-p', project)}`"
     lines = []
     if state == "no_hook":
         lines.append(f"{line}   → {recipe}")
@@ -3933,7 +4005,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
         coll_mark, coll_hint = (
             None,
             f"missing — {len(active_ids)} active node(s) have no vectors; "
-            f"run `mitos reconcile -p {config.project!r}`",
+            f"run `mitos reconcile {shell_flag('-p', config.project)}`",
         )
     elif graph_unbuilt:
         # The calm fresh-project sentence below is FALSE over a corpus of hundreds,
@@ -4050,7 +4122,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
             "\n  ⚠ the graph is unbuilt — the markdown corpus (decisions.md and "
             "decisions/archive/) holds entries but the graph holds no nodes, so every "
             "read answers empty and reads as 'no precedent'. "
-            f"Run `mitos rebuild -p {config.project!r}` to build it from the corpus "
+            f"Run `mitos rebuild {shell_flag('-p', config.project)}` to build it from the corpus "
             "(usually a clone: the graph is gitignored, the corpus is not)."
         )
     # Vector-completeness verdict from the exact id-diff computed above (not a
@@ -4069,15 +4141,15 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
     if scroll_failed:
         print(
             "\n  ⚠ could not verify vector completeness — Qdrant scroll failed; "
-            f"run `mitos status -p {config.project!r}` again when Qdrant is reachable."
+            f"run `mitos status {shell_flag('-p', config.project)}` again when Qdrant is reachable."
         )
     elif missing_active_slugs:
         n = len(missing_active_slugs)
         print(
             f"\n  ⚠ vector index incomplete — {n} active node(s) have no vector "
             f"and are invisible to semantic surface/query. Run "
-            f"`mitos reconcile -p {config.project!r}` to re-embed them (or "
-            f"`mitos sync -p {config.project!r}` if the outbox is non-empty) — either "
+            f"`mitos reconcile {shell_flag('-p', config.project)}` to re-embed them (or "
+            f"`mitos sync {shell_flag('-p', config.project)}` if the outbox is non-empty) — either "
             f"needs the embedding provider to answer, which this report does not "
             f"check. Informational, not a readiness blocker."
         )
@@ -4086,7 +4158,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
             # leaving the operator to infer it from "if the outbox is non-empty".
             print(
                 f"      the embedding queue was seeded by `{embedding_seed['established_by']}` "
-                f"at {embedding_seed['established_at']} — `mitos sync -p {config.project!r}` "
+                f"at {embedding_seed['established_at']} — `mitos sync {shell_flag('-p', config.project)}` "
                 f"restores search once the embedding provider answers"
             )
         if n <= 5:
@@ -4131,7 +4203,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
             if f["status"] in ("outdated", "unversioned")
         )
         print(f"  ⚠ agent-file mitos note out of date ({stale_files}) "
-              f"— refresh with `mitos agent-block -p {config.project!r}`")
+              f"— refresh with `mitos agent-block {shell_flag('-p', config.project)}`")
     if skill_md_state == "differs":
         # "differs", never "outdated": a committed skill.md can be newer than this
         # install. `absent` stays silent (a clone that does not commit skill.md is
@@ -4141,9 +4213,9 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
         # bare re-run in a directory registered under another name refreshes the
         # file and then refuses. `project` is the boundary value (see docstring),
         # never `config.project`, which is a path for an unregistered route.
-        refresh = f"mitos -C {workspace_dir!r} init"
+        refresh = f"mitos -C {shell_arg(workspace_dir)} init"
         if project is not None:
-            refresh += f" --name {project!r}"
+            refresh += f" {shell_flag('--name', project)}"
         print(f"  ⚠ .mitos/skill.md differs from what this mitos writes "
               f"— refresh it with `{refresh}`")
     print()
@@ -4161,7 +4233,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
             print(f"  {n}. Start Mitos's Qdrant: `docker compose up -d` from the mitos repo"); n += 1
         if graph_unbuilt:
             print(f"  {n}. Build the graph from your corpus: "
-                  f"`mitos rebuild -p {config.project!r}` "
+                  f"`mitos rebuild {shell_flag('-p', config.project)}` "
                   f"(the graph is derivative — the markdown corpus is the source)"); n += 1
         print("  Full walkthrough → SETUP.md "
               "(https://github.com/dovahkiin-v/mitos/blob/main/SETUP.md)")
@@ -4227,8 +4299,8 @@ def _print_divergence_rung(report: Dict[str, Any], *, project: str) -> None:
     order_only = [row for row in scope if row.get("order_only")]
     if membership:
         print(f"      • {len(membership)} entry(s) whose scope tags differ — a "
-              f"FINDABILITY defect: scope-filtered reads and `mitos scopes -p "
-              f"{project!r}` miss them")
+              f"FINDABILITY defect: scope-filtered reads and `mitos scopes "
+              f"{shell_flag('-p', project)}` miss them")
         for row in membership[:5]:
             print(f"          - {row.get('slug')}: graph {row.get('graph')} vs "
                   f"markdown {row.get('markdown')}")
@@ -4249,14 +4321,14 @@ def _print_divergence_rung(report: Dict[str, Any], *, project: str) -> None:
         verdicts = report.get("edge_verdicts") or {}
         if verdicts.get("repairable"):
             print(f"          - {verdicts['repairable']} declared edge(s) whose target "
-                  f"is active and legal — `mitos rebuild -p {project!r}` replays them")
+                  f"is active and legal — `mitos rebuild {shell_flag('-p', project)}` replays them")
         if verdicts.get("target_retired"):
             print(f"          - {verdicts['target_retired']} point at a since-retired "
                   f"target — legal, but a replay must reach them in COMMIT order "
                   f"(citations resolve against the active view)")
         if verdicts.get("unresolvable"):
             print(f"          - {verdicts['unresolvable']} name no entry in the graph "
-                  f"— fix the citation, or `mitos restore-source -p {project!r}` if its "
+                  f"— fix the citation, or `mitos restore-source {shell_flag('-p', project)}` if its "
                   f"block went missing")
         if verdicts.get("illegal"):
             offenders = report.get("illegal_edge_types") or []
@@ -4272,22 +4344,22 @@ def _print_divergence_rung(report: Dict[str, Any], *, project: str) -> None:
     if report.get("graph_only"):
         active = sum(1 for row in report["graph_only"] if row.get("active"))
         print(f"      • {len(report['graph_only'])} node(s) have NO `### ` block in "
-              f"the corpus ({active} active) — `mitos rebuild -p {project!r}` cannot "
+              f"the corpus ({active} active) — `mitos rebuild {shell_flag('-p', project)}` cannot "
               f"reconstruct them, so its completeness gate refuses. Run "
-              f"`mitos restore-source -p {project!r} --all-graph-only --dry-run` to "
+              f"`mitos restore-source {shell_flag('-p', project)} --all-graph-only --dry-run` to "
               f"review.")
 
     reconcilable = report.get("reconcilable") or 0
     if reconcilable:
-        print(f"      → {reconcilable} of these can be repaired now: `mitos sync -p "
-              f"{project!r}` reconciles a diverged buffer entry, printing the field "
+        print(f"      → {reconcilable} of these can be repaired now: `mitos sync "
+              f"{shell_flag('-p', project)}` reconciles a diverged buffer entry, printing the field "
               f"diff first (add `--yes` to apply without prompting, or "
               f"`--reconcile-entry <slug>` to apply one named entry's whole "
               f"reconcile — the only way to apply an edge DELETION unattended).")
     if report.get("archived_drift"):
         print(f"      ({report['archived_drift']} of these sit in an ARCHIVE file — "
               f"`sync` reads only the buffer, so their reconciler is "
-              f"`mitos rebuild -p {project!r}`.)")
+              f"`mitos rebuild {shell_flag('-p', project)}`.)")
 
 
 def cmd_restore_source(
@@ -4655,10 +4727,10 @@ def _amend_refused_canonical_core(result: Dict[str, Any], config: MitosConfig) -
     lines = [f"Amend refused [canonical_core]: {_amend_fields(result['fields'])} — Decided "
              "and Mechanisms are what a decision is (its id is computed from them), so "
              "changing them records a new decision rather than editing this one.",
-             f"  Record the new decision with `mitos record -p {config.project!r}`, naming "
+             f"  Record the new decision with `mitos record {shell_flag('-p', config.project)}`, naming "
              "the relation that says why this one moved:"]
     # Every route, by the distinction — never one door.
-    flags = {intent: f"--{relation} {handle!r}" for intent, relation in result["routes"].items()}
+    flags = {intent: shell_flag(f"--{relation}", handle) for intent, relation in result["routes"].items()}
     width = max((len(flag) for flag in flags.values()), default=0)
     for intent, flag in flags.items():
         lines.append(f"    {flag:{width}}  {_AMEND_ROUTE_INTENTS.get(intent, intent)}")
@@ -4669,14 +4741,14 @@ def _amend_refused_edges(result: Dict[str, Any], config: MitosConfig) -> List[st
     return [f"Amend refused [edges]: {_amend_fields(result['fields'])} — a relation change "
             "can retire or resurrect a decision, so this verb does not make it.",
             "  Edit the relation line in decisions.md, then apply it with "
-            f"`mitos sync -p {config.project!r} --reconcile-entry {result['slug']!r}`."]
+            f"`mitos sync {shell_flag('-p', config.project)} {shell_flag('--reconcile-entry', result['slug'])}`."]
 
 
 def _amend_refused_diverged(result: Dict[str, Any], config: MitosConfig) -> List[str]:
     return [f"Amend refused [diverged]: the entry for {result['slug']!r} in decisions.md "
             f"already differs from the graph in {_amend_fields(result['fields'])}.",
-            f"  Apply that edit with `mitos sync -p {config.project!r} --reconcile-entry "
-            f"{result['slug']!r}`, or undo it in decisions.md, then amend."]
+            f"  Apply that edit with `mitos sync {shell_flag('-p', config.project)} "
+            f"{shell_flag('--reconcile-entry', result['slug'])}`, or undo it in decisions.md, then amend."]
 
 
 def _amend_refused_unparseable(result: Dict[str, Any], config: MitosConfig) -> List[str]:
@@ -4733,7 +4805,7 @@ def _amend_archived_lines(result: Dict[str, Any], config: MitosConfig) -> List[s
     return [f"{result['slug']!r} is archived — its entry sits in decisions/archive/, and "
             "this verb edits decisions.md only.",
             "  `sync` reads only the buffer, so an archived entry's reconciler is "
-            f"`mitos rebuild -p {config.project!r}`: edit the entry in its archive file, "
+            f"`mitos rebuild {shell_flag('-p', config.project)}`: edit the entry in its archive file, "
             "then rebuild."]
 
 
@@ -4748,8 +4820,8 @@ def _amend_not_found_lines(result: Dict[str, Any], config: MitosConfig) -> List[
     # reads no buffer, and this one just read decisions.md and found no such entry.
     handle = result["slug"]
     return [f"{handle!r} names no decision in the graph and no entry in decisions.md.",
-            f"  Find the handle with `mitos list -p {config.project!r} --oneline`, or "
-            f"`mitos show -p {config.project!r} -- {handle!r}`."]
+            f"  Find the handle with `mitos list {shell_flag('-p', config.project)} --oneline`, or "
+            f"`mitos show {shell_flag('-p', config.project)} -- {shell_arg(handle)}`."]
 
 
 def _amend_refused_lines(result: Dict[str, Any], config: MitosConfig) -> List[str]:
@@ -4899,7 +4971,7 @@ def cmd_agent_block(workspace_dir: str, check: bool = False, *,
         return 0
 
     workspace_dir = os.path.abspath(workspace_dir)
-    recipe = f"`mitos agent-block -p {(project or workspace_dir)!r}`"
+    recipe = f"`mitos agent-block {shell_flag('-p', project or workspace_dir)}`"
     report = agent_block_drift(workspace_dir)
     files = report["files"]
     print(f"\nAgent-file mitos note (current guide: v{AGENT_GUIDE_VERSION}) for {workspace_dir}\n")
@@ -5996,7 +6068,7 @@ def _check_degradation_summary(degradations: Tuple[str, ...], *, project: str) -
         "probe_read": "completeness could not be certified (the index probe was unreadable)",
         "collection_missing": (
             f"the vector collection does not exist — run "
-            f"`mitos reconcile -p {project!r}` to rebuild it"
+            f"`mitos reconcile {shell_flag('-p', project)}` to rebuild it"
         ),
         "judgment_truncated": (
             "the judge's response was truncated (max_tokens exceeded)"
@@ -6115,11 +6187,11 @@ def _print_check_report(
         for item in exclusions:
             print(f"  - {handle_text(item)}")
         print("  These keep failing to embed; the durable fix is outbox quarantine "
-              f"(substrate-owned). Re-run `mitos sync -p {project!r}` to retry.")
+              f"(substrate-owned). Re-run `mitos sync {shell_flag('-p', project)}` to retry.")
 
     if transient_count:
         print(f"\n{transient_count} decision(s) are behind the vector index — recall "
-              f"may be thinned. Run `mitos sync -p {project!r}` to catch up.")
+              f"may be thinned. Run `mitos sync {shell_flag('-p', project)}` to catch up.")
 
     if not result.findings and not degradations:
         if scope is not None and result.nodes_total == 0:
@@ -6131,6 +6203,24 @@ def _print_check_report(
             noun = "decision" if result.nodes_swept == 1 else "decisions"
             print(f"Corpus coherent — {result.nodes_swept} {noun} audited, "
                   f"no contradictions found.")
+    if not degradations and result.nodes_total:
+        print(_check_cost_line(result))
+
+
+def _check_cost_line(result: "check.CheckRunResult") -> str:
+    """Names what a healthy run judged and spent — the cost a run otherwise hides.
+
+    Only the shortfall branch used to give a batch count, so a healthy run that
+    spent real money read the same as one that reused everything.
+    """
+    reused = (f"; {result.pairs_reused} pair(s) answered from history at no cost"
+              if result.pairs_reused else "")
+    if not result.batches_executed:
+        return f"Judged 0 batches — nothing was spent{reused}."
+    noun = "batch" if result.batches_executed == 1 else "batches"
+    return (f"Judged {result.batches_executed} {noun} "
+            f"({result.tokens_input:,} input / {result.tokens_output:,} output "
+            f"tokens){reused}.")
 
 
 #: The directory of the ``mitos`` package, which ``python -m mitos`` (and
@@ -6255,7 +6345,7 @@ def _hook_block_recipe(config: MitosConfig) -> str:
     Returns:
         The backticked ``… check -p …`` recipe.
     """
-    return f"`{_running_mitos_command()} check -p {config.project!r}`"
+    return f"`{_running_mitos_command()} check {shell_flag('-p', config.project)}`"
 
 
 def _hook_block_message(config: MitosConfig, uncovered: int) -> str:
@@ -7449,6 +7539,7 @@ _SELECTOR_EXEMPT_VERBS: Dict[str, str] = {
     "init": EXEMPT_CREATES_REGISTRATION,
     "serve": EXEMPT_NO_WORKSPACE,
     "projects": EXEMPT_EXPLICITLY_GLOBAL,
+    "unregister": EXEMPT_EXPLICITLY_GLOBAL,
 }
 
 # Why each of them is global, in this surface's words. Keyed by VERB rather than
@@ -7462,6 +7553,8 @@ _EXEMPT_VERB_NOTES: Dict[str, str] = {
               "launch it plainly: `mitos serve`."),
     "projects": ("`projects` reads the machine-wide registry and targets no single "
                  "workspace — it works from anywhere."),
+    "unregister": ("`unregister` edits the machine-wide registry and names its "
+                   "registration positionally — `mitos unregister <name>`."),
     "set-key": ("`set-key --global` writes the machine-wide .env shared by every "
                 "project — drop `--global` to write one project's own .env."),
 }
@@ -7718,7 +7811,8 @@ def _resolve_selector(selector: Optional[str],
         raise
 
 
-def _registered_projects_line(bounded: routing.BoundedNames) -> str:
+def _registered_projects_line(bounded: routing.BoundedNames, *,
+                              matches_shown: bool = False) -> str:
     """Renders the registered-name vocabulary, respecting the enumeration bound.
 
     Above ``routing.REGISTERED_NAMES_BOUND`` the enumeration collapses to the
@@ -7730,6 +7824,9 @@ def _registered_projects_line(bounded: routing.BoundedNames) -> str:
 
     Args:
         bounded: The policy verdict from ``routing.bounded_registered_names``.
+        matches_shown: The body already printed the close matches as a
+            did-you-mean, so a collapsed line gives the count without repeating
+            them (L14).
 
     Returns:
         One indented line for the error body.
@@ -7741,7 +7838,7 @@ def _registered_projects_line(bounded: routing.BoundedNames) -> str:
     if not bounded.collapsed:
         return (f"  Registered projects: {', '.join(bounded.names)} "
                 f"(list with `mitos projects`).")
-    if bounded.names:
+    if bounded.names and not matches_shown:
         return (f"  {bounded.total} projects registered, closest: "
                 f"{', '.join(bounded.names)} (list them all with `mitos projects`).")
     return (f"  {bounded.total} projects registered — list them with "
@@ -7793,7 +7890,8 @@ def _render_targeting_error(err: ProjectTargetingError) -> str:
             # `PROJECT_DIDYOUMEAN_MAX` — and dropping one would hide the very
             # distinction the caller needs to see.
             lines.append(f"  Did you mean: {', '.join(err.close_matches)}")
-        lines.append(_registered_projects_line(bounded))
+        lines.append(_registered_projects_line(
+            bounded, matches_shown=bool(err.close_matches)))
     elif err.discriminator == TARGET_RELATIVE_PATH:
         lines = [
             f"the project selector {err.selector!r} is not an absolute path.",
@@ -7891,6 +7989,112 @@ def _non_negative_int(value: str) -> int:
     return number
 
 
+# The two global options argparse accepts only before the verb. `-p`/`--project` is
+# registered on both sides, so it is not one of them.
+_PRE_VERB_ONLY_OPTIONS = frozenset({"-C", "--directory"})
+
+
+class _TeachingParser(argparse.ArgumentParser):
+    """An ArgumentParser whose usage errors add one line naming the right form (L9).
+
+    Argparse's own message and exit 2 are kept — a script reading either keeps
+    working — and a teaching line is appended for the three walls the AX ledger
+    re-sighted for months: a global option after the verb, a positional spelled as
+    a ``--flag``, and a flag that belongs to a sibling verb. The last one used to
+    surface as ``required: ident`` (argparse checks required positionals first),
+    which names the wrong fault; a required-argument error raised while an unknown
+    flag sits in the verb's arguments is answered with the flag's lesson instead.
+
+    ``add_subparsers`` builds every verb parser from this class, so one definition
+    covers the tree. ``_mitos_root`` and ``_mitos_verb`` are set on each verb parser
+    by :func:`_build_parser`.
+    """
+
+    _mitos_root: Optional["_TeachingParser"] = None
+    _mitos_verb: Optional[str] = None
+    _mitos_args: Sequence[str] = ()
+
+    def parse_known_args(self, args=None, namespace=None):  # noqa: D401 - argparse API
+        """Records the arguments this parser was handed, for :meth:`error`."""
+        self._mitos_args = list(sys.argv[1:] if args is None else args)
+        return super().parse_known_args(args, namespace)
+
+    def parse_args(self, args=None, namespace=None):  # noqa: D401 - argparse API
+        """Parses like argparse, teaching on the arguments nothing recognized."""
+        parsed, extras = self.parse_known_args(args, namespace)
+        if extras:
+            verb = getattr(parsed, "command", None)
+            lesson = _flag_lesson(self, verb, extras)
+            message = f"unrecognized arguments: {' '.join(extras)}"
+            self.error(f"{message}\n  {lesson}" if lesson else message)
+        return parsed
+
+    def error(self, message: str):  # noqa: D401 - argparse API
+        """Exits 2 like argparse; a verb's missing-positional error may teach a flag."""
+        if (self._mitos_root is not None
+                and message.startswith("the following arguments are required")):
+            unknown = [arg for arg in self._mitos_args
+                       if arg.startswith("-") and arg != "--"
+                       and arg.split("=", 1)[0] not in self._option_string_actions]
+            if unknown:
+                lesson = _flag_lesson(self._mitos_root, self._mitos_verb, unknown)
+                if lesson:
+                    message = (f"unrecognized arguments: {' '.join(unknown)}\n"
+                               f"  {lesson}")
+        super().error(message)
+
+
+def _flag_lesson(root: argparse.ArgumentParser, verb: Optional[str],
+                 extras: Sequence[str]) -> Optional[str]:
+    """Composes the one teaching line for the first unrecognized option, if any.
+
+    Args:
+        root: The top-level parser (its subparsers are the sibling verbs).
+        verb: The verb being parsed, or ``None`` when none was reached.
+        extras: The unrecognized arguments, in order.
+
+    Returns:
+        The lesson, or ``None`` when no extra argument looks like an option.
+    """
+    flag = next((arg.split("=", 1)[0] for arg in extras
+                 if arg.startswith("-") and arg != "--"), None)
+    if flag is None or verb is None:
+        return None
+    if flag in _PRE_VERB_ONLY_OPTIONS:
+        return (f"`{flag}` is a global option and goes before the verb: "
+                f"`mitos -C <dir> {verb} …`.")
+    choices: Dict[str, argparse.ArgumentParser] = {}
+    for action in root._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            choices = action.choices
+    verb_parser = choices.get(verb)
+    if verb_parser is None:
+        return None
+    positionals = [action.dest for action in verb_parser._actions
+                   if not action.option_strings and action.dest != "help"]
+    bare = flag.lstrip("-").replace("-", "_")
+    if bare in positionals:
+        return (f"`{verb}` takes its {bare} as a positional argument, not `{flag}`: "
+                f"`mitos {verb} -p <project> <{bare}>`.")
+    own = [option for option in verb_parser._option_string_actions
+           if option.startswith("--")]
+    near = difflib.get_close_matches(flag, own, n=1, cutoff=0.75)
+    if near:
+        return f"Did you mean `{near[0]}`? (`mitos {verb} -h` lists its options.)"
+    seen: Set[int] = set()
+    takers: List[str] = []
+    for name, sibling in choices.items():
+        if id(sibling) in seen or sibling is verb_parser:
+            continue
+        seen.add(id(sibling))
+        if flag in sibling._option_string_actions:
+            takers.append(f"`mitos {name}`")
+    if takers:
+        return (f"`{flag}` is not an option of `mitos {verb}`; it belongs to "
+                f"{', '.join(takers)}. (`mitos {verb} -h` lists its options.)")
+    return f"`mitos {verb} -h` lists its options."
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Builds the CLI argument parser.
 
@@ -7901,7 +8105,7 @@ def _build_parser() -> argparse.ArgumentParser:
     Returns:
         The fully configured top-level parser, subparsers registered.
     """
-    parser = argparse.ArgumentParser(
+    parser = _TeachingParser(
         description="Mitos: Architectural Decision Substrate for LLM-native workflows.",
         epilog=_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -7946,6 +8150,19 @@ def _build_parser() -> argparse.ArgumentParser:
         "projects", help="List the Mitos projects registered on this machine.")
     proj_p.add_argument("--json", action="store_true", dest="as_json",
                         help="Emit machine-readable JSON.")
+    proj_p.add_argument("--all", action="store_true", dest="show_all",
+                        help="Also list registrations whose workspace no longer exists.")
+
+    # unregister — the registry's one remover (global, like `projects`).
+    unreg_p = subparsers.add_parser(
+        "unregister",
+        help="Remove a project's registration (the workspace itself is untouched).")
+    unreg_target = unreg_p.add_mutually_exclusive_group(required=True)
+    unreg_target.add_argument("name", nargs="?", default=None,
+                              help="The registered name to remove, exactly as listed.")
+    unreg_target.add_argument("--missing", action="store_true",
+                              help="Remove every registration whose workspace no "
+                                   "longer exists.")
 
     # sync
     sync_p = subparsers.add_parser("sync", help="Sync buffer decisions to graph database.")
@@ -8013,7 +8230,7 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Set ranked top-k to retrieve (1–50; default 5). Raises or lowers the count — a context-budget dial.")
 
     # show
-    show_p = subparsers.add_parser("show", help="Display details of a specific node.")
+    show_p = subparsers.add_parser("show", help="Display details of a specific node. A missing handle exits 1 (text on stderr; --json still emits {found: false}).")
     show_p.add_argument("ident", help="Slug or ID of node.")
     show_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON (for agents).")
 
@@ -8395,14 +8612,18 @@ def _build_parser() -> argparse.ArgumentParser:
     # Deduped by `id()` because the five aliased verbs (`query`/`query_decisions`,
     # `surface`/`surface_decisions`, `list`/`list_decisions`, `scopes`/
     # `list_scopes`, `record`/`record_decision`) are ONE parser object under two
-    # names: 30 names over 25 objects, and a second `add_argument` on the same
+    # names: 31 names over 26 objects, and a second `add_argument` on the same
     # object raises `ArgumentError: conflicting option strings`. The
     # `allow_abbrev` assignment above needs no such guard — it is idempotent — so
     # the dedupe guards only the registration. Being one object is also what makes
     # the aliases free: covering the object once covers both names.
     _selector_registered: Set[int] = set()
-    for _verb_parser in subparsers.choices.values():
+    for _verb_name, _verb_parser in subparsers.choices.items():
         _verb_parser.allow_abbrev = False
+        _verb_parser._mitos_root = parser
+        if _verb_parser._mitos_verb is None:
+            # First name wins, so an aliased object teaches by its short verb.
+            _verb_parser._mitos_verb = _verb_name
         if id(_verb_parser) in _selector_registered:
             continue
         _selector_registered.add(id(_verb_parser))
@@ -8523,7 +8744,9 @@ def main() -> None:
             # targeted, and a keyword here would empty that tuple.
             cmd_init(config, name=args.name, force=args.force)
         elif args.command == "projects":
-            cmd_projects(as_json=args.as_json)
+            cmd_projects(as_json=args.as_json, show_all=args.show_all)
+        elif args.command == "unregister":
+            cmd_unregister(args.name, missing=args.missing)
         elif args.command == "sync":
             # The split lives here, at the call site, exactly as 1a's join does:
             # `None` (flag absent) survives as `None` so the handler can tell it

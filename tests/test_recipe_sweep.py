@@ -84,6 +84,10 @@ def test_every_skill_md_cli_twin_parses_and_names_its_workspace(tmp_path,
             args = _parse(recipe)
             assert args.command == "projects"
             continue
+        if recipe == "mitos unregister <name>":  # selector-exempt, names a registration
+            args = _parse(recipe.replace("<name>", "some-name"))
+            assert args.command == "unregister" and args.name == "some-name"
+            continue
         recipe = recipe.replace("<slug>", "my-slug").replace(" …", "")
         verb = shlex.split(recipe)[1]
         args = _parse(recipe + "".join(
@@ -265,7 +269,7 @@ def test_the_pause_message_names_no_shell_command(tmp_path, monkeypatch) -> None
         monkeypatch.delenv(key, raising=False)
     workspace = _registered(tmp_path, "ws")
     m = MitosSyncManager(MitosConfig(str(workspace)))
-    nr._seed_echo_corpus(m)
+    nr._seed_echo_corpus(m, stamped=True)
     res = nr._echo_pause(m, nr._ECHO_GATHERED, cites="echo-b, echo-d")
     message = res["message"]
     # Every clause the census listed is present, so the row reads the whole body.

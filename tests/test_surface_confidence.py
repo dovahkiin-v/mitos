@@ -492,8 +492,10 @@ def _query_pointer(surface, config):
     form names `mitos surface -p`, and its `repr` survives a project carrying a
     space), so deriving costs no coverage.
     """
+    from mitos.shell_quote import shell_flag
+
     return _SURFACE_POINTERS[surface]["precedent_scan"].format(
-        project=repr(config.project)
+        selector=shell_flag("-p", config.project)
     )
 
 
@@ -2132,7 +2134,8 @@ def test_cli_and_mcp_thin_alike(ws, verb):
     mcp_clause, cli_clause = _clause_for("mcp", config, 2), _clause_for("cli", config, 2)
     assert mcp_out["note"].endswith(mcp_clause) and cli_out["note"].endswith(cli_clause)
     pointers = {s: _SURFACE_POINTERS[s]["dereference"] for s in ("cli", "mcp")}
-    cli_form = pointers["cli"].format(project=repr(config.project))
+    from mitos.shell_quote import shell_flag
+    cli_form = pointers["cli"].format(selector=shell_flag("-p", config.project))
     assert cli_clause.replace(cli_form, pointers["mcp"]) == mcp_clause
 
 

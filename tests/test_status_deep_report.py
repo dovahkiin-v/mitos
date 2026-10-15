@@ -415,6 +415,12 @@ class TestTheGateIsTheNodeCount:
         argue with a test rather than notice a comment: `conflict.py` imports this
         module, so an import here lands inside the check family's discovered
         no-write fence (`test_conflict_closeout.py`'s exact-set pin).
+
+        Argued once, in 0.19.1: `mitos.shell_quote` is the one admitted import —
+        import-free itself, two pure string functions, adjudicated into the fence
+        by the exact-set pin — because the CLI recipes this module composes must
+        be shell-quoted by the same spelling as every other surface's. Anything
+        else still has to argue here.
         """
         import ast
         import mitos.recall as recall_mod
@@ -427,7 +433,7 @@ class TestTheGateIsTheNodeCount:
                 imported += [a.name for a in node.names]
             elif isinstance(node, ast.ImportFrom) and node.module:
                 imported.append(node.module)
-        assert [m for m in imported if m.split(".")[0] == "mitos"] == []
+        assert [m for m in imported if m.split(".")[0] == "mitos"] == ["mitos.shell_quote"]
 
 
 # --------------------------------------------------------------------------- #

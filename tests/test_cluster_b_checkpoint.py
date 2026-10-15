@@ -15,8 +15,8 @@ over the files the child wrote — ``settledness.buffered_entries``, the importe
 ``_ARCHIVE_FILENAME_RE``, ``parse_file_reversed`` in ``rebuild``'s order, the renderer's
 constants — never a figure typed here.
 
-**Exactly one substitution crosses a process boundary.** A keyless ``sync`` returns before
-its rotation step (``Sync requires API keys``), so a sync that rotates runs through
+**Exactly one substitution crosses a process boundary.** A keyless ``sync`` commits nothing
+(``Sync requires API keys``), though since 0.19.1 it still rotates; a sync that commits runs through
 ``LAUNCHER``: a fresh interpreter that patches the provider SDK class
 ``google.genai.Client`` and then runs the real ``mitos.cli.main()`` with real argv, selector
 resolution, config and streams. The key it sees is a dummy, Qdrant is a dead port and no
@@ -371,33 +371,40 @@ def test_f2_repeated_cli_syncs_drain_to_a_fixed_point_below_threshold(tmp_path) 
     assert _stream(ws) == stream_before
 
 
-def test_f2b_a_keyless_sync_evaluates_no_rotation(tmp_path) -> None:
-    """F2b: the keyless floor, pinned as current truth (D-3e-5).
+def test_f2b_a_keyless_sync_still_evaluates_rotation(tmp_path) -> None:
+    """F2b: the keyless floor rotates before it returns (inverted 0.19.1, D-3e-5 ruled).
 
-    A keyless ``sync`` returns at ``Sync requires API keys`` before its rotation step, so
-    a workspace with no ``GEMINI_API_KEY`` drains only through ``record``. The vision's
-    D2 says the predicate is evaluated identically on both paths; this row states what
-    ships, so a change inverts a test rather than a comment. Handed to 5b's ROADMAP as:
-    *keyless `mitos sync` evaluates no rotation — a keyless workspace drains only through
-    `record` (trigger: an operator reports a keyless sync did not drain the buffer).*
+    A keyless ``sync`` commits nothing and returns at ``Sync requires API keys``, but
+    the buffer's settled tail is a property of the buffer, not of this run's commits —
+    the vision's D2 says the predicate runs identically on both paths. Until 0.19.1 the
+    floor returned above the rotation step, so a keyless workspace drained only through
+    ``record``; Vinga ruled that a remediation (2026-09-18), and this row was inverted
+    with it rather than deleted.
     """
     threshold = 3
     base = str(tmp_path)
     env = _env(base)
-    ws = _build(base, env, "f2bws", _plain([f"f2b-entry-{i}" for i in range(threshold + 2)]),
+    count = threshold + 2
+    ws = _build(base, env, "f2bws", _plain([f"f2b-entry-{i}" for i in range(count)]),
                 threshold=threshold)
     _back_date(ws)
     buffer_before = _read(_buffer(ws))
     assert settledness.buffered_entries(buffer_before) >= threshold
     assert _archive_snapshot(ws) is None
+    stream_before = _stream(ws)
 
     done = _mitos(env, ws, "-p", ws, "sync")
 
     assert done.returncode == 0, done.stdout + done.stderr
     assert any(l.startswith(KEY_LINE_PREFIX) for l in done.stdout.splitlines()), done.stdout
-    assert _read(_buffer(ws)) == buffer_before
-    assert _archive_snapshot(ws) is None
-    assert not any(l.startswith("Rotated ") for l in (done.stdout + done.stderr).splitlines())
+    buffered_after = settledness.buffered_entries(_read(_buffer(ws)))
+    assert buffered_after < count, "a keyless sync must still drain the settled tail"
+    assert _archive_snapshot(ws) is not None
+    rotated = [l for l in done.stderr.splitlines() if l.startswith("Rotated ")]
+    assert rotated, done.stderr
+    assert not any(l.startswith(FAILURE_PREFIX)
+                   for l in (done.stdout + done.stderr).splitlines())
+    assert _stream(ws) == stream_before, "rotation moves entries, it never loses one"
 
 
 # --------------------------------------------------------------------------- #

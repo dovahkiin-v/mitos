@@ -472,7 +472,8 @@ def _example_call(tool: str, err: ProjectTargetingError,
     return f"`{tool}(project='{target}', …)`"
 
 
-def _registered_projects_line(bounded: routing.BoundedNames) -> str:
+def _registered_projects_line(bounded: routing.BoundedNames, *,
+                              matches_shown: bool = False) -> str:
     """Renders the registered-name vocabulary, respecting the enumeration bound.
 
     The MCP twin of ``cli._registered_projects_line`` — same policy, different
@@ -499,6 +500,9 @@ def _registered_projects_line(bounded: routing.BoundedNames) -> str:
 
     Args:
         bounded: The policy verdict from ``routing.bounded_registered_names``.
+        matches_shown: The body already printed the close matches as a
+            did-you-mean, so a collapsed line gives the count without repeating
+            them (L14).
 
     Returns:
         One indented line for the error body.
@@ -511,7 +515,7 @@ def _registered_projects_line(bounded: routing.BoundedNames) -> str:
                 "still reachable by its absolute path.")
     if not bounded.collapsed:
         return f"  Registered projects: {', '.join(bounded.names)}."
-    if bounded.names:
+    if bounded.names and not matches_shown:
         return (f"  Registered projects: {bounded.total}, closest to what you "
                 f"passed: {', '.join(bounded.names)}.")
     return f"  Registered projects: {bounded.total} — too many to enumerate here."
@@ -561,9 +565,10 @@ def _render_registry_error(err: RegistryError) -> str:
 
     The escape-hatch clause is gated on ``file_unusable``: it is the answer to a
     broken routing *file*, and offering it for a registration refusal would be
-    advice about a fault this surface cannot even reach (no MCP tool writes the
-    registry). The gate is here rather than assumed, so the renderer stays correct
-    if a future tool does.
+    advice about a fault this surface cannot reach through a refusal: the one MCP
+    tool that writes the registry, ``unregister_project``, only removes, and its
+    refusals (an unknown name, an entry the line surgery cannot remove) are not
+    repaired by a path selector.
 
     Args:
         err: The typed error, carrying the located cause as its message.
@@ -666,7 +671,8 @@ def _render_targeting_error(err: ProjectTargetingError, tool: str) -> str:
             f"  Retry with "
             f"{'a registered name, or with ' if err.registered_names else ''}"
             f"the absolute path of the workspace you mean — {example}.")
-        lines.append(_registered_projects_line(bounded))
+        lines.append(_registered_projects_line(
+            bounded, matches_shown=bool(err.close_matches)))
     elif err.discriminator == TARGET_RELATIVE_PATH:
         # The realistic mistake on this surface: agents reach for relative paths
         # by habit, from a world where a working directory means something. This
@@ -1448,8 +1454,10 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
                     project: Optional[str] = None, full_top: Optional[int] = None) -> str:
     """Look up a SPECIFIC decision by slug or claim — the targeted lookup.
 
-    Use this when you know roughly what you're after (a slug you're carrying, or a
-    pointed claim). For the broad "is there precedent near this?" scan before
+    Use this when you know roughly what you're after (a pointed claim, or a slug
+    you're carrying). A slug in hand is a dereference: call show_node with it
+    first — it answers for superseded nodes too, where this verb's slug branch
+    sees the active view only. For the broad "is there precedent near this?" scan before
     deciding, use surface_decisions — its `confidence` says whether precedent
     exists, where this verb's rates only the ranking; for the EXHAUSTIVE set in a
     scope, list_decisions. If query matches a unique slug exactly, returns that one
@@ -1463,7 +1471,8 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
         depth: The retrieval depth (e.g. 'letter'). v0.1 enforces Letter mode.
         brief: An existence screen over the ranked matches, to dereference from
             by slug: if True, they omit `rejected_paths` (an exact-slug hit is
-            always returned in full — you asked for that one).
+            always returned in full — you asked for that one — and says so in
+            `thinning_not_applied`).
         limit: Ranked top-k for the SEMANTIC branch (default 5; clamped to 1–50).
             Ignored by an exact-slug hit.
         full_top: Keep `rejected_paths` on ranked matches 1..N only; lower ranks
@@ -1546,6 +1555,14 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             "context": node["context"],
         }
         output.update(modifiers)
+        if full_top is not None:
+            # `brief`/`full_top` thin RANKED matches; an exact-slug hit is the one
+            # the caller named, returned whole. Said in the payload, not only in
+            # the description, so a caller who asked for a thinned read is not left
+            # wondering why `rejected_paths` arrived.
+            output["thinning_not_applied"] = (
+                "exact-slug hit — returned whole; brief/full_top thin ranked "
+                "matches only")
         # Provenance last, after the payload's own content fields — show_node's
         # rule, one screen up, applied to the other dereference exit. Most
         # valuable here: this is the answer an agent acts on directly, so a hit
@@ -2176,7 +2193,7 @@ def amend_commentary(slug: str,
 
 @mcp.tool()
 def list_projects() -> str:
-    """List every Mitos project registered on this machine, with its workspace path.
+    """List the Mitos projects registered on this machine, with their workspace paths.
 
     The discovery primitive behind every other tool's `project` argument: this is
     where the vocabulary comes from. Call it when you do not know a project's
@@ -2184,8 +2201,11 @@ def list_projects() -> str:
     registered, or once at the start of a session to learn what this machine
     holds. One round trip, and every later call can name its target.
 
-    It reports registrations, not health — whether a registered path still holds
-    a usable workspace is a question for the tool you actually want to call.
+    It reports registrations, not health — with one exception, absence: a
+    registration whose workspace directory no longer exists cannot be a target, so
+    it is hidden and counted in `hidden_missing` instead of listed. Whether an
+    existing path still holds a usable workspace is a question for the tool you
+    actually want to call.
 
     An empty result is a healthy state, not a failure: nothing is registered on
     this machine yet. A workspace can still be targeted by passing its absolute
@@ -2196,9 +2216,10 @@ def list_projects() -> str:
     for one workspace.
 
     Returns:
-        A JSON string: {registry_path, count, projects}, where each entry in
-        `projects` is {name, path} — `name` is what you pass as `project`, `path`
-        is the workspace it reaches. The order is the registry's own document
+        A JSON string: {registry_path, count, hidden_missing, projects}, where each
+        entry in `projects` is {name, path} — `name` is what you pass as
+        `project`, `path` is the workspace it reaches. `count` is the listed
+        entries; `hidden_missing` is how many were hidden as gone. The order is the registry's own document
         order, never sorted: it is the order a path lookup resolves its first
         match in, so it is the order that actually decides. `registry_path` names
         the file the registrations live in, and is reported whether or not that
@@ -2215,7 +2236,43 @@ def list_projects() -> str:
     except RegistryError as err:
         raise _RenderedToolError(_render_registry_error(err)) from err
     return dumps_display(
-        projects_payload(registered, registry.registry_path()),
+        projects_payload(
+            registered, registry.registry_path(),
+            missing=routing.missing_registrations(registered),
+        ),
         ensure_ascii=False,
         indent=2,
+    )
+
+
+@mcp.tool()
+def unregister_project(name: str) -> str:
+    """Remove one project's registration from this machine's registry — routing only.
+
+    The registry maps names to workspace paths; this deletes one name. The
+    workspace itself — its decisions, graph and vectors — is never read or
+    touched, and stays reachable by passing its absolute path as `project`. Use it
+    for registrations that should not be there, such as a throwaway or test
+    workspace that `list_projects` still shows. Do not use it to
+    "reset" a real project; nothing about the project changes except that its
+    name stops resolving.
+
+    Args:
+        name: The registered name to remove, exactly as `list_projects` shows it
+            (case included). This tool takes no `project`: it edits the
+            machine-wide registry, not one workspace.
+
+    Returns:
+        A JSON string: {unregistered, path, workspace_untouched: true}, where
+        `path` is the workspace the removed name pointed at. An unknown name is an
+        error and removes nothing.
+    """
+    try:
+        removed = registry.unregister(name)
+    except RegistryError as err:
+        raise _RenderedToolError(_render_registry_error(err)) from err
+    return dumps_display(
+        {"unregistered": name, "path": removed, "workspace_untouched": True},
+        ensure_ascii=False,
+        indent=None,
     )

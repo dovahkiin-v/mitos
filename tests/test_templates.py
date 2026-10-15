@@ -242,8 +242,8 @@ def test_skill_md_pairs_every_tool_with_a_selectored_cli_twin(two_workspaces):
     """The list is the CLI-fallback map, so each tool line must carry a runnable twin.
 
     One line per live tool, each `(CLI: `mitos …`)`, and every twin names its
-    project with `-p .` — except `mitos projects`, which is selector-exempt and
-    correctly bare (the no-bare-recipe row above sweeps the other direction).
+    project with `-p .` — except `mitos projects` and `mitos unregister`, which are
+    selector-exempt and correctly bare (the no-bare-recipe row above sweeps the other direction).
     """
     tools = _tool_names()
     assert len(tools) >= 8   # non-vacuity
@@ -251,7 +251,7 @@ def test_skill_md_pairs_every_tool_with_a_selectored_cli_twin(two_workspaces):
     lines = dict(_TOOL_LINE.findall(text))
     assert set(lines) == tools
     for name, recipe in lines.items():
-        if recipe == "mitos projects":
+        if recipe in ("mitos projects", "mitos unregister <name>"):
             continue
         assert " -p ." in recipe, f"{name}'s CLI twin {recipe!r} names no project"
 
@@ -349,7 +349,7 @@ def test_a_v2_paste_is_outdated_to_status(tmp_path, monkeypatch, capsys):
 
     cli.cmd_status(str(ws), as_json=True)
     data = json.loads(capsys.readouterr().out)
-    assert data["agent_guide_version"] == 4 == AGENT_GUIDE_VERSION
+    assert data["agent_guide_version"] == 5 == AGENT_GUIDE_VERSION
     assert [f["marker_version"] for f in data["agent_files"]] == [2]
     assert [f["status"] for f in data["agent_files"]] == ["outdated"]
 
@@ -428,3 +428,35 @@ def test_a_fresh_init_reports_no_mcp_row_at_all(tmp_path, monkeypatch, capsys):
     assert "READY ✓" in out
     assert "MCP" not in out
     assert "mcp" not in out
+
+
+def test_every_check_teaching_surface_names_the_unprompted_spend(tmp_path):
+    """H-spend-below-brake (Vinga's ruling, 2026-10-14): the agent block, skill.md and
+    the scaffolded .env each say `mitos check` spends up to the brake without asking.
+    The number is typed in prose, so it is pinned to the constant the gate reads."""
+    from mitos import check
+
+    brake = f"up to {check.CHECK_CONFIRM_BATCHES} judgment batches"
+    assert brake in " ".join(agent_block().split())
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _init(ws)
+    skill = (ws / ".mitos" / "skill.md").read_text(encoding="utf-8")
+    assert brake in skill
+    env = " ".join(line.lstrip("# ") for line in
+                   (ws / ".env").read_text(encoding="utf-8").splitlines())
+    assert brake in " ".join(env.split())
+
+
+_V4_PASTE = _V2_PASTE.replace("mitos-agent-guide: v2", "mitos-agent-guide: v4")
+
+
+def test_a_v4_paste_is_outdated_once_the_spend_clause_lands(tmp_path, monkeypatch, capsys):
+    """A literal `4`, for the v2/v3 rows' reason: v4 copies exist in the wild."""
+    ws = tmp_path / "pasted"
+    ws.mkdir()
+    _init(ws)
+    (ws / "AGENTS.md").write_text(_V4_PASTE, encoding="utf-8")
+    capsys.readouterr()
+    assert cli.cmd_agent_block(str(ws), check=True) == 1
+    assert f"⚠ AGENTS.md  (guide v4 → v{AGENT_GUIDE_VERSION})" in capsys.readouterr().out

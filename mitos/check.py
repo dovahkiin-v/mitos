@@ -273,10 +273,20 @@ class CorpusSnapshot:
             hash-ordered post-passes, never from iteration order.
         edge_index: The either-direction strong-edge index, built ONCE from a single
             ``get_edges()`` pass and reused across every swept node.
+        live: The corpus-wide active set, for liveness questions a scoped sweep set
+            cannot answer — a partner outside ``--scope`` is unswept, not dead.
+            ``None`` means the sweep set already is the whole live set (an unscoped
+            run); read it through :attr:`live_nodes`.
     """
 
     nodes: Tuple[Dict[str, Any], ...]
     edge_index: StrongEdgeIndex
+    live: Optional[Tuple[Dict[str, Any], ...]] = None
+
+    @property
+    def live_nodes(self) -> Tuple[Dict[str, Any], ...]:
+        """Returns the corpus-wide active set (the sweep set when unscoped)."""
+        return self.nodes if self.live is None else self.live
 
 
 def snapshot_corpus(
@@ -284,8 +294,9 @@ def snapshot_corpus(
 ) -> CorpusSnapshot:
     """Snapshots the live sweep set and the strong-edge index at run start.
 
-    Exactly two graph reads — one ``get_active_decisions(scope)`` for the sweep set,
-    one ``get_edges()`` for the index — never re-read per node (the build-once seam
+    Two graph reads — one ``get_active_decisions(scope)`` for the sweep set, one
+    ``get_edges()`` for the index — plus, on a scoped run only, one unscoped
+    ``get_active_decisions()`` for :attr:`CorpusSnapshot.live`; never re-read per node (the build-once seam
     the 2a handoff pins; a per-node rebuild would be O(edges) × O(nodes) for zero
     benefit). ``scope`` filters the *proposal set only* (CHK-D2/CONF-D2): a scoped
     snapshot sweeps only matching nodes, but their gathered partners may be any live
@@ -308,7 +319,8 @@ def snapshot_corpus(
     """
     nodes = tuple(store.get_active_decisions(scope))
     edge_index = build_strong_edge_index(store.get_edges())
-    return CorpusSnapshot(nodes=nodes, edge_index=edge_index)
+    live = None if scope is None else tuple(store.get_active_decisions())
+    return CorpusSnapshot(nodes=nodes, edge_index=edge_index, live=live)
 
 
 def sweep_node(
@@ -549,9 +561,15 @@ def carry_standing_findings(
        (:func:`_is_finding` on raw ``tenable`` + ``confidence``, never the stored
        ``surfaced`` column). A tenable or below-threshold prior is not a finding and
        is silently skipped; it is not a departure either, having never stood.
-    2. **Both sides live** — each hash is an active decision in this run's snapshot.
-       Every resolution path mutates an entry, which changes its content hash, so a
-       resolved pair falls out here by construction.
+    2. **Both sides live** — each hash is an active decision in the corpus-wide
+       live set (:attr:`CorpusSnapshot.live_nodes`, never the scoped sweep set: a
+       partner outside ``--scope`` is unswept, not dead). Every resolution path
+       mutates an entry, which changes its content hash, so a resolved pair falls
+       out here by construction.
+
+    Under ``--scope`` a prior with neither side in the sweep set is outside the run
+    entirely — the sweep could never have reached it — so it is neither carried nor
+    departed; the unscoped run is where it stands.
     3. **No declared strong edge** — the same :class:`StrongEdgeIndex` screen the
        sweep applies. Without it the carry would resurrect exactly the findings an
        author settled by declaring ``Supersedes:``/``Amends:``/``Narrows:``/
@@ -579,7 +597,8 @@ def carry_standing_findings(
     if reuse_index is None:
         return [], []
 
-    live: Dict[str, Dict[str, Any]] = {node["id"]: node for node in snapshot.nodes}
+    live: Dict[str, Dict[str, Any]] = {node["id"]: node for node in snapshot.live_nodes}
+    swept_set = {node["id"] for node in snapshot.nodes}
     already = {
         tuple(sorted((pair.proposal_hash, pair.partner_hash))) for pair in swept_pairs
     }
@@ -592,6 +611,8 @@ def carry_standing_findings(
         if key in already:
             continue
         lo, hi = key
+        if snapshot.live is not None and lo not in swept_set and hi not in swept_set:
+            continue
         if lo not in live or hi not in live:
             departed.append(
                 DepartedFinding(
@@ -1180,6 +1201,9 @@ class CheckRunResult:
         departed: Finding-grade priors that stopped standing this run, echoed from
             the plan with their derived reason. The surface prints counts by
             reason; the identities ride the JSON.
+        tokens_input: Input tokens billed across every batch a response arrived
+            for, failed ones included — the run's spend, as the provider reported it.
+        tokens_output: Output tokens, likewise.
         failed_batches: One row per failed batch, in occurrence order, so
             ``len(failed_batches) == batches_failed``: its pairs, pin and usage
             (``None`` where no response arrived). The same rows land in
@@ -1209,6 +1233,8 @@ class CheckRunResult:
     end_probe: "StaleProbe | ProbeUnavailable"
     departed: Tuple[DepartedFinding, ...] = ()
     failed_batches: Tuple[FailedJudgmentBatch, ...] = ()
+    tokens_input: int = 0
+    tokens_output: int = 0
 
     @property
     def judgment_degraded(self) -> Optional[Unavailable]:
@@ -1538,6 +1564,8 @@ def execute_corpus_check(
     judgment_abort: Optional[Unavailable] = None
     consecutive_failures = 0
     batches_executed = 0
+    tokens_input = 0
+    tokens_output = 0
     batches_failed = 0
     batches_skipped = 0
     pairs_judged_fresh = 0
@@ -1657,6 +1685,11 @@ def execute_corpus_check(
 
         execution = judge(prompt)
         batches_executed += 1
+        billed_now = (_billed_execution(execution) if isinstance(execution, Unavailable)
+                      else execution)
+        if billed_now is not None:
+            tokens_input += billed_now.token_input or 0
+            tokens_output += billed_now.token_output or 0
         if isinstance(execution, Unavailable):
             record_batch_failure(  # isolated, or the abort — by class
                 execution, group=group, billed=_billed_execution(execution)
@@ -1792,6 +1825,8 @@ def execute_corpus_check(
         end_probe=end_probe,
         departed=plan.departed,
         failed_batches=tuple(failed_batches),
+        tokens_input=tokens_input,
+        tokens_output=tokens_output,
     )
 
 

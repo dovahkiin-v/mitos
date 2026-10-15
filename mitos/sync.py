@@ -91,6 +91,7 @@ from mitos.identity import (
 )
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.provider_cause import describe_embed_failure
+from mitos.shell_quote import shell_flag
 from mitos.tool_markup import field_values, find_tool_call_markup
 from mitos.vector_store import QdrantVectorStore, hash_to_uuid
 from mitos.renderer import MitosRenderer, OVERFLOW_HINT_WINDOW_SECONDS, summarize_overflows
@@ -1654,6 +1655,12 @@ class MitosSyncManager:
             # is empty reaches the return above this one and DOES report, correctly,
             # because on that corpus the named target genuinely is absent.
             ledger.mark_keyless()
+            # The keyless floor commits nothing, but what rotates is a property of the
+            # buffer, not of this run's commits — so it evaluates rotation before it
+            # returns, exactly as the keyed path does after its commits (D2; Vinga's
+            # D-3e-5 ruling, 2026-09-18). Without it a keyless workspace drained only
+            # through `record`.
+            self._rotate_after_sync()
             return
             
         renderer = MitosRenderer(self.config.workspace_dir)
@@ -1994,24 +2001,8 @@ class MitosSyncManager:
         for entry, _raw, exc in residual:
             self._report_commit_quarantine(entry, exc)
 
-        # 4. Archive rotation of the buffer's settled tail. What rotates is a property
-        # of the buffer, not of this run's commits: `_rotate_settled` reads the live
-        # buffer once under the lock and moves the contiguous settled run at its
-        # oldest end, bounded per acquisition. A rotation failure — a graph read
-        # included — is reported here and never fails the sync: the commits stand.
-        # Every line goes to stderr, and nothing rotated is silence.
-        try:
-            outcome = self._rotate_settled(window=settledness.ROTATION_WINDOW_ENTRIES)
-        except Exception as e:
-            sys.stdout.flush()
-            print(
-                f"[Warning] Archive rotation failed: {e}. decisions.md is unchanged; an "
-                f"archive may already hold a copy of the entries it was moving.",
-                file=sys.stderr,
-            )
-        else:
-            if outcome is not None:
-                self._report_rotation(outcome)
+        # 4. Archive rotation of the buffer's settled tail.
+        self._rotate_after_sync()
 
         # 5. Trigger renderer to statelessly regenerate files (C3)
         try:
@@ -2034,6 +2025,27 @@ class MitosSyncManager:
             hits, misses, rate = self.embed_provider.get_stats()
             print(f"\n[Observability] Cache Stats: Hits: {hits}, Misses: {misses}, Hit Rate: {rate*100:.1f}%")
 
+    def _rotate_after_sync(self) -> None:
+        """Rotates the buffer's settled tail on the sync path and words the outcome.
+
+        `_rotate_settled` reads the live buffer once under the lock and moves the
+        contiguous settled run at its oldest end, bounded per acquisition. A rotation
+        failure — a graph read included — is reported here and never fails the sync:
+        the commits stand. Every line goes to stderr, and nothing rotated is silence.
+        """
+        try:
+            outcome = self._rotate_settled(window=settledness.ROTATION_WINDOW_ENTRIES)
+        except Exception as e:
+            sys.stdout.flush()
+            print(
+                f"[Warning] Archive rotation failed: {e}. decisions.md is unchanged; an "
+                f"archive may already hold a copy of the entries it was moving.",
+                file=sys.stderr,
+            )
+        else:
+            if outcome is not None:
+                self._report_rotation(outcome)
+
     def _rotate_settled(self, *, window: int) -> Optional[rotation.RotationOutcome]:
         """Rotates the buffer's settled tail, at most ``window`` entries, archive first.
 
@@ -2047,9 +2059,10 @@ class MitosSyncManager:
         ``config.decisions_file`` is read, and it is parsed as decisions, so an open
         question never rotates.
 
-        On the sync path this runs after the commits and their quarantine fixpoint. A
-        sync that returns before that — an empty buffer, no ``GEMINI_API_KEY``, or a
-        lock timeout — evaluates nothing. A run whose entries were skipped for review
+        On the sync path this runs after the commits and their quarantine fixpoint, and
+        on the keyless floor in their place (that floor commits nothing, but the buffer's
+        settled tail does not depend on this run's commits). A sync that returns earlier
+        — an empty buffer or a lock timeout — evaluates nothing. A run whose entries were skipped for review
         does evaluate: an uncommitted entry is simply never settled.
 
         On the record path ``record_decision_entry`` calls it once per ``created``
@@ -3562,7 +3575,7 @@ class MitosSyncManager:
             # After the edge lines and before any refusal, so this recipe never sits
             # beside a `--reconcile-entry` one where the two could be mistaken.
             print("  Only the differing spans are shown. For the whole values:")
-            print(f"    mitos sync -p {self.config.project!r} --full")
+            print(f"    mitos sync {shell_flag('-p', self.config.project)} --full")
 
         # `authorized` satisfies BOTH branches below for the entry the caller named,
         # and nothing else: the fall-through is the shipped one, not a second route.
@@ -3585,8 +3598,8 @@ class MitosSyncManager:
                 # RENAME the graph's slug is the one string this recipe must not carry
                 # — a caller copying it would name an entry no parsed block matches and
                 # get the never-seen refusal on a target sitting in front of them.
-                print(f"    mitos sync -p {self.config.project!r} "
-                      f"--reconcile-entry {entry.slug!r}")
+                print(f"    mitos sync {shell_flag('-p', self.config.project)} "
+                      f"{shell_flag('--reconcile-entry', entry.slug)}")
                 print("  Or restore the relation line in decisions.md to reconcile "
                       "the commentary alone.")
                 return False
@@ -3606,8 +3619,8 @@ class MitosSyncManager:
                           "authorized no repair for this entry. To apply it "
                           "non-interactively, name it:")
                     # The markdown slug, for the reason the sibling refusal states.
-                    print(f"    mitos sync -p {self.config.project!r} "
-                          f"--reconcile-entry {entry.slug!r}")
+                    print(f"    mitos sync {shell_flag('-p', self.config.project)} "
+                          f"{shell_flag('--reconcile-entry', entry.slug)}")
                     return False
                 choice = input("Reconcile the graph to the markdown? "
                                "[r]econcile / [s]kip: ").strip().lower()
@@ -4469,6 +4482,15 @@ class MitosSyncManager:
                 # Ahead of the closing sentence, so the commitment retraction still
                 # closes the body.
                 echo_prose = "".join(f"{line}. " for line in _declared_echo_lines(echo))
+                # B9's dereference sentence only where it can apply: a neighbour that
+                # carries a stamp. On an unstamped set it sent the caller to chase a
+                # field no neighbour has.
+                stamp_clause = (
+                    "If you go on to supersede or amend a neighbour, an "
+                    "amended_by/narrowed_by stamp on it means it has moved on — "
+                    "dereference that slug before linking. "
+                    if any(n.get("amended_by") or n.get("narrowed_by") for n in neighbors)
+                    else "")
                 return {
                     "status": "needs_review",
                     "code": "similar_decision_exists",
@@ -4484,9 +4506,7 @@ class MitosSyncManager:
                         "neighbour this decision genuinely relates to, "
                         "acknowledge_neighbors=True for neighbours that stand "
                         "independently alongside it — or both at once for a mixed "
-                        "set. If you go on to supersede or amend a neighbour, an "
-                        "amended_by/narrowed_by stamp on it means it has moved on — "
-                        "dereference that slug before linking. "
+                        f"set. {stamp_clause}"
                         f"{PAUSE_HELD_CLAUSE}{_PAUSE_DIGEST_CLAUSE} {echo_prose}"
                         "Nothing was written."
                     ),
