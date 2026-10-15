@@ -221,10 +221,16 @@ def test_cli_pathology_show_and_list(isolated_workspace, capsys) -> None:
     
     # 1. Attempt to show nonexistent slug — the genuine-absence branch carries the
     #    static, hedged `mitos sync` pointer (5a: a None means typo or unsynced draft).
-    cmd_show(config, "nonexistent-slug")
+    #    Since 0.19.1 the text miss is an error exit (stderr, exit 1) — inverted here
+    #    deliberately, not rewritten: still no Python trace, still the quiet line.
+    capsys.readouterr()  # drop cmd_init's banner so the stdout-silence pin is show's alone
+    with pytest.raises(SystemExit) as exc:
+        cmd_show(config, "nonexistent-slug")
+    assert exc.value.code == 1
     captured = capsys.readouterr()
-    assert "not found" in captured.out.lower()
-    assert "mitos sync" in captured.out.lower()
+    assert "not found" in captured.err.lower()
+    assert "mitos sync" in captured.err.lower()
+    assert captured.out == ""
 
     # 2. Attempt to list with empty database
     cmd_list(config)

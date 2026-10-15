@@ -1516,7 +1516,10 @@ def cmd_show(config: MitosConfig, ident: str, as_json: bool = False) -> None:
     instead of 404-ing. Only a genuinely-absent identifier reaches the not-found
     branch, whose hedged ``mitos sync`` pointer reads no buffer (truthful for both a
     typo and an authored-but-unsynced draft) and names the caller's own selector, so
-    the recipe it prints is one a post-flip shell will actually run.
+    the recipe it prints is one a post-flip shell will actually run. A miss exits 1
+    on both arms (ruled 2026-10-15, the `amend-commentary` convention): text puts
+    the line on stderr, ``--json`` still emits the ``{found: false}`` object and
+    then exits 1, so a shell reads the code and a parser reads the body.
     With ``as_json`` it emits a
     Letter-complete, modifier-stamped JSON object (the not-found case a JSON object
     too, never a bare text print) — both shapes carrying the trailing
@@ -1531,11 +1534,6 @@ def cmd_show(config: MitosConfig, ident: str, as_json: bool = False) -> None:
     Returns:
         None.
     """
-    # Both text exits (the dereferenced node and the not-found pointer) answer on
-    # stdout, so one gated leading echo covers them; the two `--json` branches
-    # carry the same three fields as keys and must not also carry a text line.
-    if not as_json:
-        _echo_corpus(config)
     store = GraphStore(config.db_path)
 
     # State-agnostic resolution: id → active slug → most-recent in lineage → None.
@@ -1552,12 +1550,27 @@ def cmd_show(config: MitosConfig, ident: str, as_json: bool = False) -> None:
             # Provenance last, exactly as the `show_node` twin stamps it: the
             # absent-handle answer is the one most in need of naming its corpus
             # ("no such handle here" vs "you asked the wrong project").
+            # The object is emitted on every exit and the code still says miss:
+            # exit 1 on both arms (ruled 2026-10-15), the convention
+            # `amend-commentary` set — a JSON object on every exit, never a
+            # miss exiting 0. `show_node`, the MCP twin, keeps returning the
+            # same object in-band; the exit code is the CLI's channel alone.
             missing = {"found": False, "ident": ident, "hint": hint}
             missing.update(corpus_provenance(config))
             _emit_json(missing)
-            return
-        print(f"Node with ID or Slug '{ident}' not found — {hint}.")
-        return
+            sys.exit(1)
+        # The text miss is an error exit: stderr, exit 1, with the corpus echo on
+        # the same channel — the rule the record and reconcile error paths keep,
+        # so a shell asking "does this handle exist" reads the code and a stdout
+        # consumer never sees a not-found line where a node was expected.
+        _echo_corpus(config, file=sys.stderr)
+        print(f"Node with ID or Slug '{ident}' not found — {hint}.", file=sys.stderr)
+        sys.exit(1)
+
+    # The text hit answers on stdout, led by the gated corpus echo; the `--json`
+    # branch carries the same three fields as keys and must not also carry a text line.
+    if not as_json:
+        _echo_corpus(config)
 
     # Compute the node's state in its own kind's vocabulary — the kind-aware read
     # `show_node` calls too, so an open question reads parked/resolved (or a kill
@@ -8217,7 +8230,7 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Set ranked top-k to retrieve (1–50; default 5). Raises or lowers the count — a context-budget dial.")
 
     # show
-    show_p = subparsers.add_parser("show", help="Display details of a specific node.")
+    show_p = subparsers.add_parser("show", help="Display details of a specific node. A missing handle exits 1 (text on stderr; --json still emits {found: false}).")
     show_p.add_argument("ident", help="Slug or ID of node.")
     show_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON (for agents).")
 

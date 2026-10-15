@@ -485,12 +485,49 @@ def test_cli_show_json_not_found_is_object_with_hint(ws, capsys) -> None:
     """
     config, m = ws
     capsys.readouterr()
-    cmd_show(config, "no-such-slug", as_json=True)
+    with pytest.raises(SystemExit):  # exit 1 on a miss since 0.19.1; the object still lands
+        cmd_show(config, "no-such-slug", as_json=True)
     out = json.loads(capsys.readouterr().out)
     assert out["found"] is False
     assert out["ident"] == "no-such-slug"
     assert "mitos sync" in out["hint"].lower()
     assert f"-p {config.project!r}" in out["hint"]
+
+
+def test_cli_show_text_not_found_exits_1_on_stderr(ws, capsys) -> None:
+    """Text `show` on a genuinely-absent handle exits 1 with the not-found line (and
+    the corpus echo) on stderr, and prints nothing to stdout.
+
+    The exit-code contract, ruled 2026-10-15: a shell asking "does this handle exist"
+    reads the code, so a miss is non-zero — the channel rule the record and reconcile
+    error paths already keep (echo + message on stderr).
+    """
+    config, m = ws
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as exc:
+        cmd_show(config, "no-such-slug", as_json=False)
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "no-such-slug" in captured.err
+    assert "not found" in captured.err
+    assert "mitos sync" in captured.err.lower()
+
+
+def test_cli_show_json_not_found_emits_object_then_exits_1(ws, capsys) -> None:
+    """The `--json` miss emits the `{found: false}` object on stdout AND exits 1 —
+    the `amend-commentary` convention (a JSON object on every exit, never a miss
+    exiting 0), so a shell reads the code and a parser reads the body. The MCP
+    twin `show_node` keeps returning the same object in-band; the exit code is
+    the CLI's channel alone."""
+    config, m = ws
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as exc:
+        cmd_show(config, "no-such-slug", as_json=True)
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["found"] is False
+    assert captured.err == ""
 
 
 # --------------------------------------------------------------------------- #
@@ -637,7 +674,15 @@ def test_show_node_parity_with_cli_show_json(ws, capsys) -> None:
     ro = GraphStore(config.db_path, read_only=True)
     for ident in ("par-v1", "par-oq", "nope-not-here"):
         capsys.readouterr()
-        cmd_show(config, ident, as_json=True)
+        if ident == "nope-not-here":
+            # The CLI miss exits 1 since 0.19.1 and still emits the object; the
+            # MCP twin returns the same object in-band. Shape parity holds
+            # across that channel difference — which is what this row pins.
+            with pytest.raises(SystemExit) as exc:
+                cmd_show(config, ident, as_json=True)
+            assert exc.value.code == 1
+        else:
+            cmd_show(config, ident, as_json=True)
         cli_out = json.loads(capsys.readouterr().out)
         with patch.object(mcp_server, "get_workspace_components", return_value=(ro, None, None)):
             mcp_out = json.loads(mcp_server.show_node(ident, project=config.workspace_dir))
