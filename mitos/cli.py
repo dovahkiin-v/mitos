@@ -4275,7 +4275,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
         print(f"      ({q['points']} vector(s) indexed)")
     # The three corpus locations that have no check row to hang off, as neutral `•`
     # facts in the idiom the report already speaks (`• graph holds …`, `• {n}
-    # graveyard point(s)`) — a resolved path passes and fails nothing, so it is not
+    # point(s) belong to retired nodes`) — a resolved path passes and fails nothing, so it is not
     # a rung in any glyph and never joins `checks`. Unconditional by design: the two
     # sessions that grepped `.mitos/decisions.md` and got confident zero-hit answers
     # were working in HEALTHY workspaces where every row read ✓, so a path shown
