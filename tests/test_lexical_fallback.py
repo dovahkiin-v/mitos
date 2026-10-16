@@ -600,7 +600,7 @@ _ABSENT = "mitos-tmp-absent-collection"
 class _MissingCollection:
     """A vector store answering: Qdrant is up, that collection does not exist."""
 
-    def query(self, vector, limit=5):
+    def query(self, vector, limit=5, *, with_payload=True):
         raise CollectionMissingError(
             f"Qdrant collection '{_ABSENT}' does not exist "
             "(Qdrant is up and answered 404 to the query).",
@@ -912,7 +912,7 @@ class _NoMatches:
     verb reads as done while one exit says nothing (3e's per-EXIT lesson).
     """
 
-    def query(self, vector, limit=5):
+    def query(self, vector, limit=5, *, with_payload=True):
         return []
 
 

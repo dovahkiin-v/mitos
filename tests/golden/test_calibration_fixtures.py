@@ -174,3 +174,37 @@ def test_the_resolver_refuses_a_ref_that_is_not_one_item(index, ref, needle):
 def test_the_resolver_names_one_item_by_its_option_prefix(index):
     refs = CH.resolve_item_refs(index, _probe(target_items=[{"owner": "harbor-api-rate-limit", "option": "Per-IP"}]))
     assert [(r["ordinal"], len(r["part_ids"])) for r in refs["targets"]] == [(2, 1)]
+
+
+# --------------------------------------------------------------------------- #
+# Phase 2a — the harness joins hits by point id, so an ids-only read labels too
+# --------------------------------------------------------------------------- #
+
+def test_label_hits_joins_an_ids_only_read_by_point_id(index):
+    """The production ids-only shape (``{point_id, score}``) carries no payload slug;
+    ``label_hits`` labels it through the ``hash_to_uuid(node_id)`` map, with the
+    node's slug, kind and liveness. The proxy forwards ``with_payload`` to the store
+    it wraps (bound explicitly: the module-scoped graph predates the per-test record)."""
+    from _point_hits import CannedVector
+
+    matches = [{"slug": n["slug"], "score": 0.9 - 0.001 * i} for i, n in enumerate(index.nodes)]
+    proxy = CH.RecordingVectorStore(CannedVector(matches, store=index.store))
+    raw = proxy.query([0.1], limit=len(matches), with_payload=False)
+    assert all(set(h) == {"point_id", "score"} for h in raw)
+    assert proxy.calls[0][0] == len(matches)
+
+    first = index.nodes[0]["slug"]
+    hits = CH.label_hits(index, raw, [first])
+
+    assert [h["slug"] for h in hits] == [n["slug"] for n in index.nodes]
+    assert [h["kind"] for h in hits] == [n["kind"] for n in index.nodes]
+    assert [h["live"] for h in hits] == [index.live_by_slug[n["slug"]] for n in index.nodes]
+    assert [h["self"] for h in hits] == [s == first for s in (n["slug"] for n in index.nodes)]
+    assert {False, True} <= {h["live"] for h in hits}  # retired nodes are in the window
+
+
+def test_label_hits_refuses_a_point_the_collection_was_not_built_from(index):
+    from _point_hits import orphan_point_id
+
+    with pytest.raises(AssertionError, match="not a point this collection was built from"):
+        CH.label_hits(index, [{"point_id": orphan_point_id("stray"), "score": 0.5}], [])

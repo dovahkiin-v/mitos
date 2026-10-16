@@ -9,6 +9,7 @@ exercise those features re-enable them explicitly (``monkeypatch.delenv(...)``).
 
 import os
 
+import _point_hits
 import live_helpers
 
 import pytest
@@ -224,6 +225,35 @@ def hermetic_mitos_env(request, monkeypatch, tmp_path):
             monkeypatch.delenv(name, raising=False)
 
 
+# Record every GraphStore construction, so a canned vector double with no explicit
+# store can bind to the one graph its test built (tests/_point_hits.py).
+_point_hits.install_store_recorder()
+
+
+@pytest.fixture(autouse=True)
+def point_hit_fixture_faults():
+    """Fails a test that ends with an unconsumed canned-hit fixture fault (2a, G1).
+
+    A canned vector double never raises on a fixture mistake — a slug naming no
+    node or several, a double with no graph to bind, an unknown keyed vector —
+    because every reader wraps its search in a broad catch, and a raise there
+    reads as a degraded or empty window, which an absence-asserting row would
+    pass over (vision §6.2 constraint 8). The double records the fault instead,
+    and this teardown fails the test outside any reader's catch. The same record
+    holds the test's ``GraphStore`` constructions for the doubles' fallback
+    binding; both are cleared per test.
+    """
+    _point_hits.begin_test()
+    yield
+    faults = _point_hits.end_test()
+    if faults:
+        pytest.fail(
+            "unconsumed canned-hit fixture fault(s) — the test's vector double could "
+            "not honour the point-id contract:\n  " + "\n  ".join(faults),
+            pytrace=False,
+        )
+
+
 @pytest.fixture(scope="session", autouse=True)
 def sweep_leaked_qdrant_collections():
     """After the whole suite, delete test-ONLY collections from the shared Qdrant.
@@ -293,6 +323,7 @@ LIVE_MODULES: tuple[str, ...] = (
     "test_collection_absence_live.py",
     "test_status_overview_live.py",
     "test_calibration_live.py",
+    "test_point_identity_live.py",
 )
 
 

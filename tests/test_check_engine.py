@@ -236,7 +236,7 @@ def _plan(
     **kwargs: Any,
 ) -> CheckPlan:
     """Plans over the keyed substrate at production pins (overridable via kwargs)."""
-    embed, vector = _keyed_substrate(neighbourhoods)
+    embed, vector = _keyed_substrate(neighbourhoods, store=store)
     kwargs.setdefault("model_alias", PRODUCTION_ALIAS)
     return plan_corpus_check(
         store=store,

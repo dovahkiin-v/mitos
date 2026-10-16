@@ -87,7 +87,8 @@ class _SeveredVector(_FakeVector):
     breaker gate returned first (the clean freeze counter, plan D3).
     """
 
-    def query(self, vector: List[float], limit: int = 5) -> List[Dict[str, Any]]:
+    def query(self, vector: List[float], limit: int = 5, *,
+              with_payload: bool = True) -> List[Dict[str, Any]]:
         self.queries += 1
         raise VectorStoreError("qdrant query severed")
 
@@ -99,7 +100,8 @@ class _CollectionlessVector(_FakeVector):
     turns on, injected at the same seam as its sibling above.
     """
 
-    def query(self, vector: List[float], limit: int = 5) -> List[Dict[str, Any]]:
+    def query(self, vector: List[float], limit: int = 5, *,
+              with_payload: bool = True) -> List[Dict[str, Any]]:
         self.queries += 1
         raise CollectionMissingError(
             "Qdrant collection 'mitos-x' does not exist", collection="mitos-x"
@@ -432,7 +434,8 @@ def test_raw_cause_detail_never_leaks_to_stdout(
     secret = "QDRANT-RAW-CAUSE-DO-NOT-PRINT-7f3a"
 
     class _DetailVector(_FakeVector):
-        def query(self, vector: List[float], limit: int = 5) -> List[Dict[str, Any]]:
+        def query(self, vector: List[float], limit: int = 5, *,
+                  with_payload: bool = True) -> List[Dict[str, Any]]:
             self.queries += 1
             raise VectorStoreError(secret)
 

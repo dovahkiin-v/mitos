@@ -229,7 +229,8 @@ def test_graph_fault_inside_check_never_blocks_commit(
     judge = _RecordingJudge(_execution([]))
 
     class _BoomVector(_FakeVector):
-        def query(self, vector: List[float], limit: int = 5) -> List[Dict[str, Any]]:
+        def query(self, vector: List[float], limit: int = 5, *,
+                  with_payload: bool = True) -> List[Dict[str, Any]]:
             raise RuntimeError("qdrant/graph exploded mid-check")
 
     manager.embed_provider = _FakeEmbed()  # type: ignore[assignment]

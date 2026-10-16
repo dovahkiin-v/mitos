@@ -24,6 +24,7 @@ are REAL content hashes); zero LLM, zero telemetry, zero writes. Run under
 ``./venv/bin/python -m pytest`` (bare ``python`` lacks the deps).
 """
 
+import hashlib
 import os
 import tempfile
 from typing import Any, Dict, List, Optional
@@ -53,6 +54,7 @@ from mitos.parser import ParsedEntry
 from mitos.store import GraphStore
 
 from _conflict_helpers import _keyed_substrate, _match
+from _point_hits import point_hit
 
 
 # --------------------------------------------------------------------------- #
@@ -603,8 +605,11 @@ def test_gather_internal_store_fault_propagates_out_of_iter_sweep() -> None:
     faults degrade)."""
     node = _pure_node("hash-a", "fault-a")
     snapshot = CorpusSnapshot(nodes=(node,), edge_index=build_strong_edge_index([]))
+    # The store is a fault double holding no graph, so the hit is authored raw: a
+    # point naming a node (id derived, never hardcoded) whose re-verify read faults.
+    neighbour_id = hashlib.sha256(b"neighbour").hexdigest()
     embed, vector = _keyed_substrate(
-        {node["core_axiom"]: [_match("neighbour", 0.9)]}
+        {node["core_axiom"]: [point_hit(neighbour_id, 0.9, slug="neighbour")]}
     )
     with pytest.raises(DatabaseError):
         list(

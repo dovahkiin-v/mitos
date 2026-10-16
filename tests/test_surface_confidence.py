@@ -45,6 +45,8 @@ from mitos.recall import (_SURFACE_POINTERS, assess_query_recall,
                           SURFACE_WEAK_THRESHOLD, WindowLever, limit_clause,
                           window_lever)
 
+from _point_hits import CannedVector, orphan_hit
+
 
 # The cause the degraded rows inject. It is the phrase the "no providers" route
 # really produces (``degraded_reason_from_error(None, …)``), so an end-to-end row
@@ -93,12 +95,8 @@ class _FakeEmbed:
         return [0.1, 0.2, 0.3]
 
 
-class _FakeVector:
-    def __init__(self, matches):
-        self._matches = matches
-
-    def query(self, vector, limit=5):
-        return self._matches
+class _FakeVector(CannedVector):
+    """Canned matches through the shared leaf (every hit carries its ``point_id``)."""
 
 
 def _counts(*names_and_counts):
@@ -301,7 +299,7 @@ def _surface_with(matches, ws, query="some claim", scope=None, full_top=None, br
     from mitos import mcp_server
     config, _ = ws
     store = GraphStore(config.db_path, read_only=True)
-    vector = _FakeVector(matches) if isinstance(matches, list) else matches
+    vector = _FakeVector(matches, store=store) if isinstance(matches, list) else matches
     embed = None if matches is None else _FakeEmbed()
     with patch.object(mcp_server, "get_workspace_components",
                       return_value=(store, embed, vector)):
@@ -824,14 +822,14 @@ def test_every_band_composer_call_site_is_accounted_for():
 class _Boom:
     """A vector store that fails mid-query — the generic degraded route."""
 
-    def query(self, vector, limit=5):
+    def query(self, vector, limit=5, *, with_payload=True):
         raise RuntimeError("qdrant fell over")
 
 
 class _MissingCollection:
     """Qdrant is up and says that collection does not exist."""
 
-    def query(self, vector, limit=5):
+    def query(self, vector, limit=5, *, with_payload=True):
         raise CollectionMissingError(
             "Qdrant collection 'mitos-tmp-absent' does not exist.",
             collection="mitos-tmp-absent",
@@ -841,7 +839,7 @@ class _MissingCollection:
 class _NoMatches:
     """Present, and simply returns nothing — the healthy-empty arm's other shape."""
 
-    def query(self, vector, limit=5):
+    def query(self, vector, limit=5, *, with_payload=True):
         return []
 
 
@@ -967,7 +965,7 @@ def _mcp_query(matches, ws, query="a claim that is not any slug", full_top=None,
     from mitos import mcp_server
     config, _ = ws
     store = GraphStore(config.db_path, read_only=True)
-    vector = _FakeVector(matches) if isinstance(matches, list) else matches
+    vector = _FakeVector(matches, store=store) if isinstance(matches, list) else matches
     embed = None if matches is None else _FakeEmbed()
     with patch.object(mcp_server, "get_workspace_components",
                       return_value=(store, embed, vector)):
@@ -1925,7 +1923,8 @@ def test_the_blackout_and_the_unbuilt_graph_carry_the_notice_too(ws, cloned, mon
     from mitos import mcp_server
     store = GraphStore(config.db_path, read_only=True)
     with patch.object(mcp_server, "get_workspace_components", return_value=(
-            store, _FakeEmbed(), _FakeVector([{"slug": "dead-v1", "score": 0.9}]))):
+            store, _FakeEmbed(),
+            _FakeVector([{"slug": "dead-v1", "score": 0.9}], store=store))):
         blackout = json.loads(mcp_server.surface_decisions("c", project=config.workspace_dir))
     assert blackout["all_superseded"]
     assert blackout["check_notice"]["state"] == _gate()._SHOWN["started"]["state"]
@@ -2430,8 +2429,9 @@ def test_a_full_window_that_surfaces_nothing_names_no_lever(ws, driver):
     config, _ = ws
     _seed_4c(ws)
     call, key, _verb, surface = _4A_DRIVERS[driver]
+    # The four ghosts are points no node carries — orphans, declared as such.
     points = [{"slug": "oq-parked", "score": 0.7}] + [
-        {"slug": f"ghost-{i}", "score": 0.65} for i in range(4)]
+        orphan_hit(0.65, slug=f"ghost-{i}", tag=f"ghost-{i}") for i in range(4)]
     resp = call(points, ws)
     assert resp["confidence"] == "none"
     assert resp[key] == []
@@ -2491,8 +2491,9 @@ def test_no_lever_at_the_clamp_ceiling(ws, driver):
     _seed_4c(ws)
     call, _key, _verb, surface = _4A_DRIVERS[driver]
     for limit, present in ((50, False), (49, True)):
+        # Raw points filling the window: orphans, declared as such.
         points = [{"slug": "dec-a", "score": 0.7}] + [
-            {"slug": f"ghost-{i}", "score": 0.61} for i in range(limit - 1)]
+            orphan_hit(0.61, slug=f"ghost-{i}", tag=f"ghost-{i}") for i in range(limit - 1)]
         resp = call(points, ws, limit=limit)
         assert resp["confidence"] == "weak"
         base = _base_note(driver, config, 0.7, 1)

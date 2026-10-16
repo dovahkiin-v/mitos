@@ -14,6 +14,7 @@ reaches a live service. ``drifted`` is not constructible on the real v0.1 store 
 channel is reserved) → its "kept as live" case uses a stub store.
 """
 
+import hashlib
 import shutil
 import tempfile
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -36,6 +37,8 @@ from mitos.errors import (CollectionMissingError, DatabaseError, EmbeddingError,
 from mitos.identity import canonical_core_string_norm, embedding_text
 from mitos.parser import ParsedEntry
 from mitos.store import GraphStore
+
+from _point_hits import CannedVector, orphan_hit, orphan_point_id, point_hit
 
 
 # --------------------------------------------------------------------------- #
@@ -122,28 +125,41 @@ class _FakeEmbed:
         return [0.1, 0.2, 0.3]
 
 
-class _FakeVector:
-    """Returns canned matches (or raises); records the over-fetch limit + call count."""
+class _FakeVector(CannedVector):
+    """Returns canned matches (or raises); records the over-fetch limit + call count.
+
+    Routes through the shared canned-hit leaf, so every hit carries its node's
+    ``point_id`` and ``limit`` is honoured as production honours it.
+    """
 
     def __init__(
         self,
         matches: Optional[List[Dict[str, Any]]] = None,
         raises: Optional[BaseException] = None,
     ) -> None:
-        self._matches = matches if matches is not None else []
+        super().__init__(matches)
         self._raises = raises
-        self.last_limit: Optional[int] = None
-        self.call_count = 0
 
-    def query(self, vector: List[float], limit: int = 5) -> List[Dict[str, Any]]:
-        self.call_count += 1
-        self.last_limit = limit
+    @property
+    def call_count(self) -> int:
+        return self.queries
+
+    def canned_for(self, vector: List[float]) -> Optional[List[Dict[str, Any]]]:
         if self._raises is not None:
             raise self._raises
-        return list(self._matches)
+        return self._matches
 
     def upsert(self, *a: Any, **k: Any) -> None:  # pragma: no cover - never hit in 2a
         pass
+
+
+def _stub_hit(slug: str, score: float) -> Dict[str, Any]:
+    """A raw production-shaped hit for a ``_StubStore`` row (it holds no graph to bind).
+
+    The id is derived from the slug, never hardcoded; the gather still joins on the
+    payload slug in 2a, so only the hit's shape matters here.
+    """
+    return point_hit(hashlib.sha256(slug.encode("utf-8")).hexdigest(), score, slug=slug)
 
 
 class _SpyStore:
@@ -293,7 +309,7 @@ def test_s3_absent_and_retired_drop_at_none_without_probing_state(store: GraphSt
     _supersede(store, "eviction-fifo", "eviction-lru")
     spy = _SpyStore(store)
     matches = [
-        {"slug": "ghost-never-committed", "score": 0.9},  # (a) absent → None
+        orphan_hit(0.9, slug="ghost-never-committed"),     # (a) absent → None
         {"slug": "eviction-lru", "score": 0.8},           # (b) superseded → None (active-scoped)
     ]
     result = _gather("Axiom.", _FakeEmbed(), _FakeVector(matches), spy)
@@ -345,7 +361,7 @@ def test_open_question_match_is_dropped_by_kind_not_crashed_on(store: GraphStore
 def test_s3_drops_when_state_reverify_says_superseded_even_if_slug_resolved() -> None:
     """A node that passes the active-view slug read but whose computed state is superseded is dropped."""
     stub = _StubStore(state="superseded")
-    matches = [{"slug": "raced-out", "score": 0.9}]
+    matches = [_stub_hit("raced-out", 0.9)]
     result = _gather("Axiom.", _FakeEmbed(), _FakeVector(matches), stub)
 
     assert result == []
@@ -360,7 +376,7 @@ def test_s3_drops_when_state_reverify_says_superseded_even_if_slug_resolved() ->
 def test_drifted_is_kept_as_live() -> None:
     """A ``drifted`` computed state counts as live (``active ∪ drifted``) and is kept."""
     stub = _StubStore(state="drifted")
-    matches = [{"slug": "drifting", "score": 0.7}]
+    matches = [_stub_hit("drifting", 0.7)]
     result = _gather("Axiom.", _FakeEmbed(), _FakeVector(matches), stub)
 
     assert isinstance(result, list) and len(result) == 1
@@ -430,7 +446,7 @@ def test_collection_missing_is_its_own_typed_unavailable(store: GraphStore) -> N
 def test_store_fault_propagates_and_is_not_masked() -> None:
     """A ``DatabaseError`` from the graph store propagates — not swallowed into a lie."""
     stub = _StubStore(state_raises=DatabaseError("db locked"))
-    matches = [{"slug": "foo", "score": 0.9}]
+    matches = [_stub_hit("foo", 0.9)]
     with pytest.raises(DatabaseError):
         _gather("Axiom.", _FakeEmbed(), _FakeVector(matches), stub)
 
@@ -453,7 +469,7 @@ def test_all_matches_retired_returns_empty_list_not_unavailable(store: GraphStor
     _supersede(store, "new-policy", "old-policy")
     matches = [
         {"slug": "old-policy", "score": 0.9},     # superseded → None
-        {"slug": "vanished", "score": 0.8},        # absent → None
+        orphan_hit(0.8, slug="vanished"),          # absent → None
     ]
     result = _gather("Axiom.", _FakeEmbed(), _FakeVector(matches), store)
     assert result == []
@@ -467,7 +483,9 @@ def test_all_matches_retired_returns_empty_list_not_unavailable(store: GraphStor
 def test_none_slug_is_guarded_before_the_store_read(store: GraphStore) -> None:
     """A match with ``slug=None`` (vector_store emits it) drops with no ``get_node_by_slug`` call."""
     spy = _SpyStore(store)
-    matches = [{"slug": None, "score": 0.9}]
+    # Authored raw: a point whose payload carries no slug. Its subject retires with
+    # 2d's identity rewire; 2a keeps it honest (the hit still carries a point id).
+    matches = [{"point_id": orphan_point_id("none-slug"), "slug": None, "score": 0.9}]
     result = _gather("Axiom.", _FakeEmbed(), _FakeVector(matches), spy)
 
     assert result == []

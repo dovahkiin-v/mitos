@@ -9,8 +9,12 @@ import json
 import os
 import hashlib
 import logging
+import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import List, Dict, Optional, Any, FrozenSet, Sequence, Set, Tuple
+from typing import (
+    List, Dict, Optional, Any, FrozenSet, Iterable, Sequence, Set, Tuple,
+)
 from mitos.errors import (
     DatabaseError,
     ValidationError,
@@ -456,6 +460,16 @@ def compute_hash(
 # bound-variable limit on every build, including the older 999-variable default.
 _CREATED_AT_CHUNK = 500
 
+# Point-id prefixes bound per statement in ``GraphStore.resolve_point_ids``. One
+# bind per prefix (the range's upper bound is derived in SQL), so the same 500
+# keeps the statement under the 999-variable floor; ``_scopes_for`` runs once per
+# chunk because it does not chunk its own ``IN``.
+_POINT_ID_CHUNK = 500
+
+# A normalized point id: what remains of ``hash_to_uuid(node_id)`` once its dashes
+# are removed and it is lowercased — the first 32 hex characters of a node id.
+_POINT_ID_PREFIX_RE = re.compile(r"[0-9a-f]{32}")
+
 
 def _utc_now_iso() -> str:
     """Returns the current UTC instant as an ISO-8601 microsecond string (MI-10).
@@ -564,6 +578,50 @@ class CommitDelta:
             "commentary_fields_changed": self.commentary_fields_changed,
             "cascade_affected_scopes": self.cascade_affected_scopes
         }
+
+
+@dataclass(frozen=True)
+class PointResolution:
+    """The partition of a batch of vector-index point ids by the node each names.
+
+    Every distinct input string lands in exactly one of the three buckets. Keys
+    are the point ids exactly as given, so a caller indexes by a hit's own
+    ``point_id``.
+
+    Attributes:
+        nodes: Point id → the one node carrying its prefix, in the reader-facing
+            shape plus ``computed_state`` (``get_node_state``'s semantics) and no
+            modifier stamps. Each entry is its own shallow copy.
+        orphans: Point ids no node carries (or that are not a well-formed point
+            id), in input order, deduplicated.
+        ambiguous: Point id → the sorted ids of the two or more nodes sharing its
+            128-bit prefix; resolved to neither.
+    """
+
+    nodes: Dict[str, Dict[str, Any]]
+    orphans: List[str]
+    ambiguous: Dict[str, List[str]]
+
+
+def _point_id_prefix(point_id: Any) -> Optional[str]:
+    """Normalizes a point id to the node-id prefix it names, or None if it names none.
+
+    The inverse of ``vector_store.hash_to_uuid`` up to its truncation: dashes are
+    removed and the rest lowercased, and the result must be exactly 32 hex
+    characters. Anything else cannot be the prefix of a node id.
+
+    Args:
+        point_id: A point id as the vector index returned it.
+
+    Returns:
+        The 32-character lowercase hex prefix, or None.
+    """
+    if not isinstance(point_id, str):
+        return None
+    prefix = point_id.replace("-", "").lower()
+    if _POINT_ID_PREFIX_RE.fullmatch(prefix) is None:
+        return None
+    return prefix
 
 
 def _assert_sqlite_version() -> None:
@@ -1043,6 +1101,91 @@ class GraphStore:
             )
         finally:
             conn.close()
+
+    def resolve_point_ids(self, point_ids: Iterable[str]) -> PointResolution:
+        """Maps vector-index point ids to their nodes in one batched, state-agnostic read.
+
+        A point id is ``hash_to_uuid(node_id)``: the first 128 bits of the node's
+        content-hash id, so a hit names its node without its payload slug, which is
+        a handle (mutable, MI-2; shared across a same-slug supersession, MI-13).
+        Each input is normalized by removing dashes and lowercasing and must then be
+        32 hex characters; anything else is an orphan. Inputs are deduplicated by
+        the raw string, each distinct prefix is read once, and every distinct raw
+        string gets its own bucket entry.
+
+        Per chunk this costs one ``FROM nodes`` SELECT — an indexed range join, a
+        node matching prefix ``p`` when ``p <= id < p || 'g'`` (ids are lowercase
+        hex and ``'g'`` sorts above every hex digit) — plus at most one bulk scope
+        fetch. The column is never lowercased, which would forfeit the index; the
+        CTE is aliased and ``nodes`` is not, because the derived-state fragments
+        correlate on the bare ``nodes`` (the alias trap), and no CTE column is
+        selected, because :meth:`_hydrate_node` would carry it onto the node.
+
+        ``computed_state`` mirrors :meth:`get_node_state` exactly (decision
+        vocabulary, ``drifted`` for an unkilled node with a drifted signal). An
+        orphan is found by the join returning nothing, never by asking a state:
+        :meth:`get_node_state` answers ``"active"`` for an id the graph does not
+        hold. No modifier stamps are applied — they are a separate batched read
+        (:meth:`get_modifiers_map`), so a stamp fault costs only the stamps.
+
+        Args:
+            point_ids: Point ids exactly as ``VectorStore.query`` returned them.
+
+        Returns:
+            The :class:`PointResolution` partition of the input. Empty input runs
+            no statement.
+
+        Raises:
+            DatabaseError: If the read fails.
+        """
+        raw = list(dict.fromkeys(point_ids))
+        prefix_of = {pid: _point_id_prefix(pid) for pid in raw}
+        prefixes = list(dict.fromkeys(p for p in prefix_of.values() if p is not None))
+        matched: Dict[str, List[Dict[str, Any]]] = {}
+        if prefixes:
+            conn = self._get_connection()
+            try:
+                for start in range(0, len(prefixes), _POINT_ID_CHUNK):
+                    chunk = prefixes[start:start + _POINT_ID_CHUNK]
+                    values = ",".join("(?)" for _ in chunk)
+                    rows = conn.execute(
+                        f"WITH p(lo) AS (VALUES {values}) "
+                        f"SELECT nodes.*, {_IS_DRIFTED_SQL}, {_KILLER_TYPE_SQL} "
+                        "FROM p JOIN nodes "
+                        "ON nodes.id >= p.lo AND nodes.id < p.lo || 'g'",
+                        chunk,
+                    ).fetchall()
+                    scopes_map = self._scopes_for(conn, [row["id"] for row in rows])
+                    for row in rows:
+                        # Read the state before hydrating: _hydrate_node pops
+                        # killer_type and recasts is_drifted.
+                        if row["killer_type"] is None and row["is_drifted"]:
+                            state = "drifted"
+                        else:
+                            state = _computed_decision_state(row["killer_type"])
+                        node = self._hydrate_node(row, scopes_map.get(row["id"], []))
+                        node["computed_state"] = state
+                        matched.setdefault(row["id"][:32], []).append(node)
+            except sqlite3.Error as e:
+                raise DatabaseError(
+                    f"Failed to resolve {len(prefixes)} point id(s): {str(e)}"
+                )
+            finally:
+                conn.close()
+
+        nodes: Dict[str, Dict[str, Any]] = {}
+        orphans: List[str] = []
+        ambiguous: Dict[str, List[str]] = {}
+        for pid in raw:
+            prefix = prefix_of[pid]
+            found = matched.get(prefix, []) if prefix is not None else []
+            if not found:
+                orphans.append(pid)
+            elif len(found) > 1:
+                ambiguous[pid] = sorted(node["id"] for node in found)
+            else:
+                nodes[pid] = dict(found[0])
+        return PointResolution(nodes=nodes, orphans=orphans, ambiguous=ambiguous)
 
     def _scopes_for(
         self, conn: sqlite3.Connection, node_ids: List[str]

@@ -12,16 +12,21 @@ hand it the proxy; the draft form calls ``conflict.gather_candidates`` with the 
 Both readers make exactly one ``query`` call, and the proxy keeps what it returned,
 scores included, before the reader drops retired hits into a list without scores.
 
-Hits are joined to nodes by payload slug inside this collection only, guarded at
-population by an assertion that every payload slug is unique. When 2a returns point ids
-from ``VectorStore.query``, the join moves to ``hash_to_uuid(node_id)``.
+Hits are joined to nodes by their point id: ``VectorStore.query`` returns each hit's
+``point_id`` (2a), and `index_graph` maps ``hash_to_uuid(node_id)`` to each node of the
+expected set. The map is built here, independently of ``GraphStore.resolve_point_ids``:
+an instrument that resolved through the code it measures could not catch that code being
+wrong. Labels stay slugs, so the sealed fixtures and every earlier run stay comparable;
+fixtures still name nodes by slug, which is why the slug-uniqueness assertion stays.
 
 A rejection-target fixture is also read against two more throwaway collections, the two
 rejection-index shapes ruling 2 compares: one point per rejected item part
 (``rejections.rejection_points``) and one point per decision holding its whole
 ``rejected_paths`` field. No shipped reader searches them before 5a, so `search_points`
-reads them raw, because only the raw search returns a point's **id**; both shape reads join
-hits to the graph by that id, never by payload.
+reads them raw with ``exact`` search, which makes "every point valued" a declaration —
+``VectorStore.query`` has no exact knob, and production has no reason to gain one. Both
+shape reads join hits to the graph by point id, never by payload. 5a's switch to the
+shipped rejection search retires `search_points`.
 
 This module imports ``_semantic_harness`` and never ``_conflict_harness``, which pulls
 ``anthropic`` in; Layer C makes no judge call.
@@ -70,8 +75,12 @@ class RecordingVectorStore:
         self._inner = inner
         self.calls: List[Tuple[int, List[Dict[str, Any]]]] = []
 
-    def query(self, vector: List[float], limit: int = 5) -> List[Dict[str, Any]]:
-        result = self._inner.query(vector, limit=limit)
+    def query(self, vector: List[float], limit: int = 5, *,
+              with_payload: bool = True) -> List[Dict[str, Any]]:
+        # Forwards the keyword: from 2c the readers pass ``with_payload=False``, and a
+        # wrapper rejecting it would raise inside the reader's catch-all and turn every
+        # read into a degraded one.
+        result = self._inner.query(vector, limit=limit, with_payload=with_payload)
         self.calls.append((limit, result))
         return result
 
@@ -112,6 +121,7 @@ class CalibrationIndex:
     workspace: str
     nodes: List[Dict[str, Any]]
     nodes_by_slug: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    nodes_by_point_id: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     live_by_slug: Dict[str, bool] = field(default_factory=dict)
     shapes: Optional[ShapeCollections] = None
 
@@ -169,15 +179,17 @@ def index_graph(store: Any, provider: Any = None, vstore: Any = None) -> Calibra
     slugs = [n["slug"] for n in nodes]
     duplicates = sorted({s for s in slugs if slugs.count(s) > 1})
     assert not duplicates, (
-        f"payload slugs must be unique for the harness's slug join (until 2a returns "
-        f"point ids); duplicated: {duplicates}"
+        f"slugs must be unique: fixtures name nodes by slug and labels are slugs "
+        f"(hits join by point id); duplicated: {duplicates}"
     )
     index = CalibrationIndex(store=store, provider=provider, vstore=vstore, workspace="", nodes=nodes)
     for node in nodes:
         index.nodes_by_slug[node["slug"]] = node
+        index.nodes_by_point_id[hash_to_uuid(node["id"])] = node
         index.live_by_slug[node["slug"]] = (
             node["kind"] == "decision" and store.get_node_state(node["id"]) in LIVE_STATES
         )
+    assert len(index.nodes_by_point_id) == len(nodes), "two nodes share a point id"
     return index
 
 
@@ -305,17 +317,23 @@ def resolve_item_refs(index: CalibrationIndex, fixture: Dict[str, Any]) -> Dict[
 # ---------------------------------------------------------------------------
 
 def label_hits(index: CalibrationIndex, raw: List[Dict[str, Any]], exclude: List[str]) -> List[Dict[str, Any]]:
-    """Labels raw hits with kind, liveness and self for `derive_result`."""
+    """Labels raw hits with slug, kind, liveness and self for `derive_result`.
+
+    Each hit joins to its node through its ``point_id`` — never its payload slug, which
+    an ids-only read does not carry — and the label is the node's slug. A point id this
+    collection was not built from asserts: the collection holds exactly the expected set.
+    """
     hits = []
     for h in raw:
-        node = index.nodes_by_slug.get(h["slug"])
-        assert node is not None, f"hit {h['slug']!r} is not a node this collection was built from"
+        node = index.nodes_by_point_id.get(h["point_id"])
+        assert node is not None, f"hit {h['point_id']!r} is not a point this collection was built from"
+        slug = node["slug"]
         hits.append({
-            "slug": h["slug"],
+            "slug": slug,
             "value": h["score"],
             "kind": node["kind"],
-            "live": index.live_by_slug[h["slug"]],
-            "self": h["slug"] in exclude,
+            "live": index.live_by_slug[slug],
+            "self": slug in exclude,
         })
     return hits
 
@@ -329,10 +347,12 @@ def _one_call(proxy: RecordingVectorStore, fixture: Dict[str, Any]) -> List[Dict
 
 
 def search_points(base_url: str, collection: str, vector: List[float], limit: int) -> List[Dict[str, Any]]:
-    """One raw ``POST …/points/search``: the only read that returns a point's id until 2a.
+    """One raw ``POST …/points/search`` with ``exact`` set, for the two shape collections.
 
     ``exact`` makes "every point valued" a declaration rather than a consequence of the
-    collection sitting below HNSW's indexing threshold.
+    collection sitting below HNSW's indexing threshold. ``VectorStore.query`` returns
+    point ids too since 2a, but it has no exact knob, so this read stays until 5a's
+    switch to the shipped rejection search retires it.
 
     Returns:
         ``[{"id", "score", "payload"}]``, best first.

@@ -175,28 +175,35 @@ class FakeVectorStore:
             self._collections[self.collection] = {}
         self._collections[self.collection][point_id] = (list(vector), dict(payload))
 
-    def query(self, vector: List[float], limit: int = 5) -> List[Dict[str, Any]]:
-        """Returns the nearest points in the real client's shape, best first."""
+    def query(self, vector: List[float], limit: int = 5, *,
+              with_payload: bool = True) -> List[Dict[str, Any]]:
+        """Returns the nearest points in the real client's shape, best first.
+
+        A point is stored under its node id (``upsert``'s ``point_id`` is the node
+        id), so each hit's ``point_id`` is ``hash_to_uuid(node id)``, exactly what
+        Qdrant returns for a mitos write; the hit is built by the shared canned-hit
+        leaf, which also projects ``with_payload=False`` to ``{point_id, score}``.
+        """
         from mitos.errors import CollectionMissingError
+
+        from _point_hits import PAYLOAD_DEFAULTS, point_hit, project_hit
 
         points = self._collections.get(self.collection)
         if points is None:
             raise CollectionMissingError(
                 f"collection {self.collection!r} is missing", collection=self.collection)
         ranked = sorted(
-            ((cosine(vector, stored), payload) for stored, payload in points.values()),
-            key=lambda pair: pair[0], reverse=True,
+            ((cosine(vector, stored), node_id, payload)
+             for node_id, (stored, payload) in points.items()),
+            key=lambda triple: triple[0], reverse=True,
         )
         return [
-            {
-                "slug": payload.get("slug"),
-                "scope": payload.get("scope", []),
-                "state": payload.get("state"),
-                "kind": payload.get("kind"),
-                "embedding_text": payload.get("embedding_text"),
-                "score": score,
-            }
-            for score, payload in ranked[:limit]
+            project_hit(
+                point_hit(node_id, score, **{k: payload[k] for k in PAYLOAD_DEFAULTS
+                                             if k in payload}),
+                with_payload,
+            )
+            for score, node_id, payload in ranked[:limit]
         ]
 
     def __getattr__(self, name: str) -> Any:

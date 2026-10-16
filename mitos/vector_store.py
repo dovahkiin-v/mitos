@@ -67,6 +67,22 @@ def _raise_response_error(resp: "requests.Response", *, operation: str,
     raise VectorStoreError(f"Qdrant {operation} failed: {resp.text}")
 
 
+def _is_point_id(value: Any) -> bool:
+    """Reports whether a value is a Qdrant point id: a string or an integer.
+
+    ``bool`` is an ``int`` subclass and is refused explicitly; ``None`` is refused,
+    so a hit carrying ``"id": null`` is a malformed answer, never the string
+    ``"None"``.
+
+    Args:
+        value: The ``id`` a search hit carried, or None when it carried none.
+
+    Returns:
+        True if the value can be a point id.
+    """
+    return isinstance(value, (str, int)) and not isinstance(value, bool)
+
+
 def _decode_result(resp: "requests.Response", *, operation: str) -> Any:
     """Extracts Qdrant's ``result`` from a 200 body, or raises a typed error.
 
@@ -426,6 +442,8 @@ class QdrantVectorStore:
         self,
         vector: List[float],
         limit: int = 5,
+        *,
+        with_payload: bool = True,
     ) -> List[Dict[str, Any]]:
         """Queries Qdrant for the semantically nearest vectors.
 
@@ -435,12 +453,27 @@ class QdrantVectorStore:
         ``gemini-live`` vs ``live-voice`` drift). Scope is handled downstream as a
         discoverability hint in :mod:`mitos.recall`, never as a recall filter.
 
+        Every hit carries ``point_id``: the Qdrant point id exactly as Qdrant
+        returns it, as a string. For a point mitos wrote it is
+        ``hash_to_uuid(node_id)`` — the first 128 bits of the node's content-hash
+        id, so the hit names its node — and it is **not** the 64-hex node id that
+        ``id`` means on a node dict (nor ``upsert``'s ``point_id`` argument, which
+        is the node id). A reader maps a hit to its node through this id
+        (:meth:`~mitos.store.GraphStore.resolve_point_ids`); the payload slug is a
+        handle, mutable and shareable across a same-slug supersession.
+
         Args:
             vector: The query embedding vector.
             limit: Maximum matches to return.
+            with_payload: When True (the default), each hit is
+                ``{point_id, slug, scope, state, kind, embedding_text, score}``,
+                a missing payload key reading ``[]`` for ``scope`` and ``None``
+                otherwise. When False, the request asks Qdrant for no payload and
+                each hit is exactly ``{point_id, score}``: no payload key appears,
+                not even as ``None``.
 
         Returns:
-            A list of dictionary results with payload and scores.
+            A list of hit dicts in Qdrant's ranked order.
 
         Raises:
             CollectionMissingError: If Qdrant is up but the collection does not
@@ -448,14 +481,16 @@ class QdrantVectorStore:
                 calling surface decides whether that is a gap or simply the empty
                 index of a project with nothing to index yet.
             VectorStoreError: If Qdrant is unreachable, returns another non-200
-                status, or answers 200 with a body of the wrong shape.
+                status, or answers 200 with a body of the wrong shape — including
+                a hit with no ``id``, or (when a payload was asked for) a hit whose
+                payload is not an object.
         """
         search_url = f"{self.base_url}/collections/{self.collection}/points/search"
 
         body: Dict[str, Any] = {
             "vector": vector,
             "limit": limit,
-            "with_payload": True
+            "with_payload": with_payload
         }
 
         try:
@@ -474,27 +509,40 @@ class QdrantVectorStore:
             # result coerced to empty is the one shape that reaches a fail-closed
             # consumer looking like a healthy "nothing matched".
             results = _decode_result(resp, operation="query")
+            # A hit with no `id` is the scroll's "200 of the wrong shape", refused
+            # the same way: coalesced to None, it would reach the resolver as an
+            # orphan and a whole window would read "nothing here" over a malformed
+            # answer. An `id` that is neither a string nor an integer (Qdrant's two
+            # point-id types) is the same fault by another spelling — `null` would
+            # otherwise become the string "None". A payload that is not an object
+            # (a `null` on the default path) is refused here too, rather than
+            # escaping untyped below.
             if not isinstance(results, list) or any(
-                not isinstance(item, dict) for item in results
+                not isinstance(item, dict)
+                or not _is_point_id(item.get("id"))
+                or (with_payload and not isinstance(item.get("payload", {}), dict))
+                for item in results
             ):
                 raise VectorStoreError(
                     "Qdrant query returned an unexpected result shape "
-                    "(expected a list of objects)."
+                    "(expected a list of objects, each carrying an `id`"
+                    + (" and an object payload)." if with_payload else ").")
                 )
 
             output = []
             for item in results:
-                # Format to a standard output tuple
-                payload = item.get("payload", {})
-                score = item.get("score", 0.0)
-                output.append({
-                    "slug": payload.get("slug"),
-                    "scope": payload.get("scope", []),
-                    "state": payload.get("state"),
-                    "kind": payload.get("kind"),
-                    "embedding_text": payload.get("embedding_text"),
-                    "score": score
-                })
+                hit: Dict[str, Any] = {"point_id": str(item["id"])}
+                if with_payload:
+                    payload = item.get("payload", {})
+                    hit.update({
+                        "slug": payload.get("slug"),
+                        "scope": payload.get("scope", []),
+                        "state": payload.get("state"),
+                        "kind": payload.get("kind"),
+                        "embedding_text": payload.get("embedding_text"),
+                    })
+                hit["score"] = item.get("score", 0.0)
+                output.append(hit)
 
             return output
 

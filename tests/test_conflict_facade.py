@@ -15,6 +15,7 @@ Facade fake ``node`` dicts are RICHER than 2b's ``{}`` — the facade hits
 (``candidate_payload`` → ``letter_payload``).
 """
 
+import hashlib
 import json
 from typing import Any, Dict, List, Optional
 
@@ -32,6 +33,8 @@ from mitos.conflict import (
 )
 from mitos.errors import EmbeddingError
 from mitos.parser import ParsedEntry
+
+from _point_hits import CannedVector
 
 
 # --------------------------------------------------------------------------- #
@@ -58,14 +61,12 @@ class _FakeEmbed:
         return [0.1, 0.2, 0.3]
 
 
-class _FakeVector:
-    """Returns canned ``(slug, score)`` matches for the over-fetch query."""
+class _FakeVector(CannedVector):
+    """Returns canned ``(slug, score)`` matches for the over-fetch query.
 
-    def __init__(self, matches: List[Dict[str, Any]]) -> None:
-        self._matches = matches
-
-    def query(self, vector: List[float], limit: int = 5) -> List[Dict[str, Any]]:
-        return list(self._matches)
+    Routes through the shared canned-hit leaf, bound to the row's ``_FakeStore``,
+    so every hit carries the ``point_id`` of the node its slug names.
+    """
 
 
 class _FakeStore:
@@ -73,6 +74,11 @@ class _FakeStore:
 
     def __init__(self, nodes: Dict[str, Dict[str, Any]]) -> None:
         self._nodes = nodes
+
+    def resolve_slug(self, slug: str) -> List[str]:
+        """The canned leaf's slug derivation (every node, as the real store's)."""
+        node = self._nodes.get(slug)
+        return [node["id"]] if node is not None else []
 
     def get_node_by_slug(self, slug: str) -> Optional[Dict[str, Any]]:
         return self._nodes.get(slug)
@@ -105,7 +111,9 @@ def _node(slug: str, *, axiom: Optional[str] = None, scope: Optional[List[str]] 
           rejected: Optional[str] = None, **extra: Any) -> Dict[str, Any]:
     """A hydrated store node carrying the keys the facade reads (+ optional modifier stamps)."""
     node = {
-        "id": f"id-{slug}",
+        # A content-hash-shaped id, derived from the slug (never hardcoded), so the
+        # canned leaf can build the hit's point id from it.
+        "id": hashlib.sha256(slug.encode("utf-8")).hexdigest(),
         "slug": slug,
         "kind": "decision",
         "core_axiom": axiom if axiom is not None else f"axiom for {slug}",
@@ -188,11 +196,12 @@ def _run(
     surface_threshold: float = 0.85,
 ) -> Any:
     """Drives the facade with hand-rolled fakes + explicit dials."""
+    fake_store = _FakeStore(nodes if nodes is not None else {})
     return run_conflict_check(
         entry if entry is not None else _entry(),
         embed_provider=embed if embed is not None else _FakeEmbed(),
-        vector_store=_FakeVector(matches if matches is not None else []),
-        store=_FakeStore(nodes if nodes is not None else {}),
+        vector_store=_FakeVector(matches if matches is not None else [], store=fake_store),
+        store=fake_store,
         judge=judge,
         floor=floor,
         top_k=top_k,

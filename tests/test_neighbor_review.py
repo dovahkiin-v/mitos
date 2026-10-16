@@ -32,6 +32,8 @@ from mitos.sync import (DRAFT_DIGEST_FIELDS, MitosSyncManager, PAUSE_HELD_CLAUSE
                         _NEIGHBOR_REVIEW_THRESHOLD, _PAUSE_DIGEST_CLAUSE,
                         _PAUSE_RESOLVING_RELATIONS, _draft_digest)
 
+from _point_hits import CannedVector
+
 
 @pytest.fixture
 def offline(monkeypatch):
@@ -54,12 +56,8 @@ class _FakeEmbed:
         return [0.1, 0.2, 0.3]
 
 
-class _FakeVector:
-    def __init__(self, matches):
-        self._matches = matches
-
-    def query(self, vector, limit=5):
-        return self._matches
+class _FakeVector(CannedVector):
+    """Canned matches through the shared leaf (every hit carries its ``point_id``)."""
 
     def upsert(self, *a, **k):
         pass
@@ -68,7 +66,7 @@ class _FakeVector:
 def _arm(m, matches):
     """Wire fake embeddings/vector so the review runs deterministically."""
     m.embed_provider = _FakeEmbed()
-    m.vector_store = _FakeVector(matches)
+    m.vector_store = _FakeVector(matches, store_of=lambda: m.store)
 
 
 # --------------------------------------------------------------------------- #
@@ -750,7 +748,7 @@ class _RaisingVector:
     def __init__(self, exc):
         self._exc = exc
 
-    def query(self, vector, limit=5):
+    def query(self, vector, limit=5, *, with_payload=True):
         raise self._exc
 
     def upsert(self, *a, **k):
@@ -2678,7 +2676,7 @@ class _CreatableVector:
     def __init__(self):
         self.exists = False
 
-    def query(self, vector, limit=5):
+    def query(self, vector, limit=5, *, with_payload=True):
         if not self.exists:
             raise CollectionMissingError("absent")
         return []

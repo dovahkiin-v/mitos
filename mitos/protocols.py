@@ -4,9 +4,9 @@ This module defines Protocol classes for GraphStore, VectorStore, and
 EmbeddingProvider to decouple Mitos components and support seamless swap-ins.
 """
 
-from typing import Protocol, List, Dict, Optional, Any, Tuple, Set
+from typing import Protocol, List, Dict, Optional, Any, Tuple, Set, Iterable
 from mitos.parser import ParsedEntry
-from mitos.store import CommitDelta
+from mitos.store import CommitDelta, PointResolution
 
 class EmbeddingProvider(Protocol):
     """Protocol for cache-aware, prefix-based text embedding providers."""
@@ -69,18 +69,30 @@ class VectorStore(Protocol):
         self,
         vector: List[float],
         limit: int = 5,
+        *,
+        with_payload: bool = True,
     ) -> List[Dict[str, Any]]:
         """Queries for the semantically nearest vectors.
 
         Recall is scope-blind by contract — scope is a downstream discoverability
         hint, never a recall filter (see :meth:`QdrantVectorStore.query`).
 
+        Every hit carries ``point_id``, the index's own id for the point as a
+        string — for a mitos write, ``hash_to_uuid(node_id)``, never the 64-hex
+        node id itself (unlike :meth:`upsert`'s ``point_id`` argument). It is the
+        hit's identity; :meth:`GraphStoreProtocol.resolve_point_ids` maps it to its
+        node. A hit with no id is a protocol fault, raised, never a hit.
+
         Args:
             vector: The query embedding vector.
             limit: Maximum matches to return.
+            with_payload: True (the default) gives
+                ``{point_id, slug, scope, state, kind, embedding_text, score}``
+                per hit; False gives exactly ``{point_id, score}``, with no
+                payload key at all.
 
         Returns:
-            A list of dictionary results with payload and scores.
+            A list of hit dicts in ranked order.
         """
         ...
 
@@ -110,6 +122,35 @@ class GraphStoreProtocol(Protocol):
 
         Returns:
             A list of matching node IDs.
+        """
+        ...
+
+    def resolve_point_ids(self, point_ids: Iterable[str]) -> PointResolution:
+        """Maps vector-index point ids to their nodes in one batched, state-agnostic read.
+
+        Each id is taken exactly as :meth:`VectorStore.query` returns it, normalized
+        by removing dashes and lowercasing, and must then be 32 hex characters: the
+        prefix of a 64-hex node id. Inputs are deduplicated by the raw string, and
+        every distinct raw string lands in exactly one bucket of the result:
+
+        - ``nodes``: the one node carrying that prefix, in the reader-facing shape
+          with ``computed_state`` (exactly :meth:`get_node_state`'s semantics) and
+          no modifier stamps — stamps are a separate read
+          (:meth:`get_modifiers_map`). Retired nodes resolve.
+        - ``orphans``: no node carries the prefix (or the id is malformed), found by
+          the read returning nothing — never by asking a node's state, which
+          answers ``"active"`` for an id the graph does not hold.
+        - ``ambiguous``: two or more nodes share the prefix; reported with their ids
+          and resolved to neither.
+
+        Args:
+            point_ids: Point ids as the vector index returned them.
+
+        Returns:
+            The partition of the input. Empty input runs no statement.
+
+        Raises:
+            DatabaseError: If the read fails.
         """
         ...
 

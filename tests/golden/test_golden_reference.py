@@ -272,14 +272,13 @@ def test_record_pause_surface_stamps_modifiers(tmp_path):
     from mitos.config import MitosConfig
     from mitos.sync import MitosSyncManager
 
+    from _point_hits import CannedVector
+
     class _Embed:
         def get_embedding(self, text, is_query=False):
             return [0.1, 0.2, 0.3]
 
-    class _Vector:
-        def query(self, vector, limit=5):
-            return [{"slug": "harbor-blob-encryption-at-rest", "score": 0.9}]
-
+    class _Vector(CannedVector):
         def upsert(self, *a, **k):
             pass
 
@@ -288,7 +287,10 @@ def test_record_pause_surface_stamps_modifiers(tmp_path):
     manager = MitosSyncManager(config)
     manager.store = build_reference_graph(str(tmp_path / "graph.sqlite"))
     manager.embed_provider = _Embed()
-    manager.vector_store = _Vector()
+    # Bound explicitly: the workspace's own graph and the reference graph are two
+    # graphs, and the hit names a reference-graph node.
+    manager.vector_store = _Vector(
+        [{"slug": "harbor-blob-encryption-at-rest", "score": 0.9}], store=manager.store)
 
     entry = ParsedEntry("decision", "probe-blob-encryption", 1, 2)
     entry.axiom = "Encrypt every stored blob at rest."

@@ -64,7 +64,8 @@ class _RecordingVector:
             self.created = True
         self.landed.append(point_id)
 
-    def query(self, vector: List[float], limit: int = 5) -> List[Dict[str, Any]]:
+    def query(self, vector: List[float], limit: int = 5, *,
+              with_payload: bool = True) -> List[Dict[str, Any]]:
         return []
 
     def list_point_ids(self, page_size: int = 256) -> Set[str]:
@@ -293,7 +294,8 @@ class _AbsenceAwareVector(_RecordingVector):
     whether the **first** record's write created the collection.
     """
 
-    def query(self, vector: List[float], limit: int = 5) -> List[Dict[str, Any]]:
+    def query(self, vector: List[float], limit: int = 5, *,
+              with_payload: bool = True) -> List[Dict[str, Any]]:
         if self.absent and not self.created:
             raise CollectionMissingError(
                 "Qdrant collection 'mitos-tmp-fake' does not exist",

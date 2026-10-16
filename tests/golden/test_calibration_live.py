@@ -184,7 +184,8 @@ def test_collection_holds_every_harbor_node(calibration_index):
     for slug in RETIRED_NODES:
         assert hash_to_uuid(by_slug[slug]["id"]) in ids, f"retired {slug} has no point"
         assert index.live_by_slug[slug] is False
-    assert len(index.nodes_by_slug) == len(index.nodes), "payload slugs are not unique"
+    assert len(index.nodes_by_slug) == len(index.nodes), "slugs are not unique (fixtures resolve by slug)"
+    assert len(index.nodes_by_point_id) == len(index.nodes), "point ids are not unique (hits join by point id)"
 
 
 def test_shape_collections_hold_every_rejection_point(calibration_index, shape_collections):

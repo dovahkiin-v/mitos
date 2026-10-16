@@ -33,6 +33,8 @@ from mitos.store import GraphStore, MODIFIER_EDGE_KEYS
 from mitos.sync import MitosSyncManager
 from mitos.renderer import render_node_markdown, MitosRenderer, assemble_render
 
+from _point_hits import CannedVector
+
 
 @pytest.fixture
 def offline(monkeypatch):
@@ -243,20 +245,13 @@ class _FakeEmbed:
         return [0.1, 0.2, 0.3]
 
 
-class _FakeVector:
-    """Stand-in vector store — replays a fixed ranked match list.
+class _FakeVector(CannedVector):
+    """Stand-in vector store — replays a fixed ranked match list through the shared leaf.
 
     Records the ``limit`` it was last called with (so a test can prove ``--limit``
     threads through un-truncated) and slices its match list to ``[:limit]`` (so a
-    test can prove a lowered ``--limit`` trims and a raised one does not no-op)."""
-
-    def __init__(self, matches):
-        self._matches = matches
-        self.last_limit = None
-
-    def query(self, vector, limit: int = 5):
-        self.last_limit = limit
-        return self._matches[:limit]
+    test can prove a lowered ``--limit`` trims and a raised one does not no-op); every
+    hit carries its node's ``point_id``."""
 
 
 def test_mcp_surface_semantic_path_surfaces_modifiers(ws) -> None:

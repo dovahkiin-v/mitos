@@ -287,6 +287,16 @@ def test_query_500_stays_a_plain_vector_store_error(mock_post: MagicMock) -> Non
     # as "nothing matched" and a fail-closed consumer certifies a corpus it never
     # actually read — the absent-key guard's own failure mode by another spelling.
     pytest.param({"result": None}, id="result-null"),
+    # A hit with no `id` (D3): coalesced to None it would reach the resolver as an
+    # orphan, and a whole window would read "nothing here" over a malformed answer.
+    pytest.param({"result": [{"score": 0.9, "payload": {"slug": "x"}}]}, id="hit-without-id"),
+    # An `id: null` is the same fault spelled differently; `str()` would make it
+    # the string "None", an orphan over a malformed answer.
+    pytest.param({"result": [{"id": None, "score": 0.9, "payload": {"slug": "x"}}]},
+                 id="hit-with-null-id"),
+    # A `null` payload on the default path escaped as an untyped AttributeError.
+    pytest.param({"result": [{"id": "uuid-1", "score": 0.9, "payload": None}]},
+                 id="payload-null"),
 ])
 @patch("mitos.vector_store.requests.post")
 def test_query_malformed_200_raises_typed(mock_post: MagicMock, body: object) -> None:
@@ -348,6 +358,8 @@ def test_vector_store_query_handling(mock_post: MagicMock) -> None:
 
     assert len(results) == 1
     assert results[0]["slug"] == "query-result"
+    # The hit's identity rides beside the payload, as Qdrant returned it (2a).
+    assert results[0]["point_id"] == "uuid-123"
     # Raw semantic score is returned untouched — no scope boost inflating it.
     assert results[0]["score"] == 0.95
     assert results[0]["scope"] == ["core"]
@@ -456,3 +468,68 @@ def test_list_collection_names_malformed_200_raises_typed(
     with pytest.raises(VectorStoreError) as excinfo:
         list_collection_names(_URL, timeout=3.0)
     assert not isinstance(excinfo.value, VectorStoreUnreachableError)
+
+
+# --------------------------------------------------------------------------- #
+# Phase 2a — every hit carries its point id; `with_payload=False` is ids and scores
+# --------------------------------------------------------------------------- #
+
+_TWO_HITS = {
+    "result": [
+        {"id": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0", "score": 0.91,
+         "payload": {"slug": "first", "scope": ["core"], "state": "active",
+                     "kind": "decision", "embedding_text": "First."}},
+        # Qdrant may hold an integer id for a point mitos did not write; it comes back
+        # as a string, which no resolver can match to a node.
+        {"id": 7, "score": 0.5, "payload": {"slug": "second"}},
+    ]
+}
+
+
+@patch("mitos.vector_store.requests.post")
+def test_query_returns_each_hits_point_id_beside_the_payload(mock_post: MagicMock) -> None:
+    """The default path keeps today's six keys and adds ``point_id``, a string."""
+    mock_post.return_value = _resp(200, _TWO_HITS)
+
+    results = QdrantVectorStore(_URL, collection_name=_COLLECTION).query([0.1], limit=2)
+
+    assert [r["point_id"] for r in results] == ["0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0", "7"]
+    assert set(results[0]) == {"point_id", "slug", "scope", "state", "kind",
+                               "embedding_text", "score"}
+    # A missing payload key takes the default the client always applied.
+    assert results[1]["scope"] == [] and results[1]["state"] is None
+    assert mock_post.call_args.kwargs["json"]["with_payload"] is True
+
+
+@patch("mitos.vector_store.requests.post")
+def test_query_ids_only_sends_no_payload_request_and_returns_two_keys(
+    mock_post: MagicMock,
+) -> None:
+    """``with_payload=False`` asks Qdrant for no payload and returns exactly
+    ``{point_id, score}`` — no payload key at all, not even as None — so a reader
+    reaching for ``slug`` raises ``KeyError`` rather than reading a silent None."""
+    mock_post.return_value = _resp(200, {"result": [
+        {"id": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0", "score": 0.91, "payload": None},
+        {"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "score": 0.4},
+    ]})
+
+    results = QdrantVectorStore(_URL, collection_name=_COLLECTION).query(
+        [0.1], limit=2, with_payload=False)
+
+    assert mock_post.call_args.kwargs["json"]["with_payload"] is False
+    assert results == [
+        {"point_id": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0", "score": 0.91},
+        {"point_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "score": 0.4},
+    ]
+    with pytest.raises(KeyError):
+        results[0]["slug"]
+
+
+@patch("mitos.vector_store.requests.post")
+def test_query_ids_only_still_refuses_a_hit_without_an_id(mock_post: MagicMock) -> None:
+    """The ids-only path has nothing but the id to offer; its absence is a fault."""
+    mock_post.return_value = _resp(200, {"result": [{"score": 0.9}]})
+
+    with pytest.raises(VectorStoreError):
+        QdrantVectorStore(_URL, collection_name=_COLLECTION).query(
+            [0.1], limit=1, with_payload=False)
