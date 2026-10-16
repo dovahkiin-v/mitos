@@ -126,7 +126,7 @@ class WalkContractError(TypeError):
     Raised at ``walk_ranked`` entry (a missing method, ``limit`` outside
     ``1..bound-1``) and where results arrive (a resolver result that is not a
     :class:`PointResolution`, a stamp map that is not a ``dict``, a hit without a
-    string ``point_id``). Every surface re-raises it ahead of its degraded arm:
+    string ``point_id`` or a numeric ``score``). Every surface re-raises it ahead of its degraded arm:
     swallowed, it would read as "semantic recall degraded".
     """
 
@@ -187,12 +187,20 @@ class RankedWalk:
 
 
 def _point_id_of(hit: Any) -> str:
-    """Returns a hit's point id, or raises when it carries none."""
+    """Returns a hit's point id, or raises when the hit breaks the protocol.
+
+    A hit is ``{point_id: str, score: number}`` at least. A missing score is checked
+    here too: left to a bare ``KeyError`` inside a surface's broad catch, a double
+    that dropped it would read as degraded recall rather than as a broken double.
+    """
     pid = hit.get("point_id") if isinstance(hit, dict) else None
     if not isinstance(pid, str):
         raise WalkContractError(
             f"a vector hit must carry a string point_id; got {hit!r}"
         )
+    score = hit.get("score")
+    if not isinstance(score, (int, float)) or isinstance(score, bool):
+        raise WalkContractError(f"a vector hit must carry a numeric score; got {hit!r}")
     return pid
 
 
@@ -224,7 +232,8 @@ def fill(hits: List[Dict[str, Any]], resolution: PointResolution, *,
         A :class:`RankedWalk` with ``stamps`` empty and ``stamps_unread`` False.
 
     Raises:
-        WalkContractError: If a hit carries no string ``point_id``.
+        WalkContractError: If a hit carries no string ``point_id`` or no numeric
+            ``score``.
     """
     orphans = set(resolution.orphans)
     ambiguous = resolution.ambiguous

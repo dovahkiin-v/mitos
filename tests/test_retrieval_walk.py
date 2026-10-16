@@ -181,6 +181,16 @@ def test_fill_accepts_a_limit_at_or_past_the_bound() -> None:
     assert _fill(w, limit=5, bound=2).end == SHORT_BOUND
 
 
+@pytest.mark.parametrize("hit", [{"point_id": "p-1"}, {"point_id": "p-1", "score": None},
+                                 {"point_id": "p-1", "score": True}],
+                         ids=["no-score", "null-score", "bool-score"])
+def test_a_hit_without_a_numeric_score_is_a_contract_error(hit) -> None:
+    """Left to a bare `KeyError`, a missing score would raise inside a surface's broad
+    catch and read as degraded recall."""
+    with pytest.raises(WalkContractError, match="score"):
+        fill([hit], PointResolution({}, [], {}), limit=1, bound=5)
+
+
 def test_a_hit_without_a_string_point_id_is_a_contract_error() -> None:
     with pytest.raises(WalkContractError, match="point_id"):
         fill([{"score": .9}], PointResolution({}, [], {}), limit=1, bound=5)
