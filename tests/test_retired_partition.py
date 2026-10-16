@@ -435,6 +435,24 @@ def test_several_seeds_are_one_select_on_one_connection(store, monkeypatch):
     assert recorder.statements[0][0].lstrip().startswith("WITH RECURSIVE")
 
 
+def test_the_live_end_read_drives_from_the_chain_never_scans_edges(store, monkeypatch):
+    """P17: the outer join is pinned to drive from the chain (``CROSS JOIN``). Left to
+    the planner it scanned every edge — 24.5 ms against 0.4 ms on the burial horizon."""
+    seed = _commit(store, "old")
+    _commit(store, "mid", supersedes=["old"])
+    _commit(store, "new", supersedes=["mid"])
+    recorder = _record(store, monkeypatch)
+    store.get_live_ends([seed])
+    sql, params = recorder.statements[0]
+    conn = sqlite3.connect(store.db_path)
+    try:
+        plan = [row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + sql, params)]
+    finally:
+        conn.close()
+    assert not [step for step in plan if step.startswith("SCAN e")], plan
+    assert "CROSS JOIN edges e" in sql
+
+
 def test_an_empty_input_reads_nothing(store, monkeypatch):
     recorder = _record(store, monkeypatch)
     assert store.get_live_ends([]) == {}

@@ -3220,6 +3220,11 @@ class GraphStore:
         aliased join it would correlate on nothing and call every node live — the
         alias trap). No ``signals`` read: drifted is live.
 
+        The outer join is a ``CROSS JOIN`` on purpose: it pins SQLite's join order so
+        the read drives from the chain rows into ``idx_edges_target``. Left to the
+        planner, it scanned every edge and probed the chain (measured on the 50,000-
+        decision burial graph: 24.5 ms for five seeds, against 0.4 ms pinned).
+
         The chain analysis is an iterative three-colour DFS over the fetched edge
         set (``_walk_mutation_lineage``'s idiom), so a cycle is detected rather
         than walked forever, and a convergent DAG is not mistaken for one.
@@ -3256,7 +3261,7 @@ class GraphStore:
                          AND k.edge_type IN {_KILL_EDGE_TYPES_SQL}
                    ) AS live
             FROM chain c
-            JOIN edges e ON e.target_id = c.node
+            CROSS JOIN edges e ON e.target_id = c.node
             JOIN nodes n ON n.id = e.source_id
             WHERE e.edge_type IN {_KILL_EDGE_TYPES_SQL}
             """,
