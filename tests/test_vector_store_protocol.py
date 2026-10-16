@@ -422,16 +422,27 @@ RANKED_SURFACES = {
 
 
 def _enclosing_calls(source: str) -> List[Tuple[str, ast.Call]]:
-    """Every call in ``source``, paired with the name of its outermost function."""
+    """Every call in ``source``, paired with the name of its outermost function.
+
+    Total over the module: a call outside any function is paired with ``<module>``
+    (or the class name, for a class body), so a module-level ``vs.query(...)`` is a
+    set difference too rather than a call the row never looked at.
+    """
+    def calls(tree: ast.AST) -> List[ast.Call]:
+        return [c for c in ast.walk(tree) if isinstance(c, ast.Call)]
+
     out = []
     for node in ast.parse(source).body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            out.extend((node.name, c) for c in ast.walk(node) if isinstance(c, ast.Call))
+            out.extend((node.name, c) for c in calls(node))
         elif isinstance(node, ast.ClassDef):
             for item in node.body:
                 if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    out.extend((f"{node.name}.{item.name}", c) for c in ast.walk(item)
-                               if isinstance(c, ast.Call))
+                    out.extend((f"{node.name}.{item.name}", c) for c in calls(item))
+                else:
+                    out.extend((node.name, c) for c in calls(item))
+        else:
+            out.extend(("<module>", c) for c in calls(node))
     return out
 
 
@@ -465,5 +476,12 @@ def test_the_call_site_row_reports_a_planted_direct_call(tmp_path) -> None:
     planted.write_text(textwrap.dedent('''
         def reader(vs, v):
             return vs.query(v, limit=5)
+
+        HITS = VS.query(V, limit=5)
+
+        class Reader:
+            hits = VS.query(V, limit=5)
     '''), encoding="utf-8")
-    assert query_call_sites([planted]) == {("_zz_scratch_2c.py", "reader")}
+    assert query_call_sites([planted]) == {("_zz_scratch_2c.py", "reader"),
+                                           ("_zz_scratch_2c.py", "<module>"),
+                                           ("_zz_scratch_2c.py", "Reader")}

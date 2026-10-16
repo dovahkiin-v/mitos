@@ -126,8 +126,8 @@ class WalkContractError(TypeError):
     Raised at ``walk_ranked`` entry (a missing method, ``limit`` outside
     ``1..bound-1``) and where results arrive (a resolver result that is not a
     :class:`PointResolution`, a stamp map that is not a ``dict``, a hit without a
-    string ``point_id`` or a numeric ``score``). Every surface re-raises it ahead of its degraded arm:
-    swallowed, it would read as "semantic recall degraded".
+    string ``point_id`` or a numeric ``score``). Every surface re-raises it ahead of
+    its degraded arm: swallowed, it would read as "semantic recall degraded".
     """
 
 
