@@ -325,6 +325,7 @@ LIVE_MODULES: tuple[str, ...] = (
     "test_calibration_live.py",
     "test_point_identity_live.py",
     "test_ranked_walk_live.py",
+    "test_rejection_index_live.py",
 )
 
 

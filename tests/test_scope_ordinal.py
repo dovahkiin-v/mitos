@@ -167,8 +167,8 @@ def test_step4_backfills_alphabetically_so_a_migrated_graph_reads_and_renders_id
     assert _user_version(path) == 3
     assert json.loads(before_scopes)["n-one"] == ["ax", "cli", "zeta", "ž"]
 
-    after = GraphStore(path)  # the writable boot runs step 4
-    assert _user_version(path) == _pending_head(MIGRATION_STEPS) == 4
+    after = GraphStore(path)  # the writable boot runs step 4 and every later rung
+    assert _user_version(path) == _pending_head(MIGRATION_STEPS)
     assert _ordered_rows(after, "n-one") == [("ax", 0), ("cli", 1), ("zeta", 2), ("ž", 3)]
     assert _ordered_rows(after, "n-two") == [("z", 0), ("ä", 1)]
     assert _ordered_rows(after, "n-three") == [("solo", 0)]
@@ -349,14 +349,15 @@ def test_a_mixed_add_remove_and_reorder_lands_the_exact_authored_list(store) -> 
 # --- Version overlap and ties ------------------------------------------------------
 
 
-def test_an_older_ladder_and_an_older_writer_still_work_on_a_step4_graph(store) -> None:
+def test_an_older_ladder_and_an_older_writer_still_work_on_a_head_graph(store) -> None:
     node_id = store.commit_parsed_entry(_decision("wal", "Use WAL.", ["zeta", "ax"])).node_id
     schema_before = _raw(store.db_path, "SELECT sql FROM sqlite_master ORDER BY name")
 
     conn = open_connection(store.db_path)
     try:
-        # An older mitos's ladder (head 3) applies nothing to a step-4 graph.
-        assert run_migrations(conn, MIGRATION_STEPS[:3]) == 4
+        # An older mitos's ladder (head 3) applies nothing to a head graph; the
+        # runner answers the graph's own version, which is the live head.
+        assert run_migrations(conn, MIGRATION_STEPS[:3]) == _pending_head(MIGRATION_STEPS)
         assert _raw(store.db_path, "SELECT sql FROM sqlite_master ORDER BY name") == schema_before
         # Its reconcile INSERT names no ordinal and still commits, at the DEFAULT.
         conn.execute(

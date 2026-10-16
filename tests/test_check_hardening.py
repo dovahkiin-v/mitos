@@ -264,6 +264,11 @@ class _WriteSpyStore:
         "add_pending_embedding",
         "remove_pending_embedding",
         "increment_pending_attempts",
+        # The rejection backlog and its marker (recall-confidence 4a).
+        "clear_rejection_backlog_row",
+        "note_rejection_backlog_failure",
+        "stamp_rejection_seed",
+        "clear_rejection_seed",
     })
 
     def __init__(self, inner: GraphStore) -> None:

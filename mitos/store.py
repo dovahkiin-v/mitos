@@ -30,6 +30,7 @@ from mitos.identity import SLUG_MAX_LEN, compute_node_id, mechanism_canonical_no
 from mitos.migrations import (
     EMBEDDING_SEED_ESTABLISHED_BY,
     MIGRATION_STEPS,
+    REJECTION_SEED_ESTABLISHED_BY,
     MigrationStep,
     run_migrations,
     is_pre_v1a_schema,
@@ -37,6 +38,7 @@ from mitos.migrations import (
     restore_from_snapshot,
 )
 from mitos.parser import ParsedEntry
+from mitos.rejections import enumerate_rejected_paths
 # The resolver's result type lives in the walk's leaf so the walk can type-check it
 # without importing this module (the check family's fence); re-exported here.
 from mitos.retrieval_walk import PointResolution
@@ -544,6 +546,74 @@ def write_embedding_seed(
     """
     conn.execute(
         _EMBEDDING_SEED_UPSERT_SQL, (established_by, now or _utc_now_iso())
+    )
+
+
+# The one spelling of the ``rejection_seed`` upsert, shared by
+# ``GraphStore.stamp_rejection_seed`` and :func:`write_rejection_seed` exactly as the
+# decision marker's upsert is shared above. The two markers live in separate tables
+# (ladder step 5), so neither stamp can touch the other's row.
+_REJECTION_SEED_UPSERT_SQL: str = """
+    INSERT INTO rejection_seed (id, established_by, established_at)
+    VALUES (1, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+        established_by = excluded.established_by,
+        established_at = excluded.established_at
+"""
+
+
+def write_rejection_seed(
+    conn: sqlite3.Connection, established_by: str, *, now: Optional[str] = None
+) -> None:
+    """Stamps the rejection index's seed marker on ``conn``, without committing.
+
+    The in-transaction twin of :meth:`GraphStore.stamp_rejection_seed`, mirroring
+    :func:`write_embedding_seed`: the statement is issued and the transaction is left
+    to the caller. The ``established_by`` vocabulary is enforced by the table's own
+    ``CHECK`` (``migrations.REJECTION_SEED_ESTABLISHED_BY``).
+
+    Args:
+        conn: An open, writable connection whose transaction the caller owns.
+        established_by: The verb that established coverage — one of
+            ``migrations.REJECTION_SEED_ESTABLISHED_BY``.
+        now: The UTC ISO-8601 stamp to record; defaults to :func:`_utc_now_iso`
+            (MI-10).
+    """
+    conn.execute(
+        _REJECTION_SEED_UPSERT_SQL, (established_by, now or _utc_now_iso())
+    )
+
+
+# SQLite's message when a read names ``rejection_backlog`` on a graph that has not run
+# ladder step 5 (identical on a ``mode=ro`` connection). The backlog reads match it as
+# a substring, like ``_MISSING_ORDINAL_ERROR``, so any other fault still raises.
+_MISSING_REJECTION_BACKLOG_ERROR: str = "no such table: rejection_backlog"
+
+
+class RejectionBacklogRow(NamedTuple):
+    """One ``rejection_backlog`` row, as the store's reads return it (runtime only).
+
+    Attributes:
+        node_id: The owning decision's content-hash id.
+        queued_at: The enqueueing commit's UTC ISO-8601 stamp.
+        enqueue_seq: The row's compare token. A clear or a failure note lands
+            only on the row still carrying it; no later enqueue repeats it.
+        retry_count: Failed write attempts since the row was enqueued.
+    """
+
+    node_id: str
+    queued_at: str
+    enqueue_seq: int
+    retry_count: int
+
+
+def _rejection_backlog_row(row: sqlite3.Row) -> RejectionBacklogRow:
+    """Builds a :class:`RejectionBacklogRow` from a backlog ``SELECT`` row."""
+    return RejectionBacklogRow(
+        node_id=row["node_id"],
+        queued_at=row["queued_at"],
+        enqueue_seq=int(row["enqueue_seq"]),
+        retry_count=int(row["retry_count"]),
     )
 
 
@@ -1955,6 +2025,26 @@ class GraphStore:
                     self._reconcile_edges(cursor, node_id, parsed, now)
                 )
                 self._enqueue_outbox(cursor, node_id, parsed, now)
+                # --- Rejection backlog (field-aware, same transaction) ----------
+                # Only a decision can hold rejected items. A new one enqueues when
+                # its field enumerates at least one item (the leaf decides what an
+                # item is; nothing for a new owner with none). A re-commit enqueues
+                # when the stored field changed, compared raw with None read as
+                # "" — a change to empty included, since its old items must go.
+                # Every other edit leaves a standing row untouched.
+                if parsed.kind == "decision":
+                    if is_new:
+                        rejection_due = (
+                            enumerate_rejected_paths(rejected_paths_json or "").shape
+                            != "empty"
+                        )
+                    else:
+                        rejection_due = (
+                            (prior["rejected_paths_json"] or "")
+                            != (rejected_paths_json or "")
+                        )
+                    if rejection_due:
+                        self._enqueue_rejection_backlog(cursor, node_id, now)
                 store_failures = list(store_failures)
 
                 # --- Same-id commentary write + the single ``updated_at`` tick --
@@ -2535,10 +2625,11 @@ class GraphStore:
 
         The enqueue is **never** skipped (recall-over-precision, OPERA §11): a
         missed enqueue is permanent vector staleness (the costly miss), a false one
-        is a free drain-time cache-hit (the cheap false positive). Commentary is
-        not forever vector-irrelevant — V2's anti-knowledge vector keys on
-        ``rejected_paths`` (commentary) and churns on commentary edits by design,
-        so a commentary-blind enqueue would silently starve it the moment V2 ships.
+        is a free drain-time cache-hit (the cheap false positive). The rejection
+        index is not driven from this row: it keeps a field-aware row of its own in
+        ``rejection_backlog``, written by :meth:`_enqueue_rejection_backlog` in the
+        same transaction, so this outbox stays unconditional on its own grounds
+        and never serves as the rejected items' queue.
 
         A re-enqueue RESETS drain state (re-stamps ``queued_at``, clears
         ``retry_count`` to 0) rather than a bare idempotent no-op: a node V3b
@@ -2574,6 +2665,42 @@ class GraphStore:
                 queued_at = excluded.queued_at,
                 retry_count = 0
             """,
+            (node_id, now),
+        )
+
+    def _enqueue_rejection_backlog(
+        self, cursor: sqlite3.Cursor, node_id: str, now: str
+    ) -> None:
+        """Queues a decision's rejected items for a write, inside the commit's transaction.
+
+        The in-transaction twin of ``_enqueue_outbox`` for the rejection index: it
+        runs on ``commit_parsed_entry``'s cursor, so the row commits with the node or
+        not at all (MI-12). The caller decides **whether** to enqueue (the decision is
+        new with an item, or its stored ``rejected_paths`` changed); this method only
+        writes.
+
+        It deletes the node's standing row, if any, and inserts a fresh one, so every
+        enqueue mints a new ``enqueue_seq`` and starts at ``retry_count = 0``. The
+        sequence is ``AUTOINCREMENT`` and never reused within a graph, so a reader
+        holding an older seq can never clear or note the newer row.
+
+        Unlike the decision outbox, a re-commit is **not** this row's retry. Only a
+        field-aware enqueue resets it; a re-commit that leaves ``rejected_paths``
+        unchanged never reaches this method, so a standing row keeps its seq and its
+        ``retry_count``, and it is retried by the next pass over the backlog.
+
+        Args:
+            cursor: The open cursor inside ``commit_parsed_entry``'s transaction.
+            node_id: The committing decision's content-hash id (the node row
+                already exists by this point, so the FK is satisfied).
+            now: The commit's single UTC ISO-8601 stamp (MI-10).
+        """
+        cursor.execute(
+            "DELETE FROM rejection_backlog WHERE node_id = ?", (node_id,)
+        )
+        cursor.execute(
+            "INSERT INTO rejection_backlog (node_id, queued_at, retry_count) "
+            "VALUES (?, ?, 0)",
             (node_id, now),
         )
 
@@ -3108,6 +3235,230 @@ class GraphStore:
                     )
         except sqlite3.Error as e:
             raise DatabaseError(f"Failed to clear the embedding seed marker: {str(e)}")
+        finally:
+            conn.close()
+
+    # --- The rejection backlog and its seed marker (ladder step 5) ---------------
+    #
+    # Reads treat a graph without the rung as "rung not applied": a read-only store
+    # never migrates, so it can open a step-4 graph. They match exactly the missing
+    # table's message; any other SQLite fault raises. Writes never fall back — only a
+    # migrated, writable store reaches them, so a missing table there is a fault.
+
+    def get_rejection_backlog_row(self, node_id: str) -> Optional[RejectionBacklogRow]:
+        """Returns a decision's standing rejection backlog row, or None.
+
+        Args:
+            node_id: The decision's content-hash id.
+
+        Returns:
+            The row, or None when no row stands or the graph predates the rung.
+
+        Raises:
+            DatabaseError: If the read fails for any other reason.
+        """
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT node_id, queued_at, enqueue_seq, retry_count "
+                "FROM rejection_backlog WHERE node_id = ?",
+                (node_id,),
+            ).fetchone()
+            return _rejection_backlog_row(row) if row is not None else None
+        except sqlite3.Error as e:
+            if _MISSING_REJECTION_BACKLOG_ERROR in str(e):
+                return None
+            raise DatabaseError(f"Failed to read the rejection backlog: {str(e)}")
+        finally:
+            conn.close()
+
+    def claim_rejection_backlog(
+        self, limit: int, *, after_seq: Optional[int] = None
+    ) -> List[RejectionBacklogRow]:
+        """Reads the next rejection backlog rows, in enqueue order.
+
+        A plain ordered ``SELECT``, not a claim — the same single-writer semantics as
+        :meth:`claim_pending_embeddings`. Rows come in ``enqueue_seq`` order, and an
+        enqueue replaces its row with a fresh, larger seq, so a re-queued owner moves
+        to the back of the queue. ``after_seq`` is a keyset cursor on the primary key:
+        only rows with a larger seq are returned.
+
+        Args:
+            limit: The most rows to return.
+            after_seq: The last ``enqueue_seq`` already walked, or None to read from
+                the head of the queue.
+
+        Returns:
+            Up to ``limit`` rows; ``[]`` when the graph predates the rung.
+
+        Raises:
+            DatabaseError: If the read fails for any other reason.
+        """
+        conn = self._get_connection()
+        try:
+            if after_seq is None:
+                rows = conn.execute(
+                    "SELECT node_id, queued_at, enqueue_seq, retry_count "
+                    "FROM rejection_backlog ORDER BY enqueue_seq LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT node_id, queued_at, enqueue_seq, retry_count "
+                    "FROM rejection_backlog WHERE enqueue_seq > ? "
+                    "ORDER BY enqueue_seq LIMIT ?",
+                    (after_seq, limit),
+                ).fetchall()
+            return [_rejection_backlog_row(row) for row in rows]
+        except sqlite3.Error as e:
+            if _MISSING_REJECTION_BACKLOG_ERROR in str(e):
+                return []
+            raise DatabaseError(f"Failed to read the rejection backlog: {str(e)}")
+        finally:
+            conn.close()
+
+    def clear_rejection_backlog_row(self, node_id: str, *, enqueue_seq: int) -> bool:
+        """Deletes a decision's backlog row, only if it still carries ``enqueue_seq``.
+
+        A commit that re-queued the owner since the caller read its row replaced
+        that row with a larger seq, so a stale clear deletes nothing.
+
+        Args:
+            node_id: The decision's content-hash id.
+            enqueue_seq: The seq of the row the caller read.
+
+        Returns:
+            True iff a row was deleted.
+
+        Raises:
+            DatabaseError: If the delete fails.
+        """
+        conn = self._get_connection()
+        try:
+            with conn:
+                cursor = conn.execute(
+                    "DELETE FROM rejection_backlog "
+                    "WHERE node_id = ? AND enqueue_seq = ?",
+                    (node_id, enqueue_seq),
+                )
+                return cursor.rowcount == 1
+        except sqlite3.Error as e:
+            raise DatabaseError(f"Failed to clear a rejection backlog row: {str(e)}")
+        finally:
+            conn.close()
+
+    def note_rejection_backlog_failure(self, node_id: str, *, enqueue_seq: int) -> bool:
+        """Counts one failed write attempt on a backlog row, only on ``enqueue_seq``.
+
+        Args:
+            node_id: The decision's content-hash id.
+            enqueue_seq: The seq of the row the caller read.
+
+        Returns:
+            True iff the row's ``retry_count`` was incremented.
+
+        Raises:
+            DatabaseError: If the update fails.
+        """
+        conn = self._get_connection()
+        try:
+            with conn:
+                cursor = conn.execute(
+                    "UPDATE rejection_backlog SET retry_count = retry_count + 1 "
+                    "WHERE node_id = ? AND enqueue_seq = ?",
+                    (node_id, enqueue_seq),
+                )
+                return cursor.rowcount == 1
+        except sqlite3.Error as e:
+            raise DatabaseError(
+                f"Failed to note a rejection backlog failure: {str(e)}"
+            )
+        finally:
+            conn.close()
+
+    def stamp_rejection_seed(self, established_by: str) -> None:
+        """Records that the rejection backlog covers the rejection index's expected set.
+
+        The standalone-connection twin of :func:`write_rejection_seed`, mirroring
+        :meth:`stamp_embedding_seed`. Re-stamping replaces the existing row.
+
+        Args:
+            established_by: The verb that established coverage — one of
+                ``migrations.REJECTION_SEED_ESTABLISHED_BY``.
+
+        Raises:
+            DatabaseError: If the write fails, including the ``CHECK`` refusing an
+                ``established_by`` outside the declared vocabulary.
+        """
+        conn = self._get_connection()
+        try:
+            with conn:
+                write_rejection_seed(conn, established_by)
+        except sqlite3.Error as e:
+            raise DatabaseError(
+                f"Failed to stamp the rejection seed marker "
+                f"(established_by must be one of "
+                f"{', '.join(REJECTION_SEED_ESTABLISHED_BY)}): {str(e)}"
+            )
+        finally:
+            conn.close()
+
+    def rejection_seed(self) -> Optional[Dict[str, str]]:
+        """Returns the rejection index's seed marker, or None when none stands.
+
+        Mirrors :meth:`embedding_seed`: any unreadable state, a graph without the
+        rung included, reads as absent, which is the safe answer to "may this write
+        create the collection?".
+
+        Returns:
+            ``{"established_by": …, "established_at": …}`` as plain strings, or
+            ``None``.
+        """
+        try:
+            conn = self._get_connection()
+        except DatabaseError:
+            return None
+        try:
+            row = conn.execute(
+                "SELECT established_by, established_at FROM rejection_seed WHERE id = 1"
+            ).fetchone()
+            if row is None:
+                return None
+            return {
+                "established_by": row["established_by"],
+                "established_at": row["established_at"],
+            }
+        except sqlite3.Error:
+            return None
+        finally:
+            conn.close()
+
+    def clear_rejection_seed(self, *, established_at: Optional[str] = None) -> None:
+        """Drops the rejection index's seed marker.
+
+        Mirrors :meth:`clear_embedding_seed`, including the stamp compare: given the
+        ``established_at`` the caller read, it spends only that marker, so one
+        re-stamped meanwhile survives.
+
+        Args:
+            established_at: The stamp of the marker to spend, compared exactly. None
+                deletes whatever marker stands.
+
+        Raises:
+            DatabaseError: If the delete fails.
+        """
+        conn = self._get_connection()
+        try:
+            with conn:
+                if established_at is None:
+                    conn.execute("DELETE FROM rejection_seed WHERE id = 1")
+                else:
+                    conn.execute(
+                        "DELETE FROM rejection_seed WHERE id = 1 AND established_at = ?",
+                        (established_at,),
+                    )
+        except sqlite3.Error as e:
+            raise DatabaseError(f"Failed to clear the rejection seed marker: {str(e)}")
         finally:
             conn.close()
 
@@ -4019,7 +4370,10 @@ class GraphStore:
         ``(queued_at, node_id)`` key are returned, by the same order. The drain walks
         the backlog this way, so a row that failed (and so kept its ``queued_at``)
         is passed rather than re-read, and the parameter list stays two values long
-        at any backlog size. The returned rows carry NO ``embedding_text`` (the column
+        at any backlog size. The keyset is a row-value comparison so that SQLite seeks
+        ``idx_pending_embeddings_queue`` (ladder step 5) to the cursor; the equivalent
+        ``queued_at > ? OR (queued_at = ? AND …)`` spelling walks the index from its
+        head on every claim. The returned rows carry NO ``embedding_text`` (the column
         is gone, C2/M8); the drainer re-derives it per node. ``drainer_id`` is
         retained for surface stability (R12) and is unused.
 
@@ -4054,11 +4408,11 @@ class GraphStore:
                     """
                     SELECT node_id, queued_at, retry_count
                     FROM pending_embeddings
-                    WHERE queued_at > ? OR (queued_at = ? AND node_id > ?)
+                    WHERE (queued_at, node_id) > (?, ?)
                     ORDER BY queued_at, node_id
                     LIMIT ?
                     """,
-                    (queued_at, queued_at, node_id, limit)
+                    (queued_at, node_id, limit)
                 )
             return [dict(row) for row in cursor.fetchall()]
         except sqlite3.Error as e:

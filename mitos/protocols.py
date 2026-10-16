@@ -9,6 +9,7 @@ from typing import (Protocol, List, Dict, Optional, Any, FrozenSet, Tuple, Set, 
 from mitos.parser import ParsedEntry
 from mitos.retrieval_walk import PointResolution
 from mitos.store import CommitDelta
+from mitos.vector_store import RejectionPoint, RejectionSearch
 
 class EmbeddingProvider(Protocol):
     """Protocol for cache-aware, prefix-based text embedding providers."""
@@ -129,6 +130,90 @@ class VectorStore(Protocol):
         """
         ...
 
+
+
+class RejectionIndex(Protocol):
+    """Protocol for the rejection index: one point per rejected item, in a sibling collection.
+
+    Named apart from :class:`VectorStore` on purpose (``search`` and
+    ``upsert_points``, never ``query`` and ``upsert``): its ids are item UUIDs taken
+    as given, its payload is the owner and the model, and a rejection hit must
+    never be taken for a decision hit. Every method but ``search``'s time budget
+    types its failures one way: unreachable, missing collection, or refused (see
+    :class:`~mitos.vector_store.QdrantRejectionIndex`).
+    """
+
+    def search(
+        self, vector: List[float], limit: int, *, budget_seconds: float
+    ) -> RejectionSearch:
+        """Searches the nearest items under a caller-bounded wait.
+
+        Args:
+            vector: The query embedding.
+            limit: Maximum hits to return.
+            budget_seconds: The wait bound, in seconds.
+
+        Returns:
+            ``searched=True`` with hits in ranked order, or ``searched=False`` and
+            no hits when the wait ran over the budget or the budget was already
+            spent (not positive) — never a raise for either.
+        """
+        ...
+
+    def retrieve_present(self, point_ids: Sequence[str]) -> Set[str]:
+        """Returns the subset of these point ids the index holds.
+
+        Args:
+            point_ids: The ids to ask about. Empty sends nothing.
+
+        Returns:
+            The present ids, as strings.
+        """
+        ...
+
+    def list_owner_point_ids(self, owner_id: str, page_size: int = 256) -> Set[str]:
+        """Lists every point one owner holds.
+
+        Args:
+            owner_id: The owning decision's 64-hex node id.
+            page_size: Maximum points fetched per page.
+
+        Returns:
+            The owner's point-id strings.
+        """
+        ...
+
+    def list_point_ids(self, page_size: int = 256) -> Set[str]:
+        """Lists every point id in the index.
+
+        Args:
+            page_size: Maximum points fetched per page.
+
+        Returns:
+            Every point-id string in the index.
+        """
+        ...
+
+    def upsert_points(
+        self, points: Sequence[RejectionPoint], *, model: str, may_create: bool
+    ) -> None:
+        """Writes items with their ids as given, each write confirmed.
+
+        Args:
+            points: The items to write. Empty sends nothing.
+            model: The embedding model id, recorded on every point.
+            may_create: Whether this write may create an absent collection.
+                Required and keyword-only — every write site declares.
+        """
+        ...
+
+    def delete_points(self, point_ids: Sequence[str]) -> None:
+        """Deletes exactly these points by their ids; confirmed or raised.
+
+        Args:
+            point_ids: The point ids to delete. Empty sends nothing.
+        """
+        ...
 
 class GraphStoreProtocol(Protocol):
     """Protocol for the relational, SQLite-backed decision graph."""

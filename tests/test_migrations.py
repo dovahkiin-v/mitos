@@ -21,6 +21,7 @@ from mitos.migrations import (
     _v1b_schema,
     _v1c_schema,
     _v2a_scope_ordinal,
+    _v4a_rejection_substrate,
     is_pre_v1a_schema,
     run_migrations,
 )
@@ -59,16 +60,17 @@ def _create_step(table: str):
     return step
 
 
-def test_registry_has_v1a_v1b_v1c_and_scope_ordinal_steps() -> None:
-    """The live registry carries four ladder rungs: V1a, V1b, V1c and the scope ordinal.
+def test_registry_has_v1a_v1b_v1c_scope_ordinal_and_rejection_substrate_steps() -> None:
+    """The live registry carries five rungs: V1a, V1b, V1c, the scope ordinal, rejections.
 
     Phase 5a appended ``(1, _v1_schema)`` (entry-001 flip); the collection-absence
     phase 1b appended ``(2, _v1b_schema)`` (the ``mechanisms`` DDL + widened ``edges``
     CHECK); phase 1c appended ``(3, _v1c_schema)`` (the ``embedding_seed`` coverage
     marker); surface-entropy phase 2a appends ``(4, _v2a_scope_ordinal)`` (the
-    ``node_scopes.ordinal`` column and its alphabetical backfill) — each via
-    ``.append``, never a rebind, so ``run_migrations``'s def-time-bound default arg
-    sees all four on the live boot.
+    ``node_scopes.ordinal`` column and its alphabetical backfill); recall-confidence
+    phase 4a appends ``(5, _v4a_rejection_substrate)`` (the rejection backlog, its seed
+    marker and the outbox's keyset index) — each via ``.append``, never a rebind, so
+    ``run_migrations``'s def-time-bound default arg sees all five on the live boot.
 
     The count assertion is the deliberate hand-off tripwire each phase inherits: it
     reds on the next append, which is how the appending phase is forced to notice the
@@ -78,7 +80,9 @@ def test_registry_has_v1a_v1b_v1c_and_scope_ordinal_steps() -> None:
     assert (2, _v1b_schema) in MIGRATION_STEPS
     assert (3, _v1c_schema) in MIGRATION_STEPS
     assert (4, _v2a_scope_ordinal) in MIGRATION_STEPS
-    assert len(MIGRATION_STEPS) == 4  # V1a + V1b + V1c + the scope ordinal
+    assert (5, _v4a_rejection_substrate) in MIGRATION_STEPS
+    # V1a + V1b + V1c + the scope ordinal + the rejection substrate
+    assert len(MIGRATION_STEPS) == 5
 
 
 def test_empty_ladder_is_noop() -> None:
@@ -803,14 +807,23 @@ def test_full_ladder_boots_fresh_db_to_head_via_live_registry(tmp_path) -> None:
         head = run_migrations(conn, MIGRATION_STEPS)
         assert head == _pending_head(MIGRATION_STEPS)
         assert _user_version(conn) == _pending_head(MIGRATION_STEPS)
-        # All six V1a tables + the mechanisms registry + the coverage marker.
+        # All six V1a tables + the mechanisms registry + the coverage marker + the
+        # rejection backlog and its marker (step 5). ``rejection_backlog``'s
+        # AUTOINCREMENT key makes SQLite create its internal ``sqlite_sequence``
+        # table, named here rather than filtered.
         tables = {
             row[0]
             for row in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table';"
             )
         }
-        assert tables == set(_V1A_TABLES) | {"mechanisms", "embedding_seed"}
+        assert tables == set(_V1A_TABLES) | {
+            "mechanisms",
+            "embedding_seed",
+            "rejection_backlog",
+            "rejection_seed",
+            "sqlite_sequence",
+        }
         # The marker table ships PRESENT and EMPTY: a fresh project has no covering act
         # standing, and "healthy and empty" must not read as "coverage established".
         assert conn.execute("SELECT COUNT(*) FROM embedding_seed;").fetchone()[0] == 0

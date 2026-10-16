@@ -7,8 +7,8 @@ initialization handling, and filtered semantic queries.
 import pytest
 from unittest.mock import MagicMock, patch
 from mitos.models import EMBEDDING_DIM
-from mitos.vector_store import (QdrantVectorStore, hash_to_uuid, list_collection_names,
-                                scroll_point_ids)
+from mitos.vector_store import (QdrantRejectionIndex, QdrantVectorStore, hash_to_uuid,
+                                list_collection_names, scroll_point_ids)
 from mitos.errors import (CollectionMissingError, VectorStoreError,
                           VectorStoreUnreachableError)
 
@@ -541,47 +541,66 @@ def test_query_ids_only_still_refuses_a_hit_without_an_id(mock_post: MagicMock) 
 
 _DELETE_URL = f"{_URL}/collections/{_COLLECTION}/points/delete?wait=true"
 _COMPLETED = {"result": {"operation_id": 7, "status": "completed"}, "status": "ok"}
+# 4a: the rejection index's client shares this body (``_delete_points``), so every row
+# runs over both classes and the two contracts cannot fork.
+_ON_BOTH_DELETE_CLIENTS = pytest.mark.parametrize(
+    "client_cls", [QdrantVectorStore, QdrantRejectionIndex],
+    ids=["decision", "rejection"],
+)
 _LISTED = ["0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"]
 
 
+@_ON_BOTH_DELETE_CLIENTS
 @patch("mitos.vector_store.requests.post")
-def test_delete_points_waits_and_sends_the_listed_ids_verbatim(mock_post: MagicMock) -> None:
+def test_delete_points_waits_and_sends_the_listed_ids_verbatim(
+    mock_post: MagicMock, client_cls: type
+) -> None:
     """``wait=true`` (without it Qdrant answers ``acknowledged``, which confirms nothing),
     and the ids exactly as the listing gave them — never re-hashed as node ids."""
     mock_post.return_value = _resp(200, _COMPLETED)
 
-    QdrantVectorStore(_URL, collection_name=_COLLECTION).delete_points(_LISTED)
+    client_cls(_URL, _COLLECTION).delete_points(_LISTED)
 
     assert mock_post.call_count == 1
     assert mock_post.call_args.args[0] == _DELETE_URL
     assert mock_post.call_args.kwargs["json"] == {"points": _LISTED}
 
 
+@_ON_BOTH_DELETE_CLIENTS
 @patch("mitos.vector_store.requests.post")
-def test_delete_points_sends_a_decimal_id_back_as_an_integer(mock_post: MagicMock) -> None:
+def test_delete_points_sends_a_decimal_id_back_as_an_integer(
+    mock_post: MagicMock, client_cls: type
+) -> None:
     """The scroll stringifies a foreign integer id; a string ``"7"`` would 400 the whole
     batch (measured on 1.16.3). A non-ASCII digit string is not an integer id and stays
     a string — ``str.isdigit`` alone would admit it."""
     mock_post.return_value = _resp(200, _COMPLETED)
 
-    QdrantVectorStore(_URL, collection_name=_COLLECTION).delete_points(
+    client_cls(_URL, _COLLECTION).delete_points(
         ["7", _LISTED[0], "٧", "12a"])
 
     assert mock_post.call_args.kwargs["json"] == {"points": [7, _LISTED[0], "٧", "12a"]}
 
 
+@_ON_BOTH_DELETE_CLIENTS
 @patch("mitos.vector_store.requests.post")
-def test_delete_points_with_no_ids_sends_nothing(mock_post: MagicMock) -> None:
-    QdrantVectorStore(_URL, collection_name=_COLLECTION).delete_points([])
+def test_delete_points_with_no_ids_sends_nothing(
+    mock_post: MagicMock, client_cls: type
+) -> None:
+    client_cls(_URL, _COLLECTION).delete_points([])
     assert mock_post.call_count == 0
 
 
+@_ON_BOTH_DELETE_CLIENTS
 @patch("mitos.vector_store.requests.post")
-def test_delete_points_returns_on_completed(mock_post: MagicMock) -> None:
+def test_delete_points_returns_on_completed(
+    mock_post: MagicMock, client_cls: type
+) -> None:
     mock_post.return_value = _resp(200, _COMPLETED)
-    assert QdrantVectorStore(_URL, collection_name=_COLLECTION).delete_points(_LISTED) is None
+    assert client_cls(_URL, _COLLECTION).delete_points(_LISTED) is None
 
 
+@_ON_BOTH_DELETE_CLIENTS
 @pytest.mark.parametrize("body", [
     {"result": {"operation_id": 7, "status": "acknowledged"}, "status": "ok"},
     {"result": {"operation_id": 7}, "status": "ok"},
@@ -593,42 +612,49 @@ def test_delete_points_returns_on_completed(mock_post: MagicMock) -> None:
 ])
 @patch("mitos.vector_store.requests.post")
 def test_delete_points_raises_when_the_answer_is_not_a_confirmation(
-    mock_post: MagicMock, body: object
+    mock_post: MagicMock, body: object, client_cls: type
 ) -> None:
     mock_post.return_value = _resp(200, body)
     with pytest.raises(VectorStoreError) as excinfo:
-        QdrantVectorStore(_URL, collection_name=_COLLECTION).delete_points(_LISTED)
+        client_cls(_URL, _COLLECTION).delete_points(_LISTED)
     assert type(excinfo.value) is VectorStoreError  # refused, not "stop"
 
 
+@_ON_BOTH_DELETE_CLIENTS
 @patch("mitos.vector_store.requests.post")
-def test_delete_points_raises_on_a_refused_batch(mock_post: MagicMock) -> None:
+def test_delete_points_raises_on_a_refused_batch(
+    mock_post: MagicMock, client_cls: type
+) -> None:
     """One malformed id 400s the whole batch (measured): a refusal, the next batch may go."""
     mock_post.return_value = _resp(400)
     with pytest.raises(VectorStoreError) as excinfo:
-        QdrantVectorStore(_URL, collection_name=_COLLECTION).delete_points(_LISTED)
+        client_cls(_URL, _COLLECTION).delete_points(_LISTED)
     assert type(excinfo.value) is VectorStoreError
 
 
+@_ON_BOTH_DELETE_CLIENTS
 @patch("mitos.vector_store.requests.put")
 @patch("mitos.vector_store.requests.post")
 def test_delete_points_reports_an_absent_collection_and_creates_nothing(
-    mock_post: MagicMock, mock_put: MagicMock
+    mock_post: MagicMock, mock_put: MagicMock, client_cls: type
 ) -> None:
     mock_post.return_value = _resp(404)
     with pytest.raises(CollectionMissingError) as excinfo:
-        QdrantVectorStore(_URL, collection_name=_COLLECTION).delete_points(_LISTED)
+        client_cls(_URL, _COLLECTION).delete_points(_LISTED)
     assert excinfo.value.collection == _COLLECTION
     assert mock_put.call_count == 0
 
 
+@_ON_BOTH_DELETE_CLIENTS
 @patch("mitos.vector_store.requests.post")
-def test_delete_points_types_a_transport_fault_as_unreachable(mock_post: MagicMock) -> None:
+def test_delete_points_types_a_transport_fault_as_unreachable(
+    mock_post: MagicMock, client_cls: type
+) -> None:
     import requests
 
     mock_post.side_effect = requests.ConnectionError("connection refused")
     with pytest.raises(VectorStoreUnreachableError):
-        QdrantVectorStore(_URL, collection_name=_COLLECTION).delete_points(_LISTED)
+        client_cls(_URL, _COLLECTION).delete_points(_LISTED)
 
 
 def test_the_node_id_delete_is_gone() -> None:
