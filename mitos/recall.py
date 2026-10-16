@@ -41,7 +41,7 @@ business widening it.
 """
 
 import difflib
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Tuple
 
 from mitos.shell_quote import shell_flag
 
@@ -98,6 +98,13 @@ SURFACE_DIDYOUMEAN_CUTOFF: float = 0.6
 # slug may start with ``-`` (``renderer._show_forms``' idiom). The MCP form names a
 # read tool and no shell command.
 #
+# ``dereference_id`` and ``history`` are the blackout's heals (:func:`blackout_note`,
+# their one consumer): the by-handle read of one retired decision by its id — the id,
+# because a retired decision may share its slug with the live one that replaced it —
+# and the read of the retired history. The CLI forms carry the selector, on
+# ``dereference``'s quoting rule; the MCP forms name read tools, never a shell
+# command (a tool call is not one, so MCP may name it).
+#
 # ``limit_arg`` and ``full_top_arg`` spell the two knobs :func:`edge_clause` names,
 # each with an ``{n}`` placeholder. They are argument spellings, not commands: the
 # clause rides ``surface`` and ``query`` alike, so it cannot name a verb, and the CLI
@@ -108,8 +115,10 @@ _SURFACE_POINTERS: Dict[str, Dict[str, str]] = {
         "complete": "mitos list",
         "complete_scope": "mitos list --scope '{scope}'",
         "dereference": "`mitos show {selector} -- <slug>`",
+        "dereference_id": "`mitos show {selector} -- <id>`",
         "discovery": "mitos scopes",
         "full_top_arg": "--full-top {n}",
+        "history": "`mitos list {selector} --state all`",
         "limit_arg": "--limit {n}",
         "precedent_scan": "`mitos surface {selector}`",
         "state_all": "mitos list --scope '{scope}' --state all",
@@ -119,8 +128,10 @@ _SURFACE_POINTERS: Dict[str, Dict[str, str]] = {
         "complete": "list_decisions()",
         "complete_scope": "list_decisions(scope='{scope}')",
         "dereference": "show_node(ident='<slug>')",
+        "dereference_id": "show_node(ident='<id>')",
         "discovery": "list_scopes",
         "full_top_arg": "full_top={n}",
+        "history": "list_decisions(state='all')",
         "limit_arg": "limit={n}",
         "precedent_scan": "surface_decisions()",
         "state_all": "list_decisions(scope='{scope}', state='all')",
@@ -410,6 +421,236 @@ def _with_edge(note: str, edge: Optional[WindowEdge], surface: str) -> str:
     return f"{note} {edge_clause(edge, surface=surface)}"
 
 
+# The two end values of the shared walk a short window can carry. Spelled here for
+# the reason ``_WALK_END_UNMEASURED`` is; rows pin them equal to
+# ``retrieval_walk.EXHAUSTED`` / ``retrieval_walk.SHORT_BOUND``.
+_WALK_END_EXHAUSTED = "exhausted"
+_WALK_END_SHORT_BOUND = "short_bound"
+
+# The two kinds of short window (``ShortWindow.kind``).
+SHORT_KIND_RAN_OUT = "ran_out"
+SHORT_KIND_BOUND_RETIRED = "bound_retired"
+
+
+class RetiredPartition(NamedTuple):
+    """The retired decisions a ranked answer shows, as the walk passed them.
+
+    Attributes:
+        shown: The walk hits to render as handles, closest first, at most
+            ``limit`` of them.
+        omitted: How many further members were left out (the count an envelope
+            states as ``retired_partition_omitted``).
+        leads: True when the closest shown member outranks the top live hit —
+            the case the lead line states.
+    """
+
+    shown: List[Any]
+    omitted: int
+    leads: bool
+
+
+def retired_partition(walk: "object") -> RetiredPartition:
+    """Bounds the walk's retired partition for presentation. The ONE place it is bounded.
+
+    Membership is the walk's (``walk.passed``: the retired hits a full window
+    outranked with its last live decision, or every retired hit when the window is
+    short). The bound is a presentation budget and lives here, beside the edge
+    rule: at most ``limit`` shown, closest first, the rest counted. ``walk`` is
+    duck-typed (``passed``, ``window``, ``limit``).
+
+    Args:
+        walk: The shared walk's result (``retrieval_walk.RankedWalk``).
+
+    Returns:
+        A :class:`RetiredPartition`.
+    """
+    passed = walk.passed
+    shown = list(passed[:walk.limit])
+    window = walk.window
+    leads = bool(window) and bool(shown) and shown[0].rank < window[0].rank
+    return RetiredPartition(shown=shown, omitted=len(passed) - len(shown), leads=leads)
+
+
+class ShortWindow(NamedTuple):
+    """Why a ranked window holds fewer live decisions than ``limit``.
+
+    Attributes:
+        kind: ``SHORT_KIND_RAN_OUT`` (the fetch returned fewer points than its
+            bound: the whole index was read) or ``SHORT_KIND_BOUND_RETIRED`` (the
+            fetch reached its bound with the window still short).
+        held: How many live decisions the window holds.
+        limit: The clamped window size.
+        returned: How many points the fetch returned.
+        retired: How many of those points were retired decisions (a short walk
+            never stops early, so this is every one in the fetch).
+    """
+
+    kind: str
+    held: int
+    limit: int
+    returned: int
+    retired: int
+
+
+def short_window(walk: "object") -> Optional[ShortWindow]:
+    """Decides whether a ranked answer says why its window is short.
+
+    A window under ``limit`` over a fetch that returned at least one point says
+    why, at every ``limit`` the ceiling included: the index ran out, or the bound
+    was reached with the neighbourhood mostly retired. A full window, an empty
+    fetch, or any other end says nothing (on a full window the edge rule speaks
+    instead, so the two never co-occur). ``walk`` is duck-typed (``window``,
+    ``limit``, ``returned``, ``end``, ``retired``).
+
+    Args:
+        walk: The shared walk's result (``retrieval_walk.RankedWalk``).
+
+    Returns:
+        A :class:`ShortWindow`, or None when the clause must stay absent.
+    """
+    held = len(walk.window)
+    if held >= walk.limit or walk.returned < 1:
+        return None
+    if walk.end == _WALK_END_EXHAUSTED:
+        kind = SHORT_KIND_RAN_OUT
+    elif walk.end == _WALK_END_SHORT_BOUND:
+        kind = SHORT_KIND_BOUND_RETIRED
+    else:
+        return None
+    return ShortWindow(kind=kind, held=held, limit=walk.limit,
+                       returned=walk.returned, retired=len(walk.retired))
+
+
+def short_window_clause(short: ShortWindow, *, surface: str) -> str:
+    """Words the sentence a ranked note carries when its window is short.
+
+    Facts only, and no lever: on ``ran_out`` the whole index was read, and on
+    ``bound_retired`` a higher ``limit`` re-reads the same fixed fetch, so naming
+    either would be a false line. No write instruction and no verdict on the corpus,
+    so it is lawful in both registers. Pure string formatting.
+
+    Args:
+        short: The short window from :func:`short_window`.
+        surface: ``"cli"`` or ``"mcp"`` — selects the ``limit`` spelling.
+
+    Returns:
+        One sentence.
+    """
+    at = _SURFACE_POINTERS[surface]["limit_arg"].format(n=short.limit)
+    noun = "decision" if short.held == 1 else "decisions"
+    stem = f"This window is short, {short.held} live {noun} at {at}:"
+    if short.kind == SHORT_KIND_RAN_OUT:
+        points = "point" if short.returned == 1 else "points"
+        return (f"{stem} the read reached the end of the index after "
+                f"{short.returned} {points}.")
+    return (
+        f"{stem} the read stopped at its {short.returned}-point bound, and "
+        f"{short.retired} of those points were retired decisions."
+    )
+
+
+def _successor_slugs(handle: Mapping[str, Any]) -> Optional[List[str]]:
+    """Where a retired handle's current word lives, or None when unread.
+
+    ``live_end`` when present (``[]`` stays ``[]``: the chain reaches no live
+    decision); otherwise the immediate successor stamps, which are live by
+    construction when no ``live_end`` was written; None when the handle carries no
+    successor key at all (the stamps went unread).
+    """
+    if "live_end" in handle:
+        return list(handle["live_end"])
+    successors = list(handle.get("superseded_by", [])) + list(handle.get("corrected_by", []))
+    return successors or None
+
+
+def retired_lead_clause(handle: Mapping[str, Any], *, surface: str) -> str:
+    """Words the line that opens a ranked note when a retired decision outranks rank 1.
+
+    The read-path guard against re-proposing an abandoned approach: the closest
+    match was retired, and here is where its current word lives. Names handle slugs
+    only — no pointer, no selector — so it needs no config. When the stamps went
+    unread it says the successor could not be read, and the closing
+    ``stamps_unread`` clause gives the reason. Pure string formatting.
+
+    Args:
+        handle: The leading handle (``display.retired_handle``).
+        surface: ``"cli"`` or ``"mcp"``; the wording is the same on both.
+
+    Returns:
+        One sentence.
+    """
+    if surface not in _SURFACE_POINTERS:
+        raise KeyError(surface)
+    stem = f"The closest match was retired: {handle['slug']} ({handle['state']})"
+    successors = _successor_slugs(handle)
+    if successors is None:
+        return f"{stem}; its successor could not be read."
+    if not successors:
+        return f"{stem}; its kill chain reaches no live decision."
+    return f"{stem}; its current word lives in {', '.join(successors)}."
+
+
+def blackout_note(handles: List[Mapping[str, Any]], *, short: Optional[ShortWindow],
+                  surface: str, config: "object") -> str:
+    """Builds the blackout note: the lead's zero-live form.
+
+    Ranked recall reached precedents but every one is retired, which would
+    otherwise read as a true miss — a false-novelty signal that costs the agent a
+    re-derivation of a call the graveyard already settled. The note names each
+    shown handle and where its current word lives (its live end, never a dead hop),
+    then the reads that heal: one retired decision whole by its id, and the
+    retired history. Each boundary words its own heal (``dereference_id`` /
+    ``history``): the CLI names commands with the selector, MCP names read tools
+    and no shell command. A blackout window is always short, so the short-window
+    clause closes it when given. Calm, one short block (P9). Pure string
+    formatting.
+
+    Args:
+        handles: The shown handles (``display.retired_handle``), closest first.
+        short: The short window from :func:`short_window`, or None.
+        surface: ``"cli"`` or ``"mcp"``.
+        config: The active ``MitosConfig`` (duck-typed). Read only for
+            ``project``, which the CLI heals name as their selector.
+
+    Returns:
+        The blackout note string.
+    """
+    pointers = _SURFACE_POINTERS[surface]
+    selector = shell_flag("-p", getattr(config, "project", ""))
+    n = len(handles)
+    parts: List[str] = []
+    for h in handles:
+        successors = _successor_slugs(h)
+        if successors is None:
+            parts.append(f"{h['slug']} ({h['state']})")
+        elif not successors:
+            parts.append(f"{h['slug']} ({h['state']}, no live successor)")
+        else:
+            parts.append(f"{h['slug']} ({h['state']} → {', '.join(successors)})")
+    noun, verb = ("match", "is") if n == 1 else ("matches", "are")
+    note = (
+        f"All {n} nearest {noun} {verb} retired — no live precedent on this claim, "
+        f"but it was settled before. Retired: {'; '.join(parts)}. Read one whole "
+        f"with {pointers['dereference_id'].format(selector=selector)}, or the retired "
+        f"history with {pointers['history'].format(selector=selector)}."
+    )
+    if short is not None:
+        note = f"{note} {short_window_clause(short, surface=surface)}"
+    return note
+
+
+def _ranked_note(note: str, *, lead: Optional[Mapping[str, Any]],
+                 edge: Optional[WindowEdge], short: Optional[ShortWindow],
+                 surface: str) -> str:
+    """Wraps a ranked band note: lead → band note → (edge | short)."""
+    if lead is not None:
+        note = f"{retired_lead_clause(lead, surface=surface)} {note}"
+    note = _with_edge(note, edge, surface)
+    if short is not None:
+        note = f"{note} {short_window_clause(short, surface=surface)}"
+    return note
+
+
 def _classify_recall(*, top_score: Optional[float], result_count: int) -> str:
     """Decides the confidence band. The ONE place that band choice is made.
 
@@ -453,6 +694,8 @@ def assess_surface_recall(
     scope_counts: Optional[Dict[str, Dict[str, int]]] = None,
     surface: str,
     edge: Optional[WindowEdge],
+    lead: Optional[Mapping[str, Any]],
+    short: Optional[ShortWindow],
     scope_total: Optional[int] = None,
     degraded_reason: Optional[str],
 ) -> Tuple[Optional[str], str]:
@@ -476,6 +719,15 @@ def assess_surface_recall(
             holds ranked results — ``strong``, ``weak`` and the with-results ``none``,
             unused-scope variants included; the nothing-ranked fork and every
             degraded arm ignore it.
+        lead: The leading retired handle when a retired decision outranks rank 1
+            (``retired_partition``'s ``leads``), else None. Required keyword, never
+            defaulted. Its line opens every note that holds ranked results, before
+            the unused-scope prefix: the closest match is the first thing said.
+        short: The short window from :func:`short_window`, or None. Required
+            keyword, never defaulted. Its clause follows the band note where the
+            edge clause would; the two never co-occur (a short window has no edge).
+            Every note holding ranked results reads lead → band note → (edge |
+            short), then the call site's withheld and stamps-unread clauses.
         scope_total: How many active decisions the scope holds, passed only by the
             degraded scope dump. Its presence is what selects the dump's own
             sentence, which names how many of them it shows; None keeps the shared
@@ -559,22 +811,20 @@ def assess_surface_recall(
     # Semantic ran with a real, confident hit.
     if band == "strong":
         matches_phrase = "Here are results that matched semantically." if scope_prefix else "Ranked top matches."
-        return "strong", _with_edge(
+        return "strong", _ranked_note(
             f"{scope_prefix}{matches_phrase} For the COMPLETE set of decisions in a scope — a "
             f"completeness pass — call {complete_hint}.",
-            edge,
-            surface,
+            lead=lead, edge=edge, short=short, surface=surface,
         )
 
     # Semantic ran but it's in the Twilight Zone (loose neighbour / phrased differently)
     if band == "weak":
         shown = f"{top_score:.2f}" if top_score is not None else "?"
         matches_phrase = "Here are results that matched semantically (twilight zone" if scope_prefix else "Twilight zone"
-        return "weak", _with_edge(
+        return "weak", _ranked_note(
             f"{scope_prefix}{matches_phrase}: top score {shown} is close. They might be family neighbours or "
             f"exact precedent phrased differently. Check carefully before deciding.",
-            edge,
-            surface,
+            lead=lead, edge=edge, short=short, surface=surface,
         )
 
     # Semantic ran but every match is garbage (off-axis)
@@ -584,7 +834,8 @@ def assess_surface_recall(
             msg = f"{scope_prefix}Top score {shown} is too low to be related. Treat as no-precedent and decide fresh."
         else:
             msg = f"Very likely off-axis: top score {shown} is too low to be related. The scope is populated, but nothing matches your query. Treat as no-precedent and decide fresh."
-        return "none", _with_edge(msg, edge, surface)
+        return "none", _ranked_note(msg, lead=lead, edge=edge, short=short,
+                                    surface=surface)
 
     # Semantic ran and returned nothing surfaceable.
     if scope_unused:
@@ -604,6 +855,8 @@ def assess_query_recall(
     config: "object",
     surface: str,
     edge: Optional[WindowEdge],
+    lead: Optional[Mapping[str, Any]],
+    short: Optional[ShortWindow],
 ) -> Tuple[str, str]:
     """Classifies a targeted-lookup result and builds its ``query``-register note.
 
@@ -639,6 +892,10 @@ def assess_query_recall(
             keyword, never defaulted. Its clause ends the ``strong``, ``weak`` and
             with-results ``none`` notes (after the redirect where there is one), in
             the same characters ``assess_surface_recall`` appends.
+        lead: The leading retired handle, or None — as in
+            :func:`assess_surface_recall`, and opening the same three notes.
+        short: The short window, or None — as in :func:`assess_surface_recall`,
+            in the edge clause's place.
 
     Returns:
         A ``(confidence, note)`` pair. ``confidence`` is ``"strong"`` / ``"weak"``
@@ -661,32 +918,29 @@ def assess_query_recall(
     # common answer with no legend at all. The edge clause may follow it; it names
     # arguments, not a verb.
     if band == "strong":
-        return band, _with_edge(
+        return band, _ranked_note(
             "Top match cleared the strong threshold — a real hit for this lookup, "
             "not a loose neighbour.",
-            edge,
-            surface,
+            lead=lead, edge=edge, short=short, surface=surface,
         )
 
     shown = f"{top_score:.2f}" if top_score is not None else "?"
 
     if band == "weak":
-        return band, _with_edge(
+        return band, _ranked_note(
             f"Twilight zone: top score {shown} — close, maybe not your handle. "
             f"{redirect}",
-            edge,
-            surface,
+            lead=lead, edge=edge, short=short, surface=surface,
         )
 
     # The ``"none"`` band forks the same way its sibling does: matches that all
     # ranked off-axis, versus nothing ranked at all. Neither states a verdict on the
     # corpus, and neither instructs a write.
     if result_count:
-        return band, _with_edge(
+        return band, _ranked_note(
             f"Off-axis: top score {shown} is too low to be related — nothing "
             f"ranked close. {redirect}",
-            edge,
-            surface,
+            lead=lead, edge=edge, short=short, surface=surface,
         )
     return band, (
         f"No semantic match — this ranking returned nothing. {redirect}"

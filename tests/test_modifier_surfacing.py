@@ -786,11 +786,16 @@ def test_cli_query_filters_superseded_and_stamps(ws, capsys) -> None:
     assert target["amended_by"] == ["q-amender"]
     assert target["rejected_paths"]
 
-    # text: dead-v1 omitted, q-target's ⚠ marker shown.
+    # text: dead-v1 is no ranked match, q-target's ⚠ marker shown. Since 2f the
+    # retired decision the ranking passed is named — in its own partition block and
+    # the lead (it outranked the top live hit), never as a numbered match.
     with patch("mitos.cli.MitosSyncManager", return_value=stub):
         cmd_query(config, "a claim that is not any slug")
     out = capsys.readouterr().out
-    assert "dead-v1" not in out
+    ranked = [ln for ln in out.splitlines() if ln[:1].isdigit() and ". " in ln]
+    assert ranked and all("dead-v1" not in ln for ln in ranked)
+    block = out.split("Retired decisions this ranking passed")[1].split("→ ")[0]
+    assert "dead-v1" in block and "superseded_by: dead-v2" in block
     assert "q-target" in out and "⚠" in out and "amended by" in out and "q-amender" in out
 
 
@@ -864,7 +869,7 @@ def test_cli_query_true_miss_keeps_plain_message(ws, capsys) -> None:
     with patch("mitos.cli.MitosSyncManager", return_value=stub):
         cmd_query(config, "a claim that is not any slug", as_json=True)
     resp = json.loads(capsys.readouterr().out)
-    _, band_note = assess_query_recall(edge=None, top_score=None, result_count=0,
+    _, band_note = assess_query_recall(lead=None, short=None, edge=None, top_score=None, result_count=0,
                                        config=config, surface="cli")
     assert resp == {"query": "a claim that is not any slug", "depth_mode": "letter",
                     "matches": [],
@@ -878,6 +883,16 @@ def test_cli_query_true_miss_keeps_plain_message(ws, capsys) -> None:
     with patch("mitos.cli.MitosSyncManager", return_value=stub):
         cmd_query(config, "a claim that is not any slug")
     assert "No matching decisions found." in capsys.readouterr().out
+
+
+def _dead_v1_handle(m) -> dict:
+    """The blackout handle of ``dead-v1`` at 0.9, superseded by the live ``dead-v2``.
+
+    2f rewrote these four rows on intent: the handle gained the node's ``id`` and the
+    hit's ``score``; its successor is live, so no ``live_end`` (the stamp names it).
+    """
+    return {"slug": "dead-v1", "id": m.store.resolve_slug("dead-v1")[0],
+            "state": "superseded", "score": 0.9, "superseded_by": ["dead-v2"]}
 
 
 def test_cli_query_blackout_vector(ws, capsys) -> None:
@@ -895,7 +910,7 @@ def test_cli_query_blackout_vector(ws, capsys) -> None:
         cmd_query(config, "a claim that is not any slug", as_json=True)
     resp = json.loads(capsys.readouterr().out)
     assert resp["matches"] == []
-    assert resp["all_superseded"] == [{"slug": "dead-v1", "state": "superseded", "superseded_by": ["dead-v2"]}]
+    assert resp["all_superseded"] == [_dead_v1_handle(m)]
 
     with patch("mitos.cli.MitosSyncManager", return_value=stub):
         cmd_query(config, "a claim that is not any slug")
@@ -952,7 +967,7 @@ def test_cli_surface_blackout_vector(ws, capsys) -> None:
         cmd_surface(config, "a claim that is not any slug", as_json=True)
     resp = json.loads(capsys.readouterr().out)
     assert resp["active_decisions"] == []
-    assert resp["all_superseded"] == [{"slug": "dead-v1", "state": "superseded", "superseded_by": ["dead-v2"]}]
+    assert resp["all_superseded"] == [_dead_v1_handle(m)]
     assert "dead-v1" in resp["note"]
 
 
@@ -992,7 +1007,7 @@ def test_mcp_query_blackout_vector(ws) -> None:
         resp = json.loads(mcp_server.query_decisions("a claim that is not any slug",
             project=config.workspace_dir))
     assert resp["matches"] == []
-    assert resp["all_superseded"] == [{"slug": "dead-v1", "state": "superseded", "superseded_by": ["dead-v2"]}]
+    assert resp["all_superseded"] == [_dead_v1_handle(m)]
 
 
 def test_mcp_surface_blackout_vector(ws) -> None:
@@ -1008,7 +1023,7 @@ def test_mcp_surface_blackout_vector(ws) -> None:
         resp = json.loads(mcp_server.surface_decisions(query="a claim that is not any slug",
             project=config.workspace_dir))
     assert resp["active_decisions"] == []
-    assert resp["all_superseded"] == [{"slug": "dead-v1", "state": "superseded", "superseded_by": ["dead-v2"]}]
+    assert resp["all_superseded"] == [_dead_v1_handle(m)]
 
 
 def test_mcp_limit_threads_through(ws) -> None:

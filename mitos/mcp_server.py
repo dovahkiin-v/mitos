@@ -14,7 +14,7 @@ from mcp.server.fastmcp.utilities.func_metadata import FuncMetadata, func_metada
 from pydantic import ValidationError
 
 from mitos import amend, registry, routing
-from mitos.display import RANKED_LIMIT_CEILING, blackout_note, clamp_limit, dumps_display, letter_payload, oneline_payload, order_scope_counts, projects_payload, retired_handle, scope_report, show_payload
+from mitos.display import RANKED_LIMIT_CEILING, clamp_limit, dumps_display, letter_payload, oneline_payload, order_scope_counts, projects_payload, retired_handle, scope_report, show_payload
 from mitos.config import MitosConfig
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS
 from mitos.embeddings import GeminiEmbeddingProvider
@@ -37,12 +37,13 @@ from mitos.divergence import _corpus_files, corpus_holds_entries
 # Module level on purpose: `amend` and `restore` close over no `cli`/`sync`/`store`
 # (measured at planning), so unlike `MitosSyncManager` neither needs deferring.
 from mitos.restore import BufferFidelityError
-from mitos.recall import (RANKED_EDGE_MARGIN, assess_query_recall,
-                          assess_surface_recall,
+from mitos.recall import (RANKED_EDGE_MARGIN, RetiredPartition, assess_query_recall,
+                          assess_surface_recall, blackout_note,
                           corpus_provenance, missing_graph_is_a_gap,
                           missing_graph_note, missing_index_is_a_gap,
-                          scope_filter_recovery, count_withheld,
-                          stamps_unread_clause, window_edge, withheld_clause)
+                          retired_partition, scope_filter_recovery, count_withheld,
+                          short_window, stamps_unread_clause, window_edge,
+                          withheld_clause)
 from mitos.retrieval_walk import WalkContractError, walk_ranked
 
 # No cross-call "seen" dedup state — deliberately. An earlier design cached
@@ -936,11 +937,14 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         semantic ranking ran) and a `note`: `weak` or `none` means no settled precedent
         on this claim — treat it as no-precedent and decide, or call
         list_decisions(scope=...) for a certain check (don't read weak neighbours as a
-        settled decision). When ranked recall retrieved precedents but every one is
-        superseded (a blackout), `active_decisions` stays empty and a sibling
-        `all_superseded` list carries the retired handles (`slug`, `state`, and the live
-        `superseded_by` successor when known) with the `note` naming them — that is a
-        recoverable "it was settled before, go read the history", not a true miss.
+        settled decision). Retired decisions the ranking passed come as
+        `retired_partition` handles (slug, id, state, score, the successor stamps, and
+        `live_end` where the successor is itself retired), at most `limit`, closest
+        first, `retired_partition_omitted` counting the rest; read one whole by its id
+        with show_node. When every precedent the ranking retrieved is retired (a
+        blackout), `active_decisions` stays empty and `all_superseded` carries the same
+        handles, with the `note` naming where each one's current word lives — a
+        recoverable "it was settled before", not a true miss.
     """
     # An argument fault is answered before any project is resolved — see
     # list_decisions for why the ordering is deliberate.
@@ -988,9 +992,15 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
     results.update(corpus_provenance(config))
     semantic_ran = False
     top_score: Optional[float] = None
-    retired: List[Dict[str, Any]] = []
     degraded_error: Optional[Exception] = None
     edge = None
+    # The retired partition and the short window, bound before the walk so every
+    # exit — degraded, and the healthy-empty CollectionMissingError arm with no walk
+    # — hands the composer a value, never an unbound name.
+    part = RetiredPartition([], 0, False)
+    handles: List[Dict[str, Any]] = []
+    short = None
+    lead = None
     dump_total: Optional[int] = None
 
     # 1. Semantic search if embeddings and vector store are active
@@ -1041,10 +1051,14 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
             )
         if walk.window:
             top_score = max(hit.score for hit in walk.window)
-        else:
-            # Zero live: the blackout's handles, closest first, bounded at `limit`.
-            retired = [retired_handle(hit.node, walk.stamps)
-                       for hit in walk.retired[:top_k]]
+        # The retired decisions this ranking passed, closest first, bounded at
+        # `limit` (zero live: the blackout's handles). One constructor for both keys.
+        part = retired_partition(walk)
+        handles = [retired_handle(h.node, score=h.score, stamps=walk.stamps,
+                                  live_ends=walk.live_ends)
+                   for h in part.shown]
+        short = short_window(walk)
+        lead = handles[0] if part.leads else None
 
     # 2. Scope pre-filtering fallback — ONLY when semantic recall is down (degraded).
     #    When semantic ran and simply found nothing, do NOT dump an unranked scope
@@ -1113,20 +1127,30 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         scope_counts=scope_counts,
         surface="mcp",
         edge=edge,
+        lead=lead,
+        short=short,
         scope_total=dump_total,
         degraded_reason=reason,
     )
     if confidence is not None:
         results["confidence"] = confidence
     results["note"] = note
+    # Present whenever the ranking passed a retired decision; the count only when
+    # the bound left some out.
+    if handles:
+        results["retired_partition"] = handles
+        if part.omitted:
+            results["retired_partition_omitted"] = part.omitted
 
-    # Blackout: semantic ranking ran and retrieved precedents, but every one was
-    # superseded-filtered. Override the note with the recovery vector and attach the
-    # retired handles (CLI⇄MCP-identical shape, T5 parity). Distinct from a true miss
-    # (where `retired` is empty); fires regardless of any parked open questions.
-    if semantic_ran and not results["active_decisions"] and retired:
-        results["note"] = blackout_note(retired)
-        results["all_superseded"] = retired
+    # Blackout: semantic ranking ran and retrieved precedents, but every one is
+    # retired. Override the note with its zero-live form, naming each handle's live
+    # end, and attach the same handle list as `all_superseded` (CLI⇄MCP-identical
+    # shape, T5 parity). Distinct from a true miss (no handles); fires regardless of
+    # any parked open questions.
+    if semantic_ran and not results["active_decisions"] and handles:
+        results["note"] = blackout_note(handles, short=short, surface="mcp",
+                                        config=config)
+        results["all_superseded"] = handles
 
     # W31 — the unbuilt graph (a clone carrying the corpus but not the gitignored
     # *.sqlite). Consulted on the ORDINARY empty path, not in an `except` arm: an
@@ -1448,10 +1472,13 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
         A decision a later one has moved on from also carries `superseded_by`/
         `amended_by`/`narrowed_by`/`corrected_by` (the modifying slugs) — an
         exact-slug hit on an amended decision still reads `state: "active"`, so
-        chase these before trusting its axiom's mechanism. When every retrieved
-        precedent is superseded (a blackout), `matches` stays empty and a sibling
-        `all_superseded` list carries the retired handles — settled before, not a
-        true miss; read the history with list_decisions(state="all"). An
+        chase these before trusting its axiom's mechanism. Retired decisions the
+        ranking passed come as `retired_partition` handles (slug, id, state, score,
+        stamps, `live_end` where the successor is retired), at most `limit`,
+        `retired_partition_omitted` counting the rest; show_node reads one by its
+        id. When every retrieved precedent is retired (a blackout), `matches` stays
+        empty and `all_superseded` carries the same handles — settled before, not a
+        true miss. An
         exact-slug hit's `mechanisms` is the folded identity form the graph
         stores; no by-handle read returns transcripts (they stay in
         `decisions.md`), graph-primary provenance (`source`, `created_at`,
@@ -1566,7 +1593,7 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             # No edge: the query raised before any window came back.
             confidence, note = assess_query_recall(
                 top_score=top_score, result_count=0, config=config, surface="mcp",
-                edge=None,
+                edge=None, lead=None, short=None,
             )
             empty["confidence"] = confidence
             empty["note"] = note
@@ -1609,10 +1636,13 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             output_list.append(match)
         if walk.window:
             top_score = max(hit.score for hit in walk.window)
-        # Zero live: the blackout's handles, closest first, bounded at `limit`.
-        retired = ([] if output_list else
-                   [retired_handle(hit.node, walk.stamps)
-                    for hit in walk.retired[:top_k]])
+        # The retired decisions this ranking passed — see surface_decisions.
+        part = retired_partition(walk)
+        handles = [retired_handle(h.node, score=h.score, stamps=walk.stamps,
+                                  live_ends=walk.live_ends)
+                   for h in part.shown]
+        short = short_window(walk)
+        lead = handles[0] if part.leads else None
 
         envelope: Dict[str, Any] = {"query": query, "depth_mode": "letter", "matches": output_list}
         envelope.update(corpus_provenance(config))
@@ -1626,18 +1656,25 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             config=config,
             surface="mcp",
             edge=edge,
+            lead=lead,
+            short=short,
         )
         envelope["confidence"] = confidence
         envelope["note"] = note
-        # Blackout: retrieved precedents but every one retired. Add the retired
-        # handles so the agent gets a pointer, not a false miss (CLI⇄MCP-identical
-        # `all_superseded` shape, T5 parity).
-        if not output_list and retired:
-            envelope["all_superseded"] = retired
+        if handles:
+            envelope["retired_partition"] = handles
+            if part.omitted:
+                envelope["retired_partition_omitted"] = part.omitted
+        # Blackout: retrieved precedents but every one retired. The same handle
+        # list rides `all_superseded`, so the agent gets a pointer, not a false miss
+        # (CLI⇄MCP-identical shape, T5 parity).
+        if not output_list and handles:
+            envelope["all_superseded"] = handles
             # Withholding it here would be a fresh CLI⇄MCP divergence (the CLI
             # twin prints it) and an MCP⇄MCP one (`surface_decisions` already
             # emits it on this surface).
-            envelope["note"] = blackout_note(retired)
+            envelope["note"] = blackout_note(handles, short=short, surface="mcp",
+                                             config=config)
         # W31 — see surface_decisions. Both of this tool's empty envelopes carry
         # it: this one (semantic ran and matched nothing) and the healthy-empty
         # one built in the CollectionMissingError arm above. An unbuilt clone

@@ -153,67 +153,50 @@ def oneline_payload(node: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
-def retired_handle(node: Mapping[str, Any],
-                   stamps: Mapping[str, Mapping[str, List[str]]]) -> Dict[str, Any]:
-    """Shapes a retired decision's handle for the blackout, shared CLI⇄MCP.
+def retired_handle(node: Mapping[str, Any], *, score: float,
+                   stamps: Mapping[str, Mapping[str, List[str]]],
+                   live_ends: Mapping[str, List[str]]) -> Dict[str, Any]:
+    """Shapes a retired decision's handle — the one constructor, shared CLI⇄MCP.
 
-    ``{"slug", "state"}`` plus ``superseded_by`` when the stamp map carries it for
-    the node. Everything comes from the node the walk resolved by point id — never
-    from a slug lookup — so a retired decision that shares its slug with a live
-    successor is described as itself, and a renamed one under its current slug.
-    ``superseded_by`` is the **immediate** successor stamp, which on a chain may
-    itself be retired (the live end of the chain is not computed here). When the
-    stamp read faulted the map is empty and the key is omitted; the envelope's
-    ``stamps_unread`` says so. Store-free: the stamps are passed in.
+    Every ``retired_partition`` entry and every ``all_superseded`` entry is built
+    here: ``{"slug", "id", "state", "score"}``, plus ``superseded_by`` /
+    ``corrected_by`` when the stamp map carries them for the node, plus ``live_end``
+    when ``live_ends`` carries the node's id. Everything comes from the node the walk
+    resolved by point id — never from a slug lookup — so a retired decision that
+    shares its slug with a live decision is described as itself (its ``id`` reads
+    it whole by handle), and a renamed one under its current slug.
+
+    ``superseded_by`` / ``corrected_by`` are write facts: the **immediate** killer,
+    which on a chain may itself be retired. ``live_end`` is present exactly when an
+    immediate successor is retired, and names where the chain's current word lives
+    (``[]`` when the chain reaches no live decision). When the stamp or live-end
+    read faulted both maps are empty and every successor key is omitted; the
+    envelope's ``stamps_unread`` says so. Store-free: the maps are passed in.
 
     Args:
         node: The resolved node; reads ``id``, ``slug`` and ``computed_state``.
+        score: The hit's similarity score.
         stamps: Node id → modifier stamps, as the walk returned them.
+        live_ends: Node id → live-end slugs, as the walk returned them.
 
     Returns:
         The handle dict.
     """
-    handle: Dict[str, Any] = {"slug": node["slug"], "state": node["computed_state"]}
-    successors = stamps.get(node["id"], {}).get("superseded_by")
-    if successors:
-        handle["superseded_by"] = list(successors)
-    return handle
-
-
-def blackout_note(retired_handles: List[Mapping[str, Any]]) -> str:
-    """Builds the all-superseded blackout recovery note (the P3 vector text).
-
-    When ranked recall retrieved precedents but every one was superseded-filtered,
-    the surface would otherwise read as a true semantic *miss* — a false-novelty
-    signal that costs the agent an expensive re-derivation of a contradiction the
-    graveyard already settled. This note turns that dead-end into a vector: it names
-    the retired handles (and their immediate successors, when the stamps were read)
-    and points at the command that reads the retired history. Calm, one short block
-    (P9).
-
-    Args:
-        retired_handles: The retired handles (:func:`retired_handle`), each a dict
-            with ``slug`` and optionally ``superseded_by`` — the immediate
-            successor stamp, which on a chain may itself be retired.
-
-    Returns:
-        The blackout note string.
-    """
-    n = len(retired_handles)
-    parts: List[str] = []
-    for h in retired_handles:
-        successors = h.get("superseded_by")
+    handle: Dict[str, Any] = {
+        "slug": node["slug"],
+        "id": node["id"],
+        "state": node["computed_state"],
+        "score": score,
+    }
+    node_stamps = stamps.get(node["id"], {})
+    for key in ("superseded_by", "corrected_by"):
+        successors = node_stamps.get(key)
         if successors:
-            parts.append(f"{h['slug']} (→ {', '.join(successors)})")
-        else:
-            parts.append(str(h["slug"]))
-    noun, verb = ("match", "is") if n == 1 else ("matches", "are")
-    return (
-        f"All {n} nearest {noun} {verb} superseded — no active precedent on "
-        f"this claim, but it was settled before. Retired: {'; '.join(parts)}. "
-        f"Read the retired history with: mitos list --state all "
-        f"(or list_decisions(state=\"all\"))."
-    )
+            handle[key] = list(successors)
+    # Membership, not truthiness: `[]` is a stated fact (no live end reached).
+    if node["id"] in live_ends:
+        handle["live_end"] = list(live_ends[node["id"]])
+    return handle
 
 
 def node_handles(

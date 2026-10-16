@@ -930,12 +930,16 @@ def test_the_shared_leaf_holds_no_wording_and_stays_a_stdlib_tier_leaf() -> None
     #
     # The anchor was `mitos sync`, carried by the shared not-found hint. 6c split
     # that hint per surface and deleted it from this leaf, so the anchor moved to
-    # `blackout_note`'s retired-history pointer — still a deliberate workflow
-    # string, and still one that survives here precisely because it spells BOTH
-    # surfaces' form side by side, which is the property that lets a recipe live
-    # on a shared leaf at all. Re-anchored rather than deleted: dropping it would
-    # leave the sweep below able to pass over an empty set forever.
-    assert any("mitos list --state all" in literal for literal in emittable)
+    # `blackout_note`'s retired-history pointer. 2f moved the blackout note to
+    # `recall.py` (worded per boundary through its pointer table), and with it the
+    # last workflow string this leaf held: what remains emittable here is key names.
+    # So the anchor is now `retired_handle`'s `live_end` key — it proves the
+    # docstring filter is not inert (a real literal survives it), not that the leaf
+    # holds a workflow string; it holds none. Re-anchored rather than deleted:
+    # dropping it would leave the sweep below able to pass over an empty set forever.
+    # The blackout's own register is pinned where it now lives
+    # (`test_retired_partition.py`).
+    assert "live_end" in emittable
 
     for literal in emittable:
         for syntax in FORBIDDEN_SYNTAX:

@@ -24,9 +24,9 @@ from unittest.mock import patch
 
 from mitos import cli, mcp_server
 from mitos.cli import cmd_query, cmd_surface
-from mitos.display import blackout_note
 from mitos.recall import (EDGE_KIND_MID_CLUSTER, EDGE_KIND_UNMEASURED, RANKED_EDGE_MARGIN,
-                          WindowEdge, edge_clause, stamps_unread_clause, withheld_clause)
+                          ShortWindow, WindowEdge, blackout_note, edge_clause,
+                          stamps_unread_clause, withheld_clause)
 from mitos.retrieval_walk import (EDGE_UNMEASURED, RANKED_OVERFETCH_BOUND, SHORT_BOUND,
                                   walk_ranked)
 from mitos.store import GraphStore
@@ -226,18 +226,22 @@ def test_the_edge_sits_after_the_band_and_before_withheld_and_stamps_unread(ws, 
 
 @pytest.mark.parametrize("driver", list(DRIVERS))
 def test_a_blackout_carries_no_edge_clause(ws, driver):
-    """Every hit retired: no live window, so no edge, and the blackout note stands."""
-    _, m = ws
+    """Every hit retired: no live window, so no edge, and the blackout note stands
+    (2f: with the handle's id and score, and the short clause a blackout carries)."""
+    config, m = ws
     _rec(m, "old")
     _rec(m, "new", supersedes="old")
     call, _verb, surface, key = DRIVERS[driver]
     resp = call(ws, CannedVector([point_hit(_id(m, "old"), 0.9)]))
-    handles = [{"slug": "old", "state": "superseded", "superseded_by": ["new"]}]
+    handles = [{"slug": "old", "id": _id(m, "old"), "state": "superseded",
+                "score": 0.9, "superseded_by": ["new"]}]
+    note = blackout_note(handles, short=ShortWindow("ran_out", 0, 5, 1, 1),
+                         surface=surface, config=config)
     if key is not None:
         assert resp[key] == [] and resp["all_superseded"] == handles
-        assert resp["note"] == blackout_note(handles)
+        assert resp["note"] == note
     else:
-        assert blackout_note(handles) in resp
+        assert note in resp
     _no_edge(resp if key is None else resp["note"], surface)
 
 

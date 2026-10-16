@@ -309,6 +309,27 @@ async def test_an_mcp_agent_reads_every_section_one_key_from_the_payload(tmp_pat
             assert read.get("invalidates_if") == INVALIDATES_IF_A, f"S8 {label}: {read}"
             assert sorted(read.get("mechanisms") or []) == sorted(folded), f"S8 {label}: {read}"
 
+        # S8b — the retired partition (2f), after S8 because it retires A, which S8's
+        # slug branch reads in the active view; and after S7, whose two windows must
+        # see one live set (scout D-N). A unrelated successor supersedes A; A still
+        # ranks first, so the window passes it: a handle with its id, and the lead.
+        s8b = _payload(await call("S8b", "record_decision",
+                                  axiom="Invoices are archived weekly as compressed files.",
+                                  rejected_paths="Keeping invoices in the hot table.",
+                                  scope=["billing"], slug="invoice-archive-weekly",
+                                  supersedes="session-tokens-hashed"), "S8b")
+        assert s8b.get("status") == "created", f"S8b: the successor paused or failed: {s8b}"
+        s8c = _payload(await call("S8b", "surface_decisions", query=WEAK_QUERY, limit=2),
+                       "S8b")
+        assert "degraded" not in s8c, f"S8b: {s8c}"
+        part = s8c.get("retired_partition") or [{}]
+        assert part[0].get("slug") == "session-tokens-hashed", f"S8b: {s8c}"
+        assert part[0].get("superseded_by") == ["invoice-archive-weekly"], f"S8b: {part}"
+        assert len(part[0].get("id", "")) == 64, f"S8b: {part}"
+        assert s8c.get("note", "").startswith(
+            "The closest match was retired: session-tokens-hashed (superseded); its current "
+            "word lives in invoice-archive-weekly."), f"S8b: {s8c.get('note')}"
+
         # S9 — an undeclared argument is refused in mitos's voice, on the same session.
         s9 = await server.session.call_tool("list_decisions",
                                             {"project": project, "bogus_param": 1})

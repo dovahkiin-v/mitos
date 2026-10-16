@@ -31,10 +31,9 @@ import pytest
 
 from mitos import cli, mcp_server
 from mitos.cli import cmd_query, cmd_surface
-from mitos.display import blackout_note
 from mitos.errors import DatabaseError
 from mitos.parser import ParsedEntry
-from mitos.recall import stamps_unread_clause
+from mitos.recall import ShortWindow, blackout_note, stamps_unread_clause
 from mitos.retrieval_walk import RANKED_OVERFETCH_BOUND, WalkContractError
 from mitos.store import GraphStore
 from mitos.sync import MitosSyncManager
@@ -155,14 +154,21 @@ def test_a_same_slug_pair_serves_the_live_decision_once_at_its_own_score(ws, dri
 
 @pytest.mark.parametrize("driver", JSON_DRIVERS)
 def test_a_same_slug_retired_point_alone_is_a_blackout_of_the_retired_node(ws, driver):
-    _, m = ws
+    """2f rewrites the handle on intent: it gains the retired node's own id (the one
+    handle that reads it whole, since its slug names the live bearer) and its score;
+    the note gains the short-window clause (one point read, the index ran out)."""
+    config, m = ws
     retired, _successor = same_slug_lineage(m.store)
-    call, _verb, _surface, key = DRIVERS[driver]
+    call, _verb, surface, key = DRIVERS[driver]
     resp = call(ws, _vec([point_hit(retired, 0.90, slug="database")]))
     assert resp[key] == []
     assert resp["all_superseded"] == [
-        {"slug": "database", "state": "superseded", "superseded_by": ["database"]}]
-    assert resp["note"] == blackout_note(resp["all_superseded"])
+        {"slug": "database", "id": retired, "state": "superseded", "score": 0.90,
+         "superseded_by": ["database"]}]
+    assert resp["retired_partition"] == resp["all_superseded"]
+    assert resp["note"] == blackout_note(
+        resp["all_superseded"], short=ShortWindow("ran_out", 0, 5, 1, 1),
+        surface=surface, config=config)
 
 
 # --------------------------------------------------------------------------- #
@@ -202,7 +208,8 @@ def test_a_renamed_retired_decision_is_handled_under_its_current_slug(ws, driver
     resp = call(ws, _vec([point_hit(node_id, 0.9, slug="r-old-name")]))
     assert resp[key] == []
     assert resp["all_superseded"] == [
-        {"slug": "r-current", "state": "superseded", "superseded_by": ["r-successor"]}]
+        {"slug": "r-current", "id": node_id, "state": "superseded", "score": 0.9,
+         "superseded_by": ["r-successor"]}]
 
 
 # --------------------------------------------------------------------------- #
@@ -237,7 +244,12 @@ def test_orphans_questions_and_retired_hits_take_no_slot(ws, driver):
 @pytest.mark.parametrize("driver", JSON_DRIVERS)
 def test_a_live_decision_below_retired_ones_ends_the_old_blackout(ws, driver):
     """G4, a deliberate inversion: the top `limit` are retired and a live decision
-    sits below them. Before 2c that was a blackout; the walk fills from the fetch."""
+    sits below them. Before 2c that was a blackout; the walk fills from the fetch.
+
+    2f inverts the rest on intent (plan row 9): still no blackout, but the three
+    retired decisions the ranking passed are now a partition — a short window, so
+    every retired hit is a member — shown at `limit`, the third counted, and the
+    closest one leads the note."""
     _, m = ws
     hits = []
     for i in range(3):
@@ -250,6 +262,9 @@ def test_a_live_decision_below_retired_ones_ends_the_old_blackout(ws, driver):
     resp = call(ws, _vec(hits), limit=2)
     assert _hit_slugs(resp, key) == ["deep-live"]
     assert "all_superseded" not in resp
+    assert [h["slug"] for h in resp["retired_partition"]] == ["old-0", "old-1"]
+    assert resp["retired_partition_omitted"] == 1
+    assert resp["note"].startswith("The closest match was retired: old-0 (superseded)")
 
 
 @pytest.mark.parametrize("driver", JSON_DRIVERS)
@@ -265,6 +280,9 @@ def test_the_blackout_is_bounded_at_limit_closest_first(ws, driver):
     resp = call(ws, _vec(hits), limit=2)
     assert resp[key] == []
     assert [h["slug"] for h in resp["all_superseded"]] == ["old-0", "old-1"]
+    # 2f: the rest are counted, and both keys carry the one handle list.
+    assert resp["retired_partition_omitted"] == len(hits) - 2
+    assert resp["retired_partition"] == resp["all_superseded"]
 
 
 # --------------------------------------------------------------------------- #
@@ -383,11 +401,13 @@ def test_a_stamp_fault_on_a_blackout_states_it_on_the_blackout_note(ws, driver):
     _rec(m, "new", supersedes="old")
     call, _verb, surface, key = DRIVERS[driver]
     resp = call(ws, _vec([point_hit(_id(m, "old"), 0.9)]), wrap=_StampFault)
-    handles = [{"slug": "old", "state": "superseded"}]
+    handles = [{"slug": "old", "id": _id(m, "old"), "state": "superseded", "score": 0.9}]
     assert resp[key] == [] and resp["all_superseded"] == handles
     assert resp["stamps_unread"] is True
     clause = stamps_unread_clause(surface=surface, config=config)
-    assert resp["note"] == f"{blackout_note(handles)} {clause}"
+    note = blackout_note(handles, short=ShortWindow("ran_out", 0, 5, 1, 1),
+                         surface=surface, config=config)
+    assert resp["note"] == f"{note} {clause}"
 
 
 def test_a_stamp_fault_on_the_text_blackout_states_it_too(ws):
@@ -398,7 +418,10 @@ def test_a_stamp_fault_on_the_text_blackout_states_it_too(ws):
     out = _cli("query", ws, _vec([point_hit(_id(m, "old"), 0.9)]), as_json=False,
                wrap=_StampFault)
     clause = stamps_unread_clause(surface="cli", config=config)
-    assert f"{blackout_note([{'slug': 'old', 'state': 'superseded'}])} {clause}" in out
+    handles = [{"slug": "old", "id": _id(m, "old"), "state": "superseded", "score": 0.9}]
+    note = blackout_note(handles, short=ShortWindow("ran_out", 0, 5, 1, 1),
+                         surface="cli", config=config)
+    assert f"{note} {clause}" in out
 
 
 @pytest.mark.parametrize("driver", JSON_DRIVERS)
@@ -490,6 +513,8 @@ def test_cli_and_mcp_agree_on_the_handles(ws, verb):
     mcp_resp = _mcp(verb, ws, _vec(hits))
     cli_resp = _cli(verb, ws, _vec(hits), as_json=True)
     assert mcp_resp["all_superseded"] == cli_resp["all_superseded"] == [
-        {"slug": "database", "state": "superseded", "superseded_by": ["database"]},
-        {"slug": "old", "state": "superseded", "superseded_by": ["new"]},
+        {"slug": "database", "id": retired, "state": "superseded", "score": 0.9,
+         "superseded_by": ["database"]},
+        {"slug": "old", "id": _id(m, "old"), "state": "superseded", "score": 0.8,
+         "superseded_by": ["new"]},
     ]

@@ -285,6 +285,18 @@ class GraphStoreProtocol(Protocol):
         """
         ...
 
+    def get_live_ends(self, node_ids: List[str]) -> Dict[str, List[str]]:
+        """For each id whose kill chain passes through a retired successor, the live ends it reaches.
+
+        Args:
+            node_ids: The retired nodes to follow.
+
+        Returns:
+            Node id → live-end slugs, only for ids with a retired immediate
+            successor; ``[]`` when the chain reaches no live decision.
+        """
+        ...
+
     def get_modifiers(self, node_id: str) -> Dict[str, List[str]]:
         """Returns the reverse-relation modifiers for a single node.
 

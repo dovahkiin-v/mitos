@@ -35,7 +35,6 @@ from mitos.shell_quote import shell_arg, shell_flag
 from mitos.display import (
     RANKED_LIMIT_CEILING,
     apply_stdout_text_safety,
-    blackout_note,
     clamp_limit,
     dumps_display,
     handle_text,
@@ -97,13 +96,13 @@ from mitos.migrations import is_pre_v1a_schema
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS, open_connection
 from mitos.cutover import default_aside_db_path, perform_swap, rebuild_and_gate
 from mitos.lexical import degraded_reason_from_error, lexical_fallback
-from mitos.recall import (RANKED_EDGE_MARGIN, assess_query_recall,
-                          assess_surface_recall,
+from mitos.recall import (RANKED_EDGE_MARGIN, RetiredPartition, assess_query_recall,
+                          assess_surface_recall, blackout_note,
                           corpus_provenance, missing_graph_is_a_gap,
                           missing_graph_note, missing_index_is_a_gap,
-                          provenance_line, scope_filter_recovery,
-                          count_withheld, stamps_unread_clause, window_edge,
-                          withheld_clause)
+                          provenance_line, retired_partition, scope_filter_recovery,
+                          count_withheld, short_window, stamps_unread_clause,
+                          window_edge, withheld_clause)
 from mitos.retrieval_walk import WalkContractError, walk_ranked
 from mitos.sync import (MitosSyncManager, run_ambient_capture, _SLUG_MAX_LEN,
                         _ENTRIES_MARKER, _NEIGHBOR_REVIEW_THRESHOLD,
@@ -1171,9 +1170,14 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
     # Composition, outside the `try`: pure shaping over what the walk returned, so
     # a defect here is loud rather than posing as degraded recall.
     matches: List[Dict[str, Any]] = []
-    retired: List[Dict[str, Any]] = []
     top_score: Optional[float] = None
     edge = None
+    # Bound before the walk's block: the healthy-empty CollectionMissingError arm
+    # reaches the composer with no walk.
+    part = RetiredPartition([], 0, False)
+    handles: List[Dict[str, Any]] = []
+    short = None
+    lead = None
     if walk is not None:
         # The rank just past the live window: retired and open-question points
         # take no slots, so it is the next live decision the walk found.
@@ -1191,10 +1195,14 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
             matches.append(match)
         if walk.window:
             top_score = max(hit.score for hit in walk.window)
-        else:
-            # Zero live: the blackout's handles, closest first, bounded at `limit`.
-            retired = [retired_handle(hit.node, walk.stamps)
-                       for hit in walk.retired[:top_k]]
+        # The retired decisions this ranking passed, closest first, bounded at
+        # `limit` (zero live: the blackout's handles). One constructor for both keys.
+        part = retired_partition(walk)
+        handles = [retired_handle(h.node, score=h.score, stamps=walk.stamps,
+                                  live_ends=walk.live_ends)
+                   for h in part.shown]
+        short = short_window(walk)
+        lead = handles[0] if part.leads else None
     # The stamps went unread: the ranking stands and every exit that renders hits
     # or handles says so, last on its note (after every override). None when read.
     unread_clause = (stamps_unread_clause(surface="cli", config=config)
@@ -1206,9 +1214,9 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
     # Blackout: the walk found zero live decisions in its whole fetch but passed
     # retired ones. That is NOT a true miss — surfacing it as one makes the agent
     # assume novelty and re-derive a settled contradiction. Emit the retired handles
-    # + a distinct note instead. `retired` is filled only on a zero-live walk, so
-    # `not matches and retired` is exactly the blackout.
-    blackout = not matches and bool(retired)
+    # + a distinct note instead. With zero live every handle is a passed retired
+    # decision, so `not matches and handles` is exactly the blackout.
+    blackout = not matches and bool(handles)
 
     # W31 — the unbuilt graph. Unlike its I8 sibling this one is consulted on the
     # ORDINARY empty path rather than inside an `except`: an empty graph raises
@@ -1230,6 +1238,8 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         config=config,
         surface="cli",
         edge=edge,
+        lead=lead,
+        short=short,
     )
     # A thinned answer says so, on both encodings: the clause joins the local note
     # the text render prints and the envelope carries. The blackout and unbuilt
@@ -1248,11 +1258,16 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         # ranking that an override about the graph does not contradict).
         envelope["confidence"] = confidence
         envelope["note"] = note
+        if handles:
+            envelope["retired_partition"] = handles
+            if part.omitted:
+                envelope["retired_partition_omitted"] = part.omitted
         if blackout:
-            envelope["all_superseded"] = retired
+            envelope["all_superseded"] = handles
             # Closes the text/JSON divergence: the text branch below has printed
             # this note since 2d while `--json` carried the handles alone.
-            envelope["note"] = blackout_note(retired)
+            envelope["note"] = blackout_note(handles, short=short, surface="cli",
+                                             config=config)
         if unbuilt:
             envelope["note"] = missing_graph_note("cli", config)
         if withheld:
@@ -1270,7 +1285,9 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         # falls through the stamped empty header); this branch returns early and
         # was the one text exit of the read verbs that named none.
         _echo_corpus(config)
-        print(_closing(blackout_note(retired)))
+        _print_retired_partition(handles, part.omitted)
+        print(_closing(blackout_note(handles, short=short, surface="cli",
+                                     config=config)))
         return
 
     # Genuine miss — nothing was retrieved (or nothing resolved). The provenance
@@ -1309,7 +1326,37 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         if d["scope"]:
             print(f"   Scope:    {', '.join(d['scope'])}")
         print()
+    _print_retired_partition(handles, part.omitted)
     print(f"→ {_closing(note)}")
+
+
+def _print_retired_partition(handles: List[Dict[str, Any]], omitted: int) -> None:
+    """Prints a ranked answer's retired partition on the CLI text surface.
+
+    The text twin of the ``retired_partition`` / ``retired_partition_omitted``
+    keys, shared by ``mitos surface`` and ``mitos query`` and called on every exit
+    that carries handles, just before the ``→`` note line. One line per handle —
+    slug, state, score, the full id (a retired decision may share its slug with
+    the live one that replaced it, so the id is the handle that reads it whole),
+    its successor stamps and its live end when present — then a count of the
+    members the bound left out. Prints nothing when there are no handles.
+
+    Args:
+        handles: The shown handles (``display.retired_handle``).
+        omitted: How many further members were left out.
+    """
+    if not handles:
+        return
+    print("Retired decisions this ranking passed (closest first):")
+    for h in handles:
+        line = f"  {h['slug']}  ({h['state']}, score {h['score']:.3f})  id {h['id']}"
+        for key in ("superseded_by", "corrected_by", "live_end"):
+            if key in h:
+                line += f"  {key}: {', '.join(h[key]) if h[key] else '(none)'}"
+        print(line)
+    if omitted:
+        print(f"  (+{omitted} more retired not listed)")
+    print()
 
 
 def _query_band_line(confidence: str) -> Optional[str]:
@@ -2585,9 +2632,13 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     results.update(corpus_provenance(config))
     semantic_ran = False
     top_score: Optional[float] = None
-    retired: List[Dict[str, Any]] = []
     degraded_error: Optional[Exception] = None
     edge = None
+    # Bound before the walk's block — see cmd_query.
+    part = RetiredPartition([], 0, False)
+    handles: List[Dict[str, Any]] = []
+    short = None
+    lead = None
     dump_total: Optional[int] = None
 
     walk = None
@@ -2628,10 +2679,13 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
             results["active_decisions"].append(d)
         if walk.window:
             top_score = max(hit.score for hit in walk.window)
-        else:
-            # Zero live: the blackout's handles, closest first, bounded at `limit`.
-            retired = [retired_handle(hit.node, walk.stamps)
-                       for hit in walk.retired[:top_k]]
+        # The retired decisions this ranking passed — see cmd_query.
+        part = retired_partition(walk)
+        handles = [retired_handle(h.node, score=h.score, stamps=walk.stamps,
+                                  live_ends=walk.live_ends)
+                   for h in part.shown]
+        short = short_window(walk)
+        lead = handles[0] if part.leads else None
 
     # Scope listing fallback ONLY in degraded mode (mirrors the MCP tool, P5): a
     # semantic run that found nothing must not masquerade as an unranked scope dump.
@@ -2699,22 +2753,29 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         scope_counts=scope_counts,
         surface="cli",
         edge=edge,
+        lead=lead,
+        short=short,
         scope_total=dump_total,
         degraded_reason=reason,
     )
     if confidence is not None:
         results["confidence"] = confidence
     results["note"] = note
+    if handles:
+        results["retired_partition"] = handles
+        if part.omitted:
+            results["retired_partition_omitted"] = part.omitted
 
-    # Blackout: semantic ranking ran and retrieved precedents, but every one was
-    # superseded-filtered (no active match). Override the note with the recovery
-    # vector and attach the retired handles — distinct from a true miss (where
-    # `retired` is empty). Fires regardless of any parked open questions (the
-    # all_superseded vector must not be suppressed by a non-empty open_questions).
-    blackout = semantic_ran and not results["active_decisions"] and bool(retired)
+    # Blackout: semantic ranking ran and retrieved precedents, but every one is
+    # retired (no live match). Override the note with its zero-live form and attach
+    # the same handle list as `all_superseded` — distinct from a true miss (no
+    # handles). Fires regardless of any parked open questions (the all_superseded
+    # vector must not be suppressed by a non-empty open_questions).
+    blackout = semantic_ran and not results["active_decisions"] and bool(handles)
     if blackout:
-        results["note"] = blackout_note(retired)
-        results["all_superseded"] = retired
+        results["note"] = blackout_note(handles, short=short, surface="cli",
+                                        config=config)
+        results["all_superseded"] = handles
         note = results["note"]
 
     # W31 — the unbuilt graph, consulted on the ordinary empty path (see cmd_query).
@@ -2763,6 +2824,7 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
             scope_note = f" (scope: {scope})" if scope else ""
             print(provenance_line(config))
             print(f"No active precedents found for: '{query}'{scope_note}")
+        _print_retired_partition(handles, part.omitted)
         print(f"→ {note}")
         _print_check_notice(config, notice)
         return
@@ -2784,6 +2846,9 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         if d["scope"]:
             print(f"   Scope:    {', '.join(d['scope'])}")
         print()
+    # After the hit list, before the open questions and the note: on a blackout
+    # with parked open questions this is the branch that renders the handles.
+    _print_retired_partition(handles, part.omitted)
     for oq in oqs:
         print(f"[open question in scope] {oq['topic']}")
         marker = _modifier_marker(oq)

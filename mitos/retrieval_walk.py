@@ -10,17 +10,27 @@ old one. The point id is the node's identity (``hash_to_uuid(node_id)``: the
 first 128 bits of its content hash), so a hit resolves to exactly the node it was
 written for (ADR ``vector-hits-resolve-to-nodes-by-point-id-prefix-never-by-payload-slug``).
 
-The walk makes three reads and no more (ADR
+The walk makes four reads and no more (ADR
 ``readers-fill-their-window-with-live-hits-from-one-over-fetched-call``): **one**
 ``VectorStore.query`` at :data:`RANKED_OVERFETCH_BOUND` with ``with_payload=False``,
-**one** batched ``resolve_point_ids`` over every hit, and **one** batched
-``get_modifiers_map`` over the window and the first ``limit`` retired hits. In
+**one** batched ``resolve_point_ids`` over every hit, **one** batched
+``get_modifiers_map`` over the window and the first ``limit`` retired hits, and
+**one** batched ``get_live_ends`` over the retired partition's shown members. In
 between, :func:`fill` walks the hits in memory until it holds ``limit`` live
 decisions plus one more for the edge, so retired and open-question points never
 take a caller's slots. It never re-fetches.
 
+The fourth read is conditional, because it is the one whose cost grows with chain
+depth. It is made only when the partition shows a member (``passed[:limit]``): a
+full window whose retired hits all rank below the last live one shows none, and a
+read that passed no retired decision has none to show. Membership is a rank
+comparison :func:`fill` makes, so the ids are known before the read.
+
 A stamp fault costs the stamps alone: the walk returns ``stamps={}`` with
-``stamps_unread=True`` and the window stands (lock A, failure state). A resolver
+``stamps_unread=True`` and the window stands (lock A, failure state). The live-end
+read shares that fault domain, because a live end is a successor fact read off the
+same kill edges as ``superseded_by`` / ``corrected_by``: a ``DatabaseError`` from
+either read returns ``stamps={}``, ``live_ends={}`` and ``stamps_unread=True``. A resolver
 fault (``DatabaseError``) propagates, and each surface degrades it as a store
 fault. A wrong store double raises :class:`WalkContractError`, which every
 surface re-raises ahead of its degraded arm, so a double that absorbs every call
@@ -44,7 +54,7 @@ Its admission to the check family's fence
 -----------------------------------------
 Stdlib (``dataclasses``, ``typing``) plus ``mitos.errors``, which is already a
 fence member and imports only ``typing``: the leaf's runtime closure is exactly
-``{retrieval_walk.py, errors.py}``. It reads two methods off a store it is handed
+``{retrieval_walk.py, errors.py}``. It reads three methods off a store it is handed
 and writes nothing, so admitting it costs the fence no write path and no
 ``store``/``vector_store``/``telemetry`` reach. ``conflict.py``'s import of it grew
 the exact-set pin by this module alone. Keep it that way: never import ``store``,
@@ -126,7 +136,7 @@ class WalkContractError(TypeError):
 
     Raised at ``walk_ranked`` entry (a missing method, ``limit`` outside
     ``1..bound-1``) and where results arrive (a resolver result that is not a
-    :class:`PointResolution`, a stamp map that is not a ``dict``, a hit without a
+    :class:`PointResolution`, a stamp or live-end map that is not a ``dict``, a hit without a
     string ``point_id`` or a numeric ``score``). Every surface re-raises it ahead of
     its degraded arm: swallowed, it would read as "semantic recall degraded".
     """
@@ -172,10 +182,19 @@ class RankedWalk:
             ``non_decision``, ``duplicate`` — always all four keys.
         stamps: Node id → modifier stamps, for the window and ``retired[:limit]``.
             Always a dict: ``{}`` when not asked for or when the read faulted.
-        stamps_unread: True only when the stamp read faulted.
+        stamps_unread: True only when the stamp read or the live-end read faulted.
         last_score: The score of the fetch's last hit (rank ``returned``), or None
             for an empty fetch. The gather reads it to tell a cut above its floor
             from one below it; the ranked surfaces ignore it.
+        passed: The retired partition's members, in rank order and unbounded. On a
+            full window (``len(window) == limit``) they are the retired hits ranked
+            above the last live one; on a short window, empty included, every
+            retired hit in the fetch (a short walk never stops early). Always a
+            prefix of ``retired``, so ``passed[:limit]`` is already stamped.
+        live_ends: Node id → the live-end slugs of its kill chain, for
+            ``passed[:limit]`` only, and only for the ids whose immediate successor
+            is itself retired (``GraphStore.get_live_ends``' result rule). ``{}``
+            when not read or when the read faulted.
     """
 
     window: List[WalkHit]
@@ -189,6 +208,8 @@ class RankedWalk:
     stamps: Dict[str, Dict[str, List[str]]] = field(default_factory=dict)
     stamps_unread: bool = False
     last_score: Optional[float] = None
+    passed: List[WalkHit] = field(default_factory=list)
+    live_ends: Dict[str, List[str]] = field(default_factory=dict)
 
 
 def _point_id_of(hit: Any) -> str:
@@ -233,9 +254,14 @@ def fill(hits: List[Dict[str, Any]], resolution: PointResolution, *,
         bound: The ``limit`` the fetch asked for; ``len(hits) < bound`` means the
             corpus ran out.
 
+    The retired partition's membership is decided here too, because it is a rank
+    comparison and the live-end read needs the ids: on a full window the retired
+    hits ranked above the last live one, otherwise every retired hit (``passed``).
+
     Returns:
-        A :class:`RankedWalk` with ``stamps`` empty, ``stamps_unread`` False and
-        ``last_score`` the last hit's score.
+        A :class:`RankedWalk` with ``stamps`` and ``live_ends`` empty,
+        ``stamps_unread`` False, ``last_score`` the last hit's score and ``passed``
+        the partition's members.
 
     Raises:
         WalkContractError: If a hit carries no string ``point_id`` or no numeric
@@ -288,9 +314,17 @@ def fill(hits: List[Dict[str, Any]], resolution: PointResolution, *,
     if hits:
         _point_id_of(hits[-1])
         last_score = hits[-1]["score"]
+    # The retired partition's members. A full window shows only what outranked its
+    # last live decision; a retired hit between the last live and the edge was not
+    # passed over while filling, so it is not a member.
+    if len(window) == limit:
+        cutoff = window[-1].rank
+        passed = [h for h in retired if h.rank < cutoff]
+    else:
+        passed = list(retired)
     return RankedWalk(window=window, edge=edge, retired=retired, end=end,
                       returned=len(hits), bound=bound, limit=limit, skipped=skipped,
-                      last_score=last_score)
+                      last_score=last_score, passed=passed)
 
 
 def _require_callable(obj: Any, name: str, role: str) -> None:
@@ -302,7 +336,7 @@ def _require_callable(obj: Any, name: str, role: str) -> None:
 def walk_ranked(vector: List[float], *, vector_store: Any, graph: Any, limit: int,
                 bound: int = RANKED_OVERFETCH_BOUND,
                 read_stamps: bool = True) -> RankedWalk:
-    """Runs one ranked read: query, resolve, fill, stamp — three reads, no more.
+    """Runs one ranked read: query, resolve, fill, stamp, live ends — four reads, no more.
 
     Every contract check runs at entry, before the query, so a double missing a
     method fails on an empty fetch too. The vector call is
@@ -310,18 +344,23 @@ def walk_ranked(vector: List[float], *, vector_store: Any, graph: Any, limit: in
     resolved by ``graph.resolve_point_ids`` in one batch; the stamp ids are the
     window's plus the first ``limit`` retired hits' (what a bounded retired
     partition can show), read in one ``graph.get_modifiers_map`` call. No stamp
-    read is made when both lists are empty, or when ``read_stamps`` is False.
+    read is made when both lists are empty, or when ``read_stamps`` is False. Then
+    one ``graph.get_live_ends`` call over the partition's shown members
+    (``passed[:limit]``), skipped when there are none. The two reads share one fault
+    domain: a ``DatabaseError`` from either costs the stamps and the live ends
+    together, flagged ``stamps_unread``.
 
     Args:
         vector: The query embedding.
         vector_store: Duck-typed; must provide ``query``.
         graph: The duck-typed store; must provide ``resolve_point_ids``, plus
-            ``get_modifiers_map`` when ``read_stamps`` is set.
+            ``get_modifiers_map`` and ``get_live_ends`` when ``read_stamps`` is set.
         limit: The caller's clamped window size, ``1 <= limit < bound``.
         bound: The over-fetch bound.
         read_stamps: False for a reader that must do no stamp work: the conflict
             gather, which reads its live window's stamps itself and must never stamp
-            the retired hits it passed.
+            the retired hits it passed. It makes neither the stamp read nor the
+            live-end read.
 
     Returns:
         A :class:`RankedWalk`.
@@ -336,6 +375,7 @@ def walk_ranked(vector: List[float], *, vector_store: Any, graph: Any, limit: in
     _require_callable(graph, "resolve_point_ids", "graph store")
     if read_stamps:
         _require_callable(graph, "get_modifiers_map", "graph store")
+        _require_callable(graph, "get_live_ends", "graph store")
     if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit < bound:
         raise WalkContractError(f"limit must satisfy 1 <= limit < bound ({bound}); "
                                 f"got {limit!r}")
@@ -362,7 +402,20 @@ def walk_ranked(vector: List[float], *, vector_store: Any, graph: Any, limit: in
         raise WalkContractError(
             f"get_modifiers_map must return a dict; got {type(stamps).__name__}"
         )
-    return replace(walk, stamps=stamps)
+    shown_ids = [h.node["id"] for h in walk.passed[:walk.limit]]
+    if not shown_ids:
+        return replace(walk, stamps=stamps)
+    try:
+        live_ends = graph.get_live_ends(shown_ids)
+    except DatabaseError:
+        # One fault domain with the stamps: the healthy stamps are discarded too,
+        # so a handle never carries `superseded_by` without its live end.
+        return replace(walk, stamps={}, live_ends={}, stamps_unread=True)
+    if not isinstance(live_ends, dict):
+        raise WalkContractError(
+            f"get_live_ends must return a dict; got {type(live_ends).__name__}"
+        )
+    return replace(walk, stamps=stamps, live_ends=live_ends)
 
 
 def stamp_ids_of(walk: RankedWalk) -> List[str]:

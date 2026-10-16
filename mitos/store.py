@@ -12,7 +12,7 @@ import logging
 import re
 from datetime import datetime, timezone
 from typing import (
-    List, Dict, Optional, Any, FrozenSet, Iterable, Sequence, Set, Tuple,
+    List, Dict, Optional, Any, FrozenSet, Iterable, NamedTuple, Sequence, Set, Tuple,
 )
 from mitos.errors import (
     DatabaseError,
@@ -548,6 +548,33 @@ def _strip_citation(raw: str) -> str:
     if len(s) >= 2 and s.startswith("[") and s.endswith("]"):
         s = s[1:-1].strip()
     return s
+
+
+class KillChain(NamedTuple):
+    """One seed's forward walk over kill edges (``_walk_kill_chains``).
+
+    Kill edges point new→old (the killer is the edge's source), so the walk goes
+    from a retired node to whatever retired it, then to whatever retired that, until
+    it reaches nodes nothing has killed: the live ends, where the current word on the
+    seed's claim lives. Drifted counts as live — drift annotates, it does not kill.
+
+    Attributes:
+        killers: The seed's immediate killers (sources of the kill edges onto it),
+            sorted by id.
+        reached: Every node the walk reached, the seed excluded, first-seen
+            depth-first order.
+        live_ends: The ids among ``reached`` that nothing has killed, sorted by
+            id; empty when the walk reached none (a closed cycle).
+        anomaly: None, ``"fan_out"`` (some reached node, the seed included, has two
+            or more killers) or ``"cycle"`` (the walk came back to a node still on
+            its path; reported over ``"fan_out"`` when both hold). Only an
+            out-of-band edit can author either.
+    """
+
+    killers: List[str]
+    reached: List[str]
+    live_ends: List[str]
+    anomaly: Optional[str]
 
 
 class CommitDelta:
@@ -3173,6 +3200,180 @@ class GraphStore:
             node is unmodified.
         """
         return self.get_modifiers_map([node_id]).get(node_id, {})
+
+    def _walk_kill_chains(
+        self, conn: sqlite3.Connection, node_ids: List[str]
+    ) -> Tuple[Dict[str, KillChain], Dict[str, str]]:
+        """Walks every seed's kill chain forward, in ONE statement plus memory.
+
+        The shared primitive behind :meth:`get_live_ends` (and any later reader
+        that needs ``reached`` — PATTERNS "One walk, N call-sites"). A recursive CTE
+        seeded by ``node_ids`` follows each kill edge ``target_id = current`` to its
+        ``source_id`` and returns every reached kill edge with its source's slug and
+        liveness. ``UNION`` over ``(seed, node)`` rows, never ``UNION ALL``: set
+        semantics is what makes the recursion terminate on an out-of-band cycle.
+
+        Liveness is the one atom, composed on the alias: a source is live iff no
+        kill edge targets it — ``_KILL_EDGE_TYPES_SQL`` spelled out against
+        ``e.source_id`` as ``_modifiers_map``'s source gate does, never
+        ``_ACTIVE_VIEW_PREDICATE`` (it binds the unaliased ``nodes``, so inside this
+        aliased join it would correlate on nothing and call every node live — the
+        alias trap). No ``signals`` read: drifted is live.
+
+        The chain analysis is an iterative three-colour DFS over the fetched edge
+        set (``_walk_mutation_lineage``'s idiom), so a cycle is detected rather
+        than walked forever, and a convergent DAG is not mistaken for one.
+
+        Args:
+            conn: An open connection (the caller owns its lifecycle).
+            node_ids: The seeds; repeats and ids naming no node are harmless (an
+                unknown id has no chain and gets an empty :class:`KillChain`).
+
+        Returns:
+            ``(chains, slugs)``: seed id → :class:`KillChain` for every distinct
+            seed, and node id → slug for every node any chain reached.
+
+        Raises:
+            sqlite3.Error: From the statement; the public readers wrap it.
+        """
+        seeds = list(dict.fromkeys(node_ids))
+        placeholders = ",".join("?" for _ in seeds)
+        rows = conn.execute(
+            f"""
+            WITH RECURSIVE chain(seed, node) AS (
+                SELECT id, id FROM nodes WHERE id IN ({placeholders})
+                UNION
+                SELECT c.seed, e.source_id
+                FROM chain c
+                JOIN edges e ON e.target_id = c.node
+                WHERE e.edge_type IN {_KILL_EDGE_TYPES_SQL}
+            )
+            SELECT c.seed AS seed, e.target_id AS target_id,
+                   e.source_id AS source_id, n.slug AS slug,
+                   NOT EXISTS (
+                       SELECT 1 FROM edges k
+                       WHERE k.target_id = e.source_id
+                         AND k.edge_type IN {_KILL_EDGE_TYPES_SQL}
+                   ) AS live
+            FROM chain c
+            JOIN edges e ON e.target_id = c.node
+            JOIN nodes n ON n.id = e.source_id
+            WHERE e.edge_type IN {_KILL_EDGE_TYPES_SQL}
+            """,
+            seeds,
+        ).fetchall()
+        killers_of: Dict[str, Dict[str, Set[str]]] = {seed: {} for seed in seeds}
+        live: Set[str] = set()
+        slugs: Dict[str, str] = {}
+        for row in rows:
+            killers_of[row["seed"]].setdefault(row["target_id"], set()).add(
+                row["source_id"]
+            )
+            slugs[row["source_id"]] = row["slug"]
+            if row["live"]:
+                live.add(row["source_id"])
+
+        _WHITE, _GRAY, _BLACK = 0, 1, 2
+        chains: Dict[str, KillChain] = {}
+        for seed in seeds:
+            adjacency = {node: sorted(ks) for node, ks in killers_of[seed].items()}
+            fan_out = any(len(ks) > 1 for ks in adjacency.values())
+            cycle = False
+            reached: List[str] = []
+            color: Dict[str, int] = {seed: _GRAY}
+            stack: List[Tuple[str, Any]] = [(seed, iter(adjacency.get(seed, [])))]
+            while stack:
+                node, killers = stack[-1]
+                descended = False
+                for killer in killers:
+                    state = color.get(killer, _WHITE)
+                    if state == _GRAY:
+                        cycle = True
+                        continue
+                    if state == _BLACK:
+                        continue
+                    color[killer] = _GRAY
+                    reached.append(killer)
+                    stack.append((killer, iter(adjacency.get(killer, []))))
+                    descended = True
+                    break
+                if not descended:
+                    color[node] = _BLACK
+                    stack.pop()
+            anomaly = "cycle" if cycle else ("fan_out" if fan_out else None)
+            chains[seed] = KillChain(
+                killers=list(adjacency.get(seed, [])),
+                reached=reached,
+                live_ends=sorted(n for n in reached if n in live),
+                anomaly=anomaly,
+            )
+        return chains, slugs
+
+    def get_live_ends(self, node_ids: List[str]) -> Dict[str, List[str]]:
+        """For each id whose kill chain passes through a retired successor, the live ends it reaches.
+
+        A retired decision's ``superseded_by`` / ``corrected_by`` stamps are write
+        facts: they name its **immediate** killer whatever that killer's state, so
+        on a chain they name a dead hop. This read follows the chain to where the
+        current word lives. One batched statement for the whole list
+        (:meth:`_walk_kill_chains`).
+
+        Result rule: a seed appears **only** when some immediate killer is itself
+        retired. A seed whose killers are all live is absent, because its stamps
+        already name the live end; so is a live seed (it has no killer). The value
+        lists every live end the walk reached, sorted by ``slug.casefold()`` then
+        slug, or ``[]`` when the walk reached none (a cycle with no exit).
+
+        A fan-out (a node with two or more killers) or a cycle can only be authored
+        out of band (ADR ``kill-edge-acyclicity-requires-active-source``). Each
+        anomalous seed gets one ``logger.warning`` naming it, the anomaly and the
+        heal, and the read still answers: non-fatal, never a raise (ADR
+        ``get-lineage-cycle-bound-is-nonfatal-partial-return-not-abort``).
+
+        Args:
+            node_ids: The retired nodes to follow; ``[]`` reads nothing.
+
+        Returns:
+            Node id → live-end slugs, for the admitted seeds only.
+
+        Raises:
+            DatabaseError: If the read fails. Typed, so a ranked read's live-end
+                fault joins its stamp fault (``retrieval_walk`` catches exactly
+                this).
+        """
+        if not node_ids:
+            return {}
+        conn = self._get_connection()
+        try:
+            chains, slugs = self._walk_kill_chains(conn, node_ids)
+        except sqlite3.Error as e:
+            raise DatabaseError(
+                f"Failed to read live ends for {len(node_ids)} node(s): {str(e)}"
+            )
+        finally:
+            conn.close()
+        result: Dict[str, List[str]] = {}
+        for seed, chain in chains.items():
+            if chain.anomaly is not None:
+                logger.warning(
+                    "get_live_ends: kill-edge %s detected while walking the kill "
+                    "chain of node %s (%d node(s) reached, %d live end(s)). The "
+                    "supported write path never authors a kill-edge %s; this is an "
+                    "out-of-band or corrupt edge — rebuild the derivative graph from "
+                    "the markdown corpus (decisions.md and decisions/archive/, the "
+                    "authoritative source) with `mitos rebuild`.",
+                    chain.anomaly.replace("_", "-"),
+                    seed,
+                    len(chain.reached),
+                    len(chain.live_ends),
+                    chain.anomaly.replace("_", "-"),
+                )
+            live_set = set(chain.live_ends)
+            if not any(k not in live_set for k in chain.killers):
+                continue
+            ends = [slugs[n] for n in chain.live_ends]
+            result[seed] = sorted(ends, key=lambda slug: (slug.casefold(), slug))
+        return result
 
     def get_contradictions(self, node_id: str) -> List[Dict[str, str]]:
         """Returns the nodes that contradict ``node_id``, from EITHER direction.

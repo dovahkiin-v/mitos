@@ -226,13 +226,14 @@ def _commit(store: GraphStore, slug: str, *, kind: str = "decision",
 
 
 class _SpyGraph:
-    """Forwards the two batched reads to a real store and counts them; every per-hit
+    """Forwards the three batched reads to a real store and counts them; every per-hit
     read a slug-keyed loop used raises, so a walk that fell back to one is loud."""
 
     def __init__(self, inner: GraphStore) -> None:
         self._inner = inner
         self.resolved: List[List[str]] = []
         self.stamped: List[List[str]] = []
+        self.ended: List[List[str]] = []
 
     def resolve_point_ids(self, point_ids):
         ids = list(point_ids)
@@ -242,6 +243,10 @@ class _SpyGraph:
     def get_modifiers_map(self, node_ids):
         self.stamped.append(list(node_ids))
         return self._inner.get_modifiers_map(node_ids)
+
+    def get_live_ends(self, node_ids):
+        self.ended.append(list(node_ids))
+        return self._inner.get_live_ends(node_ids)
 
     def _per_hit(self, *_a, **_k):
         raise AssertionError("the walk made a per-hit store read")
@@ -254,7 +259,10 @@ def _ids(store: GraphStore, *slugs: str) -> List[str]:
     return [store.resolve_slug(s)[0] for s in slugs]
 
 
-def test_walk_ranked_makes_exactly_its_three_reads(store) -> None:
+def test_walk_ranked_makes_four_reads_with_a_member_and_three_without(store) -> None:
+    """2f inverts 2c's three-reads row on intent: a partition member (``old`` outranks
+    the last live, ``b``) adds the fourth read; a retired hit ranked below the last
+    live is no member, so the same shape with ``old`` moved down makes three."""
     a, b, c = (_commit(store, s) for s in ("a", "b", "c"))
     old = _commit(store, "old")
     _commit(store, "new", supersedes=["old"])
@@ -268,9 +276,18 @@ def test_walk_ranked_makes_exactly_its_three_reads(store) -> None:
     assert vec.calls == [(RANKED_OVERFETCH_BOUND, False)]
     assert graph.resolved == [[h["point_id"] for h in hits]]
     assert graph.stamped == [[a, b, old]]          # window, then retired[:limit]
+    assert graph.ended == [[old]]                  # passed[:limit]
     assert _slugs(walk.window) == ["a", "b"] and walk.edge.node["id"] == c
     assert walk.stamps == {a: {"amended_by": ["amender"]}, old: {"superseded_by": ["new"]}}
+    assert walk.live_ends == {}                    # `new` is live: the stamp names it
     assert walk.stamps_unread is False
+
+    below = [point_hit(a, .95), point_hit(b, .9), point_hit(old, .85), point_hit(c, .7)]
+    vec, graph = CannedVector(below, store=store), _SpyGraph(store)
+    walk = walk_ranked([0.1], vector_store=vec, graph=graph, limit=2)
+    assert walk.passed == [] and _slugs(walk.retired) == ["old"]
+    assert vec.queries == 1 and len(graph.resolved) == 1 and len(graph.stamped) == 1
+    assert graph.ended == []
 
 
 def test_only_the_first_limit_retired_hits_are_stamped(store) -> None:
@@ -284,6 +301,10 @@ def test_only_the_first_limit_retired_hits_are_stamped(store) -> None:
     assert _slugs(walk.retired) == [f"old-{i}" for i in range(4)]
     assert graph.stamped == [olds[:2]]
     assert set(walk.stamps) == set(olds[:2])
+    # Zero live: every retired hit is a member; the live ends are read for the
+    # shown ones only, a prefix of what was stamped.
+    assert _slugs(walk.passed) == [f"old-{i}" for i in range(4)]
+    assert graph.ended == [olds[:2]]
 
 
 @pytest.mark.parametrize("shape", ["short_bound", "exhausted"])
@@ -305,12 +326,18 @@ def test_an_empty_fetch_makes_no_stamp_read(store) -> None:
     graph = _SpyGraph(store)
     walk = walk_ranked([0.1], vector_store=CannedVector([], store=store), graph=graph,
                        limit=5)
-    assert walk.end == EXHAUSTED and graph.stamped == []
+    assert walk.end == EXHAUSTED and graph.stamped == [] and graph.ended == []
 
 
 def test_read_stamps_false_makes_no_stamp_read_and_needs_no_stamp_reader(store) -> None:
+    """The gather's world: neither the stamp read nor the live-end read, even with a
+    partition member in the fetch (``old`` outranks ``a``), and neither method is
+    required at entry. A double with only the resolver would raise on either call."""
     a = _commit(store, "a")
     _commit(store, "amender", amends=["a"])
+    old = _commit(store, "old")
+    _commit(store, "mid", supersedes=["old"])
+    _commit(store, "new", supersedes=["mid"])
 
     class _ResolveOnly:
         def __init__(self, inner):
@@ -319,10 +346,12 @@ def test_read_stamps_false_makes_no_stamp_read_and_needs_no_stamp_reader(store) 
         def resolve_point_ids(self, ids):
             return self._inner.resolve_point_ids(ids)
 
-    walk = walk_ranked([0.1], vector_store=CannedVector([point_hit(a, .9)], store=store),
-                       graph=_ResolveOnly(store), limit=1, read_stamps=False)
-    assert _slugs(walk.window) == ["a"]
+    walk = walk_ranked([0.1], vector_store=CannedVector(
+        [point_hit(old, .95), point_hit(a, .9)], store=store),
+        graph=_ResolveOnly(store), limit=1, read_stamps=False)
+    assert _slugs(walk.window) == ["a"] and _slugs(walk.passed) == ["old"]
     assert walk.stamps == {} and walk.stamps_unread is False
+    assert walk.live_ends == {}
 
 
 # ---- the stamp fault: costs the stamps alone ------------------------------- #
@@ -435,7 +464,8 @@ def test_a_hit_without_point_id_fails_loud(store) -> None:
                     graph=store, limit=1)
 
 
-@pytest.mark.parametrize("missing", ["resolve_point_ids", "get_modifiers_map"])
+@pytest.mark.parametrize("missing", ["resolve_point_ids", "get_modifiers_map",
+                                     "get_live_ends"])
 def test_a_missing_store_method_fails_at_entry_even_on_an_empty_fetch(store, missing):
     """K16's row: the entry check runs before the query and before any empty-window
     skip, so a double lacking a method cannot pass on a zero-hit fetch."""
@@ -444,7 +474,7 @@ def test_a_missing_store_method_fails_at_entry_even_on_an_empty_fetch(store, mis
         pass
 
     graph = _Partial()
-    for name in ("resolve_point_ids", "get_modifiers_map"):
+    for name in ("resolve_point_ids", "get_modifiers_map", "get_live_ends"):
         if name != missing:
             setattr(graph, name, getattr(store, name))
     vec = CannedVector([], store=store)

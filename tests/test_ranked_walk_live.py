@@ -246,13 +246,17 @@ def test_the_blackout_appears_when_only_the_retired_point_is_near(tmp_path, monk
     names the retired node, its state and its immediate successor's slug."""
     config, manager, vstore, collection = _workspace(tmp_path, monkeypatch, "solo")
     try:
-        _record(manager, "database", "Use the alphakw store.")
+        retired = _record(manager, "database", "Use the alphakw store.")
         _commit_successor(manager, "database", "Use the betakw store.",
                           supersedes="database", embed=False)
         call, _verb, _surface, key = DRIVERS[driver]
         resp = call((config, manager), vstore, embed=_FixedQuery({"alphakw": 1.0}))
         assert resp[key] == []
-        assert resp["all_superseded"] == [
-            {"slug": "database", "state": "superseded", "superseded_by": ["database"]}]
+        # 2f, on intent: the handle gains the retired node's id and its score; the
+        # successor is live, so no `live_end` (the stamp already names it).
+        (handle,) = resp["all_superseded"]
+        assert isinstance(handle.pop("score"), float)
+        assert handle == {"slug": "database", "id": retired, "state": "superseded",
+                          "superseded_by": ["database"]}
     finally:
         requests.delete(f"{QDRANT_URL}/collections/{collection}", timeout=5)
