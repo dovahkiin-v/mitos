@@ -765,6 +765,8 @@ _SHIPPED_AND_3B = ("active", "present", "enqueued", "expected", "expected_presen
                    "written", "left_queued", "drain_stop")
 _ADDED_3C = ("retired_node_points", "nodeless_points", "deleted", "delete_failed",
              "graph_unbuilt")
+# 4c's one additive key, the rejection backlog's drain (on every path, CC5).
+_ADDED_4C = ("rejection_drain",)
 
 
 def test_o9_the_shipped_reconcile_and_status_keys_keep_their_values(
@@ -808,7 +810,7 @@ def test_o9_every_reconcile_return_path_carries_the_same_key_set(
     keysets.append(set(_manager(clone, _Index(set(NODELESS))).reconcile_embeddings()))
 
     assert all(keys == keysets[0] for keys in keysets)
-    assert set(_SHIPPED_AND_3B) | set(_ADDED_3C) == keysets[0]
+    assert set(_SHIPPED_AND_3B) | set(_ADDED_3C) | set(_ADDED_4C) == keysets[0]
 
 
 def test_o9_the_provider_down_return_judges_nothing(tmp_path, monkeypatch) -> None:

@@ -1699,7 +1699,7 @@ def test_the_full_pointer_parses_and_the_flag_is_syncs_alone(
     assert never_built.call_count == 0, "refused above the drain"
     assert err == echo.getvalue() + (
         "--full shows a full sync's divergence report: --embed-only drains the "
-        "pending embeddings queue and reads no buffer entries. Re-run without "
+        "embedding queues and reads no buffer entries. Re-run without "
         "--embed-only.\n")
 
 

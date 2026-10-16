@@ -112,6 +112,9 @@ class Rig:
         self.index = index
         self.vector_cls = vector_cls
         self.index_names: List[str] = []
+        # The index calls the last ``_sync`` made (since 4c, its drain's), kept apart
+        # from ``index.calls`` so the X-ops teardown keeps guarding the inline leg.
+        self.sync_calls: List[Tuple[str, Dict[str, Any]]] = []
 
     @property
     def config(self):
@@ -164,7 +167,8 @@ def rig(tmp_path, monkeypatch) -> Rig:
     made = Rig(root, RecordingProvider(), FakeRejectionIndex(), _vector_store_class())
     _bind(monkeypatch, made)
     yield made
-    # X-ops, over every row: the inline leg only probes and adds.
+    # X-ops, over every row: the inline leg only probes and adds. A sync's calls
+    # (its rejection drain removes too) are split off by ``_sync``.
     assert set(made.ops()) <= {"retrieve_present", "upsert_points"}, made.index.calls
 
 
@@ -459,14 +463,24 @@ def _append_entry(rig: Rig, slug: str, field: str = FIELD) -> None:
 
 
 def _sync(rig: Rig, monkeypatch) -> MitosSyncManager:
+    """Runs one ``sync``; its index calls land in ``rig.sync_calls``, not ``index.calls``.
+
+    Since 4c a sync's commit loop runs no inline rejection leg and its own drain
+    takes the rows, so every index call a sync makes is the drain's.
+    """
     monkeypatch.setenv("GEMINI_API_KEY", "mock_key")
     m = rig.manager()
+    before = len(rig.index.calls)
     m.perform_sync(auto_accept=True)
+    rig.sync_calls = rig.index.calls[before:]
+    del rig.index.calls[before:]
     return m
 
 
 def test_l3_a_multi_entry_sync_over_an_absent_collection_probes_once(rig, monkeypatch) -> None:
-    _record_absent_first(rig)
+    """Changed at 4c (D5): the commit loop runs no inline leg, so the one probe is
+    the sync's drain listing its first owner and refusing (no rejection marker)."""
+    first = _record_absent_first(rig)["id"]
     for slug in ("synced-one", "synced-two", "synced-three"):
         _append_entry(rig, slug)
 
@@ -474,10 +488,12 @@ def test_l3_a_multi_entry_sync_over_an_absent_collection_probes_once(rig, monkey
 
     owners = [m.store.get_node_by_slug(s)["id"]
               for s in ("synced-one", "synced-two", "synced-three")]
-    assert rig.ops() == ["retrieve_present"]
+    assert rig.ops() == []  # the commit loop asked nothing
+    assert rig.sync_calls == [("list_owner_point_ids", {"owner_id": first})]
     assert rig.provider.document_calls == []
-    assert all(rig.row(o) is not None for o in owners)
-    assert m._rejection_collection_absent is True
+    assert all(rig.row(o) is not None and rig.row(o).retry_count == 0
+               for o in [first, *owners])
+    assert m._rejection_collection_absent is False  # the inline latch never ran
 
 
 def _direct_decision_count(store: GraphStore, node_id: str) -> int:
@@ -684,8 +700,13 @@ def test_f1_a_quota_outage_in_one_sync_spends_one_call(rig, monkeypatch, capsys)
 
     m = _sync(rig, monkeypatch)
 
+    # Changed at 4c (D5): the drain's one cross-owner batch meets the outage and
+    # stops, on stdout (CLI-only), charging no row; the inline leg never ran.
+    out, err = capsys.readouterr()
     assert len(rig.provider.document_calls) == 1
-    assert len(_warnings(capsys.readouterr().err)) == 1
+    assert len(rig.provider.document_calls[0]) == 2 * len(_ids("a" * 64))
+    assert _warnings(err) == []
+    assert len([line for line in out.splitlines() if "stopping the drain" in line]) == 1
     for slug in ("synced-one", "synced-two"):
         _assert_row_stands(rig, m.store.get_node_by_slug(slug)["id"])
 
@@ -1040,7 +1061,7 @@ def test_x_ops_the_leg_reads_the_licence_and_never_the_row() -> None:
     assert {"rejection_index_expects_owner_other_than", "retrieve_present",
             "upsert_points", "embed_documents", "clear_rejection_backlog_row"} <= called
     assert not called & {"delete_points", "list_owner_point_ids", "list_point_ids",
-                         "search", "get_embedding", "get_embeddings_batch",
+                         "search", "get_embedding",
                          "note_rejection_backlog_failure"}
 
 

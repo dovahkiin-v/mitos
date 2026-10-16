@@ -30,17 +30,6 @@ class EmbeddingProvider(Protocol):
         """
         ...
 
-    def get_embeddings_batch(self, texts: List[str]) -> List[List[float]]:
-        """Gets embedding vectors for a batch of texts.
-
-        Args:
-            texts: List of text blocks.
-
-        Returns:
-            List of embedding vectors.
-        """
-        ...
-
     def embed_documents(self, texts: Sequence[str]) -> List[List[float]]:
         """Embeds document texts in one provider call, bypassing the cache.
 
@@ -210,6 +199,17 @@ class RejectionIndex(Protocol):
 
         Returns:
             Every point-id string in the index.
+        """
+        ...
+
+    def list_point_owners(self, page_size: int = 256) -> Dict[str, Optional[str]]:
+        """Lists every point id in the index with the owner its payload names.
+
+        Args:
+            page_size: Maximum points fetched per page.
+
+        Returns:
+            ``{point_id: owner_id}``, the owner None when the payload names none.
         """
         ...
 

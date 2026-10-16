@@ -618,6 +618,12 @@ class RejectionBacklogRow(NamedTuple):
     retry_count: int
 
 
+# Failed attempts at which a rejection backlog row reads as poison. A count, not a
+# threshold: the drain reports rows at or past it and keeps attempting them (a row is
+# never dropped), and ``status`` reads the same name. ``check`` never reads this backlog.
+REJECTION_BACKLOG_FAILURE_TOLERANCE = 3
+
+
 def _rejection_backlog_row(row: sqlite3.Row) -> RejectionBacklogRow:
     """Builds a :class:`RejectionBacklogRow` from a backlog ``SELECT`` row."""
     return RejectionBacklogRow(
@@ -3453,6 +3459,99 @@ class GraphStore:
             raise DatabaseError(
                 f"Failed to note a rejection backlog failure: {str(e)}"
             )
+        finally:
+            conn.close()
+
+    def count_rejection_backlog(self, *, min_retry: Optional[int] = None) -> int:
+        """Counts the standing rejection backlog rows.
+
+        Args:
+            min_retry: Count only rows whose ``retry_count`` is at least this, or
+                None for every row.
+
+        Returns:
+            The row count; 0 when the graph predates the rung.
+
+        Raises:
+            DatabaseError: If the read fails for any other reason.
+        """
+        conn = self._get_connection()
+        try:
+            if min_retry is None:
+                row = conn.execute("SELECT COUNT(*) FROM rejection_backlog").fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM rejection_backlog WHERE retry_count >= ?",
+                    (min_retry,),
+                ).fetchone()
+            return int(row[0])
+        except sqlite3.Error as e:
+            if _MISSING_REJECTION_BACKLOG_ERROR in str(e):
+                return 0
+            raise DatabaseError(f"Failed to count the rejection backlog: {str(e)}")
+        finally:
+            conn.close()
+
+    def rejection_backlog_last_seq(self) -> Optional[int]:
+        """Returns the largest ``enqueue_seq`` standing in the rejection backlog.
+
+        Every enqueue mints a seq larger than any before it, so a row above this
+        value was queued after the read.
+
+        Returns:
+            The largest standing seq, or None when no row stands or the graph
+            predates the rung.
+
+        Raises:
+            DatabaseError: If the read fails for any other reason.
+        """
+        conn = self._get_connection()
+        try:
+            row = conn.execute("SELECT MAX(enqueue_seq) FROM rejection_backlog").fetchone()
+            return None if row is None or row[0] is None else int(row[0])
+        except sqlite3.Error as e:
+            if _MISSING_REJECTION_BACKLOG_ERROR in str(e):
+                return None
+            raise DatabaseError(f"Failed to read the rejection backlog: {str(e)}")
+        finally:
+            conn.close()
+
+    def get_rejection_owner_fields(
+        self, node_ids: Sequence[str]
+    ) -> Dict[str, Tuple[str, str]]:
+        """Reads the slug and the raw ``rejected_paths`` of each named node, in one query.
+
+        ``rejected_paths_json`` holds the **raw** field string, not JSON (see
+        :meth:`commit_parsed_entry`), and NULL reads as ``""`` — the same column and
+        the same coalesce the field-aware enqueue compared, so the drain enumerates
+        exactly what the commit queued it for.
+
+        Args:
+            node_ids: The owners to read. Empty asks nothing.
+
+        Returns:
+            ``{node_id: (slug, raw_field)}``; a node not in the graph is absent.
+
+        Raises:
+            DatabaseError: If the read fails.
+        """
+        ids = list(dict.fromkeys(node_ids))
+        if not ids:
+            return {}
+        conn = self._get_connection()
+        try:
+            placeholders = ", ".join("?" for _ in ids)
+            rows = conn.execute(
+                f"SELECT id, slug, rejected_paths_json FROM nodes "
+                f"WHERE id IN ({placeholders})",
+                ids,
+            ).fetchall()
+            return {
+                row["id"]: (row["slug"], row["rejected_paths_json"] or "")
+                for row in rows
+            }
+        except sqlite3.Error as e:
+            raise DatabaseError(f"Failed to read rejection owners: {str(e)}")
         finally:
             conn.close()
 

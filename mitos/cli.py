@@ -113,7 +113,9 @@ from mitos.sync import (MitosSyncManager, run_ambient_capture, _SLUG_MAX_LEN,
                         _PAUSE_RESOLVING_RELATIONS, _declared_echo_lines, _split_relation_slugs,
                         EXISTS_NO_OP_FACT, PAUSE_HELD_CLAUSE,
                         ROTATION_FAILED, ROTATION_REASON_DUPLICATED, ROTATION_ROTATED,
-                        ROTATION_SKIPPED, ROTATION_STAGE_FILE, ROTATION_STAGE_LOCK)
+                        ROTATION_SKIPPED, ROTATION_STAGE_FILE, ROTATION_STAGE_LOCK,
+                        rejection_drain_report)
+from mitos.provider_cause import describe_embed_failure
 from mitos._agent_block import agent_block, agent_block_drift, AGENT_GUIDE_VERSION
 from mitos.renderer import MitosRenderer, estimate_tokens, overflow_report
 from mitos.importer import MitosProseImporter
@@ -815,7 +817,8 @@ def cmd_sync(config: MitosConfig, auto_accept: bool = False, embed_only: bool = 
     Args:
         config: The resolved workspace config.
         auto_accept: ``--yes``.
-        embed_only: ``--embed-only`` — drains the outbox and runs no sync.
+        embed_only: ``--embed-only`` — drains the decision outbox, then the
+            rejection backlog, and runs no sync.
         verbose: ``--verbose``.
         repair_targets: ``--reconcile-entry`` handles, already split. ``None``
             means the flag was absent; ``[]`` means it was supplied and named
@@ -838,7 +841,7 @@ def cmd_sync(config: MitosConfig, auto_accept: bool = False, embed_only: bool = 
             sys.stdout.flush()
             _echo_corpus(config, file=sys.stderr)
             print("--reconcile-entry needs a full sync: --embed-only drains the "
-                  "pending embeddings queue and reads no buffer entries. Re-run "
+                  "embedding queues and reads no buffer entries. Re-run "
                   "without --embed-only.", file=sys.stderr)
             sys.exit(1)
         if not repair_targets:
@@ -854,13 +857,24 @@ def cmd_sync(config: MitosConfig, auto_accept: bool = False, embed_only: bool = 
         sys.stdout.flush()
         _echo_corpus(config, file=sys.stderr)
         print("--full shows a full sync's divergence report: --embed-only drains the "
-              "pending embeddings queue and reads no buffer entries. Re-run without "
+              "embedding queues and reads no buffer entries. Re-run without "
               "--embed-only.", file=sys.stderr)
         sys.exit(1)
     manager = MitosSyncManager(config)
     shortfall: List[str] = []
     if embed_only:
-        manager.drain_pending_embeddings()
+        # Both drains, in sync's order, each in a try of its own: a fault in one
+        # never stops the other, and neither changes this verb's exit.
+        try:
+            manager.drain_pending_embeddings()
+        except Exception as e:
+            print(f"[Warning] Outbox queue drain failed: {describe_embed_failure(e)}",
+                  file=sys.stderr)
+        try:
+            manager.drain_rejection_backlog()
+        except Exception as e:
+            print(f"[Warning] Rejection backlog drain failed: "
+                  f"{describe_embed_failure(e)}", file=sys.stderr)
     else:
         try:
             shortfall = manager.perform_sync(
@@ -1001,6 +1015,10 @@ def cmd_reconcile(config: MitosConfig, as_json: bool = False) -> int:
             f"`mitos sync {shell_flag('-p', config.project)}` retries them once the "
             f"embedding provider and Qdrant answer."
         )
+    # The rejection drain's summary, rendered here and not by the drain (which
+    # reconcile runs with report=False), so it prints once.
+    for line in rejection_drain_report(result["rejection_drain"]):
+        print(line)
     if result["deleted"] or result["delete_failed"]:
         line = f"Collected: {result['deleted']} node-less point(s) deleted"
         if result["delete_failed"]:
@@ -8424,7 +8442,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # sync
     sync_p = subparsers.add_parser("sync", help="Sync buffer decisions to graph database.")
     sync_p.add_argument("--yes", action="store_true", help="Auto-accept all parsed changes.")
-    sync_p.add_argument("--embed-only", action="store_true", help="Drain the pending embeddings outbox queue only.")
+    sync_p.add_argument("--embed-only", action="store_true", help="Drain the embedding queues only (the decision outbox, then the rejection backlog); run no sync.")
     sync_p.add_argument("--verbose", action="store_true", help="Show verbose cache statistics.")
     sync_p.add_argument(
         "--full", action="store_true",

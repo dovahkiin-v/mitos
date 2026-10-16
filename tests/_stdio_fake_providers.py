@@ -258,6 +258,10 @@ def _rejection_index_class() -> type:
                 raise AttributeError(name)
             raise _unimplemented("FakeRejectionIndex", name)
 
+        def list_point_owners(self, page_size: int = 256) -> Dict[str, Optional[str]]:
+            # Only a drain under the seed marker lists owners, and MCP never drains.
+            raise _unimplemented("FakeRejectionIndex", "list_point_owners")
+
     return LoudRejectionIndex
 
 

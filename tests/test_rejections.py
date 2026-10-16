@@ -456,13 +456,11 @@ def test_the_part_bound_is_tripwired_to_the_embedding_model_and_prefix(tmp_path)
     provider = GeminiEmbeddingProvider(str(tmp_path / "c.sqlite"), api_key="dummy")
     provider.client = SimpleNamespace(models=SimpleNamespace(embed_content=embed_content))
     provider.get_embedding("probe-single", is_query=False)
-    provider.get_embeddings_batch(["probe-batch"])
     provider.embed_documents(["probe-documents"])  # the path rejection items take
-    assert len(calls) == 3
-    single, (batched,), (documents,) = calls
+    assert len(calls) == 2
+    single, (documents,) = calls
     documents = documents.parts[0].text  # the uncached path sends one Content per text
-    for sent, text in ((single, "probe-single"), (batched, "probe-batch"),
-                       (documents, "probe-documents")):
+    for sent, text in ((single, "probe-single"), (documents, "probe-documents")):
         assert sent.endswith(text)
         assert len(sent[: -len(text)].encode("utf-8")) == DOCUMENT_PREFIX_BYTES
 

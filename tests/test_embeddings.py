@@ -80,41 +80,6 @@ def test_embedding_provider_observability(mock_client: MagicMock, temp_cache_pat
     assert rate == 0.5
 
 
-@patch("google.genai.Client")
-def test_embeddings_batch_token_aware(mock_client: MagicMock, temp_cache_path: str) -> None:
-    """Tests that get_embeddings_batch executes bulk requests and utilizes cache correctly."""
-    provider = GeminiEmbeddingProvider(temp_cache_path, api_key="mock_key")
-
-    # Mock embed API response for batch of 2
-    mock_resp = MagicMock()
-    mock_emb1 = MagicMock()
-    mock_emb1.values = [0.1, 0.1, 0.1]
-    mock_emb2 = MagicMock()
-    mock_emb2.values = [0.2, 0.2, 0.2]
-    mock_resp.embeddings = [mock_emb1, mock_emb2]
-    mock_client.return_value.models.embed_content.return_value = mock_resp
-
-    texts = ["First block", "Second block"]
-    vectors = provider.get_embeddings_batch(texts)
-    
-    assert len(vectors) == 2
-    assert vectors[0] == [0.1, 0.1, 0.1]
-    assert vectors[1] == [0.2, 0.2, 0.2]
-    
-    # Assert cache stats show misses
-    hits, misses, rate = provider.get_stats()
-    assert misses == 2
-    assert hits == 0
-
-    # Repeat call: should hit cache entirely
-    provider.reset_stats()
-    vectors_cached = provider.get_embeddings_batch(texts)
-    assert len(vectors_cached) == 2
-    hits, misses, rate = provider.get_stats()
-    assert hits == 2
-    assert misses == 0
-
-
 def test_embedding_cache_eviction_ceiling(temp_cache_path: str) -> None:
     """Verifies that the cache evicts the oldest entries when exceeding 5000 records."""
     import sqlite3

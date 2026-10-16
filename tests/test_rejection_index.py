@@ -279,9 +279,9 @@ def test_c4_a_failing_owner_index_raises(put, index_answer, error) -> None:
 
 @pytest.mark.parametrize("create_answer, error", [
     (requests.ConnectionError("refused"), VectorStoreUnreachableError),
-    (_resp(409), VectorStoreError),
     (_resp(200, {"result": False}), VectorStoreError),
-], ids=["transport", "409-exists", "not-true"])
+    (_resp(500), VectorStoreError),
+], ids=["transport", "not-true", "500"])
 @patch("mitos.vector_store.requests.put")
 def test_c4_a_failing_collection_create_raises(put, create_answer, error) -> None:
     put.side_effect = _create_sequence(create_answer)
@@ -289,6 +289,31 @@ def test_c4_a_failing_collection_create_raises(put, create_answer, error) -> Non
         _index().upsert_points(_points(1), model=_MODEL, may_create=True)
     assert type(excinfo.value) is error
     assert put.call_count == 2
+
+
+@patch("mitos.vector_store.requests.put")
+def test_c4_a_racing_create_409_reads_as_exists(put) -> None:
+    """R-409 (4c, D7): another writer created it between the 404 and this PUT."""
+    put.side_effect = _create_sequence(
+        _resp(409), _resp(200, _COMPLETED), _resp(200, _COMPLETED)
+    )
+    _index().upsert_points(_points(1), model=_MODEL, may_create=True)  # no raise
+
+    assert put.call_count == 4
+    assert [c.args[0] for c in put.call_args_list] == [
+        f"{_POINTS_URL}?wait=true",
+        f"{_URL}/collections/{_COLLECTION}",
+        f"{_URL}/collections/{_COLLECTION}/index?wait=true",
+        f"{_POINTS_URL}?wait=true",
+    ]
+
+
+@patch("mitos.vector_store.requests.put")
+def test_c4_a_409_then_a_refused_index_still_raises(put) -> None:
+    put.side_effect = _create_sequence(_resp(409), _resp(500))
+    with pytest.raises(VectorStoreError):
+        _index().upsert_points(_points(1), model=_MODEL, may_create=True)
+    assert put.call_count == 3
 
 
 def test_c4_model_and_may_create_are_required_and_keyword_only() -> None:
@@ -493,6 +518,27 @@ def test_c8_the_full_listing_is_unfiltered(post) -> None:
     assert "filter" not in post.call_args.kwargs["json"]
 
 
+@patch("mitos.vector_store.requests.post")
+def test_c8_the_owner_map_takes_back_the_owner_only_and_pages(post) -> None:
+    post.side_effect = [
+        _resp(200, {"result": {"points": [
+            {"id": "p-1", "payload": {"owner_id": OWNER_A}},
+            {"id": 7, "payload": {"owner_id": ""}},
+        ], "next_page_offset": "p-2"}}),
+        _resp(200, {"result": {"points": [
+            {"id": "p-2", "payload": {"owner_id": OWNER_A}},
+            {"id": "p-3"},
+            {"id": "p-4", "payload": {"owner_id": 5}},
+        ], "next_page_offset": None}}),
+    ]
+    assert _index().list_point_owners(page_size=2) == {
+        "p-1": OWNER_A, "7": None, "p-2": OWNER_A, "p-3": None, "p-4": None,
+    }
+    first, second = (c.kwargs["json"] for c in post.call_args_list)
+    assert first == {"limit": 2, "with_payload": ["owner_id"], "with_vector": False}
+    assert second["offset"] == "p-2" and "filter" not in second
+
+
 def _list_owner(index: QdrantRejectionIndex) -> Any:
     return index.list_owner_point_ids(OWNER_A)
 
@@ -501,7 +547,12 @@ def _list_all(index: QdrantRejectionIndex) -> Any:
     return index.list_point_ids()
 
 
-@pytest.mark.parametrize("listing", [_list_owner, _list_all], ids=["owner", "all"])
+def _list_owners(index: QdrantRejectionIndex) -> Any:
+    return index.list_point_owners()
+
+
+@pytest.mark.parametrize("listing", [_list_owner, _list_all, _list_owners],
+                         ids=["owner", "all", "owners"])
 @pytest.mark.parametrize("answer, error", [
     (requests.ConnectionError("refused"), VectorStoreUnreachableError),
     (_resp(404), CollectionMissingError),
@@ -551,11 +602,12 @@ def test_c10_the_decision_upsert_still_hashes_its_node_id(put) -> None:
 
 #: A class defining any of these is a rejection index. Never ``list_point_ids`` or
 #: ``delete_points``, which every decision double defines too.
-REJECTION_ONLY_METHODS = {"search", "upsert_points", "retrieve_present", "list_owner_point_ids"}
+REJECTION_ONLY_METHODS = {"search", "upsert_points", "retrieve_present", "list_owner_point_ids",
+                          "list_point_owners"}
 #: Every method a rejection index must define or inherit.
 REJECTION_INDEX_METHODS = (
     "search", "retrieve_present", "list_owner_point_ids", "list_point_ids",
-    "upsert_points", "delete_points",
+    "list_point_owners", "upsert_points", "delete_points",
 )
 #: Found at 4a: 3 (the protocol, the client, the shared double). A floor.
 MIN_REJECTION_INDEX_CLASSES = 3

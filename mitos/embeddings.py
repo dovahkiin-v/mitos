@@ -13,18 +13,16 @@ from mitos.models import get_embedding_model_id
 from mitos.errors import EmbeddingError
 
 # The asymmetric prefix every document embedding is sent with. One spelling for
-# the three senders (the cached single and batch paths, and the uncached
+# the two senders (the cached ``get_embedding`` and the uncached
 # ``embed_documents``); ``rejections.DOCUMENT_PREFIX_BYTES`` derives the item-part
 # bound from its byte length, and ``tests/test_rejections.py`` tripwires the bytes
 # each path actually sends.
 DOCUMENT_PREFIX = "search_document: "
 
-# The batch bounds of one ``embed_content`` call. ``get_embeddings_batch`` declared
-# them as literals and still counts characters (its behaviour is unchanged).
-# ``fit_batch`` and ``embed_documents`` count the UTF-8 bytes of the PREFIXED text,
-# which is never looser than a character count in any script (a character is at
-# least one byte), so every batch the uncached path sends is within the declared
-# bounds literally.
+# The batch bounds of one ``embed_content`` call: at most this many texts, and at
+# most this many UTF-8 bytes of PREFIXED text. ``fit_batch`` and ``embed_documents``
+# both read them at call time, so the batches the one batched path sends are within
+# the bounds literally.
 EMBED_BATCH_MAX_TEXTS = 100
 EMBED_BATCH_MAX_BYTES = 40_000
 
@@ -236,94 +234,6 @@ class GeminiEmbeddingProvider:
             
         except Exception as e:
             raise EmbeddingError(f"Gemini embedding API call failed: {str(e)}") from e
-
-    def get_embeddings_batch(self, texts: List[str]) -> List[List[float]]:
-        """Gets embeddings for a batch of documents, utilizing token-aware bounds.
-
-        No production path calls this. The rejection index does not use it: its
-        items must never enter the shared cache (their point ids are
-        content-derived, so presence in the index is their cache), and this
-        method counts characters rather than bytes and silently drops the slots
-        a short response leaves empty. It also sends a list of strings, which
-        the live API reads as one multi-part content and answers with ONE
-        embedding (measured 2026-10-17), so a batch of more than one miss is
-        short by construction. ``embed_documents`` is the uncached,
-        byte-bounded, answer-validating path that sends one content per text.
-
-        Args:
-            texts: List of text blocks.
-
-        Returns:
-            List of embedding vectors.
-        """
-        results: List[Optional[List[float]]] = [None] * len(texts)
-        miss_indices = []
-        miss_texts = []
-
-        # 1. Resolve cache hits first
-        for idx, text in enumerate(texts):
-            prefixed_text = DOCUMENT_PREFIX + text
-            content_hash = self.compute_content_hash(prefixed_text)
-            
-            cached_vector = self.cache.get(content_hash)
-            if cached_vector is not None:
-                self.hits += 1
-                results[idx] = cached_vector
-            else:
-                self.misses += 1
-                miss_indices.append(idx)
-                # Keep prefixed text for bulk API call
-                miss_texts.append(prefixed_text)
-
-        # 2. Process cache misses in token-aware batches
-        if miss_texts:
-            max_batch_count = EMBED_BATCH_MAX_TEXTS
-            max_batch_chars = EMBED_BATCH_MAX_BYTES  # counted in characters here
-            
-            current_batch = []
-            current_batch_chars = 0
-            batches = []
-            
-            for prefixed_t in miss_texts:
-                if len(current_batch) >= max_batch_count or (current_batch_chars + len(prefixed_t)) > max_batch_chars:
-                    batches.append(current_batch)
-                    current_batch = [prefixed_t]
-                    current_batch_chars = len(prefixed_t)
-                else:
-                    current_batch.append(prefixed_t)
-                    current_batch_chars += len(prefixed_t)
-            if current_batch:
-                batches.append(current_batch)
-
-            # 3. Call bulk API for each batch and populate results/cache
-            processed_count = 0
-            for batch in batches:
-                try:
-                    response = self.client.models.embed_content(
-                        model=self.model_id,
-                        contents=batch
-                    )
-                    
-                    if not response.embeddings:
-                        raise EmbeddingError("Gemini API returned empty embeddings in batch call")
-                    
-                    for i, emb in enumerate(response.embeddings):
-                        vector = emb.values
-                        # Store in results at original index
-                        orig_idx = miss_indices[processed_count + i]
-                        results[orig_idx] = vector
-                        
-                        # Cache the result
-                        text_item = batch[i]
-                        content_hash = self.compute_content_hash(text_item)
-                        self.cache.set(content_hash, vector)
-                        
-                    processed_count += len(batch)
-                except Exception as e:
-                    raise EmbeddingError(f"Batch embedding API call failed: {str(e)}") from e
-
-        # Filter out any None values (should be none)
-        return [r for r in results if r is not None]
 
     def embed_documents(self, texts: Sequence[str]) -> List[List[float]]:
         """Embeds documents in exactly one provider call, never touching the cache.

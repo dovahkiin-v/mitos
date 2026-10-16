@@ -59,6 +59,12 @@ class FakeRejectionIndex:
             create (``created`` counts it) and still answers
             ``CollectionMissingError``, as the real client does when its one retry
             after a create is answered 404 again; the collection stays absent.
+        refuse_list: a listing (``list_owner_point_ids``, ``list_point_ids``,
+            ``list_point_owners``) reaching an existing collection raises
+            ``VectorStoreError``.
+        on_call: called as ``on_call(method, details)`` right after a call is
+            recorded and before it answers, so a row can raise mid-walk or inject a
+            commit between two of a drain's calls.
 
     Recording:
         calls: every call, in order, as ``(method, details)``; ``details`` names the
@@ -74,9 +80,21 @@ class FakeRejectionIndex:
         self.refuse_upsert = False
         self.refuse_delete = False
         self.create_then_missing = False
+        self.refuse_list = False
+        self.on_call: Optional[Callable[[str, Dict[str, Any]], None]] = None
         self.points: Dict[str, Dict[str, Any]] = {}
         self.calls: List[Tuple[str, Dict[str, Any]]] = []
         self.created = 0
+
+    def _record(self, method: str, details: Dict[str, Any]) -> None:
+        self.calls.append((method, details))
+        if self.on_call is not None:
+            self.on_call(method, details)
+
+    def _listing(self, operation: str) -> None:
+        self._reach(operation)
+        if self.refuse_list:
+            raise VectorStoreError(f"fake: {operation} refused")
 
     def _reach(self, operation: str) -> None:
         if self.unreachable:
@@ -90,7 +108,7 @@ class FakeRejectionIndex:
     def search(
         self, vector: List[float], limit: int, *, budget_seconds: float
     ) -> RejectionSearch:
-        self.calls.append(("search", {"limit": limit, "budget_seconds": budget_seconds}))
+        self._record("search", {"limit": limit, "budget_seconds": budget_seconds})
         if not budget_seconds > 0:  # a spent budget sends nothing, as the client
             return RejectionSearch(searched=False, hits=[])
         if self.unreachable:
@@ -116,32 +134,41 @@ class FakeRejectionIndex:
         return RejectionSearch(searched=True, hits=hits)
 
     def retrieve_present(self, point_ids: Sequence[str]) -> Set[str]:
-        self.calls.append(("retrieve_present", {"ids": list(point_ids)}))
+        self._record("retrieve_present", {"ids": list(point_ids)})
         if not point_ids:
             return set()
         self._reach("retrieve_present")
         return {pid for pid in point_ids if pid in self.points}
 
     def list_owner_point_ids(self, owner_id: str, page_size: int = 256) -> Set[str]:
-        self.calls.append(("list_owner_point_ids", {"owner_id": owner_id}))
-        self._reach("list_owner_point_ids")
+        self._record("list_owner_point_ids", {"owner_id": owner_id})
+        self._listing("list_owner_point_ids")
         return {
             pid for pid, point in self.points.items()
             if point["payload"].get("owner_id") == owner_id
         }
 
     def list_point_ids(self, page_size: int = 256) -> Set[str]:
-        self.calls.append(("list_point_ids", {}))
-        self._reach("list_point_ids")
+        self._record("list_point_ids", {})
+        self._listing("list_point_ids")
         return set(self.points)
+
+    def list_point_owners(self, page_size: int = 256) -> Dict[str, Optional[str]]:
+        self._record("list_point_owners", {})
+        self._listing("list_point_owners")
+        owners: Dict[str, Optional[str]] = {}
+        for pid, point in self.points.items():
+            owner = point["payload"].get("owner_id")
+            owners[pid] = owner if isinstance(owner, str) and owner else None
+        return owners
 
     def upsert_points(
         self, points: Sequence[RejectionPoint], *, model: str, may_create: bool
     ) -> None:
-        self.calls.append((
+        self._record(
             "upsert_points",
             {"ids": [p.point_id for p in points], "model": model, "may_create": may_create},
-        ))
+        )
         if not isinstance(model, str) or not model:
             raise ValueError("A rejection point's model must be a non-empty string.")
         for point in points:
@@ -173,7 +200,7 @@ class FakeRejectionIndex:
             }
 
     def delete_points(self, point_ids: Sequence[str]) -> None:
-        self.calls.append(("delete_points", {"ids": list(point_ids)}))
+        self._record("delete_points", {"ids": list(point_ids)})
         if not point_ids:
             return
         self._reach("delete_points")
@@ -228,7 +255,7 @@ def exercise_rejection_index_contract(
 
     Absent → a retrieve and a listing raise ``CollectionMissingError`` → an unlicensed
     upsert raises it too and creates nothing → a licensed upsert creates → retrieve
-    answers the present subset → the owner scroll and the listing → search ranks the
+    answers the present subset → the owner scroll, the listing and the owner map → search ranks the
     nearest first with its owner → a delete shrinks the listing → an overrun search,
     and one under an already-spent budget, is ``searched=False``, never a raise.
 
@@ -243,6 +270,7 @@ def exercise_rejection_index_contract(
 
     _raises(CollectionMissingError, lambda: index.retrieve_present([a1.point_id]))
     _raises(CollectionMissingError, lambda: index.list_point_ids())
+    _raises(CollectionMissingError, lambda: index.list_point_owners())
     assert index.retrieve_present([]) == set()  # empty input asks nothing
 
     _raises(
@@ -259,6 +287,9 @@ def exercise_rejection_index_contract(
     assert index.list_owner_point_ids(OWNER_A) == {a1.point_id, a2.point_id}
     assert index.list_owner_point_ids(OWNER_B) == {b1.point_id}
     assert index.list_point_ids() == {a1.point_id, a2.point_id, b1.point_id}
+    assert index.list_point_owners() == {
+        a1.point_id: OWNER_A, a2.point_id: OWNER_A, b1.point_id: OWNER_B,
+    }
 
     answer = index.search(axis_vector(1, lean=0), 3, budget_seconds=5.0)
     assert answer.searched is True
@@ -269,6 +300,7 @@ def exercise_rejection_index_contract(
     index.delete_points([a1.point_id])
     assert index.list_point_ids() == {a2.point_id, b1.point_id}
     assert index.list_owner_point_ids(OWNER_A) == {a2.point_id}
+    assert index.list_point_owners() == {a2.point_id: OWNER_A, b1.point_id: OWNER_B}
 
     late = overrun(axis_vector(1))
     assert late.searched is False and late.hits == []

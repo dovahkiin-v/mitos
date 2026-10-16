@@ -147,19 +147,21 @@ def hash_to_uuid(sha256_hex: str) -> str:
     return f"{sha[:8]}-{sha[8:12]}-{sha[12:16]}-{sha[16:20]}-{sha[20:32]}"
 
 
-def _scroll_ids(
+def _scroll_points(
     base_url: str,
     collection: str,
     *,
     page_size: int,
     payload_filter: Optional[Dict[str, Any]] = None,
-) -> Set[str]:
-    """Enumerates point ids in a collection by a paginated, no-create scroll.
+    with_payload: Any = False,
+) -> List[Dict[str, Any]]:
+    """Enumerates a collection's points by a paginated, no-create scroll.
 
-    The one scroll body in this module. ``scroll_point_ids`` and both collections'
-    clients list through it, so a page's shape guard cannot fork between them.
-    Payloads and vectors are excluded from every page; ``payload_filter``, when
-    given, is sent as Qdrant's ``filter`` (the rejection index's owner scroll).
+    The one scroll body in this module. ``_scroll_ids`` and
+    :meth:`QdrantRejectionIndex.list_point_owners` read through it, so a page's
+    shape guard cannot fork between them. Vectors are excluded from every page, and
+    payloads unless ``with_payload`` names the keys to take back;
+    ``payload_filter``, when given, is sent as Qdrant's ``filter``.
 
     The three failure directions are typed apart: a transport fault raises
     :class:`VectorStoreUnreachableError`, a 404 :class:`CollectionMissingError`, and
@@ -170,9 +172,10 @@ def _scroll_ids(
         collection: The collection name to scroll.
         page_size: Maximum points fetched per scroll page.
         payload_filter: A Qdrant filter object, or None for every point.
+        with_payload: Qdrant's ``with_payload``: False, or a list of payload keys.
 
     Returns:
-        The set of point-id strings in the collection (or matching the filter).
+        Every point object the scroll returned, each carrying an ``id``.
 
     Raises:
         VectorStoreUnreachableError: If Qdrant did not answer.
@@ -181,13 +184,13 @@ def _scroll_ids(
             body of the wrong shape.
     """
     scroll_url = f"{base_url.rstrip('/')}/collections/{collection}/points/scroll"
-    ids: Set[str] = set()
+    found: List[Dict[str, Any]] = []
     offset: Any = None
     try:
         while True:
             body: Dict[str, Any] = {
                 "limit": page_size,
-                "with_payload": False,
+                "with_payload": with_payload,
                 "with_vector": False,
             }
             if payload_filter is not None:
@@ -222,17 +225,57 @@ def _scroll_ids(
                     "Qdrant scroll returned an unexpected points shape "
                     "(expected a list of objects carrying an `id`)."
                 )
-            for point in points:
-                ids.add(str(point["id"]))
+            found.extend(points)
 
             offset = result.get("next_page_offset")
             if offset is None:
                 break
-        return ids
+        return found
     except requests.RequestException as e:
         raise VectorStoreUnreachableError(
             f"Qdrant scroll connection error: {str(e)}"
         ) from e
+
+
+def _scroll_ids(
+    base_url: str,
+    collection: str,
+    *,
+    page_size: int,
+    payload_filter: Optional[Dict[str, Any]] = None,
+) -> Set[str]:
+    """Enumerates point ids in a collection by a paginated, no-create scroll.
+
+    ``scroll_point_ids`` and both collections' clients list ids through this, over
+    the one scroll body (:func:`_scroll_points`), with payloads excluded from every
+    page; ``payload_filter``, when given, is sent as Qdrant's ``filter`` (the
+    rejection index's owner scroll).
+
+    The three failure directions are typed apart: a transport fault raises
+    :class:`VectorStoreUnreachableError`, a 404 :class:`CollectionMissingError`, and
+    any other non-200 or a 200 of the wrong shape plain :class:`VectorStoreError`.
+
+    Args:
+        base_url: The Qdrant base URL (trailing slash tolerated).
+        collection: The collection name to scroll.
+        page_size: Maximum points fetched per scroll page.
+        payload_filter: A Qdrant filter object, or None for every point.
+
+    Returns:
+        The set of point-id strings in the collection (or matching the filter).
+
+    Raises:
+        VectorStoreUnreachableError: If Qdrant did not answer.
+        CollectionMissingError: If Qdrant is up but the collection does not exist.
+        VectorStoreError: If Qdrant answered another non-200 status, or a 200 with a
+            body of the wrong shape.
+    """
+    return {
+        str(point["id"])
+        for point in _scroll_points(
+            base_url, collection, page_size=page_size, payload_filter=payload_filter
+        )
+    }
 
 
 def scroll_point_ids(base_url: str, collection: str, page_size: int = 256) -> Set[str]:
@@ -970,6 +1013,34 @@ class QdrantRejectionIndex:
         """
         return _scroll_ids(self.base_url, self.collection, page_size=page_size)
 
+    def list_point_owners(self, page_size: int = 256) -> Dict[str, Optional[str]]:
+        """Lists every point in the collection with the owner its payload names.
+
+        One whole scroll taking back the ``owner_id`` key only, so a mass drain
+        attributes every held item to its owner without a call per owner.
+
+        Args:
+            page_size: Maximum points fetched per scroll page.
+
+        Returns:
+            ``{point_id: owner_id}``; the owner is None when the payload carries no
+            non-empty string there (not a fault; such a point belongs to no owner).
+
+        Raises:
+            VectorStoreUnreachableError: If Qdrant did not answer.
+            CollectionMissingError: If the collection does not exist.
+            VectorStoreError: On another non-200 or a 200 of the wrong shape.
+        """
+        owners: Dict[str, Optional[str]] = {}
+        for point in _scroll_points(
+            self.base_url, self.collection, page_size=page_size,
+            with_payload=[_OWNER_KEY],
+        ):
+            payload = point.get("payload")
+            owner = payload.get(_OWNER_KEY) if isinstance(payload, dict) else None
+            owners[str(point["id"])] = owner if isinstance(owner, str) and owner else None
+        return owners
+
     def upsert_points(
         self, points: Sequence[RejectionPoint], *, model: str, may_create: bool
     ) -> None:
@@ -1062,9 +1133,12 @@ class QdrantRejectionIndex:
         """Creates the collection, then its keyword index on ``owner_id``.
 
         Reached only from a licensed upsert's 404. The collection PUT must answer
-        200 with ``result: true``; the index PUT carries ``wait=true`` and must
-        answer 200 with ``status: "completed"``. Without the index every owner
-        scroll scans the whole collection.
+        200 with ``result: true``, or 409: another writer's create won the race
+        between the 404 and this PUT, so the collection exists and this goes on.
+        The index PUT carries ``wait=true`` and must answer 200 with ``status:
+        "completed"`` (it does over an index that already exists, so the race's
+        loser re-declares it harmlessly). Without the index every owner scroll scans
+        the whole collection.
 
         Residual, stated: if the index PUT fails, this raises and the collection
         stays, unindexed. That is still correct (owner scrolls work, only slower),
@@ -1073,8 +1147,8 @@ class QdrantRejectionIndex:
 
         Raises:
             VectorStoreUnreachableError: If Qdrant did not answer either request.
-            VectorStoreError: If either request was refused or not confirmed (an
-                existing collection answers 409 and lands here).
+            VectorStoreError: If either request was refused or not confirmed (any
+                non-200 but the collection PUT's 409).
         """
         collection_url = f"{self.base_url}/collections/{self.collection}"
         try:
@@ -1088,12 +1162,14 @@ class QdrantRejectionIndex:
             raise VectorStoreUnreachableError(
                 f"Qdrant connection error creating the rejection collection: {str(e)}"
             ) from e
-        if resp.status_code != 200:
+        if resp.status_code == 409:
+            pass  # A racing create won: the collection exists. Declare the index.
+        elif resp.status_code != 200:
             raise VectorStoreError(
                 f"Failed to create Qdrant collection '{self.collection}' "
                 f"(HTTP {resp.status_code}): {resp.text}"
             )
-        if _decode_result(resp, operation="rejection collection create") is not True:
+        elif _decode_result(resp, operation="rejection collection create") is not True:
             raise VectorStoreError(
                 f"Qdrant did not confirm creating collection '{self.collection}'."
             )

@@ -299,6 +299,10 @@ class MitosProseImporter:
         durability of a deferral is free here; what the arm below adds is the **notice**
         — the surrounding ``except Exception: pass`` would otherwise swallow the refusal
         into complete silence.
+
+        It is the decision leg only. The rejection backlog rows the commit queued are
+        left to the rejection backlog's drain (``drain_rejection_backlog``, run by the
+        next ``sync``), which writes each owner's items whole.
         """
         if not self.embed_provider or not self.vector_store:
             return

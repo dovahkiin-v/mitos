@@ -409,9 +409,9 @@ def test_the_reason_is_a_required_keyword():
 # Stretch — a print site added later cannot print the provider body
 # --------------------------------------------------------------------------- #
 
-_EMBED_CALLS = {"get_embedding", "get_embeddings_batch", "_best_effort_embed",
+_EMBED_CALLS = {"get_embedding", "_best_effort_embed",
                 "drain_pending_embeddings", "embed_documents", "_embed_decision_inline",
-                "_write_rejection_items_inline"}
+                "_write_rejection_items_inline", "drain_rejection_backlog", "_embed_batch"}
 
 
 def _embedding_handlers(tree):
@@ -458,3 +458,19 @@ def test_no_sync_print_site_interpolates_an_embedding_exception_bare():
     assert len(routed) >= 5, len(routed)
     offenders = [line for h, name in handlers for line in _interpolates_bare(h, name)]
     assert offenders == [], f"sync.py lines print an embedding exception bare: {offenders}"
+
+
+def test_no_cli_print_site_interpolates_an_embedding_exception_bare():
+    """The same sweep over ``cli.py``, where ``sync --embed-only`` wraps both drains."""
+    import ast
+    import inspect
+    from mitos import cli
+    tree = ast.parse(inspect.getsource(cli))
+    handlers = list(_embedding_handlers(tree))
+    # Population guard: the two `--embed-only` drain handlers (4c) are found.
+    routed = [h for h, name in handlers
+              if any(isinstance(n, ast.Call) and getattr(n.func, "id", None) == "describe_embed_failure"
+                     for n in ast.walk(h))]
+    assert len(routed) >= 2, len(routed)
+    offenders = [line for h, name in handlers for line in _interpolates_bare(h, name)]
+    assert offenders == [], f"cli.py lines print an embedding exception bare: {offenders}"

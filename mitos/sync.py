@@ -5,6 +5,7 @@ concurrency file locks, LLM capture enrichment, user reviews, and content-aware
 archive rotation.
 """
 
+import functools
 import hashlib
 import math
 import os
@@ -14,7 +15,7 @@ import re
 import json
 import sqlite3
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from decimal import Decimal, ROUND_FLOOR
 from typing import (
     TYPE_CHECKING, AbstractSet, List, Dict, Mapping, Optional, Any, Set, Tuple, Callable,
@@ -86,6 +87,8 @@ from mitos.store import (
     _EDGE_KIND_REQUIREMENT,
     _KILL_EDGE_FIELDS,
     MODIFIER_EDGE_KEYS,
+    REJECTION_BACKLOG_FAILURE_TOLERANCE,
+    RejectionBacklogRow,
     edge_kind_is_legal,
 )
 from mitos.identity import (
@@ -815,6 +818,115 @@ class DrainOutcome:
     marker: Optional[str]
 
 
+# The rejection backlog's drain (`drain_rejection_backlog`) reuses the decision drain's
+# stops and markers and adds one stop of its own. `DRAIN_STOPS` stays the decision
+# drain's closed vocabulary: that drain never stops `held`.
+REJECTION_DRAIN_STOP_HELD = "held"  # another drain holds the backlog's lock; nothing read
+REJECTION_DRAIN_STOPS = DRAIN_STOPS + (REJECTION_DRAIN_STOP_HELD,)
+
+# Rows per rejection backlog read: the owners one page's cross-owner batches are cut
+# from. Read at call time, so a row can force several pages.
+_REJECTION_DRAIN_CLAIM_SIZE = 100
+
+
+def rejection_drain_lock_path(config: MitosConfig) -> str:
+    """Returns the path of the rejection drain's operating-system lock.
+
+    It is never the ``decisions.md`` lock, which is held only briefly around the
+    buffer; this one is held for a whole drain, embedding calls included.
+
+    Args:
+        config: The workspace config.
+
+    Returns:
+        ``<workspace>/.mitos/rejection_drain.lock``.
+    """
+    return os.path.join(config.mitos_dir, "rejection_drain.lock")
+
+
+@dataclass(frozen=True)
+class RejectionDrainOutcome:
+    """What one drain of the rejection backlog did. Runtime-only, never persisted.
+
+    Attributes:
+        owners_cleared: Rows cleared: their owner's items replaced whole, or their
+            node gone from the graph.
+        items_embedded: Items embedded and written.
+        items_skipped_present: Items the owner's field states that the index already
+            held, so nothing was embedded for them.
+        items_removed: Items deleted because their owner's field no longer states
+            them.
+        owners_failed: Owners taken and left queued for a reason of their own.
+        owners_past_tolerance: Rows standing at exit whose retry count is at least
+            ``REJECTION_BACKLOG_FAILURE_TOLERANCE``; None when not read.
+        calls: ``embed_documents`` calls attempted.
+        left_queued: Rows standing at exit, read; None when not read.
+        stop: None when the walk reached the end of the backlog, else one of
+            :data:`REJECTION_DRAIN_STOPS`.
+        marker: None when no seed marker stood at entry (or nothing was read), else
+            one of :data:`DRAIN_MARKERS`.
+    """
+
+    owners_cleared: int
+    items_embedded: int
+    items_skipped_present: int
+    items_removed: int
+    owners_failed: int
+    owners_past_tolerance: Optional[int]
+    calls: int
+    left_queued: Optional[int]
+    stop: Optional[str]
+    marker: Optional[str]
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Returns the outcome as ``reconcile --json``'s ``rejection_drain`` object."""
+        return asdict(self)
+
+
+def rejection_drain_report(drain: Dict[str, Any]) -> List[str]:
+    """Words a rejection drain's summary from its ``to_dict()``; names no command.
+
+    The one renderer of the summary: the drain prints it on ``sync``, and
+    ``cmd_reconcile`` prints it from ``rejection_drain``, so neither prints it twice.
+
+    Args:
+        drain: A :meth:`RejectionDrainOutcome.to_dict` value.
+
+    Returns:
+        The lines to print; empty when the drain did nothing worth a line.
+    """
+    lines: List[str] = []
+    left = drain["left_queued"]
+    worked = any(drain[key] for key in (
+        "owners_cleared", "items_embedded", "items_skipped_present", "items_removed",
+        "owners_failed",
+    ))
+    if worked:
+        line = (
+            f"Rejection index: {drain['owners_cleared']} owner(s) replaced — "
+            f"{drain['items_embedded']} item(s) embedded, "
+            f"{drain['items_skipped_present']} already present, "
+            f"{drain['items_removed']} removed"
+        )
+        if drain["owners_failed"]:
+            line += f"; {drain['owners_failed']} owner(s) failed"
+        if left is not None:
+            line += f"; {left} row(s) left queued"
+        lines.append(line + ".")
+    elif drain["stop"] == DRAIN_STOP_UNAVAILABLE and left:
+        lines.append(
+            f"Rejection index: not drained this run; {left} backlog row(s) stay queued."
+        )
+    past = drain["owners_past_tolerance"]
+    if past:
+        lines.append(
+            f"Rejection index: {past} backlog row(s) have failed "
+            f"{REJECTION_BACKLOG_FAILURE_TOLERANCE} or more times. They stay queued "
+            f"and every drain attempts them again."
+        )
+    return lines
+
+
 def _rotation_failure_stage(exc: BaseException) -> str:
     """Classifies where a record-path rotation failed, by exception type.
 
@@ -1509,6 +1621,494 @@ class _RepairLedger:
         return line
 
 
+class _OwnerTake:
+    """One owner, taken once by a rejection drain: the row read, then its plan.
+
+    Attributes:
+        row: The backlog row as claimed; its seq is the only one the take may clear
+            or note.
+        slug: The owner's slug, for its lines.
+        expected: ``rejection_points`` of the field read after the claim.
+        relist: Whether the owner's holdings must be listed afresh rather than taken
+            from the entry listing (a retake, or a row queued after that listing).
+        to_write: ``(point_id, text)`` of the expected items not held, in
+            enumeration order.
+        to_remove: Held point ids the field no longer states.
+        landed: How many of ``to_write`` are written.
+        aborted: Set once the take failed; it is then never finalized and noted once.
+    """
+
+    def __init__(self, row: RejectionBacklogRow, slug: str,
+                 expected: Dict[str, Any], relist: bool) -> None:
+        self.row = row
+        self.slug = slug
+        self.expected = expected
+        self.relist = relist
+        self.to_write: List[Tuple[str, str]] = []
+        self.to_remove: Set[str] = set()
+        self.landed = 0
+        self.aborted = False
+
+    @property
+    def owner(self) -> str:
+        return self.row.node_id
+
+    def plan(self, held: AbstractSet[str]) -> int:
+        """Splits the expected items against what the owner holds.
+
+        Returns:
+            How many expected items are already held.
+        """
+        self.to_write = [(pid, ref.text) for pid, ref in self.expected.items()
+                         if pid not in held]
+        self.to_remove = set(held) - set(self.expected)
+        return len(self.expected) - len(self.to_write)
+
+
+# One queued item of a page: its owner's take, its point id, its text.
+_QueuedItem = Tuple[_OwnerTake, str, str]
+
+
+class _RejectionDrainWalk:
+    """One walk of the rejection backlog, run under the drain lock its caller holds.
+
+    The steps, in order, are :meth:`MitosSyncManager.drain_rejection_backlog`'s
+    contract. Every exit returns ``(stop, marker)``; the counters are read off the
+    walk afterwards, also when an exception escaped it.
+    """
+
+    def __init__(self, manager: "MitosSyncManager") -> None:
+        self.store = manager.store
+        self.index = manager.rejection_index
+        self.provider = manager.embed_provider
+        self.selector = shell_flag("-p", manager.config.project)
+        self.owners_cleared = 0
+        self.items_embedded = 0
+        self.items_skipped_present = 0
+        self.items_removed = 0
+        self.owners_failed = 0
+        self.calls = 0
+        self.model = ""  # the provider's model id, validated once at entry
+        self.seed: Optional[Dict[str, str]] = None
+        self.may_create = False
+        self.collection_present = False
+        # Under the marker: the entry listing, by owner, and the largest seq queued
+        # before it was taken. A row above that seq re-lists, as a retake does.
+        self.entry_holdings: Optional[Dict[str, Set[str]]] = None
+        self.watermark = 0
+        self.taken: Set[str] = set()
+
+    def kept(self) -> Optional[str]:
+        return DRAIN_MARKER_KEPT if self.seed is not None else None
+
+    # -- the walk ---------------------------------------------------------- #
+
+    def run(self) -> Tuple[Optional[str], Optional[str]]:
+        # A provider naming no model is its own fault, not any row's: checked once,
+        # before the claim, so it never reads as every owner's poison.
+        model = self.provider.model_id
+        if not isinstance(model, str) or not model:
+            print(
+                "[Warning] The rejection backlog was not drained: the embedding "
+                "provider reported no model id. Its rows stay queued."
+            )
+            return DRAIN_STOP_UNAVAILABLE, None
+        self.model = model
+        # Declared intent, from the state a covering verb established (read once).
+        self.seed = self.store.rejection_seed()
+        self.may_create = self.seed is not None
+        try:
+            page = self.store.claim_rejection_backlog(_REJECTION_DRAIN_CLAIM_SIZE)
+        except Exception as e:
+            self._claim_failed(e)
+            return DRAIN_STOP_CLAIM_FAILED, self.kept()
+        if not page:
+            # Nothing to replace: whatever the marker claimed is moot. Lists nothing.
+            if self.seed is None:
+                return None, None
+            return None, self._spend()
+
+        if self.seed is not None:
+            stop = self._list_entry_holdings(page)
+            if stop is not None:
+                return stop, self.kept()
+
+        while page:
+            stop = self._walk_page(page)
+            if stop is not None:
+                return stop, self.kept()
+            try:
+                page = self.store.claim_rejection_backlog(
+                    _REJECTION_DRAIN_CLAIM_SIZE, after_seq=page[-1].enqueue_seq
+                )
+            except Exception as e:
+                self._claim_failed(e)
+                return DRAIN_STOP_CLAIM_FAILED, self.kept()
+
+        if self.seed is None:
+            return None, None
+        if self.collection_present:
+            return None, self._spend()
+        # Still absent (nothing written). Spend only if nothing is left to cover:
+        # read, never inferred — a row queued behind the cursor is invisible to it.
+        try:
+            empty = self.store.claim_rejection_backlog(1) == []
+        except Exception as e:
+            self._claim_failed(e)
+            return None, DRAIN_MARKER_KEPT
+        return None, (self._spend() if empty else DRAIN_MARKER_KEPT)
+
+    def _list_entry_holdings(self, page: List[RejectionBacklogRow]) -> Optional[str]:
+        """Under the marker: one listing of the whole index, with owners."""
+        seqs = [row.enqueue_seq for row in page]
+        try:
+            last = self.store.rejection_backlog_last_seq()
+        except Exception:
+            last = None  # the head page's seqs still bound what predates the listing
+        self.watermark = max(seqs + ([last] if last is not None else []))
+        try:
+            owners = self.index.list_point_owners()
+            self.collection_present = True
+        except CollectionMissingError:
+            owners = {}  # absent: this licensed drain creates it on its first write
+        except VectorStoreError as e:
+            self._stop_store(e, "could not list the rejection index")
+            return DRAIN_STOP_OUTAGE
+        holdings: Dict[str, Set[str]] = {}
+        for point_id, owner in owners.items():
+            if owner is not None:
+                holdings.setdefault(owner, set()).add(point_id)
+        self.entry_holdings = holdings
+        return None
+
+    def _walk_page(self, page: List[RejectionBacklogRow]) -> Optional[str]:
+        # Seq first, field after (the claim above): a commit between the two mints
+        # a larger seq, so this take's clear fails and the retake reads that field.
+        try:
+            fields = self.store.get_rejection_owner_fields(
+                [row.node_id for row in page]
+            )
+        except Exception as e:
+            # One read for the page, so one fault for the page: no row is charged
+            # (the fault is the store's), and the next drain retries every one.
+            print(
+                f"[Warning] Could not read {len(page)} rejection backlog owner(s) "
+                f"from the graph: {describe_embed_failure(e)}. Their rows stay queued."
+            )
+            return None
+
+        takes: List[_OwnerTake] = []
+        for row in page:
+            retake = row.node_id in self.taken
+            self.taken.add(row.node_id)
+            if row.node_id not in fields:
+                # The node left the graph (only with foreign keys off). Its points
+                # are orphans for 4d's collector, not for this drain.
+                self._clear(row, None)
+                continue
+            slug, field = fields[row.node_id]
+            try:
+                expected = rejection_points(row.node_id, field)
+            except Exception as e:
+                self._fail_row(row, slug, e)
+                continue
+            relist = (retake or self.entry_holdings is None
+                      or row.enqueue_seq > self.watermark)
+            takes.append(_OwnerTake(row, slug, expected, relist))
+
+        # Holdings for every owner of the page, before anything of the page embeds.
+        for take in takes:
+            if take.relist:
+                try:
+                    held: AbstractSet[str] = self.index.list_owner_point_ids(take.owner)
+                    self.collection_present = True
+                except CollectionMissingError:
+                    if self.seed is None:
+                        self._stop_refused()
+                        return DRAIN_STOP_REFUSED
+                    held = set()  # licensed: the first write creates it
+                except VectorStoreError as e:
+                    self._stop_store(e, "could not list an owner's items")
+                    return DRAIN_STOP_OUTAGE
+            else:
+                held = self.entry_holdings.get(take.owner, set())
+            self.items_skipped_present += take.plan(held)
+
+        for take in takes:
+            if not take.to_write:
+                stop = self._finalize(take)
+                if stop is not None:
+                    return stop
+
+        queue: List[_QueuedItem] = [
+            (take, pid, text) for take in takes for pid, text in take.to_write
+        ]
+        while queue:
+            n = fit_batch([text for _, _, text in queue])
+            batch, queue = queue[:n], queue[n:]
+            stop, queue = self._send_batch(batch, queue)
+            if stop is not None:
+                return stop
+        return None
+
+    # -- batches ----------------------------------------------------------- #
+
+    def _send_batch(
+        self, batch: List[_QueuedItem], queue: List[_QueuedItem]
+    ) -> Tuple[Optional[str], List[_QueuedItem]]:
+        owners = list(dict.fromkeys(take for take, _, _ in batch))
+        try:
+            vectors = self._embed_batch([text for _, _, text in batch])
+        except Exception as e:
+            cause = classify_provider_error(e)
+            if cause in _DRAIN_OUTAGE_CAUSES:
+                self._stop_provider(cause, e)
+                return DRAIN_STOP_OUTAGE, queue
+            if len(owners) == 1:
+                self._abort(owners[0], e)
+                return None, self._drop(owners[0], queue)
+            # A batch failing for a reason of its own: find its owner by retrying
+            # owner by owner, each with every text it has not landed.
+            for take in owners:
+                stop, queue = self._solo(take, batch, queue)
+                if stop is not None:
+                    return stop, queue
+            return None, queue
+
+        try:
+            self._upsert(batch, vectors)
+        except VectorStoreUnreachableError as e:
+            self._stop_store(e, "did not answer the write")
+            return DRAIN_STOP_OUTAGE, queue
+        except CollectionMissingError:
+            self._stop_missing_on_write()
+            return DRAIN_STOP_REFUSED, queue
+        except Exception:
+            # Refused or unconfirmed: retry each owner's points alone, with the
+            # vectors in hand (no second embed).
+            for take in owners:
+                mine = [(item, vector) for item, vector in zip(batch, vectors)
+                        if item[0] is take]
+                try:
+                    self._upsert([item for item, _ in mine], [v for _, v in mine])
+                except VectorStoreUnreachableError as e:
+                    self._stop_store(e, "did not answer the write")
+                    return DRAIN_STOP_OUTAGE, queue
+                except CollectionMissingError:
+                    self._stop_missing_on_write()
+                    return DRAIN_STOP_REFUSED, queue
+                except Exception as e:
+                    self._abort(take, e)
+                    queue = self._drop(take, queue)
+                    continue
+                stop = self._landed(take, len(mine))
+                if stop is not None:
+                    return stop, queue
+            return None, queue
+
+        for take in owners:
+            stop = self._landed(take, sum(1 for item in batch if item[0] is take))
+            if stop is not None:
+                return stop, queue
+        return None, queue
+
+    def _solo(
+        self, take: _OwnerTake, batch: List[_QueuedItem], queue: List[_QueuedItem]
+    ) -> Tuple[Optional[str], List[_QueuedItem]]:
+        """Retries one owner alone, over every text of it not landed, in its own chunks.
+
+        Its texts leave the queue first, so its tail never rides a later batch. It
+        stops at its first failing chunk.
+        """
+        items = [item for item in batch if item[0] is take]
+        items += [item for item in queue if item[0] is take]
+        queue = self._drop(take, queue)
+        while items:
+            n = fit_batch([text for _, _, text in items])
+            chunk, items = items[:n], items[n:]
+            try:
+                vectors = self._embed_batch([text for _, _, text in chunk])
+            except Exception as e:
+                cause = classify_provider_error(e)
+                if cause in _DRAIN_OUTAGE_CAUSES:
+                    self._stop_provider(cause, e)
+                    return DRAIN_STOP_OUTAGE, queue
+                self._abort(take, e)
+                return None, queue
+            try:
+                self._upsert(chunk, vectors)
+            except VectorStoreUnreachableError as e:
+                self._stop_store(e, "did not answer the write")
+                return DRAIN_STOP_OUTAGE, queue
+            except CollectionMissingError:
+                self._stop_missing_on_write()
+                return DRAIN_STOP_REFUSED, queue
+            except Exception as e:
+                self._abort(take, e)
+                return None, queue
+            stop = self._landed(take, len(chunk))
+            if stop is not None:
+                return stop, queue
+        return None, queue
+
+    def _embed_batch(self, texts: List[str]) -> List[List[float]]:
+        """One ``embed_documents`` call, its answer validated (the model was, at entry)."""
+        self.calls += 1
+        vectors = self.provider.embed_documents(texts)
+        if not (
+            isinstance(vectors, list)
+            and len(vectors) == len(texts)
+            and all(isinstance(v, list) and v for v in vectors)
+        ):
+            raise EmbeddingError(
+                "the embedding provider answered a document batch with the wrong shape"
+            )
+        return vectors
+
+    def _upsert(self, items: List[_QueuedItem], vectors: List[List[float]]) -> None:
+        self.index.upsert_points(
+            [RejectionPoint(pid, take.owner, vector)
+             for (take, pid, _), vector in zip(items, vectors)],
+            model=self.model,
+            may_create=self.may_create,
+        )
+        # Written: the collection exists now, whatever the listing said.
+        self.collection_present = True
+
+    def _landed(self, take: _OwnerTake, count: int) -> Optional[str]:
+        self.items_embedded += count
+        take.landed += count
+        if take.landed == len(take.to_write) and not take.aborted:
+            return self._finalize(take)
+        return None
+
+    @staticmethod
+    def _drop(take: _OwnerTake, queue: List[_QueuedItem]) -> List[_QueuedItem]:
+        return [item for item in queue if item[0] is not take]
+
+    # -- finalizing an owner ----------------------------------------------- #
+
+    def _finalize(self, take: _OwnerTake) -> Optional[str]:
+        """Removes what the field no longer states, then clears against the seq read.
+
+        Runs only once every item the owner lacked is written, so an interrupted
+        drain leaves the old items beside the new ones, never none.
+        """
+        if take.to_remove:
+            try:
+                self.index.delete_points(sorted(take.to_remove))
+            except VectorStoreUnreachableError as e:
+                self._stop_store(e, "did not answer a delete")
+                return DRAIN_STOP_OUTAGE
+            except CollectionMissingError:
+                self._stop_missing_on_write()
+                return DRAIN_STOP_REFUSED
+            except Exception as e:
+                # Reported and left queued, never counted as done.
+                self._abort(take, e, removing=True)
+                return None
+            self.items_removed += len(take.to_remove)
+        self._clear(take.row, take.slug)
+        return None
+
+    def _clear(self, row: RejectionBacklogRow, slug: Optional[str]) -> None:
+        try:
+            cleared = self.store.clear_rejection_backlog_row(
+                row.node_id, enqueue_seq=row.enqueue_seq
+            )
+        except Exception as e:
+            self.owners_failed += 1
+            print(
+                f"[Warning] The rejection backlog row for '{slug or row.node_id}' "
+                f"could not be cleared: {describe_embed_failure(e)}. The row stays "
+                f"queued; the next drain finds its items in place."
+            )
+            return
+        if cleared:
+            self.owners_cleared += 1
+        # False: a commit re-queued the owner since the claim. Its new row carries a
+        # larger seq, ahead of the cursor, so this walk takes it again.
+
+    def _abort(self, take: _OwnerTake, exc: BaseException, *, removing: bool = False) -> None:
+        if take.aborted:
+            return
+        take.aborted = True
+        self._fail_row(take.row, take.slug, exc, removing=removing)
+
+    def _fail_row(self, row: RejectionBacklogRow, slug: str, exc: BaseException,
+                  *, removing: bool = False) -> None:
+        self.owners_failed += 1
+        what = ("its old items were not removed" if removing
+                else "its items were not replaced")
+        print(
+            f"[Warning] Rejected items for '{slug}': {what} — "
+            f"{describe_embed_failure(exc)}. Its rejection backlog row stays queued."
+        )
+        try:
+            self.store.note_rejection_backlog_failure(
+                row.node_id, enqueue_seq=row.enqueue_seq
+            )
+        except Exception:
+            pass  # the row stands either way; only its count did not move
+
+    # -- stops and the marker ---------------------------------------------- #
+
+    def _stop_provider(self, cause: str, exc: BaseException) -> None:
+        print(
+            f"Rejection index: stopping the drain — the embedding provider is "
+            f"unavailable ({cause}): {describe_embed_failure(exc)}. No row was "
+            f"charged; the rows stay queued for the next `mitos sync {self.selector}`."
+        )
+
+    def _stop_store(self, exc: BaseException, what: str) -> None:
+        print(
+            f"Rejection index: stopping the drain — the vector store {what}: "
+            f"{describe_embed_failure(exc)}. No row was charged; the rows stay "
+            f"queued for the next `mitos sync {self.selector}`."
+        )
+
+    def _stop_refused(self) -> None:
+        # Names no heal verb: nothing in this release builds the rejection index for
+        # a workspace that has rows and no collection, so naming one would be false.
+        try:
+            waiting: Optional[int] = self.store.count_rejection_backlog()
+        except Exception:
+            waiting = None
+        count = f"{waiting} " if waiting is not None else ""
+        print(
+            f"Rejection index: {count}rejection backlog row(s) wait until the "
+            f"rejection index is built; nothing was created or embedded."
+        )
+
+    def _stop_missing_on_write(self) -> None:
+        if self.may_create:
+            print(
+                "Rejection index: stopping the drain — the rejection collection was "
+                "created and still answered missing to the write. No row was "
+                "charged; the rows stay queued."
+            )
+        else:
+            self._stop_refused()
+
+    def _claim_failed(self, exc: BaseException) -> None:
+        print(
+            f"[Warning] Failed to read the rejection backlog: "
+            f"{describe_embed_failure(exc)}"
+        )
+
+    def _spend(self) -> str:
+        """Spends the marker this drain read; one re-stamped meanwhile survives."""
+        try:
+            self.store.clear_rejection_seed(established_at=self.seed["established_at"])
+        except Exception as e:
+            print(
+                f"[Warning] Failed to clear the rejection seed marker: "
+                f"{describe_embed_failure(e)}"
+            )
+            return DRAIN_MARKER_KEPT
+        return DRAIN_MARKER_SPENT
+
+
 class MitosSyncManager:
     """Manages the full parse-enrich-commit sync flow and side effects."""
 
@@ -1635,6 +2235,11 @@ class MitosSyncManager:
         absent from the buffer), while the key-floor return must stay silent. One
         report site after every path, and one explicit carve-out marked at the
         floor, beats four call sites and four chances to miss the one that matters.
+
+        The two drains, the decision outbox's and then the rejection backlog's, run
+        at the end of a run that read the buffer, each in a try of its own. The
+        early returns (the buffer lock busy, no entry parsed, the key floor) skip
+        both; ``--embed-only`` runs both without a sync.
 
         Args:
             auto_accept: Whether ``--yes`` is in force.
@@ -2101,8 +2706,9 @@ class MitosSyncManager:
             print(f"Committed node: {entry.slug} ✓")
             ledger.note(entry, "committed")
 
-            # best-effort embedding upsert (C2) — applies to OQ nodes too.
-            self._best_effort_embed(delta, entry)
+            # best-effort embedding upsert (C2) — applies to OQ nodes too. The
+            # rejection leg is left to this sync's own drain (step 6b).
+            self._best_effort_embed(delta, entry, rejection_leg=False)
 
         # 3b. Intra-sync fixpoint retry (4b). The main pass committed every entry
         # whose targets were already present; re-attempt the quarantined set until a
@@ -2145,6 +2751,18 @@ class MitosSyncManager:
             self.drain_pending_embeddings()
         except Exception as e:
             print(f"[Warning] Outbox queue drain failed: {describe_embed_failure(e)}")
+
+        # 6b. The rejection backlog's drain, after the decision drain and in a try of
+        # its own: a fault here never touches that drain, its marker or the exit. It
+        # takes every row the commit loop above left (that loop runs no inline
+        # rejection leg), cross-owner batched.
+        try:
+            self.drain_rejection_backlog()
+        except Exception as e:
+            print(
+                f"[Warning] Rejection backlog drain failed: {describe_embed_failure(e)}",
+                file=sys.stderr,
+            )
 
         # 7. Surplus hit/miss stats observability (4.D)
         if verbose and self.embed_provider:
@@ -2286,7 +2904,7 @@ class MitosSyncManager:
         committed, passes, residual = commit_quarantine_fixpoint(
             self.store,
             quarantined,
-            embed_fn=self._best_effort_embed,
+            embed_fn=functools.partial(self._best_effort_embed, rejection_leg=False),
         )
 
         # Convergence observability: make the fixpoint's work visible (the vision
@@ -2777,7 +3395,9 @@ class MitosSyncManager:
             "  decisions.md, then re-sync. Quit to abort."
         )
 
-    def _best_effort_embed(self, delta: CommitDelta, entry: ParsedEntry) -> Optional[List[float]]:
+    def _best_effort_embed(
+        self, delta: CommitDelta, entry: ParsedEntry, *, rejection_leg: bool = True
+    ) -> Optional[List[float]]:
         """Best-effort inline embedding of one committed node into both indexes.
 
         Every path that indexes a committed node calls this: ``record_decision``,
@@ -2795,12 +3415,25 @@ class MitosSyncManager:
         axiom's leg goes first, so the post-commit gather reads exactly what it
         read before the rejection leg existed. Neither leg raises.
 
+        ``mitos sync``'s commit loop and fixpoint pass ``rejection_leg=False``: their
+        rows wait for the same command's :meth:`drain_rejection_backlog`, which
+        batches across owners rather than spending a call per entry (ADR
+        ``sync-commit-loop-leaves-rejection-rows-to-its-own-drain-record-and-amend-write-inline``).
+        ``record_decision`` and ``amend_commentary`` keep the default, because a
+        workspace written only over MCP has no drain until its next ``sync``.
+
+        Args:
+            delta: The commit's delta.
+            entry: The ``ParsedEntry`` that commit stored.
+            rejection_leg: Whether to run the rejection leg inline.
+
         Returns:
             The decision leg's document vector (a caller may reuse it for a
             neighbour query), or None if that leg deferred or failed.
         """
         vector = self._embed_decision_inline(delta, entry)
-        self._write_rejection_items_inline(delta, entry)
+        if rejection_leg:
+            self._write_rejection_items_inline(delta, entry)
         return vector
 
     def _embed_decision_inline(
@@ -3024,8 +3657,9 @@ class MitosSyncManager:
                 self._rejection_leg_stopped = True
             self._warn_rejection_items_not_indexed(entry, exc)
         except Exception as exc:
-            # A refusal (``VectorStoreError``, a racing create's 409 included), a
-            # store fault, a caller's ValueError: one owner's leg, no latch.
+            # A refusal (``VectorStoreError``), a store fault, a caller's
+            # ValueError: one owner's leg, no latch. A racing create's 409 is not
+            # among them: the client reads it as "exists" and writes.
             self._warn_rejection_items_not_indexed(entry, exc)
 
     @staticmethod
@@ -3068,6 +3702,10 @@ class MitosSyncManager:
         self, *, listing: Optional[AbstractSet[str]] = None
     ) -> DrainOutcome:
         """Drains the decision outbox (``pending_embeddings``, C2) in one walk.
+
+        This is the decision drain; "the drain" below means it. The rejection
+        backlog has a drain of its own, :meth:`drain_rejection_backlog`, with its
+        own lock and its own seed marker.
 
         **The walk.** The outbox is read in queue order, ``(queued_at, node_id)``, a
         claim-sized page at a time, each page keyed after the last row walked. The
@@ -3382,6 +4020,132 @@ class MitosSyncManager:
             return False
         return True
 
+    def drain_rejection_backlog(self, *, report: bool = True) -> RejectionDrainOutcome:
+        """Drains the rejection backlog in one walk: each owner's items replaced whole.
+
+        The only writer that removes from the rejection index (ADR
+        ``rejection-index-inline-writes-only-add-and-only-one-drain-at-a-time-removes``).
+        It never raises: every exit returns an outcome, an escaped fault included
+        (worded, ``stop="unavailable"``, the marker kept). It is silent and returns
+        ``stop="unavailable"`` when the provider or the rejection index is None: the
+        decision drain has already said so on the same output.
+
+        **One at a time.** The walk runs under a non-blocking operating-system lock of
+        its own, :func:`rejection_drain_lock_path`, taken before any read and released
+        when the walk ends or its process dies: never a lease in the graph, never the
+        ``decisions.md`` lock, never taken by an inline write. A drain that finds it
+        held returns ``held`` having read and written nothing, leaving the backlog to
+        the holder (ADR ``rejection-backlog-hold-dies-with-its-writer-and-the-record-path-never-waits-on-it``).
+        A held lock file a killed holder left behind is acquired over, never unlinked.
+
+        **The walk.** Rows are read in ``enqueue_seq`` order, a page at a time, keyed
+        after the last seq walked, so each row standing at entry is attempted once.
+        Per row: the seq is read (the claim), **then** the owner's raw field; the
+        expected items are the field's ``rejection_points``; what the owner holds is
+        listed; the items it lacks are written (those held are skipped and counted),
+        and only once every one has landed are the items its field no longer states
+        deleted by point id, and the row cleared against the seq read. A clear that
+        answers False means a commit re-queued the owner; its new row lies ahead of
+        the cursor, so this walk takes it again, listing afresh, and converges it on
+        the latest field (ADR ``rejection-drain-retakes-an-owner-it-left-standing-only-overlapping-inline-writes-wait``).
+        An interrupted owner keeps old and new items, never none.
+
+        **Batches and failure.** The page's texts are cut into cross-owner batches by
+        ``fit_batch``, one ``embed_documents`` call and one upsert each, and an owner
+        is finalized as soon as its last item lands. An ``auth``, ``quota`` or
+        ``transient`` embed cause, an unreachable store, or a listing the store
+        refused stops the drain at once (``outage``) and charges no row. An absent
+        collection with no marker stops it (``refused``), creating and embedding
+        nothing. A batch failing for any other reason is retried owner by owner, and
+        a solo failure notes that owner's row once against its seq and aborts the
+        owner for this take (its tail is dropped, nothing of it is removed or
+        cleared), while the walk goes on (ADRs ``backlog-drains-never-let-a-failing-or-held-row-block-the-rows-behind-it``,
+        ``rejection-drain-charges-a-row-only-for-its-own-failure-never-for-an-outage-or-refusal``).
+
+        **The marker** (``rejection_seed``, never the decision index's) is read once
+        at entry. Only a standing marker licenses creating the collection, and it
+        makes the drain list the whole index once, with owners, instead of each
+        owner; a row queued after that listing is listed afresh. It is spent by 3a's
+        rule: on an empty backlog, or when the walk completes with the collection
+        present, or completes with it absent and a fresh read finds no row; an
+        outage, a refusal, a read fault or an escaped exception keeps it, and only
+        the marker this drain read is spent (ADR
+        ``seed-marker-is-spent-once-a-drain-has-attempted-every-row-standing-at-its-entry``).
+
+        Args:
+            report: Print the summary lines (:func:`rejection_drain_report`) after
+                the walk. ``reconcile`` passes False and its renderer prints them.
+
+        Returns:
+            The walk's :class:`RejectionDrainOutcome`, with ``left_queued`` and
+            ``owners_past_tolerance`` read at exit.
+        """
+        if self.embed_provider is None or self.rejection_index is None:
+            return self._rejection_drain_unavailable()
+
+        lock = FileLock(rejection_drain_lock_path(self.config), timeout=0)
+        try:
+            lock.acquire()
+        except Timeout:
+            # Ahead of OSError, which Timeout subclasses.
+            print(
+                "Rejection index: another drain holds the rejection backlog; this one "
+                "leaves it to that drain."
+            )
+            return RejectionDrainOutcome(
+                0, 0, 0, 0, 0, None, 0, None,
+                stop=REJECTION_DRAIN_STOP_HELD, marker=None,
+            )
+        except OSError as e:
+            # Not another drain's hold: the lock could not be taken at all.
+            print(
+                f"[Warning] The rejection backlog was not drained: its lock could not "
+                f"be taken ({e})."
+            )
+            return self._rejection_drain_unavailable()
+
+        walk = _RejectionDrainWalk(self)
+        try:
+            try:
+                stop, marker = walk.run()
+            except Exception as e:
+                print(
+                    f"[Warning] The rejection drain stopped: {describe_embed_failure(e)}. "
+                    f"Its rows stay queued."
+                )
+                stop, marker = DRAIN_STOP_UNAVAILABLE, walk.kept()
+            left, past = self._rejection_backlog_counts()
+        finally:
+            lock.release()
+
+        outcome = RejectionDrainOutcome(
+            walk.owners_cleared, walk.items_embedded, walk.items_skipped_present,
+            walk.items_removed, walk.owners_failed, past, walk.calls, left,
+            stop=stop, marker=marker,
+        )
+        if report:
+            for line in rejection_drain_report(outcome.to_dict()):
+                print(line)
+        return outcome
+
+    def _rejection_backlog_counts(self) -> Tuple[Optional[int], Optional[int]]:
+        """Reads the standing rows and those past the tolerance; None when unreadable."""
+        try:
+            left: Optional[int] = self.store.count_rejection_backlog()
+            past: Optional[int] = self.store.count_rejection_backlog(
+                min_retry=REJECTION_BACKLOG_FAILURE_TOLERANCE
+            )
+        except Exception:
+            left = past = None
+        return left, past
+
+    def _rejection_drain_unavailable(self) -> RejectionDrainOutcome:
+        """The outcome of a drain that did not run, its two counts read."""
+        left, past = self._rejection_backlog_counts()
+        return RejectionDrainOutcome(
+            0, 0, 0, 0, 0, past, 0, left, stop=DRAIN_STOP_UNAVAILABLE, marker=None,
+        )
+
     def reconcile_embeddings(self) -> Dict[str, Any]:
         """Embeds every node the decision index is missing, drains, then collects node-less points.
 
@@ -3464,13 +4228,17 @@ class MitosSyncManager:
             ``checks.graph_unbuilt``). The partition counts describe the listing
             this call judged, not the collection after its writes, so
             ``retired_node_points`` plus the retired points ``written`` here is
-            roughly ``status``' next count. Every return path carries the same key
-            set.
+            roughly ``status``' next count. Last, ``rejection_drain``: the
+            rejection backlog's drain, :meth:`RejectionDrainOutcome.to_dict`
+            (``stop="unavailable"`` with its counts read when the drain did not
+            run or raised). Every return path carries the same key set.
 
         Raises:
             VectorStoreError: If Qdrant is unreachable while scrolling point ids.
                 A *missing collection* does not raise (see above), and no delete
-                fault escapes: each is counted in ``delete_failed``.
+                fault escapes: each is counted in ``delete_failed``. That raise
+                carries no result, so no ``rejection_drain`` either: it happens
+                before either drain runs.
         """
         if not self.embed_provider or not self.vector_store:
             # stderr, not stdout: `mitos reconcile --json` promises stdout carries
@@ -3497,6 +4265,8 @@ class MitosSyncManager:
                 "retired_node_points": None, "nodeless_points": None,
                 "deleted": 0, "delete_failed": 0,
                 "graph_unbuilt": self.is_graph_unbuilt(),
+                # Not drained (no provider); its two counts are still read.
+                "rejection_drain": self._rejection_drain_unavailable().to_dict(),
             }
 
         expected_ids = self.store.get_decision_index_expected_ids()
@@ -3533,6 +4303,19 @@ class MitosSyncManager:
             drained = self.drain_pending_embeddings(listing=present if listed else None)
             written = drained.written
             drain_stop = drained.stop
+
+        # The rejection backlog's drain, in a bulkhead of its own: a fault in it
+        # leaves the decision heal and the collection below untouched, and the key
+        # still lands (an unavailable outcome, its counts read). Before the graph
+        # read below, which judges only the decision collection's points.
+        try:
+            rejection = self.drain_rejection_backlog(report=False)
+        except Exception as e:
+            print(
+                f"[Warning] Rejection backlog drain failed: {describe_embed_failure(e)}",
+                file=sys.stderr,
+            )
+            rejection = self._rejection_drain_unavailable()
 
         # The collection: the graph pair is read AFTER the listing (and the drain),
         # so every listed point's node is committed by now — a write commits its node
@@ -3585,6 +4368,7 @@ class MitosSyncManager:
             "deleted": deleted,
             "delete_failed": delete_failed,
             "graph_unbuilt": self.is_graph_unbuilt(),
+            "rejection_drain": rejection.to_dict(),
         }
 
     def is_graph_unbuilt(self) -> bool:
