@@ -661,7 +661,7 @@ def test_dod6_discovery_covers_the_check_family_and_respects_the_boundary() -> N
 
     2c/2d asserted ``⊇``; 5a tightens it to ``==`` against the final runtime closure, so a
     future import silently dragging a NEW module into the fence — or dropping one out of it
-    — trips this test rather than passing unnoticed. The closure is the seven source files
+    — trips this test rather than passing unnoticed. The closure was then the seven source files
     ``check.py`` runtime-reaches (``conflict.py`` → ``display.py``/``identity.py``;
     ``models.py``; ``errors.py`` — 2d's twin-catch; ``mitos/__init__.py`` via the
     ``__version__`` edge), and it excludes BOTH ``telemetry.py`` (the sanctioned sink) AND
@@ -681,11 +681,19 @@ def test_dod6_discovery_covers_the_check_family_and_respects_the_boundary() -> N
     ``shell_quote.py`` joined the same way (the 0.19.1 fix pass): ``recall.py``'s CLI
     recipes quote the project through it, so ``-p '<name>'`` survives a dash-led name
     and both quote kinds. A ninth member — import-free, two pure string functions,
-    no write — adjudicated here for the same reason as the eighth."""
+    no write — adjudicated here for the same reason as the eighth.
+
+    ``retrieval_walk.py`` joined as the tenth (the recall-confidence vision's 2d):
+    ``conflict.py`` imports the shared identity walk so the gather resolves its one
+    over-fetch by point id, like every ranked read. Its admission was adjudicated
+    ahead of the import by 2c's pre-admission row below — stdlib plus ``errors.py``
+    (already a member), two methods read off a duck-typed store, no write — so the
+    set grew by exactly that module and ``store.py`` stays out."""
     names = {os.path.basename(path) for path in _check_family_closure()}
     assert names == {
         "check.py", "conflict.py", "display.py", "errors.py",
-        "identity.py", "models.py", "recall.py", "shell_quote.py", "__init__.py",
+        "identity.py", "models.py", "recall.py", "retrieval_walk.py",
+        "shell_quote.py", "__init__.py",
     }
     # The boundary + everything only reachable through it stay out (belt-and-suspenders
     # over the exact-set pin: a regression names the offender, not just a set diff).

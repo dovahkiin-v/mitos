@@ -1760,7 +1760,9 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
         not run; absent neighbours are not checked-clean) or a debounced
         `scope_overflow` health nudge (not about this decision). It MAY carry
         `rotation`: older settled entries this call moved to an archive, with its
-        own `outcome`; a failed rotation leaves the write standing.
+        own `outcome`; a failed rotation leaves the write standing. A pause or a
+        created result MAY carry `neighbor_review_cut`: the review read its whole
+        bound, so a live neighbour may lie past it.
     """
     config = _target_config(project, "record_decision")
     # Build our own writable manager — do NOT reuse get_workspace_components()

@@ -12,6 +12,11 @@ set becomes a function of the live graph alone. Two rows keep that change honest
   only APIs that are stable across the change: ``run_conflict_check``,
   ``plan_corpus_check`` / ``execute_corpus_check`` and a recording judge. It never
   reads ``gather_candidates``' return.
+* **P2 — the judge's world is the live graph.** Over a neighbourhood where retired
+  points outrank enough live ones that 20 raw points would lose a live candidate,
+  ``run_conflict_check``'s screened candidates and prompts, and the corpus check's
+  pairs and prompts, are identical with every vector present and with the retired
+  vectors removed. Break B1 (the raw bound back at ~20) reds it.
 
 The geometry is real cosine ranking (``FakeVectorStore``, the suite's one ranking
 double), over a real temp ``GraphStore`` committed through ``commit_parsed_entry``.
@@ -35,6 +40,7 @@ from mitos.conflict import Unavailable, run_conflict_check
 from mitos.identity import embedding_text
 from mitos.parser import ParsedEntry
 from mitos.store import GraphStore
+from mitos.vector_store import hash_to_uuid
 
 from _conflict_helpers import _execution
 from _stdio_fake_providers import FakeVectorStore
@@ -42,7 +48,7 @@ from _stdio_fake_providers import FakeVectorStore
 SNAPSHOT = os.path.join(os.path.dirname(__file__), "fixtures", "judge_prompts_2d.json")
 WRITE_ENV = "MITOS_WRITE_JUDGE_PROMPTS"
 PRODUCTION_ALIAS = "SONNET"
-DIMENSIONS = 24
+DIMENSIONS = 64
 
 
 # --------------------------------------------------------------------------- #
@@ -233,3 +239,90 @@ def test_p1_every_judge_prompt_is_byte_identical_to_the_pre_2d_snapshot(world) -
     assert [p["path"] for p in captured["prompts"]] == [p["path"] for p in snapshot["prompts"]]
     for got, want in zip(captured["prompts"], snapshot["prompts"]):
         assert got == want, f"prompt {want['path']} changed"
+
+
+# --------------------------------------------------------------------------- #
+# P2's neighbourhood: 26 retired points outrank every live candidate
+# --------------------------------------------------------------------------- #
+
+def build_p2(world: World) -> Tuple[List[ParsedEntry], List[str]]:
+    """Live decisions, their retired predecessors and retired near-duplicates.
+
+    Twenty-six retired points sit at cosines 0.98 down to 0.905 to the draft, so a
+    20-point raw window held nothing live before 2d. Below them, twelve live
+    decisions span 0.90 to 0.77 (eleven above the floor), two of them naming the
+    draft's option in ``rejected_paths``, and three sit below the floor.
+
+    Returns:
+        The drafts, and the retired decisions' node ids.
+    """
+    retired: List[str] = []
+    axis = 1
+    live_cosines = [0.90 - 0.012 * i for i in range(12)] + [0.70, 0.66, 0.62]
+    for i in range(26):
+        cosine = 0.98 - 0.003 * i
+        retired.append(world.commit(f"old-cache-{i:02d}", f"Retired cache rule number {i}.",
+                                    cosine, axis))
+        axis += 1
+    for i, cosine in enumerate(live_cosines):
+        relations = {}
+        if i < 8:
+            relations["supersedes"] = [f"old-cache-{i:02d}"]
+        rejected = ("Rejected caching session data in process memory: it diverges "
+                    "across workers." if i in (2, 5) else "Rejected the obvious alternative.")
+        world.commit(f"live-cache-{i:02d}", f"Live cache rule number {i}.", cosine, axis,
+                     rejected=rejected, **relations)
+        axis += 1
+    # The retired near-duplicates: killed by one live decision far from the draft.
+    world.commit("cache-cleanup", "One decision retires the old near-duplicates.", 0.10,
+                 axis, supersedes=[f"old-cache-{i:02d}" for i in range(8, 26)])
+    world.embed.add(DRAFT_ONE[1], _at_cosine(1.0, axis + 1))
+    world.embed.add(DRAFT_TWO[1], _at_cosine(0.97, axis + 2))
+    return ([_draft(*DRAFT_ONE), _draft(*DRAFT_TWO, narrows=["live-cache-03"])], retired)
+
+
+def _judge_world(world: World, drafts: List[ParsedEntry]) -> Dict[str, Any]:
+    """Every screened candidate set, every prompt, and the corpus check's pairs."""
+    seen: Dict[str, Any] = {"run_conflict_check": [], "prompts": []}
+    for draft in drafts:
+        judge = _PromptJudge(draft.slug)
+        result = run_conflict_check(draft, embed_provider=world.embed,
+                                    vector_store=world.vectors, store=world.store,
+                                    judge=judge)
+        assert not isinstance(result, Unavailable), result
+        seen["run_conflict_check"].append(
+            [p.candidate.node["id"] for p in result.judged_pairs])
+        seen["prompts"] += [(p.system, p.user) for p in judge.prompts]
+    plan = plan_corpus_check(store=world.store, embed_provider=world.embed,
+                             vector_store=world.vectors, telemetry=None,
+                             model_alias=PRODUCTION_ALIAS)
+    assert plan.sweep_degraded is None
+    seen["pairs"] = [(p.proposal_hash, p.partner_hash, p.score) for p in plan.pairs]
+    judge = _PromptJudge("corpus")
+    execute_corpus_check(plan, judge=judge, telemetry=None, store=world.store)
+    seen["prompts"] += [(p.system, p.user) for p in judge.prompts]
+    return seen
+
+
+def test_p2_the_judges_world_is_identical_with_and_without_retired_vectors(world) -> None:
+    """Constraint 2: the judge's candidate set is a function of the live graph alone.
+
+    Non-vacuous by construction, checked here: the 20 highest-scoring points are all
+    retired, so a 20-point window would have handed the judge nothing.
+    """
+    drafts, retired = build_p2(world)
+    top20 = world.vectors.query(world.embed.get_embedding(
+        embedding_text({"kind": "decision", "axiom": DRAFT_ONE[1]})), limit=20,
+        with_payload=False)
+    retired_points = {hash_to_uuid(node_id) for node_id in retired}
+    assert all(hit["point_id"] in retired_points for hit in top20)
+
+    with_retired = _judge_world(world, drafts)
+    world.drop_points(retired)
+    without_retired = _judge_world(world, drafts)
+
+    assert with_retired["run_conflict_check"] == without_retired["run_conflict_check"]
+    assert all(with_retired["run_conflict_check"])        # each draft judged something
+    assert with_retired["pairs"] == without_retired["pairs"]
+    assert with_retired["pairs"]                          # the sweep found pairs
+    assert with_retired["prompts"] == without_retired["prompts"]

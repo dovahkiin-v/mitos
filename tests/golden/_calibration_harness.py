@@ -58,8 +58,10 @@ import _semantic_harness as H  # noqa: E402
 # (``conflict.CONFLICT_OVERFETCH_LIMIT``), which is what the pause sees.
 RECORD_LIMIT = 10
 # Retagged by 2c: the query form now reads through the shared identity walk (one call at
-# the over-fetch bound, ids only), so runs before and after can be told apart.
-READER = "mcp.surface_decisions(retrieval_walk)+conflict.gather_candidates"
+# the over-fetch bound, ids only), so runs before and after can be told apart. Retagged
+# by 2d: the draft form's gather reads through the same walk (one call at the gather raw
+# bound, ids only).
+READER = "mcp.surface_decisions(retrieval_walk)+conflict.gather_candidates(retrieval_walk)"
 # The reader's own live predicate (``surface_decisions`` and ``gather_candidates`` both).
 LIVE_STATES = ("active", "drifted")
 MITOS_DIR = os.path.dirname(os.path.abspath(mitos.__file__))
@@ -140,7 +142,7 @@ class FormRead:
     result: Dict[str, Any]
     calls: List[Tuple[int, List[Dict[str, Any]]]]
     envelope: Optional[Dict[str, Any]] = None
-    candidates: Optional[List[Any]] = None
+    candidates: Optional[Any] = None   # the draft form's ``conflict.Gathering``
     shape_searches: Optional[Dict[str, int]] = None
 
 
@@ -460,15 +462,18 @@ def read_draft_form(index: CalibrationIndex, fixture: Dict[str, Any]) -> FormRea
         embedding_text({"kind": "decision", "axiom": fixture["text"]}), is_query=False
     )
     proxy = RecordingVectorStore(index.vstore)
-    candidates = conflict.gather_candidates(
+    gathering = conflict.gather_candidates(
         fixture["text"], embed_provider=index.provider, vector_store=proxy, store=index.store
     )
-    if isinstance(candidates, conflict.Unavailable):
-        raise DraftReadUnavailable(candidates)
-    raw = _one_call(proxy, fixture)
+    if isinstance(gathering, conflict.Unavailable):
+        raise DraftReadUnavailable(gathering)
+    # The raw ranking the gather received, up to `CONFLICT_OVERFETCH_LIMIT`: since 2d the
+    # gather fetches at the raw bound (every Harbor point), so the slice keeps the
+    # recorded window the size it always was.
+    raw = _one_call(proxy, fixture)[:conflict.CONFLICT_OVERFETCH_LIMIT]
     hits = label_hits(index, raw, fixture.get("exclude", []))
     result = R.derive_result(fixture, hits, None, sync._NEIGHBOR_REVIEW_THRESHOLD)
-    return FormRead(result=result, calls=proxy.calls, candidates=candidates)
+    return FormRead(result=result, calls=proxy.calls, candidates=gathering)
 
 
 def read_fixture(index: CalibrationIndex, fixture: Dict[str, Any]) -> FormRead:

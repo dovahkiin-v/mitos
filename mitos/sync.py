@@ -38,6 +38,7 @@ from mitos.conflict import (
     ConflictCheckResult,
     ConflictFinding,
     ConflictUnavailableReason,
+    Gathering,
     SEMANTIC_SUBSTRATE_REASONS,
     Unavailable,
     candidate_payload,
@@ -875,6 +876,15 @@ _REVIEW_UNAVAILABLE_CAUSES = {
     ),
 }
 
+# The sync sensor's per-entry line when the conflict check's gather was cut above its
+# floor (``ConflictCheckResult.gather_cut``). Printed on stdout beside the finding
+# block; it names no command and trips nothing.
+_CONFLICT_GATHER_CUT_LINE = (
+    "[Conflict] The neighbour search for this decision read its whole bound and held "
+    f"fewer than {CONFLICT_OVERFETCH_LIMIT} live decisions while its last point still "
+    "scored at or above the floor; a conflicting decision may lie past what it read."
+)
+
 # What the reconcile pre-flight (``_uncommittable_edges``) does about each store
 # failure code — the whole class, declared, so none can be silently missed.
 #
@@ -940,6 +950,36 @@ def _review_unavailable_notice(cause: str) -> str:
     return (
         f"Near-duplicate review could not run ({cause}); this decision committed "
         "without a neighbour check."
+    )
+
+
+def _review_cut_notice(gathering: Optional[Gathering], floor: float) -> Optional[str]:
+    """One calm sentence for a near-dup review whose gather was cut above ``floor``.
+
+    The sibling of :func:`_review_unavailable_notice`: that one says the review could
+    not run, this one says it ran over less than it should have. The gather read its
+    whole raw bound, held fewer live decisions than it fills, and its last point still
+    scored at or above the pause's floor — so a live neighbour may lie past what it
+    read. It names **no command**, for the same boundary reason its sibling documents
+    (this string is a receipt dict value, so it reaches an MCP caller verbatim), and
+    with no command in it there is nothing to word per surface.
+
+    Args:
+        gathering: The review's healthy gathering, or None when the gather never ran
+            healthy.
+        floor: The consumer's floor (the pause's ``_NEIGHBOR_REVIEW_THRESHOLD``).
+
+    Returns:
+        The sentence when the gathering was cut above ``floor``; otherwise None.
+    """
+    if gathering is None or not gathering.cut_above(floor):
+        return None
+    return (
+        f"Near-duplicate review read its whole bound of {gathering.bound} points and "
+        f"held {len(gathering.live)} live decision(s), fewer than the "
+        f"{CONFLICT_OVERFETCH_LIMIT} it fills; its last point still scored "
+        f"{gathering.last_score:.2f}, at or above the {floor:.2f} floor, so a live "
+        "neighbour may lie past what it read."
     )
 
 
@@ -2352,6 +2392,10 @@ class MitosSyncManager:
         # → `findings == []` → print nothing.
         if result.findings:
             self._print_conflict_findings(result.findings)
+        # The gather was cut above the check's floor: say so beside the findings, on
+        # the same channel. Data, never a degradation — the breaker stays untouched.
+        if result.gather_cut:
+            print(_CONFLICT_GATHER_CUT_LINE)
 
         # 5b persistence: a JUDGED result (the LLM fired) writes its judged pairs to the
         # telemetry corpus — the surfaced findings AND the silent-but-judged negative labels
@@ -3041,13 +3085,15 @@ class MitosSyncManager:
     def _review_neighbors(self, entry: ParsedEntry, declared_targets: set, *,
                           gathered_index: Optional[Dict[str, Tuple[str, float]]] = None,
                           top_k: int = CONFLICT_TOP_K,
+                          gathering_sink: Optional[List[Gathering]] = None,
                           ) -> "List[Dict[str, Any]] | Unavailable":
         """Pre-commit: existing live decisions too similar to ``entry`` to ignore (P4).
 
         Composes the Conflict sensor's candidate stages (the same discovery `mitos
         check` uses): :func:`gather_candidates` embeds the axiom in document space,
-        over-fetches one bounded KNN window, and keeps only live *decisions* — an
-        open question in the window is screened by kind, never crashed on — then
+        fills ``CONFLICT_OVERFETCH_LIMIT`` live *decisions* from one bounded KNN call
+        resolved by point id — an open question or a retired point in the fetch takes
+        no slot — then
         :func:`screen_candidates` drops declared/self, floors at
         ``_NEIGHBOR_REVIEW_THRESHOLD``, and truncates to ``top_k``.
         Surfacing survivors BEFORE the write is the whole point: after the commit the
@@ -3065,8 +3111,8 @@ class MitosSyncManager:
             declared_targets: Casefolded slugs the entry already links to — its declared
                 relation targets plus their transitive mutation lineage — excluded so a
                 linked neighbour is not re-flagged.
-            gathered_index: Optional sink the caller passes to keep this call's *raw*
-                gathered set, ``{casefolded slug: (stored slug, score)}``. The pause
+            gathered_index: Optional sink the caller passes to keep this call's
+                gathered live set, ``{casefolded slug: (stored slug, score)}``. The pause
                 echo partitions the caller's declarations against the gathered
                 candidates and the floor — the primary sets (M8) — and the screened
                 return cannot answer for them: S4 drops a declared target *before* the
@@ -3077,9 +3123,15 @@ class MitosSyncManager:
             top_k: How many screened survivors to keep. The pause uses the default,
                 ``CONFLICT_TOP_K``, which is what it displays. The acknowledged path
                 (:meth:`_acknowledged_neighbors_field`) passes
-                ``CONFLICT_OVERFETCH_LIMIT``, the whole gather window, because an
-                acknowledgement covers every neighbour the gate would have held the
-                write for, not only the ones a pause would show.
+                ``CONFLICT_OVERFETCH_LIMIT``, the gather's 20 live candidates,
+                because an acknowledgement covers every neighbour the gate would have
+                held the write for, not only the ones a pause would show.
+            gathering_sink: Optional sink that receives the one
+                :class:`~mitos.conflict.Gathering` when the gather ran healthy, and
+                nothing otherwise (no providers, a typed ``Unavailable``, or a
+                raise). The caller words a cut from it; the record path's tombstones
+                read its retired hits. A sink for the same reason as
+                ``gathered_index``.
 
         Returns:
             A list of :func:`~mitos.conflict.candidate_payload` dicts for
@@ -3101,15 +3153,18 @@ class MitosSyncManager:
         )
         if isinstance(gathered, Unavailable):
             return gathered
+        # Filled only once the gather is known healthy, so a cut can never ride beside
+        # a review that could not run.
+        if gathering_sink is not None:
+            gathering_sink.append(gathered)
         if gathered_index is not None:
-            # Read the handle off the hydrated node, not off ``Candidate.slug``: the
-            # latter is the vector-store payload's spelling (they agree in production
-            # because the payload was written from the node, but they are two sources).
+            # The gather resolves by point id, so the node's slug is the one handle.
             gathered_index.update(
-                {c.node["slug"].casefold(): (c.node["slug"], c.score) for c in gathered}
+                {c.node["slug"].casefold(): (c.node["slug"], c.score)
+                 for c in gathered.live}
             )
         screened = screen_candidates(
-            gathered,
+            gathered.live,
             declared_targets=declared_targets,
             own_slug=entry.slug,
             floor=_NEIGHBOR_REVIEW_THRESHOLD,
@@ -3236,6 +3291,8 @@ class MitosSyncManager:
                                       supersedes: Optional[str],
                                       corrects: Optional[str],
                                       extra_relations: Dict[str, str],
+                                      *,
+                                      gathering_sink: Optional[List[Gathering]] = None,
                                       ) -> Optional[List[str]]:
         """Names the neighbours an acknowledged write went past, never raising (F10).
 
@@ -3246,8 +3303,9 @@ class MitosSyncManager:
         the embedding cache and the gather adds one vector query, no embedding call.
         The list is not cut to the pause's ``CONFLICT_TOP_K``: an acknowledgement
         covers every neighbour the gate would have held the write for, bounded only by
-        the gather window (``CONFLICT_OVERFETCH_LIMIT``). The new node's own vector is
-        in that window, and the own-slug screen drops it.
+        the gather's 20 live candidates (``CONFLICT_OVERFETCH_LIMIT``). The new node's
+        own vector is in that fetch and holds one of the 20, and the own-slug screen
+        drops it.
 
         Called after the commit and outside the lock, like :meth:`_audit_debt_fields`.
         ``None`` means nothing is claimed: no embedding provider or vector store (where
@@ -3260,6 +3318,8 @@ class MitosSyncManager:
             supersedes: The raw ``supersedes`` argument.
             corrects: The raw ``corrects`` argument.
             extra_relations: The seven non-kill relations, as the pause reads them.
+            gathering_sink: Forwarded to :meth:`_review_neighbors`, so the caller can
+                word a cut of this re-run gather.
 
         Returns:
             The neighbours' stored slugs, most similar first; ``[]`` when the gather
@@ -3277,7 +3337,8 @@ class MitosSyncManager:
             declared = self._review_declared_targets(supersedes, corrects,
                                                      extra_relations)
             reviewed = self._review_neighbors(entry, declared,
-                                              top_k=CONFLICT_OVERFETCH_LIMIT)
+                                              top_k=CONFLICT_OVERFETCH_LIMIT,
+                                              gathering_sink=gathering_sink)
         except Exception as e:
             # stderr: the MCP write tool shares this path and uses stdout for JSON-RPC.
             print(f"[Warning] Acknowledged-neighbour read failed for '{entry.slug}': "
@@ -4427,6 +4488,9 @@ class MitosSyncManager:
         # must never block the commit, but "couldn't check" must not read as "checked,
         # clean" either — the threaded notice lands on the created receipt (step 10).
         review_unavailable: Optional[str] = None
+        # The near-dup review's cut statement (Gathering.cut_above at the pause's floor),
+        # threaded to the pause or the created receipt; absent when not cut.
+        review_cut: Optional[str] = None
         if not acknowledge_neighbors:
             neighbors: List[Dict[str, Any]] = []
             # The caller's own declarations, per relation, for the pause echo — built
@@ -4443,6 +4507,9 @@ class MitosSyncManager:
             # This call's raw gathered set, filled by _review_neighbors. Primary-set
             # input to the partition (M8); empty when the sweep never ran.
             gathered_index: Dict[str, Tuple[str, float]] = {}
+            # The gathering itself, when the review ran healthy: the cut statement's
+            # source. Empty when it never ran or could not.
+            gatherings: List[Gathering] = []
             try:
                 # Declared targets plus their transitive mutation lineage (3b): by
                 # naming a chain head the author has acknowledged the whole lineage.
@@ -4450,7 +4517,8 @@ class MitosSyncManager:
                 declared_targets = self._review_declared_targets(
                     supersedes, corrects, extra_relations)
                 reviewed = self._review_neighbors(entry, declared_targets,
-                                                  gathered_index=gathered_index)
+                                                  gathered_index=gathered_index,
+                                                  gathering_sink=gatherings)
             except (DatabaseError, ValidationError) as exc:
                 # A graph-store fault during the pause read (gather's node reads or the
                 # lineage walk). Fail open — a fault this severe fails Phase B anyway,
@@ -4471,6 +4539,11 @@ class MitosSyncManager:
                     )
                 else:
                     neighbors = reviewed
+            # The cut statement, only beside a review that ran: a review that could
+            # not run already says so, and the two never co-occur.
+            if review_unavailable is None and gatherings:
+                review_cut = _review_cut_notice(gatherings[0],
+                                                _NEIGHBOR_REVIEW_THRESHOLD)
             if neighbors:
                 # The declared-edge echo (A2). mitos is stateless across calls, so a
                 # pause on a different node cannot say "since your last attempt" — and
@@ -4512,6 +4585,7 @@ class MitosSyncManager:
                     ),
                     "draft_digest": _draft_digest(entry),
                     **echo,
+                    **({"neighbor_review_cut": review_cut} if review_cut else {}),
                 }
 
         # === Phase B — the only writes, fully serialised under one lock ===
@@ -4661,8 +4735,15 @@ class MitosSyncManager:
         #     cache. Same never-raising shape as 9b/9c; None when it could not run.
         acknowledged: Optional[List[str]] = None
         if acknowledge_neighbors:
+            acknowledged_gatherings: List[Gathering] = []
             acknowledged = self._acknowledged_neighbors_field(
-                entry, supersedes, corrects, extra_relations)
+                entry, supersedes, corrects, extra_relations,
+                gathering_sink=acknowledged_gatherings)
+            # The re-run gather's cut, only when the list it fills was produced: a
+            # `None` list already says the read could not be trusted.
+            if acknowledged is not None and acknowledged_gatherings:
+                review_cut = _review_cut_notice(acknowledged_gatherings[0],
+                                                _NEIGHBOR_REVIEW_THRESHOLD)
 
         # 9e. The edges this write wired, each naming what it hit (B4). Same
         #     never-raising shape as 9b/9c/9d, so the literal below holds a value
@@ -4713,6 +4794,11 @@ class MitosSyncManager:
         # (never on clean-empty, unconfigured, or acknowledged-past records).
         if review_unavailable:
             result["neighbor_review_unavailable"] = review_unavailable
+        # The review ran over less than it should have: its gather was cut above the
+        # pause's floor (pre-commit, or the acknowledged path's re-run). Absent when the
+        # case did not arise; never beside `neighbor_review_unavailable`.
+        if review_cut:
+            result["neighbor_review_cut"] = review_cut
         # Debounced, presentation-only: a one-line nudge naming the over-ceiling files,
         # their ceilings and its own once-a-day cadence, and no command — it is shared
         # by both surfaces (MCP returns it verbatim; CLI text prints it after the

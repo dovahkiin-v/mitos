@@ -251,4 +251,46 @@ def test_the_query_form_reads_one_ids_only_call_at_the_bound_and_labels_its_wind
     assert len(raw) == len(index.nodes) > CH.RECORD_LIMIT
     assert [h["slug"] for h in read.result["hits"]] == \
         [n["slug"] for n in index.nodes[:CH.RECORD_LIMIT]]
-    assert CH.READER == "mcp.surface_decisions(retrieval_walk)+conflict.gather_candidates"
+    assert CH.READER == ("mcp.surface_decisions(retrieval_walk)"
+                         "+conflict.gather_candidates(retrieval_walk)")
+
+
+# --------------------------------------------------------------------------- #
+# Phase 2d — the draft form's gather reads through the same walk
+# --------------------------------------------------------------------------- #
+
+def test_the_draft_form_reads_one_ids_only_call_at_the_raw_bound_and_slices_its_window(
+        index, monkeypatch):
+    """The draft-form twin of the row above: `read_draft_form` drives the gather, which
+    asks the proxy once at `CONFLICT_RAW_BOUND` with ids only, so the proxy holds every
+    Harbor point; the recorded raw window is its first `CONFLICT_OVERFETCH_LIMIT` hits,
+    the size it always was, and `candidates` carries the `Gathering`."""
+    import dataclasses
+
+    from _point_hits import CannedVector
+    from mitos import conflict
+
+    monkeypatch.setenv("QDRANT_URL", "http://localhost:9")
+    for key in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "ANTHROPIC_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
+
+    class _Embed:
+        def get_embedding(self, text, is_query=False):
+            return [0.1, 0.2]
+
+    matches = [{"slug": n["slug"], "score": 0.9 - 0.001 * i} for i, n in enumerate(index.nodes)]
+    probe = dataclasses.replace(index, provider=_Embed(),
+                                vstore=CannedVector(matches, store=index.store))
+    fixture = {"id": "gather-probe", "form": "draft", "measure": "node", "text": "probe",
+               "class": "probe", "targets": [index.nodes[0]["slug"]], "negatives": [],
+               "exclude": []}
+    read = CH.read_draft_form(probe, fixture)
+
+    assert len(read.calls) == 1
+    limit, raw, with_payload = read.calls[0]
+    assert (limit, with_payload) == (conflict.CONFLICT_RAW_BOUND, False)
+    assert len(raw) == len(index.nodes) > conflict.CONFLICT_OVERFETCH_LIMIT
+    assert [h["slug"] for h in read.result["hits"]] == \
+        [n["slug"] for n in index.nodes[:conflict.CONFLICT_OVERFETCH_LIMIT]]
+    assert isinstance(read.candidates, conflict.Gathering)
+    assert len(read.candidates.live) <= conflict.CONFLICT_OVERFETCH_LIMIT

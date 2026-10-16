@@ -6,7 +6,9 @@ neighbours and, at high confidence, surfaces the tension at the accept prompt. T
 sensor is advisory — it applies no verb, mutates nothing, and never blocks a commit.
 
 Phase 1a landed the numeric dials (the §8 catalog). Phase 2a adds the first pipeline
-stage — :func:`gather_candidates` (§6.5 S1–S3) — plus the shared typed-degradation
+stage — :func:`gather_candidates` (§6.5 S1–S3; since the recall-confidence vision's 2d
+it resolves its one over-fetch by point id through the shared identity walk and fills
+:data:`CONFLICT_OVERFETCH_LIMIT` live candidates) — plus the shared typed-degradation
 shape (:class:`Unavailable` / :class:`ConflictUnavailableReason`) the whole pipeline
 reuses. Phase 2b adds the filter/rank stage (:func:`screen_candidates`). Phase 3a adds
 the deterministic edges of the judgment layer — the single canonical prompt renderer
@@ -19,9 +21,10 @@ module or a heavy dependency (``anthropic``, the Qdrant/genai clients) at module
 scope — ``from mitos.conflict import CONFLICT_TOP_K`` must stay cheap forever. When
 2a/3b need a client, inject it as a parameter and guard the type annotation behind
 ``if TYPE_CHECKING:`` (the ``importer.py`` shape). The dep-free import test pins this.
-The module-scope imports below (``mitos.errors``, ``mitos.identity``, and 2b's
-``mitos.display``) are pure-stdlib Tier-1 leaves; the injected clients arrive as
-params, typed only under ``TYPE_CHECKING``.
+The module-scope imports below (``mitos.errors``, ``mitos.identity``, 2b's
+``mitos.display``, ``mitos.recall`` and the identity walk ``mitos.retrieval_walk``) are
+pure-stdlib Tier-1 leaves; the injected clients arrive as params, typed only under
+``TYPE_CHECKING``.
 """
 
 from __future__ import annotations
@@ -36,6 +39,13 @@ from mitos.display import letter_payload
 from mitos.errors import CollectionMissingError, EmbeddingError, VectorStoreError
 from mitos.identity import compute_node_id, embedding_text
 from mitos.recall import missing_index_is_a_gap
+from mitos.retrieval_walk import (
+    EXHAUSTED,
+    SHORT_BOUND,
+    WalkContractError,
+    WalkHit,
+    walk_ranked,
+)
 
 if TYPE_CHECKING:
     # Runtime-injected, duck-typed clients — annotated only for the type checker.
@@ -87,13 +97,37 @@ CONFLICT_LLM_TIMEOUT_S = 30
 #   + VINGA_QUESTIONS), never a prose deferral. See tests/golden/CONFLICT_PROMPT_FIT.md.
 CONFLICT_SIMILARITY_FLOOR = 0.76
 
-# CONF-D3/D7 — the single bounded over-fetch width for candidate gathering (S2). The
-# raw KNN window must be wide enough that S3's non-live drops AND 2b's S4 declared/
-# own-slug drops cannot shadow an undeclared neighbour out of the final top-K. A
-# generous fixed margin above K (4× → 20), bounded to ONE Qdrant call (never an
-# iterative re-fetch loop, P11-safe at 50K nodes). Unlike CONFLICT_SIMILARITY_FLOOR
-# this is an operational tuning value, not a 4b-calibrated corpus-empirical number.
+# CONF-D3/D7 — how many LIVE candidates the gather holds (S2–S3). Wide enough that 2b's
+# S4 declared/own-slug drops cannot shadow an undeclared neighbour out of the final
+# top-K: a generous fixed margin above K (4× → 20). Since the recall-confidence
+# vision's 2d it counts live decisions, not raw points: the gather fills these 20 from
+# ONE vector call at CONFLICT_RAW_BOUND, walked in memory by the shared identity walk,
+# never an iterative re-fetch (P11-safe at 50K nodes). The name stays because sync.py,
+# Layer C and the tests import it (P1: renaming a public constant is not additive).
+# Unlike CONFLICT_SIMILARITY_FLOOR this is an operational tuning value, not a
+# 4b-calibrated corpus-empirical number.
 CONFLICT_OVERFETCH_LIMIT = 4 * CONFLICT_TOP_K   # = 20
+
+# The gather raw bound: how many points the gather's one vector call fetches before
+# the walk fills CONFLICT_OVERFETCH_LIMIT live candidates from them. A budget constant,
+# not a calibrated threshold (vision §6.3), so it stays outside Layer C's pin
+# population, like retrieval_walk.RANKED_OVERFETCH_BOUND. Read as a module global at
+# call time, never bound as a default argument, so a row can move it.
+#
+# Set by phase 2d's runs `20261016-1030-62dc12d-burial`, `20261016-1048-62dc12d-timing`
+# and `20261016-1052-62dc12d-gather-dogfood` (re-run and recorded at the commit that set
+# it), on the burial horizon Vinga ruled for the ranked bound (W-emp + M). The rule is
+# the strictest of three: no gather in the horizon holds fewer than 20 live (B_min =
+# 664, so 675; 0 binding production cuts there), the suite's ten-to-one neighbourhood
+# fills (220, so 225), and every live decision of the dogfood corpus fills (50). Core
+# p95 of the whole gather at 675: 39.2 ms burial, 42.1 ms timing, 22.8 ms dogfood,
+# against P16's 50 ms; today's 20-point gather measured 18.6 / 30.1 / 21.4 ms. A full
+# corpus sweep of the 40,000-live timing graph costs about 470 s more than today's
+# (sampled, 2,000 nodes). On the dogfood corpus live-fill changed 219 of 540 live sets
+# and added and removed no judge pair, no pause outcome and no cut. W-max is the
+# sensitivity row (1,020, so 1,025). The net: the first cut on a real corpus is the
+# build order for the `active` hint (Ruling 1).
+CONFLICT_RAW_BOUND: int = 675
 
 # CONF-D8 / vision §7 — how a judged candidate was gathered, stamped onto every
 # telemetry row's ``candidate_source`` column (5b). In v0.2 the sole gather path is
@@ -102,12 +136,6 @@ CONFLICT_OVERFETCH_LIMIT = 4 * CONFLICT_TOP_K   # = 20
 # candidate source — the ROADMAP'd mechanism-overlap gather feeding the Drift vision —
 # reads as an explicit enumeration point, not a magic literal to hunt for later.
 CONFLICT_CANDIDATE_SOURCE = "embedding_topk"
-
-# The two computed states that count as "live" for candidate gathering. Mirrors the
-# proven recall idiom (surface_decisions): keep active ∪ drifted,
-# drop superseded/corrected. Re-derived per-node via get_node_state (M3), never trusted
-# from the Qdrant payload's stale ``state`` field.
-_LIVE_STATES = ("active", "drifted")
 
 
 class ConflictUnavailableReason(Enum):
@@ -235,17 +263,21 @@ class Unavailable:
 class Candidate:
     """One gathered live neighbour — a proposal's potential conflict, pre-filter.
 
-    Carried forward from 2a (gather) to 2b (filter/rank/render). 2a returns *every*
-    live over-fetched neighbour un-filtered, un-floored, un-truncated; 2b applies the
-    declared-target/own-slug drop, the similarity floor, the ranking, and the top-K
-    truncation, then renders ``node`` via :func:`candidate_payload`.
+    Carried forward from 2a (gather) to 2b (filter/rank/render). The gather returns
+    its live candidates un-filtered, un-floored, un-truncated (``Gathering.live``); 2b
+    applies the declared-target/own-slug drop, the similarity floor, the ranking, and
+    the top-K truncation, then renders ``node`` via :func:`candidate_payload`.
 
     Attributes:
-        slug: The neighbour's slug (as returned by the vector store).
+        slug: The resolved node's slug (``node["slug"]``), never the vector payload's:
+            the gather resolves each hit by point id, so a renamed decision is
+            screened and judged under its current slug.
         score: The raw similarity score from the KNN query (similarity-descending).
-        node: The hydrated, modifier-stamped store reader dict from
-            ``get_node_by_slug`` (2b renders it; 2a carries it opaquely).
-        state: The re-verified computed state — ``"active"`` or ``"drifted"``.
+        node: The reader-facing node, equal dict for dict to what
+            ``get_node_by_slug`` returns for it: the resolver's node with
+            ``computed_state`` popped and its modifier stamps merged (2b renders it;
+            the gather carries it opaquely).
+        state: The resolver's computed state — ``"active"`` or ``"drifted"``.
     """
 
     slug: str
@@ -254,51 +286,112 @@ class Candidate:
     state: str
 
 
+@dataclass(frozen=True)
+class Gathering:
+    """What one healthy gather found. Runtime only, never persisted.
+
+    The judge paths read :attr:`live` alone. :attr:`retired` is the record path's
+    (the pause's tombstones); it carries identities and scores only — no stamps, no
+    handles — so a corpus sweep does no handle work for it (P17). ``Gathering``
+    defines no ``__bool__``, ``__len__``, ``__iter__`` or list equality on purpose:
+    every old list-shaped use of the gather fails loudly instead of passing.
+
+    Attributes:
+        live: Up to :data:`CONFLICT_OVERFETCH_LIMIT` live candidates, in KNN order.
+        retired: The retired decisions the fill passed, in rank order.
+        end: The walk's end state (``retrieval_walk.EDGE_FOUND`` /
+            ``EDGE_UNMEASURED`` / ``SHORT_BOUND`` / ``EXHAUSTED``).
+        returned: How many hits the one vector call returned.
+        bound: The raw bound the call asked for.
+        last_score: The score of the fetch's last hit (rank ``returned``), or None
+            when the fetch returned nothing.
+    """
+
+    live: List[Candidate]
+    retired: List[WalkHit]
+    end: str
+    returned: int
+    bound: int
+    last_score: Optional[float]
+
+    def cut_above(self, floor: float) -> bool:
+        """Whether the bound cut this gather with its tail still at or above ``floor``.
+
+        True when the gather read its whole raw bound, holds fewer than
+        :data:`CONFLICT_OVERFETCH_LIMIT` live candidates, and its last **raw** point
+        still scores at or above ``floor``. Scores fall down the fetch, so only a raw
+        tail at or above the floor can hide an above-floor live neighbour past the
+        bound. A fetch holding exactly the limit at the bound is full, not cut, and a
+        fetch that ran out read everything. It is data for its consumer to state or
+        count; it never degrades a run.
+
+        Args:
+            floor: The consumer's similarity floor, inclusive.
+
+        Returns:
+            True when the gather was cut above ``floor``.
+        """
+        return (self.end == SHORT_BOUND and self.last_score is not None
+                and self.last_score >= floor)
+
+
 def gather_candidates(
     axiom: str,
     *,
     embed_provider: "EmbeddingProvider",
     vector_store: "VectorStore",
     store: "GraphStoreProtocol",
-) -> "List[Candidate] | Unavailable":
+) -> "Gathering | Unavailable":
     """Gathers the live decisions a proposed axiom might fight (§6.5 S1–S3).
 
     The first pipeline stage of the Conflict sensor: embed the proposal in *document*
-    space, one bounded scope-blind KNN over-fetch, then re-verify each match's computed
-    state against the graph and keep only the live ones (``active ∪ drifted``). Returns
-    the live candidate set **un-filtered, un-ranked, un-truncated** (S4–S6 is 2b's job)
-    — or a typed :class:`Unavailable` when the semantic substrate is unreachable.
+    space, then one scope-blind KNN over-fetch at :data:`CONFLICT_RAW_BOUND`, resolved
+    by point id and walked in memory by the shared identity walk
+    (``retrieval_walk.walk_ranked``) until it holds :data:`CONFLICT_OVERFETCH_LIMIT`
+    live decisions. Liveness is the resolver's computed state (M3), never the payload;
+    retired and open-question points take no slot. The live candidates come back
+    **un-filtered, un-ranked, un-truncated** (S4–S6 is 2b's job), beside the retired
+    hits the fill passed and the fetch's end — or a typed :class:`Unavailable` when
+    the semantic substrate is unreachable.
 
     Three terminal states the vision forbids conflating:
 
-    * :class:`Unavailable` — the embedding call **or** the Qdrant query raised (degraded).
-    * ``[]`` — substrate healthy, but no live neighbour survived S3 (a legitimate empty:
-      an empty corpus, or every top match retired). **Never** an :class:`Unavailable`.
-    * ``[Candidate, ...]`` — one or more live neighbours, in query (similarity-descending)
-      order.
+    * :class:`Unavailable` — the embedding call **or** the vector query raised (degraded).
+    * a :class:`Gathering` whose ``live`` is empty — substrate healthy, no live
+      neighbour (an empty corpus, or every point retired). **Never** an :class:`Unavailable`.
+    * a :class:`Gathering` with live candidates, in query (similarity-descending) order.
 
     Degradation is narrow (CONF-D10 / plan D4): only ``EmbeddingError`` and
     ``VectorStoreError`` — the two *semantic-substrate* faults — become
-    :class:`Unavailable`. A ``get_node_by_slug`` / ``get_node_state`` failure is a
-    **local graph-store fault** (the same store the commit uses); masking it as
-    "semantic recall unavailable" would lie, so it **propagates** (5a's surface-level
-    fail-open catches it and never blocks the commit).
+    :class:`Unavailable`. A resolver or stamp-read failure is a **local graph-store
+    fault** (the same store the commit uses); masking it as "semantic recall
+    unavailable" would lie, so it **propagates** — never the ranked surfaces'
+    stamps-lost rule, which governs a different contract.
 
     Args:
         axiom: The proposed decision's raw axiom text (S1 normalizes it).
         embed_provider: The injected embedding provider (Gemini). Kept keyword-only
             so call sites read self-documenting.
         vector_store: The injected vector store (Qdrant). Scope-blind by contract.
-        store: The injected graph store — the S3 source-of-truth for computed state.
+        store: The injected graph store; must provide ``resolve_point_ids`` and
+            ``get_modifiers_map``.
 
     Returns:
-        The list of live :class:`Candidate`\\ s (possibly empty) in similarity-descending
-        order, or an :class:`Unavailable` when the embedding or vector-store call failed.
+        A :class:`Gathering`, or an :class:`Unavailable` when the embedding or
+        vector-store call failed.
 
     Raises:
-        DatabaseError: If a graph-store read fails (propagated, never masked — D4).
-        ValidationError: If ``get_node_by_slug`` finds >1 active node for a slug
-            (an MI-13 breach — a real invariant fault, not semantic unavailability).
+        DatabaseError: If the resolver or the stamp read fails (propagated, never
+            masked — D4).
+        WalkContractError: If a store or vector double breaks the walk's contract —
+            a missing ``resolve_point_ids`` or ``get_modifiers_map``, a resolver
+            result that is not a ``PointResolution``, a stamp map that is not a
+            ``dict``, a hit without a point id or score. A ``TypeError``: no
+            consumer catches it narrowly, so ``check --staged`` and the pause let
+            it escape, and only the sync sensor's and the acknowledged receipt's
+            pre-existing broad bulkheads turn it into a warning. The stamp-read
+            check runs after the embed, so an embedding fault still reads as
+            ``Unavailable(EMBEDDING)``, exactly as the walk's own checks do.
     """
     # S1 — embed the NORMALIZED axiom in document space (is_query=False, CONF-D2/D2).
     # Route through identity.embedding_text so the S1 vector is byte-identical to what
@@ -311,60 +404,64 @@ def gather_candidates(
     except EmbeddingError as exc:
         return Unavailable(reason=ConflictUnavailableReason.EMBEDDING, detail=str(exc))
 
-    # S2 — a single bounded, scope-blind over-fetch (CONF-D3/D7). One Qdrant call, never
-    # iterative: the wide window absorbs S3's non-live drops and 2b's S4 declared/self drops.
+    # The walk skips its stamp-reader check under read_stamps=False; the gather reads
+    # the stamps itself, so it checks here — a store without the method must fail on
+    # an empty fetch too, never pass because nothing was there to stamp.
+    if not callable(getattr(store, "get_modifiers_map", None)):
+        raise WalkContractError("the gather's graph store must provide "
+                                f"get_modifiers_map(); {type(store).__name__} does not")
+
+    # S2–S3 — one scope-blind over-fetch at the raw bound, resolved by point id and
+    # filled to CONFLICT_OVERFETCH_LIMIT live decisions in memory (CONF-D3/D7, ADR
+    # readers-fill-their-window-with-live-hits-from-one-over-fetched-call). No stamp
+    # work in the walk: the retired hits it passes must stay stamp-free (P17). The bound
+    # is read here, at call time. The walk's edge (live rank 21) is the same fetch, so
+    # discarding it costs nothing.
     try:
-        matches = vector_store.query(vector, limit=CONFLICT_OVERFETCH_LIMIT)
+        walk = walk_ranked(vector, vector_store=vector_store, graph=store,
+                           limit=CONFLICT_OVERFETCH_LIMIT, bound=CONFLICT_RAW_BOUND,
+                           read_stamps=False)
     except CollectionMissingError as exc:
         # Subclass first — an absent collection is a recoverable state with a named
         # heal, not the unreachable-Qdrant fault the broader arm below describes.
         #
         # I8, on the same predicate the four read surfaces use: over a graph holding
         # no active nodes an absent collection IS the empty index, so this is the
-        # "legitimate empty corpus" the contract above already promises returns `[]`.
-        # Degrading here instead would fail a fresh workspace's first
-        # `check --staged` closed and hand it `mitos reconcile` — which enqueues
-        # nothing over an empty active set, so the advice cannot heal what it names.
-        # The gate and the heal agree by construction; an unreadable graph answers
-        # True and still degrades.
+        # "legitimate empty corpus" the contract above promises returns a healthy,
+        # empty gathering ("the corpus ran out", never a cut). Degrading here instead
+        # would fail a fresh workspace's first `check --staged` closed and hand it
+        # `mitos reconcile` — which enqueues nothing over an empty active set, so the
+        # advice cannot heal what it names. The gate and the heal agree by
+        # construction; an unreadable graph answers True and still degrades.
         if not missing_index_is_a_gap(store):
-            return []
+            return Gathering(live=[], retired=[], end=EXHAUSTED, returned=0,
+                             bound=CONFLICT_RAW_BOUND, last_score=None)
         return Unavailable(
             reason=ConflictUnavailableReason.COLLECTION_MISSING, detail=str(exc)
         )
     except VectorStoreError as exc:
         return Unavailable(reason=ConflictUnavailableReason.VECTOR_STORE, detail=str(exc))
 
-    # S3 — per-match computed-state re-verification (M3, the race-guard). Order-preserved.
-    # Resolve FIRST (get_node_by_slug is active-scoped → None for a retired OR absent node),
-    # THEN re-derive state on the survivor — never probe get_node_state on an unresolved id
-    # (it defaults an absent node to "active", store.py:1055, and would mislabel a stale
-    # vector as live). Store faults here propagate (D4) — no try around the graph reads.
-    candidates: List[Candidate] = []
-    for match in matches:
-        slug = match.get("slug")
-        if not slug:  # a payload missing its slug (vector_store.py emits slug=None) — drop.
-            continue
-        node = store.get_node_by_slug(slug)
-        if not node:  # retired (active-scoped miss) or genuinely absent — the primary filter.
-            continue
-        # Scope to decisions. The Qdrant collection also holds open_question vectors
-        # (sync embeds every committed node), and get_node_by_slug is kind-agnostic, so a
-        # KNN match can resolve to an OQ. An OQ is out of scope for conflict gathering AND
-        # carries no ``core_axiom`` — passing it downstream would KeyError in
-        # judge_input_from_node. get_node_state can't screen it either: it derives
-        # decision state from kill edges only, so a resolved/parked OQ reports "active"
-        # (OQ resolution rides the ``resolves`` edge, which is not a kill edge — store.py).
-        # Filter kind here, at the one gather site, rather than teach get_node_state OQ state.
-        if node["kind"] != "decision":
-            continue
-        state = store.get_node_state(node["id"])
-        if state not in _LIVE_STATES:  # superseded/corrected slipped past under a race — drop.
-            continue
-        candidates.append(
-            Candidate(slug=slug, score=match.get("score", 0.0), node=node, state=state)
-        )
-    return candidates
+    # The live window's stamps, in ONE batched read (never per candidate). The node
+    # each candidate carries must equal what get_node_by_slug returns for it, dict for
+    # dict, because candidate_payload, the judge adapter and the pause read it: the
+    # resolver's node, minus its computed_state, plus the non-empty stamps
+    # get_node_by_slug's _stamp_modifiers would set. A stamp fault propagates (D4).
+    stamps: Dict[str, Dict[str, List[str]]] = {}
+    if walk.window:
+        stamps = store.get_modifiers_map([hit.node["id"] for hit in walk.window])
+        if not isinstance(stamps, dict):
+            raise WalkContractError(
+                f"get_modifiers_map must return a dict; got {type(stamps).__name__}"
+            )
+    live: List[Candidate] = []
+    for hit in walk.window:
+        node = dict(hit.node)
+        state = node.pop("computed_state")
+        node.update(stamps.get(node["id"], {}))
+        live.append(Candidate(slug=node["slug"], score=hit.score, node=node, state=state))
+    return Gathering(live=live, retired=list(walk.retired), end=walk.end,
+                     returned=walk.returned, bound=walk.bound, last_score=walk.last_score)
 
 
 # The CONF-D7 "strong relationship" set — the resolution-bearing fields the author has
@@ -418,8 +515,8 @@ def screen_candidates(
 ) -> "List[Candidate]":
     """Filters, floors, ranks and truncates 2a's gathered neighbours (§6.5 S4–S6).
 
-    The second and final candidate-pipeline stage. Given 2a's raw ``list[Candidate]``
-    (every live over-fetched neighbour, un-filtered), produce the judged batch:
+    The second and final candidate-pipeline stage. Given the gather's live candidates
+    (``Gathering.live``, un-filtered), produce the judged batch:
 
     * **S4 — drop the already-reasoned.** Remove any candidate whose slug is a declared
       strong-relationship target (``declared_targets``) or the proposal's own slug
@@ -431,7 +528,7 @@ def screen_candidates(
     The S4 → S5 → S6 order is load-bearing (CONF-D7 "Shadowing"): dropping declared/self
     *before* the floor and *before* truncation means a high-similarity declared neighbour
     can never consume a ``top_k`` slot and shadow a genuine undeclared conflict out of the
-    window. 2a's over-fetch sizes the raw list so the margin is spent on real candidates.
+    window. The gather's live fill sizes the list so the margin is spent on real candidates.
 
     Storeless and pure — no I/O, no embedding, no state re-verify (2a did that). Returns
     ``[]`` (a *clean* short-circuit) when the input is empty, everything was
@@ -444,7 +541,7 @@ def screen_candidates(
     ``CONFLICT_SIMILARITY_FLOOR`` (4b calibrated it — CONF-D2).
 
     Args:
-        candidates: 2a's gathered live neighbours (similarity-descending; may be empty).
+        candidates: The gather's live candidates (similarity-descending; may be empty).
         declared_targets: The casefolded declared strong-target slugs, from
             :func:`declared_strong_targets`.
         own_slug: The proposal's own slug at check time (RF-1); folded here.
@@ -476,9 +573,9 @@ def candidate_payload(candidate: "Candidate", *, brief: bool = False) -> "Dict[s
     / ``corrected_by``).
 
     Storeless (plan D4-primary): the stamps are copied straight off ``candidate.node``,
-    which 2a hydrated via ``get_node_by_slug`` — already ``_stamp_modifiers``-run
-    (store.py:1037), so the node carries the *non-empty* stamps from the same
-    ``get_modifiers`` source, one hop earlier. No redundant store read, no fault surface.
+    which the gather stamped from one batched ``get_modifiers_map`` over its live
+    window — the *non-empty* stamps ``get_node_by_slug``'s ``_stamp_modifiers`` would
+    set, from the same source, one hop earlier. No redundant store read, no fault surface.
     ``letter_payload`` drops modifier keys (a store-free leaf), so 2b re-copies them here —
     the third caller mirroring the ``cli.py`` / ``mcp_server._decision_payload`` pattern
     (each caller stamps around the shared leaf, D1). Stamping happens *after*
@@ -487,8 +584,8 @@ def candidate_payload(candidate: "Candidate", *, brief: bool = False) -> "Dict[s
     "amended axioms read as live" trap).
 
     Args:
-        candidate: A survivor of :func:`screen_candidates`; its ``node`` is the hydrated,
-            modifier-stamped ``get_node_by_slug`` reader dict.
+        candidate: A survivor of :func:`screen_candidates`; its ``node`` is the
+            reader-facing, modifier-stamped node (equal to ``get_node_by_slug``'s).
         brief: When True, omit ``rejected_paths`` (keeps stamps). Default False — the
             surfaced finding wants the candidate's M5 anti-knowledge.
 
@@ -1103,6 +1200,10 @@ class ConflictCheckResult:
         findings: The surfaced (gated) subset; ``[]`` ⇒ 5a prints nothing (P9).
         judged_pairs: ALL judged pairs (the telemetry source); ``[]`` ⇒ the clean short-circuit.
         execution: The batch's :class:`JudgmentExecution`; ``None`` ⇒ no LLM call fired (clean-empty).
+        gather_cut: The gather read its whole raw bound, held fewer than
+            :data:`CONFLICT_OVERFETCH_LIMIT` live candidates, and its last raw point
+            still scored at or above this check's ``floor`` (:meth:`Gathering.cut_above`).
+            Data for the caller to state or count; never a degradation.
     """
 
     proposal_input: JudgeInput
@@ -1110,6 +1211,7 @@ class ConflictCheckResult:
     findings: List[ConflictFinding]
     judged_pairs: List[JudgedPair]
     execution: Optional[JudgmentExecution]
+    gather_cut: bool = False
 
 
 def run_conflict_check(
@@ -1158,7 +1260,10 @@ def run_conflict_check(
         (propagated verbatim) when 2a's substrate, the executor, or the parse degraded.
 
     Raises:
-        DatabaseError: If a graph-store read fails inside 2a (propagated, never masked — D4).
+        DatabaseError: If a graph-store read fails inside the gather (propagated, never
+            masked — D4).
+        WalkContractError: If a store or vector double breaks the walk's contract
+            (see :func:`gather_candidates`).
     """
     # The proposal projection + the DoD-6 join hash. Mint the hash by mirroring the commit
     # path's ``compute_node_id`` EXACTLY (sync.py:586/:1547): the decision canonical core is
@@ -1182,12 +1287,14 @@ def run_conflict_check(
     )
     if isinstance(gathered, Unavailable):
         return gathered
+    # A cut is judged against THIS check's floor, the one its screen applies below.
+    gather_cut = gathered.cut_above(floor)
 
     # S4–S6 (2b) — drop declared/self, floor, rank, truncate to top_k. The batch is capped
     # HERE; the facade never re-caps, so render/executor always see ≤ top_k candidates
-    # (the ~3K-token budget, CONF-D7).
+    # (the ~3K-token budget, CONF-D7). The judge paths read the live candidates only.
     screened = screen_candidates(
-        gathered,
+        gathered.live,
         declared_targets=declared_strong_targets(entry),
         own_slug=entry.slug,
         floor=floor,
@@ -1202,6 +1309,7 @@ def run_conflict_check(
             findings=[],
             judged_pairs=[],
             execution=None,
+            gather_cut=gather_cut,
         )
 
     # Project each candidate ONCE (judge the raw node via 3a's adapter — never the display
@@ -1257,4 +1365,5 @@ def run_conflict_check(
         findings=findings,
         judged_pairs=judged_pairs,
         execution=execution,
+        gather_cut=gather_cut,
     )

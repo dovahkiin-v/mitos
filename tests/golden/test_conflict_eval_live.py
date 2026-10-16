@@ -519,7 +519,7 @@ def test_corpus_declared_pairs_never_judged(conflict_index):
                 store=store,
             )
         _skip_if_unavailable(gathered)
-        gathered_ids = {c.node["id"] for c in gathered}
+        gathered_ids = {c.node["id"] for c in gathered.live}
         assert _hash(store, b_slug) in gathered_ids, (
             f"non-vacuity broken: {b_slug} did not co-retrieve for {a_slug} — the "
             f"absence-from-plan would be a retrieval miss, not a screen drop. "

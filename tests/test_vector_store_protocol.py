@@ -405,11 +405,10 @@ def test_an_unconsumed_fixture_fault_fails_the_test_at_teardown(tmp_path) -> Non
 # Phase 2c: every `VectorStore.query` call site in `mitos/` goes through the walk
 # --------------------------------------------------------------------------- #
 
-#: The direct `.query(` call sites allowed in `mitos/`: the walk's one call, and the
-#: gather, which 2d moves onto the walk (then this set shrinks to the walk alone).
+#: The direct `.query(` call sites allowed in `mitos/`: the walk's one call, alone.
+#: Since 2d moved the conflict gather onto the walk, every reader resolves by identity.
 ALLOWED_QUERY_CALL_SITES = {
     ("retrieval_walk.py", "walk_ranked"),
-    ("conflict.py", "gather_candidates"),  # 2d moves it
 }
 
 #: The four ranked surfaces, each of which must call the walk.
@@ -419,6 +418,10 @@ RANKED_SURFACES = {
     ("cli.py", "cmd_surface"),
     ("cli.py", "cmd_query"),
 }
+
+#: Every walk caller: the four ranked surfaces plus the conflict gather (2d), which
+#: is not a ranked read and so stays out of `RANKED_SURFACES`.
+WALK_CALLERS = RANKED_SURFACES | {("conflict.py", "gather_candidates")}
 
 
 def _enclosing_calls(source: str) -> List[Tuple[str, ast.Call]]:
@@ -467,7 +470,7 @@ def test_every_vector_query_in_mitos_goes_through_the_walk() -> None:
     kept a private copy of the loop, which would pass the first by calling nothing."""
     files = sorted(MITOS_DIR.rglob("*.py"))
     assert query_call_sites(files) == ALLOWED_QUERY_CALL_SITES
-    assert RANKED_SURFACES <= walk_callers(files)
+    assert WALK_CALLERS <= walk_callers(files)
 
 
 def test_the_call_site_row_reports_a_planted_direct_call(tmp_path) -> None:

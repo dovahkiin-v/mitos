@@ -29,7 +29,8 @@ empty window.
 
 Why a module of its own
 -----------------------
-The walk cannot live in ``store.py``: the conflict gather (2d) will call it, and
+The walk cannot live in ``store.py``: the conflict gather (``conflict.gather_candidates``)
+calls it, and
 the check family's fence (``tests/test_conflict_closeout.py``) pins that
 ``store.py`` never enters that family's runtime-import closure. It cannot live in
 ``recall.py`` or ``display.py`` either — both sit inside that closure already and
@@ -45,7 +46,7 @@ Stdlib (``dataclasses``, ``typing``) plus ``mitos.errors``, which is already a
 fence member and imports only ``typing``: the leaf's runtime closure is exactly
 ``{retrieval_walk.py, errors.py}``. It reads two methods off a store it is handed
 and writes nothing, so admitting it costs the fence no write path and no
-``store``/``vector_store``/``telemetry`` reach. 2d's ``conflict.py`` import grows
+``store``/``vector_store``/``telemetry`` reach. ``conflict.py``'s import of it grew
 the exact-set pin by this module alone. Keep it that way: never import ``store``,
 ``protocols``, ``vector_store``, ``display``, ``recall`` or ``config`` here.
 """
@@ -172,6 +173,9 @@ class RankedWalk:
         stamps: Node id → modifier stamps, for the window and ``retired[:limit]``.
             Always a dict: ``{}`` when not asked for or when the read faulted.
         stamps_unread: True only when the stamp read faulted.
+        last_score: The score of the fetch's last hit (rank ``returned``), or None
+            for an empty fetch. The gather reads it to tell a cut above its floor
+            from one below it; the ranked surfaces ignore it.
     """
 
     window: List[WalkHit]
@@ -184,6 +188,7 @@ class RankedWalk:
     skipped: Dict[str, int]
     stamps: Dict[str, Dict[str, List[str]]] = field(default_factory=dict)
     stamps_unread: bool = False
+    last_score: Optional[float] = None
 
 
 def _point_id_of(hit: Any) -> str:
@@ -229,7 +234,8 @@ def fill(hits: List[Dict[str, Any]], resolution: PointResolution, *,
             corpus ran out.
 
     Returns:
-        A :class:`RankedWalk` with ``stamps`` empty and ``stamps_unread`` False.
+        A :class:`RankedWalk` with ``stamps`` empty, ``stamps_unread`` False and
+        ``last_score`` the last hit's score.
 
     Raises:
         WalkContractError: If a hit carries no string ``point_id`` or no numeric
@@ -276,8 +282,12 @@ def fill(hits: List[Dict[str, Any]], resolution: PointResolution, *,
         end = EDGE_UNMEASURED
     else:
         end = SHORT_BOUND
+    # The walk may stop before the last hit; that hit is still checked, so its
+    # score is a number whichever way the walk ended.
+    last_score = hits[-1]["score"] if hits and _point_id_of(hits[-1]) else None
     return RankedWalk(window=window, edge=edge, retired=retired, end=end,
-                      returned=len(hits), bound=bound, limit=limit, skipped=skipped)
+                      returned=len(hits), bound=bound, limit=limit, skipped=skipped,
+                      last_score=last_score)
 
 
 def _require_callable(obj: Any, name: str, role: str) -> None:
@@ -306,7 +316,9 @@ def walk_ranked(vector: List[float], *, vector_store: Any, graph: Any, limit: in
             ``get_modifiers_map`` when ``read_stamps`` is set.
         limit: The caller's clamped window size, ``1 <= limit < bound``.
         bound: The over-fetch bound.
-        read_stamps: False for a reader that must do no stamp work (2d's gather).
+        read_stamps: False for a reader that must do no stamp work: the conflict
+            gather, which reads its live window's stamps itself and must never stamp
+            the retired hits it passed.
 
     Returns:
         A :class:`RankedWalk`.

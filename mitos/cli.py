@@ -90,7 +90,8 @@ from mitos.identity import compute_node_id
 from mitos.models import get_embedding_model_id, get_model_id
 from mitos.parser import (ParsedEntry, load_format_spec, parse_entry_stream,
                           read_text_or_none)
-from mitos.conflict import (run_conflict_check, ConflictUnavailableReason,
+from mitos.conflict import (CONFLICT_OVERFETCH_LIMIT, run_conflict_check,
+                            ConflictUnavailableReason,
                             SEMANTIC_SUBSTRATE_REASONS)
 from mitos.migrations import is_pre_v1a_schema
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS, open_connection
@@ -2225,6 +2226,10 @@ def cmd_record(
                 print(f"      scope: {', '.join(n['scope'])}", file=sys.stderr)
         for line in _declared_echo_lines(result):
             print(f"  {line}", file=sys.stderr)
+        # The review was cut above its floor: the one composed sentence, verbatim (it
+        # names no command, so every surface carries the same string).
+        if result.get("neighbor_review_cut"):
+            print(f"  {result['neighbor_review_cut']}", file=sys.stderr)
         # Same co-equal framing as the shared needs_review message (one constant,
         # two spellings — the CLI renders flags, the message bare names).
         menu = "/".join(f"--{r}" for r in _PAUSE_RESOLVING_RELATIONS)
@@ -2320,6 +2325,12 @@ def cmd_record(
     if review_notice:
         sys.stdout.flush()
         print(f"\n{review_notice}", file=sys.stderr)
+    # Its sibling: the review ran, but its gather was cut above the floor. Same
+    # flush-first stderr shape; the two never ride one receipt.
+    review_cut = result.get("neighbor_review_cut")
+    if review_cut:
+        sys.stdout.flush()
+        print(f"\n{review_cut}", file=sys.stderr)
     # A rotation failure — the write stands. Same flush-first stderr shape, and before
     # the coherence line, which stays last.
     if rotated and rotated.get("outcome") == ROTATION_FAILED:
@@ -5970,6 +5981,9 @@ def _check_json_object(
         "summary_row_written": row_written,
         # Always present: null unless this unscoped run's entry write failed.
         "attempt_unrecorded": attempt_unrecorded,
+        # Always present: healthy sweeps whose gather was cut above the floor. The
+        # raw bound's alarm — never a degradation, never persisted.
+        "gathers_cut": result.gathers_cut,
     })
     return obj
 
@@ -6140,6 +6154,9 @@ def _print_check_report(
         print(f"\n{transient_count} decision(s) are behind the vector index — recall "
               f"may be thinned. Run `mitos sync {shell_flag('-p', project)}` to catch up.")
 
+    if result.gathers_cut:
+        print(f"\n{_gathers_cut_line(result.gathers_cut, 'decision')}")
+
     if not result.findings and not degradations:
         if scope is not None and result.nodes_total == 0:
             print(f"0 of {denominator} live decisions match scope '{scope}' — "
@@ -6152,6 +6169,20 @@ def _print_check_report(
                   f"no contradictions found.")
     if not degradations and result.nodes_total:
         print(_check_cost_line(result))
+
+
+def _gathers_cut_line(count: int, noun: str) -> str:
+    """One report line counting gathers the raw bound cut above the floor.
+
+    Shared by the corpus and ``--staged`` reports. It states the bound's alarm and
+    names no recovery: a cut degrades nothing, and the remedy is mitos's, not the
+    reader's.
+    """
+    plural = noun if count == 1 else f"{noun}s"
+    return (f"Neighbour search was cut short for {count} {plural}: it read its whole "
+            f"bound and held fewer than {CONFLICT_OVERFETCH_LIMIT} live decisions while "
+            "its last point still scored at or above the floor, so a conflicting "
+            "decision may lie past what it read.")
 
 
 def _check_cost_line(result: "check.CheckRunResult") -> str:
@@ -7088,6 +7119,7 @@ def _print_staged_report(
     degraded: "Set[str]",
     exclusions: List[Dict[str, Any]],
     transient_count: int,
+    gathers_cut: int,
 ) -> None:
     """Renders the human gate report to stdout — calm, both sides named (P9)."""
     if findings:
@@ -7119,6 +7151,9 @@ def _print_staged_report(
     if transient_count:
         print(f"\n{transient_count} decision(s) are behind the vector index — recall "
               f"may be thinned. Run `mitos sync` to catch up.")
+
+    if gathers_cut:
+        print(f"\n{_gathers_cut_line(gathers_cut, 'pending decision')}")
 
     if not findings and not degraded:
         noun = "decision" if nodes_swept == 1 else "decisions"
@@ -7175,6 +7210,7 @@ def _run_staged_check(
                     exit_code=0, nodes_total=0, nodes_swept=0, batches_executed=0,
                     pairs_judged_fresh=0, finding_objs=[], degradations=[],
                     exclusions=[], transient_count=0, row_written=False,
+                    gathers_cut=0,
                 ), **corpus_provenance(config)})
             else:
                 # THE OBLIGATION CARVE-OUT (§4.7): the echo rides output the surface
@@ -7249,6 +7285,9 @@ def _run_staged_check(
         nodes_swept = 0
         pairs_judged_fresh = 0
         batches_executed = 0
+        # Healthy checks whose gather was cut above the floor: counted on the report,
+        # never a degradation token and never an exit-code input.
+        gathers_cut = 0
         for entry in pending:
             result = run_conflict_check(
                 entry, embed_provider=embed, vector_store=vector, store=store, judge=judge
@@ -7272,6 +7311,8 @@ def _run_staged_check(
                         degraded.add("judgment_truncated")
                 break
             nodes_swept += 1
+            if result.gather_cut:
+                gathers_cut += 1
             pairs_judged_fresh += len(result.judged_pairs)
             if result.execution is not None:
                 batches_executed += 1
@@ -7351,12 +7392,14 @@ def _run_staged_check(
             finding_objs=[_staged_finding_json(e, h, f, p) for e, h, f, p in findings],
             degradations=sorted(degraded), exclusions=exclusions,
             transient_count=transient_count, row_written=row_written,
+            gathers_cut=gathers_cut,
         ), **corpus_provenance(config)})
     else:
         _echo_corpus(config)
         _print_staged_report(
             findings, nodes_swept=nodes_swept, nodes_total=len(pending),
             degraded=degraded, exclusions=exclusions, transient_count=transient_count,
+            gathers_cut=gathers_cut,
         )
     return exit_code
 
@@ -7376,6 +7419,7 @@ def _staged_json_object(
     exclusions: List[Dict[str, Any]],
     transient_count: int,
     row_written: bool,
+    gathers_cut: int,
 ) -> Dict[str, Any]:
     """Assembles the single §8 staged ``--json`` object (a shipped API — additive only).
 
@@ -7385,7 +7429,8 @@ def _staged_json_object(
     ``exit_code == 1 ⟺ findings_new > 0`` holds on staged exactly as on corpus. The
     ``batches_*`` accounting reads: planned = one potential batch per pending entry;
     executed = entries that fired the judge; skipped = clean-empty or breaker-skipped
-    (so ``planned == executed + skipped`` holds).
+    (so ``planned == executed + skipped`` holds). ``gathers_cut`` (always present) counts
+    the pending entries whose healthy check's gather was cut above the floor.
     """
     return {
         "run_id": run_id,
@@ -7408,6 +7453,7 @@ def _staged_json_object(
         "coverage_exclusions": exclusions,
         "index_backlog_transient": transient_count,
         "summary_row_written": row_written,
+        "gathers_cut": gathers_cut,
     }
 
 

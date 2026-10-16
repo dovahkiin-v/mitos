@@ -520,3 +520,27 @@ def test_a_point_id_round_trips_to_its_node_through_the_walk(store) -> None:
     walk = walk_ranked([0.1], vector_store=CannedVector([point_hit(a, .9)], store=store),
                        graph=store, limit=1)
     assert walk.window[0].point_id == hash_to_uuid(a)
+
+
+# --------------------------------------------------------------------------- #
+# 2d: last_score, the score of the fetch's last hit
+# --------------------------------------------------------------------------- #
+
+def test_last_score_is_the_fetchs_last_hit_even_when_the_walk_stops_early() -> None:
+    """The gather judges a cut on the last *raw* score, which the walk alone sees."""
+    world = _World().live("a", 0.9).live("b", 0.8).live("c", 0.7).retired("d", 0.6)
+    walk = _fill(world, limit=1, bound=4)
+    assert walk.end == EDGE_FOUND          # stopped at rank 2
+    assert walk.last_score == 0.6          # still the fetch's last hit
+
+
+def test_last_score_is_none_for_an_empty_fetch() -> None:
+    assert _fill(_World(), limit=1, bound=5).last_score is None
+
+
+def test_a_last_hit_past_the_edge_without_a_score_still_breaks_the_contract() -> None:
+    """The walk may stop before the last hit; that hit is checked anyway."""
+    world = _World().live("a", 0.9).live("b", 0.8)
+    hits = world.hits + [{"point_id": "p-tail"}]
+    with pytest.raises(WalkContractError):
+        fill(hits, world.resolution(), limit=1, bound=3)

@@ -41,10 +41,11 @@ import pytest
 
 import anthropic
 
-from mitos.conflict import ConflictUnavailableReason, Unavailable
+from mitos.conflict import ConflictUnavailableReason, Gathering, Unavailable
 from mitos.conflict_judgment import make_judgment_executor
 from mitos.config import MitosConfig
 from mitos.errors import CollectionMissingError, EmbeddingError, VectorStoreError
+from mitos.retrieval_walk import EXHAUSTED
 from mitos.sync import MitosSyncManager
 
 from _conflict_helpers import (
@@ -470,7 +471,12 @@ def test_typed_faults_produce_typed_unavailable_reasons() -> None:
     from mitos.conflict import gather_candidates
 
     class _Store:
-        def get_node_by_slug(self, slug: str) -> Any:  # never reached on these legs
+        # The walk's two graph reads, declared so the contract checks pass and the
+        # legs reach the substrate; neither may run when the substrate is severed.
+        def resolve_point_ids(self, point_ids: Any) -> Any:  # never reached on these legs
+            raise AssertionError("graph read must not run when the substrate is severed")
+
+        def get_modifiers_map(self, node_ids: Any) -> Any:  # never reached on these legs
             raise AssertionError("graph read must not run when the substrate is severed")
 
         def get_active_node_ids(self) -> set:
@@ -519,7 +525,7 @@ def test_absent_collection_degrades_only_when_the_graph_has_something_to_index(
 
     The predicate has two opposite outcomes, so it needs a fixture for each — a
     one-sided row passes under either behaviour. The empty-graph half is the one
-    that was missing: `gather_candidates`' own contract already promises `[]` for
+    that was missing: `gather_candidates`' own contract already promises an empty gathering for
     "a legitimate empty: an empty corpus", and re-keying `check`'s precondition
     onto the operation broke that promise for the state where the collection has
     never been created. It bites hardest on a fresh workspace whose first commit
@@ -537,7 +543,10 @@ def test_absent_collection_degrades_only_when_the_graph_has_something_to_index(
         def get_active_node_ids(self) -> set:
             return active_ids
 
-        def get_node_by_slug(self, slug: str) -> Any:  # no match survives to S3
+        def resolve_point_ids(self, point_ids: Any) -> Any:  # the query raised first
+            raise AssertionError("the query raised — S3 must never run")
+
+        def get_modifiers_map(self, node_ids: Any) -> Any:
             raise AssertionError("the query raised — S3 must never run")
 
     result = gather_candidates(
@@ -549,7 +558,10 @@ def test_absent_collection_degrades_only_when_the_graph_has_something_to_index(
         assert isinstance(result, Unavailable)
         assert result.reason is ConflictUnavailableReason.COLLECTION_MISSING
     else:
-        assert result == []
+        # The healthy empty: the corpus ran out, so it is never a cut.
+        assert isinstance(result, Gathering)
+        assert result.live == [] and result.retired == []
+        assert result.end == EXHAUSTED and not result.cut_above(0.0)
 
 
 def test_an_unreadable_graph_still_degrades_on_an_absent_collection() -> None:
@@ -565,7 +577,10 @@ def test_an_unreadable_graph_still_degrades_on_an_absent_collection() -> None:
         def get_active_node_ids(self) -> set:
             raise RuntimeError("graph unreadable")
 
-        def get_node_by_slug(self, slug: str) -> Any:
+        def resolve_point_ids(self, point_ids: Any) -> Any:
+            raise AssertionError("the query raised — S3 must never run")
+
+        def get_modifiers_map(self, node_ids: Any) -> Any:
             raise AssertionError("the query raised — S3 must never run")
 
     result = gather_candidates(

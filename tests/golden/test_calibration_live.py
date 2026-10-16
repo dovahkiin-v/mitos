@@ -232,7 +232,7 @@ def test_smoke_records_values_in_both_spaces(calibration_index):
                     f"{fx['id']}: envelope score for {d['slug']} is not the proxied hit's"
                 )
         else:
-            for c in read.candidates:
+            for c in read.candidates.live:
                 assert c.score == raw_score.get(c.slug), (
                     f"{fx['id']}: candidate {c.slug} is not a proxied hit with an equal score"
                 )

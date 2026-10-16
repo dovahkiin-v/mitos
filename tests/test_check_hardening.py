@@ -93,6 +93,8 @@ _CORPUS_JSON_KEYS = {
     "findings_new", "findings_known", "departed", "degradations",
     "judgment_failure_reasons", "judgment_failed_batches", "coverage_exclusions",
     "index_backlog_transient", "summary_row_written", "attempt_unrecorded",
+    # 2d: healthy sweeps whose gather was cut above the floor — always present.
+    "gathers_cut",
     "project", "collection", "workspace",
 }
 

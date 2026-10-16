@@ -332,7 +332,7 @@ def sweep_node(
     store: "GraphStoreProtocol",
     floor: float = CONFLICT_SIMILARITY_FLOOR,
     top_k: int = CONFLICT_TOP_K,
-) -> "List[Candidate] | Unavailable":
+) -> "NodeSweep":
     """Discovers ONE swept node's undeclared conflict candidates (the per-node stage).
 
     Composes the shipped pipeline stages in the pinned order — ``gather_candidates`` →
@@ -348,7 +348,8 @@ def sweep_node(
     ``declared_targets=set()`` is correct, not a gap: the strong-edge screen already
     did the declared drop id-natively, both directions; ``screen_candidates`` keeps
     the ``own_slug`` self-drop (a KNN echoing the swept node itself), the floor, and
-    the rank/truncate.
+    the rank/truncate. The swept node is committed, so its own point is in the fetch
+    and holds one of the gather's live slots until that self-drop removes it.
 
     Args:
         node: The hydrated swept decision (a ``CorpusSnapshot.nodes`` element).
@@ -360,10 +361,12 @@ def sweep_node(
         top_k: The cap on the surviving batch (default ``CONFLICT_TOP_K``).
 
     Returns:
-        The surviving :class:`Candidate` list (possibly ``[]`` — healthy-empty), or
-        the typed :class:`Unavailable` gather returned (degraded; passed through as a
-        VALUE, verbatim — never blurred into ``[]``, never raised). Graph-store
-        faults inside gather propagate (KD5) — only the two semantic-substrate faults
+        The node's :class:`NodeSweep`: its ``result`` is the surviving
+        :class:`Candidate` list (possibly ``[]`` — healthy-empty), or the typed
+        :class:`Unavailable` gather returned (degraded; passed through as a VALUE,
+        verbatim — never blurred into ``[]``, never raised), and its ``gather_cut``
+        says whether a healthy gather was cut above ``floor``. Graph-store faults
+        inside gather propagate (KD5) — only the two semantic-substrate faults
         degrade.
     """
     gathered = gather_candidates(
@@ -373,14 +376,18 @@ def sweep_node(
         store=store,
     )
     if isinstance(gathered, Unavailable):
-        return gathered
-    undeclared = screen_strong_edge_pairs(node["id"], gathered, edge_index)
-    return screen_candidates(
-        undeclared,
-        declared_targets=set(),
-        own_slug=node["slug"],
-        floor=floor,
-        top_k=top_k,
+        return NodeSweep(node=node, result=gathered)
+    undeclared = screen_strong_edge_pairs(node["id"], gathered.live, edge_index)
+    return NodeSweep(
+        node=node,
+        result=screen_candidates(
+            undeclared,
+            declared_targets=set(),
+            own_slug=node["slug"],
+            floor=floor,
+            top_k=top_k,
+        ),
+        gather_cut=gathered.cut_above(floor),
     )
 
 
@@ -397,10 +404,15 @@ class NodeSweep:
     Attributes:
         node: The hydrated swept decision dict.
         result: ``List[Candidate]`` (healthy) or ``Unavailable`` (degraded).
+        gather_cut: The node's gather read its whole raw bound, held fewer than the
+            live limit, and its last raw point still scored at or above the sweep's
+            floor (``conflict.Gathering.cut_above``). Counted on the report, never a
+            degradation; always False on a degraded sweep.
     """
 
     node: Dict[str, Any]
     result: "List[Candidate] | Unavailable"
+    gather_cut: bool = False
 
 
 def iter_sweep(
@@ -437,17 +449,14 @@ def iter_sweep(
         One :class:`NodeSweep` per snapshot node, in snapshot order.
     """
     for node in snapshot.nodes:
-        yield NodeSweep(
-            node=node,
-            result=sweep_node(
-                node,
-                edge_index=snapshot.edge_index,
-                embed_provider=embed_provider,
-                vector_store=vector_store,
-                store=store,
-                floor=floor,
-                top_k=top_k,
-            ),
+        yield sweep_node(
+            node,
+            edge_index=snapshot.edge_index,
+            embed_provider=embed_provider,
+            vector_store=vector_store,
+            store=store,
+            floor=floor,
+            top_k=top_k,
         )
 
 
@@ -1075,6 +1084,9 @@ class CheckPlan:
             that cannot read its history must not assert what is still standing.
         departed: Finding-grade priors that stopped standing, with the derived
             reason. Counted on the surface, never narrated.
+        gathers_cut: How many healthy sweeps' gathers were cut above the floor
+            (:attr:`NodeSweep.gather_cut`). The raw bound's alarm, reported and
+            never persisted; it degrades nothing and withholds no coverage.
     """
 
     run_id: str
@@ -1094,6 +1106,7 @@ class CheckPlan:
     start_probe: StaleProbe
     carried: Tuple[CarriedFinding, ...] = ()
     departed: Tuple[DepartedFinding, ...] = ()
+    gathers_cut: int = 0
 
 
 @dataclass(frozen=True)
@@ -1209,6 +1222,9 @@ class CheckRunResult:
             (``None`` where no response arrived). The same rows land in
             telemetry's ``failed_judgment_batches``. The no-judge abort and
             skipped batches add none; nothing was attempted.
+        gathers_cut: Echoed from the plan — healthy sweeps whose gather was cut
+            above the floor. Report-only: never persisted to ``check_runs``, never
+            read by :func:`run_degradations` or :func:`exit_code_for`.
     """
 
     run_id: str
@@ -1235,6 +1251,7 @@ class CheckRunResult:
     failed_batches: Tuple[FailedJudgmentBatch, ...] = ()
     tokens_input: int = 0
     tokens_output: int = 0
+    gathers_cut: int = 0
 
     @property
     def judgment_degraded(self) -> Optional[Unavailable]:
@@ -1417,6 +1434,8 @@ def plan_corpus_check(
         for sweep in consumed
         if not isinstance(sweep.result, Unavailable)
     )
+    # Counted over the same healthy sweeps (a degraded sweep's gather_cut is False).
+    gathers_cut = sum(1 for sweep in consumed if sweep.gather_cut)
 
     pairs = tuple(dedup_oriented_pairs(consumed))
 
@@ -1461,6 +1480,7 @@ def plan_corpus_check(
         start_probe=start_probe,
         carried=tuple(carried),
         departed=tuple(departed),
+        gathers_cut=gathers_cut,
     )
 
 
@@ -1827,6 +1847,7 @@ def execute_corpus_check(
         failed_batches=tuple(failed_batches),
         tokens_input=tokens_input,
         tokens_output=tokens_output,
+        gathers_cut=plan.gathers_cut,
     )
 
 

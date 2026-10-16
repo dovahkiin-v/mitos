@@ -33,6 +33,9 @@ from mitos.conflict import (
 )
 from mitos.errors import EmbeddingError
 from mitos.parser import ParsedEntry
+from mitos.retrieval_walk import PointResolution
+from mitos.store import MODIFIER_EDGE_KEYS
+from mitos.vector_store import hash_to_uuid
 
 from _point_hits import CannedVector
 
@@ -47,6 +50,9 @@ def offline(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("QDRANT_URL", "http://localhost:9")
     for key in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "ANTHROPIC_API_KEY"):
         monkeypatch.delenv(key, raising=False)
+
+
+_STAMP_KEYS = frozenset(MODIFIER_EDGE_KEYS.values())
 
 
 class _FakeEmbed:
@@ -70,7 +76,13 @@ class _FakeVector(CannedVector):
 
 
 class _FakeStore:
-    """Resolves slugs to hydrated nodes from a dict; every resolved node is ``active``."""
+    """Resolves point ids to nodes from a dict; every resolved node is ``active``.
+
+    Since 2d the gather reads a store through the walk's batched resolver plus one
+    stamp read, so this double answers both the way the real store does: the
+    resolver's node carries ``computed_state`` and no modifier stamps, and
+    ``get_modifiers_map`` returns each node's non-empty stamps (ledger entry-001).
+    """
 
     def __init__(self, nodes: Dict[str, Dict[str, Any]]) -> None:
         self._nodes = nodes
@@ -80,11 +92,25 @@ class _FakeStore:
         node = self._nodes.get(slug)
         return [node["id"]] if node is not None else []
 
-    def get_node_by_slug(self, slug: str) -> Optional[Dict[str, Any]]:
-        return self._nodes.get(slug)
+    def resolve_point_ids(self, point_ids: List[str]) -> PointResolution:
+        by_point = {hash_to_uuid(n["id"]): n for n in self._nodes.values()}
+        nodes = {
+            pid: {**{k: v for k, v in by_point[pid].items() if k not in _STAMP_KEYS},
+                  "computed_state": "active"}
+            for pid in point_ids if pid in by_point
+        }
+        return PointResolution(nodes=nodes,
+                               orphans=[pid for pid in point_ids if pid not in nodes],
+                               ambiguous={})
 
-    def get_node_state(self, node_id: str) -> str:
-        return "active"
+    def get_modifiers_map(self, node_ids: List[str]) -> Dict[str, Dict[str, List[str]]]:
+        by_id = {n["id"]: n for n in self._nodes.values()}
+        stamps = {}
+        for node_id in node_ids:
+            held = {k: v for k, v in by_id[node_id].items() if k in _STAMP_KEYS and v}
+            if held:
+                stamps[node_id] = held
+        return stamps
 
 
 class _RecordingJudge:
