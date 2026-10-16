@@ -284,7 +284,10 @@ def fill(hits: List[Dict[str, Any]], resolution: PointResolution, *,
         end = SHORT_BOUND
     # The walk may stop before the last hit; that hit is still checked, so its
     # score is a number whichever way the walk ended.
-    last_score = hits[-1]["score"] if hits and _point_id_of(hits[-1]) else None
+    last_score = None
+    if hits:
+        _point_id_of(hits[-1])
+        last_score = hits[-1]["score"]
     return RankedWalk(window=window, edge=edge, retired=retired, end=end,
                       returned=len(hits), bound=bound, limit=limit, skipped=skipped,
                       last_score=last_score)

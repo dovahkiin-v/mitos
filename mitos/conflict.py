@@ -114,19 +114,20 @@ CONFLICT_OVERFETCH_LIMIT = 4 * CONFLICT_TOP_K   # = 20
 # population, like retrieval_walk.RANKED_OVERFETCH_BOUND. Read as a module global at
 # call time, never bound as a default argument, so a row can move it.
 #
-# Set by phase 2d's runs `20261016-1030-62dc12d-burial`, `20261016-1048-62dc12d-timing`
-# and `20261016-1052-62dc12d-gather-dogfood` (re-run and recorded at the commit that set
-# it), on the burial horizon Vinga ruled for the ranked bound (W-emp + M). The rule is
-# the strictest of three: no gather in the horizon holds fewer than 20 live (B_min =
-# 664, so 675; 0 binding production cuts there), the suite's ten-to-one neighbourhood
-# fills (220, so 225), and every live decision of the dogfood corpus fills (50). Core
-# p95 of the whole gather at 675: 39.2 ms burial, 42.1 ms timing, 22.8 ms dogfood,
-# against P16's 50 ms; today's 20-point gather measured 18.6 / 30.1 / 21.4 ms. A full
-# corpus sweep of the 40,000-live timing graph costs about 470 s more than today's
-# (sampled, 2,000 nodes). On the dogfood corpus live-fill changed 219 of 540 live sets
-# and added and removed no judge pair, no pause outcome and no cut. W-max is the
-# sensitivity row (1,020, so 1,025). The net: the first cut on a real corpus is the
-# build order for the `active` hint (Ruling 1).
+# Set by phase 2d's recorded runs `20261016-1056-3cc098c-burial`,
+# `20261016-1113-3cc098c-timing` and `20261016-1115-3cc098c-gather-dogfood` (RESULT
+# `measure/horizon/RESULT-20261016-1056-3cc098c-burial-gather.md` in the vision folder),
+# on the burial horizon Vinga ruled for the ranked bound (W-emp + M). The rule is the
+# strictest of three: no gather in the horizon holds fewer than 20 live (B_min = 664,
+# so 675; 0 binding production cuts there), the suite's ten-to-one neighbourhood fills
+# (220, so 225), and every live decision of the dogfood corpus fills (50). Core p95 of
+# the whole gather at 675: 37.8 ms burial, 42.2 ms timing, 23.2 ms dogfood, against
+# P16's 50 ms; today's 20-point gather measured 17.5 / 30.9 / 21.7 ms. A full corpus
+# sweep of the 40,000-live timing graph costs about 463 s more than today's (sampled,
+# 2,000 nodes). On the dogfood corpus live-fill changed 219 of 540 live sets and added
+# and removed no judge pair, no pause outcome and no cut. W-max is the sensitivity row
+# (1,020, so 1,025). The net: the first cut on a real corpus is the build order for the
+# `active` hint (Ruling 1).
 CONFLICT_RAW_BOUND: int = 675
 
 # CONF-D8 / vision §7 — how a judged candidate was gathered, stamped onto every
