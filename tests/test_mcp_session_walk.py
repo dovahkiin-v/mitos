@@ -40,13 +40,17 @@ from _stdio_fake_providers import (
     FAULT_BODY_SENTINEL,
     FAULT_ENV,
     UNIMPLEMENTED_MARKER,
+    cosine,
+    fake_vector,
 )
 from mcp_harness import harness_env, mitos_server
 from mitos import cli
 from mitos.config import MitosConfig
 from mitos.identity import mechanism_canonical_norm
 from mitos.provider_cause import PROVIDER_CAUSES, provider_cause_phrase
-from mitos.recall import WindowLever, limit_clause
+from mitos.identity import embedding_text
+from mitos.recall import (EDGE_KIND_MID_CLUSTER, RANKED_EDGE_MARGIN, WindowEdge,
+                          edge_clause)
 from mitos.telemetry import (
     ATTEMPT_COULD_NOT_COMPLETE,
     AttemptOutcome,
@@ -74,6 +78,12 @@ AXIOM_C = ("Session tokens are stored hashed with a per-user salt and are never 
 
 #: Scores ~0.73 against A on the fake: the `weak` band.
 WEAK_QUERY = "session tokens stored hashed with salt never written to log"
+
+#: A fourth auth decision, recorded after S6, that the fake ranks just below C against
+#: WEAK_QUERY — inside the edge margin (measured 0.6708 vs C's 0.6742) — while staying
+#: under the pause floor against A and C, so S7a's window ends mid-cluster.
+AXIOM_D = ("Session tokens stored server side are hashed with salt and are never "
+           "written to disk logs.")
 
 MECHANISMS_A = ["SQLite!", "Str Casefold", "argon2"]
 CONTEXT_A = "Found while auditing the login flow's storage."
@@ -261,12 +271,31 @@ async def test_an_mcp_agent_reads_every_section_one_key_from_the_payload(tmp_pat
         notice = s6.get("check_notice") or {}
         assert notice.get("state") == ATTEMPT_COULD_NOT_COMPLETE, f"S6: {s6}"
 
-        # S7 — a weak ranking that filled its window names limit as the lever.
-        s7 = _payload(await call("S7", "surface_decisions", query=WEAK_QUERY, limit=2), "S7")
-        assert "degraded" not in s7, f"S7: {s7}"
-        assert s7.get("confidence") == "weak", f"S7: the fixture left the band: {s7}"
-        assert limit_clause(WindowLever(limit=2, held=2), surface="mcp") in s7.get("note", ""), (
-            f"S7: {s7.get('note')}")
+        # S7 — the window's edge: a fourth auth decision just below C makes S7a's
+        # window end mid-cluster (the clause, by its exact sentence); S7b's ends at the
+        # drop to the billing decision (no clause, by whole-note equality).
+        s7d = _payload(await call("S7", "record_decision", axiom=AXIOM_D,
+                                  rejected_paths="Logging a token prefix for support.",
+                                  scope=["auth"], slug="session-tokens-server-side"), "S7")
+        assert s7d.get("status") == "created", f"S7: D paused or failed: {s7d}"
+        q = fake_vector(WEAK_QUERY)
+        score = {slug: cosine(q, fake_vector(embedding_text({"kind": "decision", "axiom": ax})))
+                 for slug, ax in (("a", AXIOM_A), ("b", AXIOM_B), ("c", AXIOM_C), ("d", AXIOM_D))}
+        assert score["a"] > score["c"] > score["d"] > score["b"], f"S7: {score}"
+        assert score["c"] - score["d"] < RANKED_EDGE_MARGIN, f"S7: the D gap moved: {score}"
+        assert score["d"] - score["b"] >= RANKED_EDGE_MARGIN, f"S7: {score}"
+
+        s7a = _payload(await call("S7a", "surface_decisions", query=WEAK_QUERY, limit=2), "S7a")
+        assert "degraded" not in s7a, f"S7a: {s7a}"
+        assert s7a.get("confidence") == "weak", f"S7a: the fixture left the band: {s7a}"
+        clause = edge_clause(WindowEdge(EDGE_KIND_MID_CLUSTER, 2, 2), surface="mcp")
+        assert s7a.get("note", "").endswith(f" {clause}"), f"S7a: {s7a.get('note')}"
+
+        s7b = _payload(await call("S7b", "surface_decisions", query=WEAK_QUERY, limit=3), "S7b")
+        assert s7b.get("confidence") == "weak", f"S7b: {s7b}"
+        assert len(s7b.get("active_decisions", [])) == 3, f"S7b: {s7b}"
+        # Edge-free: the note S7a's band earns, with nothing after it.
+        assert s7b.get("note") == s7a["note"][: -len(clause) - 1], f"S7b: {s7b.get('note')}"
 
         # S8 — both by-handle reads carry context, invalidates_if and folded mechanisms.
         folded = [mechanism_canonical_norm(m) for m in MECHANISMS_A]

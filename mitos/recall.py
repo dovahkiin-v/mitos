@@ -55,6 +55,13 @@ from mitos.shell_quote import shell_flag
 SURFACE_STRONG_THRESHOLD: float = 0.75
 SURFACE_WEAK_THRESHOLD: float = 0.60
 
+# The edge margin: a ranked window ends mid-cluster when its next live rank scores
+# within this much of its last returned one (``window_edge``). Calibrated, recorded in
+# tests/golden/calibration/record.json: the median depth at which a non-target outranks
+# a labelled target (bullseye and handle-words, query space), read on the dense run
+# beside Harbor's. Method: tests/golden/_calibration_record.py ``edge_margin_boundary``.
+RANKED_EDGE_MARGIN: float = 0.0156
+
 # How many live scope tags the bounded unused-scope vector lists (busiest first) before
 # it stops and points at the dedicated discovery surface. Mirrors clamp_limit's working
 # top-k. Keeps the vector bounded at P11 scale — never the full vocabulary on a response.
@@ -91,7 +98,7 @@ SURFACE_DIDYOUMEAN_CUTOFF: float = 0.6
 # slug may start with ``-`` (``renderer._show_forms``' idiom). The MCP form names a
 # read tool and no shell command.
 #
-# ``limit_arg`` and ``full_top_arg`` spell the two knobs :func:`limit_clause` names,
+# ``limit_arg`` and ``full_top_arg`` spell the two knobs :func:`edge_clause` names,
 # each with an ``{n}`` placeholder. They are argument spellings, not commands: the
 # clause rides ``surface`` and ``query`` alike, so it cannot name a verb, and the CLI
 # fragments are flags that parse on either verb as printed. Unwrapped on purpose —
@@ -276,97 +283,131 @@ def scope_filter_recovery(
     return {"note": note}
 
 
-class WindowLever(NamedTuple):
-    """The result window a ranked answer filled, as :func:`limit_clause` names it.
+# The two kinds of edge a ranked answer states (``WindowEdge.kind``).
+EDGE_KIND_MID_CLUSTER = "mid_cluster"
+EDGE_KIND_UNMEASURED = "unmeasured"
+
+# The one end value of the shared walk this module reads. Spelled here because this
+# module may not import ``retrieval_walk``; a row pins it equal to
+# ``retrieval_walk.EDGE_UNMEASURED``.
+_WALK_END_UNMEASURED = "edge_unmeasured"
+
+
+class WindowEdge(NamedTuple):
+    """How a ranked answer's window ended, when that is worth a sentence.
 
     Attributes:
-        limit: The clamped top-k this call asked the vector store for.
-        held: How many ranks stay whole if the caller widens the window; 0 means
-            the answer is already axiom-only throughout.
+        kind: ``EDGE_KIND_MID_CLUSTER`` or ``EDGE_KIND_UNMEASURED``.
+        limit: The clamped window this ranking filled.
+        held: How many ranks stay whole if the caller widens the window (0 means
+            the answer is axiom-only throughout); None when no lever is named — at
+            the ceiling, or on an unmeasured edge.
     """
 
+    kind: str
     limit: int
-    held: int
+    held: Optional[int]
 
 
-def window_lever(
-    *, points: int, limit: int, ceiling: int, full_top: Optional[int]
-) -> Optional[WindowLever]:
-    """Decides whether a ranked answer may name a wider window as the next move.
+def window_edge(
+    walk: "object", *, margin: float, ceiling: int, full_top: Optional[int]
+) -> Optional[WindowEdge]:
+    """Decides what a ranked answer says about the rank just past its window.
 
-    The ONE place that rule is made, for all four ranked surfaces. A wider window
-    reaches something only when this one came back full and a higher ``limit``
-    would not clamp straight back to it; on a short window (a small or fresh
-    corpus) or at the ceiling the lever does nothing, and naming it would be a
-    false line.
+    The ONE place the edge rule is made, for every ranked surface. ``walk`` is the
+    shared walk's result (``retrieval_walk.RankedWalk``), duck-typed: ``window``,
+    ``edge``, ``end`` and ``limit`` are read. The rule:
 
-    ``points`` is the length of the **live window** the shared walk filled
-    (``retrieval_walk``): "full" means ``limit`` live decisions were found.
-    Retired and open-question points no longer take a window's slots — the walk
-    over-fetches and skips them — so the window it returns is the retrieval depth
-    the lever describes. A fetch that ran out holding exactly ``limit`` live still
-    names the lever; the edge clause that replaces this one drops it there.
+    * an empty window says nothing;
+    * with an edge, the window ended **mid-cluster** when the last returned score
+      minus the edge's is below ``margin`` (strict, so a gap equal to it is a clear
+      drop). A negative gap — the next rank scoring higher, which an unordered list
+      can give — is mid-cluster too, on purpose;
+    * with no edge because the fetch reached its bound holding exactly ``limit`` live
+      decisions, the edge is **unmeasured**, and it is said, because left unsaid it
+      would read as a clear drop;
+    * otherwise (a short window, or a fetch that ran out, full or not) nothing.
 
-    ``ceiling`` is injected by the boundary (``display.RANKED_LIMIT_CEILING``)
-    rather than imported: this module admits one ``mitos`` import and no other
-    (module docstring).
+    The lever — a higher ``limit`` with ``full_top`` held — is named only on a
+    mid-cluster edge below ``ceiling``. Not on an unmeasured one: the walk fetches its
+    fixed bound whatever ``limit`` is, so a higher ``limit`` re-reads the same fetch
+    and comes back short. ``margin`` and ``ceiling`` are required and injected by the
+    boundary (``RANKED_EDGE_MARGIN``, ``display.RANKED_LIMIT_CEILING``): a later
+    ranking with a margin of its own passes it here, and a default would let it read
+    the wrong one silently.
 
     Args:
-        points: How many live decisions the walk's window holds.
-        limit: The clamped top-k the call asked for.
+        walk: The ranked walk the answer was composed from.
+        margin: The edge margin of the ranking the walk came from.
         ceiling: The clamp ceiling a higher ``limit`` would be cut back to.
-        full_top: The effective ``full_top`` after the boundary normalised
-            ``brief`` to 0; None when the caller set no cutoff.
+        full_top: The effective ``full_top`` after the boundary normalised ``brief``
+            to 0; None when the caller set no cutoff.
 
     Returns:
-        A :class:`WindowLever`, or None when the clause must stay absent.
+        A :class:`WindowEdge`, or None when the clause must stay absent.
     """
-    if points < limit or limit >= ceiling:
+    window = walk.window
+    if not window:
         return None
-    held = limit if full_top is None else min(full_top, limit)
-    return WindowLever(limit=limit, held=held)
+    limit = walk.limit
+    if walk.edge is not None:
+        if window[-1].score - walk.edge.score >= margin:
+            return None
+        if limit >= ceiling:
+            return WindowEdge(kind=EDGE_KIND_MID_CLUSTER, limit=limit, held=None)
+        held = limit if full_top is None else min(full_top, limit)
+        return WindowEdge(kind=EDGE_KIND_MID_CLUSTER, limit=limit, held=held)
+    if walk.end == _WALK_END_UNMEASURED:
+        return WindowEdge(kind=EDGE_KIND_UNMEASURED, limit=limit, held=None)
+    return None
 
 
-def limit_clause(lever: WindowLever, *, surface: str) -> str:
-    """Words the clause a filled ``weak``/``none`` ranking ends its band note with.
+def edge_clause(edge: WindowEdge, *, surface: str) -> str:
+    """Words the sentence a ranked note ends with when its window's edge is stated.
 
     Verb-independent on purpose, as :func:`withheld_clause` is: ``surface`` and
-    ``query`` gain the same characters on one surface, so the query note stays no
+    ``query`` gain the same characters on one boundary, so the query note stays no
     longer than the surface note it displaces. It speaks about this ranking's depth
-    only — no verdict on the corpus, no write instruction, and no claim that the
-    deeper ranks score higher — so it is lawful in both registers. It names the
-    held rank count as a number, so the re-send works in one turn; with nothing
-    held it names ``limit`` alone, since naming ``full_top`` would hand a ``brief``
-    caller a re-send the boundary refuses. Pure string formatting, so it cannot
-    raise inside ``query_decisions``' ranked ``try`` and pose as degraded recall.
+    only — no verdict on the corpus, no write instruction, no claim that the next
+    ranks score higher or matter more — so it is lawful in both registers. A named
+    lever carries the held rank count as a number, so the re-send works in one turn;
+    with nothing held it names ``limit`` alone, since naming ``full_top`` would hand
+    a ``brief`` caller a re-send the boundary refuses. Pure string formatting, so it
+    cannot raise inside a ranked path and pose as degraded recall.
 
     Args:
-        lever: The window this ranking filled (from :func:`window_lever`).
+        edge: The edge from :func:`window_edge`.
         surface: ``"cli"`` or ``"mcp"`` — selects the argument spellings.
 
     Returns:
-        One sentence, e.g. ``"This ranking filled limit=5; a higher limit reaches
-        further ranks, and with full_top=5 the added ones come back axiom-only."``.
+        One sentence, e.g. ``"This ranking ended mid-cluster at limit=5: the next rank
+        scores as close as the last; a higher limit reaches it, and with full_top=5
+        the added ranks come back axiom-only."``.
     """
     pointers = _SURFACE_POINTERS[surface]
-    filled = pointers["limit_arg"].format(n=lever.limit)
-    if lever.held == 0:
+    at = pointers["limit_arg"].format(n=edge.limit)
+    if edge.kind == EDGE_KIND_UNMEASURED:
         return (
-            f"This ranking filled {filled}; a higher limit reaches further ranks, "
-            f"axiom-only like these."
+            f"This ranking's edge at {at} is unmeasured: the read fetched no further "
+            f"live rank, so it cannot say whether the window ended mid-cluster."
         )
-    held = pointers["full_top_arg"].format(n=lever.held)
+    stem = f"This ranking ended mid-cluster at {at}: the next rank scores as close as the last"
+    if edge.held is None:
+        return f"{stem}."
+    if edge.held == 0:
+        return f"{stem}; a higher limit reaches it, axiom-only like these."
+    held = pointers["full_top_arg"].format(n=edge.held)
     return (
-        f"This ranking filled {filled}; a higher limit reaches further ranks, and "
-        f"with {held} the added ones come back axiom-only."
+        f"{stem}; a higher limit reaches it, and with {held} the added ranks come "
+        f"back axiom-only."
     )
 
 
-def _with_lever(note: str, lever: Optional[WindowLever], surface: str) -> str:
-    """Appends the window clause to a band note when a lever was granted."""
-    if lever is None:
+def _with_edge(note: str, edge: Optional[WindowEdge], surface: str) -> str:
+    """Appends the edge clause to a ranked band note when the edge is stated."""
+    if edge is None:
         return note
-    return f"{note} {limit_clause(lever, surface=surface)}"
+    return f"{note} {edge_clause(edge, surface=surface)}"
 
 
 def _classify_recall(*, top_score: Optional[float], result_count: int) -> str:
@@ -411,7 +452,7 @@ def assess_surface_recall(
     scope: Optional[str],
     scope_counts: Optional[Dict[str, Dict[str, int]]] = None,
     surface: str,
-    lever: Optional[WindowLever],
+    edge: Optional[WindowEdge],
     scope_total: Optional[int] = None,
     degraded_reason: Optional[str],
 ) -> Tuple[Optional[str], str]:
@@ -430,10 +471,11 @@ def assess_surface_recall(
             fabricate a typo hint).
         surface: ``"cli"`` or ``"mcp"`` — selects the pointer wording. Required keyword:
             no callsite may silently emit the wrong surface's call-forms (the T7 gate).
-        lever: The filled window from :func:`window_lever`, or None. Required keyword,
-            never defaulted: every call site decides. It rides only the ``weak`` note
-            and the with-results ``none`` note; ``strong``, the nothing-ranked fork
-            and every degraded arm ignore it.
+        edge: The window's edge from :func:`window_edge`, or None. Required keyword,
+            never defaulted: every call site decides. Its clause ends every note that
+            holds ranked results — ``strong``, ``weak`` and the with-results ``none``,
+            unused-scope variants included; the nothing-ranked fork and every
+            degraded arm ignore it.
         scope_total: How many active decisions the scope holds, passed only by the
             degraded scope dump. Its presence is what selects the dump's own
             sentence, which names how many of them it shows; None keeps the shared
@@ -517,19 +559,21 @@ def assess_surface_recall(
     # Semantic ran with a real, confident hit.
     if band == "strong":
         matches_phrase = "Here are results that matched semantically." if scope_prefix else "Ranked top matches."
-        return "strong", (
+        return "strong", _with_edge(
             f"{scope_prefix}{matches_phrase} For the COMPLETE set of decisions in a scope — a "
-            f"completeness pass — call {complete_hint}."
+            f"completeness pass — call {complete_hint}.",
+            edge,
+            surface,
         )
 
     # Semantic ran but it's in the Twilight Zone (loose neighbour / phrased differently)
     if band == "weak":
         shown = f"{top_score:.2f}" if top_score is not None else "?"
         matches_phrase = "Here are results that matched semantically (twilight zone" if scope_prefix else "Twilight zone"
-        return "weak", _with_lever(
+        return "weak", _with_edge(
             f"{scope_prefix}{matches_phrase}: top score {shown} is close. They might be family neighbours or "
             f"exact precedent phrased differently. Check carefully before deciding.",
-            lever,
+            edge,
             surface,
         )
 
@@ -540,7 +584,7 @@ def assess_surface_recall(
             msg = f"{scope_prefix}Top score {shown} is too low to be related. Treat as no-precedent and decide fresh."
         else:
             msg = f"Very likely off-axis: top score {shown} is too low to be related. The scope is populated, but nothing matches your query. Treat as no-precedent and decide fresh."
-        return "none", _with_lever(msg, lever, surface)
+        return "none", _with_edge(msg, edge, surface)
 
     # Semantic ran and returned nothing surfaceable.
     if scope_unused:
@@ -559,7 +603,7 @@ def assess_query_recall(
     result_count: int,
     config: "object",
     surface: str,
-    lever: Optional[WindowLever],
+    edge: Optional[WindowEdge],
 ) -> Tuple[str, str]:
     """Classifies a targeted-lookup result and builds its ``query``-register note.
 
@@ -591,10 +635,10 @@ def assess_query_recall(
             for ``project``, which the CLI redirect names as its selector.
         surface: ``"cli"`` or ``"mcp"`` — selects the pointer wording. Required
             keyword: no call site may silently emit the other surface's call-forms.
-        lever: The filled window from :func:`window_lever`, or None. Required
-            keyword, never defaulted. It rides the ``weak`` and with-results
-            ``none`` notes after the redirect, in the same characters
-            ``assess_surface_recall`` appends.
+        edge: The window's edge from :func:`window_edge`, or None. Required
+            keyword, never defaulted. Its clause ends the ``strong``, ``weak`` and
+            with-results ``none`` notes (after the redirect where there is one), in
+            the same characters ``assess_surface_recall`` appends.
 
     Returns:
         A ``(confidence, note)`` pair. ``confidence`` is ``"strong"`` / ``"weak"``
@@ -614,20 +658,23 @@ def assess_query_recall(
     # Legend only, and it names no verb: the caller asked for a thing and got it, so
     # a redirect here is a per-answer turn tax wearing a legend. It still carries a
     # note — this is the band a caller meets most often, and dropping it leaves the
-    # common answer with no legend at all.
+    # common answer with no legend at all. The edge clause may follow it; it names
+    # arguments, not a verb.
     if band == "strong":
-        return band, (
+        return band, _with_edge(
             "Top match cleared the strong threshold — a real hit for this lookup, "
-            "not a loose neighbour."
+            "not a loose neighbour.",
+            edge,
+            surface,
         )
 
     shown = f"{top_score:.2f}" if top_score is not None else "?"
 
     if band == "weak":
-        return band, _with_lever(
+        return band, _with_edge(
             f"Twilight zone: top score {shown} — close, maybe not your handle. "
             f"{redirect}",
-            lever,
+            edge,
             surface,
         )
 
@@ -635,10 +682,10 @@ def assess_query_recall(
     # ranked off-axis, versus nothing ranked at all. Neither states a verdict on the
     # corpus, and neither instructs a write.
     if result_count:
-        return band, _with_lever(
+        return band, _with_edge(
             f"Off-axis: top score {shown} is too low to be related — nothing "
             f"ranked close. {redirect}",
-            lever,
+            edge,
             surface,
         )
     return band, (

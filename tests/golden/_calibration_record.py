@@ -597,6 +597,73 @@ def summarize_shapes(results: List[dict]) -> Dict[str, Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# The edge margin's method (recall.RANKED_EDGE_MARGIN)
+# ---------------------------------------------------------------------------
+
+# The classes whose targets are the decisions a ranked read should return. The other two
+# classes carry no targets, so they have no ranking to invert.
+EDGE_MARGIN_CLASSES: Tuple[str, ...] = ("bullseye", "handle-words")
+
+
+def inversion_depths(results: List[dict]) -> List[float]:
+    """Measures how deep the score order inverts the relevance order, per labelled target.
+
+    Read over query-space results of ``EDGE_MARGIN_CLASSES`` only, in the ranking a
+    ranked read keeps: live, non-self decisions, best first. When a non-target ranks above
+    a target, the target's depth is the best such non-target's value minus the target's.
+    Another target ranked above is not an inversion (``margin_vs_best_other_live`` would
+    count it). A target that is absent from the window, or not a live competitor, has no
+    rank to invert and is skipped. Takes the shape both the committed Harbor run and the
+    dense runner's ``results.jsonl`` hold.
+
+    Args:
+        results: Fixture results (``derive_result``'s shape).
+
+    Returns:
+        One depth per inverted target, in result order. A target ranked first gives none.
+    """
+    depths: List[float] = []
+    for r in results:
+        if r.get("class") not in EDGE_MARGIN_CLASSES or r.get("space") != "query":
+            continue
+        ranking = [
+            h for h in r["hits"]
+            if h.get("live") and not h.get("self") and h.get("kind") == "decision"
+        ]
+        target_slugs = {t["slug"] for t in r["targets"]}
+        for target in r["targets"]:
+            if target.get("absent"):
+                continue
+            best_other: Optional[float] = None
+            value: Optional[float] = None
+            for h in ranking:
+                if h["slug"] == target["slug"]:
+                    value = h["value"]
+                    break
+                if h["slug"] not in target_slugs:
+                    best_other = h["value"] if best_other is None else max(best_other, h["value"])
+            if value is not None and best_other is not None:
+                depths.append(best_other - value)
+    return depths
+
+
+def edge_margin_boundary(results: List[dict]) -> Optional[float]:
+    """Returns one corpus's edge-margin boundary: the median inversion depth, 4 decimals.
+
+    The median is nearest-rank (``nearest_rank``), the record's own convention, so the
+    boundary can be reproduced by hand from the depths.
+
+    Args:
+        results: Fixture results (see ``inversion_depths``).
+
+    Returns:
+        The boundary, or ``None`` when the corpus shows no inversion at all.
+    """
+    median = nearest_rank(sorted(inversion_depths(results)), 50)
+    return None if median is None else round(median, 4)
+
+
+# ---------------------------------------------------------------------------
 # Record and run files
 # ---------------------------------------------------------------------------
 

@@ -1,5 +1,21 @@
 {
-  "constants": {},
+  "constants": {
+    "mitos.recall.RANKED_EDGE_MARGIN": {
+      "boundaries": {
+        "dense-20261016-9251904": 0.0156,
+        "harbor-20261015-a79a820": 0.0008
+      },
+      "kind": "margin",
+      "method": "median inversion depth (edge_margin_boundary): a non-target ranked above a labelled target, best such non-target minus the target, live non-self decisions, query space",
+      "separates": [
+        "bullseye",
+        "handle-words"
+      ],
+      "side": "dense",
+      "space": "query",
+      "value": 0.0156
+    }
+  },
   "embedding_model": "gemini-embedding-2",
   "runs": [
     {

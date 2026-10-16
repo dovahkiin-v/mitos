@@ -37,11 +37,12 @@ from mitos.divergence import _corpus_files, corpus_holds_entries
 # Module level on purpose: `amend` and `restore` close over no `cli`/`sync`/`store`
 # (measured at planning), so unlike `MitosSyncManager` neither needs deferring.
 from mitos.restore import BufferFidelityError
-from mitos.recall import (assess_query_recall, assess_surface_recall,
+from mitos.recall import (RANKED_EDGE_MARGIN, assess_query_recall,
+                          assess_surface_recall,
                           corpus_provenance, missing_graph_is_a_gap,
                           missing_graph_note, missing_index_is_a_gap,
                           scope_filter_recovery, count_withheld,
-                          stamps_unread_clause, window_lever, withheld_clause)
+                          stamps_unread_clause, window_edge, withheld_clause)
 from mitos.retrieval_walk import WalkContractError, walk_ranked
 
 # No cross-call "seen" dedup state — deliberately. An earlier design cached
@@ -989,7 +990,7 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
     top_score: Optional[float] = None
     retired: List[Dict[str, Any]] = []
     degraded_error: Optional[Exception] = None
-    lever = None
+    edge = None
     dump_total: Optional[int] = None
 
     # 1. Semantic search if embeddings and vector store are active
@@ -1028,10 +1029,10 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
     # Composition, outside the `try`: pure shaping over what the walk returned, so
     # a defect here is loud rather than posing as degraded recall.
     if walk is not None:
-        # The live window, not raw points: retired and open-question points take
-        # no slots, so "full" means `limit` live decisions (2e's edge replaces it).
-        lever = window_lever(points=len(walk.window), limit=top_k,
-                             ceiling=RANKED_LIMIT_CEILING, full_top=full_top)
+        # The rank just past the live window: retired and open-question points
+        # take no slots, so it is the next live decision the walk found.
+        edge = window_edge(walk, margin=RANKED_EDGE_MARGIN,
+                           ceiling=RANKED_LIMIT_CEILING, full_top=full_top)
         for rank, hit in enumerate(walk.window, start=1):
             results["active_decisions"].append(
                 _decision_payload(hit.node, hit.score,
@@ -1111,7 +1112,7 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         scope=scope,
         scope_counts=scope_counts,
         surface="mcp",
-        lever=lever,
+        edge=edge,
         scope_total=dump_total,
         degraded_reason=reason,
     )
@@ -1562,10 +1563,10 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             # This is the healthy-empty arm, not a degraded one: ranking ran and
             # matched nothing, so it takes the band exactly like the envelope above.
             # (Its degraded sibling, ten lines up, returns before assessment.)
-            # No lever: the query raised before any window came back.
+            # No edge: the query raised before any window came back.
             confidence, note = assess_query_recall(
                 top_score=top_score, result_count=0, config=config, surface="mcp",
-                lever=None,
+                edge=None,
             )
             empty["confidence"] = confidence
             empty["note"] = note
@@ -1592,9 +1593,9 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
         # Composition, outside the `try`: every arm above returns, so this is the
         # healthy ranked answer, and a shaping defect here is loud rather than
         # posing as degraded recall.
-        # The live window, not raw points — see surface_decisions.
-        lever = window_lever(points=len(walk.window), limit=top_k,
-                             ceiling=RANKED_LIMIT_CEILING, full_top=full_top)
+        # The rank just past the live window — see surface_decisions.
+        edge = window_edge(walk, margin=RANKED_EDGE_MARGIN,
+                           ceiling=RANKED_LIMIT_CEILING, full_top=full_top)
         output_list = []
         for rank, hit in enumerate(walk.window, start=1):
             match = letter_payload(
@@ -1624,7 +1625,7 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             result_count=len(output_list),
             config=config,
             surface="mcp",
-            lever=lever,
+            edge=edge,
         )
         envelope["confidence"] = confidence
         envelope["note"] = note

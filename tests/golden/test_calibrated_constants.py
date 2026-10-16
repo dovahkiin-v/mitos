@@ -31,8 +31,10 @@ import _calibration_record as R  # noqa: E402
 MITOS_DIR = os.path.dirname(os.path.abspath(mitos.__file__))
 RECORD_POINTER = "tests/golden/calibration/record.json"
 
-# Dotted names whose value the record pins. 2e, 5a, 6a and 7a add theirs.
-CALIBRATED_CONSTANTS: FrozenSet[str] = frozenset()
+# Dotted names whose value the record pins. 5a, 6a and 7a add theirs.
+CALIBRATED_CONSTANTS: FrozenSet[str] = frozenset({
+    "mitos.recall.RANKED_EDGE_MARGIN",
+})
 
 # Shipped thresholds that owe calibration, with the phase that sets each.
 PENDING: Dict[str, str] = {
@@ -130,10 +132,20 @@ def test_every_shipped_threshold_is_calibrated_pending_or_exempt():
     )
 
 
-def test_no_constant_is_calibrated_yet():
-    """Lands empty; 2e inverts this in the commit that adds the first record entry."""
-    assert R.load_record()["constants"] == {}
-    assert CALIBRATED_CONSTANTS == frozenset()
+def test_the_edge_margin_is_the_first_calibrated_constant():
+    """Inverted from `test_no_constant_is_calibrated_yet` (landed empty in 1b): 2e's
+    commit adds the first record entry, and the record holds exactly the pinned set."""
+    assert set(R.load_record()["constants"]) == set(CALIBRATED_CONSTANTS)
+    assert CALIBRATED_CONSTANTS == frozenset({"mitos.recall.RANKED_EDGE_MARGIN"})
+
+
+def test_the_edge_margins_harbor_boundary_recomputes_from_the_committed_run():
+    """D6: the method is code, not a notebook. Harbor's boundary in the record is what
+    `edge_margin_boundary` derives from the committed run's fixtures; the dense side
+    is re-derived out of repo by the dense runner through the same function."""
+    entry = R.load_record()["constants"]["mitos.recall.RANKED_EDGE_MARGIN"]
+    harbor = R.load_run("harbor-20261015-a79a820")
+    assert R.edge_margin_boundary(harbor["fixtures"]) == entry["boundaries"]["harbor-20261015-a79a820"]
 
 
 def test_each_calibrated_constant_comment_points_at_the_record():

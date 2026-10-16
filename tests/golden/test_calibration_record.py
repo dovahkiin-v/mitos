@@ -905,3 +905,57 @@ def test_a_schema_two_run_round_trips_through_the_record(record_dir):
     run_id = R.append_run(run, record_dir)
     assert R.load_run(run_id, record_dir) == dict(run, run_id=run_id)
     assert set(R.load_run(run_id, record_dir)["classes"]["bullseye"]) == {"query", "document"}
+
+
+# ---------------------------------------------------------------------------
+# The edge margin's method (2e): inversion depths
+# ---------------------------------------------------------------------------
+
+def _inv(hits, targets, cls="bullseye", space="query", absent=()):
+    return {"class": cls, "space": space, "hits": hits,
+            "targets": [{"slug": t, "absent": t in absent} for t in targets]}
+
+
+def test_a_target_ranked_first_has_no_inversion():
+    r = _inv([_hit("t", 0.9), _hit("n", 0.8)], ["t"])
+    assert R.inversion_depths([r]) == []
+
+
+def test_a_non_target_above_a_target_gives_the_best_ones_gap():
+    r = _inv([_hit("n1", 0.9), _hit("n2", 0.85), _hit("t", 0.8)], ["t"])
+    assert R.inversion_depths([r]) == [pytest.approx(0.1)]
+
+
+def test_a_second_target_above_is_not_an_inversion():
+    """Unlike `margin_vs_best_other_live`, another target outranking a target is the
+    ranking agreeing with the labels."""
+    r = _inv([_hit("t1", 0.9), _hit("t2", 0.85)], ["t1", "t2"])
+    assert R.inversion_depths([r]) == []
+    r = _inv([_hit("t1", 0.9), _hit("n", 0.88), _hit("t2", 0.85)], ["t1", "t2"])
+    assert R.inversion_depths([r]) == [pytest.approx(0.03)]
+
+
+def test_self_retired_and_non_decision_hits_are_not_competitors():
+    r = _inv([_hit("me", 0.95, self=True), _hit("dead", 0.93, live=False),
+              _hit("oq", 0.92, kind="open_question"), _hit("t", 0.9)], ["t"])
+    assert R.inversion_depths([r]) == []
+
+
+def test_an_absent_or_non_live_target_is_skipped():
+    r = _inv([_hit("n", 0.9)], ["t"], absent=("t",))
+    assert R.inversion_depths([r]) == []
+    r = _inv([_hit("n", 0.9), _hit("t", 0.8, live=False)], ["t"])
+    assert R.inversion_depths([r]) == []
+
+
+def test_only_the_two_target_classes_in_query_space_are_read():
+    hits = [_hit("n", 0.9), _hit("t", 0.8)]
+    assert R.inversion_depths([_inv(hits, ["t"], cls="family-neighbour")]) == []
+    assert R.inversion_depths([_inv(hits, ["t"], space="document")]) == []
+    assert R.inversion_depths([_inv(hits, ["t"], cls="handle-words")]) == [pytest.approx(0.1)]
+
+
+def test_the_boundary_is_the_nearest_rank_median_to_four_places_or_none():
+    rows = [_inv([_hit("n", 0.9), _hit("t", 0.9 - d)], ["t"]) for d in (0.01, 0.02, 0.03, 0.04)]
+    assert R.edge_margin_boundary(rows) == 0.02   # nearest rank 2 of 4, not the mean 0.025
+    assert R.edge_margin_boundary([_inv([_hit("t", 0.9)], ["t"])]) is None

@@ -97,11 +97,12 @@ from mitos.migrations import is_pre_v1a_schema
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS, open_connection
 from mitos.cutover import default_aside_db_path, perform_swap, rebuild_and_gate
 from mitos.lexical import degraded_reason_from_error, lexical_fallback
-from mitos.recall import (assess_query_recall, assess_surface_recall,
+from mitos.recall import (RANKED_EDGE_MARGIN, assess_query_recall,
+                          assess_surface_recall,
                           corpus_provenance, missing_graph_is_a_gap,
                           missing_graph_note, missing_index_is_a_gap,
                           provenance_line, scope_filter_recovery,
-                          count_withheld, stamps_unread_clause, window_lever,
+                          count_withheld, stamps_unread_clause, window_edge,
                           withheld_clause)
 from mitos.retrieval_walk import WalkContractError, walk_ranked
 from mitos.sync import (MitosSyncManager, run_ambient_capture, _SLUG_MAX_LEN,
@@ -1172,12 +1173,12 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
     matches: List[Dict[str, Any]] = []
     retired: List[Dict[str, Any]] = []
     top_score: Optional[float] = None
-    lever = None
+    edge = None
     if walk is not None:
-        # The live window, not raw points: retired and open-question points take
-        # no slots, so "full" means `limit` live decisions (2e's edge replaces it).
-        lever = window_lever(points=len(walk.window), limit=top_k,
-                             ceiling=RANKED_LIMIT_CEILING, full_top=full_top)
+        # The rank just past the live window: retired and open-question points
+        # take no slots, so it is the next live decision the walk found.
+        edge = window_edge(walk, margin=RANKED_EDGE_MARGIN,
+                           ceiling=RANKED_LIMIT_CEILING, full_top=full_top)
         for rank, hit in enumerate(walk.window, start=1):
             match = letter_payload(
                 hit.node,
@@ -1228,7 +1229,7 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         result_count=len(matches),
         config=config,
         surface="cli",
-        lever=lever,
+        edge=edge,
     )
     # A thinned answer says so, on both encodings: the clause joins the local note
     # the text render prints and the envelope carries. The blackout and unbuilt
@@ -2586,7 +2587,7 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     top_score: Optional[float] = None
     retired: List[Dict[str, Any]] = []
     degraded_error: Optional[Exception] = None
-    lever = None
+    edge = None
     dump_total: Optional[int] = None
 
     walk = None
@@ -2616,9 +2617,9 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
 
     # Composition, outside the `try` — see cmd_query.
     if walk is not None:
-        # The live window, not raw points (see cmd_query).
-        lever = window_lever(points=len(walk.window), limit=top_k,
-                             ceiling=RANKED_LIMIT_CEILING, full_top=full_top)
+        # The rank just past the live window (see cmd_query).
+        edge = window_edge(walk, margin=RANKED_EDGE_MARGIN,
+                           ceiling=RANKED_LIMIT_CEILING, full_top=full_top)
         for rank, hit in enumerate(walk.window, start=1):
             d = letter_payload(hit.node, brief=_rank_thinned(rank, full_top),
                                extras={"score": hit.score})
@@ -2697,7 +2698,7 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         scope=scope,
         scope_counts=scope_counts,
         surface="cli",
-        lever=lever,
+        edge=edge,
         scope_total=dump_total,
         degraded_reason=reason,
     )
