@@ -379,6 +379,19 @@ def test_live_ends_sort_by_casefold_then_slug():
     assert "slug.casefold(), slug" in inspect.getsource(GraphStore.get_live_ends)
 
 
+def test_the_store_answers_its_live_ends_in_casefold_then_slug_order(store):
+    """The order as the store returns it, not as ``sorted`` would: three live ends
+    whose plain slug order and casefold order disagree (the chain analysis sorts by
+    id first, so only the result rule's own sort can put them right). Slugs collide
+    case-insensitively at commit, so the casefold tie the ``slug`` tie-break breaks
+    cannot be built through the store; the row above pins that half."""
+    seed = _commit(store, "seed")
+    mid = _commit(store, "mid", supersedes=["seed"])
+    for slug in ("Zed-end", "alpha-end", "Mid-end"):
+        _plant_edge(store, _commit(store, slug), mid)
+    assert store.get_live_ends([seed]) == {seed: ["alpha-end", "Mid-end", "Zed-end"]}
+
+
 def _bounded(fn, seconds: float = 10.0):
     """G3: a cycle row runs under a guard, so a non-terminating walk reds, never hangs."""
     box: Dict[str, Any] = {}
