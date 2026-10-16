@@ -247,8 +247,9 @@ class Unavailable:
     the Qdrant query fails. It is the loud, typed inverse of the fail-silent
     ``except Exception: return []`` the shipped recall helpers use: a core that
     swallowed the exception into a silent empty would make every downstream consumer
-    lie about "no conflict found" (CONF-D10). ``[]`` means healthy-but-empty;
-    ``Unavailable`` means degraded — the two must never blur.
+    lie about "no conflict found" (CONF-D10). A :class:`Gathering` with an empty
+    ``live`` means healthy-but-empty; ``Unavailable`` means degraded — the two must
+    never blur.
 
     Attributes:
         reason: The typed degradation reason (the surface switches on this).
