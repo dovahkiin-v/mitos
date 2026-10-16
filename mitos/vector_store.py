@@ -770,7 +770,7 @@ class QdrantRejectionIndex:
     """REST client for the rejection index: one point per rejected item.
 
     It sits in a collection of its own beside the decision collection
-    (``config.rejection_collection_name``) and is a client apart from
+    (``MitosConfig.rejection_collection``) and is a client apart from
     :class:`QdrantVectorStore`, not a second instance of it: item ids are already
     UUIDs (never re-hashed), the payload is the owner and the model, and its
     operations are named apart (``search``, ``upsert_points``) so a rejection hit can

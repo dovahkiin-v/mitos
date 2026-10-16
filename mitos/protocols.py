@@ -14,6 +14,10 @@ from mitos.vector_store import RejectionPoint, RejectionSearch
 class EmbeddingProvider(Protocol):
     """Protocol for cache-aware, prefix-based text embedding providers."""
 
+    # The resolved embedding model id (``MITOS_MODEL_OVERRIDE_EMBEDDING``
+    # honoured). The rejection index stamps it on every point it writes.
+    model_id: str
+
     def get_embedding(self, text: str, is_query: bool = False) -> List[float]:
         """Gets embedding vector for a single text.
 
@@ -34,6 +38,21 @@ class EmbeddingProvider(Protocol):
 
         Returns:
             List of embedding vectors.
+        """
+        ...
+
+    def embed_documents(self, texts: Sequence[str]) -> List[List[float]]:
+        """Embeds document texts in one provider call, bypassing the cache.
+
+        Args:
+            texts: At most one batch of unprefixed document texts.
+
+        Returns:
+            One non-empty vector per text, in order; ``[]`` for empty input.
+
+        Raises:
+            ValueError: If the batch exceeds the declared bounds.
+            EmbeddingError: If the call fails or the answer is malformed.
         """
         ...
 

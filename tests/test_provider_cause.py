@@ -410,7 +410,8 @@ def test_the_reason_is_a_required_keyword():
 # --------------------------------------------------------------------------- #
 
 _EMBED_CALLS = {"get_embedding", "get_embeddings_batch", "_best_effort_embed",
-                "drain_pending_embeddings"}
+                "drain_pending_embeddings", "embed_documents", "_embed_decision_inline",
+                "_write_rejection_items_inline"}
 
 
 def _embedding_handlers(tree):

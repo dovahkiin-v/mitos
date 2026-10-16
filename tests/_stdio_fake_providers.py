@@ -1,4 +1,4 @@
-"""Launches ``mitos serve`` with only its two provider constructors bound to fakes.
+"""Launches ``mitos serve`` with only its three provider constructors bound to fakes.
 
 A stdio row that walks the receipts needs a server that embeds and ranks, and
 constraint 15 says every row this vision adds runs offline: no key, no Qdrant. A
@@ -10,13 +10,16 @@ gets out of the way:
    interpreter, exactly as ``mcp_harness.SERVE_ARGS`` relies on);
 2. rebinds ``GeminiEmbeddingProvider`` and ``QdrantVectorStore`` at the two
    construct sites the MCP path reaches — ``mitos.mcp_server``
-   (``get_workspace_components``) and ``mitos.sync`` (``MitosSyncManager``). Both
-   modules did ``from … import`` at their own scope, so rebinding the defining
-   modules would change nothing. The other two construct sites are left alone on
-   purpose: ``mitos.importer`` (the import verb) and ``mitos.cli``'s
-   ``_build_check_substrate`` (the check verb) are not reachable from a tool;
+   (``get_workspace_components``) and ``mitos.sync`` (``MitosSyncManager``) — and
+   the third constructor, ``QdrantRejectionIndex``, at ``mitos.sync`` alone (the
+   only MCP-reachable site that builds one: the record and amend tools' inline
+   rejection leg). Both modules did ``from … import`` at their own scope, so
+   rebinding the defining modules would change nothing. The other two construct
+   sites are left alone on purpose: ``mitos.importer`` (the import verb) and
+   ``mitos.cli``'s ``_build_check_substrate`` (the check verb) are not reachable
+   from a tool;
 3. sets ``sys.argv`` to ``mitos serve`` and calls the same ``cli.main()`` that
-   ``python -m mitos.cli serve`` runs. Everything above the two constructors — the
+   ``python -m mitos.cli serve`` runs. Everything above the three constructors — the
    FastMCP subclass, the tool bodies, the payload assembly — is the branch's code.
 
 Launch it with ``mitos_server(cwd=…, env=…, args=(str(LAUNCHER),))``. ADR
@@ -30,7 +33,8 @@ answer anything else loudly: an ``UNIMPLEMENTED`` line on stderr as well as the
 raise, because production may swallow the raise. A row asserts that line absent.
 
 ``MITOS_FAKE_EMBED_FAULT`` (``auth``, ``quota``, ``transient`` or ``unknown``)
-makes every ``get_embedding`` call fail the way the Gemini SDK does: an
+makes every ``get_embedding`` and ``embed_documents`` call fail the way the Gemini
+SDK does: an
 ``EmbeddingError`` carrying a provider body, chained from an SDK-shaped error with
 the matching typed fields. The fault fires in the call, never the constructor: a
 constructor raise is swallowed at the construct site, and the read would then
@@ -132,15 +136,26 @@ class FakeEmbeddingProvider:
         if self._fault is not None and self._fault not in FAULT_FIELDS:
             raise SystemExit(f"{FAULT_ENV}={self._fault!r} is not one of {sorted(FAULT_FIELDS)}")
 
+    def _raise_fault(self) -> None:
+        from mitos.errors import EmbeddingError
+
+        body = f'{FAULT_BODY_SENTINEL} {{"error": {{"message": "planted {self._fault}"}}}}'
+        raise EmbeddingError(f"Gemini embedding API call failed: {body}") from _SdkLikeError(
+            body, **FAULT_FIELDS[self._fault])
+
     def get_embedding(self, text: str, is_query: bool = False) -> List[float]:
         """Returns the fake vector for ``text``, or raises the planted fault."""
         if self._fault is not None:
-            from mitos.errors import EmbeddingError
-
-            body = f'{FAULT_BODY_SENTINEL} {{"error": {{"message": "planted {self._fault}"}}}}'
-            raise EmbeddingError(f"Gemini embedding API call failed: {body}") from _SdkLikeError(
-                body, **FAULT_FIELDS[self._fault])
+            self._raise_fault()
         return fake_vector(text)
+
+    def embed_documents(self, texts: Sequence[str]) -> List[List[float]]:
+        """Returns one fake vector per text (uncached), or raises the planted fault."""
+        if not texts:
+            return []
+        if self._fault is not None:
+            self._raise_fault()
+        return [fake_vector(text) for text in texts]
 
     def __getattr__(self, name: str) -> Any:
         if name.startswith("__"):
@@ -229,14 +244,47 @@ class FakeVectorStore:
         raise _unimplemented("FakeVectorStore", name)
 
 
+def _rejection_index_class() -> type:
+    """Builds the rejection-index fake: the shared double, loud on anything else.
+
+    Imported lazily so the module's import (by the rows that read its markers)
+    stays light.
+    """
+    from _rejection_index_double import FakeRejectionIndex
+
+    class LoudRejectionIndex(FakeRejectionIndex):
+        def __getattr__(self, name: str) -> Any:
+            if name.startswith("__"):
+                raise AttributeError(name)
+            raise _unimplemented("FakeRejectionIndex", name)
+
+    return LoudRejectionIndex
+
+
+#: Process-lifetime rejection indexes, one per collection name: every tool call
+#: constructs a fresh manager, so the points must outlive the instance, as
+#: ``FakeVectorStore``'s do.
+_REJECTION_INDEXES: Dict[str, Any] = {}
+
+
+def fake_rejection_index(qdrant_url: str, collection_name: str) -> Any:
+    """Stands in for ``QdrantRejectionIndex(url, name)``, keyed by collection."""
+    index = _REJECTION_INDEXES.get(collection_name)
+    if index is None:
+        index = _rejection_index_class()()
+        _REJECTION_INDEXES[collection_name] = index
+    return index
+
+
 def bind() -> None:
-    """Rebinds both constructors at both MCP-reachable construct sites."""
+    """Rebinds the three constructors at their MCP-reachable construct sites."""
     import mitos.mcp_server
     import mitos.sync
 
     for module in (mitos.mcp_server, mitos.sync):
         module.GeminiEmbeddingProvider = FakeEmbeddingProvider
         module.QdrantVectorStore = FakeVectorStore
+    mitos.sync.QdrantRejectionIndex = fake_rejection_index
     print(BOUND_MARKER, file=sys.stderr, flush=True)
 
 

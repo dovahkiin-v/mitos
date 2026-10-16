@@ -282,6 +282,17 @@ _DECISION_INDEX_EXPECTED_PREDICATE: str = (
     f"(nodes.kind = 'open_question' AND {_ACTIVE_VIEW_PREDICATE}))"
 )
 
+# The rejection index's OWNERS (recall-confidence 4b): every decision node in every
+# computed state, and nothing else — an open question holds no ``rejected_paths``, so
+# it never owns an item. Bound by ``rejection_index_expects_owner_other_than`` (the
+# inline creation licence: "the graph's only decision, live or retired"), and the one
+# atom any later expected-set read or gap predicate of the rejection index binds, so
+# the licence and the sensor cannot drift. A superset of "decisions holding at least
+# one item" only through a decision whose field enumerates nothing, which every write
+# route refuses; there the licence errs safe (no create; the row waits for a
+# ``reconcile``). Correlates on the UNALIASED ``nodes`` (the §4.3 alias trap).
+_REJECTION_INDEX_OWNER_PREDICATE: str = "nodes.kind = 'decision'"
+
 # Indexed scope-membership filter (P11: ``idx_node_scopes_scope`` serves
 # ``scope = ?``, then the PK joins back to ``node_id``). Appended to a read SELECT
 # and bound with a single ``?`` scope value — never an O(N) Python post-filter.
@@ -671,7 +682,12 @@ class CommitDelta:
     """Represents the structured delta returned after an entry commit.
 
     Carries metadata about the committed node and any cascading scope changes
-    required for incremental rerendering (V1-D22).
+    required for incremental rerendering (V1-D22), plus what the commit decided
+    for the rejection index: whether the node is new, and the ``enqueue_seq`` of
+    the ``rejection_backlog`` row this commit minted. The seq is handed out of the
+    commit's own transaction because it is the only token that pairs with the
+    field the commit stored; a row read after the commit could return a newer seq
+    a concurrent re-queue minted, and clearing that would lose its write.
     """
 
     def __init__(
@@ -680,13 +696,22 @@ class CommitDelta:
         node_scope: List[str],
         self_old_scope: List[str],
         commentary_fields_changed: bool,
-        cascade_affected_scopes: List[str]
+        cascade_affected_scopes: List[str],
+        created: bool = False,
+        rejection_enqueue_seq: Optional[int] = None,
     ) -> None:
         self.node_id = node_id
         self.node_scope = node_scope
         self.self_old_scope = self_old_scope
         self.commentary_fields_changed = commentary_fields_changed
         self.cascade_affected_scopes = cascade_affected_scopes
+        # True when the commit inserted the node (``commit_parsed_entry``'s
+        # ``is_new``); False for any re-commit of an existing id.
+        self.created = created
+        # The ``enqueue_seq`` this commit's rejection-backlog enqueue minted, or
+        # None when the commit queued no rejection row (an open question, an edit
+        # leaving ``rejected_paths`` unchanged, a new owner with no item).
+        self.rejection_enqueue_seq = rejection_enqueue_seq
 
     def to_dict(self) -> Dict[str, Any]:
         """Converts the CommitDelta into a serializable dictionary."""
@@ -695,7 +720,9 @@ class CommitDelta:
             "node_scope": self.node_scope,
             "self_old_scope": self.self_old_scope,
             "commentary_fields_changed": self.commentary_fields_changed,
-            "cascade_affected_scopes": self.cascade_affected_scopes
+            "cascade_affected_scopes": self.cascade_affected_scopes,
+            "created": self.created,
+            "rejection_enqueue_seq": self.rejection_enqueue_seq,
         }
 
 
@@ -1774,16 +1801,19 @@ class GraphStore:
         kill-edges (``supersedes`` / ``corrects``) via declarative mirror, and a
         post-mutation slug-collision assertion (V1-D4) enforces one active node per
         ``casefold(slug)``. A referential violation rolls the whole entry back with
-        a structured ``source="store"`` envelope. Outbox enqueue (5c) and the read
-        views (5d) remain deferred seams. Format validation is the parser's job
-        (C1 / Decision 2) — the store owns referential truth, not format truth.
+        a structured ``source="store"`` envelope. The decision outbox row and,
+        field-aware, the rejection backlog row are enqueued on the same cursor, so
+        they commit with the node or not at all. Format validation is the parser's
+        job (C1 / Decision 2) — the store owns referential truth, not format truth.
 
         Args:
             parsed: A well-formed ``ParsedEntry`` (the parser's C1 guarantee).
 
         Returns:
-            A ``CommitDelta`` carrying the committed ``node_id`` plus the scope /
-            commentary-change metadata.
+            A ``CommitDelta`` carrying the committed ``node_id``, the scope /
+            commentary-change metadata, whether the node is new (``created``),
+            and the ``enqueue_seq`` of the rejection backlog row this commit
+            minted (``rejection_enqueue_seq``, ``None`` when it queued none).
 
         Raises:
             ValidationError: If the canonical-core field that feeds the hash is
@@ -2032,6 +2062,7 @@ class GraphStore:
                 # when the stored field changed, compared raw with None read as
                 # "" — a change to empty included, since its old items must go.
                 # Every other edit leaves a standing row untouched.
+                rejection_enqueue_seq: Optional[int] = None
                 if parsed.kind == "decision":
                     if is_new:
                         rejection_due = (
@@ -2044,7 +2075,9 @@ class GraphStore:
                             != (rejected_paths_json or "")
                         )
                     if rejection_due:
-                        self._enqueue_rejection_backlog(cursor, node_id, now)
+                        rejection_enqueue_seq = self._enqueue_rejection_backlog(
+                            cursor, node_id, now
+                        )
                 store_failures = list(store_failures)
 
                 # --- Same-id commentary write + the single ``updated_at`` tick --
@@ -2195,6 +2228,8 @@ class GraphStore:
                         False if is_new else direct_footprint_changed
                     ),
                     cascade_affected_scopes=cascade_affected_scopes,
+                    created=is_new,
+                    rejection_enqueue_seq=rejection_enqueue_seq,
                 )
         except sqlite3.IntegrityError as e:
             # The DDL CHECKs/FKs are the structural type gate (Lesson 2). The most
@@ -2670,14 +2705,14 @@ class GraphStore:
 
     def _enqueue_rejection_backlog(
         self, cursor: sqlite3.Cursor, node_id: str, now: str
-    ) -> None:
+    ) -> int:
         """Queues a decision's rejected items for a write, inside the commit's transaction.
 
         The in-transaction twin of ``_enqueue_outbox`` for the rejection index: it
         runs on ``commit_parsed_entry``'s cursor, so the row commits with the node or
         not at all (MI-12). The caller decides **whether** to enqueue (the decision is
-        new with an item, or its stored ``rejected_paths`` changed); this method only
-        writes.
+        new with an item, or its stored ``rejected_paths`` changed); this method
+        writes the row and returns the seq it minted.
 
         It deletes the node's standing row, if any, and inserts a fresh one, so every
         enqueue mints a new ``enqueue_seq`` and starts at ``retry_count = 0``. The
@@ -2694,6 +2729,12 @@ class GraphStore:
             node_id: The committing decision's content-hash id (the node row
                 already exists by this point, so the FK is satisfied).
             now: The commit's single UTC ISO-8601 stamp (MI-10).
+
+        Returns:
+            The new row's ``enqueue_seq``. It is read as ``cursor.lastrowid``
+            straight after the INSERT, with nothing run on the cursor in between;
+            on an ``INTEGER PRIMARY KEY`` table that is the inserted seq. The
+            commit carries it out on ``CommitDelta.rejection_enqueue_seq``.
         """
         cursor.execute(
             "DELETE FROM rejection_backlog WHERE node_id = ?", (node_id,)
@@ -2703,6 +2744,7 @@ class GraphStore:
             "VALUES (?, ?, 0)",
             (node_id, now),
         )
+        return int(cursor.lastrowid)
 
     def get_active_decisions(self, scope: Optional[str] = None) -> List[Dict[str, Any]]:
         """Exposes the active-view set of decisions (C3 / M3).
@@ -3132,6 +3174,44 @@ class GraphStore:
             row = conn.execute(
                 "SELECT 1 FROM nodes "
                 f"WHERE {_DECISION_INDEX_EXPECTED_PREDICATE} "
+                "AND nodes.id != ? LIMIT 1",
+                (node_id,),
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+
+    def rejection_index_expects_owner_other_than(self, node_id: str) -> bool:
+        """Reports whether any decision node besides ``node_id`` exists, in any state.
+
+        The inline rejection write's creation licence: a write may create the
+        absent rejection collection only when its decision is the graph's only
+        decision, live or retired (ADR
+        ``rejection-collection-creation-follows-the-decision-index-a-seed-marker-of-its-own``).
+        Any other decision could own items the write would leave unindexed in a
+        collection that then looks built. Open questions never count — the
+        rejection index holds none — which is why this is not
+        :meth:`decision_index_expects_node_other_than`: that one counts surviving
+        open questions, so a project's first decision beside a parked question
+        could never create.
+
+        Binds ``_REJECTION_INDEX_OWNER_PREDICATE`` rather than re-encoding it. An
+        ``EXISTS … LIMIT 1`` read: it stops at the first other decision row (the
+        ``UNIQUE (id, kind)`` autoindex covers it), so no index on ``kind`` is
+        needed. Store faults propagate, as the twin's do; the inline leg catches
+        them.
+
+        Args:
+            node_id: The decision the calling write covers.
+
+        Returns:
+            True iff at least one decision node other than ``node_id`` exists.
+        """
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM nodes "
+                f"WHERE {_REJECTION_INDEX_OWNER_PREDICATE} "
                 "AND nodes.id != ? LIMIT 1",
                 (node_id,),
             ).fetchone()

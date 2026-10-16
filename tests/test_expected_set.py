@@ -365,8 +365,10 @@ def test_e5_every_what_should_the_index_hold_consumer_reads_the_expected_set() -
         "cutover.rebuild_and_gate",
         "cli.cmd_status",
     }
+    # The decision leg of the inline embed (4b split ``_best_effort_embed`` into
+    # the decision leg and the rejection leg; the gate moved with the body).
     assert sites["decision_index_expects_node_other_than"] == {
-        "sync.MitosSyncManager._best_effort_embed",
+        "sync.MitosSyncManager._embed_decision_inline",
         "importer.MitosProseImporter._best_effort_embed",
     }
     # The active read survives only as a count of the live surface.

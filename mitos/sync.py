@@ -58,6 +58,7 @@ from mitos.divergence import (
 )
 from mitos.errors import (
     CollectionMissingError,
+    EmbeddingError,
     MitosError,
     SynthesisError,
     ParseError,
@@ -94,13 +95,15 @@ from mitos.identity import (
     embedding_text,
     mechanism_canonical_norm,
 )
-from mitos.embeddings import GeminiEmbeddingProvider
+from mitos.embeddings import GeminiEmbeddingProvider, fit_batch
 from mitos.provider_cause import (AUTH, QUOTA, TRANSIENT, classify_provider_error,
                                   describe_embed_failure)
 from mitos.shell_quote import shell_flag
 from mitos.tool_markup import field_values, find_tool_call_markup
 from mitos.recall import missing_graph_is_a_gap
-from mitos.vector_store import QdrantVectorStore, hash_to_uuid, partition_points
+from mitos.rejections import rejection_points
+from mitos.vector_store import (QdrantRejectionIndex, QdrantVectorStore, RejectionPoint,
+                                hash_to_uuid, partition_points)
 from mitos.renderer import MitosRenderer, OVERFLOW_HINT_WINDOW_SECONDS, summarize_overflows
 from mitos.restore import BufferFidelityError, verify_amended_buffer
 
@@ -1518,14 +1521,33 @@ class MitosSyncManager:
         # Lazy initialize vector / embedding dependencies as best-effort (C2/P14)
         self.embed_provider: Optional[GeminiEmbeddingProvider] = None
         self.vector_store: Optional[QdrantVectorStore] = None
+        # The sibling rejection-item collection's client (recall-confidence 4b).
+        # Written inline by ``_write_rejection_items_inline``; None whenever either
+        # constructor above failed, so a keyless or "down" workspace runs no leg.
+        self.rejection_index: Optional[QdrantRejectionIndex] = None
 
         # Set once an inline embed has met an absent collection it may not create, so
         # a multi-entry sync prints ONE deferral line and skips N−1 wasted Qdrant round
         # trips (and N−1 embedding calls). Per manager instance — one per command — and
-        # read ONLY by ``_best_effort_embed``: a covering drain later in the same
+        # read by the decision leg (``_embed_decision_inline``) and the post-commit
+        # acknowledged-neighbour gather (``_acknowledged_neighbors_field``), which would
+        # meet the same absence. Neither reads the rejection latches below, and the
+        # rejection leg never reads this one. A covering drain later in the same
         # ``perform_sync`` must not consult it, or a rebuild-then-sync would refuse to
         # heal because a record earlier in the run found the collection missing.
         self._collection_absent = False
+
+        # The rejection leg's two per-command latches, read ONLY by
+        # ``_write_rejection_items_inline``. ``_rejection_collection_absent``: an
+        # unlicensed leg found the rejection collection absent, so later entries skip
+        # the probe and spend nothing (the absence is silent — every upgraded
+        # workspace sits there until its one rebuild of the index, and the backlog
+        # row is the durable record). ``_rejection_leg_stopped``: an outage (an
+        # auth, quota or transient provider cause, or an unreachable store), so a
+        # sync committing forty entries during a 429 spends one failed call, not
+        # forty. An ``unknown`` cause or a refusal latches neither: it costs one owner.
+        self._rejection_collection_absent = False
+        self._rejection_leg_stopped = False
 
         try:
             cache_path = os.path.join(self.config.mitos_dir, "embedding_cache.sqlite")
@@ -1537,6 +1559,12 @@ class MitosSyncManager:
             self.vector_store = QdrantVectorStore(
                 self.config.qdrant_url,
                 self.config.qdrant_collection
+            )
+            # Last, inside the same try: no network I/O at construct, and any
+            # earlier failure leaves it None exactly as it leaves the others.
+            self.rejection_index = QdrantRejectionIndex(
+                self.config.qdrant_url,
+                self.config.rejection_collection,
             )
         except Exception as e:
             # Let operations continue in degraded graph-only mode per S1/F2
@@ -2750,7 +2778,35 @@ class MitosSyncManager:
         )
 
     def _best_effort_embed(self, delta: CommitDelta, entry: ParsedEntry) -> Optional[List[float]]:
-        """Best-effort async embedding upsert pipeline (C2).
+        """Best-effort inline embedding of one committed node into both indexes.
+
+        Every path that indexes a committed node calls this: ``record_decision``,
+        ``amend_commentary``, and ``mitos sync``'s commit loop and quarantine
+        fixpoint. Two legs run in order, each a bulkhead for the other:
+
+        1. :meth:`_embed_decision_inline`, the decision index (the axiom's point,
+           through the shared embedding cache). Gated by ``_collection_absent``.
+        2. :meth:`_write_rejection_items_inline`, the rejection index (the items
+           the commit's ``rejected_paths`` states, uncached). Gated by
+           ``_rejection_collection_absent`` and ``_rejection_leg_stopped``.
+
+        The rejection leg runs whatever the decision leg returned: the decision
+        collection being absent or its write failing costs that leg alone. The
+        axiom's leg goes first, so the post-commit gather reads exactly what it
+        read before the rejection leg existed. Neither leg raises.
+
+        Returns:
+            The decision leg's document vector (a caller may reuse it for a
+            neighbour query), or None if that leg deferred or failed.
+        """
+        vector = self._embed_decision_inline(delta, entry)
+        self._write_rejection_items_inline(delta, entry)
+        return vector
+
+    def _embed_decision_inline(
+        self, delta: CommitDelta, entry: ParsedEntry
+    ) -> Optional[List[float]]:
+        """The decision leg of the inline embed: the axiom's point (C2).
 
         The committing node is already enqueued on the ``pending_embeddings`` Outbox
         by ``commit_parsed_entry`` (``_enqueue_outbox``, 5c), so this is the inline
@@ -2840,6 +2896,173 @@ class MitosSyncManager:
             # drain. stderr — shared with the MCP write tool's JSON-RPC stdout channel.
             print(f"[Warning] Embedding upsert deferred for '{entry.slug}': {describe_embed_failure(e)}", file=sys.stderr)
             return None
+
+    def _write_rejection_items_inline(
+        self, delta: CommitDelta, entry: ParsedEntry
+    ) -> None:
+        """Adds the items a commit's ``rejected_paths`` states to the rejection index.
+
+        The inline half of the rejection index's lifecycle (recall-confidence 4b). It
+        runs only when the commit queued a rejection backlog row, and it only
+        **adds**: it never removes, never retries and never notes the row (ADR
+        ``rejection-index-inline-writes-only-add-and-only-one-drain-at-a-time-removes``).
+
+        - The items are read from ``entry``, the field this commit stored, and the
+          only seq it may clear is ``delta.rejection_enqueue_seq``, the one this
+          commit minted. That (seq, field) pair is one snapshot; a row read back
+          after the commit could hold a newer seq a concurrent re-queue minted.
+        - **Licence**: it may create the absent collection only when its decision is
+          the graph's only decision, live or retired
+          (``rejection_index_expects_owner_other_than``).
+        - **Presence**: a new owner holding the licence asks nothing (its ids derive
+          from an owner that is new). Every other write asks once, by the ids its
+          field determines: an unlicensed new owner learns that the collection exists
+          before it embeds anything, and an amend embeds only what is not present
+          (ADR ``inline-rejection-write-checks-presence-by-item-id-and-a-new-owner-asks-nothing``).
+          An unlicensed write that finds the collection absent latches and returns
+          silently, having embedded nothing.
+        - **One call**: at most one ``embed_documents`` call, holding ``fit_batch``'s
+          prefix of the items not present, in enumeration order. It never touches
+          the shared embedding cache. Any overflow waits in the row for the drain.
+        - **Clear**: a new owner whose every item landed clears its own row against
+          its seq (a ``False`` answer means a newer commit re-queued it, which the
+          drain converges). An amend never clears: the items its field dropped are
+          still in the index, and only a drain removes.
+
+        Every fault leaves the row and costs this leg alone: the commit, the
+        receipt and the decision leg are untouched. An outage (``auth``, ``quota``
+        or ``transient`` provider cause, or an unreachable store) latches the leg
+        off for the rest of the command; any other fault costs one owner. Each
+        prints one stderr line naming no verb (stdout is the MCP JSON-RPC channel).
+
+        Args:
+            delta: The commit's delta (``created``, ``rejection_enqueue_seq``).
+            entry: The ``ParsedEntry`` that commit stored.
+        """
+        seq = getattr(delta, "rejection_enqueue_seq", None)
+        if not isinstance(seq, int) or isinstance(seq, bool):
+            return
+        if self.embed_provider is None or self.rejection_index is None:
+            return
+        if self._rejection_collection_absent or self._rejection_leg_stopped:
+            return
+        may_create = False
+        try:
+            points = rejection_points(delta.node_id, entry.rejected_paths or "")
+            if not points:
+                # An amend to an empty field: nothing to add. The row stays for a
+                # drain to remove the old items.
+                return
+            ids = list(points)
+            may_create = not self.store.rejection_index_expects_owner_other_than(
+                delta.node_id
+            )
+            if delta.created and may_create:
+                present: AbstractSet[str] = frozenset()
+            else:
+                try:
+                    present = self.rejection_index.retrieve_present(ids)
+                except CollectionMissingError:
+                    if not may_create:
+                        self._rejection_collection_absent = True
+                        return
+                    present = frozenset()
+            missing = [pid for pid in ids if pid not in present]
+            if missing:
+                model = self.embed_provider.model_id
+                if not isinstance(model, str) or not model:
+                    raise EmbeddingError(
+                        "the embedding provider reported no model id"
+                    )
+                texts = [points[pid].text for pid in missing]
+                n = fit_batch(texts)
+                vectors = self.embed_provider.embed_documents(texts[:n])
+                if not (
+                    isinstance(vectors, list)
+                    and len(vectors) == n
+                    and all(isinstance(v, list) and v for v in vectors)
+                ):
+                    raise EmbeddingError(
+                        "the embedding provider answered a document batch with the "
+                        "wrong shape"
+                    )
+                self.rejection_index.upsert_points(
+                    [
+                        RejectionPoint(pid, delta.node_id, vector)
+                        for pid, vector in zip(missing[:n], vectors)
+                    ],
+                    model=model,
+                    may_create=may_create,
+                )
+                landed = n == len(missing)
+            else:
+                landed = True
+            if delta.created and landed:
+                try:
+                    self.store.clear_rejection_backlog_row(
+                        delta.node_id, enqueue_seq=seq
+                    )
+                except Exception as exc:
+                    # The items landed; only the clear failed. Say so, rather than
+                    # the not-indexed line, and leave the row (a drain finds every
+                    # item present and clears it). One owner, no latch.
+                    self._warn_rejection_row_not_cleared(entry, exc)
+        except CollectionMissingError as exc:
+            if not may_create:
+                # Deleted between the probe and the write: the steady-state absence,
+                # silent as the probe's. The batch is spent and lost (bounded to one).
+                self._rejection_collection_absent = True
+                return
+            # The create ran and the retry still answered missing: the endpoint is
+            # broken for this write, a refusal of one owner, not a latch.
+            self._warn_rejection_items_not_indexed(entry, exc)
+        except VectorStoreUnreachableError as exc:
+            self._rejection_leg_stopped = True
+            self._warn_rejection_items_not_indexed(entry, exc)
+        except EmbeddingError as exc:
+            if classify_provider_error(exc) in (AUTH, QUOTA, TRANSIENT):
+                self._rejection_leg_stopped = True
+            self._warn_rejection_items_not_indexed(entry, exc)
+        except Exception as exc:
+            # A refusal (``VectorStoreError``, a racing create's 409 included), a
+            # store fault, a caller's ValueError: one owner's leg, no latch.
+            self._warn_rejection_items_not_indexed(entry, exc)
+
+    @staticmethod
+    def _warn_rejection_items_not_indexed(
+        entry: ParsedEntry, exc: BaseException
+    ) -> None:
+        """Prints the rejection leg's one failure line on stderr.
+
+        It names no verb: the row stays queued for the drain, and naming a command
+        that does not yet act on this backlog would be a false recovery.
+        """
+        try:
+            print(
+                f"[Warning] Rejected items for '{entry.slug}' were not indexed: "
+                f"{describe_embed_failure(exc)}. Its rejection backlog row stays queued.",
+                file=sys.stderr,
+            )
+        except Exception:
+            pass
+
+    @staticmethod
+    def _warn_rejection_row_not_cleared(
+        entry: ParsedEntry, exc: BaseException
+    ) -> None:
+        """Prints the line for a write that landed and a clear that failed.
+
+        Like :meth:`_warn_rejection_items_not_indexed`, it names no verb.
+        """
+        try:
+            print(
+                f"[Warning] Rejected items for '{entry.slug}' were indexed, but its "
+                f"rejection backlog row could not be cleared: "
+                f"{describe_embed_failure(exc)}. The row stays queued.",
+                file=sys.stderr,
+            )
+        except Exception:
+            pass
 
     def drain_pending_embeddings(
         self, *, listing: Optional[AbstractSet[str]] = None

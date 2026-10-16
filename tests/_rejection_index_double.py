@@ -55,6 +55,10 @@ class FakeRejectionIndex:
             ``VectorStoreError``.
         refuse_delete: a delete reaching an existing collection raises
             ``VectorStoreError``.
+        create_then_missing: a licensed upsert on an absent collection runs the
+            create (``created`` counts it) and still answers
+            ``CollectionMissingError``, as the real client does when its one retry
+            after a create is answered 404 again; the collection stays absent.
 
     Recording:
         calls: every call, in order, as ``(method, details)``; ``details`` names the
@@ -69,6 +73,7 @@ class FakeRejectionIndex:
         self.unreachable = False
         self.refuse_upsert = False
         self.refuse_delete = False
+        self.create_then_missing = False
         self.points: Dict[str, Dict[str, Any]] = {}
         self.calls: List[Tuple[str, Dict[str, Any]]] = []
         self.created = 0
@@ -152,8 +157,13 @@ class FakeRejectionIndex:
                     "fake: the collection does not exist and this write may not create it",
                     collection="fake-rejections",
                 )
-            self.present = True
             self.created += 1
+            if self.create_then_missing:
+                raise CollectionMissingError(
+                    "fake: the collection was created and the retry still answered missing",
+                    collection="fake-rejections",
+                )
+            self.present = True
         if self.refuse_upsert:
             raise VectorStoreError("fake: upsert refused")
         for point in points:

@@ -225,6 +225,36 @@ def hermetic_mitos_env(request, monkeypatch, tmp_path):
             monkeypatch.delenv(name, raising=False)
 
 
+class OfflineRejectionIndexRefused(Exception):
+    """Raised by the offline stand-in for ``QdrantRejectionIndex``'s constructor."""
+
+
+def _refuse_rejection_index(*args, **kwargs):
+    raise OfflineRejectionIndexRefused(
+        "offline tests never construct a real QdrantRejectionIndex; bind a "
+        "FakeRejectionIndex factory at mitos.sync.QdrantRejectionIndex instead"
+    )
+
+
+@pytest.fixture(autouse=True)
+def offline_rejection_index(request, monkeypatch):
+    """Keeps every non-live manager's rejection index ``None`` unless a row binds one.
+
+    ``MitosSyncManager`` builds its ``QdrantRejectionIndex`` last inside the
+    constructor ``try`` that builds the provider and the vector store, so a raise
+    here leaves ``rejection_index`` ``None`` and the inline rejection leg off. Without
+    it, a row whose real constructors succeed on a dummy key would send rejection
+    probes to whatever ``QDRANT_URL`` names — the box's live :7333 for some rows,
+    nothing at all on keyless CI — so the offline lane would behave differently on
+    the two (4b scout, D-1: about 70 rows in 10 files). One rule rather than a file
+    list: a row about the leg binds a ``FakeRejectionIndex`` factory with
+    ``monkeypatch.setattr("mitos.sync.QdrantRejectionIndex", …)``, which overrides
+    this. ``LIVE_MODULES`` are exempt, as they are from the credential strip.
+    """
+    if request.node.path.name not in LIVE_MODULES:
+        monkeypatch.setattr("mitos.sync.QdrantRejectionIndex", _refuse_rejection_index)
+
+
 # Record every GraphStore construction, so a canned vector double with no explicit
 # store can bind to the one graph its test built (tests/_point_hits.py).
 _point_hits.install_store_recorder()
@@ -326,6 +356,7 @@ LIVE_MODULES: tuple[str, ...] = (
     "test_point_identity_live.py",
     "test_ranked_walk_live.py",
     "test_rejection_index_live.py",
+    "test_rejection_inline_live.py",
 )
 
 
