@@ -29,8 +29,9 @@ did-you-mean + a top-K busiest-first candidate slice + an overflow pointer to th
 dedicated scope-discovery surface — never the full tag vocabulary on the hot path
 (P11).
 
-Pure stdlib — no graph or network access, and **zero ``mitos`` imports**
-(``difflib`` for the did-you-mean). Where a policy here needs a fact only another
+Pure stdlib — no graph or network access — plus **one admitted ``mitos`` import**,
+the import-free ``shell_quote`` leaf (``difflib`` for the did-you-mean; pinned by
+``test_recall_stays_a_zero_mitos_import_leaf``). Where a policy here needs a fact only another
 module can compute, the fact is *injected* rather than imported:
 :func:`missing_graph_is_a_gap` takes the corpus scan as a required keyword. That
 is not ceremony — ``conflict.py`` imports this module, so an import added here
@@ -299,21 +300,19 @@ def window_lever(
     corpus) or at the ceiling the lever does nothing, and naming it would be a
     false line.
 
-    ``points`` is the length of the **raw** vector-store return, not the surfaced
-    list. That is deliberate and does not contradict the ADR
-    ``confidence-band-inputs-come-from-the-surfaced-list-not-raw-retrieval``: the
-    band's ``top_score`` and ``result_count`` stay off the surfaced list, because
-    they describe what the caller got. The lever describes retrieval depth, so it
-    reads retrieval — an open question or a retired handle in a full window leaves
-    fewer decisions than ``limit``, but the window was still full and a higher
-    ``limit`` still reaches further.
+    ``points`` is the length of the **live window** the shared walk filled
+    (``retrieval_walk``): "full" means ``limit`` live decisions were found.
+    Retired and open-question points no longer take a window's slots — the walk
+    over-fetches and skips them — so the window it returns is the retrieval depth
+    the lever describes. A fetch that ran out holding exactly ``limit`` live still
+    names the lever; the edge clause that replaces this one drops it there.
 
     ``ceiling`` is injected by the boundary (``display.RANKED_LIMIT_CEILING``)
-    rather than imported, per this module's zero-``mitos``-imports rule (module
-    docstring).
+    rather than imported: this module admits one ``mitos`` import and no other
+    (module docstring).
 
     Args:
-        points: How many points the vector store returned for this query.
+        points: How many live decisions the walk's window holds.
         limit: The clamped top-k the call asked for.
         ceiling: The clamp ceiling a higher ``limit`` would be cut back to.
         full_top: The effective ``full_top`` after the boundary normalised
@@ -694,6 +693,33 @@ def withheld_clause(count: int, *, surface: str, config: "object") -> str:
     return f"{count} hits omit rejected_paths; read any one whole with {pointer}."
 
 
+def stamps_unread_clause(*, surface: str, config: "object") -> str:
+    """Words the note clause a ranked answer ends with when its stamps went unread.
+
+    The walk read the ranking but not the modifier stamps, so any hit may have been
+    amended, narrowed or retired since and its payload cannot say so. The clause
+    states that and names the by-handle read, which carries the stamps. A read,
+    never a write, and no verdict on the corpus, so it is lawful in both registers.
+    Appended after every note override and after the withheld clause; absent on a
+    healthy answer. Pure string formatting.
+
+    Args:
+        surface: ``"cli"`` or ``"mcp"`` — selects the dereference wording.
+        config: The active ``MitosConfig`` (duck-typed). Read only for ``project``,
+            which the CLI recipe names as its selector.
+
+    Returns:
+        One sentence.
+    """
+    pointer = _SURFACE_POINTERS[surface]["dereference"].format(
+        selector=shell_flag("-p", getattr(config, "project", ""))
+    )
+    return (
+        "Modifier stamps could not be read, so any hit may have been amended or "
+        f"superseded; {pointer} reads one with its stamps."
+    )
+
+
 def corpus_provenance(config: "object") -> Dict[str, str]:
     """Builds the corpus-provenance fields every recall answer should carry.
 
@@ -824,9 +850,9 @@ def missing_graph_is_a_gap(
             unread).
         corpus_scan: The corpus scan, called with ``config`` —
             ``divergence.corpus_holds_entries`` at every call site, which reads
-            buffer plus archives. **Required**, never defaulted: this module keeps
-            zero ``mitos`` imports (see the module docstring for why the import is
-            not free), and a defaulted no-op would let a forgotten call site answer
+            buffer plus archives. **Required**, never defaulted: this module admits
+            no ``mitos`` import beyond ``shell_quote`` (see the module docstring for
+            why an import is not free), and a defaulted no-op would let a forgotten call site answer
             a silent ``False`` instead of raising.
 
     Returns:

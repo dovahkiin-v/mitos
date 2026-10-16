@@ -55,9 +55,11 @@ def clamp_limit(limit: Optional[int]) -> int:
     ``None`` (the flag was omitted) resolves to the default working top-k of 5.
     Any explicit value is clamped to ``[1, RANKED_LIMIT_CEILING]`` — silently and
     calmly (P9), never an error wall: a request below 1 clamps up to 1, a request
-    above the ceiling clamps down to it. The resolved value SETS the top-k passed
-    to ``vector_store.query(limit=…)`` — it is not a ``min(default, N)`` truncation,
-    so ``limit=20`` genuinely deepens recall past the default.
+    above the ceiling clamps down to it. The resolved value SETS the ranked
+    window: the shared walk's ``limit`` (``retrieval_walk.walk_ranked``), which
+    fills that many live decisions from one vector call at the over-fetch bound.
+    It is not a ``min(default, N)`` truncation, so ``limit=20`` genuinely deepens
+    recall past the default.
 
     Args:
         limit: The caller's requested top-k, or ``None`` to take the default.
@@ -151,6 +153,33 @@ def oneline_payload(node: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
+def retired_handle(node: Mapping[str, Any],
+                   stamps: Mapping[str, Mapping[str, List[str]]]) -> Dict[str, Any]:
+    """Shapes a retired decision's handle for the blackout, shared CLI⇄MCP.
+
+    ``{"slug", "state"}`` plus ``superseded_by`` when the stamp map carries it for
+    the node. Everything comes from the node the walk resolved by point id — never
+    from a slug lookup — so a retired decision that shares its slug with a live
+    successor is described as itself, and a renamed one under its current slug.
+    ``superseded_by`` is the **immediate** successor stamp, which on a chain may
+    itself be retired (the live end of the chain is not computed here). When the
+    stamp read faulted the map is empty and the key is omitted; the envelope's
+    ``stamps_unread`` says so. Store-free: the stamps are passed in.
+
+    Args:
+        node: The resolved node; reads ``id``, ``slug`` and ``computed_state``.
+        stamps: Node id → modifier stamps, as the walk returned them.
+
+    Returns:
+        The handle dict.
+    """
+    handle: Dict[str, Any] = {"slug": node["slug"], "state": node["computed_state"]}
+    successors = stamps.get(node["id"], {}).get("superseded_by")
+    if successors:
+        handle["superseded_by"] = list(successors)
+    return handle
+
+
 def blackout_note(retired_handles: List[Mapping[str, Any]]) -> str:
     """Builds the all-superseded blackout recovery note (the P3 vector text).
 
@@ -158,12 +187,14 @@ def blackout_note(retired_handles: List[Mapping[str, Any]]) -> str:
     the surface would otherwise read as a true semantic *miss* — a false-novelty
     signal that costs the agent an expensive re-derivation of a contradiction the
     graveyard already settled. This note turns that dead-end into a vector: it names
-    the retired handles (and their live successors, when known) and points at the
-    command that reads the retired history. Calm, one short block (P9).
+    the retired handles (and their immediate successors, when the stamps were read)
+    and points at the command that reads the retired history. Calm, one short block
+    (P9).
 
     Args:
-        retired_handles: The filtered-out handles, each a dict with ``slug`` and
-            optionally ``superseded_by`` (the live successor slugs).
+        retired_handles: The retired handles (:func:`retired_handle`), each a dict
+            with ``slug`` and optionally ``superseded_by`` — the immediate
+            successor stamp, which on a chain may itself be retired.
 
     Returns:
         The blackout note string.
@@ -315,10 +346,10 @@ def letter_payload(
     ``state`` / ``depth_mode`` already occupy that slot at every routed site).
 
     Returns an **un-stamped** core: modifier-stamping
-    (``superseded_by``/``amended_by``/…) is the caller's job via the
-    ``GraphStore.get_modifiers(...)`` seam — never folded in here. This keeps the
-    helper a pure dict→dict Tier-1 leaf (no ``store`` coupling) and preserves the
-    callers' batch (``get_modifiers_map``) vs per-node stamping paths. ``brief``
+    (``superseded_by``/``amended_by``/…) is the caller's job — the ranked reads
+    stamp from the walk's one batched ``get_modifiers_map`` read, other readers
+    through ``GraphStore.get_modifiers(...)`` — never folded in here. This keeps the
+    helper a pure dict→dict Tier-1 leaf (no ``store`` coupling). ``brief``
     governs only the ``rejected_paths`` key inside this helper; because stamping
     happens in the caller *after* this returns, ``brief`` can never drop a
     modifier stamp.

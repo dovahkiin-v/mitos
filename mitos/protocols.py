@@ -6,7 +6,8 @@ EmbeddingProvider to decouple Mitos components and support seamless swap-ins.
 
 from typing import Protocol, List, Dict, Optional, Any, Tuple, Set, Iterable
 from mitos.parser import ParsedEntry
-from mitos.store import CommitDelta, PointResolution
+from mitos.retrieval_walk import PointResolution
+from mitos.store import CommitDelta
 
 class EmbeddingProvider(Protocol):
     """Protocol for cache-aware, prefix-based text embedding providers."""

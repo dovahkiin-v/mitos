@@ -10,7 +10,6 @@ import os
 import hashlib
 import logging
 import re
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import (
     List, Dict, Optional, Any, FrozenSet, Iterable, Sequence, Set, Tuple,
@@ -38,6 +37,9 @@ from mitos.migrations import (
     restore_from_snapshot,
 )
 from mitos.parser import ParsedEntry
+# The resolver's result type lives in the walk's leaf so the walk can type-check it
+# without importing this module (the check family's fence); re-exported here.
+from mitos.retrieval_walk import PointResolution
 from mitos.scope_tags import normalize_scope_tags
 
 # Module logger for non-failing notices. The store is a pure primitive — it logs
@@ -578,29 +580,6 @@ class CommitDelta:
             "commentary_fields_changed": self.commentary_fields_changed,
             "cascade_affected_scopes": self.cascade_affected_scopes
         }
-
-
-@dataclass(frozen=True)
-class PointResolution:
-    """The partition of a batch of vector-index point ids by the node each names.
-
-    Every distinct input string lands in exactly one of the three buckets. Keys
-    are the point ids exactly as given, so a caller indexes by a hit's own
-    ``point_id``.
-
-    Attributes:
-        nodes: Point id → the one node carrying its prefix, in the reader-facing
-            shape plus ``computed_state`` (``get_node_state``'s semantics) and no
-            modifier stamps. Each entry is its own shallow copy.
-        orphans: Point ids no node carries (or that are not a well-formed point
-            id), in input order, deduplicated.
-        ambiguous: Point id → the sorted ids of the two or more nodes sharing its
-            128-bit prefix; resolved to neither.
-    """
-
-    nodes: Dict[str, Dict[str, Any]]
-    orphans: List[str]
-    ambiguous: Dict[str, List[str]]
 
 
 def _point_id_prefix(point_id: Any) -> Optional[str]:
@@ -3164,12 +3143,20 @@ class GraphStore:
             A mapping of node_id -> {reverse_key: [modifier_slug, ...]}. Only nodes
             that actually have modifiers appear, and each carries only the
             reverse-relation keys that are non-empty (an unmodified node is absent).
+
+        Raises:
+            DatabaseError: If the read fails. Typed, so a ranked read's stamp fault
+                costs the stamps alone (``retrieval_walk`` catches exactly this).
         """
         if not node_ids:
             return {}
         conn = self._get_connection()
         try:
             return self._modifiers_map(conn, node_ids)
+        except sqlite3.Error as e:
+            raise DatabaseError(
+                f"Failed to read modifiers for {len(node_ids)} node(s): {str(e)}"
+            )
         finally:
             conn.close()
 

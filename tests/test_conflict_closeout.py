@@ -621,11 +621,21 @@ def _runtime_mitos_imports(source: str, filename: str) -> List[str]:
 def _check_family_closure() -> List[str]:
     """KD7's discovery: the check family's source files, by runtime-import closure.
 
-    Starts at ``mitos/check.py``, resolves every runtime ``mitos``-family import to
-    its source file, and recurses — except the sanctioned-sink boundary, which is
-    neither returned (linted) nor traversed. Returns sorted absolute paths.
+    Starts at ``mitos/check.py``; see :func:`_closure_from`. Returns sorted
+    absolute paths.
     """
-    entry = os.path.join(_MITOS_PKG_DIR, "check.py")
+    return _closure_from("check.py")
+
+
+def _closure_from(entry_basename: str) -> List[str]:
+    """The runtime-import closure of one ``mitos/`` module, as sorted absolute paths.
+
+    Resolves every runtime ``mitos``-family import to its source file and recurses —
+    except the sanctioned-sink boundary, which is neither returned (linted) nor
+    traversed. Generalized from the check family's discovery (2c) so a module can be
+    adjudicated for admission before an import puts it inside the fence.
+    """
+    entry = os.path.join(_MITOS_PKG_DIR, entry_basename)
     discovered: List[str] = []
     seen: Set[str] = set()
     queue = [entry]
@@ -685,6 +695,30 @@ def test_dod6_discovery_covers_the_check_family_and_respects_the_boundary() -> N
     assert "protocols.py" not in names
     assert "parser.py" not in names
     assert "sync.py" not in names
+
+
+def test_the_identity_walk_is_admissible_to_the_check_familys_fence() -> None:
+    """2c's pre-admission of ``mitos/retrieval_walk.py``, adjudicated before 2d's
+    ``conflict.py`` import puts it inside the exact-set pin above.
+
+    The walk is a stdlib leaf plus ``mitos.errors`` (already a member, ``typing``
+    only), so its runtime closure is exactly ``{retrieval_walk.py, errors.py}`` —
+    ``from mitos.errors import X`` records ``mitos.errors`` and ``mitos.errors.X``,
+    never the bare ``mitos``, so ``__init__.py`` is not reached. It reads two methods
+    off a duck-typed store it is handed and writes nothing, so it passes the no-write
+    lint. Admitting it costs the fence no write path and no reach into ``store.py``,
+    ``vector_store.py``, ``protocols.py`` or ``telemetry.py``: when 2d's import lands,
+    the exact set grows by ``retrieval_walk.py`` alone (``errors.py`` is in it)."""
+    paths = _closure_from("retrieval_walk.py")
+    names = {os.path.basename(path) for path in paths}
+    assert names == {"retrieval_walk.py", "errors.py"}
+    for outsider in ("store.py", "vector_store.py", "protocols.py", "telemetry.py"):
+        assert outsider not in names
+    violations: List[Tuple[str, int, str]] = []
+    for path in paths:
+        with open(path, encoding="utf-8") as f:
+            violations.extend(_write_call_violations(f.read(), os.path.basename(path)))
+    assert violations == []
 
 
 def test_dod6_no_write_lint_over_the_discovered_check_family() -> None:

@@ -1367,9 +1367,10 @@ def test_the_band_is_read_off_decisions_never_off_a_skipped_open_question(ws, dr
 def test_a_retired_open_question_is_never_offered_as_a_retired_precedent(ws, driver):
     """Row 4. Alone in the window — beside a live decision the blackout never fires.
 
-    Today `_retired_handle` resolves the superseded OQ's slug without reading
-    its kind, and the blackout presents a parked question as a settled
-    decision's retired precedent. No crash, a wrong answer. The positive control
+    Before the screen, the slug-keyed handle builder resolved the superseded
+    OQ's slug without reading its kind, and the blackout presented a parked
+    question as a settled decision's retired precedent. Since 2c the walk skips
+    it as a non-decision before it can be retired. The positive control
     (a superseded DECISION alone) proves the retired arm is screened, not disabled.
     """
     config, m = ws
@@ -1426,7 +1427,8 @@ def test_an_exact_slug_composition_fault_is_loud_not_a_silent_ranked_search(ws, 
     composition. Kept inside the old `except Exception: pass`, it slid silently
     into the ranked search and returned a healthy-looking envelope; with the
     `try` narrowed to the store reads, it raises. Only the planted slug is
-    malformed — the ranked loop's lookups reach the real method.
+    malformed; the plant is live because the exact-slug branch is the one place
+    left that looks a node up by slug (the ranked read resolves by point id).
     """
     from mitos import mcp_server
     config, _ = ws
@@ -1463,32 +1465,40 @@ def test_text_renders_rank_the_decisions_past_an_open_question(ws, verb):
     assert "oq-parked" not in out
 
 
-def test_every_ranked_read_loop_screens_kind():
-    """Stretch: the structural twin of the matrix above. Every loop in the two
-    surface modules that resolves a slug to a node carries a `kind` comparison —
-    and a fifth such loop fails the set comparison until it is screened too."""
+def test_every_ranked_read_screens_kind_through_the_walk():
+    """Stretch: the structural twin of the matrix above, moved by 2c to where the
+    screen now lives. The four ranked surfaces resolve no slug in a loop — each calls
+    the shared walk — and the walk's `fill` compares `kind` before it reads
+    `computed_state` (a resolved open question reports `active`). A fifth surface
+    that kept a private slug loop fails the first assertion."""
     import mitos.cli
     import mitos.mcp_server
+    import mitos.retrieval_walk
 
-    def loops(module):
+    surfaces = {"surface_decisions", "query_decisions", "cmd_surface", "cmd_query"}
+    calls_walk = set()
+    for module in (mitos.mcp_server, mitos.cli):
         for fn in ast.walk(ast.parse(inspect.getsource(module))):
             if not isinstance(fn, ast.FunctionDef):
                 continue
             for loop in (n for n in ast.walk(fn) if isinstance(n, ast.For)):
                 calls = {c.func.attr for c in ast.walk(loop)
                          if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)}
-                if "get_node_by_slug" in calls:
-                    kinded = any(isinstance(c, ast.Compare) and isinstance(c.left, ast.Subscript)
-                                 and isinstance(c.left.slice, ast.Constant)
-                                 and c.left.slice.value == "kind" for c in ast.walk(loop))
-                    yield fn.name, kinded
+                assert "get_node_by_slug" not in calls, f"{fn.name} resolves hits by slug"
+            if any(isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+                   and c.func.id == "walk_ranked" for c in ast.walk(fn)):
+                calls_walk.add(fn.name)
+    assert calls_walk == surfaces
 
-    # A list, not a dict: every loop is judged, so a second unscreened loop in one
-    # verb cannot hide behind a screened sibling.
-    found = list(loops(mitos.mcp_server)) + list(loops(mitos.cli))
-    assert {name for name, _ in found} == {
-        "surface_decisions", "query_decisions", "cmd_surface", "cmd_query"}
-    assert all(kinded for _, kinded in found), found
+    fill = next(n for n in ast.walk(ast.parse(inspect.getsource(mitos.retrieval_walk)))
+                if isinstance(n, ast.FunctionDef) and n.name == "fill")
+
+    def first_line(key):
+        return min(c.lineno for c in ast.walk(fill)
+                   if isinstance(c, ast.Subscript) and isinstance(c.slice, ast.Constant)
+                   and c.slice.value == key)
+
+    assert first_line("kind") < first_line("computed_state")
 
 
 # --------------------------------------------------------------------------- #
@@ -2423,9 +2433,13 @@ def test_a_short_window_answers_todays_note_byte_for_byte(ws, driver, band):
 
 @pytest.mark.parametrize("driver", list(_4A_DRIVERS))
 def test_a_full_window_that_surfaces_nothing_names_no_lever(ws, driver):
-    """Row 3 / G2: five points (the parked OQ and four unresolvable slugs) fill the
-    window and surface nothing — `none`'s nothing-ranked fork, where a lever exists and
-    the clause must still stay absent."""
+    """Row 3 / G2: five points (the parked OQ and four unresolvable slugs) surface
+    nothing — `none`'s nothing-ranked fork, and the clause stays absent.
+
+    Since 2c the walk fills the window with live decisions only, so these five
+    points fill nothing: the OQ is skipped as a non-decision and the orphans as
+    orphans, the window is empty, and no lever exists to name. (Before 2c the five
+    raw points counted as a full window and the clause was withheld by the fork.)"""
     config, _ = ws
     _seed_4c(ws)
     call, key, _verb, surface = _4A_DRIVERS[driver]
@@ -2440,17 +2454,26 @@ def test_a_full_window_that_surfaces_nothing_names_no_lever(ws, driver):
 
 
 @pytest.mark.parametrize("driver", list(_4A_DRIVERS))
-def test_the_window_counts_points_not_decisions(ws, driver):
-    """Row 4 / G9b: the OQ takes one of five slots, four decisions surface, the band is
-    weak — the window was full, so the lever is named."""
+def test_the_window_counts_live_decisions_not_points(ws, driver):
+    """Row 4 / G9b, inverted by 2c on purpose. Before the walk an open question took
+    one of five slots, four decisions surfaced and the window still read as full, so
+    the lever was named. Under the walk the OQ takes no slot: with four decisions in
+    the fetch the window holds four, is short, and names nothing; with a fifth the
+    window fills with five live decisions and names the lever."""
     config, _ = ws
-    _seed_4b(ws)
+    _seed_4c(ws)
     call, key, _verb, surface = _4A_DRIVERS[driver]
     points = [{"slug": "oq-parked", "score": 0.72}] + _points("weak", 4)
     resp = call(points, ws)
     assert resp["confidence"] == "weak"
     assert [h["slug"] for h in resp[key]] == _4B_SLUGS
-    assert resp["note"] == (f"{_base_note(driver, config, 0.7, 4)} "
+    assert resp["note"] == _base_note(driver, config, 0.7, 4)
+    assert _lever_stem(surface, 5) not in resp["note"]
+
+    points = [{"slug": "oq-parked", "score": 0.72}] + _points("weak", 5)
+    resp = call(points, ws)
+    assert [h["slug"] for h in resp[key]] == _4C_SLUGS
+    assert resp["note"] == (f"{_base_note(driver, config, 0.7, 5)} "
                             f"{_lever_clause_for(surface, 5, 5)}")
 
 
@@ -2483,20 +2506,32 @@ def test_no_degraded_envelope_names_the_lever(ws, driver, route):
         assert _lever_stem(surface, 3) not in dump["note"]
 
 
+def _commit_live(store: GraphStore, prefix: str, n: int) -> None:
+    """Commits ``n`` live decisions ``{prefix}-0..`` straight through the store."""
+    for i in range(n):
+        e = ParsedEntry("decision", f"{prefix}-{i}", 1, 5)
+        e.axiom = f"Axiom for {prefix}-{i}."
+        e.rejected_paths = f"Rejected for {prefix}-{i}."
+        e.scope = ["x"]
+        store.commit_parsed_entry(e)
+
+
 @pytest.mark.parametrize("driver", list(_4A_DRIVERS))
 def test_no_lever_at_the_clamp_ceiling(ws, driver):
-    """Row 6 / D2: 50 raw points at limit=50 — a higher limit clamps back to 50, so the
-    clause is absent. At 49 the same shape names it (the row is not vacuous)."""
-    config, _ = ws
-    _seed_4c(ws)
+    """Row 6 / D2: a window filled at limit=50 — a higher limit clamps back to 50, so
+    the clause is absent. At 49 the same shape names it (the row is not vacuous).
+
+    Since 2c a full window means `limit` LIVE decisions (2a's orphan fixture now
+    fills nothing), so the fetch carries 50 live decisions."""
+    config, m = ws
+    _commit_live(m.store, "deep", 50)
     call, _key, _verb, surface = _4A_DRIVERS[driver]
     for limit, present in ((50, False), (49, True)):
-        # Raw points filling the window: orphans, declared as such.
-        points = [{"slug": "dec-a", "score": 0.7}] + [
-            orphan_hit(0.61, slug=f"ghost-{i}", tag=f"ghost-{i}") for i in range(limit - 1)]
+        points = [{"slug": "deep-0", "score": 0.7}] + [
+            {"slug": f"deep-{i}", "score": 0.61} for i in range(1, 50)]
         resp = call(points, ws, limit=limit)
         assert resp["confidence"] == "weak"
-        base = _base_note(driver, config, 0.7, 1)
+        base = _base_note(driver, config, 0.7, limit)
         if present:
             assert resp["note"] == f"{base} {_lever_clause_for(surface, limit, limit)}"
         else:

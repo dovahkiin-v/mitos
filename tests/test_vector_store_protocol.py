@@ -399,3 +399,71 @@ def test_an_unconsumed_fixture_fault_fails_the_test_at_teardown(tmp_path) -> Non
     assert "ERROR at teardown of test_canned_slug_names_no_node" in out, out
     assert "'nobody' names no node" in out, out
     assert "2 passed, 1 error" in out, out
+
+
+# --------------------------------------------------------------------------- #
+# Phase 2c: every `VectorStore.query` call site in `mitos/` goes through the walk
+# --------------------------------------------------------------------------- #
+
+#: The direct `.query(` call sites allowed in `mitos/`: the walk's one call, and the
+#: gather, which 2d moves onto the walk (then this set shrinks to the walk alone).
+ALLOWED_QUERY_CALL_SITES = {
+    ("retrieval_walk.py", "walk_ranked"),
+    ("conflict.py", "gather_candidates"),  # 2d moves it
+}
+
+#: The four ranked surfaces, each of which must call the walk.
+RANKED_SURFACES = {
+    ("mcp_server.py", "surface_decisions"),
+    ("mcp_server.py", "query_decisions"),
+    ("cli.py", "cmd_surface"),
+    ("cli.py", "cmd_query"),
+}
+
+
+def _enclosing_calls(source: str) -> List[Tuple[str, ast.Call]]:
+    """Every call in ``source``, paired with the name of its outermost function."""
+    out = []
+    for node in ast.parse(source).body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            out.extend((node.name, c) for c in ast.walk(node) if isinstance(c, ast.Call))
+        elif isinstance(node, ast.ClassDef):
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    out.extend((f"{node.name}.{item.name}", c) for c in ast.walk(item)
+                               if isinstance(c, ast.Call))
+    return out
+
+
+def query_call_sites(files: List[Path]) -> set:
+    """``(file, function)`` for every call whose callee is an attribute named ``query``."""
+    return {(path.name, fn) for path in files
+            for fn, call in _enclosing_calls(path.read_text(encoding="utf-8"))
+            if isinstance(call.func, ast.Attribute) and call.func.attr == "query"}
+
+
+def walk_callers(files: List[Path]) -> set:
+    """``(file, function)`` for every call to ``walk_ranked``, bare or qualified."""
+    return {(path.name, fn) for path in files
+            for fn, call in _enclosing_calls(path.read_text(encoding="utf-8"))
+            if (isinstance(call.func, ast.Name) and call.func.id == "walk_ranked")
+            or (isinstance(call.func, ast.Attribute) and call.func.attr == "walk_ranked")}
+
+
+def test_every_vector_query_in_mitos_goes_through_the_walk() -> None:
+    """Vision §6.2 constraint 8, by AST. A later reader is covered by arriving: a new
+    direct call is a set difference here. The second clause catches a surface that
+    kept a private copy of the loop, which would pass the first by calling nothing."""
+    files = sorted(MITOS_DIR.rglob("*.py"))
+    assert query_call_sites(files) == ALLOWED_QUERY_CALL_SITES
+    assert RANKED_SURFACES <= walk_callers(files)
+
+
+def test_the_call_site_row_reports_a_planted_direct_call(tmp_path) -> None:
+    """Positive control over a planted module (break K12 plants the same in `mitos/`)."""
+    planted = tmp_path / "_zz_scratch_2c.py"
+    planted.write_text(textwrap.dedent('''
+        def reader(vs, v):
+            return vs.query(v, limit=5)
+    '''), encoding="utf-8")
+    assert query_call_sites([planted]) == {("_zz_scratch_2c.py", "reader")}

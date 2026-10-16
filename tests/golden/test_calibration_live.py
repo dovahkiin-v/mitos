@@ -223,7 +223,8 @@ def test_smoke_records_values_in_both_spaces(calibration_index):
         for t in r["targets"]:
             if t["value"] is None:
                 problems.append(f"{fx['id']}: target {t['slug']} absent from the window (a finding)")
-        raw_score = {h["slug"]: h["score"] for h in raw}
+        # Keyed through the node: the walk's hits carry no payload slug (ids only).
+        raw_score = {index.nodes_by_point_id[h["point_id"]]["slug"]: h["score"] for h in raw}
         if fx["form"] == "query":
             assert "confidence" in read.envelope, f"{fx['id']}: degraded envelope {read.envelope}"
             for d in read.envelope["active_decisions"]:
@@ -304,7 +305,8 @@ def test_calibration_classes(calibration_index, shape_collections):
     fixtures, reads = _labelled_reads(index)
     for fx, read in zip(fixtures, reads):
         raw = read.calls[0][1]
-        raw_score = {h["slug"]: h["score"] for h in raw}
+        # Keyed through the node: the walk's hits carry no payload slug (ids only).
+        raw_score = {index.nodes_by_point_id[h["point_id"]]["slug"]: h["score"] for h in raw}
         if fx["form"] == "query":
             assert "confidence" in read.envelope, f"{fx['id']}: degraded envelope {read.envelope}"
             for d in read.envelope["active_decisions"]:

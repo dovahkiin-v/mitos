@@ -14,7 +14,7 @@ from mcp.server.fastmcp.utilities.func_metadata import FuncMetadata, func_metada
 from pydantic import ValidationError
 
 from mitos import amend, registry, routing
-from mitos.display import RANKED_LIMIT_CEILING, blackout_note, clamp_limit, dumps_display, letter_payload, oneline_payload, order_scope_counts, projects_payload, scope_report, show_payload
+from mitos.display import RANKED_LIMIT_CEILING, blackout_note, clamp_limit, dumps_display, letter_payload, oneline_payload, order_scope_counts, projects_payload, retired_handle, scope_report, show_payload
 from mitos.config import MitosConfig
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS
 from mitos.embeddings import GeminiEmbeddingProvider
@@ -40,8 +40,9 @@ from mitos.restore import BufferFidelityError
 from mitos.recall import (assess_query_recall, assess_surface_recall,
                           corpus_provenance, missing_graph_is_a_gap,
                           missing_graph_note, missing_index_is_a_gap,
-                          scope_filter_recovery, count_withheld, window_lever,
-                          withheld_clause)
+                          scope_filter_recovery, count_withheld,
+                          stamps_unread_clause, window_lever, withheld_clause)
+from mitos.retrieval_walk import WalkContractError, walk_ranked
 
 # No cross-call "seen" dedup state — deliberately. An earlier design cached
 # already-surfaced slugs in a process-global set and trimmed `rejected_paths` (the
@@ -83,58 +84,9 @@ def _attach_modifiers(payload: Dict[str, Any], node: Dict[str, Any], store: Grap
     return payload
 
 
-def _retired_handle(store: GraphStore, slug: str) -> Optional[Dict[str, Any]]:
-    """Builds a retired-handle pointer for a superseded-filtered ranked match.
-
-    The MCP twin of ``cli._retired_handle`` — kept independent per surface (the
-    ranked loops collect retired handles separately, mirroring the deliberate
-    payload-shaper asymmetry), but emitting the identical ``{"slug", "state"}`` (+
-    ``superseded_by`` successor) shape so the blackout ``all_superseded`` field is
-    byte-equal CLI⇄MCP (T5 parity). State is read authoritatively from the computed
-    ``get_node_state`` via the state-agnostic ``resolve_slug`` (the vector payload's
-    ``state`` is stale-at-embed-time). Calm degradation (P9): an unresolvable slug
-    returns ``None`` (omitted by the caller), a failed state read falls back to
-    ``"superseded"``.
-
-    Args:
-        store: The graph store to resolve the slug and read state/modifiers from.
-        slug: The slug of the superseded-filtered match.
-
-    Returns:
-        The retired-handle dict, or ``None`` if the slug does not resolve or names
-        no decision (a superseded open question is not a retired precedent).
-    """
-    try:
-        node_ids = store.resolve_slug(slug)
-    except Exception:
-        return None
-    if not node_ids:
-        return None
-    # A retired open question is not a retired precedent: only a slug that names a
-    # decision is offered (a `supersedes` lineage is same-kind, so "any decision"
-    # never keeps a mixed handle).
-    try:
-        if "decision" not in store.resolve_slug_kinds(slug):
-            return None
-    except Exception:
-        return None
-    node_id = node_ids[0]
-    try:
-        state = store.get_node_state(node_id)
-    except Exception:
-        state = "superseded"
-    handle: Dict[str, Any] = {"slug": slug, "state": state}
-    try:
-        successors = store.get_modifiers(node_id).get("superseded_by")
-        if successors:
-            handle["superseded_by"] = successors
-    except Exception:
-        pass
-    return handle
-
-
 def _decision_payload(node: Dict[str, Any], score: float, *, brief: bool,
-                      store: Optional[GraphStore] = None) -> Dict[str, Any]:
+                      store: Optional[GraphStore] = None,
+                      stamps: Optional[Dict[str, Dict[str, List[str]]]] = None) -> Dict[str, Any]:
     """Shapes a Letter-mode decision payload.
 
     ``rejected_paths`` — the heavy, high-value field whose reasoning stops
@@ -146,13 +98,18 @@ def _decision_payload(node: Dict[str, Any], score: float, *, brief: bool,
         node: A store node dict (``slug``, ``core_axiom``, ``rejected_paths``, ``scope``).
         score: The relevance score to attach.
         brief: Drop ``rejected_paths`` for an axiom-only scan.
-        store: When given, reverse-relation modifier keys are stamped on (always,
-            even for brief payloads).
+        store: When given, reverse-relation modifier keys are read per node and
+            stamped on, fail-silent (the degraded scope dump's path).
+        stamps: The ranked path's batched stamp map (``RankedWalk.stamps``); the
+            node's entry is stamped on. Both apply always, even for brief payloads.
 
     Returns:
         A Letter-mode decision dict.
     """
     payload = letter_payload(node, brief=brief, extras={"score": score})
+    if stamps is not None:
+        for key, slugs in stamps.get(node["id"], {}).items():
+            payload[key] = list(slugs)
     if store is not None:
         _attach_modifiers(payload, node, store)
     return payload
@@ -971,8 +928,9 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         parked in that scope). Each decision: slug, axiom, scope, score, and
         rejected_paths unless brief or full_top. A precedent a later decision has moved on from
         also carries the modifying slugs under
-        `superseded_by`/`amended_by`/`narrowed_by`/`corrected_by` (always present when
-        they apply, even on a brief scan) — chase those before treating its axiom as
+        `superseded_by`/`amended_by`/`narrowed_by`/`corrected_by` (present when they
+        apply, even on a brief scan; `stamps_unread` marks an answer whose stamps
+        could not be read) — chase those before treating its axiom as
         the current mechanism. Also includes `confidence` (`strong`/`weak`/`none` when
         semantic ranking ran) and a `note`: `weak` or `none` means no settled precedent
         on this claim — treat it as no-precedent and decide, or call
@@ -1035,47 +993,21 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
     dump_total: Optional[int] = None
 
     # 1. Semantic search if embeddings and vector store are active
+    walk = None
     if embed_provider and vector_store:
         try:
             # Generate query vector
             q_vector = embed_provider.get_embedding(query, is_query=True)
-            matches = vector_store.query(q_vector, limit=top_k)
+            # The shared identity walk: one vector call at the over-fetch bound,
+            # every hit resolved by its point id, the window filled with live
+            # decisions, the stamps read in one batch (a stamp fault costs the
+            # stamps alone and is flagged, never degraded).
+            walk = walk_ranked(q_vector, vector_store=vector_store, graph=store,
+                               limit=top_k)
             semantic_ran = True
-            # Raw points, not surfaced decisions: the lever reads retrieval depth.
-            lever = window_lever(points=len(matches), limit=top_k,
-                                 ceiling=RANKED_LIMIT_CEILING, full_top=full_top)
-
-            for m in matches:
-                slug = m["slug"]
-                node = store.get_node_by_slug(slug)
-                if not node:
-                    handle = _retired_handle(store, slug)
-                    if handle:
-                        retired.append(handle)
-                    continue
-                if node["kind"] != "decision":
-                    # An open question: never embedding-ranked (C4), not retired —
-                    # skipped before the band sees its score.
-                    continue
-
-                # Verify computed active status in SQLite (M3 computed state is source-of-truth)
-                node_state = store.get_node_state(node["id"])
-                if node_state not in ("active", "drifted"):
-                    # Stale vector reference — a retired handle for the blackout vector.
-                    handle = _retired_handle(store, slug)
-                    if handle:
-                        retired.append(handle)
-                    continue
-
-                # Rank among the decisions returned, taken at append time — never
-                # the index into `matches`, whose skipped entries consume no rank.
-                rank = len(results["active_decisions"]) + 1
-                results["active_decisions"].append(
-                    _decision_payload(node, m["score"],
-                                      brief=_rank_thinned(rank, full_top), store=store)
-                )
-                if top_score is None or m["score"] > top_score:
-                    top_score = m["score"]
+        except WalkContractError:
+            # A wrong store or vector double: loud, never "recall degraded".
+            raise
         except CollectionMissingError as e:
             # I8 — an absent collection over an EMPTY active set IS the empty index,
             # and a just-initialized project must not read as broken: leave
@@ -1092,6 +1024,26 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
             # Degrade to exact/scope filtering only
             semantic_ran = False
             degraded_error = e
+
+    # Composition, outside the `try`: pure shaping over what the walk returned, so
+    # a defect here is loud rather than posing as degraded recall.
+    if walk is not None:
+        # The live window, not raw points: retired and open-question points take
+        # no slots, so "full" means `limit` live decisions (2e's edge replaces it).
+        lever = window_lever(points=len(walk.window), limit=top_k,
+                             ceiling=RANKED_LIMIT_CEILING, full_top=full_top)
+        for rank, hit in enumerate(walk.window, start=1):
+            results["active_decisions"].append(
+                _decision_payload(hit.node, hit.score,
+                                  brief=_rank_thinned(rank, full_top),
+                                  stamps=walk.stamps)
+            )
+        if walk.window:
+            top_score = max(hit.score for hit in walk.window)
+        else:
+            # Zero live: the blackout's handles, closest first, bounded at `limit`.
+            retired = [retired_handle(hit.node, walk.stamps)
+                       for hit in walk.retired[:top_k]]
 
     # 2. Scope pre-filtering fallback — ONLY when semantic recall is down (degraded).
     #    When semantic ran and simply found nothing, do NOT dump an unranked scope
@@ -1197,6 +1149,14 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
             f"{results['note']} {withheld_clause(withheld, surface='mcp', config=config)}"
         )
         results["rejected_paths_withheld"] = withheld
+
+    # The stamps went unread: the ranking stands, the fault is stated. Last on the
+    # note, after every override and the withheld clause; absent when read.
+    if walk is not None and walk.stamps_unread:
+        results["note"] = (
+            f"{results['note']} {stamps_unread_clause(surface='mcp', config=config)}"
+        )
+        results["stamps_unread"] = True
 
     # After the recall answer's own keys; absent (never null) when not shown.
     if notice:
@@ -1574,103 +1534,21 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
     if embed_provider and vector_store:
         # Before the `try`, for the reason the CollectionMissingError arm below
         # states: that arm builds its own empty envelope rather than falling
-        # through, so a `top_score` bound inside the loop would be an unbound local
-        # there.
+        # through, so it needs a bound `top_score`.
         top_score: Optional[float] = None
+        top_k = clamp_limit(limit)
         try:
-            top_k = clamp_limit(limit)
             q_vector = embed_provider.get_embedding(query, is_query=True)
-            matches = vector_store.query(q_vector, limit=top_k)
-            # Raw points, not surfaced matches — see surface_decisions.
-            lever = window_lever(points=len(matches), limit=top_k,
-                                 ceiling=RANKED_LIMIT_CEILING, full_top=full_top)
-
-            output_list = []
-            retired: List[Dict[str, Any]] = []
-            for m in matches:
-                slug = m["slug"]
-                node = store.get_node_by_slug(slug)
-                if not node:
-                    handle = _retired_handle(store, slug)
-                    if handle:
-                        retired.append(handle)
-                    continue
-                if node["kind"] != "decision":
-                    # An open question: never embedding-ranked (C4), not retired.
-                    continue
-
-                node_state = store.get_node_state(node["id"])
-                if node_state not in ("active", "drifted"):
-                    handle = _retired_handle(store, slug)
-                    if handle:
-                        retired.append(handle)
-                    continue
-
-                # Rank among the decisions returned, at append time (see
-                # surface_decisions).
-                match = letter_payload(
-                    node,
-                    brief=_rank_thinned(len(output_list) + 1, full_top),
-                    extras={"state": node_state, "score": m["score"], "depth_mode": "letter"},
-                )
-                match.update(store.get_modifiers(node["id"]))
-                output_list.append(match)
-                # Off the SURFACED list, after the append — never off `matches`,
-                # which still holds the superseded and unresolvable nodes this loop
-                # just dropped (the CLI twin does the same, one file over).
-                if top_score is None or m["score"] > top_score:
-                    top_score = m["score"]
-
-            # Blackout: retrieved precedents but every one superseded-filtered.
-            # Add the retired handles so the agent gets a pointer, not a false miss
-            # (CLI⇄MCP-identical `all_superseded` shape, T5 parity).
-            envelope: Dict[str, Any] = {"query": query, "depth_mode": "letter", "matches": output_list}
-            envelope.update(corpus_provenance(config))
-            # The confidence band, in the `query` register — a verdict on this
-            # ranking, never on the corpus. Assigned BEFORE the overrides below so
-            # blackout/unbuilt reassign the note over it (the note yields;
-            # `confidence` stands on every one of these exits).
-            confidence, note = assess_query_recall(
-                top_score=top_score,
-                result_count=len(output_list),
-                config=config,
-                surface="mcp",
-                lever=lever,
-            )
-            envelope["confidence"] = confidence
-            envelope["note"] = note
-            if not output_list and retired:
-                envelope["all_superseded"] = retired
-                # Withholding it here would be a fresh CLI⇄MCP divergence (the CLI
-                # twin prints it) and an MCP⇄MCP one (`surface_decisions` already
-                # emits it on this surface).
-                envelope["note"] = blackout_note(retired)
-            # W31 — see surface_decisions. Both of this tool's empty envelopes carry
-            # it: this one (semantic ran and matched nothing) and the healthy-empty
-            # one built in the CollectionMissingError arm below. An unbuilt clone
-            # typically reaches the second — its collection is absent too — but the
-            # first is reachable whenever the collection exists and the graph does
-            # not, and a diagnosis present on one exit only is a verb that reads as
-            # done (3e's per-EXIT lesson).
-            elif not output_list and missing_graph_is_a_gap(
-                store, config, corpus_scan=corpus_holds_entries
-            ):
-                envelope["note"] = missing_graph_note("mcp", config)
-            # See surface_decisions. Pure formatting, so it cannot raise into the
-            # `except Exception` below and pose as degraded recall.
-            withheld = count_withheld(output_list)
-            if withheld:
-                envelope["note"] = (
-                    f"{envelope['note']} "
-                    f"{withheld_clause(withheld, surface='mcp', config=config)}"
-                )
-                envelope["rejected_paths_withheld"] = withheld
-            return dumps_display(envelope, ensure_ascii=False, indent=2)
+            # The shared identity walk (see surface_decisions).
+            walk = walk_ranked(q_vector, vector_store=vector_store, graph=store,
+                               limit=top_k)
+        except WalkContractError:
+            # A wrong store or vector double: loud, never "recall degraded".
+            raise
         except CollectionMissingError as e:
             # I8 — see surface_decisions. The healthy-empty envelope is BUILT here
-            # rather than fallen through to: the envelope above (and its `return`)
-            # live inside this `try`, after the query that raised, so there is no
-            # empty path to fall through to at all.
+            # rather than fallen through to: the healthy envelope below is built
+            # from the walk, which this arm never received.
             if missing_index_is_a_gap(store):
                 return _lexical_degraded_response(
                     query, config=config, reason=degraded_reason_from_error(
@@ -1710,6 +1588,82 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
                     e, surface="mcp", project=config.project),
                 store=store, full_top=full_top, limit=clamp_limit(limit),
             )
+
+        # Composition, outside the `try`: every arm above returns, so this is the
+        # healthy ranked answer, and a shaping defect here is loud rather than
+        # posing as degraded recall.
+        # The live window, not raw points — see surface_decisions.
+        lever = window_lever(points=len(walk.window), limit=top_k,
+                             ceiling=RANKED_LIMIT_CEILING, full_top=full_top)
+        output_list = []
+        for rank, hit in enumerate(walk.window, start=1):
+            match = letter_payload(
+                hit.node,
+                brief=_rank_thinned(rank, full_top),
+                extras={"state": hit.node["computed_state"], "score": hit.score,
+                        "depth_mode": "letter"},
+            )
+            for key, slugs in walk.stamps.get(hit.node["id"], {}).items():
+                match[key] = list(slugs)
+            output_list.append(match)
+        if walk.window:
+            top_score = max(hit.score for hit in walk.window)
+        # Zero live: the blackout's handles, closest first, bounded at `limit`.
+        retired = ([] if output_list else
+                   [retired_handle(hit.node, walk.stamps)
+                    for hit in walk.retired[:top_k]])
+
+        envelope: Dict[str, Any] = {"query": query, "depth_mode": "letter", "matches": output_list}
+        envelope.update(corpus_provenance(config))
+        # The confidence band, in the `query` register — a verdict on this
+        # ranking, never on the corpus. Assigned BEFORE the overrides below so
+        # blackout/unbuilt reassign the note over it (the note yields;
+        # `confidence` stands on every one of these exits).
+        confidence, note = assess_query_recall(
+            top_score=top_score,
+            result_count=len(output_list),
+            config=config,
+            surface="mcp",
+            lever=lever,
+        )
+        envelope["confidence"] = confidence
+        envelope["note"] = note
+        # Blackout: retrieved precedents but every one retired. Add the retired
+        # handles so the agent gets a pointer, not a false miss (CLI⇄MCP-identical
+        # `all_superseded` shape, T5 parity).
+        if not output_list and retired:
+            envelope["all_superseded"] = retired
+            # Withholding it here would be a fresh CLI⇄MCP divergence (the CLI
+            # twin prints it) and an MCP⇄MCP one (`surface_decisions` already
+            # emits it on this surface).
+            envelope["note"] = blackout_note(retired)
+        # W31 — see surface_decisions. Both of this tool's empty envelopes carry
+        # it: this one (semantic ran and matched nothing) and the healthy-empty
+        # one built in the CollectionMissingError arm above. An unbuilt clone
+        # typically reaches the second — its collection is absent too — but the
+        # first is reachable whenever the collection exists and the graph does
+        # not, and a diagnosis present on one exit only is a verb that reads as
+        # done (3e's per-EXIT lesson).
+        elif not output_list and missing_graph_is_a_gap(
+            store, config, corpus_scan=corpus_holds_entries
+        ):
+            envelope["note"] = missing_graph_note("mcp", config)
+        # See surface_decisions.
+        withheld = count_withheld(output_list)
+        if withheld:
+            envelope["note"] = (
+                f"{envelope['note']} "
+                f"{withheld_clause(withheld, surface='mcp', config=config)}"
+            )
+            envelope["rejected_paths_withheld"] = withheld
+        # See surface_decisions: last on the note, absent when the stamps were read.
+        if walk.stamps_unread:
+            envelope["note"] = (
+                f"{envelope['note']} "
+                f"{stamps_unread_clause(surface='mcp', config=config)}"
+            )
+            envelope["stamps_unread"] = True
+        return dumps_display(envelope, ensure_ascii=False, indent=2)
 
     # No embedding provider / vector store wired at all — degrade lexically.
     return _lexical_degraded_response(

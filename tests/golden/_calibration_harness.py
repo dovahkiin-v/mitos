@@ -57,14 +57,17 @@ import _semantic_harness as H  # noqa: E402
 # The query form's window. The draft form reads the gather's own window
 # (``conflict.CONFLICT_OVERFETCH_LIMIT``), which is what the pause sees.
 RECORD_LIMIT = 10
-READER = "mcp.surface_decisions+conflict.gather_candidates"
+# Retagged by 2c: the query form now reads through the shared identity walk (one call at
+# the over-fetch bound, ids only), so runs before and after can be told apart.
+READER = "mcp.surface_decisions(retrieval_walk)+conflict.gather_candidates"
 # The reader's own live predicate (``surface_decisions`` and ``gather_candidates`` both).
 LIVE_STATES = ("active", "drifted")
 MITOS_DIR = os.path.dirname(os.path.abspath(mitos.__file__))
 
 
 class RecordingVectorStore:
-    """Wraps a vector store and keeps every ``query`` call's limit and raw result.
+    """Wraps a vector store and keeps every ``query`` call's limit, raw result and
+    ``with_payload`` flag, as ``(limit, result, with_payload)``.
 
     Duck-typed on purpose: the readers call only ``query``, and every other attribute
     passes through. It defines no ``__len__`` or ``__bool__``, so the readers' truthiness
@@ -73,15 +76,15 @@ class RecordingVectorStore:
 
     def __init__(self, inner: Any) -> None:
         self._inner = inner
-        self.calls: List[Tuple[int, List[Dict[str, Any]]]] = []
+        self.calls: List[Tuple[int, List[Dict[str, Any]], bool]] = []
 
     def query(self, vector: List[float], limit: int = 5, *,
               with_payload: bool = True) -> List[Dict[str, Any]]:
-        # Forwards the keyword: from 2c the readers pass ``with_payload=False``, and a
-        # wrapper rejecting it would raise inside the reader's catch-all and turn every
-        # read into a degraded one.
+        # Forwards the keyword: since 2c the ranked readers pass ``with_payload=False``,
+        # and a wrapper rejecting it would raise inside the reader's catch-all and turn
+        # every read into a degraded one. The result stays at index 1.
         result = self._inner.query(vector, limit=limit, with_payload=with_payload)
-        self.calls.append((limit, result))
+        self.calls.append((limit, result, with_payload))
         return result
 
     def __getattr__(self, name: str) -> Any:
@@ -432,7 +435,10 @@ def read_query_form(index: CalibrationIndex, fixture: Dict[str, Any]) -> FormRea
         envelope = json.loads(
             surface_decisions(fixture["text"], project=index.workspace, limit=RECORD_LIMIT, brief=True)
         )
-    raw = _one_call(proxy, fixture)
+    # The raw ranking the shipped path received, up to `RECORD_LIMIT`: since 2c the
+    # walk fetches at the over-fetch bound (every Harbor point), so the slice keeps the
+    # recorded window the size it always was.
+    raw = _one_call(proxy, fixture)[:RECORD_LIMIT]
     hits = label_hits(index, raw, fixture.get("exclude", []))
     result = R.derive_result(fixture, hits, envelope.get("confidence"), None)
     searches = None

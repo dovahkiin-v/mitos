@@ -45,6 +45,7 @@ from mitos.display import (
     oneline_payload,
     order_scope_counts,
     projects_payload,
+    retired_handle,
     scope_report,
     truncate_words,
     resolve_display_ensure_ascii,
@@ -99,7 +100,9 @@ from mitos.recall import (assess_query_recall, assess_surface_recall,
                           corpus_provenance, missing_graph_is_a_gap,
                           missing_graph_note, missing_index_is_a_gap,
                           provenance_line, scope_filter_recovery,
-                          count_withheld, window_lever, withheld_clause)
+                          count_withheld, stamps_unread_clause, window_lever,
+                          withheld_clause)
+from mitos.retrieval_walk import WalkContractError, walk_ranked
 from mitos.sync import (MitosSyncManager, run_ambient_capture, _SLUG_MAX_LEN,
                         _ENTRIES_MARKER, _NEIGHBOR_REVIEW_THRESHOLD,
                         _PAUSE_RESOLVING_RELATIONS, _declared_echo_lines, _split_relation_slugs,
@@ -980,59 +983,6 @@ def cmd_capture(config: MitosConfig, text: str) -> None:
         print(f"Failed to append captured entry: {str(e)}")
 
 
-def _retired_handle(store: GraphStore, slug: str) -> Optional[Dict[str, Any]]:
-    """Builds a retired-handle pointer for a superseded-filtered ranked match.
-
-    A match dropped by the active-view filter (``get_node_by_slug`` → ``None`` or a
-    non-``active``/``drifted`` computed state) is not noise — it is a genuine retired
-    handle the agent can chase (V1-D16: a vector-store slug always resolves to *some*
-    node; nodes are never deleted). This returns ``{"slug", "state"}`` — and, when the
-    graph knows it, the live successor under ``superseded_by`` — so the blackout vector
-    hands the agent a pointer, not a payload. The state is read authoritatively from the
-    *computed* ``get_node_state`` (the vector payload's ``state`` is stale-at-embed-time
-    and absent under test), via the state-agnostic ``resolve_slug``.
-
-    Calm degradation (P9): if the slug fails to resolve at all, returns ``None`` (the
-    caller omits it) rather than crash; if the state read fails, falls back to
-    ``"superseded"``.
-
-    Args:
-        store: The graph store to resolve the slug and read state/modifiers from.
-        slug: The slug of the superseded-filtered match.
-
-    Returns:
-        The retired-handle dict, or ``None`` if the slug does not resolve or names
-        no decision (a superseded open question is not a retired precedent).
-    """
-    try:
-        node_ids = store.resolve_slug(slug)
-    except Exception:
-        return None
-    if not node_ids:
-        return None
-    # A retired open question is not a retired precedent: only a slug that names a
-    # decision is offered (a `supersedes` lineage is same-kind, so "any decision"
-    # never keeps a mixed handle).
-    try:
-        if "decision" not in store.resolve_slug_kinds(slug):
-            return None
-    except Exception:
-        return None
-    node_id = node_ids[0]
-    try:
-        state = store.get_node_state(node_id)
-    except Exception:
-        state = "superseded"
-    handle: Dict[str, Any] = {"slug": slug, "state": state}
-    try:
-        successors = store.get_modifiers(node_id).get("superseded_by")
-        if successors:
-            handle["superseded_by"] = successors
-    except Exception:
-        pass
-    return handle
-
-
 def _rank_thinned(rank: int, full_top: Optional[int]) -> bool:
     """Says whether the hit at 1-based ``rank`` among returned decisions is thinned.
 
@@ -1182,68 +1132,23 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
 
     store = manager.store
     top_k = clamp_limit(limit)
-    # Initialized BEFORE the `try` for the reason the CollectionMissingError arm's own
-    # comment gives below: that arm constructs the empty result rather than falling
-    # through, so a `top_score` bound inside the loop would be an unbound local on
-    # exactly the state (empty graph + absent collection) nobody reaches by hand.
-    # `lever` for the same reason: that arm falls through to the assessment below.
-    top_score: Optional[float] = None
-    lever = None
+    walk = None
     try:
         q_vector = manager.embed_provider.get_embedding(query_text, is_query=True)
-        raw_matches = manager.vector_store.query(q_vector, limit=top_k)
-        # `raw_matches`, not `matches`: the lever reads retrieval depth, and
-        # `matches` below is the surfaced list.
-        lever = window_lever(points=len(raw_matches), limit=top_k,
-                             ceiling=RANKED_LIMIT_CEILING, full_top=full_top)
-
-        # Filter superseded first, then stamp + Letter — mirrors the ranked loop in
-        # mcp_server.query_decisions byte-for-byte (T4 parity). A superseded-not-reused
-        # slug is dropped at the active-view get_node_by_slug → None step, closing the
-        # M3 leak where a superseded node would otherwise read as live. Each dropped
-        # match is a retired handle the blackout vector points the agent at.
-        matches = []
-        retired: List[Dict[str, Any]] = []
-        for m in raw_matches:
-            node = store.get_node_by_slug(m["slug"])
-            if not node:
-                handle = _retired_handle(store, m["slug"])
-                if handle:
-                    retired.append(handle)
-                continue
-            if node["kind"] != "decision":
-                # An open question: never embedding-ranked (C4), not retired —
-                # skipped before the band sees its score.
-                continue
-            node_state = store.get_node_state(node["id"])
-            if node_state not in ("active", "drifted"):
-                handle = _retired_handle(store, m["slug"])
-                if handle:
-                    retired.append(handle)
-                continue
-            # Rank among the decisions returned, at append time — never the index
-            # into `raw_matches`, whose skipped entries consume no rank.
-            match = letter_payload(
-                node,
-                brief=_rank_thinned(len(matches) + 1, full_top),
-                extras={"state": node_state, "score": m["score"], "depth_mode": "letter"},
-            )
-            match.update(store.get_modifiers(node["id"]))
-            matches.append(match)
-            # Off the SURFACED list, after the append — never off `raw_matches`,
-            # which still holds the superseded and unresolvable nodes this loop
-            # just dropped. A band read off the raw return rates a match the
-            # caller never saw.
-            if top_score is None or m["score"] > top_score:
-                top_score = m["score"]
+        # The shared identity walk — the same call mcp_server.query_decisions makes
+        # (T4 parity by construction): one vector call at the over-fetch bound,
+        # every hit resolved by its point id (never its payload slug), the window
+        # filled with live decisions, the stamps read in one batch.
+        walk = walk_ranked(q_vector, vector_store=manager.vector_store, graph=store,
+                           limit=top_k)
+    except WalkContractError:
+        # A wrong store or vector double: loud, never "recall degraded".
+        raise
     except CollectionMissingError as e:
         # I8 — an absent collection over an EMPTY active set IS the empty index, and
         # a fresh project must not read as broken; over a populated graph it is a
         # real hole and the degraded header names it plus `mitos reconcile`.
-        # The empty result is constructed HERE, not fallen through to: `matches` and
-        # `retired` are assigned inside the `try`, after the query that raised, so a
-        # bare fall-through would hit an unbound local — on exactly the state (empty
-        # graph + absent collection) nobody reaches by hand.
+        # Otherwise `walk` stays None and the empty result is built below.
         if missing_index_is_a_gap(store):
             _emit_lexical_degraded(
                 config, query_text, reason=degraded_reason_from_error(
@@ -1251,8 +1156,6 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
                 store=store, as_json=as_json, full_top=full_top, limit=limit,
             )
             return
-        matches = []
-        retired = []
     except Exception as e:
         # Embedding/Qdrant failure mid-query (e.g. a 429): never the raw
         # provider blob — one calm cause line + the deterministic fallback.
@@ -1263,11 +1166,46 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         )
         return
 
-    # Blackout: retrieval returned matches but every one was superseded-filtered
-    # (displayed == 0, retrieved > 0). That is NOT a true miss — surfacing it as one
-    # makes the agent assume novelty and re-derive a settled contradiction. Emit the
-    # retired handles + a distinct note instead. `retired` is non-empty only when the
-    # filter dropped something, so `not matches and retired` is exactly the blackout.
+    # Composition, outside the `try`: pure shaping over what the walk returned, so
+    # a defect here is loud rather than posing as degraded recall.
+    matches: List[Dict[str, Any]] = []
+    retired: List[Dict[str, Any]] = []
+    top_score: Optional[float] = None
+    lever = None
+    if walk is not None:
+        # The live window, not raw points: retired and open-question points take
+        # no slots, so "full" means `limit` live decisions (2e's edge replaces it).
+        lever = window_lever(points=len(walk.window), limit=top_k,
+                             ceiling=RANKED_LIMIT_CEILING, full_top=full_top)
+        for rank, hit in enumerate(walk.window, start=1):
+            match = letter_payload(
+                hit.node,
+                brief=_rank_thinned(rank, full_top),
+                extras={"state": hit.node["computed_state"], "score": hit.score,
+                        "depth_mode": "letter"},
+            )
+            for key, slugs in walk.stamps.get(hit.node["id"], {}).items():
+                match[key] = list(slugs)
+            matches.append(match)
+        if walk.window:
+            top_score = max(hit.score for hit in walk.window)
+        else:
+            # Zero live: the blackout's handles, closest first, bounded at `limit`.
+            retired = [retired_handle(hit.node, walk.stamps)
+                       for hit in walk.retired[:top_k]]
+    # The stamps went unread: the ranking stands and every exit that renders hits
+    # or handles says so, last on its note (after every override). None when read.
+    unread_clause = (stamps_unread_clause(surface="cli", config=config)
+                     if walk is not None and walk.stamps_unread else None)
+
+    def _closing(text: str) -> str:
+        return f"{text} {unread_clause}" if unread_clause else text
+
+    # Blackout: the walk found zero live decisions in its whole fetch but passed
+    # retired ones. That is NOT a true miss — surfacing it as one makes the agent
+    # assume novelty and re-derive a settled contradiction. Emit the retired handles
+    # + a distinct note instead. `retired` is filled only on a zero-live walk, so
+    # `not matches and retired` is exactly the blackout.
     blackout = not matches and bool(retired)
 
     # W31 — the unbuilt graph. Unlike its I8 sibling this one is consulted on the
@@ -1317,6 +1255,9 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
             envelope["note"] = missing_graph_note("cli", config)
         if withheld:
             envelope["rejected_paths_withheld"] = withheld
+        if unread_clause:
+            envelope["note"] = _closing(envelope["note"])
+            envelope["stamps_unread"] = True
         _emit_json(envelope)
         return
 
@@ -1327,7 +1268,7 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         # falls through the stamped empty header); this branch returns early and
         # was the one text exit of the read verbs that named none.
         _echo_corpus(config)
-        print(blackout_note(retired))
+        print(_closing(blackout_note(retired)))
         return
 
     # Genuine miss — nothing was retrieved (or nothing resolved). The provenance
@@ -1342,12 +1283,12 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         # redirect sends the caller to `surface`, which answers just as empty over
         # that same unbuilt graph — a turn spent one line above the correct heal.
         if unbuilt:
-            print(f"→ {missing_graph_note('cli', config)}")
+            print(f"→ {_closing(missing_graph_note('cli', config))}")
         else:
             band_line = _query_band_line(confidence)
             if band_line:
                 print(band_line)
-            print(f"→ {note}")
+            print(f"→ {_closing(note)}")
         return
 
     print(f"\nQuery matches for: '{query_text}'  [{provenance_line(config)}]")
@@ -1366,7 +1307,7 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         if d["scope"]:
             print(f"   Scope:    {', '.join(d['scope'])}")
         print()
-    print(f"→ {note}")
+    print(f"→ {_closing(note)}")
 
 
 def _query_band_line(confidence: str) -> Optional[str]:
@@ -2621,6 +2562,8 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     )
     top_k = clamp_limit(limit)
 
+    # The degraded scope dump's shaper (per-node stamps; 2g owns that envelope).
+    # The ranked path stamps from the walk's one batched read instead.
     def _shape(node, score, thinned):
         d = letter_payload(node, brief=thinned, extras={"score": score})
         d.update(store.get_modifiers(node["id"]))
@@ -2635,38 +2578,17 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     lever = None
     dump_total: Optional[int] = None
 
+    walk = None
     if manager.embed_provider and manager.vector_store:
         try:
             q_vector = manager.embed_provider.get_embedding(query, is_query=True)
-            matches = manager.vector_store.query(q_vector, limit=top_k)
+            # The shared identity walk — see cmd_query.
+            walk = walk_ranked(q_vector, vector_store=manager.vector_store,
+                               graph=store, limit=top_k)
             semantic_ran = True
-            # Raw points, not surfaced decisions: the lever reads retrieval depth.
-            lever = window_lever(points=len(matches), limit=top_k,
-                                 ceiling=RANKED_LIMIT_CEILING, full_top=full_top)
-            for m in matches:
-                node = store.get_node_by_slug(m["slug"])
-                if not node:
-                    handle = _retired_handle(store, m["slug"])
-                    if handle:
-                        retired.append(handle)
-                    continue
-                if node["kind"] != "decision":
-                    # An open question: never embedding-ranked (C4), not retired.
-                    continue
-                state = store.get_node_state(node["id"])
-                if state not in ("active", "drifted"):
-                    handle = _retired_handle(store, m["slug"])
-                    if handle:
-                        retired.append(handle)
-                    continue
-                # Rank among the decisions returned, at append time — never the
-                # index into `matches`, whose skipped entries consume no rank.
-                rank = len(results["active_decisions"]) + 1
-                results["active_decisions"].append(
-                    _shape(node, m["score"], _rank_thinned(rank, full_top))
-                )
-                if top_score is None or m["score"] > top_score:
-                    top_score = m["score"]
+        except WalkContractError:
+            # A wrong store or vector double: loud, never "recall degraded".
+            raise
         except CollectionMissingError as e:
             # I8 — see cmd_query. Over an empty active set the absent collection IS
             # the empty index, so `semantic_ran` stays True: the read renders "ran
@@ -2680,6 +2602,24 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         except Exception as e:
             semantic_ran = False
             degraded_error = e
+
+    # Composition, outside the `try` — see cmd_query.
+    if walk is not None:
+        # The live window, not raw points (see cmd_query).
+        lever = window_lever(points=len(walk.window), limit=top_k,
+                             ceiling=RANKED_LIMIT_CEILING, full_top=full_top)
+        for rank, hit in enumerate(walk.window, start=1):
+            d = letter_payload(hit.node, brief=_rank_thinned(rank, full_top),
+                               extras={"score": hit.score})
+            for key, slugs in walk.stamps.get(hit.node["id"], {}).items():
+                d[key] = list(slugs)
+            results["active_decisions"].append(d)
+        if walk.window:
+            top_score = max(hit.score for hit in walk.window)
+        else:
+            # Zero live: the blackout's handles, closest first, bounded at `limit`.
+            retired = [retired_handle(hit.node, walk.stamps)
+                       for hit in walk.retired[:top_k]]
 
     # Scope listing fallback ONLY in degraded mode (mirrors the MCP tool, P5): a
     # semantic run that found nothing must not masquerade as an unranked scope dump.
@@ -2783,6 +2723,13 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         results["note"] = f"{note} {withheld_clause(withheld, surface='cli', config=config)}"
         note = results["note"]
         results["rejected_paths_withheld"] = withheld
+
+    # The stamps went unread: the ranking stands, the fault is stated — last on the
+    # note, after every override and the withheld clause; absent when read.
+    if walk is not None and walk.stamps_unread:
+        results["note"] = f"{note} {stamps_unread_clause(surface='cli', config=config)}"
+        note = results["note"]
+        results["stamps_unread"] = True
 
     # After the recall answer's own keys; absent (never null) when not shown.
     if notice:

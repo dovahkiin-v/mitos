@@ -208,3 +208,47 @@ def test_label_hits_refuses_a_point_the_collection_was_not_built_from(index):
 
     with pytest.raises(AssertionError, match="not a point this collection was built from"):
         CH.label_hits(index, [{"point_id": orphan_point_id("stray"), "score": 0.5}], [])
+
+
+# --------------------------------------------------------------------------- #
+# Phase 2c — the query form reads through the shared identity walk
+# --------------------------------------------------------------------------- #
+
+def test_the_query_form_reads_one_ids_only_call_at_the_bound_and_labels_its_window(
+        index, tmp_path, monkeypatch):
+    """§9.6 offline: `read_query_form` drives `surface_decisions`, which now asks the
+    proxy once at the over-fetch bound with ids only, so the proxy holds every Harbor
+    point; the labelled hits are the first `RECORD_LIMIT` of that ranking."""
+    import dataclasses
+
+    from _point_hits import CannedVector
+    from mitos.cli import cmd_init
+    from mitos.config import MitosConfig
+    from mitos.retrieval_walk import RANKED_OVERFETCH_BOUND
+
+    monkeypatch.setenv("QDRANT_URL", "http://localhost:9")
+    for key in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "ANTHROPIC_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
+    workspace = str(tmp_path / "ws")
+    os.makedirs(workspace)
+    cmd_init(MitosConfig(workspace))
+
+    class _Embed:
+        def get_embedding(self, text, is_query=False):
+            return [0.1, 0.2]
+
+    matches = [{"slug": n["slug"], "score": 0.9 - 0.001 * i} for i, n in enumerate(index.nodes)]
+    probe = dataclasses.replace(index, provider=_Embed(), workspace=workspace,
+                                vstore=CannedVector(matches, store=index.store))
+    fixture = {"id": "walk-probe", "form": "query", "measure": "node", "text": "probe",
+               "class": "probe", "targets": [index.nodes[0]["slug"]], "negatives": [],
+               "exclude": []}
+    read = CH.read_query_form(probe, fixture)
+
+    assert len(read.calls) == 1
+    limit, raw, with_payload = read.calls[0]
+    assert (limit, with_payload) == (RANKED_OVERFETCH_BOUND, False)
+    assert len(raw) == len(index.nodes) > CH.RECORD_LIMIT
+    assert [h["slug"] for h in read.result["hits"]] == \
+        [n["slug"] for n in index.nodes[:CH.RECORD_LIMIT]]
+    assert CH.READER == "mcp.surface_decisions(retrieval_walk)+conflict.gather_candidates"

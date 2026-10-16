@@ -904,22 +904,38 @@ def test_cli_query_blackout_vector(ws, capsys) -> None:
     assert "dead-v1" in out and "dead-v2" in out and "superseded" in out
 
 
+def _deep_corpus(store: GraphStore, n: int = 51) -> list:
+    """Commits ``n`` live decisions (``deep-0..``) and returns their canned matches,
+    best first — more live decisions than any clamped ``limit`` can ask for."""
+    for i in range(n):
+        e = ParsedEntry("decision", f"deep-{i}", 1, 5)
+        e.axiom = f"Deep decision {i}."
+        e.rejected_paths = "Rejected the obvious alternative."
+        e.scope = ["x"]
+        store.commit_parsed_entry(e)
+    return [{"slug": f"deep-{i}", "score": 0.9 - i * 0.001} for i in range(n)]
+
+
 def test_cli_query_limit_threads_through(ws, capsys) -> None:
-    """`--limit` SETS the top-k: a value above the default-5 must reach
-    vector_store.query un-truncated (the §6 no-op-above-default trap), a low value
-    trims, and out-of-range values clamp calmly to [1, RANKED_LIMIT_CEILING]."""
+    """`--limit` SETS the window: above the default-5 it deepens it un-truncated (the
+    §6 no-op-above-default trap), a low value trims, and out-of-range values clamp
+    calmly to [1, RANKED_LIMIT_CEILING]. Since 2c the vector call is always at the
+    over-fetch bound, so the window is what `limit` sets: 51 live decisions in the
+    fetch yield exactly the clamped count."""
     from mitos.display import RANKED_LIMIT_CEILING
+    from mitos.retrieval_walk import RANKED_OVERFETCH_BOUND
     config, m = ws
-    _rec(m, "q-target", scope=["x"])
-    store = GraphStore(config.db_path, read_only=True)
+    canned = _deep_corpus(m.store)
 
     for requested, expected in [(20, 20), (3, 3), (999, RANKED_LIMIT_CEILING), (0, 1), (None, 5)]:
-        fake_vec = _FakeVector([{"slug": "q-target", "score": 0.8}])
-        stub = _StubManager(store, _FakeEmbed(), fake_vec)
+        fake_vec = _FakeVector(list(canned))
+        stub = _StubManager(m.store, _FakeEmbed(), fake_vec)
         with patch("mitos.cli.MitosSyncManager", return_value=stub):
             cmd_query(config, "a claim that is not any slug", as_json=True, limit=requested)
-        capsys.readouterr()
-        assert fake_vec.last_limit == expected, f"--limit {requested} → {fake_vec.last_limit}, want {expected}"
+        resp = json.loads(capsys.readouterr().out)
+        assert [h["slug"] for h in resp["matches"]] == [f"deep-{i}" for i in range(expected)], \
+            f"--limit {requested} → {len(resp['matches'])}, want {expected}"
+        assert fake_vec.calls == [(RANKED_OVERFETCH_BOUND, False)]
 
 
 def test_cli_surface_blackout_vector(ws, capsys) -> None:
@@ -996,26 +1012,33 @@ def test_mcp_surface_blackout_vector(ws) -> None:
 
 
 def test_mcp_limit_threads_through(ws) -> None:
-    """The MCP `limit` arg SETS the top-k threaded to vector_store.query; clamps calmly."""
+    """The MCP `limit` arg SETS the window on both ranked tools; clamps calmly. The
+    vector call is at the over-fetch bound (see the CLI twin above)."""
     from mitos import mcp_server
     from mitos.display import RANKED_LIMIT_CEILING
+    from mitos.retrieval_walk import RANKED_OVERFETCH_BOUND
     config, m = ws
-    _rec(m, "q-target", scope=["x"])
+    canned = _deep_corpus(m.store)
     store = GraphStore(config.db_path, read_only=True)
 
     for requested, expected in [(20, 20), (3, 3), (999, RANKED_LIMIT_CEILING), (0, 1)]:
-        fake_vec = _FakeVector([{"slug": "q-target", "score": 0.8}])
+        want = [f"deep-{i}" for i in range(expected)]
+        fake_vec = _FakeVector(list(canned), store=store)
         with patch.object(mcp_server, "get_workspace_components",
                           return_value=(store, _FakeEmbed(), fake_vec)):
-            mcp_server.query_decisions("a claim that is not any slug", limit=requested,
-                project=config.workspace_dir)
-        assert fake_vec.last_limit == expected
-        fake_vec2 = _FakeVector([{"slug": "q-target", "score": 0.8}])
+            resp = json.loads(mcp_server.query_decisions(
+                "a claim that is not any slug", limit=requested,
+                project=config.workspace_dir))
+        assert [h["slug"] for h in resp["matches"]] == want
+        assert fake_vec.calls == [(RANKED_OVERFETCH_BOUND, False)]
+        fake_vec2 = _FakeVector(list(canned), store=store)
         with patch.object(mcp_server, "get_workspace_components",
                           return_value=(store, _FakeEmbed(), fake_vec2)):
-            mcp_server.surface_decisions(query="a claim that is not any slug", limit=requested,
-                project=config.workspace_dir)
-        assert fake_vec2.last_limit == expected
+            resp = json.loads(mcp_server.surface_decisions(
+                query="a claim that is not any slug", limit=requested,
+                project=config.workspace_dir))
+        assert [h["slug"] for h in resp["active_decisions"]] == want
+        assert fake_vec2.calls == [(RANKED_OVERFETCH_BOUND, False)]
 
 
 def test_cli_mcp_blackout_parity(ws) -> None:
