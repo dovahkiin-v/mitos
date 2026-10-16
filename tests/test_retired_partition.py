@@ -21,7 +21,6 @@ import io
 import json
 import logging
 import sqlite3
-import tempfile
 import threading
 import time
 from contextlib import redirect_stdout
@@ -971,6 +970,37 @@ def test_a_fault_on_a_read_with_handles_keeps_the_handles_and_states_it(ws, driv
     else:
         assert "superseded_by" not in _block(faulted)
         assert _text_ranks(faulted) == _text_ranks(healthy)
+
+
+@pytest.mark.parametrize("surface", ["mcp", "cli"])
+def test_one_envelope_reads_lead_band_withheld_then_stamps_unread(ws, surface):
+    """Row 8 end to end: on one real envelope (a thinned graze with a stamp fault)
+    every 2f piece sits where §3.4 orders it, the call sites' clauses after them."""
+    config, m = ws
+    hits = _graze_world(m)
+    if surface == "mcp":
+        store = _StampFault(GraphStore(config.db_path, read_only=True))
+        with patch.object(mcp_server, "get_workspace_components",
+                          return_value=(store, _FakeEmbed(), CannedVector(hits))):
+            resp = json.loads(mcp_server.surface_decisions(
+                _CLAIM, project=config.workspace_dir, limit=2, brief=True))
+    else:
+        manager = MitosSyncManager(config)
+        manager.embed_provider, manager.vector_store = _FakeEmbed(), CannedVector(hits)
+        manager.store = _StampFault(manager.store)
+        buf = io.StringIO()
+        with patch.object(cli, "MitosSyncManager", return_value=manager), redirect_stdout(buf):
+            cmd_surface(config, _CLAIM, as_json=True, limit=2, brief=True)
+        resp = json.loads(buf.getvalue())
+    note = resp["note"]
+    withheld = withheld_clause(2, surface=surface, config=config)
+    unread = stamps_unread_clause(surface=surface, config=config)
+    assert resp["rejected_paths_withheld"] == 2 and resp["stamps_unread"] is True
+    assert note.startswith(_LEAD_STEM)
+    band = note.index("Ranked top matches.") if "Ranked top matches." in note else note.index(
+        "Twilight zone")
+    assert 0 < band < note.index(withheld) < note.index(unread)
+    assert note.endswith(unread)
 
 
 # --------------------------------------------------------------------------- #
