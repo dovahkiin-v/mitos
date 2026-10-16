@@ -22,7 +22,7 @@ Run under ``./venv/bin/python -m pytest`` (PATTERNS — bare ``python`` lacks de
 import json
 import os
 import sqlite3
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 from unittest.mock import patch
 
 import pytest
@@ -106,6 +106,11 @@ class _Vector:
         self.points.add(hash_to_uuid(point_id))
         self.payloads[point_id] = dict(payload)
         self.written.append(point_id)
+
+    def delete_points(self, point_ids: Sequence[str]) -> None:
+        if self.absent and not self.created:
+            raise self._missing()
+        self.points.difference_update(point_ids)
 
     def query(self, vector: List[float], limit: int = 5, *,
               with_payload: bool = True) -> List[Dict[str, Any]]:

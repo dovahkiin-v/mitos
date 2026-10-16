@@ -16,6 +16,9 @@ whole contract, including the fields its own rows never read. Three rows hold th
 - **Behavioural.** The shared doubles' hits carry a string ``point_id`` that resolves,
   through ``resolve_point_ids`` on the bound graph, to the node intended, with the
   production key sets and ``limit`` honoured.
+- **The delete (recall-confidence 3c).** Every class defining ``query``, ``upsert`` or
+  ``list_point_ids`` defines or inherits ``delete_points`` with the protocol's
+  signature, and on the shared doubles a deleted point leaves the next answer.
 
 The fixture-fault teardown (conftest's ``point_hit_fixture_faults``) is pinned last, in
 a pytest subprocess, because its subject is a test failing.
@@ -28,7 +31,7 @@ import subprocess
 import sys
 import textwrap
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import pytest
 
@@ -154,6 +157,117 @@ def nonconforming_from(path: Path, reference: List[Param]) -> List[str]:
 
 
 # --------------------------------------------------------------------------- #
+# delete_points (recall-confidence 3c): every vector store, double or real, has it
+# --------------------------------------------------------------------------- #
+
+#: A class defining any of these is a vector store, and must define or inherit
+#: ``delete_points``.
+VECTOR_STORE_METHODS = {"query", "upsert", "list_point_ids"}
+#: Found at 3c: 32 (the protocol, the client and thirty test doubles). A floor.
+MIN_VECTOR_STORE_CLASSES = 30
+
+
+def _methods(node: ast.ClassDef) -> Dict[str, ast.FunctionDef]:
+    return {item.name: item for item in node.body
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+
+def _classes(files: List[Path]) -> List[Tuple[Path, ast.ClassDef]]:
+    return [(path, node) for path in files
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+            if isinstance(node, ast.ClassDef)]
+
+
+def _delete_reference() -> List[Param]:
+    sig = inspect.signature(VectorStore.delete_points)
+    return [(p.name, p.kind.name,
+             _NO_DEFAULT if p.default is inspect.Parameter.empty else p.default)
+            for p in sig.parameters.values()]
+
+
+def delete_signature_mismatches(files: List[Path], reference: List[Param]) -> List[str]:
+    return [f"{path.name}::{cls.name}.delete_points{_ast_params(fn)}"
+            for path, cls in _classes(files)
+            for name, fn in _methods(cls).items()
+            if name == "delete_points" and _ast_params(fn) != reference]
+
+
+def lacking_delete(files: List[Path], universe: List[Path]) -> List[str]:
+    """Vector stores in ``files`` that neither define nor inherit ``delete_points``.
+
+    Inheritance resolves by base-class **name** over every class in ``universe`` —
+    tree-wide, because four doubles subclass a ``_FakeVector`` they import from
+    ``_conflict_helpers`` and a per-file lookup would miss that base. Every class
+    sharing a name must provide it for the name to count as providing it.
+    """
+    by_name: Dict[str, List[ast.ClassDef]] = {}
+    for _path, cls in _classes(universe):
+        by_name.setdefault(cls.name, []).append(cls)
+
+    def provides(cls: ast.ClassDef, seen: frozenset) -> bool:
+        if "delete_points" in _methods(cls):
+            return True
+        for base in cls.bases:
+            name = ast.unparse(base).split(".")[-1]
+            candidates = by_name.get(name, [])
+            if name not in seen and candidates and all(
+                    provides(c, seen | {name}) for c in candidates):
+                return True
+        return False
+
+    return [f"{path.name}::{cls.name}" for path, cls in _classes(files)
+            if VECTOR_STORE_METHODS & set(_methods(cls))
+            and not provides(cls, frozenset({cls.name}))]
+
+
+def test_every_delete_points_in_the_tree_has_the_protocols_signature() -> None:
+    reference = _delete_reference()
+    assert reference == [("self", "POSITIONAL_OR_KEYWORD", _NO_DEFAULT),
+                         ("point_ids", "POSITIONAL_OR_KEYWORD", _NO_DEFAULT)]
+    assert delete_signature_mismatches(_tree_files(), reference) == []
+
+
+def test_every_vector_store_in_the_tree_defines_or_inherits_delete_points() -> None:
+    files = _tree_files()
+    stores = [(p, c) for p, c in _classes(files) if VECTOR_STORE_METHODS & set(_methods(c))]
+    assert len(stores) >= MIN_VECTOR_STORE_CLASSES, len(stores)
+    assert lacking_delete(files, files) == []
+
+
+def test_the_delete_rows_report_a_planted_double(tmp_path) -> None:
+    """Positive control: a lacking double, a wrong signature, and an inheriting one
+    (which conforms) — the inheritance resolved through a base in another file."""
+    base = tmp_path / "_planted_base.py"
+    base.write_text(textwrap.dedent('''
+        class _PlantedBase:
+            def query(self, vector, limit=5, *, with_payload=True):
+                return []
+            def delete_points(self, point_ids):
+                pass
+    '''), encoding="utf-8")
+    planted = tmp_path / "test_planted_delete.py"
+    planted.write_text(textwrap.dedent('''
+        from _planted_base import _PlantedBase
+        def test_x():
+            class _Lacking:
+                def upsert(self, point_id, vector, payload, *, may_create):
+                    pass
+            class _WrongShape:
+                def query(self, vector, limit=5, *, with_payload=True):
+                    return []
+                def delete_points(self, point_ids, wait=True):
+                    pass
+            class _Inherits(_PlantedBase):
+                def query(self, vector, limit=5, *, with_payload=True):
+                    return []
+    '''), encoding="utf-8")
+    universe = [base, planted, *_tree_files()]
+    assert lacking_delete([planted], universe) == ["test_planted_delete.py::_Lacking"]
+    assert [m.split("::")[1].split(".")[0] for m in
+            delete_signature_mismatches([planted], _delete_reference())] == ["_WrongShape"]
+
+
+# --------------------------------------------------------------------------- #
 # The second clause — hit-returning doubles go through the leaf
 # --------------------------------------------------------------------------- #
 
@@ -221,6 +335,9 @@ class _AskWith:
               with_payload: bool = True) -> List[Dict[str, Any]]:
         return self._inner.query(self._fixed, limit, with_payload=with_payload)
 
+    def delete_points(self, point_ids: Sequence[str]) -> None:
+        self._inner.delete_points(point_ids)
+
 
 def _canned(store: GraphStore, matches: List[Dict[str, Any]]) -> Any:
     return CannedVector(matches, store=store)
@@ -281,6 +398,11 @@ def test_shared_doubles_honour_the_whole_contract(tmp_path, build) -> None:
     assert [h["point_id"] for h in ids_only] == [h["point_id"] for h in full]
 
     assert len(double.query([0.1, 0.2], limit=2)) == 2
+
+    # 3c: a deleted point is gone from the double's next answer, by its listed id.
+    double.delete_points([full[1]["point_id"]])
+    after = double.query([0.1, 0.2], limit=3)
+    assert [h["point_id"] for h in after] == [full[0]["point_id"], full[2]["point_id"]]
     assert take_faults() == []
 
 

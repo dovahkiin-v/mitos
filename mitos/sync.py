@@ -53,8 +53,8 @@ from mitos.telemetry import (CommentaryAuditRow, ConflictCheckRow, JudgmentBatch
 from mitos.check_notice import compose_check_notice
 from mitos.audit_debt import AuditDebt, derive_audit_debt
 from mitos.divergence import (
-    code_point_names, declared_edges, differing_span, entry_divergence, is_reconcilable,
-    judged_text, needs_code_points,
+    code_point_names, corpus_holds_entries, declared_edges, differing_span, entry_divergence,
+    is_reconcilable, judged_text, needs_code_points,
 )
 from mitos.errors import (
     CollectionMissingError,
@@ -65,6 +65,7 @@ from mitos.errors import (
     DatabaseError,
     EntryFailure,
     VectorStoreError,
+    VectorStoreUnreachableError,
     CommitError,
     STORE_CYCLE_VIOLATION,
     STORE_DANGLING_EDGE,
@@ -98,7 +99,8 @@ from mitos.provider_cause import (AUTH, QUOTA, TRANSIENT, classify_provider_erro
                                   describe_embed_failure)
 from mitos.shell_quote import shell_flag
 from mitos.tool_markup import field_values, find_tool_call_markup
-from mitos.vector_store import QdrantVectorStore, hash_to_uuid
+from mitos.recall import missing_graph_is_a_gap
+from mitos.vector_store import QdrantVectorStore, hash_to_uuid, partition_points
 from mitos.renderer import MitosRenderer, OVERFLOW_HINT_WINDOW_SECONDS, summarize_overflows
 from mitos.restore import BufferFidelityError, verify_amended_buffer
 
@@ -779,6 +781,10 @@ _DRAIN_OUTAGE_CAUSES = frozenset({AUTH, QUOTA, TRANSIENT})
 
 # Rows per outbox read. The walk is keyset-paged, so this sizes each read, not the walk.
 _DRAIN_CLAIM_SIZE = 10
+
+# Node-less points per delete request in `reconcile`'s collection — the scroll's page
+# size. Read at call time, so a row can force several chunks.
+_ORPHAN_DELETE_CHUNK = 256
 
 
 @dataclass(frozen=True)
@@ -3154,7 +3160,7 @@ class MitosSyncManager:
         return True
 
     def reconcile_embeddings(self) -> Dict[str, Any]:
-        """Embeds every node the decision index is missing, then drains the outbox.
+        """Embeds every node the decision index is missing, drains, then collects node-less points.
 
         Heals the gap an ordinary drain cannot reach: when Qdrant is wiped directly
         (a bare ``curl -X DELETE`` of the collection) WITHOUT a ``rebuild``/
@@ -3182,6 +3188,40 @@ class MitosSyncManager:
         the drain's first upsert then creates the collection. Only genuine
         unreachability raises.
 
+        **The collection** (the index's death story, P4). After the drain the graph
+        is read — active ids, then every node id — and the listing is partitioned
+        (:func:`~mitos.vector_store.partition_points`, the one partition ``status``
+        applies too): points of retired nodes are history and kept, killed open
+        questions included; points whose node is not in the graph are garbage and
+        are deleted by their listed id (ADR
+        ``reconcile-heals-every-decision-vector-and-collects-only-node-less-points``).
+        The graph read comes **after** the listing: a write commits its node before
+        it upserts its point, so every listed point's node is committed by then, and
+        a record landing mid-collection keeps its point. The delete runs in chunks of
+        ``_ORPHAN_DELETE_CHUNK``; a refused chunk is counted in ``delete_failed`` and
+        the next is tried, while an unreachable Qdrant or a missing collection stops
+        the loop and counts every unconfirmed id as failed. A foreign point written
+        into this workspace's collection by another workspace sharing it is node-less
+        here and is deleted too — accepted, because nothing deleted is beyond a
+        re-seed.
+
+        **Over a graph holding no nodes, nothing is judged and nothing is deleted.**
+        Every listed point would look node-less there (a clone without its gitignored
+        graph file), so a heal that trusted that would wipe the collection of every
+        such workspace at once — P5's cascade. The guard keys on the **node count**,
+        never on :func:`~mitos.recall.missing_graph_is_a_gap`: that predicate also
+        asks the corpus, and ``corpus_holds_entries`` reads an unreadable file as
+        empty, so a zero-node graph beside an unreadable ``decisions.md`` would read
+        as "built and empty" and lose every point. The predicate answers
+        ``graph_unbuilt`` instead, so ``cmd_reconcile`` names ``mitos rebuild``
+        exactly when ``status``' unbuilt rung does.
+
+        Precedence for the partition keys, first match wins (the same rule
+        ``status`` applies): the graph pair could not be read, or the provider-down
+        return → ``None``/``None``; an empty listing (absent collection, or no
+        point) → ``0``/``0`` on any graph; a non-empty listing over a graph holding
+        no nodes → ``None``/``None``; otherwise the partition's counts.
+
         Returns:
             The shipped keys ``active`` (active-node count), ``present`` (the
             collection's point count, retired and orphan points included) and
@@ -3191,12 +3231,23 @@ class MitosSyncManager:
             :class:`DrainOutcome` ``written`` / ``stop``; ``0`` / ``None`` when
             nothing was missing and no drain ran) and ``left_queued`` (the outbox
             rows standing when this returns, read — never inferred from the drain's
-            counters, which count only rows attempted). Every return path carries
-            the same key set.
+            counters, which count only rows attempted). Then the collection's:
+            ``retired_node_points`` and ``nodeless_points`` (the listing's history
+            and garbage buckets, ``None`` when not judged — see the precedence
+            above); ``deleted`` (node-less points whose delete Qdrant confirmed);
+            ``delete_failed`` (node-less points refused or unconfirmed — still
+            there, and the next reconcile retries them); and ``graph_unbuilt``
+            (``missing_graph_is_a_gap``'s answer, ``status --json``'s
+            ``checks.graph_unbuilt``). The partition counts describe the listing
+            this call judged, not the collection after its writes, so
+            ``retired_node_points`` plus the retired points ``written`` here is
+            roughly ``status``' next count. Every return path carries the same key
+            set.
 
         Raises:
             VectorStoreError: If Qdrant is unreachable while scrolling point ids.
-                A *missing collection* does not raise (see above).
+                A *missing collection* does not raise (see above), and no delete
+                fault escapes: each is counted in ``delete_failed``.
         """
         if not self.embed_provider or not self.vector_store:
             # stderr, not stdout: `mitos reconcile --json` promises stdout carries
@@ -3217,6 +3268,12 @@ class MitosSyncManager:
                 "expected": 0, "expected_present": 0,
                 "written": 0, "left_queued": len(self.store.get_pending_embeddings()),
                 "drain_stop": None,
+                # Nothing was listed, so nothing was judged or collected. The unbuilt
+                # answer is still computed: it is a graph-and-corpus read, and a
+                # keyless clone is still a clone.
+                "retired_node_points": None, "nodeless_points": None,
+                "deleted": 0, "delete_failed": 0,
+                "graph_unbuilt": self.is_graph_unbuilt(),
             }
 
         expected_ids = self.store.get_decision_index_expected_ids()
@@ -3254,6 +3311,40 @@ class MitosSyncManager:
             written = drained.written
             drain_stop = drained.stop
 
+        # The collection: the graph pair is read AFTER the listing (and the drain),
+        # so every listed point's node is committed by now — a write commits its node
+        # before it upserts — and a record landing mid-collection keeps its point.
+        # Active first, then every node; the partition intersects them, so a rebuild
+        # swap between the two reads cannot make an active node look node-less.
+        node_ids: Optional[AbstractSet[str]] = None
+        try:
+            active_ids = self.store.get_active_node_ids()
+            node_ids = self.store.get_all_node_ids()
+        except Exception as e:
+            # The seed above already ran; a graph fault here leaves the collection
+            # undone (not judged), it does not fail the heal.
+            print(
+                f"[Warning] Could not read the graph to judge the index's points; "
+                f"nothing was collected: {e}",
+                file=sys.stderr,
+            )
+        retired_node_points: Optional[int] = None
+        nodeless_points: Optional[int] = None
+        deleted = 0
+        delete_failed = 0
+        if node_ids is None:
+            pass  # not judged: the graph pair could not be read
+        elif not present:
+            # An empty listing is judged and empty on any graph: no point to judge.
+            retired_node_points = nodeless_points = 0
+        elif node_ids:
+            # The guard: only over a graph holding nodes. Over a zero-node graph every
+            # listed point would look node-less, so it is left not judged instead.
+            partition = partition_points(present, node_ids=node_ids, active_ids=active_ids)
+            retired_node_points = len(partition.retired_node)
+            nodeless_points = len(partition.nodeless)
+            deleted, delete_failed = self._delete_nodeless_points(partition.nodeless)
+
         return {
             "active": active_count,
             "present": len(present),
@@ -3266,7 +3357,62 @@ class MitosSyncManager:
             # per-commit rows that were queued before this reconcile.
             "left_queued": len(self.store.get_pending_embeddings()),
             "drain_stop": drain_stop,
+            "retired_node_points": retired_node_points,
+            "nodeless_points": nodeless_points,
+            "deleted": deleted,
+            "delete_failed": delete_failed,
+            "graph_unbuilt": self.is_graph_unbuilt(),
         }
+
+    def is_graph_unbuilt(self) -> bool:
+        """Answers ``status``' unbuilt-graph question, with ``status``' own predicate.
+
+        Returns:
+            True when the graph holds no node while the corpus holds entries.
+        """
+        return missing_graph_is_a_gap(
+            self.store, self.config, corpus_scan=corpus_holds_entries
+        )
+
+    def _delete_nodeless_points(self, nodeless: AbstractSet[str]) -> Tuple[int, int]:
+        """Deletes node-less points chunk by chunk; counts confirmed and failed.
+
+        A chunk refused or left unconfirmed (plain ``VectorStoreError``) is counted
+        failed and the next chunk is tried. An unreachable Qdrant or a missing
+        collection stops the loop, because every later chunk would meet the same
+        fault; every id not yet confirmed is counted failed. Nothing else is caught.
+
+        Args:
+            nodeless: The listed ids whose node is not in the graph.
+
+        Returns:
+            ``(deleted, delete_failed)``.
+        """
+        ids = sorted(nodeless)
+        size = _ORPHAN_DELETE_CHUNK
+        deleted = 0
+        failed = 0
+        for start in range(0, len(ids), size):
+            chunk = ids[start:start + size]
+            try:
+                self.vector_store.delete_points(chunk)
+            except (VectorStoreUnreachableError, CollectionMissingError) as e:
+                failed += len(ids) - start
+                print(
+                    f"[Warning] Stopped deleting node-less points; "
+                    f"{len(ids) - start} not deleted: {e}",
+                    file=sys.stderr,
+                )
+                break
+            except VectorStoreError as e:
+                failed += len(chunk)
+                print(
+                    f"[Warning] {len(chunk)} node-less point(s) not deleted: {e}",
+                    file=sys.stderr,
+                )
+                continue
+            deleted += len(chunk)
+        return deleted, failed
 
     # --- record_decision: the write half of the MCP server (Fork A) ---
 

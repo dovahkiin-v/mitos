@@ -626,6 +626,9 @@ def test_status_a_retired_only_graph_over_an_absent_collection(
     assert checks["missing_retired_slugs"] == ["cycle-a", "cycle-b"]
     # G9: an absent collection has no points, verified rather than unknown.
     assert checks["orphan_points"] == 0
+    # 3c: its partition is judged and empty too.
+    assert checks["retired_node_points"] == 0
+    assert checks["nodeless_points"] == 0
     assert checks["missing_active_vectors"] == 0
 
     _rc, out = _status(config, capsys, as_json=False)
@@ -652,6 +655,9 @@ def test_status_key_order_is_identical_in_every_branch(tmp_path, monkeypatch, ca
     for key in _NEW_KEYS:
         assert key in orders[0]
     assert orders[0].index("missing_retired_slugs") < orders[0].index("orphan_points")
+    # 3c: the orphan count's partition sits immediately after it.
+    at = orders[0].index("orphan_points")
+    assert orders[0][at + 1:at + 3] == ["retired_node_points", "nodeless_points"]
 
 
 def test_status_a_fresh_project_reports_no_retired_decisions(tmp_path, monkeypatch, capsys) -> None:
@@ -680,6 +686,11 @@ def test_setup_runbook_names_every_decision_not_the_active_node_set() -> None:
     assert "Re-embed the V1a active set" not in setup
     assert ("it diffs every decision (live or retired) plus the active open questions "
             "against Qdrant's actual points") in setup
+    # 3c inverted the box's silence on deletion: reconcile now collects node-less points,
+    # over a built graph only, and names `rebuild` over an unbuilt one.
+    assert ("`reconcile` also deletes points whose node is no longer in the graph, over "
+            "a built graph only: over a clone whose graph is unbuilt it deletes nothing "
+            "and names `mitos rebuild` instead.") in setup
 
 
 def test_the_reconcile_help_names_every_decision() -> None:
@@ -688,6 +699,8 @@ def test_the_reconcile_help_names_every_decision() -> None:
     helps = {choice.dest: choice.help for choice in action._choices_actions}
     assert "Re-embed active nodes" not in helps["reconcile"]
     assert "every decision (live or retired)" in helps["reconcile"]
+    # 3c: the help names the collection too.
+    assert "delete points whose node has left the graph" in helps["reconcile"]
 
 
 def test_the_cutover_finish_block_names_every_decision() -> None:

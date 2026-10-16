@@ -607,6 +607,13 @@ class _MissingCollection:
             collection=_ABSENT,
         )
 
+    def delete_points(self, point_ids):
+        raise CollectionMissingError(
+            f"Qdrant collection '{_ABSENT}' does not exist "
+            "(Qdrant is up and answered 404 to the delete).",
+            collection=_ABSENT,
+        )
+
 
 class _Embeds:
     """An embedding provider that succeeds — the fault under test is downstream."""
@@ -914,6 +921,9 @@ class _NoMatches:
 
     def query(self, vector, limit=5, *, with_payload=True):
         return []
+
+    def delete_points(self, point_ids):
+        pass  # nothing is stored, so nothing is left to delete
 
 
 class TestUnbuiltGraphOnTheOrdinaryEmptyEnvelope:

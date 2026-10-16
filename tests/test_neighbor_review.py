@@ -754,6 +754,9 @@ class _RaisingVector:
     def upsert(self, *a, **k):
         pass
 
+    def delete_points(self, point_ids):
+        raise self._exc
+
 
 def test_active_oq_in_window_pauses_on_genuine_decision(ws):
     """T1 (the mandatory regression): an active OQ in the KNN window never empties the pause.
@@ -2688,6 +2691,10 @@ class _CreatableVector:
             if not may_create:
                 raise CollectionMissingError("absent")
             self.exists = True
+
+    def delete_points(self, point_ids):
+        if not self.exists:
+            raise CollectionMissingError("absent")
 
 
 def test_f10_a_fresh_workspace_reads_empty_not_null(ws):

@@ -602,7 +602,8 @@ def test_cmd_reconcile_text_and_json_carry_the_same_numbers(
     The collection holds the active points plus one orphan point, so ``present`` (4) is
     not what was already indexed (3). The text line no longer calls ``present`` "already
     indexed" (the stale §4.11 line); ``--json`` stdout is one object whose three shipped
-    keys keep their values.
+    keys keep their values. Since 3c the orphan names no node, so the same reconcile
+    collects it, and both renderings say so.
     """
     from mitos import cli
 
@@ -624,12 +625,15 @@ def test_cmd_reconcile_text_and_json_carry_the_same_numbers(
     assert _shipped(payload) == {"active": 3, "present": 4, "enqueued": 2}
     assert _added(payload) == {"expected": 5, "expected_present": 3, "written": 2,
                                "left_queued": 0, "drain_stop": None}
+    assert (payload["nodeless_points"], payload["deleted"]) == (1, 1)
+    assert payload["retired_node_points"] == 0  # the retired points were not listed
 
     text = _run(False)
     assert "Reconciled: 5 node(s) the decision index should hold (3 active), " \
            "3 already indexed, 2 enqueued, 2 embedded." in text
     assert "4 point(s) already indexed" not in text
     assert "still queued" not in text
+    assert "Collected: 1 node-less point(s) deleted." in text
 
 
 def test_cmd_reconcile_text_names_rows_left_queued(

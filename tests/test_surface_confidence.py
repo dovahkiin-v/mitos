@@ -837,11 +837,20 @@ class _Boom:
     def query(self, vector, limit=5, *, with_payload=True):
         raise RuntimeError("qdrant fell over")
 
+    def delete_points(self, point_ids):
+        raise RuntimeError("qdrant fell over")
+
 
 class _MissingCollection:
     """Qdrant is up and says that collection does not exist."""
 
     def query(self, vector, limit=5, *, with_payload=True):
+        raise CollectionMissingError(
+            "Qdrant collection 'mitos-tmp-absent' does not exist.",
+            collection="mitos-tmp-absent",
+        )
+
+    def delete_points(self, point_ids):
         raise CollectionMissingError(
             "Qdrant collection 'mitos-tmp-absent' does not exist.",
             collection="mitos-tmp-absent",
@@ -853,6 +862,9 @@ class _NoMatches:
 
     def query(self, vector, limit=5, *, with_payload=True):
         return []
+
+    def delete_points(self, point_ids):
+        pass  # nothing is stored, so nothing is left to delete
 
 
 def _sentinel(*_args, **_kwargs):

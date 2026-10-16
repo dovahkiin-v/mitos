@@ -191,15 +191,18 @@ def _commit_active_and_superseded(tmp_path):
 
 
 def test_status_warns_by_id_diff_even_when_count_looks_healthy(tmp_path, monkeypatch, capsys):
-    """The incident shape: the point COUNT clears the active count (graveyard slack), yet
-    an active node has no vector. The id-diff catches it where `points >= active` couldn't."""
+    """The incident shape: the point COUNT clears the active count (non-active points pad
+    it), yet an active node has no vector. The id-diff catches it where `points >= active`
+    couldn't."""
     _init(tmp_path)
     capsys.readouterr()
     monkeypatch.setenv("GEMINI_API_KEY", "testkey")
     ids = _commit_n(tmp_path, 3)
-    # Qdrant holds 2 of the 3 active nodes + 2 graveyard points → 4 points >= 3 active,
-    # so the old count proxy would read HEALTHY, but node-02 is genuinely missing.
-    present = _uuids(ids[:2]) | {"graveyard-a", "graveyard-b"}
+    # Qdrant holds 2 of the 3 active nodes + 2 node-less points → 4 points >= 3 active,
+    # so the old count proxy would read HEALTHY, but node-02 is genuinely missing. (The
+    # two padding ids name no node, so the garbage rung prints too — its `reconcile`
+    # is asserted by the node-less row below; this row's subject is the active diff.)
+    present = _uuids(ids[:2]) | {"nodeless-a", "nodeless-b"}
     monkeypatch.setattr(cli, "_check_qdrant", _qdrant(True, True, points=len(present)))
     monkeypatch.setattr(cli, "scroll_point_ids", _scroll(present))
 
@@ -208,11 +211,11 @@ def test_status_warns_by_id_diff_even_when_count_looks_healthy(tmp_path, monkeyp
     assert "vector index incomplete" in out
     assert "1 active node(s) have no vector" in out
     assert "node-02" in out  # names the missing slug at small N
-    assert "mitos reconcile" in out
+    assert "Run `mitos reconcile -p" in out and "to re-embed them" in out
 
 
 def test_status_silent_when_all_active_present(tmp_path, monkeypatch, capsys):
-    """No warning when every active node has a vector — even with graveyard points around."""
+    """No warning when every active node has a vector."""
     _init(tmp_path)
     capsys.readouterr()
     monkeypatch.setenv("GEMINI_API_KEY", "testkey")
@@ -241,22 +244,50 @@ def test_status_active_only_superseded_absence_is_not_missing(tmp_path, monkeypa
     assert "vector index incomplete" not in out  # both active nodes present → healthy
 
 
-def test_status_orphan_points_reported_as_info_not_warning(tmp_path, monkeypatch, capsys):
-    """Graveyard points (vector present, node inactive) are reported neutrally, never warned —
-    they are the all-superseded blackout vector's substrate."""
+def test_status_retired_node_points_reported_as_history_not_warning(
+    tmp_path, monkeypatch, capsys
+):
+    """A retired node's point (vector present, node in the graph but superseded) is
+    history — reported neutrally, never warned, never offered for deletion: it is the
+    retired matches' and the all-superseded blackout vector's substrate."""
     _init(tmp_path)
     capsys.readouterr()
     monkeypatch.setenv("GEMINI_API_KEY", "testkey")
-    ids = _commit_n(tmp_path, 2)
-    present = _uuids(ids) | {"graveyard-x", "graveyard-y", "graveyard-z"}  # 3 orphans
+    keep_id, old_id, new_id = _commit_active_and_superseded(tmp_path)
+    present = _uuids([keep_id, old_id, new_id])
     monkeypatch.setattr(cli, "_check_qdrant", _qdrant(True, True, points=len(present)))
     monkeypatch.setattr(cli, "scroll_point_ids", _scroll(present))
 
     assert cli.cmd_status(str(tmp_path)) == 0
     out = capsys.readouterr().out
     assert "vector index incomplete" not in out  # every active node has a vector
-    assert "3 graveyard point(s)" in out
+    assert "• 1 point(s) belong to retired nodes — history, kept" in out
     assert "not an error" in out  # reported neutrally, not as a warning
+    assert "⚠" not in out.split("belong to retired nodes")[1].split("\n")[0]
+    assert "mitos reconcile" not in out  # nothing to heal
+    assert "belong to no node" not in out
+
+
+def test_status_nodeless_points_get_the_garbage_rung_naming_reconcile(
+    tmp_path, monkeypatch, capsys
+):
+    """Ids no graph node can carry are node-less: garbage a rebuild left, which take
+    ranked-read slots and resolve to nothing. They get an informational ⚠ rung naming
+    `reconcile` (the collector), and they never block readiness."""
+    _init(tmp_path)
+    capsys.readouterr()
+    monkeypatch.setenv("GEMINI_API_KEY", "testkey")
+    ids = _commit_n(tmp_path, 2)
+    present = _uuids(ids) | {"nodeless-x", "nodeless-y", "nodeless-z"}
+    monkeypatch.setattr(cli, "_check_qdrant", _qdrant(True, True, points=len(present)))
+    monkeypatch.setattr(cli, "scroll_point_ids", _scroll(present))
+
+    assert cli.cmd_status(str(tmp_path)) == 0  # informational, not a readiness blocker
+    out = capsys.readouterr().out
+    assert "vector index incomplete" not in out  # every active node has a vector
+    assert "⚠ 3 point(s) belong to no node in the graph" in out
+    assert "Run `mitos reconcile -p" in out and "to delete them" in out
+    assert "belong to retired nodes" not in out
 
 
 def test_status_full_collection_wipe_warns_when_graph_populated(tmp_path, monkeypatch, capsys):
@@ -312,12 +343,13 @@ def test_status_degrades_when_scroll_fails(tmp_path, monkeypatch, capsys):
 
 
 def test_status_json_carries_missing_and_orphans(tmp_path, monkeypatch, capsys):
-    """The JSON surface carries the real missing-active count/slugs and orphan count."""
+    """The JSON surface carries the real missing-active count/slugs and orphan count, and
+    the orphan count's partition: the one id no node carries is node-less."""
     _init(tmp_path)
     capsys.readouterr()
     monkeypatch.setenv("GEMINI_API_KEY", "testkey")
     ids = _commit_n(tmp_path, 3)
-    present = _uuids(ids[:2]) | {"graveyard-a"}  # node-02 missing, 1 orphan
+    present = _uuids(ids[:2]) | {"nodeless-a"}  # node-02 missing, 1 node-less orphan
     monkeypatch.setattr(cli, "_check_qdrant", _qdrant(True, True, points=len(present)))
     monkeypatch.setattr(cli, "scroll_point_ids", _scroll(present))
 
@@ -327,6 +359,8 @@ def test_status_json_carries_missing_and_orphans(tmp_path, monkeypatch, capsys):
     assert checks["missing_active_vectors"] == 1
     assert checks["missing_active_slugs"] == ["node-02"]
     assert checks["orphan_points"] == 1
+    assert checks["retired_node_points"] == 0
+    assert checks["nodeless_points"] == 1
     assert checks["active_nodes"] == 3
 
 

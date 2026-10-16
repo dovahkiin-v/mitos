@@ -152,9 +152,9 @@ _SURFACE_POINTERS: Dict[str, Dict[str, str]] = {
 # command runs it and there is no rebuild tool to hunt for.
 #
 # `mitos reconcile` is NOT a pointer here and must never become one: over an unbuilt
-# graph it diffs an empty active set against an absent collection, finds nothing to
-# enqueue, and reports success on a workspace it did not touch — converting a
-# recoverable state into one the operator believes they already fixed.
+# graph it judges no point, deletes nothing, refuses naming `mitos rebuild` and exits
+# 1 — so pointing at it sends the reader through a refusal to the heal this clause
+# names directly.
 MISSING_GRAPH_POINTERS: Dict[str, Dict[str, str]] = {
     "cli": {
         "build": "run `mitos rebuild {selector}` to build it from the corpus",

@@ -28,7 +28,7 @@ always routed through `_execution([...])` (a bare Mock return makes 3a's
 
 import datetime as _datetime
 import os
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -231,6 +231,9 @@ def test_graph_fault_inside_check_never_blocks_commit(
     class _BoomVector(_FakeVector):
         def query(self, vector: List[float], limit: int = 5, *,
                   with_payload: bool = True) -> List[Dict[str, Any]]:
+            raise RuntimeError("qdrant/graph exploded mid-check")
+
+        def delete_points(self, point_ids: Sequence[str]) -> None:
             raise RuntimeError("qdrant/graph exploded mid-check")
 
     manager.embed_provider = _FakeEmbed()  # type: ignore[assignment]

@@ -27,7 +27,7 @@ Run under ``./venv/bin/python -m pytest`` (PATTERNS — bare ``python`` lacks de
 """
 
 import os
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Sequence, Set
 
 import pytest
 
@@ -53,6 +53,7 @@ class _RecordingVector:
         self.created = False
         self.declarations: List[bool] = []
         self.landed: List[str] = []
+        self.deleted: List[str] = []
 
     def upsert(self, point_id: str, vector: List[float], payload: Dict[str, Any],
                *, may_create: bool) -> None:
@@ -77,6 +78,14 @@ class _RecordingVector:
                 collection="mitos-tmp-fake",
             )
         return set()
+
+    def delete_points(self, point_ids: Sequence[str]) -> None:
+        if self.absent and not self.created:
+            raise CollectionMissingError(
+                "Qdrant collection 'mitos-tmp-fake' does not exist",
+                collection="mitos-tmp-fake",
+            )
+        self.deleted.extend(point_ids)
 
 
 class _FakeEmbed:
@@ -479,6 +488,12 @@ def test_a_refused_drain_retains_the_marker_it_never_consumed(tmp_path) -> None:
         def upsert(self, point_id: str, vector: List[float], payload: Dict[str, Any],
                    *, may_create: bool) -> None:
             self.declarations.append(may_create)
+            raise CollectionMissingError(
+                "Qdrant collection 'mitos-tmp-fake' does not exist",
+                collection="mitos-tmp-fake",
+            )
+
+        def delete_points(self, point_ids: Sequence[str]) -> None:
             raise CollectionMissingError(
                 "Qdrant collection 'mitos-tmp-fake' does not exist",
                 collection="mitos-tmp-fake",

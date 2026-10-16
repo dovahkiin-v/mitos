@@ -194,6 +194,9 @@ class _Upserts:
     def upsert(self, *a, **kw):
         raise AssertionError("the embedding raised first; nothing reaches upsert")
 
+    def delete_points(self, point_ids):
+        raise AssertionError("the embedding raised first; nothing reaches a delete")
+
 
 def _mcp(config, exc, tool="surface_decisions", **kw):
     comps = (GraphStore(config.db_path, read_only=True), _Boom(exc), object())

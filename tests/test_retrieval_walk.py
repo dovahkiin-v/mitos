@@ -434,6 +434,9 @@ class _NoPointId:
         return [{"score": h["score"]}
                 for h in self._inner.query(vector, limit, with_payload=with_payload)]
 
+    def delete_points(self, point_ids):
+        self._inner.delete_points(point_ids)
+
 
 def test_a_magicmock_store_fails_loud(store) -> None:
     """Ledger entry-002: a MagicMock absorbs `resolve_point_ids` and returns a

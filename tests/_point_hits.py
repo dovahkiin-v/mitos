@@ -44,7 +44,7 @@ import functools
 import os
 import re
 import uuid
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set
 
 from mitos.store import GraphStore
 from mitos.vector_store import hash_to_uuid
@@ -287,6 +287,9 @@ class CannedVector:
         queries: How many times :meth:`query` ran.
         last_limit: The ``limit`` of the latest call (None before any).
         calls: ``(limit, with_payload)`` per call, in order.
+        deleted: Every point id :meth:`delete_points` removed; a later query no
+            longer returns a hit carrying one.
+        delete_calls: The ids each :meth:`delete_points` call received, in order.
     """
 
     def __init__(self, matches: Optional[List[Dict[str, Any]]] = None, *,
@@ -302,6 +305,8 @@ class CannedVector:
         self.queries = 0
         self.last_limit: Optional[int] = None
         self.calls: List[tuple] = []
+        self.deleted: Set[str] = set()
+        self.delete_calls: List[List[str]] = []
 
     def bind(self, store: Any) -> "CannedVector":
         """Binds the graph slugs resolve in; an explicit bind beats the fallback."""
@@ -325,4 +330,12 @@ class CannedVector:
         if store is None and self._store_of is not None:
             store = self._store_of()
         hits = derive_hits(canned, store, owner=type(self).__name__)
+        # A deleted point is gone from the index: filtered after the hits are derived
+        # and before the limit, as a real store would rank only what it still holds.
+        hits = [hit for hit in hits if hit["point_id"] not in self.deleted]
         return [project_hit(hit, with_payload) for hit in hits[:limit]]
+
+    def delete_points(self, point_ids: Sequence[str]) -> None:
+        """Records the call and removes the ids from every later query's hits."""
+        self.delete_calls.append(list(point_ids))
+        self.deleted.update(point_ids)

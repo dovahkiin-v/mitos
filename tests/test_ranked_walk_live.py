@@ -232,6 +232,9 @@ def test_one_vector_call_at_the_bound_ids_only_against_the_server(written, drive
             self.calls.append((limit, with_payload))
             return self._inner.query(vector, limit, with_payload=with_payload)
 
+        def delete_points(self, point_ids):
+            self._inner.delete_points(point_ids)
+
     counting = _Counting(vstore)
     call, *_ = DRIVERS[driver]
     call(ws, counting, embed=_FixedQuery({"alphakw": 1.0}))

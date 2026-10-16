@@ -45,7 +45,7 @@ import os
 import re
 import sys
 from collections import Counter
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 #: The environment name that selects a provider fault for the whole child.
 FAULT_ENV = "MITOS_FAKE_EMBED_FAULT"
@@ -205,6 +205,23 @@ class FakeVectorStore:
             )
             for score, node_id, payload in ranked[:limit]
         ]
+
+    def delete_points(self, point_ids: Sequence[str]) -> None:
+        """Deletes the points whose listed id is among ``point_ids``.
+
+        Points are stored under their node id, so a listed id matches its
+        ``hash_to_uuid`` image, never the node id itself.
+        """
+        from mitos.errors import CollectionMissingError
+        from mitos.vector_store import hash_to_uuid
+
+        points = self._collections.get(self.collection)
+        if points is None:
+            raise CollectionMissingError(
+                f"collection {self.collection!r} is missing", collection=self.collection)
+        doomed = set(point_ids)
+        for node_id in [nid for nid in points if hash_to_uuid(nid) in doomed]:
+            del points[node_id]
 
     def __getattr__(self, name: str) -> Any:
         if name.startswith("__"):

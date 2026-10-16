@@ -110,6 +110,25 @@ class VectorStore(Protocol):
         """
         ...
 
+    def delete_points(self, point_ids: Sequence[str]) -> None:
+        """Deletes exactly these points, by the index's own ids; confirmed or raised.
+
+        The ids are the strings :meth:`list_point_ids` returns, never re-hashed —
+        unlike :meth:`upsert`'s ``point_id`` argument, which is a node id. A point
+        whose node has left the graph has only its listed id to be named by. Empty
+        input sends nothing. Nothing is swallowed and nothing is created (see
+        :meth:`~mitos.vector_store.QdrantVectorStore.delete_points`).
+
+        Args:
+            point_ids: The listed point ids to delete.
+
+        Raises:
+            VectorStoreUnreachableError: If the index did not answer.
+            CollectionMissingError: If the index's collection does not exist.
+            VectorStoreError: If the index refused or did not confirm the delete.
+        """
+        ...
+
 
 class GraphStoreProtocol(Protocol):
     """Protocol for the relational, SQLite-backed decision graph."""

@@ -33,7 +33,7 @@ hard transitive dep of ``anthropic`` (both already installed); it constructs the
 exception objects. No ``mitos/`` source change, no ``__version__`` bump — test-only.
 """
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -93,6 +93,9 @@ class _SeveredVector(_FakeVector):
         self.queries += 1
         raise VectorStoreError("qdrant query severed")
 
+    def delete_points(self, point_ids: Sequence[str]) -> None:
+        raise VectorStoreError("qdrant delete severed")
+
 
 class _CollectionlessVector(_FakeVector):
     """The S2 over-fetch query raises the `CollectionMissingError` SUBCLASS.
@@ -104,6 +107,11 @@ class _CollectionlessVector(_FakeVector):
     def query(self, vector: List[float], limit: int = 5, *,
               with_payload: bool = True) -> List[Dict[str, Any]]:
         self.queries += 1
+        raise CollectionMissingError(
+            "Qdrant collection 'mitos-x' does not exist", collection="mitos-x"
+        )
+
+    def delete_points(self, point_ids: Sequence[str]) -> None:
         raise CollectionMissingError(
             "Qdrant collection 'mitos-x' does not exist", collection="mitos-x"
         )
@@ -438,6 +446,9 @@ def test_raw_cause_detail_never_leaks_to_stdout(
         def query(self, vector: List[float], limit: int = 5, *,
                   with_payload: bool = True) -> List[Dict[str, Any]]:
             self.queries += 1
+            raise VectorStoreError(secret)
+
+        def delete_points(self, point_ids: Sequence[str]) -> None:
             raise VectorStoreError(secret)
 
     judge = _RecordingJudge(_execution([]))

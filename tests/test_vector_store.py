@@ -533,3 +533,112 @@ def test_query_ids_only_still_refuses_a_hit_without_an_id(mock_post: MagicMock) 
     with pytest.raises(VectorStoreError):
         QdrantVectorStore(_URL, collection_name=_COLLECTION).query(
             [0.1], limit=1, with_payload=False)
+
+
+# --------------------------------------------------------------------------- #
+# delete_points — recall-confidence 3c: by listed id, confirmed or raised
+# --------------------------------------------------------------------------- #
+
+_DELETE_URL = f"{_URL}/collections/{_COLLECTION}/points/delete?wait=true"
+_COMPLETED = {"result": {"operation_id": 7, "status": "completed"}, "status": "ok"}
+_LISTED = ["0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"]
+
+
+@patch("mitos.vector_store.requests.post")
+def test_delete_points_waits_and_sends_the_listed_ids_verbatim(mock_post: MagicMock) -> None:
+    """``wait=true`` (without it Qdrant answers ``acknowledged``, which confirms nothing),
+    and the ids exactly as the listing gave them — never re-hashed as node ids."""
+    mock_post.return_value = _resp(200, _COMPLETED)
+
+    QdrantVectorStore(_URL, collection_name=_COLLECTION).delete_points(_LISTED)
+
+    assert mock_post.call_count == 1
+    assert mock_post.call_args.args[0] == _DELETE_URL
+    assert mock_post.call_args.kwargs["json"] == {"points": _LISTED}
+
+
+@patch("mitos.vector_store.requests.post")
+def test_delete_points_sends_a_decimal_id_back_as_an_integer(mock_post: MagicMock) -> None:
+    """The scroll stringifies a foreign integer id; a string ``"7"`` would 400 the whole
+    batch (measured on 1.16.3). A non-ASCII digit string is not an integer id and stays
+    a string — ``str.isdigit`` alone would admit it."""
+    mock_post.return_value = _resp(200, _COMPLETED)
+
+    QdrantVectorStore(_URL, collection_name=_COLLECTION).delete_points(
+        ["7", _LISTED[0], "٧", "12a"])
+
+    assert mock_post.call_args.kwargs["json"] == {"points": [7, _LISTED[0], "٧", "12a"]}
+
+
+@patch("mitos.vector_store.requests.post")
+def test_delete_points_with_no_ids_sends_nothing(mock_post: MagicMock) -> None:
+    QdrantVectorStore(_URL, collection_name=_COLLECTION).delete_points([])
+    assert mock_post.call_count == 0
+
+
+@patch("mitos.vector_store.requests.post")
+def test_delete_points_returns_on_completed(mock_post: MagicMock) -> None:
+    mock_post.return_value = _resp(200, _COMPLETED)
+    assert QdrantVectorStore(_URL, collection_name=_COLLECTION).delete_points(_LISTED) is None
+
+
+@pytest.mark.parametrize("body", [
+    {"result": {"operation_id": 7, "status": "acknowledged"}, "status": "ok"},
+    {"result": {"operation_id": 7}, "status": "ok"},
+    {"result": None},
+    {"result": ["completed"]},
+    {"status": "ok"},
+    ["completed"],
+    ValueError("not json"),
+])
+@patch("mitos.vector_store.requests.post")
+def test_delete_points_raises_when_the_answer_is_not_a_confirmation(
+    mock_post: MagicMock, body: object
+) -> None:
+    mock_post.return_value = _resp(200, body)
+    with pytest.raises(VectorStoreError) as excinfo:
+        QdrantVectorStore(_URL, collection_name=_COLLECTION).delete_points(_LISTED)
+    assert type(excinfo.value) is VectorStoreError  # refused, not "stop"
+
+
+@patch("mitos.vector_store.requests.post")
+def test_delete_points_raises_on_a_refused_batch(mock_post: MagicMock) -> None:
+    """One malformed id 400s the whole batch (measured): a refusal, the next batch may go."""
+    mock_post.return_value = _resp(400)
+    with pytest.raises(VectorStoreError) as excinfo:
+        QdrantVectorStore(_URL, collection_name=_COLLECTION).delete_points(_LISTED)
+    assert type(excinfo.value) is VectorStoreError
+
+
+@patch("mitos.vector_store.requests.put")
+@patch("mitos.vector_store.requests.post")
+def test_delete_points_reports_an_absent_collection_and_creates_nothing(
+    mock_post: MagicMock, mock_put: MagicMock
+) -> None:
+    mock_post.return_value = _resp(404)
+    with pytest.raises(CollectionMissingError) as excinfo:
+        QdrantVectorStore(_URL, collection_name=_COLLECTION).delete_points(_LISTED)
+    assert excinfo.value.collection == _COLLECTION
+    assert mock_put.call_count == 0
+
+
+@patch("mitos.vector_store.requests.post")
+def test_delete_points_types_a_transport_fault_as_unreachable(mock_post: MagicMock) -> None:
+    import requests
+
+    mock_post.side_effect = requests.ConnectionError("connection refused")
+    with pytest.raises(VectorStoreUnreachableError):
+        QdrantVectorStore(_URL, collection_name=_COLLECTION).delete_points(_LISTED)
+
+
+def test_the_node_id_delete_is_gone() -> None:
+    """The old delete took a node id and re-hashed it, so it could not name a node-less
+    point, and swallowed every fault. It was removed, not aliased."""
+    import pathlib
+
+    import mitos
+
+    removed = "delete" + "_point" + "("
+    assert not hasattr(QdrantVectorStore, "delete" + "_point")
+    for path in pathlib.Path(mitos.__file__).parent.rglob("*.py"):
+        assert removed not in path.read_text(encoding="utf-8"), path

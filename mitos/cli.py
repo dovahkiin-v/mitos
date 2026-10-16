@@ -73,7 +73,7 @@ from mitos.divergence import (RELATIONSHIP_FIELDS, corpus_graph_divergence,
                               corpus_holds_entries, divergence_total)
 from mitos.restore import BufferFidelityError
 from mitos.env import resolve_key
-from mitos.vector_store import scroll_point_ids, hash_to_uuid, QdrantVectorStore
+from mitos.vector_store import scroll_point_ids, hash_to_uuid, partition_points, QdrantVectorStore
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.telemetry import (
     AttemptRefusal, AttemptStart, TelemetryStore, ConflictCheckRow, JudgmentBatch,
@@ -892,30 +892,72 @@ def cmd_sync(config: MitosConfig, auto_accept: bool = False, embed_only: bool = 
         sys.exit(1)
 
 
+def _unbuilt_reconcile_refusal(config: MitosConfig) -> str:
+    """Words ``reconcile``'s refusal over an unbuilt graph, naming the heal it is not.
+
+    Composed once here rather than borrowed from ``recall.missing_graph_note``: that
+    sentence explains an *empty read answer*, and this verb refuses instead.
+
+    Args:
+        config: The active workspace config (its ``project`` names the selector).
+
+    Returns:
+        The one-line refusal.
+    """
+    return (
+        "Not reconciled: the markdown corpus (`decisions.md` and `decisions/archive/`) "
+        "holds entries but the graph holds no nodes, so no point was judged and "
+        "nothing was deleted — run "
+        f"`mitos rebuild {shell_flag('-p', config.project)}` to build the graph from "
+        "the corpus."
+    )
+
+
 def cmd_reconcile(config: MitosConfig, as_json: bool = False) -> int:
-    """Embeds every node the decision index is missing, healing a direct vector wipe.
+    """Embeds every node the decision index is missing, and deletes node-less points.
 
     The one-command heal for the gap ``sync`` cannot reach: a bare Qdrant wipe
     (``curl -X DELETE`` of the collection, no ``rebuild``/``cutover``) leaves the
     graph populated, Qdrant empty, and the outbox empty — so ``sync`` drains
     nothing. Reconcile diffs the decision index's expected set — every decision,
     live or retired, plus the active open questions — against Qdrant's actual
-    point ids, enqueues the missing nodes, and drains. Idempotent.
+    point ids, enqueues the missing nodes, and drains. Then it collects: a point
+    whose node is no longer in the graph is deleted by its listed id, while a
+    retired node's point is history and kept. Collection runs over a built graph
+    only (:meth:`MitosSyncManager.reconcile_embeddings` has the guard and why).
+    Idempotent.
+
+    Over an **unbuilt** graph — the corpus holds entries, the graph holds no node,
+    the clone without its gitignored ``*.sqlite`` — reconcile is not the heal: it
+    deletes nothing, and refuses on stderr naming ``mitos rebuild``, in place of the
+    summary. ``--json`` still prints exactly one object, carrying
+    ``graph_unbuilt: true``.
+
+    The exit contract: **1** when the next actor needs a different act — Qdrant
+    down, or an unbuilt graph (``rebuild``); **0** when re-running ``reconcile``
+    completes the heal — rows left queued (``left_queued``) or node-less points
+    whose delete failed (``delete_failed``), each with its own line. A keyless or
+    provider-down workspace with a built graph still exits 0 after its stderr
+    warning: keyless is not another act.
 
     Args:
         config: The active workspace config.
         as_json: Whether to emit the result as a JSON object.
 
     Returns:
-        Process exit code (0 on success, 1 if Qdrant is down). An absent
-        or failing embedding provider is reported as a warning and still exits 0.
+        Process exit code.
     """
     manager = MitosSyncManager(config)
-    # Ahead of the call, not ahead of the report: `reconcile_embeddings` writes its
-    # own provider-down line (to stderr, since 5c) before returning, so an echo
-    # placed beside the report below would not be the leading line the reader sees.
-    if not as_json:
+    # The echo rides the response's stream, per exit: the summary answers on stdout
+    # and the unbuilt refusal on stderr. It leads the call rather than the report:
+    # the drain prints progress to stdout during the call, and `reconcile_embeddings`
+    # writes its provider-down line (stderr) before returning. Asked here with the
+    # predicate the manager answers `graph_unbuilt` with; an unbuilt graph has an
+    # empty expected set, so nothing drains before the refusal.
+    echoed = False
+    if not as_json and not manager.is_graph_unbuilt():
         _echo_corpus(config)
+        echoed = True
     try:
         if as_json:
             # stdout carries exactly one JSON object; the drain's progress lines are
@@ -937,19 +979,57 @@ def cmd_reconcile(config: MitosConfig, as_json: bool = False) -> int:
 
     if as_json:
         print(json.dumps({**result, **corpus_provenance(config)}))
-    else:
-        # `present` is not "already indexed": it counts retired and orphan points too.
-        # What was already indexed is the expected set's share, `expected_present`.
+        return 1 if result["graph_unbuilt"] else 0
+
+    if result["graph_unbuilt"]:
+        sys.stdout.flush()
+        _echo_corpus(config, file=sys.stderr)
+        print(_unbuilt_reconcile_refusal(config), file=sys.stderr)
+        return 1
+    if not echoed:
+        _echo_corpus(config)
+    # `present` is not "already indexed": it counts retired and orphan points too.
+    # What was already indexed is the expected set's share, `expected_present`.
+    print(
+        f"Reconciled: {result['expected']} node(s) the decision index should hold "
+        f"({result['active']} active), {result['expected_present']} already indexed, "
+        f"{result['enqueued']} enqueued, {result['written']} embedded."
+    )
+    if result["left_queued"]:
         print(
-            f"Reconciled: {result['expected']} node(s) the decision index should hold "
-            f"({result['active']} active), {result['expected_present']} already indexed, "
-            f"{result['enqueued']} enqueued, {result['written']} embedded."
+            f"{result['left_queued']} embedding row(s) still queued — "
+            f"`mitos sync {shell_flag('-p', config.project)}` retries them once the "
+            f"embedding provider and Qdrant answer."
         )
-        if result["left_queued"]:
+    if result["deleted"] or result["delete_failed"]:
+        line = f"Collected: {result['deleted']} node-less point(s) deleted"
+        if result["delete_failed"]:
+            line += (
+                f", {result['delete_failed']} could not be deleted — Qdrant refused or "
+                f"did not confirm; `mitos reconcile {shell_flag('-p', config.project)}` "
+                f"again retries them"
+            )
+        print(line + ".")
+    if result["retired_node_points"]:
+        print(
+            f"{result['retired_node_points']} point(s) of retired nodes kept as history."
+        )
+    if result["nodeless_points"] is None and result["present"]:
+        # Not judged with points listed: a graph holding no nodes (the guard) or a
+        # graph read that faulted (already warned on stderr). Told apart by one count.
+        try:
+            node_count: Optional[int] = manager.store.graph_fingerprint()[0]
+        except Exception:
+            node_count = None
+        if node_count == 0:
             print(
-                f"{result['left_queued']} embedding row(s) still queued — "
-                f"`mitos sync {shell_flag('-p', config.project)}` retries them once the "
-                f"embedding provider and Qdrant answer."
+                f"{result['present']} point(s) not judged — the graph holds no nodes; "
+                "reconcile deletes points only over a built graph."
+            )
+        else:
+            print(
+                f"{result['present']} point(s) not judged — the graph could not be "
+                "read; nothing was deleted."
             )
     return 0
 
@@ -3220,10 +3300,10 @@ def _overview_notes(project: Dict[str, Any], payload: Dict[str, Any], *,
       separates the fresh project (flagged before, healthy now) from a populated one.
     * **No prescription.** The corpus gate cannot separate the clone whose graph was
       never built (heal: ``mitos rebuild``) from the project whose collection was swept
-      (heal: ``mitos reconcile``), and for the clone ``reconcile`` is the heal 4b
-      calls *"one word away and worse than silence"* — it diffs an empty active set
-      against an absent collection, enqueues nothing, and reports success on a
-      workspace it did not touch. So the note points at ``mitos status <name>``,
+      (heal: ``mitos reconcile``), and for the clone ``reconcile`` is not the heal —
+      over an unbuilt graph it judges no point, deletes nothing, refuses naming
+      ``rebuild`` and exits 1, so naming it would route the reader through a
+      refusal. So the note points at ``mitos status <name>``,
       which reads the graph and names the right heal. That is the *"projects
       discovers, status diagnoses"* division the vision already states.
 
@@ -3843,20 +3923,29 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
 
     # Vector-index completeness by EXACT id-diff, not a count proxy. `mitos status`
     # is the SENSOR (reconcile is the heal), so it must catch a shortfall the count
-    # `points >= active` structurally can't — dead-vector slack in the graveyard
-    # (superseded vectors that linger, never GC'd) inflates the point total past the
-    # active threshold and hides genuinely-missing active vectors (the live-corpus
-    # incident: 181 >= 178 read healthy over 12 invisible active nodes). We scroll
-    # Qdrant's actual point ids and diff. `status` is a read-only sensor and creates
-    # nothing — the module-level scroll keeps it independent of a store entirely.
+    # `points >= active` structurally can't — non-active points (retired decisions'
+    # vectors, kept by design) inflate the point total past the active threshold and
+    # hide genuinely-missing active vectors (the live-corpus incident: 181 >= 178
+    # read healthy over 12 invisible active nodes). We scroll Qdrant's actual point
+    # ids and diff. `status` is a read-only sensor and creates nothing — the
+    # module-level scroll keeps it independent of a store entirely.
     #
     # `missing_active` = active nodes with no vector (invisible to semantic search —
-    #   the warned state). `orphan_points` = points with no active node — the
-    #   graveyard substrate the all-superseded blackout vector consumes, per
-    #   graveyard-vectors-now-consumed-by-blackout-best-effort: reported neutrally,
-    #   never a warning, never deleted here. `None` means "could not verify" (scroll
-    #   failed) — distinct from `0` ("verified complete"); we never fall back to the
-    #   count proxy we just declared structurally blind.
+    #   the warned state). `orphan_points` = points with no active node, partitioned
+    #   (`partition_points`, the one partition `reconcile` applies) into
+    #   `retired_node_points` — points of nodes still in the graph but not active:
+    #   history, the substrate retired matches and the all-superseded blackout read
+    #   (graveyard-vectors-now-consumed-by-blackout-best-effort), reported neutrally
+    #   and never collected — and `nodeless_points`, points whose node is not in the
+    #   graph at all: garbage, which `mitos reconcile` deletes. The partition is read
+    #   AFTER the scroll, in the heal's order, so a record landing during `status`
+    #   cannot show as node-less, and `orphan_points` derives from that same read
+    #   pair, so the two keys sum to it. Over a graph holding no nodes with points
+    #   listed the partition is not computed (every point would look node-less):
+    #   the pair stays `None` while `orphan_points` keeps its int. `None` everywhere
+    #   means "could not verify" (scroll failed, or a graph read failed) — distinct
+    #   from `0` ("verified complete"); we never fall back to the count proxy we
+    #   just declared structurally blind.
     # `missing_retired_*` = retired decisions with no vector, the sibling partition of
     #   the decision index's expected set (`expected_ids - active_ids`, one store read
     #   shared with `reconcile`, so the heal clears this warning by construction).
@@ -3865,11 +3954,14 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
     missing_active_slugs: Optional[List[str]] = None
     missing_retired_slugs: Optional[List[str]] = None
     orphan_points: Optional[int] = None
+    retired_node_points: Optional[int] = None
+    nodeless_points: Optional[int] = None
     retired_ids: Optional[FrozenSet[str]] = (
         None if expected_ids is None else expected_ids - active_ids
     )
     scroll_failed = False
     if q["reachable"] and q["collection_exists"] and active_nodes is not None:
+        present: Optional[Set[str]] = None
         try:
             present = scroll_point_ids(config.qdrant_url, config.qdrant_collection)
             missing_active_slugs = sorted(
@@ -3880,10 +3972,31 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
                     id_to_slug.get(nid, nid) for nid in retired_ids
                     if hash_to_uuid(nid) not in present
                 )
-            active_uuids = {hash_to_uuid(nid) for nid in active_ids}
-            orphan_points = len(present - active_uuids)
         except VectorStoreError:
             scroll_failed = True  # unknown — do not fabricate "complete"
+            present = None
+        if present is not None:
+            # The partition's read pair, after the scroll and outside its `try`: a
+            # graph fault here leaves the three point keys "could not verify" and
+            # keeps the slug diffs, and it is not a scroll failure.
+            try:
+                pair_store = GraphStore(config.db_path, read_only=True)
+                pair_active = pair_store.get_active_node_ids()
+                pair_nodes = pair_store.get_all_node_ids()
+            except Exception:
+                pair_nodes = None
+            if pair_nodes is not None:
+                active_uuids = {hash_to_uuid(nid) for nid in pair_active & pair_nodes}
+                orphan_points = len(present - active_uuids)
+                if not present:
+                    retired_node_points = nodeless_points = 0
+                elif pair_nodes:
+                    partition = partition_points(
+                        present, node_ids=pair_nodes, active_ids=pair_active
+                    )
+                    retired_node_points = len(partition.retired_node)
+                    nodeless_points = len(partition.nodeless)
+                # else: points listed over a graph holding no nodes — not judged.
     elif q["reachable"] and not q["collection_exists"] and expected_ids:
         # Collection deleted OUTRIGHT (not just its points) while the graph holds
         # nodes the decision index should hold — every one of them is missing (the
@@ -3894,7 +4007,11 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
         # reconcile` re-creates the collection and embeds every one.
         missing_active_slugs = sorted(id_to_slug.get(nid, nid) for nid in active_ids)
         missing_retired_slugs = sorted(id_to_slug.get(nid, nid) for nid in retired_ids)
-        orphan_points = 0
+    if q["reachable"] and not q["collection_exists"] and active_nodes is not None:
+        # An absent collection lists nothing, so its points are judged and empty on
+        # any graph that was read — a graph found empty included. Only the three
+        # point keys: the missing-vector keys keep the expected-set gate above.
+        orphan_points = retired_node_points = nodeless_points = 0
 
     # Corpus↔graph divergence (B′). Purely informational — a corpus mid-edit is a
     # normal state, so gating readiness on it would make an ordinary hand edit read
@@ -4016,6 +4133,8 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
                 ),
                 "missing_retired_slugs": missing_retired_slugs,
                 "orphan_points": orphan_points,
+                "retired_node_points": retired_node_points,
+                "nodeless_points": nodeless_points,
                 "graph_unbuilt": graph_unbuilt,
                 # Renamed from `mcp_wired` in 6a, and the rename is the point: the
                 # same file read now means the opposite thing. A consumer reading
@@ -4183,12 +4302,10 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
     #
     # The heal is `mitos rebuild` — the corpus is buffer plus archives, and `mitos
     # sync` reads the buffer alone, so over a drained buffer it builds nothing — and
-    # EMPHATICALLY not `mitos reconcile`: reconcile
-    # diffs an empty active set against an absent collection, finds nothing to
-    # enqueue, and reports success on a workspace it did not touch — converting a
-    # recoverable state into one the operator believes they already fixed. That is
-    # one word away from being the wrong answer, which is why a row asserts the
-    # word's absence from this rung.
+    # EMPHATICALLY not `mitos reconcile`: over an unbuilt graph reconcile judges no
+    # point, deletes nothing, refuses naming `rebuild` and exits 1, so naming it here
+    # would send the operator through a refusal to reach the heal this rung can name
+    # directly. A row asserts the word's absence from this rung.
     if graph_unbuilt:
         print(
             "\n  ⚠ the graph is unbuilt — the markdown corpus (decisions.md and "
@@ -4205,8 +4322,10 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
     #   • missing_active_slugs non-empty → the warned state: active nodes with no
     #     vector, invisible to semantic surface/query (names slugs at small N).
     #   • empty → verified complete; stay quiet.
-    # Orphan (graveyard) points are reported neutrally, never as a warning — they
-    # are the blackout vector's substrate (graveyard-vectors-now-consumed-by-blackout).
+    # Retired nodes' points are reported neutrally, never as a warning — they are
+    # history, the blackout vector's substrate (graveyard-vectors-now-consumed-by-
+    # blackout). Node-less points get an informational rung naming `reconcile`, the
+    # collector; neither feeds `ready`, the verdict or the exit code.
     # Each branch is self-guarding on the diff outcome above — no collection_exists
     # gate here, so a full collection wipe with a populated graph (which sets
     # missing_active_slugs to the whole active set) warns just like a points wipe.
@@ -4254,12 +4373,25 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
         if n <= 5:
             for slug in missing_retired_slugs:
                 print(f"      • {slug}")
-    if orphan_points:
+    if retired_node_points:
         print(
-            f"  • {orphan_points} graveyard point(s) belong to inactive/removed "
-            f"nodes — retained (they power all-superseded blackout recovery), "
-            f"not an error."
+            f"  • {retired_node_points} point(s) belong to retired nodes — history, "
+            f"kept: retired matches and the all-superseded blackout read them; not an "
+            f"error."
         )
+    if nodeless_points:
+        print(
+            f"\n  ⚠ {nodeless_points} point(s) belong to no node in the graph — left by "
+            f"a rebuild that did not reconstruct their nodes; they take ranked-read "
+            f"slots and resolve to nothing. Run "
+            f"`mitos reconcile {shell_flag('-p', config.project)}` to delete them. "
+            f"Informational, not a readiness blocker."
+        )
+    if orphan_points and nodeless_points is None:
+        # Points listed over a graph holding no nodes: every one would look node-less,
+        # so none is judged. No heal is named here — the unbuilt rung names `rebuild`
+        # when the corpus holds entries.
+        print(f"  • {orphan_points} point(s) not judged — the graph holds no nodes.")
     if overflows:
         _print_overflow_detail(overflows, verbose=verbose, project=config.project)
     if divergence_report is not None:
@@ -8320,7 +8452,8 @@ def _build_parser() -> argparse.ArgumentParser:
     rec_p = subparsers.add_parser(
         "reconcile",
         help="Embed every decision (live or retired) and active open question missing "
-             "from Qdrant (heal a direct vector wipe).",
+             "from Qdrant (heal a direct vector wipe), and delete points whose node has "
+             "left the graph.",
     )
     rec_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON.")
 

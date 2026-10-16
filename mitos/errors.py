@@ -331,7 +331,9 @@ class VectorStoreUnreachableError(VectorStoreError):
     every shipped ``except VectorStoreError`` net keeps catching it unchanged, and a
     consumer opts into the narrower catch deliberately.
 
-    Raised today only by :func:`mitos.vector_store.list_collection_names`.
+    Raised today by :func:`mitos.vector_store.list_collection_names` and
+    :meth:`mitos.vector_store.QdrantVectorStore.delete_points` (where it tells a
+    batch loop to stop rather than try the next batch).
     ``scroll_point_ids``' identical transport arm is deliberately left alone — its
     consumers collapse the two states and narrowing that error's class is a change
     to a shipped read path, not this one's work.

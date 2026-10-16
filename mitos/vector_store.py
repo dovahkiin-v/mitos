@@ -17,7 +17,7 @@ single write must not be able to spend it.
 
 import requests
 import json
-from typing import List, Dict, Any, Set
+from typing import AbstractSet, Any, Dict, FrozenSet, List, NamedTuple, Sequence, Set
 from mitos.errors import (
     CollectionMissingError,
     VectorStoreError,
@@ -573,12 +573,129 @@ class QdrantVectorStore:
         """
         return scroll_point_ids(self.base_url, self.collection, page_size=page_size)
 
-    def delete_point(self, point_id: str) -> None:
-        """Deletes a point from Qdrant by its SHA-256 node ID."""
-        uuid_id = hash_to_uuid(point_id)
-        delete_url = f"{self.base_url}/collections/{self.collection}/points/delete"
-        body = {"points": [uuid_id]}
+    def delete_points(self, point_ids: Sequence[str]) -> None:
+        """Deletes exactly these points, by the index's own ids; confirmed or raised.
+
+        The ids are taken **as the index lists them** — the strings
+        :meth:`list_point_ids` / :func:`scroll_point_ids` return — and are never
+        re-hashed. That is the contrast with :meth:`upsert`, whose ``point_id``
+        argument is a 64-hex node id: a point whose node has left the graph has no
+        node id left to hash, so its listed id is the only name it has.
+
+        The scroll stringifies every id, so an all-decimal ASCII string goes back as
+        a JSON integer: a foreign integer-id point then round-trips, and the request
+        is not refused whole as malformed (measured on Qdrant 1.16.3: a string
+        ``"7"`` is a 400 for the entire batch). A non-ASCII digit string stays a
+        string, because ``str.isdigit`` alone would admit ``"٧"``.
+
+        The request carries ``wait=true`` and success is a 200 whose ``result``
+        reads ``status: "completed"``. Without ``wait`` Qdrant answers
+        ``"acknowledged"``, which confirms nothing — the next listing could still
+        hold the point — so that answer raises here. Measured on 1.16.3: deleting an
+        id that does not exist answers ``completed`` too, so a confirmation says
+        "this id is gone", never "this id existed".
+
+        Deletion never creates: a 404 is reported, not healed, so the
+        "reading never writes" contract is held by the delete side as well.
+
+        Args:
+            point_ids: The listed point ids to delete. Empty sends no request.
+
+        Raises:
+            VectorStoreUnreachableError: If Qdrant did not answer (a transport
+                fault) — a caller looping over batches stops.
+            CollectionMissingError: If Qdrant is up but the collection does not
+                exist (HTTP 404) — a caller stops likewise.
+            VectorStoreError: If Qdrant answered and refused or did not confirm —
+                any other non-200, a body of the wrong shape, or a status other
+                than ``completed``. A caller may try its next batch.
+        """
+        if not point_ids:
+            return
+        delete_url = (
+            f"{self.base_url}/collections/{self.collection}/points/delete?wait=true"
+        )
+        body = {
+            "points": [
+                int(pid) if pid.isascii() and pid.isdigit() else pid
+                for pid in point_ids
+            ]
+        }
         try:
-            requests.post(delete_url, json=body, timeout=5)
-        except Exception:
-            pass
+            resp = requests.post(
+                delete_url,
+                json=body,
+                headers={"Content-Type": "application/json"},
+                timeout=5,
+            )
+        except requests.RequestException as e:
+            raise VectorStoreUnreachableError(
+                f"Qdrant connection error during delete: {str(e)}"
+            ) from e
+        if resp.status_code != 200:
+            _raise_response_error(
+                resp, operation="delete", collection=self.collection
+            )
+        result = _decode_result(resp, operation="delete")
+        status = result.get("status") if isinstance(result, dict) else None
+        if status != "completed":
+            raise VectorStoreError(
+                "Qdrant delete was not confirmed (expected result status "
+                f"'completed', got {status!r}); the points may still be there."
+            )
+
+
+class PointPartition(NamedTuple):
+    """A listing's non-active points, split by whether their node is in the graph.
+
+    Attributes:
+        retired_node: Listed ids whose node is in the graph but not in its active
+            set — history, kept.
+        nodeless: Listed ids no graph node maps to — garbage, collected by
+            ``mitos reconcile``.
+    """
+
+    retired_node: FrozenSet[str]
+    nodeless: FrozenSet[str]
+
+
+def partition_points(present: AbstractSet[str], *, node_ids: AbstractSet[str],
+                     active_ids: AbstractSet[str]) -> PointPartition:
+    """Splits a listing's non-active points into history and garbage.
+
+    The one partition both ``mitos status`` and ``mitos reconcile`` apply, so the
+    heal clears its own warning by construction. Pure set arithmetic over three id
+    sets: each node id is mapped once through :func:`hash_to_uuid` and compared with
+    the listed strings exactly as the index returned them (Qdrant lists its UUIDs
+    lowercase and hyphenated, which is ``hash_to_uuid``'s form).
+
+    History requires node membership, so an active id the node read lacks (a
+    rebuild swapped the graph between the caller's two reads) cannot make its point
+    history: that point is node-less, which is true of the graph now. The two
+    buckets therefore always sum to ``|present − uuid(active ∩ nodes)|``, and a
+    caller that reports that count beside them must derive it with the same
+    intersection (``status`` does).
+
+    **What "retired node" holds:** every graph node outside the active set —
+    retired decisions (superseded or corrected) **and killed open questions**. A
+    superseded or corrected open question is outside the decision index's expected
+    set, so ``reconcile`` never re-seeds its point; but its node is still in the
+    graph, so its point is history and is never deleted either. The only garbage is
+    a point whose node is not in the graph (ADR
+    ``reconcile-heals-every-decision-vector-and-collects-only-node-less-points``).
+
+    Args:
+        present: The listed point ids.
+        node_ids: Every node id in the graph (64-hex), any kind, any state.
+        active_ids: The active node ids (active decisions plus open questions).
+
+    Returns:
+        The partition of ``present`` minus the active points.
+    """
+    node_points = {hash_to_uuid(node_id) for node_id in node_ids}
+    active_points = {hash_to_uuid(node_id) for node_id in active_ids}
+    nodeless = frozenset(pid for pid in present if pid not in node_points)
+    retired_node = frozenset(
+        pid for pid in present if pid in node_points and pid not in active_points
+    )
+    return PointPartition(retired_node=retired_node, nodeless=nodeless)

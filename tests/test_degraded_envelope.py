@@ -150,11 +150,18 @@ class _MissingCollection:
         raise CollectionMissingError(
             f"Qdrant collection '{_ABSENT}' does not exist.", collection=_ABSENT)
 
+    def delete_points(self, point_ids):
+        raise CollectionMissingError(
+            f"Qdrant collection '{_ABSENT}' does not exist.", collection=_ABSENT)
+
 
 class _Raising:
     """A vector store that fails mid-query."""
 
     def query(self, vector, limit=5, *, with_payload=True):
+        raise RuntimeError("qdrant fell over")
+
+    def delete_points(self, point_ids):
         raise RuntimeError("qdrant fell over")
 
 

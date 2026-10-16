@@ -396,12 +396,13 @@ class TestTheGateIsTheNodeCount:
             missing_graph_is_a_gap(None, _Config("/nope"))
 
     def test_the_note_names_rebuild_per_boundary_and_never_reconcile(self) -> None:
-        """One word away from being the wrong answer, on both surfaces.
+        """`rebuild` is the heal on both surfaces; `reconcile` is never named.
 
-        `mitos reconcile` over an unbuilt graph diffs an empty active set against an
-        absent collection, enqueues nothing, and reports SUCCESS on a workspace it
-        did not touch — converting a recoverable state into one the operator
-        believes they already fixed. And `mitos sync` is the other wrong word: it
+        `mitos reconcile` over an unbuilt graph judges no point, deletes nothing,
+        refuses naming `rebuild` and exits 1 (3c of the recall-confidence vision;
+        before it, it reported success on a workspace it did not touch), so naming it
+        would route the reader through a refusal. And `mitos sync` is the other wrong
+        word: it
         reads the buffer alone, so over a rotated corpus it builds nothing. The CLI
         names `rebuild` with its selector; MCP names no command at all.
         """
@@ -1045,7 +1046,10 @@ _SHIPPED_CHECK_KEYS = {
     "active_nodes", "missing_active_vectors", "missing_active_slugs",
     # recall-confidence 3b: retired-decision completeness, siblings of the active keys.
     "retired_decisions", "missing_retired_vectors", "missing_retired_slugs",
-    "orphan_points", "graph_unbuilt", "mcp_project_entry",
+    "orphan_points",
+    # recall-confidence 3c: the orphan count's partition, history and garbage.
+    "retired_node_points", "nodeless_points",
+    "graph_unbuilt", "mcp_project_entry",
 }
 
 _PATH_KEYS = ("decisions_file", "questions_file", "archive_dir", "db_path")

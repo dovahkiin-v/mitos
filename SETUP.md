@@ -566,7 +566,9 @@ leaves a workspace that simply re-runs clean — no manual restore. Run these st
    > and drains them in one pass (idempotent; re-embeds hit the cache, so no
    > embedding-API spend when text is unchanged). `mitos status .` flags this
    > state as `⚠ vector index incomplete`, and names retired decisions with no
-   > vector on a line of their own.
+   > vector on a line of their own. `reconcile` also deletes points whose node
+   > is no longer in the graph, over a built graph only: over a clone whose graph
+   > is unbuilt it deletes nothing and names `mitos rebuild` instead.
 6. **Restart `mitos serve`** if it was running.
 7. **Verify.** `mitos status .` → expect `READY ✓`.
 8. **Remove the backup.** Once you're satisfied, delete the

@@ -38,7 +38,7 @@ import os
 import sys
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from unittest.mock import patch
 
 import requests
@@ -88,6 +88,9 @@ class RecordingVectorStore:
         result = self._inner.query(vector, limit=limit, with_payload=with_payload)
         self.calls.append((limit, result, with_payload))
         return result
+
+    def delete_points(self, point_ids: Sequence[str]) -> None:
+        self._inner.delete_points(point_ids)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)

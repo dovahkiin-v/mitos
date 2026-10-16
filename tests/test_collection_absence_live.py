@@ -651,3 +651,95 @@ def test_status_then_reconcile_then_status_heals_the_graveyard_live(
     assert after["missing_retired_vectors"] == 0
     assert after["missing_retired_slugs"] == []
     assert after["missing_active_vectors"] == 0
+
+
+def test_reconcile_collects_a_nodeless_point_and_status_clears_live(
+    absent_collection: str, tmp_path, monkeypatch, capsys
+) -> None:
+    """L1 (phase 3c of the recall-confidence vision): the death story on a real instance.
+
+    Two active decisions and a superseded one, all embedded, plus one point written by
+    hand whose node is not in the graph. ``status --json`` partitions the orphan count
+    (one history, one garbage), ``reconcile --json`` deletes exactly the node-less one by
+    its listed id, the next listing holds every other point, and ``status`` clears.
+    """
+    import json
+    from unittest.mock import patch
+
+    from mitos import cli
+    from mitos.config import MitosConfig
+    from mitos.vector_store import hash_to_uuid
+
+    config, _ids = _live_workspace(
+        tmp_path, absent_collection,
+        ("orphan-new", "Orphan axiom, the successor.\n**Supersedes:** orphan-old"),
+        ("orphan-old", "Orphan axiom, retired."),
+        ("orphan-live", "Orphan axiom, never retired."),
+    )
+    manager = _manager_with_faked_embeddings(config, absent_collection)
+    expected = manager.store.get_decision_index_expected_ids()
+    writer = QdrantVectorStore(QDRANT_URL, absent_collection)
+    for node_id in expected:
+        writer.upsert(node_id, _vector(), {"slug": node_id[:8], "scope": []}, may_create=True)
+    nodeless_node = uuid.uuid4().hex * 2  # a sha-shaped id no node carries
+    writer.upsert(nodeless_node, [0.0] * EMBEDDING_DIM, {"slug": "gone"}, may_create=False)
+    kept = {hash_to_uuid(n) for n in expected}
+    assert writer.list_point_ids() == kept | {hash_to_uuid(nodeless_node)}
+
+    real_config = MitosConfig
+
+    def _config(*args: Any, **kwargs: Any) -> MitosConfig:
+        built = real_config(*args, **kwargs)
+        built.qdrant_url = QDRANT_URL
+        built.qdrant_collection = absent_collection
+        return built
+
+    monkeypatch.setattr(cli, "MitosConfig", _config)
+    monkeypatch.setenv("GEMINI_API_KEY", "testkey")
+
+    def _checks() -> dict:
+        capsys.readouterr()
+        cli.cmd_status(config.workspace_dir, as_json=True)
+        return json.loads(capsys.readouterr().out)["checks"]
+
+    before = _checks()
+    assert (before["retired_node_points"], before["nodeless_points"]) == (1, 1)
+    assert before["orphan_points"] == 2
+
+    capsys.readouterr()
+    with patch("mitos.cli.MitosSyncManager", return_value=manager):
+        assert cli.cmd_reconcile(config, as_json=True) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert (result["deleted"], result["delete_failed"]) == (1, 0)
+    assert result["enqueued"] == 0
+
+    assert writer.list_point_ids() == kept
+
+    after = _checks()
+    assert (after["retired_node_points"], after["nodeless_points"]) == (1, 0)
+
+
+def test_delete_points_against_a_real_instance(absent_collection: str) -> None:
+    """L2: the client's contract measured, not assumed (G1 — Qdrant 1.16.3).
+
+    A listed id is gone from the next scroll; an id never written is confirmed all the
+    same (``completed`` says "gone", never "existed"); an absent collection raises the
+    typed error and is not created.
+    """
+    from mitos.vector_store import hash_to_uuid
+
+    store = QdrantVectorStore(QDRANT_URL, absent_collection)
+    with pytest.raises(CollectionMissingError):
+        store.delete_points([hash_to_uuid("a" * 64)])
+    assert absent_collection not in _listing()
+
+    for node_id in ("a" * 64, "b" * 64):
+        store.upsert(node_id, _vector(), {"slug": node_id[:4]}, may_create=True)
+    listed = store.list_point_ids()
+    assert listed == {hash_to_uuid("a" * 64), hash_to_uuid("b" * 64)}
+
+    store.delete_points([hash_to_uuid("a" * 64)])
+    assert store.list_point_ids() == {hash_to_uuid("b" * 64)}
+
+    store.delete_points([hash_to_uuid("c" * 64)])  # never written: confirmed anyway
+    assert store.list_point_ids() == {hash_to_uuid("b" * 64)}

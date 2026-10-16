@@ -2889,6 +2889,28 @@ class GraphStore:
         finally:
             conn.close()
             
+    def get_all_node_ids(self) -> FrozenSet[str]:
+        """Returns every node id in the graph — any kind, any state — unhydrated.
+
+        One ``SELECT id FROM nodes``: the "is this point's node still in the graph?"
+        side of the orphan partition (:func:`mitos.vector_store.partition_points`),
+        read by ``reconcile`` and ``status`` after their listing. It stays **off**
+        :class:`~mitos.protocols.GraphStoreProtocol`: both callers hold a concrete
+        ``GraphStore``, so no duck-typed caller reaches it. ``tests/test_orphan_collection.py``
+        pins it equal to the ids :meth:`get_all_nodes` returns.
+
+        Store faults propagate; each caller decides what a fault means for it.
+
+        Returns:
+            Every node id (SHA-256 hex) the graph holds.
+        """
+        conn = self._get_connection()
+        try:
+            rows = conn.execute("SELECT id FROM nodes").fetchall()
+            return frozenset(row[0] for row in rows)
+        finally:
+            conn.close()
+
     def get_active_node_ids(self) -> Set[str]:
         """Returns the active node id set (active decisions + open questions).
 
