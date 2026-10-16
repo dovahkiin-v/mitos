@@ -4,7 +4,8 @@ This module defines Protocol classes for GraphStore, VectorStore, and
 EmbeddingProvider to decouple Mitos components and support seamless swap-ins.
 """
 
-from typing import Protocol, List, Dict, Optional, Any, Tuple, Set, Iterable, Sequence
+from typing import (Protocol, List, Dict, Optional, Any, FrozenSet, Tuple, Set, Iterable,
+                    Sequence)
 from mitos.parser import ParsedEntry
 from mitos.retrieval_walk import PointResolution
 from mitos.store import CommitDelta
@@ -206,6 +207,18 @@ class GraphStoreProtocol(Protocol):
 
         Returns:
             Node id → computed state, for the held ids only.
+        """
+        ...
+
+    def get_active_decision_ids(self) -> FrozenSet[str]:
+        """Returns the ids of the active-view decisions, unhydrated.
+
+        The population ``check``'s corpus sweep judges (drifted included, unscoped),
+        read as ids only. ``check.probe_stale_index`` keeps a backlog row only when
+        its node is in this set.
+
+        Returns:
+            The active decision node ids.
         """
         ...
 

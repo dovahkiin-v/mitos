@@ -9,7 +9,9 @@ answer is *no*:
   path, and an injected ``embed_fn=`` callback into ``replay.commit_quarantine_fixpoint``.
   The third is the one a test plan forgets, and nothing else exercises it.
 * ``drain_pending_embeddings`` — declaring from the ``embedding_seed`` marker, refusing as
-  a whole rather than per row, and clearing the marker when the outbox empties.
+  a whole rather than per row, and spending the marker once its walk has attempted every
+  row with the collection present, or the outbox is empty (``tests/test_outbox_drain.py``
+  pins the walk and the spend rule in full).
 * ``MitosProseImporter._best_effort_embed`` — the same graph gate, and the one site that
   *adds* a defer path rather than reusing one.
 * ``reconcile_embeddings`` — stamping the marker so its own drain is a covering write.
@@ -428,15 +430,16 @@ def test_a_marked_drain_creates_and_clears_the_marker(tmp_path) -> None:
     assert vector.created is True
     assert len(vector.landed) == 3
     assert manager.store.get_pending_embeddings() == []
-    assert manager.store.embedding_seed() is None  # cleared on drain-to-empty
+    assert manager.store.embedding_seed() is None  # spent: walk completed, collection present
 
 
-def test_a_drain_that_makes_no_progress_retains_the_marker(tmp_path) -> None:
+def test_a_drain_stopped_by_a_provider_outage_retains_the_marker(tmp_path) -> None:
     """Success criterion 9, second half: rows remain, so the claim still holds.
 
-    The zero-resolving progress guard exists for a dead embedding provider. Clearing the
-    marker there would punish an outage by making the *next* drain non-covering — the heal
-    would then defer forever, with nothing naming why.
+    A provider outage (here a 429, which the classifier reads as ``quota``) stops the
+    drain at its first row. Spending the marker there would punish an outage by making
+    the *next* drain non-covering — the heal would then defer forever, with nothing
+    naming why.
     """
     config = _workspace(tmp_path)
     store = GraphStore(config.db_path)
@@ -511,8 +514,8 @@ def test_an_already_empty_outbox_clears_a_standing_marker(tmp_path) -> None:
 def test_the_marker_never_authorizes_an_inline_write(tmp_path) -> None:
     """Gotcha 1: ``rebuild`` → ``record`` (no sync) must create nothing.
 
-    The marker's whole safety rests on having exactly one consumer. If a ``record``
-    consulted it after a ``rebuild``, the first record into a swept project would mint a
+    The marker's whole safety rests on exactly one consumer acting on it (``mitos
+    status`` only prints it). If a ``record`` consulted it after a ``rebuild``, the first record into a swept project would mint a
     one-point collection — the precise hazard this phase closes, reintroduced through its
     own mechanism.
     """

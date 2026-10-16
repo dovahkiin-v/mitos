@@ -22,10 +22,12 @@ And the write half (1c), which is where absence becomes *durable*:
   byte-identical with N rows queued;
 * ``rebuild`` → ``sync`` (and its ``--embed-only`` twin) creates the collection holding
   the full active set, which is what makes ``rebuild``'s own printed next step true;
-* ``rebuild`` → ``record`` with no sync creates nothing — the marker has exactly one
-  consumer;
+* ``rebuild`` → ``record`` with no sync creates nothing — exactly one consumer acts on
+  the marker;
 * ``import`` into a populated graph creates nothing and leaves every row queued;
-* ``reconcile`` heals the whole surface in one pass.
+* ``reconcile`` heals the whole surface in one pass;
+* a seeded drain skips points the collection already holds (phase 3a of the
+  recall-confidence vision).
 
 Discipline: every collection name here carries the ``mitos-tmp`` prefix so
 ``conftest``'s ``sweep_leaked_qdrant_collections`` can reclaim it, and each row
@@ -415,7 +417,7 @@ def test_rebuild_then_sync_creates_the_collection_with_the_full_active_set(
 def test_rebuild_then_record_with_no_sync_creates_nothing(
     absent_collection: str, tmp_path
 ) -> None:
-    """Gotcha 1: the marker has exactly ONE consumer, and this is the row that proves it.
+    """Gotcha 1: exactly ONE consumer acts on the marker, and this is the row that proves it.
 
     If a ``record`` consulted the marker after a ``rebuild``, the first record into a
     swept project would mint a one-point collection — the precise hazard this phase exists
@@ -537,3 +539,37 @@ def test_reconcile_heals_an_absent_collection_end_to_end(
     }
     # Idempotent: the second pass finds everything present and enqueues nothing.
     assert manager.reconcile_embeddings() == {"active": 3, "present": 3, "enqueued": 0}
+
+
+def test_a_seeded_drain_skips_points_the_collection_already_holds(
+    absent_collection: str, tmp_path
+) -> None:
+    """Phase 3a of the recall-confidence vision: presence-skip against a real collection.
+
+    Three of four queued nodes already have their points (content-derived ids, so
+    presence is the right vector). Under a stamped marker the drain lists once, removes
+    those three rows without embedding them, embeds the fourth, and spends the marker.
+    """
+    from mitos.vector_store import hash_to_uuid
+
+    config, node_ids = _live_workspace(
+        tmp_path, absent_collection,
+        ("seed-skip-a", "Seed skip axiom a."), ("seed-skip-b", "Seed skip axiom b."),
+        ("seed-skip-c", "Seed skip axiom c."), ("seed-skip-d", "Seed skip axiom d."),
+    )
+    writer = QdrantVectorStore(QDRANT_URL, absent_collection)
+    for node_id in node_ids[:3]:
+        writer.upsert(node_id, _vector(), {"slug": node_id[:8], "scope": []}, may_create=True)
+
+    manager = _manager_with_faked_embeddings(config, absent_collection)
+    for node_id in node_ids:
+        manager.store.add_pending_embedding(node_id)
+    manager.store.stamp_embedding_seed("rebuild")
+
+    outcome = manager.drain_pending_embeddings()
+
+    assert manager.embed_provider.get_embedding.call_count == 1
+    assert (outcome.written, outcome.skipped_present, outcome.stop) == (1, 3, None)
+    assert manager.store.get_pending_embeddings() == []
+    assert manager.store.embedding_seed() is None
+    assert manager.vector_store.list_point_ids() == {hash_to_uuid(n) for n in node_ids}

@@ -382,8 +382,8 @@ def test_sync_outbox_drain_loops_past_batch_limit(sync_env: Tuple[MitosConfig, M
     drain used to run exactly once, so a corpus with >10 pending nodes — the state
     right after ``mitos rebuild``/``cutover`` re-seed the whole active set — was left
     with ``vectors < nodes`` until ``sync`` happened to run again (the documented
-    single-``sync`` re-embed silently under-delivering). The drain now loops until the
-    outbox is empty.
+    single-``sync`` re-embed silently under-delivering). The drain now walks the whole
+    backlog, a claim at a time.
     """
     config, manager, tmpdir = sync_env
     store = GraphStore(config.db_path)
@@ -412,13 +412,49 @@ def test_sync_outbox_drain_loops_past_batch_limit(sync_env: Tuple[MitosConfig, M
 
 
 def test_sync_outbox_drain_stops_on_total_failure(sync_env: Tuple[MitosConfig, MitosSyncManager, str]) -> None:
-    """The drain loop's progress guard: a fully-erroring provider terminates, not spins.
+    """A store outage stops the drain after one attempted row, not one per row.
 
-    When every claimed row errors on upsert (an embedding-provider outage), the batch
-    resolves zero rows; re-claiming would return the same rows forever, so the loop
-    breaks after one batch. The rows stay in the outbox (retry_count incremented) to
-    drain on a later sync — fail-fast in aggregate: one outage costs one batch of
-    attempts, not a hot spin.
+    When the vector store fails the write (a ``VectorStoreError`` other than a missing
+    collection), the fault belongs to the store, not the row: trying the next row
+    would only spend another embedding. So the walk stops at once. The row it hit
+    gains its retry and every row stays in the outbox to drain on a later sync —
+    fail-fast in aggregate: one outage costs one attempted row, not a hot spin.
+    """
+    from mitos.errors import VectorStoreError
+    from mitos.sync import DRAIN_STOP_OUTAGE
+
+    config, manager, tmpdir = sync_env
+    store = GraphStore(config.db_path)
+
+    n = 15
+    for i in range(n):
+        e = ParsedEntry("decision", f"fail-{i:02d}", 1, 5)
+        e.axiom = f"Axiom {i}"
+        e.rejected_paths = "None."
+        d = store.commit_parsed_entry(e)
+        store.add_pending_embedding(d.node_id)
+
+    manager.embed_provider = MagicMock()
+    manager.embed_provider.get_embedding = MagicMock(return_value=[0.1, 0.2, 0.3])
+    manager.vector_store = MagicMock()
+    manager.vector_store.upsert = MagicMock(side_effect=VectorStoreError("Qdrant down"))
+
+    outcome = manager.drain_pending_embeddings()
+
+    assert outcome.stop == DRAIN_STOP_OUTAGE
+    assert len(store.get_pending_embeddings()) == n
+    assert manager.vector_store.upsert.call_count == 1
+    assert manager.embed_provider.get_embedding.call_count == 1
+    assert sorted(r["retry_count"] for r in store.get_pending_embeddings()) == [0] * (n - 1) + [1]
+
+
+def test_sync_outbox_drain_walks_past_per_row_failures(sync_env: Tuple[MitosConfig, MitosSyncManager, str]) -> None:
+    """A bare exception from the upsert is a per-row failure: the walk tries every row once.
+
+    The twin of the store-outage row above. An exception that is not a vector-store
+    error says nothing about the store, so each row keeps its place, gains one retry,
+    and the walk moves on. It still terminates: the keyset cursor never revisits a row
+    within one walk.
     """
     config, manager, tmpdir = sync_env
     store = GraphStore(config.db_path)
@@ -436,13 +472,12 @@ def test_sync_outbox_drain_stops_on_total_failure(sync_env: Tuple[MitosConfig, M
     manager.vector_store = MagicMock()
     manager.vector_store.upsert = MagicMock(side_effect=Exception("Qdrant down"))
 
-    # Must return (not hang). Only the first batch is attempted, then the guard breaks.
-    manager.drain_pending_embeddings()
+    outcome = manager.drain_pending_embeddings()
 
-    # Nothing drained; the loop tried exactly one claim batch (<= the limit of 10)
-    # rather than re-claiming the same failing rows.
-    assert len(store.get_pending_embeddings()) == n
-    assert manager.vector_store.upsert.call_count <= 10
+    assert outcome.stop is None
+    assert outcome.failed == n
+    assert manager.vector_store.upsert.call_count == n
+    assert [r["retry_count"] for r in store.get_pending_embeddings()] == [1] * n
 
 
 def test_sync_auto_heal_sample_block(sync_env: Tuple[MitosConfig, MitosSyncManager, str]) -> None:

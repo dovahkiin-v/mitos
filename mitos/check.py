@@ -45,10 +45,10 @@ no code path can reach the spend without holding the object that disclosed its c
 
 Phase 2d adds the run's **honesty hardware** (CHK-D4) and its **memory** (CHK-D7): the
 deterministic stale-index probe (:func:`probe_stale_index`) reads the pending-embeddings
-Outbox at plan entry and execute exit — a backlog row below ``CHECK_STALE_RETRY_TOLERANCE``
-gates the run partial (an index that never drained those nodes silently thinned the
-sweep's recall), while a row at or above tolerance is a *disclosed coverage exclusion*
-that never gates (the poison-row escape). One derivation site, :func:`run_degradations`,
+Outbox at plan entry and execute exit and keeps the rows of live decisions only — a kept
+row below ``CHECK_STALE_RETRY_TOLERANCE`` gates the run partial (an index that never
+drained those nodes silently thinned the sweep's recall), while a row at or above
+tolerance is a *disclosed coverage exclusion* that never gates (the poison-row escape). One derivation site, :func:`run_degradations`,
 feeds both :func:`exit_code_for` (degraded-2 dominates findings-1) and the persisted
 ``degraded_reason``, and :func:`check_run_row_from_result` derives every ``check_runs``
 scalar from the same :class:`CheckRunResult` the report reads — the row and the report
@@ -937,12 +937,17 @@ class StaleProbe:
     so a backlogged node outside the scope could still have surfaced as a
     candidate.
 
+    Only live decisions' rows are kept (:func:`probe_stale_index`): a retired
+    decision's, an open question's or a node-less row hides nothing from the sweep,
+    which judges live decisions only, so it neither gates nor is disclosed.
+
     Attributes:
-        transient: Rows with ``retry_count < CHECK_STALE_RETRY_TOLERANCE`` —
-            expected to drain on the next ``mitos sync``; their presence GATES
-            the run partial (the ``"stale_index"`` degradation).
-        excluded: Rows at or above the tolerance — chronic failures the drain
-            keeps retrying (poison rows). Disclosed as named coverage
+        transient: Live decisions' rows with ``retry_count <
+            CHECK_STALE_RETRY_TOLERANCE`` — expected to drain on the next
+            ``mitos sync``; their presence GATES the run partial (the
+            ``"stale_index"`` degradation).
+        excluded: Live decisions' rows at or above the tolerance — chronic
+            failures the drain keeps retrying (poison rows). Disclosed as named coverage
             exclusions, they NEVER gate: without this escape one poison row
             would turn the gate red forever and a pre-commit hook would
             permanently block (the CHK-D4 escape). The durable fix (an Outbox
@@ -976,38 +981,49 @@ class ProbeUnavailable:
 
 
 def probe_stale_index(store: "GraphStoreProtocol") -> StaleProbe:
-    """Reads the pending-embeddings backlog once and partitions it at the tolerance.
+    """Reads the pending-embeddings backlog once and partitions its live rows at the tolerance.
 
     One ``store.get_pending_embeddings()`` read (the GRAPH store — telemetry
-    reads stay one-per-run, §6.2), partitioned on ``retry_count`` against
-    ``CHECK_STALE_RETRY_TOLERANCE`` and node-id-sorted in both halves, so two
-    probes over an unchanged backlog are byte-identical (DoD-3 determinism).
-    Public: 3b composes it directly around the staged facade, outside this
-    engine's two call sites.
+    reads stay one-per-run, §6.2). When that backlog is non-empty, one
+    ``store.get_active_decision_ids()`` read follows, and only rows whose node
+    is in it are kept: the population the corpus sweep judges, drifted
+    decisions included. A retired decision's row, an open question's row and a
+    row whose node left the graph hide nothing from the sweep, so they leave
+    both partitions (ADR ``check-stale-index-probe-counts-only-live-decisions-rows``).
+    An empty backlog costs the one read. The kept rows are partitioned on
+    ``retry_count`` against ``CHECK_STALE_RETRY_TOLERANCE`` and node-id-sorted
+    in both halves, so two probes over an unchanged backlog are byte-identical
+    (DoD-3 determinism). Public: 3b composes it directly around the staged
+    facade, outside this engine's two call sites.
 
     Row fields are read by direct key — a schema drift is a loud ``KeyError``,
     never a ``.get(..., 0)`` (a silently-zero ``retry_count`` would turn poison
     into transient and resurrect the permanent-red-gate bug the tolerance
     exists to kill). There is deliberately NO try/except here: the two call
     sites dispose of faults differently (KD2 — plan propagates, execute wraps),
-    so the caller owns the disposition.
+    so the caller owns the disposition, for both reads alike.
 
     Args:
-        store: The graph store (the injected duck-typed collaborator; only
-            ``get_pending_embeddings`` is read).
+        store: The graph store (the injected collaborator; reads
+            ``get_pending_embeddings`` and, over a non-empty backlog,
+            ``get_active_decision_ids``).
 
     Returns:
-        The partitioned, sorted :class:`StaleProbe`. Empty backlog → healthy
-        ``StaleProbe((), ())``.
+        The partitioned, sorted :class:`StaleProbe`. Empty backlog, or no live
+        decision's row in it → healthy ``StaleProbe((), ())``.
     """
+    rows = store.get_pending_embeddings()
+    live = store.get_active_decision_ids() if rows else frozenset()
     transient: List[BacklogRow] = []
     excluded: List[BacklogRow] = []
-    for raw in store.get_pending_embeddings():
+    for raw in rows:
         row = BacklogRow(
             node_id=raw["node_id"],
             queued_at=raw["queued_at"],
             retry_count=raw["retry_count"],
         )
+        if row.node_id not in live:
+            continue
         if row.retry_count >= CHECK_STALE_RETRY_TOLERANCE:
             excluded.append(row)
         else:

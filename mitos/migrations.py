@@ -577,9 +577,13 @@ def _v1b_schema(conn: sqlite3.Connection) -> None:
 # read it into meaning: **the outbox covers the active set**, because a command that
 # bounds it that way said so. It is written by the two operator-invoked verbs that
 # actually deliver that property (``rebuild``/``cutover``'s prune, and
-# ``reconcile``'s enqueue pass) and read by exactly one consumer,
-# ``MitosSyncManager.drain_pending_embeddings``, which clears it the moment the
-# outbox empties and the claim stops being true.
+# ``reconcile``'s enqueue pass). It has two readers: ``mitos status`` prints it, and
+# ``MitosSyncManager.drain_pending_embeddings`` acts on it — the only one that does.
+# The drain spends the marker it read once its walk has attempted every row standing
+# at its entry with the collection present, or once the backlog is empty; an outage
+# or a refusal keeps it (phase 3a of the recall-confidence vision, which retired the
+# older "clears it the moment the outbox empties" rule once a poison row could stay
+# queued for good).
 #
 # Why a graph table rather than a file in ``.mitos/``: the fact being recorded is
 # *about* ``pending_embeddings``, a graph table, and the graph is the exact artifact

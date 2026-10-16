@@ -285,10 +285,19 @@ def test_no_encoding_carries_the_provider_body(ws, capsys, cause):
     m, captured = _record_with(config, exc, capsys, f"blob-{cause}")
     assert SENTINEL not in captured.err + captured.out
 
-    # The drain retries the queued row with the same provider and reports on stdout.
+    # The drain retries the queued rows with the same provider and reports on stdout.
+    # The outbox holds the `ws` fixture's two records, then this one, in queue order.
+    # An outage (auth / quota / transient) stops the walk at its first row; an
+    # `unknown` failure is per-row, so the walk tries all three.
     m.drain_pending_embeddings()
     drained = capsys.readouterr()
-    assert f"Failed to drain embedding for 'blob-{cause}': " in drained.out
+    lines = [ln for ln in drained.out.splitlines() if "Failed to drain embedding for '" in ln]
+    phrase = provider_cause_phrase(cause)
+    if cause == "unknown":
+        assert len(lines) == 3, drained.out
+        assert f"Failed to drain embedding for 'blob-{cause}': " in drained.out
+    else:
+        assert lines == [f"[Warning] Failed to drain embedding for 'cache-strategy': {phrase}"], drained.out
     assert SENTINEL not in drained.out + drained.err
 
 

@@ -113,7 +113,7 @@ def test_stamp_read_clear_roundtrip(store: GraphStore) -> None:
 
 
 def test_clearing_an_absent_marker_is_a_noop(store: GraphStore) -> None:
-    """The drain clears on every drain-to-empty, so the no-marker case must be quiet."""
+    """The drain spends the marker it read on an empty backlog, so the no-marker case must be quiet."""
     store.clear_embedding_seed()
     store.clear_embedding_seed()
     assert store.embedding_seed() is None
@@ -284,10 +284,10 @@ def test_all_three_producers_are_live_and_their_set_is_the_vocabulary(tmp_path) 
     seen: List[Optional[str]] = []
     real_drain = manager.drain_pending_embeddings
 
-    def _spy_drain() -> None:
+    def _spy_drain():
         seed = manager.store.embedding_seed()
         seen.append(seed["established_by"] if seed else None)
-        real_drain()
+        return real_drain()  # the drain returns its DrainOutcome; a spy passes it on
 
     manager.drain_pending_embeddings = _spy_drain  # type: ignore[method-assign]
     manager.reconcile_embeddings()

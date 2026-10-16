@@ -5,6 +5,7 @@ initialization, sync, ambient capture, querying, list, render, import, and
 MCP serving.
 """
 
+import contextlib
 import sys
 import os
 import re
@@ -912,7 +913,14 @@ def cmd_reconcile(config: MitosConfig, as_json: bool = False) -> int:
     if not as_json:
         _echo_corpus(config)
     try:
-        result = manager.reconcile_embeddings()
+        if as_json:
+            # stdout carries exactly one JSON object; the drain's progress lines are
+            # diagnostics, so they go to stderr. Routed here, at the boundary, like the
+            # provider-down line inside the call.
+            with contextlib.redirect_stdout(sys.stderr):
+                result = manager.reconcile_embeddings()
+        else:
+            result = manager.reconcile_embeddings()
     except VectorStoreError as e:
         msg = f"Reconcile unavailable — Qdrant down: {str(e)}"
         if as_json:

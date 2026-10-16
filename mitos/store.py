@@ -2966,13 +2966,14 @@ class GraphStore:
         """Returns the coverage marker, or None when no covering act stands.
 
         Absence of the row is the false state — there is no ``covers = 0`` row to
-        interpret. Read by exactly one consumer,
-        ``MitosSyncManager.drain_pending_embeddings``, at its entry.
+        interpret. Two readers: ``MitosSyncManager.drain_pending_embeddings`` acts on
+        it (read once at its entry), and ``mitos status`` prints it. The drain is the
+        only one that acts.
 
         An unreadable marker (a hand-truncated graph missing the table entirely) reads
-        as **absent**, not as a fault: the only consumer's safe answer to "may this
-        write create the collection?" is *no*, and deferral costs an outbox row that
-        was already written. Failing loud here would turn a recoverable graph into a
+        as **absent**, not as a fault: the drain's safe answer to "may this write
+        create the collection?" is *no*, and deferral costs an outbox row that was
+        already written. Failing loud here would turn a recoverable graph into a
         failed ``sync`` while still not creating anything.
 
         Returns:
@@ -2998,11 +2999,20 @@ class GraphStore:
         finally:
             conn.close()
 
-    def clear_embedding_seed(self) -> None:
+    def clear_embedding_seed(self, *, established_at: Optional[str] = None) -> None:
         """Drops the coverage marker — the claim has been delivered or has expired.
 
-        Called by the drain the moment the outbox empties: coverage is no longer
-        pending, so the marker must stop authorizing creation.
+        The drain spends the marker it read once its walk has attempted every row
+        standing at its entry with the collection present, or once it finds the
+        backlog empty (``drain_pending_embeddings`` states the rule). A walk spans
+        minutes, and a ``reconcile`` may re-stamp meanwhile, recording a covering
+        act this drain did not run under — so the drain passes the
+        ``established_at`` it read, and the delete then spends only that marker: a
+        re-stamped one survives.
+
+        Args:
+            established_at: The stamp of the marker to spend, compared exactly. None
+                deletes whatever marker stands.
 
         Raises:
             DatabaseError: If the delete fails.
@@ -3010,7 +3020,13 @@ class GraphStore:
         conn = self._get_connection()
         try:
             with conn:
-                conn.execute("DELETE FROM embedding_seed WHERE id = 1")
+                if established_at is None:
+                    conn.execute("DELETE FROM embedding_seed WHERE id = 1")
+                else:
+                    conn.execute(
+                        "DELETE FROM embedding_seed WHERE id = 1 AND established_at = ?",
+                        (established_at,),
+                    )
         except sqlite3.Error as e:
             raise DatabaseError(f"Failed to clear the embedding seed marker: {str(e)}")
         finally:
@@ -3905,28 +3921,66 @@ class GraphStore:
         finally:
             conn.close()
 
-    def claim_pending_embeddings(self, drainer_id: str, limit: int = 10) -> List[Dict[str, Any]]:
-        """Reads a batch of pending embeddings to drain (V1a single-writer semantics).
+    def claim_pending_embeddings(
+        self,
+        drainer_id: str,
+        limit: int = 10,
+        *,
+        after: Optional[Tuple[str, str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Reads the next rows to drain, in queue order (V1a single-writer semantics).
 
-        Aligned to V1a (Phase 8a): the prototype's ``claimed_by`` claim machinery
-        (UPDATE ... RETURNING) defers to V3b (§5.2.8) — V1a is single-writer
-        (``busy_timeout``), so a plain ordered SELECT is the whole contract. The
-        returned rows carry NO ``embedding_text`` (the column is gone, C2/M8); the
-        drainer re-derives it per node. ``drainer_id`` is retained for surface
-        stability (R12) and is unused under single-writer semantics.
+        A plain ordered ``SELECT`` over ``(queued_at, node_id)`` — not a claim. The
+        prototype's ``claimed_by`` machinery (UPDATE ... RETURNING) defers to V3b
+        (§5.2.8); V1a is single-writer (``busy_timeout``), so nothing is reserved and
+        two concurrent drainers can both read a row. ``node_id`` breaks ties because a
+        ``rebuild`` replay can give many rows one ``queued_at`` stamp.
+
+        ``after`` is a keyset cursor: with it, only rows strictly after that
+        ``(queued_at, node_id)`` key are returned, by the same order. The drain walks
+        the backlog this way, so a row that failed (and so kept its ``queued_at``)
+        is passed rather than re-read, and the parameter list stays two values long
+        at any backlog size. The returned rows carry NO ``embedding_text`` (the column
+        is gone, C2/M8); the drainer re-derives it per node. ``drainer_id`` is
+        retained for surface stability (R12) and is unused.
+
+        Args:
+            drainer_id: Unused (R12).
+            limit: The most rows to return.
+            after: The last ``(queued_at, node_id)`` key already walked, or None to
+                read from the head of the queue.
+
+        Returns:
+            Up to ``limit`` rows ``{"node_id", "queued_at", "retry_count"}``.
+
+        Raises:
+            DatabaseError: If the read fails.
         """
         conn = self._get_connection()
         try:
             cursor = conn.cursor()
-            cursor.execute(
-                """
-                SELECT node_id, queued_at, retry_count
-                FROM pending_embeddings
-                ORDER BY queued_at
-                LIMIT ?
-                """,
-                (limit,)
-            )
+            if after is None:
+                cursor.execute(
+                    """
+                    SELECT node_id, queued_at, retry_count
+                    FROM pending_embeddings
+                    ORDER BY queued_at, node_id
+                    LIMIT ?
+                    """,
+                    (limit,)
+                )
+            else:
+                queued_at, node_id = after
+                cursor.execute(
+                    """
+                    SELECT node_id, queued_at, retry_count
+                    FROM pending_embeddings
+                    WHERE queued_at > ? OR (queued_at = ? AND node_id > ?)
+                    ORDER BY queued_at, node_id
+                    LIMIT ?
+                    """,
+                    (queued_at, queued_at, node_id, limit)
+                )
             return [dict(row) for row in cursor.fetchall()]
         except sqlite3.Error as e:
             raise DatabaseError(f"Failed to claim pending embeddings: {str(e)}")

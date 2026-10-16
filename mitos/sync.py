@@ -62,6 +62,7 @@ from mitos.errors import (
     ValidationError,
     DatabaseError,
     EntryFailure,
+    VectorStoreError,
     CommitError,
     STORE_CYCLE_VIOLATION,
     STORE_DANGLING_EDGE,
@@ -91,7 +92,8 @@ from mitos.identity import (
     mechanism_canonical_norm,
 )
 from mitos.embeddings import GeminiEmbeddingProvider
-from mitos.provider_cause import describe_embed_failure
+from mitos.provider_cause import (AUTH, QUOTA, TRANSIENT, classify_provider_error,
+                                  describe_embed_failure)
 from mitos.shell_quote import shell_flag
 from mitos.tool_markup import field_values, find_tool_call_markup
 from mitos.vector_store import QdrantVectorStore, hash_to_uuid
@@ -752,6 +754,54 @@ _ROTATION_FAILED_NOTE = (
     "The decision was recorded. Rotation left decisions.md unchanged; an archive may "
     "already hold a copy of the entries it was moving."
 )
+
+
+# The decision outbox's drain (`drain_pending_embeddings`): why a walk stopped and what
+# it did with the seed marker it read. Two closed vocabularies, named once here; the
+# tests import them rather than retype them.
+DRAIN_STOP_OUTAGE = "outage"            # auth/quota/transient on the embed, or the store failed the write
+DRAIN_STOP_REFUSED = "refused"          # absent collection and no covering intent
+DRAIN_STOP_UNAVAILABLE = "unavailable"  # no provider or no vector store; nothing read
+DRAIN_STOP_CLAIM_FAILED = "claim_failed"  # the outbox read itself failed
+DRAIN_STOPS = (DRAIN_STOP_OUTAGE, DRAIN_STOP_REFUSED, DRAIN_STOP_UNAVAILABLE,
+               DRAIN_STOP_CLAIM_FAILED)
+
+DRAIN_MARKER_SPENT = "spent"
+DRAIN_MARKER_KEPT = "kept"
+DRAIN_MARKERS = (DRAIN_MARKER_SPENT, DRAIN_MARKER_KEPT)
+
+# The provider causes that are outages, not properties of a row: the drain stops at the
+# first one instead of charging it to every row behind it (ADR
+# `drain-outage-is-a-provider-cause-auth-quota-or-transient-or-an-unreachable-store`).
+_DRAIN_OUTAGE_CAUSES = frozenset({AUTH, QUOTA, TRANSIENT})
+
+# Rows per outbox read. The walk is keyset-paged, so this sizes each read, not the walk.
+_DRAIN_CLAIM_SIZE = 10
+
+
+@dataclass(frozen=True)
+class DrainOutcome:
+    """What one drain of the decision outbox did. Runtime-only, never persisted.
+
+    Attributes:
+        written: Rows embedded and upserted, then removed.
+        skipped_present: Rows removed without embedding, because the seed marker stood
+            and the node's point was already in the collection.
+        pruned: Rows removed because their node is no longer in the graph.
+        failed: Rows attempted and left queued with their retry count moved, the
+            outage row included.
+        stop: None when the walk reached the end of the backlog, else one of
+            :data:`DRAIN_STOPS`.
+        marker: None when no seed marker stood at entry (or nothing was read), else
+            one of :data:`DRAIN_MARKERS`.
+    """
+
+    written: int
+    skipped_present: int
+    pruned: int
+    failed: int
+    stop: Optional[str]
+    marker: Optional[str]
 
 
 def _rotation_failure_stage(exc: BaseException) -> str:
@@ -2778,94 +2828,146 @@ class MitosSyncManager:
             print(f"[Warning] Embedding upsert deferred for '{entry.slug}': {describe_embed_failure(e)}", file=sys.stderr)
             return None
 
-    def drain_pending_embeddings(self) -> None:
-        """Drains the pending embeddings outbox queue (C2).
+    def drain_pending_embeddings(self) -> DrainOutcome:
+        """Drains the decision outbox (``pending_embeddings``, C2) in one walk.
 
-        Claims a batch of pending embeddings atomically to prevent concurrent
-        drainers from double-processing rows, processes them, and removes resolved entries.
+        **The walk.** The outbox is read in queue order, ``(queued_at, node_id)``, a
+        claim-sized page at a time, each page keyed after the last row walked. The
+        read is a plain ordered ``SELECT``, not a claim: two concurrent drainers can
+        both process a row, which costs an idempotent upsert and at worst a second
+        embed. Each row standing at entry is attempted once per walk. A row that
+        fails for a reason of its own (the provider classifier's ``unknown``, or a
+        fault after the embed) keeps its place and gains one retry, and the walk
+        moves on to the rows behind it, so no head of failing rows can stop a later
+        drain (ADR ``backlog-drains-never-let-a-failing-or-held-row-block-the-rows-behind-it``).
+        A row enqueued mid-walk is re-stamped ahead of the cursor and taken in the same
+        walk. An **outage** stops the walk at once: the embed call failing ``auth``,
+        ``quota`` or ``transient``, or the vector store failing the write with anything
+        but a missing collection. The row the outage hit still gains its retry, exactly
+        as every failure always has; the gain is that an outage charges one row, not
+        every row behind it. There is no backoff: the next drain is the retry.
 
-        **Whether this drain may create an absent collection is not a property of the
-        running call site.** The drain has three callers (``mitos sync --embed-only``,
-        the sync commit path, and ``reconcile_embeddings``), and ``--embed-only`` is a
-        drain with no buffer at all — its covering-ness is entirely a property of outbox
-        state that a *prior* command deliberately established, which a call-site flag
-        structurally cannot express. So the knowledge travels to the substrate: the
-        ``embedding_seed`` marker, written by ``rebuild``/``cutover``'s prune (the act
-        that makes the outbox equal the active set) and by ``reconcile``'s enqueue pass.
-        This is the marker's only consumer. It is read **once at entry** — not per
-        claim-batch, so a concurrent second drainer cannot flip it mid-run — and cleared
-        the moment the outbox empties, because that is the moment coverage has been
-        delivered and the claim stops being true. A drain that stops early (the
-        zero-progress guard, or a refusal) **keeps** the marker: rows remain, so the next
-        drain is still covering.
+        **The seed marker.** Whether this drain may create an absent collection is not a
+        property of the call site: ``--embed-only`` is a drain with no buffer at all, so
+        its covering-ness is outbox state a prior command established. The
+        ``embedding_seed`` marker carries it — stamped by ``rebuild``/``cutover``'s
+        prune and by ``reconcile``'s enqueue. It has two readers: this drain, which acts
+        on it, and ``mitos status``, which prints it. It is read **once at entry**, so a
+        concurrent drainer cannot flip it mid-walk.
+
+        Under a standing marker the drain lists the collection's point ids once, and a
+        row whose point is already present is removed without embedding or reading its
+        node: a content-derived point id means presence is the right vector under the
+        same model (ADR ``mass-seed-drain-skips-present-points-under-the-seed-marker-an-ordinary-drain-re-upserts``).
+        The residual is known: a per-commit row queued for a present node while a
+        marker stands is skipped too, so a renamed decision's payload slug waits for
+        that node's next commit. With no marker nothing is listed and every row is
+        embedded and upserted, which is what heals such a payload.
+
+        The marker is **spent** when the drain finds its backlog empty, or when its walk
+        completes with the collection present (the listing found it, or a write in this
+        drain created it). A walk that completes with the collection still absent spends
+        it only if the backlog reads empty afterwards. An outage, a refusal, a failed
+        read or an exception escaping the walk **keeps** it: spending is never in a
+        ``finally``. Only the marker this drain read is spent; one re-stamped while it
+        ran survives (ADR ``seed-marker-is-spent-once-a-drain-has-attempted-every-row-standing-at-its-entry``).
 
         It is emphatically *not* an inferred comparison of outbox size against the active
         set — that is not a completeness measure (the outbox holds rows for
         no-longer-active nodes), it is more expensive than the signals it would replace,
         and it decays silently once a migration hands every project a clean collection
         holding only active points.
+
+        Returns:
+            The walk's :class:`DrainOutcome`. Every production caller ignores it today.
         """
         if not self.embed_provider or not self.vector_store:
             print("Cannot drain outbox: Embedding provider or vector store down.")
-            return
+            return DrainOutcome(0, 0, 0, 0, stop=DRAIN_STOP_UNAVAILABLE, marker=None)
 
-        import uuid
         drainer_id = f"drainer-{uuid.uuid4()}"
 
         # Declared intent, from the state a prior command established (read once).
-        may_create = self.store.embedding_seed() is not None
+        seed = self.store.embedding_seed()
+        may_create = seed is not None
 
-        printed_header = False
-        total_drained = 0
-        # Set by the refusal arm below; the refusal must escape BOTH loops (the per-item
-        # `for` and the enclosing claim-batch `while`), and a bare `break` leaves only
-        # the inner one.
-        refused = False
+        written = skipped = pruned = failed = 0
+
+        def outcome(stop: Optional[str], marker: Optional[str]) -> DrainOutcome:
+            # Every exit after a skip says how many rows it skipped: a skip prints no
+            # per-row line, so an outage after hundreds of skips would otherwise hide them.
+            if skipped:
+                print(
+                    f"Skipped {skipped} already-indexed row(s): the embedding queue was "
+                    f"seeded by `{seed['established_by']}`."
+                )
+            return DrainOutcome(written, skipped, pruned, failed, stop=stop, marker=marker)
+
+        kept = DRAIN_MARKER_KEPT if seed is not None else None
+
         try:
-            # Drain the outbox in claim-batches until it is EMPTY. A single call must
-            # not stop after one `limit`-sized batch: a corpus with more than `limit`
-            # unembedded nodes — the common state right after `mitos rebuild`/`cutover`,
-            # which re-seed the outbox with the whole active set — would otherwise be
-            # left with `vectors < nodes` until the operator happened to run `sync`
-            # again (the documented single-`sync` re-embed silently under-delivering).
-            #
-            # Progress guard: a batch that resolves ZERO rows (every claimed row errored
-            # — e.g. an embedding-provider 429/outage) breaks the loop rather than
-            # re-claiming the same failing rows forever. Those rows keep their
-            # incremented `retry_count` and drain on a later sync — fail-fast in
-            # aggregate: one outage costs one batch of attempts, not a hot spin. An
-            # orphan row (node gone from the graph) counts as resolved (it LEAVES the
-            # outbox), so a batch of orphans still makes progress and the loop continues.
-            while True:
+            try:
+                pending = self.store.claim_pending_embeddings(
+                    drainer_id, limit=_DRAIN_CLAIM_SIZE
+                )
+            except Exception as e:
+                print(f"[Warning] Failed to claim outbox queue: {str(e)}")
+                return outcome(DRAIN_STOP_CLAIM_FAILED, kept)
+
+            if not pending:
+                # Nothing to deliver: whatever coverage the marker claimed is moot, so
+                # it is spent. Never lists the collection.
+                if seed is None:
+                    return outcome(None, None)
+                return outcome(None, self._spend_embedding_seed(seed))
+
+            # Under the marker, one listing for the whole walk. A normal return means
+            # the collection is present, whatever it holds — an empty set included.
+            present: Set[str] = set()
+            collection_present = False
+            if seed is not None:
                 try:
-                    pending = self.store.claim_pending_embeddings(drainer_id, limit=10)
-                except Exception as e:
-                    print(f"[Warning] Failed to claim outbox queue: {str(e)}")
-                    return
+                    present = self.vector_store.list_point_ids()
+                    collection_present = True
+                except CollectionMissingError:
+                    present = set()
+                except VectorStoreError as e:
+                    print(
+                        f"Stopping the drain before any row: the vector store could not "
+                        f"list the collection ({str(e)}). The queue is unchanged; the "
+                        f"next `mitos sync` retries."
+                    )
+                    return outcome(DRAIN_STOP_OUTAGE, kept)
 
-                if not pending:
-                    # The outbox is empty: any coverage the marker claimed has been
-                    # delivered (or there was nothing to deliver), so the claim is spent
-                    # and must stop authorizing creation. Clearing here covers both the
-                    # drained-to-empty exit and an already-empty outbox on entry.
-                    self._clear_embedding_seed_best_effort()
-                    break
+            print("Draining pending embeddings queue ...")
 
-                if not printed_header:
-                    print("Draining pending embeddings queue ...")
-                    printed_header = True
-
-                batch_resolved = 0  # rows that LEFT the outbox this batch (embedded or orphan-pruned)
+            while pending:
                 for item in pending:
                     node_id = item["node_id"]
+
+                    if seed is not None and hash_to_uuid(node_id) in present:
+                        # Presence-skip: before `get_node`, so a skipped row costs no
+                        # graph read and no provider call. A present point whose node
+                        # has left the graph is skipped too; the point is an orphan
+                        # for the collector, not for this drain.
+                        try:
+                            self.store.remove_pending_embedding(node_id)
+                            skipped += 1
+                        except Exception as e:
+                            failed += 1
+                            self._increment_pending_best_effort(node_id)
+                            print(f"[Warning] Failed to clear an already-indexed outbox row: {str(e)}")
+                        continue
 
                     # Fetch node details from graph for Qdrant payload
                     node = self.store.get_node(node_id)
                     if not node:
-                        # Node has been deleted from graph; remove from queue
+                        # The node left the graph. Close to unreachable in production:
+                        # `pending_embeddings.node_id` is a foreign key to `nodes`, so
+                        # only a store opened with foreign keys off can leave this row.
                         try:
                             self.store.remove_pending_embedding(node_id)
-                            batch_resolved += 1
+                            pruned += 1
                         except Exception:
                             pass
                         continue
@@ -2886,52 +2988,82 @@ class MitosSyncManager:
                         "embedding_text": embed_text
                     }
 
+                    # The embed call has a try of its own: only ITS exception is
+                    # classified (a store or graph error's text can carry "429").
                     try:
-                        # 1. Fetch embedding vector
                         vector = self.embed_provider.get_embedding(embed_text, is_query=False)
-                        # 2. Upsert to Qdrant
+                    except Exception as e:
+                        cause = classify_provider_error(e)
+                        failed += 1
+                        self._increment_pending_best_effort(node_id)
+                        print(f"[Warning] Failed to drain embedding for '{node['slug']}': {describe_embed_failure(e)}")
+                        if cause in _DRAIN_OUTAGE_CAUSES:
+                            print(
+                                f"Stopping the drain: the embedding provider is unavailable "
+                                f"({cause}). The rows behind this one stay queued for the "
+                                f"next `mitos sync`."
+                            )
+                            return outcome(DRAIN_STOP_OUTAGE, kept)
+                        continue
+
+                    try:
                         self.vector_store.upsert(
                             node_id, vector, payload, may_create=may_create
                         )
-                        # 3. Clean up queue row on success
-                        self.store.remove_pending_embedding(node_id)
-                        batch_resolved += 1
-                        total_drained += 1
-                        print(f"Successfully drained embedding for '{node['slug']}' ✓")
                     except CollectionMissingError:
-                        # Ahead of the generic arm below, and deliberately quiet: a
-                        # refusal is a property of the whole drain, not of this row, so
-                        # it costs ONE calm line and stops immediately rather than
-                        # repeating per node. And NO `increment_pending_attempts` — the
-                        # row was not rejected, the drain declined; inflating a counter
-                        # that exists to describe genuine failure would poison it.
+                        # Ahead of the VectorStoreError arm (it is a subclass), and
+                        # deliberately quiet: a refusal is a property of the whole drain,
+                        # not of this row, so it costs ONE calm line and stops
+                        # immediately. And NO `increment_pending_attempts` — the row was
+                        # not rejected, the drain declined; inflating a counter that
+                        # exists to describe genuine failure would poison it.
                         print(
                             "Stopping the drain: the Qdrant collection is missing and no "
                             "covering re-embed has been requested, so writing now would "
                             "index only part of the corpus. Run `mitos reconcile` to "
                             "rebuild it in one pass."
                         )
-                        refused = True
-                        break
-                    except Exception as e:
-                        # Increment retry count on failure (which also releases this row)
-                        try:
-                            self.store.increment_pending_attempts(node_id)
-                        except Exception:
-                            pass
+                        return outcome(DRAIN_STOP_REFUSED, kept)
+                    except VectorStoreError as e:
+                        # A store outage: the point id, vector and payload are well-formed
+                        # by construction, so a fault on the write belongs to the store,
+                        # and trying the next row would only spend another embedding.
+                        failed += 1
+                        self._increment_pending_best_effort(node_id)
                         print(f"[Warning] Failed to drain embedding for '{node['slug']}': {describe_embed_failure(e)}")
+                        print(
+                            "Stopping the drain: the vector store failed the write. The "
+                            "rows behind this one stay queued for the next `mitos sync`."
+                        )
+                        return outcome(DRAIN_STOP_OUTAGE, kept)
+                    except Exception as e:
+                        failed += 1
+                        self._increment_pending_best_effort(node_id)
+                        print(f"[Warning] Failed to drain embedding for '{node['slug']}': {describe_embed_failure(e)}")
+                        continue
 
-                # The refusal escapes the claim-batch loop too — the inner `break` only
-                # left the per-item one, and re-claiming would meet the same absent
-                # collection. The marker (if any) is deliberately RETAINED: rows remain,
-                # so the coverage claim still holds for the next drain.
-                if refused:
-                    break
+                    # Written: the collection exists now, whatever the listing said.
+                    collection_present = True
+                    try:
+                        self.store.remove_pending_embedding(node_id)
+                    except Exception as e:
+                        # The point is written; the row stays and the next drain
+                        # re-upserts it (a cache hit).
+                        failed += 1
+                        self._increment_pending_best_effort(node_id)
+                        print(f"[Warning] Failed to drain embedding for '{node['slug']}': {describe_embed_failure(e)}")
+                        continue
+                    written += 1
+                    print(f"Successfully drained embedding for '{node['slug']}' ✓")
 
-                # Nothing left the outbox this batch — every claimed row errored (a
-                # dead/erroring provider). Stop; re-claiming would return the same rows.
-                if batch_resolved == 0:
-                    break
+                cursor = (pending[-1]["queued_at"], pending[-1]["node_id"])
+                try:
+                    pending = self.store.claim_pending_embeddings(
+                        drainer_id, limit=_DRAIN_CLAIM_SIZE, after=cursor
+                    )
+                except Exception as e:
+                    print(f"[Warning] Failed to claim outbox queue: {str(e)}")
+                    return outcome(DRAIN_STOP_CLAIM_FAILED, kept)
         finally:
             # Clean up: release any remaining locks held by this specific drainer
             try:
@@ -2939,19 +3071,64 @@ class MitosSyncManager:
             except Exception:
                 pass
 
-    def _clear_embedding_seed_best_effort(self) -> None:
+        if seed is None:
+            return outcome(None, None)
+        if collection_present:
+            return outcome(None, self._spend_embedding_seed(seed))
+        # The collection is still absent (nothing written). Spend only if nothing is
+        # left to cover — read, never inferred from `failed == 0`: a row queued behind
+        # the cursor mid-walk is invisible to the walk.
+        try:
+            empty = self.store.claim_pending_embeddings(drainer_id, limit=1) == []
+        except Exception as e:
+            print(f"[Warning] Failed to claim outbox queue: {str(e)}")
+            return outcome(None, DRAIN_MARKER_KEPT)
+        if empty:
+            return outcome(None, self._spend_embedding_seed(seed))
+        return outcome(None, DRAIN_MARKER_KEPT)
+
+    def _increment_pending_best_effort(self, node_id: str) -> None:
+        """Moves a failed row's retry count, swallowing a store fault (as always)."""
+        try:
+            self.store.increment_pending_attempts(node_id)
+        except Exception:
+            pass
+
+    def _spend_embedding_seed(self, seed: Dict[str, str]) -> str:
+        """Spends the marker the drain read, and reports which way it went.
+
+        Args:
+            seed: The marker as the drain read it at entry.
+
+        Returns:
+            ``DRAIN_MARKER_SPENT``, or ``DRAIN_MARKER_KEPT`` when the clear failed.
+        """
+        if self._clear_embedding_seed_best_effort(established_at=seed["established_at"]):
+            return DRAIN_MARKER_SPENT
+        return DRAIN_MARKER_KEPT
+
+    def _clear_embedding_seed_best_effort(self, *, established_at: Optional[str] = None) -> bool:
         """Clears the coverage marker, reporting rather than raising on failure.
 
         The clear is bookkeeping on a delivered claim, not part of the drain's product,
         so a graph fault here must not turn a fully-drained outbox into a failed
         ``sync``. Failing to clear is also the *safe* direction — the marker only ever
-        authorizes a covering drain, and the next one re-reads the (now empty) outbox
-        and clears it again.
+        authorizes a covering drain, and the next one re-reads the outbox and spends it
+        again.
+
+        Args:
+            established_at: The stamp of the marker read at the drain's entry; the
+                delete spends only that marker, so a re-stamp made meanwhile survives.
+
+        Returns:
+            True when the delete ran, False when it failed.
         """
         try:
-            self.store.clear_embedding_seed()
+            self.store.clear_embedding_seed(established_at=established_at)
         except Exception as e:
             print(f"[Warning] Failed to clear the embedding seed marker: {str(e)}")
+            return False
+        return True
 
     def reconcile_embeddings(self) -> Dict[str, int]:
         """Re-embeds active nodes missing from Qdrant, then drains the outbox.
