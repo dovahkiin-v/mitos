@@ -110,7 +110,7 @@ _RECOVERY_CLAUSES: Dict[str, Dict[str, str]] = {
             "a person with a shell in that project runs it"
         ),
         "reconcile": (
-            "only a reconcile re-creates it and re-embeds the active decisions, which "
+            "only a reconcile re-creates it and embeds every decision it is missing, which "
             "no tool on this surface performs — a person with a shell in that project "
             "runs it"
         ),

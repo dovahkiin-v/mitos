@@ -1097,18 +1097,20 @@ def missing_index_is_a_gap(store: "object") -> bool:
     semantic read surfaces (``mitos query`` / ``mitos surface`` and their MCP
     twins) and the conflict sweep behind ``mitos check --staged`` and the
     sync-time sensor, so the shapes they take cannot become several behaviours.
-    Over a graph holding **no** active nodes an absent collection *is* the empty
-    index — a just-initialized project is healthy, not broken — and the caller
-    renders its ordinary nothing-found result with no diagnostic. Over a
-    populated graph it is a real hole in recall, and the caller says so and names
-    the heal.
+    Over a graph whose decision index expects **nothing** an absent collection
+    *is* the empty index — a just-initialized project is healthy, not broken —
+    and the caller renders its ordinary nothing-found result with no diagnostic.
+    Over a populated graph it is a real hole in recall, and the caller says so
+    and names the heal.
 
-    Gated on ``get_active_node_ids`` rather than ``get_active_decisions`` for a
-    reason stronger than "open questions are embedded too": that set — active
-    decisions ∪ surviving open questions — is exactly what
-    ``reconcile_embeddings`` enqueues, so the diagnostic fires if and only if the
-    ``mitos reconcile`` it points at would actually have something to index. The
-    gate and the heal agree by construction.
+    Gated on ``get_decision_index_expected_ids`` — every decision, live or
+    retired, plus the surviving open questions — because that set is exactly
+    what ``reconcile_embeddings`` enqueues, so the diagnostic fires if and only
+    if the ``mitos reconcile`` it points at would actually have something to
+    index. The gate and the heal agree by construction: one store read behind
+    both (ADR ``decision-index-gap-and-creation-carve-out-key-on-its-expected-set``).
+    A graph holding only retired decisions is therefore a gap, not the empty
+    index.
 
     An unreadable graph answers **True**, the loud branch: "I could not check"
     must never render as the healthy-empty "I checked, there is nothing to index".
@@ -1121,7 +1123,7 @@ def missing_index_is_a_gap(store: "object") -> bool:
         True when the absence should be surfaced as a degradation.
     """
     try:
-        return bool(store.get_active_node_ids())
+        return bool(store.get_decision_index_expected_ids())
     except Exception:
         return True
 
@@ -1153,8 +1155,8 @@ def missing_graph_is_a_gap(
 
     **The gate is the TOTAL node count, never the active set**, and the reasoning
     is the sibling's own applied to a different heal: that predicate gates on
-    ``get_active_node_ids`` because that set is exactly what ``mitos reconcile``
-    enqueues, while this one gates on the node count because ``mitos rebuild``
+    ``get_decision_index_expected_ids`` because that set is exactly what ``mitos
+    reconcile`` enqueues, while this one gates on the node count because ``mitos rebuild``
     commits every corpus *entry* to nodes regardless of computed state. Gate and heal agree by
     construction, and they are different heals — asking a **computed-state view**
     whether the graph was ever *built* is asking the wrong question, however the

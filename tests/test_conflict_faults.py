@@ -479,12 +479,12 @@ def test_typed_faults_produce_typed_unavailable_reasons() -> None:
         def get_modifiers_map(self, node_ids: Any) -> Any:  # never reached on these legs
             raise AssertionError("graph read must not run when the substrate is severed")
 
-        def get_active_node_ids(self) -> set:
+        def get_decision_index_expected_ids(self) -> frozenset:
             # Declared explicitly, not left to the I8 gate's unreadable-graph
             # fallback: a stub missing this method degrades via `except Exception`
             # and the COLLECTION_MISSING leg below would then pass for the wrong
             # reason. A populated graph is what makes an absent collection a gap.
-            return {"some-node-id"}
+            return frozenset({"some-node-id"})
 
     embed_fault = gather_candidates(
         "Some axiom.", embed_provider=_SeveredEmbed(),
@@ -512,14 +512,14 @@ def test_typed_faults_produce_typed_unavailable_reasons() -> None:
 
 
 @pytest.mark.parametrize(
-    "active_ids, expect_degraded",
+    "expected_ids, expect_degraded",
     [
         pytest.param({"a-committed-node"}, True, id="populated-graph-is-a-gap"),
         pytest.param(set(), False, id="empty-graph-is-the-empty-index"),
     ],
 )
 def test_absent_collection_degrades_only_when_the_graph_has_something_to_index(
-    active_ids: set, expect_degraded: bool,
+    expected_ids: set, expect_degraded: bool,
 ) -> None:
     """I8 at the sweep: absence is a gap iff `mitos reconcile` would index something.
 
@@ -530,18 +530,18 @@ def test_absent_collection_degrades_only_when_the_graph_has_something_to_index(
     onto the operation broke that promise for the state where the collection has
     never been created. It bites hardest on a fresh workspace whose first commit
     runs `mitos check --staged` from a pre-commit hook: exit 2, advised to run
-    `mitos reconcile`, which enqueues nothing over an empty active set and so
+    `mitos reconcile`, which enqueues nothing over an empty expected set and so
     cannot heal what it names — a dead end, not a vector.
 
-    Gated on the same `get_active_node_ids` the four read surfaces use, and the
-    same set `reconcile_embeddings` enqueues, so the gate and the heal agree by
-    construction.
+    Gated on the same `get_decision_index_expected_ids` the four read surfaces use,
+    and the same set `reconcile_embeddings` enqueues, so the gate and the heal agree
+    by construction.
     """
     from mitos.conflict import gather_candidates
 
     class _Store:
-        def get_active_node_ids(self) -> set:
-            return active_ids
+        def get_decision_index_expected_ids(self) -> frozenset:
+            return frozenset(expected_ids)
 
         def resolve_point_ids(self, point_ids: Any) -> Any:  # the query raised first
             raise AssertionError("the query raised — S3 must never run")
@@ -574,7 +574,7 @@ def test_an_unreadable_graph_still_degrades_on_an_absent_collection() -> None:
     from mitos.conflict import gather_candidates
 
     class _UnreadableStore:
-        def get_active_node_ids(self) -> set:
+        def get_decision_index_expected_ids(self) -> frozenset:
             raise RuntimeError("graph unreadable")
 
         def resolve_point_ids(self, point_ids: Any) -> Any:

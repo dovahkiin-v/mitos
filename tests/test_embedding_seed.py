@@ -1,16 +1,18 @@
 """The two substrate questions a covering write needs answered.
 
-Phase 1c reserves creating an absent Qdrant collection for a write that **covers the
-workspace's active set**, and the two callers derive that from two deliberately
-different sources — which is the whole design, not an inconsistency:
+Phase 1c reserves creating an absent Qdrant collection for a write that **covers what
+the decision index should hold** — its expected set, every decision plus the active open
+questions, since recall-confidence 3b (the workspace's active set before it) — and the
+two callers derive that from two deliberately different sources — which is the whole
+design, not an inconsistency:
 
 * a **single-node** write (a ``record``, an ``import`` entry) asks the graph:
-  ``has_active_node_other_than(node_id)``. Its answer is a property of the running
-  write, and it must agree with ``get_active_node_ids()`` exactly, because a
-  disagreement in either direction is the defect (claiming coverage it does not deliver,
-  or refusing the fresh-project carve-out).
+  ``decision_index_expects_node_other_than(node_id)``. Its answer is a property of the
+  running write, and it must agree with ``get_decision_index_expected_ids()`` exactly,
+  because a disagreement in either direction is the defect (claiming coverage it does not
+  deliver, or refusing the fresh-project carve-out).
 * a **drain** asks the ``embedding_seed`` marker, which records that a *prior* command
-  bounded the outbox to the active set. A drain cannot see its own covering-ness from
+  bounded the outbox to the expected set. A drain cannot see its own covering-ness from
   inside — ``mitos sync --embed-only`` has no buffer at all — so the knowledge travels to
   the substrate rather than being re-derived there.
 
@@ -246,7 +248,7 @@ def test_all_three_producers_are_live_and_their_set_is_the_vocabulary(tmp_path) 
     """
     from unittest.mock import MagicMock
 
-    from mitos.cutover import _prune_embedding_queue_to_active
+    from mitos.cutover import _prune_embedding_queue_to_expected
     from mitos.sync import MitosSyncManager
 
     observed: Set[str] = set()
@@ -258,7 +260,7 @@ def test_all_three_producers_are_live_and_their_set_is_the_vocabulary(tmp_path) 
         db_path = str(ws / ".mitos" / "graph.sqlite")
         aside_store = GraphStore(db_path)
         node_id = _decision(aside_store, "d1", "An axiom.")
-        _prune_embedding_queue_to_active(
+        _prune_embedding_queue_to_expected(
             db_path, {node_id}, established_by=expected
         )
         seed = GraphStore(db_path).embedding_seed()
@@ -284,10 +286,12 @@ def test_all_three_producers_are_live_and_their_set_is_the_vocabulary(tmp_path) 
     seen: List[Optional[str]] = []
     real_drain = manager.drain_pending_embeddings
 
-    def _spy_drain():
+    def _spy_drain(**kwargs):
         seed = manager.store.embedding_seed()
         seen.append(seed["established_by"] if seed else None)
-        return real_drain()  # the drain returns its DrainOutcome; a spy passes it on
+        # The drain returns its DrainOutcome, and reconcile hands it a `listing=`; a spy
+        # passes both on.
+        return real_drain(**kwargs)
 
     manager.drain_pending_embeddings = _spy_drain  # type: ignore[method-assign]
     manager.reconcile_embeddings()
@@ -299,22 +303,22 @@ def test_all_three_producers_are_live_and_their_set_is_the_vocabulary(tmp_path) 
 
 
 # --------------------------------------------------------------------------- #
-# The graph gate — it must agree with the shipped active set, exactly
+# The graph gate — it must agree with the decision index's expected set, exactly
 # --------------------------------------------------------------------------- #
 
 def _agrees(store: GraphStore, node_id: str) -> bool:
     """The gate's answer, and the definition it must never diverge from."""
-    gate = store.has_active_node_other_than(node_id)
-    reference = len(store.get_active_node_ids() - {node_id}) > 0
+    gate = store.decision_index_expects_node_other_than(node_id)
+    reference = len(store.get_decision_index_expected_ids() - {node_id}) > 0
     assert gate == reference, (
-        f"has_active_node_other_than={gate} but the shipped active set says "
-        f"{reference} — the gate and get_active_node_ids have diverged"
+        f"decision_index_expects_node_other_than={gate} but the expected set says "
+        f"{reference} — the gate and get_decision_index_expected_ids have diverged"
     )
     return gate
 
 
 def test_an_empty_graph_covers_its_first_node(store: GraphStore) -> None:
-    """The fresh-project carve-out: with nothing else live, one point IS the active set."""
+    """The fresh-project carve-out: with nothing else expected, one point IS the whole set."""
     node_id = _decision(store, "first", "The first axiom.")
     assert _agrees(store, node_id) is False
 
@@ -326,17 +330,25 @@ def test_a_second_node_is_not_covered_by_a_single_write(store: GraphStore) -> No
     assert _agrees(store, second) is True
 
 
-def test_a_superseded_node_does_not_hold_the_gate_open(store: GraphStore) -> None:
-    """Liveness is the kill-edge anti-join, so a retired node needs no embedding."""
-    _decision(store, "old", "The old axiom.")
+def test_a_superseded_decision_holds_the_gate_open(store: GraphStore) -> None:
+    """A retired decision is expected too, so the gate stays open over it (inverted in 3b).
+
+    Before recall-confidence 3b this row read the opposite: liveness was the gate, and a
+    retired node needed no embedding. A decision's vector now lives as long as its node
+    (ADR ``graveyard-is-deliberate-every-decision-vector-lives-as-long-as-its-node``), so
+    ``old`` still needs a point and one write of ``new`` does not cover the index.
+    """
+    old = _decision(store, "old", "The old axiom.")
     new = _decision(store, "new", "The new axiom.", supersedes=["old"])
-    # `old` is superseded, so `new` alone IS the active set.
+    # `old` is superseded, so `new` alone is the live surface…
     assert store.get_active_node_ids() == {new}
-    assert _agrees(store, new) is False
+    # …but the decision index expects both.
+    assert store.get_decision_index_expected_ids() == {old, new}
+    assert _agrees(store, new) is True
 
 
 def test_a_parked_open_question_holds_the_gate_open(store: GraphStore) -> None:
-    """Open questions are in the active set too — a decisions-only gate would over-create."""
+    """Open questions are in the expected set too — a decisions-only gate would over-create."""
     _open_question(store, "an-unsettled-topic", "Caching", "Which cache?")
     decision = _decision(store, "d1", "An unrelated axiom.")
     assert _agrees(store, decision) is True
@@ -347,17 +359,19 @@ def test_a_RESOLVED_open_question_still_holds_the_gate_open(store: GraphStore) -
 
     ``resolves`` is **not** a kill edge, so a resolved open question is still returned by
     ``get_open_questions`` and is still in ``get_active_node_ids`` (its own docstring says
-    so: *"``resolved`` OQs are RETURNED; callers foreground ``parked``"*). It therefore
-    genuinely needs an embedding, and a fresh project holding one plus its first decision
-    must **defer**, not create — a one-point collection over a two-node active set is
-    exactly the partial index this phase exists to prevent.
+    so: *"``resolved`` OQs are RETURNED; callers foreground ``parked``"*), and so in the
+    decision index's expected set. It therefore genuinely needs an embedding, and a
+    fresh project holding one plus its first decision must **defer**, not create — a
+    one-point collection over a two-node expected set is exactly the partial index this
+    phase exists to prevent.
 
     The plan predicted the opposite ("still creates") from a ``_OQ_RESOLVED_PREDICATE``
     clause that belongs to ``get_scope_counts``' parked aggregate, not to the active-view
     read. Adding that clause to the gate would have made it disagree with the shipped
     active set — the same defect, mirrored, on a path no developer reaches by hand. So the
-    assertion is pinned against ``get_active_node_ids()`` itself rather than against a
-    hand-written expectation.
+    assertion is pinned against the store's own reads (``get_active_node_ids()`` then,
+    ``get_decision_index_expected_ids()`` since 3b) rather than against a hand-written
+    expectation.
     """
     oq_id = _open_question(store, "an-unsettled-topic", "Caching", "Which cache?")
     decision = _decision(
@@ -367,12 +381,13 @@ def test_a_RESOLVED_open_question_still_holds_the_gate_open(store: GraphStore) -
     # The OQ reads as resolved…
     states = {q["slug"]: q["state"] for q in store.get_open_questions()}
     assert states == {"an-unsettled-topic": "resolved"}
-    # …and is nonetheless active, which is what the gate must honour.
+    # …and is nonetheless active, and expected, which is what the gate must honour.
     assert store.get_active_node_ids() == {oq_id, decision}
+    assert store.get_decision_index_expected_ids() == {oq_id, decision}
     assert _agrees(store, decision) is True
 
 
-def test_the_gate_agrees_with_the_active_set_across_the_matrix(store: GraphStore) -> None:
+def test_the_gate_agrees_with_the_expected_set_across_the_matrix(store: GraphStore) -> None:
     """One row walking the whole fixture matrix, so agreement is a gate not a claim.
 
     Each step re-asserts the equivalence for every node in the graph, including the

@@ -685,3 +685,43 @@ def test_a_node_less_row_is_pruned(tmp_path) -> None:
                                    stop=None, marker=None)
     assert vector.written == [node_id]
     assert store.get_pending_embeddings() == []
+
+
+# --------------------------------------------------------------------------- #
+# 3b — a listing the caller already took (WIRING_LEDGER entry-006)
+# --------------------------------------------------------------------------- #
+
+def test_a_handed_listing_replaces_the_walks_own_under_the_marker(tmp_path) -> None:
+    """Under a marker the drain presence-skips against the caller's listing and lists nothing."""
+    config = _workspace(tmp_path)
+    store = GraphStore(config.db_path)
+    present = _decision(store, "present", "Already indexed.")
+    missing = _decision(store, "missing", "Not yet indexed.")
+    store.stamp_embedding_seed("reconcile")
+
+    vector, embed = _Vector(), _Embed()
+    manager = _manager(config, vector, embed)
+    outcome = manager.drain_pending_embeddings(listing={hash_to_uuid(present)})
+
+    assert vector.list_calls == 0
+    assert outcome.skipped_present == 1 and outcome.written == 1
+    assert vector.written == [missing]
+    assert outcome.marker == DRAIN_MARKER_SPENT  # the handed listing is of a present collection
+
+
+def test_with_no_marker_a_handed_listing_is_ignored(tmp_path) -> None:
+    """An ordinary drain re-upserts every row (it heals a renamed slug's payload); a
+    listing it was handed must not turn it into a presence-skipping one."""
+    config = _workspace(tmp_path)
+    store = GraphStore(config.db_path)
+    ids = [_decision(store, f"node-{i}", f"Axiom {i}.") for i in range(3)]
+    assert store.embedding_seed() is None
+
+    vector, embed = _Vector(present=tuple(ids)), _Embed()
+    manager = _manager(config, vector, embed)
+    outcome = manager.drain_pending_embeddings(listing={hash_to_uuid(i) for i in ids})
+
+    assert vector.list_calls == 0
+    assert outcome.skipped_present == 0
+    assert outcome.written == 3
+    assert sorted(vector.written) == sorted(ids)

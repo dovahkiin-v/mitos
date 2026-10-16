@@ -60,8 +60,9 @@ class VectorStore(Protocol):
             point_id: The SHA-256 node ID.
             vector: The embedding vector values.
             payload: Node metadata.
-            may_create: Whether this write covers the workspace's active set and may
-                therefore bring an absent index into existence. Required and
+            may_create: Whether this write covers the decision index's expected set
+                (every decision plus the active open questions) and may therefore
+                bring an absent index into existence. Required and
                 keyword-only — every write site declares (see
                 :meth:`~mitos.vector_store.QdrantVectorStore.upsert`).
         """
@@ -219,6 +220,20 @@ class GraphStoreProtocol(Protocol):
 
         Returns:
             The active decision node ids.
+        """
+        ...
+
+    def get_decision_index_expected_ids(self) -> FrozenSet[str]:
+        """Returns the decision index's expected set, as ids, unhydrated.
+
+        Every decision node in every computed state plus the open questions that
+        survive Stage 1. ``recall.missing_index_is_a_gap`` reaches it by duck typing
+        from inside the check family's fence (``conflict.gather_candidates``), which
+        is why it is on this protocol; ``get_active_node_ids`` has no duck-typed
+        caller and stays off it.
+
+        Returns:
+            The node ids the decision index should hold a point for.
         """
         ...
 

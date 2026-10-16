@@ -379,8 +379,9 @@ class QdrantVectorStore:
             point_id: The SHA-256 node ID.
             vector: The embedding vector values.
             payload: Node metadata {slug, scope, state, kind, embedding_text}.
-            may_create: Whether this write covers the workspace's active set and may
-                therefore bring an absent collection into existence. Callers derive it
+            may_create: Whether this write covers the decision index's expected set
+                (every decision plus the active open questions) and may therefore
+                bring an absent collection into existence. Callers derive it
                 from declared intent — the graph gate for a single-node write, the
                 ``embedding_seed`` marker for a drain — never from an inferred
                 comparison.
@@ -415,7 +416,8 @@ class QdrantVectorStore:
             resp = _put()
             if _collection_is_missing(resp):
                 # ── The one place an absent collection is created. ──────────────
-                # Narrowed to writes that COVER the workspace's active set. A write
+                # Narrowed to writes that COVER what the decision index should hold
+                # (every decision plus the active open questions). A write
                 # covering only itself defers here: creating would leave a collection
                 # holding one point out of N, and from the next write on every net
                 # keyed on absence would report "checked, clean" over an index that
@@ -424,7 +426,8 @@ class QdrantVectorStore:
                 if not may_create:
                     raise CollectionMissingError(
                         f"Qdrant collection '{self.collection}' does not exist, and "
-                        f"this write does not cover the workspace's active set — "
+                        f"this write does not cover every decision the index should "
+                        f"hold — "
                         f"deferring rather than creating an index holding only part "
                         f"of the corpus. Run `mitos reconcile` to build it in one pass.",
                         collection=self.collection,

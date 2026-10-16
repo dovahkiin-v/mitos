@@ -16,7 +16,9 @@ import sqlite3
 import uuid
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_FLOOR
-from typing import TYPE_CHECKING, List, Dict, Mapping, Optional, Any, Set, Tuple, Callable
+from typing import (
+    TYPE_CHECKING, AbstractSet, List, Dict, Mapping, Optional, Any, Set, Tuple, Callable,
+)
 from filelock import FileLock, Timeout
 
 if TYPE_CHECKING:
@@ -2755,10 +2757,11 @@ class MitosSyncManager:
         deferred/failed.
 
         This is a **single-node** write, so it may create an absent collection only when
-        that one node *is* the whole active set — the fresh-project carve-out. The
-        declaration comes from the graph gate
-        (:meth:`~mitos.store.GraphStore.has_active_node_other_than`), the same shipped
-        active-view predicate the read-side gate uses; a populated graph defers instead,
+        that one node *is* the whole of what the decision index should hold — the
+        fresh-project carve-out. The declaration comes from the graph gate
+        (:meth:`~mitos.store.GraphStore.decision_index_expects_node_other_than`), the
+        twin of the expected-set read the read-side gate uses; a populated graph — one
+        holding only retired decisions included — defers instead,
         keeping the collection absent so the honest "couldn't check" notice keeps firing
         rather than quietly becoming "checked, clean" over a one-point index.
         """
@@ -2781,7 +2784,9 @@ class MitosSyncManager:
                   file=sys.stderr)
             return None
 
-        # Prepare payload
+        # Prepare payload. ``state`` is an inert literal no reader trusts: state is
+        # computed (M3), a retired decision's point carries "active" too, and a stored
+        # state would go stale on the next kill edge. Do not "fix" it.
         payload = {
             "slug": entry.slug,
             "scope": entry.scope,
@@ -2791,14 +2796,15 @@ class MitosSyncManager:
         }
 
         try:
-            # Declared intent, from the graph gate: this write covers the active set iff
-            # there is no other active node. Cheap enough to run unconditionally (an
-            # EXISTS … LIMIT 1), and it must be computed before the write because only
-            # the 404 reveals whether it matters. Deliberately INSIDE this try: the
+            # Declared intent, from the graph gate: this write covers the decision index's
+            # expected set iff the graph expects no other node. Cheap enough to run
+            # unconditionally (an EXISTS … LIMIT 1), and it must be computed before the
+            # write because only the 404 reveals whether it matters. Deliberately INSIDE
+            # this try: the
             # helper's contract is that it swallows its own faults and leaves the outbox
             # row (that is what makes deferral cheap), and a graph read added outside it
             # would let a store fault escape a path that has never raised.
-            may_create = not self.store.has_active_node_other_than(delta.node_id)
+            may_create = not self.store.decision_index_expects_node_other_than(delta.node_id)
             # Check embedding provider and generate vector
             vector = self.embed_provider.get_embedding(payload["embedding_text"], is_query=False)
             self.vector_store.upsert(delta.node_id, vector, payload, may_create=may_create)
@@ -2817,7 +2823,8 @@ class MitosSyncManager:
             self._collection_absent = True
             print(
                 f"[Warning] Embedding upsert deferred for '{entry.slug}': the Qdrant "
-                f"collection is missing and this write does not cover the active set. "
+                f"collection is missing and this write does not cover every decision "
+                f"the index should hold. "
                 f"Queued — run `mitos reconcile` to rebuild the index.",
                 file=sys.stderr,
             )
@@ -2828,7 +2835,9 @@ class MitosSyncManager:
             print(f"[Warning] Embedding upsert deferred for '{entry.slug}': {describe_embed_failure(e)}", file=sys.stderr)
             return None
 
-    def drain_pending_embeddings(self) -> DrainOutcome:
+    def drain_pending_embeddings(
+        self, *, listing: Optional[AbstractSet[str]] = None
+    ) -> DrainOutcome:
         """Drains the decision outbox (``pending_embeddings``, C2) in one walk.
 
         **The walk.** The outbox is read in queue order, ``(queued_at, node_id)``, a
@@ -2872,14 +2881,25 @@ class MitosSyncManager:
         ``finally``. Only the marker this drain read is spent; one re-stamped while it
         ran survives (ADR ``seed-marker-is-spent-once-a-drain-has-attempted-every-row-standing-at-its-entry``).
 
-        It is emphatically *not* an inferred comparison of outbox size against the active
-        set — that is not a completeness measure (the outbox holds rows for
-        no-longer-active nodes), it is more expensive than the signals it would replace,
-        and it decays silently once a migration hands every project a clean collection
-        holding only active points.
+        It is emphatically *not* an inferred comparison of outbox size against the
+        decision index's expected set — that is not a completeness measure (the outbox
+        can hold rows for nodes that have left the graph), it is more expensive than the
+        signals it would replace, and it decays silently once a migration hands every
+        project a clean collection.
+
+        Args:
+            listing: A point-id listing of a **present** collection that the caller has
+                already taken (``reconcile_embeddings``, which just listed it to diff).
+                Consulted only when a seed marker stands at entry, and then it replaces
+                the walk's own listing, exactly as a normal listing return would — so a
+                reconcile scrolls the collection once, not twice. With no marker it is
+                ignored. A caller that met ``CollectionMissingError`` passes nothing, so
+                this walk lists for itself and the absent-collection spend rule applies
+                untouched; a handed listing must never fake a present collection.
 
         Returns:
-            The walk's :class:`DrainOutcome`. Every production caller ignores it today.
+            The walk's :class:`DrainOutcome`. ``reconcile_embeddings`` reports from it;
+            ``sync`` ignores it.
         """
         if not self.embed_provider or not self.vector_store:
             print("Cannot drain outbox: Embedding provider or vector store down.")
@@ -2921,13 +2941,14 @@ class MitosSyncManager:
                     return outcome(None, None)
                 return outcome(None, self._spend_embedding_seed(seed))
 
-            # Under the marker, one listing for the whole walk. A normal return means
-            # the collection is present, whatever it holds — an empty set included.
-            present: Set[str] = set()
+            # Under the marker, one listing for the whole walk — the caller's, when it
+            # handed one (always of a present collection), else our own. A normal return
+            # means the collection is present, whatever it holds — an empty set included.
+            present: AbstractSet[str] = set()
             collection_present = False
             if seed is not None:
                 try:
-                    present = self.vector_store.list_point_ids()
+                    present = self.vector_store.list_point_ids() if listing is None else listing
                     collection_present = True
                 except CollectionMissingError:
                     present = set()
@@ -2980,6 +3001,8 @@ class MitosSyncManager:
                         topic=node.get("topic"), questions_raised=node.get("questions_raised"),
                     )
 
+                    # ``state`` is an inert literal no reader trusts (M3): a retired
+                    # decision's point carries "active" too. Do not "fix" it.
                     payload = {
                         "slug": node["slug"],
                         "scope": node["scope"],
@@ -3130,34 +3153,46 @@ class MitosSyncManager:
             return False
         return True
 
-    def reconcile_embeddings(self) -> Dict[str, int]:
-        """Re-embeds active nodes missing from Qdrant, then drains the outbox.
+    def reconcile_embeddings(self) -> Dict[str, Any]:
+        """Embeds every node the decision index is missing, then drains the outbox.
 
-        Heals the gap Fix 1's drain cannot reach: when Qdrant is wiped directly
+        Heals the gap an ordinary drain cannot reach: when Qdrant is wiped directly
         (a bare ``curl -X DELETE`` of the collection) WITHOUT a ``rebuild``/
         ``cutover`` — which re-seed the outbox — the graph has nodes, Qdrant has
-        none, and the outbox is empty, so ``sync`` drains nothing. This pass
-        diffs the graph's ACTIVE node set against Qdrant's actual point ids,
-        enqueues every missing active node, and drains.
+        none, and the outbox is empty, so ``sync`` drains nothing. This pass diffs
+        the decision index's **expected set**
+        (:meth:`~mitos.store.GraphStore.get_decision_index_expected_ids`: every
+        decision, live or retired, plus the active open questions) against Qdrant's
+        actual point ids, enqueues every missing node, and drains. It is the same
+        read ``mitos status`` reports completeness against, so the heal clears its
+        own warning by construction.
 
-        Only the active surface is reconciled (``get_active_node_ids``): dead and
-        superseded nodes are intentionally not re-embedded (retrieval filters
-        them via ``has_id`` and never returns them — see the
-        ``cutover-bounds-embedding-seed-to-active`` decision). Bounded to one
-        paginated scroll + a set difference (no per-node probes), so it stays
-        cheap at the P11 horizon. Idempotent: a second run finds nothing missing
-        and enqueues nothing. Re-queued nodes hit the embedding cache, so the
-        heal costs no embedding-API calls when the text is unchanged.
-
-        Returns:
-            Counts ``{"active", "present", "enqueued"}`` — active nodes, points
-            already in Qdrant, and nodes enqueued for re-embedding.
+        A retired decision is seeded like a live one: its vector lives exactly as
+        long as its node, and the read surfaces partition it by computed state (ADR
+        ``graveyard-is-deliberate-every-decision-vector-lives-as-long-as-its-node``).
+        Bounded to one paginated scroll + a set difference (no per-node probes), so
+        it stays cheap at the P11 horizon, and the drain is handed that same listing
+        rather than scrolling again. Idempotent: a second run finds nothing missing
+        and enqueues nothing. Re-queued nodes hit the embedding cache, so the heal
+        costs no embedding-API calls when the text is unchanged.
 
         An **absent collection reads as empty**, not as an error: it is the very
         state this heal exists for (a wipe, or a rename that left the old name
-        behind), so every active node is missing and every one gets enqueued — the
-        drain's first upsert then creates the collection. Only genuine
+        behind), so every expected node is missing and every one gets enqueued —
+        the drain's first upsert then creates the collection. Only genuine
         unreachability raises.
+
+        Returns:
+            The shipped keys ``active`` (active-node count), ``present`` (the
+            collection's point count, retired and orphan points included) and
+            ``enqueued`` (nodes this reconcile enqueued), plus ``expected`` (the
+            expected set's size), ``expected_present`` (``expected - enqueued``:
+            the part already indexed), ``written`` and ``drain_stop`` (the drain's
+            :class:`DrainOutcome` ``written`` / ``stop``; ``0`` / ``None`` when
+            nothing was missing and no drain ran) and ``left_queued`` (the outbox
+            rows standing when this returns, read — never inferred from the drain's
+            counters, which count only rows attempted). Every return path carries
+            the same key set.
 
         Raises:
             VectorStoreError: If Qdrant is unreachable while scrolling point ids.
@@ -3174,35 +3209,63 @@ class MitosSyncManager:
                 "Cannot reconcile: Embedding provider or vector store down.",
                 file=sys.stderr,
             )
-            return {"active": 0, "present": 0, "enqueued": 0}
+            # Nothing was read or done, so the counts are 0 — except ``left_queued``,
+            # which is a read of the standing outbox on every path: rows queued before
+            # this call still stand, and 0 would tell the operator nothing is waiting.
+            return {
+                "active": 0, "present": 0, "enqueued": 0,
+                "expected": 0, "expected_present": 0,
+                "written": 0, "left_queued": len(self.store.get_pending_embeddings()),
+                "drain_stop": None,
+            }
 
-        active_ids = self.store.get_active_node_ids()
+        expected_ids = self.store.get_decision_index_expected_ids()
+        # The live surface, for the shipped ``active`` count only — never what to seed.
+        active_count = len(self.store.get_active_node_ids())
+        listed = False
         try:
             present = self.vector_store.list_point_ids()
+            listed = True
         except CollectionMissingError:
             # Narrow by design: a connection-level VectorStoreError must keep
             # propagating so `mitos reconcile` can still report Qdrant down.
             present = set()
-        missing = [nid for nid in active_ids if hash_to_uuid(nid) not in present]
+        missing = [nid for nid in expected_ids if hash_to_uuid(nid) not in present]
 
         for node_id in missing:
             self.store.add_pending_embedding(node_id)
 
+        written = 0
+        drain_stop: Optional[str] = None
         if missing:
-            # The enqueue above is the act that makes the outbox cover the active set,
-            # so record it before draining: the drain reads the marker, not a flag, and
-            # stamping it durably buys crash-safety for free — a reconcile that dies
-            # mid-drain leaves the marker standing, and the operator's next `sync`
-            # completes the heal instead of refusing it. This is one of only three
-            # producers, all operator-invoked: nothing implicit ever stamps it, which is
-            # what keeps the heal operator-invoked rather than automatic.
+            # The enqueue above is the act that makes the outbox cover the decision
+            # index's expected set, so record it before draining: the drain reads the
+            # marker, not a flag, and stamping it durably buys crash-safety for free —
+            # a reconcile that dies mid-drain leaves the marker standing, and the
+            # operator's next `sync` completes the heal instead of refusing it. This is
+            # one of only three producers, all operator-invoked: nothing implicit ever
+            # stamps it, which is what keeps the heal operator-invoked rather than
+            # automatic.
             self.store.stamp_embedding_seed("reconcile")
-            self.drain_pending_embeddings()
+            # Hand over the listing only when it is one of a PRESENT collection. Over
+            # a 404 the drain lists for itself (a cheap 404), so 3a's absent-collection
+            # spend rule sees the truth rather than a faked present collection.
+            drained = self.drain_pending_embeddings(listing=present if listed else None)
+            written = drained.written
+            drain_stop = drained.stop
 
         return {
-            "active": len(active_ids),
+            "active": active_count,
             "present": len(present),
             "enqueued": len(missing),
+            "expected": len(expected_ids),
+            "expected_present": len(expected_ids) - len(missing),
+            "written": written,
+            # Read, never inferred: ``failed`` counts only rows attempted (an outage on
+            # row 1 of 33 reports 1 while 33 stand), and ``enqueued - written`` misses
+            # per-commit rows that were queued before this reconcile.
+            "left_queued": len(self.store.get_pending_embeddings()),
+            "drain_stop": drain_stop,
         }
 
     # --- record_decision: the write half of the MCP server (Fork A) ---

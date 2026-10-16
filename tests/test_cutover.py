@@ -431,10 +431,17 @@ def test_sc8_live_graph_untouched_on_pass_and_abort(tmp_path):
     assert _fingerprint(config.db_path) == before
 
 
-# --- SC9: embedding seed bounded to active (mixed corpus, both kinds) ----------
+# --- SC9: embedding seed bounded to the expected set (mixed corpus, both kinds) --
 
 
-def test_sc9_embedding_seed_bounded_to_active(tmp_path):
+def test_sc9_embedding_seed_holds_every_decision(tmp_path):
+    """Inverted in recall-confidence 3b: the seed keeps every decision, not the live tip.
+
+    A decision's vector lives as long as its node (ADR
+    ``graveyard-is-deliberate-every-decision-vector-lives-as-long-as-its-node``), so the
+    rebuild's seed is the decision index's expected set. Before 3b this row pinned
+    ``{"d3", "q1"}`` — the active set — and the two retired links were pruned.
+    """
     config = _config(tmp_path)
     # A 3-deep supersedes chain (2 dead, 1 active) + one active open question.
     _write(
@@ -451,8 +458,8 @@ def test_sc9_embedding_seed_bounded_to_active(tmp_path):
 
     assert result.decisions_committed == 3
     assert result.open_questions_committed == 1
-    # Only the live tip of the chain + the active OQ keep an embedding seed.
-    assert _pending_slugs(result.aside_db_path) == {"d3", "q1"}
+    # Every decision in the chain + the active OQ keep an embedding seed.
+    assert _pending_slugs(result.aside_db_path) == {"d1", "d2", "d3", "q1"}
     decs, oqs = _active_slugs(result.aside_db_path)
     assert decs == {"d3"}
     assert oqs == {"q1"}
@@ -482,12 +489,13 @@ def test_the_prune_names_the_verb_that_asked_for_it(tmp_path):
     assert _embedding_seed(resilient.aside_db_path) == "rebuild"
 
 
-def test_an_empty_active_set_still_stamps_over_an_emptied_queue(tmp_path):
-    """The marker's claim is about coverage, and covering nothing is still covering.
+def test_the_prune_drops_only_killed_open_questions_and_still_stamps(tmp_path):
+    """The prune stays a prune: it removes exactly the rows outside the expected set.
 
-    A corpus whose every entry is superseded prunes the queue to empty. The claim
-    ("the outbox covers the active set") is then trivially true, and the next drain finds
-    nothing and clears it — which is why the empty case needs no special arm.
+    Rewritten in recall-confidence 3b. Before it, this row pinned a superseded decision's
+    row being pruned (``{"d2"}``). A retired decision is now expected, so the only rows a
+    rebuild's prune removes are those of superseded or corrected open questions — and the
+    marker is stamped in the same transaction either way.
     """
     config = _config(tmp_path)
     _write(
@@ -497,9 +505,18 @@ def test_an_empty_active_set_still_stamps_over_an_emptied_queue(tmp_path):
             _decision("d1", "Axiom one."),
         ),
     )
+    _write(
+        config.questions_file,
+        _stream(
+            _oq("q3", "A topic.", "Q three?") + "\n**Corrects:** q2",
+            _oq("q2", "A topic.", "Q two?") + "\n**Supersedes:** q1",
+            _oq("q1", "A topic.", "Q one?"),
+        ),
+    )
     result = rebuild_and_gate(config, aside_db_path=_aside(config))
 
-    assert _pending_slugs(result.aside_db_path) == {"d2"}
+    assert result.open_questions_committed == 3
+    assert _pending_slugs(result.aside_db_path) == {"d1", "d2", "q3"}
     assert _embedding_seed(result.aside_db_path) == "cutover"
 
 
@@ -984,9 +1001,9 @@ def test_cutover_finish_block_still_promises_the_next_sync_recreates(tmp_path, c
     populated graph, absent collection — looks exactly like the case 1c is about to
     defer, so a grep-driven sweep naturally marks this false and "fixes" a working
     instruction. It survives because ``rebuild``/``cutover`` issue no upsert and
-    ``_prune_embedding_queue_to_active`` bounds the outbox to exactly the active
-    set: the prescribed ``sync`` is therefore a **covering** drain, and creating is
-    precisely what a covering write is allowed to do.
+    ``_prune_embedding_queue_to_expected`` bounds the outbox to exactly the decision
+    index's expected set: the prescribed ``sync`` is therefore a **covering** drain, and
+    creating is precisely what a covering write is allowed to do.
 
     Pinned in both places it is written — the finish block and its SETUP.md twin —
     so 1c has to invert a test rather than notice a comment.

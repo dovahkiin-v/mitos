@@ -22,7 +22,9 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import Callable, List, Mapping, Optional, Dict, Any, Sequence, Set, Tuple
+from typing import (
+    Callable, FrozenSet, List, Mapping, Optional, Dict, Any, Sequence, Set, Tuple,
+)
 
 from mitos import __version__
 from mitos import amend
@@ -456,8 +458,9 @@ def _inert_pin_note(config: MitosConfig, *, offer_deletion: bool = False) -> Opt
 #: statement of fact plus the named heal, never a diagnosis: `init` must work on a
 #: fresh, service-less machine, so it makes NO network call and therefore cannot
 #: know whether the new collection is actually empty. `mitos reconcile` ships today
-#: (it re-embeds the active set against whatever collection is in force), so the
-#: pointer names a capability this release has, not one a later phase brings.
+#: (it embeds every decision the index is missing, against whatever collection is in
+#: force), so the pointer names a capability this release has, not one a later phase
+#: brings.
 _COLLECTION_CARRY_OVER_POINTER = (
     "If this workspace's vectors were built under the old name, "
     "`mitos reconcile` rebuilds them here."
@@ -890,13 +893,14 @@ def cmd_sync(config: MitosConfig, auto_accept: bool = False, embed_only: bool = 
 
 
 def cmd_reconcile(config: MitosConfig, as_json: bool = False) -> int:
-    """Re-embeds active nodes missing from Qdrant, healing a direct vector wipe.
+    """Embeds every node the decision index is missing, healing a direct vector wipe.
 
     The one-command heal for the gap ``sync`` cannot reach: a bare Qdrant wipe
     (``curl -X DELETE`` of the collection, no ``rebuild``/``cutover``) leaves the
     graph populated, Qdrant empty, and the outbox empty — so ``sync`` drains
-    nothing. Reconcile diffs the ACTIVE node set against Qdrant's actual point
-    ids, enqueues the missing nodes, and drains. Idempotent.
+    nothing. Reconcile diffs the decision index's expected set — every decision,
+    live or retired, plus the active open questions — against Qdrant's actual
+    point ids, enqueues the missing nodes, and drains. Idempotent.
 
     Args:
         config: The active workspace config.
@@ -934,11 +938,19 @@ def cmd_reconcile(config: MitosConfig, as_json: bool = False) -> int:
     if as_json:
         print(json.dumps({**result, **corpus_provenance(config)}))
     else:
+        # `present` is not "already indexed": it counts retired and orphan points too.
+        # What was already indexed is the expected set's share, `expected_present`.
         print(
-            f"Reconciled: {result['active']} active node(s), "
-            f"{result['present']} point(s) already indexed, "
-            f"{result['enqueued']} re-embedded."
+            f"Reconciled: {result['expected']} node(s) the decision index should hold "
+            f"({result['active']} active), {result['expected_present']} already indexed, "
+            f"{result['enqueued']} enqueued, {result['written']} embedded."
         )
+        if result["left_queued"]:
+            print(
+                f"{result['left_queued']} embedding row(s) still queued — "
+                f"`mitos sync {shell_flag('-p', config.project)}` retries them once the "
+                f"embedding provider and Qdrant answer."
+            )
     return 0
 
 
@@ -1147,7 +1159,8 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         # A wrong store or vector double: loud, never "recall degraded".
         raise
     except CollectionMissingError as e:
-        # I8 — an absent collection over an EMPTY active set IS the empty index, and
+        # I8 — an absent collection over a graph whose decision index expects NOTHING
+        # (no decision, no live open question) IS the empty index, and
         # a fresh project must not read as broken; over a populated graph it is a
         # real hole and the degraded header names it plus `mitos reconcile`.
         # Otherwise `walk` stays None and the empty result is built below.
@@ -2647,7 +2660,7 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
             # A wrong store or vector double: loud, never "recall degraded".
             raise
         except CollectionMissingError as e:
-            # I8 — see cmd_query. Over an empty active set the absent collection IS
+            # I8 — see cmd_query. Over an empty expected set the absent collection IS
             # the empty index, so `semantic_ran` stays True: the read renders "ran
             # and found nothing", which is also what correctly suppresses the
             # degraded-only unranked scope dump below.
@@ -3789,6 +3802,10 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
     graph_nodes = None
     active_nodes = None
     active_ids: Set[str] = set()
+    # The decision index's expected set (every decision + the active open questions),
+    # its own `None` default: "the expected read completed" is not inferred from
+    # `active_nodes`, which a later fault in the same `try` leaves set.
+    expected_ids: Optional[FrozenSet[str]] = None
     id_to_slug: Dict[str, str] = {}
     # Read-only size-ceiling report for the generated context files. This is the
     # health surface the write-path overflow nudge points at — the detailed breakdown
@@ -3811,9 +3828,11 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
             id_to_slug = {n["id"]: n["slug"] for n in all_nodes}
             active_ids = ro_store.get_active_node_ids()
             active_nodes = len(active_ids)
+            expected_ids = ro_store.get_decision_index_expected_ids()
             overflows = overflow_report(ro_store)
             # The coverage marker, if one stands: a `rebuild`/`cutover`/`reconcile`
-            # bounded the outbox to the active set and has not drained yet. Purely
+            # seeded the outbox with the decision index's expected set and has not
+            # drained yet. Purely
             # informational — it tells the operator that a plain `mitos sync` restores
             # search, which is otherwise a fact only the drain knows. Never a readiness
             # gate: an unseeded queue is an ordinary state, not a fault.
@@ -3838,8 +3857,17 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
     #   never a warning, never deleted here. `None` means "could not verify" (scroll
     #   failed) — distinct from `0` ("verified complete"); we never fall back to the
     #   count proxy we just declared structurally blind.
+    # `missing_retired_*` = retired decisions with no vector, the sibling partition of
+    #   the decision index's expected set (`expected_ids - active_ids`, one store read
+    #   shared with `reconcile`, so the heal clears this warning by construction).
+    #   Their `None` follows `missing_active_*` branch for branch, and is also `None`
+    #   when the expected read did not complete.
     missing_active_slugs: Optional[List[str]] = None
+    missing_retired_slugs: Optional[List[str]] = None
     orphan_points: Optional[int] = None
+    retired_ids: Optional[FrozenSet[str]] = (
+        None if expected_ids is None else expected_ids - active_ids
+    )
     scroll_failed = False
     if q["reachable"] and q["collection_exists"] and active_nodes is not None:
         try:
@@ -3847,17 +3875,25 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
             missing_active_slugs = sorted(
                 id_to_slug.get(nid, nid) for nid in active_ids if hash_to_uuid(nid) not in present
             )
+            if retired_ids is not None:
+                missing_retired_slugs = sorted(
+                    id_to_slug.get(nid, nid) for nid in retired_ids
+                    if hash_to_uuid(nid) not in present
+                )
             active_uuids = {hash_to_uuid(nid) for nid in active_ids}
             orphan_points = len(present - active_uuids)
         except VectorStoreError:
             scroll_failed = True  # unknown — do not fabricate "complete"
-    elif q["reachable"] and not q["collection_exists"] and active_ids:
+    elif q["reachable"] and not q["collection_exists"] and expected_ids:
         # Collection deleted OUTRIGHT (not just its points) while the graph holds
-        # active nodes — the whole active surface is missing (the diff against an
-        # empty collection). This is a full wipe, NOT the healthy fresh-project empty
-        # state; absence of the collection must not read as calm health next to a
-        # populated graph. `mitos reconcile` re-creates the collection and re-embeds.
+        # nodes the decision index should hold — every one of them is missing (the
+        # diff against an empty collection). This is a full wipe, NOT the healthy
+        # fresh-project empty state; absence of the collection must not read as calm
+        # health next to a populated graph. Gated on the expected set, not the active
+        # one, so a graph holding only retired decisions reports them too. `mitos
+        # reconcile` re-creates the collection and embeds every one.
         missing_active_slugs = sorted(id_to_slug.get(nid, nid) for nid in active_ids)
+        missing_retired_slugs = sorted(id_to_slug.get(nid, nid) for nid in retired_ids)
         orphan_points = 0
 
     # Corpus↔graph divergence (B′). Purely informational — a corpus mid-edit is a
@@ -3971,6 +4007,14 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
                     None if missing_active_slugs is None else len(missing_active_slugs)
                 ),
                 "missing_active_slugs": missing_active_slugs,
+                # Siblings, not a retype (3b): retired-decision completeness against
+                # the decision index's expected set. The active keys above keep their
+                # meaning. Neither feeds `ready`, the verdict or the exit code.
+                "retired_decisions": None if retired_ids is None else len(retired_ids),
+                "missing_retired_vectors": (
+                    None if missing_retired_slugs is None else len(missing_retired_slugs)
+                ),
+                "missing_retired_slugs": missing_retired_slugs,
                 "orphan_points": orphan_points,
                 "graph_unbuilt": graph_unbuilt,
                 # Renamed from `mcp_wired` in 6a, and the rename is the point: the
@@ -4023,6 +4067,16 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
         coll_mark, coll_hint = (
             None,
             f"missing — {len(active_ids)} active node(s) have no vectors; "
+            f"run `mitos reconcile {shell_flag('-p', config.project)}`",
+        )
+    elif expected_ids:
+        # No active node, but the decision index still expects retired decisions —
+        # decisions WERE recorded, and the creation carve-out keys on the expected
+        # set, so the next record will not create the collection either. "None
+        # recorded yet" would be false twice.
+        coll_mark, coll_hint = (
+            None,
+            f"missing — {len(retired_ids or ())} retired decision(s) have no vectors; "
             f"run `mitos reconcile {shell_flag('-p', config.project)}`",
         )
     elif graph_unbuilt:
@@ -4181,6 +4235,24 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
             )
         if n <= 5:
             for slug in missing_active_slugs:
+                print(f"      • {slug}")
+    if not scroll_failed and missing_retired_slugs:
+        n = len(missing_retired_slugs)
+        print(
+            f"\n  ⚠ {n} retired decision(s) have no vector, so semantic surface/query "
+            f"cannot name them among retired matches. Run "
+            f"`mitos reconcile {shell_flag('-p', config.project)}` to embed only the "
+            f"missing ones — it needs the embedding provider to answer, which this "
+            f"report does not check. Informational, not a readiness blocker."
+        )
+        if embedding_seed:
+            print(
+                f"      the embedding queue was seeded by `{embedding_seed['established_by']}` "
+                f"at {embedding_seed['established_at']} — `mitos sync {shell_flag('-p', config.project)}` "
+                f"completes it once the embedding provider answers"
+            )
+        if n <= 5:
+            for slug in missing_retired_slugs:
                 print(f"      • {slug}")
     if orphan_points:
         print(
@@ -5165,11 +5237,11 @@ def cmd_cutover(
     print("  1. Wipe the stale Qdrant collection (its vectors are keyed on the old")
     print("     prototype ids — it auto-recreates on the next sync):")
     print(f"       {qdrant_wipe_cmd}")
-    print("  2. Re-embed the V1a active set:  mitos sync   (or: mitos sync --embed-only)")
+    print("  2. Embed every decision:  mitos sync   (or: mitos sync --embed-only)")
     print("     Semantic surface/query stay degraded until the queue drains;")
     print("     graph-only `mitos list` works throughout.")
     print("     (If you ever wipe Qdrant later with the outbox already empty,")
-    print("      `mitos reconcile` re-embeds the active set in one pass.)")
+    print("      `mitos reconcile` embeds every missing decision in one pass.)")
     print("  3. If `mitos serve` was running, restart it.")
     print("  4. Verify:  mitos status   → expect READY ✓")
     if bak_path:
@@ -8247,7 +8319,8 @@ def _build_parser() -> argparse.ArgumentParser:
     # reconcile
     rec_p = subparsers.add_parser(
         "reconcile",
-        help="Re-embed active nodes missing from Qdrant (heal a direct vector wipe).",
+        help="Embed every decision (live or retired) and active open question missing "
+             "from Qdrant (heal a direct vector wipe).",
     )
     rec_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON.")
 

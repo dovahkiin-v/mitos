@@ -263,6 +263,23 @@ _OQ_RESOLVED_PREDICATE: str = (
 )
 _OQ_RESOLVED_SQL: str = f"{_OQ_RESOLVED_PREDICATE} AS is_resolved"
 
+# The decision index's EXPECTED SET (recall-confidence 3b; ADR
+# ``decision-index-gap-and-creation-carve-out-key-on-its-expected-set``): every
+# decision node in every computed state — a decision's vector lives exactly as long
+# as its node (ADR ``graveyard-is-deliberate-every-decision-vector-lives-as-long-as-its-node``)
+# — plus the open questions that survive Stage 1. No ``_OQ_RESOLVED_PREDICATE``: a
+# *resolved* open question stays in, as it is in ``get_active_node_ids``. So the active
+# set is a subset of this one by construction. ONE atom, bound by both readers
+# (``get_decision_index_expected_ids`` and ``decision_index_expects_node_other_than``),
+# so the sensor (``status``), the heal (``reconcile``), the rebuild/cutover seed, the gap
+# predicate and the creation carve-out cannot drift apart. "Decision index" in the name
+# because the rejection index has an expected set of its own. Like
+# ``_ACTIVE_VIEW_PREDICATE`` it correlates on the UNALIASED ``nodes`` (the §4.3 alias trap).
+_DECISION_INDEX_EXPECTED_PREDICATE: str = (
+    "(nodes.kind = 'decision' OR "
+    f"(nodes.kind = 'open_question' AND {_ACTIVE_VIEW_PREDICATE}))"
+)
+
 # Indexed scope-membership filter (P11: ``idx_node_scopes_scope`` serves
 # ``scope = ?``, then the PK joins back to ``node_id``). Appended to a read SELECT
 # and bound with a single ``?`` scope value — never an O(N) Python post-filter.
@@ -490,7 +507,7 @@ def _utc_now_iso() -> str:
 
 # The one spelling of the ``embedding_seed`` upsert. Two callers need it on two
 # different connections — ``GraphStore.stamp_embedding_seed`` on its own, and
-# ``cutover._prune_embedding_queue_to_active`` inside the transaction that makes the
+# ``cutover._prune_embedding_queue_to_expected`` inside the transaction that makes the
 # claim true — so the SQL is single-sourced here rather than retyped at the second
 # site. The same in-transaction-twin shape ``_enqueue_outbox`` / ``add_pending_embedding``
 # already established for the outbox. ``ON CONFLICT(id) DO UPDATE`` so a re-stamp
@@ -511,7 +528,9 @@ def write_embedding_seed(
 
     The in-transaction twin of :meth:`GraphStore.stamp_embedding_seed`: it issues the
     statement and leaves the transaction to the caller, so the act that *makes* the
-    outbox cover the active set and the record *claiming* it can land together. The
+    outbox cover the decision index's expected set
+    (:meth:`GraphStore.get_decision_index_expected_ids`) and the record *claiming* it
+    can land together. The
     ``established_by`` vocabulary is enforced by the table's own ``CHECK`` (see
     ``migrations.EMBEDDING_SEED_ESTABLISHED_BY``) — an unknown verb is refused at
     write time, not filtered here.
@@ -2873,10 +2892,14 @@ class GraphStore:
     def get_active_node_ids(self) -> Set[str]:
         """Returns the active node id set (active decisions + open questions).
 
-        The single source of the V1a active predicate (G5): reads through the
-        store's own active-view methods rather than re-encoding the kill-edge
-        anti-join, so cutover, reconcile, and any future consumer share one
-        definition of "the live architectural surface."
+        Reads through the store's own active-view methods rather than re-encoding
+        the kill-edge anti-join. This is a count of *the live architectural surface*
+        and nothing else: ``status``' ``active_nodes`` / ``missing_active_*``,
+        ``reconcile``'s ``active`` key and the rebuild's
+        ``reconstructed_active_count``. It is **not** what the decision index should
+        hold — that is :meth:`get_decision_index_expected_ids`, a superset (it keeps
+        every retired decision too), and every "what should the index hold?" consumer
+        reads that one (``tests/test_expected_set.py`` pins who calls which).
 
         Returns:
             The set of active decision + open-question node ids (SHA-256 hashes).
@@ -2885,47 +2908,81 @@ class GraphStore:
         active.update(node["id"] for node in self.get_open_questions())
         return active
 
-    def has_active_node_other_than(self, node_id: str) -> bool:
-        """Reports whether the active set holds any node besides ``node_id``.
+    def get_decision_index_expected_ids(self) -> FrozenSet[str]:
+        """Returns the decision index's expected set, as ids, unhydrated.
 
-        The cheap complement of :meth:`get_active_node_ids` for the one question a
-        single-node write needs answered: *does this write cover the live surface, or
-        is there live architecture it leaves unindexed?* An empty graph, or a graph
-        holding only this node, answers ``False`` — the fresh-project carve-out, where
-        one point genuinely **is** the whole active set.
+        Every decision node in every computed state (active, drifted, superseded,
+        corrected) plus the open questions that survive Stage 1 (parked and
+        resolved; a superseded or corrected one is out). A decision's vector lives
+        exactly as long as its node (ADR
+        ``graveyard-is-deliberate-every-decision-vector-lives-as-long-as-its-node``),
+        so this — not :meth:`get_active_node_ids` — is what ``status`` reports
+        completeness against, what ``reconcile`` diffs, what the rebuild/cutover
+        seed keeps in the outbox and what ``recall.missing_index_is_a_gap`` gates
+        on. One read for the sensor and the heal is what lets the heal clear its
+        own warning (ADR ``decision-index-gap-and-creation-carve-out-key-on-its-expected-set``).
+        The active set is a subset of this one by construction.
 
-        Deliberately not ``len(get_active_node_ids() - {node_id}) > 0``: that is two
-        full active-view fetches, each running ``_hydrate_rows`` (the bulk scope fetch,
-        the modifier stamp, the reader-facing alias re-key), i.e. a hydrated read of
-        the entire live corpus — on **every** record, not only when it matters. This is
-        an ``EXISTS … LIMIT 1`` over the same predicate: an index seek (P11/P17).
+        Binds ``_DECISION_INDEX_EXPECTED_PREDICATE`` rather than re-encoding it, and
+        ``nodes`` stays UNALIASED so the correlated liveness predicate binds (the
+        alias trap the constant's own comment warns about). Its per-record twin is
+        :meth:`decision_index_expects_node_other_than`; ``tests/test_expected_set.py``
+        pins the agreement over a fixture matrix.
 
-        The two must never disagree, so this binds the shipped ``_ACTIVE_VIEW_PREDICATE``
-        rather than re-encoding it ("Active-view liveness is ONE SQL atom", PATTERNS),
-        and over exactly the kinds ``get_active_node_ids`` unions — active decisions
-        **plus** ``get_open_questions``' Stage-1 survivors. Note what is *not* here: no
+        Store faults propagate (``DatabaseError`` / ``sqlite3.Error``); each caller
+        decides what a fault means for it.
+
+        Returns:
+            The node ids the decision index should hold a point for.
+        """
+        conn = self._get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT nodes.id FROM nodes "
+                f"WHERE {_DECISION_INDEX_EXPECTED_PREDICATE}"
+            ).fetchall()
+            return frozenset(row[0] for row in rows)
+        finally:
+            conn.close()
+
+    def decision_index_expects_node_other_than(self, node_id: str) -> bool:
+        """Reports whether the decision index's expected set holds any node besides ``node_id``.
+
+        The cheap complement of :meth:`get_decision_index_expected_ids` for the one
+        question a single-node write needs answered: *does this write cover what the
+        decision index should hold, or is there a node it leaves unindexed?* An empty
+        graph, or a graph holding only this node, answers ``False`` — the
+        fresh-project carve-out, where one point genuinely **is** the whole expected
+        set. A graph holding only retired decisions answers ``True``: they are
+        expected too, so a lone record into it must not create a collection holding
+        one point.
+
+        Deliberately not ``len(get_decision_index_expected_ids() - {node_id}) > 0``:
+        that is a whole-corpus id read on **every** record, not only when it matters.
+        This is an ``EXISTS … LIMIT 1`` over the same predicate: an index seek
+        (P11/P17), and any decision satisfies the first disjunct.
+
+        The two must never disagree, so this binds the one
+        ``_DECISION_INDEX_EXPECTED_PREDICATE`` rather than re-encoding it ("Active-view
+        liveness is ONE SQL atom", PATTERNS). Note what is *not* in it: no
         ``_OQ_RESOLVED_PREDICATE`` clause. ``resolves`` is not a kill edge, so a
         *resolved* open question is still returned by ``get_open_questions`` and is
-        still in the active id set (its docstring says so outright) — it genuinely needs
-        an embedding, and excluding it here would make this gate claim coverage the
-        write does not deliver. ``tests/test_embedding_seed.py`` pins the agreement over
-        a fixture matrix rather than trusting it.
-
-        ``nodes`` stays UNALIASED so the correlated liveness predicate binds (the alias
-        trap the constant's own comment warns about).
+        still expected — it genuinely needs an embedding, and excluding it here would
+        make this gate claim coverage the write does not deliver.
+        ``tests/test_expected_set.py`` pins the agreement over a fixture matrix rather
+        than trusting it.
 
         Args:
             node_id: The node the calling write covers.
 
         Returns:
-            True iff at least one active node other than ``node_id`` exists.
+            True iff at least one expected node other than ``node_id`` exists.
         """
         conn = self._get_connection()
         try:
             row = conn.execute(
                 "SELECT 1 FROM nodes "
-                "WHERE nodes.kind IN ('decision', 'open_question') "
-                f"AND {_ACTIVE_VIEW_PREDICATE} "
+                f"WHERE {_DECISION_INDEX_EXPECTED_PREDICATE} "
                 "AND nodes.id != ? LIMIT 1",
                 (node_id,),
             ).fetchone()
@@ -2934,7 +2991,7 @@ class GraphStore:
             conn.close()
 
     def stamp_embedding_seed(self, established_by: str) -> None:
-        """Records that ``pending_embeddings`` covers the graph's active set.
+        """Records that ``pending_embeddings`` covers the decision index's expected set.
 
         The standalone-connection twin of :func:`write_embedding_seed`, for the
         producer that is not already inside the transaction it describes

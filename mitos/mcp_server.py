@@ -979,7 +979,7 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
             # A wrong store or vector double: loud, never "recall degraded".
             raise
         except CollectionMissingError as e:
-            # I8 — an absent collection over an EMPTY active set IS the empty index,
+            # I8 — an absent collection over an EMPTY expected set IS the empty index,
             # and a just-initialized project must not read as broken: leave
             # `semantic_ran` True so this renders "ran and found nothing" (which is
             # also what suppresses the degraded-only unranked scope dump below).
@@ -1558,8 +1558,8 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             # W31 — the state this envelope was built for and the unbuilt graph are
             # the SAME workspace on a clone: no *.sqlite, so no collection was ever
             # created either. `missing_index_is_a_gap` said the absence is healthy
-            # (an empty active set has nothing to index); this says why the active
-            # set is empty, and names the heal that fixes both. Without it the clone
+            # (an empty expected set has nothing to index); this says why it is
+            # empty, and names the heal that fixes both. Without it the clone
             # gets the cleanest possible empty answer over hundreds of decisions.
             if missing_graph_is_a_gap(
                 store, config, corpus_scan=corpus_holds_entries

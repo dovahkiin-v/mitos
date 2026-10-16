@@ -573,9 +573,11 @@ def _v1b_schema(conn: sqlite3.Connection) -> None:
 # --- V1c schema (Phase 1c): migration ladder step 3 ----------------------------
 #
 # ``embedding_seed`` — the durable record that ``pending_embeddings`` covers the
-# graph's active set. A row present means exactly one thing, and nothing else may
-# read it into meaning: **the outbox covers the active set**, because a command that
-# bounds it that way said so. It is written by the two operator-invoked verbs that
+# decision index's expected set (every decision plus the active open questions —
+# ``GraphStore.get_decision_index_expected_ids``; the graph's active set until
+# recall-confidence 3b widened it). A row present means exactly one thing, and nothing
+# else may read it into meaning: **the outbox covers the expected set**, because a
+# command that bounds it that way said so. It is written by the two operator-invoked verbs that
 # actually deliver that property (``rebuild``/``cutover``'s prune, and
 # ``reconcile``'s enqueue pass). It has two readers: ``mitos status`` prints it, and
 # ``MitosSyncManager.drain_pending_embeddings`` acts on it — the only one that does.

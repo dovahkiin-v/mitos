@@ -427,12 +427,12 @@ def gather_candidates(
         # Subclass first — an absent collection is a recoverable state with a named
         # heal, not the unreachable-Qdrant fault the broader arm below describes.
         #
-        # I8, on the same predicate the four read surfaces use: over a graph holding
-        # no active nodes an absent collection IS the empty index, so this is the
-        # "legitimate empty corpus" the contract above promises returns a healthy,
-        # empty gathering ("the corpus ran out", never a cut). Degrading here instead
+        # I8, on the same predicate the four read surfaces use: over a graph whose
+        # decision index expects nothing an absent collection IS the empty index, so
+        # this is the "legitimate empty corpus" the contract above promises returns a
+        # healthy, empty gathering ("the corpus ran out", never a cut). Degrading here instead
         # would fail a fresh workspace's first `check --staged` closed and hand it
-        # `mitos reconcile` — which enqueues nothing over an empty active set, so the
+        # `mitos reconcile` — which enqueues nothing over an empty expected set, so the
         # advice cannot heal what it names. The gate and the heal agree by
         # construction; an unreadable graph answers True and still degrades.
         if not missing_index_is_a_gap(store):

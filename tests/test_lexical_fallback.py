@@ -709,7 +709,7 @@ class TestAbsentCollectionOnTheReadSurfaces:
     # -- the gate reads the set `reconcile` would index, not just decisions ---
 
     def test_a_graph_holding_only_an_open_question_still_speaks(self, ws):
-        """``get_active_node_ids`` is decisions ∪ open questions — the set the heal covers.
+        """The expected set holds open questions too — it is the set the heal covers.
 
         Gated on ``get_active_decisions`` instead, a workspace whose only content is
         a parked open question would read as clean-empty while ``mitos reconcile``

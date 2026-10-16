@@ -1696,7 +1696,7 @@ def test_every_shown_state_rides_the_semantic_envelope_and_the_healthy_one_does_
 
 @pytest.mark.parametrize("route", ["collection_missing", "no_matches"])
 def test_the_healthy_empty_index_carries_the_notice(ws, monkeypatch, route):
-    """Criterion 3: an absent collection over an empty active set is the empty index
+    """Criterion 3: an absent collection over an empty expected set is the empty index
     a fresh clone meets — `semantic_ran` stays True and the envelope carries it."""
     config, _ = ws
     seed = dict(_gate()._SHOWN["could_not_complete"])

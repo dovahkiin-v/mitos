@@ -553,7 +553,7 @@ leaves a workspace that simply re-runs clean — no manual restore. Run these st
    curl -X DELETE <qdrant_url>/collections/<collection>
    ```
    (`mitos cutover` prints the exact command with your URL + collection filled in.)
-5. **Re-embed the V1a active set.** Run `mitos sync -p .` (or `mitos sync -p .
+5. **Embed every decision.** Run `mitos sync -p .` (or `mitos sync -p .
    --embed-only`) to drain the embedding queue. Until it finishes there is a
    **bounded semantic-surface outage**: `surface`/`query` are degraded, but
    graph-only `mitos list -p .` works throughout.
@@ -561,10 +561,12 @@ leaves a workspace that simply re-runs clean — no manual restore. Run these st
    > **Healing a bare Qdrant wipe.** If you ever delete the Qdrant collection
    > *without* a `cutover`/`rebuild` (which re-seed the embedding queue), the
    > outbox is empty and a sync has nothing to drain. Run **`mitos reconcile
-   > -p .`**: it diffs the active node set against Qdrant's actual points,
-   > re-queues the missing active nodes, and drains them in one pass (idempotent;
-   > re-embeds hit the cache, so no embedding-API spend when text is unchanged).
-   > `mitos status .` flags this state as `⚠ vector index incomplete`.
+   > -p .`**: it diffs every decision (live or retired) plus the active open
+   > questions against Qdrant's actual points, re-queues only the missing ones,
+   > and drains them in one pass (idempotent; re-embeds hit the cache, so no
+   > embedding-API spend when text is unchanged). `mitos status .` flags this
+   > state as `⚠ vector index incomplete`, and names retired decisions with no
+   > vector on a line of their own.
 6. **Restart `mitos serve`** if it was running.
 7. **Verify.** `mitos status .` → expect `READY ✓`.
 8. **Remove the backup.** Once you're satisfied, delete the

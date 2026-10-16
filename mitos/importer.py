@@ -307,6 +307,8 @@ class MitosProseImporter:
             # Reported once for this import; say nothing and spend nothing further.
             return
 
+        # ``state`` is an inert literal no reader trusts (M3): a retired decision's
+        # point carries "active" too. Do not "fix" it.
         payload = {
             "slug": entry.slug,
             "scope": entry.scope,
@@ -320,7 +322,7 @@ class MitosProseImporter:
         try:
             # Inside the try for the same reason as the sync twin: the graph read must
             # not be able to escape a helper whose whole contract is best-effort.
-            may_create = not self.store.has_active_node_other_than(delta.node_id)
+            may_create = not self.store.decision_index_expects_node_other_than(delta.node_id)
             vector = self.embed_provider.get_embedding(payload["embedding_text"], is_query=False)
             self.vector_store.upsert(
                 delta.node_id, vector, payload, may_create=may_create
@@ -333,7 +335,8 @@ class MitosProseImporter:
             self._collection_absent = True
             print(
                 "[Warning] Embeddings deferred for this import: the Qdrant collection "
-                "is missing and these writes do not cover the active set. Every node is "
+                "is missing and these writes do not cover every decision the index "
+                "should hold. Every node is "
                 "queued — run `mitos reconcile` to build the index in one pass."
             )
         except Exception:

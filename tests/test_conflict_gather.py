@@ -465,7 +465,7 @@ def test_collection_missing_is_its_own_typed_unavailable(store: GraphStore) -> N
     check token would all report "unreachable" for a running Qdrant.
 
     **The seeded decision is load-bearing, not scenery.** The ``store`` fixture is an
-    empty graph, and over an empty active set an absent collection is the empty index
+    empty graph, and over an empty expected set an absent collection is the empty index
     rather than a gap (I8) — the arm returns an empty gathering and never reaches the reason this
     row is about. One live decision puts the sweep in the state where absence is a
     real hole, which is the only state where arm ordering is observable. The

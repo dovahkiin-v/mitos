@@ -380,7 +380,7 @@ def test_sync_outbox_drain_loops_past_batch_limit(sync_env: Tuple[MitosConfig, M
 
     Regression: ``claim_pending_embeddings`` bounds each claim to ``limit=10`` and the
     drain used to run exactly once, so a corpus with >10 pending nodes — the state
-    right after ``mitos rebuild``/``cutover`` re-seed the whole active set — was left
+    right after ``mitos rebuild``/``cutover`` re-seed the whole expected set — was left
     with ``vectors < nodes`` until ``sync`` happened to run again (the documented
     single-``sync`` re-embed silently under-delivering). The drain now walks the whole
     backlog, a claim at a time.
