@@ -311,18 +311,19 @@ def test_mcp_query_exact_slug_superseded_carries_superseded_by(ws) -> None:
 def test_modifiers_survive_brief_trim(ws) -> None:
     """The staleness flag is ALWAYS attached — even on a brief payload where
     rejected_paths is trimmed. A lightweight scan that lost the heavy field still needs
-    to know the axiom has been moved on from."""
-    from mitos import mcp_server
+    to know the axiom has been moved on from. (2g: the degraded scope dump, the path
+    that used `_decision_payload(store=)`, is `degraded.scope_dump`.)"""
+    from mitos.degraded import scope_dump
     config, m = ws
-    _rec(m, "hot")
-    _rec(m, "hot-v2", amends="hot")
+    _rec(m, "hot", scope=["heat"])
+    _rec(m, "hot-v2", scope=["other"], amends="hot")
     store = GraphStore(config.db_path, read_only=True)
-    node = store.get_node_by_slug("hot")
 
-    brief = mcp_server._decision_payload(node, 1.0, brief=True, store=store)
+    brief = scope_dump(store, "heat", limit=None, full_top=0).decisions[0]
+    assert brief["slug"] == "hot"
     assert "rejected_paths" not in brief and brief["amended_by"] == ["hot-v2"]
 
-    full = mcp_server._decision_payload(node, 1.0, brief=False, store=store)
+    full = scope_dump(store, "heat", limit=None, full_top=None).decisions[0]
     assert full["rejected_paths"] and full["amended_by"] == ["hot-v2"]
 
 

@@ -577,8 +577,10 @@ def _parse_section(sec: Dict[str, Any]) -> ParsedEntry:
 # required fields or build a failure envelope (4b), and does NOT strip HTML
 # comments from stream content (V1-D7 — comments are literal field text).
 #
-# It is built UNWIRED alongside the still-live prototype ``parse_decisions_file``
-# (Key Decision 1): no consumer calls it until 5a (commit) and 7a (cutover).
+# It was built UNWIRED alongside the prototype ``parse_decisions_file`` (Key
+# Decision 1); 5a (commit) and 7a (cutover) wired it, and the lexical fallback
+# reads through it too, so the ids it hashes are the commit's. The prototype has
+# no production reader left.
 #
 # C1 PURITY (Key Decision 2): the normalization helpers below fold/casefold/dedup
 # to the SAME §12 byte-forms as ``mitos/identity.py`` (so a token the parser
@@ -710,9 +712,10 @@ def _span_end_excluding_trailing_sentinels(
     buffer to move the entry, so a sentinel inside the span gets carried into the archive while its
     partner stays behind. A stranded ``<!-- ROTATED START`` is an unterminated HTML
     comment, and ``strip_html_comments`` carries that state across lines — blanking
-    every entry below it for ``parse_decisions_file``, the lexical fallback's only
-    reader. Degraded search would then go silently blind over text sitting right
-    there in the file.
+    every entry below it for ``parse_decisions_file`` — the prototype reader, which
+    the lexical fallback read through until it moved to ``parse_entry_stream`` and
+    which any comment-stripping reader still shares. That reader would then go
+    silently blind over text sitting right there in the file.
 
     Excluding the sentinels from BOTH neighbouring spans keeps a legacy pair intact
     under any rotation order: whichever entry moves, the pair stays in the buffer
@@ -906,8 +909,9 @@ def _tokenize_entry(
         # and strand the other. A stranded `<!-- ROTATED START` is not cosmetic: it
         # is an unterminated HTML comment, and `strip_html_comments` carries that
         # state across lines, blanking every entry below it for `parse_decisions_file`
-        # — which is the lexical fallback's only reader, so degraded search would go
-        # silently blind over text that is right there in the file. Consuming at the
+        # — the prototype reader (degraded search read through it until it moved to
+        # this tokenizer), which would go silently blind over text that is right
+        # there in the file. Consuming at the
         # tokenizer leaves spans and per-line offsets exactly as they were.
         #
         # The precise reading matters: the sentinel LINES are non-content, the

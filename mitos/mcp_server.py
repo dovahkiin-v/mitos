@@ -30,15 +30,16 @@ from mitos.errors import (
     TARGET_RELATIVE_PATH,
     TARGET_UNKNOWN_NAME,
 )
-from mitos.lexical import degraded_reason_from_error, lexical_fallback
+from mitos.degraded import lexical_envelope, scope_dump
+from mitos.lexical import degraded_reason_from_error
 from mitos.check_notice import compose_check_notice
 from mitos.telemetry import read_last_attempt
-from mitos.divergence import _corpus_files, corpus_holds_entries
+from mitos.divergence import corpus_holds_entries
 # Module level on purpose: `amend` and `restore` close over no `cli`/`sync`/`store`
 # (measured at planning), so unlike `MitosSyncManager` neither needs deferring.
 from mitos.restore import BufferFidelityError
-from mitos.recall import (RANKED_EDGE_MARGIN, RetiredPartition, assess_query_recall,
-                          assess_surface_recall, blackout_note,
+from mitos.recall import (DEGRADED_NOT_COMPUTED, RANKED_EDGE_MARGIN, RetiredPartition,
+                          assess_query_recall, assess_surface_recall, blackout_note,
                           corpus_provenance, missing_graph_is_a_gap,
                           missing_graph_note, missing_index_is_a_gap,
                           retired_partition, scope_filter_recovery, count_withheld,
@@ -59,35 +60,7 @@ from mitos.retrieval_walk import WalkContractError, walk_ranked
 # (or `full_top=N` to keep the top N whole) — explicit, per-call, stateless. (V5 owns the rebuilt MCP server; carry this forward.)
 
 
-def _attach_modifiers(payload: Dict[str, Any], node: Dict[str, Any], store: GraphStore) -> Dict[str, Any]:
-    """Stamps reverse-relation modifier keys onto a decision payload, in place.
-
-    Adds ``superseded_by`` / ``amended_by`` / ``narrowed_by`` / ``corrected_by``
-    (only the non-empty ones) so a reader knows a later decision has moved on from
-    this axiom and which one to chase — the fix for amended/narrowed nodes that stay
-    ``active`` with their original (now-stale) mechanism text. Always applied,
-    independent of ``brief``: the staleness flag matters even on an axiom-only scan,
-    where ``rejected_paths`` is trimmed but the trap remains.
-    Fail-silent — a modifier lookup error never breaks the recall response.
-
-    Args:
-        payload: The decision payload to augment.
-        node: The store node dict (must carry ``id``).
-        store: The graph store to read reverse edges from.
-
-    Returns:
-        The same payload dict, with any modifier keys added.
-    """
-    try:
-        for key, slugs in store.get_modifiers(node["id"]).items():
-            payload[key] = slugs
-    except Exception:
-        pass
-    return payload
-
-
 def _decision_payload(node: Dict[str, Any], score: float, *, brief: bool,
-                      store: Optional[GraphStore] = None,
                       stamps: Optional[Dict[str, Dict[str, List[str]]]] = None) -> Dict[str, Any]:
     """Shapes a Letter-mode decision payload.
 
@@ -100,10 +73,8 @@ def _decision_payload(node: Dict[str, Any], score: float, *, brief: bool,
         node: A store node dict (``slug``, ``core_axiom``, ``rejected_paths``, ``scope``).
         score: The relevance score to attach.
         brief: Drop ``rejected_paths`` for an axiom-only scan.
-        store: When given, reverse-relation modifier keys are read per node and
-            stamped on, fail-silent (the degraded scope dump's path).
         stamps: The ranked path's batched stamp map (``RankedWalk.stamps``); the
-            node's entry is stamped on. Both apply always, even for brief payloads.
+            node's entry is stamped on, always, even for brief payloads.
 
     Returns:
         A Letter-mode decision dict.
@@ -112,8 +83,6 @@ def _decision_payload(node: Dict[str, Any], score: float, *, brief: bool,
     if stamps is not None:
         for key, slugs in stamps.get(node["id"], {}).items():
             payload[key] = list(slugs)
-    if store is not None:
-        _attach_modifiers(payload, node, store)
     return payload
 
 class _RenderedToolError(Exception):
@@ -782,14 +751,13 @@ def _lexical_degraded_response(query: str, *, config: MitosConfig, reason: str,
                                full_top: Optional[int], limit: int,
                                open_questions: Optional[List[Dict[str, Any]]] = None,
                                check_notice: Optional[Dict[str, Any]] = None) -> str:
-    """Builds the degraded lexical-fallback JSON for the MCP read tools.
+    """Encodes the lexical degraded envelope for the MCP read tools.
 
     The MCP twin of ``cli._emit_lexical_degraded`` (ADR
-    ``read-verbs-degrade-to-lexical-decisions-md-fallback``): the shared
-    ``lexical_fallback`` runs the term-match over the markdown corpus (buffer plus
-    archives), so the two surfaces cannot drift. The envelope carries
-    ``degraded: "lexical"`` and a ``degraded_reason`` — never an ``{error}`` object
-    or raw provider text.
+    ``read-verbs-degrade-to-lexical-decisions-md-fallback``): a renderer only —
+    ``degraded.lexical_envelope`` composes every key and clause for both surfaces,
+    so the two cannot drift. The envelope carries ``degraded: "lexical"`` and a
+    ``degraded_reason`` — never an ``{error}`` object or raw provider text.
 
     Args:
         query: The claim/topic the caller was trying to recall.
@@ -805,7 +773,8 @@ def _lexical_degraded_response(query: str, *, config: MitosConfig, reason: str,
         full_top: How many top matches keep ``rejected_paths`` (None ⇒ all, 0 ⇒
             none — the tool's ``brief``). A thinned answer says so by
             ``rejected_paths_withheld`` and a note clause.
-        limit: Max matches to return.
+        limit: Max matches to return (the call sites pass it clamped; the leaf
+            clamps again, idempotently).
         open_questions: An already-computed scoped parked-OQ list to carry on
             the envelope (present-if-scanned semantics — None means omitted).
         check_notice: The standing check notice ``surface_decisions`` composed,
@@ -814,22 +783,11 @@ def _lexical_degraded_response(query: str, *, config: MitosConfig, reason: str,
     Returns:
         The degraded envelope as a JSON string.
     """
-    envelope = lexical_fallback(
-        query, corpus_paths=_corpus_files(config), reason=reason, store=store,
-        limit=limit, full_top=full_top,
+    envelope = lexical_envelope(
+        query, config=config, surface="mcp", reason=reason, store=store,
+        limit=limit, full_top=full_top, open_questions=open_questions,
+        check_notice=check_notice,
     )
-    envelope["query"] = query
-    envelope.update(corpus_provenance(config))
-    withheld = count_withheld(envelope["matches"])
-    if withheld:
-        envelope["note"] = (
-            f"{envelope['note']} {withheld_clause(withheld, surface='mcp', config=config)}"
-        )
-        envelope["rejected_paths_withheld"] = withheld
-    if open_questions is not None:
-        envelope["open_questions"] = open_questions
-    if check_notice is not None:
-        envelope["check_notice"] = check_notice
     return dumps_display(envelope, ensure_ascii=False, indent=2)
 
 
@@ -920,6 +878,7 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
             reasoning.
         limit: Ranked top-k to retrieve (default 5; clamped to 1–50). Raise it to dig
             deeper, lower it to save context — a context-budget dial, not a cap at 5.
+            A degraded text match takes the same count.
         full_top: Keep `rejected_paths` on ranks 1..N only; lower ranks are
             axiom-only. Default: every rank whole. `full_top=0` is `brief=True`;
             passing both is refused.
@@ -1063,18 +1022,13 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
     # 2. Scope pre-filtering fallback — ONLY when semantic recall is down (degraded).
     #    When semantic ran and simply found nothing, do NOT dump an unranked scope
     #    listing dressed as matches — that's the false-precedent ambiguity P5 closes.
+    #    One read, stamped by its own hydration; None (a fault, or an empty scope)
+    #    leaves the answer empty-handed, so it takes the lexical exit below.
     if not semantic_ran and not results["active_decisions"] and scope:
-        try:
-            active_decs = store.get_active_decisions(scope=scope)
-            dump_total = len(active_decs)
-            for d in active_decs[:top_k]:
-                rank = len(results["active_decisions"]) + 1
-                results["active_decisions"].append(
-                    _decision_payload(d, 1.0, brief=_rank_thinned(rank, full_top),
-                                      store=store)
-                )
-        except Exception:
-            pass
+        dump = scope_dump(store, scope, limit=top_k, full_top=full_top)
+        if dump is not None:
+            results["active_decisions"] = dump.decisions
+            dump_total = dump.total
 
     # The degraded cause, computed once and handed to both the lexical exit's header
     # and the scope-dump / partial-list note, so the two cannot name different causes.
@@ -1135,6 +1089,10 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
     if confidence is not None:
         results["confidence"] = confidence
     results["note"] = note
+    # The dump is the one degraded exit that reaches this composer; it says what it
+    # could not compute (the clause is already on its note).
+    if dump_total is not None:
+        results["not_computed"] = list(DEGRADED_NOT_COMPUTED)
     # Present whenever the ranking passed a retired decision; the count only when
     # the bound left some out.
     if handles:
@@ -1459,7 +1417,7 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             always returned in full — you asked for that one — and says so in
             `thinning_not_applied`).
         limit: Ranked top-k for the SEMANTIC branch (default 5; clamped to 1–50).
-            Ignored by an exact-slug hit.
+            Ignored by an exact-slug hit; a degraded text match takes the same count.
         full_top: Keep `rejected_paths` on ranked matches 1..N only; lower ranks
             are axiom-only. Default: all whole. `full_top=0` is `brief=True`;
             passing both is refused. An exact-slug hit is always whole.

@@ -746,7 +746,9 @@ def assess_surface_recall(
         A ``(confidence, note)`` pair. ``confidence`` is ``"strong"`` / ``"weak"`` /
         ``"none"`` when semantic ranking ran, else ``None`` (degraded). ``note`` is a
         one-line, action-oriented string — never the old boilerplate that printed
-        identically on every response.
+        identically on every response. A degraded note that returns results ends
+        with :func:`degraded_omission_clause`; its caller sets the matching
+        ``not_computed`` key.
     """
     pointers = _SURFACE_POINTERS[surface]
     scope_phrase = f"scope '{scope}'" if scope else "this query"
@@ -774,10 +776,15 @@ def assess_surface_recall(
                 "assess_surface_recall: a degraded call must pass degraded_reason — "
                 "the cause the caller's degraded header names"
             )
+        # Both result-bearing branches end with the omission clause: a degraded
+        # answer has no scores, so no partition, edge or band (the caller adds the
+        # matching ``not_computed`` key). The no-results branches carry none — no
+        # surface reaches them, since both route an empty degraded answer to the
+        # lexical exit, which states its own.
         if result_count and scope_total is not None:
             # The dump's own branch: it names how many of the scope's decisions it
-            # shows. ``result_count`` is what the envelope returns, so a dump cut
-            # short by a mid-loop fault is still counted truthfully.
+            # shows. ``result_count`` is what the envelope returns; the dump is one
+            # read, so it is either whole (up to ``limit``) or not shown at all.
             if result_count < scope_total:
                 shown_part = (
                     f"{result_count} of the {scope_total} active decisions in {scope_phrase}"
@@ -789,13 +796,15 @@ def assess_surface_recall(
             return None, (
                 f"Semantic recall unavailable ({degraded_reason}) — showing "
                 f"{shown_part} as a fallback, NOT a relevance ranking. For the "
-                f"authoritative set use {complete_hint} (pure graph read)."
+                f"authoritative set use {complete_hint} (pure graph read). "
+                f"{degraded_omission_clause()}"
             )
         if result_count:
             return None, (
                 f"Semantic recall unavailable ({degraded_reason}) — showing the "
                 f"active decisions in {scope_phrase} as a fallback, NOT a relevance "
-                f"ranking. For the authoritative set use {complete_hint} (pure graph read)."
+                f"ranking. For the authoritative set use {complete_hint} (pure graph read). "
+                f"{degraded_omission_clause()}"
             )
         if scope_unused:
             return None, (
@@ -963,6 +972,31 @@ def count_withheld(hits: List[Dict[str, Any]]) -> int:
         How many of them lack ``rejected_paths``; 0 on a default (whole) answer.
     """
     return sum(1 for hit in hits if "rejected_paths" not in hit)
+
+
+# What a degraded answer could not compute, as concept tokens: ``retired_partition``
+# names the ranked envelopes' key, ``edge`` the window-edge clause, ``band`` the
+# ``confidence`` band. Each needs similarity scores, which a degraded read has none
+# of. Carried on every degraded envelope as ``not_computed`` (serialized as a list)
+# and never on a ranked one, so on a ranked envelope an absent ``retired_partition``
+# still means computed and empty. A tuple here only so no caller can mutate it.
+DEGRADED_NOT_COMPUTED: Tuple[str, ...] = ("retired_partition", "edge", "band")
+
+
+def degraded_omission_clause() -> str:
+    """Words the note clause every degraded answer carries: what it did not compute.
+
+    The note twin of ``not_computed`` (:data:`DEGRADED_NOT_COMPUTED`), for the CLI
+    text surface, where there is no key to read. A fact with no pointer and no
+    write, so it is the same sentence on both surfaces. Pure string formatting.
+
+    Returns:
+        One sentence naming the three omissions.
+    """
+    return (
+        "Not computed without similarity scores: the retired partition, the "
+        "window's edge and the confidence band."
+    )
 
 
 def withheld_clause(count: int, *, surface: str, config: "object") -> str:

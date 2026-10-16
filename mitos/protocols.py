@@ -4,7 +4,7 @@ This module defines Protocol classes for GraphStore, VectorStore, and
 EmbeddingProvider to decouple Mitos components and support seamless swap-ins.
 """
 
-from typing import Protocol, List, Dict, Optional, Any, Tuple, Set, Iterable
+from typing import Protocol, List, Dict, Optional, Any, Tuple, Set, Iterable, Sequence
 from mitos.parser import ParsedEntry
 from mitos.retrieval_walk import PointResolution
 from mitos.store import CommitDelta
@@ -191,6 +191,21 @@ class GraphStoreProtocol(Protocol):
 
         Returns:
             The computed state string.
+        """
+        ...
+
+    def get_node_states(self, node_ids: Sequence[str]) -> Dict[str, str]:
+        """Maps each id the graph holds to its computed state, in one batched read.
+
+        The same vocabulary as :meth:`get_node_state`, but an id the graph does
+        not hold is absent from the map rather than answered ``active``, so a
+        caller tests existence by membership.
+
+        Args:
+            node_ids: Content-hash node ids, exact (not point-id prefixes).
+
+        Returns:
+            Node id → computed state, for the held ids only.
         """
         ...
 

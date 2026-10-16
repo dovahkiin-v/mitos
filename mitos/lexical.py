@@ -20,19 +20,37 @@ the envelope (``unread_files``) and in the note, never skipped quietly.
 Factored here once so the CLI verbs and their MCP twins share the identical
 behaviour (CLI⇄MCP parity is a standing contract, not per-surface luck).
 
-Stamping: when the graph is readable the matches are filtered to active
-entries and stamped via ``GraphStore.get_modifiers`` (the every-read-surface
-rule); when it is not (the pre-V1a case), a one-line disclosure replaces the
-stamps — entries come straight from markdown and may include superseded ones.
+Identity and stamping: each matched block is parsed with the commit's own
+tokenizer (``parser.parse_entry_stream``) and named by the content-hash id the
+commit minted for it (``identity.compute_node_id`` over its axiom and mechanisms),
+never by its slug, which a same-slug supersession shares and a rename moves (ADR
+``lexical-fallback-resolves-corpus-entries-by-content-hash-id-never-by-slug``).
+When the graph is readable, one ``GraphStore.get_node_states`` read for the whole
+answer drops the retired matches and states the live ones, and one
+``GraphStore.get_modifiers_map`` read stamps them (the every-read-surface rule). A
+block whose id the graph does not hold (authored but unsynced) stays, with no state
+and no stamps. Two faults are stated, never swallowed: when the graph is down (the
+pre-V1a case) or its state read fails, a one-line disclosure replaces the filter and
+the stamps (``stamps_unavailable``: entries come straight from markdown and may
+include superseded ones); when only the modifiers read fails, the filter and states
+stand and the envelope says ``stamps_unread``.
 """
 
 import os
 from typing import Any, Dict, List, Optional, Sequence, Set
 
-from mitos.errors import CollectionMissingError, EmbeddingError, VectorStoreError
-from mitos.parser import parse_decisions_file
+from mitos.display import clamp_limit
+from mitos.errors import (
+    CollectionMissingError,
+    DatabaseError,
+    EmbeddingError,
+    VectorStoreError,
+)
+from mitos.identity import compute_node_id
+from mitos.parser import parse_entry_stream
 from mitos.provider_cause import QUOTA, classify_provider_error, provider_cause_phrase
 from mitos.shell_quote import shell_flag
+from mitos.store import LIVE_STATES
 
 # Terms shorter than this are dropped from the query before matching — they are
 # stop-word noise ("a", "of", "to") that would match nearly every entry. Longer
@@ -61,11 +79,6 @@ DISPLAY_STOPWORDS: frozenset[str] = frozenset({
     "which", "while", "who", "whom", "why", "will", "with", "you", "your",
     "yours", "yourself", "yourselves",
 })
-
-# Default result cap when the caller passes no limit. Mirrors the spirit of the
-# ranked verbs' clamp without importing their ceiling — a grep needs no 50-row
-# mode by default.
-LEXICAL_DEFAULT_LIMIT: int = 10
 
 _STAMPS_UNAVAILABLE_DISCLOSURE = (
     "Graph unavailable — state/modifier stamps not applied; entries come "
@@ -207,10 +220,17 @@ def lexical_fallback(
             fails loudly.
         reason: The one-line cause phrase (see ``degraded_reason_from_error``).
         store: A readable ``GraphStore``, or None when the graph itself is down
-            (pre-V1a). When given, superseded entries are filtered out and each
-            match is modifier-stamped; when None, a stamps-unavailable
-            disclosure rides the note instead.
-        limit: Max matches to return; None ⇒ ``LEXICAL_DEFAULT_LIMIT``.
+            (pre-V1a). When given, it is read exactly twice per answer, whatever
+            the match count: ``get_node_states`` over every ranked candidate's id
+            (retired matches are dropped, live ones carry ``state``), then
+            ``get_modifiers_map`` over the stated matches (their stamps). A
+            ``DatabaseError`` from the first is treated as no store; one from the
+            second costs the stamps alone and sets ``stamps_unread``. Any other
+            exception propagates. When None, a stamps-unavailable disclosure rides
+            the note instead.
+        limit: Max matches to return, clamped as the ranked reads clamp it
+            (``display.clamp_limit``): None ⇒ 5, any value ⇒ ``[1,
+            RANKED_LIMIT_CEILING]``.
         full_top: How many top matches keep ``rejected_paths``, by position among
             the matches returned; the rest are axiom-only. None ⇒ every match whole,
             0 ⇒ none (the boundaries' ``brief``). The count and its note clause are
@@ -220,10 +240,13 @@ def lexical_fallback(
         ``{degraded: "lexical", degraded_reason, matches: [...], note}`` — each
         match a Letter-shaped dict (slug, axiom, scope, rejected_paths unless
         thinned by ``full_top``, matched_terms) plus state + modifier stamps when the graph is
-        readable. ``matched_terms`` omits ``DISPLAY_STOPWORDS``; ``stopwords_dropped``
-        counts the omitted terms and is present only when non-zero.
-        ``stamps_unavailable: True`` is set when the graph is not readable, and
-        ``unread_files`` (basenames) only when some corpus file could not be read.
+        readable and holds the block. ``matched_terms`` omits ``DISPLAY_STOPWORDS``;
+        ``stopwords_dropped`` counts the omitted terms and is present only when
+        non-zero. ``stamps_unavailable: True`` is set when the graph is not readable
+        (no store, or its state read failed), ``stamps_unread: True`` when only the
+        stamps could not be read (the leaf adds no clause for it: the wording is
+        per-surface, the composer's), and ``unread_files`` (basenames) only when some
+        corpus file could not be read. The two stamp keys never co-occur.
 
     Raises:
         TypeError: When ``corpus_paths`` is a single string, which would otherwise
@@ -234,7 +257,7 @@ def lexical_fallback(
             "lexical_fallback: corpus_paths is a sequence of corpus file paths, "
             "not one path string"
         )
-    cap = limit if limit and limit > 0 else LEXICAL_DEFAULT_LIMIT
+    cap = clamp_limit(limit)
     terms = _query_terms(query)
 
     ranked: List[Any] = []
@@ -243,39 +266,68 @@ def lexical_fallback(
     for file_rank, path in enumerate(reversed(list(corpus_paths))):
         # Read AND parse per file, one guard: a file that exists and cannot be
         # read, decoded or parsed is disclosed, never answered around in silence.
-        # A file gone since the listing is simply not part of the corpus now.
+        # A file gone since the listing is simply not part of the corpus now. The
+        # commit's tokenizer, so the id below is the one the commit minted; a
+        # malformed entry is dropped into a discarded collector.
         try:
             with open(path, encoding="utf-8") as f:
                 text = f.read()
-            entries = parse_decisions_file(text, errors=[]) if text else []
+            entries = (
+                parse_entry_stream(text, "decision", source_path=path, failures=[])
+                if text else []
+            )
         except FileNotFoundError:
             continue
         except Exception:
             unread.append(os.path.basename(path))
             continue
         for position, entry in enumerate(entries):
-            if entry.kind != "decision":
-                continue
             # Dedup by handle only — an entry with no slug has nothing to be a
-            # duplicate of, and must not shadow another slugless entry.
+            # duplicate of, and must not shadow another slugless entry. The newest
+            # block per slug is kept: a same-slug successor is written after its
+            # predecessor, so it is the live one whenever one is live.
             key = (entry.slug or "").casefold()
             if key and key in seen_slugs:
                 continue
             seen_slugs.add(key)
-            axiom = entry.core_axiom or entry.axiom or ""
-            haystack = f"{entry.slug}\n{axiom}".casefold()
+            haystack = f"{entry.slug}\n{entry.axiom}".casefold()
             hit = [t for t in terms if t in haystack]
             if hit:
-                ranked.append((len(hit), file_rank, position, hit, entry))
+                node_id = compute_node_id(
+                    kind="decision", axiom=entry.axiom,
+                    mechanism_refs=entry.mechanisms,
+                )
+                ranked.append((len(hit), file_rank, position, hit, entry, node_id))
     # Most distinct terms first; ties by file (newest first), then by position —
     # every buffer and rotation-written archive is newest-first below its marker.
     ranked.sort(key=lambda t: (-t[0], t[1], t[2]))
 
+    # One state read for every candidate, before the walk: the filter must run
+    # before the cap and the `full_top` thinning, which count kept matches only.
+    # Called even over no candidates (it short-circuits without a connection), so
+    # the answer's reads are the same two whatever it matched. Only the store call
+    # sits in the `try`, and only `DatabaseError` is caught: a store missing the
+    # method raises.
+    graph_read = store is not None
+    states: Dict[str, str] = {}
+    if store is not None:
+        try:
+            states = store.get_node_states([t[5] for t in ranked])
+        except DatabaseError:
+            graph_read = False
+
     matches: List[Dict[str, Any]] = []
-    for _count, _file_rank, _position, hit, entry in ranked:
+    stated_ids: List[str] = []
+    for _count, _file_rank, _position, hit, entry, node_id in ranked:
+        # An id the graph does not hold is an authored-but-unsynced block: it
+        # stays, with no state and no stamps — dropping the gold source on a graph
+        # miss would be a false empty.
+        state = states.get(node_id) if graph_read else None
+        if state is not None and state not in LIVE_STATES:
+            continue
         payload: Dict[str, Any] = {
             "slug": entry.slug,
-            "axiom": entry.core_axiom or entry.axiom or "",
+            "axiom": entry.axiom,
             "scope": entry.scope,
             # Display only: ``hit`` above ranked the entry and stays whole there.
             "matched_terms": [t for t in hit if t not in DISPLAY_STOPWORDS],
@@ -287,34 +339,28 @@ def lexical_fallback(
         # the append below, and a filtered entry never reaches it.
         if full_top is None or len(matches) + 1 <= full_top:
             payload["rejected_paths"] = entry.rejected_paths
-        if store is not None:
-            # Graph readable: filter to active, stamp modifiers. An entry the
-            # graph doesn't know (authored-but-unsynced) stays, unstamped —
-            # dropping the gold source on a graph miss would be a false empty.
-            # resolve_slug (state-agnostic) rather than the active-view
-            # get_node_by_slug, so a superseded entry is seen and filtered.
-            node_id = None
-            try:
-                node_ids = store.resolve_slug(entry.slug)
-                node_id = node_ids[0] if node_ids else None
-            except Exception:
-                node_id = None
-            if node_id:
-                try:
-                    state = store.get_node_state(node_id)
-                except Exception:
-                    state = None
-                if state is not None and state not in ("active", "drifted"):
-                    continue
-                if state is not None:
-                    payload["state"] = state
-                try:
-                    payload.update(store.get_modifiers(node_id))
-                except Exception:
-                    pass
+        if state is not None:
+            payload["state"] = state
+            stated_ids.append(node_id)
+        else:
+            stated_ids.append("")
         matches.append(payload)
         if len(matches) >= cap:
             break
+
+    # One stamp read for the stated matches, after the walk. Unconditional once
+    # the state read succeeded, even over no ids, for the same reason as above. A
+    # fault here costs the stamps alone and is stated.
+    stamps_unread = False
+    if graph_read:
+        try:
+            stamps = store.get_modifiers_map([i for i in stated_ids if i])
+        except DatabaseError:
+            stamps_unread = True
+        else:
+            for payload, node_id in zip(matches, stated_ids):
+                for key, slugs in stamps.get(node_id, {}).items():
+                    payload[key] = list(slugs)
 
     note = lexical_header(reason)
     envelope: Dict[str, Any] = {
@@ -322,9 +368,11 @@ def lexical_fallback(
         "degraded_reason": reason,
         "matches": matches,
     }
-    if store is None:
+    if not graph_read:
         envelope["stamps_unavailable"] = True
         note = f"{note} {_STAMPS_UNAVAILABLE_DISCLOSURE}"
+    if stamps_unread:
+        envelope["stamps_unread"] = True
     if unread:
         envelope["unread_files"] = unread
         note = (f"{note} {len(unread)} corpus file(s) could not be read: "

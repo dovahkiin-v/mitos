@@ -66,7 +66,7 @@ from mitos.errors import (
     TARGET_EXEMPT_VERB, TARGET_MISSING, TARGET_PATH_NOT_A_WORKSPACE,
     TARGET_REGISTERED_UNREACHABLE, TARGET_RELATIVE_PATH, TARGET_UNKNOWN_NAME,
 )
-from mitos.divergence import (RELATIONSHIP_FIELDS, _corpus_files, corpus_graph_divergence,
+from mitos.divergence import (RELATIONSHIP_FIELDS, corpus_graph_divergence,
                               corpus_holds_entries, divergence_total)
 from mitos.restore import BufferFidelityError
 from mitos.env import resolve_key
@@ -95,9 +95,10 @@ from mitos.conflict import (CONFLICT_OVERFETCH_LIMIT, run_conflict_check,
 from mitos.migrations import is_pre_v1a_schema
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS, open_connection
 from mitos.cutover import default_aside_db_path, perform_swap, rebuild_and_gate
-from mitos.lexical import degraded_reason_from_error, lexical_fallback
-from mitos.recall import (RANKED_EDGE_MARGIN, RetiredPartition, assess_query_recall,
-                          assess_surface_recall, blackout_note,
+from mitos.degraded import lexical_envelope, scope_dump
+from mitos.lexical import degraded_reason_from_error
+from mitos.recall import (DEGRADED_NOT_COMPUTED, RANKED_EDGE_MARGIN, RetiredPartition,
+                          assess_query_recall, assess_surface_recall, blackout_note,
                           corpus_provenance, missing_graph_is_a_gap,
                           missing_graph_note, missing_index_is_a_gap,
                           provenance_line, retired_partition, scope_filter_recovery,
@@ -997,14 +998,16 @@ def _emit_lexical_degraded(config: MitosConfig, query: str, *, reason: str,
                            full_top: Optional[int], limit: Optional[int],
                            open_questions: Optional[List[Dict[str, Any]]] = None,
                            check_notice: Optional[Dict[str, Any]] = None) -> None:
-    """Runs the deterministic lexical fallback and renders it on the CLI.
+    """Renders the lexical degraded envelope on the CLI.
 
     The shared degraded exit for ``surface``/``query`` (ADR
     ``read-verbs-degrade-to-lexical-decisions-md-fallback``): one calm header
     naming the cause, then a term-match over the markdown corpus (buffer plus
-    archives) — never the raw provider blob, never the clean-empty header. Exit
-    code stays 0 (deliberate: the JSON ``degraded`` marker + changed header
-    already disambiguate).
+    archives) — never the raw provider blob, never the clean-empty header. A
+    renderer only: ``degraded.lexical_envelope`` composes every key and clause,
+    the same call ``mcp_server._lexical_degraded_response`` encodes. Exit code
+    stays 0 (deliberate: the JSON ``degraded`` marker + changed header already
+    disambiguate).
 
     Args:
         config: The active workspace configuration (supplies the corpus files).
@@ -1016,30 +1019,20 @@ def _emit_lexical_degraded(config: MitosConfig, query: str, *, reason: str,
         full_top: How many top matches keep ``rejected_paths`` (None ⇒ all, 0 ⇒
             none — the verb's ``--brief``). A thinned answer says so by
             ``rejected_paths_withheld`` and a note clause, on both encodings.
-        limit: Max matches; None ⇒ the lexical default.
+        limit: Max matches, the raw ``--limit``: the leaf clamps it as the ranked
+            reads do (None ⇒ 5, any value ⇒ ``[1, RANKED_LIMIT_CEILING]``).
         open_questions: An already-computed scoped parked-OQ list to carry on
             the envelope (present-if-scanned semantics — None means omitted).
         check_notice: The standing check notice ``cmd_surface`` composed: the key
             on JSON, the line plus its recovery clause last on text. None
             (``cmd_query`` always) means omitted.
     """
-    envelope = lexical_fallback(
-        query, corpus_paths=_corpus_files(config), reason=reason, store=store,
-        limit=limit, full_top=full_top,
+    # Composed before the `as_json` split, so the printed note and the envelope's agree.
+    envelope = lexical_envelope(
+        query, config=config, surface="cli", reason=reason, store=store,
+        limit=limit, full_top=full_top, open_questions=open_questions,
+        check_notice=check_notice,
     )
-    envelope["query"] = query
-    envelope.update(corpus_provenance(config))
-    # Before the `as_json` split, so the printed note and the envelope's agree.
-    withheld = count_withheld(envelope["matches"])
-    if withheld:
-        envelope["note"] = (
-            f"{envelope['note']} {withheld_clause(withheld, surface='cli', config=config)}"
-        )
-        envelope["rejected_paths_withheld"] = withheld
-    if open_questions is not None:
-        envelope["open_questions"] = open_questions
-    if check_notice is not None:
-        envelope["check_notice"] = check_notice
     if as_json:
         _emit_json(envelope)
         return
@@ -2621,13 +2614,6 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     )
     top_k = clamp_limit(limit)
 
-    # The degraded scope dump's shaper (per-node stamps; 2g owns that envelope).
-    # The ranked path stamps from the walk's one batched read instead.
-    def _shape(node, score, thinned):
-        d = letter_payload(node, brief=thinned, extras={"score": score})
-        d.update(store.get_modifiers(node["id"]))
-        return d
-
     results: Dict[str, Any] = {"active_decisions": []}
     results.update(corpus_provenance(config))
     semantic_ran = False
@@ -2689,17 +2675,13 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
 
     # Scope listing fallback ONLY in degraded mode (mirrors the MCP tool, P5): a
     # semantic run that found nothing must not masquerade as an unranked scope dump.
+    # One read, stamped by its own hydration; None (a fault, or an empty scope)
+    # leaves the answer empty-handed, so it takes the lexical exit below.
     if not semantic_ran and not results["active_decisions"] and scope:
-        try:
-            active_decs = store.get_active_decisions(scope=scope)
-            dump_total = len(active_decs)
-            for d in active_decs[:top_k]:
-                rank = len(results["active_decisions"]) + 1
-                results["active_decisions"].append(
-                    _shape(d, 1.0, _rank_thinned(rank, full_top))
-                )
-        except Exception:
-            pass
+        dump = scope_dump(store, scope, limit=top_k, full_top=full_top)
+        if dump is not None:
+            results["active_decisions"] = dump.decisions
+            dump_total = dump.total
 
     # The degraded cause, computed once and handed to both the lexical exit's header
     # and the scope-dump / partial-list note, so the two cannot name different causes.
@@ -2761,6 +2743,10 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     if confidence is not None:
         results["confidence"] = confidence
     results["note"] = note
+    # The dump is the one degraded exit that reaches this composer; it says what it
+    # could not compute (the clause is already on its note).
+    if dump_total is not None:
+        results["not_computed"] = list(DEGRADED_NOT_COMPUTED)
     if handles:
         results["retired_partition"] = handles
         if part.omitted:
@@ -8273,7 +8259,7 @@ def _build_parser() -> argparse.ArgumentParser:
     q_depth.add_argument("--full-top", type=_non_negative_int, default=None, metavar="N",
                          dest="full_top", help=_FULL_TOP_HELP)
     q_p.add_argument("--limit", type=int, default=None,
-                     help="Set ranked top-k to retrieve (1–50; default 5). Raises or lowers the count — a context-budget dial.")
+                     help="Set ranked top-k to retrieve (1–50; default 5). Raises or lowers the count — a context-budget dial; a degraded text match takes the same count.")
 
     # surface (alias: surface_decisions — MCP tool name) — the precedent-recall loop
     surf_p = subparsers.add_parser("surface", aliases=["surface_decisions"],
@@ -8286,7 +8272,7 @@ def _build_parser() -> argparse.ArgumentParser:
     surf_depth.add_argument("--full-top", type=_non_negative_int, default=None, metavar="N",
                             dest="full_top", help=_FULL_TOP_HELP)
     surf_p.add_argument("--limit", type=int, default=None,
-                        help="Set ranked top-k to retrieve (1–50; default 5). Raises or lowers the count — a context-budget dial.")
+                        help="Set ranked top-k to retrieve (1–50; default 5). Raises or lowers the count — a context-budget dial; a degraded text match takes the same count.")
 
     # show
     show_p = subparsers.add_parser("show", help="Display details of a specific node. A missing handle exits 1 (text on stderr; --json still emits {found: false}).")

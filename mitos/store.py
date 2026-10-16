@@ -462,9 +462,10 @@ def compute_hash(
 # bound-variable limit on every build, including the older 999-variable default.
 _CREATED_AT_CHUNK = 500
 
-# Point-id prefixes bound per statement in ``GraphStore.resolve_point_ids``. One
-# bind per prefix (the range's upper bound is derived in SQL), so the same 500
-# keeps the statement under the 999-variable floor; ``_scopes_for`` runs once per
+# Ids bound per statement in ``GraphStore.resolve_point_ids`` (one bind per
+# point-id prefix; the range's upper bound is derived in SQL) and in
+# ``GraphStore.get_node_states`` (one bind per exact id). The same 500 keeps both
+# under the 999-variable floor; ``resolve_point_ids`` runs ``_scopes_for`` once per
 # chunk because it does not chunk its own ``IN``.
 _POINT_ID_CHUNK = 500
 
@@ -1192,6 +1193,58 @@ class GraphStore:
             else:
                 nodes[pid] = dict(found[0])
         return PointResolution(nodes=nodes, orphans=orphans, ambiguous=ambiguous)
+
+    def get_node_states(self, node_ids: Sequence[str]) -> Dict[str, str]:
+        """Maps each content-hash id the graph holds to its computed state, in one batched read.
+
+        The exact-id sibling of :meth:`resolve_point_ids`, for a caller that already
+        holds whole node ids (the lexical fallback hashes each corpus block the way
+        the commit does). State is :meth:`get_node_state`'s decision vocabulary
+        (``active`` / ``drifted`` / ``superseded`` / ``corrected``), derived from
+        the same ``_IS_DRIFTED_SQL`` / ``_KILLER_TYPE_SQL`` fragments and the same
+        drifted rule, so liveness stays one SQL atom. An id the graph does not hold
+        is **absent** from the map: existence comes from the ``IN`` read, never from
+        asking a state, because :meth:`get_node_state` answers ``"active"`` for an
+        unknown id. Nothing is hydrated and no scopes are fetched. ``nodes`` is not
+        aliased, because the derived-state fragments correlate on the bare name.
+
+        Args:
+            node_ids: Content-hash node ids. Deduplicated here; order is not kept.
+
+        Returns:
+            Node id → computed state, for the ids the graph holds. Empty input runs
+            no statement and opens no connection.
+
+        Raises:
+            DatabaseError: If the read fails.
+        """
+        ids = list(dict.fromkeys(node_ids))
+        if not ids:
+            return {}
+        conn = self._get_connection()
+        try:
+            out: Dict[str, str] = {}
+            # Read at call time, so a test can shrink the chunk.
+            chunk_size = _POINT_ID_CHUNK
+            for start in range(0, len(ids), chunk_size):
+                chunk = ids[start:start + chunk_size]
+                placeholders = ",".join("?" for _ in chunk)
+                for row in conn.execute(
+                    f"SELECT nodes.id, {_IS_DRIFTED_SQL}, {_KILLER_TYPE_SQL} "
+                    f"FROM nodes WHERE nodes.id IN ({placeholders})",
+                    chunk,
+                ):
+                    if row["killer_type"] is None and row["is_drifted"]:
+                        out[row["id"]] = "drifted"
+                    else:
+                        out[row["id"]] = _computed_decision_state(row["killer_type"])
+            return out
+        except sqlite3.Error as e:
+            raise DatabaseError(
+                f"Failed to read the state of {len(ids)} node(s): {str(e)}"
+            )
+        finally:
+            conn.close()
 
     def _scopes_for(
         self, conn: sqlite3.Connection, node_ids: List[str]
