@@ -734,6 +734,33 @@ def test_check_runs_stays_silent_on_old_model_history_after_a_swap(record_dir):
     assert _has(pins, "was measured on 'model-a'")
 
 
+def test_check_runs_reports_a_run_indexed_twice(record_dir):
+    record, _, _, harbor, _ = _clean(record_dir)
+    record["runs"].append(dict(record["runs"][0]))
+    problems = R.check_runs(record, record_dir)
+    assert _has(problems, f"run '{harbor}' is indexed more than once")
+    assert len(problems) == 1, problems
+
+
+def test_check_runs_reports_a_malformed_run_and_still_checks_the_rest(record_dir):
+    """A file whose provenance is a list fails that run alone; later runs and orphans are still read."""
+    record, _, _, harbor, dense = _clean(record_dir)
+    path = os.path.join(record_dir, R.RUNS_DIRNAME, f"{harbor}.json")
+    with open(path) as f:
+        run = json.load(f)
+    run["provenance"] = ["not", "an", "object"]
+    with open(path, "w") as f:
+        json.dump(run, f)
+    record["runs"][1]["decision_count"] = 501
+    with open(os.path.join(record_dir, R.RUNS_DIRNAME, "dense-19990101-0000000.json"), "w") as f:
+        json.dump(_run(corpus="dense"), f)
+    problems = R.check_runs(record, record_dir)
+    assert _has(problems, f"run '{harbor}' is malformed")
+    assert _has(problems, f"run '{dense}' index entry says decision_count=501")
+    assert _has(problems, "'dense-19990101-0000000.json' is not in the record's index")
+    assert not _has(problems, "could not be checked")
+
+
 def test_check_runs_never_raises_on_a_malformed_record(record_dir):
     assert _has(R.check_runs({}, record_dir), "no `runs` list")
     assert _has(R.check_runs({"runs": ["x", {"run_id": "../up"}]}, record_dir), "not an object")

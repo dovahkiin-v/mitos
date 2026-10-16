@@ -1012,12 +1012,15 @@ def check_runs(record: Dict[str, Any], record_dir: str = RECORD_DIR) -> List[str
                 problems.append(f"index entry {entry!r} is not an object")
                 continue
             run_id = entry.get("run_id")
-            named.add(run_id)
             try:
                 path = _run_path(run_id, record_dir)
             except ValueError as exc:
                 problems.append(f"index entry: {exc}")
                 continue
+            if run_id in named:
+                problems.append(f"run {run_id!r} is indexed more than once")
+                continue
+            named.add(run_id)
             if not os.path.exists(path):
                 problems.append(f"run {run_id!r} is indexed but has no run file")
                 continue
@@ -1029,11 +1032,20 @@ def check_runs(record: Dict[str, Any], record_dir: str = RECORD_DIR) -> List[str
             if not isinstance(run, dict):
                 problems.append(f"run {run_id!r} has a run file that is not an object")
                 continue
+            # One malformed file (a list where an object belongs) is that run's problem;
+            # it must not hide the runs after it or the orphan sweep.
             try:
                 _refuse_run(run, dict(record, embedding_model=entry.get("embedding_model")))
             except ValueError as exc:
                 problems.append(f"run {run_id!r} would be refused today: {exc}")
-            on_file = _summary_of_file(run)
+            except Exception as exc:
+                problems.append(f"run {run_id!r} is malformed: {type(exc).__name__}: {exc}")
+                continue
+            try:
+                on_file = _summary_of_file(run)
+            except Exception as exc:
+                problems.append(f"run {run_id!r} is malformed: {type(exc).__name__}: {exc}")
+                continue
             for field in _SUMMARY_FIELDS:
                 if entry.get(field) != on_file[field]:
                     problems.append(
