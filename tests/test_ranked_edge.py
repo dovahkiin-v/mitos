@@ -33,7 +33,7 @@ from mitos.store import GraphStore
 from mitos.sync import MitosSyncManager
 
 from _point_hits import CannedVector, orphan_hit, point_hit
-from test_ranked_walk_surfaces import DRIVERS, JSON_DRIVERS, TEXT_DRIVERS, _StampFault, _id
+from test_ranked_walk_surfaces import DRIVERS, _StampFault, _id
 from test_surface_confidence import (_FakeEmbed, _query_pointer, _rec, cloned, offline,  # noqa: F401
                                      ws)
 
