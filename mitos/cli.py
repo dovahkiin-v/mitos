@@ -122,7 +122,8 @@ from mitos.retrieval_walk import (REJECTIONS_OVER_BUDGET, RejectionLeg,
                                   WalkContractError, walk_ranked,
                                   walk_rejection_lookup)
 from mitos.sync import (MitosSyncManager, run_ambient_capture, _SLUG_MAX_LEN,
-                        _ENTRIES_MARKER, _NEIGHBOR_REVIEW_THRESHOLD,
+                        _ENTRIES_MARKER, _NEIGHBOR_REVIEW_THRESHOLD, _TOMBSTONE_FLOOR,
+                        _floor_text,
                         _PAUSE_RESOLVING_RELATIONS, _declared_echo_lines, _split_relation_slugs,
                         EXISTS_NO_OP_FACT, PAUSE_HELD_CLAUSE,
                         ROTATION_FAILED, ROTATION_REASON_DUPLICATED, ROTATION_ROTATED,
@@ -2675,11 +2676,25 @@ def cmd_record(
         # would be a wall between the author and the anti-knowledge it judges
         # tenability from; the sentences are `_declared_echo_lines` over this same
         # dict's keys, so this render and the two machine encodings cannot disagree.
+        #
+        # 7a: the header counts both partitions with their floors; a tombstone-only
+        # pause never says it is similar to zero decisions. One block per tombstone
+        # follows the neighbours, its whole-read recipe naming the retired decision's
+        # id (a slug may name its live bearer), then the counts and the full-review
+        # sentence verbatim.
         _echo_corpus(config, file=sys.stderr)
-        print(f"⚠ Paused — '{result['slug']}' is ≥{_NEIGHBOR_REVIEW_THRESHOLD:.2f} "
-              f"similar to {len(result.get('neighbors', []))} existing decision(s) you "
-              "did not reference. Nothing written.", file=sys.stderr)
-        for n in result.get("neighbors", []):
+        neighbors = result.get("neighbors", [])
+        tombstones = result.get("tombstones", [])
+        said = []
+        if neighbors:
+            said.append(f"≥{_floor_text(_NEIGHBOR_REVIEW_THRESHOLD)} similar to "
+                        f"{len(neighbors)} existing decision(s) you did not reference")
+        if tombstones:
+            said.append(f"≥{_floor_text(_TOMBSTONE_FLOOR)} similar to {len(tombstones)} "
+                        "decision(s) this corpus retired")
+        print(f"⚠ Paused — '{result['slug']}' is {', and '.join(said)}. Nothing written.",
+              file=sys.stderr)
+        for n in neighbors:
             score = n.get("score")
             score_s = f"{score:.2f}" if isinstance(score, (int, float)) else "?"
             stamps = "".join(
@@ -2701,19 +2716,56 @@ def cmd_record(
                 print(f"      rejected: {rejected}", file=sys.stderr)
             if n.get("scope"):
                 print(f"      scope: {', '.join(n['scope'])}", file=sys.stderr)
+        if result.get("neighbors_omitted"):
+            print(f"  (+{result['neighbors_omitted']} more live neighbour(s) above the "
+                  "floor not shown)", file=sys.stderr)
+        if tombstones:
+            print("  Tombstones — decisions this corpus retired, closest first:",
+                  file=sys.stderr)
+        for t in tombstones:
+            print(f"  † {t['slug']}  ({t['state']}, score {t['score']:.3f})  id {t['id']}",
+                  file=sys.stderr)
+            axiom = "\n      ".join((t.get("axiom") or "").splitlines())
+            if axiom:
+                print(f"      {axiom}", file=sys.stderr)
+            for key in ("live_end", "superseded_by", "corrected_by"):
+                if key in t:
+                    print(f"      {key.replace('_', ' ')}: "
+                          f"{', '.join(t[key]) if t[key] else '(none reached)'}",
+                          file=sys.stderr)
+            if t.get("successor_on_pause"):
+                print(f"      its successor is on this pause: "
+                      f"{', '.join(t['successor_on_pause'])}", file=sys.stderr)
+            if t.get("successor_ambiguous"):
+                print("      only --acknowledge-neighbors clears it: its successor's slug "
+                      "names two decisions, and a relation to it is refused",
+                      file=sys.stderr)
+            print(f"      read it whole with "
+                  f"`mitos show {shell_flag('-p', config.project)} -- {shell_arg(t['id'])}`",
+                  file=sys.stderr)
+        if result.get("tombstones_omitted"):
+            print(f"  (+{result['tombstones_omitted']} more tombstone(s) above the floor "
+                  "not shown)", file=sys.stderr)
         for line in _declared_echo_lines(result):
             print(f"  {line}", file=sys.stderr)
-        # The review was cut above its floor: the one composed sentence, verbatim (it
-        # names no command, so every surface carries the same string).
+        # The review's coverage sentences, verbatim (each names no command, so every
+        # surface carries the same string): it filled full, or it was cut.
+        if result.get("neighbor_review_full"):
+            print(f"  {result['neighbor_review_full']}", file=sys.stderr)
         if result.get("neighbor_review_cut"):
             print(f"  {result['neighbor_review_cut']}", file=sys.stderr)
         # Same co-equal framing as the shared needs_review message (one constant,
         # two spellings — the CLI renders flags, the message bare names).
         menu = "/".join(f"--{r}" for r in _PAUSE_RESOLVING_RELATIONS)
-        print(f"  → Judge each neighbour, then re-record with that judgment: {menu} "
-              "<slug> at any neighbour this decision relates to, "
-              "--acknowledge-neighbors for neighbours that stand independently — or "
-              "both at once for a mixed set.", file=sys.stderr)
+        if neighbors:
+            print(f"  → Judge each neighbour, then re-record with that judgment: {menu} "
+                  "<slug> at any neighbour this decision relates to, "
+                  "--acknowledge-neighbors for neighbours that stand independently — or "
+                  "both at once for a mixed set.", file=sys.stderr)
+        if tombstones:
+            print("  → For a tombstone the draft does not re-tread: --supersedes <live "
+                  "successor> for a deliberate reversal, another relation flag at that "
+                  "successor, or --acknowledge-neighbors.", file=sys.stderr)
         # The message's held clause without its digest half: this render carries no
         # draft_digest, and pointing at a key the reader cannot see would be false.
         print(f"  → {PAUSE_HELD_CLAUSE}.", file=sys.stderr)

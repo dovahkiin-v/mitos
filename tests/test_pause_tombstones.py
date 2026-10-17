@@ -410,6 +410,20 @@ def test_get_kill_chains_returns_reached_and_slugs(store):
     assert store.get_kill_chains([]) == ({}, {})
 
 
+def test_a_sixty_deep_chain_answers_alike_through_both_readers(store):
+    """Row 13: the refactor is behaviour-identical on a deep chain — `get_live_ends`
+    and `live_ends_from_chains` over `get_kill_chains` name the one live end."""
+    from mitos.store import live_ends_from_chains
+    ids = [_commit(store, "link-00")]
+    for i in range(1, 61):
+        ids.append(_commit(store, f"link-{i:02d}", supersedes=[f"link-{i - 1:02d}"]))
+    seeds = ids[:3]
+    assert store.get_live_ends(seeds) == {i: ["link-60"] for i in seeds}
+    chains, slugs = store.get_kill_chains(seeds)
+    assert live_ends_from_chains(chains, slugs) == store.get_live_ends(seeds)
+    assert len(chains[ids[0]].reached) == 60 and chains[ids[0]].live_ends == [ids[-1]]
+
+
 def test_get_kill_chains_chunks_its_seeds(store, monkeypatch):
     """One `?` per seed, chunked at 500 like the point-id reads."""
     from mitos import store as store_module
@@ -441,3 +455,412 @@ def test_get_kill_chains_wraps_a_broken_connection(store, monkeypatch):
     monkeypatch.setattr(store, "_get_connection", lambda: _Broken())
     with pytest.raises(DatabaseError, match="kill chains"):
         store.get_kill_chains(["a" * 64])
+
+
+# =========================================================================== #
+# The record path (T17's 7a rows): the partition on the pause, MCP and CLI
+# =========================================================================== #
+
+import json  # noqa: E402
+from unittest.mock import patch  # noqa: E402
+
+from mitos.cli import cmd_record  # noqa: E402
+from mitos.conflict import CONFLICT_OVERFETCH_LIMIT  # noqa: E402
+
+from mitos.shell_quote import shell_arg  # noqa: E402
+
+from _point_hits import point_hit  # noqa: E402
+from test_neighbor_review import (_FakeEmbed, _FakeVector, _RaisingEmbed,  # noqa: E402,F401
+                                  _arm, _armed_real_manager_factory, _seed, offline,
+                                  small_bound, ws)
+
+_HIGH = 0.9
+_BETWEEN = round((sync._NEIGHBOR_REVIEW_THRESHOLD + _FLOOR) / 2, 4)  # live floor ≤ x < tombstone floor
+_DRAFT = "The draft walks a road the corpus already tried."
+
+
+def _id_of(m, slug):
+    ids = m.store.resolve_slug(slug)
+    assert len(ids) == 1, ids
+    return ids[0]
+
+
+def _retire(m, slug, axiom=None, by=None, how="supersedes"):
+    """Seeds ``slug`` and a live ``by`` (default ``{slug}-next``) that kills it."""
+    _seed(m, slug, axiom or f"Axiom for {slug}.")
+    _seed(m, by or f"{slug}-next", f"Axiom for {by or slug + '-next'}.", **{how: slug})
+    return _id_of(m, slug)
+
+
+def _buffer(config):
+    with open(config.decisions_file, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def _draft(m, slug="draft", **rels):
+    return m.record_decision_entry(_DRAFT, "rej", ["s"], slug=slug, **rels)
+
+
+def _surfaces(config, matches, **rels):
+    """The same draft through MCP `record_decision` and CLI `record` (text and --json),
+    each surface building its own armed real manager. Returns (mcp, cli_json, cli_text,
+    cli_exit)."""
+    from mitos import mcp_server
+    factory = _armed_real_manager_factory(matches)
+    with patch("mitos.cli.MitosSyncManager", side_effect=factory), \
+         patch("mitos.sync.MitosSyncManager", side_effect=factory), \
+         patch("mitos.mcp_server.MitosConfig", return_value=config):
+        mcp = json.loads(mcp_server.record_decision(_DRAFT, "rej", ["s"], slug="draft",
+                                                    project=config.workspace_dir, **rels))
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        out = io.StringIO()
+        with redirect_stdout(out), pytest.raises(SystemExit) as exc:
+            cmd_record(config, axiom=_DRAFT, rejected="rej", scope=["s"], slug="draft",
+                       as_json=True, **rels)
+        cli_json = json.loads(out.getvalue())
+        err = io.StringIO()
+        with redirect_stderr(err), redirect_stdout(io.StringIO()), pytest.raises(SystemExit) as exc2:
+            cmd_record(config, axiom=_DRAFT, rejected="rej", scope=["s"], slug="draft", **rels)
+    assert exc.value.code == exc2.value.code
+    return mcp, cli_json, err.getvalue(), exc2.value.code
+
+
+# -- Row 1: a re-tread pauses on its tombstone alone -------------------------------------
+
+def test_a_re_tread_pauses_on_its_tombstone_alone_and_writes_nothing(ws):
+    config, m = ws
+    old = _retire(m, "old-way", "We store sessions in signed JWTs.", by="new-way")
+    before = _buffer(config)
+    _arm(m, [{"slug": "old-way", "score": _HIGH}])
+    res = _draft(m)
+    assert res["status"] == "needs_review" and res["code"] == "similar_decision_exists"
+    assert res["neighbors"] == []
+    assert res["tombstones"] == [{
+        "slug": "old-way", "id": old, "state": "superseded", "score": _HIGH,
+        "superseded_by": ["new-way"], "axiom": "We store sessions in signed JWTs."}]
+    assert "tombstones_omitted" not in res and "neighbors_omitted" not in res
+    msg = res["message"]
+    assert "similar to 0" not in msg and "this corpus retired" in msg
+    assert f"≥{sync._floor_text(_FLOOR)}" in msg and "acknowledge_neighbors=True" in msg
+    assert "mitos " not in msg
+    assert _buffer(config) == before
+    assert m.store.get_node_by_slug("draft") is None
+
+
+def test_a_retired_hit_between_the_floors_does_not_pause(ws):
+    """The two floors are separate: a retired neighbour at or above the live floor but
+    under the tombstone floor is no tombstone."""
+    config, m = ws
+    assert sync._NEIGHBOR_REVIEW_THRESHOLD <= _BETWEEN < _FLOOR
+    _retire(m, "old-way")
+    _arm(m, [{"slug": "old-way", "score": _BETWEEN}])
+    assert _draft(m)["status"] == "created"
+
+
+def test_both_surfaces_pause_on_a_tombstone_alone(ws):
+    config, m = ws
+    old = _retire(m, "old-way", "We store sessions in signed JWTs.", by="new-way")
+    mcp, cli_json, text, code = _surfaces(config, [{"slug": "old-way", "score": _HIGH}])
+    assert code == 2
+    for res in (mcp, cli_json):
+        assert res["status"] == "needs_review" and res["neighbors"] == []
+        assert [t["id"] for t in res["tombstones"]] == [old]
+    assert "this corpus retired" in text and "0 existing" not in text
+    assert f"† old-way  (superseded, score {_HIGH:.3f})  id {old}" in text
+    assert "We store sessions in signed JWTs." in text
+    assert "superseded by: new-way" in text
+    assert f"-- {shell_arg(old)}`" in text and "mitos show" in text
+    assert "--acknowledge-neighbors" in text and "Judge each neighbour" not in text
+
+
+# -- Row 2: the kill-chain exemption --------------------------------------------------------
+
+def test_superseding_x_does_not_pause_on_xs_retired_predecessor(ws):
+    config, m = ws
+    _retire(m, "p", by="x")
+    _arm(m, [{"slug": "p", "score": _HIGH}])
+    assert _draft(m, supersedes="x")["status"] == "created"
+
+
+def test_amending_the_corrector_does_not_pause_on_the_corrected(ws):
+    config, m = ws
+    _retire(m, "p", by="x", how="corrects")
+    _arm(m, [{"slug": "p", "score": _HIGH}])
+    assert _draft(m, amends="x")["status"] == "created"
+
+
+def test_a_lineage_holding_the_corrector_does_not_pause(ws):
+    config, m = ws
+    _retire(m, "p", by="c", how="corrects")
+    _seed(m, "y", "Axiom for y.", amends="c")
+    _arm(m, [{"slug": "p", "score": _HIGH}])
+    assert _draft(m, amends="y")["status"] == "created"
+
+
+def test_an_undeclared_tombstone_in_the_same_draft_still_pauses(ws):
+    config, m = ws
+    _retire(m, "p", by="x")
+    _retire(m, "q")
+    _arm(m, [{"slug": "p", "score": 0.92}, {"slug": "q", "score": 0.88}])
+    res = _draft(m, supersedes="x")
+    assert res["status"] == "needs_review"
+    assert [t["slug"] for t in res["tombstones"]] == ["q"]
+
+
+# -- Row 3: declared target and lineage --------------------------------------------------
+
+def test_a_retired_lineage_ancestor_of_an_amends_target_is_never_a_tombstone(ws):
+    config, m = ws
+    _seed(m, "a", "Axiom for a.")
+    _seed(m, "b", "Axiom for b.", amends="a")
+    _seed(m, "c", "Axiom for c.", supersedes="a")
+    _arm(m, [{"slug": "a", "score": _HIGH}])
+    assert _draft(m, amends="b")["status"] == "created"
+
+
+# -- Row 4: the same-slug successor ------------------------------------------------------
+
+def test_a_same_slug_successor_says_acknowledgement_only(ws):
+    config, m = ws
+    from test_point_identity import same_slug_lineage
+    retired, _successor = same_slug_lineage(m.store)
+    _arm(m, [point_hit(retired, _HIGH)])
+    res = _draft(m)
+    assert res["status"] == "needs_review"
+    (t,) = res["tombstones"]
+    assert t["id"] == retired and t["successor_ambiguous"] is True
+    assert "successor_ambiguous clears only with acknowledge_neighbors=True" in res["message"]
+
+
+def test_a_distinct_slug_successor_carries_no_ambiguity(ws):
+    config, m = ws
+    _retire(m, "old-way", by="new-way")
+    _arm(m, [{"slug": "old-way", "score": _HIGH}])
+    res = _draft(m)
+    assert "successor_ambiguous" not in res["tombstones"][0]
+    assert "successor_ambiguous" not in res["message"]
+
+
+# -- Row 5: the successor on the pause ---------------------------------------------------
+
+def test_a_tombstone_stays_beside_its_successor_and_one_relation_clears_both(ws):
+    config, m = ws
+    _retire(m, "old-way", by="new-way")
+    matches = [{"slug": "old-way", "score": _HIGH}, {"slug": "new-way", "score": 0.88}]
+    _arm(m, matches)
+    res = _draft(m)
+    assert [n["slug"] for n in res["neighbors"]] == ["new-way"]
+    (t,) = res["tombstones"]
+    assert t["slug"] == "old-way" and t["successor_on_pause"] == ["new-way"]
+    assert "successor_on_pause" in res["message"]
+    _arm(m, matches)
+    assert _draft(m, cites="new-way")["status"] == "created"
+
+
+# -- Row 6: the bound and both counts ----------------------------------------------------
+
+def test_seven_tombstones_show_five_and_count_two(ws):
+    config, m = ws
+    for i in range(7):
+        _retire(m, f"t{i}")
+    _arm(m, [{"slug": f"t{i}", "score": round(0.95 - 0.01 * i, 4)} for i in range(7)])
+    res = _draft(m)
+    assert [t["slug"] for t in res["tombstones"]] == ["t0", "t1", "t2", "t3", "t4"]
+    assert res["tombstones_omitted"] == 2
+    assert "2 more tombstone(s) above the floor are not shown" in res["message"]
+
+
+def test_seven_live_neighbours_show_five_and_count_two(ws):
+    config, m = ws
+    for i in range(7):
+        _seed(m, f"n{i}", f"Axiom for n{i}.")
+    _arm(m, [{"slug": f"n{i}", "score": round(0.95 - 0.01 * i, 4)} for i in range(7)])
+    res = _draft(m)
+    assert [n["slug"] for n in res["neighbors"]] == ["n0", "n1", "n2", "n3", "n4"]
+    assert res["neighbors_omitted"] == 2 and "tombstones" not in res
+    assert "and 2 more above the floor are not shown" in res["message"]
+
+
+def test_at_the_bound_neither_count_is_present(ws):
+    config, m = ws
+    for i in range(5):
+        _seed(m, f"n{i}", f"Axiom for n{i}.")
+        _retire(m, f"t{i}")
+    _arm(m, [{"slug": f"n{i}", "score": 0.9} for i in range(5)]
+         + [{"slug": f"t{i}", "score": 0.89} for i in range(5)])
+    res = _draft(m)
+    assert len(res["neighbors"]) == 5 and len(res["tombstones"]) == 5
+    assert "neighbors_omitted" not in res and "tombstones_omitted" not in res
+
+
+# -- Row 7: D7, the full review ----------------------------------------------------------
+
+def _live_corpus(m, n):
+    for i in range(n):
+        _seed(m, f"live-{i:02d}", f"Axiom for live {i}.")
+    return [{"slug": f"live-{i:02d}", "score": round(0.97 - 0.005 * i, 4)} for i in range(n)]
+
+
+def test_a_full_review_says_its_counts_cover_what_it_read(ws):
+    config, m = ws
+    _arm(m, _live_corpus(m, CONFLICT_OVERFETCH_LIMIT + 1))
+    res = _draft(m)
+    full = res["neighbor_review_full"]
+    assert f"all {CONFLICT_OVERFETCH_LIMIT} of its live candidates" in full
+    assert "a live neighbour or a tombstone may lie past them" in full
+    assert "mitos" not in full and "neighbor_review_cut" not in res
+    assert res["neighbors_omitted"] == CONFLICT_OVERFETCH_LIMIT - 5
+
+
+def test_an_exhausted_review_is_not_full(ws):
+    config, m = ws
+    _arm(m, _live_corpus(m, CONFLICT_OVERFETCH_LIMIT))
+    assert "neighbor_review_full" not in _draft(m)
+
+
+def test_a_full_review_whose_last_candidate_is_under_both_floors_is_not_full(ws):
+    config, m = ws
+    matches = _live_corpus(m, CONFLICT_OVERFETCH_LIMIT + 1)
+    matches[CONFLICT_OVERFETCH_LIMIT - 1]["score"] = 0.5
+    matches[CONFLICT_OVERFETCH_LIMIT]["score"] = 0.49
+    _arm(m, matches)
+    assert "neighbor_review_full" not in _draft(m)
+
+
+def test_a_cut_review_is_never_full(ws, small_bound):
+    from _point_hits import orphan_hit
+    config, m = ws
+    _retire(m, "old-way")
+    hits = [{"slug": "old-way", "score": 0.95}]
+    hits += [orphan_hit(0.94 - 0.001 * i, tag=f"cut-{i}") for i in range(CONFLICT_OVERFETCH_LIMIT)]
+    _arm(m, hits)
+    res = _draft(m)
+    assert res["status"] == "needs_review" and "neighbor_review_full" not in res
+    cut = res["neighbor_review_cut"]
+    assert "a live neighbour or a tombstone may lie past what it read" in cut
+
+
+def test_a_cut_between_the_floors_names_only_the_live_partition(ws, small_bound):
+    from _point_hits import orphan_hit
+    config, m = ws
+    _seed(m, "prior", "Axiom for prior.")
+    tail = _BETWEEN
+    hits = [{"slug": "prior", "score": 0.95}]
+    hits += [orphan_hit(0.94 - (0.94 - tail) * i / (CONFLICT_OVERFETCH_LIMIT - 1), tag=f"cut-{i}")
+             for i in range(CONFLICT_OVERFETCH_LIMIT)]
+    _arm(m, hits)
+    cut = _draft(m)["neighbor_review_cut"]
+    assert "so a live neighbour may lie past what it read" in cut
+
+
+# -- Row 8: the failure state ------------------------------------------------------------
+
+@pytest.mark.parametrize("read", ["get_kill_chains", "get_modifiers_map"])
+def test_a_tombstone_read_fault_fails_open_and_never_reads_as_clean(ws, monkeypatch, read):
+    config, m = ws
+    _retire(m, "old-way")
+    _arm(m, [{"slug": "old-way", "score": _HIGH}])
+    calls = []
+
+    def broken(*a, **k):
+        calls.append(a)
+        raise DatabaseError(f"injected {read} fault")
+    monkeypatch.setattr(m.store, read, broken)
+    res = _draft(m)
+    assert res["status"] == "created" and calls
+    assert "could not run (graph read failed)" in res["neighbor_review_unavailable"]
+    assert "tombstones" not in res
+
+
+def test_a_fault_also_discards_the_live_neighbours(ws, monkeypatch):
+    config, m = ws
+    _retire(m, "old-way")
+    _seed(m, "live-twin", "Axiom for live twin.")
+    _arm(m, [{"slug": "old-way", "score": _HIGH}, {"slug": "live-twin", "score": 0.88}])
+    monkeypatch.setattr(m.store, "get_kill_chains",
+                        lambda ids: (_ for _ in ()).throw(DatabaseError("injected")))
+    res = _draft(m)
+    assert res["status"] == "created" and "neighbor_review_unavailable" in res
+
+
+def test_no_retired_hit_at_the_floor_reads_nothing(ws, monkeypatch):
+    config, m = ws
+    _retire(m, "old-way")
+    _arm(m, [{"slug": "old-way", "score": _BETWEEN}])
+    calls = []
+    monkeypatch.setattr(m.store, "get_kill_chains", lambda ids: calls.append(ids))
+    res = _draft(m)
+    assert res["status"] == "created" and calls == []
+    assert "neighbor_review_unavailable" not in res
+
+
+def test_an_unavailable_gather_does_no_tombstone_work(ws, monkeypatch):
+    from mitos.errors import EmbeddingError
+    config, m = ws
+    _retire(m, "old-way")
+    _arm(m, [{"slug": "old-way", "score": _HIGH}])
+    m.embed_provider = _RaisingEmbed(EmbeddingError("down"))
+    calls = []
+    monkeypatch.setattr(m.store, "get_kill_chains", lambda ids: calls.append(ids))
+    res = _draft(m)
+    assert res["status"] == "created" and calls == []
+    assert "embedding service unavailable" in res["neighbor_review_unavailable"]
+
+
+# -- Row 9: the acknowledged path --------------------------------------------------------
+
+def test_acknowledging_past_a_tombstone_commits_with_the_live_list_unchanged(ws):
+    config, m = ws
+    _retire(m, "old-way")
+    _arm(m, [{"slug": "old-way", "score": _HIGH}])
+    res = _draft(m, acknowledge_neighbors=True)
+    assert res["status"] == "created"
+    assert res["acknowledged_neighbors"] == []
+    assert "tombstones" not in res and "tombstones_omitted" not in res
+
+
+# -- Row 10: D9, a declaration that cleared a tombstone is not "no near match" -----------
+
+def test_a_declaration_that_cleared_a_tombstone_sits_in_declared(ws):
+    config, m = ws
+    _retire(m, "p", by="x")
+    _seed(m, "live-twin", "Axiom for live twin.")
+    _arm(m, [{"slug": "p", "score": _HIGH}, {"slug": "live-twin", "score": 0.88}])
+    res = _draft(m, cites="x")
+    assert res["status"] == "needs_review" and "tombstones" not in res
+    assert res["declared"] == ["x"] and "declared_no_near_match" not in res
+
+
+def test_without_the_tombstone_the_same_declaration_is_no_near_match(ws):
+    """D9's control: the exclusion is the cleared tombstone, nothing else."""
+    config, m = ws
+    _retire(m, "p", by="x")
+    _seed(m, "live-twin", "Axiom for live twin.")
+    _arm(m, [{"slug": "live-twin", "score": 0.88}])
+    res = _draft(m, cites="x")
+    assert res["declared_no_near_match"] == [{"slug": "x"}]
+
+
+# -- Row 12: parity ----------------------------------------------------------------------
+
+def test_cli_json_and_mcp_carry_one_pause_and_the_text_names_each_id(ws):
+    config, m = ws
+    old = _retire(m, "old-way", by="new-way")
+    other = _retire(m, "older-way")
+    _seed(m, "live-twin", "Axiom for live twin.")
+    matches = [{"slug": "old-way", "score": 0.93}, {"slug": "older-way", "score": 0.91},
+               {"slug": "live-twin", "score": 0.88}, {"slug": "new-way", "score": 0.86}]
+    mcp, cli_json, text, code = _surfaces(config, matches)
+    assert code == 2
+    echo = {"project", "collection", "workspace"}
+    assert set(mcp) == set(cli_json)
+    assert {k: v for k, v in mcp.items() if k not in echo} == \
+        {k: v for k, v in cli_json.items() if k not in echo}
+    assert [t["id"] for t in mcp["tombstones"]] == [old, other]
+    assert mcp["tombstones"][0]["successor_on_pause"] == ["new-way"]
+    assert "mitos " not in mcp["message"]
+    for tid in (old, other):
+        assert f"-- {shell_arg(tid)}`" in text
+    assert "its successor is on this pause: new-way" in text
+    assert "Judge each neighbour" in text and "For a tombstone the draft does not re-tread" in text

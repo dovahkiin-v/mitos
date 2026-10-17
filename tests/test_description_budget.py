@@ -558,3 +558,34 @@ def test_container_shape_is_stated_in_the_first_sentence(tool, arg):
             f"{tool}'s `{arg}` takes one string, but its first sentence says "
             f"'list' ({doc!r}) — the word an agent reads as ['a', 'b']."
         )
+
+
+# --- 7a: the pause's tombstone partition ships before its prose -------------------------
+#
+# 7a wires the partition into the pause and its runtime message; `record_decision`'s
+# description and SETUP.md's pause passage are 7b's to rewrite. Until then they must not
+# half-describe it. Each row was seen red against a planted mention first.
+
+def _setup_md():
+    import os
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "SETUP.md")
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def test_record_decision_description_does_not_yet_mention_tombstones():
+    desc = _descriptions()["record_decision"].lower()
+    assert "tombstone" not in desc and "retired" not in desc, (
+        "7b rewrites record_decision's pause paragraph for the tombstone partition; "
+        "invert this row in that phase, not before"
+    )
+
+
+def test_setup_md_pause_passage_still_quotes_the_live_floor_alone():
+    text = _flat(_setup_md())
+    assert "strongly similar (≥0.80) to an existing decision it does not reference" in text, (
+        "SETUP.md's pause passage is 7b's to rewrite; invert this row in that phase"
+    )
+    assert "tombstone" not in text.lower(), (
+        "SETUP.md's pause passage is 7b's to rewrite; invert this row in that phase"
+    )

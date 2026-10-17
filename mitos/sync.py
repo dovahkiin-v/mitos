@@ -5,6 +5,7 @@ concurrency file locks, LLM capture enrichment, user reviews, and content-aware
 archive rotation.
 """
 
+import dataclasses
 import functools
 import hashlib
 import math
@@ -94,6 +95,7 @@ from mitos.store import (
     live_ends_from_chains,
 )
 from mitos.display import retired_handle
+from mitos.retrieval_walk import EDGE_FOUND, EDGE_UNMEASURED
 from mitos.identity import (
     SLUG_LENGTH_REASON,
     SLUG_MAX_LEN,
@@ -1177,6 +1179,22 @@ class TombstoneReview(NamedTuple):
     cleared_by: Set[str]
 
 
+class PauseReview(NamedTuple):
+    """What the pre-commit near-duplicate review found (:meth:`MitosSyncManager._review_pause`).
+
+    Attributes:
+        pause: The ``needs_review`` dict to return (nothing written), or None when no
+            partition holds anything (or the review could not run).
+        unavailable: The fail-open notice when the review could not run, else None.
+        cut: The cut sentence when the review ran over less than it should have and no
+            pause carries it, else None (the created receipt carries it).
+    """
+
+    pause: Optional[Dict[str, Any]]
+    unavailable: Optional[str]
+    cut: Optional[str]
+
+
 def _review_unavailable_notice(cause: str) -> str:
     """One calm receipt sentence for a near-dup check that could not run (fail-open).
 
@@ -1211,33 +1229,95 @@ def _review_unavailable_notice(cause: str) -> str:
     )
 
 
-def _review_cut_notice(gathering: Optional[Gathering], floor: float) -> Optional[str]:
-    """One calm sentence for a near-dup review whose gather was cut above ``floor``.
+def _floor_text(floor: float) -> str:
+    """Renders a floor exactly: two places when that is the whole value (``0.80``), else
+    every place it holds (``0.8265``). A floor rounded up would state a bound the
+    partition does not keep (a tombstone at 0.827 under "≥0.83")."""
+    two = f"{floor:.2f}"
+    return two if float(two) == floor else f"{floor:.4f}".rstrip("0")
+
+
+def _past_what(score: float, floor: float, tombstone_floor: Optional[float]) -> str:
+    """Names what may lie past a gather whose last score is ``score``: a live neighbour
+    when it sits at or above the live floor, a tombstone when at or above the tombstone
+    floor (scores fall down the fetch, so nothing past it scores higher)."""
+    parts = []
+    if score >= floor:
+        parts.append("a live neighbour")
+    if tombstone_floor is not None and score >= tombstone_floor:
+        parts.append("a tombstone")
+    return " or ".join(parts)
+
+
+def _review_cut_notice(gathering: Optional[Gathering], floor: float, *,
+                       tombstone_floor: Optional[float] = None) -> Optional[str]:
+    """One calm sentence for a near-dup review whose gather was cut above its floor.
 
     The sibling of :func:`_review_unavailable_notice`: that one says the review could
     not run, this one says it ran over less than it should have. The gather read its
     whole raw bound, held fewer live decisions than it fills, and its last point still
-    scored at or above the pause's floor — so a live neighbour may lie past what it
-    read. It names **no command**, for the same boundary reason its sibling documents
-    (this string is a receipt dict value, so it reaches an MCP caller verbatim), and
-    with no command in it there is nothing to word per surface.
+    scored at or above the lower of the pause's floors — so a live neighbour, or a
+    tombstone when the score also clears the tombstone floor, may lie past what it read
+    (7a D7: a cut above a lower tombstone floor can hide a tombstone too). It names **no
+    command**, for the same boundary reason its sibling documents (this string is a
+    receipt dict value, so it reaches an MCP caller verbatim), and with no command in it
+    there is nothing to word per surface.
 
     Args:
         gathering: The review's healthy gathering, or None when the gather never ran
             healthy.
-        floor: The consumer's floor (the pause's ``_NEIGHBOR_REVIEW_THRESHOLD``).
+        floor: The live floor (the pause's ``_NEIGHBOR_REVIEW_THRESHOLD``).
+        tombstone_floor: The tombstone floor (``_TOMBSTONE_FLOOR``) when the review's
+            consumer reads tombstones; the cut is judged at the lower of the two.
 
     Returns:
-        The sentence when the gathering was cut above ``floor``; otherwise None.
+        The sentence when the gathering was cut above the lower floor; otherwise None.
     """
-    if gathering is None or not gathering.cut_above(floor):
+    judged = floor if tombstone_floor is None else min(floor, tombstone_floor)
+    if gathering is None or not gathering.cut_above(judged):
         return None
     return (
         f"Near-duplicate review read its whole bound of {gathering.bound} points and "
         f"held {len(gathering.live)} live decision(s), fewer than the "
         f"{CONFLICT_OVERFETCH_LIMIT} it fills; its last point still scored "
-        f"{gathering.last_score:.2f}, at or above the {floor:.2f} floor, so a live "
-        "neighbour may lie past what it read."
+        f"{gathering.last_score:.2f}, at or above the {_floor_text(judged)} floor, so "
+        f"{_past_what(gathering.last_score, floor, tombstone_floor)} may lie past what it read."
+    )
+
+
+def _review_full_notice(gathering: Optional[Gathering], floor: float,
+                        tombstone_floor: float) -> Optional[str]:
+    """One calm sentence for a review whose live fill ended full of above-floor candidates (7a D7).
+
+    The gather fills ``CONFLICT_OVERFETCH_LIMIT`` live candidates; when it holds all of
+    them, the last still at or above the lower of the two floors, and the walk ended at
+    an edge rather than running out, live neighbours and tombstones above their floors
+    may lie past what it walked — so the pause's ``neighbors_omitted`` and
+    ``tombstones_omitted`` count what it read, not what exists. The sentence names what
+    filled (the gather's candidates, never what the pause shows, which is at most
+    ``CONFLICT_TOP_K``) and no command; it is :func:`_review_cut_notice`'s sibling and
+    never rides beside it (a cut gather holds fewer than the limit, a full one does not).
+
+    Args:
+        gathering: The review's healthy gathering, or None.
+        floor: The live floor.
+        tombstone_floor: The tombstone floor.
+
+    Returns:
+        The sentence when the review ended full; otherwise None.
+    """
+    if gathering is None or len(gathering.live) < CONFLICT_OVERFETCH_LIMIT \
+            or gathering.end not in (EDGE_FOUND, EDGE_UNMEASURED):
+        return None
+    last = gathering.live[-1].score
+    if last < min(floor, tombstone_floor):
+        return None
+    return (
+        f"Near-duplicate review filled all {CONFLICT_OVERFETCH_LIMIT} of its live candidates "
+        f"and the last still scored {last:.2f}, at or above the "
+        f"{_floor_text(min(floor, tombstone_floor))} floor, so "
+        f"{_past_what(last, floor, tombstone_floor)} may lie past them; the omitted counts "
+        "cover what it read."
     )
 
 
@@ -1246,6 +1326,7 @@ def _declared_echo(
     canonical_slugs: Dict[str, str],
     gathered_index: Dict[str, Tuple[str, float]],
     floor: float,
+    cleared_by: AbstractSet[str] = frozenset(),
 ) -> Dict[str, Any]:
     """Partitions the caller's own declared targets for the pause body (A2).
 
@@ -1255,9 +1336,16 @@ def _declared_echo(
     :data:`_PAUSE_RESOLVING_RELATIONS`:
 
     * **Group two** (``declared_no_near_match``) — targets in ``V`` declared through at
-      least one ``PR`` relation that fall outside ``V ∩ G ∩ (score >= floor)``.
+      least one ``PR`` relation that fall outside ``V ∩ G ∩ (score >= floor)`` and did
+      not clear a tombstone on this call (``cleared_by``, 7a D9).
     * **Group one** (``declared``) — the complement over ``V``, keyed on all nine
       relations.
+
+    The tombstone clause keeps group two's sentence true: a declaration whose id set
+    meets a retired hit's ``{T.id} ∪ KillChain(T).reached`` at or above the tombstone
+    floor did resolve part of the pause, so it is not reported as one that "does not
+    resolve this pause". It adds no tombstone to the echo and no key; ``cleared_by`` is
+    computed from the primary sets (the declarations and the exemption decision, M8).
 
     Four properties are contract, not implementation taste:
 
@@ -1293,6 +1381,8 @@ def _declared_echo(
         gathered_index: Casefolded gathered slug -> ``(stored slug, score)`` for every
             candidate this call's sweep returned, pre-screen.
         floor: The similarity floor the screen applied (``_NEIGHBOR_REVIEW_THRESHOLD``).
+        cleared_by: Casefolded declared targets that exempted a retired hit at or above
+            the tombstone floor (``TombstoneReview.cleared_by``); never in group two.
 
     Returns:
         The echo's keys, ready to merge into the pause dict — any of ``declared``,
@@ -1320,7 +1410,8 @@ def _declared_echo(
         # on the write path.
         handle = canonical_slugs.get(folded, verbatim)
         gathered = gathered_index.get(folded)
-        if folded in resolving and not (gathered is not None and gathered[1] >= floor):
+        if folded in resolving and folded not in cleared_by \
+                and not (gathered is not None and gathered[1] >= floor):
             item: Dict[str, Any] = {"slug": handle}
             if gathered is not None:
                 item["score"] = gathered[1]
@@ -1409,6 +1500,67 @@ def _declared_echo_lines(payload: Dict[str, Any]) -> List[str]:
         lines.append("Pass every declaration again when you re-record")
 
     return lines
+
+
+def _pause_message(payload: Dict[str, Any]) -> str:
+    """The pause's ``message``, composed from the pause dict's own keys (7a D6).
+
+    Every clause is gated on a key the payload carries, so the MCP message, the CLI
+    text (which composes its own lines from the same keys) and ``--json`` cannot
+    disagree. It is in the MCP register: it names ``acknowledge_neighbors=True`` and
+    relation arguments by their bare names, never a shell command. A tombstone-only
+    pause opens on its tombstones and never says it is similar to zero decisions.
+
+    Args:
+        payload: The pause dict, without its ``message``.
+
+    Returns:
+        The message.
+    """
+    slug = payload["slug"]
+    neighbors = payload.get("neighbors") or []
+    tombstones = payload.get("tombstones") or []
+    parts: List[str] = []
+    if neighbors:
+        omitted = payload.get("neighbors_omitted")
+        parts.append(
+            f"Paused: '{slug}' is ≥{_floor_text(_NEIGHBOR_REVIEW_THRESHOLD)} similar to "
+            f"{len(neighbors)} existing decision(s) you did not reference"
+            + (f", and {omitted} more above the floor are not shown." if omitted else ".")
+            + " Judge each neighbour from its axiom, rejected_paths, scope, and modifier "
+            "stamps, then re-record with that judgment: a relation arg "
+            f"({'/'.join(_PAUSE_RESOLVING_RELATIONS)}) pointing at any neighbour this "
+            "decision genuinely relates to, acknowledge_neighbors=True for neighbours that "
+            "stand independently alongside it — or both at once for a mixed set.")
+        if any(n.get("amended_by") or n.get("narrowed_by") for n in neighbors):
+            # B9's dereference sentence only where it can apply: a neighbour that
+            # carries a stamp.
+            parts.append("If you go on to supersede or amend a neighbour, an "
+                         "amended_by/narrowed_by stamp on it means it has moved on — "
+                         "dereference that slug before linking.")
+    if tombstones:
+        omitted = payload.get("tombstones_omitted")
+        lead = f"Paused: '{slug}' is" if not neighbors else "It is also"
+        parts.append(
+            f"{lead} ≥{_floor_text(_TOMBSTONE_FLOOR)} similar to {len(tombstones)} decision(s) this "
+            "corpus retired (tombstones): ground it already tried and abandoned, which the "
+            "draft sits closer to than the floor"
+            + (f"; {omitted} more tombstone(s) above the floor are not shown." if omitted else ".")
+            + " Each names where its current word lives (live_end, else superseded_by or "
+            "corrected_by). If the draft does not re-tread it, declare a relation to that "
+            "live successor, which clears it (a deliberate reversal is a supersedes of the "
+            "successor), or pass acknowledge_neighbors=True.")
+        if any(t.get("successor_on_pause") for t in tombstones):
+            parts.append("A tombstone marked successor_on_pause has that successor among "
+                         "the neighbours above, so one relation to it clears both.")
+        if any(t.get("successor_ambiguous") for t in tombstones):
+            parts.append("A tombstone marked successor_ambiguous clears only with "
+                         "acknowledge_neighbors=True: its successor's slug names two "
+                         "decisions, and record_decision refuses a relation target that two "
+                         "decisions carry.")
+    echo_prose = "".join(f"{line}. " for line in _declared_echo_lines(payload))
+    return (" ".join(parts) + f" {PAUSE_HELD_CLAUSE}{_PAUSE_DIGEST_CLAUSE} "
+            f"{echo_prose}Nothing was written.")
 
 
 def _floored_score_text(score: float) -> str:
@@ -5174,6 +5326,156 @@ class MitosSyncManager:
         return TombstoneReview(shown=shown, omitted=len(kept) - len(shown_hits),
                                cleared_by=cleared_by)
 
+    def _review_pause(self, entry: ParsedEntry, supersedes: Optional[str],
+                      corrects: Optional[str], extra_relations: Dict[str, str], *,
+                      canonical_slugs: Dict[str, str],
+                      own_id: Optional[str] = None) -> PauseReview:
+        """The pre-commit near-duplicate review, both partitions (P4; 7a).
+
+        Still Phase A, so a pause writes nothing. One gather
+        (:meth:`_review_neighbors`, screened to the gather's whole live window so both
+        counts come from one list, D5) feeds the live partition, cut to
+        ``CONFLICT_TOP_K``, and the tombstone partition (:meth:`_review_tombstones`, over
+        the same gathering's retired hits); one lineage walk (:meth:`_review_declared`)
+        feeds the live screen's suppression and the tombstones' exemption. The pause
+        returns when either partition holds something.
+
+        Fail-open, one fault domain (D3): a ``DatabaseError``/``ValidationError`` from
+        any read — the gather's, the lineage walk's, the kill-chain, stamp or slug reads
+        of the tombstones — discards both partitions and yields the
+        ``neighbor_review_unavailable`` notice, so an absent tombstone never reads as
+        checked-clean; a typed embed or vector-store ``Unavailable`` words its cause the
+        same way. Anything else is a real bug and propagates.
+
+        The record path and the replay worker (a store-and-providers shell) call it, so
+        the replay prices the shipped pause and not a copy of it.
+
+        Args:
+            entry: The parsed draft.
+            supersedes: The raw ``supersedes`` argument.
+            corrects: The raw ``corrects`` argument.
+            extra_relations: The seven non-kill relations, stripped, non-empty only.
+            canonical_slugs: Casefolded declared target → stored slug, from Phase A's
+                validation loops (the echo prints stored spellings).
+            own_id: The draft's own node id. Never in the graph on the record path (the
+                ``exists`` gate answers first), so dropping it from the retired hits is
+                a no-op there; a replayed draft's node may exist, retired, and is never
+                its own tombstone.
+
+        Returns:
+            The :class:`PauseReview`.
+        """
+        review_unavailable: Optional[str] = None
+        neighbors: List[Dict[str, Any]] = []
+        tombs = TombstoneReview(shown=[], omitted=0, cleared_by=set())
+        # The caller's own declarations, per relation, for the pause echo — built
+        # BESIDE the declared review below, which folds the relation name away. Purely
+        # additive: nothing that Phase B reads moves in here.
+        # `test_mixed_neighbors_declared_edge_survives_acknowledge_bypass` documents
+        # why that matters — this review is skipped under acknowledge_neighbors while
+        # Phase B still writes edges from the raw relation args, so relocating any
+        # normalization into it drops declared edges when both flags travel together,
+        # with every other row green.
+        declared_by_relation: Dict[str, Optional[str]] = {
+            "supersedes": supersedes, "corrects": corrects, **extra_relations,
+        }
+        # This call's raw gathered set, filled by _review_neighbors. Primary-set input to
+        # the partition (M8); empty when the sweep never ran.
+        gathered_index: Dict[str, Tuple[str, float]] = {}
+        # The gathering itself, when the review ran healthy: the cut, the full-review
+        # sentence and the tombstones read it. Empty when it never ran or could not.
+        gatherings: List[Gathering] = []
+        try:
+            # Declared targets plus their transitive mutation lineage (3b): by naming a
+            # chain head the author has acknowledged the whole lineage. Without
+            # providers the gate cannot run, and the declared set stays the direct
+            # targets with no walk (the graph-only fast path).
+            declared: Optional[DeclaredReview] = None
+            if self.embed_provider and self.vector_store:
+                declared = self._review_declared(supersedes, corrects, extra_relations)
+                declared_targets = declared.slugs
+            else:
+                declared_targets = self._review_declared_targets(
+                    supersedes, corrects, extra_relations)
+            reviewed = self._review_neighbors(entry, declared_targets,
+                                              gathered_index=gathered_index,
+                                              top_k=CONFLICT_OVERFETCH_LIMIT,
+                                              gathering_sink=gatherings)
+            if not isinstance(reviewed, Unavailable) and gatherings and declared is not None:
+                gathering = gatherings[0]
+                if own_id is not None:
+                    gathering = dataclasses.replace(
+                        gathering,
+                        retired=[h for h in gathering.retired if h.node["id"] != own_id])
+                tombs = self._review_tombstones(
+                    gathering, declared, shown_neighbors=reviewed[:CONFLICT_TOP_K])
+        except (DatabaseError, ValidationError) as exc:
+            # A graph-store fault during the pause read (the gather's node reads, the
+            # lineage walk, a tombstone read). Fail open — a fault this severe fails
+            # Phase B anyway, where commit-arbitration belongs; a pre-commit crash never
+            # does. Both partitions are discarded: a partly read pause would pass for a
+            # whole one.
+            review_unavailable = _review_unavailable_notice("graph read failed")
+            gatherings = []
+            # stderr: the MCP write tool shares this path and uses stdout for JSON-RPC.
+            print(f"[Warning] Neighbor review skipped for '{entry.slug}': {exc}",
+                  file=sys.stderr)
+        else:
+            if isinstance(reviewed, Unavailable):
+                # Embed/vector-store degradation, typed by the gather. The reason words
+                # the notice; `.detail` is logging-only, never rendered.
+                review_unavailable = _review_unavailable_notice(
+                    _REVIEW_UNAVAILABLE_CAUSES.get(
+                        reviewed.reason, reviewed.reason.value.replace("_", " ")
+                    )
+                )
+            else:
+                neighbors = reviewed
+        gathering = gatherings[0] if gatherings else None
+        # The cut statement and the full-review sentence, only beside a review that ran:
+        # a review that could not run already says so, and the two never co-occur.
+        cut = full = None
+        if review_unavailable is None and gathering is not None:
+            cut = _review_cut_notice(gathering, _NEIGHBOR_REVIEW_THRESHOLD,
+                                     tombstone_floor=_TOMBSTONE_FLOOR)
+            full = _review_full_notice(gathering, _NEIGHBOR_REVIEW_THRESHOLD, _TOMBSTONE_FLOOR)
+        shown = neighbors[:CONFLICT_TOP_K]
+        if not shown and not tombs.shown:
+            return PauseReview(pause=None, unavailable=review_unavailable, cut=cut)
+        # The declared-edge echo (A2). mitos is stateless across calls, so a pause on a
+        # different node cannot say "since your last attempt" — and a caller that
+        # cannot tell whether its declaration registered mints a second, false edge
+        # into the gold source. The one thing that answers it is what this call already
+        # computed and threw away. A declaration that cleared a tombstone resolved part
+        # of the pause, so it is never group two (D9).
+        echo = _declared_echo(declared_by_relation, canonical_slugs, gathered_index,
+                              _NEIGHBOR_REVIEW_THRESHOLD, cleared_by=tombs.cleared_by)
+        pause: Dict[str, Any] = {
+            "status": "needs_review",
+            "code": "similar_decision_exists",
+            "slug": entry.slug,
+            # Present on every pause, `[]` on a tombstone-only one: consumers index it.
+            "neighbors": shown,
+        }
+        if len(neighbors) > len(shown):
+            pause["neighbors_omitted"] = len(neighbors) - len(shown)
+        if tombs.shown:
+            pause["tombstones"] = tombs.shown
+        if tombs.omitted:
+            pause["tombstones_omitted"] = tombs.omitted
+        pause.update(echo)
+        pause = {
+            **{k: pause[k] for k in ("status", "code", "slug", "neighbors")},
+            **{k: pause[k] for k in ("neighbors_omitted", "tombstones", "tombstones_omitted")
+               if k in pause},
+            "message": _pause_message(pause),
+            "draft_digest": _draft_digest(entry),
+            **echo,
+            **({"neighbor_review_full": full} if full else {}),
+            **({"neighbor_review_cut": cut} if cut else {}),
+        }
+        return PauseReview(pause=pause, unavailable=None, cut=None)
+
     def _acknowledged_neighbors_field(self, entry: ParsedEntry,
                                       supersedes: Optional[str],
                                       corrects: Optional[str],
@@ -6113,15 +6415,29 @@ class MitosSyncManager:
             passed, ``acknowledged_neighbors`` (:meth:`_acknowledged_neighbors_field`):
             the stored slugs of every unlinked live decision at or above the floor
             that the write went past, most similar first, ``[]`` when there were
-            none, or ``None`` when the gather could not run; OR, when a highly-similar unreferenced decision exists and
+            none, or ``None`` when the gather could not run; OR, when a highly-similar
+            unreferenced live decision or retired decision exists and
             ``acknowledge_neighbors`` is False, a ``{status: "needs_review", code:
             "similar_decision_exists", slug, neighbors, message, draft_digest}`` pause
-            that wrote NOTHING — ``draft_digest`` (:func:`_draft_digest`) is what a
-            re-send passes back to be compared with this draft;
+            that wrote NOTHING (:meth:`_review_pause`) — ``draft_digest``
+            (:func:`_draft_digest`) is what a re-send passes back to be compared with
+            this draft;
             each ``neighbors`` element is an enriched, modifier-stamped decision-read
             payload (:func:`~mitos.conflict.candidate_payload`: ``slug`` / ``axiom`` /
             ``scope`` / ``score`` / ``rejected_paths`` plus any ``amended_by``/
-            ``narrowed_by`` stamps) the authoring agent judges tenability from. That
+            ``narrowed_by`` stamps) the authoring agent judges tenability from, at most
+            ``CONFLICT_TOP_K`` and ``[]`` on a tombstone-only pause. The pause's second
+            partition, ``tombstones`` (7a), lists the retired decisions the draft sits at
+            or above ``_TOMBSTONE_FLOOR`` to, closest first, at most ``CONFLICT_TOP_K``,
+            exempt ones dropped first (:meth:`_review_tombstones`): each a retired handle
+            (:func:`~mitos.display.retired_handle`: ``slug`` / ``id`` / ``state`` /
+            ``score`` / successor stamps / ``live_end``) plus its whole ``axiom`` and, when
+            they hold, ``successor_on_pause`` and ``successor_ambiguous: true``. Counts
+            ride beside them only when non-zero: ``neighbors_omitted`` and
+            ``tombstones_omitted``; ``neighbor_review_full`` says, when the gather's live
+            fill ended full above the lower floor, that both counts cover what it read;
+            ``neighbor_review_cut`` says the gather was cut. Every one of these keys is
+            absent when computed and empty. That
             pause also echoes the caller's own declared relation targets, partitioned
             by :func:`_declared_echo` and present only when non-empty: ``declared``
             (every target it typed, canonical spellings) and
@@ -6366,114 +6682,25 @@ class MitosSyncManager:
             return _record_error("slug_collision", slug=entry.slug)
 
         # Near-duplicate review (P4) — still Phase A, so a pause writes NOTHING
-        # (buffer byte-for-byte unchanged). The neighbours payload is a stamped
-        # decision-read surface (candidate_payload) the agent judges from. Surfacing
-        # BEFORE commit is the point: after commit the author can no longer point a
-        # relation at it (a re-record is a no-op). Offline-safe
-        # (no embeddings → no pause) and bypassable with acknowledge_neighbors=True.
-        # The record surface fails OPEN on any pause-read fault: the check degrading
-        # must never block the commit, but "couldn't check" must not read as "checked,
+        # (buffer byte-for-byte unchanged). Two partitions: the live neighbours, a
+        # stamped decision-read surface (candidate_payload) the agent judges from, and
+        # the tombstones, retired decisions the draft sits closer to than their floor
+        # (7a). Surfacing BEFORE commit is the point: after commit the author can no
+        # longer point a relation at either (a re-record is a no-op). Offline-safe (no
+        # embeddings → no pause) and bypassable with acknowledge_neighbors=True. The
+        # record surface fails OPEN on any pause-read fault: the check degrading must
+        # never block the commit, but "couldn't check" must not read as "checked,
         # clean" either — the threaded notice lands on the created receipt (step 10).
         review_unavailable: Optional[str] = None
-        # The near-dup review's cut statement (Gathering.cut_above at the pause's floor),
-        # threaded to the pause or the created receipt; absent when not cut.
+        # The near-dup review's cut statement, threaded to the pause or the created
+        # receipt; absent when not cut.
         review_cut: Optional[str] = None
         if not acknowledge_neighbors:
-            neighbors: List[Dict[str, Any]] = []
-            # The caller's own declarations, per relation, for the pause echo — built
-            # BESIDE the declared-targets set below (_review_declared_targets), which
-            # folds the relation name away. Purely additive: nothing that Phase B reads moves in here.
-            # `test_mixed_neighbors_declared_edge_survives_acknowledge_bypass` documents
-            # why that matters — this whole block is skipped under acknowledge_neighbors
-            # while Phase B still writes edges from the raw relation args, so relocating
-            # any normalization into it drops declared edges when both flags travel
-            # together, with every other row green.
-            declared_by_relation: Dict[str, Optional[str]] = {
-                "supersedes": supersedes, "corrects": corrects, **extra_relations,
-            }
-            # This call's raw gathered set, filled by _review_neighbors. Primary-set
-            # input to the partition (M8); empty when the sweep never ran.
-            gathered_index: Dict[str, Tuple[str, float]] = {}
-            # The gathering itself, when the review ran healthy: the cut statement's
-            # source. Empty when it never ran or could not.
-            gatherings: List[Gathering] = []
-            try:
-                # Declared targets plus their transitive mutation lineage (3b): by
-                # naming a chain head the author has acknowledged the whole lineage.
-                # One source with the acknowledged path's post-commit gather.
-                declared_targets = self._review_declared_targets(
-                    supersedes, corrects, extra_relations)
-                reviewed = self._review_neighbors(entry, declared_targets,
-                                                  gathered_index=gathered_index,
-                                                  gathering_sink=gatherings)
-            except (DatabaseError, ValidationError) as exc:
-                # A graph-store fault during the pause read (gather's node reads or the
-                # lineage walk). Fail open — a fault this severe fails Phase B anyway,
-                # where commit-arbitration belongs; a pre-commit crash never does.
-                # Exactly these two classes: anything else is a real bug and propagates.
-                review_unavailable = _review_unavailable_notice("graph read failed")
-                # stderr: the MCP write tool shares this path and uses stdout for JSON-RPC.
-                print(f"[Warning] Neighbor review skipped for '{entry.slug}': {exc}",
-                      file=sys.stderr)
-            else:
-                if isinstance(reviewed, Unavailable):
-                    # Embed/vector-store degradation, typed by the gather. The reason
-                    # words the notice; `.detail` is logging-only, never rendered.
-                    review_unavailable = _review_unavailable_notice(
-                        _REVIEW_UNAVAILABLE_CAUSES.get(
-                            reviewed.reason, reviewed.reason.value.replace("_", " ")
-                        )
-                    )
-                else:
-                    neighbors = reviewed
-            # The cut statement, only beside a review that ran: a review that could
-            # not run already says so, and the two never co-occur.
-            if review_unavailable is None and gatherings:
-                review_cut = _review_cut_notice(gatherings[0],
-                                                _NEIGHBOR_REVIEW_THRESHOLD)
-            if neighbors:
-                # The declared-edge echo (A2). mitos is stateless across calls, so a
-                # pause on a different node cannot say "since your last attempt" — and
-                # a caller that cannot tell whether its declaration registered mints a
-                # second, false edge into the gold source. The one thing that answers
-                # it is what this call already computed and threw away.
-                echo = _declared_echo(declared_by_relation, canonical_slugs,
-                                      gathered_index, _NEIGHBOR_REVIEW_THRESHOLD)
-                # Ahead of the closing sentence, so the commitment retraction still
-                # closes the body.
-                echo_prose = "".join(f"{line}. " for line in _declared_echo_lines(echo))
-                # B9's dereference sentence only where it can apply: a neighbour that
-                # carries a stamp. On an unstamped set it sent the caller to chase a
-                # field no neighbour has.
-                stamp_clause = (
-                    "If you go on to supersede or amend a neighbour, an "
-                    "amended_by/narrowed_by stamp on it means it has moved on — "
-                    "dereference that slug before linking. "
-                    if any(n.get("amended_by") or n.get("narrowed_by") for n in neighbors)
-                    else "")
-                return {
-                    "status": "needs_review",
-                    "code": "similar_decision_exists",
-                    "slug": entry.slug,
-                    "neighbors": neighbors,
-                    "message": (
-                        f"Paused: '{entry.slug}' is ≥{_NEIGHBOR_REVIEW_THRESHOLD:.2f} "
-                        f"similar to {len(neighbors)} existing decision(s) you did not "
-                        "reference. Judge each neighbour from its axiom, "
-                        "rejected_paths, scope, and modifier stamps, then re-record "
-                        "with that judgment: a relation arg "
-                        f"({'/'.join(_PAUSE_RESOLVING_RELATIONS)}) pointing at any "
-                        "neighbour this decision genuinely relates to, "
-                        "acknowledge_neighbors=True for neighbours that stand "
-                        "independently alongside it — or both at once for a mixed "
-                        f"set. {stamp_clause}"
-                        f"{PAUSE_HELD_CLAUSE}{_PAUSE_DIGEST_CLAUSE} {echo_prose}"
-                        "Nothing was written."
-                    ),
-                    "draft_digest": _draft_digest(entry),
-                    **echo,
-                    **({"neighbor_review_cut": review_cut} if review_cut else {}),
-                }
+            review = self._review_pause(entry, supersedes, corrects, extra_relations,
+                                        canonical_slugs=canonical_slugs, own_id=node_id)
+            if review.pause is not None:
+                return review.pause
+            review_unavailable, review_cut = review.unavailable, review.cut
 
         # === Phase B — the only writes, fully serialised under one lock ===
         try:
@@ -6630,7 +6857,8 @@ class MitosSyncManager:
             # `None` list already says the read could not be trusted.
             if acknowledged is not None and acknowledged_gatherings:
                 review_cut = _review_cut_notice(acknowledged_gatherings[0],
-                                                _NEIGHBOR_REVIEW_THRESHOLD)
+                                                _NEIGHBOR_REVIEW_THRESHOLD,
+                                                tombstone_floor=_TOMBSTONE_FLOOR)
 
         # 9e. The edges this write wired, each naming what it hit (B4). Same
         #     never-raising shape as 9b/9c/9d, so the literal below holds a value
