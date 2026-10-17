@@ -17,6 +17,11 @@ lexical envelope adds both here; the dump's note gains the clause from
 The term-match itself stays in ``lexical.lexical_fallback``, which has no surface,
 so its store-less golden rows stay byte-valid.
 
+The field-scoped lookup's lexical answer (``query`` with ``field``) is composed here
+too, by :func:`lexical_rejection_envelope` over ``lexical.lexical_rejection_matches``:
+its matches are rejected options, so it has its own header, its own ``not_computed``
+tokens and its own omission clause.
+
 Tier 2: composition over ``lexical``, ``recall``, ``display`` and ``divergence``. It
 never imports ``cli`` or ``mcp_server``, and nothing in the check family imports it.
 """
@@ -25,9 +30,12 @@ from typing import Any, Dict, List, NamedTuple, Optional
 
 from mitos.display import clamp_limit, letter_payload
 from mitos.divergence import _corpus_files
-from mitos.lexical import lexical_fallback
-from mitos.recall import (DEGRADED_NOT_COMPUTED, corpus_provenance, count_withheld,
-                          degraded_omission_clause, stamps_unread_clause,
+from mitos.lexical import (_STAMPS_UNAVAILABLE_DISCLOSURE, lexical_fallback,
+                           lexical_rejection_header, lexical_rejection_matches)
+from mitos.recall import (DEGRADED_NOT_COMPUTED, LOOKUP_DEGRADED_NOT_COMPUTED,
+                          REJECTED_PATHS_FIELD, corpus_provenance, count_withheld,
+                          count_withheld_decisions, degraded_omission_clause,
+                          lookup_omission_clause, stamps_unread_clause,
                           withheld_clause)
 from mitos.store import MODIFIER_EDGE_KEYS
 
@@ -106,6 +114,100 @@ def lexical_envelope(
         envelope["open_questions"] = open_questions
     if check_notice is not None:
         envelope["check_notice"] = check_notice
+    return envelope
+
+
+# The lookup's lexical no-match line: the grep a person can run to be sure.
+_NO_REJECTION_MATCH_LINE = (
+    "No rejected option matched the text either — grep the `**Rejected:**` fields of "
+    "the workspace's `decisions.md` and `decisions/archive/` to be sure."
+)
+
+
+def lexical_rejection_envelope(
+    query: str,
+    *,
+    config: Any,
+    surface: str,
+    reason: str,
+    store: Optional[Any],
+    limit: Optional[int],
+    full_top: Optional[int],
+    gap: bool,
+) -> Dict[str, Any]:
+    """Composes the field-scoped lookup's lexical answer for either boundary.
+
+    Every exit of the lookup that cannot rank items by score answers here: a text
+    match over the parsed rejected options (``lexical.lexical_rejection_matches``),
+    labelled lexical and band-free. Keys, in order: ``query``, ``field``,
+    ``degraded``, ``degraded_reason``, ``rejection_matches`` (absent when none),
+    ``rejection_section: "gap"`` when the index is a gap, ``not_computed``
+    (:data:`recall.LOOKUP_DEGRADED_NOT_COMPUTED`), provenance, ``note``, then
+    ``stamps_unavailable`` / ``stamps_unread`` / ``unread_files`` /
+    ``rejected_paths_withheld`` when they apply. The note reads: the header, the
+    stamps disclosure, the unread files, the no-match line, the omission clause, the
+    withheld clause, the stamps-unread clause.
+
+    Args:
+        query: The claim the caller asked about.
+        config: The call's one resolved workspace config.
+        surface: ``"cli"`` or ``"mcp"`` — selects the pointer clauses' register.
+        reason: The cause phrase for the header (on the gap,
+            ``recall.rejection_lookup_gap_reason``, which carries the heal).
+        store: A readable graph store, or None when the graph itself is down.
+        limit: The caller's limit, in items.
+        full_top: How many owners keep ``rejected_paths`` (None ⇒ all, 0 ⇒ none).
+        gap: Whether the rejection index is missing over a non-empty expected set.
+
+    Returns:
+        The envelope dict, ready to encode.
+    """
+    leaf = lexical_rejection_matches(
+        query, corpus_paths=_corpus_files(config), store=store, limit=limit,
+        full_top=full_top,
+    )
+    matches = leaf["matches"]
+    envelope: Dict[str, Any] = {
+        "query": query, "field": REJECTED_PATHS_FIELD, "degraded": "lexical",
+        "degraded_reason": reason,
+    }
+    if matches:
+        envelope["rejection_matches"] = matches
+    if gap:
+        envelope["rejection_section"] = "gap"
+    envelope["not_computed"] = list(LOOKUP_DEGRADED_NOT_COMPUTED)
+    envelope.update(corpus_provenance(config))
+    note = lexical_rejection_header(reason)
+    if not leaf["graph_read"]:
+        note = f"{note} {_STAMPS_UNAVAILABLE_DISCLOSURE}"
+    unread = leaf["unread_files"]
+    if unread:
+        note = (f"{note} {len(unread)} corpus file(s) could not be read: "
+                f"{', '.join(unread)}.")
+    if not matches:
+        note = f"{note} {_NO_REJECTION_MATCH_LINE}"
+    note = f"{note} {lookup_omission_clause(retired_dropped=leaf['graph_read'])}"
+    here = [m["id"] for m in matches if m["letter"] == "here"]
+    shown: Dict[str, set] = {}
+    for match in matches:
+        shown.setdefault(match["id"], set()).add(match["ordinal"])
+    withheld = count_withheld_decisions(
+        thinned_ids=here[full_top:] if full_top is not None else [],
+        shown_ordinals=shown, item_counts=leaf["item_counts"],
+    )
+    if withheld:
+        note = f"{note} {withheld_clause(withheld, surface=surface, config=config)}"
+    if leaf["stamps_unread"]:
+        note = f"{note} {stamps_unread_clause(surface=surface, config=config)}"
+    envelope["note"] = note
+    if not leaf["graph_read"]:
+        envelope["stamps_unavailable"] = True
+    if leaf["stamps_unread"]:
+        envelope["stamps_unread"] = True
+    if unread:
+        envelope["unread_files"] = unread
+    if withheld:
+        envelope["rejected_paths_withheld"] = withheld
     return envelope
 
 

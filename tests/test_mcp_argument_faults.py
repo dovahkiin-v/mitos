@@ -92,6 +92,7 @@ def test_one_fault_is_singular_and_a_parameterless_tool_says_so():
     ("record_decision", "supersede", ["supersedes"]),
     ("surface_decisions", "projet", ["project"]),
     ("record_decision", "rejected", ["rejected_paths"]),
+    ("query_decisions", "fields", ["field"]),  # 5c's selector, once declared
     ("surface_decisions", "claim", []),  # 0.6 would say `limit` — the K4 trap
     ("record_decision", "tags", []),
     ("show_node", "name", []),
@@ -107,6 +108,18 @@ def test_did_you_mean_is_the_tools_own_names_by_containment_or_a_close_ratio(
             f"did you mean {' or '.join(f'`{name}`' for name in expected)}?"), first
     else:
         assert "did you mean" not in first and first.endswith(f"of {tool}."), first
+
+
+def test_the_field_selector_belongs_to_query_decisions_alone():
+    """5c: `surface_decisions` takes no selector (a rejection is part of its precedent
+    answer), so the boundary refuses `field` there before any tool code."""
+    assert "field" in mcp._captured_arguments["query_decisions"].properties
+    assert "field" not in mcp._captured_arguments["surface_decisions"].properties
+    body = _refusal("surface_decisions", {"query": "x", "field": "rejected_paths",
+                                          "project": "p"})
+    assert body.split("\n")[:2] == [
+        "surface_decisions was not run: 1 argument fault.",
+        "  `field` is not an argument of surface_decisions."]
 
 
 def test_a_suggestion_never_names_an_argument_already_sent():

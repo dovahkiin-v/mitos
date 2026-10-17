@@ -736,8 +736,15 @@ def test_the_upgrade_note_orders_the_server_first_and_states_the_egress() -> Non
     assert ("Meanwhile each ranked read checks every rejected item it would show "
             "against its decision's current field, so an item the previous build left "
             "stale is never shown.") in note
-    # Still no verb named and nothing said to be hidden: those are 5b's and 5c's.
-    for word in ("surface", "query", "hide"):
+    # 5c inverted 4d's "no verb named" for `query` alone: step 3 states the order the
+    # field selector needs. Still nothing about `surface`, and nothing said hidden.
+    refresh = note.index("**Then refresh each workspace's skill text.**")
+    assert reconcile < refresh
+    assert ("the skill text teaches `query_decisions`' `field` selector, which a 0.19 "
+            "server refuses and an older one ignores, answering the decision ranking "
+            "to a caller who asked for rejected options. So refresh it only after step "
+            "1 has moved every server.") in note
+    for word in ("surface", "hide"):
         assert word not in note.lower(), word
 
 

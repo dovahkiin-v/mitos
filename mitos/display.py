@@ -202,7 +202,8 @@ def retired_handle(node: Mapping[str, Any], *, score: float,
 def rejection_matches_payload(rejections: Any, *, window_ids: Sequence[str],
                               owners_whole: bool,
                               stamps: Mapping[str, Mapping[str, List[str]]],
-                              live_ends: Mapping[str, List[str]]) -> List[Dict[str, Any]]:
+                              live_ends: Mapping[str, List[str]],
+                              whole_owners: Optional[int] = None) -> List[Dict[str, Any]]:
     """Shapes a ranked answer's rejection matches — the one constructor, shared CLI⇄MCP.
 
     Every match carries ``slug``, ``id`` and ``state`` (its owner's), ``score``,
@@ -232,6 +233,11 @@ def rejection_matches_payload(rejections: Any, *, window_ids: Sequence[str],
             ``recall.rejection_owners_whole``).
         stamps: Node id → modifier stamps, as the walk returned them.
         live_ends: Node id → live-end slugs, as the walk returned them.
+        whole_owners: How many ``here`` owners keep ``rejected_paths``, counted in
+            first-appearance order (the field-scoped lookup's ``full_top``, which
+            counts owners); later ``here`` owners are axiom-only. None keeps every
+            ``here`` owner at ``owners_whole``'s depth (the section). A retired
+            owner is never counted: it carries a handle, not a Letter.
 
     Returns:
         One dict per match, in the section's (score) order.
@@ -264,9 +270,11 @@ def rejection_matches_payload(rejections: Any, *, window_ids: Sequence[str],
         elif owner["id"] in lettered:
             payload["letter"] = "section"
         else:
+            whole = owners_whole and (whole_owners is None
+                                      or len(lettered) < whole_owners)
             lettered.add(owner["id"])
             payload["letter"] = "here"
-            for key, value in letter_payload(owner, brief=not owners_whole).items():
+            for key, value in letter_payload(owner, brief=not whole).items():
                 if key not in payload:
                     payload[key] = value
         for key, slugs in stamps.get(owner["id"], {}).items():

@@ -65,6 +65,15 @@ ranked read's core p95 past the 40 ms trigger at the horizon, which builds it (A
 ``ranked-walk-resolves-every-hit-whole-light-resolver-unbuilt-until-core-p95-passes-40ms``).
 The gather keeps the one whole resolve: it consumes every retired node it passed.
 
+The field-scoped lookup
+-----------------------
+``query``'s field-scoped mode asks the rejection index alone — *was this rejected,
+and by what?* — through :func:`walk_rejection_lookup`: one search, one whole resolve
+of the hits' owners, :func:`fill_rejections` with no floor and a bound of
+``limit + 1`` items, then the window's stamps and live ends. No decision query. Its
+search failures propagate rather than becoming states, because there the rejection
+ranking is the answer.
+
 Why a module of its own
 -----------------------
 The walk cannot live in ``store.py``: the conflict gather (``conflict.gather_candidates``)
@@ -158,6 +167,18 @@ REJECTION_OVERFETCH_BOUND: int = 100
 # corpus overruns it: run the search concurrently with the decision query, inside
 # the walk (ROADMAP).
 REJECTION_SEARCH_BUDGET_SECONDS: float = 0.013
+
+# The field-scoped lookup's time budget, in seconds: the decision search's, which the
+# vision gives the lookup (§6.3) — `QdrantVectorStore.query`'s 5-second socket timeout
+# (agreement-pinned by a row that reads that method's source: this leaf cannot import
+# the vector store). A budget constant, not a calibrated threshold. It is not the
+# section's 13 ms: that budget protects a section nobody asked for inside P16's 50 ms,
+# while the lookup's caller asked, and its rejection ranking is the whole answer.
+REJECTION_LOOKUP_BUDGET_SECONDS: float = 5.0
+
+# The lookup's floor: none. `fill_rejections` stops at its bound alone, and the band
+# carries the confidence (the caller asked; a floor would silence the tool).
+NO_FLOOR: float = float("-inf")
 
 # The computed states a ranked read serves as live. Agreement-pinned to
 # `store.LIVE_STATES` by a row; spelled here because this leaf cannot import the
@@ -318,6 +339,57 @@ class RejectionWalk:
     item_counts: Dict[str, int]
     returned: int
     fetch: int
+
+
+@dataclass(frozen=True)
+class RejectionLookupWalk:
+    """What the field-scoped lookup found: rejected items ranked alone. Runtime only.
+
+    Attributes:
+        state: ``searched``, or ``over_budget`` when the search ran past its time
+            budget (then nothing was walked: the window is empty, ``end`` is
+            ``exhausted`` and ``returned`` is 0).
+        window: Verified matches in score order, at most ``limit`` distinct items.
+        edge: Verified item ``limit + 1``, or None when the walk held none.
+        end: The shared walk's four values, carried over to items: ``edge_found``
+            (``limit + 1`` items held), ``edge_unmeasured`` (exactly ``limit`` held
+            over a full fetch), ``short_bound`` (fewer than ``limit`` held over a
+            full fetch) or ``exhausted`` (the fetch came back short: the index ran
+            out).
+        limit: The caller's clamped window size, in items.
+        returned: How many hits the search returned.
+        fetch: The ``limit`` the search asked for.
+        short: ``end == short_bound``: fewer than ``limit`` items over a full fetch.
+            Never ``fill_rejections``' own ``short``, which is True on a full window
+            whose edge item the fetch did not reach.
+        dropped: Hits verification dropped, by reason — always all of
+            :data:`REJECTION_DROP_KEYS`.
+        item_counts: Owner id → how many distinct items its current field can
+            serve, for every owner of a held match.
+        stamps: Node id → modifier stamps, for the window's owners.
+        stamps_unread: True only when the stamp read or the live-end read faulted.
+        live_ends: Node id → live-end slugs, for the window's retired owners whose
+            immediate successor is retired.
+    """
+
+    state: str
+    window: List[RejectionMatch]
+    edge: Optional[RejectionMatch]
+    end: str
+    limit: int
+    returned: int
+    fetch: int
+    short: bool
+    dropped: Dict[str, int]
+    item_counts: Dict[str, int]
+    stamps: Dict[str, Dict[str, List[str]]] = field(default_factory=dict)
+    stamps_unread: bool = False
+    live_ends: Dict[str, List[str]] = field(default_factory=dict)
+
+    @property
+    def matches(self) -> List[RejectionMatch]:
+        """The window, under the name the shaper reads (never the edge)."""
+        return self.window
 
 
 @dataclass(frozen=True)
@@ -787,6 +859,123 @@ def walk_ranked(vector: List[float], *, vector_store: Any, graph: Any, limit: in
         # One fault domain with the stamps: the healthy stamps are discarded too,
         # so a handle never carries `superseded_by` without its live end.
         return replace(walk, stamps={}, live_ends={}, stamps_unread=True)
+    if not isinstance(live_ends, dict):
+        raise WalkContractError(
+            f"get_live_ends must return a dict; got {type(live_ends).__name__}"
+        )
+    return replace(walk, stamps=stamps, live_ends=live_ends)
+
+
+def walk_rejection_lookup(vector: List[float], *, index: Any, graph: Any,
+                          items_of: Callable[[str, str], Mapping[str, Any]],
+                          limit: int, fetch: int = REJECTION_OVERFETCH_BOUND,
+                          budget_seconds: float = REJECTION_LOOKUP_BUDGET_SECONDS,
+                          ) -> RejectionLookupWalk:
+    """Runs the field-scoped lookup: the rejection index alone, ranked by item.
+
+    The reads, and no others: **one** ``index.search(vector, fetch,
+    budget_seconds=…)`` — no decision query, the decision collection is not read;
+    **one** ``graph.resolve_point_ids`` over every hit's owner (point-id form,
+    deduped in hit order), whole, because verification reads each owner's
+    ``rejected_paths`` and every owner resolved is one the answer can show (none
+    when no hit names an owner); :func:`fill_rejections` with no floor and a bound
+    of ``limit + 1`` items, so the item past the window is the edge; then **one**
+    ``graph.get_modifiers_map`` over the window's owners and **one**
+    ``graph.get_live_ends`` over its retired owners (skipped when there are none),
+    in one fault domain as in :func:`walk_ranked`.
+
+    The search is the answer here, not a section beside one, so its failures are not
+    states: ``CollectionMissingError`` and every ``VectorStoreError`` propagate, and
+    each surface degrades them. The one non-raising failure is an overrun
+    (``searched=False``), returned as ``over_budget`` with nothing walked.
+
+    Args:
+        vector: The query embedding.
+        index: Duck-typed; must provide ``search(vector, limit, *, budget_seconds)``.
+        graph: The duck-typed store; must provide ``resolve_point_ids``,
+            ``get_modifiers_map`` and ``get_live_ends``.
+        items_of: ``rejections.point_items``, injected.
+        limit: The caller's clamped window size in items, ``1 <= limit < fetch``.
+        fetch: How many items the search asks for.
+        budget_seconds: The search's time budget.
+
+    Returns:
+        A :class:`RejectionLookupWalk`.
+
+    Raises:
+        WalkContractError: On a contract fault (a missing method, ``limit`` out of
+            range, a malformed answer or a non-dict stamp map).
+        DatabaseError: From the resolver; the caller degrades it as a store fault.
+        Exception: Whatever ``index.search`` raises, propagated unchanged.
+    """
+    _require_callable(index, "search", "rejection index")
+    _require_callable(graph, "resolve_point_ids", "graph store")
+    _require_callable(graph, "get_modifiers_map", "graph store")
+    _require_callable(graph, "get_live_ends", "graph store")
+    if not callable(items_of):
+        raise WalkContractError("the lookup's items_of must be callable")
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit < fetch:
+        raise WalkContractError(f"limit must satisfy 1 <= limit < fetch ({fetch}); "
+                                f"got {limit!r}")
+
+    search = index.search(vector, fetch, budget_seconds=budget_seconds)
+    if not isinstance(getattr(search, "searched", None), bool):
+        raise WalkContractError(
+            f"a rejection search answer must carry a bool searched; got {search!r}"
+        )
+    hits = _rejection_hits_of(search)
+    empty_drops = {key: 0 for key in REJECTION_DROP_KEYS}
+    if not search.searched:
+        return RejectionLookupWalk(
+            state=REJECTIONS_OVER_BUDGET, window=[], edge=None, end=EXHAUSTED,
+            limit=limit, returned=0, fetch=fetch, short=False, dropped=empty_drops,
+            item_counts={},
+        )
+    owners = list(dict.fromkeys(
+        pid for pid in (_owner_point_id(owner_id) for _pid, owner_id, _score in hits)
+        if pid is not None
+    ))
+    resolution = (_resolution(graph.resolve_point_ids(owners), "resolve_point_ids")
+                  if owners else PointResolution(nodes={}, orphans=[], ambiguous={}))
+    filled = fill_rejections(search, resolution, items_of=items_of, floor=NO_FLOOR,
+                             bound=limit + 1, fetch=fetch)
+    window = filled.matches[:limit]
+    edge = filled.matches[limit] if len(filled.matches) > limit else None
+    # `filled.short` is "bound unfilled over a full fetch"; with the bound at
+    # limit + 1 it is also True on a full window whose edge the fetch never reached,
+    # which is the unmeasured edge, not a short window.
+    if edge is not None:
+        end = EDGE_FOUND
+    elif not filled.short:
+        end = EXHAUSTED
+    elif len(window) == limit:
+        end = EDGE_UNMEASURED
+    else:
+        end = SHORT_BOUND
+    walk = RejectionLookupWalk(
+        state=REJECTIONS_SEARCHED, window=window, edge=edge, end=end, limit=limit,
+        returned=filled.returned, fetch=fetch, short=end == SHORT_BOUND,
+        dropped=filled.dropped, item_counts=filled.item_counts,
+    )
+    stamp_ids = list(dict.fromkeys(match.owner["id"] for match in window))
+    if not stamp_ids:
+        return walk
+    try:
+        stamps = graph.get_modifiers_map(stamp_ids)
+    except DatabaseError:
+        return replace(walk, stamps_unread=True)
+    if not isinstance(stamps, dict):
+        raise WalkContractError(
+            f"get_modifiers_map must return a dict; got {type(stamps).__name__}"
+        )
+    retired_ids = list(dict.fromkeys(m.owner["id"] for m in window if not m.live))
+    if not retired_ids:
+        return replace(walk, stamps=stamps)
+    try:
+        live_ends = graph.get_live_ends(retired_ids)
+    except DatabaseError:
+        # One fault domain with the stamps, as in walk_ranked.
+        return replace(walk, stamps_unread=True)
     if not isinstance(live_ends, dict):
         raise WalkContractError(
             f"get_live_ends must return a dict; got {type(live_ends).__name__}"

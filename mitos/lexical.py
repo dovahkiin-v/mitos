@@ -37,9 +37,9 @@ stand and the envelope says ``stamps_unread``.
 """
 
 import os
-from typing import Any, Dict, List, Optional, Sequence, Set
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
-from mitos.display import clamp_limit
+from mitos.display import clamp_limit, letter_payload
 from mitos.errors import (
     CollectionMissingError,
     DatabaseError,
@@ -49,6 +49,7 @@ from mitos.errors import (
 from mitos.identity import compute_node_id
 from mitos.parser import parse_entry_stream
 from mitos.provider_cause import QUOTA, classify_provider_error, provider_cause_phrase
+from mitos.rejections import enumerate_rejected_paths, point_items
 from mitos.shell_quote import shell_flag
 from mitos.store import LIVE_STATES
 
@@ -182,6 +183,19 @@ def lexical_header(reason: str) -> str:
     )
 
 
+def lexical_rejection_header(reason: str) -> str:
+    """Builds the field-scoped lookup's degraded header line for the given cause.
+
+    Not :func:`lexical_header`, which names a slug-and-axiom match: this one says
+    what ran, a text match over the rejected options themselves.
+    """
+    return (
+        f"Semantic search over rejected options unavailable ({reason}) — a "
+        f"deterministic text match over the rejected options in the markdown corpus "
+        f"(decisions.md + decisions/archive/) (degraded):"
+    )
+
+
 def _query_terms(query: str) -> List[str]:
     """Splits a query into distinct casefolded match terms (len ≥ 3)."""
     seen: List[str] = []
@@ -190,6 +204,56 @@ def _query_terms(query: str) -> List[str]:
         if len(term) >= LEXICAL_MIN_TERM_LEN and term not in seen:
             seen.append(term)
     return seen
+
+
+def _corpus_entries(corpus_paths: Sequence[str],
+                    unread: List[str]) -> Iterator[Tuple[int, int, Any]]:
+    """Yields the corpus's decision entries newest first, each slug once.
+
+    The one corpus loop both lexical matches share, so they cannot drift: files in
+    ``divergence._corpus_files`` order reversed (the buffer first), each read and
+    parsed under one guard, then every entry deduplicated by slug before any caller
+    matches it.
+
+    Args:
+        corpus_paths: The corpus files, oldest archive first, buffer last.
+        unread: Appended with the basename of every file that exists and could not
+            be read, decoded or parsed.
+
+    Yields:
+        ``(file_rank, position, entry)``: the file's rank (0 = newest), the entry's
+        position in its file, and the parsed entry.
+    """
+    seen_slugs: Set[str] = set()
+    for file_rank, path in enumerate(reversed(list(corpus_paths))):
+        # Read AND parse per file, one guard: a file that exists and cannot be
+        # read, decoded or parsed is disclosed, never answered around in silence.
+        # A file gone since the listing is simply not part of the corpus now. The
+        # commit's tokenizer, so the id a caller computes is the one the commit
+        # minted; a malformed entry is dropped into a discarded collector.
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+            entries = (
+                parse_entry_stream(text, "decision", source_path=path, failures=[])
+                if text else []
+            )
+        except FileNotFoundError:
+            continue
+        except Exception:
+            unread.append(os.path.basename(path))
+            continue
+        for position, entry in enumerate(entries):
+            # Dedup by handle only — an entry with no slug has nothing to be a
+            # duplicate of, and must not shadow another slugless entry. The newest
+            # block per slug is kept: a same-slug successor is written after its
+            # predecessor, so it is the live one whenever one is live. Every entry
+            # is seen here, matched or not.
+            key = (entry.slug or "").casefold()
+            if key and key in seen_slugs:
+                continue
+            seen_slugs.add(key)
+            yield file_rank, position, entry
 
 
 def lexical_fallback(
@@ -262,42 +326,15 @@ def lexical_fallback(
 
     ranked: List[Any] = []
     unread: List[str] = []
-    seen_slugs: Set[str] = set()
-    for file_rank, path in enumerate(reversed(list(corpus_paths))):
-        # Read AND parse per file, one guard: a file that exists and cannot be
-        # read, decoded or parsed is disclosed, never answered around in silence.
-        # A file gone since the listing is simply not part of the corpus now. The
-        # commit's tokenizer, so the id below is the one the commit minted; a
-        # malformed entry is dropped into a discarded collector.
-        try:
-            with open(path, encoding="utf-8") as f:
-                text = f.read()
-            entries = (
-                parse_entry_stream(text, "decision", source_path=path, failures=[])
-                if text else []
+    for file_rank, position, entry in _corpus_entries(corpus_paths, unread):
+        haystack = f"{entry.slug}\n{entry.axiom}".casefold()
+        hit = [t for t in terms if t in haystack]
+        if hit:
+            node_id = compute_node_id(
+                kind="decision", axiom=entry.axiom,
+                mechanism_refs=entry.mechanisms,
             )
-        except FileNotFoundError:
-            continue
-        except Exception:
-            unread.append(os.path.basename(path))
-            continue
-        for position, entry in enumerate(entries):
-            # Dedup by handle only — an entry with no slug has nothing to be a
-            # duplicate of, and must not shadow another slugless entry. The newest
-            # block per slug is kept: a same-slug successor is written after its
-            # predecessor, so it is the live one whenever one is live.
-            key = (entry.slug or "").casefold()
-            if key and key in seen_slugs:
-                continue
-            seen_slugs.add(key)
-            haystack = f"{entry.slug}\n{entry.axiom}".casefold()
-            hit = [t for t in terms if t in haystack]
-            if hit:
-                node_id = compute_node_id(
-                    kind="decision", axiom=entry.axiom,
-                    mechanism_refs=entry.mechanisms,
-                )
-                ranked.append((len(hit), file_rank, position, hit, entry, node_id))
+            ranked.append((len(hit), file_rank, position, hit, entry, node_id))
     # Most distinct terms first; ties by file (newest first), then by position —
     # every buffer and rotation-written archive is newest-first below its marker.
     ranked.sort(key=lambda t: (-t[0], t[1], t[2]))
@@ -381,3 +418,148 @@ def lexical_fallback(
         note = f"{note} {_NO_MATCH_LINE}"
     envelope["note"] = note
     return envelope
+
+
+def lexical_rejection_matches(
+    query: str,
+    *,
+    corpus_paths: Sequence[str],
+    store: Optional[Any],
+    limit: Optional[int],
+    full_top: Optional[int],
+) -> Dict[str, Any]:
+    """Term-matches the query against each rejected option in the markdown corpus.
+
+    The lexical twin of the rejection ranking, for an answer that cannot rank by
+    score: each entry's ``rejected_paths`` is enumerated
+    (``rejections.enumerate_rejected_paths``) and each **item** is matched on its own
+    text, never the raw field, with :func:`lexical_fallback`'s terms (casefold,
+    distinct, at least ``LEXICAL_MIN_TERM_LEN`` characters). Only the items the
+    rejection index could serve are candidates (``rejections.point_items``' ordinals:
+    of two byte-identical items, the first), so this answer and the semantic one name
+    the same items. Ranked by most distinct terms, then file (newest first), then
+    position, then ordinal. The corpus is read through the loop
+    :func:`lexical_fallback` reads it with.
+
+    When the graph is readable it is read twice, whatever the match count:
+    ``get_node_states`` over every candidate's owner — a retired owner's items are
+    dropped, a live one's carry ``state``, an unsynced owner's stay without one —
+    then ``get_modifiers_map`` over the stated owners shown. A ``DatabaseError`` from
+    the first is treated as no store (nothing is dropped); one from the second costs
+    the stamps alone.
+
+    Surface-free: no header, no reason and no note. The lookup's lexical envelope
+    composes those, and the ranked reads' degraded sections reuse this leaf as it is.
+
+    Args:
+        query: The claim the caller asked about.
+        corpus_paths: The corpus files in ``divergence._corpus_files`` order.
+        store: A readable ``GraphStore``, or None when the graph itself is down.
+        limit: Max matched items, clamped as the ranked reads clamp it.
+        full_top: How many owners keep ``rejected_paths`` on their Letter, by first
+            appearance (None ⇒ all, 0 ⇒ none). Matched items are never thinned.
+
+    Returns:
+        ``{matches, item_counts, graph_read, stamps_unread, unread_files}``. Each
+        match carries ``slug``, ``id`` (the owner's content-hash id), ``state`` when
+        known, ``ordinal``, ``item``, ``matched_terms`` (``stopwords_dropped`` when
+        non-zero) and ``letter``: ``here`` on an owner's first match, followed by its
+        Letter (``axiom``, ``scope``, ``rejected_paths`` unless thinned), or
+        ``section`` on its later ones; then the owner's stamps when read. No
+        ``score``. ``item_counts`` maps each matched owner to how many distinct items
+        its field can serve.
+
+    Raises:
+        TypeError: When ``corpus_paths`` is a single string.
+    """
+    if isinstance(corpus_paths, (str, bytes)):
+        raise TypeError(
+            "lexical_rejection_matches: corpus_paths is a sequence of corpus file "
+            "paths, not one path string"
+        )
+    cap = clamp_limit(limit)
+    terms = _query_terms(query)
+
+    ranked: List[Any] = []
+    unread: List[str] = []
+    servable: Dict[str, int] = {}
+    for file_rank, position, entry in _corpus_entries(corpus_paths, unread):
+        hits = []
+        for item in enumerate_rejected_paths(entry.rejected_paths).items:
+            haystack = item.text.casefold()
+            hit = [t for t in terms if t in haystack]
+            if hit:
+                hits.append((item, hit))
+        if not hits:
+            continue
+        node_id = compute_node_id(
+            kind="decision", axiom=entry.axiom, mechanism_refs=entry.mechanisms,
+        )
+        ordinals = {i.ordinal for i in point_items(node_id, entry.rejected_paths).values()}
+        servable[node_id] = len(ordinals)
+        for item, hit in hits:
+            if item.ordinal in ordinals:
+                ranked.append((len(hit), file_rank, position, item.ordinal, hit, entry,
+                               node_id, item))
+    ranked.sort(key=lambda t: (-t[0], t[1], t[2], t[3]))
+
+    # One state read over every candidate owner, before the cap and the thinning,
+    # which count kept matches only (lexical_fallback's rule, and its fault rule).
+    graph_read = store is not None
+    states: Dict[str, str] = {}
+    if store is not None:
+        try:
+            states = store.get_node_states(list(dict.fromkeys(t[6] for t in ranked)))
+        except DatabaseError:
+            graph_read = False
+
+    matches: List[Dict[str, Any]] = []
+    lettered: List[str] = []
+    stated: List[str] = []
+    for _count, _file_rank, _position, ordinal, hit, entry, node_id, item in ranked:
+        state = states.get(node_id) if graph_read else None
+        if state is not None and state not in LIVE_STATES:
+            continue
+        payload: Dict[str, Any] = {"slug": entry.slug, "id": node_id}
+        if state is not None:
+            payload["state"] = state
+        payload["ordinal"] = ordinal
+        payload["item"] = item.text.rstrip()
+        payload["matched_terms"] = [t for t in hit if t not in DISPLAY_STOPWORDS]
+        dropped = len(hit) - len(payload["matched_terms"])
+        if dropped:
+            payload["stopwords_dropped"] = dropped
+        if node_id in lettered:
+            payload["letter"] = "section"
+        else:
+            whole = full_top is None or len(lettered) < full_top
+            lettered.append(node_id)
+            payload["letter"] = "here"
+            owner = {"slug": entry.slug, "core_axiom": entry.axiom,
+                     "scope": entry.scope, "rejected_paths": entry.rejected_paths}
+            for key, value in letter_payload(owner, brief=not whole).items():
+                if key not in payload:
+                    payload[key] = value
+        if state is not None and node_id not in stated:
+            stated.append(node_id)
+        matches.append(payload)
+        if len(matches) >= cap:
+            break
+
+    stamps_unread = False
+    if graph_read:
+        try:
+            stamps = store.get_modifiers_map(stated)
+        except DatabaseError:
+            stamps_unread = True
+        else:
+            for payload in matches:
+                for key, slugs in stamps.get(payload["id"], {}).items():
+                    payload[key] = list(slugs)
+    return {
+        "matches": matches,
+        "item_counts": {m["id"]: servable[m["id"]] for m in matches},
+        "graph_read": graph_read,
+        "stamps_unread": stamps_unread,
+        "unread_files": unread,
+    }

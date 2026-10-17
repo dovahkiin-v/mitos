@@ -294,6 +294,9 @@ CLASSIFIED = {
     ("cli", "brief"): _to(*_RANKED),  # skill text: `brief=True`
     ("cli", "full_top"): _to(*_RANKED),  # skill text: `full_top=N`
     ("cli", "clear"): _to("amend_commentary"),  # skill text: `clear=[…]`
+    # skill text: `field="rejected_paths"`, the field-scoped lookup (5c). Only
+    # `query_decisions` declares it; `surface_decisions` refuses it.
+    ("cli", "field"): _to("query_decisions"),
     ("cli", "state"): _not_a_call_form("the `mitos list` text header"),
     ("conflict", "slug"): _not_a_call_form("an internal ValueError message"),
     # `name` became a tool parameter with `unregister_project` (0.19.1), which

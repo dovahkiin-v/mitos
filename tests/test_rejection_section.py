@@ -1259,10 +1259,11 @@ def test_every_ranked_walk_call_passes_the_leg() -> None:
                      ("cli.py", "cmd_query"): True}
 
 
-def test_the_rejection_search_is_called_only_by_the_walk() -> None:
+def test_the_rejection_search_is_called_only_by_the_walks() -> None:
     """The twin of the one-vector-call row: an index ``.search(`` call in ``mitos/``
-    lives in ``retrieval_walk.walk_ranked`` alone (``re`` and compiled patterns'
-    ``.search`` are not index calls)."""
+    lives in the two walks alone — ``walk_ranked``'s leg and 5c's
+    ``walk_rejection_lookup`` — so no surface searches the index around them (``re``
+    and compiled patterns' ``.search`` are not index calls)."""
     sites = set()
     for filename in sorted(os.listdir(MITOS_DIR)):
         if not filename.endswith(".py"):
@@ -1276,11 +1277,13 @@ def test_the_rejection_search_is_called_only_by_the_walk() -> None:
                         and node.func.attr == "search"
                         and any(kw.arg == "budget_seconds" for kw in node.keywords)):
                     sites.add((filename, fn.name))
-    assert sites == {("retrieval_walk.py", "walk_ranked")}
+    assert sites == {("retrieval_walk.py", "walk_ranked"),
+                     ("retrieval_walk.py", "walk_rejection_lookup")}
 
 
-def test_the_fetch_bound_exceeds_the_limit_ceiling() -> None:
-    assert REJECTION_OVERFETCH_BOUND > RANKED_LIMIT_CEILING
+def test_the_fetch_bound_holds_the_lookups_edge_at_the_limit_ceiling() -> None:
+    """Tightened by 5c (G5): the lookup fills ``limit + 1`` items from this one fetch."""
+    assert REJECTION_OVERFETCH_BOUND > RANKED_LIMIT_CEILING + 1
 
 
 def test_the_floor_is_calibrated() -> None:

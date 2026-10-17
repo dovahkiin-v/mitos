@@ -52,6 +52,10 @@ EXEMPT: Dict[str, str] = {
     ),
     "mitos.conflict.CONFLICT_SURFACE_THRESHOLD": "judge confidence gate, not an embedding similarity",
     "mitos.display._ONELINE_AXIOM_FLOOR": "a display width in characters (24), not a similarity",
+    "mitos.retrieval_walk.NO_FLOOR": (
+        "-inf: the field-scoped lookup's absence of a floor, by design (5c D3); the band "
+        "carries its confidence, so there is no value to calibrate"
+    ),
 }
 
 

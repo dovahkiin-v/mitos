@@ -30,7 +30,7 @@ from mitos.errors import (
     TARGET_RELATIVE_PATH,
     TARGET_UNKNOWN_NAME,
 )
-from mitos.degraded import lexical_envelope, scope_dump
+from mitos.degraded import lexical_envelope, lexical_rejection_envelope, scope_dump
 from mitos.lexical import degraded_reason_from_error
 from mitos.check_notice import compose_check_notice
 from mitos.telemetry import read_last_attempt
@@ -43,12 +43,17 @@ from mitos.recall import (DEGRADED_NOT_COMPUTED, RANKED_EDGE_MARGIN, RetiredPart
                           corpus_provenance, missing_graph_is_a_gap,
                           missing_graph_note, missing_index_is_a_gap,
                           missing_rejection_index_is_a_gap, REJECTION_MATCH_FLOOR,
-                          REJECTION_SECTION_BOUND, rejection_section,
+                          REJECTION_LOOKUP_OVER_BUDGET_REASON,
+                          REJECTION_SECTION_BOUND, lookup_field_fault,
+                          rejection_lookup, rejection_lookup_gap_reason,
+                          rejection_section,
                           retired_partition, scope_filter_recovery, count_withheld,
                           short_window, stamps_unread_clause, window_edge,
                           withheld_clause)
 from mitos.rejections import point_items
-from mitos.retrieval_walk import RejectionLeg, WalkContractError, walk_ranked
+from mitos.retrieval_walk import (REJECTIONS_OVER_BUDGET, RejectionLeg,
+                                  WalkContractError, walk_ranked,
+                                  walk_rejection_lookup)
 
 # No cross-call "seen" dedup state — deliberately. An earlier design cached
 # already-surfaced slugs in a process-global set and trimmed `rejected_paths` (the
@@ -1452,7 +1457,8 @@ def show_node(ident: str, project: Optional[str] = None) -> str:
 
 @mcp.tool()
 def query_decisions(query: str, depth: str = "letter", brief: bool = False, limit: int = 5,
-                    project: Optional[str] = None, full_top: Optional[int] = None) -> str:
+                    project: Optional[str] = None, full_top: Optional[int] = None,
+                    field: Optional[str] = None) -> str:
     """Look up a SPECIFIC decision by slug or claim — the targeted lookup.
 
     Use this when you know roughly what you're after (a pointed claim, or a slug
@@ -1482,6 +1488,10 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
         project: Which project this call is about — REQUIRED on every call: a
             registered project name (e.g. 'mitos') or the absolute path of a
             workspace. Call `list_projects()` if you do not know the names.
+        field: Set to "rejected_paths" (its one value) to ask "was this rejected,
+            and by what?": the rejection index is searched alone. `limit` then
+            counts rejected options, `full_top` counts their decisions, and a slug
+            in `query` is ranked like any claim, never dereferenced.
 
     Returns:
         A JSON string containing the ranked results in Letter-mode payload shape.
@@ -1503,7 +1513,8 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
         (owner slug, state, stamps, score, ordinal, whole item, `letter`). One means
         that decision rejected it in its own context, whatever the band; weigh
         whether the reason carries over. `rejection_section` appears only when the
-        section is not whole.
+        section is not whole. With `field`, the answer is `rejection_matches` alone,
+        ranked by option, each owner's Letter once; its band rates that ranking.
     """
     # No standing check notice on any exit of this verb, deliberately (vision §4.3):
     # `surface_decisions` is the read put before a write and carries it; a second
@@ -1517,6 +1528,9 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
     fault = _full_top_fault(brief, full_top)
     if fault:
         return fault
+    field_fault = lookup_field_fault(field)
+    if field_fault:
+        return dumps_display({"error": field_fault}, ensure_ascii=False, indent=None)
     # One effective depth value from here down; the exact-slug branch ignores it.
     if brief:
         full_top = 0
@@ -1529,11 +1543,23 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
     try:
         store, embed_provider, vector_store = get_workspace_components(config)
     except Exception as e:
+        reason = degraded_reason_from_error(e, surface="mcp", project=config.project)
+        if field is not None:
+            return _lexical_rejection_response(
+                query, config=config, reason=reason, store=None, full_top=full_top,
+                limit=clamp_limit(limit), gap=False,
+            )
         return _lexical_degraded_response(
-            query, config=config, reason=degraded_reason_from_error(
-                e, surface="mcp", project=config.project), store=None,
+            query, config=config, reason=reason, store=None,
             full_top=full_top, limit=clamp_limit(limit),
         )
+
+    # The field-scoped lookup, before the exact-slug branch: a caller asking what
+    # was rejected is not asking for the decision a slug names.
+    if field is not None:
+        return _query_rejections(query, config=config, store=store,
+                                 embed_provider=embed_provider, limit=limit,
+                                 full_top=full_top)
 
     # 1. Try resolving query as direct slug first. The `try` covers the store reads
     #    only: a failed lookup falls through to the ranked search, as does a slug
@@ -1740,6 +1766,81 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             None, surface="mcp", project=config.project), store=store,
         full_top=full_top, limit=clamp_limit(limit),
     )
+
+
+def _lexical_rejection_response(query: str, *, config: MitosConfig, reason: str,
+                                store: Optional[GraphStore], full_top: Optional[int],
+                                limit: int, gap: bool) -> str:
+    """Encodes the field-scoped lookup's lexical answer (``degraded.lexical_rejection_envelope``)."""
+    envelope = lexical_rejection_envelope(
+        query, config=config, surface="mcp", reason=reason, store=store, limit=limit,
+        full_top=full_top, gap=gap,
+    )
+    return dumps_display(envelope, ensure_ascii=False, indent=2)
+
+
+def _query_rejections(query: str, *, config: MitosConfig, store: GraphStore,
+                      embed_provider: Optional[GeminiEmbeddingProvider],
+                      limit: Optional[int], full_top: Optional[int]) -> str:
+    """Answers ``query_decisions(field="rejected_paths")``: the rejection index alone.
+
+    The MCP twin of ``cli._cmd_query_rejections``: one embedding, the lookup walk
+    (``retrieval_walk.walk_rejection_lookup``; the decision collection is not read),
+    then ``recall.rejection_lookup`` composes the answer. Every exit that cannot rank
+    items answers with the lexical match over rejected options: no provider or index,
+    an embedding or index fault, a resolver fault, an overrun, and an absent
+    collection over decisions that state rejected options (the gap). An absent
+    collection over none is the healthy empty answer.
+
+    Args:
+        query: The claim the caller asked about.
+        config: The call's one resolved workspace config.
+        store: The read-only graph store.
+        embed_provider: The embedding provider, or None when none is wired.
+        limit: The caller's limit in items (clamped here).
+        full_top: The effective depth in owners (0 under ``brief``).
+
+    Returns:
+        The answer as a JSON string.
+    """
+    top_k = clamp_limit(limit)
+
+    def lexical(reason: str, *, gap: bool = False) -> str:
+        return _lexical_rejection_response(query, config=config, reason=reason,
+                                           store=store, full_top=full_top,
+                                           limit=top_k, gap=gap)
+
+    index = _ranked_rejection_index(config)
+    if embed_provider is None or index is None:
+        return lexical(degraded_reason_from_error(None, surface="mcp",
+                                                  project=config.project))
+    walk = None
+    try:
+        q_vector = embed_provider.get_embedding(query, is_query=True)
+        walk = walk_rejection_lookup(q_vector, index=index, graph=store,
+                                     items_of=point_items, limit=top_k)
+    except WalkContractError:
+        # A wrong store or index double: loud, never "recall degraded".
+        raise
+    except CollectionMissingError:
+        if missing_rejection_index_is_a_gap(store):
+            return lexical(rejection_lookup_gap_reason(surface="mcp", config=config),
+                           gap=True)
+        # An empty expected set: the absent collection IS the empty index, and the
+        # composer below builds the healthy empty answer from no walk.
+    except Exception as e:
+        return lexical(degraded_reason_from_error(e, surface="mcp",
+                                                  project=config.project))
+    if walk is not None and walk.state == REJECTIONS_OVER_BUDGET:
+        return lexical(REJECTION_LOOKUP_OVER_BUDGET_REASON)
+    envelope = rejection_lookup(
+        walk, query=query, full_top=full_top, shape=rejection_matches_payload,
+        margin=RANKED_EDGE_MARGIN, ceiling=RANKED_LIMIT_CEILING,
+        graph_gap=lambda: missing_graph_is_a_gap(
+            store, config, corpus_scan=corpus_holds_entries),
+        surface="mcp", config=config,
+    )
+    return dumps_display(envelope, ensure_ascii=False, indent=2)
 
 
 #: MCP's recovery clause for a record-path rotation failure: a fact and a human next

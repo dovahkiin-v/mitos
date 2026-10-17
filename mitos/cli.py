@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import (
-    Callable, FrozenSet, List, Mapping, Optional, Dict, Any, Sequence, Set, Tuple,
+    Callable, FrozenSet, List, Mapping, NamedTuple, Optional, Dict, Any, Sequence, Set, Tuple,
 )
 
 from mitos import __version__
@@ -102,7 +102,7 @@ from mitos.store import (GraphStore, MODIFIER_EDGE_KEYS, REJECTION_BACKLOG_FAILU
                          open_connection)
 from mitos.rejections import diff_rejection_index, expected_rejection_points, point_items
 from mitos.cutover import default_aside_db_path, perform_swap, rebuild_and_gate
-from mitos.degraded import lexical_envelope, scope_dump
+from mitos.degraded import lexical_envelope, lexical_rejection_envelope, scope_dump
 from mitos.lexical import degraded_reason_from_error
 from mitos.recall import (DEGRADED_NOT_COMPUTED, RANKED_EDGE_MARGIN, RetiredPartition,
                           assess_query_recall, assess_surface_recall, blackout_note,
@@ -110,11 +110,16 @@ from mitos.recall import (DEGRADED_NOT_COMPUTED, RANKED_EDGE_MARGIN, RetiredPart
                           missing_graph_note, missing_index_is_a_gap,
                           missing_rejection_index_is_a_gap,
                           provenance_line, REJECTION_MATCH_FLOOR,
-                          REJECTION_SECTION_BOUND, rejection_section,
+                          LOOKUP_FIELDS, REJECTION_LOOKUP_OVER_BUDGET_REASON,
+                          REJECTION_SECTION_BOUND, lookup_field_fault,
+                          rejection_lookup, rejection_lookup_gap_reason,
+                          rejection_section,
                           retired_partition, scope_filter_recovery,
                           count_withheld, short_window, stamps_unread_clause,
                           window_edge, withheld_clause)
-from mitos.retrieval_walk import RejectionLeg, WalkContractError, walk_ranked
+from mitos.retrieval_walk import (REJECTIONS_OVER_BUDGET, RejectionLeg,
+                                  WalkContractError, walk_ranked,
+                                  walk_rejection_lookup)
 from mitos.sync import (MitosSyncManager, run_ambient_capture, _SLUG_MAX_LEN,
                         _ENTRIES_MARKER, _NEIGHBOR_REVIEW_THRESHOLD,
                         _PAUSE_RESOLVING_RELATIONS, _declared_echo_lines, _split_relation_slugs,
@@ -560,7 +565,7 @@ def _skill_md_text(format_spec_content: str) -> str:
         "If the Mitos MCP server is wired into your agent, call these tools directly — best experience: structured args, no shell-quoting. If it is NOT wired, each maps to a CLI verb (and the CLI also accepts five of the long names as aliases, e.g. `mitos record_decision -p .`):\n"
         "- `record_decision`  (CLI: `mitos record -p .`) — the moment you commit to a foundational choice (a schema, a library, a pattern, a path you're abandoning), persist it WITH the alternatives you rejected and why, so future sessions inherit it instead of relitigating. Recording rich prose via the CLI? Use `--axiom-file -` / `--rejected-file -` / `--context-file -` to read from stdin and avoid shell-quoting.\n"
         "- `surface_decisions` (CLI: `mitos surface -p .`) — surface active precedents for a claim/scope BEFORE you decide, so you don't relitigate a settled call. This is the recall loop — use it first. Every hit carries its full `rejected_paths` by default. `brief=True` (CLI `--brief`) is an existence screen: scan the axioms, then read the hits that matter whole with `show_node`. `full_top=N` (CLI `--full-top N`) keeps the reasoning on the top N ranks only. If an answer carries `rejection_matches`, read them before you propose: each is an option a decision already rejected for its own question, with that decision's reason — weigh whether the reason carries over.\n"
-        "- `query_decisions`   (CLI: `mitos query -p .`) — the TARGETED lookup: a slug you are carrying, or a pointed claim. Its confidence band rates how well the ranking matched what you named, not whether precedent exists — `surface_decisions` answers that one.\n"
+        "- `query_decisions`   (CLI: `mitos query -p .`) — the TARGETED lookup of a pointed claim. On the tool an exact slug returns that decision whole; on the CLI, read a slug with `mitos show -p . -- <slug>`. Its confidence band rates how well the ranking matched what you named, not whether precedent exists — `surface_decisions` answers that one. Before you propose an option, ask whether it was already rejected: `field=\"rejected_paths\"` (CLI `--field rejected_paths`) ranks the rejected options alone, each with its decision's reason.\n"
         "- `list_decisions`    (CLI: `mitos list -p .`) — the EXHAUSTIVE recall path. surface/query are semantic and capped at the top few matches; this returns EVERY decision in a scope, deterministically, so a completeness pass or audit doesn't miss anything below the relevance cliff. Needs no key or Qdrant.\n"
         "- `list_scopes`       (CLI: `mitos scopes -p .`) — the scope vocabulary with a count per tag. Read it before a scope-filtered read, or before tagging a new decision, so you reuse a tag that exists instead of minting a near-duplicate.\n"
         "- `show_node`         (CLI: `mitos show -p . -- <slug>`) — dereference one exact handle (slug or id) to its stored fields, including a node that has been superseded; transcripts, provenance and outgoing edges are left out.\n"
@@ -1298,7 +1303,8 @@ def _emit_lexical_degraded(config: MitosConfig, query: str, *, reason: str,
 
 def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
               as_json: bool = False, brief: bool = False,
-              limit: Optional[int] = None, full_top: Optional[int] = None) -> None:
+              limit: Optional[int] = None, full_top: Optional[int] = None,
+              field: Optional[str] = None) -> None:
     """Queries the vector store semantically for similar decisions — the CLI twin
     of the MCP ``query_decisions`` tool's *ranked* branch.
 
@@ -1326,6 +1332,11 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
             ``min(default, N)`` truncation.
         full_top: Keep ``rejected_paths`` on ranks 1..N among the returned
             decisions only; None ⇒ every rank whole.
+        field: ``"rejected_paths"`` asks the field-scoped lookup instead — the
+            rejection index alone, ranked by item (:func:`_cmd_query_rejections`);
+            ``limit`` then counts items and ``full_top`` owners. None ⇒ the
+            decision ranking. Any other value is refused (argparse's ``choices``
+            refuses it first on the command line).
     """
     # One effective depth value from here down: `brief` is `full_top=0`.
     if brief:
@@ -1340,6 +1351,17 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
             _emit_json({"error": msg, **corpus_provenance(config)}, indent=None)
             return
         raise ValueError(msg)
+    # The same refusal as the depth fault's, on both encodings, for direct callers.
+    field_fault = lookup_field_fault(field)
+    if field_fault:
+        if as_json:
+            _emit_json({"error": field_fault, **corpus_provenance(config)}, indent=None)
+            return
+        raise ValueError(field_fault)
+    if field is not None:
+        _cmd_query_rejections(config, query_text, as_json=as_json, limit=limit,
+                              full_top=full_top)
+        return
 
     # No standing check notice on any exit of this verb, deliberately (vision §4.3):
     # `surface` is the read put before a write and carries it; a second telemetry
@@ -1588,6 +1610,137 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
     _print_retired_partition(handles, part.omitted)
     _print_rejection_section(section)
     print(f"→ {_closing(note)}")
+
+
+def _cmd_query_rejections(config: MitosConfig, query_text: str, *, as_json: bool,
+                          limit: Optional[int], full_top: Optional[int]) -> None:
+    """Answers ``mitos query --field rejected_paths``: the rejection index alone.
+
+    The CLI twin of ``mcp_server._query_rejections`` — the same walk
+    (``retrieval_walk.walk_rejection_lookup``), the same composer
+    (``recall.rejection_lookup``) and the same lexical answer
+    (``degraded.lexical_rejection_envelope``) on the same exits; the text is a
+    renderer over the envelope ``--json`` emits. Like the decision ranking it never
+    dereferences a slug (ADR ``cli-query-stays-semantic-not-dereference-twin``).
+
+    Args:
+        config: The active workspace configuration.
+        query_text: The claim the caller asked about.
+        as_json: Emit the JSON envelope instead of text.
+        limit: The caller's limit in items.
+        full_top: The effective depth in owners (0 under ``--brief``).
+    """
+    top_k = clamp_limit(limit)
+
+    def lexical(reason: str, store: Optional[GraphStore], *, gap: bool = False) -> None:
+        envelope = lexical_rejection_envelope(
+            query_text, config=config, surface="cli", reason=reason, store=store,
+            limit=top_k, full_top=full_top, gap=gap,
+        )
+        if as_json:
+            _emit_json(envelope)
+        else:
+            _print_rejection_lookup_lexical(config, envelope)
+
+    # A pre-V1a graph raises at store construction: the match reads markdown alone.
+    try:
+        manager = MitosSyncManager(config)
+    except Exception as e:
+        lexical(degraded_reason_from_error(e, surface="cli", project=config.project),
+                None)
+        return
+    store = manager.store
+    index = _ranked_rejection_index(config)
+    if not manager.embed_provider or index is None:
+        lexical(degraded_reason_from_error(None, surface="cli", project=config.project),
+                store)
+        return
+    walk = None
+    try:
+        q_vector = manager.embed_provider.get_embedding(query_text, is_query=True)
+        walk = walk_rejection_lookup(q_vector, index=index, graph=store,
+                                     items_of=point_items, limit=top_k)
+    except WalkContractError:
+        # A wrong store or index double: loud, never "recall degraded".
+        raise
+    except CollectionMissingError:
+        if missing_rejection_index_is_a_gap(store):
+            lexical(rejection_lookup_gap_reason(surface="cli", config=config), store,
+                    gap=True)
+            return
+        # An empty expected set: the absent collection IS the empty index.
+    except Exception as e:
+        lexical(degraded_reason_from_error(e, surface="cli", project=config.project),
+                store)
+        return
+    if walk is not None and walk.state == REJECTIONS_OVER_BUDGET:
+        lexical(REJECTION_LOOKUP_OVER_BUDGET_REASON, store)
+        return
+    envelope = rejection_lookup(
+        walk, query=query_text, full_top=full_top, shape=rejection_matches_payload,
+        margin=RANKED_EDGE_MARGIN, ceiling=RANKED_LIMIT_CEILING,
+        graph_gap=lambda: missing_graph_is_a_gap(
+            store, config, corpus_scan=corpus_holds_entries),
+        surface="cli", config=config,
+    )
+    if as_json:
+        _emit_json(envelope)
+        return
+    _print_rejection_lookup(config, envelope)
+
+
+class _MatchList(NamedTuple):
+    """The ``matches`` view :func:`_print_rejection_section` reads."""
+
+    matches: List[Dict[str, Any]]
+
+
+def _print_rejection_lookup(config: MitosConfig, envelope: Dict[str, Any]) -> None:
+    """Renders the field-scoped lookup's healthy envelope on the CLI text surface.
+
+    The corpus line, the band line (as ``mitos query`` prints it), the ranked
+    rejected options through :func:`_print_rejection_section` (the section's own
+    match lines), then the ``→`` note. A miss says so in place of the list.
+    """
+    matches = envelope.get("rejection_matches", [])
+    if matches:
+        print(f"\nRejection lookup for: '{envelope['query']}'  [{provenance_line(config)}]")
+    else:
+        print(provenance_line(config))
+        print("No matching rejected options found.")
+    band_line = _query_band_line(envelope["confidence"])
+    if band_line:
+        print(band_line)
+    if matches:
+        print("-" * 60)
+        _print_rejection_section(_MatchList(matches))
+    print(f"→ {envelope['note']}")
+
+
+def _print_rejection_lookup_lexical(config: MitosConfig, envelope: Dict[str, Any]) -> None:
+    """Renders the field-scoped lookup's lexical answer on the CLI text surface.
+
+    The corpus line, the note (the degraded header first), then one line per
+    matched item — owner slug, state when known, ordinal and the item — with its
+    matched terms, and the owner's Letter under a ``here`` match.
+    """
+    print(provenance_line(config))
+    print(envelope["note"])
+    for m in envelope.get("rejection_matches", []):
+        state = f"  ({m['state']})" if "state" in m else ""
+        print(f"  {m['slug']}{state}  item {m['ordinal']}: {m['item']}")
+        if m["matched_terms"]:
+            print(f"    matched: {', '.join(m['matched_terms'])}")
+        if m["letter"] == "here":
+            print(f"    Decided:  {m['axiom']}")
+            if "rejected_paths" in m:
+                print(f"    Rejected: {m['rejected_paths']}")
+            if m["scope"]:
+                print(f"    Scope:    {', '.join(m['scope'])}")
+        marker = _modifier_marker(m)
+        if marker:
+            print(f"    {marker}")
+    print()
 
 
 def _print_retired_partition(handles: List[Dict[str, Any]], omitted: int) -> None:
@@ -8931,7 +9084,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # query (alias: query_decisions — MCP tool name)
     q_p = subparsers.add_parser("query", aliases=["query_decisions"],
-                                help="Targeted lookup by slug or pointed claim (its confidence rates the ranking, not the corpus).")
+                                help="Targeted lookup of a pointed claim; `--field rejected_paths` ranks rejected options alone (its confidence rates the ranking, not the corpus).")
     q_p.add_argument("claim", help="Assertion or subsystem query.")
     q_p.add_argument("--depth", default="letter", help="Depth (default: letter).")
     q_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON.")
@@ -8942,6 +9095,8 @@ def _build_parser() -> argparse.ArgumentParser:
                          dest="full_top", help=_FULL_TOP_HELP)
     q_p.add_argument("--limit", type=int, default=None,
                      help="Set ranked top-k to retrieve (1–50; default 5). Raises or lowers the count — a context-budget dial; a degraded text match takes the same count.")
+    q_p.add_argument("--field", choices=list(LOOKUP_FIELDS), default=None,
+                     help="Search one stored field alone: `rejected_paths` asks whether an option was already rejected, and by what. --limit then counts rejected options and --full-top their decisions.")
 
     # surface (alias: surface_decisions — MCP tool name) — the precedent-recall loop
     surf_p = subparsers.add_parser("surface", aliases=["surface_decisions"],
@@ -9492,7 +9647,7 @@ def main() -> None:
         elif args.command == "capture":
             cmd_capture(config, args.text)
         elif args.command in ("query", "query_decisions"):
-            cmd_query(config, args.claim, depth=args.depth, as_json=args.as_json, brief=args.brief, limit=args.limit, full_top=args.full_top)
+            cmd_query(config, args.claim, depth=args.depth, as_json=args.as_json, brief=args.brief, limit=args.limit, full_top=args.full_top, field=args.field)
         elif args.command in ("surface", "surface_decisions"):
             cmd_surface(config, args.query, scope=args.scope, as_json=args.as_json, brief=args.brief, limit=args.limit, full_top=args.full_top)
         elif args.command == "show":

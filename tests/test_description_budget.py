@@ -259,6 +259,25 @@ def test_the_ranked_descriptions_name_the_rejection_section(tool):
         assert desc.index(phrase) > returns, (tool, phrase, "outside Returns")
 
 
+def test_query_decisions_documents_the_field_selector_after_project():
+    """5c: `field` is documented past `project`, so the required-argument window (and
+    the head) did not move; its doc names the one value, what it searches, what
+    `limit`/`full_top` count there and the exact-slug exit it never takes; `Returns`
+    says what the answer is with it."""
+    desc = _descriptions()["query_decisions"]
+    project = _arg_entry_span(desc, "project")
+    field = _arg_entry_span(desc, "field")
+    assert field[0] > project[1]
+    assert project[1] <= REQUIRED_ARGS_WINDOW
+    doc = _flat(desc[field[0]:field[1]])
+    for phrase in ('"rejected_paths"', "was this rejected, and by what?",
+                   "searched alone", "`limit` then counts rejected options",
+                   "`full_top` counts their decisions", "never dereferenced"):
+        assert phrase in doc, phrase
+    returns = _flat(desc[desc.index("Returns:"):])
+    assert "With `field`, the answer is `rejection_matches` alone" in returns
+
+
 _REQUIRED_PAIRS = _required_pairs()
 
 

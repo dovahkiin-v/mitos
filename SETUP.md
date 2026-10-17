@@ -275,7 +275,7 @@ uses the MCP for the decision loop and the CLI for setup/ops.
 | Inspect open questions — `open-questions` | ✅ (only here) | — |
 | **Record a decision** (+ typed relations: `supersedes`/`amends`/`depends_on`/…) | `mitos record` | `record_decision` ★ |
 | **Surface precedents (the recall loop)** | `mitos surface` | `surface_decisions` ★ |
-| **Look up by slug/claim** | `mitos query` | `query_decisions` |
+| **Look up a pointed claim** (MCP also an exact slug; `--field rejected_paths` / `field` ranks rejected options alone) | `mitos query` | `query_decisions` |
 | **Enumerate the full set in a scope (exhaustive recall)** | `mitos list` | `list_decisions` |
 | **Enumerate the scope vocabulary** | `mitos scopes` | `list_scopes` |
 | **Show one node by slug** | `mitos show` | `show_node` |
@@ -537,7 +537,11 @@ order:
    vectors are back they take slots from live hits in its reads and in its
    conflict sensing.
 3. **Then refresh each workspace's skill text.** If `mitos status <project>`
-   reports that `.mitos/skill.md` differs, run the command it prints.
+   reports that `.mitos/skill.md` differs, run the command it prints. The order
+   matters here too: the skill text teaches `query_decisions`' `field` selector,
+   which a 0.19 server refuses and an older one ignores, answering the decision
+   ranking to a caller who asked for rejected options. So refresh it only after
+   step 1 has moved every server.
 4. **What leaves the machine.** Each decision's `rejected_paths` is now sent to
    the embedding provider beside its axiom.
 5. **Rolling back.** Install the previous version. The rejection collection stays

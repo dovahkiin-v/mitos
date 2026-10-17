@@ -27,6 +27,11 @@ that was not computed whole (gap, not searched, unavailable, short) with its not
 clause and the gap's per-surface heal, and the withheld rule counted over decisions.
 The walk that found the matches and the shaper that words them are handed in.
 
+The **field-scoped lookup** (``query``'s ``field`` selector, :func:`rejection_lookup`)
+is composed here as well: the rejection ranking as the whole answer, its band legend,
+its edge counted in owners, its short clause, and the lexical answer's not-computed
+tokens and reasons.
+
 The policy is **surface-agnostic**: it emits the recall *signal* (which confidence
 branch, whether the scope tag is unused) and words each pointer from a per-surface
 table (CLI verbs vs MCP tool call-forms), so no CLI/MCP presentation knowledge
@@ -1253,6 +1258,309 @@ def rejection_section(walk: "object", *, full_top: Optional[int],
               if state is not None else None)
     return RejectionSection(matches=matches, state=state, dropped=dropped,
                             withheld=withheld, clause=clause)
+
+
+# The field-scoped lookup (``query``'s ``field`` selector): the stored fields a caller
+# may search alone. One today. A later index over another field adds a value here and
+# renames nothing — the argument's name is a contract (AX Hardening 3, lock 3). Both
+# boundaries refuse any other value through :func:`lookup_field_fault`, and the CLI's
+# ``--field`` choices are this tuple.
+REJECTED_PATHS_FIELD = "rejected_paths"
+LOOKUP_FIELDS: Tuple[str, ...] = (REJECTED_PATHS_FIELD,)
+
+
+def lookup_field_fault(value: Optional[str]) -> Optional[str]:
+    """Words the refusal of a ``field`` value outside :data:`LOOKUP_FIELDS`, or None.
+
+    An argument fault, answered before any project is resolved on both surfaces, as
+    ``depth``'s is. Names no command and no call-form: it says what is accepted.
+
+    Args:
+        value: The caller's ``field``; None (the selector unset) is never a fault.
+
+    Returns:
+        The refusal message, or None when the value is accepted.
+    """
+    if value is None or value in LOOKUP_FIELDS:
+        return None
+    accepted = ", ".join(f"'{name}'" for name in LOOKUP_FIELDS)
+    return (f"Field '{value}' cannot be searched alone; the accepted value is "
+            f"{accepted}, which ranks rejected options alone.")
+
+
+# The lookup's degraded reason when its search ran past its time budget. A reason
+# phrase for the lexical header, on ``lexical.degraded_reason_from_error``'s register.
+REJECTION_LOOKUP_OVER_BUDGET_REASON = "the rejection search ran past its time budget"
+
+
+def rejection_lookup_gap_reason(*, surface: str, config: "object") -> str:
+    """Words the lookup's degraded reason when the rejection index is a gap.
+
+    Its own phrase, not :func:`rejection_section_clause`'s ``gap`` sentence: that one
+    says no rejected option was searched, which beside a lexical match over rejected
+    options would contradict the header it sits in. The heal is
+    :data:`REJECTION_GAP_POINTERS`' (the MCP form names no command and no tool), and
+    the note does not state it a second time.
+
+    Args:
+        surface: ``"cli"`` or ``"mcp"`` — selects the heal's wording.
+        config: The active ``MitosConfig`` (duck-typed). Read only for ``project``.
+
+    Returns:
+        A short cause phrase for the degraded header.
+    """
+    heal = REJECTION_GAP_POINTERS[surface]["build"].format(
+        selector=shell_flag("-p", getattr(config, "project", ""))
+    )
+    return ("the rejection index is missing while decisions here state rejected "
+            f"options — {heal}")
+
+
+# What the lookup's lexical answer could not compute: the band and the edge, which
+# need scores. Not :data:`DEGRADED_NOT_COMPUTED`: its ``retired_partition`` and
+# ``rejection_matches`` tokens would be false here, because the lookup has no retired
+# partition to compute and its rejection matches ARE computed, lexically.
+LOOKUP_DEGRADED_NOT_COMPUTED: Tuple[str, ...] = ("band", "edge")
+
+
+def lookup_omission_clause(*, retired_dropped: bool) -> str:
+    """Words what the lookup's lexical answer did not compute or list.
+
+    The note twin of ``not_computed`` (:data:`LOOKUP_DEGRADED_NOT_COMPUTED`). A
+    retired decision's rejected options are dropped only when the graph's states
+    were read; otherwise the stamps-unavailable disclosure says the answer may
+    include superseded decisions, and this clause says nothing about them.
+
+    Args:
+        retired_dropped: Whether the lexical match read the graph's states.
+
+    Returns:
+        One or two sentences.
+    """
+    clause = ("Not computed without similarity scores: the confidence band and the "
+              "ranking's edge.")
+    if retired_dropped:
+        clause = f"{clause} Rejected options of retired decisions are not listed."
+    return clause
+
+
+def _lookup_band_note(band: str, *, top_score: Optional[float], result_count: int,
+                      surface: str, config: "object") -> str:
+    """Words the lookup's band note: a rating of its item ranking, never a verdict.
+
+    Its own legend, not :func:`assess_query_recall`'s: on item scores a ``strong``
+    top often belongs to an option that shares the claim's words and names a
+    different mechanism (5b measured vocabulary near-misses up to 0.815 against an
+    own-question median of 0.750), so "a real hit" would be false here. The notes say
+    how close the ranking came and leave the judgement to the reader of the item.
+    """
+    pointer = _SURFACE_POINTERS[surface]["precedent_scan"].format(
+        selector=shell_flag("-p", getattr(config, "project", ""))
+    )
+    redirect = f"For whether precedent exists, restate the claim and ask {pointer}."
+    shown = f"{top_score:.2f}" if top_score is not None else "?"
+    if band == "strong":
+        return ("Top rejected option cleared the strong threshold — close to the "
+                "claim; read the item and its decision's reason to judge whether "
+                "that rejection covers your option.")
+    if band == "weak":
+        return (f"Twilight zone: top score {shown} — a rejected option close to the "
+                f"claim, maybe not the one you mean. {redirect}")
+    if result_count:
+        return (f"Off-axis: top score {shown} is too low to be related — no rejected "
+                f"option ranked close to the claim. {redirect}")
+    return f"No rejected option ranked — this ranking returned nothing. {redirect}"
+
+
+def lookup_edge(walk: "object", *, owners: int, margin: float, ceiling: int,
+                full_top: Optional[int]) -> Optional[WindowEdge]:
+    """Decides the lookup's edge, its lever counted in owners, never in ranks.
+
+    :func:`window_edge`'s rule, unchanged, over the item ranking; then the held count
+    is re-counted, because the lookup's ``full_top`` counts **live owners** (the
+    ``here`` Letters), not matched items: ``owners`` at the default, ``min(full_top,
+    owners)`` under ``full_top``, and None with no live owner in the window (every
+    item a retired handle), under ``brief`` too, since a ``full_top`` lever means
+    nothing with no Letter to thin. At the ceiling ``window_edge``'s None stands.
+
+    Args:
+        walk: The ``RejectionLookupWalk`` (duck-typed: ``window``, ``edge``,
+            ``end``, ``limit``).
+        owners: How many ``here`` owners the shaped window letters.
+        margin: The edge margin of the ranking (``RANKED_EDGE_MARGIN`` today).
+        ceiling: The clamp ceiling.
+        full_top: The effective ``full_top`` (0 under ``brief``), or None.
+
+    Returns:
+        A :class:`WindowEdge`, or None when the clause stays absent.
+    """
+    edge = window_edge(walk, margin=margin, ceiling=ceiling, full_top=full_top)
+    if edge is None or edge.held is None:
+        return edge
+    if owners == 0:
+        return edge._replace(held=None)
+    return edge._replace(held=owners if full_top is None else min(full_top, owners))
+
+
+def lookup_edge_clause(edge: WindowEdge, *, ceiling: int, surface: str) -> str:
+    """Words the lookup's edge sentence, in items and owners.
+
+    :func:`edge_clause`'s shape over the rejection ranking, with its own nouns: the
+    ranks are rejected options and ``full_top`` thins the decisions they belong to,
+    so "live rank" and "the added ranks come back axiom-only" would be false here (an
+    added item always carries its whole text). With no Letter in the window the lever
+    names ``limit`` alone; at the ceiling it names none. Pure string formatting.
+
+    Args:
+        edge: The edge from :func:`lookup_edge`.
+        ceiling: The clamp ceiling a higher ``limit`` would be cut back to.
+        surface: ``"cli"`` or ``"mcp"`` — selects the argument spellings.
+
+    Returns:
+        One sentence.
+    """
+    pointers = _SURFACE_POINTERS[surface]
+    at = pointers["limit_arg"].format(n=edge.limit)
+    if edge.kind == EDGE_KIND_UNMEASURED:
+        return (
+            f"This ranking's edge at {at} is unmeasured: the read fetched no further "
+            f"rejected option, so it cannot say whether the window ended mid-cluster."
+        )
+    stem = (f"This ranking ended mid-cluster at {at}: the next rejected option scores "
+            f"as close as the last")
+    if edge.held is None:
+        if edge.limit >= ceiling:
+            return f"{stem}."
+        return f"{stem}; a higher limit reaches it."
+    if edge.held == 0:
+        return (f"{stem}; a higher limit reaches it, its decision axiom-only like "
+                f"these.")
+    held = pointers["full_top_arg"].format(n=edge.held)
+    return (f"{stem}; a higher limit reaches it, and with {held} the decisions it "
+            f"adds come back axiom-only.")
+
+
+def lookup_short_clause(walk: "object", *, surface: str) -> Optional[str]:
+    """Words why the lookup's window holds fewer than ``limit`` items, or None.
+
+    Two reasons a window comes back short, each said (constraint 5): the index ran
+    out (``exhausted`` with at least one hit), or the fetch filled before the ranking
+    did (``short_bound``) — verification dropped items whose decision no longer
+    states them or is gone, or, with nothing dropped, the fetch's hits were parts of
+    fewer items. No lever: a higher ``limit`` re-reads the same fetch. A full window
+    says nothing here; its edge is :func:`lookup_edge_clause`'s. Pure string
+    formatting.
+
+    Args:
+        walk: The ``RejectionLookupWalk`` (duck-typed: ``window``, ``limit``,
+            ``end``, ``returned``, ``dropped``).
+        surface: ``"cli"`` or ``"mcp"`` — selects the ``limit`` spelling.
+
+    Returns:
+        One sentence, or None.
+    """
+    if len(walk.window) >= walk.limit:
+        return None
+    if walk.end == _WALK_END_EXHAUSTED and walk.returned:
+        at = _SURFACE_POINTERS[surface]["limit_arg"].format(n=walk.limit)
+        return (f"The ranking reached the end of the rejection index before it filled "
+                f"{at}.")
+    if walk.end != _WALK_END_SHORT_BOUND:
+        return None
+    n = sum(walk.dropped.values())
+    if n == 0:
+        return ("The rejection search's fetch filled before the ranking did — its "
+                "hits were parts of fewer rejected options — so the ranking may hold "
+                "fewer than it could.")
+    noun = "rejected option" if n == 1 else "rejected options"
+    return (f"Verification dropped {n} {noun} whose decision no longer states them or "
+            "is gone, so the ranking may hold fewer than it could.")
+
+
+def rejection_lookup(walk: Optional["object"], *, query: str, full_top: Optional[int],
+                     shape: Callable[..., List[Dict[str, Any]]], margin: float,
+                     ceiling: int, graph_gap: Callable[[], bool], surface: str,
+                     config: "object") -> Dict[str, Any]:
+    """Composes the field-scoped lookup's healthy envelope, once for both surfaces.
+
+    The rejection ranking is the answer: ``rejection_matches`` shaped by the
+    section's own shaper (no decision window, so a match's ``letter`` is ``here``,
+    ``section`` or ``retired``), matched items whole at every depth and owners thinned
+    by ``full_top`` in first-appearance order. The band rates that ranking; the note
+    reads band → edge, then the short clause, the withheld clause and the
+    stamps-unread clause. An empty window over an unbuilt graph says so instead of the
+    band note (W31). Each boundary encodes or renders the dict and adds nothing.
+
+    Args:
+        walk: The ``RejectionLookupWalk`` (duck-typed), or None for the healthy empty
+            answer (an absent collection over an empty expected set).
+        query: The caller's query, echoed.
+        full_top: The effective depth in owners (None ⇒ every owner whole, 0 ⇒
+            ``brief``).
+        shape: ``display.rejection_matches_payload``.
+        margin: The edge margin (``RANKED_EDGE_MARGIN``).
+        ceiling: The clamp ceiling (``display.RANKED_LIMIT_CEILING``).
+        graph_gap: Asked only on an empty window:
+            ``missing_graph_is_a_gap(store, config, corpus_scan=…)`` bound by the
+            caller.
+        surface: ``"cli"`` or ``"mcp"``.
+        config: The active ``MitosConfig`` (duck-typed).
+
+    Returns:
+        The envelope: ``query``, ``field``, ``depth_mode``, ``rejection_matches``
+        (absent when empty), provenance, ``confidence``, ``note``, then
+        ``rejection_section: "short"`` with ``rejection_dropped``,
+        ``rejected_paths_withheld`` and ``stamps_unread`` when they apply.
+    """
+    window = list(walk.window) if walk is not None else []
+    matches: List[Dict[str, Any]] = []
+    if window:
+        matches = shape(walk, window_ids=[], owners_whole=True, stamps=walk.stamps,
+                        live_ends=walk.live_ends, whole_owners=full_top)
+    here = [match["id"] for match in matches if match["letter"] == "here"]
+    top_score = max(match.score for match in window) if window else None
+    band = _classify_recall(top_score=top_score, result_count=len(window))
+    note = _lookup_band_note(band, top_score=top_score, result_count=len(window),
+                             surface=surface, config=config)
+    edge = (lookup_edge(walk, owners=len(here), margin=margin, ceiling=ceiling,
+                        full_top=full_top) if walk is not None else None)
+    if edge is not None:
+        note = f"{note} {lookup_edge_clause(edge, ceiling=ceiling, surface=surface)}"
+    if not window and graph_gap():
+        note = missing_graph_note(surface, config)
+    short = (lookup_short_clause(walk, surface=surface) if walk is not None
+             else None)
+    if short is not None:
+        note = f"{note} {short}"
+    shown: Dict[str, set] = {}
+    for match in matches:
+        shown.setdefault(match["id"], set()).add(match["ordinal"])
+    withheld = count_withheld_decisions(
+        thinned_ids=here[full_top:] if full_top is not None else [],
+        shown_ordinals=shown,
+        item_counts=walk.item_counts if walk is not None else {},
+    )
+    if withheld:
+        note = f"{note} {withheld_clause(withheld, surface=surface, config=config)}"
+    stamps_unread = walk is not None and walk.stamps_unread
+    if stamps_unread:
+        note = f"{note} {stamps_unread_clause(surface=surface, config=config)}"
+
+    envelope: Dict[str, Any] = {"query": query, "field": REJECTED_PATHS_FIELD,
+                                "depth_mode": "letter"}
+    if matches:
+        envelope["rejection_matches"] = matches
+    envelope.update(corpus_provenance(config))
+    envelope["confidence"] = band
+    envelope["note"] = note
+    if walk is not None and walk.short:
+        envelope["rejection_section"] = "short"
+        envelope["rejection_dropped"] = sum(walk.dropped.values())
+    if withheld:
+        envelope["rejected_paths_withheld"] = withheld
+    if stamps_unread:
+        envelope["stamps_unread"] = True
+    return envelope
 
 
 # What a degraded answer could not compute, as concept tokens: ``retired_partition``
