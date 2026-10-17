@@ -55,7 +55,7 @@ from unittest.mock import patch
 import requests
 
 import mitos
-from mitos import conflict, recall, sync
+from mitos import conflict, lexical, recall, sync
 from mitos.identity import canonical_core_string_norm, embedding_text
 from mitos.mcp_server import surface_decisions
 from mitos.rejections import enumerate_rejected_paths, rejection_points
@@ -73,6 +73,7 @@ RECORD_LIMIT = 10
 # by 2d: the draft form's gather reads through the same walk (one call at the gather raw
 # bound, ids only). Retagged by 5b: the query form's envelope carries the shipped
 # rejection leg's section, and items are read through the shipped rejection client.
+# Retagged by 6a: every query-form hit carries its lexical overlap with the query.
 READER = ("mcp.surface_decisions(retrieval_walk+rejection_leg)"
           "+conflict.gather_candidates(retrieval_walk)")
 # The per-item reader (5b): one shipped-client search over the whole collection,
@@ -395,12 +396,17 @@ def resolve_item_refs(index: CalibrationIndex, fixture: Dict[str, Any]) -> Dict[
 # Reads
 # ---------------------------------------------------------------------------
 
-def label_hits(index: CalibrationIndex, raw: List[Dict[str, Any]], exclude: List[str]) -> List[Dict[str, Any]]:
+def label_hits(index: CalibrationIndex, raw: List[Dict[str, Any]], exclude: List[str], *,
+               query: Optional[str] = None) -> List[Dict[str, Any]]:
     """Labels raw hits with slug, kind, liveness and self for `derive_result`.
 
     Each hit joins to its node through its ``point_id`` — never its payload slug, which
     an ids-only read does not carry — and the label is the node's slug. A point id this
     collection was not built from asserts: the collection holds exactly the expected set.
+
+    With ``query`` (the query form, 6a), each hit also carries ``overlap``: the share of
+    the query's terms its slug and mechanisms hold (`_calibration_record.overlap`, through
+    the shipped tokenizer). The node is already in hand, so it costs no read.
     """
     hits = []
     for h in raw:
@@ -414,6 +420,10 @@ def label_hits(index: CalibrationIndex, raw: List[Dict[str, Any]], exclude: List
             "live": index.live_by_slug[slug],
             "self": slug in exclude,
         })
+        if query is not None:
+            hits[-1]["overlap"] = R.overlap(query, slug, node.get("mechanisms") or [],
+                                            terms=lexical._query_terms,
+                                            stopwords=lexical.DISPLAY_STOPWORDS)
     return hits
 
 
@@ -599,7 +609,7 @@ def read_query_form(index: CalibrationIndex, fixture: Dict[str, Any]) -> FormRea
     # walk fetches at the over-fetch bound (every Harbor point), so the slice keeps the
     # recorded window the size it always was.
     raw = _one_call(proxy, fixture)[:RECORD_LIMIT]
-    hits = label_hits(index, raw, fixture.get("exclude", []))
+    hits = label_hits(index, raw, fixture.get("exclude", []), query=fixture["text"])
     result = R.derive_result(fixture, hits, envelope.get("confidence"), None)
     result["section"] = section_of(envelope)
     result["section_state"] = envelope.get("rejection_section")

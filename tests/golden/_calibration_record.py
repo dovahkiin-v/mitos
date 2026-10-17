@@ -34,7 +34,7 @@ import math
 import os
 import re
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 GOLDEN_DIR = os.path.dirname(os.path.abspath(__file__))
 RECORD_DIR = os.path.join(GOLDEN_DIR, "calibration")
@@ -341,6 +341,11 @@ def derive_result(
          "live": bool(h["live"]) and h["kind"] == "decision", "self": bool(h.get("self", False))}
         for h in hits
     ]
+    # 6a: a hit's lexical overlap with the query (`overlap`) rides along when the harness
+    # measured it; a reader that did not carries no key.
+    for out, h in zip(raw, hits):
+        if "overlap" in h:
+            out["overlap"] = h["overlap"]
     live = [h for h in raw if h["live"] and not h["self"]]
     target_set = set(fixture["targets"])
     best_other = max((h["value"] for h in live if h["slug"] not in target_set), default=None)
@@ -738,10 +743,31 @@ def rejection_floor_boundary(results: List[dict]) -> Optional[float]:
               if n.get("value") is not None]
     if not values:
         return None
-    top = max(values)
+    return _strictly_above(max(values))
+
+
+def _strictly_above(top: float) -> float:
+    """The smallest 4-decimal value strictly above ``top``.
+
+    One rounding rule for every "strictly above" boundary and for the range check's upper
+    envelope. A maximum already at 4 decimals moves up one step.
+    """
     boundary = round((math.floor(top * 10_000) + 1) / 10_000, 4)
     if boundary <= top:  # float noise: an exact 4-place maximum floored one step low
         boundary = round(boundary + 0.0001, 4)
+    return boundary
+
+
+def _at_or_below(low: float) -> float:
+    """The largest 4-decimal value at or below ``low``.
+
+    The mirror of `_strictly_above`, for every "at or below" boundary and the range
+    check's lower envelope. A minimum already at 4 decimals is its own boundary.
+    """
+    boundary = round(math.floor(low * 10_000) / 10_000, 4)
+    step = round(boundary + 0.0001, 4)
+    if step <= low:  # float noise: an exact 4-place minimum floored one step low
+        boundary = step
     return boundary
 
 
@@ -762,6 +788,332 @@ def rejection_floor_retention(results: List[dict], floor: float) -> Optional[flo
     if not values:
         return None
     return sum(1 for v in values if v is not None and v >= floor) / len(values)
+
+
+# ---------------------------------------------------------------------------
+# The band's methods (recall.SURFACE_STRONG_THRESHOLD, SURFACE_WEAK_THRESHOLD,
+# RANKED_TOP_CLUSTER_MARGIN), and the item ranking's analogues (6a D4)
+# ---------------------------------------------------------------------------
+
+# The four query-form classes the band separates. A rank-1 hit can be right only for an
+# answering class; a non-answering one holds nothing that answers. "Related" is every
+# band class but off-axis: the only class `none` may hold.
+BAND_CLASSES: Tuple[str, ...] = ("bullseye", "handle-words", "family-neighbour", "off-axis")
+ANSWERING_CLASSES: Tuple[str, ...] = EDGE_MARGIN_CLASSES
+NON_ANSWERING_CLASSES: Tuple[str, ...] = ("family-neighbour", "off-axis")
+RELATED_CLASSES: Tuple[str, ...] = ("bullseye", "handle-words", "family-neighbour")
+BANDS: Tuple[str, ...] = ("strong", "weak", "none")
+# Below this many rank-1-wrong depths, the top-cluster margin pools every inversion
+# depth instead: a median of a handful is not a measured distribution (2e D2).
+TOP_CLUSTER_MIN_DEPTHS = 10
+# 1.96: a 95% Wilson interval.
+WILSON_Z = 1.96
+
+
+def _band_results(results: List[dict]) -> List[dict]:
+    """The results the decision band reads: the four band classes, query space only."""
+    return [r for r in results if r.get("class") in BAND_CLASSES and r.get("space") == "query"]
+
+
+def _live_ranking(result: dict) -> List[dict]:
+    """A result's ranked-read list: live, non-self decisions, best first."""
+    return [h for h in result["hits"]
+            if h.get("live") and not h.get("self") and h.get("kind") == "decision"]
+
+
+def strong_boundary(results: List[dict]) -> Optional[float]:
+    """Returns one corpus's ``strong`` boundary: strictly above every non-answer's top.
+
+    The smallest 4-decimal value strictly above the largest ``top_live_value`` of any
+    family-neighbour or off-axis result in query space, so ``strong`` never claims a
+    precedent the corpus measures as a neighbour that does not answer (6a D1).
+
+    Returns:
+        The boundary, or ``None`` when no non-answering result has a top value.
+    """
+    tops = [r["top_live_value"] for r in _band_results(results)
+            if r["class"] in NON_ANSWERING_CLASSES and r.get("top_live_value") is not None]
+    return _strictly_above(max(tops)) if tops else None
+
+
+def weak_boundary(results: List[dict]) -> Optional[float]:
+    """Returns one corpus's ``weak`` boundary: at or below every related read's top.
+
+    The largest 4-decimal value at or below the smallest ``top_live_value`` of any
+    bullseye, handle-words or family-neighbour result in query space. Answering classes
+    read their top value, not their target's, because the classifier reads the top. So
+    ``none`` never fires where the corpus still sees a near precedent (6a D1, P14).
+
+    Returns:
+        The boundary, or ``None`` when no related result has a top value.
+    """
+    tops = [r["top_live_value"] for r in _band_results(results)
+            if r["class"] in RELATED_CLASSES and r.get("top_live_value") is not None]
+    return _at_or_below(min(tops)) if tops else None
+
+
+def rank_one_wrong_depths(results: List[dict]) -> List[float]:
+    """Measures how far below rank 1 the best target sits, where rank 1 is not a target.
+
+    Over answering-class results in query space whose rank-1 live hit is not one of the
+    fixture's targets: rank 1's value minus the best target's value in the live ranking.
+    A result with no target in the ranking has nothing to measure and gives none.
+
+    Returns:
+        One depth per such result, in result order.
+    """
+    depths: List[float] = []
+    for r in _band_results(results):
+        if r["class"] not in ANSWERING_CLASSES:
+            continue
+        ranking = _live_ranking(r)
+        targets = {t["slug"] for t in r["targets"]}
+        if not ranking or ranking[0]["slug"] in targets:
+            continue
+        below = [h["value"] for h in ranking if h["slug"] in targets]
+        if below:
+            depths.append(ranking[0]["value"] - max(below))
+    return depths
+
+
+def top_cluster_depths(results: List[dict]) -> Tuple[str, List[float]]:
+    """The population the top-cluster margin reads, and its name (6a D3).
+
+    The rank-1-wrong depths (`rank_one_wrong_depths`) when there are at least
+    ``TOP_CLUSTER_MIN_DEPTHS`` of them; otherwise every inversion depth of the answering
+    classes (`inversion_depths`, 2e's population).
+
+    Returns:
+        ``("rank-one-wrong" | "pooled-inversions", depths)``.
+    """
+    wrong = rank_one_wrong_depths(results)
+    if len(wrong) >= TOP_CLUSTER_MIN_DEPTHS:
+        return "rank-one-wrong", wrong
+    return "pooled-inversions", inversion_depths(results)
+
+
+def top_cluster_margin_boundary(results: List[dict]) -> Optional[float]:
+    """Returns one corpus's top-cluster margin: the median depth at which rank 1 is wrong.
+
+    The nearest-rank median of `top_cluster_depths`, 4 decimals, as `edge_margin_boundary`
+    rounds. Read on the dense corpus, where clusters form; Harbor's is recorded beside it.
+
+    Returns:
+        The boundary, or ``None`` when the population is empty.
+    """
+    median = nearest_rank(sorted(top_cluster_depths(results)[1]), 50)
+    return None if median is None else round(median, 4)
+
+
+def rank_one_margin(result: dict) -> Optional[float]:
+    """Rank 1's score minus the next live hit's, from a stored result (6a D5 (ii)).
+
+    A stored result holds the window only, so with one live hit there is no next one and
+    the input is ``None``: its promotion rule never fires (it fails closed).
+    """
+    ranking = _live_ranking(result)
+    return ranking[0]["value"] - ranking[1]["value"] if len(ranking) >= 2 else None
+
+
+def overlap(query: str, slug: str, mechanisms: List[str], *,
+            terms: Callable[[str], List[str]], stopwords: Any) -> Optional[float]:
+    """The share of the query's terms a hit's slug and mechanisms carry (6a D5 (i)).
+
+    ``|Q ∩ H| / |Q|``: ``Q`` is the query's terms minus ``stopwords``; ``H`` is the terms
+    of the slug and every mechanism, hyphens read as spaces (both are kebab handles).
+    The tokenizer is injected (``lexical._query_terms`` and ``lexical.DISPLAY_STOPWORDS``
+    at every caller), so this module stays stdlib.
+
+    Returns:
+        The share, 4 decimals, or ``None`` when the query has no term left.
+    """
+    q = [t for t in terms(query) if t not in stopwords]
+    if not q:
+        return None
+    handles = [slug] + [m for m in mechanisms if isinstance(m, str)]
+    h = set(terms(" ".join(x.replace("-", " ") for x in handles)))
+    return round(sum(1 for t in q if t in h) / len(q), 4)
+
+
+def wilson(k: int, n: int, z: float = WILSON_Z) -> List[float]:
+    """The Wilson score interval for ``k`` of ``n``, 4 decimals; ``[0.0, 1.0]`` at ``n == 0``.
+
+    A rate over a handful is never quoted bare: the interval says how little it pins.
+    """
+    if n == 0:
+        return [0.0, 1.0]
+    p = k / n
+    centre = p + z * z / (2 * n)
+    spread = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+    denom = 1 + z * z / n
+    return [round(max(0.0, (centre - spread) / denom), 4), round(min(1.0, (centre + spread) / denom), 4)]
+
+
+def auc(positives: List[float], negatives: List[float]) -> Optional[float]:
+    """The probability a positive scores above a negative, ties counting half, 4 decimals.
+
+    How well one input separates two populations, whatever its scale (6a D5).
+
+    Returns:
+        The AUC, or ``None`` when either population is empty.
+    """
+    if not positives or not negatives:
+        return None
+    wins = sum(1.0 if p > n else 0.5 if p == n else 0.0 for p in positives for n in negatives)
+    return round(wins / (len(positives) * len(negatives)), 4)
+
+
+def band_of(top: Optional[float], *, strong: float, weak: float) -> str:
+    """The band a top value lands in under a given pair, as ``recall._classify_recall`` cuts.
+
+    A result with no live hit surfaced nothing, which the classifier reads as ``none``.
+    """
+    if top is None or top < weak:
+        return "none"
+    return "strong" if top >= strong else "weak"
+
+
+def _precision_table(rows: List[Tuple[Optional[float], bool, str]], *, strong: float, weak: float,
+                     groups: Tuple[str, ...]) -> Dict[str, Any]:
+    """Per band: fires, right, precision and its interval, counts by group; plus the base."""
+    bands: Dict[str, Any] = {}
+    for band in BANDS:
+        mine = [(right, group) for top, right, group in rows if band_of(top, strong=strong, weak=weak) == band]
+        fires, right = len(mine), sum(1 for ok, _ in mine if ok)
+        bands[band] = {
+            "fires": fires, "right": right,
+            "precision": round(right / fires, 4) if fires else None,
+            "interval": wilson(right, fires),
+            "by_group": {g: sum(1 for _, x in mine if x == g) for g in groups},
+        }
+    n, right = len(rows), sum(1 for _, ok, _ in rows if ok)
+    return {"n": n, "right": right, "base": round(right / n, 4) if n else None, "bands": bands,
+            "strong": strong, "weak": weak}
+
+
+def rank_one_right(result: dict) -> bool:
+    """Whether a band result's rank-1 live hit is one of its targets (answering classes only)."""
+    if result.get("class") not in ANSWERING_CLASSES:
+        return False
+    ranking = _live_ranking(result)
+    return bool(ranking) and ranking[0]["slug"] in {t["slug"] for t in result["targets"]}
+
+
+def band_precision(results: List[dict], *, strong: float, weak: float) -> Dict[str, Any]:
+    """States each band's measured precision on one corpus under a given pair (6a D2).
+
+    Over the four band classes in query space: a result lands in the band its
+    ``top_live_value`` reads, and is *right* when its rank-1 live hit is a target, which
+    a non-answering class never is. ``base`` is rank 1 right over every band result: what
+    a band calling everything ``strong`` would score.
+
+    Returns:
+        ``{n, right, base, strong, weak, bands: {band: {fires, right, precision,
+        interval, by_group}}}``, ``by_group`` counting by class. ``precision`` is
+        ``None`` and the interval ``[0.0, 1.0]`` for a band with no fires.
+    """
+    rows = [(r.get("top_live_value"), rank_one_right(r), r["class"]) for r in _band_results(results)]
+    return _precision_table(rows, strong=strong, weak=weak, groups=BAND_CLASSES)
+
+
+def precision_entry(table: Dict[str, Any], band: str = "strong") -> Dict[str, Any]:
+    """One run's record ``precision`` block for a band, from a `band_precision` table."""
+    b = table["bands"][band]
+    return {"fires": b["fires"], "right": b["right"], "precision": b["precision"],
+            "interval": b["interval"], "base": table["base"]}
+
+
+def _rejection_results(results: List[dict]) -> List[dict]:
+    """Every rejection-target result with a per-item ranking, all three forms (6a D4)."""
+    return [r for r in results
+            if r.get("class") == "rejection-target" and r.get("measure") == "item"
+            and isinstance(r.get("items"), dict) and "per_item" in r["items"]]
+
+
+def _item_rank_one_right(shape: dict) -> bool:
+    return any(t.get("rank") == 1 for t in shape["targets"])
+
+
+def item_strong_boundary(results: List[dict]) -> Optional[float]:
+    """The item ranking's ``strong`` boundary: strictly above every hard negative.
+
+    The band rule's item analogue, read by the floor's own method (the item classes hold
+    no fixture that nothing answers, so the labelled near-misses stand in for one).
+    """
+    return rejection_floor_boundary(results)
+
+
+def item_weak_boundary(results: List[dict]) -> Optional[float]:
+    """The item ranking's ``weak`` boundary: at or below every fixture's top item value.
+
+    Over every rejection-target result, all three forms: the lookup's question is
+    option-level, so an ``elsewhere-does-not-carry`` target is a right answer to it
+    (6a D4). The top value is what the lookup's classifier reads.
+    """
+    tops = [r["items"]["per_item"]["top_value"] for r in _rejection_results(results)
+            if r["items"]["per_item"].get("top_value") is not None]
+    return _at_or_below(min(tops)) if tops else None
+
+
+def item_band_precision(results: List[dict], *, strong: float, weak: float) -> Dict[str, Any]:
+    """`band_precision` over the item ranking: right when the rank-1 item is a target item.
+
+    Every rejection-target result, all three forms; ``by_group`` counts by form.
+    """
+    rows = [(r["items"]["per_item"].get("top_value"), _item_rank_one_right(r["items"]["per_item"]),
+             r.get("rejection_form")) for r in _rejection_results(results)]
+    return _precision_table(rows, strong=strong, weak=weak, groups=REJECTION_FORMS)
+
+
+def item_rank_one_wrong_depths(results: List[dict]) -> List[float]:
+    """`rank_one_wrong_depths` over the item ranking, every form: top value minus the best target's."""
+    depths: List[float] = []
+    for r in _rejection_results(results):
+        shape = r["items"]["per_item"]
+        values = [t["value"] for t in shape["targets"] if t.get("value") is not None]
+        if values and shape.get("top_value") is not None and not _item_rank_one_right(shape):
+            depths.append(shape["top_value"] - max(values))
+    return depths
+
+
+def item_inversion_depths(results: List[dict]) -> List[float]:
+    """`inversion_depths` over the item ranking, every form.
+
+    Targets carry their collapsed rank, not their ordinal, so a unit above a target is a
+    non-target when no target holds its rank.
+    """
+    depths: List[float] = []
+    for r in _rejection_results(results):
+        shape = r["items"]["per_item"]
+        units = _collapse(shape["hits"], per_item=True)
+        target_ranks = {t["rank"] for t in shape["targets"] if t.get("rank") is not None}
+        for t in shape["targets"]:
+            if t.get("rank") is None or t.get("value") is None:
+                continue
+            above = [units[i]["value"] for i in range(t["rank"] - 1) if i + 1 not in target_ranks]
+            if above:
+                depths.append(max(above) - t["value"])
+    return depths
+
+
+def item_top_cluster_depths(results: List[dict]) -> Tuple[str, List[float]]:
+    """`top_cluster_depths` over the item ranking, with the same fallback."""
+    wrong = item_rank_one_wrong_depths(results)
+    if len(wrong) >= TOP_CLUSTER_MIN_DEPTHS:
+        return "rank-one-wrong", wrong
+    return "pooled-inversions", item_inversion_depths(results)
+
+
+def item_top_cluster_margin_boundary(results: List[dict]) -> Optional[float]:
+    """`top_cluster_margin_boundary` over the item ranking."""
+    median = nearest_rank(sorted(item_top_cluster_depths(results)[1]), 50)
+    return None if median is None else round(median, 4)
+
+
+def item_edge_margin_boundary(results: List[dict]) -> Optional[float]:
+    """`edge_margin_boundary` over the item ranking: the median item inversion depth."""
+    median = nearest_rank(sorted(item_inversion_depths(results)), 50)
+    return None if median is None else round(median, 4)
 
 
 # ---------------------------------------------------------------------------
@@ -1083,6 +1435,80 @@ def _check_cry_wolf(name: str, entry: Dict[str, Any], top: Optional[float]) -> L
     return problems
 
 
+# Constants whose entry states a measured precision (6a D2/D7): a ``precision`` block
+# with one key per cited run. `strong` is the one band a verdict clause rests on.
+PRECISION_STATED: Tuple[str, ...] = ("mitos.recall.SURFACE_STRONG_THRESHOLD",)
+# The subset that also states it on traffic, under a ``replay`` key. The harvest holds no
+# field-scoped read, so an item-ranking constant can never be measured there.
+REPLAY_PRECISION: Tuple[str, ...] = ("mitos.recall.SURFACE_STRONG_THRESHOLD",)
+PRECISION_KEYS: Tuple[str, ...] = ("fires", "right", "precision", "interval", "base")
+REPLAY_EXTRA_KEYS: Tuple[str, ...] = ("run", "proxy")
+PRECISION_TOLERANCE = 1e-3
+
+
+def _check_precision_part(name: str, where: str, part: Any, extra: Tuple[str, ...]) -> List[str]:
+    """Checks one run's precision figures; returns problems.
+
+    ``fires >= right >= 0``; ``precision`` within `PRECISION_TOLERANCE` of ``right /
+    fires``; an interval ``[low, high]`` with ``0 <= low <= high <= 1``; ``base`` a number
+    in [0, 1], or ``null`` for a corpus with no fixture. A line above every fixture is a
+    stated "never fires here": ``fires == 0`` holds only ``right == 0``, ``precision:
+    null`` and ``interval: [0.0, 1.0]``, never a division.
+    """
+    label = f"{name}: `precision.{where}"
+    if not isinstance(part, dict):
+        return [f"{label}` is not an object"]
+    keys, want = set(part), set(PRECISION_KEYS) | set(extra)
+    if keys != want:
+        return [f"{label}` keys must be exactly {sorted(want)}; missing {sorted(want - keys)}, "
+                f"extra {sorted(keys - want)}"]
+    problems: List[str] = []
+    fires, right, precision = part["fires"], part["right"], part["precision"]
+    if not (_is_count(fires) and _is_count(right) and right <= fires):
+        return [f"{label}` needs counts with fires >= right >= 0"]
+    interval = part["interval"]
+    if not (isinstance(interval, list) and len(interval) == 2 and all(_is_number(x) for x in interval)
+            and 0 <= interval[0] <= interval[1] <= 1):
+        problems.append(f"{label}.interval` must be [low, high] with 0 <= low <= high <= 1")
+    base = part["base"]
+    if not (base is None or (_is_number(base) and 0 <= base <= 1)):
+        problems.append(f"{label}.base` must be a rate in [0, 1] or null")
+    if fires == 0:
+        if right != 0 or precision is not None or interval != [0.0, 1.0]:
+            problems.append(f"{label}` fires nowhere, so it states right 0, precision null and "
+                            f"interval [0.0, 1.0]")
+    elif not _is_number(precision) or abs(precision - right / fires) > PRECISION_TOLERANCE:
+        problems.append(f"{label}.precision` {precision!r} is not right / fires = {right / fires!r}")
+    for key in extra:
+        if not isinstance(part[key], str) or not part[key]:
+            problems.append(f"{label}.{key}` must name its run or proxy")
+    return problems
+
+
+def _check_precision(name: str, entry: Dict[str, Any], cited: List[str]) -> List[str]:
+    """Checks a `PRECISION_STATED` entry's ``precision`` block; returns problems.
+
+    One key per cited run, plus ``replay`` exactly when the name is in `REPLAY_PRECISION`.
+    """
+    block = entry.get("precision")
+    if not isinstance(block, dict):
+        return [f"{name}: states its precision in a `precision` block, one key per cited run"]
+    want = set(cited) | ({"replay"} if name in REPLAY_PRECISION else set())
+    problems: List[str] = []
+    for key in sorted(want - set(block)):
+        problems.append(f"{name}: `precision` has no {key!r} key")
+    for key in sorted(set(block) - want):
+        if key == "replay":
+            problems.append(f"{name}: carries a `precision.replay` key but is not measured on "
+                            f"traffic (REPLAY_PRECISION is {list(REPLAY_PRECISION)})")
+        else:
+            problems.append(f"{name}: `precision` names {key!r}, which the entry does not cite")
+    for key in sorted(want & set(block)):
+        problems.extend(_check_precision_part(
+            name, key, block[key], REPLAY_EXTRA_KEYS if key == "replay" else ()))
+    return problems
+
+
 def _check_constant(
     name: str, entry: Any, record: Dict[str, Any], runs: Dict[str, Dict[str, Any]]
 ) -> List[str]:
@@ -1153,19 +1579,23 @@ def _check_constant(
                     lows.append(part["min"])
                 if part.get("max") is not None:
                     highs.append(part["max"])
-        if kind == "threshold" and lows and highs and not (min(lows) <= boundary <= max(highs)):
+        # The range is the 4-decimal envelope of the classes' extremes, by the boundary
+        # functions' own rounding: a correct `weak` floors just below its class minimum,
+        # and a correct strictly-above boundary can sit one step past a class maximum.
+        envelope = (_at_or_below(min(lows)), _strictly_above(max(highs))) if lows and highs else None
+        if kind == "threshold" and envelope and not (envelope[0] <= boundary <= envelope[1]):
             problems.append(
                 f"{name}: boundary {boundary!r} for run {run_id!r} lies outside its classes' "
-                f"observed range [{min(lows)!r}, {max(highs)!r}]"
+                f"observed range [{envelope[0]!r}, {envelope[1]!r}] (4-decimal envelope)"
             )
         # A raised floor is decoupled from its boundaries, so its value is held to every
         # cited run's range itself: one above every target separates nothing (D3's case).
         # A non-number value is reported once, by the side check below, never raised here.
-        if side == "ceiling" and _is_number(value) and lows and highs \
-                and not (min(lows) <= value <= max(highs)):
+        if side == "ceiling" and _is_number(value) and envelope \
+                and not (envelope[0] <= value <= envelope[1]):
             problems.append(
                 f"{name}: raised value {value!r} lies outside run {run_id!r}'s observed range "
-                f"[{min(lows)!r}, {max(highs)!r}]"
+                f"[{envelope[0]!r}, {envelope[1]!r}] (4-decimal envelope)"
             )
 
     if side == "higher" and value != max(boundaries.values()):
@@ -1188,6 +1618,11 @@ def _check_constant(
     elif "cry_wolf" in entry:
         problems.append(f"{name}: carries a `cry_wolf` block but arms no escalation "
                         f"(ESCALATION_FLOORS is {list(ESCALATION_FLOORS)})")
+    if name in PRECISION_STATED:
+        problems.extend(_check_precision(name, entry, list(boundaries)))
+    elif "precision" in entry:
+        problems.append(f"{name}: carries a `precision` block but states no precision "
+                        f"(PRECISION_STATED is {list(PRECISION_STATED)})")
     return problems
 
 

@@ -496,3 +496,25 @@ def test_a_section_the_instrument_cannot_vouch_for_is_a_fault(
     with pytest.raises(raised) as err:
         CH.read_query_form(probe, _fixture(fixtures, "rejection-own-postgres"))
     assert needle in str(err.value) and "rejection-own-postgres" in str(err.value)
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6a — every query-form hit carries its lexical overlap with the query
+# --------------------------------------------------------------------------- #
+
+def test_label_hits_measures_overlap_over_the_slug_and_the_nodes_mechanisms(index):
+    """A handle-words query scores 1.0 on its own decision, and a query word only a
+    mechanism carries counts too: the harness reads the node's ``mechanisms`` (X10)."""
+    from _point_hits import CannedVector
+
+    node = next(n for n in index.nodes if n["kind"] == "decision" and n.get("mechanisms")
+                and any(m.replace("-", " ") not in n["slug"].replace("-", " ") for m in n["mechanisms"]))
+    mechanism = next(m for m in node["mechanisms"] if m.replace("-", " ") not in node["slug"].replace("-", " "))
+    proxy = CH.RecordingVectorStore(CannedVector([{"slug": node["slug"], "score": 0.9}], store=index.store))
+    raw = proxy.query([0.1], limit=1, with_payload=False)
+
+    handle = CH.label_hits(index, raw, [], query=node["slug"].replace("-", " "))
+    assert handle[0]["overlap"] == 1.0
+    words = CH.label_hits(index, raw, [], query=mechanism.replace("-", " "))
+    assert words[0]["overlap"] == 1.0
+    assert "overlap" not in CH.label_hits(index, raw, [])[0]  # the draft form measures none

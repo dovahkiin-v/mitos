@@ -21,7 +21,9 @@ import _calibration_record as R  # noqa: E402
 MODEL = "model-a"
 TS = "2026-10-16T08:00:00+00:00"
 SHA = "9dd49d4aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-STRONG = "mitos.recall.SURFACE_STRONG_THRESHOLD"
+# A synthetic threshold name, outside `PRECISION_STATED` and `REPLAY_PRECISION`: the fixture
+# record exercises the checker's shared rules; the precision block has rows of its own (6a).
+STRONG = "mitos.recall.SYNTHETIC_THRESHOLD"
 
 
 # ---------------------------------------------------------------------------
@@ -646,7 +648,7 @@ def test_a_floor_between_negatives_and_targets_is_inside_the_range(record_dir):
 
 
 def test_a_floor_above_every_target_and_negative_is_outside_the_range(record_dir):
-    assert _has(_floor_record(record_dir, 0.97), "outside its classes' observed range [0.7, 0.95]")
+    assert _has(_floor_record(record_dir, 0.97), "outside its classes' observed range [0.7, 0.9501]")  # 6a: the 4-decimal envelope
 
 
 def test_check_pins_reports_a_threshold_boundary_outside_its_classes_range(record_dir):
@@ -1124,3 +1126,321 @@ def test_the_ceiling_side_and_a_cry_wolf_block_belong_to_escalation_floors_only(
     assert _has(_problems(record, runs, {STRONG: 0.76}), "belongs to an escalation floor")
     record["constants"][STRONG].update(side="higher", value=0.75, cry_wolf=_cry_wolf())
     assert _has(_problems(record, runs, {STRONG: 0.75}), "arms no escalation")
+
+
+# ---------------------------------------------------------------------------
+# 6a: the band's methods, their item analogues, and the precision block
+# ---------------------------------------------------------------------------
+
+STRONG_BAND = "mitos.recall.SURFACE_STRONG_THRESHOLD"
+
+
+def _band(cls, hits, targets=(), fid=None, space="query"):
+    """A band-class result through `derive_result`, query space unless told otherwise."""
+    measure = "target" if cls in R.ANSWERING_CLASSES else "top_live"
+    fx = _fx(id=fid or f"{cls}-{len(hits)}", **{"class": cls}, targets=list(targets), measure=measure)
+    result = R.derive_result(fx, hits, "weak", None)
+    result["space"] = space
+    return result
+
+
+@pytest.mark.parametrize("value, above, below", [
+    (0.80866736, 0.8087, 0.8086),
+    (0.8087, 0.8088, 0.8087),          # an exact 4-place value: above moves up, below keeps it
+    (0.6375222, 0.6376, 0.6375),       # Harbor's family-neighbour minimum floors to 0.6375
+    (0.6375, 0.6376, 0.6375),
+    (0.69999, 0.7, 0.6999),
+])
+def test_the_two_rounding_helpers_are_one_rule_each(value, above, below):
+    assert R._strictly_above(value) == above and R._strictly_above(value) > value
+    assert R._at_or_below(value) == below and R._at_or_below(value) <= value
+
+
+def test_the_strong_boundary_sits_strictly_above_every_non_answering_top():
+    """An exact 4-place maximum moves up a step: `strong` never fires on a measured
+    non-answer (X3's tie row)."""
+    results = [_band("family-neighbour", [_hit("n", 0.8)]), _band("off-axis", [_hit("o", 0.7)]),
+               _band("bullseye", [_hit("t", 0.95)], ["t"])]
+    assert R.strong_boundary(results) == 0.8001
+    results.append(_band("off-axis", [_hit("o2", 0.80866736)]))
+    assert R.strong_boundary(results) == 0.8087
+
+
+def test_the_strong_boundary_reads_band_classes_in_query_space_only():
+    results = [_band("family-neighbour", [_hit("n", 0.7)]),
+               _band("family-neighbour", [_hit("d", 0.9)], space="document"),
+               _band("bullseye", [_hit("t", 0.99)], ["t"])]
+    rej = R.derive_result(_fx(id="r", **{"class": "rejection-target"}, measure="item"), [_hit("x", 0.95)], "weak", None)
+    assert R.strong_boundary(results + [rej]) == 0.7001
+    assert R.strong_boundary([_band("bullseye", [_hit("t", 0.9)], ["t"])]) is None
+
+
+def test_the_weak_boundary_floors_the_lowest_related_top_and_reads_family_neighbours():
+    """The minimum is a family-neighbour's: an answering-only population would miss it (X4)."""
+    results = [_band("bullseye", [_hit("t", 0.72)], ["t"]), _band("handle-words", [_hit("t", 0.7)], ["t"]),
+               _band("family-neighbour", [_hit("n", 0.6375222)]), _band("off-axis", [_hit("o", 0.5)])]
+    assert R.weak_boundary(results) == 0.6375
+
+
+def test_a_low_rejection_or_retired_or_document_top_does_not_move_the_weak_boundary():
+    """Scout: "related" is the band classes in query space, never `class != off-axis`."""
+    base = [_band("bullseye", [_hit("t", 0.72)], ["t"]), _band("family-neighbour", [_hit("n", 0.69)])]
+    rej = R.derive_result(_fx(id="r", **{"class": "rejection-target"}, measure="item"), [_hit("x", 0.6163)], "weak", None)
+    retired = R.derive_result(_fx(id="rp", **{"class": "retired-precedent"}), [_hit("y", 0.55)], "weak", None)
+    doc = _band("bullseye", [_hit("t", 0.4)], ["t"], space="document")
+    assert R.weak_boundary(base + [rej, retired, doc]) == R.weak_boundary(base) == 0.69
+    assert R.weak_boundary([_band("off-axis", [_hit("o", 0.7)])]) is None
+
+
+def test_a_result_with_no_live_hit_has_no_top_and_bounds_nothing():
+    results = [_band("family-neighbour", [_hit("n", 0.9, live=False)]), _band("off-axis", [_hit("o", 0.7)])]
+    assert R.strong_boundary(results) == 0.7001
+
+
+def test_rank_one_wrong_depths_read_answering_results_whose_rank_one_is_not_a_target():
+    right = _band("bullseye", [_hit("t", 0.9), _hit("n", 0.89)], ["t"])
+    wrong = _band("handle-words", [_hit("n1", 0.9), _hit("n2", 0.88), _hit("t", 0.86)], ["t"])
+    missing = _band("bullseye", [_hit("n", 0.9)], ["t"])  # no target in the window: nothing to measure
+    neighbour = _band("family-neighbour", [_hit("n", 0.9), _hit("m", 0.5)])
+    assert R.rank_one_wrong_depths([right, wrong, missing, neighbour]) == [pytest.approx(0.04)]
+
+
+def _wrong(n):
+    return [_band("bullseye", [_hit("n", 0.9), _hit("t", 0.9 - 0.001 * (i + 1))], ["t"], fid=f"w{i}")
+            for i in range(n)]
+
+
+@pytest.mark.parametrize("n, population", [(9, "pooled-inversions"), (10, "rank-one-wrong")])
+def test_the_top_cluster_margin_pools_every_inversion_below_ten_rank_one_wrong_depths(n, population):
+    """X6: the fallback's threshold is 10, the 2e "median of a handful" rule."""
+    extra = _band("handle-words", [_hit("t1", 0.95), _hit("n", 0.9), _hit("t2", 0.5)], ["t1", "t2"])
+    name, depths = R.top_cluster_depths(_wrong(n) + [extra])
+    assert name == population
+    assert len(depths) == (n if population == "rank-one-wrong" else n + 1)
+    assert R.TOP_CLUSTER_MIN_DEPTHS == 10
+
+
+def test_the_top_cluster_margin_is_the_nearest_rank_median_at_four_places():
+    assert R.top_cluster_margin_boundary(_wrong(10)) == 0.005
+    assert R.top_cluster_margin_boundary([_band("bullseye", [_hit("t", 0.9)], ["t"])]) is None
+
+
+def test_rank_one_margin_needs_a_second_live_hit_and_fails_closed_without_one():
+    r = _band("bullseye", [_hit("a", 0.9), _hit("q", 0.89, kind="open_question", live=False), _hit("b", 0.85)], ["a"])
+    assert R.rank_one_margin(r) == pytest.approx(0.05)
+    assert R.rank_one_margin(_band("bullseye", [_hit("a", 0.9)], ["a"])) is None
+
+
+def test_derive_result_carries_a_hits_overlap_when_the_reader_measured_one():
+    hits = [dict(_hit("a", 0.9), overlap=0.5), _hit("b", 0.8)]
+    raw = R.derive_result(_fx(), hits, "weak", None)["hits"]
+    assert raw[0]["overlap"] == 0.5 and "overlap" not in raw[1]
+
+
+def _terms(text):
+    return [t for t in (w.strip(".,?").casefold() for w in text.split()) if len(t) >= 3]
+
+
+def test_overlap_reads_the_slug_and_the_mechanisms_hyphens_as_spaces():
+    """X10's unit half: a query word that only a mechanism carries."""
+    kw = {"terms": _terms, "stopwords": frozenset({"the"})}
+    assert R.overlap("the harbor api rate limit", "harbor-api-rate-limit", [], **kw) == 1.0
+    assert R.overlap("rate limit token bucket", "harbor-api-rate-limit", ["token-bucket"], **kw) == 1.0
+    assert R.overlap("rate limit token bucket", "harbor-api-rate-limit", [], **kw) == 0.5
+    assert R.overlap("the", "harbor-api-rate-limit", [], **kw) is None
+
+
+@pytest.mark.parametrize("k, n, interval", [
+    (0, 0, [0.0, 1.0]),
+    (8, 9, [0.565, 0.9801]),
+    (36, 36, [0.9036, 1.0]),
+    (0, 5, [0.0, 0.4345]),
+])
+def test_wilson_interval(k, n, interval):
+    assert R.wilson(k, n) == interval
+
+
+def _precision_corpus():
+    return [
+        _band("bullseye", [_hit("t", 0.9)], ["t"], fid="b1"),                   # strong, right
+        _band("handle-words", [_hit("n", 0.85), _hit("t", 0.84)], ["t"], fid="h1"),  # strong, wrong
+        _band("bullseye", [_hit("t", 0.7)], ["t"], fid="b2"),                   # weak, right
+        _band("family-neighbour", [_hit("n", 0.81)], ["n"], fid="f1"),          # strong, never right
+        _band("off-axis", [_hit("o", 0.5)], fid="o1"),                          # none
+    ]
+
+
+def test_band_precision_states_each_band_with_counts_interval_and_base():
+    table = R.band_precision(_precision_corpus(), strong=0.8, weak=0.6)
+    s, w, n = (table["bands"][b] for b in R.BANDS)
+    assert (s["fires"], s["right"], s["precision"]) == (3, 1, 0.3333)
+    assert s["by_group"] == {"bullseye": 1, "handle-words": 1, "family-neighbour": 1, "off-axis": 0}
+    assert (w["fires"], w["right"], w["precision"], w["interval"]) == (1, 1, 1.0, R.wilson(1, 1))
+    assert (table["n"], table["right"], table["base"]) == (5, 2, 0.4)
+    assert n["fires"] == 1 and n["by_group"]["off-axis"] == 1
+
+
+def test_a_family_neighbour_rank_one_is_never_right_even_when_it_lists_the_hit():
+    """X8: a non-answering class holds nothing that answers, whatever its labels say."""
+    table = R.band_precision([_band("family-neighbour", [_hit("n", 0.9)], ["n"])], strong=0.8, weak=0.6)
+    assert table["bands"]["strong"]["right"] == 0 and table["right"] == 0
+
+
+def test_a_band_with_no_fires_states_null_precision_and_the_whole_interval():
+    table = R.band_precision(_precision_corpus(), strong=0.95, weak=0.0)
+    assert table["bands"]["strong"] == {"fires": 0, "right": 0, "precision": None, "interval": [0.0, 1.0],
+                                        "by_group": {c: 0 for c in R.BAND_CLASSES}}
+    assert R.precision_entry(table) == {"fires": 0, "right": 0, "precision": None,
+                                        "interval": [0.0, 1.0], "base": 0.4}
+
+
+def test_band_of_cuts_as_the_classifier_does():
+    assert [R.band_of(v, strong=0.8, weak=0.6) for v in (0.8, 0.7999, 0.6, 0.5999, None)] == \
+        ["strong", "weak", "weak", "none", "none"]
+
+
+def _item(form, top, targets, negatives=(), hits=None):
+    """A rejection-target result: `targets` as (value, rank), `negatives` as values."""
+    return {"id": f"r-{form}-{top}", "class": "rejection-target", "measure": "item", "space": "query",
+            "rejection_form": form,
+            "items": {"per_item": {
+                "hits": hits or [], "top_value": top,
+                "targets": [{"owner": "o", "option": "A", "value": v, "rank": k, "absent": v is None}
+                            for v, k in targets],
+                "negatives": [{"owner": "g", "option": "N", "value": v, "rank": 9, "kind": "vocabulary"}
+                              for v in negatives]}}}
+
+
+def test_the_item_weak_boundary_reads_every_form_including_does_not_carry():
+    """X17: the lookup's question is option-level, so `elsewhere-does-not-carry` counts."""
+    results = [_item("own-question", 0.8, [(0.8, 1)]), _item("elsewhere-carries", 0.75, [(0.7, 2)]),
+               _item("elsewhere-does-not-carry", 0.6304111, [(0.6, 3)])]
+    assert R.item_weak_boundary(results) == 0.6304
+    assert R.item_strong_boundary([_item("own-question", 0.9, [(0.9, 1)], [0.7366])]) == 0.7367
+
+
+def test_item_band_precision_is_right_only_when_a_target_item_ranks_first():
+    results = [_item("own-question", 0.9, [(0.9, 1)]), _item("elsewhere-does-not-carry", 0.85, [(0.8, 2)]),
+               _item("elsewhere-carries", 0.7, [(0.7, 1)])]
+    table = R.item_band_precision(results, strong=0.8, weak=0.6)
+    s = table["bands"]["strong"]
+    assert (s["fires"], s["right"]) == (2, 1)
+    assert s["by_group"] == {"own-question": 1, "elsewhere-carries": 0, "elsewhere-does-not-carry": 1}
+    assert table["base"] == 0.6667
+
+
+def test_item_depths_read_collapsed_ranks_every_form():
+    hits = [_ih("x", 0.9, 1, 0), _ih("o", 0.85, 1, 0), _ih("y", 0.8, 1, 0), _ih("o", 0.75, 2, 0)]
+    r = _item("elsewhere-does-not-carry", 0.9, [(0.85, 2), (0.75, 4)], hits=hits)
+    assert R.item_rank_one_wrong_depths([r]) == [pytest.approx(0.05)]
+    assert R.item_inversion_depths([r]) == [pytest.approx(0.05), pytest.approx(0.15)]
+    assert R.item_top_cluster_depths([r]) == ("pooled-inversions", R.item_inversion_depths([r]))
+    assert R.item_edge_margin_boundary([r]) == 0.05
+
+
+# -- the record's precision block (D7) --------------------------------------------------------
+
+def _precision_part(fires=9, right=8, base=0.3929, **over):
+    part = {"fires": fires, "right": right, "precision": round(right / fires, 4) if fires else None,
+            "interval": R.wilson(right, fires), "base": base}
+    part.update(over)
+    return part
+
+
+def _band_record(record_dir, precision="default", weak_floor=None):
+    """A record with one harbor and one dense run over the four band classes, and the
+    strong threshold's entry; ``weak_floor`` adds a weak entry floored at that value."""
+    classes = {"bullseye": {"query": _class_block([0.71, 0.84, 0.9])},
+               "handle-words": {"query": _class_block([0.8, 0.86])},
+               "family-neighbour": {"query": _class_block([0.6375222, 0.7, 0.8072], "top_live")},
+               "off-axis": {"query": _class_block([0.66, 0.7], "top_live")}}
+    harbor = R.append_run(_run(classes=classes), record_dir)
+    dense = R.append_run(_run(corpus="dense", decision_count=500, classes=classes), record_dir)
+    record = R.load_record(record_dir)
+    entry = {"value": 0.8073, "kind": "threshold", "space": "query", "side": "higher",
+             "separates": list(R.BAND_CLASSES), "boundaries": {harbor: 0.8073, dense: 0.8073},
+             "method": "synthetic"}
+    if precision == "default":
+        entry["precision"] = {harbor: _precision_part(), dense: _precision_part(36, 36, 0.7956),
+                              "replay": _precision_part(4, 3, 0.5, run="20261017-0000-abc1234-dogfood-copy",
+                                                        proxy="rank-1 USED, record-followed reads")}
+    elif precision is not None:
+        entry["precision"] = precision(harbor, dense)
+    record["constants"][STRONG_BAND] = entry
+    constants = {STRONG_BAND: 0.8073}
+    if weak_floor is not None:
+        name = "mitos.recall.SURFACE_WEAK_THRESHOLD"
+        record["constants"][name] = {"value": weak_floor, "kind": "threshold", "space": "query",
+                                     "side": "lower", "separates": list(R.BAND_CLASSES),
+                                     "boundaries": {harbor: weak_floor, dense: weak_floor}, "method": "synthetic"}
+        constants[name] = weak_floor
+    return _problems(record, R.load_cited_runs(record, record_dir), constants), harbor, dense
+
+
+def test_a_stated_precision_block_is_clean(record_dir):
+    assert STRONG_BAND in R.PRECISION_STATED and STRONG_BAND in R.REPLAY_PRECISION
+    assert _band_record(record_dir)[0] == []
+
+
+def test_a_precision_stated_constant_without_its_block_is_refused(record_dir):
+    assert _has(_band_record(record_dir, precision=None)[0], "states its precision in a `precision` block")
+
+
+def test_a_cited_runs_missing_precision_key_is_refused(record_dir):
+    """X7: a re-derivation that forgets to restate one corpus reds the offline tier."""
+    problems, _, _ = _band_record(record_dir, precision=lambda h, d: {
+        h: _precision_part(), "replay": _precision_part(run="r", proxy="p")})
+    assert any("`precision` has no 'dense-" in p for p in problems)
+
+
+def test_the_replay_key_is_owed_inside_replay_precision_and_refused_outside(record_dir, monkeypatch):
+    problems, _, _ = _band_record(record_dir, precision=lambda h, d: {h: _precision_part(), d: _precision_part()})
+    assert _has(problems, "`precision` has no 'replay' key")
+    monkeypatch.setattr(R, "REPLAY_PRECISION", ())
+    problems, _, _ = _band_record(record_dir)
+    assert _has(problems, "is not measured on traffic")
+
+
+def test_a_precision_block_on_a_constant_that_states_none_is_refused(record_dir, monkeypatch):
+    monkeypatch.setattr(R, "PRECISION_STATED", ())
+    assert _has(_band_record(record_dir)[0], "states no precision")
+
+
+@pytest.mark.parametrize("part, needle", [
+    (_precision_part(precision=0.5), "is not right / fires"),
+    (dict(_precision_part(), fires=3, right=4), "fires >= right >= 0"),
+    (_precision_part(interval=[0.9, 0.5]), "0 <= low <= high <= 1"),
+    (_precision_part(base=1.2), "a rate in [0, 1] or null"),
+    (dict(_precision_part(), extra=1), "keys must be exactly"),
+    # X16: a line above every fixture states the null form, never a division
+    (_precision_part(fires=0, right=0, precision=0.0), "fires nowhere"),
+    (_precision_part(fires=0, right=0, interval=[0.0, 0.0]), "fires nowhere"),
+])
+def test_a_malformed_precision_part_is_reported(record_dir, part, needle):
+    problems, _, _ = _band_record(record_dir, precision=lambda h, d: {
+        h: part, d: _precision_part(), "replay": _precision_part(run="r", proxy="p")})
+    assert _has(problems, needle), problems
+
+
+def test_a_fires_zero_block_is_accepted_in_its_exact_null_form(record_dir):
+    problems, _, _ = _band_record(record_dir, precision=lambda h, d: {
+        h: _precision_part(fires=0, right=0), d: _precision_part(),
+        "replay": _precision_part(run="r", proxy="p")})
+    assert problems == []
+
+
+@pytest.mark.parametrize("weak, clean", [
+    (0.6375, True),    # floored just under the 0.6375222 class minimum: inside the envelope
+    (0.6374, False),   # two steps under the raw minimum (X15's reverse): outside
+])
+def test_the_range_envelope_admits_a_floored_weak_and_refuses_a_step_further(record_dir, weak, clean):
+    problems = _band_record(record_dir, weak_floor=weak)[0]
+    assert (not any("SURFACE_WEAK_THRESHOLD" in p for p in problems)) is clean, problems
+
+
+@pytest.mark.parametrize("value, clean", [(0.9001, True), (0.9002, False)])
+def test_the_range_envelope_admits_one_step_past_a_maximum_and_refuses_two(record_dir, value, clean):
+    record, runs, _, harbor, dense = _clean(record_dir)  # bullseye's maximum is 0.9
+    record["constants"][STRONG].update(value=value, side="higher", boundaries={harbor: value, dense: 0.73})
+    problems = _problems(record, runs, {STRONG: value})
+    assert (not _has(problems, "observed range")) is clean, problems

@@ -54,7 +54,7 @@ business widening it.
 """
 
 import difflib
-from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 from mitos.shell_quote import shell_flag
 
@@ -420,6 +420,30 @@ def window_edge(
     if walk.end == _WALK_END_UNMEASURED:
         return WindowEdge(kind=EDGE_KIND_UNMEASURED, limit=limit, held=None)
     return None
+
+
+def top_cluster_size(scores: Sequence[float], *, margin: float) -> int:
+    """Counts the hits that sit in the top cluster: within ``margin`` of rank 1's score.
+
+    The ONE place top-cluster membership is decided. ``scores`` is a surfaced list's
+    scores, best first; rank 1 is always a member, so a non-empty list counts at least
+    one. Membership is strict, as :func:`window_edge`'s is: a hit whose score sits exactly
+    ``margin`` below rank 1's is a clear drop, not a member. A hit scoring above rank 1 (an
+    unordered list) is a member. ``margin`` is a required keyword because each ranking
+    calibrates its own (``RANKED_TOP_CLUSTER_MARGIN`` for the decision ranking), and a
+    default would let a second ranking read the wrong one silently.
+
+    Args:
+        scores: The surfaced hits' scores, rank 1 first.
+        margin: The top-cluster margin of the ranking the scores came from.
+
+    Returns:
+        How many hits are in the top cluster; 0 for an empty list.
+    """
+    if not scores:
+        return 0
+    top = scores[0]
+    return sum(1 for score in scores if top - score < margin)
 
 
 def edge_clause(edge: WindowEdge, *, surface: str) -> str:
