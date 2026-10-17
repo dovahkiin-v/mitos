@@ -1498,7 +1498,7 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
     if as_json:
         envelope: Dict[str, Any] = {"query": query_text, "depth_mode": "letter", "matches": matches}
         envelope.update(corpus_provenance(config))
-        envelope.update(composed.envelope_keys())
+        composed.place_into(envelope)
         _emit_json(envelope)
         return
 
@@ -3422,7 +3422,7 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         ceiling=RANKED_LIMIT_CEILING, full_top=full_top, scope=scope,
         scope_counts=scope_counts, scan_faults=scan_faults, labels=labels,
     )
-    results.update(composed.envelope_keys())
+    composed.place_into(results)
 
     # After the recall answer's own keys; absent (never null) when not shown.
     if notice:

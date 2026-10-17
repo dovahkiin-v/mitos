@@ -1158,7 +1158,7 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         ceiling=RANKED_LIMIT_CEILING, full_top=full_top, scope=scope,
         scope_counts=scope_counts, scan_faults=scan_faults, labels=labels,
     )
-    results.update(composed.envelope_keys())
+    composed.place_into(results)
 
     # After the recall answer's own keys; absent (never null) when not shown.
     if notice:
@@ -1617,7 +1617,7 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
                 edge_margin=RANKED_EDGE_MARGIN, ceiling=RANKED_LIMIT_CEILING,
                 full_top=full_top, scan_faults=(), labels=NO_LABELS,
             )
-            empty.update(composed.envelope_keys())
+            composed.place_into(empty)
             return dumps_display(empty, ensure_ascii=False, indent=2)
         except Exception as e:
             # Embedding/Qdrant failure mid-query (e.g. a 429): never the raw
@@ -1672,7 +1672,7 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             edge_margin=RANKED_EDGE_MARGIN, ceiling=RANKED_LIMIT_CEILING,
             full_top=full_top, scan_faults=(), labels=labels,
         )
-        envelope.update(composed.envelope_keys())
+        composed.place_into(envelope)
         return dumps_display(envelope, ensure_ascii=False, indent=2)
 
     # No embedding provider / vector store wired at all — degrade lexically.

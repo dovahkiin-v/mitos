@@ -1371,6 +1371,21 @@ def test_the_unbuilt_override_keeps_the_label_on_the_machine_encodings(cloned, d
     assert "reconcile" not in out["note"]
 
 
+@pytest.mark.parametrize("driver", ["cli", "mcp"])
+def test_the_unbuilt_note_stands_for_the_scoped_open_question_scan(ws, cloned, driver):
+    """WIRING_LEDGER entry-017 (closed at 8a): the scoped `open_questions` list is
+    placed by the site before the composer, so under lock A it is dropped with the
+    composer's keys (`RankedNote.place_into`). Over a graph holding no nodes its `[]`
+    would claim "none parked here". The control: a built, empty workspace keeps the
+    `[]`, which there is the computed truth."""
+    surface = _cli_surface_json if driver == "cli" else _surface_with
+    control = surface([], ws, scope="clone")
+    assert control["open_questions"] == [] and "graph is unbuilt" not in control["note"]
+    out = surface([], cloned, scope="clone")
+    assert "graph is unbuilt" in out["note"]
+    assert "open_questions" not in out, out
+
+
 # --------------------------------------------------------------------------- #
 # T9 — the band reads off the SURFACED list, not the raw vector-store return.
 # --------------------------------------------------------------------------- #

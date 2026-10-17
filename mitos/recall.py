@@ -1585,6 +1585,12 @@ def compose_note(*, rejection_lead: Optional[str] = None,
 OVERRIDE_BLACKOUT = "blackout"
 OVERRIDE_UNBUILT = "unbuilt"
 
+# Graph-supplied keys a ranked site places before the composer runs: `surface`'s
+# scoped open-question scan. Under the unbuilt graph they are dropped with the
+# composer's own (lock A): over a graph holding no nodes the scan reads `[]`, which
+# would claim "none parked here" (WIRING_LEDGER entry-017).
+SITE_PLACED_GRAPH_KEYS: Tuple[str, ...] = ("open_questions",)
+
 
 class RankedNote(NamedTuple):
     """One ranked answer's composed band, note and graph-supplied keys.
@@ -1658,6 +1664,21 @@ class RankedNote(NamedTuple):
         if self.labels_unread:
             keys["stamp_labels_unread"] = True
         return keys
+
+    def place_into(self, envelope: Dict[str, Any]) -> None:
+        """Places :meth:`envelope_keys` into a ranked site's envelope, after its hit list.
+
+        Under the unbuilt graph it first drops the keys the site placed from the graph
+        before the composer ran (:data:`SITE_PLACED_GRAPH_KEYS`), so the unbuilt note
+        stands for those too (lock A). Every ranked site places through this method.
+
+        Args:
+            envelope: The site's envelope, mutated in place.
+        """
+        if self.override == OVERRIDE_UNBUILT:
+            for key in SITE_PLACED_GRAPH_KEYS:
+                envelope.pop(key, None)
+        envelope.update(self.envelope_keys())
 
 
 _REGISTERS: Tuple[str, ...] = ("surface", "query")
