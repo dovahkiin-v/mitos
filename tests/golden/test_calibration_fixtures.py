@@ -307,7 +307,7 @@ def test_the_query_form_reads_one_ids_only_call_at_the_bound_and_labels_its_wind
     assert [h["slug"] for h in read.result["hits"]] == \
         [n["slug"] for n in index.nodes[:CH.RECORD_LIMIT]]
     assert CH.READER == ("mcp.surface_decisions(retrieval_walk+rejection_leg)"
-                         "+conflict.gather_candidates(retrieval_walk)")
+                         "+conflict.gather_candidates(retrieval_walk)+sync._review_tombstones")
     # No per-item index bound: the autouse seam's empty index answers, nothing is compared.
     assert (read.result["section"], read.result["section_state"], read.item_ranking) == ([], None, None)
 
@@ -351,6 +351,77 @@ def test_the_draft_form_reads_one_ids_only_call_at_the_raw_bound_and_slices_its_
         [n["slug"] for n in index.nodes[:conflict.CONFLICT_OVERFETCH_LIMIT]]
     assert isinstance(read.candidates, conflict.Gathering)
     assert len(read.candidates.live) <= conflict.CONFLICT_OVERFETCH_LIMIT
+
+
+# --------------------------------------------------------------------------- #
+# Phase 7a — draft values from the whole fetch; the shipped tombstone review checked
+# --------------------------------------------------------------------------- #
+
+def _draft_probe(index, monkeypatch, matches):
+    import dataclasses
+
+    from _point_hits import CannedVector
+
+    monkeypatch.setenv("QDRANT_URL", "http://localhost:9")
+    for key in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "ANTHROPIC_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
+
+    class _Embed:
+        def get_embedding(self, text, is_query=False):
+            return [0.1, 0.2]
+
+    return dataclasses.replace(index, provider=_Embed(),
+                               vstore=CannedVector(matches, store=index.store))
+
+
+def _retired_slug(index):
+    return next(n["slug"] for n in index.nodes
+                if n["kind"] == "decision" and not index.live_by_slug[n["slug"]])
+
+
+def test_a_draft_target_past_the_twentieth_raw_point_is_valued_where_it_sits(index, monkeypatch):
+    from mitos import conflict
+    matches = [{"slug": n["slug"], "score": 0.9 - 0.001 * i} for i, n in enumerate(index.nodes)]
+    deep = index.nodes[conflict.CONFLICT_OVERFETCH_LIMIT + 3]["slug"]
+    fixture = {"id": "deep-probe", "form": "draft", "measure": "target", "text": "probe",
+               "class": "probe", "targets": [deep], "negatives": [], "exclude": []}
+    read = CH.read_draft_form(_draft_probe(index, monkeypatch, matches), fixture)
+    target = read.result["targets"][0]
+    assert target["absent"] is False and target["raw_rank"] == conflict.CONFLICT_OVERFETCH_LIMIT + 4
+    assert target["value"] == pytest.approx(0.9 - 0.001 * (conflict.CONFLICT_OVERFETCH_LIMIT + 3))
+    assert len(read.result["hits"]) == conflict.CONFLICT_OVERFETCH_LIMIT
+
+
+def test_a_retired_precedent_read_asks_the_shipped_tombstone_review(index, monkeypatch):
+    from mitos import sync
+    retired = _retired_slug(index)
+    others = [n["slug"] for n in index.nodes if n["slug"] != retired]
+    matches = ([{"slug": retired, "score": sync._TOMBSTONE_FLOOR + 0.05}]
+               + [{"slug": s, "score": 0.5 - 0.001 * i} for i, s in enumerate(others)])
+    fixture = {"id": "retired-probe", "form": "draft", "measure": "target", "text": "probe",
+               "class": "retired-precedent", "targets": [retired], "negatives": [],
+               "exclude": []}
+    probe = _draft_probe(index, monkeypatch, matches)
+    read = CH.read_draft_form(probe, fixture)
+    assert read.result["pause_floor"] == sync._TOMBSTONE_FLOOR
+    assert read.result["targets"][0]["clears_pause_floor"] is True
+
+    def silent(self, gathering, declared, **kw):
+        return sync.TombstoneReview(shown=[], omitted=0, cleared_by=set())
+    monkeypatch.setattr(sync.MitosSyncManager, "_review_tombstones", silent)
+    with pytest.raises(CH.TombstoneDisagreement, match="retired-probe"):
+        CH.read_draft_form(_draft_probe(index, monkeypatch, matches), fixture)
+
+
+def test_a_retired_target_below_the_floor_owes_no_tombstone(index, monkeypatch):
+    from mitos import sync
+    retired = _retired_slug(index)
+    matches = [{"slug": retired, "score": sync._TOMBSTONE_FLOOR - 0.05}]
+    fixture = {"id": "retired-low", "form": "draft", "measure": "target", "text": "probe",
+               "class": "retired-precedent", "targets": [retired], "negatives": [],
+               "exclude": []}
+    read = CH.read_draft_form(_draft_probe(index, monkeypatch, matches), fixture)
+    assert read.result["targets"][0]["clears_pause_floor"] is False
 
 
 # --------------------------------------------------------------------------- #

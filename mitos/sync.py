@@ -18,7 +18,8 @@ import uuid
 from dataclasses import asdict, dataclass
 from decimal import Decimal, ROUND_FLOOR
 from typing import (
-    TYPE_CHECKING, AbstractSet, List, Dict, Mapping, Optional, Any, Set, Tuple, Callable,
+    TYPE_CHECKING, AbstractSet, List, Dict, Mapping, NamedTuple, Optional, Any, Sequence, Set,
+    Tuple, Callable,
 )
 from filelock import FileLock, Timeout
 
@@ -90,7 +91,9 @@ from mitos.store import (
     REJECTION_BACKLOG_FAILURE_TOLERANCE,
     RejectionBacklogRow,
     edge_kind_is_legal,
+    live_ends_from_chains,
 )
+from mitos.display import retired_handle
 from mitos.identity import (
     SLUG_LENGTH_REASON,
     SLUG_MAX_LEN,
@@ -1010,6 +1013,14 @@ def _rotation_report(outcome: "rotation.RotationOutcome") -> Optional[Dict[str, 
 # lineage suppression). Tune here.
 _NEIGHBOR_REVIEW_THRESHOLD = 0.80
 
+# A retired decision the draft sits at or above this document-document similarity to
+# is a tombstone on the pause (7a): the draft may re-tread ground the corpus already
+# tried and abandoned. Its own constant, never an alias of the live floor above: the
+# two share a space and a population of vectors but not a class boundary (vision
+# §6.3). Provisional at 0.80, PENDING its measurement in phase 7a's constants commit;
+# no surface reads it until the partition is wired.
+_TOMBSTONE_FLOOR = 0.80
+
 # The relations the pause offers for resolving a flagged neighbour — a fourth
 # edge-field set beside store.py's kill/deferred/mutation trio, derivable from none
 # of them (those are graph semantics; this is authoring guidance). Every surface
@@ -1103,6 +1114,62 @@ _PREFLIGHT_DISPOSITIONS: Dict[str, str] = {
         "per-entry failure names it. Revisit if one is ever observed repeating."
     ),
 }
+
+
+def _ambiguous_target(ids: Sequence[str]) -> bool:
+    """Whether a relation target's resolved ids name more than one decision.
+
+    The one predicate behind every ambiguity refusal ``record_decision`` makes
+    (``supersedes_ambiguous``, ``corrects_ambiguous``, ``relation_target_ambiguous``)
+    and behind the pause's ``successor_ambiguous`` fact, so the pause can never call a
+    successor relatable that the validator would refuse. The ids come from
+    ``GraphStore.resolve_slug``, which is casefold-exact and state-agnostic: a
+    retired decision that shares its slug with its live successor makes that slug
+    ambiguous for every relation.
+
+    Args:
+        ids: ``resolve_slug``'s answer for the target.
+
+    Returns:
+        True when the target names two or more nodes.
+    """
+    return len(ids) > 1
+
+
+class DeclaredReview(NamedTuple):
+    """What a draft's declarations exempt on the pause, by slug and by node id (7a).
+
+    One lineage walk fills all three fields (:meth:`MitosSyncManager._review_declared`).
+
+    Attributes:
+        slugs: Casefolded declared targets of all nine relations, plus the casefolded
+            slugs of the transitive mutation lineage of the ``supersedes`` /
+            ``amends`` / ``narrows`` targets. The live screen's suppression set.
+        ids_by_target: Each declared target's casefolded slug → its node id, plus, for
+            a mutation target, every lineage ancestor's id. A target that does not
+            resolve to exactly one node contributes nothing (Phase A refuses it before
+            the pause; a replay shell may meet one).
+        ids: The union of ``ids_by_target``'s values.
+    """
+
+    slugs: Set[str]
+    ids_by_target: Dict[str, Set[str]]
+    ids: Set[str]
+
+
+class TombstoneReview(NamedTuple):
+    """The pause's tombstone partition (:meth:`MitosSyncManager._review_tombstones`).
+
+    Attributes:
+        shown: The tombstone entries, closest first, at most the bound.
+        omitted: Non-exempt retired hits at or above the floor that were not shown.
+        cleared_by: The casefolded declared targets that exempted at least one
+            retired hit at or above the floor (the declared echo reads it).
+    """
+
+    shown: List[Dict[str, Any]]
+    omitted: int
+    cleared_by: Set[str]
 
 
 def _review_unavailable_notice(cause: str) -> str:
@@ -4708,7 +4775,7 @@ class MitosSyncManager:
         ids = self.store.resolve_slug(target)
         if not ids:
             return _record_error("relation_target_not_found", relation=relation, target=target)
-        if len(ids) > 1:
+        if _ambiguous_target(ids):
             return _record_error("relation_target_ambiguous", relation=relation, target=target)
         node = self.store.get_node(ids[0])
         if not node or node.get("slug", "").casefold() != target.casefold():
@@ -4807,10 +4874,25 @@ class MitosSyncManager:
         )
         return [candidate_payload(c) for c in screened]
 
-    def _lineage_suppression_slugs(
+    def _resolve_slug_typed(self, slug: str) -> List[str]:
+        """``GraphStore.resolve_slug`` with its raw ``sqlite3.Error`` typed (7a).
+
+        The pause's fail-open arm catches exactly ``DatabaseError``/``ValidationError``,
+        and ``resolve_slug`` raises the raw error, so every slug read the pause's review
+        makes goes through here.
+
+        Raises:
+            DatabaseError: If the read fails.
+        """
+        try:
+            return self.store.resolve_slug(slug)
+        except sqlite3.Error as exc:
+            raise DatabaseError(f"Failed to resolve slug '{slug}': {exc}")
+
+    def _lineage_ancestors(
         self, mutation_target_slugs: List[Optional[str]]
-    ) -> set[str]:
-        """Casefolded slugs of the transitive mutation ancestors of declared targets (3b).
+    ) -> Dict[str, List[Dict[str, str]]]:
+        """The transitive mutation ancestors of declared targets, per target (3b, 7a).
 
         Transitive-lineage near-duplicate suppression. When an author declares an
         ``amends``/``narrows``/``supersedes`` edge to the HEAD of a multi-link mutation
@@ -4819,11 +4901,14 @@ class MitosSyncManager:
         author has acknowledged the whole lineage, not just the node they happened to
         declare. This helper resolves each declared mutation target to its node id and
         walks :meth:`GraphStore.get_lineage` (the transitive ``supersedes`` ∪ ``amends``
-        ∪ ``narrows`` ancestor walk, Phase 3a) from it, returning every ancestor's
-        casefolded slug to merge into ``declared_targets`` — the suppression set
-        :meth:`_review_neighbors` passes to ``screen_candidates``, whose S4 stage drops
-        candidates by casefolded membership. Both sides casefold, matching that filter
-        exactly. Merging
+        ∪ ``narrows`` ancestor walk, Phase 3a) from it. :meth:`_review_declared` reads
+        the one walk twice: every ancestor's casefolded slug merges into
+        ``declared_targets`` — the suppression set :meth:`_review_neighbors` passes to
+        ``screen_candidates``, whose S4 stage drops candidates by casefolded membership
+        (both sides casefold, matching that filter exactly) — and every ancestor's
+        ``node_id`` joins the target's exemption ids for the tombstone partition, which
+        compares ids because a retired decision may share its slug with a live one
+        (7a). Merging
         into the set only ever *grows* suppression, so V1a's DIRECT suppression of all
         nine relation types is preserved by construction (must-not-regress, DoD #13b).
 
@@ -4855,20 +4940,28 @@ class MitosSyncManager:
         helper adds no cycle handling of its own — that is the read-side "tolerate" half
         of 3a's one-walk-two-call-sites split.
 
+        ``get_lineage`` and ``resolve_slug`` raise a raw ``sqlite3.Error`` on a failed
+        read; both are typed as ``DatabaseError`` here, so the pause's fail-open arm
+        (which catches exactly ``DatabaseError``/``ValidationError``) owns them like
+        every other pause read.
+
         Args:
             mutation_target_slugs: The declared ``supersedes``/``amends``/``narrows``
                 target slugs; any element may be ``None`` or empty (skipped).
 
         Returns:
-            The casefolded slugs of every transitive mutation ancestor of every
-            resolvable declared target; an empty set when no mutation edge was declared
-            (or no target resolves to exactly one node).
+            Casefolded target slug → its ancestors (``get_lineage``'s ``{node_id, slug,
+            kind}`` dicts), for every target that resolves to exactly one node; empty
+            when no mutation edge was declared.
+
+        Raises:
+            DatabaseError: If the lineage read fails.
         """
-        suppressed: set[str] = set()
+        ancestors: Dict[str, List[Dict[str, str]]] = {}
         for slug in mutation_target_slugs:
             if not slug or not slug.strip():
                 continue
-            ids = self.store.resolve_slug(slug)
+            ids = self._resolve_slug_typed(slug)
             # Each declared target was pre-validated unique-and-existing before the gate
             # runs (supersedes at the supersedes fast-fail, amends/narrows via
             # _validate_relation_target), so resolve_slug returns exactly one id on the
@@ -4876,9 +4969,66 @@ class MitosSyncManager:
             # a non-unique seed cannot meaningfully seed a single lineage walk.
             if len(ids) != 1:
                 continue
-            for ancestor in self.store.get_lineage(ids[0]):
-                suppressed.add(ancestor["slug"].casefold())
-        return suppressed
+            try:
+                walked = self.store.get_lineage(ids[0])
+            except sqlite3.Error as exc:
+                raise DatabaseError(f"Failed to read the lineage of '{slug}': {exc}")
+            ancestors.setdefault(slug.casefold(), []).extend(walked)
+        return ancestors
+
+    def _review_declared(self, supersedes: Optional[str], corrects: Optional[str],
+                         extra_relations: Dict[str, str]) -> DeclaredReview:
+        """What a draft's declarations exempt on the pause, by slug and by id (7a).
+
+        One lineage walk (:meth:`_lineage_ancestors`) feeds all three fields of the
+        :class:`DeclaredReview`: the live screen's suppression slugs, and each declared
+        target's exemption ids for the tombstone partition. It reads ``self.store``
+        unconditionally and nothing else on the manager, because the replay worker and
+        Layer C's draft reader call it on a store-only shell; the provider gate that
+        keeps the graph-only fast path free of the walk is
+        :meth:`_review_declared_targets`'.
+
+        Ids, not slugs, carry the exemption: a retired decision may share its slug with
+        its live bearer, so a declaration of the live ``x`` must not clear the retired
+        ``x`` (constraint 8). Phase A has already refused any target that names no node
+        or several, so each target resolves to exactly one id here — possibly a
+        retired one (a draft may ``amends`` a uniquely-slugged retired decision), which
+        then exempts that decision itself. A target resolving otherwise (a replay shell
+        skips Phase A) contributes its slug and no id.
+
+        Args:
+            supersedes: The raw ``supersedes`` argument.
+            corrects: The raw ``corrects`` argument.
+            extra_relations: The seven non-kill relations, stripped, non-empty only.
+
+        Returns:
+            The :class:`DeclaredReview`.
+
+        Raises:
+            DatabaseError: If a slug or lineage read fails.
+        """
+        direct = [t for raw in ([supersedes, corrects] + list(extra_relations.values()))
+                  for t in _split_relation_slugs(raw)]
+        slugs = {t.casefold() for t in direct}
+        ids_by_target: Dict[str, Set[str]] = {}
+        for target in direct:
+            ids = self._resolve_slug_typed(target)
+            if len(ids) == 1:
+                ids_by_target.setdefault(target.casefold(), set()).add(ids[0])
+        lineage = self._lineage_ancestors(
+            _split_relation_slugs(supersedes)
+            + _split_relation_slugs(extra_relations.get("amends"))
+            + _split_relation_slugs(extra_relations.get("narrows"))
+        )
+        for folded, ancestors in lineage.items():
+            for ancestor in ancestors:
+                slugs.add(ancestor["slug"].casefold())
+                ids_by_target.setdefault(folded, set()).add(ancestor["node_id"])
+        return DeclaredReview(
+            slugs=slugs,
+            ids_by_target=ids_by_target,
+            ids=set().union(*ids_by_target.values()) if ids_by_target else set(),
+        )
 
     def _review_declared_targets(self, supersedes: Optional[str],
                                  corrects: Optional[str],
@@ -4909,18 +5059,115 @@ class MitosSyncManager:
             The casefolded slugs the review must not flag. Graph-store faults from the
             lineage walk propagate; each caller owns its disposition.
         """
-        declared = {
+        if self.embed_provider and self.vector_store:
+            return self._review_declared(supersedes, corrects, extra_relations).slugs
+        return {
             t.casefold()
             for raw in ([supersedes, corrects] + list(extra_relations.values()))
             for t in _split_relation_slugs(raw)
         }
-        if self.embed_provider and self.vector_store:
-            declared |= self._lineage_suppression_slugs(
-                _split_relation_slugs(supersedes)
-                + _split_relation_slugs(extra_relations.get("amends"))
-                + _split_relation_slugs(extra_relations.get("narrows"))
-            )
-        return declared
+
+    def _review_tombstones(self, gathering: Gathering, declared: DeclaredReview, *,
+                           shown_neighbors: Sequence[Mapping[str, Any]],
+                           bound: Optional[int] = CONFLICT_TOP_K,
+                           floor: Optional[float] = None) -> TombstoneReview:
+        """The pause's tombstone partition from one healthy gathering (7a, vision §4.9).
+
+        A pure consumer of the gather's retired partition plus at most three reads, all
+        in Phase A: it runs no gather and embeds nothing.
+
+        * **Membership.** ``gathering.retired`` (rank order, so closest first) at or
+          above the floor. When none is, nothing is read and the review is empty.
+        * **Exemption, before the bound, by node id** (D4). One
+          :meth:`~mitos.store.GraphStore.get_kill_chains` over every such hit. A hit
+          ``T`` is exempt when some declared target's ids (``declared.ids_by_target``)
+          meet ``{T.id} ∪ KillChain(T).reached``: the declared target is ``T`` or its
+          lineage holds ``T``, or ``T``'s forward kill chain reaches a declared target
+          or its lineage — the walk that covers ``corrects``, which ``get_lineage``
+          leaves out. Those targets are ``cleared_by``.
+        * **The bound.** The first ``bound`` non-exempt hits are shown, the rest
+          counted in ``omitted``. ``bound=None`` shows them all.
+        * **The entries.** Each is :func:`~mitos.display.retired_handle`'s handle (from
+          one :meth:`~mitos.store.GraphStore.get_modifiers_map` over the shown ids,
+          and the live ends of the walk already read, through
+          :func:`~mitos.store.live_ends_from_chains`), plus the hit node's whole
+          ``axiom`` (the agent must recognise what it re-treads), plus two facts over
+          its live successors (its ``live_end`` when present, else its
+          ``superseded_by`` ∪ ``corrected_by``, which the live-end rule guarantees are
+          live then): ``successor_on_pause``, the successors among
+          ``shown_neighbors`` by casefolded slug (both sides live, and a live slug
+          names its one live bearer), present only when non-empty; and
+          ``successor_ambiguous: True`` when some successor's slug names several
+          nodes, by the validator's own predicate (:func:`_ambiguous_target`), so only
+          acknowledgement clears the tombstone. Present only when true.
+
+        Faults are not caught: a ``DatabaseError`` from any read propagates to the
+        pause's fail-open arm, which discards the live neighbours too (D3). A partly
+        read tombstone partition would pass for a whole one.
+
+        It reads ``self.store`` and nothing else on the manager, so the replay worker
+        and Layer C's draft reader call it on a store-only shell.
+
+        Args:
+            gathering: The review's healthy gathering.
+            declared: The draft's :class:`DeclaredReview`.
+            shown_neighbors: The live neighbours the pause shows (their ``slug``).
+            bound: How many tombstones to show; ``None`` for all.
+            floor: The tombstone floor; ``None`` reads ``_TOMBSTONE_FLOOR`` at call
+                time. The candidate sweep passes a lower floor to price a lowered one.
+
+        Returns:
+            The :class:`TombstoneReview`.
+
+        Raises:
+            DatabaseError: If a kill-chain, stamp or slug read fails.
+        """
+        if floor is None:
+            floor = _TOMBSTONE_FLOOR
+        above = [hit for hit in gathering.retired if hit.score >= floor]
+        if not above:
+            return TombstoneReview(shown=[], omitted=0, cleared_by=set())
+        chains, chain_slugs = self.store.get_kill_chains([hit.node["id"] for hit in above])
+        kept = []
+        cleared_by: Set[str] = set()
+        for hit in above:
+            node_id = hit.node["id"]
+            reach = {node_id, *chains[node_id].reached}
+            clearing = {target for target, ids in declared.ids_by_target.items()
+                        if ids & reach}
+            if clearing:
+                cleared_by |= clearing
+                continue
+            kept.append(hit)
+        shown_hits = kept if bound is None else kept[:bound]
+        if not shown_hits:
+            return TombstoneReview(shown=[], omitted=0, cleared_by=cleared_by)
+        shown_ids = [hit.node["id"] for hit in shown_hits]
+        live_ends = live_ends_from_chains({i: chains[i] for i in shown_ids}, chain_slugs)
+        stamps = self.store.get_modifiers_map(shown_ids)
+        on_pause = {n["slug"].casefold() for n in shown_neighbors}
+        ambiguity: Dict[str, bool] = {}
+        shown: List[Dict[str, Any]] = []
+        for hit in shown_hits:
+            entry = retired_handle(hit.node, score=hit.score, stamps=stamps,
+                                   live_ends=live_ends)
+            entry["axiom"] = hit.node["core_axiom"]
+            if "live_end" in entry:
+                successors = list(entry["live_end"])
+            else:
+                successors = list(dict.fromkeys(entry.get("superseded_by", [])
+                                                + entry.get("corrected_by", [])))
+            beside = [s for s in successors if s.casefold() in on_pause]
+            if beside:
+                entry["successor_on_pause"] = beside
+            for slug in successors:
+                if slug not in ambiguity:
+                    ambiguity[slug] = _ambiguous_target(self._resolve_slug_typed(slug))
+            if any(ambiguity[slug] for slug in successors):
+                entry["successor_ambiguous"] = True
+            shown.append(entry)
+        return TombstoneReview(shown=shown, omitted=len(kept) - len(shown_hits),
+                               cleared_by=cleared_by)
 
     def _acknowledged_neighbors_field(self, entry: ParsedEntry,
                                       supersedes: Optional[str],
@@ -6027,7 +6274,7 @@ class MitosSyncManager:
             ids = self.store.resolve_slug(_sup)
             if not ids:
                 return _record_error("supersedes_not_found", supersedes=_sup)
-            if len(ids) > 1:
+            if _ambiguous_target(ids):
                 return _record_error("supersedes_ambiguous", supersedes=_sup)
             target = self.store.get_node(ids[0])
             if not target or target.get("slug", "").casefold() != _sup.casefold():
@@ -6044,7 +6291,7 @@ class MitosSyncManager:
             ids = self.store.resolve_slug(_cor)
             if not ids:
                 return _record_error("corrects_not_found", corrects=_cor)
-            if len(ids) > 1:
+            if _ambiguous_target(ids):
                 return _record_error("corrects_ambiguous", corrects=_cor)
             target = self.store.get_node(ids[0])
             if not target or target.get("slug", "").casefold() != _cor.casefold():

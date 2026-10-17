@@ -76,8 +76,10 @@ RECORD_LIMIT = 10
 # Not retagged by 6a: every query-form hit now carries its lexical overlap with the
 # query, but it is derived from the node already in hand, not read through a new path,
 # and the runs that first carry it (`harbor-20261017-15ccebb` on) record this string.
+# Retagged by 7a: the draft form's targets and negatives are valued from the gather's
+# whole fetch, and every retired-precedent read asks the shipped tombstone review.
 READER = ("mcp.surface_decisions(retrieval_walk+rejection_leg)"
-          "+conflict.gather_candidates(retrieval_walk)")
+          "+conflict.gather_candidates(retrieval_walk)+sync._review_tombstones")
 # The per-item reader (5b): one shipped-client search over the whole collection,
 # labelled by this module's own map.
 ITEM_READER = "QdrantRejectionIndex.search(limit=all)+rejections.rejection_points"
@@ -205,6 +207,16 @@ class SectionDisagreement(Exception):
 
     Also raised when the section was not searched or not whole, since then nothing can
     be compared. A fault for the fixture: the run it belongs to is unrecordable.
+    """
+
+
+class TombstoneDisagreement(Exception):
+    """A retired-precedent target at or above the tombstone floor is not a tombstone.
+
+    ``read_draft_form`` asks the shipped review (``sync._review_tombstones``) over the
+    gathering it holds, with nothing declared: every retired target the instrument
+    measured at or above the floor must come back as a tombstone, or the instrument and
+    the surface disagree. A fault for the fixture, like `SectionDisagreement`.
     """
 
 
@@ -647,13 +659,61 @@ def read_draft_form(index: CalibrationIndex, fixture: Dict[str, Any]) -> FormRea
     )
     if isinstance(gathering, conflict.Unavailable):
         raise DraftReadUnavailable(gathering)
-    # The raw ranking the gather received, up to `CONFLICT_OVERFETCH_LIMIT`: since 2d the
-    # gather fetches at the raw bound (every Harbor point), so the slice keeps the
-    # recorded window the size it always was.
-    raw = _one_call(proxy, fixture)[:conflict.CONFLICT_OVERFETCH_LIMIT]
+    # 7a: targets and negatives are valued from the gather's whole fetch (at the raw
+    # bound since 2d), so a retired target ranked past the 20th raw point is measured
+    # wherever it sits (vision §5.3); over the measurement copy's 595 points it can be.
+    # The recorded raw window keeps its first `CONFLICT_OVERFETCH_LIMIT` hits, the size it
+    # always was, and on Harbor every value is unchanged.
+    raw = _one_call(proxy, fixture)
     hits = label_hits(index, raw, fixture.get("exclude", []))
-    result = R.derive_result(fixture, hits, None, sync._NEIGHBOR_REVIEW_THRESHOLD)
+    result = R.derive_result(fixture, hits, None, _pause_floor_of(fixture))
+    result["hits"] = result["hits"][:conflict.CONFLICT_OVERFETCH_LIMIT]
+    if fixture["class"] == "retired-precedent":
+        check_tombstone_agreement(index, fixture, result, gathering)
     return FormRead(result=result, calls=proxy.calls, candidates=gathering)
+
+
+def _pause_floor_of(fixture: Dict[str, Any]) -> float:
+    """The floor a draft fixture's class pauses at: a retired target meets the tombstone
+    floor (7a), every other class the live neighbour floor. A build before 7a has no
+    tombstone floor and its draft fixtures all read the live one."""
+    if fixture["class"] == "retired-precedent" and hasattr(sync, "_TOMBSTONE_FLOOR"):
+        return sync._TOMBSTONE_FLOOR
+    return sync._NEIGHBOR_REVIEW_THRESHOLD
+
+
+def check_tombstone_agreement(index: CalibrationIndex, fixture: Dict[str, Any],
+                              result: Dict[str, Any], gathering: Any) -> Optional[List[str]]:
+    """Asserts the shipped review shows every retired target at or above its floor (§6.6).
+
+    Calls ``sync._review_tombstones`` on the gathering the reader already holds, on a
+    store-only manager shell, with nothing declared and no bound, and requires each
+    target whose measured value is at or above the tombstone floor among the shown
+    tombstones. Feature-detected: a build without the review reads as before (``None``).
+
+    Returns:
+        The shown tombstones' slugs, or ``None`` on a build without the review.
+
+    Raises:
+        TombstoneDisagreement: When a target at or above the floor is not shown.
+    """
+    if not hasattr(sync.MitosSyncManager, "_review_tombstones"):
+        return None
+    shell = object.__new__(sync.MitosSyncManager)
+    shell.store = index.store
+    review = shell._review_tombstones(
+        gathering, sync.DeclaredReview(slugs=set(), ids_by_target={}, ids=set()),
+        shown_neighbors=[], bound=None)
+    shown = [t["slug"] for t in review.shown]
+    floor = sync._TOMBSTONE_FLOOR
+    missing = [t["slug"] for t in result["targets"]
+               if t["value"] is not None and t["value"] >= floor and t["slug"] not in shown]
+    if missing:
+        raise TombstoneDisagreement(
+            f"fixture {fixture['id']!r}: target(s) {missing} sit at or above the tombstone "
+            f"floor {floor} but the shipped review shows {shown}"
+        )
+    return shown
 
 
 def read_fixture(index: CalibrationIndex, fixture: Dict[str, Any]) -> FormRead:

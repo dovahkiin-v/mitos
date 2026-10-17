@@ -709,11 +709,13 @@ def test_a_floor_above_every_target_and_negative_is_outside_the_range(record_dir
 def test_check_pins_reports_a_threshold_boundary_outside_its_classes_range(record_dir):
     record, runs, _, harbor, dense = _clean(record_dir)
     entry = record["constants"][STRONG]
-    entry.update(value=7.5, side="unmoved", boundaries={harbor: 7.5, dense: 0.73})
-    problems = _problems(record, runs, {STRONG: 7.5})
+    # 7a: side `unmoved` now holds its value at or below every boundary, so the value
+    # sits under both; the out-of-range boundary is what this row is about.
+    entry.update(value=0.7, side="unmoved", boundaries={harbor: 7.5, dense: 0.73})
+    problems = _problems(record, runs, {STRONG: 0.7})
     assert _has(problems, "lies outside its classes' observed range")
     entry["kind"] = "margin"
-    assert _problems(record, runs, {STRONG: 7.5}) == []
+    assert _problems(record, runs, {STRONG: 0.7}) == []
 
 
 @pytest.mark.parametrize("side, value, boundaries, clean", [
@@ -723,7 +725,11 @@ def test_check_pins_reports_a_threshold_boundary_outside_its_classes_range(recor
     ("lower", 0.73, (0.75, 0.73), True),
     ("dense", 0.75, (0.75, 0.73), False),
     ("dense", 0.73, (0.75, 0.73), True),
-    ("unmoved", 0.80, (0.75, 0.73), True),
+    # 7a inverted this case (it was clean): an unmoved floor sits at or below every
+    # corpus's recall line, and 0.80 is above both.
+    ("unmoved", 0.80, (0.75, 0.73), False),
+    ("unmoved", 0.73, (0.75, 0.73), True),
+    ("unmoved", 0.70, (0.75, 0.73), True),
 ])
 def test_check_pins_checks_each_side(record_dir, side, value, boundaries, clean):
     record, runs, _, harbor, dense = _clean(record_dir)
@@ -1511,3 +1517,39 @@ def test_the_range_envelope_admits_one_step_past_a_maximum_and_refuses_two(recor
     record["constants"][STRONG].update(value=value, side="higher", boundaries={harbor: value, dense: 0.73})
     problems = _problems(record, runs, {STRONG: value})
     assert (not _has(problems, "observed range")) is clean, problems
+
+
+# ---------------------------------------------------------------------------
+# 7a: the pause's two floors — recall lines in document space
+# ---------------------------------------------------------------------------
+
+def _draft(cls, hits, targets, fid, measure="target", negatives=()):
+    fx = _fx(id=fid, **{"class": cls}, form="draft", targets=list(targets),
+             negatives=list(negatives), measure=measure)
+    return R.derive_result(fx, hits, None, 0.8)
+
+
+def test_the_tombstone_line_sits_at_or_below_every_retired_precedent_draft_target():
+    results = [
+        _draft("retired-precedent", [_hit("r1", 0.83456), _hit("d2", 0.9)], ["r1"], "a"),
+        _draft("retired-precedent", [_hit("r2", 0.9123)], ["r2"], "b"),
+        # A query-form retired-precedent read is another space: never the draft line.
+        R.derive_result(_fx(id="q", **{"class": "retired-precedent"}, targets=["r3"]),
+                        [_hit("r3", 0.61)], "weak", None),
+        # Another class in document space is not a re-tread.
+        _draft("bullseye", [_hit("b1", 0.7)], ["b1"], "c"),
+    ]
+    assert R.tombstone_floor_boundary(results) == 0.8345
+    assert R.pause_floor_boundary(results) == 0.7
+
+
+def test_the_two_lines_read_absent_targets_as_nothing_and_an_empty_class_as_none():
+    results = [_draft("retired-precedent", [_hit("d2", 0.9)], ["r-missing"], "a")]
+    assert results[0]["targets"][0]["absent"] is True
+    assert R.tombstone_floor_boundary(results) is None
+    assert R.pause_floor_boundary([]) is None
+
+
+def test_a_line_already_on_a_four_place_step_is_its_own_line():
+    results = [_draft("bullseye", [_hit("b1", 0.8175)], ["b1"], "a")]
+    assert R.pause_floor_boundary(results) == 0.8175

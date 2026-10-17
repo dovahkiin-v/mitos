@@ -43,7 +43,7 @@ from mitos.recall import (RetiredPartition, ShortWindow, _SURFACE_POINTERS,
 from mitos.retrieval_walk import (EDGE_FOUND, EDGE_UNMEASURED, EXHAUSTED,
                                   RANKED_OVERFETCH_BOUND, SHORT_BOUND, PointResolution,
                                   fill, walk_ranked)
-from mitos.store import GraphStore, _KILL_EDGE_TYPES_SQL
+from mitos.store import GraphStore, _KILL_EDGE_TYPES_SQL, live_ends_from_chains
 from mitos.sync import MitosSyncManager
 
 from _point_hits import CannedVector, orphan_hit, point_hit
@@ -376,7 +376,10 @@ def test_live_ends_sort_by_casefold_then_slug():
     """The result rule's order, over the slugs the walk reached."""
     ends = ["b-end", "A-end", "a-end"]
     assert sorted(ends, key=lambda s: (s.casefold(), s)) == ["A-end", "a-end", "b-end"]
-    assert "slug.casefold(), slug" in inspect.getsource(GraphStore.get_live_ends)
+    # 7a moved the result rule into `live_ends_from_chains`; `get_live_ends` answers
+    # through it, so the sort's one home is there.
+    assert "slug.casefold(), slug" in inspect.getsource(live_ends_from_chains)
+    assert "live_ends_from_chains(chains, slugs)" in inspect.getsource(GraphStore.get_live_ends)
 
 
 def test_the_store_answers_its_live_ends_in_casefold_then_slug_order(store):

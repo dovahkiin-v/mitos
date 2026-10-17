@@ -354,8 +354,9 @@ def derive_result(
         fixture: A validated fixture.
         hits: The labelled raw hits.
         envelope_band: The shipped envelope's ``confidence`` (query form), else ``None``.
-        pause_floor: ``sync._NEIGHBOR_REVIEW_THRESHOLD`` at run time (draft form), else
-            ``None``.
+        pause_floor: The floor the draft's class pauses at, at run time (draft form):
+            ``sync._TOMBSTONE_FLOOR`` for retired-precedent since 7a,
+            ``sync._NEIGHBOR_REVIEW_THRESHOLD`` for every other class; else ``None``.
         envelope_evidence: The shipped envelope's ``band_evidence`` (query form, 6b),
             recorded as ``envelope_evidence``; ``None`` (absent) when the band read no
             score or the reader predates it.
@@ -839,6 +840,53 @@ def rejection_floor_retention(results: List[dict], floor: float) -> Optional[flo
     if not values:
         return None
     return sum(1 for v in values if v is not None and v >= floor) / len(values)
+
+
+# ---------------------------------------------------------------------------
+# The pause's two floors (sync._NEIGHBOR_REVIEW_THRESHOLD, sync._TOMBSTONE_FLOOR), 7a
+# ---------------------------------------------------------------------------
+
+def _document_target_values(results: List[dict], cls: str) -> List[float]:
+    """Every valued target of the class's draft-form (document-space) results."""
+    return [t["value"] for r in results
+            if r.get("class") == cls and r.get("space") == "document" and r.get("measure") == "target"
+            for t in r["targets"] if t.get("value") is not None]
+
+
+def tombstone_floor_boundary(results: List[dict]) -> Optional[float]:
+    """Returns one corpus's tombstone-floor recall line: at or below every re-tread.
+
+    The re-treads are the retired-precedent draft targets, in document space (the
+    gather's space: a draft against documents). The line is the largest 4-decimal value
+    at or below their minimum, so every measured re-tread sits on or above it (7a D1:
+    recall first). The floor itself is ``min(0.80, every corpus's line)``: it never
+    rises on the class alone, only through its cry-wolf ceiling.
+
+    Args:
+        results: Fixture results; a Harbor run's ``fixtures`` or a dense run's
+            ``results.jsonl``.
+
+    Returns:
+        The line, or ``None`` when no re-tread has a value.
+    """
+    values = _document_target_values(results, "retired-precedent")
+    return _at_or_below(min(values)) if values else None
+
+
+def pause_floor_boundary(results: List[dict]) -> Optional[float]:
+    """Returns one corpus's live pause-floor recall line: at or below every duplicate.
+
+    The duplicates are the bullseye draft targets, in document space: a draft that
+    should pause on a live neighbour (a near-restatement, or a neighbour its author then
+    linked). The line is the largest 4-decimal value at or below their minimum (7a D1:
+    the live floor follows the same recall-first rule, and never rises; it drops only to
+    a lower line).
+
+    Returns:
+        The line, or ``None`` when no duplicate has a value.
+    """
+    values = _document_target_values(results, "bullseye")
+    return _at_or_below(min(values)) if values else None
 
 
 # ---------------------------------------------------------------------------
@@ -1659,6 +1707,13 @@ def _check_constant(
         problems.append(f"{name}: side `higher` needs value == max(boundaries) = {max(boundaries.values())!r}")
     elif side == "lower" and value != min(boundaries.values()):
         problems.append(f"{name}: side `lower` needs value == min(boundaries) = {min(boundaries.values())!r}")
+    elif side == "unmoved" and not (_is_number(value)
+                                    and all(_is_number(b) for b in boundaries.values())
+                                    and value <= min(boundaries.values())):
+        # 7a: a recall-first floor stays where it is only while every corpus's recall line
+        # sits at or above it; a line below it moves the floor (side `lower`).
+        problems.append(f"{name}: side `unmoved` needs value <= min(boundaries) = "
+                        f"{min(boundaries.values())!r}")
     elif side == "dense":
         if len(dense_cited) != 1:
             problems.append(f"{name}: side `dense` needs exactly one cited dense run, found {len(dense_cited)}")

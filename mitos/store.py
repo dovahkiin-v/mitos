@@ -686,6 +686,54 @@ class KillChain(NamedTuple):
     anomaly: Optional[str]
 
 
+def live_ends_from_chains(
+    chains: Dict[str, KillChain], slugs: Dict[str, str]
+) -> Dict[str, List[str]]:
+    """Applies the live-end result rule to walked kill chains: the rule's one home.
+
+    :meth:`GraphStore.get_live_ends` answers through this, and so does any reader
+    that walked once through :meth:`GraphStore.get_kill_chains` for ``reached`` and
+    must not walk again for the ends (PATTERNS "One walk, N call-sites").
+
+    Result rule: a seed appears **only** when some immediate killer is itself
+    retired. A seed whose killers are all live is absent, because its stamps already
+    name the live end; so is a live seed (it has no killer). The value lists every
+    live end the walk reached, sorted by ``slug.casefold()`` then slug, or ``[]``
+    when the walk reached none (a cycle with no exit). Each anomalous seed (a fan-out
+    or a cycle, authorable only out of band) gets one ``logger.warning`` naming it,
+    the anomaly and the heal; the answer still comes back.
+
+    Args:
+        chains: Seed id → :class:`KillChain`, as the walk returned it.
+        slugs: Node id → slug for every node the walk reached.
+
+    Returns:
+        Node id → live-end slugs, for the admitted seeds only.
+    """
+    result: Dict[str, List[str]] = {}
+    for seed, chain in chains.items():
+        if chain.anomaly is not None:
+            logger.warning(
+                "get_live_ends: kill-edge %s detected while walking the kill "
+                "chain of node %s (%d node(s) reached, %d live end(s)). The "
+                "supported write path never authors a kill-edge %s; this is an "
+                "out-of-band or corrupt edge — rebuild the derivative graph from "
+                "the markdown corpus (decisions.md and decisions/archive/, the "
+                "authoritative source) with `mitos rebuild`.",
+                chain.anomaly.replace("_", "-"),
+                seed,
+                len(chain.reached),
+                len(chain.live_ends),
+                chain.anomaly.replace("_", "-"),
+            )
+        live_set = set(chain.live_ends)
+        if not any(k not in live_set for k in chain.killers):
+            continue
+        ends = [slugs[n] for n in chain.live_ends]
+        result[seed] = sorted(ends, key=lambda slug: (slug.casefold(), slug))
+    return result
+
+
 class CommitDelta:
     """Represents the structured delta returned after an entry commit.
 
@@ -4170,6 +4218,49 @@ class GraphStore:
             )
         return chains, slugs
 
+    def get_kill_chains(
+        self, node_ids: List[str]
+    ) -> Tuple[Dict[str, KillChain], Dict[str, str]]:
+        """Walks every seed's kill chain forward, typed: the walk's public face.
+
+        :meth:`_walk_kill_chains` over its own connection, in chunks of
+        ``_POINT_ID_CHUNK`` seeds (one ``?`` per seed, so a long list stays under
+        SQLite's variable floor), with ``sqlite3.Error`` wrapped. A reader that needs
+        ``reached`` (the record pause's exemption) calls this; a reader that needs only
+        the live ends calls :meth:`get_live_ends`, and :func:`live_ends_from_chains`
+        turns this result into that one, so the rule exists once.
+
+        Args:
+            node_ids: The seeds; ``[]`` reads nothing. Repeats and unknown ids are
+                harmless (an unknown or live id gets an empty :class:`KillChain`).
+
+        Returns:
+            ``(chains, slugs)``: seed id → :class:`KillChain` for every distinct seed,
+            and node id → slug for every node any chain reached.
+
+        Raises:
+            DatabaseError: If the read fails.
+        """
+        if not node_ids:
+            return {}, {}
+        seeds = list(dict.fromkeys(node_ids))
+        chains: Dict[str, KillChain] = {}
+        slugs: Dict[str, str] = {}
+        conn = self._get_connection()
+        try:
+            for start in range(0, len(seeds), _POINT_ID_CHUNK):
+                part, part_slugs = self._walk_kill_chains(
+                    conn, seeds[start:start + _POINT_ID_CHUNK])
+                chains.update(part)
+                slugs.update(part_slugs)
+        except sqlite3.Error as e:
+            raise DatabaseError(
+                f"Failed to read kill chains for {len(seeds)} node(s): {str(e)}"
+            )
+        finally:
+            conn.close()
+        return chains, slugs
+
     def get_live_ends(self, node_ids: List[str]) -> Dict[str, List[str]]:
         """For each id whose kill chain passes through a retired successor, the live ends it reaches.
 
@@ -4177,7 +4268,9 @@ class GraphStore:
         facts: they name its **immediate** killer whatever that killer's state, so
         on a chain they name a dead hop. This read follows the chain to where the
         current word lives. One batched statement for the whole list
-        (:meth:`_walk_kill_chains`).
+        (:meth:`_walk_kill_chains`), then the result rule, which lives in
+        :func:`live_ends_from_chains` so a reader that walked for ``reached`` applies
+        the same rule without a second walk.
 
         Result rule: a seed appears **only** when some immediate killer is itself
         retired. A seed whose killers are all live is absent, because its stamps
@@ -4213,28 +4306,7 @@ class GraphStore:
             )
         finally:
             conn.close()
-        result: Dict[str, List[str]] = {}
-        for seed, chain in chains.items():
-            if chain.anomaly is not None:
-                logger.warning(
-                    "get_live_ends: kill-edge %s detected while walking the kill "
-                    "chain of node %s (%d node(s) reached, %d live end(s)). The "
-                    "supported write path never authors a kill-edge %s; this is an "
-                    "out-of-band or corrupt edge — rebuild the derivative graph from "
-                    "the markdown corpus (decisions.md and decisions/archive/, the "
-                    "authoritative source) with `mitos rebuild`.",
-                    chain.anomaly.replace("_", "-"),
-                    seed,
-                    len(chain.reached),
-                    len(chain.live_ends),
-                    chain.anomaly.replace("_", "-"),
-                )
-            live_set = set(chain.live_ends)
-            if not any(k not in live_set for k in chain.killers):
-                continue
-            ends = [slugs[n] for n in chain.live_ends]
-            result[seed] = sorted(ends, key=lambda slug: (slug.casefold(), slug))
-        return result
+        return live_ends_from_chains(chains, slugs)
 
     def get_contradictions(self, node_id: str) -> List[Dict[str, str]]:
         """Returns the nodes that contradict ``node_id``, from EITHER direction.

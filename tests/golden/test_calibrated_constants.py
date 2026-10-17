@@ -43,6 +43,7 @@ CALIBRATED_CONSTANTS: FrozenSet[str] = frozenset({
 # Shipped thresholds that owe calibration, with the phase that sets each.
 PENDING: Dict[str, str] = {
     "mitos.sync._NEIGHBOR_REVIEW_THRESHOLD": "7a",
+    "mitos.sync._TOMBSTONE_FLOOR": "7a",
 }
 
 # Suffix matches that are not calibrated against this record, each with its reason.
@@ -152,7 +153,8 @@ def test_the_calibrated_set_is_the_two_margins_the_rejection_floor_and_the_band(
                                               "mitos.recall.SURFACE_STRONG_THRESHOLD",
                                               "mitos.recall.SURFACE_WEAK_THRESHOLD",
                                               "mitos.recall.RANKED_TOP_CLUSTER_MARGIN"})
-    assert PENDING == {"mitos.sync._NEIGHBOR_REVIEW_THRESHOLD": "7a"}
+    assert PENDING == {"mitos.sync._NEIGHBOR_REVIEW_THRESHOLD": "7a",
+                       "mitos.sync._TOMBSTONE_FLOOR": "7a"}
 
 
 def test_the_edge_margins_harbor_boundary_recomputes_from_the_committed_run():
