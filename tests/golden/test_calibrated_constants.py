@@ -264,3 +264,47 @@ def test_the_top_cluster_margin_is_its_own_constant_not_an_alias():
     assert "RANKED_TOP_CLUSTER_MARGIN = RANKED_EDGE_MARGIN" not in source
     assert type(recall.RANKED_TOP_CLUSTER_MARGIN) is float
     assert _entry("RANKED_TOP_CLUSTER_MARGIN")["side"] == "dense"
+
+
+# -- 6b: the envelope's top-cluster count, read back against the recorded hits -----------
+
+def _evidence_run():
+    """The newest indexed Harbor run whose query results carry `envelope_evidence`."""
+    runs = [entry["run_id"] for entry in R.load_record()["runs"]
+            if entry["run_id"].startswith("harbor-")]
+    for run_id in reversed(runs):
+        fixtures = R.load_run(run_id)["fixtures"]
+        if any("envelope_evidence" in fx for fx in fixtures):
+            return run_id, fixtures
+    raise AssertionError("no Harbor run carries envelope_evidence (6b's after-run)")
+
+
+def test_the_envelopes_top_cluster_equals_the_size_recomputed_from_the_run():
+    """6b D8.4: the count's first real reader. On the recorded run, each query result's
+    `envelope_evidence.top_cluster` equals `top_cluster_size` over its live, non-self hits
+    in rank order at the record's `RANKED_TOP_CLUSTER_MARGIN`, and its `top_score` is the
+    top live value. The recorded hits are a raw slice (`RECORD_LIMIT`) that retired and
+    open-question points can fill, so a live list wholly inside the cluster and shorter
+    than the envelope's window cannot confirm the count: such a result is counted as
+    unconfirmed and the row says so rather than passing it."""
+    from _calibration_harness import RECORD_LIMIT
+    from mitos.recall import top_cluster_size
+
+    margin = _entry("RANKED_TOP_CLUSTER_MARGIN")["value"]
+    run_id, fixtures = _evidence_run()
+    checked, unconfirmed, wrong = 0, [], []
+    for fx in fixtures:
+        evidence = fx.get("envelope_evidence")
+        if evidence is None:
+            continue
+        live = [h["value"] for h in fx["hits"] if h["live"] and not h["self"]]
+        size = top_cluster_size(live, margin=margin)
+        assert evidence["top_score"] == max(live), fx["id"]
+        if size == len(live) < RECORD_LIMIT:
+            unconfirmed.append(fx["id"])
+        elif size != evidence["top_cluster"]:
+            wrong.append((fx["id"], evidence["top_cluster"], size))
+        checked += 1
+    assert checked >= 40, (run_id, checked)
+    assert not wrong, wrong
+    assert not unconfirmed, f"{run_id}: the recorded slice cannot confirm {unconfirmed}"

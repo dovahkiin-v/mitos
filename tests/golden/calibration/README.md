@@ -50,6 +50,14 @@ fails unless that section equals the instrument's own ranking cut at the floor i
 the section bound. A dense run over the measurement copy binds the copy's own rejection
 collection the same way.
 
+**A query-form result carries the envelope's band evidence** (since 6b, on branch
+`vision/mitos-recall-confidence-20261014`, not yet released): `envelope_evidence` is the
+envelope's `band_evidence` (`top_score`, `top_cluster`, `edge`, `next_score` beside a found
+edge), checked by `evidence_problem` when it is recorded and again on every committed run.
+A draft-form result never carries it. `test_calibrated_constants` reads the count back:
+each result's `top_cluster` must equal `top_cluster_size` over its live, non-self hits at
+the record's `RANKED_TOP_CLUSTER_MARGIN`. Runs before 6b lack the key and stay valid.
+
 **`shapes` compares the two rejection-index shapes** (ruling 2's evidence): one point per
 rejected item part, and one point per decision holding its whole field. Each is a throwaway
 collection read whole, so no low score is censored. The per-decision shape has no shipped
