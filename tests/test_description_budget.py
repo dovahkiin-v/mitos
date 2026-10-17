@@ -622,3 +622,16 @@ def test_skill_text_teaches_the_tombstones_and_both_acknowledged_lists():
     assert "never to its slug" in linking and "`amend_commentary` by its id" in linking
     # The clauses the description no longer carries live here.
     assert "`rotation`" in tail and "`scope_overflow`" in tail
+
+
+def test_skill_text_teaches_the_sibling_note():
+    """7c: the pause's ``descends_from_declared`` is taught in the skill (the
+    description has no room), with the declaration that does not clear it."""
+    from mitos import cli
+    text = cli._skill_md_text("<<SENTINEL>>")
+    tail = text.split("<<SENTINEL>>", 1)[1]
+    linking = tail[tail.index("## Linking decisions"):]
+    sentence = next(s for s in linking.split(". ") if "`descends_from_declared`" in s)
+    assert "descends from a decision this draft declares" in sentence
+    assert "the declaration does not clear it" in linking
+    assert "judge it like any other neighbour" in linking

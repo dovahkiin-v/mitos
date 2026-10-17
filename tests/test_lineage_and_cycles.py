@@ -422,3 +422,82 @@ def test_reenqueue_advances_queued_at_and_resets_retry_count(temp_store: GraphSt
         assert row["retry_count"] == 0  # reset (the drain-revival guarantee)
     finally:
         conn.close()
+
+
+# ==============================================================================
+# 7c — get_lineage_ids: the batched id-only reader over the same walk
+# ==============================================================================
+
+
+def _ids(store: GraphStore, node_id: str) -> set:
+    """``get_lineage``'s ancestor ids, the agreement target."""
+    return {row["node_id"] for row in store.get_lineage(node_id)}
+
+
+def test_get_lineage_ids_agrees_with_get_lineage_on_every_shape(temp_store: GraphStore) -> None:
+    """Row 14: a 60-deep chain, a diamond, a mixed-kind chain, a root, an unknown id."""
+    deep, _ = _build_chain(temp_store, "deep", 60)
+    _commit(temp_store, "dia-r", "Root R.")
+    _commit(temp_store, "dia-p", "P amends R.", amends=["dia-r"])
+    _commit(temp_store, "dia-q", "Q amends R.", amends=["dia-r"])
+    diamond = _commit(temp_store, "dia-x", "X amends P and Q.", amends=["dia-p", "dia-q"])
+    root = _commit(temp_store, "mix-0", "Mixed root.")
+    _commit(temp_store, "mix-1", "Supersedes the root.", supersedes=["mix-0"])
+    _commit(temp_store, "mix-2", "Amends link 1.", amends=["mix-1"])
+    mixed = _commit(temp_store, "mix-3", "Narrows link 2.", narrows=["mix-2"])
+    unknown = "f" * 64
+    seeds = [deep, diamond, mixed, root, unknown, deep]
+    lineage = temp_store.get_lineage_ids(seeds)
+    assert set(lineage) == set(seeds)
+    for seed in seeds:
+        assert len(lineage[seed]) == len(set(lineage[seed]))
+        assert set(lineage[seed]) == _ids(temp_store, seed)
+    assert len(lineage[deep]) == 60
+    assert lineage[root] == [] and lineage[unknown] == []
+    assert temp_store.get_lineage_ids([]) == {}
+
+
+def test_get_lineage_ids_opens_no_connection_for_no_seeds(temp_store: GraphStore,
+                                                          monkeypatch) -> None:
+    def refuse():
+        raise AssertionError("a connection was opened for no seeds")
+    monkeypatch.setattr(temp_store, "_get_connection", refuse)
+    assert temp_store.get_lineage_ids([]) == {}
+
+
+def test_get_lineage_ids_wraps_a_broken_connection(temp_store: GraphStore, monkeypatch) -> None:
+    """Row 15: a raw ``sqlite3.Error`` is raised typed (the fake defines ``cursor()``)."""
+    import sqlite3
+
+    from mitos.errors import DatabaseError
+
+    class _Broken:
+        def cursor(self):
+            return self
+
+        def execute(self, sql, params=()):
+            raise sqlite3.OperationalError("database is locked")
+
+        def close(self):
+            pass
+    monkeypatch.setattr(temp_store, "_get_connection", lambda: _Broken())
+    with pytest.raises(DatabaseError, match="mutation lineage"):
+        temp_store.get_lineage_ids(["a" * 64])
+
+
+def test_get_lineage_ids_reacts_to_a_cycle_with_get_lineages_own_warning(
+        temp_store: GraphStore, caplog) -> None:
+    """Row 16: it terminates, returns the walked set, and emits the same text."""
+    a = _commit(temp_store, "corrupt-a", "Decision A.")
+    b = _commit(temp_store, "corrupt-b", "Decision B, amends A.", amends=["corrupt-a"])
+    _inject_raw_edge(temp_store, source_id=a, target_id=b, edge_type="amends")
+
+    with caplog.at_level(logging.WARNING, logger="mitos.store"):
+        temp_store.get_lineage(b)
+    expected = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="mitos.store"):
+        lineage = temp_store.get_lineage_ids([b])
+    got = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert lineage == {b: [a]}
+    assert len(expected) == 1 and got == expected

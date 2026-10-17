@@ -76,7 +76,7 @@ def _declared(store: GraphStore, supersedes: Optional[str] = None,
     return _shell(store)._review_declared(supersedes, corrects, extra)
 
 
-_NONE = DeclaredReview(slugs=set(), ids_by_target={}, ids=set())
+_NONE = DeclaredReview(slugs=set(), ids_by_target={}, ids=set(), direct_ids={})
 
 
 def _review(store: GraphStore, scored: List[Tuple[str, float]],

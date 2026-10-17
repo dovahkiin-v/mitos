@@ -705,7 +705,8 @@ def check_tombstone_agreement(index: CalibrationIndex, fixture: Dict[str, Any],
     shell = object.__new__(sync.MitosSyncManager)
     shell.store = index.store
     review = shell._review_tombstones(
-        gathering, sync.DeclaredReview(slugs=set(), ids_by_target={}, ids=set()),
+        gathering,
+        sync.DeclaredReview(slugs=set(), ids_by_target={}, ids=set(), direct_ids={}),
         shown_neighbors=[], bound=None)
     shown = [t["slug"] for t in review.shown]
     floor = sync._TOMBSTONE_FLOOR

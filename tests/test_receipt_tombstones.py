@@ -336,7 +336,7 @@ def test_bare_and_full_reviews_select_the_same_ids_in_the_same_order(tmp_path):
     counting = _Counting(store)
     shell = _shell(counting)
     gathering = _gathering(store, scored)
-    none = sync.DeclaredReview(slugs=set(), ids_by_target={}, ids=set())
+    none = sync.DeclaredReview(slugs=set(), ids_by_target={}, ids=set(), direct_ids={})
     bare = shell._review_tombstones(gathering, none, shown_neighbors=[], bound=None,
                                     bare=True)
     assert "resolve_slug" not in counting.calls

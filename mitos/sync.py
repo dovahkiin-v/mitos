@@ -1268,7 +1268,8 @@ def _retired_exists_note(slug: str, node_id: str, state: str,
 class DeclaredReview(NamedTuple):
     """What a draft's declarations exempt on the pause, by slug and by node id (7a).
 
-    One lineage walk fills all three fields (:meth:`MitosSyncManager._review_declared`).
+    One lineage walk fills the first three fields
+    (:meth:`MitosSyncManager._review_declared`); its resolution loop fills the fourth.
 
     Attributes:
         slugs: Casefolded declared targets of all nine relations, plus the casefolded
@@ -1279,11 +1280,16 @@ class DeclaredReview(NamedTuple):
             resolve to exactly one node contributes nothing (Phase A refuses it before
             the pause; a replay shell may meet one).
         ids: The union of ``ids_by_target``'s values.
+        direct_ids: Each declared target's casefolded slug → its own node id, with no
+            lineage (7c). The sibling note matches it: a neighbour descends from a
+            target only when its lineage holds that target's own id, never one of the
+            target's ancestors (``ids_by_target`` would claim a cousin descends).
     """
 
     slugs: Set[str]
     ids_by_target: Dict[str, Set[str]]
     ids: Set[str]
+    direct_ids: Dict[str, str]
 
 
 class TombstoneReview(NamedTuple):
@@ -1677,6 +1683,10 @@ def _pause_message(payload: Dict[str, Any]) -> str:
             parts.append("If you go on to supersede or amend a neighbour, an "
                          "amended_by/narrowed_by stamp on it means it has moved on — "
                          "dereference that slug before linking.")
+        if any(n.get("descends_from_declared") for n in neighbors):
+            parts.append("A neighbour marked descends_from_declared descends from a "
+                         "decision this draft declares, named there; that declaration "
+                         "does not clear it, so judge it like any other neighbour.")
     if tombstones:
         omitted = payload.get("tombstones_omitted")
         lead = f"Paused: '{slug}' is" if not neighbors else "It is also"
@@ -5229,12 +5239,16 @@ class MitosSyncManager:
         (R is *their* ancestor), so this walk does not — and must not — suppress them.
         Auto-suppressing them would mean "declaring ``amends R`` silences the gate for
         R's entire descendant cluster", hiding a GENUINE duplicate of one sibling behind
-        an unrelated declaration. The vision defers the cluster's ergonomics to a later
-        granular-acknowledge layer. The seam that layer would add — a SYMMETRIC
-        per-neighbour check, ``any(t_id in {a["node_id"] for a in
-        get_lineage(neighbour_id)} for t_id in declared_mutation_target_ids)`` gated
-        behind explicit per-neighbour acknowledgement — is named here so it is
-        discoverable, built later, never rediscovered as a "bug".
+        an unrelated declaration. The suppression stays exactly that. The symmetric
+        check is built as a note instead (7c): :meth:`_review_siblings` walks each
+        shown live neighbour's own lineage (:meth:`GraphStore.get_lineage_ids`) and
+        marks the neighbour ``descends_from_declared`` when that lineage holds a
+        declared target's own id. It differs from the seam once named here in two
+        ways, both because a note hides nothing: it matches the targets of all nine
+        declared relations, not only the mutation three, and it is shown, never
+        suppressing. It costs no read when nothing is declared. The per-neighbour
+        acknowledgement that seam was paired with stays unbuilt:
+        ``acknowledge_neighbors`` still acknowledges the whole draft's neighbours.
 
         Consumes ``get_lineage``'s loud-but-non-fatal partial-on-cycle tolerance as-is
         (Decision 5): over a corrupt graph the suppression degrades gracefully (it
@@ -5290,12 +5304,13 @@ class MitosSyncManager:
                          ) -> DeclaredReview:
         """What a draft's declarations exempt on the pause, by slug and by id (7a).
 
-        One lineage walk (:meth:`_lineage_ancestors`) feeds all three fields of the
-        :class:`DeclaredReview`: the live screen's suppression slugs, and each declared
-        target's exemption ids for the tombstone partition. It reads ``self.store``
-        unconditionally and nothing else on the manager, because the replay worker and
-        Layer C's draft reader call it on a store-only shell; the provider gate that
-        keeps the graph-only fast path free of the walk is
+        One lineage walk (:meth:`_lineage_ancestors`) feeds the :class:`DeclaredReview`:
+        the live screen's suppression slugs, and each declared target's exemption ids
+        for the tombstone partition. The resolution loop before the walk also keeps
+        each target's own id (``direct_ids``, 7c), which the sibling note matches. It
+        reads ``self.store`` unconditionally and nothing else on the manager, because
+        the replay worker and Layer C's draft reader call it on a store-only shell; the
+        provider gate that keeps the graph-only fast path free of the walk is
         :meth:`_review_declared_targets`'.
 
         Ids, not slugs, carry the exemption: a retired decision may share its slug with
@@ -5331,11 +5346,13 @@ class MitosSyncManager:
                   for t in _split_relation_slugs(raw)]
         slugs = {t.casefold() for t in direct}
         ids_by_target: Dict[str, Set[str]] = {}
+        direct_ids: Dict[str, str] = {}
         for target in direct:
             pinned = (target_ids or {}).get(target.casefold())
             ids = [pinned] if pinned is not None else self._resolve_slug_typed(target)
             if len(ids) == 1:
                 ids_by_target.setdefault(target.casefold(), set()).add(ids[0])
+                direct_ids[target.casefold()] = ids[0]
         lineage = self._lineage_ancestors(
             _split_relation_slugs(supersedes)
             + _split_relation_slugs(extra_relations.get("amends"))
@@ -5350,6 +5367,7 @@ class MitosSyncManager:
             slugs=slugs,
             ids_by_target=ids_by_target,
             ids=set().union(*ids_by_target.values()) if ids_by_target else set(),
+            direct_ids=direct_ids,
         )
 
     def _review_declared_targets(self, supersedes: Optional[str],
@@ -5499,6 +5517,80 @@ class MitosSyncManager:
         return TombstoneReview(shown=shown, omitted=len(kept) - len(shown_hits),
                                cleared_by=cleared_by)
 
+    def _review_siblings(self, gathering: Gathering, declared: DeclaredReview, *,
+                         shown_neighbors: Sequence[Mapping[str, Any]],
+                         declared_by_relation: Mapping[str, Optional[str]],
+                         canonical_slugs: Mapping[str, str]) -> Dict[str, List[str]]:
+        """Which shown neighbours descend from a declared target: the sibling note (7c).
+
+        A live neighbour whose own mutation lineage (``supersedes`` ∪ ``amends`` ∪
+        ``narrows``, walked from the neighbour by
+        :meth:`~mitos.store.GraphStore.get_lineage_ids`) holds a declared target's own
+        id (``declared.direct_ids``) descends from that target; the pause says so
+        (vision §4.9). The targets of all nine declared relations count. The match is
+        the target's own id, never its lineage: a neighbour that shares an ancestor
+        with the target is its cousin, not its descendant. The note shows and never
+        suppresses: the neighbour still pauses the draft.
+
+        One batched read over the shown neighbours' ids, and none when the draft
+        declares no target that resolved or no neighbour is shown. A neighbour's id is
+        its gathered live candidate's, joined by casefolded slug (a live slug names
+        its one live bearer; ``record_decision`` refuses a second, so the first in
+        gather order is kept if one ever appears out of band).
+
+        Faults are not caught: a ``DatabaseError`` propagates to the pause's fail-open
+        arm, which discards the whole pause (one fault domain, 7a D3), so an absent
+        note never stands beside an unread lineage. It reads ``self.store`` and
+        nothing else on the manager, because the replay worker calls the pause on a
+        store-and-providers shell.
+
+        Args:
+            gathering: The review's healthy gathering (its ``live`` candidates).
+            declared: The draft's :class:`DeclaredReview`.
+            shown_neighbors: The live neighbours the pause shows (their ``slug``).
+            declared_by_relation: Relation name → the caller's raw argument, in the
+                echo's render order; it orders and spells the names.
+            canonical_slugs: Casefolded declared target → stored slug (the echo's
+                naming rule, falling back to the declared spelling).
+
+        Returns:
+            Casefolded neighbour slug → the declared targets it descends from, in
+            declaration order, each once; only neighbours with at least one.
+
+        Raises:
+            DatabaseError: If the lineage read fails.
+        """
+        targets: List[Tuple[str, str]] = []     # (target's own id, its name)
+        named: Set[str] = set()
+        for raw in declared_by_relation.values():
+            for target in _split_relation_slugs(raw):
+                folded = target.casefold()
+                target_id = declared.direct_ids.get(folded)
+                if target_id is None or target_id in named:
+                    continue
+                named.add(target_id)
+                targets.append((target_id, canonical_slugs.get(folded, target)))
+        if not targets or not shown_neighbors:
+            return {}
+        live_ids: Dict[str, str] = {}
+        for candidate in gathering.live:
+            live_ids.setdefault(candidate.node["slug"].casefold(), candidate.node["id"])
+        seeds = [live_ids[n["slug"].casefold()] for n in shown_neighbors
+                 if n["slug"].casefold() in live_ids]
+        if not seeds:
+            return {}
+        lineage = self.store.get_lineage_ids(seeds)
+        notes: Dict[str, List[str]] = {}
+        for neighbor in shown_neighbors:
+            folded = neighbor["slug"].casefold()
+            if folded not in live_ids:
+                continue
+            reach = set(lineage[live_ids[folded]])
+            names = [name for target_id, name in targets if target_id in reach]
+            if names:
+                notes[folded] = names
+        return notes
+
     def _review_pause(self, entry: ParsedEntry, supersedes: Optional[str],
                       corrects: Optional[str], extra_relations: Dict[str, str], *,
                       canonical_slugs: Dict[str, str],
@@ -5510,15 +5602,17 @@ class MitosSyncManager:
         counts come from one list, D5) feeds the live partition, cut to
         ``CONFLICT_TOP_K``, and the tombstone partition (:meth:`_review_tombstones`, over
         the same gathering's retired hits); one lineage walk (:meth:`_review_declared`)
-        feeds the live screen's suppression and the tombstones' exemption. The pause
-        returns when either partition holds something.
+        feeds the live screen's suppression and the tombstones' exemption. A third
+        read (:meth:`_review_siblings`, 7c) marks each shown live neighbour that
+        descends from a declared target with ``descends_from_declared``; it shows and
+        never suppresses. The pause returns when either partition holds something.
 
         Fail-open, one fault domain (D3): a ``DatabaseError``/``ValidationError`` from
         any read — the gather's, the lineage walk's, the kill-chain, stamp or slug reads
-        of the tombstones — discards both partitions and yields the
-        ``neighbor_review_unavailable`` notice, so an absent tombstone never reads as
-        checked-clean; a typed embed or vector-store ``Unavailable`` words its cause the
-        same way. Anything else is a real bug and propagates.
+        of the tombstones, the sibling note's lineage read — discards both partitions
+        and yields the ``neighbor_review_unavailable`` notice, so an absent tombstone
+        never reads as checked-clean; a typed embed or vector-store ``Unavailable``
+        words its cause the same way. Anything else is a real bug and propagates.
 
         The record path and the replay worker (a store-and-providers shell) call it, so
         the replay prices the shipped pause and not a copy of it.
@@ -5541,6 +5635,8 @@ class MitosSyncManager:
         review_unavailable: Optional[str] = None
         neighbors: List[Dict[str, Any]] = []
         tombs = TombstoneReview(shown=[], omitted=0, cleared_by=set())
+        # Casefolded shown-neighbour slug → the declared targets it descends from.
+        siblings: Dict[str, List[str]] = {}
         # The caller's own declarations, per relation, for the pause echo — built
         # BESIDE the declared review below, which folds the relation name away. Purely
         # additive: nothing that Phase B reads moves in here.
@@ -5582,6 +5678,10 @@ class MitosSyncManager:
                         retired=[h for h in gathering.retired if h.node["id"] != own_id])
                 tombs = self._review_tombstones(
                     gathering, declared, shown_neighbors=reviewed[:CONFLICT_TOP_K])
+                siblings = self._review_siblings(
+                    gathering, declared, shown_neighbors=reviewed[:CONFLICT_TOP_K],
+                    declared_by_relation=declared_by_relation,
+                    canonical_slugs=canonical_slugs)
         except (DatabaseError, ValidationError) as exc:
             # A graph-store fault during the pause read (the gather's node reads, the
             # lineage walk, a tombstone read). Fail open — a fault this severe fails
@@ -5590,6 +5690,11 @@ class MitosSyncManager:
             # whole one.
             review_unavailable = _review_unavailable_notice("graph read failed")
             gatherings = []
+            # A read after the tombstones (the sibling note) can fault with the
+            # tombstones already read; reset them, or a tombstone-only pause would
+            # pass for a whole one.
+            tombs = TombstoneReview(shown=[], omitted=0, cleared_by=set())
+            siblings = {}
             # stderr: the MCP write tool shares this path and uses stdout for JSON-RPC.
             print(f"[Warning] Neighbor review skipped for '{entry.slug}': {exc}",
                   file=sys.stderr)
@@ -5612,7 +5717,10 @@ class MitosSyncManager:
             cut = _review_cut_notice(gathering, _NEIGHBOR_REVIEW_THRESHOLD,
                                      tombstone_floor=_TOMBSTONE_FLOOR)
             full = _review_full_notice(gathering, _NEIGHBOR_REVIEW_THRESHOLD, _TOMBSTONE_FLOOR)
-        shown = neighbors[:CONFLICT_TOP_K]
+        # The sibling note rides a copy of its neighbour, never the entry in place.
+        shown = [{**n, "descends_from_declared": siblings[n["slug"].casefold()]}
+                 if n["slug"].casefold() in siblings else n
+                 for n in neighbors[:CONFLICT_TOP_K]]
         if not shown and not tombs.shown:
             return PauseReview(pause=None, unavailable=review_unavailable, cut=cut)
         # The declared-edge echo (A2). mitos is stateless across calls, so a pause on a
@@ -6724,7 +6832,10 @@ class MitosSyncManager:
             payload (:func:`~mitos.conflict.candidate_payload`: ``slug`` / ``axiom`` /
             ``scope`` / ``score`` / ``rejected_paths`` plus any ``amended_by``/
             ``narrowed_by`` stamps) the authoring agent judges tenability from, at most
-            ``CONFLICT_TOP_K`` and ``[]`` on a tombstone-only pause. The pause's second
+            ``CONFLICT_TOP_K`` and ``[]`` on a tombstone-only pause; a neighbour whose
+            own mutation lineage reaches a target this draft declares also carries
+            ``descends_from_declared`` (7c, :meth:`_review_siblings`): those targets'
+            slugs, in declaration order. The pause's second
             partition, ``tombstones`` (7a), lists the retired decisions the draft sits at
             or above ``_TOMBSTONE_FLOOR`` to, closest first, at most ``CONFLICT_TOP_K``,
             exempt ones dropped first (:meth:`_review_tombstones`): each a retired handle
@@ -6734,8 +6845,8 @@ class MitosSyncManager:
             ride beside them only when non-zero: ``neighbors_omitted`` and
             ``tombstones_omitted``; ``neighbor_review_full`` says, when the gather's live
             fill ended full above the lower floor, that both counts cover what it read;
-            ``neighbor_review_cut`` says the gather was cut. Every one of these keys is
-            absent when computed and empty. That
+            ``neighbor_review_cut`` says the gather was cut. Every one of these keys,
+            ``descends_from_declared`` included, is absent when computed and empty. That
             pause also echoes the caller's own declared relation targets, partitioned
             by :func:`_declared_echo` and present only when non-empty: ``declared``
             (every target it typed, canonical spellings) and

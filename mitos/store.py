@@ -932,6 +932,38 @@ def _boot_migrations(
         conn.close()
 
 
+def _warn_lineage_cycle(node_id: str, cycle_node: str, walked: int) -> None:
+    """Emits the mutation-lineage cycle warning, the one text both readers share.
+
+    :meth:`GraphStore.get_lineage` and :meth:`GraphStore.get_lineage_ids` react to a
+    cycle alike (P5/P7): loud, non-fatal, naming the node and the repair. The supported
+    write path never authors a mutation cycle (the write-time reachability guard
+    rejects every cycle-closer), so this is an out-of-band or corrupt edge, and the
+    hot ``record`` path must stay crash-safe over it. The text is byte-identical to
+    the one ``get_lineage`` emitted before 7c, its ``get_lineage:`` lead included:
+    both readers run the same walk, and one text is what keeps the reaction single.
+    (The write guard in :meth:`GraphStore._reconcile_edges` ignores the cycle node on
+    purpose and does not call this.)
+
+    Args:
+        node_id: The seed whose lineage was walked.
+        cycle_node: The node where the cycle closed.
+        walked: How many ancestors were walked before the bound fired.
+    """
+    logger.warning(
+        "get_lineage: mutation cycle detected while walking lineage of "
+        "node %s — the cycle closes at node %s. Returning the partial "
+        "lineage (%d ancestor(s)) walked before the bound fired. The "
+        "supported write path never authors a mutation cycle; this is an "
+        "out-of-band or corrupt edge — rebuild the derivative graph from "
+        "the markdown corpus (decisions.md and decisions/archive/, the "
+        "authoritative source) with `mitos rebuild`.",
+        node_id,
+        cycle_node,
+        walked,
+    )
+
+
 class GraphStore:
     """SQLite-backed store managing nodes, edges, signals, and computed state."""
 
@@ -4373,9 +4405,10 @@ class GraphStore:
     ) -> Tuple[List[str], Optional[str]]:
         """Walks the transitive mutation-union ancestry outward from ``start_id``.
 
-        The ONE shared walk behind both :meth:`get_lineage` (read) and the
-        write-time cycle-rejection guard in :meth:`_reconcile_edges` (the vision's
-        "one walk, two call-sites", §4.3). Follows ``start_id``'s OUTGOING mutation
+        The ONE shared walk behind the read path — :meth:`get_lineage` and its
+        batched id-only twin :meth:`get_lineage_ids` (7c) — and the write-time
+        cycle-rejection guard in :meth:`_reconcile_edges` (the vision's "one walk, two
+        call-sites", §4.3). Follows ``start_id``'s OUTGOING mutation
         edges (``supersedes`` ∪ ``amends`` ∪ ``narrows`` — ``_MUTATION_EDGE_FIELDS``;
         ``corrects`` excluded, Decision 2) transitively: mutation edges point
         new→old, so an ancestor is an older node a chain of mutations descends from.
@@ -4494,23 +4527,7 @@ class GraphStore:
             cursor = conn.cursor()
             ancestor_ids, cycle_node = self._walk_mutation_lineage(cursor, node_id)
             if cycle_node is not None:
-                # Loud, non-fatal: the supported write path never authors a mutation
-                # cycle (the write-time reachability guard rejects every cycle-closer),
-                # so this is an out-of-band / corrupt edge. Name the node and surface
-                # the repair path; do NOT raise (the hot ``record`` path stays
-                # crash-safe over a corrupt graph).
-                logger.warning(
-                    "get_lineage: mutation cycle detected while walking lineage of "
-                    "node %s — the cycle closes at node %s. Returning the partial "
-                    "lineage (%d ancestor(s)) walked before the bound fired. The "
-                    "supported write path never authors a mutation cycle; this is an "
-                    "out-of-band or corrupt edge — rebuild the derivative graph from "
-                    "the markdown corpus (decisions.md and decisions/archive/, the "
-                    "authoritative source) with `mitos rebuild`.",
-                    node_id,
-                    cycle_node,
-                    len(ancestor_ids),
-                )
+                _warn_lineage_cycle(node_id, cycle_node, len(ancestor_ids))
             if not ancestor_ids:
                 return []
             # Hydrate the ancestor ids → identity dicts. ``id`` is the globally-unique
@@ -4526,6 +4543,51 @@ class GraphStore:
             return [dict(row) for row in rows]
         finally:
             conn.close()
+
+    def get_lineage_ids(self, node_ids: List[str]) -> Dict[str, List[str]]:
+        """Returns each seed's transitive mutation ancestor ids, batched (7c).
+
+        :meth:`_walk_mutation_lineage` per distinct seed, over one connection and one
+        cursor: the same walk as :meth:`get_lineage`, ids only, with no hydration
+        query. The record pause's sibling note (``descends_from_declared``) reads it
+        from the shown live neighbours, comparing ids it already holds.
+
+        The cycle reaction is :meth:`get_lineage`'s, through the same helper: tolerate,
+        truncate, warn loudly naming the node, and return what was walked. Unlike
+        :meth:`get_lineage`, a failed read is typed here (``sqlite3.Error`` →
+        ``DatabaseError``), as :meth:`get_kill_chains` types it.
+
+        Args:
+            node_ids: The seeds; ``[]`` reads nothing and opens no connection. Repeats
+                are harmless.
+
+        Returns:
+            Seed id → its ancestor ids in first-seen depth-first order, seed excluded,
+            for every distinct seed; ``[]`` for a seed with no ancestors or an unknown
+            id.
+
+        Raises:
+            DatabaseError: If the read fails.
+        """
+        if not node_ids:
+            return {}
+        seeds = list(dict.fromkeys(node_ids))
+        lineage: Dict[str, List[str]] = {}
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            for seed in seeds:
+                ancestor_ids, cycle_node = self._walk_mutation_lineage(cursor, seed)
+                if cycle_node is not None:
+                    _warn_lineage_cycle(seed, cycle_node, len(ancestor_ids))
+                lineage[seed] = ancestor_ids
+        except sqlite3.Error as e:
+            raise DatabaseError(
+                f"Failed to read the mutation lineage of {len(seeds)} node(s): {str(e)}"
+            )
+        finally:
+            conn.close()
+        return lineage
 
     def get_unregistered_mechanisms(self, parsed: ParsedEntry) -> List[str]:
         """Returns the subset of ``parsed``'s mechanism refs NOT yet in the registry.
