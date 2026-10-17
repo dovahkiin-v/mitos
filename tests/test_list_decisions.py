@@ -444,3 +444,67 @@ def test_list_text_says_nothing_when_nothing_was_cut(ws, capsys) -> None:
     capsys.readouterr()
     cmd_list(config)
     assert "cut to fit" not in capsys.readouterr().out
+
+
+# ----- entry-016: the parked open questions are part of the exhaustive answer ---- #
+# `list_decisions` once read them inside `except Exception: pass`, so a faulted scan
+# answered `open_questions: []` — "none parked in this scope", an exhaustive claim.
+# The scan now propagates on both surfaces, as `get_decisions` above it always did.
+
+from mitos.errors import DatabaseError
+
+
+def _faulting_oq_scan(*_a, **_k):
+    raise DatabaseError("planted: the open-question scan could not run")
+
+
+def test_9a_mcp_list_decisions_open_question_scan_fault_propagates(ws) -> None:
+    from mitos import mcp_server
+    config, m = ws
+    _record(m, "a", scope=["auth"])
+    store = GraphStore(config.db_path, read_only=True)
+    with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)), \
+            patch.object(GraphStore, "get_open_questions", _faulting_oq_scan):
+        with pytest.raises(DatabaseError, match="open-question scan"):
+            mcp_server.list_decisions(scope="auth", project=config.workspace_dir)
+
+
+@pytest.mark.parametrize("as_json", [False, True], ids=["text", "json"])
+def test_9a_cli_list_open_question_scan_fault_exits_nonzero(ws, capsys, monkeypatch, as_json) -> None:
+    config, m = ws
+    _record(m, "a", scope=["auth"])
+    capsys.readouterr()
+    argv = ["mitos", "-p", config.workspace_dir, "list", "--scope", "auth"]
+    monkeypatch.setattr(sys, "argv", argv + (["--json"] if as_json else []))
+    monkeypatch.setattr(GraphStore, "get_open_questions", _faulting_oq_scan)
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 1
+    out, err = capsys.readouterr()
+    assert "Error: planted: the open-question scan could not run" in err
+    # The fault comes before any print: no partial list, no "none parked" claim.
+    assert '"decisions"' not in out and "Axiom for a." not in out
+
+
+def test_9a_mcp_list_decisions_healthy_scoped_envelope_is_unchanged(ws) -> None:
+    """Control: the healthy path keeps its shape; the patched scan is the only difference."""
+    from mitos import mcp_server
+    config, m = ws
+    _record(m, "a", scope=["auth"])
+    _record(m, "d", scope=["db"])
+    _commit_oq_scope(GraphStore(config.db_path), "oq-here", ["auth"])
+    store = GraphStore(config.db_path, read_only=True)
+    with patch.object(mcp_server, "get_workspace_components", return_value=(store, None, None)):
+        here = json.loads(mcp_server.list_decisions(scope="auth", project=config.workspace_dir))
+        empty = json.loads(mcp_server.list_decisions(scope="db", project=config.workspace_dir))
+    assert list(here)[:5] == ["decisions", "open_questions", "total", "scope", "state"]
+    assert here["open_questions"] == [{"topic": "oq-here",
+                                       "questions_raised": ["What about oq-here?"],
+                                       "park_reason": None}]
+    assert here["decisions"] == [{"slug": "a", "axiom": "Axiom for a.",
+                                  "rejected_paths": "Rejected alternative for a.",
+                                  "scope": ["auth"], "state": "active"}]
+    # A healthy scoped read with nothing parked in its scope keeps its honest [].
+    assert list(empty)[:5] == ["decisions", "open_questions", "total", "scope", "state"]
+    assert empty["open_questions"] == [] and empty["total"] == 1
+    assert "scope_known" not in empty and "scope_recovery" not in empty

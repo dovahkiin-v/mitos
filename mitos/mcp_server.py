@@ -1239,13 +1239,14 @@ def list_decisions(scope: Optional[str] = None, state: str = "active", brief: bo
         d.update(modifiers.get(n["id"], {}))
         decisions.append(d)
 
-    open_questions = []
-    try:
-        for oq in store.get_open_questions(scope=scope):
-            if oq["state"] == "parked":
-                open_questions.append(_oq_payload(oq))
-    except Exception:
-        pass
+    # The parked open questions are part of this exhaustive answer, not a rider on
+    # it: a faulted scan propagates (as `cmd_list`'s does), because `[]` here claims
+    # "none parked in this scope".
+    open_questions = [
+        _oq_payload(oq)
+        for oq in store.get_open_questions(scope=scope)
+        if oq["state"] == "parked"
+    ]
 
     payload: Dict[str, Any] = {
         "decisions": decisions,
