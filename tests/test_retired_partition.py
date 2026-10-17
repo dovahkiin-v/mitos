@@ -30,6 +30,7 @@ from unittest.mock import patch
 
 import pytest
 
+from mitos.stamp_labels import NO_LABELS
 from mitos import cli, display, mcp_server, recall, retrieval_walk
 from mitos.cli import cmd_init, cmd_show, cmd_surface
 from mitos.config import MitosConfig
@@ -103,9 +104,10 @@ def _note(resp: Any, key: Optional[str]) -> str:
 
 
 def _block(out: str) -> str:
-    """The CLI text partition block: from its header to the note line."""
+    """The CLI text partition block: from its header to the label block (8a) or the note line."""
     assert "Retired decisions this ranking passed" in out, out
-    return out.split("Retired decisions this ranking passed", 1)[1].split("→ ", 1)[0]
+    block = out.split("Retired decisions this ranking passed", 1)[1].split("→ ", 1)[0]
+    return block.split("Stamped slugs, labelled:", 1)[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -637,7 +639,7 @@ def _ranked(verb, surface, top, *, lead, shape, scope=None, scope_counts=None):
         part=RetiredPartition(handles, 0, bool(lead)), section=None,
         unbuilt=lambda: False, top_cluster_margin=recall.RANKED_TOP_CLUSTER_MARGIN,
         edge_margin=recall.RANKED_EDGE_MARGIN, ceiling=50, full_top=None,
-        scope=scope, scope_counts=scope_counts, scan_faults=(),
+        scope=scope, scope_counts=scope_counts, scan_faults=(), labels=NO_LABELS,
     )
     return walk, composed.note
 
@@ -683,7 +685,7 @@ def test_the_nothing_ranked_forks_carry_no_lead_and_no_short(verb):
         walk, register=verb, surface="mcp", config=_CONFIG, handles=[],
         part=RetiredPartition([], 0, False), section=None, unbuilt=lambda: False,
         top_cluster_margin=recall.RANKED_TOP_CLUSTER_MARGIN,
-        edge_margin=recall.RANKED_EDGE_MARGIN, ceiling=50, full_top=None, scan_faults=(),
+        edge_margin=recall.RANKED_EDGE_MARGIN, ceiling=50, full_top=None, scan_faults=(), labels=NO_LABELS,
     )
     absence = recall.absence_clause(register=verb, surface="mcp", config=_CONFIG,
                                     scope=None)

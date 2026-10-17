@@ -58,7 +58,10 @@ Pure stdlib — no graph or network access — plus **one admitted ``mitos`` imp
 the import-free ``shell_quote`` leaf (``difflib`` for the did-you-mean; pinned by
 ``test_recall_stays_a_zero_mitos_import_leaf``). Where a policy here needs a fact only another
 module can compute, the fact is *injected* rather than imported:
-:func:`missing_graph_is_a_gap` takes the corpus scan as a required keyword. That
+:func:`missing_graph_is_a_gap` takes the corpus scan as a required keyword, and the
+stamp labels (8a) arrive read by the site — a value on :func:`compose_ranked`
+(``labels``), a callable on :func:`rejection_lookup` (``read_labels``), whose matches
+this module shapes — from ``mitos.stamp_labels``, which this module never imports. That
 is not ceremony — ``conflict.py`` imports this module, so an import added here
 lands inside the check family's discovered no-write fence
 (``test_conflict_closeout.py``), and a predicate the sweep never calls has no
@@ -1523,7 +1526,8 @@ def rejection_section(walk: "object", *, full_top: Optional[int],
 # (they never co-occur); ``scan_faults`` holds entry-005's clauses.
 NOTE_SLOTS: Tuple[str, ...] = (
     "rejection_lead", "retired_lead", "legend", "top_cluster", "edge", "absence",
-    "not_computed", "section_state", "withheld", "stamps_unread", "scan_faults",
+    "not_computed", "section_state", "withheld", "stamps_unread", "labels_unread",
+    "scan_faults",
 )
 
 
@@ -1533,6 +1537,7 @@ def compose_note(*, rejection_lead: Optional[str] = None,
                  absence: Optional[str] = None, not_computed: Optional[str] = None,
                  section_state: Optional[str] = None, withheld: Optional[str] = None,
                  stamps_unread: Optional[str] = None,
+                 labels_unread: Optional[str] = None,
                  scan_faults: Sequence[str] = ()) -> str:
     """Joins a note's lines in :data:`NOTE_SLOTS` order. The ONE place order is decided.
 
@@ -1540,8 +1545,8 @@ def compose_note(*, rejection_lead: Optional[str] = None,
     the present ones, joined by single spaces. The ranked surfaces reach it through
     :func:`compose_ranked`, the lookup through :func:`rejection_lookup`, and the three
     degraded composers in ``degraded`` directly (passing only ``legend``,
-    ``not_computed``, ``section_state``, ``withheld``, ``stamps_unread`` and
-    ``scan_faults``).
+    ``not_computed``, ``section_state``, ``withheld``, ``stamps_unread``,
+    ``labels_unread`` and ``scan_faults``).
 
     Args:
         rejection_lead: :func:`rejection_lead_clause`, or None.
@@ -1554,6 +1559,7 @@ def compose_note(*, rejection_lead: Optional[str] = None,
         section_state: The rejection section's clause, or None.
         withheld: :func:`withheld_clause`, or None.
         stamps_unread: :func:`stamps_unread_clause`, or None.
+        labels_unread: :func:`stamp_labels_unread_clause`, or None.
         scan_faults: Entry-005's clauses, in order; empty when none.
 
     Returns:
@@ -1563,7 +1569,7 @@ def compose_note(*, rejection_lead: Optional[str] = None,
              "legend": legend, "top_cluster": top_cluster, "edge": edge,
              "absence": absence, "not_computed": not_computed,
              "section_state": section_state, "withheld": withheld,
-             "stamps_unread": stamps_unread}
+             "stamps_unread": stamps_unread, "labels_unread": labels_unread}
     lines: List[str] = []
     for name in NOTE_SLOTS:
         if name == "scan_faults":
@@ -1600,6 +1606,9 @@ class RankedNote(NamedTuple):
         section: The rejection section, or None when the walk did not run.
         withheld: The withheld count over decisions.
         stamps_unread: Whether the walk's stamp read faulted.
+        labels: The stamp label map (8a), as the boundary read it; empty when
+            nothing was labelled.
+        labels_unread: Whether the label read faulted.
     """
 
     confidence: str
@@ -1611,16 +1620,19 @@ class RankedNote(NamedTuple):
     section: Optional[RejectionSection]
     withheld: int
     stamps_unread: bool
+    labels: Dict[str, str]
+    labels_unread: bool
 
     def envelope_keys(self) -> Dict[str, Any]:
         """The keys every ranked envelope places after its hit list, in order.
 
         ``confidence``, ``band_evidence``, ``note``, ``retired_partition`` (+
         ``retired_partition_omitted``), the section's keys, ``all_superseded`` (the
-        blackout), ``rejected_paths_withheld``, ``stamps_unread``. Under the unbuilt
-        graph only ``confidence`` and ``note``: with no graph to read, its note stands
-        for every key the graph supplies (lock A), and a later graph-supplied key joins
-        the suppressed list by being placed below that return.
+        blackout), ``stamp_labels`` (after every key that names a slug),
+        ``rejected_paths_withheld``, ``stamps_unread``, ``stamp_labels_unread``. Under
+        the unbuilt graph only ``confidence`` and ``note``: with no graph to read, its
+        note stands for every key the graph supplies (lock A), and a later
+        graph-supplied key joins the suppressed list by being placed below that return.
         """
         keys: Dict[str, Any] = {"confidence": self.confidence}
         if self.override == OVERRIDE_UNBUILT:
@@ -1637,10 +1649,14 @@ class RankedNote(NamedTuple):
             keys.update(self.section.envelope_keys())
         if self.override == OVERRIDE_BLACKOUT:
             keys["all_superseded"] = self.handles
+        if self.labels:
+            keys["stamp_labels"] = dict(self.labels)
         if self.withheld:
             keys["rejected_paths_withheld"] = self.withheld
         if self.stamps_unread:
             keys["stamps_unread"] = True
+        if self.labels_unread:
+            keys["stamp_labels_unread"] = True
         return keys
 
 
@@ -1654,7 +1670,7 @@ def compose_ranked(walk: Optional["object"], *, register: str, surface: str,
                    edge_margin: float, ceiling: int, full_top: Optional[int],
                    scope: Optional[str] = None,
                    scope_counts: Optional[Dict[str, Dict[str, int]]] = None,
-                   scan_faults: Sequence[str]) -> RankedNote:
+                   scan_faults: Sequence[str], labels: "object") -> RankedNote:
     """Composes a ranked answer's band, evidence and note: the four ranked surfaces' one call.
 
     Computed once, from the walk: the window's scores and top score, the band and its
@@ -1677,7 +1693,10 @@ def compose_ranked(walk: Optional["object"], *, register: str, surface: str,
     lead or the blackout is in the note: that note has named where the current word
     lives. The handles are shaped by the site (``display.retired_handle``) because this
     leaf imports no display; ``unbuilt`` is asked only on an empty window, so the graph
-    read stays off the healthy path.
+    read stays off the healthy path. The stamp labels arrive read by the site
+    (``stamp_labels.ranked_labels``), injected because this leaf imports nothing
+    (constraint 17); the map is placed below the unbuilt return, so the unbuilt note
+    stands for it too, and a label fault adds :func:`stamp_labels_unread_clause`.
 
     Args:
         walk: The ``RankedWalk`` (duck-typed), or None on a healthy-empty arm (an
@@ -1698,6 +1717,8 @@ def compose_ranked(walk: Optional["object"], *, register: str, surface: str,
         scope_counts: The ordered live scope counts (``surface`` only), or None.
         scan_faults: Entry-005's clauses (``oq_scan_fault_clause``,
             ``scope_counts_fault_clause``), in that order; empty when none.
+        labels: The response's ``StampLabels`` (duck-typed: ``labels``, ``unread``).
+            Required, so a ranked site that forgot to read them is a ``TypeError``.
 
     Returns:
         A :class:`RankedNote`.
@@ -1728,7 +1749,8 @@ def compose_ranked(walk: Optional["object"], *, register: str, surface: str,
     if not window and unbuilt():
         return RankedNote(confidence=confidence, note=missing_graph_note(surface, config),
                           evidence=None, override=OVERRIDE_UNBUILT, handles=[],
-                          omitted=0, section=None, withheld=0, stamps_unread=False)
+                          omitted=0, section=None, withheld=0, stamps_unread=False,
+                          labels={}, labels_unread=False)
     evidence = (band_evidence(walk, scores=scores, top_cluster_margin=top_cluster_margin,
                               edge_margin=edge_margin) if walk is not None else None)
     blackout = not window and bool(handles)
@@ -1756,6 +1778,7 @@ def compose_ranked(walk: Optional["object"], *, register: str, surface: str,
             scope=None if _scope_is_unused(scope, scope_counts) else scope)
     withheld = section.withheld if section is not None else 0
     stamps_unread = walk is not None and walk.stamps_unread
+    labels_unread = bool(labels.unread)
     note = compose_note(
         rejection_lead=(rejection_lead_clause(lead, surface=surface)
                         if lead is not None else None),
@@ -1771,12 +1794,15 @@ def compose_ranked(walk: Optional["object"], *, register: str, surface: str,
                   if withheld else None),
         stamps_unread=(stamps_unread_clause(surface=surface, config=config)
                        if stamps_unread else None),
+        labels_unread=(stamp_labels_unread_clause(surface=surface, config=config)
+                       if labels_unread else None),
         scan_faults=scan_faults,
     )
     return RankedNote(confidence=confidence, note=note, evidence=evidence,
                       override=OVERRIDE_BLACKOUT if blackout else None,
                       handles=handles, omitted=part.omitted, section=section,
-                      withheld=withheld, stamps_unread=stamps_unread)
+                      withheld=withheld, stamps_unread=stamps_unread,
+                      labels=dict(labels.labels), labels_unread=labels_unread)
 
 
 # The field-scoped lookup (``query``'s ``field`` selector): the stored fields a caller
@@ -1841,24 +1867,29 @@ def rejection_lookup_gap_reason(*, surface: str, config: "object") -> str:
 LOOKUP_DEGRADED_NOT_COMPUTED: Tuple[str, ...] = ("band", "band_evidence", "edge")
 
 
-def lookup_omission_clause(*, retired_dropped: bool) -> str:
+def lookup_omission_clause(*, retired_dropped: bool, labels_computed: bool = True) -> str:
     """Words what the lookup's lexical answer did not compute or list.
 
-    The note twin of ``not_computed`` (:data:`LOOKUP_DEGRADED_NOT_COMPUTED`). A
-    retired decision's rejected options are dropped only when the graph's states
-    were read; otherwise the stamps-unavailable disclosure says the answer may
-    include superseded decisions, and this clause says nothing about them.
+    The note twin of ``not_computed`` (:data:`LOOKUP_DEGRADED_NOT_COMPUTED`, plus
+    :data:`STAMP_LABELS_TOKEN` when the graph was not read). A retired decision's
+    rejected options are dropped only when the graph's states were read; otherwise
+    the stamps-unavailable disclosure says the answer may include superseded
+    decisions, and this clause says nothing about them.
 
     Args:
         retired_dropped: Whether the lexical match read the graph's states.
+        labels_computed: False when the graph was not read, so nothing was stamped
+            and no stamp label could be computed (8a).
 
     Returns:
-        One or two sentences.
+        One to three sentences.
     """
     clause = ("Not computed without similarity scores: the confidence band and its "
               "evidence, and the ranking's edge.")
     if retired_dropped:
         clause = f"{clause} Rejected options of retired decisions are not listed."
+    if not labels_computed:
+        clause = f"{clause} {_LABELS_NOT_COMPUTED_SENTENCE}"
     return clause
 
 
@@ -2010,7 +2041,8 @@ def rejection_lookup(walk: Optional["object"], *, query: str, full_top: Optional
                      shape: Callable[..., List[Dict[str, Any]]], margin: float,
                      top_cluster_margin: float, ceiling: int,
                      graph_gap: Callable[[], bool], surface: str,
-                     config: "object") -> LookupNote:
+                     config: "object",
+                     read_labels: Callable[[List[Dict[str, Any]]], "object"]) -> LookupNote:
     """Composes the field-scoped lookup's healthy envelope, once for both surfaces.
 
     The rejection ranking is the answer: ``rejection_matches`` shaped by the
@@ -2022,7 +2054,9 @@ def rejection_lookup(walk: Optional["object"], *, query: str, full_top: Optional
     stamps-unread. The lookup has no decision ranking, so it has no lead line. An empty
     window over an unbuilt graph answers with :func:`missing_graph_note` alone and none
     of the graph-supplied keys (W31, lock A). Each boundary encodes or renders the
-    envelope and adds nothing.
+    envelope and adds nothing. The stamp labels are read through ``read_labels`` over
+    the shaped matches (the lookup shapes them here, so the boundary binds its store
+    into a callable), below the unbuilt return, and placed after the slug-naming keys.
 
     Args:
         walk: The ``RejectionLookupWalk`` (duck-typed), or None for the healthy empty
@@ -2040,13 +2074,16 @@ def rejection_lookup(walk: Optional["object"], *, query: str, full_top: Optional
             caller.
         surface: ``"cli"`` or ``"mcp"``.
         config: The active ``MitosConfig`` (duck-typed).
+        read_labels: ``lambda m: stamp_labels.match_labels(store, m)`` bound by the
+            caller; returns a ``StampLabels`` (duck-typed: ``labels``, ``unread``).
 
     Returns:
         A :class:`LookupNote`. The envelope: ``query``, ``field``, ``depth_mode``,
         ``rejection_matches`` (absent when empty), provenance, ``confidence``,
         ``band_evidence`` (absent on an empty window), ``note``, then
-        ``rejection_section: "short"`` with ``rejection_dropped``,
-        ``rejected_paths_withheld`` and ``stamps_unread`` when they apply.
+        ``rejection_section: "short"`` with ``rejection_dropped``, ``stamp_labels``,
+        ``rejected_paths_withheld``, ``stamps_unread`` and ``stamp_labels_unread`` when
+        they apply.
     """
     window = list(walk.window) if walk is not None else []
     matches: List[Dict[str, Any]] = []
@@ -2085,6 +2122,7 @@ def rejection_lookup(walk: Optional["object"], *, query: str, full_top: Optional
         item_counts=walk.item_counts if walk is not None else {},
     )
     stamps_unread = walk is not None and walk.stamps_unread
+    labels = read_labels(matches)
     note = compose_note(
         legend=_lookup_band_note(band, top_score=top_score, result_count=len(window),
                                  surface=surface, config=config),
@@ -2098,6 +2136,8 @@ def rejection_lookup(walk: Optional["object"], *, query: str, full_top: Optional
                   if withheld else None),
         stamps_unread=(stamps_unread_clause(surface=surface, config=config)
                        if stamps_unread else None),
+        labels_unread=(stamp_labels_unread_clause(surface=surface, config=config)
+                       if labels.unread else None),
     )
     if evidence is not None:
         envelope["band_evidence"] = evidence
@@ -2105,10 +2145,14 @@ def rejection_lookup(walk: Optional["object"], *, query: str, full_top: Optional
     if walk is not None and walk.short:
         envelope["rejection_section"] = "short"
         envelope["rejection_dropped"] = sum(walk.dropped.values())
+    if labels.labels:
+        envelope["stamp_labels"] = dict(labels.labels)
     if withheld:
         envelope["rejected_paths_withheld"] = withheld
     if stamps_unread:
         envelope["stamps_unread"] = True
+    if labels.unread:
+        envelope["stamp_labels_unread"] = True
     return LookupNote(envelope=envelope, override=None)
 
 
@@ -2127,21 +2171,39 @@ DEGRADED_NOT_COMPUTED: Tuple[str, ...] = ("retired_partition", "edge", "band",
 # The ``not_computed`` token for a degraded rejection section that was not searched.
 DEGRADED_SECTION_TOKEN = "rejection_matches"
 
+# The ``not_computed`` token for the stamp label map (8a), on the two lexical exits
+# whose graph could not be read: nothing was stamped there, so nothing could be
+# labelled. Appended at the call site, never part of the shared tuples: the scope
+# dump always read its graph and labels unconditionally.
+STAMP_LABELS_TOKEN = "stamp_labels"
 
-def degraded_omission_clause() -> str:
+# The omission clauses' twin of :data:`STAMP_LABELS_TOKEN`.
+_LABELS_NOT_COMPUTED_SENTENCE = ("Stamp labels were not computed: the graph's stamps "
+                                 "could not be read.")
+
+
+def degraded_omission_clause(*, labels_computed: bool = True) -> str:
     """Words the note clause every degraded answer carries: what it did not compute.
 
-    The note twin of ``not_computed`` (:data:`DEGRADED_NOT_COMPUTED`), for the CLI
-    text surface, where there is no key to read. A fact with no pointer and no
-    write, so it is the same sentence on both surfaces. Pure string formatting.
+    The note twin of ``not_computed`` (:data:`DEGRADED_NOT_COMPUTED`, plus
+    :data:`STAMP_LABELS_TOKEN` when the graph was not read), for the CLI text
+    surface, where there is no key to read. A fact with no pointer and no write, so
+    it is the same sentence on both surfaces. Pure string formatting.
+
+    Args:
+        labels_computed: False when the lexical read could not read the graph, so
+            nothing was stamped and no stamp label could be computed (8a).
 
     Returns:
-        One sentence naming the omissions.
+        One or two sentences naming the omissions.
     """
-    return (
+    clause = (
         "Not computed without similarity scores: the retired partition, the "
         "window's edge, and the confidence band and its evidence."
     )
+    if not labels_computed:
+        clause = f"{clause} {_LABELS_NOT_COMPUTED_SENTENCE}"
+    return clause
 
 
 def degraded_section_clause(*, computed: bool, retired_dropped: bool) -> str:
@@ -2227,6 +2289,29 @@ def stamps_unread_clause(*, surface: str, config: "object") -> str:
         "Modifier stamps could not be read, so any hit may have been amended or "
         f"superseded; {pointer} reads one with its stamps."
     )
+
+
+def stamp_labels_unread_clause(*, surface: str, config: "object") -> str:
+    """Words the note clause an answer carries when its stamp labels went unread (8a).
+
+    The stamps themselves were read and stand; only ``stamp_labels``, the first clause
+    of each stamped live decision's axiom, is missing. The clause states that and
+    names the by-handle read that carries the axiom. A read, never a write, and no
+    verdict on the corpus, so it is lawful in both registers. Absent on a healthy
+    answer. Pure string formatting.
+
+    Args:
+        surface: ``"cli"`` or ``"mcp"`` — selects the dereference wording.
+        config: The active ``MitosConfig`` (duck-typed). Read only for ``project``,
+            which the CLI recipe names as its selector.
+
+    Returns:
+        One sentence.
+    """
+    pointer = _SURFACE_POINTERS[surface]["dereference"].format(
+        selector=shell_flag("-p", getattr(config, "project", ""))
+    )
+    return f"Stamp labels could not be read; {pointer} reads a stamped decision whole."
 
 
 def corpus_provenance(config: "object") -> Dict[str, str]:

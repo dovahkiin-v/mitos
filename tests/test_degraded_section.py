@@ -605,8 +605,8 @@ def test_the_dump_key_order(dws):
     assert resp["rejected_paths_withheld"] == 1  # cache-ttl: thinned, no section match
     keys = list(resp)
     assert keys[keys.index("note") + 1:] == [
-        "not_computed", "rejection_matches", "rejection_section", "stamps_unread",
-        "rejected_paths_withheld"]
+        "not_computed", "rejection_matches", "rejection_section", "stamp_labels",
+        "stamps_unread", "rejected_paths_withheld"]
     assert json.dumps(resp)  # encodable
 
 

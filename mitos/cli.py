@@ -117,7 +117,9 @@ from mitos.recall import (OVERRIDE_BLACKOUT, OVERRIDE_UNBUILT, RANKED_EDGE_MARGI
                           oq_scan_fault_clause, rejection_lookup,
                           rejection_lookup_gap_reason, rejection_section,
                           retired_partition, scope_counts_fault_clause,
-                          scope_filter_recovery, count_withheld)
+                          scope_filter_recovery, count_withheld,
+                          stamp_labels_unread_clause)
+from mitos.stamp_labels import list_labels, match_labels, ranked_labels
 from mitos.retrieval_walk import (REJECTIONS_OVER_BUDGET, RejectionLeg,
                                   WalkContractError, walk_ranked,
                                   walk_rejection_lookup)
@@ -566,7 +568,7 @@ def _skill_md_text(format_spec_content: str) -> str:
         "## Recording & recall — MCP tools (preferred) or CLI fallback\n"
         "If the Mitos MCP server is wired into your agent, call these tools directly — best experience: structured args, no shell-quoting. If it is NOT wired, each maps to a CLI verb (and the CLI also accepts five of the long names as aliases, e.g. `mitos record_decision -p .`):\n"
         "- `record_decision`  (CLI: `mitos record -p .`) — the moment you commit to a foundational choice (a schema, a library, a pattern, a path you're abandoning), persist it WITH the alternatives you rejected and why, so future sessions inherit it instead of relitigating. Write `rejected_paths` one rejected option per line, as `(N) <option>: REJECTED — <reason>`, so each option is found and shown on its own; the comma prose of the format spec's sample above still parses, as one option. Recording rich prose via the CLI? Use `--axiom-file -` / `--rejected-file -` / `--context-file -` to read from stdin and avoid shell-quoting.\n"
-        f"- `surface_decisions` (CLI: `mitos surface -p .`) — surface active precedents for a claim/scope BEFORE you decide, so you don't relitigate a settled call. This is the recall loop — use it first. Every hit carries its full `rejected_paths` by default. `brief=True` (CLI `--brief`) is an existence screen: scan the axioms, then read the hits that matter whole with `show_node`. `full_top=N` (CLI `--full-top N`) keeps the reasoning on the top N ranks only. If an answer carries `rejection_matches`, read them before you propose: each is an option a decision already rejected for its own question, with that decision's reason — weigh whether the reason carries over. Phrase the query by the mechanism and subject, not by the conclusion you are about to reach: phrasing moves the score. Its `confidence` rates this ranking: under `weak`, {WEAK_MEANING}, so read the hits; a `top_cluster` above 1 in `band_evidence` means the order inside it does not say which one answers. A ranking cannot show that nothing covers this claim: read the scope whole with `list_decisions(scope=…)`, or `list_decisions(scope=…, oneline=True)` for one line per decision.\n"
+        f"- `surface_decisions` (CLI: `mitos surface -p .`) — surface active precedents for a claim/scope BEFORE you decide, so you don't relitigate a settled call. This is the recall loop — use it first. Every hit carries its full `rejected_paths` by default. `brief=True` (CLI `--brief`) is an existence screen: scan the axioms, then read the hits that matter whole with `show_node`. `full_top=N` (CLI `--full-top N`) keeps the reasoning on the top N ranks only. If an answer carries `rejection_matches`, read them before you propose: each is an option a decision already rejected for its own question, with that decision's reason — weigh whether the reason carries over. Phrase the query by the mechanism and subject, not by the conclusion you are about to reach: phrasing moves the score. Its `confidence` rates this ranking: under `weak`, {WEAK_MEANING}, so read the hits; a `top_cluster` above 1 in `band_evidence` means the order inside it does not say which one answers. A ranking cannot show that nothing covers this claim: read the scope whole with `list_decisions(scope=…)`, or `list_decisions(scope=…, oneline=True)` for one line per decision. A hit stamped `amended_by` / `narrowed_by` has moved on, and a retired handle's `live_end` names where its current word lives: the answer's `stamp_labels` gives each live decision those stamps name its axiom's first clause, so you see what it moved to before you dereference it.\n"
         "- `query_decisions`   (CLI: `mitos query -p .`) — the TARGETED lookup of a pointed claim. On the tool an exact slug returns that decision whole; on the CLI, read a slug with `mitos show -p . -- <slug>`. Its confidence band rates this ranking, as `surface_decisions`' does; for the precedent question, ask `surface_decisions` with the claim you are about to commit to. Before you propose an option, ask whether it was already rejected: `field=\"rejected_paths\"` (CLI `--field rejected_paths`) ranks the rejected options alone, each with its decision's reason. That ranking cannot show that no rejected option covers this claim; `list_decisions(scope=…)` keeps each decision's `rejected_paths`.\n"
         "- `list_decisions`    (CLI: `mitos list -p .`) — the EXHAUSTIVE recall path. surface/query are semantic and capped at the top few matches; this returns EVERY decision in a scope, deterministically, so a completeness pass or audit doesn't miss anything below the relevance cliff. Needs no key or Qdrant.\n"
         "- `list_scopes`       (CLI: `mitos scopes -p .`) — the scope vocabulary with a count per tag. Read it before a scope-filtered read, or before tagging a new decision, so you reuse a tag that exists instead of minting a near-duplicate.\n"
@@ -585,7 +587,7 @@ def _skill_md_text(format_spec_content: str) -> str:
         "Skip the local, easily-reversible, or already-settled choice. A quick self-test at any fork: *would the next agent waste time re-deriving or re-litigating this?* If yes, record it. When unsure, `surface_decisions` first — if no hit answers it and it clears the bar, record it.\n\n"
         "## Linking decisions\n"
         "When a decision relates to an existing one, pass that one's EXACT slug to the matching relation arg so the graph stays connected instead of accumulating silent tension: `supersedes` (replaces it), `amends`, `narrows`, `depends_on`, `resolves`, `contradicts`, `cites`. On `record_decision` these are args; on the CLI they are flags (`--supersedes`, `--depends-on`, …). Look the target up first to get its exact slug.\n"
-        "A record that sits close to a decision it does not reference pauses (`needs_review`; nothing is written), in two partitions. `neighbors` are live decisions: relate to the ones this decision bears on, and pass `acknowledge_neighbors` as true for the ones it stands apart from. A neighbour carrying `descends_from_declared` descends from a decision this draft declares, named in that key; the declaration does not clear it, so judge it like any other neighbour. `tombstones` are retired decisions, each with its axiom and where its current word lives (`superseded_by` / `corrected_by`, or `live_end` when the chain runs through another retired decision). A retired decision is never a relation target, so for a tombstone the draft does not re-tread, relate to its live successor (a deliberate reversal is a `supersedes` of the successor) or acknowledge it. A tombstone marked `successor_ambiguous` clears only by acknowledgement: its successor's slug names two decisions, and `record_decision` refuses a relation target that two decisions carry. The usual case is a same-slug supersession, where the slug reads the live decision and the id reads the retired one.\n"
+        "A record that sits close to a decision it does not reference pauses (`needs_review`; nothing is written), in two partitions. `neighbors` are live decisions: relate to the ones this decision bears on, and pass `acknowledge_neighbors` as true for the ones it stands apart from. A neighbour carrying `descends_from_declared` descends from a decision this draft declares, named in that key; the declaration does not clear it, so judge it like any other neighbour. `tombstones` are retired decisions, each with its axiom and where its current word lives (`superseded_by` / `corrected_by`, or `live_end` when the chain runs through another retired decision). A retired decision is never a relation target, so for a tombstone the draft does not re-tread, relate to its live successor (a deliberate reversal is a `supersedes` of the successor) or acknowledge it. A tombstone marked `successor_ambiguous` clears only by acknowledgement: its successor's slug names two decisions, and `record_decision` refuses a relation target that two decisions carry. The usual case is a same-slug supersession, where the slug reads the live decision and the id reads the retired one. The pause's `stamp_labels` gives the first clause of each live decision a neighbour's stamp or a tombstone's successor names.\n"
         "An acknowledged write's receipt names what the acknowledgement went past: `acknowledged_neighbors` (the live slugs) and `acknowledged_tombstones` (the retired handles, each with its id and successors). A re-record whose axiom and mechanisms are a retired decision's answers `exists` with that decision's successors: relate a new decision to those, never to its slug, and repair its commentary with `amend_commentary` by its id.\n"
     )
 
@@ -1307,6 +1309,10 @@ def _emit_lexical_degraded(config: MitosConfig, query: str, *, reason: str,
     _print_lexical_section(envelope.get("rejection_matches", []))
     for oq in envelope.get("open_questions", []):
         print(f"[open question in scope] {oq['topic']}")
+        marker = _modifier_marker(oq)
+        if marker:
+            print(f"   {marker}")
+    _print_stamp_labels(config, envelope)
     _print_check_notice(config, check_notice)
 
 
@@ -1469,6 +1475,11 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
             shape=rejection_matches_payload, surface="cli", config=config,
         )
 
+    # The stamp labels (8a), one batched read for the whole answer — the same call
+    # mcp_server.query_decisions makes. None on the healthy-empty arm: nothing named.
+    labels = ranked_labels(store, window=matches, handles=handles,
+                           matches=section.matches if section is not None else [])
+
     # The band in the `query` register — it describes how this lookup's ranking did,
     # never what the corpus holds — its evidence and the note, composed once for both
     # encodings and both arms (a walk, or the healthy-empty arm's none). The blackout
@@ -1481,7 +1492,7 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         unbuilt=lambda: missing_graph_is_a_gap(store, config,
                                                corpus_scan=corpus_holds_entries),
         top_cluster_margin=RANKED_TOP_CLUSTER_MARGIN, edge_margin=RANKED_EDGE_MARGIN,
-        ceiling=RANKED_LIMIT_CEILING, full_top=full_top, scan_faults=(),
+        ceiling=RANKED_LIMIT_CEILING, full_top=full_top, scan_faults=(), labels=labels,
     )
 
     if as_json:
@@ -1504,6 +1515,7 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         _echo_corpus(config)
         _print_retired_partition(handles, part.omitted)
         _print_rejection_section(section)
+        _print_stamp_labels(config, composed.envelope_keys())
         print(composed.note)
         return
 
@@ -1517,6 +1529,7 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         # names a rejected option, so no live decision ranks and the item does.
         if not unbuilt:
             _print_rejection_section(section)
+            _print_stamp_labels(config, composed.envelope_keys())
             band_line = _query_band_line(composed.confidence)
             if band_line:
                 print(band_line)
@@ -1541,6 +1554,7 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         print()
     _print_retired_partition(handles, part.omitted)
     _print_rejection_section(section)
+    _print_stamp_labels(config, composed.envelope_keys())
     print(f"→ {composed.note}")
 
 
@@ -1615,6 +1629,7 @@ def _cmd_query_rejections(config: MitosConfig, query_text: str, *, as_json: bool
         graph_gap=lambda: missing_graph_is_a_gap(
             store, config, corpus_scan=corpus_holds_entries),
         surface="cli", config=config,
+        read_labels=lambda found: match_labels(store, found),
     )
     if as_json:
         _emit_json(lookup.envelope)
@@ -1651,6 +1666,7 @@ def _print_rejection_lookup(config: MitosConfig, envelope: Dict[str, Any], *,
     if matches:
         print("-" * 60)
         _print_rejection_section(_MatchList(matches))
+    _print_stamp_labels(config, envelope)
     print(f"→ {envelope['note']}")
 
 
@@ -1665,6 +1681,7 @@ def _print_rejection_lookup_lexical(config: MitosConfig, envelope: Dict[str, Any
     print(envelope["note"])
     _print_lexical_matches(envelope.get("rejection_matches", []))
     print()
+    _print_stamp_labels(config, envelope)
 
 
 def _print_lexical_matches(matches: List[Dict[str, Any]]) -> None:
@@ -1714,6 +1731,34 @@ def _print_section(section: Optional[Any]) -> None:
         _print_lexical_section(section.matches)
     else:
         _print_rejection_section(section)
+
+
+def _print_stamp_labels(config: MitosConfig, keys: Mapping[str, Any], *,
+                        noteless: bool = False, file: Optional[Any] = None) -> None:
+    """Prints an answer's stamp label map on the CLI text surface (8a).
+
+    The text twin of ``stamp_labels``: a ``Stamped slugs, labelled:`` heading and one
+    ``  <slug> — <label>`` line per entry, then a blank line; nothing when the map is
+    absent. The one printer every carrying text exit calls, placed after the
+    sections it labels. A label fault is stated by the note's clause where the answer
+    has a note; ``noteless`` (the listing, the record pause) prints the clause as its
+    own line instead.
+
+    Args:
+        config: The active workspace configuration (the clause's selector).
+        keys: The envelope, payload or ``RankedNote.envelope_keys()`` carrying the
+            two keys.
+        noteless: Whether the surface has no note to carry the fault's clause.
+        file: The stream; stdout when None (the pause prints on stderr).
+    """
+    labels = keys.get("stamp_labels")
+    if labels:
+        print("Stamped slugs, labelled:", file=file)
+        for slug, label in labels.items():
+            print(f"  {slug} — {label}", file=file)
+        print(file=file)
+    elif noteless and keys.get("stamp_labels_unread"):
+        print(stamp_labels_unread_clause(surface="cli", config=config), file=file)
 
 
 def _print_retired_partition(handles: List[Dict[str, Any]], omitted: int) -> None:
@@ -2125,14 +2170,20 @@ def cmd_list(config: MitosConfig, scope: Optional[str] = None,
             scope=scope, scope_counts=scope_counts, surface="cli"
         )
 
+    items = [_list_item(d) for d in decisions]
+    # The stamp labels (8a), read once for both encodings, at the default and brief
+    # tiers only — the same call mcp_server.list_decisions makes.
+    label_keys = {} if oneline else list_labels(store, decisions=items).envelope_keys()
+
     if as_json:
         payload: Dict[str, Any] = {
-            "decisions": [_list_item(d) for d in decisions],
+            "decisions": items,
             "open_questions": [_oq_payload(oq) for oq in parked],
             "total": len(decisions),
             "scope": scope,
             "state": effective_state,
         }
+        payload.update(label_keys)
         # The brief and oneline tiers withhold the field on every decision; the count
         # says so (no clause: list has no note). Absent at zero, before provenance.
         withheld = count_withheld(payload["decisions"])
@@ -2193,6 +2244,7 @@ def cmd_list(config: MitosConfig, scope: Optional[str] = None,
             if marker:
                 print(f"        {marker}")
     print()
+    _print_stamp_labels(config, label_keys, noteless=True)
 
 
 def cmd_open_questions(config: MitosConfig, scope: Optional[str] = None,
@@ -2793,6 +2845,7 @@ def cmd_record(
         if result.get("tombstones_omitted"):
             print(f"  (+{result['tombstones_omitted']} more tombstone(s) above the floor "
                   "not shown)", file=sys.stderr)
+        _print_stamp_labels(config, result, noteless=True, file=sys.stderr)
         for line in _declared_echo_lines(result):
             print(f"  {line}", file=sys.stderr)
         # The review's coverage sentences, verbatim (each names no command, so every
@@ -3353,6 +3406,11 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         if counts_unread:
             scan_faults.append(scope_counts_fault_clause(scope))
 
+    # The stamp labels (8a) — the same call mcp_server.surface_decisions makes.
+    labels = ranked_labels(
+        store, window=results["active_decisions"], handles=handles,
+        matches=section.matches if section is not None else [])
+
     # The band, its evidence and the note, composed once — the same call
     # mcp_server.surface_decisions makes (CLI⇄MCP parity by construction).
     composed = compose_ranked(
@@ -3362,7 +3420,7 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
                                                corpus_scan=corpus_holds_entries),
         top_cluster_margin=RANKED_TOP_CLUSTER_MARGIN, edge_margin=RANKED_EDGE_MARGIN,
         ceiling=RANKED_LIMIT_CEILING, full_top=full_top, scope=scope,
-        scope_counts=scope_counts, scan_faults=scan_faults,
+        scope_counts=scope_counts, scan_faults=scan_faults, labels=labels,
     )
     results.update(composed.envelope_keys())
 
@@ -3408,6 +3466,7 @@ def _print_surface_answer(config: MitosConfig, query: str, scope: Optional[str],
         if not unbuilt:
             _print_retired_partition(handles, omitted)
             _print_section(section)
+        _print_stamp_labels(config, results)
         print(f"→ {note}")
         _print_check_notice(config, notice)
         return
@@ -3438,6 +3497,7 @@ def _print_surface_answer(config: MitosConfig, query: str, scope: Optional[str],
         marker = _modifier_marker(oq)
         if marker:
             print(f"   {marker}")
+    _print_stamp_labels(config, results)
     print(f"\n→ {note}")
     _print_check_notice(config, notice)
 

@@ -108,8 +108,9 @@ from mitos.embeddings import GeminiEmbeddingProvider, fit_batch
 from mitos.provider_cause import (AUTH, QUOTA, TRANSIENT, classify_provider_error,
                                   describe_embed_failure)
 from mitos.shell_quote import shell_flag
+from mitos.stamp_labels import pause_labels
 from mitos.tool_markup import field_values, find_tool_call_markup
-from mitos.recall import missing_graph_is_a_gap
+from mitos.recall import missing_graph_is_a_gap, stamp_labels_unread_clause
 from mitos.rejections import (diff_rejection_index, expected_rejection_points,
                               rejection_points, render_rejected_paths)
 from mitos.vector_store import (QdrantRejectionIndex, QdrantVectorStore, RejectionPoint,
@@ -1715,6 +1716,9 @@ def _pause_message(payload: Dict[str, Any]) -> str:
             parts.append("A tombstone marked successor_ambiguous with several successors "
                          "has at least one whose slug two decisions carry, a relation target "
                          "record_decision refuses; acknowledge_neighbors=True clears it.")
+    if payload.get("stamp_labels_unread"):
+        # 8a: the label read faulted after the review; the stamps themselves stand.
+        parts.append(stamp_labels_unread_clause(surface="mcp", config=None))
     echo_prose = "".join(f"{line}. " for line in _declared_echo_lines(payload))
     return (" ".join(parts) + f" {PAUSE_HELD_CLAUSE}{_PAUSE_DIGEST_CLAUSE} "
             f"{echo_prose}Nothing was written.")
@@ -5622,8 +5626,14 @@ class MitosSyncManager:
         never reads as checked-clean; a typed embed or vector-store ``Unavailable``
         words its cause the same way. Anything else is a real bug and propagates.
 
+        The stamp label read (8a) sits **outside** that domain, after it, and only when
+        a pause will be returned: the map is no partition — it labels what the
+        partitions already show — so a fault there costs the map alone
+        (``stamp_labels_unread`` and one message clause), never the pause.
+
         The record path and the replay worker (a store-and-providers shell) call it, so
-        the replay prices the shipped pause and not a copy of it.
+        the replay prices the shipped pause and not a copy of it. The label read uses
+        ``self.store`` only.
 
         Args:
             entry: The parsed draft.
@@ -5752,10 +5762,15 @@ class MitosSyncManager:
             pause["tombstones"] = tombs.shown
         if tombs.omitted:
             pause["tombstones_omitted"] = tombs.omitted
+        # The stamp labels, read after the review's fault domain (8a D5): a fault here
+        # costs the map alone. Added before the message is composed, which reads them.
+        pause.update(pause_labels(self.store, neighbors=shown,
+                                  tombstones=tombs.shown).envelope_keys())
         pause.update(echo)
         pause = {
             **{k: pause[k] for k in ("status", "code", "slug", "neighbors")},
-            **{k: pause[k] for k in ("neighbors_omitted", "tombstones", "tombstones_omitted")
+            **{k: pause[k] for k in ("neighbors_omitted", "tombstones", "tombstones_omitted",
+                                     "stamp_labels", "stamp_labels_unread")
                if k in pause},
             "message": _pause_message(pause),
             "draft_digest": _draft_digest(entry),
@@ -6853,7 +6868,12 @@ class MitosSyncManager:
             ride beside them only when non-zero: ``neighbors_omitted`` and
             ``tombstones_omitted``; ``neighbor_review_full`` says, when the gather's live
             fill ended full above the lower floor, that both counts cover what it read;
-            ``neighbor_review_cut`` says the gather was cut. Every one of these keys,
+            ``neighbor_review_cut`` says the gather was cut. ``stamp_labels`` (8a) maps
+            each live decision a neighbour's ``amended_by``/``narrowed_by`` or a
+            tombstone's live successor names, and no shown neighbour already is, to the
+            first clause of its axiom (``stamp_labels.cut_label``);
+            ``stamp_labels_unread: true`` replaces it when that read faulted, which
+            costs the map alone. Every one of these keys,
             ``descends_from_declared`` included, is absent when computed and empty. That
             pause also echoes the caller's own declared relation targets, partitioned
             by :func:`_declared_echo` and present only when non-empty: ``declared``

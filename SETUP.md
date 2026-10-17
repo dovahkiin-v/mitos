@@ -350,7 +350,9 @@ write's receipt names what it went past, `acknowledged_neighbors` and
 `acknowledged_tombstones`, and a re-record identical to a retired decision
 answers `exists` naming its successors. If you go on to supersede or amend a neighbour, an
 `amended_by`/`narrowed_by` stamp on it means it has moved on — dereference that
-slug before linking.
+slug before linking. The pause's `stamp_labels` gives the first clause of each
+live decision a neighbour's stamp or a tombstone's successor names, so you see
+what it moved to before you do.
 
 ---
 

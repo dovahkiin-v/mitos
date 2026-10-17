@@ -33,6 +33,7 @@ from typing import Iterator, Tuple
 import pytest
 from unittest.mock import patch
 
+from mitos.stamp_labels import NO_LABELS
 from mitos.config import MitosConfig
 from mitos.cli import cmd_init, cmd_query, cmd_surface
 from mitos.errors import CollectionMissingError
@@ -2698,7 +2699,7 @@ def test_the_clause_rides_every_ranked_fork_and_no_other(surface, fork, edge):
         section=None, unbuilt=lambda: False, top_cluster_margin=RANKED_TOP_CLUSTER_MARGIN,
         edge_margin=RANKED_EDGE_MARGIN, ceiling=50,
         full_top=0 if edge.held == 0 else None, scope=scope, scope_counts=counts,
-        scan_faults=(),
+        scan_faults=(), labels=NO_LABELS,
     )
     expected = _composed(verb, surface, config, top, n, edge=edge if rides else None,
                          scope=scope, scope_counts=counts)[1]

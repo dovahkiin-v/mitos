@@ -34,6 +34,7 @@ from mitos.degraded import (dump_section, lexical_envelope, lexical_rejection_en
                              scope_dump)
 from mitos.lexical import degraded_reason_from_error
 from mitos.check_notice import compose_check_notice
+from mitos.stamp_labels import NO_LABELS, list_labels, match_labels, ranked_labels
 from mitos.telemetry import read_last_attempt
 from mitos.divergence import corpus_holds_entries
 # Module level on purpose: `amend` and `restore` close over no `cli`/`sync`/`store`
@@ -929,7 +930,8 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         `superseded_by`/`amended_by`/`narrowed_by`/`corrected_by` (present when they
         apply, even on a brief scan; `stamps_unread` marks an answer whose stamps
         could not be read) — chase those before treating its axiom as
-        the current mechanism. Also includes `confidence` (`strong`/`weak`/`none` when
+        the current mechanism. `stamp_labels` maps each live slug a stamp or live_end
+        names to its axiom's first clause (`stamp_labels_unread`: unread). Also includes `confidence` (`strong`/`weak`/`none` when
         semantic ranking ran), which rates this ranking on both verbs: under `weak`, a
         score in this band does not tell the answer from a neighbour, so read the
         hits; `none` is the lowest band. `band_evidence` (`top_score`, `top_cluster`,
@@ -1136,6 +1138,13 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         if counts_unread:
             scan_faults.append(scope_counts_fault_clause(scope))
 
+    # The stamp labels (8a): one batched read over everything this answer shows,
+    # none when nothing is named. Outside every `try`: it is total over a store
+    # fault, so the only raise is a defect, which must be loud.
+    labels = ranked_labels(
+        store, window=results["active_decisions"], handles=handles,
+        matches=section.matches if section is not None else [])
+
     # The band, its evidence and the note, composed once (recall.compose_ranked):
     # the leads, the legend, the top cluster, the edge, the absence clause and the
     # omissions in one order, with the blackout and unbuilt-graph overrides at their
@@ -1147,7 +1156,7 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
                                                corpus_scan=corpus_holds_entries),
         top_cluster_margin=RANKED_TOP_CLUSTER_MARGIN, edge_margin=RANKED_EDGE_MARGIN,
         ceiling=RANKED_LIMIT_CEILING, full_top=full_top, scope=scope,
-        scope_counts=scope_counts, scan_faults=scan_faults,
+        scope_counts=scope_counts, scan_faults=scan_faults, labels=labels,
     )
     results.update(composed.envelope_keys())
 
@@ -1201,7 +1210,9 @@ def list_decisions(scope: Optional[str] = None, state: str = "active", brief: bo
         axiom, rejected_paths, scope) plus its computed `state`, and — when a later
         decision modifies it — `superseded_by`/`amended_by`/`narrowed_by`/
         `corrected_by` modifier slugs (the stamps survive every thinner tier,
-        including oneline). UNBOUNDED.
+        including oneline). Except under oneline, `stamp_labels` maps each live slug
+        a stamp names, and no listed decision is, to its axiom's first clause
+        (`stamp_labels_unread`: unread). UNBOUNDED.
     """
     # An argument fault is answered by naming the argument, before any project is
     # resolved: the caller's mistake is in the depth tier, not in the target, and
@@ -1243,6 +1254,11 @@ def list_decisions(scope: Optional[str] = None, state: str = "active", brief: bo
         "scope": scope,
         "state": state,
     }
+    # The stamp labels (8a), at the default and brief tiers only: the one-line tier
+    # keeps its bare stamps by definition. The list has no note, so a fault is the
+    # flag alone.
+    if not oneline:
+        payload.update(list_labels(store, decisions=decisions).envelope_keys())
     # The brief and oneline tiers withhold the field on every decision; the count
     # says so (no clause: list has no note). Absent at zero, before provenance.
     withheld = count_withheld(decisions)
@@ -1447,7 +1463,9 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
         A decision a later one has moved on from also carries `superseded_by`/
         `amended_by`/`narrowed_by`/`corrected_by` (the modifying slugs) — an
         exact-slug hit on an amended decision still reads `state: "active"`, so
-        chase these before trusting its axiom's mechanism. Retired decisions the
+        chase these before trusting its axiom's mechanism. A ranked answer's
+        `stamp_labels` maps each live slug they name to its axiom's first clause
+        (`stamp_labels_unread`: unread). Retired decisions the
         ranking passed come as `retired_partition` handles (slug, id, state, score,
         stamps, `live_end` where the successor is retired), at most `limit`,
         `retired_partition_omitted` counting the rest; show_node reads one by its
@@ -1597,7 +1615,7 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
                     store, config, corpus_scan=corpus_holds_entries),
                 top_cluster_margin=RANKED_TOP_CLUSTER_MARGIN,
                 edge_margin=RANKED_EDGE_MARGIN, ceiling=RANKED_LIMIT_CEILING,
-                full_top=full_top, scan_faults=(),
+                full_top=full_top, scan_faults=(), labels=NO_LABELS,
             )
             empty.update(composed.envelope_keys())
             return dumps_display(empty, ensure_ascii=False, indent=2)
@@ -1638,6 +1656,9 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
 
         envelope: Dict[str, Any] = {"query": query, "depth_mode": "letter", "matches": output_list}
         envelope.update(corpus_provenance(config))
+        # The stamp labels (8a) — see surface_decisions.
+        labels = ranked_labels(
+            store, window=output_list, handles=handles, matches=section.matches)
         # The band in the `query` register — a verdict on this ranking, never on the
         # corpus — its evidence and the note, composed once (see surface_decisions).
         # The blackout's handles ride `all_superseded`, so the agent gets a pointer,
@@ -1649,7 +1670,7 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
                                                    corpus_scan=corpus_holds_entries),
             top_cluster_margin=RANKED_TOP_CLUSTER_MARGIN,
             edge_margin=RANKED_EDGE_MARGIN, ceiling=RANKED_LIMIT_CEILING,
-            full_top=full_top, scan_faults=(),
+            full_top=full_top, scan_faults=(), labels=labels,
         )
         envelope.update(composed.envelope_keys())
         return dumps_display(envelope, ensure_ascii=False, indent=2)
@@ -1734,6 +1755,7 @@ def _query_rejections(query: str, *, config: MitosConfig, store: GraphStore,
         graph_gap=lambda: missing_graph_is_a_gap(
             store, config, corpus_scan=corpus_holds_entries),
         surface="mcp", config=config,
+        read_labels=lambda matches: match_labels(store, matches),
     )
     return dumps_display(lookup.envelope, ensure_ascii=False, indent=2)
 

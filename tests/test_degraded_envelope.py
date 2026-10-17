@@ -313,15 +313,20 @@ _EDGE_STEMS = ("This ranking ended", "This ranking's edge")
 
 def _assert_degraded_statement(driver: str, resp: Any, cause: str) -> None:
     section = _SECTION_UNFILTERED if cause == "pre-v1a" else _SECTION
+    # 8a: with the graph unread nothing was stamped, so the stamp labels join the
+    # omissions — the token on the key, its sentence on the clause.
+    omission = degraded_omission_clause(labels_computed=cause != "pre-v1a")
     if DRIVERS[driver][3] == "text":
-        assert f"{_OMISSION} {section}" in resp
+        assert f"{omission} {section}" in resp
         assert not any(stem in resp for stem in _EDGE_STEMS)
         assert "⚠ confidence:" not in resp
         return
     # 6b: the band's evidence object is named beside the band it rides with.
-    assert resp["not_computed"] == list(DEGRADED_NOT_COMPUTED) == [
+    assert list(DEGRADED_NOT_COMPUTED) == [
         "retired_partition", "edge", "band", "band_evidence"]
-    assert f"{_OMISSION} {section}" in resp["note"]
+    assert resp["not_computed"] == (list(DEGRADED_NOT_COMPUTED)
+                                    + (["stamp_labels"] if cause == "pre-v1a" else []))
+    assert f"{omission} {section}" in resp["note"]
     assert resp["rejection_section"] == "lexical"
     for key in _BAND_KEYS:
         assert key not in resp, key

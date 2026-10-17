@@ -1729,6 +1729,75 @@ class GraphStore:
         finally:
             conn.close()
 
+    def get_live_axioms(self, slugs: Sequence[str]) -> Dict[str, str]:
+        """Maps each slug naming a live decision now to that decision's axiom, in one batched read.
+
+        The stamp label map's read (recall-confidence 8a): the batched form of the
+        question :meth:`get_node_by_slug` answers per handle — which live decision does
+        this slug name? — so a label is what the dereference it saves would return.
+        Live is the active view (no incoming kill-edge; drifted is live) over
+        ``kind = 'decision'``, matched on ``slug_casefold`` with each input's
+        ``str.casefold()`` bound, so the read rides ``idx_nodes_slug_casefold``. Nothing
+        is hydrated and nothing is cut: the label is the leaf's policy, not the store's.
+        ``nodes`` is not aliased, because the active-view predicate correlates on the
+        bare name.
+
+        Unlike :meth:`get_node_by_slug`, an MI-13 breach (two live decisions sharing a
+        casefold, structurally unreachable) does not raise: that slug is omitted with
+        one ``logger.warning`` naming it, because one breached handle must never cost
+        the labels of every other.
+
+        Args:
+            slugs: Slugs as the stamps spell them. Repeats and spellings sharing a
+                casefold are read once.
+
+        Returns:
+            Input spelling → the raw ``axiom`` column (NULL read as ``""``), for each
+            input whose casefold names exactly one live decision. ``[]`` runs no
+            statement and opens no connection.
+
+        Raises:
+            DatabaseError: If the read fails.
+        """
+        spellings = list(dict.fromkeys(slugs))
+        if not spellings:
+            return {}
+        folds = list(dict.fromkeys(slug.casefold() for slug in spellings))
+        conn = self._get_connection()
+        try:
+            found: Dict[str, List[str]] = {}
+            # Read at call time, so a test can shrink the chunk.
+            chunk_size = _POINT_ID_CHUNK
+            for start in range(0, len(folds), chunk_size):
+                chunk = folds[start:start + chunk_size]
+                placeholders = ",".join("?" for _ in chunk)
+                for row in conn.execute(
+                    f"SELECT nodes.slug_casefold, nodes.axiom FROM nodes "
+                    f"WHERE nodes.slug_casefold IN ({placeholders}) "
+                    f"AND nodes.kind = 'decision' AND {_ACTIVE_VIEW_PREDICATE}",
+                    chunk,
+                ):
+                    found.setdefault(row["slug_casefold"], []).append(row["axiom"] or "")
+        except sqlite3.Error as e:
+            raise DatabaseError(
+                f"Failed to read the live axioms of {len(folds)} slug(s): {str(e)}"
+            )
+        finally:
+            conn.close()
+        out: Dict[str, str] = {}
+        for slug in spellings:
+            axioms = found.get(slug.casefold())
+            if not axioms:
+                continue
+            if len(axioms) > 1:
+                logger.warning(
+                    "get_live_axioms: slug %r names %d live decisions (MI-13 breach); "
+                    "its label is omitted", slug, len(axioms),
+                )
+                continue
+            out[slug] = axioms[0]
+        return out
+
     def get_node_state(self, node_id: str) -> str:
         """Computes one node's state from its incoming kill-edge (the V1a active view).
 

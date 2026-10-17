@@ -22,6 +22,7 @@ from typing import Dict, List, Optional
 
 import pytest
 
+from mitos.stamp_labels import NO_LABELS, StampLabels
 from mitos import recall, retrieval_walk
 from mitos.recall import (EVIDENCE_EDGE_KINDS, NOTE_SLOTS, RANKED_EDGE_MARGIN,
                           RANKED_TOP_CLUSTER_MARGIN, REJECTION_MATCH_FLOOR,
@@ -43,7 +44,8 @@ SHORT_BOUND = retrieval_walk.SHORT_BOUND
 
 # D1's order, stated here literally so a reordered ``NOTE_SLOTS`` reds the table.
 _ORDER = ("rejection_lead", "retired_lead", "legend", "top_cluster", "edge", "absence",
-          "not_computed", "section_state", "withheld", "stamps_unread", "scan_faults")
+          "not_computed", "section_state", "withheld", "stamps_unread", "labels_unread",
+          "scan_faults")
 
 _CONFIG = SimpleNamespace(project="my proj")
 _CEILING = 50
@@ -152,7 +154,7 @@ def _ranked_cell(band, lead, cluster, edge, register, surface):
         walk, register=register, surface=surface, config=_CONFIG, handles=handles,
         part=part, section=_section(matches), unbuilt=lambda: lead == "unbuilt",
         top_cluster_margin=RANKED_TOP_CLUSTER_MARGIN, edge_margin=RANKED_EDGE_MARGIN,
-        ceiling=_CEILING, full_top=None, scan_faults=(),
+        ceiling=_CEILING, full_top=None, scan_faults=(), labels=NO_LABELS,
     )
     if lead == "unbuilt":
         return composed, {"legend": missing_graph_note(surface, _CONFIG)}
@@ -204,6 +206,7 @@ def _lookup_cell(band, lead, cluster, edge, surface):
         shape=shape, margin=RANKED_EDGE_MARGIN,
         top_cluster_margin=RANKED_TOP_CLUSTER_MARGIN, ceiling=_CEILING,
         graph_gap=lambda: lead == "unbuilt", surface=surface, config=_CONFIG,
+        read_labels=lambda _matches: NO_LABELS,
     )
     if lead == "unbuilt":
         return lookup, {"legend": missing_graph_note(surface, _CONFIG)}
@@ -348,7 +351,7 @@ def test_the_two_margins_are_read_where_they_belong():
         walk, register="query", surface="mcp", config=_CONFIG, handles=[],
         part=RetiredPartition([], 0, False), section=_section([]),
         unbuilt=lambda: False, top_cluster_margin=wide, edge_margin=narrow,
-        ceiling=_CEILING, full_top=None, scan_faults=(),
+        ceiling=_CEILING, full_top=None, scan_faults=(), labels=NO_LABELS,
     )
     assert composed.evidence == evidence
     assert top_cluster_clause(2, register="query", margin=wide) in composed.note
@@ -386,7 +389,7 @@ def test_with_no_live_hit_a_live_owners_match_leads_the_blackout():
         walk, register="surface", surface="mcp", config=_CONFIG, handles=[_HANDLE],
         part=RetiredPartition([_HANDLE], 0, False), section=_section([_MATCH_HERE]),
         unbuilt=lambda: False, top_cluster_margin=RANKED_TOP_CLUSTER_MARGIN,
-        edge_margin=RANKED_EDGE_MARGIN, ceiling=_CEILING, full_top=None, scan_faults=(),
+        edge_margin=RANKED_EDGE_MARGIN, ceiling=_CEILING, full_top=None, scan_faults=(), labels=NO_LABELS,
     )
     lead = rejection_lead_clause(_MATCH_HERE, surface="mcp")
     blackout = blackout_note([_HANDLE], surface="mcp", config=_CONFIG)
@@ -487,7 +490,7 @@ def test_compose_ranked_refuses_an_unknown_register_and_a_scoped_query():
     kw = dict(surface="mcp", config=_CONFIG, handles=[],
               part=RetiredPartition([], 0, False), section=None, unbuilt=lambda: False,
               top_cluster_margin=0.01, edge_margin=0.01, ceiling=_CEILING,
-              full_top=None, scan_faults=())
+              full_top=None, scan_faults=(), labels=NO_LABELS)
     with pytest.raises(ValueError, match="register"):
         compose_ranked(None, register="lookup", **kw)
     with pytest.raises(ValueError, match="scope"):
@@ -600,7 +603,7 @@ def test_scan_faults_close_the_note_in_their_order():
         part=RetiredPartition([], 0, False), section=_section([]),
         unbuilt=lambda: False, top_cluster_margin=RANKED_TOP_CLUSTER_MARGIN,
         edge_margin=RANKED_EDGE_MARGIN, ceiling=_CEILING, full_top=None,
-        scope="a", scope_counts=None, scan_faults=faults,
+        scope="a", scope_counts=None, scan_faults=faults, labels=NO_LABELS,
     )
     assert composed.note.endswith(" ".join(faults))
 
@@ -625,6 +628,7 @@ def test_the_unbuilt_note_stands_for_every_key_the_graph_supplies():
             part=RetiredPartition([], 0, False), section=stale, unbuilt=lambda: True,
             top_cluster_margin=RANKED_TOP_CLUSTER_MARGIN, edge_margin=RANKED_EDGE_MARGIN,
             ceiling=_CEILING, full_top=None, scan_faults=(),
+            labels=StampLabels({"x": "A label."}, True),
         )
         keys = composed.envelope_keys()
         assert list(keys) == ["confidence", "note"], register
@@ -639,7 +643,7 @@ def test_the_unbuilt_graph_is_asked_only_on_an_empty_window():
                    unbuilt=lambda: asked.append(1) or True,
                    top_cluster_margin=RANKED_TOP_CLUSTER_MARGIN,
                    edge_margin=RANKED_EDGE_MARGIN, ceiling=_CEILING, full_top=None,
-                   scan_faults=())
+                   scan_faults=(), labels=NO_LABELS)
     assert asked == []
 
 

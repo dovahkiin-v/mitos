@@ -29,6 +29,14 @@ too, by :func:`lexical_rejection_envelope` over ``lexical.lexical_rejection_matc
 its matches are rejected options, so it has its own header, its own ``not_computed``
 tokens and its own omission clause.
 
+Every degraded exit carries the stamp label map (8a) beside its section, read through
+``stamp_labels.match_labels`` in one batched query. The two lexical exits read it only
+when their graph was read: otherwise nothing was stamped, so nothing can be labelled,
+and their ``not_computed`` gains ``"stamp_labels"`` with its clause twin. The scope dump
+labels unconditionally, because its one ``get_active_decisions`` read already stamped
+its decisions. A label fault costs the map alone (``stamp_labels_unread`` and its
+clause). The read is called outside every boundary's degrade ``try``.
+
 Tier 2: composition over ``lexical``, ``recall``, ``display`` and ``divergence``. It
 never imports ``cli`` or ``mcp_server``, and nothing in the check family imports it.
 """
@@ -43,12 +51,13 @@ from mitos.lexical import (_NO_MATCH_LINE, _STAMPS_UNAVAILABLE_DISCLOSURE,
                            lexical_window_section)
 from mitos.recall import (DEGRADED_NOT_COMPUTED, DEGRADED_SECTION_TOKEN,
                           LOOKUP_DEGRADED_NOT_COMPUTED, REJECTED_PATHS_FIELD,
-                          REJECTION_SECTION_BOUND, assess_surface_recall,
-                          compose_note, corpus_provenance,
+                          REJECTION_SECTION_BOUND, STAMP_LABELS_TOKEN,
+                          assess_surface_recall, compose_note, corpus_provenance,
                           count_withheld_decisions, degraded_omission_clause,
                           degraded_section_clause, lookup_omission_clause,
-                          rejection_owners_whole, stamps_unread_clause,
-                          withheld_clause)
+                          rejection_owners_whole, stamp_labels_unread_clause,
+                          stamps_unread_clause, withheld_clause)
+from mitos.stamp_labels import NO_LABELS, match_labels
 from mitos.store import MODIFIER_EDGE_KEYS
 
 # The state token every degraded section carries when it was searched: matched by
@@ -131,12 +140,13 @@ def lexical_envelope(
     and the rejection section, on the same two graph reads. Keys, in order: the
     leaf's (``lexical.lexical_fallback_envelope``), the query and the corpus
     provenance, ``not_computed``, ``rejection_matches`` (absent when none),
-    ``rejection_section: "lexical"``, the withheld count when ``full_top`` withheld
-    a decision's reasoning the section does not show, then the open questions and
-    the check notice when given. The note, through ``recall.compose_note``: the
-    leaf's note as the legend (its no-match line made true when only rejected options
-    matched), omission, section clause, withheld, stamps-unread (one ``stamps_unread``
-    covers both lists), then the scan faults.
+    ``rejection_section: "lexical"``, ``stamp_labels`` (when some), the withheld
+    count when ``full_top`` withheld a decision's reasoning the section does not show,
+    ``stamp_labels_unread`` (on a label fault), then the open questions and the check
+    notice when given. The note, through ``recall.compose_note``: the leaf's note as
+    the legend (its no-match line made true when only rejected options matched),
+    omission, section clause, withheld, stamps-unread (one ``stamps_unread`` covers
+    both lists), labels-unread, then the scan faults.
 
     Args:
         query: The claim/topic the caller was trying to recall.
@@ -168,9 +178,15 @@ def lexical_envelope(
     envelope["query"] = query
     envelope.update(corpus_provenance(config))
     envelope["not_computed"] = list(DEGRADED_NOT_COMPUTED)
+    if not read.graph_read:
+        envelope["not_computed"].append(STAMP_LABELS_TOKEN)
     if read.section:
         envelope["rejection_matches"] = read.section
     envelope["rejection_section"] = LEXICAL_SECTION_STATE
+    labels = (match_labels(store, read.section, decisions=read.matches)
+              if read.graph_read else NO_LABELS)
+    if labels.labels:
+        envelope["stamp_labels"] = dict(labels.labels)
     # Over decisions (the ranked rule): every match past `full_top`, plus every
     # `here` owner whose Letter the depth withheld, each exempt when the section
     # shows every item its field can serve.
@@ -184,17 +200,21 @@ def lexical_envelope(
     envelope["note"] = compose_note(
         legend=_lexical_legend(envelope["note"], decisions_matched=bool(read.matches),
                                options_matched=bool(read.section)),
-        not_computed=degraded_omission_clause(),
+        not_computed=degraded_omission_clause(labels_computed=read.graph_read),
         section_state=degraded_section_clause(computed=True,
                                               retired_dropped=read.graph_read),
         withheld=(withheld_clause(withheld, surface=surface, config=config)
                   if withheld else None),
         stamps_unread=(stamps_unread_clause(surface=surface, config=config)
                        if read.stamps_unread else None),
+        labels_unread=(stamp_labels_unread_clause(surface=surface, config=config)
+                       if labels.unread else None),
         scan_faults=scan_faults,
     )
     if withheld:
         envelope["rejected_paths_withheld"] = withheld
+    if labels.unread:
+        envelope["stamp_labels_unread"] = True
     if open_questions is not None:
         envelope["open_questions"] = open_questions
     if check_notice is not None:
@@ -227,12 +247,14 @@ def lexical_rejection_envelope(
     labelled lexical and band-free. Keys, in order: ``query``, ``field``,
     ``degraded``, ``degraded_reason``, ``rejection_matches`` (absent when none),
     ``rejection_section: "gap"`` when the index is a gap, ``not_computed``
-    (:data:`recall.LOOKUP_DEGRADED_NOT_COMPUTED`), provenance, ``note``, then
+    (:data:`recall.LOOKUP_DEGRADED_NOT_COMPUTED`, plus ``"stamp_labels"`` when the
+    graph was not read), provenance, ``note``, then ``stamp_labels`` /
     ``stamps_unavailable`` / ``stamps_unread`` / ``unread_files`` /
-    ``rejected_paths_withheld`` when they apply. The note reads: the header, the
-    stamps disclosure, the unread files and the no-match line as the legend, then (by
-    ``recall.compose_note``) the omission clause, the withheld clause and the
-    stamps-unread clause. The lookup carries no open-question list, so no scan fault.
+    ``rejected_paths_withheld`` / ``stamp_labels_unread`` when they apply. The note
+    reads: the header, the stamps disclosure, the unread files and the no-match line
+    as the legend, then (by ``recall.compose_note``) the omission clause, the withheld
+    clause, the stamps-unread clause and the labels-unread clause. The lookup carries
+    no open-question list, so no scan fault.
 
     Args:
         query: The claim the caller asked about.
@@ -262,6 +284,8 @@ def lexical_rejection_envelope(
     if gap:
         envelope["rejection_section"] = "gap"
     envelope["not_computed"] = list(LOOKUP_DEGRADED_NOT_COMPUTED)
+    if not leaf["graph_read"]:
+        envelope["not_computed"].append(STAMP_LABELS_TOKEN)
     envelope.update(corpus_provenance(config))
     legend = lexical_rejection_header(reason)
     if not leaf["graph_read"]:
@@ -276,14 +300,20 @@ def lexical_rejection_envelope(
         thinned_ids=here[full_top:] if full_top is not None else [],
         shown_ordinals=_shown_ordinals(matches), item_counts=leaf["item_counts"],
     )
+    labels = match_labels(store, matches) if leaf["graph_read"] else NO_LABELS
     envelope["note"] = compose_note(
         legend=legend,
-        not_computed=lookup_omission_clause(retired_dropped=leaf["graph_read"]),
+        not_computed=lookup_omission_clause(retired_dropped=leaf["graph_read"],
+                                            labels_computed=leaf["graph_read"]),
         withheld=(withheld_clause(withheld, surface=surface, config=config)
                   if withheld else None),
         stamps_unread=(stamps_unread_clause(surface=surface, config=config)
                        if leaf["stamps_unread"] else None),
+        labels_unread=(stamp_labels_unread_clause(surface=surface, config=config)
+                       if labels.unread else None),
     )
+    if labels.labels:
+        envelope["stamp_labels"] = dict(labels.labels)
     if not leaf["graph_read"]:
         envelope["stamps_unavailable"] = True
     if leaf["stamps_unread"]:
@@ -292,6 +322,8 @@ def lexical_rejection_envelope(
         envelope["unread_files"] = unread
     if withheld:
         envelope["rejected_paths_withheld"] = withheld
+    if labels.unread:
+        envelope["stamp_labels_unread"] = True
     return envelope
 
 
@@ -364,7 +396,9 @@ class DumpSection(NamedTuple):
         unread_files: Corpus files that could not be read.
         note: The dump's note, ordered by ``recall.compose_note``: the dump
             sentence, the omission clause, the section clause, withheld,
-            stamps-unread, the scan faults.
+            stamps-unread, labels-unread, the scan faults.
+        labels: The stamp label map over the dump's decisions and its section.
+        labels_unread: Whether the label read faulted.
     """
 
     matches: List[Dict[str, Any]]
@@ -376,21 +410,28 @@ class DumpSection(NamedTuple):
     not_computed: List[str]
     unread_files: List[str]
     note: str
+    labels: Dict[str, str]
+    labels_unread: bool
 
     def envelope_keys(self) -> Dict[str, Any]:
         """The dump's keys, in order: ``note``, ``not_computed``, ``rejection_matches``
-        (when some), ``rejection_section``, ``unread_files`` (when some),
-        ``stamps_unread`` (when true), ``rejected_paths_withheld`` (when > 0)."""
+        (when some), ``rejection_section``, ``stamp_labels`` (when some),
+        ``unread_files`` (when some), ``stamps_unread`` (when true),
+        ``rejected_paths_withheld`` (when > 0), ``stamp_labels_unread`` (when true)."""
         keys: Dict[str, Any] = {"note": self.note, "not_computed": self.not_computed}
         if self.matches:
             keys["rejection_matches"] = self.matches
         keys["rejection_section"] = self.state
+        if self.labels:
+            keys["stamp_labels"] = dict(self.labels)
         if self.unread_files:
             keys["unread_files"] = self.unread_files
         if self.stamps_unread:
             keys["stamps_unread"] = True
         if self.withheld:
             keys["rejected_paths_withheld"] = self.withheld
+        if self.labels_unread:
+            keys["stamp_labels_unread"] = True
         return keys
 
 
@@ -415,7 +456,9 @@ def dump_section(query: str, dump: ScopeDump, *, config: Any, store: Any,
     stamps-unread clauses and the scan faults, ordered by ``recall.compose_note``.
     No evidence and no absence clause ride it: a degraded read is band-free. The
     dump reads no scope counts (its non-empty answer already proves the scope live),
-    so its only scan fault is the open-question one.
+    so its only scan fault is the open-question one. The stamp labels are read over
+    the dump's decisions and the section's matches whatever the section's own graph
+    read said: the dump's read already stamped its decisions.
 
     Args:
         query: The claim/topic the caller was trying to recall.
@@ -461,6 +504,7 @@ def dump_section(query: str, dump: ScopeDump, *, config: Any, store: Any,
         item_counts=read.item_counts,
     )
     stamps_unread = computed and read.stamps_unread
+    labels = match_labels(store, matches, decisions=dump.decisions)
     _, sentence = assess_surface_recall(
         semantic_ran=False, top_score=None, result_count=len(dump.decisions),
         scope=scope, surface=surface, scope_total=dump.total, degraded_reason=reason,
@@ -473,10 +517,13 @@ def dump_section(query: str, dump: ScopeDump, *, config: Any, store: Any,
                   if withheld else None),
         stamps_unread=(stamps_unread_clause(surface=surface, config=config)
                        if stamps_unread else None),
+        labels_unread=(stamp_labels_unread_clause(surface=surface, config=config)
+                       if labels.unread else None),
         scan_faults=scan_faults,
     )
     return DumpSection(
         matches=matches, state=LEXICAL_SECTION_STATE if computed else "unavailable",
         dropped=None, withheld=withheld, clause=clause, stamps_unread=stamps_unread,
         not_computed=not_computed, unread_files=read.unread_files, note=note,
+        labels=dict(labels.labels), labels_unread=labels.unread,
     )

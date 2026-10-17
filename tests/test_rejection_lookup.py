@@ -32,6 +32,7 @@ import pytest
 
 import mitos.cli as cli
 import mitos.mcp_server as mcp_server
+from mitos.stamp_labels import NO_LABELS
 from mitos.cli import cmd_init, cmd_query
 from mitos.config import MitosConfig
 from mitos.display import RANKED_LIMIT_CEILING, rejection_matches_payload
@@ -961,7 +962,8 @@ def test_the_composer_takes_no_decision_window() -> None:
                      top_cluster_margin=.01, ceiling=50, graph_gap=lambda: False,
                      surface="mcp",
                      config=type("C", (), {"project": "p", "qdrant_collection": "c",
-                                           "workspace_dir": "w"})())
+                                           "workspace_dir": "w"})(),
+                     read_labels=lambda _matches: NO_LABELS)
     assert seen["window_ids"] == [] and seen["whole_owners"] == 3
     assert seen["owners_whole"] is True
     assert seen.get("stamps") == {} and rejection_matches_payload is not shape

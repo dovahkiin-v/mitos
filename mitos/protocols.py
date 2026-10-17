@@ -494,6 +494,21 @@ class GraphStoreProtocol(Protocol):
         """
         ...
 
+    def get_live_axioms(self, slugs: Sequence[str]) -> Dict[str, str]:
+        """Maps each slug naming a live decision now to that decision's axiom, in one read.
+
+        The stamp label map's read: matched by casefold through the active view,
+        keyed by the input spelling, values uncut.
+
+        Args:
+            slugs: Slugs as the stamps spell them.
+
+        Returns:
+            Input spelling → raw axiom, for each input naming exactly one live
+            decision.
+        """
+        ...
+
     def get_modifiers(self, node_id: str) -> Dict[str, List[str]]:
         """Returns the reverse-relation modifiers for a single node.
 
