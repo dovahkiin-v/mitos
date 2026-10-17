@@ -1245,9 +1245,13 @@ def _retired_exists_note(slug: str, node_id: str, state: str,
     ]
     if not faulted and successors:
         if keys.get("successor_ambiguous"):
+            # A fan-out (out-of-band only) may hold one ambiguous successor among
+            # several, and the key does not say which: claim no more than that.
             parts.append(
                 f"`record_decision` refuses a relation to {_quoted_slugs(successors)}: "
-                "two decisions carry that slug.")
+                "two decisions carry that slug." if len(successors) == 1 else
+                "`record_decision` refuses a relation to a slug that two decisions "
+                f"carry, and at least one of {_quoted_slugs(successors)} is one.")
             if slug.casefold() in {s.casefold() for s in successors}:
                 parts.append(
                     f"The slug `{slug}` reads the live decision through `show_node`; "

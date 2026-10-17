@@ -2997,8 +2997,12 @@ def _exists_recovery_lines(result: Dict[str, Any], config: MitosConfig) -> List[
             lines.append("  → Its slug also names the live decision: --reconcile-entry "
                          "and restore-source --slug above reach an entry by that slug, "
                          "so check which block they name before running them.")
+        refused = (f"A relation to {named} is refused: two decisions carry that slug."
+                   if len(successors) == 1 else
+                   "A relation to a slug two decisions carry is refused, and at least one "
+                   f"of {named} is one.")
         lines.append(
-            f"  → A relation to {named} is refused: two decisions carry that slug. "
+            f"  → {refused} "
             f"`mitos show {shell_flag('-p', project)} -- {shell_arg(successors[0])}` "
             "reads the live one; "
             f"`mitos show {shell_flag('-p', project)} -- {shell_arg(result['id'])}` "

@@ -454,6 +454,25 @@ def test_a_same_slug_re_tread_names_no_relation_and_tells_the_two_apart(ws):
     assert _cited_snake(note) <= _tool_and_arg_names()
 
 
+def test_an_ambiguous_fan_out_claims_no_refusal_for_every_successor(ws):
+    """Fresh eyes: a fan-out (out-of-band only) may hold one ambiguous successor among
+    several, and the key does not say which, so neither renderer says that a relation
+    to each of them is refused."""
+    from mitos.cli import _exists_recovery_lines
+    config, _ = ws
+    keys = {"superseded_by": ["pin-a", "pin-b"], "successor_ambiguous": True}
+    note = sync._retired_exists_note("pin", "f" * 64, "superseded", keys)
+    assert "two decisions carry that slug" not in note
+    assert "at least one of `pin-a`, `pin-b` is one" in note
+    assert _names_a_relation(note) == [] and _shell_tokens(note) == []
+    lines = _exists_recovery_lines(
+        {"slug": "pin", "id": "f" * 64, "state": "superseded", **keys}, config)
+    text = "\n".join(lines)
+    assert "two decisions carry that slug" not in text
+    assert "at least one of pin-a, pin-b is one" in text
+    assert "--supersedes" not in text
+
+
 # -- Row 11: the chain reaches no live decision ------------------------------------------
 
 def test_a_re_tread_whose_chain_reaches_no_live_decision_names_no_relation(ws):
