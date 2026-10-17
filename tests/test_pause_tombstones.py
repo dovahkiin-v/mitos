@@ -548,6 +548,15 @@ def test_a_re_tread_pauses_on_its_tombstone_alone_and_writes_nothing(ws):
     assert m.store.get_node_by_slug("draft") is None
 
 
+@pytest.mark.parametrize("floor, text", [
+    (0.80, "0.80"), (0.8265, "0.8265"), (0.815, "0.815"), (0.82649, "0.82649"),
+])
+def test_a_floor_prints_every_place_it_holds_and_never_rounds_up(floor, text):
+    # A floor past four places printed at four would round up and state a bound the
+    # partition does not keep (fresh eyes: 0.82649 printed "0.8265").
+    assert sync._floor_text(floor) == text
+
+
 def test_a_retired_hit_between_the_floors_does_not_pause(ws):
     """The two floors are separate: a retired neighbour at or above the live floor but
     under the tombstone floor is no tombstone."""

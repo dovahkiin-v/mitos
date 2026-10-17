@@ -1231,10 +1231,11 @@ def _review_unavailable_notice(cause: str) -> str:
 
 def _floor_text(floor: float) -> str:
     """Renders a floor exactly: two places when that is the whole value (``0.80``), else
-    every place it holds (``0.8265``). A floor rounded up would state a bound the
-    partition does not keep (a tombstone at 0.827 under "≥0.83")."""
+    every place it holds (``0.8265``, ``0.82649``: the shortest spelling that reads back
+    as the value). A floor rounded up would state a bound the partition does not keep
+    (a tombstone at 0.827 under "≥0.83")."""
     two = f"{floor:.2f}"
-    return two if float(two) == floor else f"{floor:.4f}".rstrip("0")
+    return two if float(two) == floor else repr(float(floor))
 
 
 def _past_what(score: float, floor: float, tombstone_floor: Optional[float]) -> str:
