@@ -15,6 +15,21 @@
       "space": "query",
       "value": 0.0156
     },
+    "mitos.recall.RANKED_TOP_CLUSTER_MARGIN": {
+      "boundaries": {
+        "dense-20261017-1f84b31": 0.0156,
+        "harbor-20261017-15ccebb": 0.0008
+      },
+      "kind": "margin",
+      "method": "top_cluster_margin_boundary: nearest-rank median depth at which rank 1 is wrong, 4 dp, read on the dense run. Population used: pooled-inversions (17 depths; rank-one-wrong depths 7 < 10). Its own constant beside RANKED_EDGE_MARGIN, never an alias.",
+      "separates": [
+        "bullseye",
+        "handle-words"
+      ],
+      "side": "dense",
+      "space": "query",
+      "value": 0.0156
+    },
     "mitos.recall.REJECTION_MATCH_FLOOR": {
       "boundaries": {
         "dense-20261017-8419920": 0.8147,
@@ -41,6 +56,74 @@
       "side": "higher",
       "space": "query",
       "value": 0.8147
+    },
+    "mitos.recall.SURFACE_STRONG_THRESHOLD": {
+      "boundaries": {
+        "dense-20261017-1f84b31": 0.8087,
+        "harbor-20261017-15ccebb": 0.8073
+      },
+      "kind": "threshold",
+      "method": "strong_boundary: strictly above every family-neighbour and off-axis top value (query space), 4 dp; the higher corpus taken. D2 clear lift held on both corpora (precision exceeds base by >= 0.15 and its Wilson lower bound exceeds base), so the strict line stands. Second pair: one pair serves both (item strong 0.8147 vs 0.8087, gap 0.006; item weak 0.6304 vs 0.6375, gap 0.0071; both <= RANKED_TOP_CLUSTER_MARGIN 0.0156). Inputs: lexical overlap and the rank-1 margin measured, neither admitted. Corpus-relative trigger: not fired on strong (0.0014), fired on weak. Replay: the decision band only; the harvest holds no field-scoped read, so the item ranking is not measured on traffic.",
+      "precision": {
+        "dense-20261017-1f84b31": {
+          "base": 0.7956,
+          "fires": 36,
+          "interval": [
+            0.9036,
+            1.0
+          ],
+          "precision": 1.0,
+          "right": 36
+        },
+        "harbor-20261017-15ccebb": {
+          "base": 0.3929,
+          "fires": 9,
+          "interval": [
+            0.565,
+            0.9801
+          ],
+          "precision": 0.8889,
+          "right": 8
+        },
+        "replay": {
+          "base": 0.0909,
+          "fires": 20,
+          "interval": [
+            0.0089,
+            0.2361
+          ],
+          "precision": 0.05,
+          "proxy": "rank-1 USED, record-followed reads",
+          "right": 1,
+          "run": "20261017-1534-1614d99-dogfood-copy"
+        }
+      },
+      "separates": [
+        "bullseye",
+        "handle-words",
+        "family-neighbour",
+        "off-axis"
+      ],
+      "side": "higher",
+      "space": "query",
+      "value": 0.8087
+    },
+    "mitos.recall.SURFACE_WEAK_THRESHOLD": {
+      "boundaries": {
+        "dense-20261017-1f84b31": 0.6963,
+        "harbor-20261017-15ccebb": 0.6375
+      },
+      "kind": "threshold",
+      "method": "weak_boundary: at or below every bullseye, handle-words and family-neighbour top value (query space), 4 dp; the lower corpus taken. Corpus-relative trigger fired: Harbor 0.6375 vs dense 0.6963, gap 0.0588 > 0.0156.",
+      "separates": [
+        "bullseye",
+        "handle-words",
+        "family-neighbour",
+        "off-axis"
+      ],
+      "side": "lower",
+      "space": "query",
+      "value": 0.6375
     }
   },
   "embedding_model": "gemini-embedding-2",

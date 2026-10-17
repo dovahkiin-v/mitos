@@ -58,15 +58,27 @@ from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Seq
 
 from mitos.shell_quote import shell_flag
 
-# The confidence bands over the top semantic score: ``strong`` at/above 0.75, ``weak``
-# at/above 0.60, ``none`` below. The first calibration (observed Gemini-embedding
-# scores: settled precedents >0.82, adjacent-but-unrelated neighbours <0.72) put a
-# single strong/weak boundary at 0.80; ``2bf3cae`` (2026-06-19) lowered it to these two
-# values, and this comment kept saying 0.80 until 0.19.1. The bands gate a *hint* to
-# the agent, never correctness — the agent always has the raw scores and
-# ``list_decisions`` for certainty. Tune here only.
-SURFACE_STRONG_THRESHOLD: float = 0.75
-SURFACE_WEAK_THRESHOLD: float = 0.60
+# The ``strong`` line of the confidence band over the top surfaced score. Calibrated,
+# recorded in tests/golden/calibration/record.json with its measured precision on both
+# corpora and the replay: strictly above every top score a query nothing answers reaches
+# (family-neighbour and off-axis, query space), the higher corpus's boundary taken, so
+# ``strong`` is rare and right rather than common and vague. The band gates a hint, never
+# correctness. Method: tests/golden/_calibration_record.py ``strong_boundary``.
+SURFACE_STRONG_THRESHOLD: float = 0.8087
+
+# The ``weak``/``none`` line. Calibrated, recorded in tests/golden/calibration/record.json:
+# at or below every top score a related query reaches (bullseye, handle-words,
+# family-neighbour), the lower corpus's boundary taken, so ``none`` fires only where no
+# corpus sees a near precedent. Method: tests/golden/_calibration_record.py ``weak_boundary``.
+SURFACE_WEAK_THRESHOLD: float = 0.6375
+
+# The top-cluster margin: a hit within this much of rank 1's score sits in the top cluster
+# (``top_cluster_size``), where the score order stops saying which hit answers. Calibrated,
+# recorded in tests/golden/calibration/record.json: the median depth at which a non-target
+# outranks a labelled target, read on the dense run where clusters form. Its own constant,
+# measured apart from the edge margin even where the two values agree. Method:
+# tests/golden/_calibration_record.py ``top_cluster_margin_boundary``.
+RANKED_TOP_CLUSTER_MARGIN: float = 0.0156
 
 # The edge margin: a ranked window ends mid-cluster when its next live rank scores
 # within this much of its last returned one (``window_edge``). Calibrated, recorded in

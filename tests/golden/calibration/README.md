@@ -109,6 +109,16 @@ A threshold named any other way escapes that row, so name new ones with those su
    range. The rejection floor's boundary is code:
    `_calibration_record.rejection_floor_boundary`, just above every hard negative of the
    corpus, recomputed from the committed Harbor run by an offline row.
+   **A threshold that states its precision** (`_calibration_record.PRECISION_STATED`: the
+   band's `strong` line) carries a `precision` block with one key per cited run, each
+   `{fires, right, precision, interval, base}` from `band_precision` at the entry's value
+   and the weak line's (`dense.py band <run>` prints both corpora's); a name also in
+   `REPLAY_PRECISION` adds a `replay` key with its `run` and `proxy` (`replay.py band`). A
+   band that fires nowhere states `right: 0`, `precision: null`, `interval: [0.0, 1.0]`.
+   The band's boundaries are code too (`strong_boundary`, `weak_boundary`,
+   `top_cluster_margin_boundary`), each recomputed from the committed Harbor run by an
+   offline row; the range check reads its classes' 4-decimal envelope, so a floored `weak`
+   sits inside it.
 4. In one commit: append the run(s) with `MITOS_UPDATE_CALIBRATION=1` (a run is appended,
    never rewritten), write the constant's record entry, add its dotted name to
    `CALIBRATED_CONSTANTS`, remove it from `PENDING`, and replace the comment above the

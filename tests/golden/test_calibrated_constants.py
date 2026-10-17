@@ -31,16 +31,17 @@ import _calibration_record as R  # noqa: E402
 MITOS_DIR = os.path.dirname(os.path.abspath(mitos.__file__))
 RECORD_POINTER = "tests/golden/calibration/record.json"
 
-# Dotted names whose value the record pins. 6a and 7a add theirs.
+# Dotted names whose value the record pins. 7a adds its own.
 CALIBRATED_CONSTANTS: FrozenSet[str] = frozenset({
     "mitos.recall.RANKED_EDGE_MARGIN",
     "mitos.recall.REJECTION_MATCH_FLOOR",
+    "mitos.recall.SURFACE_STRONG_THRESHOLD",
+    "mitos.recall.SURFACE_WEAK_THRESHOLD",
+    "mitos.recall.RANKED_TOP_CLUSTER_MARGIN",
 })
 
 # Shipped thresholds that owe calibration, with the phase that sets each.
 PENDING: Dict[str, str] = {
-    "mitos.recall.SURFACE_STRONG_THRESHOLD": "6a",
-    "mitos.recall.SURFACE_WEAK_THRESHOLD": "6a",
     "mitos.sync._NEIGHBOR_REVIEW_THRESHOLD": "7a",
 }
 
@@ -137,14 +138,21 @@ def test_every_shipped_threshold_is_calibrated_pending_or_exempt():
     )
 
 
-def test_the_calibrated_set_is_the_edge_margin_and_the_rejection_floor():
+def test_the_calibrated_set_is_the_two_margins_the_rejection_floor_and_the_band():
     """Inverted from `test_no_constant_is_calibrated_yet` (landed empty in 1b): 2e's
     commit added the first record entry (`test_the_edge_margin_is_the_first_calibrated_constant`),
-    and 5b's adds the rejection-match floor, which 5a shipped PENDING at a placeholder.
-    The record holds exactly the pinned set."""
+    5b's added the rejection-match floor, which 5a shipped PENDING at a placeholder. 6a
+    inverts `test_the_calibrated_set_is_the_edge_margin_and_the_rejection_floor`: the band's
+    two thresholds leave `PENDING` and join with the new top-cluster margin. One pair
+    serves both rankings (6a D4), so no `REJECTION_*` threshold joins. The record holds
+    exactly the pinned set."""
     assert set(R.load_record()["constants"]) == set(CALIBRATED_CONSTANTS)
     assert CALIBRATED_CONSTANTS == frozenset({"mitos.recall.RANKED_EDGE_MARGIN",
-                                              "mitos.recall.REJECTION_MATCH_FLOOR"})
+                                              "mitos.recall.REJECTION_MATCH_FLOOR",
+                                              "mitos.recall.SURFACE_STRONG_THRESHOLD",
+                                              "mitos.recall.SURFACE_WEAK_THRESHOLD",
+                                              "mitos.recall.RANKED_TOP_CLUSTER_MARGIN"})
+    assert PENDING == {"mitos.sync._NEIGHBOR_REVIEW_THRESHOLD": "7a"}
 
 
 def test_the_edge_margins_harbor_boundary_recomputes_from_the_committed_run():
@@ -204,3 +212,55 @@ def test_each_calibrated_constant_comment_points_at_the_record():
         assert any(RECORD_POINTER in line for line in block), (
             f"{dotted}: the comment above it should point at {RECORD_POINTER}"
         )
+
+
+# -- 6a: the band's constants -------------------------------------------------------------
+
+def _entry(name: str):
+    return R.load_record()["constants"][f"mitos.recall.{name}"]
+
+
+def _harbor_fixtures(entry):
+    harbor = [run_id for run_id in entry["boundaries"] if run_id.startswith("harbor-")]
+    assert len(harbor) == 1, entry["boundaries"]
+    return harbor[0], R.load_run(harbor[0])["fixtures"]
+
+
+def test_the_strong_thresholds_harbor_boundary_recomputes_from_the_committed_run():
+    """6a D1: Harbor's boundary is what `strong_boundary` derives from the committed run;
+    the dense side is re-derived out of repo by `dense.py band` through the same function."""
+    entry = _entry("SURFACE_STRONG_THRESHOLD")
+    run_id, fixtures = _harbor_fixtures(entry)
+    assert R.strong_boundary(fixtures) == entry["boundaries"][run_id]
+
+
+def test_the_weak_thresholds_harbor_boundary_recomputes_from_the_committed_run():
+    entry = _entry("SURFACE_WEAK_THRESHOLD")
+    run_id, fixtures = _harbor_fixtures(entry)
+    assert R.weak_boundary(fixtures) == entry["boundaries"][run_id]
+
+
+def test_the_top_cluster_margins_harbor_boundary_recomputes_from_the_committed_run():
+    entry = _entry("RANKED_TOP_CLUSTER_MARGIN")
+    run_id, fixtures = _harbor_fixtures(entry)
+    assert R.top_cluster_margin_boundary(fixtures) == entry["boundaries"][run_id]
+
+
+def test_the_strong_thresholds_harbor_precision_recomputes_at_the_recorded_pair():
+    """6a D2: the stated precision on Harbor is `band_precision` over the cited run at the
+    strong and weak entries' values, so a re-derivation that moves either line restates it."""
+    strong, weak = _entry("SURFACE_STRONG_THRESHOLD"), _entry("SURFACE_WEAK_THRESHOLD")
+    run_id, fixtures = _harbor_fixtures(strong)
+    table = R.band_precision(fixtures, strong=strong["value"], weak=weak["value"])
+    assert strong["precision"][run_id] == R.precision_entry(table)
+
+
+def test_the_top_cluster_margin_is_its_own_constant_not_an_alias():
+    """6a D3: two catalogued margins, each with its own literal and entry, even where the
+    values agree, so a later re-derivation may part them."""
+    from mitos import recall
+    source = open(os.path.join(MITOS_DIR, "recall.py"), encoding="utf-8").read()
+    assert re.search(r"^RANKED_TOP_CLUSTER_MARGIN: float = \d", source, re.M)
+    assert "RANKED_TOP_CLUSTER_MARGIN = RANKED_EDGE_MARGIN" not in source
+    assert type(recall.RANKED_TOP_CLUSTER_MARGIN) is float
+    assert _entry("RANKED_TOP_CLUSTER_MARGIN")["side"] == "dense"

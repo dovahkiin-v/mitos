@@ -55,6 +55,11 @@ from _point_hits import CannedVector, orphan_hit
 # really produces (``degraded_reason_from_error(None, …)``), so an end-to-end row
 # on that route and a pure-policy row compare against the same words.
 _DEGRADED = "embeddings/Qdrant unavailable"
+# 6a: a top score inside the `weak` band, derived from the calibrated lines by name (they
+# moved from 0.75/0.60 to the record's values), and the two places a note renders it.
+_WEAK_SCORE = round((SURFACE_STRONG_THRESHOLD + SURFACE_WEAK_THRESHOLD) / 2, 2)
+assert SURFACE_WEAK_THRESHOLD <= _WEAK_SCORE < SURFACE_STRONG_THRESHOLD
+_WEAK_SHOWN = f"{_WEAK_SCORE:.2f}"
 
 
 @pytest.fixture
@@ -138,10 +143,10 @@ def test_policy_strong_at_exact_threshold():
 
 
 def test_policy_weak_below_threshold_names_the_score():
-    conf, note = assess_surface_recall(lead=None, short=None, edge=None, semantic_ran=True, degraded_reason=None, top_score=0.61, result_count=3,
+    conf, note = assess_surface_recall(lead=None, short=None, edge=None, semantic_ran=True, degraded_reason=None, top_score=_WEAK_SCORE, result_count=3,
                                        scope=None, surface="cli")
     assert conf == "weak"
-    assert "0.61" in note
+    assert _WEAK_SHOWN in note
 
 
 def test_policy_off_axis_below_weak_threshold():
@@ -349,7 +354,7 @@ def test_mcp_surface_strong_hit(ws):
 def test_mcp_surface_weak_hit_flagged(ws):
     config, m = ws
     _rec(m, "loose-neighbour", scope=["db"])
-    resp = _surface_with([{"slug": "loose-neighbour", "score": 0.62}], ws, scope="db")
+    resp = _surface_with([{"slug": "loose-neighbour", "score": _WEAK_SCORE}], ws, scope="db")
     assert resp["confidence"] == "weak"
     assert "Twilight zone" in resp["note"]
     assert resp["active_decisions"]  # still returned, just flagged weak
@@ -549,10 +554,10 @@ def test_query_weak_names_the_score_and_redirects():
     — "check carefully before deciding" is the precedent-check register, and that
     is `surface`'s question, not this verb's.
     """
-    conf, note = assess_query_recall(lead=None, short=None, edge=None, top_score=0.61, result_count=3,
+    conf, note = assess_query_recall(lead=None, short=None, edge=None, top_score=_WEAK_SCORE, result_count=3,
                                      config=_StubConfig(), surface="cli")
     assert conf == "weak"
-    assert "0.61" in note
+    assert _WEAK_SHOWN in note
     assert "before deciding" not in note
     assert "mitos surface -p" in note                   # the redirect
 
@@ -1050,7 +1055,7 @@ def test_cli_query_ranked_strong_carries_the_note_and_no_band_line(ws):
     assert _query_note("cli", config=config, top_score=0.91, result_count=1) in out
 
 
-@pytest.mark.parametrize("score,band", [(0.61, "weak"), (0.41, "none")])
+@pytest.mark.parametrize("score,band", [(_WEAK_SCORE, "weak"), (0.41, "none")])
 def test_cli_query_ranked_prints_the_band_line_and_the_note(ws, score, band):
     config, m = ws
     _rec(m, "cache-strategy", scope=["db"])
@@ -1195,7 +1200,7 @@ def test_cli_and_mcp_query_notes_differ_only_in_the_call_form(ws):
     register, each boundary's own pointer."""
     config, m = ws
     _rec(m, "cache-strategy", scope=["db"])
-    matches = [{"slug": "cache-strategy", "score": 0.61}]
+    matches = [{"slug": "cache-strategy", "score": _WEAK_SCORE}]
     cli_resp = _cli_query_json(matches, ws)
     mcp_resp = _mcp_query(matches, ws)
     assert cli_resp["confidence"] == mcp_resp["confidence"] == "weak"
@@ -1274,8 +1279,8 @@ def test_the_unbuilt_override_keeps_the_label_on_the_machine_encodings(cloned, d
 def test_the_band_is_read_off_the_surfaced_list_not_the_raw_return(ws, driver):
     """R12's only detector, and it needs a ranking the filter actually thins.
 
-    `dead-v1` scores 0.95 and is superseded-filtered out; `live-one` survives at
-    0.62. Wired off the raw return the band reads `strong` — a confident verdict
+    `dead-v1` scores 0.95 and is superseded-filtered out; `live-one` survives inside
+    the `weak` band (`_WEAK_SCORE`). Wired off the raw return the band reads `strong` — a confident verdict
     on a match the caller never saw. Wired off the surfaced list it reads `weak`.
     The same fixture catches the fail-open half: a `top_score` no loop ever raised
     is None, which `_classify_recall` admits into `strong` on a non-empty set. A
@@ -1286,7 +1291,7 @@ def test_the_band_is_read_off_the_surfaced_list_not_the_raw_return(ws, driver):
     _rec(m, "live-one", scope=["x"])
     _rec(m, "dead-v1", scope=["x"])
     _rec(m, "dead-v2", scope=["x"], supersedes="dead-v1")
-    matches = [{"slug": "dead-v1", "score": 0.95}, {"slug": "live-one", "score": 0.62}]
+    matches = [{"slug": "dead-v1", "score": 0.95}, {"slug": "live-one", "score": _WEAK_SCORE}]
 
     if driver == "cli":
         resp = _cli_query_json(matches, ws)
@@ -1296,7 +1301,7 @@ def test_the_band_is_read_off_the_surfaced_list_not_the_raw_return(ws, driver):
         resp = _mcp_query(matches, ws)
     assert [d["slug"] for d in resp["matches"]] == ["live-one"]
     assert resp["confidence"] == "weak"
-    assert "0.62" in resp["note"] and "0.95" not in resp["note"]
+    assert _WEAK_SHOWN in resp["note"] and "0.95" not in resp["note"]
 
 
 # --------------------------------------------------------------------------- #
