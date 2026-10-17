@@ -1510,7 +1510,11 @@ def _stale_unbuilt(ws, monkeypatch) -> None:
     for module in (cli, mcp_server):
         monkeypatch.setattr(module, "corpus_holds_entries", lambda config: True)
     index = FakeRejectionIndex(present=True)
-    _plant(index, "f" * 64, F_TWO, {1: ABOVE, 2: JUST_ABOVE})
+    # A full fetch of points whose owner is gone: verification drops every one, so the
+    # section comes back `short` with `rejection_dropped` — the keys lock A suppresses.
+    for k in range(REJECTION_OVERFETCH_BOUND):
+        index.points[f"00000000-0000-4000-8000-{k:012d}"] = {
+            "vector": _at(ABOVE - k * 1e-6), "payload": {"owner_id": "f" * 64, "model": "m"}}
     _bind(monkeypatch, index)
 
 
@@ -1521,6 +1525,12 @@ def test_a_stale_index_under_an_unbuilt_graph_supplies_no_key(ws, monkeypatch, d
     label map is the next key this list gains."""
     from mitos.recall import missing_graph_note
     _stale_unbuilt(ws, monkeypatch)
+    for module in (cli, mcp_server):        # the control: a built graph shows the keys
+        monkeypatch.setattr(module, "corpus_holds_entries", lambda config: False)
+    control = _call(driver, ws, [], brief=True)
+    assert control["rejection_section"] == "short" and control["rejection_dropped"] > 0
+    for module in (cli, mcp_server):
+        monkeypatch.setattr(module, "corpus_holds_entries", lambda config: True)
     env = _call(driver, ws, [], brief=True)
     assert not set(_GRAPH_KEYS) & set(env), set(_GRAPH_KEYS) & set(env)
     assert env["note"] == missing_graph_note(DRIVERS[driver][2], ws)
@@ -1537,6 +1547,7 @@ def test_the_text_answer_under_an_unbuilt_graph_prints_no_section_and_no_band(
     out = TEXT_DRIVERS[verb](ws, [])
     assert "Rejected options matching" not in out
     assert "⚠ confidence" not in out
+    assert "Verification dropped" not in out      # the short section's clause
     assert f"→ {missing_graph_note('cli', ws)}" in out
 
 
