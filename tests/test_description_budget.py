@@ -244,16 +244,19 @@ def test_surface_decisions_states_the_band_axis():
 
 
 @pytest.mark.parametrize("tool", ["surface_decisions", "query_decisions"])
-def test_the_ranked_descriptions_do_not_yet_name_the_rejection_section(tool):
-    """5a ships the section's mechanics with a PROVISIONAL floor; the descriptions
-    teach an agent to rely on the section, so they ship with the calibrated floor
-    (5b, constraint 12). This pins the current truth so 5b inverts it deliberately.
-    The selector must match the tool: an empty description would pass vacuously."""
+def test_the_ranked_descriptions_name_the_rejection_section(tool):
+    """Inverted by 5b from `test_the_ranked_descriptions_do_not_yet_name_the_rejection_section`:
+    5a shipped the section with a PROVISIONAL floor and pinned the descriptions silent;
+    5b calibrated the floor and ships the prose with it (constraint 12). Each ranked
+    description names both keys and §4.6's meaning (the owner's own context, the band
+    not rating it), inside `Returns`, past every required argument. The selector must
+    match the tool: an empty description would pass vacuously."""
     desc = _flat(_descriptions()[tool]).lower()
     assert "returns:" in desc and tool.split("_")[0] in desc
-    for phrase in ("rejection_matches", "rejection_section", "rejection section",
-                   "rejection match"):
-        assert phrase not in desc, (tool, phrase)
+    returns = desc.index("returns:")
+    for phrase in ("rejection_matches", "rejection_section", "its own context", "whatever the band"):
+        assert phrase in desc, (tool, phrase)
+        assert desc.index(phrase) > returns, (tool, phrase, "outside Returns")
 
 
 _REQUIRED_PAIRS = _required_pairs()

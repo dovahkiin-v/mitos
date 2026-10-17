@@ -14,6 +14,33 @@
       "side": "dense",
       "space": "query",
       "value": 0.0156
+    },
+    "mitos.recall.REJECTION_MATCH_FLOOR": {
+      "boundaries": {
+        "dense-20261017-8419920": 0.8147,
+        "harbor-20261017-757e2f4": 0.7367
+      },
+      "cry_wolf": {
+        "appearances": 6,
+        "ceiling": 2.0,
+        "copy_state": "s3-rejection-9c6fd89",
+        "earned": 6,
+        "earned_label": 6,
+        "earned_proxy": 0,
+        "labels_sha256": "fb8f8efd30b816e813fd94066f29ff3ac435862fcbc234313e1d7cdec591708c",
+        "raised_from": null,
+        "ratio": 1.0,
+        "reads": 106,
+        "replay_run": "20261017-0619-bbb764b-dogfood-copy"
+      },
+      "kind": "threshold",
+      "method": "rejection_floor_boundary: just above every hard negative (generic + vocabulary negative_items), per-item shape, query space; the higher of the two corpora",
+      "separates": [
+        "rejection-target"
+      ],
+      "side": "higher",
+      "space": "query",
+      "value": 0.8147
     }
   },
   "embedding_model": "gemini-embedding-2",

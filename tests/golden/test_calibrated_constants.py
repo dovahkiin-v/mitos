@@ -31,17 +31,16 @@ import _calibration_record as R  # noqa: E402
 MITOS_DIR = os.path.dirname(os.path.abspath(mitos.__file__))
 RECORD_POINTER = "tests/golden/calibration/record.json"
 
-# Dotted names whose value the record pins. 5b, 6a and 7a add theirs.
+# Dotted names whose value the record pins. 6a and 7a add theirs.
 CALIBRATED_CONSTANTS: FrozenSet[str] = frozenset({
     "mitos.recall.RANKED_EDGE_MARGIN",
+    "mitos.recall.REJECTION_MATCH_FLOOR",
 })
 
 # Shipped thresholds that owe calibration, with the phase that sets each.
 PENDING: Dict[str, str] = {
     "mitos.recall.SURFACE_STRONG_THRESHOLD": "6a",
     "mitos.recall.SURFACE_WEAK_THRESHOLD": "6a",
-    # 5a ships the floor provisional (0.65, a placeholder); 5b calibrates it.
-    "mitos.recall.REJECTION_MATCH_FLOOR": "5b",
     "mitos.sync._NEIGHBOR_REVIEW_THRESHOLD": "7a",
 }
 
@@ -134,11 +133,14 @@ def test_every_shipped_threshold_is_calibrated_pending_or_exempt():
     )
 
 
-def test_the_edge_margin_is_the_first_calibrated_constant():
+def test_the_calibrated_set_is_the_edge_margin_and_the_rejection_floor():
     """Inverted from `test_no_constant_is_calibrated_yet` (landed empty in 1b): 2e's
-    commit adds the first record entry, and the record holds exactly the pinned set."""
+    commit added the first record entry (`test_the_edge_margin_is_the_first_calibrated_constant`),
+    and 5b's adds the rejection-match floor, which 5a shipped PENDING at a placeholder.
+    The record holds exactly the pinned set."""
     assert set(R.load_record()["constants"]) == set(CALIBRATED_CONSTANTS)
-    assert CALIBRATED_CONSTANTS == frozenset({"mitos.recall.RANKED_EDGE_MARGIN"})
+    assert CALIBRATED_CONSTANTS == frozenset({"mitos.recall.RANKED_EDGE_MARGIN",
+                                              "mitos.recall.REJECTION_MATCH_FLOOR"})
 
 
 def test_the_edge_margins_harbor_boundary_recomputes_from_the_committed_run():
@@ -148,6 +150,38 @@ def test_the_edge_margins_harbor_boundary_recomputes_from_the_committed_run():
     entry = R.load_record()["constants"]["mitos.recall.RANKED_EDGE_MARGIN"]
     harbor = R.load_run("harbor-20261015-a79a820")
     assert R.edge_margin_boundary(harbor["fixtures"]) == entry["boundaries"]["harbor-20261015-a79a820"]
+
+
+def _rejection_floor_entry():
+    return R.load_record()["constants"]["mitos.recall.REJECTION_MATCH_FLOOR"]
+
+
+def test_the_rejection_floors_harbor_boundary_recomputes_from_the_committed_run():
+    """5b D3: the method is code. Harbor's boundary in the record is what
+    `rejection_floor_boundary` derives from the committed run's fixtures; the dense side
+    is re-derived out of repo by `dense.py floor` through the same function."""
+    entry = _rejection_floor_entry()
+    harbor = [run_id for run_id in entry["boundaries"] if run_id.startswith("harbor-")]
+    assert len(harbor) == 1, entry["boundaries"]
+    run = R.load_run(harbor[0])
+    assert R.rejection_floor_boundary(run["fixtures"]) == entry["boundaries"][harbor[0]]
+    assert run["provenance"]["item_reader"], "the cited Harbor run read items through the shipped client"
+
+
+def test_the_rejection_floor_carries_its_cry_wolf_ceiling():
+    """5b D4/D5: an escalation floor's entry states its ceiling and the ratio measured on
+    the copy's replay, held under it, and says whether the floor rose from its boundaries."""
+    entry = _rejection_floor_entry()
+    assert "mitos.recall.REJECTION_MATCH_FLOOR" in R.ESCALATION_FLOORS
+    block = entry["cry_wolf"]
+    assert set(block) == set(R.CRY_WOLF_KEYS)
+    assert block["ratio"] <= block["ceiling"]
+    top = max(entry["boundaries"].values())
+    if entry["side"] == "ceiling":
+        assert block["raised_from"] == top and entry["value"] > top
+    else:
+        assert entry["side"] == "higher" and block["raised_from"] is None and entry["value"] == top
+    assert R._check_cry_wolf("mitos.recall.REJECTION_MATCH_FLOOR", entry, top) == []
 
 
 def test_each_calibrated_constant_comment_points_at_the_record():

@@ -11,8 +11,8 @@ touching the decision answer.
 The rows drive a real SQLite graph, ``FakeRejectionIndex`` bound at the read seam
 (``_ranked_rejection_index``) and a canned decision vector, so every score is placed
 deliberately: the query vector is one axis and a point's vector sits at a chosen
-cosine to it. The floor is always read from ``recall`` (it is provisional, PENDING
-5b), never hard-coded.
+cosine to it. The floor is always read from ``recall`` (calibrated by 5b against
+``tests/golden/calibration/record.json``), never hard-coded.
 """
 
 import ast
@@ -302,10 +302,12 @@ def test_fill_two_parts_of_one_item_collapse_to_one_match_at_the_best_score() ->
     a = _owner("a")
     world.owner(a, {"p1": (1, "one long item  \n"), "p2": (1, "one long item  \n"),
                     "q": (2, "two")})
-    world.hit("p2", a["id"], 0.95).hit("p1", a["id"], 0.9).hit("q", a["id"], 0.8)
+    # Every score above the floor, in score order (5b moved the floor past a literal 0.8).
+    mid = round(FLOOR + 0.1, 4)
+    world.hit("p2", a["id"], ABOVE).hit("p1", a["id"], mid).hit("q", a["id"], JUST_ABOVE)
     walk = world.fill()
     assert [(m.point_id, m.ordinal, m.score) for m in walk.matches] == [
-        ("p2", 1, 0.95), ("q", 2, 0.8)]
+        ("p2", 1, ABOVE), ("q", 2, JUST_ABOVE)]
     assert walk.matches[0].item == "one long item"  # the whole item, rstripped
     assert sum(walk.dropped.values()) == 0          # a collapse is not a drop
 
@@ -972,7 +974,8 @@ def test_a_short_section_with_nothing_dropped_does_not_blame_verification(ws) ->
     fresh-eyes). With drops it still counts them."""
     world = _Pure()
     a = _a_owner(world, n=1)
-    world.hit("a1", a["id"], .95).hit("a1", a["id"], .9).hit("a1", a["id"], .8)
+    # Three parts of one item, every one above the floor, so the full fetch is still short.
+    world.hit("a1", a["id"], ABOVE).hit("a1", a["id"], round(FLOOR + 0.1, 4)).hit("a1", a["id"], JUST_ABOVE)
     walk = world.fill(fetch=3)
     assert walk.short is True and sum(walk.dropped.values()) == 0
     for surface in ("cli", "mcp"):
@@ -1280,10 +1283,12 @@ def test_the_fetch_bound_exceeds_the_limit_ceiling() -> None:
     assert REJECTION_OVERFETCH_BOUND > RANKED_LIMIT_CEILING
 
 
-def test_the_floor_is_pending_5b() -> None:
+def test_the_floor_is_calibrated() -> None:
+    """Inverted by 5b from `test_the_floor_is_pending_5b`: 5a shipped the floor at a
+    placeholder in PENDING; 5b calibrated it against the record."""
     from golden.test_calibrated_constants import CALIBRATED_CONSTANTS, PENDING
-    assert PENDING["mitos.recall.REJECTION_MATCH_FLOOR"] == "5b"
-    assert "mitos.recall.REJECTION_MATCH_FLOOR" not in CALIBRATED_CONSTANTS
+    assert "mitos.recall.REJECTION_MATCH_FLOOR" not in PENDING
+    assert "mitos.recall.REJECTION_MATCH_FLOOR" in CALIBRATED_CONSTANTS
 
 
 def test_the_offline_autouse_binds_a_fake_at_both_read_seams(ws) -> None:

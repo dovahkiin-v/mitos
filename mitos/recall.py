@@ -69,13 +69,12 @@ SURFACE_WEAK_THRESHOLD: float = 0.60
 RANKED_EDGE_MARGIN: float = 0.0156
 
 # The rejection-match floor: a rejection hit scoring below it is not a match, and the
-# leg's walk stops at it. PROVISIONAL, not calibrated: listed in
-# tests/golden/test_calibrated_constants.py's PENDING as phase 5b's, which sets it
-# under the calibration rule. 0.65 is a placeholder chosen only to sit under the
-# median of Layer C's per-item rejection targets (0.720) and at the max of its generic
-# negatives (0.651), run `harbor-20261015-a79a820`; it ships no prose that leans on
-# its meaning.
-REJECTION_MATCH_FLOOR: float = 0.65
+# leg's walk stops at it. Calibrated, recorded in tests/golden/calibration/record.json:
+# just above every hard negative (generic and vocabulary items, per-item shape, query
+# space) on both corpora, the higher boundary taken, with its cry-wolf ratio read on the
+# copy's replay and held to its ceiling in the same entry. Method:
+# tests/golden/_calibration_record.py ``rejection_floor_boundary``.
+REJECTION_MATCH_FLOOR: float = 0.8147
 
 # The rejection section's bound, in items (not points): how many verified matches a
 # ranked answer carries at most. A budget constant (vision §6.3's default); 5b may

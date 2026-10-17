@@ -931,7 +931,14 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         with show_node. When every precedent the ranking retrieved is retired (a
         blackout), `active_decisions` stays empty and `all_superseded` carries the same
         handles, with the `note` naming where each one's current word lives — a
-        recoverable "it was settled before", not a true miss.
+        recoverable "it was settled before", not a true miss. `rejection_matches`
+        lists options a decision already rejected that sit close to the claim, each
+        with its owner's slug, state and stamps, the score, the item's ordinal and
+        whole text, and `letter` (`here`: the owner's axiom and reasoning ride this
+        match). A match means that decision rejected something close to the claim in
+        its own context, whatever the band: weigh whether its reason carries over
+        before proposing it. `rejection_section` appears only when the section is not
+        whole (`gap`, `not_searched`, `unavailable`, `short`).
     """
     # An argument fault is answered before any project is resolved — see
     # list_decisions for why the ordering is deliberate.
@@ -1491,7 +1498,12 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
         exact-slug hit's `mechanisms` is the folded identity form the graph
         stores; no by-handle read returns transcripts (they stay in
         `decisions.md`), graph-primary provenance (`source`, `created_at`,
-        `confirmed_by`/`confirmed_at`) or outgoing edges.
+        `confirmed_by`/`confirmed_at`) or outgoing edges. A ranked answer may carry
+        `rejection_matches`: options a decision already rejected, close to the claim
+        (owner slug, state, stamps, score, ordinal, whole item, `letter`). One means
+        that decision rejected it in its own context, whatever the band; weigh
+        whether the reason carries over. `rejection_section` appears only when the
+        section is not whole.
     """
     # No standing check notice on any exit of this verb, deliberately (vision §4.3):
     # `surface_decisions` is the read put before a write and carries it; a second

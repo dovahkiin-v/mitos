@@ -267,3 +267,17 @@ def test_the_printed_recipe_refreshes_an_unregistered_workspace(tmp_path):
 
     after = _mitos(str(elsewhere), "status", str(ws), "--json")
     assert json.loads(after.stdout)["skill_md"] == {"status": "current"}
+
+
+def test_the_skill_text_teaches_the_rejection_section_outside_the_format_spec():
+    """5b (constraint 12): the skill text ships the rejection section's reading with the
+    calibrated floor, on the recall bullets after the interpolated format spec, so it is
+    mitos's own sentence and never a format-spec edit. Pinned with a sentinel spec, so the
+    order holds whatever the installed spec says."""
+    spec = "<<FORMAT SPEC SENTINEL>>"
+    body = cli._skill_md_text(spec)
+    sentence = "If an answer carries `rejection_matches`, read them before you propose"
+    assert body.count(sentence) == 1
+    assert body.index(sentence) > body.index(spec) + len(spec)
+    line = next(ln for ln in body.splitlines() if sentence in ln)
+    assert line.startswith("- `surface_decisions`") and "its own question" in line
