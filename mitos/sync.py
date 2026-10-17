@@ -1702,11 +1702,19 @@ def _pause_message(payload: Dict[str, Any]) -> str:
         if any(t.get("successor_on_pause") for t in tombstones):
             parts.append("A tombstone marked successor_on_pause has that successor among "
                          "the neighbours above, so one relation to it clears both.")
-        if any(t.get("successor_ambiguous") for t in tombstones):
+        ambiguous = [t for t in tombstones if t.get("successor_ambiguous")]
+        if any(len(_live_successors(t)) == 1 for t in ambiguous):
             parts.append("A tombstone marked successor_ambiguous clears only with "
                          "acknowledge_neighbors=True: its successor's slug names two "
                          "decisions, and record_decision refuses a relation target that two "
                          "decisions carry.")
+        if any(len(_live_successors(t)) > 1 for t in ambiguous):
+            # A fan-out (out-of-band only) may hold one ambiguous successor among
+            # several, and the key does not say which: claim no more than that (7b's
+            # `exists` rule).
+            parts.append("A tombstone marked successor_ambiguous with several successors "
+                         "has at least one whose slug two decisions carry, a relation target "
+                         "record_decision refuses; acknowledge_neighbors=True clears it.")
     echo_prose = "".join(f"{line}. " for line in _declared_echo_lines(payload))
     return (" ".join(parts) + f" {PAUSE_HELD_CLAUSE}{_PAUSE_DIGEST_CLAUSE} "
             f"{echo_prose}Nothing was written.")

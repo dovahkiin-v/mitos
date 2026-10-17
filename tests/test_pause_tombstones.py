@@ -642,6 +642,46 @@ def test_a_same_slug_successor_says_acknowledgement_only(ws):
     assert "successor_ambiguous clears only with acknowledge_neighbors=True" in res["message"]
 
 
+def test_an_ambiguous_fan_out_tombstone_claims_no_refusal_for_every_successor(ws):
+    """Checkpoint 7: 7b's `exists` rule on the pause. A fan-out (out-of-band only) may
+    hold one ambiguous successor among several, and the key does not say which, so
+    neither the message nor the CLI line says a relation to it is refused or that only
+    acknowledgement clears it; the one-successor wording is untouched."""
+    import io
+    from contextlib import redirect_stderr, redirect_stdout
+    config, _ = ws
+    tomb = {"slug": "pin", "id": "f" * 64, "state": "superseded", "score": 0.9,
+            "superseded_by": ["pin-a"], "corrected_by": ["pin-b"],
+            "successor_ambiguous": True, "axiom": "Axiom for pin."}
+    pause = {"status": "needs_review", "code": "similar_decision_exists", "slug": "draft",
+             "neighbors": [], "tombstones": [tomb]}
+    pause["message"] = sync._pause_message(pause)
+    assert "clears only with" not in pause["message"]
+    assert "its successor's slug names two decisions" not in pause["message"]
+    assert ("successor_ambiguous with several successors has at least one whose slug two "
+            "decisions carry") in pause["message"]
+
+    class _Canned:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def record_decision_entry(self, *_a, **_k):
+            return pause
+
+    err = io.StringIO()
+    with patch("mitos.cli.MitosSyncManager", _Canned), redirect_stderr(err), \
+            redirect_stdout(io.StringIO()), pytest.raises(SystemExit):
+        cmd_record(config, axiom=_DRAFT, rejected="rej", scope=["s"], slug="draft")
+    text = err.getvalue()
+    assert "only --acknowledge-neighbors clears it" not in text
+    assert "at least one of its successors is one; --acknowledge-neighbors clears it" in text
+
+    single = {**pause, "tombstones": [{**tomb, "corrected_by": []}]}
+    assert "successor_ambiguous clears only with acknowledge_neighbors=True" in \
+        sync._pause_message(single)
+    assert "several successors" not in sync._pause_message(single)
+
+
 def test_a_distinct_slug_successor_carries_no_ambiguity(ws):
     config, m = ws
     _retire(m, "old-way", by="new-way")

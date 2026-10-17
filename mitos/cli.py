@@ -2779,7 +2779,11 @@ def cmd_record(
             if t.get("successor_on_pause"):
                 print(f"      its successor is on this pause: "
                       f"{', '.join(t['successor_on_pause'])}", file=sys.stderr)
-            if t.get("successor_ambiguous"):
+            if t.get("successor_ambiguous") and len(_live_successors(t)) > 1:
+                print("      a relation to a slug two decisions carry is refused, and at "
+                      "least one of its successors is one; --acknowledge-neighbors "
+                      "clears it", file=sys.stderr)
+            elif t.get("successor_ambiguous"):
                 print("      only --acknowledge-neighbors clears it: its successor's slug "
                       "names two decisions, and a relation to it is refused",
                       file=sys.stderr)
