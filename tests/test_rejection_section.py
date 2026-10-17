@@ -1441,3 +1441,26 @@ def test_the_four_ranked_reads_walk_light_and_the_gather_whole() -> None:
                                              "query_decisions": True}
     assert _light_kw_of("cli.py") == {"cmd_surface": True, "cmd_query": True}
     assert set(_light_kw_of("conflict.py").values()) == {None}
+
+
+@pytest.mark.parametrize("driver", list(DRIVERS))
+def test_a_here_owner_carries_its_modifier_stamps(ws, monkeypatch, driver) -> None:
+    """The stamping rule on the new read path: a match hands a reader a decision."""
+    _commit(ws, "a")
+    owner = _commit(ws, "owner", F_TWO)
+    _commit(ws, "amender", amends=["owner"])
+    index = FakeRejectionIndex(present=True)
+    _plant(index, owner, F_TWO, {1: ABOVE, 2: JUST_ABOVE})
+    _bind(monkeypatch, index)
+    env = _call(driver, ws, [{"slug": "a", "score": .9}], brief=True)
+    here, later = env["rejection_matches"]
+    assert here["letter"] == "here" and here["amended_by"] == ["amender"]
+    assert later["letter"] == "section" and later["amended_by"] == ["amender"]
+
+
+def test_an_empty_light_walk_makes_no_hydrate_read(ws) -> None:
+    store = GraphStore(ws.db_path, read_only=True)
+    graph = _LightSpy(store)
+    walk = walk_ranked(_query_vector(), vector_store=CannedVector([], store=store),
+                       graph=graph, limit=2, light=True)
+    assert graph.light == [[]] and graph.resolved == [] and walk.window == []

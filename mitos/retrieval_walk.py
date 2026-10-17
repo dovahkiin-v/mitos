@@ -818,8 +818,10 @@ def _hydrate_shown(walk: RankedWalk, owners: List[str],
     shown = ([h.point_id for h in walk.window]
              + ([walk.edge.point_id] if walk.edge is not None else [])
              + [h.point_id for h in walk.passed[:walk.limit]])
-    hydrated = _resolution(graph.resolve_point_ids(list(dict.fromkeys(shown + owners))),
-                           "resolve_point_ids")
+    wanted = list(dict.fromkeys(shown + owners))
+    # Nothing shown and no owner: no read (an empty fetch, or a blackout of none).
+    hydrated = (_resolution(graph.resolve_point_ids(wanted), "resolve_point_ids")
+                if wanted else PointResolution(nodes={}, orphans=[], ambiguous={}))
 
     def whole(hit: WalkHit) -> WalkHit:
         node = hydrated.nodes.get(hit.point_id)
