@@ -113,12 +113,15 @@ from mitos.errors import CollectionMissingError, DatabaseError, VectorStoreError
 # for the `active` hint (ADR
 # `over-fetch-bound-covers-measured-burial-horizon-and-a-real-corpus-cut-builds-the-active-hint`).
 #
-# The light resolver stays unbuilt (ADR
-# `ranked-walk-resolves-every-hit-whole-light-resolver-unbuilt-until-core-p95-passes-40ms`):
-# at 350 the whole-node resolve is about half the core, and an (id, kind, state)
-# resolve over every hit plus hydrating the window would save about 6.5 ms at p50.
-# Trigger: the first phase whose measured ranked-read core p95 at this bound
-# exceeds 40 ms on either horizon graph builds it, before adding its own cost.
+# The light resolver (ADR
+# `ranked-walk-resolves-every-hit-whole-light-resolver-unbuilt-until-core-p95-passes-40ms`)
+# is built since 5a: the rejection leg took the ranked read's core p95 past the 40 ms
+# trigger at the horizon (with the leg, whole resolve: 42.8 / 41.7 ms on timing, run
+# `20261017-0552-2523a7a-timing-rejection-search`, dirty tree). The ranked reads pass
+# `light=True`: an (id, kind, state) resolve over every hit, then one hydrate of what
+# the answer shows. Measured at 7f4bfbb (the two runs cited below), the no-leg p95
+# fell to 22.9 ms (timing) / 21.7 ms (burial) and the with-leg p95 to 38.0 / 36.8 ms.
+# The gather keeps the whole resolve.
 #
 # Must stay above `display.RANKED_LIMIT_CEILING` so `limit + 1` always fits
 # (pinned by a row, not an import: this leaf imports no `display`).
@@ -129,7 +132,11 @@ RANKED_OVERFETCH_BOUND: int = 350
 # constant, not a calibrated threshold (vision §6.3), so it stays outside Layer C's
 # pin population.
 #
-# MEASUREMENT PENDING (§7.1 of phase 5a sets it and cites its runs here).
+# Set by phase 5a's recorded runs `20261017-0602-7f4bfbb-timing-rejection-search` and
+# `20261017-0615-7f4bfbb-burial-rejection-search` (235,489 items on each 50,000-decision
+# horizon graph, 100 interleaved rounds): the search wall is flat across fetch 10–200
+# (p50 12.6–13.9 ms, p95 14.6–16.3 ms on both graphs), so the fetch costs nothing
+# measurable and the bound is the round number above the ceiling.
 #
 # Must stay above `display.RANKED_LIMIT_CEILING`: the field-scoped lookup (5c) walks
 # to a caller's `limit` with this one bound (pinned by a row, not an import).
@@ -142,8 +149,15 @@ REJECTION_OVERFETCH_BOUND: int = 100
 # (ADRs `rejection-search-on-ranked-reads-runs-under-its-own-time-budget` and
 # `rejection-search-time-budget-sits-inside-the-50ms-letter-retrieval-budget`).
 #
-# MEASUREMENT PENDING (§7.1 of phase 5a sets it and cites its runs here).
-REJECTION_SEARCH_BUDGET_SECONDS: float = 0.008
+# Set by the same two runs: the smallest budget whose overrun share at the horizon
+# is at most 1 % (13 ms: 0/100 at fetch 100 on both graphs, 1/100 at one other fetch
+# each; 12 ms: 2/100; 10 ms: 30–33/100), with the ranked read's no-leg p95 plus twice
+# the budget inside P16's 50 ms (22.9 ms timing, 21.7 ms burial, light walk: 48.9 and
+# 47.7 ms). The search itself costs ~13 ms at 235k items, so on the horizon the
+# budget is close to it; a real corpus's search is far smaller. Lever if a real
+# corpus overruns it: run the search concurrently with the decision query, inside
+# the walk (ROADMAP).
+REJECTION_SEARCH_BUDGET_SECONDS: float = 0.013
 
 # The computed states a ranked read serves as live. Agreement-pinned to
 # `store.LIVE_STATES` by a row; spelled here because this leaf cannot import the
