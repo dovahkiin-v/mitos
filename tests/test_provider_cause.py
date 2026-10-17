@@ -255,15 +255,16 @@ def test_header_dump_note_and_write_warning_carry_one_phrase(ws, capsys, cause):
 
 
 @pytest.mark.parametrize("cause", PROVIDER_CAUSES)
-def test_the_partial_list_note_names_the_same_phrase(cause):
-    """A fault after hits were appended keeps them; the note names the injected cause."""
+def test_the_dump_note_names_the_same_phrase(cause):
+    """The degraded answer with results — the scope dump, its only one since 5d
+    retired the partial-list arm — names the injected cause."""
     phrase = provider_cause_phrase(cause)
     for surface in ("cli", "mcp"):
         _, note = assess_surface_recall(
             lead=None, short=None,
             semantic_ran=False, top_score=None, result_count=2, scope="x",
-            surface=surface, edge=None, scope_total=None, degraded_reason=phrase)
-        assert note.startswith(f"Semantic recall unavailable ({phrase}) — showing the ")
+            surface=surface, edge=None, scope_total=2, degraded_reason=phrase)
+        assert note.startswith(f"Semantic recall unavailable ({phrase}) — showing all 2 ")
 
 
 @pytest.mark.parametrize("cause", PROVIDER_CAUSES)

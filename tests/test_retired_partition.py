@@ -653,8 +653,9 @@ def test_the_nothing_ranked_forks_ignore_lead_and_short(verb):
 
 
 def test_the_degraded_arm_ignores_lead_and_short():
+    # On the dump arm (5d: the only degraded arm with results takes `scope_total`).
     kw = dict(semantic_ran=False, degraded_reason="the provider is down", top_score=None,
-              result_count=2, scope=None, surface="mcp", edge=None)
+              result_count=2, scope=None, scope_total=2, surface="mcp", edge=None)
     plain = assess_surface_recall(lead=None, short=None, **kw)[1]
     assert assess_surface_recall(lead=_LEAD, short=_SHORT, **kw)[1] == plain
 

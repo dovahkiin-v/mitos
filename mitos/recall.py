@@ -25,7 +25,9 @@ The **rejection section** of the four ranked reads is composed here too
 (:func:`rejection_section`): its floor and bound, the state token naming a section
 that was not computed whole (gap, not searched, unavailable, short) with its note
 clause and the gap's per-surface heal, and the withheld rule counted over decisions.
-The walk that found the matches and the shaper that words them are handed in.
+The walk that found the matches and the shaper that words them are handed in. A
+degraded answer's section is matched by words and carries a fifth token, ``lexical``
+(``degraded`` composes it; its clause is :func:`degraded_section_clause`).
 
 The **field-scoped lookup** (``query``'s ``field`` selector, :func:`rejection_lookup`)
 is composed here as well: the rejection ranking as the whole answer, its band legend,
@@ -776,9 +778,9 @@ def assess_surface_recall(
             Every note holding ranked results reads lead → band note → (edge |
             short), then the call site's withheld and stamps-unread clauses.
         scope_total: How many active decisions the scope holds, passed only by the
-            degraded scope dump. Its presence is what selects the dump's own
-            sentence, which names how many of them it shows; None keeps the shared
-            degraded sentence, which a partial ranked list also reaches.
+            degraded scope dump, whose sentence names how many of them it shows.
+            A degraded call with results must pass it: the dump is the only
+            degraded answer that has results.
         degraded_reason: The cause phrase the caller computed once with
             ``lexical.degraded_reason_from_error`` and also put on its degraded
             header, so the header and this note cannot disagree. Required keyword,
@@ -787,15 +789,17 @@ def assess_surface_recall(
 
     Raises:
         ValueError: ``semantic_ran`` is False and ``degraded_reason`` is None — a
-            call-site defect, loud on purpose rather than a note with no cause.
+            call-site defect, loud on purpose rather than a note with no cause —
+            or ``semantic_ran`` is False with results and no ``scope_total``: a
+            degraded answer with results is the scope dump's.
 
     Returns:
         A ``(confidence, note)`` pair. ``confidence`` is ``"strong"`` / ``"weak"`` /
         ``"none"`` when semantic ranking ran, else ``None`` (degraded). ``note`` is a
         one-line, action-oriented string — never the old boilerplate that printed
-        identically on every response. A degraded note that returns results ends
-        with :func:`degraded_omission_clause`; its caller sets the matching
-        ``not_computed`` key.
+        identically on every response. The dump's note ends with
+        :func:`degraded_omission_clause`; ``degraded.dump_section`` sets the
+        matching ``not_computed`` key and the section clause that follows it.
     """
     pointers = _SURFACE_POINTERS[surface]
     scope_phrase = f"scope '{scope}'" if scope else "this query"
@@ -823,12 +827,20 @@ def assess_surface_recall(
                 "assess_surface_recall: a degraded call must pass degraded_reason — "
                 "the cause the caller's degraded header names"
             )
-        # Both result-bearing branches end with the omission clause: a degraded
-        # answer has no scores, so no partition, edge or band (the caller adds the
-        # matching ``not_computed`` key). The no-results branches carry none — no
+        # A degraded answer with results is the scope dump's, and only the dump's:
+        # with recall down no walk ran, so nothing else fills the list. Its
+        # composer (``degraded.dump_section``) sets the matching ``not_computed``,
+        # so "clause appended" and "key set" are one fact (WIRING_LEDGER entry-014).
+        if result_count and scope_total is None:
+            raise ValueError(
+                "assess_surface_recall: a degraded answer with results is the scope "
+                "dump's; pass scope_total"
+            )
+        # The dump ends with the omission clause: a degraded answer has no scores,
+        # so no partition, edge or band. The no-results branches carry none — no
         # surface reaches them, since both route an empty degraded answer to the
         # lexical exit, which states its own.
-        if result_count and scope_total is not None:
+        if result_count:
             # The dump's own branch: it names how many of the scope's decisions it
             # shows. ``result_count`` is what the envelope returns; the dump is one
             # read, so it is either whole (up to ``limit``) or not shown at all.
@@ -844,13 +856,6 @@ def assess_surface_recall(
                 f"Semantic recall unavailable ({degraded_reason}) — showing "
                 f"{shown_part} as a fallback, NOT a relevance ranking. For the "
                 f"authoritative set use {complete_hint} (pure graph read). "
-                f"{degraded_omission_clause()}"
-            )
-        if result_count:
-            return None, (
-                f"Semantic recall unavailable ({degraded_reason}) — showing the "
-                f"active decisions in {scope_phrase} as a fallback, NOT a relevance "
-                f"ranking. For the authoritative set use {complete_hint} (pure graph read). "
                 f"{degraded_omission_clause()}"
             )
         if scope_unused:
@@ -1033,8 +1038,8 @@ def count_withheld_decisions(*, thinned_ids: List[str],
     rejection section's matches already show every item its field can serve
     (``len(shown_ordinals[id]) == item_counts[id]``) — a one-item field's match is
     the common case — because then nothing of its reasoning was left out.
-    :func:`count_withheld` keeps serving the paths that carry no section (lexical,
-    ``list``); on an answer with no matches the two give the same number.
+    :func:`count_withheld` keeps serving the paths that carry no section
+    (``list``); on an answer with no matches the two give the same number.
 
     Args:
         thinned_ids: The population's node ids, repeats allowed.
@@ -1317,9 +1322,8 @@ def rejection_lookup_gap_reason(*, surface: str, config: "object") -> str:
 
 
 # What the lookup's lexical answer could not compute: the band and the edge, which
-# need scores. Not :data:`DEGRADED_NOT_COMPUTED`: its ``retired_partition`` and
-# ``rejection_matches`` tokens would be false here, because the lookup has no retired
-# partition to compute and its rejection matches ARE computed, lexically.
+# need scores. Not :data:`DEGRADED_NOT_COMPUTED`: its ``retired_partition`` token
+# would be false here, because the lookup has no retired partition to compute.
 LOOKUP_DEGRADED_NOT_COMPUTED: Tuple[str, ...] = ("band", "edge")
 
 
@@ -1565,14 +1569,17 @@ def rejection_lookup(walk: Optional["object"], *, query: str, full_top: Optional
 
 # What a degraded answer could not compute, as concept tokens: ``retired_partition``
 # names the ranked envelopes' key, ``edge`` the window-edge clause, ``band`` the
-# ``confidence`` band, ``rejection_matches`` the rejection section. Each needs
-# similarity scores, which a degraded read has none of. Carried on every degraded
-# envelope as ``not_computed`` (serialized as a list) and never on a ranked one, so
-# on a ranked envelope an absent ``retired_partition`` still means computed and
-# empty. A tuple here only so no caller can mutate it.
-DEGRADED_NOT_COMPUTED: Tuple[str, ...] = (
-    "retired_partition", "edge", "band", "rejection_matches",
-)
+# ``confidence`` band. Each needs similarity scores, which a degraded read has none
+# of. Carried on every degraded envelope as ``not_computed`` (serialized as a list)
+# and never on a ranked one, so on a ranked envelope an absent ``retired_partition``
+# still means computed and empty. The rejection section is not among them: a
+# degraded read matches rejected options by their words (``rejection_section:
+# "lexical"``); only the scope dump whose state read failed adds
+# :data:`DEGRADED_SECTION_TOKEN` back. A tuple here only so no caller can mutate it.
+DEGRADED_NOT_COMPUTED: Tuple[str, ...] = ("retired_partition", "edge", "band")
+
+# The ``not_computed`` token for a degraded rejection section that was not searched.
+DEGRADED_SECTION_TOKEN = "rejection_matches"
 
 
 def degraded_omission_clause() -> str:
@@ -1583,12 +1590,41 @@ def degraded_omission_clause() -> str:
     write, so it is the same sentence on both surfaces. Pure string formatting.
 
     Returns:
-        One sentence naming the four omissions.
+        One sentence naming the three omissions.
     """
     return (
         "Not computed without similarity scores: the retired partition, the "
-        "window's edge, the confidence band and the rejection matches."
+        "window's edge and the confidence band."
     )
+
+
+def degraded_section_clause(*, computed: bool, retired_dropped: bool) -> str:
+    """Words the note clause of a degraded answer's rejection section.
+
+    Follows :func:`degraded_omission_clause` on every degraded exit, as a ranked
+    section's state clause follows its band note. True whether or not anything
+    matched ("searched", never "found"). A fact with no pointer, so the same on both
+    surfaces. Pure string formatting.
+
+    Args:
+        computed: Whether the section was searched (False only on the scope dump
+            whose state read failed: its list is filtered, so an unfiltered section
+            beside it would be false).
+        retired_dropped: Whether the graph's states were read, so retired owners'
+            items were dropped. Under the stamps-unavailable disclosure they were
+            not, and the disclosure already says entries may include superseded
+            ones.
+
+    Returns:
+        One sentence.
+    """
+    if not computed:
+        return ("Rejected options were not searched: the graph's decision states "
+                "could not be read.")
+    if retired_dropped:
+        return ("Rejected options were searched by their words, not their meaning; "
+                "those of retired decisions are not listed.")
+    return "Rejected options were searched by their words, not their meaning."
 
 
 def withheld_clause(count: int, *, surface: str, config: "object") -> str:

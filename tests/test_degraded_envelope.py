@@ -7,8 +7,9 @@ rows here pin, on every driver (MCP ``surface_decisions`` / ``query_decisions``,
 ``mitos surface`` / ``mitos query`` on ``--json`` and text):
 
 - row 8: the lexical match count is ``clamp_limit(limit)`` on every route into it;
-- row 9: every degraded exit carries ``not_computed`` and the omission clause, and
-  no ranked, healthy-empty or exact-slug exit does;
+- row 9: every degraded exit carries ``not_computed`` and the omission clause, then
+  its rejection section's clause and ``rejection_section: "lexical"`` (5d), and no
+  ranked, healthy-empty or exact-slug exit does;
 - row 10: no degraded envelope carries a band, a partition or an edge clause;
 - row 11: the dump is stamped by its own read, makes no modifiers read, and routes
   to the lexical exit when that read raises or comes back empty;
@@ -39,7 +40,8 @@ from mitos.config import MitosConfig
 from mitos.errors import CollectionMissingError, DatabaseError
 from mitos.parser import parse_entry_stream
 from mitos.recall import (DEGRADED_NOT_COMPUTED, degraded_omission_clause,
-                          stamps_unread_clause, withheld_clause)
+                          degraded_section_clause, stamps_unread_clause,
+                          withheld_clause)
 from mitos.store import GraphStore
 from mitos.sync import MitosSyncManager
 
@@ -47,6 +49,9 @@ from _point_hits import CannedVector, point_hit
 from conftest import resolve_like_main
 
 _OMISSION = degraded_omission_clause()
+# 5d: every degraded exit's rejection section clause, right after the omission clause.
+_SECTION = degraded_section_clause(computed=True, retired_dropped=True)
+_SECTION_UNFILTERED = degraded_section_clause(computed=True, retired_dropped=False)
 _ABSENT = "mitos-tmp-absent-collection"
 _PRE_V1A = "This graph predates the V1a schema (a prototype layout was detected)."
 
@@ -299,21 +304,24 @@ def test_the_lexical_count_is_the_clamped_limit_on_every_route(dws, driver, caus
 # Rows 9 and 10 — every degraded exit says what it did not compute; none carries a band
 # --------------------------------------------------------------------------- #
 
+# 5d: `rejection_matches` / `rejection_section` left this set — every degraded exit
+# carries its section, matched by words, under the `lexical` token only.
 _BAND_KEYS = ("confidence", "retired_partition", "retired_partition_omitted",
-              "all_superseded", "rejection_matches", "rejection_section",
-              "rejection_dropped")
+              "all_superseded", "rejection_dropped")
 _EDGE_STEMS = ("This ranking ended", "This ranking's edge")
 
 
-def _assert_degraded_statement(driver: str, resp: Any) -> None:
+def _assert_degraded_statement(driver: str, resp: Any, cause: str) -> None:
+    section = _SECTION_UNFILTERED if cause == "pre-v1a" else _SECTION
     if DRIVERS[driver][3] == "text":
-        assert _OMISSION in resp
+        assert f"{_OMISSION} {section}" in resp
         assert not any(stem in resp for stem in _EDGE_STEMS)
         assert "⚠ confidence:" not in resp
         return
     assert resp["not_computed"] == list(DEGRADED_NOT_COMPUTED) == [
-        "retired_partition", "edge", "band", "rejection_matches"]
-    assert _OMISSION in resp["note"]
+        "retired_partition", "edge", "band"]
+    assert f"{_OMISSION} {section}" in resp["note"]
+    assert resp["rejection_section"] == "lexical"
     for key in _BAND_KEYS:
         assert key not in resp, key
     assert not any(stem in resp["note"] for stem in _EDGE_STEMS)
@@ -328,7 +336,7 @@ def test_every_lexical_exit_names_what_it_did_not_compute(dws, driver, cause):
     resp = drive(driver, dws, "cache", cause=cause)
     assert_cause(driver, cause, resp)
     assert listed(driver, resp) == ["cache-strategy"]
-    _assert_degraded_statement(driver, resp)
+    _assert_degraded_statement(driver, resp, cause)
 
 
 def _scoped(config: MitosConfig) -> Dict[str, str]:
@@ -348,15 +356,18 @@ def test_the_scope_dump_names_what_it_did_not_compute(dws, driver, cause):
     assert listed(driver, resp) == ["cache-strategy"]
     if DRIVERS[driver][3] == "json":
         assert "degraded" not in resp
-    _assert_degraded_statement(driver, resp)
+    _assert_degraded_statement(driver, resp, cause)
 
 
 def _assert_no_statement(resp: Any) -> None:
     if isinstance(resp, str):
         assert _OMISSION not in resp
+        assert "searched by their words" not in resp
     else:
         assert "not_computed" not in resp
         assert _OMISSION not in resp.get("note", "")
+        assert "searched by their words" not in resp.get("note", "")
+        assert resp.get("rejection_section") != "lexical"
 
 
 @pytest.mark.parametrize("driver", list(DRIVERS))
@@ -479,7 +490,9 @@ def test_scope_dump_is_none_exactly_when_there_is_no_dump(dws):
 
 @pytest.mark.parametrize("driver", ["mcp-surface", "cli-surface-json"])
 def test_the_dump_note_reads_dump_sentence_then_omission_then_withheld(dws, driver):
-    """Row 11: the dump's order (it cannot be unstamped, so it has no stamps-unread)."""
+    """Row 11: the dump's order — dump sentence, omission, section clause (5d),
+    withheld (its decisions cannot be unstamped; a section owner's stamp fault has
+    its own row)."""
     _scoped(dws)
     resp = drive(driver, dws, "nothing lexical matches this", cause="no-providers",
                  scope="caching", full_top=0)
@@ -488,7 +501,7 @@ def test_the_dump_note_reads_dump_sentence_then_omission_then_withheld(dws, driv
     withheld = withheld_clause(1, surface=surface, config=dws)
     assert note.startswith("Semantic recall unavailable (embeddings/Qdrant unavailable) "
                            "— showing the one active decision in scope 'caching'")
-    assert note.endswith(f"(pure graph read). {_OMISSION} {withheld}")
+    assert note.endswith(f"(pure graph read). {_OMISSION} {_SECTION} {withheld}")
 
 
 # --------------------------------------------------------------------------- #
@@ -501,8 +514,9 @@ def _modifiers_fault(*_a, **_k):
 
 @pytest.mark.parametrize("driver", list(DRIVERS))
 def test_a_lexical_stamp_fault_is_stated_last(dws, driver):
-    """Row 7 through the composer: the stamps cost alone, stated after the omission and
-    withheld clauses (the ranked order's tail); the state filter still ran."""
+    """Row 7 through the composer: the stamps cost alone, stated after the omission,
+    section (5d) and withheld clauses (the ranked order's tail); the state filter
+    still ran."""
     _scoped(dws)
     resp = drive(driver, dws, "write-through", cause="no-providers", full_top=0,
                  wrap=lambda s: _Spy(s, get_modifiers_map=_modifiers_fault))
@@ -510,10 +524,10 @@ def test_a_lexical_stamp_fault_is_stated_last(dws, driver):
     unread = stamps_unread_clause(surface=surface, config=dws)
     withheld = withheld_clause(2, surface=surface, config=dws)
     if DRIVERS[driver][3] == "text":
-        assert f"{_OMISSION} {withheld} {unread}" in resp
+        assert f"{_OMISSION} {_SECTION} {withheld} {unread}" in resp
         return
     assert resp["stamps_unread"] is True and "stamps_unavailable" not in resp
-    assert resp["note"].endswith(f"{_OMISSION} {withheld} {unread}")
+    assert resp["note"].endswith(f"{_OMISSION} {_SECTION} {withheld} {unread}")
     assert all(m["state"] == "active" for m in resp["matches"])
     assert not any("amended_by" in m for m in resp["matches"])
 
@@ -559,8 +573,9 @@ def test_cli_and_mcp_degraded_envelopes_agree(dws, verb, cause, full_top):
 @pytest.mark.parametrize("cause", STORE_CAUSES)
 @pytest.mark.parametrize("full_top", [None, 0])
 def test_cli_and_mcp_scope_dumps_agree(dws, cause, full_top):
-    """Row 12, the dump exit: each boundary sets the dump's `not_computed` itself, so
-    the two envelopes must agree on every key and every value but the note, whose
+    """Row 12, the dump exit: `degraded.dump_section` composes the dump's
+    `not_computed` and section once (5d; each boundary used to set the key itself),
+    so the two envelopes must agree on every key and every value but the note, whose
     complete-set hint and withheld clause are per-surface; MCP names no `mitos `."""
     _scoped(dws)
     kw = dict(cause=cause, scope="caching", full_top=full_top)

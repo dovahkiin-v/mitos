@@ -30,7 +30,8 @@ from mitos.errors import (
     TARGET_RELATIVE_PATH,
     TARGET_UNKNOWN_NAME,
 )
-from mitos.degraded import lexical_envelope, lexical_rejection_envelope, scope_dump
+from mitos.degraded import (dump_section, lexical_envelope, lexical_rejection_envelope,
+                             scope_dump)
 from mitos.lexical import degraded_reason_from_error
 from mitos.check_notice import compose_check_notice
 from mitos.telemetry import read_last_attempt
@@ -38,7 +39,7 @@ from mitos.divergence import corpus_holds_entries
 # Module level on purpose: `amend` and `restore` close over no `cli`/`sync`/`store`
 # (measured at planning), so unlike `MitosSyncManager` neither needs deferring.
 from mitos.restore import BufferFidelityError
-from mitos.recall import (DEGRADED_NOT_COMPUTED, RANKED_EDGE_MARGIN, RetiredPartition,
+from mitos.recall import (RANKED_EDGE_MARGIN, RetiredPartition,
                           assess_query_recall, assess_surface_recall, blackout_note,
                           corpus_provenance, missing_graph_is_a_gap,
                           missing_graph_note, missing_index_is_a_gap,
@@ -943,7 +944,8 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         match). A match means that decision rejected something close to the claim in
         its own context, whatever the band: weigh whether its reason carries over
         before proposing it. `rejection_section` appears only when the section is not
-        whole (`gap`, `not_searched`, `unavailable`, `short`).
+        whole (`gap`, `not_searched`, `unavailable`, `short`), or as `lexical` when
+        recall is down: options matched by their words, with `matched_terms`, no score.
     """
     # An argument fault is answered before any project is resolved — see
     # list_decisions for why the ordering is deliberate.
@@ -1080,6 +1082,11 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         if dump is not None:
             results["active_decisions"] = dump.decisions
             dump_total = dump.total
+            # The dump's rejection section, matched by words, and the rest of its
+            # degraded statement (`not_computed`, the section clause), composed
+            # once; the tail below places them as it places a ranked section.
+            section = dump_section(query, dump, config=config, store=store,
+                                   full_top=full_top)
 
     # The degraded cause, computed once and handed to both the lexical exit's header
     # and the scope-dump / partial-list note, so the two cannot name different causes.
@@ -1140,10 +1147,6 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
     if confidence is not None:
         results["confidence"] = confidence
     results["note"] = note
-    # The dump is the one degraded exit that reaches this composer; it says what it
-    # could not compute (the clause is already on its note).
-    if dump_total is not None:
-        results["not_computed"] = list(DEGRADED_NOT_COMPUTED)
     # Present whenever the ranking passed a retired decision; the count only when
     # the bound left some out.
     if handles:
@@ -1185,9 +1188,8 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
     if section is not None and section.clause:
         results["note"] = f"{results['note']} {section.clause}"
     # A thinned answer says so by a count and a clause, before the notice. The
-    # ranked count is over decisions, section owners included; the scope dump has
-    # no section and counts its hits. Absent at zero, so a default answer is
-    # byte-identical.
+    # count is over decisions, section owners included, on the ranked answer and
+    # the scope dump alike. Absent at zero, so a default answer is byte-identical.
     withheld = (section.withheld if section is not None
                 else count_withheld(results["active_decisions"]))
     if withheld:
@@ -1197,8 +1199,11 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         results["rejected_paths_withheld"] = withheld
 
     # The stamps went unread: the ranking stands, the fault is stated. Last on the
-    # note, after every override and the withheld clause; absent when read.
-    if walk is not None and walk.stamps_unread:
+    # note, after every override and the withheld clause; absent when read. On the
+    # dump (no walk) it is the section owners' stamps that went unread.
+    stamps_unread = (walk.stamps_unread if walk is not None
+                     else section is not None and section.stamps_unread)
+    if stamps_unread:
         results["note"] = (
             f"{results['note']} {stamps_unread_clause(surface='mcp', config=config)}"
         )
@@ -1508,12 +1513,13 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
         exact-slug hit's `mechanisms` is the folded identity form the graph
         stores; no by-handle read returns transcripts (they stay in
         `decisions.md`), graph-primary provenance (`source`, `created_at`,
-        `confirmed_by`/`confirmed_at`) or outgoing edges. A ranked answer may carry
-        `rejection_matches`: options a decision already rejected, close to the claim
-        (owner slug, state, stamps, score, ordinal, whole item, `letter`). One means
-        that decision rejected it in its own context, whatever the band; weigh
-        whether the reason carries over. `rejection_section` appears only when the
-        section is not whole. With `field`, the answer is `rejection_matches` alone,
+        `confirmed_by`/`confirmed_at`) or outgoing edges. A ranked or degraded answer
+        may carry `rejection_matches`: options a decision already rejected, close to
+        the claim (owner slug, state, stamps, score, ordinal, whole item, `letter`).
+        One means that decision rejected it in its own context, whatever the band;
+        weigh whether the reason carries over. `rejection_section` appears only when
+        the section is not whole, or as `lexical` when recall is down: matched by
+        words, `matched_terms` in place of the score. With `field`, the answer is `rejection_matches` alone,
         ranked by option, each owner's Letter once; its band rates that ranking.
     """
     # No standing check notice on any exit of this verb, deliberately (vision §4.3):

@@ -41,6 +41,7 @@ from mitos.store import GraphStore
 from mitos.sync import MitosSyncManager
 from mitos.provider_cause import AUTH, provider_cause_phrase
 from mitos.recall import (ShortWindow, short_window_clause)  # noqa: E402  (2f)
+from mitos.recall import degraded_section_clause  # noqa: E402  (5d)
 from mitos.recall import (_SURFACE_POINTERS, assess_query_recall,
                           assess_surface_recall, SURFACE_STRONG_THRESHOLD,
                           SURFACE_WEAK_THRESHOLD, EDGE_KIND_MID_CLUSTER,
@@ -178,8 +179,9 @@ def test_policy_weak_scope_unused_but_has_matches():
 
 
 def test_policy_degraded_with_results_is_not_a_ranking():
+    # 5d: on the dump arm (`scope_total` given), the only degraded arm with results.
     conf, note = assess_surface_recall(lead=None, short=None, edge=None, semantic_ran=False, degraded_reason=_DEGRADED, top_score=None, result_count=4,
-                                       scope="db", surface="cli")
+                                       scope="db", scope_total=4, surface="cli")
     assert conf is None
     assert "unavailable" in note and "NOT a relevance ranking" in note
     assert "mitos list" in note and "list_decisions" not in note
@@ -260,7 +262,8 @@ def test_surface_leak_gate_cli_never_emits_mcp_callforms():
     cases = [
         dict(semantic_ran=True, top_score=None, result_count=0, scope="ghost"),    # unused, no match
         dict(semantic_ran=False, top_score=None, result_count=0, scope="ghost"),   # degraded, unused
-        dict(semantic_ran=False, top_score=None, result_count=4, scope="auth"),    # degraded, populated
+        dict(semantic_ran=False, top_score=None, result_count=4, scope="auth",
+             scope_total=4),                                                       # degraded, populated (the dump; 5d)
         dict(semantic_ran=True, top_score=0.9, result_count=2, scope="auth"),      # completeness, scoped
         dict(semantic_ran=True, top_score=0.9, result_count=2, scope=None),        # completeness, no scope
         dict(semantic_ran=True, top_score=None, result_count=0, scope=None),       # no match, no scope
@@ -2538,8 +2541,9 @@ def _band_forks():
             if verb == "query" and scope_unused:
                 continue  # the query composer has no scope arm
             forks.append((verb, label, top, n, scope_unused, rides))
-    for label, n, total in (("degraded-dump", 3, 8), ("degraded-partial", 3, None),
-                            ("degraded-empty", 0, None)):
+    # 5d dropped the "degraded-partial" fork (results, no scope_total): that arm now
+    # raises on every edge shape (test_a_degraded_answer_with_results_and_no_scope_total_raises).
+    for label, n, total in (("degraded-dump", 3, 8), ("degraded-empty", 0, None)):
         forks.append(("surface-degraded", label, None, n, total, False))
     return forks
 
@@ -2707,7 +2711,7 @@ def test_no_degraded_envelope_names_the_edge(ws, driver, route):
         assert "degraded" not in dump and len(dump["active_decisions"]) == 3
         assert "confidence" not in dump
         reason = _DEGRADED if route == "no providers" else "Qdrant unreachable"
-        assert dump["note"] == _dump_note(surface, 3, 5, scope="x", reason=reason)
+        assert dump["note"] == _dump_envelope_note(surface, 3, 5, scope="x", reason=reason)
 
 
 def _commit_live(store: GraphStore, prefix: str, n: int) -> None:
@@ -2818,6 +2822,15 @@ def _dump_note(surface, shown, total, scope="y", reason=_DEGRADED):
                                  scope_total=total, surface=surface)[1]
 
 
+# 5d: the dump's envelope note is the composer's dump sentence, then its rejection
+# section's clause (searched by words, states read), then any withheld clause.
+_DUMP_SECTION = degraded_section_clause(computed=True, retired_dropped=True)
+
+
+def _dump_envelope_note(surface, shown, total, scope="y", reason=_DEGRADED):
+    return f"{_dump_note(surface, shown, total, scope=scope, reason=reason)} {_DUMP_SECTION}"
+
+
 def test_the_dump_sentence_names_how_much_of_the_scope_it_shows():
     """Row 14's words, pinned once here: part, all, and the singular — with today's
     complete_hint tail. The head is 7a's: it names the injected cause, and the
@@ -2825,11 +2838,12 @@ def test_the_dump_sentence_names_how_much_of_the_scope_it_shows():
     saw, which 4a caught blaming Qdrant for a KeyError)."""
     reason = provider_cause_phrase(AUTH)
     head = f"Semantic recall unavailable ({reason}) — showing "
-    # 2g: the dump says what it could not compute, after the complete_hint tail.
+    # 2g: the dump says what it could not compute, after the complete_hint tail
+    # (5d: three items again — rejected options are now matched by their words).
     tail = (" as a fallback, NOT a relevance ranking. For the authoritative set use "
             "list_decisions(scope='y') (pure graph read). "
             "Not computed without similarity scores: the retired partition, the "
-            "window's edge, the confidence band and the rejection matches.")
+            "window's edge and the confidence band.")
     assert (_dump_note("mcp", 7, 8, reason=reason)
             == f"{head}7 of the 8 active decisions in scope 'y'{tail}")
     assert (_dump_note("mcp", 8, 8, reason=reason)
@@ -2839,22 +2853,23 @@ def test_the_dump_sentence_names_how_much_of_the_scope_it_shows():
     assert "embeddings/Qdrant down" not in _dump_note("mcp", 7, 8)
 
 
-def test_the_partial_list_sentence_is_byte_identical_to_4b():
-    """Row 14's other half / K5: without a scope_total (the G9a partial ranked list)
-    the shared sentence is frozen from `4b23e68` except its head, which 7a changed on
-    purpose to name the injected cause, and its tail, where 2g appended the omission
-    clause (a degraded answer has no partition, edge or band — and, since 5a, no
-    rejection matches, which the clause names fourth); an edge on that degraded arm
-    is ignored."""
-    frozen = (f"Semantic recall unavailable ({_DEGRADED}) — showing the "
-              "active decisions in scope 'x' as a fallback, NOT a relevance ranking. "
-              "For the authoritative set use list_decisions(scope='x') (pure graph read). "
-              "Not computed without similarity scores: the retired partition, the "
-              "window's edge, the confidence band and the rejection matches.")
+def test_a_degraded_answer_with_results_and_no_scope_total_raises():
+    """Row 14's other half, rewritten by 5d (D6, WIRING_LEDGER entry-014): the
+    partial-list arm (degraded, results, no ``scope_total``) was reached by no
+    surface — with recall down no walk runs, so only the dump fills the list — and
+    its omission clause rode a note whose ``not_computed`` nothing set. It now
+    raises, naming the contract, on every edge shape; the missing-reason guard is
+    still asked first."""
     for edge in _EDGE_SHAPES:
-        assert assess_surface_recall(lead=None, short=None, edge=edge, semantic_ran=False, degraded_reason=_DEGRADED, top_score=None,
-                                     result_count=2, scope="x", scope_total=None,
-                                     surface="mcp")[1] == frozen
+        with pytest.raises(ValueError, match="scope dump's; pass scope_total"):
+            assess_surface_recall(lead=None, short=None, edge=edge, semantic_ran=False,
+                                  degraded_reason=_DEGRADED, top_score=None,
+                                  result_count=2, scope="x", scope_total=None,
+                                  surface="mcp")
+    with pytest.raises(ValueError, match="degraded_reason"):
+        assess_surface_recall(lead=None, short=None, edge=None, semantic_ran=False,
+                              degraded_reason=None, top_score=None, result_count=2,
+                              scope="x", scope_total=None, surface="mcp")
 
 
 @pytest.mark.parametrize("route", ["no providers", "mid-query fault"])
@@ -2871,7 +2886,7 @@ def test_the_dump_follows_limit_and_counts_on_both_surfaces(ws, limit, shown, ro
         assert len(resp["active_decisions"]) == shown
         assert set(h["slug"] for h in resp["active_decisions"]) <= set(_DUMP_SLUGS)
         reason = _DEGRADED if route == "no providers" else "Qdrant unreachable"
-        assert resp["note"] == _dump_note(surface, shown, 8, reason=reason)
+        assert resp["note"] == _dump_envelope_note(surface, shown, 8, reason=reason)
         got[surface] = resp
     assert ([h["slug"] for h in got["mcp"]["active_decisions"]]
             == [h["slug"] for h in got["cli"]["active_decisions"]])
@@ -2887,7 +2902,7 @@ def test_a_one_decision_scope_dump_reads_singular(ws, driver):
     call, _key, _verb, surface = _4A_DRIVERS[driver]
     resp = call(None, ws, scope="solo")
     assert [h["slug"] for h in resp["active_decisions"]] == ["only-one"]
-    assert resp["note"] == _dump_note(surface, 1, 1, scope="solo")
+    assert resp["note"] == _dump_envelope_note(surface, 1, 1, scope="solo")
 
 
 @pytest.mark.parametrize("driver", ["mcp-surface", "cli-surface"])
@@ -2899,4 +2914,4 @@ def test_the_dump_thins_by_position_at_a_wider_limit(ws, driver):
     resp = call(None, ws, scope="y", limit=7, full_top=2)
     assert _whole(resp["active_decisions"]) == [True, True] + [False] * 5
     assert resp["rejected_paths_withheld"] == 5
-    assert resp["note"] == f"{_dump_note(surface, 7, 8)} {_clause_for(surface, config, 5)}"
+    assert resp["note"] == f"{_dump_envelope_note(surface, 7, 8)} {_clause_for(surface, config, 5)}"

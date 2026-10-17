@@ -102,9 +102,10 @@ from mitos.store import (GraphStore, MODIFIER_EDGE_KEYS, REJECTION_BACKLOG_FAILU
                          open_connection)
 from mitos.rejections import diff_rejection_index, expected_rejection_points, point_items
 from mitos.cutover import default_aside_db_path, perform_swap, rebuild_and_gate
-from mitos.degraded import lexical_envelope, lexical_rejection_envelope, scope_dump
+from mitos.degraded import (DumpSection, dump_section, lexical_envelope,
+                             lexical_rejection_envelope, scope_dump)
 from mitos.lexical import degraded_reason_from_error
-from mitos.recall import (DEGRADED_NOT_COMPUTED, RANKED_EDGE_MARGIN, RetiredPartition,
+from mitos.recall import (RANKED_EDGE_MARGIN, RetiredPartition,
                           assess_query_recall, assess_surface_recall, blackout_note,
                           corpus_provenance, missing_graph_is_a_gap,
                           missing_graph_note, missing_index_is_a_gap,
@@ -1296,6 +1297,7 @@ def _emit_lexical_degraded(config: MitosConfig, query: str, *, reason: str,
         if d["scope"]:
             print(f"   Scope:    {', '.join(d['scope'])}")
         print()
+    _print_lexical_section(envelope.get("rejection_matches", []))
     for oq in envelope.get("open_questions", []):
         print(f"[open question in scope] {oq['topic']}")
     _print_check_notice(config, check_notice)
@@ -1726,7 +1728,20 @@ def _print_rejection_lookup_lexical(config: MitosConfig, envelope: Dict[str, Any
     """
     print(provenance_line(config))
     print(envelope["note"])
-    for m in envelope.get("rejection_matches", []):
+    _print_lexical_matches(envelope.get("rejection_matches", []))
+    print()
+
+
+def _print_lexical_matches(matches: List[Dict[str, Any]]) -> None:
+    """Prints rejection matches found by words, one line per matched item.
+
+    Shared by the lookup's lexical answer and every degraded section: owner slug,
+    state when known, ordinal and the item verbatim, its matched terms, then, by
+    ``letter``: the owner's Letter under a ``here`` match, ``see rank N above`` for
+    a ``window`` owner; then the owner's stamps marker. No score: none was computed.
+    Every line is indented, so none reads as a numbered decision line.
+    """
+    for m in matches:
         state = f"  ({m['state']})" if "state" in m else ""
         print(f"  {m['slug']}{state}  item {m['ordinal']}: {m['item']}")
         if m["matched_terms"]:
@@ -1737,10 +1752,32 @@ def _print_rejection_lookup_lexical(config: MitosConfig, envelope: Dict[str, Any
                 print(f"    Rejected: {m['rejected_paths']}")
             if m["scope"]:
                 print(f"    Scope:    {', '.join(m['scope'])}")
+        elif m["letter"] == "window":
+            print(f"    see rank {m['rank']} above")
         marker = _modifier_marker(m)
         if marker:
             print(f"    {marker}")
+
+
+def _print_lexical_section(matches: List[Dict[str, Any]]) -> None:
+    """Prints a degraded answer's rejection section, matched by words, on the CLI text
+    surface: a heading naming the lexical order, the matches, a blank line. Prints
+    nothing at all when there are no matches, so a degraded answer the section did
+    not reach renders exactly as before it existed."""
+    if not matches:
+        return
+    print("Rejected options sharing this query's words (most words first):")
+    _print_lexical_matches(matches)
     print()
+
+
+def _print_section(section: Optional[Any]) -> None:
+    """Prints ``cmd_surface``'s section through the printer its kind needs: the
+    lexical one for the scope dump's (no score), the ranked one otherwise."""
+    if isinstance(section, DumpSection):
+        _print_lexical_section(section.matches)
+    else:
+        _print_rejection_section(section)
 
 
 def _print_retired_partition(handles: List[Dict[str, Any]], omitted: int) -> None:
@@ -3155,6 +3192,11 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         if dump is not None:
             results["active_decisions"] = dump.decisions
             dump_total = dump.total
+            # The dump's rejection section, matched by words, and the rest of its
+            # degraded statement (`not_computed`, the section clause), composed
+            # once; the tail below places them as it places a ranked section.
+            section = dump_section(query, dump, config=config, store=store,
+                                   full_top=full_top)
 
     # The degraded cause, computed once and handed to both the lexical exit's header
     # and the scope-dump / partial-list note, so the two cannot name different causes.
@@ -3216,10 +3258,6 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     if confidence is not None:
         results["confidence"] = confidence
     results["note"] = note
-    # The dump is the one degraded exit that reaches this composer; it says what it
-    # could not compute (the clause is already on its note).
-    if dump_total is not None:
-        results["not_computed"] = list(DEGRADED_NOT_COMPUTED)
     if handles:
         results["retired_partition"] = handles
         if part.omitted:
@@ -3259,8 +3297,7 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         results["note"] = f"{note} {section.clause}"
         note = results["note"]
     # A thinned answer says so by a count and a clause, before the notice. Over
-    # decisions on the ranked path, section owners included; the scope dump counts
-    # its hits.
+    # decisions, section owners included, on the ranked path and the scope dump.
     withheld = (section.withheld if section is not None
                 else count_withheld(results["active_decisions"]))
     if withheld:
@@ -3269,8 +3306,11 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         results["rejected_paths_withheld"] = withheld
 
     # The stamps went unread: the ranking stands, the fault is stated — last on the
-    # note, after every override and the withheld clause; absent when read.
-    if walk is not None and walk.stamps_unread:
+    # note, after every override and the withheld clause; absent when read. On the
+    # dump (no walk) it is the section owners' stamps (see mcp_server).
+    stamps_unread = (walk.stamps_unread if walk is not None
+                     else section is not None and section.stamps_unread)
+    if stamps_unread:
         results["note"] = f"{note} {stamps_unread_clause(surface='cli', config=config)}"
         note = results["note"]
         results["stamps_unread"] = True
@@ -3296,7 +3336,7 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
             print(provenance_line(config))
             print(f"No active precedents found for: '{query}'{scope_note}")
         _print_retired_partition(handles, part.omitted)
-        _print_rejection_section(section)
+        _print_section(section)
         print(f"→ {note}")
         _print_check_notice(config, notice)
         return
@@ -3321,7 +3361,7 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     # After the hit list, before the open questions and the note: on a blackout
     # with parked open questions this is the branch that renders the handles.
     _print_retired_partition(handles, part.omitted)
-    _print_rejection_section(section)
+    _print_section(section)
     for oq in oqs:
         print(f"[open question in scope] {oq['topic']}")
         marker = _modifier_marker(oq)

@@ -10,7 +10,10 @@ instead of dead-ending (ADR
 ``read-verbs-degrade-to-lexical-decisions-md-fallback``). The fallback is a
 grep and is presented as one: an explicit degraded header, no similarity
 scores, no ``confidence`` field, and a ``degraded: "lexical"`` marker on the
-JSON envelope.
+JSON envelope. From the same corpus pass, each entry's rejected options are
+matched item by item (never the raw field), so a degraded answer still names the
+options a decision already ruled out (:func:`lexical_degraded_read`; the scope
+dump's twin, :func:`lexical_window_section`).
 
 The scan covers the whole corpus, not only the buffer: rotation moves committed
 entries into the archives, so a buffer-only grep would answer "no matches" over
@@ -37,7 +40,8 @@ stand and the envelope says ``stamps_unread``.
 """
 
 import os
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import (Any, Callable, Dict, Iterator, List, Mapping, NamedTuple, Optional,
+                    Sequence, Set, Tuple)
 
 from mitos.display import clamp_limit, letter_payload
 from mitos.errors import (
@@ -256,6 +260,294 @@ def _corpus_entries(corpus_paths: Sequence[str],
             yield file_rank, position, entry
 
 
+class LexicalRead(NamedTuple):
+    """One lexical pass over the corpus: the decision matches and the rejection section.
+
+    Attributes:
+        matches: The decision matches, :func:`lexical_fallback`'s shape (``[]`` when
+            the pass matched no decisions).
+        match_ids: Each decision match's content-hash id, in order (unsynced
+            blocks included: the id is computed, never read).
+        section: The rejection matches, :func:`lexical_rejection_matches`' shape plus
+            the ``window`` letter.
+        item_counts: Each section owner's id → how many distinct items its field
+            can serve.
+        graph_read: Whether the graph's states were read (False: no store, or the
+            state read raised ``DatabaseError``).
+        stamps_unread: Whether the stamp read raised ``DatabaseError``.
+        unread_files: Basenames of the corpus files that exist and could not be read.
+    """
+
+    matches: List[Dict[str, Any]]
+    match_ids: List[str]
+    section: List[Dict[str, Any]]
+    item_counts: Dict[str, int]
+    graph_read: bool
+    stamps_unread: bool
+    unread_files: List[str]
+
+
+def _scan(corpus_paths: Sequence[str], terms: List[str], *, decisions: bool,
+          items: bool, unread: List[str]) -> Tuple[List[Any], List[Any], Dict[str, int]]:
+    """Term-matches every corpus entry once, for its decision text and its items.
+
+    The one pass every lexical answer makes (``_corpus_entries``): each entry's slug
+    and axiom when ``decisions``, each **item** of its enumerated ``rejected_paths``
+    when ``items`` — never the raw field — keeping only the items the rejection index
+    could serve (``rejections.point_items``' ordinals). Both lists come back ranked:
+    most distinct terms, then file (newest first), then position (then ordinal).
+
+    Returns:
+        ``(decision_ranked, item_ranked, servable)``: decision tuples ``(count,
+        file_rank, position, hit, entry, node_id)``, item tuples ``(count, file_rank,
+        position, ordinal, hit, entry, node_id, item)``, and each item owner's id →
+        its servable item count.
+    """
+    decision_ranked: List[Any] = []
+    item_ranked: List[Any] = []
+    servable: Dict[str, int] = {}
+    for file_rank, position, entry in _corpus_entries(corpus_paths, unread):
+        node_id: Optional[str] = None
+        if decisions:
+            haystack = f"{entry.slug}\n{entry.axiom}".casefold()
+            hit = [t for t in terms if t in haystack]
+            if hit:
+                node_id = compute_node_id(
+                    kind="decision", axiom=entry.axiom,
+                    mechanism_refs=entry.mechanisms,
+                )
+                decision_ranked.append((len(hit), file_rank, position, hit, entry, node_id))
+        if not items:
+            continue
+        hits = []
+        for item in enumerate_rejected_paths(entry.rejected_paths).items:
+            item_text = item.text.casefold()
+            item_hit = [t for t in terms if t in item_text]
+            if item_hit:
+                hits.append((item, item_hit))
+        if not hits:
+            continue
+        if node_id is None:
+            node_id = compute_node_id(
+                kind="decision", axiom=entry.axiom, mechanism_refs=entry.mechanisms,
+            )
+        ordinals = {i.ordinal for i in point_items(node_id, entry.rejected_paths).values()}
+        servable[node_id] = len(ordinals)
+        for item, item_hit in hits:
+            if item.ordinal in ordinals:
+                item_ranked.append((len(item_hit), file_rank, position, item.ordinal,
+                                    item_hit, entry, node_id, item))
+    # Most distinct terms first; ties by file (newest first), then by position —
+    # every buffer and rotation-written archive is newest-first below its marker.
+    decision_ranked.sort(key=lambda t: (-t[0], t[1], t[2]))
+    item_ranked.sort(key=lambda t: (-t[0], t[1], t[2], t[3]))
+    return decision_ranked, item_ranked, servable
+
+
+def _read_states(store: Optional[Any], ids: List[str]) -> Tuple[bool, Dict[str, str]]:
+    """The one state read: ``(graph_read, states)``; a ``DatabaseError`` reads as no
+    store. Only the store call sits in the ``try``: a store missing the method raises."""
+    if store is None:
+        return False, {}
+    try:
+        return True, store.get_node_states(ids)
+    except DatabaseError:
+        return False, {}
+
+
+def _shape_decisions(ranked: List[Any], states: Dict[str, str], *, graph_read: bool,
+                     cap: int, full_top: Optional[int]
+                     ) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Shapes the ranked decision candidates into matches: ``(matches, match_ids)``.
+
+    Retired candidates are dropped when states were read, before the cap and the
+    ``full_top`` thinning, which count kept matches only.
+    """
+    matches: List[Dict[str, Any]] = []
+    match_ids: List[str] = []
+    for _count, _file_rank, _position, hit, entry, node_id in ranked:
+        # An id the graph does not hold is an authored-but-unsynced block: it
+        # stays, with no state and no stamps — dropping the gold source on a graph
+        # miss would be a false empty.
+        state = states.get(node_id) if graph_read else None
+        if state is not None and state not in LIVE_STATES:
+            continue
+        payload: Dict[str, Any] = {
+            "slug": entry.slug,
+            "axiom": entry.axiom,
+            "scope": entry.scope,
+            # Display only: ``hit`` above ranked the entry and stays whole there.
+            "matched_terms": [t for t in hit if t not in DISPLAY_STOPWORDS],
+        }
+        dropped = len(hit) - len(payload["matched_terms"])
+        if dropped:
+            payload["stopwords_dropped"] = dropped
+        # Rank among the matches returned: nothing is appended between here and
+        # the append below, and a filtered entry never reaches it.
+        if full_top is None or len(matches) + 1 <= full_top:
+            payload["rejected_paths"] = entry.rejected_paths
+        if state is not None:
+            payload["state"] = state
+        matches.append(payload)
+        match_ids.append(node_id)
+        if len(matches) >= cap:
+            break
+    return matches, match_ids
+
+
+def _shape_items(ranked: List[Any], states: Mapping[str, str], *, graph_read: bool,
+                 cap: int, window: Mapping[str, int], owners_whole: bool,
+                 whole_owners: Optional[int]) -> List[Dict[str, Any]]:
+    """Shapes the ranked item candidates into rejection matches, at most ``cap``.
+
+    An owner in ``window`` (id → its 1-based rank in the answer's list) is
+    ``window`` on every match, with ``rank`` and no Letter. Otherwise an owner's
+    first match is ``here`` (its Letter follows: whole when ``owners_whole`` and,
+    with ``whole_owners`` set, while fewer than that many owners were lettered —
+    ``display.rejection_matches_payload``'s two knobs) and later ones ``section``.
+    Retired owners are dropped when states were read; ``states`` may also hold
+    states the caller already knew.
+    """
+    matches: List[Dict[str, Any]] = []
+    lettered: List[str] = []
+    for _count, _file_rank, _position, ordinal, hit, entry, node_id, item in ranked:
+        state = states.get(node_id) if graph_read or node_id in window else None
+        if state is not None and state not in LIVE_STATES:
+            continue
+        payload: Dict[str, Any] = {"slug": entry.slug, "id": node_id}
+        if state is not None:
+            payload["state"] = state
+        payload["ordinal"] = ordinal
+        payload["item"] = item.text.rstrip()
+        payload["matched_terms"] = [t for t in hit if t not in DISPLAY_STOPWORDS]
+        dropped = len(hit) - len(payload["matched_terms"])
+        if dropped:
+            payload["stopwords_dropped"] = dropped
+        if node_id in window:
+            payload["letter"] = "window"
+            payload["rank"] = window[node_id]
+        elif node_id in lettered:
+            payload["letter"] = "section"
+        else:
+            whole = owners_whole and (whole_owners is None
+                                      or len(lettered) < whole_owners)
+            lettered.append(node_id)
+            payload["letter"] = "here"
+            owner = {"slug": entry.slug, "core_axiom": entry.axiom,
+                     "scope": entry.scope, "rejected_paths": entry.rejected_paths}
+            for key, value in letter_payload(owner, brief=not whole).items():
+                if key not in payload:
+                    payload[key] = value
+        matches.append(payload)
+        if len(matches) >= cap:
+            break
+    return matches
+
+
+def _stamp(payloads: List[Dict[str, Any]], ids: List[str],
+           stamps: Mapping[str, Mapping[str, List[str]]]) -> None:
+    """Copies each payload's owner stamps onto it, in place (``ids`` aligned)."""
+    for payload, node_id in zip(payloads, ids):
+        for key, slugs in stamps.get(node_id, {}).items():
+            payload[key] = list(slugs)
+
+
+def _stated(payloads: List[Dict[str, Any]], ids: List[str]) -> List[str]:
+    """The distinct ids, in order, of the payloads that carry a ``state``."""
+    return list(dict.fromkeys(i for p, i in zip(payloads, ids) if "state" in p))
+
+
+def _read(query: str, *, corpus_paths: Sequence[str], store: Optional[Any],
+          decision_cap: Optional[int], full_top: Optional[int], item_cap: Optional[int],
+          owners_whole: Callable[[int], bool], whole_owners: Optional[int]) -> LexicalRead:
+    """The lexical envelope's pass: decisions and items, one state read, one stamp read.
+
+    ``decision_cap`` None matches no decisions; ``item_cap`` None matches no items.
+    The two reads are unconditional once a store is given (2g's pinned two reads:
+    each short-circuits without a connection on no ids), over the union of both
+    lists' owners.
+    """
+    terms = _query_terms(query)
+    unread: List[str] = []
+    decision_ranked, item_ranked, servable = _scan(
+        corpus_paths, terms, decisions=decision_cap is not None,
+        items=item_cap is not None, unread=unread)
+
+    # One state read for every candidate, before the walks: the filter must run
+    # before the caps and the thinning, which count kept matches only. Called even
+    # over no candidates, so the answer's reads are the same two whatever it matched.
+    candidate_ids = [t[5] for t in decision_ranked]
+    seen = set(candidate_ids)
+    candidate_ids += [i for i in dict.fromkeys(t[6] for t in item_ranked) if i not in seen]
+    graph_read, states = _read_states(store, candidate_ids)
+
+    matches: List[Dict[str, Any]] = []
+    match_ids: List[str] = []
+    if decision_cap is not None:
+        matches, match_ids = _shape_decisions(decision_ranked, states,
+                                              graph_read=graph_read, cap=decision_cap,
+                                              full_top=full_top)
+    section: List[Dict[str, Any]] = []
+    if item_cap is not None:
+        window: Dict[str, int] = {}
+        for rank, node_id in enumerate(match_ids, start=1):
+            window.setdefault(node_id, rank)
+        section = _shape_items(item_ranked, states, graph_read=graph_read, cap=item_cap,
+                               window=window, owners_whole=owners_whole(len(match_ids)),
+                               whole_owners=whole_owners)
+    section_ids = [m["id"] for m in section]
+
+    # One stamp read for the stated matches of both lists, after the walks.
+    # Unconditional once the state read succeeded, even over no ids. A fault here
+    # costs the stamps alone and is stated.
+    stamps_unread = False
+    if graph_read:
+        stated = _stated(matches, match_ids)
+        stated += [i for i in _stated(section, section_ids) if i not in set(stated)]
+        try:
+            stamps = store.get_modifiers_map(stated)
+        except DatabaseError:
+            stamps_unread = True
+        else:
+            _stamp(matches, match_ids, stamps)
+            _stamp(section, section_ids, stamps)
+    return LexicalRead(
+        matches=matches, match_ids=match_ids, section=section,
+        item_counts={i: servable[i] for i in section_ids},
+        graph_read=graph_read, stamps_unread=stamps_unread, unread_files=unread,
+    )
+
+
+def lexical_fallback_envelope(read: LexicalRead, *, reason: str) -> Dict[str, Any]:
+    """Composes :func:`lexical_fallback`'s envelope from a lexical pass's decisions.
+
+    ``{degraded, degraded_reason, matches, [stamps_unavailable], [stamps_unread],
+    [unread_files], note}``; the note is the header, then the stamps-unavailable
+    disclosure, the unread files and the no-match line when they apply. The one
+    composition of that envelope, so the lexical envelope that also carries a
+    section reads exactly as the store-less goldens pin it.
+    """
+    note = lexical_header(reason)
+    envelope: Dict[str, Any] = {
+        "degraded": "lexical",
+        "degraded_reason": reason,
+        "matches": read.matches,
+    }
+    if not read.graph_read:
+        envelope["stamps_unavailable"] = True
+        note = f"{note} {_STAMPS_UNAVAILABLE_DISCLOSURE}"
+    if read.stamps_unread:
+        envelope["stamps_unread"] = True
+    if read.unread_files:
+        envelope["unread_files"] = read.unread_files
+        note = (f"{note} {len(read.unread_files)} corpus file(s) could not be read: "
+                f"{', '.join(read.unread_files)}.")
+    if not read.matches:
+        note = f"{note} {_NO_MATCH_LINE}"
+    envelope["note"] = note
+    return envelope
+
+
 def lexical_fallback(
     query: str,
     *,
@@ -321,103 +613,140 @@ def lexical_fallback(
             "lexical_fallback: corpus_paths is a sequence of corpus file paths, "
             "not one path string"
         )
-    cap = clamp_limit(limit)
-    terms = _query_terms(query)
+    read = _read(query, corpus_paths=corpus_paths, store=store,
+                 decision_cap=clamp_limit(limit), full_top=full_top, item_cap=None,
+                 owners_whole=lambda _n: True, whole_owners=None)
+    return lexical_fallback_envelope(read, reason=reason)
 
-    ranked: List[Any] = []
+
+def lexical_degraded_read(
+    query: str,
+    *,
+    corpus_paths: Sequence[str],
+    store: Optional[Any],
+    limit: Optional[int],
+    full_top: Optional[int],
+    bound: int,
+    owners_whole: Callable[[int], bool],
+) -> LexicalRead:
+    """Matches decisions and rejected options in one pass, for a degraded answer.
+
+    The lexical envelope's leaf: :func:`lexical_fallback`'s decision matches and,
+    from the same corpus pass and the same two graph reads, a rejection section —
+    each rejected **item** term-matched on its own text, at most ``bound`` of them,
+    beside the decisions. A section owner among the decision matches (joined by
+    content-hash id, unsynced blocks included) is ``window`` with its ``rank``;
+    any other owner's first match is ``here`` with its Letter, later ones
+    ``section``. Retired owners' items are dropped when states were read.
+
+    When the graph is readable it is read exactly twice, whatever the match count:
+    ``get_node_states`` over the union of decision candidates and item owners, then
+    ``get_modifiers_map`` over the stated decisions and section owners (one stamp
+    map for both lists). The fault rules are :func:`lexical_fallback`'s.
+
+    Args:
+        query: The claim/topic the caller was trying to recall.
+        corpus_paths: The corpus files in ``divergence._corpus_files`` order.
+        store: A readable ``GraphStore``, or None when the graph itself is down.
+        limit: Max decision matches, clamped as the ranked reads clamp it.
+        full_top: How many top decision matches keep ``rejected_paths``.
+        bound: Max section items (``recall.REJECTION_SECTION_BOUND``, passed in:
+            this leaf imports no ``recall``).
+        owners_whole: Given the decision list's length, whether a ``here`` owner
+            keeps its ``rejected_paths`` (``recall.rejection_owners_whole`` bound
+            to ``full_top``).
+
+    Returns:
+        A :class:`LexicalRead`; compose its decisions with
+        :func:`lexical_fallback_envelope`.
+
+    Raises:
+        TypeError: When ``corpus_paths`` is a single string.
+    """
+    if isinstance(corpus_paths, (str, bytes)):
+        raise TypeError(
+            "lexical_degraded_read: corpus_paths is a sequence of corpus file "
+            "paths, not one path string"
+        )
+    return _read(query, corpus_paths=corpus_paths, store=store,
+                 decision_cap=clamp_limit(limit), full_top=full_top, item_cap=bound,
+                 owners_whole=owners_whole, whole_owners=None)
+
+
+def lexical_window_section(
+    query: str,
+    *,
+    corpus_paths: Sequence[str],
+    store: Any,
+    bound: int,
+    owners_whole: bool,
+    window_ids: Sequence[str],
+    window_states: Mapping[str, str],
+    window_stamps: Mapping[str, Mapping[str, List[str]]],
+) -> LexicalRead:
+    """Matches rejected options beside a list of decisions the caller already read.
+
+    The scope dump's leaf: no decision term-match (the list is a graph read), only
+    the items, at most ``bound``. An owner in ``window_ids`` is ``window`` with its
+    ``rank``, its state and stamps taken from what the caller passed — never read.
+    Every other owner is ``here`` / ``section`` and costs the reads: at most one
+    ``get_node_states`` over those owners and at most one ``get_modifiers_map`` over
+    the stated ones, each made only when its id list is non-empty. A
+    ``DatabaseError`` from the state read leaves ``graph_read`` False (the caller
+    decides what an unfiltered section means beside its list); one from the stamp
+    read sets ``stamps_unread``.
+
+    Args:
+        query: The claim/topic the caller was trying to recall.
+        corpus_paths: The corpus files in ``divergence._corpus_files`` order.
+        store: The readable ``GraphStore`` the list came from.
+        bound: Max section items.
+        owners_whole: Whether a ``here`` owner keeps its ``rejected_paths``.
+        window_ids: The list's node ids, in rank order.
+        window_states: Each listed id's state, as the caller read it.
+        window_stamps: Each listed id's modifier stamps, as the caller read them.
+
+    Returns:
+        A :class:`LexicalRead` with no decision matches.
+
+    Raises:
+        TypeError: When ``corpus_paths`` is a single string.
+    """
+    if isinstance(corpus_paths, (str, bytes)):
+        raise TypeError(
+            "lexical_window_section: corpus_paths is a sequence of corpus file "
+            "paths, not one path string"
+        )
     unread: List[str] = []
-    for file_rank, position, entry in _corpus_entries(corpus_paths, unread):
-        haystack = f"{entry.slug}\n{entry.axiom}".casefold()
-        hit = [t for t in terms if t in haystack]
-        if hit:
-            node_id = compute_node_id(
-                kind="decision", axiom=entry.axiom,
-                mechanism_refs=entry.mechanisms,
-            )
-            ranked.append((len(hit), file_rank, position, hit, entry, node_id))
-    # Most distinct terms first; ties by file (newest first), then by position —
-    # every buffer and rotation-written archive is newest-first below its marker.
-    ranked.sort(key=lambda t: (-t[0], t[1], t[2]))
+    _, item_ranked, servable = _scan(corpus_paths, _query_terms(query),
+                                     decisions=False, items=True, unread=unread)
+    window: Dict[str, int] = {}
+    for rank, node_id in enumerate(window_ids, start=1):
+        window.setdefault(node_id, rank)
+    outside = [i for i in dict.fromkeys(t[6] for t in item_ranked) if i not in window]
+    graph_read, states = True, {}
+    if outside:
+        graph_read, states = _read_states(store, outside)
+    states = {**states, **{i: window_states[i] for i in window if i in window_states}}
+    section = _shape_items(item_ranked, states, graph_read=graph_read, cap=bound,
+                           window=window, owners_whole=owners_whole, whole_owners=None)
+    section_ids = [m["id"] for m in section]
 
-    # One state read for every candidate, before the walk: the filter must run
-    # before the cap and the `full_top` thinning, which count kept matches only.
-    # Called even over no candidates (it short-circuits without a connection), so
-    # the answer's reads are the same two whatever it matched. Only the store call
-    # sits in the `try`, and only `DatabaseError` is caught: a store missing the
-    # method raises.
-    graph_read = store is not None
-    states: Dict[str, str] = {}
-    if store is not None:
-        try:
-            states = store.get_node_states([t[5] for t in ranked])
-        except DatabaseError:
-            graph_read = False
-
-    matches: List[Dict[str, Any]] = []
-    stated_ids: List[str] = []
-    for _count, _file_rank, _position, hit, entry, node_id in ranked:
-        # An id the graph does not hold is an authored-but-unsynced block: it
-        # stays, with no state and no stamps — dropping the gold source on a graph
-        # miss would be a false empty.
-        state = states.get(node_id) if graph_read else None
-        if state is not None and state not in LIVE_STATES:
-            continue
-        payload: Dict[str, Any] = {
-            "slug": entry.slug,
-            "axiom": entry.axiom,
-            "scope": entry.scope,
-            # Display only: ``hit`` above ranked the entry and stays whole there.
-            "matched_terms": [t for t in hit if t not in DISPLAY_STOPWORDS],
-        }
-        dropped = len(hit) - len(payload["matched_terms"])
-        if dropped:
-            payload["stopwords_dropped"] = dropped
-        # Rank among the matches returned: nothing is appended between here and
-        # the append below, and a filtered entry never reaches it.
-        if full_top is None or len(matches) + 1 <= full_top:
-            payload["rejected_paths"] = entry.rejected_paths
-        if state is not None:
-            payload["state"] = state
-            stated_ids.append(node_id)
-        else:
-            stated_ids.append("")
-        matches.append(payload)
-        if len(matches) >= cap:
-            break
-
-    # One stamp read for the stated matches, after the walk. Unconditional once
-    # the state read succeeded, even over no ids, for the same reason as above. A
-    # fault here costs the stamps alone and is stated.
     stamps_unread = False
-    if graph_read:
+    _stamp(section, section_ids, window_stamps)
+    stated = [i for i in _stated(section, section_ids) if i not in window]
+    if graph_read and stated:
         try:
-            stamps = store.get_modifiers_map([i for i in stated_ids if i])
+            stamps = store.get_modifiers_map(stated)
         except DatabaseError:
             stamps_unread = True
         else:
-            for payload, node_id in zip(matches, stated_ids):
-                for key, slugs in stamps.get(node_id, {}).items():
-                    payload[key] = list(slugs)
-
-    note = lexical_header(reason)
-    envelope: Dict[str, Any] = {
-        "degraded": "lexical",
-        "degraded_reason": reason,
-        "matches": matches,
-    }
-    if not graph_read:
-        envelope["stamps_unavailable"] = True
-        note = f"{note} {_STAMPS_UNAVAILABLE_DISCLOSURE}"
-    if stamps_unread:
-        envelope["stamps_unread"] = True
-    if unread:
-        envelope["unread_files"] = unread
-        note = (f"{note} {len(unread)} corpus file(s) could not be read: "
-                f"{', '.join(unread)}.")
-    if not matches:
-        note = f"{note} {_NO_MATCH_LINE}"
-    envelope["note"] = note
-    return envelope
+            _stamp(section, section_ids, stamps)
+    return LexicalRead(
+        matches=[], match_ids=[], section=section,
+        item_counts={i: servable[i] for i in section_ids},
+        graph_read=graph_read, stamps_unread=stamps_unread, unread_files=unread,
+    )
 
 
 def lexical_rejection_matches(
@@ -449,7 +778,9 @@ def lexical_rejection_matches(
     the stamps alone.
 
     Surface-free: no header, no reason and no note. The lookup's lexical envelope
-    composes those, and the ranked reads' degraded sections reuse this leaf as it is.
+    composes those. The degraded sections of the two ranked verbs match items through
+    the same steps (:func:`lexical_degraded_read`, :func:`lexical_window_section`),
+    capped by the section bound instead of ``limit``.
 
     Args:
         query: The claim the caller asked about.
@@ -477,89 +808,14 @@ def lexical_rejection_matches(
             "lexical_rejection_matches: corpus_paths is a sequence of corpus file "
             "paths, not one path string"
         )
-    cap = clamp_limit(limit)
-    terms = _query_terms(query)
-
-    ranked: List[Any] = []
-    unread: List[str] = []
-    servable: Dict[str, int] = {}
-    for file_rank, position, entry in _corpus_entries(corpus_paths, unread):
-        hits = []
-        for item in enumerate_rejected_paths(entry.rejected_paths).items:
-            haystack = item.text.casefold()
-            hit = [t for t in terms if t in haystack]
-            if hit:
-                hits.append((item, hit))
-        if not hits:
-            continue
-        node_id = compute_node_id(
-            kind="decision", axiom=entry.axiom, mechanism_refs=entry.mechanisms,
-        )
-        ordinals = {i.ordinal for i in point_items(node_id, entry.rejected_paths).values()}
-        servable[node_id] = len(ordinals)
-        for item, hit in hits:
-            if item.ordinal in ordinals:
-                ranked.append((len(hit), file_rank, position, item.ordinal, hit, entry,
-                               node_id, item))
-    ranked.sort(key=lambda t: (-t[0], t[1], t[2], t[3]))
-
-    # One state read over every candidate owner, before the cap and the thinning,
-    # which count kept matches only (lexical_fallback's rule, and its fault rule).
-    graph_read = store is not None
-    states: Dict[str, str] = {}
-    if store is not None:
-        try:
-            states = store.get_node_states(list(dict.fromkeys(t[6] for t in ranked)))
-        except DatabaseError:
-            graph_read = False
-
-    matches: List[Dict[str, Any]] = []
-    lettered: List[str] = []
-    stated: List[str] = []
-    for _count, _file_rank, _position, ordinal, hit, entry, node_id, item in ranked:
-        state = states.get(node_id) if graph_read else None
-        if state is not None and state not in LIVE_STATES:
-            continue
-        payload: Dict[str, Any] = {"slug": entry.slug, "id": node_id}
-        if state is not None:
-            payload["state"] = state
-        payload["ordinal"] = ordinal
-        payload["item"] = item.text.rstrip()
-        payload["matched_terms"] = [t for t in hit if t not in DISPLAY_STOPWORDS]
-        dropped = len(hit) - len(payload["matched_terms"])
-        if dropped:
-            payload["stopwords_dropped"] = dropped
-        if node_id in lettered:
-            payload["letter"] = "section"
-        else:
-            whole = full_top is None or len(lettered) < full_top
-            lettered.append(node_id)
-            payload["letter"] = "here"
-            owner = {"slug": entry.slug, "core_axiom": entry.axiom,
-                     "scope": entry.scope, "rejected_paths": entry.rejected_paths}
-            for key, value in letter_payload(owner, brief=not whole).items():
-                if key not in payload:
-                    payload[key] = value
-        if state is not None and node_id not in stated:
-            stated.append(node_id)
-        matches.append(payload)
-        if len(matches) >= cap:
-            break
-
-    stamps_unread = False
-    if graph_read:
-        try:
-            stamps = store.get_modifiers_map(stated)
-        except DatabaseError:
-            stamps_unread = True
-        else:
-            for payload in matches:
-                for key, slugs in stamps.get(payload["id"], {}).items():
-                    payload[key] = list(slugs)
+    # Here the section IS the answer: capped by `limit`, and `full_top` counts owners.
+    read = _read(query, corpus_paths=corpus_paths, store=store, decision_cap=None,
+                 full_top=None, item_cap=clamp_limit(limit),
+                 owners_whole=lambda _n: True, whole_owners=full_top)
     return {
-        "matches": matches,
-        "item_counts": {m["id"]: servable[m["id"]] for m in matches},
-        "graph_read": graph_read,
-        "stamps_unread": stamps_unread,
-        "unread_files": unread,
+        "matches": read.section,
+        "item_counts": read.item_counts,
+        "graph_read": read.graph_read,
+        "stamps_unread": read.stamps_unread,
+        "unread_files": read.unread_files,
     }
