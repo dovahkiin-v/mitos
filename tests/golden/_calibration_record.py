@@ -303,8 +303,43 @@ def _slug_entry(slug: str, raw: List[dict], live: List[dict]) -> Dict[str, Any]:
     }
 
 
+# 6b: the envelope's `band_evidence` object, recorded on a query-form result as
+# `envelope_evidence`. Its edge tokens are spelled here because this module is stdlib
+# only (the replay worker loads it by path); a row pins them equal to
+# `recall.EVIDENCE_EDGE_KINDS`. `next_score` rides only beside an edge that was found.
+EVIDENCE_EDGE_KINDS = ("mid_cluster", "clear", "unmeasured", "end")
+_EVIDENCE_KEYS = ("top_score", "top_cluster", "edge")
+_EVIDENCE_FOUND = ("mid_cluster", "clear")
+
+
+def evidence_problem(evidence: Any) -> Optional[str]:
+    """Says what is wrong with a recorded `envelope_evidence`, or None when it is sound.
+
+    The exact key set (``next_score`` present iff the edge was found), the types (scores
+    numbers, ``top_cluster`` an integer of at least 1, never a bool), and ``edge`` inside
+    :data:`EVIDENCE_EDGE_KINDS`.
+    """
+    if not isinstance(evidence, dict):
+        return f"envelope_evidence {evidence!r} is not an object"
+    edge = evidence.get("edge")
+    if edge not in EVIDENCE_EDGE_KINDS:
+        return f"envelope_evidence edge {edge!r}; one of {list(EVIDENCE_EDGE_KINDS)}"
+    want = set(_EVIDENCE_KEYS) | ({"next_score"} if edge in _EVIDENCE_FOUND else set())
+    if set(evidence) != want:
+        return f"envelope_evidence keys {sorted(evidence)}; want {sorted(want)}"
+    for key in ("top_score", "next_score"):
+        if key in evidence and (isinstance(evidence[key], bool)
+                                or not isinstance(evidence[key], (int, float))):
+            return f"envelope_evidence {key} {evidence[key]!r} is not a number"
+    size = evidence["top_cluster"]
+    if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+        return f"envelope_evidence top_cluster {size!r}; an integer of at least 1"
+    return None
+
+
 def derive_result(
-    fixture: dict, hits: List[dict], envelope_band: Optional[str], pause_floor: Optional[float]
+    fixture: dict, hits: List[dict], envelope_band: Optional[str], pause_floor: Optional[float],
+    envelope_evidence: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Derives one fixture's §3.3 result from hits the harness already labelled.
 
@@ -321,17 +356,27 @@ def derive_result(
         envelope_band: The shipped envelope's ``confidence`` (query form), else ``None``.
         pause_floor: ``sync._NEIGHBOR_REVIEW_THRESHOLD`` at run time (draft form), else
             ``None``.
+        envelope_evidence: The shipped envelope's ``band_evidence`` (query form, 6b),
+            recorded as ``envelope_evidence``; ``None`` (absent) when the band read no
+            score or the reader predates it.
 
     Returns:
         The JSON-safe result dict. A target outside the window has ``value: null`` and
         ``absent: true``; it is never dropped.
 
     Raises:
-        ValueError: If the band or floor is supplied for the wrong form.
+        ValueError: If the band, its evidence or the floor is supplied for the wrong
+            form, or the evidence is malformed (:func:`evidence_problem`).
     """
     query_form = fixture["form"] == "query"
     if not query_form and envelope_band is not None:
         raise ValueError(f"fixture {fixture['id']!r}: a draft read has no envelope band")
+    if not query_form and envelope_evidence is not None:
+        raise ValueError(f"fixture {fixture['id']!r}: a draft read has no envelope evidence")
+    if envelope_evidence is not None:
+        problem = evidence_problem(envelope_evidence)
+        if problem:
+            raise ValueError(f"fixture {fixture['id']!r}: {problem}")
     if query_form and pause_floor is not None:
         raise ValueError(f"fixture {fixture['id']!r}: a query read has no pause floor")
     # An open question is never live, whatever the caller labelled: both shipped readers
@@ -376,6 +421,8 @@ def derive_result(
         "envelope_band": envelope_band,
         "pause_floor": pause_floor,
     }
+    if envelope_evidence is not None:
+        result["envelope_evidence"] = dict(envelope_evidence)
     if "rejection_form" in fixture:
         result["rejection_form"] = fixture["rejection_form"]
     return result
@@ -1287,6 +1334,12 @@ def _refuse_run(run: Dict[str, Any], record: Dict[str, Any]) -> None:
         for fx in run["fixtures"]:
             if fx.get("class") not in CLASSES:
                 raise ValueError(f"run fixture {fx.get('id')!r} has class {fx.get('class')!r}")
+            if "envelope_evidence" in fx:
+                problem = (evidence_problem(fx["envelope_evidence"])
+                           if fx.get("space") == SPACE_OF_FORM["query"]
+                           else "a draft-form result carries envelope_evidence")
+                if problem:
+                    raise ValueError(f"run fixture {fx.get('id')!r}: {problem}")
     prov = run.get("provenance") or {}
     if not isinstance(prov.get("timestamp"), str):
         raise ValueError("run provenance carries no ISO-8601 `timestamp`")

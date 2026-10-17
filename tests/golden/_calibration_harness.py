@@ -612,7 +612,8 @@ def read_query_form(index: CalibrationIndex, fixture: Dict[str, Any]) -> FormRea
     # recorded window the size it always was.
     raw = _one_call(proxy, fixture)[:RECORD_LIMIT]
     hits = label_hits(index, raw, fixture.get("exclude", []), query=fixture["text"])
-    result = R.derive_result(fixture, hits, envelope.get("confidence"), None)
+    result = R.derive_result(fixture, hits, envelope.get("confidence"), None,
+                             envelope_evidence=envelope.get("band_evidence"))
     result["section"] = section_of(envelope)
     result["section_state"] = envelope.get("rejection_section")
     item_hits = ranking = None

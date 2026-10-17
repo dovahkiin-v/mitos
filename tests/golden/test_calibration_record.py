@@ -277,6 +277,60 @@ def test_a_result_round_trips_through_json():
     assert json.loads(json.dumps(result)) == result
 
 
+# -- 6b: the envelope's band evidence ----------------------------------------------------
+
+_EVIDENCE = {"top_score": 0.9, "top_cluster": 2, "edge": "mid_cluster", "next_score": 0.85}
+
+
+def test_a_query_result_records_the_envelopes_evidence_and_round_trips():
+    result = R.derive_result(_fx(), _BASE, "strong", None, envelope_evidence=_EVIDENCE)
+    assert result["envelope_evidence"] == _EVIDENCE
+    assert json.loads(json.dumps(result)) == result
+    assert "envelope_evidence" not in R.derive_result(_fx(), _BASE, "strong", None)
+
+
+def test_evidence_on_a_draft_read_is_refused():
+    with pytest.raises(ValueError, match="no envelope evidence"):
+        R.derive_result(_fx(form="draft"), _BASE, None, 0.8, envelope_evidence=_EVIDENCE)
+
+
+@pytest.mark.parametrize("bad", [
+    {"top_score": 0.9, "top_cluster": 2, "edge": "mid_cluster"},             # no next_score
+    {"top_score": 0.9, "top_cluster": 2, "edge": "end", "next_score": 0.8},  # next on an end
+    {"top_score": 0.9, "top_cluster": 2, "edge": "sideways"},                # outside the tuple
+    {"top_score": 0.9, "top_cluster": True, "edge": "end"},                  # a bool count
+    {"top_score": 0.9, "top_cluster": 0, "edge": "end"},                     # below 1
+    {"top_score": "0.9", "top_cluster": 1, "edge": "end"},                   # a string score
+    {"top_score": 0.9, "top_cluster": 1, "edge": "end", "overlap": 0.4},     # an input key
+    [0.9, 1, "end"],                                                         # not an object
+])
+def test_malformed_evidence_is_refused(bad):
+    assert R.evidence_problem(bad)
+    with pytest.raises(ValueError):
+        R.derive_result(_fx(), _BASE, "strong", None, envelope_evidence=bad)
+
+
+def test_the_edge_tokens_agree_with_the_shipped_tuple():
+    from mitos import recall
+    assert R.EVIDENCE_EDGE_KINDS == recall.EVIDENCE_EDGE_KINDS
+
+
+def test_a_committed_run_with_malformed_evidence_is_refused(record_dir):
+    ok = _run(fixtures=[{"id": "f1", "class": "bullseye", "targets": [], "space": "query",
+                         "envelope_evidence": dict(_EVIDENCE)}])
+    R.append_run(ok, record_dir)
+    bad = _run(decision_count=31, fixtures=[{"id": "f1", "class": "bullseye", "targets": [],
+                                             "space": "query",
+                                             "envelope_evidence": {"edge": "end"}}])
+    with pytest.raises(ValueError, match="envelope_evidence"):
+        R.append_run(bad, record_dir)
+    draft = _run(decision_count=32, fixtures=[{"id": "f1", "class": "bullseye", "targets": [],
+                                               "space": "document",
+                                               "envelope_evidence": dict(_EVIDENCE)}])
+    with pytest.raises(ValueError, match="draft-form"):
+        R.append_run(draft, record_dir)
+
+
 # ---------------------------------------------------------------------------
 # Class statistics
 # ---------------------------------------------------------------------------
