@@ -643,6 +643,19 @@ def test_r_unbuilt_a_zero_node_graph_judges_and_deletes_nothing_in_either_index(
     assert not [c for c in d.index.calls if c[0] == "delete_points"]
 
 
+def test_r_unbuilt_over_an_empty_corpus_names_the_items_not_judged(d, capsys) -> None:
+    # A zero-node graph whose corpus is empty is not "unbuilt" (no refusal speaks), so
+    # the collection's own outcome must: the decision side's "not judged" twin.
+    _plant(d, "11111111-1111-1111-1111-111111111111", A)
+
+    code, out, _err = _reconcile_text(d, capsys)
+
+    assert code == 0
+    assert ("1 rejected item(s) not judged — the graph holds no nodes; reconcile "
+            "deletes items only over a built graph.") in out
+    assert "11111111-1111-1111-1111-111111111111" in d.index.points
+
+
 # --------------------------------------------------------------------------- #
 # R-faults / R-keys
 # --------------------------------------------------------------------------- #
@@ -1020,6 +1033,27 @@ def test_s_unbuilt_the_row_defers_to_the_graph_rung(absent, capsys) -> None:
     _code, out = _status_text(absent, capsys)
     assert (f"  — rejection index '{absent.config.rejection_collection}'   → nothing "
             f"indexed yet — the graph is unbuilt (see below)") in out
+
+
+def test_s_pre_v1a_the_row_defers_to_the_schema_row_and_names_no_reconcile(
+        absent, capsys) -> None:
+    # A prototype graph is read by nothing here, so the row cannot price a gap — and
+    # `reconcile` is not its heal (`cutover` is, on the graph schema row).
+    os.remove(absent.config.db_path)
+    proto = GraphStore.__new__(GraphStore)
+    proto.db_path = absent.config.db_path
+    proto.read_only = False
+    proto._init_db()
+
+    code, out = _status_text(absent, capsys)
+    _code, payload = _status(absent, capsys)
+
+    assert payload["pre_v1a"] is True and code == 1
+    assert (f"  — rejection index '{absent.config.rejection_collection}'   → not read — "
+            f"the graph predates V1a (see the graph schema row)") in out
+    assert not [line for line in _rejection_lines(out) if "reconcile" in line]
+    assert (_rkeys(payload)["rejection_expected_items"], *_three(payload)) == (
+        None, None, None, None)
 
 
 # --------------------------------------------------------------------------- #

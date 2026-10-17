@@ -521,9 +521,10 @@ vectors nor that collection, and nothing builds them implicitly. Upgrade in this
 order:
 
 1. **Move every build that reads a workspace first.** Update the global install
-   (*Prerequisites* → **Updating**); the machine-wide MCP server runs it. A running `mitos serve` keeps the build it
-   started with until its session restarts, and so does any other installed
-   build or clone: restart or update each one.
+   (*Prerequisites* → **Updating**); the machine-wide MCP server runs it. A
+   running `mitos serve` keeps the build it started with until its session
+   restarts, and so does any other installed build or clone: restart or update
+   each one.
 2. **Then run one `mitos reconcile -p <project>` per workspace.** It embeds the
    retired decisions the decision index lacks and builds the rejection index in
    the same pass, and it reports the items it embedded and those it found

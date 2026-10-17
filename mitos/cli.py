@@ -119,7 +119,8 @@ from mitos.sync import (MitosSyncManager, run_ambient_capture, _SLUG_MAX_LEN,
                         ROTATION_FAILED, ROTATION_REASON_DUPLICATED, ROTATION_ROTATED,
                         ROTATION_SKIPPED, ROTATION_STAGE_FILE, ROTATION_STAGE_LOCK,
                         REJECTION_COLLECT_HELD, REJECTION_COLLECT_UNAVAILABLE,
-                        REJECTION_COLLECT_UNREAD, rejection_drain_report)
+                        REJECTION_COLLECT_UNBUILT, REJECTION_COLLECT_UNREAD,
+                        rejection_drain_report)
 from mitos.provider_cause import describe_embed_failure
 from mitos._agent_block import agent_block, agent_block_drift, AGENT_GUIDE_VERSION
 from mitos.renderer import MitosRenderer, estimate_tokens, overflow_report
@@ -940,8 +941,10 @@ def _reconcile_rejection_index_lines(
     One summary line once the index was measured, a ``Rejection index collected:``
     line when anything was deleted or failed, and one line naming the rerun for
     ``held``, ``unread`` and (when the index was attempted at all) ``unavailable``.
-    ``unbuilt`` adds nothing: the unbuilt refusal speaks for it. No line
-    interpolates a count that was not computed.
+    ``unbuilt`` adds nothing when the unbuilt refusal speaks for it; over a
+    zero-node graph whose corpus is empty (no refusal) it adds the "not judged"
+    line the decision side prints. No line interpolates a count that was not
+    computed.
 
     Args:
         index: ``reconcile_embeddings()["rejection_index"]``.
@@ -996,6 +999,13 @@ def _reconcile_rejection_index_lines(
         lines.append(
             f"Rejection index not reconciled in full this run (see the warning above); "
             f"{rerun} again retries it."
+        )
+    elif collected == REJECTION_COLLECT_UNBUILT and index["present_items"]:
+        # Reached only when the unbuilt refusal did not speak (a zero-node graph over
+        # an empty corpus): the decision side's "not judged" line, for this index.
+        lines.append(
+            f"{index['present_items']} rejected item(s) not judged — the graph holds no "
+            f"nodes; reconcile deletes items only over a built graph."
         )
     return lines
 
@@ -3963,14 +3973,15 @@ def _rejection_index_status(
 
 def _rejection_row_hint(
     rejection: Dict[str, Any], config: MitosConfig, reachable: bool, *,
-    graph_unbuilt: bool,
+    graph_unbuilt: bool, pre_v1a: bool = False,
 ) -> Optional[str]:
     """The rejection index row's hint, printed only when the index is not present.
 
-    The decision row's ladder: unreachable, unlisted, unbuilt graph, then an absent
-    collection priced from the diff (K of N, with K = N: this index keeps no
-    embedding cache), unpriced when the graph could not be read, or calm when no
-    decision states a rejected item. No form interpolates a ``None``.
+    The decision row's ladder: unreachable, unlisted, a prototype or unbuilt graph
+    (each deferring to its own row or rung, never naming ``reconcile``, which is not
+    their heal), then an absent collection priced from the diff (K of N, with K = N:
+    this index keeps no embedding cache), unpriced when the graph could not be read,
+    or calm when no decision states a rejected item. No form interpolates a ``None``.
     """
     reconcile = f"`mitos reconcile {shell_flag('-p', config.project)}`"
     if not reachable:
@@ -3982,6 +3993,8 @@ def _rejection_row_hint(
         )
     if rejection["exists"]:
         return None
+    if pre_v1a:
+        return "not read — the graph predates V1a (see the graph schema row)"
     if graph_unbuilt:
         return "nothing indexed yet — the graph is unbuilt (see below)"
     missing = rejection["missing_items"]
@@ -4572,7 +4585,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
         (f"rejection index '{config.rejection_collection}'",
          True if rejection["exists"] else None,
          _rejection_row_hint(rejection, config, q["reachable"],
-                             graph_unbuilt=graph_unbuilt),
+                             graph_unbuilt=graph_unbuilt, pre_v1a=pre_v1a),
          (f"({rejection['present_items']} item(s) indexed)"
           if rejection["exists"] else None)),
         # No MCP-wiring row lives here any more. Wiring is a one-time machine-global
