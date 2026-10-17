@@ -161,17 +161,20 @@ def probe_entry(name: str, path: str) -> Dict[str, Any]:
         path: The registered absolute workspace path.
 
     Returns:
-        ``{"state", "qdrant_url", "collection"}`` — the last two are ``None`` for
-        every state but ``ok``, because nothing was constructed to resolve them.
+        ``{"state", "qdrant_url", "collection", "rejection_collection"}`` — the last
+        three are ``None`` for every state but ``ok``, because nothing was
+        constructed to resolve them.
 
     Raises:
         ConfigError: If the target's ``config.toml`` is malformed or invalid.
         OSError: If a filesystem probe fails in a way the stdlib does not swallow.
     """
     if not os.path.exists(path):
-        return {"state": STATE_MISSING, "qdrant_url": None, "collection": None}
+        return {"state": STATE_MISSING, "qdrant_url": None, "collection": None,
+                "rejection_collection": None}
     if not routing.is_workspace(path):
-        return {"state": STATE_NOT_A_WORKSPACE, "qdrant_url": None, "collection": None}
+        return {"state": STATE_NOT_A_WORKSPACE, "qdrant_url": None, "collection": None,
+                "rejection_collection": None}
     # A real MitosConfig, never a re-spelling: the resolved QDRANT_URL is a five-rung
     # ladder with exactly one implementation, and the collection name is derived from
     # the canonical path — a name assembled here from the basename would silently
@@ -186,6 +189,7 @@ def probe_entry(name: str, path: str) -> Dict[str, Any]:
         "state": STATE_OK,
         "qdrant_url": config.qdrant_url,
         "collection": config.qdrant_collection,
+        "rejection_collection": config.rejection_collection,
     }
 
 
@@ -306,6 +310,7 @@ def _classify_entry(outcome: _Outcome) -> Dict[str, Any]:
             "error": None,
             "qdrant_url": None,
             "collection": None,
+            "rejection_collection": None,
         }
     if outcome.error is not None:
         return {
@@ -313,6 +318,7 @@ def _classify_entry(outcome: _Outcome) -> Dict[str, Any]:
             "error": _error_text(outcome.error),
             "qdrant_url": None,
             "collection": None,
+            "rejection_collection": None,
         }
     return dict(outcome.value, error=None)
 
@@ -361,7 +367,8 @@ def build_overview(*, cwd: Optional[str] = None) -> Dict[str, Any]:
         this is, because one ``--json`` flag will return two of them and a consumer
         must not have to sniff a shape. Per project:
         ``{"name", "path", "state", "error", "shares_path_with", "qdrant_url",
-        "collection", "collection_present"}`` in registry **document order** — the
+        "collection", "collection_present", "rejection_collection",
+        "rejection_collection_present"}`` in registry **document order** — the
         order a reverse lookup resolves its first match in, so the listing shows what
         actually decides. Per instance:
         ``{"url", "reachable", "listing_available", "collection_count", "error"}`` in
@@ -430,6 +437,15 @@ def build_overview(*, cwd: Optional[str] = None) -> Dict[str, Any]:
         ):
             names: Set[str] = instance["names"]
             present = probe["collection"] in names
+        # The rejection index's presence: set membership in the same listing, under
+        # the same tri-state rule — no call per project, no scroll, no diff.
+        rejection_present: Optional[bool] = None
+        if (
+            probe["rejection_collection"] is not None
+            and instance is not None
+            and instance["listing_available"]
+        ):
+            rejection_present = probe["rejection_collection"] in instance["names"]
         projects.append(
             {
                 "name": name,
@@ -442,6 +458,8 @@ def build_overview(*, cwd: Optional[str] = None) -> Dict[str, Any]:
                 "qdrant_url": probe["qdrant_url"],
                 "collection": probe["collection"],
                 "collection_present": present,
+                "rejection_collection": probe["rejection_collection"],
+                "rejection_collection_present": rejection_present,
             }
         )
 

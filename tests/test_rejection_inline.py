@@ -50,6 +50,7 @@ from mitos.models import get_embedding_model_id
 from mitos.parser import ParsedEntry
 from mitos.rejections import rejection_points
 from mitos.store import GraphStore
+from mitos.shell_quote import shell_flag
 from mitos.sync import MitosSyncManager, _embedding_input_text
 
 from _rejection_index_double import FakeRejectionIndex
@@ -814,7 +815,9 @@ def test_f6_a_clear_fault_after_the_write_says_the_items_landed(rig, monkeypatch
     warned = _warnings(capsys.readouterr().err)
     assert len(warned) == 1
     assert "were indexed" in warned[0] and "not indexed" not in warned[0]
-    for word in ("mitos ", "sync", "reconcile", "rebuild"):
+    # Inverted at 4d: the selectored `sync` clears it (its drain finds every item present).
+    assert f"the next `mitos sync {shell_flag('-p', rig.config.project)}` clears it" in warned[0]
+    for word in ("reconcile", "rebuild"):
         assert word not in warned[0], word
     assert m._rejection_leg_stopped is False and m._rejection_collection_absent is False
     _assert_row_stands(rig, owner)
@@ -1036,13 +1039,15 @@ def test_x_check_standing_rows_change_neither_the_stale_probe_nor_the_receipt(
     assert repr(probes["leg"]) == repr(probes["no-leg"])
 
 
-def test_x_verb_the_warning_names_no_verb(rig, capsys) -> None:
+def test_x_verb_the_warning_names_the_selectored_sync(rig, capsys) -> None:
+    """Inverted at 4d: the next ``sync``'s drain acts on the row, so the line names it."""
     rig.provider.fault = "unknown"
     capsys.readouterr()
     _record(rig.manager(), "first")
     warned = _warnings(capsys.readouterr().err)
     assert len(warned) == 1
-    for word in ("mitos ", "sync", "reconcile", "rebuild"):
+    assert f"the next `mitos sync {shell_flag('-p', rig.config.project)}` retries it" in warned[0]
+    for word in ("reconcile", "rebuild"):
         assert word not in warned[0], word
 
 

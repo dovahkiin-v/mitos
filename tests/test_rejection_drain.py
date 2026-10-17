@@ -34,6 +34,7 @@ from mitos import cli
 from mitos.errors import EmbeddingError, VectorStoreError, VectorStoreUnreachableError
 from mitos.parser import ParsedEntry
 from mitos.rejections import rejection_points
+from mitos.shell_quote import shell_flag
 from mitos.store import REJECTION_BACKLOG_FAILURE_TOLERANCE, GraphStore
 from mitos.sync import (
     DRAIN_MARKER_KEPT,
@@ -1052,13 +1053,13 @@ def test_r_full_backlog_absent_no_marker_through_sync_creates_nothing(
     assert d.index.created == 0 and d.provider.document_calls == []
     assert all(_retry(d, owner) == 0 for owner in owners)
     refusals = [line for line in out.splitlines() if "wait until the rejection index" in line]
+    # X-heal, inverted at 4d: `reconcile` stamps the marker this drain lacked, so the
+    # refusal names it, selectored; an ordinary sync still creates nothing.
     assert refusals == [
         "Rejection index: 3 rejection backlog row(s) wait until the rejection index "
-        "is built; nothing was created or embedded."]
-    # X-heal: this release builds nothing that would heal it, so no verb is named
-    # (4d inverts this when its covering verbs stamp the marker).
-    for word in ("reconcile", "rebuild", "mitos"):
-        assert word not in refusals[0]
+        "is built; nothing was created or embedded. "
+        f"`mitos reconcile {shell_flag('-p', d.config.project)}` builds it."]
+    assert "rebuild" not in refusals[0]
 
 
 def _spy_order(monkeypatch) -> List[str]:

@@ -673,7 +673,9 @@ def test_the_payload_is_json_native_and_carries_no_set_or_tuple(tmp_path, qdrant
     assert json.loads(json.dumps(payload)) == payload
     assert set(payload["projects"][0]) == {
         "name", "path", "state", "error", "shares_path_with", "qdrant_url",
-        "collection", "collection_present"}
+        "collection", "collection_present",
+        # recall-confidence 4d: the rejection index's presence, from the same listing.
+        "rejection_collection", "rejection_collection_present"}
     assert set(payload["instances"][0]) == {
         "url", "reachable", "listing_available", "collection_count", "error"}
     assert payload["instances"][0]["collection_count"] == 2

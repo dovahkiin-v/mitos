@@ -13,7 +13,9 @@ graph. It:
 1. Re-parses the whole corpus and **replays it oldest-first** into a *separate*
    build-aside graph file (the live graph is never opened for writing).
 2. Bounds the embedding seed (``pending_embeddings``) to the decision index's
-   expected set: every decision, live or retired, plus the active open questions.
+   expected set: every decision, live or retired, plus the active open questions,
+   and stamps both seed markers (the decision index's and the rejection index's)
+   in that same transaction, so the next ``sync`` builds both indexes.
 3. Runs a **reconstruction-completeness gate**: it reads the still-live old
    prototype graph's active-core set and proves every active core survived into
    the rebuild — surfacing any offender for the operator.
@@ -69,7 +71,8 @@ from mitos.identity import compute_node_id
 from mitos.migrations import is_pre_v1a_schema
 from mitos.parser import ParsedEntry, parse_file_reversed
 from mitos.replay import commit_quarantine_fixpoint
-from mitos.store import GraphStore, open_connection, write_embedding_seed
+from mitos.store import (GraphStore, open_connection, write_embedding_seed,
+                         write_rejection_seed)
 
 logger = logging.getLogger(__name__)
 
@@ -918,11 +921,18 @@ def _prune_embedding_queue_to_expected(
     refused rebuild (casualties, a shortfall, a declined confirmation) discards the aside
     file and leaves no marker behind.
 
+    The rejection index's seed marker (``rejection_seed``) is stamped in the same
+    connection and commit, with the same verb. No rejection prune exists or is needed:
+    the replay's commits queued a backlog row for every decision whose field holds an
+    item, which is exactly the rejection index's expected set. The marker is what lets
+    the next ``sync``'s rejection drain create the collection and write every item.
+
     Args:
         aside_db_path: The build-aside graph (writable).
         expected_ids: The node ids to keep — the decision index's expected set.
         established_by: The verb doing the bounding — ``"cutover"`` or ``"rebuild"``
-            (one of ``migrations.EMBEDDING_SEED_ESTABLISHED_BY``).
+            (one of ``migrations.EMBEDDING_SEED_ESTABLISHED_BY`` and of
+            ``migrations.REJECTION_SEED_ESTABLISHED_BY``).
     """
     conn = open_connection(aside_db_path)
     try:
@@ -940,6 +950,11 @@ def _prune_embedding_queue_to_expected(
         # Same connection, same commit as the DELETE above: the claim and the act that
         # makes it true land together or not at all.
         write_embedding_seed(conn, established_by)
+        # The rejection index's marker, unconditionally, as the decision stamp is: the
+        # replay's commits already queued every decision holding an item (field-aware
+        # enqueue), so its backlog covers its expected set with no prune of its own.
+        # Over an empty expected set the next drain spends it on an empty backlog.
+        write_rejection_seed(conn, established_by)
         conn.commit()
     finally:
         conn.close()

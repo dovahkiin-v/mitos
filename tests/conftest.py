@@ -232,7 +232,8 @@ class OfflineRejectionIndexRefused(Exception):
 def _refuse_rejection_index(*args, **kwargs):
     raise OfflineRejectionIndexRefused(
         "offline tests never construct a real QdrantRejectionIndex; bind a "
-        "FakeRejectionIndex factory at mitos.sync.QdrantRejectionIndex instead"
+        "FakeRejectionIndex factory at mitos.sync.QdrantRejectionIndex (and at "
+        "mitos.cli.QdrantRejectionIndex for status) instead"
     )
 
 
@@ -250,9 +251,16 @@ def offline_rejection_index(request, monkeypatch):
     list: a row about the leg binds a ``FakeRejectionIndex`` factory with
     ``monkeypatch.setattr("mitos.sync.QdrantRejectionIndex", …)``, which overrides
     this. ``LIVE_MODULES`` are exempt, as they are from the credential strip.
+
+    ``cmd_status`` builds its own (4d) for the rejection listing, so the ``mitos.cli``
+    binding is refused too: without it every offline row that patches
+    ``_check_qdrant`` to reachable would scroll the live :7333. Its construction sits
+    inside status's best-effort ``try``, so the refusal reads as "could not list".
+    A row that needs a listing binds the factory at both seams.
     """
     if request.node.path.name not in LIVE_MODULES:
         monkeypatch.setattr("mitos.sync.QdrantRejectionIndex", _refuse_rejection_index)
+        monkeypatch.setattr("mitos.cli.QdrantRejectionIndex", _refuse_rejection_index)
 
 
 # Record every GraphStore construction, so a canned vector double with no explicit
@@ -358,6 +366,7 @@ LIVE_MODULES: tuple[str, ...] = (
     "test_rejection_index_live.py",
     "test_rejection_inline_live.py",
     "test_rejection_drain_live.py",
+    "test_rejection_covering_live.py",
 )
 
 

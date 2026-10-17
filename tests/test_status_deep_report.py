@@ -1050,6 +1050,9 @@ _SHIPPED_CHECK_KEYS = {
     # recall-confidence 3c: the orphan count's partition, history and garbage.
     "retired_node_points", "nodeless_points",
     "graph_unbuilt", "mcp_project_entry",
+    # recall-confidence 4d: the rejection index, from its own id diff.
+    "rejection_collection_exists", "rejection_expected_items", "missing_rejection_items",
+    "stale_rejection_items", "orphan_rejection_items", "rejection_backlog_past_tolerance",
 }
 
 _PATH_KEYS = ("decisions_file", "questions_file", "archive_dir", "db_path")

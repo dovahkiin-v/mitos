@@ -511,6 +511,39 @@ if its spend needs confirming, a person runs it at a terminal and confirms.
 
 ---
 
+## Upgrading a workspace written by an earlier Mitos
+
+An upgrade can change what a workspace's indexes should hold. This build keeps a
+vector for every decision, live or retired, and a second collection beside the
+decision collection — its name plus `-rejections` — holding each decision's
+rejected options. A workspace an earlier build wrote has neither the retired
+vectors nor that collection, and nothing builds them implicitly. Upgrade in this
+order:
+
+1. **Move every build that reads a workspace first.** Update the global install
+   (*Prerequisites* → **Updating**); the machine-wide MCP server runs it. A running `mitos serve` keeps the build it
+   started with until its session restarts, and so does any other installed
+   build or clone: restart or update each one.
+2. **Then run one `mitos reconcile -p <project>` per workspace.** It embeds the
+   retired decisions the decision index lacks and builds the rejection index in
+   the same pass, and it reports the items it embedded and those it found
+   already present (`--json` adds the embedding calls). `mitos status <project>`
+   beforehand shows what it will embed; the rejection index's missing count is
+   its embedding count, because rejected items bypass the embedding cache. Why
+   the order: an older build reads the decision collection unfiltered, so once
+   the retired vectors are back they take slots from live hits in its reads and
+   in its conflict sensing.
+3. **Then refresh each workspace's skill text.** If `mitos status <project>`
+   reports that `.mitos/skill.md` differs, run the command it prints.
+4. **What leaves the machine.** Each decision's `rejected_paths` is now sent to
+   the embedding provider beside its axiom.
+5. **Rolling back.** Install the previous version. The rejection collection stays
+   in Qdrant, unread. Records and amends the previous build makes leave their
+   decisions' rejected items stale or missing; after you upgrade again, `mitos
+   status <project>` names them and `mitos reconcile -p <project>` heals them.
+
+---
+
 ## Cutover (migrating a prototype graph to V1a)
 
 A graph created by an **older (pre-V1a) Mitos** uses a different node identity, so
@@ -554,7 +587,9 @@ leaves a workspace that simply re-runs clean — no manual restore. Run these st
    ```
    (`mitos cutover` prints the exact command with your URL + collection filled in.)
 5. **Embed every decision.** Run `mitos sync -p .` (or `mitos sync -p .
-   --embed-only`) to drain the embedding queue. Until it finishes there is a
+   --embed-only`) to drain the embedding queues — the decisions' and their
+   rejected items'. `cutover` stamps both seed markers, so this one sync builds
+   both indexes, the rejection index's collection included. Until it finishes there is a
    **bounded semantic-surface outage**: `surface`/`query` are degraded, but
    graph-only `mitos list -p .` works throughout.
 
@@ -563,12 +598,18 @@ leaves a workspace that simply re-runs clean — no manual restore. Run these st
    > outbox is empty and a sync has nothing to drain. Run **`mitos reconcile
    > -p .`**: it diffs every decision (live or retired) plus the active open
    > questions against Qdrant's actual points, re-queues only the missing ones,
-   > and drains them in one pass (idempotent; re-embeds hit the cache, so no
-   > embedding-API spend when text is unchanged). `mitos status .` flags this
+   > and drains them in one pass (idempotent). `mitos status .` flags this
    > state as `⚠ vector index incomplete`, and names retired decisions with no
    > vector on a line of their own. `reconcile` also deletes points whose node
    > is no longer in the graph, over a built graph only: over a clone whose graph
    > is unbuilt it deletes nothing and names `mitos rebuild` instead.
+   > It builds the rejection index in the same pass: every decision whose
+   > rejected items have no point is queued and embedded, and items no decision
+   > states any more are deleted. Decision re-embeds hit the embedding cache, so
+   > they cost no embedding-API spend when text is unchanged; rejected items
+   > bypass the cache, so a first build or a lost rejection collection pays one
+   > embedding per item — the missing count `mitos status .` prices on its
+   > `rejection index` row.
 6. **Restart `mitos serve`** if it was running.
 7. **Verify.** `mitos status .` → expect `READY ✓`.
 8. **Remove the backup.** Once you're satisfied, delete the

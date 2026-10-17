@@ -360,6 +360,19 @@ class GraphStoreProtocol(Protocol):
         """
         ...
 
+    def rejection_index_expects_items(self) -> bool:
+        """Reports whether some decision's ``rejected_paths`` holds at least one item.
+
+        True exactly when the rejection index's expected set is non-empty.
+        ``recall.missing_rejection_index_is_a_gap`` reaches it by duck typing, as
+        ``missing_index_is_a_gap`` reaches :meth:`get_decision_index_expected_ids`,
+        which is why it is on this protocol.
+
+        Returns:
+            True iff some decision's field enumerates an item.
+        """
+        ...
+
     def write_signal(self, node_id: str, stype: str, source: Optional[str] = None) -> None:
         """Writes a signal row (drifted, source_reencounter).
 

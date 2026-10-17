@@ -70,7 +70,7 @@ import re
 import unicodedata
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import AbstractSet, Any, Dict, FrozenSet, List, Mapping, NamedTuple, Optional, Tuple
 
 from mitos.identity import canonical_core_json_form, canonical_core_string_norm
 
@@ -531,3 +531,93 @@ def rejection_points(owner_id: str, field: str) -> Dict[str, PointRef]:
             if pid not in points:
                 points[pid] = PointRef(ordinal=item.ordinal, part_index=part.index, text=part.text)
     return points
+
+
+def expected_rejection_points(
+    owner_fields: Mapping[str, str],
+    memo: Optional[Dict[Tuple[str, str], Tuple[str, ...]]] = None,
+) -> Dict[str, str]:
+    """Derives the rejection index's expected contents from the graph's owner fields.
+
+    The one expected-set derivation that ``status`` and ``reconcile`` both call, so
+    the heal clears its own warning by construction.
+
+    Args:
+        owner_fields: ``{decision id: raw rejected_paths}``, as
+            ``GraphStore.get_rejection_index_owner_fields`` returns it.
+        memo: An optional per-command cache keyed on ``(owner_id, field)``. A
+            caller that reads the graph twice passes the same dict to both calls,
+            so an owner whose raw string is unchanged is enumerated once.
+
+    Returns:
+        ``{point_id: owner_id}`` over every owner's :func:`rejection_points`.
+
+    Raises:
+        ValueError: If an owner id is not 64 lowercase hex characters (a store
+            fault: the store hands over node ids).
+    """
+    expected: Dict[str, str] = {}
+    for owner_id, field in owner_fields.items():
+        key = (owner_id, field)
+        ids = memo.get(key) if memo is not None else None
+        if ids is None:
+            ids = tuple(rejection_points(owner_id, field))
+            if memo is not None:
+                memo[key] = ids
+        for pid in ids:
+            expected[pid] = owner_id
+    return expected
+
+
+class RejectionIndexDiff(NamedTuple):
+    """The rejection index measured against its expected contents.
+
+    A point's id is its identity: a listed id that is expected is present,
+    whatever owner its payload names.
+
+    Attributes:
+        missing: Expected point id -> owner, for every expected id not listed.
+        stale: Listed ids not expected whose payload owner is a graph decision
+            (its field no longer states the item).
+        orphaned: Listed ids not expected whose payload owner is not a graph
+            decision, or is unnamed.
+    """
+
+    missing: Dict[str, str]
+    stale: FrozenSet[str]
+    orphaned: FrozenSet[str]
+
+    @property
+    def missing_owners(self) -> FrozenSet[str]:
+        """The distinct owners of the missing items."""
+        return frozenset(self.missing.values())
+
+
+def diff_rejection_index(
+    expected: Mapping[str, str],
+    listing: Mapping[str, Optional[str]],
+    *,
+    owners: AbstractSet[str],
+) -> RejectionIndexDiff:
+    """Diffs a listing of the rejection index against its expected contents.
+
+    Args:
+        expected: ``{point_id: owner_id}`` from :func:`expected_rejection_points`.
+        listing: ``{point_id: owner_id or None}`` as
+            ``RejectionIndex.list_point_owners`` returns it.
+        owners: Every graph decision's id (the owner-fields read's keys).
+
+    Returns:
+        The missing, stale and orphaned split.
+    """
+    missing = {pid: owner for pid, owner in expected.items() if pid not in listing}
+    stale = set()
+    orphaned = set()
+    for pid, owner in listing.items():
+        if pid in expected:
+            continue
+        if owner is not None and owner in owners:
+            stale.add(pid)
+        else:
+            orphaned.add(pid)
+    return RejectionIndexDiff(missing=missing, stale=frozenset(stale), orphaned=frozenset(orphaned))

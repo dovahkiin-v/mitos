@@ -73,7 +73,8 @@ from mitos.divergence import (RELATIONSHIP_FIELDS, corpus_graph_divergence,
                               corpus_holds_entries, divergence_total)
 from mitos.restore import BufferFidelityError
 from mitos.env import resolve_key
-from mitos.vector_store import scroll_point_ids, hash_to_uuid, partition_points, QdrantVectorStore
+from mitos.vector_store import (scroll_point_ids, hash_to_uuid, partition_points,
+                                QdrantRejectionIndex, QdrantVectorStore)
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.telemetry import (
     AttemptRefusal, AttemptStart, TelemetryStore, ConflictCheckRow, JudgmentBatch,
@@ -96,7 +97,9 @@ from mitos.conflict import (CONFLICT_OVERFETCH_LIMIT, run_conflict_check,
                             ConflictUnavailableReason,
                             SEMANTIC_SUBSTRATE_REASONS)
 from mitos.migrations import is_pre_v1a_schema
-from mitos.store import GraphStore, MODIFIER_EDGE_KEYS, open_connection
+from mitos.store import (GraphStore, MODIFIER_EDGE_KEYS, REJECTION_BACKLOG_FAILURE_TOLERANCE,
+                         open_connection)
+from mitos.rejections import diff_rejection_index, expected_rejection_points
 from mitos.cutover import default_aside_db_path, perform_swap, rebuild_and_gate
 from mitos.degraded import lexical_envelope, scope_dump
 from mitos.lexical import degraded_reason_from_error
@@ -104,6 +107,7 @@ from mitos.recall import (DEGRADED_NOT_COMPUTED, RANKED_EDGE_MARGIN, RetiredPart
                           assess_query_recall, assess_surface_recall, blackout_note,
                           corpus_provenance, missing_graph_is_a_gap,
                           missing_graph_note, missing_index_is_a_gap,
+                          missing_rejection_index_is_a_gap,
                           provenance_line, retired_partition, scope_filter_recovery,
                           count_withheld, short_window, stamps_unread_clause,
                           window_edge, withheld_clause)
@@ -114,7 +118,8 @@ from mitos.sync import (MitosSyncManager, run_ambient_capture, _SLUG_MAX_LEN,
                         EXISTS_NO_OP_FACT, PAUSE_HELD_CLAUSE,
                         ROTATION_FAILED, ROTATION_REASON_DUPLICATED, ROTATION_ROTATED,
                         ROTATION_SKIPPED, ROTATION_STAGE_FILE, ROTATION_STAGE_LOCK,
-                        rejection_drain_report)
+                        REJECTION_COLLECT_HELD, REJECTION_COLLECT_UNAVAILABLE,
+                        REJECTION_COLLECT_UNREAD, rejection_drain_report)
 from mitos.provider_cause import describe_embed_failure
 from mitos._agent_block import agent_block, agent_block_drift, AGENT_GUIDE_VERSION
 from mitos.renderer import MitosRenderer, estimate_tokens, overflow_report
@@ -927,6 +932,74 @@ def _unbuilt_reconcile_refusal(config: MitosConfig) -> str:
     )
 
 
+def _reconcile_rejection_index_lines(
+    index: Dict[str, Any], config: MitosConfig, *, attempted: bool
+) -> List[str]:
+    """Words ``reconcile``'s ``rejection_index`` object for the text surface.
+
+    One summary line once the index was measured, a ``Rejection index collected:``
+    line when anything was deleted or failed, and one line naming the rerun for
+    ``held``, ``unread`` and (when the index was attempted at all) ``unavailable``.
+    ``unbuilt`` adds nothing: the unbuilt refusal speaks for it. No line
+    interpolates a count that was not computed.
+
+    Args:
+        index: ``reconcile_embeddings()["rejection_index"]``.
+        config: The workspace config (for the selectored rerun).
+        attempted: Whether a provider, a vector store and a rejection index were
+            all present; without them the index is silently not reconciled.
+
+    Returns:
+        The lines to print.
+    """
+    rerun = f"`mitos reconcile {shell_flag('-p', config.project)}`"
+    lines: List[str] = []
+    expected = index["expected_items"]
+    missing = index["missing_items"]
+    if expected is not None and missing is not None:
+        if expected == 0:
+            lines.append("Rejection index: no decision states a rejected item.")
+        elif missing:
+            lines.append(
+                f"Rejection index: {expected} item(s) of {index['expected_owners']} "
+                f"decision(s) expected, {missing} missing — {index['owners_queued']} "
+                f"decision(s) newly queued for the drain."
+            )
+        else:
+            lines.append(
+                f"Rejection index: {expected} item(s) of {index['expected_owners']} "
+                f"decision(s) expected, all present."
+            )
+    if index["deleted"] or index["delete_failed"]:
+        line = (
+            f"Rejection index collected: {index['deleted']} stale or orphaned item(s) "
+            f"deleted"
+        )
+        if index["delete_failed"]:
+            line += (
+                f", {index['delete_failed']} could not be deleted — Qdrant refused or "
+                f"did not confirm; {rerun} again retries them"
+            )
+        lines.append(line + ".")
+    collected = index["collected"]
+    if collected == REJECTION_COLLECT_HELD:
+        lines.append(
+            f"Rejection index not collected — a drain held the rejection backlog's lock; "
+            f"{rerun} again collects it."
+        )
+    elif collected == REJECTION_COLLECT_UNREAD:
+        lines.append(
+            f"Rejection index not collected — the graph could not be read, so nothing "
+            f"was deleted from it; {rerun} again collects it."
+        )
+    elif collected == REJECTION_COLLECT_UNAVAILABLE and attempted:
+        lines.append(
+            f"Rejection index not reconciled in full this run (see the warning above); "
+            f"{rerun} again retries it."
+        )
+    return lines
+
+
 def cmd_reconcile(config: MitosConfig, as_json: bool = False) -> int:
     """Embeds every node the decision index is missing, and deletes node-less points.
 
@@ -939,7 +1012,12 @@ def cmd_reconcile(config: MitosConfig, as_json: bool = False) -> int:
     whose node is no longer in the graph is deleted by its listed id, while a
     retired node's point is history and kept. Collection runs over a built graph
     only (:meth:`MitosSyncManager.reconcile_embeddings` has the guard and why).
-    Idempotent.
+    It also builds and collects the rejection index: it queues every decision
+    lacking a rejected item's point, stamps the rejection seed marker, drains, and
+    deletes the items no decision states any more (``rejection_index`` in
+    ``--json``; its lines here). Rejected items bypass the embedding cache, so a
+    first build pays one embedding per item. Nothing in that block moves the exit
+    code. Idempotent.
 
     Over an **unbuilt** graph — the corpus holds entries, the graph holds no node,
     the clone without its gitignored ``*.sqlite`` — reconcile is not the heal: it
@@ -1018,6 +1096,14 @@ def cmd_reconcile(config: MitosConfig, as_json: bool = False) -> int:
     # The rejection drain's summary, rendered here and not by the drain (which
     # reconcile runs with report=False), so it prints once.
     for line in rejection_drain_report(result["rejection_drain"]):
+        print(line)
+    rejection_attempted = (
+        manager.embed_provider is not None and manager.vector_store is not None
+        and manager.rejection_index is not None
+    )
+    for line in _reconcile_rejection_index_lines(
+        result["rejection_index"], config, attempted=rejection_attempted
+    ):
         print(line)
     if result["deleted"] or result["delete_failed"]:
         line = f"Collected: {result['deleted']} node-less point(s) deleted"
@@ -3388,7 +3474,15 @@ def _overview_notes(project: Dict[str, Any], payload: Dict[str, Any], *,
             decisions_file=os.path.join(project["path"], "decisions.md"),
             archive_dir=os.path.join(project["path"], "decisions", "archive"),
         )
-        if project["collection_present"] is False and corpus_scan(locator):
+        # Scanned at most once per project, and only when a note could use it.
+        populated: List[bool] = []
+
+        def holds_entries() -> bool:
+            if not populated:
+                populated.append(bool(corpus_scan(locator)))
+            return populated[0]
+
+        if project["collection_present"] is False and holds_entries():
             # A pointer, never a diagnosis and never a heal: the overview reads no
             # graph, so it can neither price what re-embedding would cost nor tell a
             # swept collection from an unbuilt one — and those two want opposite
@@ -3400,6 +3494,14 @@ def _overview_notes(project: Dict[str, Any], payload: Dict[str, Any], *,
             notes.append(
                 f"vector collection unknown — {project['qdrant_url']} did not answer "
                 f"with a usable listing (see below)")
+        elif (project["rejection_collection_present"] is False
+              and holds_entries()):
+            # The same pointer for the rejection index, for the same reason: no graph
+            # read, so no price. Silent while the decision collection is itself
+            # absent — the note above already sends the reader to `status`.
+            notes.append(
+                f"rejection index {project['rejection_collection']} absent — "
+                f"`mitos status {name}` for the heal")
 
     if project["shares_path_with"]:
         # A finding, never a fault — both names reach the same workspace, so nothing
@@ -3761,6 +3863,196 @@ def _commit_gate_lines(row: Dict[str, Any], *, project: str) -> List[str]:
     return lines
 
 
+def _rejection_index_status(
+    config: MitosConfig, reachable: bool, *, pre_v1a: bool
+) -> Dict[str, Any]:
+    """Reads the rejection index for ``status``: the listing first, then one graph read.
+
+    Best-effort throughout: a read that fails leaves its values ``None`` ("could not
+    verify"), never ``0``. The listing is made **before** the graph read, the heal's
+    order: an item a record writes mid-``status`` is then either unlisted (it may read
+    as missing for this one report, the safe direction) or listed with its owner
+    already committed — never orphaned. The diff is the one ``reconcile`` heals
+    (:func:`~mitos.rejections.diff_rejection_index`), so its warning clears by
+    construction. Precedence for stale and orphaned: no listing or no graph read →
+    ``None``; an empty listing (absent, or present and empty) → ``0`` on any graph
+    read; a listing over a graph holding no node → ``None`` (not judged); otherwise
+    the diff's counts. The backlog is named only past
+    ``REJECTION_BACKLOG_FAILURE_TOLERANCE``, never by its raw row count, so a
+    healthy amend never reads as an index falling behind.
+
+    Args:
+        config: The workspace config.
+        reachable: ``_check_qdrant``'s answer; no listing is attempted without it.
+        pre_v1a: A prototype graph is not read.
+
+    Returns:
+        ``exists``, ``present_items``, ``expected_items``, ``missing_items``,
+        ``missing_owners``, ``stale_items``, ``orphan_items``, ``past_tolerance``,
+        ``gap`` and ``seed``.
+    """
+    out: Dict[str, Any] = {
+        "exists": None, "present_items": None, "expected_items": None,
+        "missing_items": None, "missing_owners": None, "stale_items": None,
+        "orphan_items": None, "past_tolerance": None, "gap": None, "seed": None,
+    }
+    listing: Optional[Dict[str, Optional[str]]] = None
+    if reachable:
+        try:
+            listing = QdrantRejectionIndex(
+                config.qdrant_url, config.rejection_collection
+            ).list_point_owners()
+            out["exists"] = True
+        except CollectionMissingError:
+            listing = {}
+            out["exists"] = False
+        except Exception:
+            listing = None
+        if listing is not None:
+            out["present_items"] = len(listing)
+
+    owner_fields: Optional[Dict[str, str]] = None
+    node_count: Optional[int] = None
+    if pre_v1a:
+        pass  # a prototype graph is not read; every graph-side value stays None
+    elif not os.path.exists(config.db_path):
+        # No graph file: nothing is recorded, so nothing is expected.
+        owner_fields, node_count, out["gap"], out["past_tolerance"] = {}, 0, False, 0
+    else:
+        try:
+            store = GraphStore(config.db_path, read_only=True)
+        except Exception:
+            store = None
+        if store is not None:
+            try:
+                node_count = len(store.get_all_node_ids())
+                owner_fields = store.get_rejection_index_owner_fields()
+            except Exception:
+                owner_fields = node_count = None
+            out["gap"] = missing_rejection_index_is_a_gap(store)
+            try:
+                out["past_tolerance"] = store.count_rejection_backlog(
+                    min_retry=REJECTION_BACKLOG_FAILURE_TOLERANCE
+                )
+            except Exception:
+                pass
+            out["seed"] = store.rejection_seed()
+        else:
+            out["gap"] = True  # "could not check" is never the healthy-empty answer
+
+    if owner_fields is None:
+        return out
+    try:
+        expected = expected_rejection_points(owner_fields)
+    except Exception:
+        return out
+    out["expected_items"] = len(expected)
+    if listing is None:
+        return out
+    diff = diff_rejection_index(expected, listing, owners=owner_fields.keys())
+    out["missing_items"] = len(diff.missing)
+    out["missing_owners"] = len(diff.missing_owners)
+    if not listing:
+        out["stale_items"] = out["orphan_items"] = 0
+    elif node_count:
+        out["stale_items"] = len(diff.stale)
+        out["orphan_items"] = len(diff.orphaned)
+    # else: items listed over a graph holding no node — not judged.
+    return out
+
+
+def _rejection_row_hint(
+    rejection: Dict[str, Any], config: MitosConfig, reachable: bool, *,
+    graph_unbuilt: bool,
+) -> Optional[str]:
+    """The rejection index row's hint, printed only when the index is not present.
+
+    The decision row's ladder: unreachable, unlisted, unbuilt graph, then an absent
+    collection priced from the diff (K of N, with K = N: this index keeps no
+    embedding cache), unpriced when the graph could not be read, or calm when no
+    decision states a rejected item. No form interpolates a ``None``.
+    """
+    reconcile = f"`mitos reconcile {shell_flag('-p', config.project)}`"
+    if not reachable:
+        return "needs Qdrant up (see above)"
+    if rejection["exists"] is None:
+        return (
+            f"could not be listed; `mitos status {shell_flag('-p', config.project)}` "
+            f"again when Qdrant answers"
+        )
+    if rejection["exists"]:
+        return None
+    if graph_unbuilt:
+        return "nothing indexed yet — the graph is unbuilt (see below)"
+    missing = rejection["missing_items"]
+    if missing is None:
+        if rejection["gap"] is False:
+            return (
+                "created when a decision's rejected items are first indexed — none "
+                "expected yet"
+            )
+        return f"missing — could not read the graph to price it; run {reconcile}"
+    if missing:
+        return (
+            f"missing — {missing} rejected item(s) of {rejection['missing_owners']} "
+            f"decision(s) have no point; run {reconcile} ({missing} embedding(s) — "
+            f"this index keeps no embedding cache)"
+        )
+    return "created when a decision's rejected items are first indexed — none expected yet"
+
+
+def _rejection_index_rungs(rejection: Dict[str, Any], config: MitosConfig) -> List[str]:
+    """The rejection index's informational rungs, gated on the diff, never the backlog.
+
+    Missing items in a present collection (with the seed line when a marker stands),
+    stale items as a neutral line (a healthy amend leaves them until the next drain),
+    orphaned items, items not judged over a graph holding no node, and backlog rows
+    past the tolerance. None feeds ``ready``, the verdict or the exit code. Each states
+    an index fact and its heal; none says what a read finds.
+    """
+    sel = shell_flag("-p", config.project)
+    lines: List[str] = []
+    missing = rejection["missing_items"]
+    if rejection["exists"] and missing:
+        lines.append(
+            f"\n  ⚠ rejection index incomplete — {missing} rejected item(s) of "
+            f"{rejection['missing_owners']} decision(s) have no point. "
+            f"`mitos reconcile {sel}` embeds them: {missing} embedding(s), none cached. "
+            f"Informational, not a readiness blocker."
+        )
+        seed = rejection["seed"]
+        if seed:
+            lines.append(
+                f"      the rejection backlog was seeded by `{seed['established_by']}` "
+                f"at {seed['established_at']} — the next `mitos sync {sel}` builds it "
+                f"once the embedding provider answers"
+            )
+    stale = rejection["stale_items"]
+    if stale:
+        lines.append(
+            f"  • {stale} rejected item(s) await removal — their decision's field no "
+            f"longer states them; `mitos reconcile {sel}` removes them."
+        )
+    orphaned = rejection["orphan_items"]
+    if orphaned:
+        lines.append(
+            f"\n  ⚠ {orphaned} rejected item(s) belong to no decision in the graph — "
+            f"`mitos reconcile {sel}` deletes them. Informational, not a readiness "
+            f"blocker."
+        )
+    present = rejection["present_items"]
+    if present and stale is None and orphaned is None and rejection["expected_items"] is not None:
+        lines.append(f"  • {present} rejected item(s) not judged — the graph holds no nodes.")
+    past = rejection["past_tolerance"]
+    if past:
+        lines.append(
+            f"\n  ⚠ {past} decision(s)' rejected items failed to index "
+            f"{REJECTION_BACKLOG_FAILURE_TOLERANCE} or more times; they stay queued, and "
+            f"every `mitos sync {sel}` and `mitos reconcile {sel}` attempts them again."
+        )
+    return lines
+
+
 def cmd_status(workspace_dir: str, as_json: bool = False, *,
                project: Optional[str] = None, verbose: bool = False) -> int:
     """Reports whether Mitos is set up for a project, and what (if anything) is missing.
@@ -4031,6 +4323,8 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
         # point keys: the missing-vector keys keep the expected-set gate above.
         orphan_points = retired_node_points = nodeless_points = 0
 
+    rejection = _rejection_index_status(config, q["reachable"], pre_v1a=pre_v1a)
+
     # Corpus↔graph divergence (B′). Purely informational — a corpus mid-edit is a
     # normal state, so gating readiness on it would make an ordinary hand edit read
     # as breakage. Best-effort like every other read here: a fault leaves the safe
@@ -4109,6 +4403,7 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
             "pre_v1a": pre_v1a,
             "qdrant_url": config.qdrant_url,
             "collection": config.qdrant_collection,
+            "rejection_collection": config.rejection_collection,
             # The four resolved corpus locations, flat beside the other
             # resolved-identity values rather than in a `paths` sub-map: `checks` is
             # the payload's only nested map and it holds verdicts and the counts that
@@ -4154,6 +4449,15 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
                 "retired_node_points": retired_node_points,
                 "nodeless_points": nodeless_points,
                 "graph_unbuilt": graph_unbuilt,
+                # The rejection index (4d), siblings of the decision index's keys and
+                # worded from the same id diff `reconcile` heals. None = could not
+                # verify. Neither feeds `ready`, the verdict or the exit code.
+                "rejection_collection_exists": rejection["exists"],
+                "rejection_expected_items": rejection["expected_items"],
+                "missing_rejection_items": rejection["missing_items"],
+                "stale_rejection_items": rejection["stale_items"],
+                "orphan_rejection_items": rejection["orphan_items"],
+                "rejection_backlog_past_tolerance": rejection["past_tolerance"],
                 # Renamed from `mcp_wired` in 6a, and the rename is the point: the
                 # same file read now means the opposite thing. A consumer reading
                 # `mcp_wired: true` for "good" would read a hazard as an
@@ -4263,6 +4567,14 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
         # about which name is in force.
         (f"collection '{config.qdrant_collection}'", coll_mark, coll_hint,
          _inert_pin_note(config, offer_deletion=True)),
+        # The rejection index's sibling row: ✓ when present, else neutral "—", never
+        # ✗ — an absent rejection collection is never a readiness question.
+        (f"rejection index '{config.rejection_collection}'",
+         True if rejection["exists"] else None,
+         _rejection_row_hint(rejection, config, q["reachable"],
+                             graph_unbuilt=graph_unbuilt),
+         (f"({rejection['present_items']} item(s) indexed)"
+          if rejection["exists"] else None)),
         # No MCP-wiring row lives here any more. Wiring is a one-time machine-global
         # act since the registry landed, so it is not a per-project readiness rung
         # in either direction — and its replacement is a *finding* that must be
@@ -4410,6 +4722,8 @@ def cmd_status(workspace_dir: str, as_json: bool = False, *,
         # so none is judged. No heal is named here — the unbuilt rung names `rebuild`
         # when the corpus holds entries.
         print(f"  • {orphan_points} point(s) not judged — the graph holds no nodes.")
+    for line in _rejection_index_rungs(rejection, config):
+        print(line)
     if overflows:
         _print_overflow_detail(overflows, verbose=verbose, project=config.project)
     if divergence_report is not None:
@@ -8471,7 +8785,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "reconcile",
         help="Embed every decision (live or retired) and active open question missing "
              "from Qdrant (heal a direct vector wipe), and delete points whose node has "
-             "left the graph.",
+             "left the graph. Also builds the rejection index and deletes rejected items "
+             "no decision states.",
     )
     rec_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON.")
 

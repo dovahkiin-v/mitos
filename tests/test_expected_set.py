@@ -693,6 +693,13 @@ def test_setup_runbook_names_every_decision_not_the_active_node_set() -> None:
     assert ("`reconcile` also deletes points whose node is no longer in the graph, over "
             "a built graph only: over a clone whose graph is unbuilt it deletes nothing "
             "and names `mitos rebuild` instead.") in setup
+    # 4d rewrote the cache clause, true for both indexes: decision re-embeds hit the
+    # cache, rejected items bypass it and `status` prices the build.
+    assert "re-embeds hit the cache, so no embedding-API spend" not in setup
+    assert ("Decision re-embeds hit the embedding cache, so they cost no embedding-API "
+            "spend when text is unchanged; rejected items bypass the cache, so a first "
+            "build or a lost rejection collection pays one embedding per item") in setup
+    assert "It builds the rejection index in the same pass" in setup
 
 
 def test_the_reconcile_help_names_every_decision() -> None:
@@ -703,6 +710,27 @@ def test_the_reconcile_help_names_every_decision() -> None:
     assert "every decision (live or retired)" in helps["reconcile"]
     # 3c: the help names the collection too.
     assert "delete points whose node has left the graph" in helps["reconcile"]
+    # 4d: and the rejection index it builds and collects.
+    assert "Also builds the rejection index and deletes rejected items" in helps["reconcile"]
+
+
+def test_the_upgrade_note_orders_the_server_first_and_states_the_egress() -> None:
+    """The upgrade note as 4d ships it: server first, one reconcile, egress stated."""
+    setup = _collapsed((REPO / "SETUP.md").read_text(encoding="utf-8"))
+    head = "## Upgrading a workspace written by an earlier Mitos"
+    assert head in setup and setup.index(head) < setup.index("## Cutover")
+    note = setup[setup.index(head):setup.index("## Cutover")]
+    server = note.index("**Move every build that reads a workspace first.**")
+    # `_collapsed` blanks every ">", so the placeholder reads "<project " here.
+    reconcile = note.index("**Then run one `mitos reconcile -p <project ` per workspace.**")
+    assert server < reconcile
+    assert ("It embeds the retired decisions the decision index lacks and builds the "
+            "rejection index in the same pass") in note
+    assert ("Each decision's `rejected_paths` is now sent to the embedding provider "
+            "beside its axiom.") in note
+    # True at 4d: nothing here may claim a read finds or hides rejected items (5a).
+    for word in ("surface", "query", "match", "hide"):
+        assert word not in note.lower(), word
 
 
 def test_the_cutover_finish_block_names_every_decision() -> None:

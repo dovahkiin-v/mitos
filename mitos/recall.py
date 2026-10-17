@@ -1128,6 +1128,35 @@ def missing_index_is_a_gap(store: "object") -> bool:
         return True
 
 
+def missing_rejection_index_is_a_gap(store: "object") -> bool:
+    """Decides whether an absent rejection collection is a gap worth reporting.
+
+    The rejection index's twin of :func:`missing_index_is_a_gap`. Over a graph
+    whose decisions state no rejected item, an absent rejection collection *is*
+    the empty index, and nothing is wrong. Over a graph where some decision's
+    ``rejected_paths`` holds an item, it is a hole the caller names with its heal.
+
+    Gated on ``rejection_index_expects_items`` — "the rejection index's own
+    expected set is non-empty" — so it fires exactly when ``reconcile``'s
+    collection pass would find something missing in an absent collection: the
+    gate and the heal agree. The decision index's predicate is deliberately not
+    borrowed: it counts open questions, and a questions-only workspace would be
+    sent to a ``reconcile`` with nothing to write.
+
+    An unreadable graph answers **True**, the loud branch, as its twin does.
+
+    Args:
+        store: The graph store (duck-typed; recall is a leaf module).
+
+    Returns:
+        True when the absence should be surfaced as a gap.
+    """
+    try:
+        return bool(store.rejection_index_expects_items())
+    except Exception:
+        return True
+
+
 def missing_graph_is_a_gap(
     store: Optional["object"],
     config: "object",

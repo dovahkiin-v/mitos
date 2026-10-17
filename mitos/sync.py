@@ -104,7 +104,8 @@ from mitos.provider_cause import (AUTH, QUOTA, TRANSIENT, classify_provider_erro
 from mitos.shell_quote import shell_flag
 from mitos.tool_markup import field_values, find_tool_call_markup
 from mitos.recall import missing_graph_is_a_gap
-from mitos.rejections import rejection_points
+from mitos.rejections import (diff_rejection_index, expected_rejection_points,
+                              rejection_points)
 from mitos.vector_store import (QdrantRejectionIndex, QdrantVectorStore, RejectionPoint,
                                 hash_to_uuid, partition_points)
 from mitos.renderer import MitosRenderer, OVERFLOW_HINT_WINDOW_SECONDS, summarize_overflows
@@ -823,6 +824,18 @@ class DrainOutcome:
 # drain's closed vocabulary: that drain never stops `held`.
 REJECTION_DRAIN_STOP_HELD = "held"  # another drain holds the backlog's lock; nothing read
 REJECTION_DRAIN_STOPS = DRAIN_STOPS + (REJECTION_DRAIN_STOP_HELD,)
+
+# What `reconcile`'s collection of the rejection index did (`rejection_index.collected`),
+# a closed vocabulary beside the drain's stops; the tests import it rather than retype it.
+REJECTION_COLLECT_JUDGED = "judged"            # the listing was judged (an empty one included)
+REJECTION_COLLECT_HELD = "held"                # a drain held the backlog's lock; nothing deleted
+REJECTION_COLLECT_UNBUILT = "unbuilt"          # the graph holds no node; nothing judged
+REJECTION_COLLECT_UNREAD = "unread"            # the graph read under the lock failed
+REJECTION_COLLECT_UNAVAILABLE = "unavailable"  # no provider or index, a fault, or no lock
+REJECTION_COLLECT_OUTCOMES = (
+    REJECTION_COLLECT_JUDGED, REJECTION_COLLECT_HELD, REJECTION_COLLECT_UNBUILT,
+    REJECTION_COLLECT_UNREAD, REJECTION_COLLECT_UNAVAILABLE,
+)
 
 # Rows per rejection backlog read: the owners one page's cross-owner batches are cut
 # from. Read at call time, so a row can force several pages.
@@ -1803,7 +1816,7 @@ class _RejectionDrainWalk:
             self.taken.add(row.node_id)
             if row.node_id not in fields:
                 # The node left the graph (only with foreign keys off). Its points
-                # are orphans for 4d's collector, not for this drain.
+                # are orphans for `reconcile`'s collection, not for this drain.
                 self._clear(row, None)
                 continue
             slug, field = fields[row.node_id]
@@ -2068,8 +2081,10 @@ class _RejectionDrainWalk:
         )
 
     def _stop_refused(self) -> None:
-        # Names no heal verb: nothing in this release builds the rejection index for
-        # a workspace that has rows and no collection, so naming one would be false.
+        # Names the heal: `reconcile` queues every owner the index lacks and stamps the
+        # rejection seed marker, which licenses the create this drain refused. An
+        # ordinary `sync` over a populated graph never builds the index (the build is
+        # operator-invoked, never implicit).
         try:
             waiting: Optional[int] = self.store.count_rejection_backlog()
         except Exception:
@@ -2077,7 +2092,8 @@ class _RejectionDrainWalk:
         count = f"{waiting} " if waiting is not None else ""
         print(
             f"Rejection index: {count}rejection backlog row(s) wait until the "
-            f"rejection index is built; nothing was created or embedded."
+            f"rejection index is built; nothing was created or embedded. "
+            f"`mitos reconcile {self.selector}` builds it."
         )
 
     def _stop_missing_on_write(self) -> None:
@@ -3565,8 +3581,10 @@ class MitosSyncManager:
         Every fault leaves the row and costs this leg alone: the commit, the
         receipt and the decision leg are untouched. An outage (``auth``, ``quota``
         or ``transient`` provider cause, or an unreachable store) latches the leg
-        off for the rest of the command; any other fault costs one owner. Each
-        prints one stderr line naming no verb (stdout is the MCP JSON-RPC channel).
+        off for the rest of the command; any other fault costs one owner. A failed
+        write prints one stderr line naming the selectored ``sync`` whose drain
+        retries the row (stdout is the MCP JSON-RPC channel); the unlicensed
+        absent-collection probe stays silent (``status`` states that gap).
 
         Args:
             delta: The commit's delta (``created``, ``rejection_enqueue_seq``).
@@ -3662,37 +3680,41 @@ class MitosSyncManager:
             # among them: the client reads it as "exists" and writes.
             self._warn_rejection_items_not_indexed(entry, exc)
 
-    @staticmethod
     def _warn_rejection_items_not_indexed(
-        entry: ParsedEntry, exc: BaseException
+        self, entry: ParsedEntry, exc: BaseException
     ) -> None:
         """Prints the rejection leg's one failure line on stderr.
 
-        It names no verb: the row stays queued for the drain, and naming a command
-        that does not yet act on this backlog would be a false recovery.
+        It names the selectored ``sync``: a failure arises only where a write was
+        attempted, so the collection exists or the write was licensed, and the next
+        ``sync``'s rejection drain does act on the row. stderr only, never an MCP
+        payload — the channel the decision leg's ``reconcile`` line already uses.
         """
         try:
             print(
                 f"[Warning] Rejected items for '{entry.slug}' were not indexed: "
-                f"{describe_embed_failure(exc)}. Its rejection backlog row stays queued.",
+                f"{describe_embed_failure(exc)}. Its rejection backlog row stays queued; "
+                f"the next `mitos sync {shell_flag('-p', self.config.project)}` "
+                f"retries it.",
                 file=sys.stderr,
             )
         except Exception:
             pass
 
-    @staticmethod
     def _warn_rejection_row_not_cleared(
-        entry: ParsedEntry, exc: BaseException
+        self, entry: ParsedEntry, exc: BaseException
     ) -> None:
         """Prints the line for a write that landed and a clear that failed.
 
-        Like :meth:`_warn_rejection_items_not_indexed`, it names no verb.
+        Like :meth:`_warn_rejection_items_not_indexed`, it names the selectored
+        ``sync``, whose drain finds every item present and clears the row.
         """
         try:
             print(
                 f"[Warning] Rejected items for '{entry.slug}' were indexed, but its "
                 f"rejection backlog row could not be cleared: "
-                f"{describe_embed_failure(exc)}. The row stays queued.",
+                f"{describe_embed_failure(exc)}. The row stays queued; the next "
+                f"`mitos sync {shell_flag('-p', self.config.project)}` clears it.",
                 file=sys.stderr,
             )
         except Exception:
@@ -4071,6 +4093,12 @@ class MitosSyncManager:
         outage, a refusal, a read fault or an escaped exception keeps it, and only
         the marker this drain read is spent (ADR
         ``seed-marker-is-spent-once-a-drain-has-attempted-every-row-standing-at-its-entry``).
+        Its four producers are the operator's covering acts, never a read, a record or
+        a check (``migrations.REJECTION_SEED_ESTABLISHED_BY``): ``reconcile``, when it
+        queued an owner the index lacked; ``rebuild`` and ``cutover``, in the aside
+        transaction beside the decision marker; and an import into a graph that held no
+        decision. Without one, an absent collection makes the drain refuse, naming
+        ``mitos reconcile``.
 
         Args:
             report: Print the summary lines (:func:`rejection_drain_report`) after
@@ -4147,7 +4175,7 @@ class MitosSyncManager:
         )
 
     def reconcile_embeddings(self) -> Dict[str, Any]:
-        """Embeds every node the decision index is missing, drains, then collects node-less points.
+        """Heals both indexes: embeds what each is missing, drains, then collects what is dead.
 
         Heals the gap an ordinary drain cannot reach: when Qdrant is wiped directly
         (a bare ``curl -X DELETE`` of the collection) WITHOUT a ``rebuild``/
@@ -4166,8 +4194,9 @@ class MitosSyncManager:
         Bounded to one paginated scroll + a set difference (no per-node probes), so
         it stays cheap at the P11 horizon, and the drain is handed that same listing
         rather than scrolling again. Idempotent: a second run finds nothing missing
-        and enqueues nothing. Re-queued nodes hit the embedding cache, so the heal
-        costs no embedding-API calls when the text is unchanged.
+        and enqueues nothing. Re-queued decision nodes hit the embedding cache, so
+        the decision half costs no embedding-API calls when the text is unchanged;
+        the rejection index keeps no cache (below).
 
         An **absent collection reads as empty**, not as an error: it is the very
         state this heal exists for (a wipe, or a rename that left the old name
@@ -4203,6 +4232,25 @@ class MitosSyncManager:
         ``graph_unbuilt`` instead, so ``cmd_reconcile`` names ``mitos rebuild``
         exactly when ``status``' unbuilt rung does.
 
+        **The rejection index** (R1–R5, after the decision heal, each step in a
+        bulkhead of its own). Its expected set is computable from the graph alone —
+        every decision's ``rejected_paths``, enumerated by the one leaf
+        (:func:`~mitos.rejections.expected_rejection_points`) — and it is diffed by
+        point id (:func:`~mitos.rejections.diff_rejection_index`), the same diff
+        ``status`` words, so the heal clears its own warning. R1 reads the owners'
+        fields, R2 lists the whole index once with owners (absent reads as empty),
+        R3 queues every owner lacking an item (a standing row is never touched) and
+        stamps ``rejection_seed("reconcile")`` when anything is missing, R4 is the
+        rejection drain (it lists for itself and, under that marker, creates an
+        absent collection and writes every item), and R5 deletes the listing's
+        stale items (an owner that no longer states them) and orphaned ones (an
+        owner not in the graph, or unnamed) — judged against a graph read taken
+        after the listing, under the drain's lock, and never over a graph holding
+        no node (:meth:`_collect_rejection_index`). The items bypass the embedding
+        cache: a first build or a lost collection pays one embedding per item, the
+        missing count ``status`` prices. With no provider or no rejection index,
+        nothing of it runs, silently.
+
         Precedence for the partition keys, first match wins (the same rule
         ``status`` applies): the graph pair could not be read, or the provider-down
         return → ``None``/``None``; an empty listing (absent collection, or no
@@ -4231,7 +4279,14 @@ class MitosSyncManager:
             roughly ``status``' next count. Last, ``rejection_drain``: the
             rejection backlog's drain, :meth:`RejectionDrainOutcome.to_dict`
             (``stop="unavailable"`` with its counts read when the drain did not
-            run or raised). Every return path carries the same key set.
+            run or raised), and beside it ``rejection_index``: ``expected_items``,
+            ``expected_owners``, ``present_items``, ``collection_present``,
+            ``missing_items`` (R3's count: what this reconcile set out to embed),
+            ``owners_queued``, ``seed_stamped``, ``stale_items`` and
+            ``orphan_items`` (the listing as R5 judged it; None unless
+            ``judged``), ``deleted``, ``delete_failed`` and ``collected`` (one of
+            :data:`REJECTION_COLLECT_OUTCOMES`); a count not computed is None.
+            Every return path carries the same key set.
 
         Raises:
             VectorStoreError: If Qdrant is unreachable while scrolling point ids.
@@ -4267,6 +4322,7 @@ class MitosSyncManager:
                 "graph_unbuilt": self.is_graph_unbuilt(),
                 # Not drained (no provider); its two counts are still read.
                 "rejection_drain": self._rejection_drain_unavailable().to_dict(),
+                "rejection_index": self._rejection_index_unavailable(),
             }
 
         expected_ids = self.store.get_decision_index_expected_ids()
@@ -4304,10 +4360,29 @@ class MitosSyncManager:
             written = drained.written
             drain_stop = drained.stop
 
-        # The rejection backlog's drain, in a bulkhead of its own: a fault in it
+        # The rejection index, R1–R3: measure it against the graph and queue every
+        # owner lacking an item (stamping the marker), in a bulkhead of its own — a
+        # fault leaves nothing queued or stamped and the decision heal untouched.
+        # Silent with no index (the drain is silent there too).
+        rejection_index = self._rejection_index_unavailable()
+        rejection_listing: Optional[Dict[str, Optional[str]]] = None
+        enumerated: Dict[Tuple[str, str], Tuple[str, ...]] = {}
+        if self.rejection_index is not None:
+            try:
+                rejection_listing = self._measure_rejection_index(rejection_index, enumerated)
+            except Exception as e:
+                print(
+                    f"[Warning] The rejection index could not be measured against "
+                    f"the graph: {describe_embed_failure(e)}",
+                    file=sys.stderr,
+                )
+                rejection_index["collected"] = REJECTION_COLLECT_UNAVAILABLE
+
+        # R4, the rejection backlog's drain, in a bulkhead of its own: a fault in it
         # leaves the decision heal and the collection below untouched, and the key
         # still lands (an unavailable outcome, its counts read). Before the graph
-        # read below, which judges only the decision collection's points.
+        # read below, which judges only the decision collection's points. It lists
+        # for itself: its watermark needs its own read before its own listing.
         try:
             rejection = self.drain_rejection_backlog(report=False)
         except Exception as e:
@@ -4316,6 +4391,18 @@ class MitosSyncManager:
                 file=sys.stderr,
             )
             rejection = self._rejection_drain_unavailable()
+
+        # R5, the rejection index's collection, after the drain and in its own
+        # bulkhead: only over a listing R2 actually made.
+        if rejection_listing is not None:
+            try:
+                self._collect_rejection_index(rejection_index, rejection_listing, enumerated)
+            except Exception as e:
+                print(
+                    f"[Warning] The rejection index's collection stopped: {e}",
+                    file=sys.stderr,
+                )
+                rejection_index["collected"] = REJECTION_COLLECT_UNAVAILABLE
 
         # The collection: the graph pair is read AFTER the listing (and the drain),
         # so every listed point's node is committed by now — a write commits its node
@@ -4369,6 +4456,7 @@ class MitosSyncManager:
             "delete_failed": delete_failed,
             "graph_unbuilt": self.is_graph_unbuilt(),
             "rejection_drain": rejection.to_dict(),
+            "rejection_index": rejection_index,
         }
 
     def is_graph_unbuilt(self) -> bool:
@@ -4382,12 +4470,7 @@ class MitosSyncManager:
         )
 
     def _delete_nodeless_points(self, nodeless: AbstractSet[str]) -> Tuple[int, int]:
-        """Deletes node-less points chunk by chunk; counts confirmed and failed.
-
-        A chunk refused or left unconfirmed (plain ``VectorStoreError``) is counted
-        failed and the next chunk is tried. An unreachable Qdrant or a missing
-        collection stops the loop, because every later chunk would meet the same
-        fault; every id not yet confirmed is counted failed. Nothing else is caught.
+        """Deletes the decision collection's node-less points; counts confirmed and failed.
 
         Args:
             nodeless: The listed ids whose node is not in the graph.
@@ -4395,18 +4478,42 @@ class MitosSyncManager:
         Returns:
             ``(deleted, delete_failed)``.
         """
-        ids = sorted(nodeless)
+        return self._delete_points_chunked(
+            self.vector_store, nodeless, noun="node-less point"
+        )
+
+    @staticmethod
+    def _delete_points_chunked(
+        client: Any, point_ids: AbstractSet[str], *, noun: str
+    ) -> Tuple[int, int]:
+        """Deletes listed points by id, chunk by chunk; counts confirmed and failed.
+
+        The one stop/continue rule for both indexes' collections. A chunk refused or
+        left unconfirmed (plain ``VectorStoreError``) is counted failed and the next
+        chunk is tried. An unreachable Qdrant or a missing collection stops the loop,
+        because every later chunk would meet the same fault; every id not yet
+        confirmed is counted failed. Nothing else is caught.
+
+        Args:
+            client: The collection's client (``delete_points(ids)``).
+            point_ids: The listed ids to delete.
+            noun: What a point is, singular, for the warnings.
+
+        Returns:
+            ``(deleted, delete_failed)``.
+        """
+        ids = sorted(point_ids)
         size = _ORPHAN_DELETE_CHUNK
         deleted = 0
         failed = 0
         for start in range(0, len(ids), size):
             chunk = ids[start:start + size]
             try:
-                self.vector_store.delete_points(chunk)
+                client.delete_points(chunk)
             except (VectorStoreUnreachableError, CollectionMissingError) as e:
                 failed += len(ids) - start
                 print(
-                    f"[Warning] Stopped deleting node-less points; "
+                    f"[Warning] Stopped deleting {noun}s; "
                     f"{len(ids) - start} not deleted: {e}",
                     file=sys.stderr,
                 )
@@ -4414,12 +4521,147 @@ class MitosSyncManager:
             except VectorStoreError as e:
                 failed += len(chunk)
                 print(
-                    f"[Warning] {len(chunk)} node-less point(s) not deleted: {e}",
+                    f"[Warning] {len(chunk)} {noun}(s) not deleted: {e}",
                     file=sys.stderr,
                 )
                 continue
             deleted += len(chunk)
         return deleted, failed
+
+    @staticmethod
+    def _rejection_index_unavailable() -> Dict[str, Any]:
+        """``reconcile --json``'s ``rejection_index`` when nothing was measured.
+
+        Counts not computed are None; nothing was queued, stamped or deleted.
+        """
+        return {
+            "expected_items": None, "expected_owners": None, "present_items": None,
+            "collection_present": None, "missing_items": None, "owners_queued": 0,
+            "seed_stamped": False, "stale_items": None, "orphan_items": None,
+            "deleted": 0, "delete_failed": 0,
+            "collected": REJECTION_COLLECT_UNAVAILABLE,
+        }
+
+    def _measure_rejection_index(
+        self, index: Dict[str, Any], memo: Dict[Tuple[str, str], Tuple[str, ...]]
+    ) -> Dict[str, Optional[str]]:
+        """Reconcile's R1–R3: reads the owners, lists the index, queues the missing.
+
+        Fills ``index`` in place as each count is computed, so a fault part-way
+        leaves only what was really read. The owner fields are read **before** the
+        listing, for the missing count only: an item written between the two is
+        listed, so it is not queued, and an owner that changes between them is
+        queued anyway and the drain converges it. Every owner lacking an item is
+        queued (never a standing row touched), and the rejection seed marker is
+        stamped (``reconcile``) only when something is missing — the act that
+        makes the backlog cover the expected set, and so the one that licenses the
+        drain to create an absent collection.
+
+        Args:
+            index: The ``rejection_index`` dict being built.
+            memo: The command's enumeration memo, shared with R5.
+
+        Returns:
+            The listing (``{}`` for an absent collection).
+
+        Raises:
+            Exception: Any graph, listing or write fault; the caller reports it.
+        """
+        owner_fields = self.store.get_rejection_index_owner_fields()
+        expected = expected_rejection_points(owner_fields, memo)
+        index["expected_items"] = len(expected)
+        index["expected_owners"] = len(set(expected.values()))
+        try:
+            listing = self.rejection_index.list_point_owners()
+            index["collection_present"] = True
+        except CollectionMissingError:
+            listing = {}
+            index["collection_present"] = False
+        index["present_items"] = len(listing)
+        diff = diff_rejection_index(expected, listing, owners=owner_fields.keys())
+        index["missing_items"] = len(diff.missing)
+        if diff.missing:
+            index["owners_queued"] = self.store.enqueue_rejection_backlog_owners(
+                sorted(diff.missing_owners)
+            )
+            self.store.stamp_rejection_seed("reconcile")
+            index["seed_stamped"] = True
+        return listing
+
+    def _collect_rejection_index(
+        self,
+        index: Dict[str, Any],
+        listing: Dict[str, Optional[str]],
+        memo: Dict[Tuple[str, str], Tuple[str, ...]],
+    ) -> None:
+        """Reconcile's R5: deletes the listing's stale and orphaned items, under the drain lock.
+
+        The listing is judged against a graph read taken **after** it (and after
+        the drain), so an item a record or amend writes mid-collection was never
+        listed and is never judged, and a listed item its owner still states at
+        this read is expected and kept. Precedence, first match wins: an empty
+        listing is judged and empty on any graph (no lock, no second read — every
+        first build); otherwise the rejection drain's operating-system lock is
+        taken non-blocking (held → ``held``, nothing deleted; not takeable →
+        ``unavailable``); under it a graph holding no node is ``unbuilt`` (every
+        item would look ownerless — the decision collection's guard, keyed on the
+        node count); otherwise the listing is judged and its stale and orphaned
+        items are deleted by id. Every remover takes that one lock (ADR
+        ``rejection-index-removers-share-the-drain-lock-reconcile-collects-under-it``),
+        so a concurrent ``sync`` drain cannot interleave between this read and its
+        deletes. A graph fault under the lock is ``unread``. Re-deleting an item
+        the drain already removed is harmless: a delete of an absent id completes.
+
+        Args:
+            index: The ``rejection_index`` dict being built, filled in place.
+            listing: R2's listing (``listing0``).
+            memo: The command's enumeration memo, shared with R1.
+        """
+        if not listing:
+            index.update(stale_items=0, orphan_items=0, collected=REJECTION_COLLECT_JUDGED)
+            return
+        collect_lock = FileLock(rejection_drain_lock_path(self.config), timeout=0)
+        try:
+            collect_lock.acquire()
+        except Timeout:
+            # Ahead of OSError, which Timeout subclasses.
+            index["collected"] = REJECTION_COLLECT_HELD
+            return
+        except OSError as e:
+            print(
+                f"[Warning] The rejection index was not collected: the rejection "
+                f"backlog's lock could not be taken ({e}).",
+                file=sys.stderr,
+            )
+            index["collected"] = REJECTION_COLLECT_UNAVAILABLE
+            return
+        try:
+            try:
+                node_count = len(self.store.get_all_node_ids())
+                owner_fields = (
+                    self.store.get_rejection_index_owner_fields() if node_count else {}
+                )
+                expected = expected_rejection_points(owner_fields, memo)
+            except Exception as e:
+                print(
+                    f"[Warning] Could not read the graph to judge the rejection index's "
+                    f"items; nothing was deleted from it: {e}",
+                    file=sys.stderr,
+                )
+                index["collected"] = REJECTION_COLLECT_UNREAD
+                return
+            if node_count == 0:
+                index["collected"] = REJECTION_COLLECT_UNBUILT
+                return
+            diff = diff_rejection_index(expected, listing, owners=owner_fields.keys())
+            index["stale_items"] = len(diff.stale)
+            index["orphan_items"] = len(diff.orphaned)
+            index["deleted"], index["delete_failed"] = self._delete_points_chunked(
+                self.rejection_index, diff.stale | diff.orphaned, noun="rejected item"
+            )
+            index["collected"] = REJECTION_COLLECT_JUDGED
+        finally:
+            collect_lock.release()
 
     # --- record_decision: the write half of the MCP server (Fork A) ---
 

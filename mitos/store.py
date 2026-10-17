@@ -285,10 +285,11 @@ _DECISION_INDEX_EXPECTED_PREDICATE: str = (
 # The rejection index's OWNERS (recall-confidence 4b): every decision node in every
 # computed state, and nothing else — an open question holds no ``rejected_paths``, so
 # it never owns an item. Bound by ``rejection_index_expects_owner_other_than`` (the
-# inline creation licence: "the graph's only decision, live or retired"), and the one
-# atom any later expected-set read or gap predicate of the rejection index binds, so
-# the licence and the sensor cannot drift. A superset of "decisions holding at least
-# one item" only through a decision whose field enumerates nothing, which every write
+# inline creation licence: "the graph's only decision, live or retired"), by the
+# expected-set read ``get_rejection_index_owner_fields`` (4d), by the gap predicate's
+# read ``rejection_index_expects_items`` and by the import's empty-graph read
+# ``holds_any_decision`` — one atom, so the licence and the sensor cannot drift. A
+# superset of "decisions holding at least one item" only through a decision whose field enumerates nothing, which every write
 # route refuses; there the licence errs safe (no create; the row waits for a
 # ``reconcile``). Correlates on the UNALIASED ``nodes`` (the §4.3 alias trap).
 _REJECTION_INDEX_OWNER_PREDICATE: str = "nodes.kind = 'decision'"
@@ -580,7 +581,8 @@ def write_rejection_seed(
 
     The in-transaction twin of :meth:`GraphStore.stamp_rejection_seed`, mirroring
     :func:`write_embedding_seed`: the statement is issued and the transaction is left
-    to the caller. The ``established_by`` vocabulary is enforced by the table's own
+    to the caller. Its caller is ``cutover._prune_embedding_queue_to_expected``
+    (``rebuild``/``cutover``, in the aside transaction). The ``established_by`` vocabulary is enforced by the table's own
     ``CHECK`` (``migrations.REJECTION_SEED_ESTABLISHED_BY``).
 
     Args:
@@ -3089,8 +3091,7 @@ class GraphStore:
     def get_active_node_ids(self) -> Set[str]:
         """Returns the active node id set (active decisions + open questions).
 
-        Reads through the store's own active-view methods rather than re-encoding
-        the kill-edge anti-join. This is a count of *the live architectural surface*
+        This is a count of *the live architectural surface*
         and nothing else: ``status``' ``active_nodes`` / ``missing_active_*``,
         ``reconcile``'s ``active`` key and the rebuild's
         ``reconstructed_active_count``. It is **not** what the decision index should
@@ -3098,12 +3099,27 @@ class GraphStore:
         every retired decision too), and every "what should the index hold?" consumer
         reads that one (``tests/test_expected_set.py`` pins who calls which).
 
+        One ids-only SQL over the shipped ``_ACTIVE_VIEW_PREDICATE`` (WIRING_LEDGER
+        entry-009): the same population as the ids of :meth:`get_active_decisions`
+        plus :meth:`get_open_questions` — both apply exactly that predicate unscoped,
+        a drifted decision stays in and a parked or resolved open question stays in —
+        without hydrating a row. ``nodes`` stays UNALIASED so the correlated
+        predicate binds. ``tests/test_rejection_covering.py`` pins the agreement with
+        the hydrating derivation over a fixture matrix.
+
         Returns:
             The set of active decision + open-question node ids (SHA-256 hashes).
         """
-        active: Set[str] = {node["id"] for node in self.get_active_decisions()}
-        active.update(node["id"] for node in self.get_open_questions())
-        return active
+        conn = self._get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT nodes.id FROM nodes "
+                "WHERE nodes.kind IN ('decision', 'open_question') "
+                f"AND {_ACTIVE_VIEW_PREDICATE}"
+            ).fetchall()
+            return {row[0] for row in rows}
+        finally:
+            conn.close()
 
     def get_decision_index_expected_ids(self) -> FrozenSet[str]:
         """Returns the decision index's expected set, as ids, unhydrated.
@@ -3555,11 +3571,141 @@ class GraphStore:
         finally:
             conn.close()
 
+    def get_rejection_index_owner_fields(self) -> Dict[str, str]:
+        """Reads every rejection index owner's raw ``rejected_paths``, in one query.
+
+        Every decision node in every computed state (``_REJECTION_INDEX_OWNER_PREDICATE``),
+        the field coalesced to ``""`` exactly as :meth:`get_rejection_owner_fields`
+        does; the column holds the **raw** string, not JSON. This is the graph side
+        of the rejection index's expected set: ``rejections.expected_rejection_points``
+        turns it into point ids, and ``status`` and ``reconcile`` both diff a listing
+        against that, so the heal clears its own warning. It stays off
+        :class:`~mitos.protocols.GraphStoreProtocol`: both callers hold a concrete
+        ``GraphStore``.
+
+        Returns:
+            ``{decision id: raw rejected_paths}`` for every decision node.
+
+        Raises:
+            DatabaseError: If the read fails.
+        """
+        conn = self._get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT nodes.id, nodes.rejected_paths_json FROM nodes "
+                f"WHERE {_REJECTION_INDEX_OWNER_PREDICATE}"
+            ).fetchall()
+            return {row[0]: row[1] or "" for row in rows}
+        except sqlite3.Error as e:
+            raise DatabaseError(f"Failed to read rejection index owners: {str(e)}")
+        finally:
+            conn.close()
+
+    def rejection_index_expects_items(self) -> bool:
+        """Reports whether some decision's ``rejected_paths`` holds at least one item.
+
+        The rejection index's expected set is non-empty exactly when this is True,
+        so it is what ``recall.missing_rejection_index_is_a_gap`` gates on: an
+        absent collection is a gap only when there is something to build. A cursor
+        over the decisions with a non-empty column, answering at the first field
+        whose enumeration is not ``empty`` (in practice the first row); a
+        whitespace-only field is skipped exactly as the enumeration skips it. An
+        open question owns no item, so a questions-only graph answers False.
+
+        Store faults propagate; the predicate turns them into its loud answer.
+
+        Returns:
+            True iff the rejection index's expected set holds an item.
+        """
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                "SELECT nodes.rejected_paths_json FROM nodes "
+                f"WHERE {_REJECTION_INDEX_OWNER_PREDICATE} "
+                "AND nodes.rejected_paths_json IS NOT NULL "
+                "AND nodes.rejected_paths_json != ''"
+            )
+            for row in cursor:
+                if enumerate_rejected_paths(row[0]).shape != "empty":
+                    return True
+            return False
+        finally:
+            conn.close()
+
+    def holds_any_decision(self) -> bool:
+        """Reports whether the graph holds any decision node, in any state.
+
+        The import's "into an empty graph" question for the rejection seed marker:
+        empty means no rejection index owner, so a graph holding only open
+        questions is empty for this index. An ``EXISTS … LIMIT 1`` over
+        ``_REJECTION_INDEX_OWNER_PREDICATE``.
+
+        Returns:
+            True iff at least one decision node exists.
+
+        Raises:
+            DatabaseError: If the read fails.
+        """
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                f"SELECT 1 FROM nodes WHERE {_REJECTION_INDEX_OWNER_PREDICATE} LIMIT 1"
+            ).fetchone()
+            return row is not None
+        except sqlite3.Error as e:
+            raise DatabaseError(f"Failed to read the graph's decisions: {str(e)}")
+        finally:
+            conn.close()
+
+    def enqueue_rejection_backlog_owners(self, node_ids: Iterable[str]) -> int:
+        """Queues each named owner that has no standing rejection backlog row.
+
+        ``reconcile``'s enqueue, the standalone twin of the commit-only
+        ``_enqueue_rejection_backlog``. One transaction; an owner that already has a
+        row is left exactly as it stands (``ON CONFLICT(node_id) DO NOTHING``): its
+        seq is never re-minted, so a drain mid-walk sees no spurious retake, and its
+        ``retry_count`` is never reset, so a poison row keeps reading past the
+        tolerance. That deliberately departs from the decision outbox's
+        ``add_pending_embedding``, which resets the retry count.
+
+        Args:
+            node_ids: The owners to queue (decision ids already in the graph).
+
+        Returns:
+            The number of rows inserted.
+
+        Raises:
+            DatabaseError: If the write fails.
+        """
+        ids = list(dict.fromkeys(node_ids))
+        if not ids:
+            return 0
+        now = _utc_now_iso()
+        conn = self._get_connection()
+        try:
+            with conn:
+                inserted = 0
+                for node_id in ids:
+                    cursor = conn.execute(
+                        "INSERT INTO rejection_backlog (node_id, queued_at, retry_count) "
+                        "VALUES (?, ?, 0) ON CONFLICT(node_id) DO NOTHING",
+                        (node_id, now),
+                    )
+                    inserted += cursor.rowcount
+            return inserted
+        except sqlite3.Error as e:
+            raise DatabaseError(f"Failed to queue rejection backlog owners: {str(e)}")
+        finally:
+            conn.close()
+
     def stamp_rejection_seed(self, established_by: str) -> None:
         """Records that the rejection backlog covers the rejection index's expected set.
 
         The standalone-connection twin of :func:`write_rejection_seed`, mirroring
-        :meth:`stamp_embedding_seed`. Re-stamping replaces the existing row.
+        :meth:`stamp_embedding_seed`. Re-stamping replaces the existing row. Its
+        callers are ``reconcile_embeddings`` (when it queued a missing owner) and
+        ``MitosProseImporter.import_from_file`` (an import into a graph that held no
+        decision).
 
         Args:
             established_by: The verb that established coverage — one of
