@@ -318,8 +318,9 @@ def _assert_degraded_statement(driver: str, resp: Any, cause: str) -> None:
         assert not any(stem in resp for stem in _EDGE_STEMS)
         assert "⚠ confidence:" not in resp
         return
+    # 6b: the band's evidence object is named beside the band it rides with.
     assert resp["not_computed"] == list(DEGRADED_NOT_COMPUTED) == [
-        "retired_partition", "edge", "band"]
+        "retired_partition", "edge", "band", "band_evidence"]
     assert f"{_OMISSION} {section}" in resp["note"]
     assert resp["rejection_section"] == "lexical"
     for key in _BAND_KEYS:

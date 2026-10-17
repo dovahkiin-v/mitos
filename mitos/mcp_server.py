@@ -8,7 +8,7 @@ import difflib
 import json
 import os
 import sys
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Sequence, Tuple
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.utilities.func_metadata import FuncMetadata, func_metadata
 from pydantic import ValidationError
@@ -39,18 +39,17 @@ from mitos.divergence import corpus_holds_entries
 # Module level on purpose: `amend` and `restore` close over no `cli`/`sync`/`store`
 # (measured at planning), so unlike `MitosSyncManager` neither needs deferring.
 from mitos.restore import BufferFidelityError
-from mitos.recall import (RANKED_EDGE_MARGIN, RetiredPartition,
-                          assess_query_recall, assess_surface_recall, blackout_note,
+from mitos.recall import (RANKED_EDGE_MARGIN, RANKED_TOP_CLUSTER_MARGIN,
+                          RetiredPartition, compose_ranked,
                           corpus_provenance, missing_graph_is_a_gap,
-                          missing_graph_note, missing_index_is_a_gap,
+                          missing_index_is_a_gap,
                           missing_rejection_index_is_a_gap, REJECTION_MATCH_FLOOR,
                           REJECTION_LOOKUP_OVER_BUDGET_REASON,
                           REJECTION_SECTION_BOUND, lookup_field_fault,
-                          rejection_lookup, rejection_lookup_gap_reason,
-                          rejection_section,
-                          retired_partition, scope_filter_recovery, count_withheld,
-                          short_window, stamps_unread_clause, window_edge,
-                          withheld_clause)
+                          oq_scan_fault_clause, rejection_lookup,
+                          rejection_lookup_gap_reason, rejection_section,
+                          retired_partition, scope_counts_fault_clause,
+                          scope_filter_recovery, count_withheld)
 from mitos.rejections import point_items
 from mitos.retrieval_walk import (REJECTIONS_OVER_BUDGET, RejectionLeg,
                                   WalkContractError, walk_ranked,
@@ -784,7 +783,8 @@ def _lexical_degraded_response(query: str, *, config: MitosConfig, reason: str,
                                store: Optional[GraphStore],
                                full_top: Optional[int], limit: int,
                                open_questions: Optional[List[Dict[str, Any]]] = None,
-                               check_notice: Optional[Dict[str, Any]] = None) -> str:
+                               check_notice: Optional[Dict[str, Any]] = None,
+                               scan_faults: Sequence[str] = ()) -> str:
     """Encodes the lexical degraded envelope for the MCP read tools.
 
     The MCP twin of ``cli._emit_lexical_degraded`` (ADR
@@ -813,6 +813,8 @@ def _lexical_degraded_response(query: str, *, config: MitosConfig, reason: str,
             the envelope (present-if-scanned semantics — None means omitted).
         check_notice: The standing check notice ``surface_decisions`` composed,
             carried verbatim; None (``query_decisions`` always) means omitted.
+        scan_faults: ``recall.oq_scan_fault_clause`` when the scoped open-question
+            scan raised (WIRING_LEDGER entry-005); empty otherwise.
 
     Returns:
         The degraded envelope as a JSON string.
@@ -820,7 +822,7 @@ def _lexical_degraded_response(query: str, *, config: MitosConfig, reason: str,
     envelope = lexical_envelope(
         query, config=config, surface="mcp", reason=reason, store=store,
         limit=limit, full_top=full_top, open_questions=open_questions,
-        check_notice=check_notice,
+        check_notice=check_notice, scan_faults=scan_faults,
     )
     return dumps_display(envelope, ensure_ascii=False, indent=2)
 
@@ -992,17 +994,12 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
     results: Dict[str, Any] = {"active_decisions": []}
     results.update(corpus_provenance(config))
     semantic_ran = False
-    top_score: Optional[float] = None
     degraded_error: Optional[Exception] = None
-    edge = None
-    # The retired partition and the short window, bound before the walk so every
-    # exit — degraded, and the healthy-empty CollectionMissingError arm with no walk
-    # — hands the composer a value, never an unbound name.
+    # The retired partition, bound before the walk so every exit — degraded, and the
+    # healthy-empty CollectionMissingError arm with no walk — hands the composer a
+    # value, never an unbound name.
     part = RetiredPartition([], 0, False)
     handles: List[Dict[str, Any]] = []
-    short = None
-    lead = None
-    dump_total: Optional[int] = None
     # The rejection section; composed only when the walk ran.
     section = None
 
@@ -1043,26 +1040,18 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
     # Composition, outside the `try`: pure shaping over what the walk returned, so
     # a defect here is loud rather than posing as degraded recall.
     if walk is not None:
-        # The rank just past the live window: retired and open-question points
-        # take no slots, so it is the next live decision the walk found.
-        edge = window_edge(walk, margin=RANKED_EDGE_MARGIN,
-                           ceiling=RANKED_LIMIT_CEILING, full_top=full_top)
         for rank, hit in enumerate(walk.window, start=1):
             results["active_decisions"].append(
                 _decision_payload(hit.node, hit.score,
                                   brief=_rank_thinned(rank, full_top),
                                   stamps=walk.stamps)
             )
-        if walk.window:
-            top_score = max(hit.score for hit in walk.window)
         # The retired decisions this ranking passed, closest first, bounded at
         # `limit` (zero live: the blackout's handles). One constructor for both keys.
         part = retired_partition(walk)
         handles = [retired_handle(h.node, score=h.score, stamps=walk.stamps,
                                   live_ends=walk.live_ends)
                    for h in part.shown]
-        short = short_window(walk)
-        lead = handles[0] if part.leads else None
         # The rejection section, composed once (recall): matches, state, clause, and
         # the withheld count over decisions. The gap's graph read happens only when
         # the collection was absent, and outside the ranked `try`.
@@ -1072,7 +1061,32 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
             shape=rejection_matches_payload, surface="mcp", config=config,
         )
 
-    # 2. Scope pre-filtering fallback — ONLY when semantic recall is down (degraded).
+    # The degraded cause, computed once and handed to both the lexical exit's header
+    # and the scope dump's note, so the two cannot name different causes.
+    reason = (degraded_reason_from_error(degraded_error, surface="mcp",
+                                         project=config.project)
+              if not semantic_ran else None)
+
+    # 2. Append Open Questions ONLY when a scope was given (C4 resolves clause).
+    #    Omitting the key when no scope disambiguates "not scanned" from "none here";
+    #    a scan that raised omits it too and says so (WIRING_LEDGER entry-005), since
+    #    `[]` would claim "none parked here" for a scan that never finished.
+    scan_faults: List[str] = []
+    if scope:
+        open_questions = []
+        oq_unread = False
+        try:
+            for q in store.get_open_questions(scope=scope):
+                if q["state"] == "parked":
+                    open_questions.append(_oq_payload(q))
+        except Exception:
+            oq_unread = True
+        if oq_unread:
+            scan_faults.append(oq_scan_fault_clause(scope))
+        else:
+            results["open_questions"] = open_questions
+
+    # 3. Scope pre-filtering fallback — ONLY when semantic recall is down (degraded).
     #    When semantic ran and simply found nothing, do NOT dump an unranked scope
     #    listing dressed as matches — that's the false-precedent ambiguity P5 closes.
     #    One read, stamped by its own hydration; None (a fault, or an empty scope)
@@ -1081,30 +1095,16 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         dump = scope_dump(store, scope, limit=top_k, full_top=full_top)
         if dump is not None:
             results["active_decisions"] = dump.decisions
-            dump_total = dump.total
-            # The dump's rejection section, matched by words, and the rest of its
-            # degraded statement (`not_computed`, the section clause), composed
-            # once; the tail below places them as it places a ranked section.
-            section = dump_section(query, dump, config=config, store=store,
-                                   full_top=full_top)
-
-    # The degraded cause, computed once and handed to both the lexical exit's header
-    # and the scope-dump / partial-list note, so the two cannot name different causes.
-    reason = (degraded_reason_from_error(degraded_error, surface="mcp",
-                                         project=config.project)
-              if not semantic_ran else None)
-
-    # 3. Append Open Questions ONLY when a scope was given (C4 resolves clause).
-    #    Omitting the key when no scope disambiguates "not scanned" from "none here".
-    if scope:
-        open_questions = []
-        try:
-            for q in store.get_open_questions(scope=scope):
-                if q["state"] == "parked":
-                    open_questions.append(_oq_payload(q))
-        except Exception:
-            pass
-        results["open_questions"] = open_questions
+            # The dump's whole degraded statement — its note, `not_computed`, the
+            # section matched by words, the withheld count — composed once; the
+            # boundary places its keys.
+            dumped = dump_section(query, dump, config=config, store=store,
+                                  full_top=full_top, surface="mcp", scope=scope,
+                                  reason=reason, scan_faults=scan_faults)
+            results.update(dumped.envelope_keys())
+            if notice:
+                results["check_notice"] = notice
+            return dumps_display(results, ensure_ascii=False, indent=2)
 
     # Degraded and empty-handed on decisions: route into the deterministic
     # lexical fallback (ADR read-verbs-degrade-to-lexical-decisions-md-fallback)
@@ -1116,98 +1116,36 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
             query, config=config, reason=reason,
             store=store, full_top=full_top, limit=top_k,
             open_questions=results.get("open_questions"),
-            check_notice=notice,
+            check_notice=notice, scan_faults=scan_faults,
         )
 
-    # Confidence signal — let the agent tell a settled precedent from loose neighbours
-    # or genuine absence, instead of a boilerplate note that read the same every time
-    # (AX P5). Pass the live scope-count map (busiest-first) when a scope is given: it is
-    # the unused-scope oracle (a tag absent from it gets a bounded self-correction
-    # vector) and the did-you-mean / top-K source. Calm-degrade to None on error.
+    # The live scope-count map (busiest-first) when a scope is given: the unused-scope
+    # oracle (a tag absent from it gets a bounded self-correction vector) and the
+    # did-you-mean / top-K source. A read that raised leaves it None and is named.
     scope_counts: Optional[Dict[str, Dict[str, int]]] = None
     if scope:
+        counts_unread = False
         try:
             scope_counts = order_scope_counts(store.get_scope_counts())
         except Exception:
-            pass
+            counts_unread = True
+        if counts_unread:
+            scan_faults.append(scope_counts_fault_clause(scope))
 
-    confidence, note = assess_surface_recall(
-        semantic_ran=semantic_ran,
-        top_score=top_score,
-        result_count=len(results["active_decisions"]),
-        scope=scope,
-        scope_counts=scope_counts,
-        surface="mcp",
-        edge=edge,
-        lead=lead,
-        short=short,
-        scope_total=dump_total,
-        degraded_reason=reason,
+    # The band, its evidence and the note, composed once (recall.compose_ranked):
+    # the leads, the legend, the top cluster, the edge, the absence clause and the
+    # omissions in one order, with the blackout and unbuilt-graph overrides at their
+    # recorded precedence. W31's predicate is asked only on an empty window.
+    composed = compose_ranked(
+        walk, register="surface", surface="mcp", config=config, handles=handles,
+        part=part, section=section,
+        unbuilt=lambda: missing_graph_is_a_gap(store, config,
+                                               corpus_scan=corpus_holds_entries),
+        top_cluster_margin=RANKED_TOP_CLUSTER_MARGIN, edge_margin=RANKED_EDGE_MARGIN,
+        ceiling=RANKED_LIMIT_CEILING, full_top=full_top, scope=scope,
+        scope_counts=scope_counts, scan_faults=scan_faults,
     )
-    if confidence is not None:
-        results["confidence"] = confidence
-    results["note"] = note
-    # Present whenever the ranking passed a retired decision; the count only when
-    # the bound left some out.
-    if handles:
-        results["retired_partition"] = handles
-        if part.omitted:
-            results["retired_partition_omitted"] = part.omitted
-    # The rejection section's keys, after the retired partition; none when it was
-    # computed and empty.
-    if section is not None:
-        results.update(section.envelope_keys())
-
-    # Blackout: semantic ranking ran and retrieved precedents, but every one is
-    # retired. Override the note with its zero-live form, naming each handle's live
-    # end, and attach the same handle list as `all_superseded` (CLI⇄MCP-identical
-    # shape, T5 parity). Distinct from a true miss (no handles); fires regardless of
-    # any parked open questions.
-    if semantic_ran and not results["active_decisions"] and handles:
-        results["note"] = blackout_note(handles, short=short, surface="mcp",
-                                        config=config)
-        results["all_superseded"] = handles
-
-    # W31 — the unbuilt graph (a clone carrying the corpus but not the gitignored
-    # *.sqlite). Consulted on the ORDINARY empty path, not in an `except` arm: an
-    # empty graph raises nothing, it answers empty, and that answer is what an agent
-    # reads as "no precedent" for a project holding hundreds. After the blackout
-    # override so the graph note wins if both applied — with no graph, a pointer at
-    # the graveyard names the wrong heal; in fact they exclude each other, since a
-    # retired handle is a node. CLI⇄MCP parity is structural: one predicate, one
-    # composer, each surface's own register.
-    if not results["active_decisions"] and missing_graph_is_a_gap(
-        store, config, corpus_scan=corpus_holds_entries
-    ):
-        results["note"] = missing_graph_note("mcp", config)
-
-    # The note's tail, after every override, in one order on all four surfaces:
-    # the rejection section's state clause, the withheld clause, the stamps-unread
-    # clause. An override can co-occur with a withheld count: a blackout or a miss
-    # under `brief` still withholds its `here` rejection owners.
-    if section is not None and section.clause:
-        results["note"] = f"{results['note']} {section.clause}"
-    # A thinned answer says so by a count and a clause, before the notice. The
-    # count is over decisions, section owners included, on the ranked answer and
-    # the scope dump alike. Absent at zero, so a default answer is byte-identical.
-    withheld = (section.withheld if section is not None
-                else count_withheld(results["active_decisions"]))
-    if withheld:
-        results["note"] = (
-            f"{results['note']} {withheld_clause(withheld, surface='mcp', config=config)}"
-        )
-        results["rejected_paths_withheld"] = withheld
-
-    # The stamps went unread: the ranking stands, the fault is stated. Last on the
-    # note, after every override and the withheld clause; absent when read. On the
-    # dump (no walk) it is the section owners' stamps that went unread.
-    stamps_unread = (walk.stamps_unread if walk is not None
-                     else section is not None and section.stamps_unread)
-    if stamps_unread:
-        results["note"] = (
-            f"{results['note']} {stamps_unread_clause(surface='mcp', config=config)}"
-        )
-        results["stamps_unread"] = True
+    results.update(composed.envelope_keys())
 
     # After the recall answer's own keys; absent (never null) when not shown.
     if notice:
@@ -1613,10 +1551,6 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
 
     # 2. Perform ranked semantic claim search
     if embed_provider and vector_store:
-        # Before the `try`, for the reason the CollectionMissingError arm below
-        # states: that arm builds its own empty envelope rather than falling
-        # through, so it needs a bound `top_score`.
-        top_score: Optional[float] = None
         top_k = clamp_limit(limit)
         try:
             q_vector = embed_provider.get_embedding(query, is_query=True)
@@ -1642,25 +1576,22 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             }
             empty.update(corpus_provenance(config))
             # This is the healthy-empty arm, not a degraded one: ranking ran and
-            # matched nothing, so it takes the band exactly like the envelope above.
-            # (Its degraded sibling, ten lines up, returns before assessment.)
-            # No edge: the query raised before any window came back.
-            confidence, note = assess_query_recall(
-                top_score=top_score, result_count=0, config=config, surface="mcp",
-                edge=None, lead=None, short=None,
+            # matched nothing, so it composes through the same composer as the
+            # envelope below, from no walk (its degraded sibling, ten lines up,
+            # returns before composition). W31 — the state this envelope was built
+            # for and the unbuilt graph are the SAME workspace on a clone (no
+            # *.sqlite, so no collection was ever created either): the composer's
+            # unbuilt override says why it is empty and names the heal.
+            composed = compose_ranked(
+                None, register="query", surface="mcp", config=config, handles=[],
+                part=RetiredPartition([], 0, False), section=None,
+                unbuilt=lambda: missing_graph_is_a_gap(
+                    store, config, corpus_scan=corpus_holds_entries),
+                top_cluster_margin=RANKED_TOP_CLUSTER_MARGIN,
+                edge_margin=RANKED_EDGE_MARGIN, ceiling=RANKED_LIMIT_CEILING,
+                full_top=full_top, scan_faults=(),
             )
-            empty["confidence"] = confidence
-            empty["note"] = note
-            # W31 — the state this envelope was built for and the unbuilt graph are
-            # the SAME workspace on a clone: no *.sqlite, so no collection was ever
-            # created either. `missing_index_is_a_gap` said the absence is healthy
-            # (an empty expected set has nothing to index); this says why it is
-            # empty, and names the heal that fixes both. Without it the clone
-            # gets the cleanest possible empty answer over hundreds of decisions.
-            if missing_graph_is_a_gap(
-                store, config, corpus_scan=corpus_holds_entries
-            ):
-                empty["note"] = missing_graph_note("mcp", config)
+            empty.update(composed.envelope_keys())
             return dumps_display(empty, ensure_ascii=False, indent=2)
         except Exception as e:
             # Embedding/Qdrant failure mid-query (e.g. a 429): never the raw
@@ -1674,9 +1605,6 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
         # Composition, outside the `try`: every arm above returns, so this is the
         # healthy ranked answer, and a shaping defect here is loud rather than
         # posing as degraded recall.
-        # The rank just past the live window — see surface_decisions.
-        edge = window_edge(walk, margin=RANKED_EDGE_MARGIN,
-                           ceiling=RANKED_LIMIT_CEILING, full_top=full_top)
         output_list = []
         for rank, hit in enumerate(walk.window, start=1):
             match = letter_payload(
@@ -1688,15 +1616,11 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             for key, slugs in walk.stamps.get(hit.node["id"], {}).items():
                 match[key] = list(slugs)
             output_list.append(match)
-        if walk.window:
-            top_score = max(hit.score for hit in walk.window)
         # The retired decisions this ranking passed — see surface_decisions.
         part = retired_partition(walk)
         handles = [retired_handle(h.node, score=h.score, stamps=walk.stamps,
                                   live_ends=walk.live_ends)
                    for h in part.shown]
-        short = short_window(walk)
-        lead = handles[0] if part.leads else None
         # The rejection section — see surface_decisions.
         section = rejection_section(
             walk, full_top=full_top,
@@ -1706,64 +1630,20 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
 
         envelope: Dict[str, Any] = {"query": query, "depth_mode": "letter", "matches": output_list}
         envelope.update(corpus_provenance(config))
-        # The confidence band, in the `query` register — a verdict on this
-        # ranking, never on the corpus. Assigned BEFORE the overrides below so
-        # blackout/unbuilt reassign the note over it (the note yields;
-        # `confidence` stands on every one of these exits).
-        confidence, note = assess_query_recall(
-            top_score=top_score,
-            result_count=len(output_list),
-            config=config,
-            surface="mcp",
-            edge=edge,
-            lead=lead,
-            short=short,
+        # The band in the `query` register — a verdict on this ranking, never on the
+        # corpus — its evidence and the note, composed once (see surface_decisions).
+        # The blackout's handles ride `all_superseded`, so the agent gets a pointer,
+        # not a false miss; the unbuilt graph's note stands alone (W31, lock A).
+        composed = compose_ranked(
+            walk, register="query", surface="mcp", config=config, handles=handles,
+            part=part, section=section,
+            unbuilt=lambda: missing_graph_is_a_gap(store, config,
+                                                   corpus_scan=corpus_holds_entries),
+            top_cluster_margin=RANKED_TOP_CLUSTER_MARGIN,
+            edge_margin=RANKED_EDGE_MARGIN, ceiling=RANKED_LIMIT_CEILING,
+            full_top=full_top, scan_faults=(),
         )
-        envelope["confidence"] = confidence
-        envelope["note"] = note
-        if handles:
-            envelope["retired_partition"] = handles
-            if part.omitted:
-                envelope["retired_partition_omitted"] = part.omitted
-        envelope.update(section.envelope_keys())
-        # Blackout: retrieved precedents but every one retired. The same handle
-        # list rides `all_superseded`, so the agent gets a pointer, not a false miss
-        # (CLI⇄MCP-identical shape, T5 parity).
-        if not output_list and handles:
-            envelope["all_superseded"] = handles
-            # Withholding it here would be a fresh CLI⇄MCP divergence (the CLI
-            # twin prints it) and an MCP⇄MCP one (`surface_decisions` already
-            # emits it on this surface).
-            envelope["note"] = blackout_note(handles, short=short, surface="mcp",
-                                             config=config)
-        # W31 — see surface_decisions. Both of this tool's empty envelopes carry
-        # it: this one (semantic ran and matched nothing) and the healthy-empty
-        # one built in the CollectionMissingError arm above. An unbuilt clone
-        # typically reaches the second — its collection is absent too — but the
-        # first is reachable whenever the collection exists and the graph does
-        # not, and a diagnosis present on one exit only is a verb that reads as
-        # done (3e's per-EXIT lesson).
-        elif not output_list and missing_graph_is_a_gap(
-            store, config, corpus_scan=corpus_holds_entries
-        ):
-            envelope["note"] = missing_graph_note("mcp", config)
-        # The note's tail — see surface_decisions.
-        if section.clause:
-            envelope["note"] = f"{envelope['note']} {section.clause}"
-        withheld = section.withheld
-        if withheld:
-            envelope["note"] = (
-                f"{envelope['note']} "
-                f"{withheld_clause(withheld, surface='mcp', config=config)}"
-            )
-            envelope["rejected_paths_withheld"] = withheld
-        # See surface_decisions: last on the note, absent when the stamps were read.
-        if walk.stamps_unread:
-            envelope["note"] = (
-                f"{envelope['note']} "
-                f"{stamps_unread_clause(surface='mcp', config=config)}"
-            )
-            envelope["stamps_unread"] = True
+        envelope.update(composed.envelope_keys())
         return dumps_display(envelope, ensure_ascii=False, indent=2)
 
     # No embedding provider / vector store wired at all — degrade lexically.
@@ -1839,14 +1719,15 @@ def _query_rejections(query: str, *, config: MitosConfig, store: GraphStore,
                                                   project=config.project))
     if walk is not None and walk.state == REJECTIONS_OVER_BUDGET:
         return lexical(REJECTION_LOOKUP_OVER_BUDGET_REASON)
-    envelope = rejection_lookup(
+    lookup = rejection_lookup(
         walk, query=query, full_top=full_top, shape=rejection_matches_payload,
-        margin=RANKED_EDGE_MARGIN, ceiling=RANKED_LIMIT_CEILING,
+        margin=RANKED_EDGE_MARGIN, top_cluster_margin=RANKED_TOP_CLUSTER_MARGIN,
+        ceiling=RANKED_LIMIT_CEILING,
         graph_gap=lambda: missing_graph_is_a_gap(
             store, config, corpus_scan=corpus_holds_entries),
         surface="mcp", config=config,
     )
-    return dumps_display(envelope, ensure_ascii=False, indent=2)
+    return dumps_display(lookup.envelope, ensure_ascii=False, indent=2)
 
 
 #: MCP's recovery clause for a record-path rotation failure: a fact and a human next

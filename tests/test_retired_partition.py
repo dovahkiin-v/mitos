@@ -608,66 +608,100 @@ _LEAD = {"slug": "old", "id": "n1", "state": "superseded", "score": 0.9,
          "superseded_by": ["mid"], "live_end": ["new"]}
 _SHORT = ShortWindow("ran_out", 1, 5, 3, 1)
 _EDGE = recall.WindowEdge(recall.EDGE_KIND_MID_CLUSTER, 5, 5)
-_FORKS = [("surface", dict(top_score=0.9, result_count=2)),
-          ("surface", dict(top_score=0.65, result_count=2)),
-          ("surface", dict(top_score=0.3, result_count=2)),
-          ("query", dict(top_score=0.9, result_count=2)),
-          ("query", dict(top_score=0.65, result_count=2)),
-          ("query", dict(top_score=0.3, result_count=2))]
+# 6b: the ranked forks' line order moved from the two legend producers into
+# `recall.compose_ranked`. These rows keep their 2f intent (the lead opens the note, the
+# band follows, then the edge or the short clause) and drive the composer over walk
+# doubles; D9's full table is `test_note_composer.py`'s.
+_BANDS = {"strong": 0.9, "weak": 0.7, "none": 0.5}
+_FORKS = [(verb, band) for verb in ("surface", "query") for band in _BANDS]
 
 
-def _compose(verb, surface, kw, *, lead, edge, short):
+def _ranked(verb, surface, top, *, lead, shape, scope=None, scope_counts=None):
+    """`compose_ranked` over a walk double: one hit ("short") or five spaced ones ("edge")."""
+    if shape == "short":
+        window = [SimpleNamespace(score=top, rank=2, node={"id": "a"})]
+        walk = SimpleNamespace(window=window, edge=None, end=EXHAUSTED, limit=5,
+                               returned=3, retired=[None], passed=[], stamps_unread=False)
+    else:
+        window = [SimpleNamespace(score=top - k / 10, rank=k + 2, node={"id": f"w{k}"})
+                  for k in range(5)]
+        walk = SimpleNamespace(window=window, edge=SimpleNamespace(score=top - 0.405),
+                               end=EDGE_FOUND, limit=5, returned=20, retired=[],
+                               passed=[], stamps_unread=False)
+    handles = [_LEAD] if lead else []
+    composed = recall.compose_ranked(
+        walk, register=verb, surface=surface, config=_CONFIG, handles=handles,
+        part=RetiredPartition(handles, 0, bool(lead)), section=None,
+        unbuilt=lambda: False, top_cluster_margin=recall.RANKED_TOP_CLUSTER_MARGIN,
+        edge_margin=recall.RANKED_EDGE_MARGIN, ceiling=50, full_top=None,
+        scope=scope, scope_counts=scope_counts, scan_faults=(),
+    )
+    return walk, composed.note
+
+
+def _legend(verb, surface, top, n, **kw):
     if verb == "surface":
-        return assess_surface_recall(semantic_ran=True, degraded_reason=None, scope=None,
-                                     surface=surface, lead=lead, edge=edge, short=short,
-                                     **kw)[1]
-    return assess_query_recall(config=_CONFIG, surface=surface, lead=lead, edge=edge,
-                               short=short, **kw)[1]
+        return assess_surface_recall(semantic_ran=True, degraded_reason=None, top_score=top,
+                                     result_count=n, scope=None, surface=surface, **kw)[1]
+    return assess_query_recall(config=_CONFIG, surface=surface, top_score=top,
+                               result_count=n)[1]
 
 
 @pytest.mark.parametrize("surface", ["cli", "mcp"])
-@pytest.mark.parametrize("verb,kw", _FORKS)
-def test_every_ranked_fork_reads_lead_band_then_edge_or_short(verb, kw, surface):
-    band = _compose(verb, surface, kw, lead=None, edge=None, short=None)
+@pytest.mark.parametrize("verb,band", _FORKS)
+def test_every_ranked_fork_reads_lead_band_then_edge_or_short(verb, band, surface):
+    top = _BANDS[band]
     lead = retired_lead_clause(_LEAD, surface=surface)
-    assert _compose(verb, surface, kw, lead=_LEAD, edge=None, short=_SHORT) == (
-        f"{lead} {band} {short_window_clause(_SHORT, surface=surface)}")
-    assert _compose(verb, surface, kw, lead=_LEAD, edge=_EDGE, short=None) == (
-        f"{lead} {band} {edge_clause(_EDGE, surface=surface)}")
+    walk, note = _ranked(verb, surface, top, lead=True, shape="short")
+    assert note == (f"{lead} {_legend(verb, surface, top, 1)} "
+                    f"{short_window_clause(short_window(walk), surface=surface)}")
+    walk, note = _ranked(verb, surface, top, lead=True, shape="edge")
+    edge = window_edge(walk, margin=recall.RANKED_EDGE_MARGIN, ceiling=50, full_top=None)
+    assert edge is not None and edge.kind == recall.EDGE_KIND_MID_CLUSTER
+    assert note == (f"{lead} {_legend(verb, surface, top, 5)} "
+                    f"{edge_clause(edge, surface=surface)}")
 
 
 def test_the_lead_opens_before_the_unused_scope_prefix():
     counts = {"auth": {"active_decisions": 2, "parked_open_questions": 0}}
-    note = assess_surface_recall(semantic_ran=True, degraded_reason=None, top_score=0.9,
-                                 result_count=2, scope="nope", scope_counts=counts,
-                                 surface="mcp", lead=_LEAD, edge=None, short=None)[1]
+    _, note = _ranked("surface", "mcp", 0.9, lead=True, shape="short", scope="nope",
+                      scope_counts=counts)
     lead = retired_lead_clause(_LEAD, surface="mcp")
     assert note.startswith(f"{lead} ") and "nope" in note[len(lead):]
 
 
 @pytest.mark.parametrize("verb", ["surface", "query"])
-def test_the_nothing_ranked_forks_ignore_lead_and_short(verb):
-    kw = dict(top_score=None, result_count=0)
-    plain = _compose(verb, "mcp", kw, lead=None, edge=None, short=None)
-    assert _compose(verb, "mcp", kw, lead=_LEAD, edge=None, short=_SHORT) == plain
+def test_the_nothing_ranked_forks_carry_no_lead_and_no_short(verb):
+    """Was `…_ignore_lead_and_short` (2f): a nothing-ranked note opens on its legend and
+    states no short clause; the absence clause follows it (6b)."""
+    walk = SimpleNamespace(window=[], edge=None, end=EXHAUSTED, limit=5, returned=3,
+                           retired=[], passed=[], stamps_unread=False)
+    composed = recall.compose_ranked(
+        walk, register=verb, surface="mcp", config=_CONFIG, handles=[],
+        part=RetiredPartition([], 0, False), section=None, unbuilt=lambda: False,
+        top_cluster_margin=recall.RANKED_TOP_CLUSTER_MARGIN,
+        edge_margin=recall.RANKED_EDGE_MARGIN, ceiling=50, full_top=None, scan_faults=(),
+    )
+    absence = recall.absence_clause(register=verb, surface="mcp", config=_CONFIG,
+                                    scope=None)
+    assert composed.note == f"{_legend(verb, 'mcp', None, 0)} {absence}"
 
 
-def test_the_degraded_arm_ignores_lead_and_short():
-    # On the dump arm (5d: the only degraded arm with results takes `scope_total`).
-    kw = dict(semantic_ran=False, degraded_reason="the provider is down", top_score=None,
-              result_count=2, scope=None, scope_total=2, surface="mcp", edge=None)
-    plain = assess_surface_recall(lead=None, short=None, **kw)[1]
-    assert assess_surface_recall(lead=_LEAD, short=_SHORT, **kw)[1] == plain
-
-
-def test_lead_and_short_are_required_keywords_on_both_composers():
+def test_the_legend_producers_take_no_lead_and_no_short():
+    """Was `test_lead_and_short_are_required_keywords_on_both_composers` and
+    `test_the_degraded_arm_ignores_lead_and_short` (2f): the lead and the short window
+    are `compose_ranked`'s required inputs now (its `part` and `walk`), so the legend
+    producers refuse them, the degraded arm included."""
     with pytest.raises(TypeError, match="lead"):
-        assess_surface_recall(semantic_ran=True, degraded_reason=None, top_score=0.7,
-                              result_count=1, scope=None, surface="mcp", edge=None,
-                              short=None)
+        assess_surface_recall(semantic_ran=False, degraded_reason="down", top_score=None,
+                              result_count=2, scope=None, scope_total=2, surface="mcp",
+                              lead=_LEAD)
     with pytest.raises(TypeError, match="short"):
         assess_query_recall(top_score=0.7, result_count=1, config=_CONFIG, surface="mcp",
-                            edge=None, lead=None)
+                            short=_SHORT)
+    import inspect as _inspect
+    params = _inspect.signature(recall.compose_ranked).parameters
+    assert params["part"].default is _inspect.Parameter.empty
 
 
 @pytest.mark.parametrize("spec", ["LLLLLLL", "LRLRL", "RRLRRL", "LLRRR", "RRR", "L", "LLL"])
@@ -709,7 +743,7 @@ def _clauses(surface: str) -> List[str]:
         retired_lead_clause(_LEAD, surface=surface),
         short_window_clause(ShortWindow("ran_out", 0, 5, 1, 1), surface=surface),
         short_window_clause(ShortWindow("bound_retired", 2, 50, 350, 300), surface=surface),
-        blackout_note(handles, short=_SHORT, surface=surface, config=_CONFIG),
+        blackout_note(handles, surface=surface, config=_CONFIG),
     ]
 
 
@@ -741,8 +775,8 @@ def test_the_mcp_wording_names_no_shell_command():
 
 
 def test_each_boundary_words_its_own_blackout_heal():
-    cli_note = blackout_note([_LEAD], short=None, surface="cli", config=_CONFIG)
-    mcp_note = blackout_note([_LEAD], short=None, surface="mcp", config=_CONFIG)
+    cli_note = blackout_note([_LEAD], surface="cli", config=_CONFIG)
+    mcp_note = blackout_note([_LEAD], surface="mcp", config=_CONFIG)
     assert "`mitos show -p 'my proj' -- <id>`" in cli_note
     assert "`mitos list -p 'my proj' --state all`" in cli_note
     assert "show_node(ident='<id>')" in mcp_note
@@ -758,7 +792,7 @@ def test_the_pointer_keys_exist_under_both_surfaces():
 
 def test_the_blackout_names_the_live_end_never_the_dead_hop():
     """F11's row at the composer: ``old``'s immediate successor ``mid`` is retired."""
-    note = blackout_note([_LEAD], short=None, surface="mcp", config=_CONFIG)
+    note = blackout_note([_LEAD], surface="mcp", config=_CONFIG)
     assert "old (superseded → new)" in note and "mid" not in note
 
 
@@ -852,6 +886,28 @@ def test_the_lead_opens_the_note_when_a_retired_decision_outranks_rank_one(ws, d
     resp = call(ws, CannedVector(mid), limit=2)
     assert _partition_slugs(resp, key) == ["old0"]
     assert _LEAD_STEM not in _note(resp, key)
+
+
+@pytest.mark.parametrize("driver", list(DRIVERS))
+def test_the_retired_lead_leaves_the_absence_clause_out(ws, driver):
+    """6b (D6): a note that names where the current word lives says nothing about how
+    to conclude an absence; the same answer without the lead carries the clause on a
+    band that does not settle the question."""
+    _, m = ws
+    call, _verb, _surface, key = DRIVERS[driver]
+    stem = "A ranking cannot show that nothing covers this claim"
+    _graze_world(m)
+    low = [point_hit(_id(m, "old0"), .70), point_hit(_id(m, "a"), .69),
+           point_hit(_id(m, "b"), .60), point_hit(_id(m, "c"), .50)]
+    _graze_world(m)
+    resp = call(ws, CannedVector(low), limit=2)
+    assert _note(resp, key).startswith(_LEAD_STEM)
+    assert stem not in _note(resp, key)
+    no_lead = [point_hit(_id(m, "a"), .69), point_hit(_id(m, "old0"), .68),
+               point_hit(_id(m, "b"), .60), point_hit(_id(m, "c"), .50)]
+    resp = call(ws, CannedVector(no_lead), limit=2)
+    assert _LEAD_STEM not in _note(resp, key)
+    assert stem in _note(resp, key)
 
 
 # --------------------------------------------------------------------------- #
@@ -1057,8 +1113,10 @@ def test_a_blackout_states_its_short_window_too(ws, driver, kind):
         {"id": o, "slug": f"old{i}", "computed_state": "superseded"}, score=.9 - i / 100,
         stamps={o: {"superseded_by": [f"old{i}-next"]}}, live_ends={})
         for i, o in enumerate(old)]
-    expected = blackout_note(handles, short=ShortWindow(kind, 0, 5, len(hits), 2),
-                             surface=surface, config=config)
+    # 6b: the short clause rides the composer's edge slot after the blackout, bytes
+    # unchanged; no absence clause follows a blackout.
+    expected = (f"{blackout_note(handles, surface=surface, config=config)} "
+                f"{short_window_clause(ShortWindow(kind, 0, 5, len(hits), 2), surface=surface)}")
     assert _note(resp, key) == expected
     if key:
         assert resp["all_superseded"] == handles

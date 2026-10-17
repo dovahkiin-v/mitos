@@ -261,9 +261,8 @@ def test_the_dump_note_names_the_same_phrase(cause):
     phrase = provider_cause_phrase(cause)
     for surface in ("cli", "mcp"):
         _, note = assess_surface_recall(
-            lead=None, short=None,
             semantic_ran=False, top_score=None, result_count=2, scope="x",
-            surface=surface, edge=None, scope_total=2, degraded_reason=phrase)
+            surface=surface, scope_total=2, degraded_reason=phrase)
         assert note.startswith(f"Semantic recall unavailable ({phrase}) — showing all 2 ")
 
 
@@ -345,9 +344,8 @@ def test_no_mcp_pointer_names_a_shell_command():
 def test_the_rendered_unused_scope_prefix_on_mcp_names_no_command():
     counts = {"auth": {"decisions": 3, "open_questions": 0}}
     _, note = assess_surface_recall(
-        lead=None, short=None,
         semantic_ran=True, top_score=None, result_count=0, scope="ghost",
-        scope_counts=counts, surface="mcp", edge=None, degraded_reason=None)
+        scope_counts=counts, surface="mcp", degraded_reason=None)
     assert "unused scope tag" in note and "mitos " not in note
     recovery = scope_filter_recovery(scope="ghost", scope_counts=counts, surface="mcp")
     assert recovery is not None
@@ -393,15 +391,15 @@ def test_the_mocked_cutover_arm_prints_a_recipe_for_this_project(offline, tmp_pa
 @pytest.mark.parametrize("scope_total", [None, 4])
 def test_a_degraded_call_without_a_reason_raises(scope_total):
     with pytest.raises(ValueError, match="degraded_reason"):
-        assess_surface_recall(lead=None, short=None, semantic_ran=False, top_score=None, result_count=2,
-                              scope="x", surface="mcp", edge=None,
+        assess_surface_recall(semantic_ran=False, top_score=None, result_count=2,
+                              scope="x", surface="mcp",
                               scope_total=scope_total, degraded_reason=None)
 
 
 def test_the_reason_is_a_required_keyword():
     with pytest.raises(TypeError, match="degraded_reason"):
-        assess_surface_recall(lead=None, short=None, semantic_ran=True, top_score=0.9, result_count=1,
-                              scope=None, surface="mcp", edge=None)
+        assess_surface_recall(semantic_ran=True, top_score=0.9, result_count=1,
+                              scope=None, surface="mcp")
     with pytest.raises(TypeError):
         degraded_reason_from_error(None)
 

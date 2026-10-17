@@ -33,7 +33,7 @@ from mitos import cli, mcp_server
 from mitos.cli import cmd_query, cmd_surface
 from mitos.errors import DatabaseError
 from mitos.parser import ParsedEntry
-from mitos.recall import ShortWindow, blackout_note, stamps_unread_clause
+from mitos.recall import ShortWindow, blackout_note, short_window_clause, stamps_unread_clause
 from mitos.retrieval_walk import RANKED_OVERFETCH_BOUND, WalkContractError
 from mitos.store import GraphStore
 from mitos.sync import MitosSyncManager
@@ -50,6 +50,12 @@ Wrap = Optional[Callable[[GraphStore], Any]]
 # --------------------------------------------------------------------------- #
 # Drivers: (surface, verb, encoding) → the response (a dict, or the text)
 # --------------------------------------------------------------------------- #
+
+
+def _blackout_with_short(handles, short, *, surface, config):
+    """The blackout note with its short clause after it (6b: the composer's edge slot)."""
+    return (f"{blackout_note(handles, surface=surface, config=config)} "
+            f"{short_window_clause(short, surface=surface)}")
 
 def _mcp(tool: str, ws, vector, *, wrap: Wrap = None, limit: Optional[int] = None,
          embed: Any = None):
@@ -166,9 +172,7 @@ def test_a_same_slug_retired_point_alone_is_a_blackout_of_the_retired_node(ws, d
         {"slug": "database", "id": retired, "state": "superseded", "score": 0.90,
          "superseded_by": ["database"]}]
     assert resp["retired_partition"] == resp["all_superseded"]
-    assert resp["note"] == blackout_note(
-        resp["all_superseded"], short=ShortWindow("ran_out", 0, 5, 1, 1),
-        surface=surface, config=config)
+    assert resp["note"] == _blackout_with_short(resp["all_superseded"], ShortWindow("ran_out", 0, 5, 1, 1), surface=surface, config=config)
 
 
 # --------------------------------------------------------------------------- #
@@ -405,8 +409,7 @@ def test_a_stamp_fault_on_a_blackout_states_it_on_the_blackout_note(ws, driver):
     assert resp[key] == [] and resp["all_superseded"] == handles
     assert resp["stamps_unread"] is True
     clause = stamps_unread_clause(surface=surface, config=config)
-    note = blackout_note(handles, short=ShortWindow("ran_out", 0, 5, 1, 1),
-                         surface=surface, config=config)
+    note = _blackout_with_short(handles, ShortWindow("ran_out", 0, 5, 1, 1), surface=surface, config=config)
     assert resp["note"] == f"{note} {clause}"
 
 
@@ -419,8 +422,7 @@ def test_a_stamp_fault_on_the_text_blackout_states_it_too(ws):
                wrap=_StampFault)
     clause = stamps_unread_clause(surface="cli", config=config)
     handles = [{"slug": "old", "id": _id(m, "old"), "state": "superseded", "score": 0.9}]
-    note = blackout_note(handles, short=ShortWindow("ran_out", 0, 5, 1, 1),
-                         surface="cli", config=config)
+    note = _blackout_with_short(handles, ShortWindow("ran_out", 0, 5, 1, 1), surface="cli", config=config)
     assert f"{note} {clause}" in out
 
 

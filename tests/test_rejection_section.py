@@ -40,7 +40,7 @@ from mitos.errors import CollectionMissingError, DatabaseError
 from mitos.parser import ParsedEntry
 from mitos.recall import (REJECTION_MATCH_FLOOR, REJECTION_SECTION_BOUND,
                           count_withheld, count_withheld_decisions,
-                          rejection_owners_whole, rejection_section_clause,
+                          rejection_lead_clause, rejection_owners_whole, rejection_section_clause,
                           rejection_section_state, withheld_clause)
 from mitos.rejections import point_items
 from mitos.retrieval_walk import (REJECTION_DROP_KEYS, REJECTION_OVERFETCH_BOUND,
@@ -1102,13 +1102,16 @@ def test_a_blackout_carries_the_section_beside_all_superseded(
     surface = DRIVERS[driver][2]
     assert env["all_superseded"] == bare["all_superseded"]
     assert env["rejection_matches"][0]["letter"] == "here"
+    # 6b: with no live hit, the live owner's match leads ahead of the blackout.
+    lead = rejection_lead_clause(env["rejection_matches"][0], surface=surface)
     if brief:
         # The withheld clause survives the blackout override, after it.
         assert env["rejected_paths_withheld"] == 1
         assert env["note"] == (
-            f"{bare['note']} {withheld_clause(1, surface=surface, config=ws)}")
+            f"{lead} {bare['note']} {withheld_clause(1, surface=surface, config=ws)}")
     else:
-        assert "rejected_paths_withheld" not in env and env["note"] == bare["note"]
+        assert "rejected_paths_withheld" not in env
+        assert env["note"] == f"{lead} {bare['note']}"
 
 
 @pytest.mark.parametrize("brief", [False, True])
@@ -1127,19 +1130,20 @@ def test_a_miss_whose_query_names_a_rejected_option_carries_the_section(
 
 
 @pytest.mark.parametrize("driver", list(DRIVERS))
-def test_an_unbuilt_graph_override_keeps_the_tail(ws, monkeypatch, driver) -> None:
-    """The unbuilt-graph note overrides the band note, and the section's clause still
-    follows it: the tail is composed after every override."""
+def test_an_unbuilt_graph_note_stands_alone_without_the_section(ws, monkeypatch,
+                                                                driver) -> None:
+    """Was `test_an_unbuilt_graph_override_keeps_the_tail` (5a), inverted by 6b on lock A:
+    with no graph to read, the unbuilt-graph note stands for every key the graph
+    supplies — the section's state and its clause included."""
     from mitos.recall import missing_graph_note
     for module in (cli, mcp_server):
         monkeypatch.setattr(module, "corpus_holds_entries", lambda config: True)
     _bind(monkeypatch, None)
     env = _call(driver, ws, [])
     surface = DRIVERS[driver][2]
-    clause = rejection_section_clause("unavailable", dropped=None, surface=surface,
-                                      config=ws)
-    assert env["rejection_section"] == "unavailable"
-    assert env["note"] == f"{missing_graph_note(surface, ws)} {clause}"
+    assert not set(SECTION_KEYS) & set(env)
+    assert env["note"] == missing_graph_note(surface, ws)
+    assert "confidence" in env and "band_evidence" not in env
 
 
 # --------------------------------------------------------------------------- #
@@ -1489,3 +1493,87 @@ def test_an_empty_light_walk_makes_no_hydrate_read(ws) -> None:
     walk = walk_ranked(_query_vector(), vector_store=CannedVector([], store=store),
                        graph=graph, limit=2, light=True)
     assert graph.light == [[]] and graph.resolved == [] and walk.window == []
+
+
+# --------------------------------------------------------------------------- #
+# 6b: lock A on the ranked exits — a stale index under an unbuilt graph
+# --------------------------------------------------------------------------- #
+
+_GRAPH_KEYS = (*SECTION_KEYS, "retired_partition", "retired_partition_omitted",
+               "all_superseded", "band_evidence", "rejected_paths_withheld",
+               "stamps_unread")
+
+
+def _stale_unbuilt(ws, monkeypatch) -> None:
+    """The corpus holds entries, the graph no nodes, and the rejection collection
+    holds a point whose owner is gone: verification drops it, the section is short."""
+    for module in (cli, mcp_server):
+        monkeypatch.setattr(module, "corpus_holds_entries", lambda config: True)
+    index = FakeRejectionIndex(present=True)
+    _plant(index, "f" * 64, F_TWO, {1: ABOVE, 2: JUST_ABOVE})
+    _bind(monkeypatch, index)
+
+
+@pytest.mark.parametrize("driver", list(DRIVERS))
+def test_a_stale_index_under_an_unbuilt_graph_supplies_no_key(ws, monkeypatch, driver) -> None:
+    """Lock A: no retired partition, no rejection keys, no evidence, no withheld count,
+    no stamps flag — the unbuilt-graph note alone, with `confidence` standing. 8a's
+    label map is the next key this list gains."""
+    from mitos.recall import missing_graph_note
+    _stale_unbuilt(ws, monkeypatch)
+    env = _call(driver, ws, [], brief=True)
+    assert not set(_GRAPH_KEYS) & set(env), set(_GRAPH_KEYS) & set(env)
+    assert env["note"] == missing_graph_note(DRIVERS[driver][2], ws)
+    assert env["confidence"] == "none"
+
+
+@pytest.mark.parametrize("verb", list(TEXT_DRIVERS))
+def test_the_text_answer_under_an_unbuilt_graph_prints_no_section_and_no_band(
+        ws, monkeypatch, verb) -> None:
+    """CLI text obeys `--json`'s precedence: under the unbuilt note neither the section
+    nor the band line prints (before 6b both text exits printed the section first)."""
+    from mitos.recall import missing_graph_note
+    _stale_unbuilt(ws, monkeypatch)
+    out = TEXT_DRIVERS[verb](ws, [])
+    assert "Rejected options matching" not in out
+    assert "⚠ confidence" not in out
+    assert f"→ {missing_graph_note('cli', ws)}" in out
+
+
+# --------------------------------------------------------------------------- #
+# 6b: the rejection lead, driven on every exit
+# --------------------------------------------------------------------------- #
+
+def _lead_world(ws, monkeypatch):
+    """A live decision at a `weak` top and a live owner whose item scores above it."""
+    from mitos.recall import SURFACE_STRONG_THRESHOLD, SURFACE_WEAK_THRESHOLD
+    _commit(ws, "a")
+    owner = _commit(ws, "owner", F_TWO)
+    index = FakeRejectionIndex(present=True)
+    _plant(index, owner, F_TWO, {1: ABOVE})
+    _bind(monkeypatch, index)
+    weak = round((SURFACE_STRONG_THRESHOLD + SURFACE_WEAK_THRESHOLD) / 2, 2)
+    assert weak < ABOVE
+    return [{"slug": "a", "score": weak}]
+
+
+@pytest.mark.parametrize("driver", list(DRIVERS))
+def test_a_live_owners_match_above_the_top_leads_the_note(ws, monkeypatch, driver) -> None:
+    window = _lead_world(ws, monkeypatch)
+    env = _call(driver, ws, window)
+    surface = DRIVERS[driver][2]
+    match = env["rejection_matches"][0]
+    assert match["letter"] == "here"
+    lead = rejection_lead_clause(match, surface=surface)
+    assert env["note"].startswith(f"{lead} ")
+    assert env["confidence"] == "weak"
+    # A rejection lead does not drop the absence clause (D6).
+    assert "A ranking cannot show" in env["note"]
+
+
+@pytest.mark.parametrize("verb", list(TEXT_DRIVERS))
+def test_the_text_note_opens_on_the_rejection_lead(ws, monkeypatch, verb) -> None:
+    window = _lead_world(ws, monkeypatch)
+    out = TEXT_DRIVERS[verb](ws, window)
+    note = next(line for line in out.splitlines() if line.startswith("→ "))
+    assert note.startswith("→ A rejected option ranks above every live decision here: owner")

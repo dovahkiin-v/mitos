@@ -34,6 +34,18 @@ is composed here as well: the rejection ranking as the whole answer, its band le
 its edge counted in owners, its short clause, and the lexical answer's not-computed
 tokens and reasons.
 
+**One composer orders every line of a note** (6b). :func:`compose_note` is the one place
+line order is decided (:data:`NOTE_SLOTS`: rejection lead, retired lead, legend, top
+cluster, edge or short, absence, then the omissions and scan faults); each line arrives
+worded by the function that owns it. The four ranked surfaces call
+:func:`compose_ranked`, which also builds ``band_evidence`` (:func:`band_evidence`: the
+top score, the top cluster, the edge, beside ``confidence``) and applies the blackout
+and unbuilt-graph overrides at their recorded precedence; the lookup composes through
+it in :func:`rejection_lookup`, and ``degraded`` through it for the three degraded
+exits. A band's note describes the ranking's shape in measured quantities; a verdict
+stays only where the band's measured precision supports it, and every band that does
+not settle the question says how an absence is concluded (:func:`absence_clause`).
+
 The policy is **surface-agnostic**: it emits the recall *signal* (which confidence
 branch, whether the scope tag is unused) and words each pointer from a per-surface
 table (CLI verbs vs MCP tool call-forms), so no CLI/MCP presentation knowledge
@@ -56,7 +68,7 @@ business widening it.
 import difflib
 from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
-from mitos.shell_quote import shell_flag
+from mitos.shell_quote import shell_arg, shell_flag
 
 # The ``strong`` line of the confidence band over the top surfaced score. Calibrated,
 # recorded in tests/golden/calibration/record.json with its measured precision on both
@@ -150,6 +162,15 @@ SURFACE_DIDYOUMEAN_CUTOFF: float = 0.6
 # clause rides ``surface`` and ``query`` alike, so it cannot name a verb, and the CLI
 # fragments are flags that parse on either verb as printed. Unwrapped on purpose —
 # the backticks above mark a whole command a reader can run.
+#
+# ``exhaustive``, ``exhaustive_oneline`` and ``exhaustive_whole`` are the absence
+# clause's reads (:func:`absence_clause`): the enumeration that can show an absence a
+# ranking cannot. ``exhaustive_whole`` is the lookup's, at the default depth, which keeps
+# ``rejected_paths`` (the one-line tier and ``brief`` carry none). The CLI forms carry
+# the selector because the clause rides ``query`` notes, where a bare recipe is refused
+# (G9). ``{scope}`` is the caller's scope when one was given (the ``complete_scope``
+# idiom; shell-quoted on the CLI, where the form is a command to run), else the literal
+# ``<scope>`` for the reader to fill.
 _SURFACE_POINTERS: Dict[str, Dict[str, str]] = {
     "cli": {
         "complete": "mitos list",
@@ -157,6 +178,9 @@ _SURFACE_POINTERS: Dict[str, Dict[str, str]] = {
         "dereference": "`mitos show {selector} -- <slug>`",
         "dereference_id": "`mitos show {selector} -- <id>`",
         "discovery": "mitos scopes",
+        "exhaustive": "`mitos list {selector} --scope {scope}`",
+        "exhaustive_oneline": "`mitos list {selector} --scope {scope} --oneline`",
+        "exhaustive_whole": "`mitos list {selector} --scope {scope}`",
         "full_top_arg": "--full-top {n}",
         "history": "`mitos list {selector} --state all`",
         "limit_arg": "--limit {n}",
@@ -170,6 +194,9 @@ _SURFACE_POINTERS: Dict[str, Dict[str, str]] = {
         "dereference": "show_node(ident='<slug>')",
         "dereference_id": "show_node(ident='<id>')",
         "discovery": "list_scopes",
+        "exhaustive": "list_decisions(scope='{scope}')",
+        "exhaustive_oneline": "list_decisions(scope='{scope}', oneline=True)",
+        "exhaustive_whole": "list_decisions(scope='{scope}')",
         "full_top_arg": "full_top={n}",
         "history": "list_decisions(state='all')",
         "limit_arg": "limit={n}",
@@ -359,10 +386,22 @@ def scope_filter_recovery(
 EDGE_KIND_MID_CLUSTER = "mid_cluster"
 EDGE_KIND_UNMEASURED = "unmeasured"
 
-# The one end value of the shared walk this module reads. Spelled here because this
-# module may not import ``retrieval_walk``; a row pins it equal to
-# ``retrieval_walk.EDGE_UNMEASURED``.
+# The end values of the shared walk this module reads. Spelled here because this
+# module may not import ``retrieval_walk``; rows pin them equal to
+# ``retrieval_walk.EDGE_UNMEASURED`` / ``retrieval_walk.EDGE_FOUND``.
 _WALK_END_UNMEASURED = "edge_unmeasured"
+_WALK_END_EDGE_FOUND = "edge_found"
+
+
+def _ends_mid_cluster(last: float, next_score: float, *, margin: float) -> bool:
+    """The edge rule's one comparison: the next rank sits within ``margin`` of the last.
+
+    Strict, so a gap equal to the margin is a clear drop; a negative gap (the next rank
+    scoring higher, which an unordered list can give) is mid-cluster. Shared by
+    :func:`window_edge` and :func:`band_evidence`, so the clause and the evidence cannot
+    disagree about one walk.
+    """
+    return last - next_score < margin
 
 
 class WindowEdge(NamedTuple):
@@ -423,7 +462,7 @@ def window_edge(
         return None
     limit = walk.limit
     if walk.edge is not None:
-        if window[-1].score - walk.edge.score >= margin:
+        if not _ends_mid_cluster(window[-1].score, walk.edge.score, margin=margin):
             return None
         if limit >= ceiling:
             return WindowEdge(kind=EDGE_KIND_MID_CLUSTER, limit=limit, held=None)
@@ -456,6 +495,98 @@ def top_cluster_size(scores: Sequence[float], *, margin: float) -> int:
         return 0
     top = scores[0]
     return sum(1 for score in scores if top - score < margin)
+
+
+# The ``edge`` tokens of ``band_evidence``, one per walk end over a non-empty window:
+# ``mid_cluster`` / ``clear`` (an edge was found, and the next rank's gap to the last is
+# below / at least the edge margin), ``unmeasured`` (the fetch stopped at its bound, so a
+# further rank may exist) and ``end`` (the index holds no further rank).
+EVIDENCE_EDGE_KINDS: Tuple[str, ...] = ("mid_cluster", "clear", "unmeasured", "end")
+
+
+def band_evidence(walk: "object", *, scores: Sequence[float], top_cluster_margin: float,
+                  edge_margin: float) -> Optional[Dict[str, Any]]:
+    """Builds the measured quantities behind a band: the envelope's ``band_evidence``.
+
+    The ONE place the object is built, for both rankings (the decision window and the
+    lookup's item window). Present iff the band read a top score, which is iff the
+    window is non-empty; every member that does not apply is absent, never null:
+
+    * ``top_score`` — the window's maximum, the score :func:`_classify_recall` reads;
+    * ``top_cluster`` — :func:`top_cluster_size` over the window at
+      ``top_cluster_margin``, at least 1;
+    * ``edge`` — one of :data:`EVIDENCE_EDGE_KINDS`, read off ``walk.end``;
+    * ``next_score`` — the next rank's score, only where an edge was found. Absent
+      means no next rank was measured, and ``edge`` says why.
+
+    No admitted input rides it (6a admitted none), so the key set is exactly these
+    four; a later admitted input adds its key here and inverts the row that pins them.
+
+    Args:
+        walk: The walk the window came from (duck-typed: ``end``, ``edge``).
+        scores: The window's scores in rank order (rank 1 first; never a sorted copy).
+        top_cluster_margin: The ranking's top-cluster margin.
+        edge_margin: The ranking's edge margin.
+
+    Returns:
+        The evidence dict, or None for an empty window.
+
+    Raises:
+        ValueError: On a walk end outside the four the walk can reach — a call-site
+            defect, loud rather than an evidence object naming no reason.
+    """
+    if not scores:
+        return None
+    end = walk.end
+    evidence: Dict[str, Any] = {
+        "top_score": max(scores),
+        "top_cluster": top_cluster_size(scores, margin=top_cluster_margin),
+    }
+    if end == _WALK_END_EDGE_FOUND:
+        next_score = walk.edge.score
+        mid = _ends_mid_cluster(scores[-1], next_score, margin=edge_margin)
+        evidence["edge"] = "mid_cluster" if mid else "clear"
+        evidence["next_score"] = next_score
+    elif end in (_WALK_END_UNMEASURED, _WALK_END_SHORT_BOUND):
+        evidence["edge"] = "unmeasured"
+    elif end == _WALK_END_EXHAUSTED:
+        evidence["edge"] = "end"
+    else:
+        raise ValueError(f"band_evidence: unknown walk end {end!r}")
+    return evidence
+
+
+def top_cluster_clause(size: int, *, register: str, margin: float) -> Optional[str]:
+    """Words the line a note carries when the top of its ranking is a cluster.
+
+    A ranking fact and a read instruction, nothing more: the score order inside the
+    cluster does not say which hit answers (6a: rank 1 right 10 of 15 times inside the
+    margin, 99 of 101 outside), so the reader reads them all. No verdict and no write,
+    so it is lawful in every register. The margin printed is the constant passed in,
+    never a literal. Pure string formatting.
+
+    Args:
+        size: :func:`top_cluster_size` of the window.
+        register: ``"surface"`` / ``"query"`` (decision hits) or ``"lookup"`` (rejected
+            options).
+        margin: The top-cluster margin the size was counted at.
+
+    Returns:
+        One sentence, or None when the top is a single hit.
+
+    Raises:
+        ValueError: On an unknown register.
+    """
+    if register in ("surface", "query"):
+        noun = "hits"
+    elif register == "lookup":
+        noun = "rejected options"
+    else:
+        raise ValueError(f"top_cluster_clause: unknown register {register!r}")
+    if size < 2:
+        return None
+    return (f"The top {size} {noun} score within {margin:g} of rank 1, so their order "
+            f"does not say which one answers: read them all.")
 
 
 def edge_clause(edge: WindowEdge, *, surface: str) -> str:
@@ -497,13 +628,6 @@ def edge_clause(edge: WindowEdge, *, surface: str) -> str:
         f"{stem}; a higher limit reaches it, and with {held} the added ranks come "
         f"back axiom-only."
     )
-
-
-def _with_edge(note: str, edge: Optional[WindowEdge], surface: str) -> str:
-    """Appends the edge clause to a ranked band note when the edge is stated."""
-    if edge is None:
-        return note
-    return f"{note} {edge_clause(edge, surface=surface)}"
 
 
 # The two end values of the shared walk a short window can carry. Spelled here for
@@ -675,8 +799,8 @@ def retired_lead_clause(handle: Mapping[str, Any], *, surface: str) -> str:
     return f"{stem}; its current word lives in {', '.join(successors)}."
 
 
-def blackout_note(handles: List[Mapping[str, Any]], *, short: Optional[ShortWindow],
-                  surface: str, config: "object") -> str:
+def blackout_note(handles: List[Mapping[str, Any]], *, surface: str,
+                  config: "object") -> str:
     """Builds the blackout note: the lead's zero-live form.
 
     Ranked recall reached precedents but every one is retired, which would
@@ -686,13 +810,12 @@ def blackout_note(handles: List[Mapping[str, Any]], *, short: Optional[ShortWind
     then the reads that heal: one retired decision whole by its id, and the
     retired history. Each boundary words its own heal (``dereference_id`` /
     ``history``): the CLI names commands with the selector, MCP names read tools
-    and no shell command. A blackout window is always short, so the short-window
-    clause closes it when given. Calm, one short block (P9). Pure string
-    formatting.
+    and no shell command. A blackout window is always short; the short-window
+    clause follows it in :func:`compose_note`'s ``edge`` slot. Calm, one short
+    block (P9). Pure string formatting.
 
     Args:
         handles: The shown handles (``display.retired_handle``), closest first.
-        short: The short window from :func:`short_window`, or None.
         surface: ``"cli"`` or ``"mcp"``.
         config: The active ``MitosConfig`` (duck-typed). Read only for
             ``project``, which the CLI heals name as their selector.
@@ -713,34 +836,19 @@ def blackout_note(handles: List[Mapping[str, Any]], *, short: Optional[ShortWind
         else:
             parts.append(f"{h['slug']} ({h['state']} → {', '.join(successors)})")
     noun, verb = ("match", "is") if n == 1 else ("matches", "are")
-    note = (
+    return (
         f"All {n} nearest {noun} {verb} retired — no live precedent on this claim, "
         f"but it was settled before. Retired: {'; '.join(parts)}. Read one whole "
         f"with {pointers['dereference_id'].format(selector=selector)}, or the retired "
         f"history with {pointers['history'].format(selector=selector)}."
     )
-    if short is not None:
-        note = f"{note} {short_window_clause(short, surface=surface)}"
-    return note
-
-
-def _ranked_note(note: str, *, lead: Optional[Mapping[str, Any]],
-                 edge: Optional[WindowEdge], short: Optional[ShortWindow],
-                 surface: str) -> str:
-    """Wraps a ranked band note: lead → band note → (edge | short)."""
-    if lead is not None:
-        note = f"{retired_lead_clause(lead, surface=surface)} {note}"
-    note = _with_edge(note, edge, surface)
-    if short is not None:
-        note = f"{note} {short_window_clause(short, surface=surface)}"
-    return note
 
 
 def _classify_recall(*, top_score: Optional[float], result_count: int) -> str:
     """Decides the confidence band. The ONE place that band choice is made.
 
     Reached only when ranking actually ran — a degraded read has no band, and the
-    two composers keep that fence in different ways (``assess_surface_recall``
+    two legend producers keep that fence in different ways (``assess_surface_recall``
     returns before it; ``assess_query_recall`` has no degraded arm at all).
 
     It is not top-score arithmetic alone: ``result_count`` is read too, which is
@@ -751,10 +859,11 @@ def _classify_recall(*, top_score: Optional[float], result_count: int) -> str:
     scores never reached the caller reads ``"strong"``. That is deliberate and
     inherited byte-for-byte: it keeps a surface that legitimately has no scores
     (the degraded scope-listing fallback) from being labelled off-axis. The
-    consequence is that a call site which forgets to accumulate ``top_score``
-    ships an all-``strong`` band over every populated answer with nothing red, so
-    the repair lives at the call sites (each reads the score off its *surfaced*
-    list) and in the tests that pin a superseded-filtered ranking.
+    consequence is that a caller which forgets to pass ``top_score`` ships an
+    all-``strong`` band over every populated answer with nothing red, so the repair
+    lives in the two composers that read it off the *surfaced* window themselves
+    (:func:`compose_ranked`, :func:`rejection_lookup`; since 6b no site accumulates
+    it) and in the tests that pin a superseded-filtered ranking.
 
     Args:
         top_score: The highest score among the surfaced matches, or None.
@@ -770,6 +879,13 @@ def _classify_recall(*, top_score: Optional[float], result_count: int) -> str:
     return "none"
 
 
+# The phrase every ``weak`` legend carries, on all three registers (D4 of 6b): ``weak``
+# holds answers and non-answers of every class on both corpora (Harbor 3 of 19 right,
+# dense 73 of 101), so what a score in it supports is exactly this and nothing narrower.
+# One constant because the ranked-read descriptions are pinned to say the same thing.
+WEAK_MEANING = "a score in this band does not tell the answer from a neighbour"
+
+
 def assess_surface_recall(
     *,
     semantic_ran: bool,
@@ -778,13 +894,18 @@ def assess_surface_recall(
     scope: Optional[str],
     scope_counts: Optional[Dict[str, Dict[str, int]]] = None,
     surface: str,
-    edge: Optional[WindowEdge],
-    lead: Optional[Mapping[str, Any]],
-    short: Optional[ShortWindow],
     scope_total: Optional[int] = None,
     degraded_reason: Optional[str],
 ) -> Tuple[Optional[str], str]:
-    """Classifies a surface result and builds the agent-facing note.
+    """Classifies a surface result and words its legend: the band's own sentence.
+
+    The legend only. The lines around it — the leads, the top cluster, the edge, the
+    absence clause and the omissions — are :func:`compose_ranked`'s, which calls this
+    for the ``legend`` slot; on ``surface`` that slot holds the unused-scope prefix and
+    the band sentence as one string, so both leads precede the prefix. A verdict stays
+    only where 6a measured the band's precision supporting it: ``strong`` makes none,
+    ``weak`` says :data:`WEAK_MEANING`, and ``none`` states the score and the ranking
+    fact, because ``none`` fired on no fixture of either corpus and on no replayed read.
 
     Args:
         semantic_ran: Whether semantic ranking actually executed (embeddings + vector
@@ -799,20 +920,6 @@ def assess_surface_recall(
             fabricate a typo hint).
         surface: ``"cli"`` or ``"mcp"`` — selects the pointer wording. Required keyword:
             no callsite may silently emit the wrong surface's call-forms (the T7 gate).
-        edge: The window's edge from :func:`window_edge`, or None. Required keyword,
-            never defaulted: every call site decides. Its clause ends every note that
-            holds ranked results — ``strong``, ``weak`` and the with-results ``none``,
-            unused-scope variants included; the nothing-ranked fork and every
-            degraded arm ignore it.
-        lead: The leading retired handle when a retired decision outranks rank 1
-            (``retired_partition``'s ``leads``), else None. Required keyword, never
-            defaulted. Its line opens every note that holds ranked results, before
-            the unused-scope prefix: the closest match is the first thing said.
-        short: The short window from :func:`short_window`, or None. Required
-            keyword, never defaulted. Its clause follows the band note where the
-            edge clause would; the two never co-occur (a short window has no edge).
-            Every note holding ranked results reads lead → band note → (edge |
-            short), then the call site's withheld and stamps-unread clauses.
         scope_total: How many active decisions the scope holds, passed only by the
             degraded scope dump, whose sentence names how many of them it shows.
             A degraded call with results must pass it: the dump is the only
@@ -830,12 +937,11 @@ def assess_surface_recall(
             degraded answer with results is the scope dump's.
 
     Returns:
-        A ``(confidence, note)`` pair. ``confidence`` is ``"strong"`` / ``"weak"`` /
-        ``"none"`` when semantic ranking ran, else ``None`` (degraded). ``note`` is a
-        one-line, action-oriented string — never the old boilerplate that printed
-        identically on every response. The dump's note ends with
-        :func:`degraded_omission_clause`; ``degraded.dump_section`` sets the
-        matching ``not_computed`` key and the section clause that follows it.
+        A ``(confidence, legend)`` pair. ``confidence`` is ``"strong"`` / ``"weak"`` /
+        ``"none"`` when semantic ranking ran, else ``None`` (degraded). The dump's
+        legend carries no omission clause: ``degraded.dump_section`` places
+        :func:`degraded_omission_clause` in :func:`compose_note`'s ``not_computed``
+        slot, beside the matching ``not_computed`` key.
     """
     pointers = _SURFACE_POINTERS[surface]
     scope_phrase = f"scope '{scope}'" if scope else "this query"
@@ -866,16 +972,15 @@ def assess_surface_recall(
         # A degraded answer with results is the scope dump's, and only the dump's:
         # with recall down no walk ran, so nothing else fills the list. Its
         # composer (``degraded.dump_section``) sets the matching ``not_computed``,
-        # so "clause appended" and "key set" are one fact (WIRING_LEDGER entry-014).
+        # so "clause placed" and "key set" are one fact (WIRING_LEDGER entry-014).
         if result_count and scope_total is None:
             raise ValueError(
                 "assess_surface_recall: a degraded answer with results is the scope "
                 "dump's; pass scope_total"
             )
-        # The dump ends with the omission clause: a degraded answer has no scores,
-        # so no partition, edge or band. The no-results branches carry none — no
-        # surface reaches them, since both route an empty degraded answer to the
-        # lexical exit, which states its own.
+        # The no-results branches carry no omission clause — no surface reaches
+        # them, since both route an empty degraded answer to the lexical exit, which
+        # states its own.
         if result_count:
             # The dump's own branch: it names how many of the scope's decisions it
             # shows. ``result_count`` is what the envelope returns; the dump is one
@@ -891,8 +996,7 @@ def assess_surface_recall(
             return None, (
                 f"Semantic recall unavailable ({degraded_reason}) — showing "
                 f"{shown_part} as a fallback, NOT a relevance ranking. For the "
-                f"authoritative set use {complete_hint} (pure graph read). "
-                f"{degraded_omission_clause()}"
+                f"authoritative set use {complete_hint} (pure graph read)."
             )
         if scope_unused:
             return None, (
@@ -904,45 +1008,40 @@ def assess_surface_recall(
         )
 
     band = _classify_recall(top_score=top_score, result_count=result_count)
+    shown = f"{top_score:.2f}" if top_score is not None else "?"
 
-    # Semantic ran with a real, confident hit.
+    # Semantic ran with a real, confident hit. No verdict: it names the ranking and
+    # the completeness read.
     if band == "strong":
         matches_phrase = "Here are results that matched semantically." if scope_prefix else "Ranked top matches."
-        return "strong", _ranked_note(
+        return "strong", (
             f"{scope_prefix}{matches_phrase} For the COMPLETE set of decisions in a scope — a "
-            f"completeness pass — call {complete_hint}.",
-            lead=lead, edge=edge, short=short, surface=surface,
+            f"completeness pass — call {complete_hint}."
         )
 
-    # Semantic ran but it's in the Twilight Zone (loose neighbour / phrased differently)
+    # The twilight band: answers and non-answers of every class sit here, so the
+    # legend says the score cannot tell them apart, and asks for a read.
     if band == "weak":
-        shown = f"{top_score:.2f}" if top_score is not None else "?"
-        matches_phrase = "Here are results that matched semantically (twilight zone" if scope_prefix else "Twilight zone"
-        return "weak", _ranked_note(
-            f"{scope_prefix}{matches_phrase}: top score {shown} is close. They might be family neighbours or "
-            f"exact precedent phrased differently. Check carefully before deciding.",
-            lead=lead, edge=edge, short=short, surface=surface,
+        matches_phrase = "Here are results that matched semantically. Twilight zone" if scope_prefix else "Twilight zone"
+        return "weak", (
+            f"{scope_prefix}{matches_phrase}: top score {shown} is close, but "
+            f"{WEAK_MEANING}. Read the hits before relying on rank 1, and check "
+            f"carefully before deciding."
         )
 
-    # Semantic ran but every match is garbage (off-axis)
+    # The lowest band with results: the score and the ranking fact, no verdict on
+    # the corpus — ``none`` has no measured support, and it reads on queries aimed at
+    # a real rejection. The absence clause follows it (``compose_ranked``).
     if result_count:
-        shown = f"{top_score:.2f}" if top_score is not None else "?"
-        if scope_unused:
-            msg = f"{scope_prefix}Top score {shown} is too low to be related. Treat as no-precedent and decide fresh."
-        else:
-            msg = f"Very likely off-axis: top score {shown} is too low to be related. The scope is populated, but nothing matches your query. Treat as no-precedent and decide fresh."
-        return "none", _ranked_note(msg, lead=lead, edge=edge, short=short,
-                                    surface=surface)
-
-    # Semantic ran and returned nothing surfaceable.
-    if scope_unused:
+        stem = f"{scope_prefix}Top score" if scope_unused else "Off-axis: top score"
         return "none", (
-            f"{scope_prefix}No semantic match. Safe to decide, then record it."
+            f"{stem} {shown} sits in the lowest band — nothing ranked close to this "
+            f"query."
         )
-    return "none", (
-        f"No semantic match for {scope_phrase} — likely no settled precedent. Decide "
-        f"and record it, or call {complete_hint} for a certain completeness check."
-    )
+
+    # Nothing ranked at all. Scope never filters the ranking, so the legend names
+    # none; the absence clause that follows names the scope's exhaustive read.
+    return "none", f"{scope_prefix}No semantic match — no decision ranked for this query."
 
 
 def assess_query_recall(
@@ -951,23 +1050,19 @@ def assess_query_recall(
     result_count: int,
     config: "object",
     surface: str,
-    edge: Optional[WindowEdge],
-    lead: Optional[Mapping[str, Any]],
-    short: Optional[ShortWindow],
 ) -> Tuple[str, str]:
-    """Classifies a targeted-lookup result and builds its ``query``-register note.
+    """Classifies a targeted-lookup result and words its ``query``-register legend.
 
     The band is :func:`_classify_recall`'s — the same three tokens
     ``assess_surface_recall`` emits, because a band that meant different things on
-    two verbs would be worse than no band. The **note** is not shared, and none of
-    it may be inherited: ``surface``'s wording describes the *corpus* (*"likely no
-    settled precedent"*, *"decide and record it"*, *"the scope is populated"*),
-    and every one of those clauses is a claim a targeted lookup did not measure.
-    On this verb the band describes **this lookup's ranking** and nothing else, and
-    the corpus question is routed to the verb that answers it. No ``"none"``-band
-    note here tells the caller to decide or to record: a precedent that is in the
-    graph and absent from the ranking is an ordinary state, and answering it with a
-    write instruction is how a duplicate gets minted.
+    two verbs would be worse than no band. The **legend** is not shared, and none of
+    it may be inherited: ``surface``'s wording may route a caller to decide, and every
+    such clause is a claim a targeted lookup did not measure. On this verb the band
+    describes **this lookup's ranking** and nothing else, and the corpus question is
+    routed to the verb that answers it. No legend here tells the caller to decide or to
+    record: a precedent that is in the graph and absent from the ranking is an
+    ordinary state, and answering it with a write instruction is how a duplicate gets
+    minted. The lines around the legend are :func:`compose_ranked`'s.
 
     Two parameters are absent on purpose. There is no ``semantic_ran``: every
     degraded route on both call sites returns before assessment, so a composer with
@@ -985,63 +1080,185 @@ def assess_query_recall(
             for ``project``, which the CLI redirect names as its selector.
         surface: ``"cli"`` or ``"mcp"`` — selects the pointer wording. Required
             keyword: no call site may silently emit the other surface's call-forms.
-        edge: The window's edge from :func:`window_edge`, or None. Required
-            keyword, never defaulted. Its clause ends the ``strong``, ``weak`` and
-            with-results ``none`` notes (after the redirect where there is one), in
-            the same characters ``assess_surface_recall`` appends.
-        lead: The leading retired handle, or None — as in
-            :func:`assess_surface_recall`, and opening the same three notes.
-        short: The short window, or None — as in :func:`assess_surface_recall`,
-            in the edge clause's place.
 
     Returns:
-        A ``(confidence, note)`` pair. ``confidence`` is ``"strong"`` / ``"weak"``
+        A ``(confidence, legend)`` pair. ``confidence`` is ``"strong"`` / ``"weak"``
         / ``"none"`` and is **never** None — see the degraded fence above.
     """
-    pointer = _SURFACE_POINTERS[surface]["precedent_scan"].format(
-        selector=shell_flag("-p", getattr(config, "project", ""))
-    )
-    # Names a question, not a re-run: re-issuing this same string on the other verb
-    # buys the same embedding, the same ranking and the same matches for the price
-    # of a turn. What earns the turn is the precedent question stated as the claim
-    # the caller is about to commit to — a different string.
-    redirect = f"For whether precedent exists, restate the claim and ask {pointer}."
+    redirect = _precedent_redirect(surface=surface, config=config)
 
     band = _classify_recall(top_score=top_score, result_count=result_count)
 
     # Legend only, and it names no verb: the caller asked for a thing and got it, so
     # a redirect here is a per-answer turn tax wearing a legend. It still carries a
     # note — this is the band a caller meets most often, and dropping it leaves the
-    # common answer with no legend at all. The edge clause may follow it; it names
-    # arguments, not a verb.
+    # common answer with no legend at all. Kept against 6a's measurement: ``strong``
+    # is rare and right on both instruments.
     if band == "strong":
-        return band, _ranked_note(
-            "Top match cleared the strong threshold — a real hit for this lookup, "
-            "not a loose neighbour.",
-            lead=lead, edge=edge, short=short, surface=surface,
-        )
+        return band, ("Top match cleared the strong threshold — a real hit for this "
+                      "lookup, not a loose neighbour.")
 
     shown = f"{top_score:.2f}" if top_score is not None else "?"
 
     if band == "weak":
-        return band, _ranked_note(
-            f"Twilight zone: top score {shown} — close, maybe not your handle. "
-            f"{redirect}",
-            lead=lead, edge=edge, short=short, surface=surface,
-        )
+        return band, (f"Twilight zone: top score {shown} — close, maybe not your "
+                      f"handle; {WEAK_MEANING}. {redirect}")
 
     # The ``"none"`` band forks the same way its sibling does: matches that all
-    # ranked off-axis, versus nothing ranked at all. Neither states a verdict on the
+    # ranked low, versus nothing ranked at all. Neither states a verdict on the
     # corpus, and neither instructs a write.
     if result_count:
-        return band, _ranked_note(
-            f"Off-axis: top score {shown} is too low to be related — nothing "
-            f"ranked close. {redirect}",
-            lead=lead, edge=edge, short=short, surface=surface,
-        )
-    return band, (
-        f"No semantic match — this ranking returned nothing. {redirect}"
+        return band, (f"Off-axis: top score {shown} sits in the lowest band — nothing "
+                      f"ranked close. {redirect}")
+    return band, f"No semantic match — this ranking returned nothing. {redirect}"
+
+
+def _precedent_redirect(*, surface: str, config: "object") -> str:
+    """The ``query`` and lookup registers' redirect to the verb that answers precedent.
+
+    Names a question, not a re-run: re-issuing this same string on the other verb buys
+    the same embedding, the same ranking and the same matches for the price of a turn.
+    What earns the turn is the precedent question stated as the claim the caller is
+    about to commit to — a different string.
+    """
+    pointer = _SURFACE_POINTERS[surface]["precedent_scan"].format(
+        selector=shell_flag("-p", getattr(config, "project", ""))
     )
+    return f"For whether precedent exists, restate the claim and ask {pointer}."
+
+
+def rejection_lead(matches: Sequence[Mapping[str, Any]], *,
+                   top_score: Optional[float]) -> Optional[Mapping[str, Any]]:
+    """Picks the rejection match that leads a ranked note, or None.
+
+    The first shaped match (section order is score order) whose owner is live — its
+    ``letter`` is ``here``, ``section`` or ``window``, never ``retired`` — and whose
+    score is strictly above the top live hit's. With no live hit (``top_score`` None)
+    the first live owner's match leads, ahead of a blackout. A retired owner's match
+    stays in the section as its handle and never leads (ADR
+    ``ranked-read-note-leads-with-a-live-owners-rejection-then-a-closer-retired-decision``).
+    The owner's own rank is never read: an owner at window rank 4 leads when its item
+    outranks rank 1 (ADR
+    ``rejection-lead-binds-to-its-owners-question-and-is-never-gated-on-the-owners-rank``).
+
+    The frame is raw scores because 6a recorded one threshold pair for both rankings
+    (item and decision thresholds within a top-cluster margin of each other). Should a
+    re-calibration record a second pair for the rejection ranking, a match leads only
+    when it clears that ranking's own ``strong`` and the decision ranking is not
+    ``strong``, and this function gains that branch (ADR
+    ``rejection-match-leads-the-note-only-in-a-frame-the-calibration-layer-validates``).
+
+    Args:
+        matches: The section's shaped matches (``display.rejection_matches_payload``).
+        top_score: The top live hit's score, or None with no live hit.
+
+    Returns:
+        The leading match, or None.
+    """
+    for match in matches:
+        if match["letter"] == "retired":
+            continue
+        if top_score is None or match["score"] > top_score:
+            return match
+    return None
+
+
+def rejection_lead_clause(match: Mapping[str, Any], *, surface: str) -> str:
+    """Words the line that opens a ranked note when a live owner's rejection leads.
+
+    It binds the rejection to its owner's question: the option was rejected in that
+    decision's own context, so the line asks the reader to weigh whether that reason
+    carries over, and never reads as a ban on the option or as an answer that
+    overrides the live hits. A read instruction only, so it is lawful in ``query``'s
+    register. It names the envelope key where the owner's axiom rides, so one sentence
+    is true on JSON and text alike. The wording is the same on both surfaces; ``surface``
+    is validated so a composer passes it uniformly (:func:`retired_lead_clause`'s
+    idiom). Pure string formatting.
+
+    Args:
+        match: The leading match (:func:`rejection_lead`).
+        surface: ``"cli"`` or ``"mcp"``.
+
+    Returns:
+        One sentence.
+    """
+    if surface not in _SURFACE_POINTERS:
+        raise KeyError(surface)
+    if match["letter"] == "window":
+        where = f"at rank {match['rank']} of this window"
+    else:
+        where = "on its match in rejection_matches"
+    return (
+        f"A rejected option ranks above every live decision here: {match['slug']} "
+        f"rejected its item {match['ordinal']} in its own context, settling its own "
+        f"question. Its axiom is {where}; weigh whether that reason carries over to "
+        f"this claim."
+    )
+
+
+def absence_clause(*, register: str, surface: str, config: "object",
+                   scope: Optional[str]) -> str:
+    """Words how an absence is concluded, on every band that does not settle the question.
+
+    A ranking cannot show that nothing covers a claim; the exhaustive read can. On
+    ``surface`` and ``query`` it names the enumeration and its one-line tier; on the
+    lookup it names the whole-depth read alone, because the one-line tier and
+    ``brief`` carry no ``rejected_paths``. One wording for ``surface`` and ``query``,
+    with no write instruction, so the ``query`` register lock polices it on both. The
+    CLI forms carry the selector; ``scope`` fills the scope slot when the caller gave
+    one. Pure string formatting.
+
+    Args:
+        register: ``"surface"``, ``"query"`` or ``"lookup"``.
+        surface: ``"cli"`` or ``"mcp"`` — selects the read's spelling.
+        config: The active ``MitosConfig`` (duck-typed). Read only for ``project``.
+        scope: The caller's scope, or None (always None off ``surface``).
+
+    Returns:
+        One sentence.
+
+    Raises:
+        ValueError: On an unknown register.
+    """
+    pointers = _SURFACE_POINTERS[surface]
+    selector = shell_flag("-p", getattr(config, "project", ""))
+    if scope:
+        slot = shell_arg(scope) if surface == "cli" else scope
+    else:
+        slot = "<scope>"
+
+    def read(key: str) -> str:
+        return pointers[key].format(selector=selector, scope=slot)
+
+    if register in ("surface", "query"):
+        return (f"A ranking cannot show that nothing covers this claim; the exhaustive "
+                f"read can: {read('exhaustive')}, or {read('exhaustive_oneline')} for "
+                f"one line per decision.")
+    if register == "lookup":
+        return (f"A ranking cannot show that no rejected option covers this claim; the "
+                f"exhaustive read can: {read('exhaustive_whole')}, which keeps each "
+                f"decision's rejected_paths.")
+    raise ValueError(f"absence_clause: unknown register {register!r}")
+
+
+def oq_scan_fault_clause(scope: str) -> str:
+    """Words a faulted scan of the scope's parked open questions (WIRING_LEDGER entry-005).
+
+    Said instead of an empty list: ``open_questions: []`` reads "none parked here",
+    which a scan that raised cannot claim, so the key is absent and this names why.
+    Pure string formatting.
+    """
+    return f"The open questions in scope '{scope}' could not be read."
+
+
+def scope_counts_fault_clause(scope: str) -> str:
+    """Words a faulted read of the scope vocabulary (WIRING_LEDGER entry-005).
+
+    Without the counts the unused-scope check cannot run, so a typo'd scope reads like
+    a live one; the clause says the check was not made. Pure string formatting.
+    """
+    return (f"The scope vocabulary could not be read, so whether '{scope}' is a live "
+            f"tag was not checked.")
 
 
 def count_withheld(hits: List[Dict[str, Any]]) -> int:
@@ -1301,6 +1518,268 @@ def rejection_section(walk: "object", *, full_top: Optional[int],
                             withheld=withheld, clause=clause)
 
 
+# The note's line order, the one statement of it (D1 of 6b): every exit that composes
+# a note joins its present lines in this order through :func:`compose_note`, and no call
+# site concatenates note text. ``edge`` holds the edge clause or the short-window clause
+# (they never co-occur); ``scan_faults`` holds entry-005's clauses.
+NOTE_SLOTS: Tuple[str, ...] = (
+    "rejection_lead", "retired_lead", "legend", "top_cluster", "edge", "absence",
+    "not_computed", "section_state", "withheld", "stamps_unread", "scan_faults",
+)
+
+
+def compose_note(*, rejection_lead: Optional[str] = None,
+                 retired_lead: Optional[str] = None, legend: str,
+                 top_cluster: Optional[str] = None, edge: Optional[str] = None,
+                 absence: Optional[str] = None, not_computed: Optional[str] = None,
+                 section_state: Optional[str] = None, withheld: Optional[str] = None,
+                 stamps_unread: Optional[str] = None,
+                 scan_faults: Sequence[str] = ()) -> str:
+    """Joins a note's lines in :data:`NOTE_SLOTS` order. The ONE place order is decided.
+
+    Each line arrives already worded by the function that owns it; this only places
+    the present ones, joined by single spaces. The ranked surfaces reach it through
+    :func:`compose_ranked`, the lookup through :func:`rejection_lookup`, and the three
+    degraded composers in ``degraded`` directly (passing only ``legend``,
+    ``not_computed``, ``section_state``, ``withheld``, ``stamps_unread`` and
+    ``scan_faults``).
+
+    Args:
+        rejection_lead: :func:`rejection_lead_clause`, or None.
+        retired_lead: :func:`retired_lead_clause`, or None.
+        legend: The band's sentence (or the blackout, or a degraded header) — always.
+        top_cluster: :func:`top_cluster_clause`, or None.
+        edge: The edge or short-window clause, or None.
+        absence: :func:`absence_clause`, or None.
+        not_computed: A degraded exit's omission clause, or None.
+        section_state: The rejection section's clause, or None.
+        withheld: :func:`withheld_clause`, or None.
+        stamps_unread: :func:`stamps_unread_clause`, or None.
+        scan_faults: Entry-005's clauses, in order; empty when none.
+
+    Returns:
+        The note.
+    """
+    slots = {"rejection_lead": rejection_lead, "retired_lead": retired_lead,
+             "legend": legend, "top_cluster": top_cluster, "edge": edge,
+             "absence": absence, "not_computed": not_computed,
+             "section_state": section_state, "withheld": withheld,
+             "stamps_unread": stamps_unread}
+    lines: List[str] = []
+    for name in NOTE_SLOTS:
+        if name == "scan_faults":
+            lines.extend(line for line in scan_faults if line)
+        elif slots[name]:
+            lines.append(slots[name])
+    return " ".join(lines)
+
+
+# The overrides a composed note can carry (``RankedNote.override``, ``LookupNote``): the
+# blackout replaces the legend; the unbuilt-graph note replaces the whole note and stands
+# for every key the graph supplies (lock A).
+OVERRIDE_BLACKOUT = "blackout"
+OVERRIDE_UNBUILT = "unbuilt"
+
+
+class RankedNote(NamedTuple):
+    """One ranked answer's composed band, note and graph-supplied keys.
+
+    ``band_evidence`` is present iff the band read a top score, which means the window
+    is non-empty: absent on a miss, a blackout, the healthy-empty arms and the unbuilt
+    graph, and never composed on a degraded or exact-slug exit (those name it in
+    ``not_computed`` or carry no band at all).
+
+    Attributes:
+        confidence: The band, on every exit (an override about the graph does not
+            contradict a fact about the ranking).
+        note: The composed note.
+        evidence: :func:`band_evidence`, or None (absent).
+        override: :data:`OVERRIDE_BLACKOUT`, :data:`OVERRIDE_UNBUILT` or None — the
+            CLI text gate for the band line and the printed sections.
+        handles: The retired partition's shown handles.
+        omitted: How many members the partition bound left out.
+        section: The rejection section, or None when the walk did not run.
+        withheld: The withheld count over decisions.
+        stamps_unread: Whether the walk's stamp read faulted.
+    """
+
+    confidence: str
+    note: str
+    evidence: Optional[Dict[str, Any]]
+    override: Optional[str]
+    handles: List[Dict[str, Any]]
+    omitted: int
+    section: Optional[RejectionSection]
+    withheld: int
+    stamps_unread: bool
+
+    def envelope_keys(self) -> Dict[str, Any]:
+        """The keys every ranked envelope places after its hit list, in order.
+
+        ``confidence``, ``band_evidence``, ``note``, ``retired_partition`` (+
+        ``retired_partition_omitted``), the section's keys, ``all_superseded`` (the
+        blackout), ``rejected_paths_withheld``, ``stamps_unread``. Under the unbuilt
+        graph only ``confidence`` and ``note``: with no graph to read, its note stands
+        for every key the graph supplies (lock A), and a later graph-supplied key joins
+        the suppressed list by being placed below that return.
+        """
+        keys: Dict[str, Any] = {"confidence": self.confidence}
+        if self.override == OVERRIDE_UNBUILT:
+            keys["note"] = self.note
+            return keys
+        if self.evidence is not None:
+            keys["band_evidence"] = self.evidence
+        keys["note"] = self.note
+        if self.handles:
+            keys["retired_partition"] = self.handles
+            if self.omitted:
+                keys["retired_partition_omitted"] = self.omitted
+        if self.section is not None:
+            keys.update(self.section.envelope_keys())
+        if self.override == OVERRIDE_BLACKOUT:
+            keys["all_superseded"] = self.handles
+        if self.withheld:
+            keys["rejected_paths_withheld"] = self.withheld
+        if self.stamps_unread:
+            keys["stamps_unread"] = True
+        return keys
+
+
+_REGISTERS: Tuple[str, ...] = ("surface", "query")
+
+
+def compose_ranked(walk: Optional["object"], *, register: str, surface: str,
+                   config: "object", handles: List[Dict[str, Any]],
+                   part: RetiredPartition, section: Optional[RejectionSection],
+                   unbuilt: Callable[[], bool], top_cluster_margin: float,
+                   edge_margin: float, ceiling: int, full_top: Optional[int],
+                   scope: Optional[str] = None,
+                   scope_counts: Optional[Dict[str, Dict[str, int]]] = None,
+                   scan_faults: Sequence[str]) -> RankedNote:
+    """Composes a ranked answer's band, evidence and note: the four ranked surfaces' one call.
+
+    Computed once, from the walk: the window's scores and top score, the band and its
+    legend (:func:`assess_surface_recall` / :func:`assess_query_recall`), the edge or
+    short window, the top cluster, the rejection lead, the absence clause and the
+    evidence; then :func:`compose_note` orders them. The overrides keep their recorded
+    precedence (ADR ``override-precedence-is-quantified-over-the-response-not-the-note-key``):
+
+    * **unbuilt** (an empty window over a graph holding no nodes while the corpus holds
+      entries): the note is :func:`missing_graph_note` alone and no graph-supplied key
+      rides — no lead, partition, section, evidence, withheld or stamps (lock A). It
+      beats the blackout, which cannot co-occur (a retired handle is a node), coded
+      rather than left to that;
+    * **blackout** (ranking ran, zero live, handles passed): the legend is
+      :func:`blackout_note`, the short clause follows it, the retired lead is empty (the
+      blackout is its zero-live form) and so is the absence clause; a live owner's
+      rejection match still leads it.
+
+    The absence clause rides ``weak`` and ``none`` and is left out whenever the retired
+    lead or the blackout is in the note: that note has named where the current word
+    lives. The handles are shaped by the site (``display.retired_handle``) because this
+    leaf imports no display; ``unbuilt`` is asked only on an empty window, so the graph
+    read stays off the healthy path.
+
+    Args:
+        walk: The ``RankedWalk`` (duck-typed), or None on a healthy-empty arm (an
+            absent collection over an empty expected set).
+        register: ``"surface"`` or ``"query"``.
+        surface: ``"cli"`` or ``"mcp"``.
+        config: The active ``MitosConfig`` (duck-typed).
+        handles: The partition's shown handles, shaped by the site.
+        part: :func:`retired_partition` of the walk (empty with no walk).
+        section: :func:`rejection_section` of the walk, or None with no walk.
+        unbuilt: ``missing_graph_is_a_gap(store, config, corpus_scan=…)`` bound by the
+            caller.
+        top_cluster_margin: ``RANKED_TOP_CLUSTER_MARGIN``.
+        edge_margin: ``RANKED_EDGE_MARGIN``.
+        ceiling: The clamp ceiling (``display.RANKED_LIMIT_CEILING``).
+        full_top: The effective ``full_top`` (0 under ``brief``), or None.
+        scope: The caller's scope (``surface`` only).
+        scope_counts: The ordered live scope counts (``surface`` only), or None.
+        scan_faults: Entry-005's clauses (``oq_scan_fault_clause``,
+            ``scope_counts_fault_clause``), in that order; empty when none.
+
+    Returns:
+        A :class:`RankedNote`.
+
+    Raises:
+        ValueError: On an unknown register, on ``scope``/``scope_counts`` passed with
+            ``register="query"``, or on a walk end outside the four (from
+            :func:`band_evidence`).
+    """
+    if register not in _REGISTERS:
+        raise ValueError(f"compose_ranked: unknown register {register!r}")
+    if register == "query" and (scope is not None or scope_counts is not None):
+        raise ValueError("compose_ranked: the query register takes no scope")
+    window = list(walk.window) if walk is not None else []
+    scores = [hit.score for hit in window]
+    top_score = max(scores) if scores else None
+    if register == "surface":
+        confidence, legend = assess_surface_recall(
+            semantic_ran=True, top_score=top_score, result_count=len(window),
+            scope=scope, scope_counts=scope_counts, surface=surface,
+            degraded_reason=None,
+        )
+    else:
+        confidence, legend = assess_query_recall(
+            top_score=top_score, result_count=len(window), config=config,
+            surface=surface,
+        )
+    if not window and unbuilt():
+        return RankedNote(confidence=confidence, note=missing_graph_note(surface, config),
+                          evidence=None, override=OVERRIDE_UNBUILT, handles=[],
+                          omitted=0, section=None, withheld=0, stamps_unread=False)
+    evidence = (band_evidence(walk, scores=scores, top_cluster_margin=top_cluster_margin,
+                              edge_margin=edge_margin) if walk is not None else None)
+    blackout = not window and bool(handles)
+    lead = rejection_lead(section.matches if section is not None else [],
+                          top_score=top_score)
+    edge = (window_edge(walk, margin=edge_margin, ceiling=ceiling, full_top=full_top)
+            if window else None)
+    short = short_window(walk) if (window or blackout) else None
+    if edge is not None:
+        edge_line: Optional[str] = edge_clause(edge, surface=surface)
+    elif short is not None:
+        edge_line = short_window_clause(short, surface=surface)
+    else:
+        edge_line = None
+    retired_line = (retired_lead_clause(handles[0], surface=surface)
+                    if part.leads and handles else None)
+    if blackout:
+        legend = blackout_note(handles, surface=surface, config=config)
+    absence = None
+    if confidence != "strong" and retired_line is None and not blackout:
+        # A scope the vocabulary says is unused is not handed to the exhaustive read:
+        # the unused-scope vector already names the live tags, so the slot stays open.
+        absence = absence_clause(
+            register=register, surface=surface, config=config,
+            scope=None if _scope_is_unused(scope, scope_counts) else scope)
+    withheld = section.withheld if section is not None else 0
+    stamps_unread = walk is not None and walk.stamps_unread
+    note = compose_note(
+        rejection_lead=(rejection_lead_clause(lead, surface=surface)
+                        if lead is not None else None),
+        retired_lead=retired_line,
+        legend=legend,
+        top_cluster=(top_cluster_clause(evidence["top_cluster"], register=register,
+                                        margin=top_cluster_margin)
+                     if evidence is not None else None),
+        edge=edge_line,
+        absence=absence,
+        section_state=section.clause if section is not None else None,
+        withheld=(withheld_clause(withheld, surface=surface, config=config)
+                  if withheld else None),
+        stamps_unread=(stamps_unread_clause(surface=surface, config=config)
+                       if stamps_unread else None),
+        scan_faults=scan_faults,
+    )
+    return RankedNote(confidence=confidence, note=note, evidence=evidence,
+                      override=OVERRIDE_BLACKOUT if blackout else None,
+                      handles=handles, omitted=part.omitted, section=section,
+                      withheld=withheld, stamps_unread=stamps_unread)
+
+
 # The field-scoped lookup (``query``'s ``field`` selector): the stored fields a caller
 # may search alone. One today. A later index over another field adds a value here and
 # renames nothing — the argument's name is a contract (AX Hardening 3, lock 3). Both
@@ -1357,10 +1836,10 @@ def rejection_lookup_gap_reason(*, surface: str, config: "object") -> str:
             f"options — {heal}")
 
 
-# What the lookup's lexical answer could not compute: the band and the edge, which
-# need scores. Not :data:`DEGRADED_NOT_COMPUTED`: its ``retired_partition`` token
-# would be false here, because the lookup has no retired partition to compute.
-LOOKUP_DEGRADED_NOT_COMPUTED: Tuple[str, ...] = ("band", "edge")
+# What the lookup's lexical answer could not compute: the band, its evidence and the
+# edge, which need scores. Not :data:`DEGRADED_NOT_COMPUTED`: its ``retired_partition``
+# token would be false here, because the lookup has no retired partition to compute.
+LOOKUP_DEGRADED_NOT_COMPUTED: Tuple[str, ...] = ("band", "band_evidence", "edge")
 
 
 def lookup_omission_clause(*, retired_dropped: bool) -> str:
@@ -1377,8 +1856,8 @@ def lookup_omission_clause(*, retired_dropped: bool) -> str:
     Returns:
         One or two sentences.
     """
-    clause = ("Not computed without similarity scores: the confidence band and the "
-              "ranking's edge.")
+    clause = ("Not computed without similarity scores: the confidence band and its "
+              "evidence, and the ranking's edge.")
     if retired_dropped:
         clause = f"{clause} Rejected options of retired decisions are not listed."
     return clause
@@ -1386,18 +1865,16 @@ def lookup_omission_clause(*, retired_dropped: bool) -> str:
 
 def _lookup_band_note(band: str, *, top_score: Optional[float], result_count: int,
                       surface: str, config: "object") -> str:
-    """Words the lookup's band note: a rating of its item ranking, never a verdict.
+    """Words the lookup's legend: a rating of its item ranking, never a verdict.
 
     Its own legend, not :func:`assess_query_recall`'s: on item scores a ``strong``
     top often belongs to an option that shares the claim's words and names a
     different mechanism (5b measured vocabulary near-misses up to 0.815 against an
-    own-question median of 0.750), so "a real hit" would be false here. The notes say
-    how close the ranking came and leave the judgement to the reader of the item.
+    own-question median of 0.750), so "a real hit" would be false here, and 6a found
+    no item lift for ``strong`` either. The legends say how close the ranking came and
+    leave the judgement to the reader of the item; ``weak`` says :data:`WEAK_MEANING`.
     """
-    pointer = _SURFACE_POINTERS[surface]["precedent_scan"].format(
-        selector=shell_flag("-p", getattr(config, "project", ""))
-    )
-    redirect = f"For whether precedent exists, restate the claim and ask {pointer}."
+    redirect = _precedent_redirect(surface=surface, config=config)
     shown = f"{top_score:.2f}" if top_score is not None else "?"
     if band == "strong":
         return ("Top rejected option cleared the strong threshold — close to the "
@@ -1405,9 +1882,9 @@ def _lookup_band_note(band: str, *, top_score: Optional[float], result_count: in
                 "that rejection covers your option.")
     if band == "weak":
         return (f"Twilight zone: top score {shown} — a rejected option close to the "
-                f"claim, maybe not the one you mean. {redirect}")
+                f"claim, maybe not the one you mean; {WEAK_MEANING}. {redirect}")
     if result_count:
-        return (f"Off-axis: top score {shown} is too low to be related — no rejected "
+        return (f"Off-axis: top score {shown} sits in the lowest band — no rejected "
                 f"option ranked close to the claim. {redirect}")
     return f"No rejected option ranked — this ranking returned nothing. {redirect}"
 
@@ -1517,19 +1994,36 @@ def lookup_short_clause(walk: "object", *, surface: str) -> Optional[str]:
             "is gone, so the ranking may hold fewer than it could.")
 
 
+class LookupNote(NamedTuple):
+    """The field-scoped lookup's composed answer.
+
+    Attributes:
+        envelope: The serialized envelope (its key set carries no override marker).
+        override: :data:`OVERRIDE_UNBUILT` or None — the CLI text gate for the band
+            line, kept off the dict so the envelope's keys do not change.
+    """
+
+    envelope: Dict[str, Any]
+    override: Optional[str]
+
+
 def rejection_lookup(walk: Optional["object"], *, query: str, full_top: Optional[int],
                      shape: Callable[..., List[Dict[str, Any]]], margin: float,
-                     ceiling: int, graph_gap: Callable[[], bool], surface: str,
-                     config: "object") -> Dict[str, Any]:
+                     top_cluster_margin: float, ceiling: int,
+                     graph_gap: Callable[[], bool], surface: str,
+                     config: "object") -> LookupNote:
     """Composes the field-scoped lookup's healthy envelope, once for both surfaces.
 
     The rejection ranking is the answer: ``rejection_matches`` shaped by the
     section's own shaper (no decision window, so a match's ``letter`` is ``here``,
     ``section`` or ``retired``), matched items whole at every depth and owners thinned
-    by ``full_top`` in first-appearance order. The band rates that ranking; the note
-    reads band → edge, then the short clause, the withheld clause and the
-    stamps-unread clause. An empty window over an unbuilt graph says so instead of the
-    band note (W31). Each boundary encodes or renders the dict and adds nothing.
+    by ``full_top`` in first-appearance order. The band rates that ranking, and
+    ``band_evidence`` carries its measured quantities over items. The note goes through
+    :func:`compose_note`: legend → top cluster → edge or short → absence → withheld →
+    stamps-unread. The lookup has no decision ranking, so it has no lead line. An empty
+    window over an unbuilt graph answers with :func:`missing_graph_note` alone and none
+    of the graph-supplied keys (W31, lock A). Each boundary encodes or renders the
+    envelope and adds nothing.
 
     Args:
         walk: The ``RejectionLookupWalk`` (duck-typed), or None for the healthy empty
@@ -1539,6 +2033,8 @@ def rejection_lookup(walk: Optional["object"], *, query: str, full_top: Optional
             ``brief``).
         shape: ``display.rejection_matches_payload``.
         margin: The edge margin (``RANKED_EDGE_MARGIN``).
+        top_cluster_margin: The top-cluster margin (``RANKED_TOP_CLUSTER_MARGIN``; one
+            pair serves both rankings, 6a). Its own keyword, never ``margin`` reused.
         ceiling: The clamp ceiling (``display.RANKED_LIMIT_CEILING``).
         graph_gap: Asked only on an empty window:
             ``missing_graph_is_a_gap(store, config, corpus_scan=…)`` bound by the
@@ -1547,8 +2043,9 @@ def rejection_lookup(walk: Optional["object"], *, query: str, full_top: Optional
         config: The active ``MitosConfig`` (duck-typed).
 
     Returns:
-        The envelope: ``query``, ``field``, ``depth_mode``, ``rejection_matches``
-        (absent when empty), provenance, ``confidence``, ``note``, then
+        A :class:`LookupNote`. The envelope: ``query``, ``field``, ``depth_mode``,
+        ``rejection_matches`` (absent when empty), provenance, ``confidence``,
+        ``band_evidence`` (absent on an empty window), ``note``, then
         ``rejection_section: "short"`` with ``rejection_dropped``,
         ``rejected_paths_withheld`` and ``stamps_unread`` when they apply.
     """
@@ -1557,21 +2054,29 @@ def rejection_lookup(walk: Optional["object"], *, query: str, full_top: Optional
     if window:
         matches = shape(walk, window_ids=[], owners_whole=True, stamps=walk.stamps,
                         live_ends=walk.live_ends, whole_owners=full_top)
-    here = [match["id"] for match in matches if match["letter"] == "here"]
-    top_score = max(match.score for match in window) if window else None
+    scores = [match.score for match in window]
+    top_score = max(scores) if scores else None
     band = _classify_recall(top_score=top_score, result_count=len(window))
-    note = _lookup_band_note(band, top_score=top_score, result_count=len(window),
-                             surface=surface, config=config)
+    envelope: Dict[str, Any] = {"query": query, "field": REJECTED_PATHS_FIELD,
+                                "depth_mode": "letter"}
+    if matches:
+        envelope["rejection_matches"] = matches
+    envelope.update(corpus_provenance(config))
+    envelope["confidence"] = band
+    if not window and graph_gap():
+        envelope["note"] = missing_graph_note(surface, config)
+        return LookupNote(envelope=envelope, override=OVERRIDE_UNBUILT)
+    evidence = (band_evidence(walk, scores=scores, top_cluster_margin=top_cluster_margin,
+                              edge_margin=margin) if walk is not None else None)
+    here = [match["id"] for match in matches if match["letter"] == "here"]
     edge = (lookup_edge(walk, owners=len(here), margin=margin, ceiling=ceiling,
                         full_top=full_top) if walk is not None else None)
     if edge is not None:
-        note = f"{note} {lookup_edge_clause(edge, ceiling=ceiling, surface=surface)}"
-    if not window and graph_gap():
-        note = missing_graph_note(surface, config)
-    short = (lookup_short_clause(walk, surface=surface) if walk is not None
-             else None)
-    if short is not None:
-        note = f"{note} {short}"
+        edge_line: Optional[str] = lookup_edge_clause(edge, ceiling=ceiling,
+                                                      surface=surface)
+    else:
+        edge_line = (lookup_short_clause(walk, surface=surface) if walk is not None
+                     else None)
     shown: Dict[str, set] = {}
     for match in matches:
         shown.setdefault(match["id"], set()).add(match["ordinal"])
@@ -1580,18 +2085,23 @@ def rejection_lookup(walk: Optional["object"], *, query: str, full_top: Optional
         shown_ordinals=shown,
         item_counts=walk.item_counts if walk is not None else {},
     )
-    if withheld:
-        note = f"{note} {withheld_clause(withheld, surface=surface, config=config)}"
     stamps_unread = walk is not None and walk.stamps_unread
-    if stamps_unread:
-        note = f"{note} {stamps_unread_clause(surface=surface, config=config)}"
-
-    envelope: Dict[str, Any] = {"query": query, "field": REJECTED_PATHS_FIELD,
-                                "depth_mode": "letter"}
-    if matches:
-        envelope["rejection_matches"] = matches
-    envelope.update(corpus_provenance(config))
-    envelope["confidence"] = band
+    note = compose_note(
+        legend=_lookup_band_note(band, top_score=top_score, result_count=len(window),
+                                 surface=surface, config=config),
+        top_cluster=(top_cluster_clause(evidence["top_cluster"], register="lookup",
+                                        margin=top_cluster_margin)
+                     if evidence is not None else None),
+        edge=edge_line,
+        absence=(absence_clause(register="lookup", surface=surface, config=config,
+                                scope=None) if band != "strong" else None),
+        withheld=(withheld_clause(withheld, surface=surface, config=config)
+                  if withheld else None),
+        stamps_unread=(stamps_unread_clause(surface=surface, config=config)
+                       if stamps_unread else None),
+    )
+    if evidence is not None:
+        envelope["band_evidence"] = evidence
     envelope["note"] = note
     if walk is not None and walk.short:
         envelope["rejection_section"] = "short"
@@ -1600,19 +2110,20 @@ def rejection_lookup(walk: Optional["object"], *, query: str, full_top: Optional
         envelope["rejected_paths_withheld"] = withheld
     if stamps_unread:
         envelope["stamps_unread"] = True
-    return envelope
+    return LookupNote(envelope=envelope, override=None)
 
 
 # What a degraded answer could not compute, as concept tokens: ``retired_partition``
 # names the ranked envelopes' key, ``edge`` the window-edge clause, ``band`` the
-# ``confidence`` band. Each needs similarity scores, which a degraded read has none
-# of. Carried on every degraded envelope as ``not_computed`` (serialized as a list)
+# ``confidence`` band and ``band_evidence`` its evidence object. Each needs similarity
+# scores, which a degraded read has none of. Carried on every degraded envelope as ``not_computed`` (serialized as a list)
 # and never on a ranked one, so on a ranked envelope an absent ``retired_partition``
 # still means computed and empty. The rejection section is not among them: a
 # degraded read matches rejected options by their words (``rejection_section:
 # "lexical"``); only the scope dump whose state read failed adds
 # :data:`DEGRADED_SECTION_TOKEN` back. A tuple here only so no caller can mutate it.
-DEGRADED_NOT_COMPUTED: Tuple[str, ...] = ("retired_partition", "edge", "band")
+DEGRADED_NOT_COMPUTED: Tuple[str, ...] = ("retired_partition", "edge", "band",
+                                          "band_evidence")
 
 # The ``not_computed`` token for a degraded rejection section that was not searched.
 DEGRADED_SECTION_TOKEN = "rejection_matches"
@@ -1626,11 +2137,11 @@ def degraded_omission_clause() -> str:
     write, so it is the same sentence on both surfaces. Pure string formatting.
 
     Returns:
-        One sentence naming the three omissions.
+        One sentence naming the omissions.
     """
     return (
         "Not computed without similarity scores: the retired partition, the "
-        "window's edge and the confidence band."
+        "window's edge, and the confidence band and its evidence."
     )
 
 

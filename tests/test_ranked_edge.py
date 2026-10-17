@@ -26,7 +26,7 @@ from mitos import cli, mcp_server
 from mitos.cli import cmd_query, cmd_surface
 from mitos.recall import (EDGE_KIND_MID_CLUSTER, EDGE_KIND_UNMEASURED, RANKED_EDGE_MARGIN,
                           ShortWindow, WindowEdge, blackout_note, edge_clause,
-                          stamps_unread_clause, withheld_clause)
+                          short_window_clause, stamps_unread_clause, withheld_clause)
 from mitos.retrieval_walk import (EDGE_UNMEASURED, RANKED_OVERFETCH_BOUND, SHORT_BOUND,
                                   walk_ranked)
 from mitos.store import GraphStore
@@ -41,6 +41,12 @@ _CLAIM = "a claim that is not any slug"
 _SLUGS = [f"edge-{i}" for i in range(1, 7)]
 _TOP = [0.9, 0.86, 0.83, 0.8, 0.78]      # strong; the fifth is the last returned
 
+
+
+def _blackout_with_short(handles, short, *, surface, config):
+    """The blackout note with its short clause after it (6b: the composer's edge slot)."""
+    return (f"{blackout_note(handles, surface=surface, config=config)} "
+            f"{short_window_clause(short, surface=surface)}")
 
 def _seed(m) -> None:
     for slug in _SLUGS:
@@ -235,8 +241,7 @@ def test_a_blackout_carries_no_edge_clause(ws, driver):
     resp = call(ws, CannedVector([point_hit(_id(m, "old"), 0.9)]))
     handles = [{"slug": "old", "id": _id(m, "old"), "state": "superseded",
                 "score": 0.9, "superseded_by": ["new"]}]
-    note = blackout_note(handles, short=ShortWindow("ran_out", 0, 5, 1, 1),
-                         surface=surface, config=config)
+    note = _blackout_with_short(handles, ShortWindow("ran_out", 0, 5, 1, 1), surface=surface, config=config)
     if key is not None:
         assert resp[key] == [] and resp["all_superseded"] == handles
         assert resp["note"] == note

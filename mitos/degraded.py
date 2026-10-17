@@ -14,9 +14,11 @@ Every degraded exit states what it did not compute: ``not_computed`` (the
 every degraded exit carries a rejection section matched by words: the rejected
 options of the corpus, term-matched item by item, beside the decisions, labelled
 ``rejection_section: "lexical"`` with no score, and the section clause after the
-omission clause. The lexical envelope adds all of it here; the dump's note gains the
-omission clause from ``recall.assess_surface_recall``, and :func:`dump_section`
-composes the dump's keys and the rest of its note, which its boundary only places.
+omission clause. Every note here is ordered by ``recall.compose_note``: the lexical
+envelope composes its own, and :func:`dump_section` composes the dump's whole note
+(its sentence from ``recall.assess_surface_recall``'s degraded arm) and its keys, which
+its boundary only places. A scoped open-question scan that raised is named on both, in
+the note's ``scan_faults`` slot (WIRING_LEDGER entry-005).
 
 The term-match itself stays in ``lexical`` (``lexical_degraded_read``,
 ``lexical_window_section``), which has no surface, so ``lexical_fallback``'s
@@ -31,16 +33,18 @@ Tier 2: composition over ``lexical``, ``recall``, ``display`` and ``divergence``
 never imports ``cli`` or ``mcp_server``, and nothing in the check family imports it.
 """
 
-from typing import Any, Dict, List, NamedTuple, Optional
+from typing import Any, Dict, List, NamedTuple, Optional, Sequence
 
 from mitos.display import clamp_limit, letter_payload
 from mitos.divergence import _corpus_files
-from mitos.lexical import (_STAMPS_UNAVAILABLE_DISCLOSURE, lexical_degraded_read,
-                           lexical_fallback_envelope, lexical_rejection_header,
-                           lexical_rejection_matches, lexical_window_section)
+from mitos.lexical import (_NO_MATCH_LINE, _STAMPS_UNAVAILABLE_DISCLOSURE,
+                           lexical_degraded_read, lexical_fallback_envelope,
+                           lexical_rejection_header, lexical_rejection_matches,
+                           lexical_window_section)
 from mitos.recall import (DEGRADED_NOT_COMPUTED, DEGRADED_SECTION_TOKEN,
                           LOOKUP_DEGRADED_NOT_COMPUTED, REJECTED_PATHS_FIELD,
-                          REJECTION_SECTION_BOUND, corpus_provenance,
+                          REJECTION_SECTION_BOUND, assess_surface_recall,
+                          compose_note, corpus_provenance,
                           count_withheld_decisions, degraded_omission_clause,
                           degraded_section_clause, lookup_omission_clause,
                           rejection_owners_whole, stamps_unread_clause,
@@ -83,6 +87,31 @@ def _unread_sentence(unread: List[str]) -> str:
     return f"{len(unread)} corpus file(s) could not be read: {', '.join(unread)}."
 
 
+# The lexical envelope's no-match line when no decision matched by its words but its
+# rejection section did: the leaf's own line ("No lexical matches either …") would
+# contradict the items beneath it. Same grep pointer, true beside the section.
+_NO_DECISION_MATCH_LINE = (
+    "No decision matched the text, though the rejected options below did — grep the "
+    "workspace's `decisions.md` and `decisions/archive/` to be sure."
+)
+
+
+def _lexical_legend(leaf_note: str, *, decisions_matched: bool,
+                    options_matched: bool) -> str:
+    """The lexical envelope's legend: the leaf's note, its no-match line made true.
+
+    ``lexical.lexical_fallback_envelope`` composes the header, the stamps disclosure,
+    the unread files and, with no decision matched, its no-match line, in that order;
+    its store-less goldens pin those bytes, so the leaf is left alone. Here, when the
+    section holds items, the trailing line is swapped for one that says what did
+    match, and every fact before it stays where the leaf put it.
+    """
+    if decisions_matched or not options_matched:
+        return leaf_note
+    stem = leaf_note[: -len(_NO_MATCH_LINE)].rstrip()
+    return f"{stem} {_NO_DECISION_MATCH_LINE}"
+
+
 def lexical_envelope(
     query: str,
     *,
@@ -94,6 +123,7 @@ def lexical_envelope(
     full_top: Optional[int],
     open_questions: Optional[List[Dict[str, Any]]] = None,
     check_notice: Optional[Dict[str, Any]] = None,
+    scan_faults: Sequence[str] = (),
 ) -> Dict[str, Any]:
     """Composes the lexical degraded envelope for either boundary.
 
@@ -103,8 +133,10 @@ def lexical_envelope(
     provenance, ``not_computed``, ``rejection_matches`` (absent when none),
     ``rejection_section: "lexical"``, the withheld count when ``full_top`` withheld
     a decision's reasoning the section does not show, then the open questions and
-    the check notice when given. The note reads: the leaf's note, omission, section
-    clause, withheld, stamps-unread (one ``stamps_unread`` covers both lists).
+    the check notice when given. The note, through ``recall.compose_note``: the
+    leaf's note as the legend (its no-match line made true when only rejected options
+    matched), omission, section clause, withheld, stamps-unread (one ``stamps_unread``
+    covers both lists), then the scan faults.
 
     Args:
         query: The claim/topic the caller was trying to recall.
@@ -121,6 +153,8 @@ def lexical_envelope(
             scanned semantics — None means omitted).
         check_notice: The standing check notice ``surface`` composed; None means
             omitted.
+        scan_faults: ``recall.oq_scan_fault_clause`` when the scoped open-question
+            scan raised (then ``open_questions`` is None); empty otherwise.
 
     Returns:
         The degraded envelope dict, ready to encode.
@@ -137,10 +171,6 @@ def lexical_envelope(
     if read.section:
         envelope["rejection_matches"] = read.section
     envelope["rejection_section"] = LEXICAL_SECTION_STATE
-    envelope["note"] = (
-        f"{envelope['note']} {degraded_omission_clause()} "
-        f"{degraded_section_clause(computed=True, retired_dropped=read.graph_read)}"
-    )
     # Over decisions (the ranked rule): every match past `full_top`, plus every
     # `here` owner whose Letter the depth withheld, each exempt when the section
     # shows every item its field can serve.
@@ -151,15 +181,20 @@ def lexical_envelope(
         thinned_ids=thinned, shown_ordinals=_shown_ordinals(read.section),
         item_counts=read.item_counts,
     )
+    envelope["note"] = compose_note(
+        legend=_lexical_legend(envelope["note"], decisions_matched=bool(read.matches),
+                               options_matched=bool(read.section)),
+        not_computed=degraded_omission_clause(),
+        section_state=degraded_section_clause(computed=True,
+                                              retired_dropped=read.graph_read),
+        withheld=(withheld_clause(withheld, surface=surface, config=config)
+                  if withheld else None),
+        stamps_unread=(stamps_unread_clause(surface=surface, config=config)
+                       if read.stamps_unread else None),
+        scan_faults=scan_faults,
+    )
     if withheld:
-        envelope["note"] = (
-            f"{envelope['note']} {withheld_clause(withheld, surface=surface, config=config)}"
-        )
         envelope["rejected_paths_withheld"] = withheld
-    if read.stamps_unread:
-        envelope["note"] = (
-            f"{envelope['note']} {stamps_unread_clause(surface=surface, config=config)}"
-        )
     if open_questions is not None:
         envelope["open_questions"] = open_questions
     if check_notice is not None:
@@ -195,8 +230,9 @@ def lexical_rejection_envelope(
     (:data:`recall.LOOKUP_DEGRADED_NOT_COMPUTED`), provenance, ``note``, then
     ``stamps_unavailable`` / ``stamps_unread`` / ``unread_files`` /
     ``rejected_paths_withheld`` when they apply. The note reads: the header, the
-    stamps disclosure, the unread files, the no-match line, the omission clause, the
-    withheld clause, the stamps-unread clause.
+    stamps disclosure, the unread files and the no-match line as the legend, then (by
+    ``recall.compose_note``) the omission clause, the withheld clause and the
+    stamps-unread clause. The lookup carries no open-question list, so no scan fault.
 
     Args:
         query: The claim the caller asked about.
@@ -227,29 +263,27 @@ def lexical_rejection_envelope(
         envelope["rejection_section"] = "gap"
     envelope["not_computed"] = list(LOOKUP_DEGRADED_NOT_COMPUTED)
     envelope.update(corpus_provenance(config))
-    note = lexical_rejection_header(reason)
+    legend = lexical_rejection_header(reason)
     if not leaf["graph_read"]:
-        note = f"{note} {_STAMPS_UNAVAILABLE_DISCLOSURE}"
+        legend = f"{legend} {_STAMPS_UNAVAILABLE_DISCLOSURE}"
     unread = leaf["unread_files"]
     if unread:
-        note = (f"{note} {len(unread)} corpus file(s) could not be read: "
-                f"{', '.join(unread)}.")
+        legend = f"{legend} {_unread_sentence(unread)}"
     if not matches:
-        note = f"{note} {_NO_REJECTION_MATCH_LINE}"
-    note = f"{note} {lookup_omission_clause(retired_dropped=leaf['graph_read'])}"
+        legend = f"{legend} {_NO_REJECTION_MATCH_LINE}"
     here = [m["id"] for m in matches if m["letter"] == "here"]
-    shown: Dict[str, set] = {}
-    for match in matches:
-        shown.setdefault(match["id"], set()).add(match["ordinal"])
     withheld = count_withheld_decisions(
         thinned_ids=here[full_top:] if full_top is not None else [],
-        shown_ordinals=shown, item_counts=leaf["item_counts"],
+        shown_ordinals=_shown_ordinals(matches), item_counts=leaf["item_counts"],
     )
-    if withheld:
-        note = f"{note} {withheld_clause(withheld, surface=surface, config=config)}"
-    if leaf["stamps_unread"]:
-        note = f"{note} {stamps_unread_clause(surface=surface, config=config)}"
-    envelope["note"] = note
+    envelope["note"] = compose_note(
+        legend=legend,
+        not_computed=lookup_omission_clause(retired_dropped=leaf["graph_read"]),
+        withheld=(withheld_clause(withheld, surface=surface, config=config)
+                  if withheld else None),
+        stamps_unread=(stamps_unread_clause(surface=surface, config=config)
+                       if leaf["stamps_unread"] else None),
+    )
     if not leaf["graph_read"]:
         envelope["stamps_unavailable"] = True
     if leaf["stamps_unread"]:
@@ -312,12 +346,11 @@ def scope_dump(
 
 
 class DumpSection(NamedTuple):
-    """The scope dump's rejection section and the rest of its degraded statement.
+    """The scope dump's whole degraded statement: its note, keys and rejection section.
 
-    Read by each boundary's tail exactly where a ranked answer's
-    ``recall.RejectionSection`` is (``matches``, ``state``, ``dropped``,
-    ``withheld``, ``clause`` and :meth:`envelope_keys`), plus ``stamps_unread``,
-    which the boundary folds into its one stamps-unread check.
+    The boundary places :meth:`envelope_keys` after the dump's decisions and its open
+    questions and writes no note of its own; the CLI text prints ``note`` and renders
+    the section from ``matches``.
 
     Attributes:
         matches: The shaped matches (``[]`` when none, or when not searched).
@@ -329,6 +362,9 @@ class DumpSection(NamedTuple):
         stamps_unread: Whether the section owners' stamp read failed.
         not_computed: The dump's ``not_computed`` tokens.
         unread_files: Corpus files that could not be read.
+        note: The dump's note, ordered by ``recall.compose_note``: the dump
+            sentence, the omission clause, the section clause, withheld,
+            stamps-unread, the scan faults.
     """
 
     matches: List[Dict[str, Any]]
@@ -339,12 +375,13 @@ class DumpSection(NamedTuple):
     stamps_unread: bool
     not_computed: List[str]
     unread_files: List[str]
+    note: str
 
     def envelope_keys(self) -> Dict[str, Any]:
-        """The dump's degraded keys, in order: ``not_computed``, ``rejection_matches``
+        """The dump's keys, in order: ``note``, ``not_computed``, ``rejection_matches``
         (when some), ``rejection_section``, ``unread_files`` (when some),
-        ``stamps_unread`` (when true)."""
-        keys: Dict[str, Any] = {"not_computed": self.not_computed}
+        ``stamps_unread`` (when true), ``rejected_paths_withheld`` (when > 0)."""
+        keys: Dict[str, Any] = {"note": self.note, "not_computed": self.not_computed}
         if self.matches:
             keys["rejection_matches"] = self.matches
         keys["rejection_section"] = self.state
@@ -352,12 +389,15 @@ class DumpSection(NamedTuple):
             keys["unread_files"] = self.unread_files
         if self.stamps_unread:
             keys["stamps_unread"] = True
+        if self.withheld:
+            keys["rejected_paths_withheld"] = self.withheld
         return keys
 
 
 def dump_section(query: str, dump: ScopeDump, *, config: Any, store: Any,
-                 full_top: Optional[int]) -> DumpSection:
-    """Composes the scope dump's rejection section, matched by words, for both boundaries.
+                 full_top: Optional[int], surface: str, scope: str, reason: str,
+                 scan_faults: Sequence[str]) -> DumpSection:
+    """Composes the scope dump's degraded statement, for both boundaries.
 
     The dump's decisions are a graph read; its section is a text match over the
     corpus's rejected items (``lexical.lexical_window_section``), with the dump's
@@ -368,15 +408,27 @@ def dump_section(query: str, dump: ScopeDump, *, config: Any, store: Any,
     no matches, ``rejection_matches`` back on ``not_computed``): the dump's
     decisions are filtered and stamped, so an unfiltered section beside them would
     misdescribe the answer. A stamp-read fault costs the section's stamps alone.
-    Wording is surface-free; the boundary appends ``clause``, then its withheld and
-    stamps-unread clauses.
+
+    The note is the dump's whole note: ``recall.assess_surface_recall``'s degraded
+    sentence (how many of the scope's decisions it shows, and the cause the header
+    names), then the omission clause, the section clause, the withheld and
+    stamps-unread clauses and the scan faults, ordered by ``recall.compose_note``.
+    No evidence and no absence clause ride it: a degraded read is band-free. The
+    dump reads no scope counts (its non-empty answer already proves the scope live),
+    so its only scan fault is the open-question one.
 
     Args:
         query: The claim/topic the caller was trying to recall.
         dump: The non-empty :class:`ScopeDump` the boundary is answering with.
-        config: The call's one resolved workspace config (the corpus files).
+        config: The call's one resolved workspace config (the corpus files, the
+            CLI pointers' selector).
         store: The graph store the dump read.
         full_top: The effective depth (None ⇒ whole, 0 ⇒ brief).
+        surface: ``"cli"`` or ``"mcp"``.
+        scope: The scope the dump listed.
+        reason: The degraded cause phrase the boundary computed once.
+        scan_faults: ``recall.oq_scan_fault_clause`` when the scoped open-question
+            scan raised; empty otherwise.
 
     Returns:
         A :class:`DumpSection`.
@@ -408,9 +460,23 @@ def dump_section(query: str, dump: ScopeDump, *, config: Any, store: Any,
         thinned_ids=thinned, shown_ordinals=_shown_ordinals(matches),
         item_counts=read.item_counts,
     )
+    stamps_unread = computed and read.stamps_unread
+    _, sentence = assess_surface_recall(
+        semantic_ran=False, top_score=None, result_count=len(dump.decisions),
+        scope=scope, surface=surface, scope_total=dump.total, degraded_reason=reason,
+    )
+    note = compose_note(
+        legend=sentence,
+        not_computed=degraded_omission_clause(),
+        section_state=clause,
+        withheld=(withheld_clause(withheld, surface=surface, config=config)
+                  if withheld else None),
+        stamps_unread=(stamps_unread_clause(surface=surface, config=config)
+                       if stamps_unread else None),
+        scan_faults=scan_faults,
+    )
     return DumpSection(
         matches=matches, state=LEXICAL_SECTION_STATE if computed else "unavailable",
-        dropped=None, withheld=withheld, clause=clause,
-        stamps_unread=computed and read.stamps_unread, not_computed=not_computed,
-        unread_files=read.unread_files,
+        dropped=None, withheld=withheld, clause=clause, stamps_unread=stamps_unread,
+        not_computed=not_computed, unread_files=read.unread_files, note=note,
     )

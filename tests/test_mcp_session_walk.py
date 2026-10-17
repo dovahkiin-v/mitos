@@ -50,7 +50,7 @@ from mitos.identity import mechanism_canonical_norm
 from mitos.provider_cause import PROVIDER_CAUSES, provider_cause_phrase
 from mitos.identity import embedding_text
 from mitos.recall import (EDGE_KIND_MID_CLUSTER, RANKED_EDGE_MARGIN, WindowEdge,
-                          edge_clause)
+                          absence_clause, edge_clause)
 from mitos.telemetry import (
     ATTEMPT_COULD_NOT_COMPLETE,
     AttemptOutcome,
@@ -289,13 +289,15 @@ async def test_an_mcp_agent_reads_every_section_one_key_from_the_payload(tmp_pat
         assert "degraded" not in s7a, f"S7a: {s7a}"
         assert s7a.get("confidence") == "weak", f"S7a: the fixture left the band: {s7a}"
         clause = edge_clause(WindowEdge(EDGE_KIND_MID_CLUSTER, 2, 2), surface="mcp")
-        assert s7a.get("note", "").endswith(f" {clause}"), f"S7a: {s7a.get('note')}"
+        # 6b: the composer places the edge clause before the absence clause.
+        absence = absence_clause(register="surface", surface="mcp", config=None, scope=None)
+        assert s7a.get("note", "").endswith(f" {clause} {absence}"), f"S7a: {s7a.get('note')}"
 
         s7b = _payload(await call("S7b", "surface_decisions", query=WEAK_QUERY, limit=3), "S7b")
         assert s7b.get("confidence") == "weak", f"S7b: {s7b}"
         assert len(s7b.get("active_decisions", [])) == 3, f"S7b: {s7b}"
         # Edge-free: the note S7a's band earns, with nothing after it.
-        assert s7b.get("note") == s7a["note"][: -len(clause) - 1], f"S7b: {s7b.get('note')}"
+        assert s7b.get("note") == s7a["note"].replace(f" {clause}", ""), f"S7b: {s7b.get('note')}"
 
         # S8 — both by-handle reads carry context, invalidates_if and folded mechanisms.
         folded = [mechanism_canonical_norm(m) for m in MECHANISMS_A]

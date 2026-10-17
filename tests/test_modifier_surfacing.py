@@ -28,7 +28,7 @@ from conftest import resolve_like_main
 from mitos.config import MitosConfig
 from mitos.cli import cmd_init, cmd_list, cmd_open_questions, cmd_query, cmd_show, cmd_surface
 from mitos.parser import ParsedEntry
-from mitos.recall import assess_query_recall
+from mitos.recall import absence_clause, assess_query_recall
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS
 from mitos.sync import MitosSyncManager
 from mitos.renderer import render_node_markdown, MitosRenderer, assemble_render
@@ -870,8 +870,11 @@ def test_cli_query_true_miss_keeps_plain_message(ws, capsys) -> None:
     with patch("mitos.cli.MitosSyncManager", return_value=stub):
         cmd_query(config, "a claim that is not any slug", as_json=True)
     resp = json.loads(capsys.readouterr().out)
-    _, band_note = assess_query_recall(lead=None, short=None, edge=None, top_score=None, result_count=0,
-                                       config=config, surface="cli")
+    _, legend = assess_query_recall(top_score=None, result_count=0,
+                                    config=config, surface="cli")
+    # 6b: the miss's note is its legend, then the absence clause.
+    band_note = f"{legend} " + absence_clause(register="query", surface="cli",
+                                              config=config, scope=None)
     assert resp == {"query": "a claim that is not any slug", "depth_mode": "letter",
                     "matches": [],
                     "project": config.project,

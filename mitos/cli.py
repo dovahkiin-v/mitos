@@ -106,19 +106,18 @@ from mitos.cutover import default_aside_db_path, perform_swap, rebuild_and_gate
 from mitos.degraded import (DumpSection, dump_section, lexical_envelope,
                              lexical_rejection_envelope, scope_dump)
 from mitos.lexical import degraded_reason_from_error
-from mitos.recall import (RANKED_EDGE_MARGIN, RetiredPartition,
-                          assess_query_recall, assess_surface_recall, blackout_note,
-                          corpus_provenance, missing_graph_is_a_gap,
-                          missing_graph_note, missing_index_is_a_gap,
+from mitos.recall import (OVERRIDE_BLACKOUT, OVERRIDE_UNBUILT, RANKED_EDGE_MARGIN,
+                          RANKED_TOP_CLUSTER_MARGIN, RetiredPartition,
+                          compose_ranked, corpus_provenance, missing_graph_is_a_gap,
+                          missing_index_is_a_gap,
                           missing_rejection_index_is_a_gap,
                           provenance_line, REJECTION_MATCH_FLOOR,
                           LOOKUP_FIELDS, REJECTION_LOOKUP_OVER_BUDGET_REASON,
                           REJECTION_SECTION_BOUND, lookup_field_fault,
-                          rejection_lookup, rejection_lookup_gap_reason,
-                          rejection_section,
-                          retired_partition, scope_filter_recovery,
-                          count_withheld, short_window, stamps_unread_clause,
-                          window_edge, withheld_clause)
+                          oq_scan_fault_clause, rejection_lookup,
+                          rejection_lookup_gap_reason, rejection_section,
+                          retired_partition, scope_counts_fault_clause,
+                          scope_filter_recovery, count_withheld)
 from mitos.retrieval_walk import (REJECTIONS_OVER_BUDGET, RejectionLeg,
                                   WalkContractError, walk_ranked,
                                   walk_rejection_lookup)
@@ -1246,7 +1245,8 @@ def _emit_lexical_degraded(config: MitosConfig, query: str, *, reason: str,
                            store: Optional[GraphStore], as_json: bool,
                            full_top: Optional[int], limit: Optional[int],
                            open_questions: Optional[List[Dict[str, Any]]] = None,
-                           check_notice: Optional[Dict[str, Any]] = None) -> None:
+                           check_notice: Optional[Dict[str, Any]] = None,
+                           scan_faults: Sequence[str] = ()) -> None:
     """Renders the lexical degraded envelope on the CLI.
 
     The shared degraded exit for ``surface``/``query`` (ADR
@@ -1275,12 +1275,14 @@ def _emit_lexical_degraded(config: MitosConfig, query: str, *, reason: str,
         check_notice: The standing check notice ``cmd_surface`` composed: the key
             on JSON, the line plus its recovery clause last on text. None
             (``cmd_query`` always) means omitted.
+        scan_faults: ``recall.oq_scan_fault_clause`` when ``cmd_surface``'s scoped
+            open-question scan raised (WIRING_LEDGER entry-005); empty otherwise.
     """
     # Composed before the `as_json` split, so the printed note and the envelope's agree.
     envelope = lexical_envelope(
         query, config=config, surface="cli", reason=reason, store=store,
         limit=limit, full_top=full_top, open_questions=open_questions,
-        check_notice=check_notice,
+        check_notice=check_notice, scan_faults=scan_faults,
     )
     if as_json:
         _emit_json(envelope)
@@ -1431,22 +1433,14 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
     # Composition, outside the `try`: pure shaping over what the walk returned, so
     # a defect here is loud rather than posing as degraded recall.
     matches: List[Dict[str, Any]] = []
-    top_score: Optional[float] = None
-    edge = None
     # Bound before the walk's block: the healthy-empty CollectionMissingError arm
     # reaches the composer with no walk.
     part = RetiredPartition([], 0, False)
     handles: List[Dict[str, Any]] = []
-    short = None
-    lead = None
     # The rejection section; composed only when the walk ran (the healthy-empty
     # CollectionMissingError arm reaches here with none).
     section = None
     if walk is not None:
-        # The rank just past the live window: retired and open-question points
-        # take no slots, so it is the next live decision the walk found.
-        edge = window_edge(walk, margin=RANKED_EDGE_MARGIN,
-                           ceiling=RANKED_LIMIT_CEILING, full_top=full_top)
         for rank, hit in enumerate(walk.window, start=1):
             match = letter_payload(
                 hit.node,
@@ -1457,16 +1451,12 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
             for key, slugs in walk.stamps.get(hit.node["id"], {}).items():
                 match[key] = list(slugs)
             matches.append(match)
-        if walk.window:
-            top_score = max(hit.score for hit in walk.window)
         # The retired decisions this ranking passed, closest first, bounded at
         # `limit` (zero live: the blackout's handles). One constructor for both keys.
         part = retired_partition(walk)
         handles = [retired_handle(h.node, score=h.score, stamps=walk.stamps,
                                   live_ends=walk.live_ends)
                    for h in part.shown]
-        short = short_window(walk)
-        lead = handles[0] if part.leads else None
         # The rejection section, composed once (recall) — the same call
         # mcp_server.query_decisions makes.
         section = rejection_section(
@@ -1474,91 +1464,34 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
             gap=lambda: missing_rejection_index_is_a_gap(store),
             shape=rejection_matches_payload, surface="cli", config=config,
         )
-    # The ranked count is over decisions, section owners included; with no walk
-    # (the healthy-empty arm) there is nothing to count.
-    withheld = section.withheld if section is not None else count_withheld(matches)
-    # The stamps went unread: the ranking stands and every exit that renders hits
-    # or handles says so, last on its note (after every override). None when read.
-    unread_clause = (stamps_unread_clause(surface="cli", config=config)
-                     if walk is not None and walk.stamps_unread else None)
 
-    def _closing(text: str) -> str:
-        """The note's tail, composed once for every exit, after its override: the
-        rejection section's state clause, the withheld clause, the stamps-unread
-        clause — the one order all four ranked surfaces use."""
-        if section is not None and section.clause:
-            text = f"{text} {section.clause}"
-        if withheld:
-            text = f"{text} {withheld_clause(withheld, surface='cli', config=config)}"
-        return f"{text} {unread_clause}" if unread_clause else text
-
-    # Blackout: the walk found zero live decisions in its whole fetch but passed
-    # retired ones. That is NOT a true miss — surfacing it as one makes the agent
-    # assume novelty and re-derive a settled contradiction. Emit the retired handles
-    # + a distinct note instead. With zero live every handle is a passed retired
-    # decision, so `not matches and handles` is exactly the blackout.
-    blackout = not matches and bool(handles)
-
-    # W31 — the unbuilt graph. Unlike its I8 sibling this one is consulted on the
-    # ORDINARY empty path rather than inside an `except`: an empty graph raises
-    # nothing, it simply answers empty, which is precisely why the answer is
-    # indistinguishable from "no precedent" without it. Mutually exclusive with
-    # `blackout` by construction (a retired handle is a node, and this fires only
-    # over a graph with none), so the two can never contradict each other.
-    unbuilt = not matches and missing_graph_is_a_gap(
-        store, config, corpus_scan=corpus_holds_entries
+    # The band in the `query` register — it describes how this lookup's ranking did,
+    # never what the corpus holds — its evidence and the note, composed once for both
+    # encodings and both arms (a walk, or the healthy-empty arm's none). The blackout
+    # (zero live, retired handles passed) and the unbuilt graph (W31: an empty graph
+    # raises nothing, it answers empty) are the composer's overrides, at one
+    # precedence: the unbuilt note stands alone, for every key the graph supplies.
+    composed = compose_ranked(
+        walk, register="query", surface="cli", config=config, handles=handles,
+        part=part, section=section,
+        unbuilt=lambda: missing_graph_is_a_gap(store, config,
+                                               corpus_scan=corpus_holds_entries),
+        top_cluster_margin=RANKED_TOP_CLUSTER_MARGIN, edge_margin=RANKED_EDGE_MARGIN,
+        ceiling=RANKED_LIMIT_CEILING, full_top=full_top, scan_faults=(),
     )
 
-    # The confidence band, in the `query` register: it describes how this lookup's
-    # ranking did, never what the corpus holds. One call serves both encodings.
-    # `assess_query_recall` never returns None, so there is no `is not None` guard
-    # here — copying `cmd_surface`'s would be a branch that can never be False.
-    confidence, note = assess_query_recall(
-        top_score=top_score,
-        result_count=len(matches),
-        config=config,
-        surface="cli",
-        edge=edge,
-        lead=lead,
-        short=short,
-    )
-    # A thinned answer says so, on both encodings, through `_closing`: composed after
-    # the blackout and unbuilt overrides, because a zero-match answer under `brief`
-    # can still withhold its `here` rejection owners.
-
-    # Build the per-match list once, then branch the two renderings over it.
     if as_json:
         envelope: Dict[str, Any] = {"query": query_text, "depth_mode": "letter", "matches": matches}
         envelope.update(corpus_provenance(config))
-        # Band note FIRST, then the overrides reassign it — the precedence is
-        # confidence note < blackout < unbuilt, and it is the NOTE that yields:
-        # `confidence` stands on every one of these exits (it is a fact about the
-        # ranking that an override about the graph does not contradict).
-        envelope["confidence"] = confidence
-        envelope["note"] = note
-        if handles:
-            envelope["retired_partition"] = handles
-            if part.omitted:
-                envelope["retired_partition_omitted"] = part.omitted
-        if section is not None:
-            envelope.update(section.envelope_keys())
-        if blackout:
-            envelope["all_superseded"] = handles
-            # Closes the text/JSON divergence: the text branch below has printed
-            # this note since 2d while `--json` carried the handles alone.
-            envelope["note"] = blackout_note(handles, short=short, surface="cli",
-                                             config=config)
-        if unbuilt:
-            envelope["note"] = missing_graph_note("cli", config)
-        envelope["note"] = _closing(envelope["note"])
-        if withheld:
-            envelope["rejected_paths_withheld"] = withheld
-        if unread_clause:
-            envelope["stamps_unread"] = True
+        envelope.update(composed.envelope_keys())
         _emit_json(envelope)
         return
 
-    if blackout:
+    # The text renders the same composed note; the band line prints only when no
+    # override replaced the legend, and nothing the graph supplies prints under the
+    # unbuilt note.
+    unbuilt = composed.override == OVERRIDE_UNBUILT
+    if composed.override == OVERRIDE_BLACKOUT:
         # Stamped for the same reason as the miss below: "everything here is
         # superseded" and "you asked the wrong project" are the two readings this
         # line separates. `cmd_surface`'s blackout already names its corpus (it
@@ -1567,8 +1500,7 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         _echo_corpus(config)
         _print_retired_partition(handles, part.omitted)
         _print_rejection_section(section)
-        print(_closing(blackout_note(handles, short=short, surface="cli",
-                                     config=config)))
+        print(composed.note)
         return
 
     # Genuine miss — nothing was retrieved (or nothing resolved). The provenance
@@ -1579,23 +1511,16 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         print("No matching decisions found.")
         # The case the rejection section exists for is often this one: the query
         # names a rejected option, so no live decision ranks and the item does.
-        _print_rejection_section(section)
-        # This branch APPENDS where the envelope above assigns, so the override is
-        # written rather than inherited: left to the copy, a miss over an unbuilt
-        # graph would print the band note *and* the pointer, and the band note's
-        # redirect sends the caller to `surface`, which answers just as empty over
-        # that same unbuilt graph — a turn spent one line above the correct heal.
-        if unbuilt:
-            print(f"→ {_closing(missing_graph_note('cli', config))}")
-        else:
-            band_line = _query_band_line(confidence)
+        if not unbuilt:
+            _print_rejection_section(section)
+            band_line = _query_band_line(composed.confidence)
             if band_line:
                 print(band_line)
-            print(f"→ {_closing(note)}")
+        print(f"→ {composed.note}")
         return
 
     print(f"\nQuery matches for: '{query_text}'  [{provenance_line(config)}]")
-    band_line = _query_band_line(confidence)
+    band_line = _query_band_line(composed.confidence)
     if band_line:
         print(band_line)
     print("-" * 60)
@@ -1612,7 +1537,7 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         print()
     _print_retired_partition(handles, part.omitted)
     _print_rejection_section(section)
-    print(f"→ {_closing(note)}")
+    print(f"→ {composed.note}")
 
 
 def _cmd_query_rejections(config: MitosConfig, query_text: str, *, as_json: bool,
@@ -1679,17 +1604,18 @@ def _cmd_query_rejections(config: MitosConfig, query_text: str, *, as_json: bool
     if walk is not None and walk.state == REJECTIONS_OVER_BUDGET:
         lexical(REJECTION_LOOKUP_OVER_BUDGET_REASON, store)
         return
-    envelope = rejection_lookup(
+    lookup = rejection_lookup(
         walk, query=query_text, full_top=full_top, shape=rejection_matches_payload,
-        margin=RANKED_EDGE_MARGIN, ceiling=RANKED_LIMIT_CEILING,
+        margin=RANKED_EDGE_MARGIN, top_cluster_margin=RANKED_TOP_CLUSTER_MARGIN,
+        ceiling=RANKED_LIMIT_CEILING,
         graph_gap=lambda: missing_graph_is_a_gap(
             store, config, corpus_scan=corpus_holds_entries),
         surface="cli", config=config,
     )
     if as_json:
-        _emit_json(envelope)
+        _emit_json(lookup.envelope)
         return
-    _print_rejection_lookup(config, envelope)
+    _print_rejection_lookup(config, lookup.envelope, override=lookup.override)
 
 
 class _MatchList(NamedTuple):
@@ -1698,12 +1624,15 @@ class _MatchList(NamedTuple):
     matches: List[Dict[str, Any]]
 
 
-def _print_rejection_lookup(config: MitosConfig, envelope: Dict[str, Any]) -> None:
+def _print_rejection_lookup(config: MitosConfig, envelope: Dict[str, Any], *,
+                            override: Optional[str]) -> None:
     """Renders the field-scoped lookup's healthy envelope on the CLI text surface.
 
     The corpus line, the band line (as ``mitos query`` prints it), the ranked
     rejected options through :func:`_print_rejection_section` (the section's own
-    match lines), then the ``→`` note. A miss says so in place of the list.
+    match lines), then the ``→`` note. A miss says so in place of the list. Under
+    the unbuilt-graph note no band line prints (``override``, the composer's marker,
+    kept off the envelope): that note stands alone, on text as on ``--json``.
     """
     matches = envelope.get("rejection_matches", [])
     if matches:
@@ -1711,7 +1640,8 @@ def _print_rejection_lookup(config: MitosConfig, envelope: Dict[str, Any]) -> No
     else:
         print(provenance_line(config))
         print("No matching rejected options found.")
-    band_line = _query_band_line(envelope["confidence"])
+    band_line = (_query_band_line(envelope["confidence"])
+                 if override != OVERRIDE_UNBUILT else None)
     if band_line:
         print(band_line)
     if matches:
@@ -3123,15 +3053,10 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     results: Dict[str, Any] = {"active_decisions": []}
     results.update(corpus_provenance(config))
     semantic_ran = False
-    top_score: Optional[float] = None
     degraded_error: Optional[Exception] = None
-    edge = None
     # Bound before the walk's block — see cmd_query.
     part = RetiredPartition([], 0, False)
     handles: List[Dict[str, Any]] = []
-    short = None
-    lead = None
-    dump_total: Optional[int] = None
     # The rejection section; composed only when the walk ran.
     section = None
 
@@ -3163,30 +3088,50 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
 
     # Composition, outside the `try` — see cmd_query.
     if walk is not None:
-        # The rank just past the live window (see cmd_query).
-        edge = window_edge(walk, margin=RANKED_EDGE_MARGIN,
-                           ceiling=RANKED_LIMIT_CEILING, full_top=full_top)
         for rank, hit in enumerate(walk.window, start=1):
             d = letter_payload(hit.node, brief=_rank_thinned(rank, full_top),
                                extras={"score": hit.score})
             for key, slugs in walk.stamps.get(hit.node["id"], {}).items():
                 d[key] = list(slugs)
             results["active_decisions"].append(d)
-        if walk.window:
-            top_score = max(hit.score for hit in walk.window)
         # The retired decisions this ranking passed — see cmd_query.
         part = retired_partition(walk)
         handles = [retired_handle(h.node, score=h.score, stamps=walk.stamps,
                                   live_ends=walk.live_ends)
                    for h in part.shown]
-        short = short_window(walk)
-        lead = handles[0] if part.leads else None
         # The rejection section — see cmd_query.
         section = rejection_section(
             walk, full_top=full_top,
             gap=lambda: missing_rejection_index_is_a_gap(store),
             shape=rejection_matches_payload, surface="cli", config=config,
         )
+
+    # The degraded cause, computed once and handed to both the lexical exit's header
+    # and the scope dump's note, so the two cannot name different causes.
+    reason = (degraded_reason_from_error(degraded_error, surface="cli",
+                                         project=config.project)
+              if not semantic_ran else None)
+
+    # Open questions only when a scope was given (absent = not scanned, [] = none
+    # here). A scan that raised leaves the key absent and names the fault (WIRING_LEDGER
+    # entry-005): `[]` would claim "none parked here" for a scan that never finished.
+    scan_faults: List[str] = []
+    if scope:
+        open_questions = []
+        oq_unread = False
+        try:
+            for oq in store.get_open_questions(scope=scope):
+                if oq["state"] == "parked":
+                    open_questions.append({
+                        "topic": oq["slug"], "questions_raised": oq["questions_raised"],
+                        "park_reason": oq.get("park_reason"), **_oq_modifiers(oq),
+                    })
+        except Exception:
+            oq_unread = True
+        if oq_unread:
+            scan_faults.append(oq_scan_fault_clause(scope))
+        else:
+            results["open_questions"] = open_questions
 
     # Scope listing fallback ONLY in degraded mode (mirrors the MCP tool, P5): a
     # semantic run that found nothing must not masquerade as an unranked scope dump.
@@ -3196,32 +3141,21 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         dump = scope_dump(store, scope, limit=top_k, full_top=full_top)
         if dump is not None:
             results["active_decisions"] = dump.decisions
-            dump_total = dump.total
-            # The dump's rejection section, matched by words, and the rest of its
-            # degraded statement (`not_computed`, the section clause), composed
-            # once; the tail below places them as it places a ranked section.
-            section = dump_section(query, dump, config=config, store=store,
-                                   full_top=full_top)
-
-    # The degraded cause, computed once and handed to both the lexical exit's header
-    # and the scope-dump / partial-list note, so the two cannot name different causes.
-    reason = (degraded_reason_from_error(degraded_error, surface="cli",
-                                         project=config.project)
-              if not semantic_ran else None)
-
-    # Open questions only when a scope was given (absent = not scanned, [] = none here).
-    if scope:
-        open_questions = []
-        try:
-            for oq in store.get_open_questions(scope=scope):
-                if oq["state"] == "parked":
-                    open_questions.append({
-                        "topic": oq["slug"], "questions_raised": oq["questions_raised"],
-                        "park_reason": oq.get("park_reason"), **_oq_modifiers(oq),
-                    })
-        except Exception:
-            pass
-        results["open_questions"] = open_questions
+            # The dump's whole degraded statement, composed once (degraded); the
+            # boundary places its keys and prints its note.
+            dumped = dump_section(query, dump, config=config, store=store,
+                                  full_top=full_top, surface="cli", scope=scope,
+                                  reason=reason, scan_faults=scan_faults)
+            results.update(dumped.envelope_keys())
+            if notice:
+                results["check_notice"] = notice
+            if as_json:
+                _emit_json(results)
+                return
+            _print_surface_answer(config, query, scope, results, handles=[],
+                                  omitted=0, section=dumped, override=None,
+                                  notice=notice)
+            return
 
     # Degraded and empty-handed on decisions: route into the deterministic
     # lexical fallback (ADR read-verbs-degrade-to-lexical-decisions-md-fallback)
@@ -3233,92 +3167,34 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
             config, query, reason=reason,
             store=store, as_json=as_json, full_top=full_top, limit=limit,
             open_questions=results.get("open_questions"),
-            check_notice=notice,
+            check_notice=notice, scan_faults=scan_faults,
         )
         return
 
-    # Confidence signal — distinguish a settled precedent from loose neighbours / no
-    # match (AX P5). Shared policy with the MCP tool via mitos.recall. The live
-    # scope-count map (busiest-first) is the unused-scope oracle + did-you-mean / top-K
-    # source; calm-degrade to None on error.
+    # The live scope-count map (busiest-first) is the unused-scope oracle + did-you-mean
+    # / top-K source; a read that raised leaves it None and is named (entry-005).
     scope_counts: Optional[Dict[str, Dict[str, int]]] = None
     if scope:
+        counts_unread = False
         try:
             scope_counts = order_scope_counts(store.get_scope_counts())
         except Exception:
-            pass
-    confidence, note = assess_surface_recall(
-        semantic_ran=semantic_ran,
-        top_score=top_score,
-        result_count=len(results["active_decisions"]),
-        scope=scope,
-        scope_counts=scope_counts,
-        surface="cli",
-        edge=edge,
-        lead=lead,
-        short=short,
-        scope_total=dump_total,
-        degraded_reason=reason,
+            counts_unread = True
+        if counts_unread:
+            scan_faults.append(scope_counts_fault_clause(scope))
+
+    # The band, its evidence and the note, composed once — the same call
+    # mcp_server.surface_decisions makes (CLI⇄MCP parity by construction).
+    composed = compose_ranked(
+        walk, register="surface", surface="cli", config=config, handles=handles,
+        part=part, section=section,
+        unbuilt=lambda: missing_graph_is_a_gap(store, config,
+                                               corpus_scan=corpus_holds_entries),
+        top_cluster_margin=RANKED_TOP_CLUSTER_MARGIN, edge_margin=RANKED_EDGE_MARGIN,
+        ceiling=RANKED_LIMIT_CEILING, full_top=full_top, scope=scope,
+        scope_counts=scope_counts, scan_faults=scan_faults,
     )
-    if confidence is not None:
-        results["confidence"] = confidence
-    results["note"] = note
-    if handles:
-        results["retired_partition"] = handles
-        if part.omitted:
-            results["retired_partition_omitted"] = part.omitted
-    # The rejection section's keys, after the retired partition (see
-    # mcp_server.surface_decisions).
-    if section is not None:
-        results.update(section.envelope_keys())
-
-    # Blackout: semantic ranking ran and retrieved precedents, but every one is
-    # retired (no live match). Override the note with its zero-live form and attach
-    # the same handle list as `all_superseded` — distinct from a true miss (no
-    # handles). Fires regardless of any parked open questions (the all_superseded
-    # vector must not be suppressed by a non-empty open_questions).
-    blackout = semantic_ran and not results["active_decisions"] and bool(handles)
-    if blackout:
-        results["note"] = blackout_note(handles, short=short, surface="cli",
-                                        config=config)
-        results["all_superseded"] = handles
-        note = results["note"]
-
-    # W31 — the unbuilt graph, consulted on the ordinary empty path (see cmd_query).
-    # Placed after the blackout override so the graph note wins if both ever applied:
-    # with no graph, a pointer at the collection or the graveyard names the wrong
-    # heal. They cannot both apply in fact — a retired handle is a node — but the
-    # precedence is written down rather than left to that coincidence.
-    if not results["active_decisions"] and missing_graph_is_a_gap(
-        store, config, corpus_scan=corpus_holds_entries
-    ):
-        results["note"] = missing_graph_note("cli", config)
-        note = results["note"]
-
-    # The note's tail, after every override, in the one order (see
-    # mcp_server.surface_decisions): the section's state clause, the withheld
-    # clause, the stamps-unread clause; the printed note follows.
-    if section is not None and section.clause:
-        results["note"] = f"{note} {section.clause}"
-        note = results["note"]
-    # A thinned answer says so by a count and a clause, before the notice. Over
-    # decisions, section owners included, on the ranked path and the scope dump.
-    withheld = (section.withheld if section is not None
-                else count_withheld(results["active_decisions"]))
-    if withheld:
-        results["note"] = f"{note} {withheld_clause(withheld, surface='cli', config=config)}"
-        note = results["note"]
-        results["rejected_paths_withheld"] = withheld
-
-    # The stamps went unread: the ranking stands, the fault is stated — last on the
-    # note, after every override and the withheld clause; absent when read. On the
-    # dump (no walk) it is the section owners' stamps (see mcp_server).
-    stamps_unread = (walk.stamps_unread if walk is not None
-                     else section is not None and section.stamps_unread)
-    if stamps_unread:
-        results["note"] = f"{note} {stamps_unread_clause(surface='cli', config=config)}"
-        note = results["note"]
-        results["stamps_unread"] = True
+    results.update(composed.envelope_keys())
 
     # After the recall answer's own keys; absent (never null) when not shown.
     if notice:
@@ -3327,9 +3203,28 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     if as_json:
         _emit_json(results)
         return
+    _print_surface_answer(config, query, scope, results, handles=handles,
+                          omitted=part.omitted, section=section,
+                          override=composed.override, notice=notice)
 
+
+def _print_surface_answer(config: MitosConfig, query: str, scope: Optional[str],
+                          results: Dict[str, Any], *, handles: List[Dict[str, Any]],
+                          omitted: int, section: Optional[Any],
+                          override: Optional[str],
+                          notice: Optional[Dict[str, Any]]) -> None:
+    """Renders ``mitos surface``'s text answer from its composed envelope.
+
+    The text twin of the ``--json`` envelope, gated as the envelope is: under the
+    unbuilt-graph note no retired partition and no rejection section print (lock A),
+    and the band line prints only when no override replaced the legend. Its ``none``
+    line names no scope: a scopeless call and an answer of open questions alone hold
+    no populated scope to speak of.
+    """
     ad, oqs = results["active_decisions"], results.get("open_questions", [])
     conf = results.get("confidence")
+    note = results["note"]
+    unbuilt = override == OVERRIDE_UNBUILT
     if not ad and not oqs:
         # The clean-empty header asserts "checked, none found" — it must never
         # co-occur with a degraded/unavailable note ("couldn't check"). With the
@@ -3340,17 +3235,17 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
             scope_note = f" (scope: {scope})" if scope else ""
             print(provenance_line(config))
             print(f"No active precedents found for: '{query}'{scope_note}")
-        _print_retired_partition(handles, part.omitted)
-        _print_section(section)
+        if not unbuilt:
+            _print_retired_partition(handles, omitted)
+            _print_section(section)
         print(f"→ {note}")
         _print_check_notice(config, notice)
         return
     print(f"\nPrecedents for: '{query}'" + (f"  (scope: {scope})" if scope else "")
           + f"  [{provenance_line(config)}]")
-    if conf == "weak":
-        print("⚠ confidence: weak — twilight zone: matches are close but may not settle this.")
-    elif conf == "none":
-        print("⚠ confidence: likely off-axis — the scope is populated, but nothing matches your query.")
+    band_line = _surface_band_line(conf) if override is None else None
+    if band_line:
+        print(band_line)
     print("-" * 60)
     for i, d in enumerate(ad, start=1):
         print(f"{i}. {d['slug']}  (score {d['score']:.3f})")
@@ -3365,8 +3260,9 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         print()
     # After the hit list, before the open questions and the note: on a blackout
     # with parked open questions this is the branch that renders the handles.
-    _print_retired_partition(handles, part.omitted)
-    _print_section(section)
+    if not unbuilt:
+        _print_retired_partition(handles, omitted)
+        _print_section(section)
     for oq in oqs:
         print(f"[open question in scope] {oq['topic']}")
         marker = _modifier_marker(oq)
@@ -3374,6 +3270,29 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
             print(f"   {marker}")
     print(f"\n→ {note}")
     _print_check_notice(config, notice)
+
+
+def _surface_band_line(confidence: Optional[str]) -> Optional[str]:
+    """The one-line band label for ``mitos surface``'s text rendering, or None.
+
+    The twin of :func:`_query_band_line`, in ``surface``'s words: ``strong`` and a
+    degraded answer (no band) print nothing. The ``none`` line names the band and the
+    ranking fact only — "the scope is populated" was false on every scopeless call
+    and on an answer of open questions alone. The caller prints it only when no
+    override replaced the legend: a blackout or unbuilt note beside a band label
+    contradicts it.
+
+    Args:
+        confidence: The band from the composed envelope, or None.
+
+    Returns:
+        The line to print, or None when the band prints none.
+    """
+    if confidence == "weak":
+        return "⚠ confidence: weak — twilight zone: matches are close but may not settle this."
+    if confidence == "none":
+        return "⚠ confidence: none — nothing ranked close to this query."
+    return None
 
 
 def cmd_serve() -> None:

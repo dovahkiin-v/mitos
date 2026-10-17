@@ -709,7 +709,9 @@ def test_an_absent_index_over_stated_items_answers_lexically_with_the_gap(ws, dr
     out = _call(driver, ws, FakeRejectionIndex(present=False), query="redis restart")
 
     assert out["degraded"] == "lexical" and out["rejection_section"] == "gap"
-    assert out["not_computed"] == list(LOOKUP_DEGRADED_NOT_COMPUTED) == ["band", "edge"]
+    # 6b: the band's evidence object is named beside the band it rides with.
+    assert out["not_computed"] == list(LOOKUP_DEGRADED_NOT_COMPUTED) == [
+        "band", "band_evidence", "edge"]
     assert "confidence" not in out
     assert _gap_heal(driver, ws) in out["degraded_reason"]
     assert out["note"].count(_gap_heal(driver, ws)) == 1  # the heal is stated once
@@ -956,7 +958,8 @@ def test_the_composer_takes_no_decision_window() -> None:
         short = False
 
     rejection_lookup(_Walk(), query="q", full_top=3, shape=shape, margin=.01,
-                     ceiling=50, graph_gap=lambda: False, surface="mcp",
+                     top_cluster_margin=.01, ceiling=50, graph_gap=lambda: False,
+                     surface="mcp",
                      config=type("C", (), {"project": "p", "qdrant_collection": "c",
                                            "workspace_dir": "w"})())
     assert seen["window_ids"] == [] and seen["whole_owners"] == 3
@@ -990,3 +993,39 @@ def test_the_skill_teaches_the_lookup_and_the_cli_slug_read() -> None:
     assert "ask whether it was already rejected" in line
     assert "`mitos show -p . -- <slug>`" in line
     assert body.index("<<FORMAT SPEC SENTINEL>>") < body.index(line)
+
+
+# --------------------------------------------------------------------------- #
+# 6b: lock A on the lookup — the unbuilt-graph note stands alone
+# --------------------------------------------------------------------------- #
+
+_GRAPH_KEYS = ("rejection_matches", "rejection_section", "rejection_dropped",
+               "rejected_paths_withheld", "stamps_unread", "band_evidence")
+
+
+@pytest.mark.parametrize("driver", list(JSON_DRIVERS))
+def test_an_unbuilt_graph_over_a_stale_index_answers_with_its_note_alone(ws, driver) -> None:
+    """A stale rejection collection whose every hit verification drops, over a graph
+    holding no nodes while the corpus holds entries: before 6b the short clause and
+    `rejection_section: "short"` rode after the W31 note. Lock A: with no graph to read,
+    the note stands for every key the graph supplies (8a's label map joins this list)."""
+    _seed(ws, [_block("db", F_DB)], commit=False)
+    assert GraphStore(ws.db_path, read_only=True).graph_fingerprint()[0] == 0
+    index = FakeRejectionIndex(present=True)
+    _plant_stale(index, "f" * 64, REJECTION_OVERFETCH_BOUND, .90)
+    out = _call(driver, ws, index)
+    assert not set(_GRAPH_KEYS) & set(out)
+    assert out["note"] == missing_graph_note(driver, ws)
+    assert out["confidence"] == "none"
+
+
+def test_the_text_lookup_under_an_unbuilt_graph_prints_no_band_line(ws) -> None:
+    """The CLI text obeys `--json`'s precedence: the composer's override marker (kept
+    off the envelope) gates the band line, so only the note speaks."""
+    _seed(ws, [_block("db", F_DB)], commit=False)
+    index = FakeRejectionIndex(present=True)
+    _plant_stale(index, "f" * 64, REJECTION_OVERFETCH_BOUND, .90)
+    out = _cli(ws, index, as_json=False)
+    assert "⚠ confidence" not in out
+    assert f"→ {missing_graph_note('cli', ws)}" in out
+    assert "Verification dropped" not in out
