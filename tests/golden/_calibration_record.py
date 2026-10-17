@@ -59,10 +59,18 @@ SPACES: Tuple[str, ...] = ("query", "document")
 MEASURES: Tuple[str, ...] = ("target", "top_live", "item")
 # How a rejection-target query meets the rejected option (vision §4.1's class table).
 REJECTION_FORMS: Tuple[str, ...] = ("own-question", "elsewhere-carries", "elsewhere-does-not-carry")
+# A rejection-target fixture's hard negatives come in two kinds (5b): ``generic`` (do
+# nothing, defer, status quo) and ``vocabulary`` (another decision's non-generic item,
+# rejected for another question, naming a different mechanism while sharing the query's
+# subject words). ``elsewhere-does-not-carry`` is never a negative: it stays a target
+# under its form (vision §4.1).
+NEGATIVE_KINDS: Tuple[str, ...] = ("generic", "vocabulary")
 # The two rejection-index shapes ruling 2 compares: one point per rejected option, and one
 # point per decision holding the whole field. Not ``mitos.rejections.SHAPES``.
 SHAPES: Tuple[str, ...] = ("per_item", "per_decision")
-SIDES: Tuple[str, ...] = ("higher", "lower", "dense", "unmoved")
+# ``ceiling`` (5b): an escalation floor raised past its boundaries by its cry-wolf
+# ceiling; valid only with a ``cry_wolf`` block that says from where (`_check_cry_wolf`).
+SIDES: Tuple[str, ...] = ("higher", "lower", "dense", "unmoved", "ceiling")
 KINDS: Tuple[str, ...] = ("threshold", "margin")
 CORPORA: Tuple[str, ...] = ("harbor", "dense")
 
@@ -116,10 +124,13 @@ def _is_slug_list(value: Any) -> bool:
     return isinstance(value, list) and all(isinstance(s, str) and s for s in value)
 
 
-def _is_item_ref_list(value: Any) -> bool:
+def _is_item_ref_list(value: Any, *, kinded: bool) -> bool:
+    """A list of ``{owner, option}`` refs; ``kinded`` refs carry a ``kind`` from `NEGATIVE_KINDS` too."""
+    keys = {"owner", "option", "kind"} if kinded else {"owner", "option"}
     return isinstance(value, list) and all(
-        isinstance(r, dict) and set(r) == {"owner", "option"}
+        isinstance(r, dict) and set(r) == keys
         and all(isinstance(r[k], str) and r[k].strip() for k in ("owner", "option"))
+        and (not kinded or r["kind"] in NEGATIVE_KINDS)
         for r in value
     )
 
@@ -193,12 +204,16 @@ def _validate_fixture(fx: Any, require_class: bool) -> None:
     for key in _SLUG_LIST_KEYS:
         if key in fx and not _is_slug_list(fx[key]):
             raise ValueError(f"fixture {label}: `{key}` must be a list of slugs")
-    for key in _ITEM_REF_KEYS:
-        if key in fx and not _is_item_ref_list(fx[key]):
-            raise ValueError(
-                f"fixture {label}: `{key}` must be a list of {{owner, option}} objects, "
-                f"both non-empty strings and nothing else"
-            )
+    if "target_items" in fx and not _is_item_ref_list(fx["target_items"], kinded=False):
+        raise ValueError(
+            f"fixture {label}: `target_items` must be a list of {{owner, option}} objects, "
+            f"both non-empty strings and nothing else"
+        )
+    if "negative_items" in fx and not _is_item_ref_list(fx["negative_items"], kinded=True):
+        raise ValueError(
+            f"fixture {label}: `negative_items` must be a list of {{owner, option, kind}} objects: "
+            f"owner and option non-empty strings, kind one of {list(NEGATIVE_KINDS)}, nothing else"
+        )
     _validate_rejection_keys(fx, label)
     if fx["measure"] == "target" and not fx["targets"]:
         raise ValueError(f"fixture {label}: measure `target` with no targets measures nothing")
@@ -399,6 +414,8 @@ def _item_shape(fixture: dict, hits: List[dict], refs: Dict[str, List[dict]], pe
         value = value_of.get(key)
         out: Dict[str, Any] = {"owner": ref["owner"], "option": ref["option"], "value": value,
                                "rank": rank_of.get(key), "absent": value is None}
+        if "kind" in ref:
+            out["kind"] = ref["kind"]
         if margin:
             out["margin_vs_best_other"] = (
                 value - best_other if value is not None and best_other is not None else None
@@ -416,7 +433,7 @@ def _item_shape(fixture: dict, hits: List[dict], refs: Dict[str, List[dict]], pe
 def derive_item_result(
     fixture: dict, hits_by_shape: Dict[str, List[dict]], refs: Dict[str, List[dict]]
 ) -> Dict[str, Any]:
-    """Derives a rejection-target fixture's ``items`` value in both index shapes (§3.3).
+    """Derives a rejection-target fixture's ``items`` value in each index shape read (§3.3).
 
     ``hits_by_shape[shape]`` is the shape collection's whole ranking, best first, each hit
     labelled by the harness from its point id: ``{point_id, owner, ordinal, part, value,
@@ -430,25 +447,34 @@ def derive_item_result(
     minus the best collapsed unit that is not a target. Per decision, every ref is valued
     at its owner's whole-field point.
 
+    ``per_item`` is required: it is the index that ships, and the class statistics read
+    it. ``per_decision`` is optional (5b): only Harbor's throwaway shapes carry it, so a
+    dense run over the copy derives ``per_item`` alone. A negative ref's ``kind`` rides
+    its entry.
+
     Args:
         fixture: A validated rejection-target fixture.
-        hits_by_shape: The labelled hits per shape in ``SHAPES``.
+        hits_by_shape: The labelled hits per shape read, ``per_item`` among them.
         refs: The resolved refs.
 
     Returns:
-        ``{shape: {hits, targets, negatives, top_value}}``. A ref no hit carries is kept
-        with ``value: null`` and ``absent: true``.
+        ``{shape: {hits, targets, negatives, top_value}}`` for each shape read, in
+        ``SHAPES`` order. A ref no hit carries is kept with ``value: null`` and
+        ``absent: true``.
 
     Raises:
-        ValueError: If the fixture is not item-measured or a shape is missing.
+        ValueError: If the fixture is not item-measured, ``per_item`` is missing, or a
+            shape is not one of ``SHAPES``.
     """
     if fixture["measure"] != "item":
         raise ValueError(f"fixture {fixture['id']!r}: only an item-measured fixture has items")
-    missing = [s for s in SHAPES if s not in hits_by_shape]
-    if missing:
-        raise ValueError(f"fixture {fixture['id']!r}: no hits for shapes {missing}")
+    if "per_item" not in hits_by_shape:
+        raise ValueError(f"fixture {fixture['id']!r}: no hits for the per_item shape")
+    unknown = sorted(set(hits_by_shape) - set(SHAPES))
+    if unknown:
+        raise ValueError(f"fixture {fixture['id']!r}: unknown shapes {unknown}; one of {list(SHAPES)}")
     return {shape: _item_shape(fixture, hits_by_shape[shape], refs, shape == "per_item")
-            for shape in SHAPES}
+            for shape in SHAPES if shape in hits_by_shape}
 
 
 # ---------------------------------------------------------------------------
@@ -565,21 +591,29 @@ def summarize_shapes(results: List[dict]) -> Dict[str, Dict[str, Any]]:
     """Builds the run's ``shapes`` block from its item-measured results (ruling 2's evidence).
 
     Per shape: ``targets`` and ``negatives`` statistics, ``targets`` again ``by_form``,
-    ``target_rank_one`` (the share of target refs ranked first, over every target ref,
-    absent ones included) and ``margin`` (statistics of ``margin_vs_best_other``).
+    ``negatives`` again ``negatives_by_kind`` (5b), ``target_rank_one`` (the share of
+    target refs ranked first, over every target ref, absent ones included) and ``margin``
+    (statistics of ``margin_vs_best_other``).
+
+    Harbor only: ``build_run`` calls it for a harbor run, the one corpus that reads both
+    shapes. A shape some item result lacks (a per-item-only result) is left out rather
+    than summarized over part of the run.
 
     Args:
         results: Every fixture result of the run; only ``measure: item`` ones are read.
 
     Returns:
-        ``{shape: {targets, negatives, by_form, target_rank_one, margin}}`` for each shape
-        in ``SHAPES``, or ``{}`` when the run holds no item-measured result.
+        ``{shape: {targets, negatives, by_form, negatives_by_kind, target_rank_one,
+        margin}}`` for each shape every item result holds, or ``{}`` when the run holds no
+        item-measured result.
     """
     items = [r for r in results if r.get("measure") == "item" and r.get("class") is not None]
     if not items:
         return {}
     out: Dict[str, Dict[str, Any]] = {}
     for shape in SHAPES:
+        if any(shape not in r["items"] for r in items):
+            continue
         targets = [t for r in items for t in r["items"][shape]["targets"]]
         by_form = {
             form: stats([t["value"] for r in items if r.get("rejection_form") == form
@@ -590,6 +624,11 @@ def summarize_shapes(results: List[dict]) -> Dict[str, Dict[str, Any]]:
             "targets": stats([t["value"] for t in targets]),
             "negatives": stats([n["value"] for r in items for n in r["items"][shape]["negatives"]]),
             "by_form": by_form,
+            "negatives_by_kind": {
+                kind: stats([n["value"] for r in items for n in r["items"][shape]["negatives"]
+                             if n.get("kind") == kind])
+                for kind in NEGATIVE_KINDS
+            },
             "target_rank_one": (sum(1 for t in targets if t["rank"] == 1) / len(targets)) if targets else None,
             "margin": stats([t["margin_vs_best_other"] for t in targets]),
         }
@@ -661,6 +700,68 @@ def edge_margin_boundary(results: List[dict]) -> Optional[float]:
     """
     median = nearest_rank(sorted(inversion_depths(results)), 50)
     return None if median is None else round(median, 4)
+
+
+# ---------------------------------------------------------------------------
+# The rejection-match floor's method (recall.REJECTION_MATCH_FLOOR)
+# ---------------------------------------------------------------------------
+
+# The forms whose owner's reason carries over: the floor's recall is read over these.
+# ``elsewhere-does-not-carry`` is a labelled case, never a negative and never recall (D1).
+CARRYING_FORMS: Tuple[str, ...] = ("own-question", "elsewhere-carries")
+
+
+def _rejection_items(results: List[dict]) -> List[dict]:
+    """The per-item shape of every rejection-target result, item-measured and labelled."""
+    return [r["items"]["per_item"] for r in results
+            if r.get("class") == "rejection-target" and r.get("measure") == "item"
+            and isinstance(r.get("items"), dict) and "per_item" in r["items"]]
+
+
+def rejection_floor_boundary(results: List[dict]) -> Optional[float]:
+    """Returns one corpus's rejection-floor boundary: just above every hard negative.
+
+    The hard negatives are every ``negative_items`` value of the per-item shape over the
+    corpus's rejection-target results, both kinds. The boundary is the smallest
+    4-decimal value strictly above their maximum, so ``fill_rejections``' ``score <
+    floor`` keeps the maximum negative out of a section (5b D3: P14's "better silent
+    than noisy", read strictly). A maximum already at 4 decimals moves up one step.
+
+    Args:
+        results: Fixture results (``derive_result`` plus ``items``); the committed Harbor
+            run's ``fixtures`` and the dense runner's ``results.jsonl`` both hold them.
+
+    Returns:
+        The boundary, or ``None`` when no negative has a value.
+    """
+    values = [n["value"] for shape in _rejection_items(results) for n in shape["negatives"]
+              if n.get("value") is not None]
+    if not values:
+        return None
+    top = max(values)
+    boundary = round((math.floor(top * 10_000) + 1) / 10_000, 4)
+    if boundary <= top:  # float noise: an exact 4-place maximum floored one step low
+        boundary = round(boundary + 0.0001, 4)
+    return boundary
+
+
+def rejection_floor_retention(results: List[dict], floor: float) -> Optional[float]:
+    """Returns the share of carrying targets a floor keeps: the boundary's recall.
+
+    Over the per-item targets of the ``own-question`` and ``elsewhere-carries`` results
+    (``CARRYING_FORMS``); an absent target counts as not kept. ``elsewhere-does-not-carry``
+    is left out (D1).
+
+    Returns:
+        The share at or above ``floor``, or ``None`` when there is no carrying target.
+    """
+    values = [t["value"] for r in results
+              if r.get("class") == "rejection-target" and r.get("rejection_form") in CARRYING_FORMS
+              and isinstance(r.get("items"), dict) and "per_item" in r["items"]
+              for t in r["items"]["per_item"]["targets"]]
+    if not values:
+        return None
+    return sum(1 for v in values if v is not None and v >= floor) / len(values)
 
 
 # ---------------------------------------------------------------------------
@@ -911,6 +1012,77 @@ def _summary_of_file(run: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+# Floors that arm an escalation, so read on traffic: each record entry carries a
+# ``cry_wolf`` block (5b D5). 7a adds the tombstone floor.
+ESCALATION_FLOORS: Tuple[str, ...] = ("mitos.recall.REJECTION_MATCH_FLOOR",)
+# The block's keys, exactly: the ceiling and the ratio measured against it, its
+# population, and the ids that let anyone re-read it. ``earned`` is the union of the two
+# signals ``earned_label`` and ``earned_proxy`` count apart. Numbers and ids only.
+CRY_WOLF_KEYS: Tuple[str, ...] = (
+    "ceiling", "ratio", "appearances", "earned", "earned_label", "earned_proxy", "reads",
+    "replay_run", "copy_state", "labels_sha256", "raised_from",
+)
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _is_count(v: Any) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+def _check_cry_wolf(name: str, entry: Dict[str, Any], top: Optional[float]) -> List[str]:
+    """Checks an escalation floor's ``cry_wolf`` block and its side; returns problems.
+
+    The ratio is sections shown over sections earned, rounded to 4 places, and must sit
+    at or under the ceiling; nothing shown is a ratio of 0. ``raised_from`` is ``null``
+    for side ``higher`` and equals ``max(boundaries)`` (``top``) for side ``ceiling``.
+    """
+    block = entry.get("cry_wolf")
+    if not isinstance(block, dict):
+        return [f"{name}: an escalation floor carries a `cry_wolf` block (its ceiling and ratio)"]
+    keys = set(block)
+    if keys != set(CRY_WOLF_KEYS):
+        return [f"{name}: `cry_wolf` keys must be exactly {sorted(CRY_WOLF_KEYS)}; "
+                f"missing {sorted(set(CRY_WOLF_KEYS) - keys)}, extra {sorted(keys - set(CRY_WOLF_KEYS))}"]
+    problems: List[str] = []
+    for key in ("ceiling", "ratio"):
+        if not _is_number(block[key]) or block[key] < 0:
+            problems.append(f"{name}: `cry_wolf.{key}` must be a non-negative number")
+    for key in ("appearances", "earned", "earned_label", "earned_proxy", "reads"):
+        if not _is_count(block[key]):
+            problems.append(f"{name}: `cry_wolf.{key}` must be a count")
+    for key in ("replay_run", "copy_state"):
+        if not isinstance(block[key], str) or not block[key]:
+            problems.append(f"{name}: `cry_wolf.{key}` must name its run or state")
+    if not isinstance(block["labels_sha256"], str) or not _SHA256_RE.fullmatch(block["labels_sha256"]):
+        problems.append(f"{name}: `cry_wolf.labels_sha256` must be a 64-hex digest")
+    if problems:
+        return problems
+    shown, earned = block["appearances"], block["earned"]
+    if earned > shown or max(block["earned_label"], block["earned_proxy"]) > earned \
+            or earned > block["earned_label"] + block["earned_proxy"] or shown > block["reads"]:
+        problems.append(f"{name}: `cry_wolf` counts are inconsistent (earned is the union of label and "
+                        f"proxy, never above appearances; appearances never above reads)")
+    elif shown and not earned:
+        problems.append(f"{name}: `cry_wolf` shows {shown} sections and none earned; no ratio sits "
+                        f"under a ceiling, so the floor rises until nothing appears")
+    else:
+        expected = round(shown / earned, 4) if shown else 0.0
+        if block["ratio"] != expected:
+            problems.append(f"{name}: `cry_wolf.ratio` {block['ratio']!r} is not appearances / earned "
+                            f"= {expected!r}")
+        if block["ratio"] > block["ceiling"]:
+            problems.append(f"{name}: cry-wolf ratio {block['ratio']!r} is over its ceiling "
+                            f"{block['ceiling']!r}; the floor rises before it lands")
+    side, raised = entry.get("side"), block["raised_from"]
+    if side == "ceiling":
+        if raised is None or raised != top:
+            problems.append(f"{name}: side `ceiling` needs `cry_wolf.raised_from` == max(boundaries) = {top!r}")
+    elif raised is not None:
+        problems.append(f"{name}: `cry_wolf.raised_from` is set but the side is {side!r}; "
+                        f"a raised floor takes side `ceiling`")
+    return problems
+
+
 def _check_constant(
     name: str, entry: Any, record: Dict[str, Any], runs: Dict[str, Dict[str, Any]]
 ) -> List[str]:
@@ -986,6 +1158,13 @@ def _check_constant(
                 f"{name}: boundary {boundary!r} for run {run_id!r} lies outside its classes' "
                 f"observed range [{min(lows)!r}, {max(highs)!r}]"
             )
+        # A raised floor is decoupled from its boundaries, so its value is held to every
+        # cited run's range itself: one above every target separates nothing (D3's case).
+        if side == "ceiling" and lows and highs and not (min(lows) <= value <= max(highs)):
+            problems.append(
+                f"{name}: raised value {value!r} lies outside run {run_id!r}'s observed range "
+                f"[{min(lows)!r}, {max(highs)!r}]"
+            )
 
     if side == "higher" and value != max(boundaries.values()):
         problems.append(f"{name}: side `higher` needs value == max(boundaries) = {max(boundaries.values())!r}")
@@ -996,6 +1175,17 @@ def _check_constant(
             problems.append(f"{name}: side `dense` needs exactly one cited dense run, found {len(dense_cited)}")
         elif value != boundaries[dense_cited[0]]:
             problems.append(f"{name}: side `dense` needs value == boundaries[{dense_cited[0]!r}]")
+    elif side == "ceiling":
+        if name not in ESCALATION_FLOORS:
+            problems.append(f"{name}: side `ceiling` belongs to an escalation floor ({list(ESCALATION_FLOORS)})")
+        elif not (_is_number(value) and value > max(boundaries.values())):
+            problems.append(f"{name}: side `ceiling` needs value > max(boundaries) = {max(boundaries.values())!r}")
+    if name in ESCALATION_FLOORS:
+        top = max(boundaries.values()) if all(_is_number(b) for b in boundaries.values()) else None
+        problems.extend(_check_cry_wolf(name, entry, top))
+    elif "cry_wolf" in entry:
+        problems.append(f"{name}: carries a `cry_wolf` block but arms no escalation "
+                        f"(ESCALATION_FLOORS is {list(ESCALATION_FLOORS)})")
     return problems
 
 

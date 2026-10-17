@@ -133,7 +133,7 @@ def test_the_pure_module_imports_from_outside_the_repo_and_only_the_stdlib(tmp_p
     # 1c: the item measure and the rejection-target keys
     ({"measure": "item"}, "measure `item` belongs to class rejection-target"),
     ({"target_items": [{"owner": "d2", "option": "A"}]}, "belong to rejection-target fixtures only"),
-    ({"negative_items": [{"owner": "d2", "option": "A"}]}, "belong to rejection-target fixtures only"),
+    ({"negative_items": [{"owner": "d2", "option": "A", "kind": "generic"}]}, "belong to rejection-target fixtures only"),
     ({"rejection_form": "own-question"}, "belong to rejection-target fixtures only"),
 ])
 def test_the_validator_refuses_a_malformed_fixture_and_names_it(over, needle):
@@ -147,7 +147,8 @@ def _rx(**over):
     fx = {"id": "rejection-one", "class": "rejection-target", "form": "query", "text": "a proposal",
           "targets": ["d2"], "negatives": [], "measure": "item", "notes": "why",
           "target_items": [{"owner": "d2", "option": "Postgres"}],
-          "negative_items": [{"owner": "d3", "option": "Do nothing"}], "rejection_form": "own-question"}
+          "negative_items": [{"owner": "d3", "option": "Do nothing", "kind": "generic"}],
+          "rejection_form": "own-question"}
     fx.update(over)
     return fx
 
@@ -160,7 +161,10 @@ def _rx(**over):
     ({"target_items": []}, "at least one `target_items`"),
     ({"negative_items": []}, "at least one `negative_items`"),
     ({"target_items": [{"owner": "d2"}]}, "{owner, option}"),
-    ({"negative_items": [{"option": "Defer"}]}, "{owner, option}"),
+    ({"negative_items": [{"option": "Defer", "kind": "generic"}]}, "{owner, option, kind}"),
+    ({"negative_items": [{"owner": "d3", "option": "Defer"}]}, "{owner, option, kind}"),
+    ({"negative_items": [{"owner": "d3", "option": "Defer", "kind": "noise"}]}, "kind one of"),
+    ({"target_items": [{"owner": "d2", "option": "A", "kind": "vocabulary"}]}, "{owner, option}"),
     ({"target_items": [{"owner": "d2", "option": " "}]}, "{owner, option}"),
     ({"target_items": [{"owner": "d2", "option": "A", "ordinal": 1}]}, "{owner, option}"),
     ({"target_items": ["d2"]}, "{owner, option}"),
@@ -380,11 +384,25 @@ def test_an_item_ref_no_hit_carries_is_absent_and_kept():
                                             "absent": True, "margin_vs_best_other": None}]
 
 
-def test_derive_item_result_refuses_a_non_item_fixture_and_a_missing_shape():
+def test_derive_item_result_refuses_a_non_item_fixture_and_a_missing_per_item_shape():
     with pytest.raises(ValueError, match="only an item-measured"):
         R.derive_item_result(_fx(), {"per_item": [], "per_decision": []}, {"targets": [], "negatives": []})
-    with pytest.raises(ValueError, match="no hits for shapes"):
-        R.derive_item_result(_rx(), {"per_item": []}, {"targets": [], "negatives": []})
+    with pytest.raises(ValueError, match="no hits for the per_item shape"):
+        R.derive_item_result(_rx(), {"per_decision": []}, {"targets": [], "negatives": []})
+    with pytest.raises(ValueError, match="unknown shapes"):
+        R.derive_item_result(_rx(), {"per_item": [], "per_field": []}, {"targets": [], "negatives": []})
+
+
+def test_a_per_item_only_result_derives_and_carries_each_negative_s_kind():
+    """5b: the dense run over the copy has no per-decision shape; a negative's kind rides it."""
+    refs = {"targets": [_iref("t", "Postgres", 1)],
+            "negatives": [dict(_iref("g", "Defer", 1), kind="generic"),
+                          dict(_iref("v", "Blobs", 1), kind="vocabulary")]}
+    items = R.derive_item_result(
+        _rx(), {"per_item": [_ih("t", 0.8, 1, 0), _ih("v", 0.7, 1, 0), _ih("g", 0.6, 1, 0)]}, refs)
+    assert set(items) == {"per_item"}
+    assert [(n["owner"], n["kind"]) for n in items["per_item"]["negatives"]] == [("g", "generic"), ("v", "vocabulary")]
+    assert "kind" not in items["per_item"]["targets"][0]
 
 
 def _item_result(fid, form, per_item_t, per_dec_t, rank_i=1, rank_d=1, neg=0.5):
@@ -392,7 +410,8 @@ def _item_result(fid, form, per_item_t, per_dec_t, rank_i=1, rank_d=1, neg=0.5):
         return {"hits": [], "top_value": value,
                 "targets": [{"owner": "o", "option": "A", "value": value, "rank": rank, "absent": value is None,
                              "margin_vs_best_other": None if value is None else value - 0.6}],
-                "negatives": [{"owner": "g", "option": "Defer", "value": neg, "rank": 9, "absent": False}]}
+                "negatives": [{"owner": "g", "option": "Defer", "value": neg, "rank": 9, "absent": False,
+                               "kind": "generic"}]}
     fx = _rx(id=fid, rejection_form=form)
     result = R.derive_result(fx, [_hit("o", 0.7)], "weak", None)
     result["items"] = {"per_item": shape(per_item_t, rank_i), "per_decision": shape(per_dec_t, rank_d)}
@@ -415,11 +434,22 @@ def test_summarize_shapes_compares_both_shapes_and_counts_absent_refs_in_rank_on
     assert pi["by_form"]["own-question"]["values"] == [0.90]
     assert pi["by_form"]["elsewhere-does-not-carry"]["absent"] == 1
     assert pi["negatives"]["values"] == [0.5, 0.5, 0.5]
+    assert pi["negatives_by_kind"]["generic"]["values"] == [0.5, 0.5, 0.5]
+    assert pi["negatives_by_kind"]["vocabulary"]["n"] == 0
     assert pd["margin"]["values"] == pytest.approx([0.0, 0.1, 0.2])
     classes = R.summarize_classes(results)
     assert classes["rejection-target"]["query"]["values"] == [0.85, 0.90]  # per item, the ruled shape
     assert classes["rejection-target"]["query"]["negatives"]["values"] == [0.5, 0.5, 0.5]
     assert R.summarize_shapes([R.derive_result(_fx(), _BASE, "weak", None)]) == {}
+
+
+def test_summarize_shapes_leaves_out_a_shape_some_item_result_lacks():
+    """Harbor only reads both shapes; a per-item-only result never summarizes a partial
+    per-decision block."""
+    full = _item_result("r1", "own-question", 0.90, 0.80)
+    partial = _item_result("r2", "own-question", 0.85, 0.70)
+    del partial["items"]["per_decision"]
+    assert set(R.summarize_shapes([full, partial])) == {"per_item"}
 
 
 def test_unlabelled_results_summarize_to_nothing():
@@ -959,3 +989,129 @@ def test_the_boundary_is_the_nearest_rank_median_to_four_places_or_none():
     rows = [_inv([_hit("n", 0.9), _hit("t", 0.9 - d)], ["t"]) for d in (0.01, 0.02, 0.03, 0.04)]
     assert R.edge_margin_boundary(rows) == 0.02   # nearest rank 2 of 4, not the mean 0.025
     assert R.edge_margin_boundary([_inv([_hit("t", 0.9)], ["t"])]) is None
+
+
+# ---------------------------------------------------------------------------
+# The rejection-match floor (5b D3) and the escalation floor's record entry (D5)
+# ---------------------------------------------------------------------------
+
+FLOOR = "mitos.recall.REJECTION_MATCH_FLOOR"
+
+
+def _rej(form, targets, negatives, cls="rejection-target"):
+    """A rejection-target result holding per-item target and negative values only."""
+    return {"id": f"r-{form}", "class": cls, "measure": "item", "rejection_form": form,
+            "items": {"per_item": {
+                "targets": [{"owner": "o", "option": "A", "value": v} for v in targets],
+                "negatives": [{"owner": "g", "option": "N", "value": v, "kind": k} for v, k in negatives]}}}
+
+
+@pytest.mark.parametrize("top, boundary", [
+    (0.65133, 0.6514),   # the next 4-place value up
+    (0.6513, 0.6514),    # an exact 4-place maximum moves up one step, never stays
+    (0.70, 0.7001),
+    (0.69999, 0.7),
+])
+def test_the_floor_boundary_is_the_smallest_four_place_value_strictly_above_every_negative(top, boundary):
+    results = [_rej("own-question", [0.9], [(0.5, "generic"), (top, "vocabulary")]),
+               _rej("elsewhere-carries", [0.8], [(0.6, "generic")])]
+    got = R.rejection_floor_boundary(results)
+    assert got == boundary and got > top
+
+
+def test_the_floor_boundary_reads_both_kinds_every_form_and_only_the_rejection_class():
+    results = [_rej("elsewhere-does-not-carry", [0.95], [(0.71, "vocabulary")]),
+               _rej("own-question", [0.9], [(0.66, "generic")]),
+               _rej("own-question", [0.9], [(0.99, "generic")], cls="bullseye")]
+    assert R.rejection_floor_boundary(results) == 0.7101
+    assert R.rejection_floor_boundary([_rej("own-question", [0.9], [(None, "generic")])]) is None
+    assert R.rejection_floor_boundary([]) is None
+
+
+def test_retention_counts_own_and_carries_targets_and_leaves_does_not_carry_out():
+    results = [_rej("own-question", [0.80, 0.60, None], []),
+               _rej("elsewhere-carries", [0.75], []),
+               _rej("elsewhere-does-not-carry", [0.10, 0.20], [])]
+    assert R.rejection_floor_retention(results, 0.70) == pytest.approx(2 / 4)  # absent is not kept
+    assert R.rejection_floor_retention(results, 0.80) == pytest.approx(1 / 4)
+    assert R.rejection_floor_retention([_rej("elsewhere-does-not-carry", [0.9], [])], 0.5) is None
+
+
+def _cry_wolf(**over):
+    block = {"ceiling": 2.0, "ratio": 1.6, "appearances": 24, "earned": 15, "earned_label": 12,
+             "earned_proxy": 6, "reads": 106, "replay_run": "20261017-0000-abc1234-dogfood-copy",
+             "copy_state": "s3-rejection-9c6fd89", "labels_sha256": "a" * 64, "raised_from": None}
+    block.update(over)
+    return block
+
+
+def _escalation_record(record_dir, value=0.80, side="higher", boundary=0.80, cry_wolf="default"):
+    """`_floor_record`'s classes, under the escalation floor's own name."""
+    run = R.append_run(_run(classes={"rejection-target": {"query": _class_block(
+        [0.85, 0.90, 0.95], "item", negatives=[0.70, 0.74, 0.78])}}), record_dir)
+    record = R.load_record(record_dir)
+    entry = {"value": value, "kind": "threshold", "space": "query", "separates": ["rejection-target"],
+             "boundaries": {run: boundary}, "side": side, "method": "synthetic"}
+    if cry_wolf is not None:
+        entry["cry_wolf"] = _cry_wolf() if cry_wolf == "default" else cry_wolf
+    record["constants"][FLOOR] = entry
+    return _problems(record, R.load_cited_runs(record, record_dir), {FLOOR: value})
+
+
+def test_an_escalation_floor_with_its_ceiling_met_is_clean(record_dir):
+    assert FLOOR in R.ESCALATION_FLOORS
+    assert _escalation_record(record_dir) == []
+
+
+def test_an_escalation_floor_without_a_cry_wolf_block_is_refused(record_dir):
+    assert _has(_escalation_record(record_dir, cry_wolf=None), "carries a `cry_wolf` block")
+
+
+@pytest.mark.parametrize("over, needle", [
+    ({"ratio": 2.4, "appearances": 24, "earned": 10, "earned_label": 8, "earned_proxy": 4}, "over its ceiling"),
+    ({"ratio": 1.0}, "is not appearances / earned"),
+    ({"earned": 0, "earned_label": 0, "earned_proxy": 0, "ratio": 0.0}, "none earned"),
+    ({"earned": 25}, "inconsistent"),
+    ({"earned_label": 16}, "inconsistent"),
+    ({"labels_sha256": "abc"}, "64-hex"),
+    ({"replay_run": ""}, "must name its run"),
+    ({"reads": -1}, "must be a count"),
+    ({"raised_from": 0.78}, "a raised floor takes side `ceiling`"),
+])
+def test_a_cry_wolf_block_that_does_not_hold_is_refused(record_dir, over, needle):
+    assert _has(_escalation_record(record_dir, cry_wolf=_cry_wolf(**over)), needle)
+
+
+def test_a_cry_wolf_block_with_a_key_missing_or_extra_is_refused(record_dir):
+    block = _cry_wolf()
+    del block["earned_proxy"]
+    assert _has(_escalation_record(record_dir, cry_wolf=block), "missing ['earned_proxy']")
+    assert _has(_escalation_record(record_dir, cry_wolf=_cry_wolf(slug="leak")), "extra ['slug']")
+
+
+def test_nothing_shown_is_a_ratio_of_zero(record_dir):
+    block = _cry_wolf(appearances=0, earned=0, earned_label=0, earned_proxy=0, ratio=0.0)
+    assert _escalation_record(record_dir, cry_wolf=block) == []
+
+
+@pytest.mark.parametrize("value, raised, clean, needle", [
+    (0.88, 0.80, True, None),                       # raised above its boundary, inside the range
+    (0.80, 0.80, False, "needs value > max(boundaries)"),
+    (0.88, None, False, "needs `cry_wolf.raised_from` == max(boundaries)"),
+    (0.88, 0.79, False, "needs `cry_wolf.raised_from` == max(boundaries)"),
+    (0.97, 0.80, False, "raised value 0.97 lies outside run"),  # above every target: D3's escalation
+])
+def test_the_ceiling_side(record_dir, value, raised, clean, needle):
+    problems = _escalation_record(record_dir, value=value, side="ceiling",
+                                  cry_wolf=_cry_wolf(raised_from=raised))
+    assert (problems == []) is clean, problems
+    if needle:
+        assert _has(problems, needle)
+
+
+def test_the_ceiling_side_and_a_cry_wolf_block_belong_to_escalation_floors_only(record_dir):
+    record, runs, _, harbor, dense = _clean(record_dir)
+    record["constants"][STRONG].update(side="ceiling", value=0.76)
+    assert _has(_problems(record, runs, {STRONG: 0.76}), "belongs to an escalation floor")
+    record["constants"][STRONG].update(side="higher", value=0.75, cry_wolf=_cry_wolf())
+    assert _has(_problems(record, runs, {STRONG: 0.75}), "arms no escalation")

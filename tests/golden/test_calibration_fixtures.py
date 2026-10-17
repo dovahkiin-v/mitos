@@ -7,9 +7,11 @@ something real, every (class, space) holds its minimum, the rejection-target cla
 the shape its floors are set from, and the corpus edits it measures stay numbered.
 """
 
+import math
 import os
 import sys
 from collections import Counter
+from typing import List
 
 import pytest
 
@@ -20,6 +22,9 @@ sys.path.insert(0, GOLDEN)
 from _harness import build_reference_graph  # noqa: E402
 import _calibration_harness as CH  # noqa: E402
 import _calibration_record as R  # noqa: E402
+
+sys.path.insert(0, os.path.dirname(GOLDEN))  # tests/, for the shared rejection-index double
+from _rejection_index_double import FakeRejectionIndex  # noqa: E402
 
 HUB = "harbor-storage-is-sqlite"
 
@@ -35,7 +40,12 @@ MINIMUMS = {
     ("retired-precedent", "query"): 4,
     ("retired-precedent", "document"): 5,
 }
-FORM_MINIMUMS = {"own-question": 4, "elsewhere-carries": 3, "elsewhere-does-not-carry": 3}
+# Raised by 5b: carries and does-not-carry each hold four, so the floor's recall
+# (own + carries) and its cry-wolf reading (does-not-carry counts as not earned) both
+# rest on more than three cases.
+FORM_MINIMUMS = {"own-question": 4, "elsewhere-carries": 4, "elsewhere-does-not-carry": 4}
+# 5b: at least this many rejection-target fixtures carry a vocabulary negative.
+VOCABULARY_MINIMUM = 8
 
 # The generic items (do nothing, defer, status quo), named here rather than guessed from
 # their text. Each is a hard negative of the rejection floor and never a target.
@@ -107,6 +117,51 @@ def test_the_rejection_target_class_keeps_its_shape(fixtures):
         uses.update(_refs(fx, "negative_items") & GENERIC_ITEMS)
     thin = {item: uses[item] for item in GENERIC_ITEMS if uses[item] < 2}
     assert not thin, f"each generic item is a negative at least twice: {thin}"
+
+
+def test_every_negative_item_names_its_kind_and_generic_means_the_named_set(fixtures):
+    """5b D1: a negative is generic (one of `GENERIC_ITEMS`, named, not guessed) or
+    vocabulary; validation requires the key, this row requires the two to agree."""
+    for fx in _rejection(fixtures):
+        for ref in fx["negative_items"]:
+            item = (ref["owner"], ref["option"])
+            assert ref["kind"] in R.NEGATIVE_KINDS, (fx["id"], ref)
+            assert (ref["kind"] == "generic") == (item in GENERIC_ITEMS), (
+                f"{fx['id']}: {item} is kind {ref['kind']!r}; generic means one of GENERIC_ITEMS"
+            )
+
+
+def test_vocabulary_negatives_are_another_decisions_other_item(fixtures):
+    """A vocabulary negative is a non-generic item of another decision: never the
+    fixture's own target item, never owned by a target item's owner, and present on at
+    least `VOCABULARY_MINIMUM` fixtures."""
+    carrying = []
+    for fx in _rejection(fixtures):
+        vocabulary = {(r["owner"], r["option"]) for r in fx["negative_items"] if r["kind"] == "vocabulary"}
+        if vocabulary:
+            carrying.append(fx["id"])
+        assert not vocabulary & _refs(fx, "target_items"), f"{fx['id']}: its own target as a vocabulary negative"
+        target_owners = {o for o, _ in _refs(fx, "target_items")}
+        assert not {o for o, _ in vocabulary} & target_owners, (
+            f"{fx['id']}: a vocabulary negative owned by the target's own decision"
+        )
+        assert not vocabulary & GENERIC_ITEMS, f"{fx['id']}: a generic item tagged vocabulary"
+    assert len(carrying) >= VOCABULARY_MINIMUM, (len(carrying), carrying)
+
+
+@pytest.mark.parametrize("negative, needle", [
+    ({"owner": "harbor-backup-nightly", "option": "Do nothing"}, "{owner, option, kind}"),
+    ({"owner": "harbor-backup-nightly", "option": "Do nothing", "kind": "noise"}, "kind one of"),
+])
+def test_a_negative_item_without_a_known_kind_is_refused(negative, needle):
+    fixture = {"id": "kind-probe", "class": "rejection-target", "form": "query", "text": "probe",
+               "targets": ["harbor-storage-is-sqlite"], "negatives": [], "measure": "item",
+               "notes": "probe", "rejection_form": "own-question",
+               "target_items": [{"owner": "harbor-storage-is-sqlite", "option": "Postgres"}],
+               "negative_items": [negative]}
+    with pytest.raises(ValueError) as err:
+        R.validate_fixtures([fixture])
+    assert needle in str(err.value) and "negative_items" in str(err.value)
 
 
 def test_no_fixture_names_the_hub_as_a_negative(fixtures):
@@ -251,8 +306,10 @@ def test_the_query_form_reads_one_ids_only_call_at_the_bound_and_labels_its_wind
     assert len(raw) == len(index.nodes) > CH.RECORD_LIMIT
     assert [h["slug"] for h in read.result["hits"]] == \
         [n["slug"] for n in index.nodes[:CH.RECORD_LIMIT]]
-    assert CH.READER == ("mcp.surface_decisions(retrieval_walk)"
+    assert CH.READER == ("mcp.surface_decisions(retrieval_walk+rejection_leg)"
                          "+conflict.gather_candidates(retrieval_walk)")
+    # No per-item index bound: the autouse seam's empty index answers, nothing is compared.
+    assert (read.result["section"], read.result["section_state"], read.item_ranking) == ([], None, None)
 
 
 # --------------------------------------------------------------------------- #
@@ -294,3 +351,148 @@ def test_the_draft_form_reads_one_ids_only_call_at_the_raw_bound_and_slices_its_
         [n["slug"] for n in index.nodes[:conflict.CONFLICT_OVERFETCH_LIMIT]]
     assert isinstance(read.candidates, conflict.Gathering)
     assert len(read.candidates.live) <= conflict.CONFLICT_OVERFETCH_LIMIT
+
+
+# --------------------------------------------------------------------------- #
+# Phase 5b — items read through the shipped client; the shipped section checked
+# --------------------------------------------------------------------------- #
+
+def _query_angle_vector(score: float) -> List[float]:
+    """A 2-d vector whose cosine with `_Embed`'s query vector is ``score``."""
+    alpha = math.atan2(0.2, 0.1)
+    delta = math.acos(score)
+    return [math.cos(alpha + delta), math.sin(alpha + delta)]
+
+
+def _item_probe(index, tmp_path, monkeypatch, client):
+    """`index` with a stub embedder, a canned decision store, a workspace, and ``client``
+    bound as the per-item index, seeded with every Harbor rejection point at distinct
+    scores (0.99 down by 0.02 in map order, so some sit above the floor and most below)."""
+    import dataclasses
+
+    from _point_hits import CannedVector
+    from mitos.cli import cmd_init
+    from mitos.config import MitosConfig
+    from mitos.vector_store import RejectionPoint
+
+    monkeypatch.setenv("QDRANT_URL", "http://localhost:9")
+    for key in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "ANTHROPIC_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
+    workspace = str(tmp_path / "ws")
+    os.makedirs(workspace)
+    cmd_init(MitosConfig(workspace))
+
+    class _Embed:
+        def get_embedding(self, text, is_query=False):
+            return [0.1, 0.2]
+
+    points = CH.item_points_of(index)
+    client.upsert_points(
+        [RejectionPoint(point_id=pid, owner_id=index.nodes_by_slug[slug]["id"],
+                        vector=_query_angle_vector(0.99 - 0.02 * i))
+         for i, (pid, (slug, _, _)) in enumerate(points.items())],
+        model="test-embedding-model", may_create=True,
+    )
+    matches = [{"slug": n["slug"], "score": 0.9 - 0.001 * i} for i, n in enumerate(index.nodes)]
+    return dataclasses.replace(index, provider=_Embed(), workspace=workspace,
+                               vstore=CannedVector(matches, store=index.store),
+                               items=CH.ItemIndex(client, points))
+
+
+def _fixture(fixtures, fid):
+    return next(f for f in fixtures if f["id"] == fid)
+
+
+def test_the_item_reader_labels_every_point_by_the_harness_map(index, fixtures, tmp_path, monkeypatch):
+    """`read_rejection_items` reads per_item through the client, every point, labelled by
+    `item_points_of`; with no Harbor shapes bound it reads no per_decision shape."""
+    probe = _item_probe(index, tmp_path, monkeypatch, FakeRejectionIndex(present=True))
+    read = CH.read_query_form(probe, _fixture(fixtures, "rejection-own-postgres"))
+
+    assert read.shape_searches == {"per_item": 1}
+    assert set(read.result["items"]) == {"per_item"}
+    hits = read.result["items"]["per_item"]["hits"]
+    assert len(hits) == len(probe.items.points) == len(read.item_ranking)
+    for h in hits:
+        assert (h["owner"], h["ordinal"], h["part"]) == probe.items.points[h["point_id"]]
+    negatives = read.result["items"]["per_item"]["negatives"]
+    assert [n["kind"] for n in negatives] == [r["kind"] for r in _fixture(fixtures, "rejection-own-postgres")["negative_items"]]
+    assert all(not r["absent"] for r in read.result["items"]["per_item"]["targets"] + negatives)
+
+
+@pytest.mark.parametrize("fid", ["rejection-own-postgres", "bullseye-rate-limit-per-minute"])
+def test_the_shipped_section_agrees_with_the_instrument(index, fixtures, tmp_path, monkeypatch, fid):
+    """A faithful index: the envelope's section is the instrument's ranking cut at the
+    floor and the bound, for a rejection target and for any other query fixture."""
+    from mitos.recall import REJECTION_MATCH_FLOOR, REJECTION_SECTION_BOUND
+
+    fixture = _fixture(fixtures, fid)
+    probe = _item_probe(index, tmp_path, monkeypatch, FakeRejectionIndex(present=True))
+    read = CH.read_query_form(probe, fixture)
+
+    section = read.result["section"]
+    assert read.result["section_state"] is None
+    assert 0 < len(section) == REJECTION_SECTION_BOUND
+    predicted = [p for p in read.item_ranking if p["score"] >= REJECTION_MATCH_FLOOR][:REJECTION_SECTION_BOUND]
+    assert [(m["slug"], m["ordinal"]) for m in section] == [(p["slug"], p["ordinal"]) for p in predicted]
+
+
+class _LegSwapsTwo(FakeRejectionIndex):
+    """The shipped leg's search (its fetch, not the instrument's whole-collection read)
+    answers its first two hits swapped."""
+
+    def search(self, vector, limit, *, budget_seconds):
+        answer = super().search(vector, limit, budget_seconds=budget_seconds)
+        if limit != len(self.points) and len(answer.hits) > 1:
+            hits = list(answer.hits)
+            hits[0], hits[1] = hits[1], hits[0]
+            return answer._replace(hits=hits)
+        return answer
+
+
+class _LegDropsOne(FakeRejectionIndex):
+    """The shipped leg's search loses its best hit."""
+
+    def search(self, vector, limit, *, budget_seconds):
+        answer = super().search(vector, limit, budget_seconds=budget_seconds)
+        if limit != len(self.points):
+            return answer._replace(hits=list(answer.hits)[1:])
+        return answer
+
+
+class _LegOverruns(FakeRejectionIndex):
+    """The shipped leg's search overruns its budget; the instrument's does not."""
+
+    def search(self, vector, limit, *, budget_seconds):
+        if limit != len(self.points):
+            return super().search(vector, limit, budget_seconds=0.0)
+        return super().search(vector, limit, budget_seconds=budget_seconds)
+
+
+class _InstrumentTruncated(FakeRejectionIndex):
+    """The instrument's whole-collection search comes back one point short."""
+
+    def search(self, vector, limit, *, budget_seconds):
+        answer = super().search(vector, limit, budget_seconds=budget_seconds)
+        if limit == len(self.points):
+            return answer._replace(hits=list(answer.hits)[:-1])
+        return answer
+
+
+@pytest.mark.parametrize("broken, raised, needle", [
+    (_LegSwapsTwo, CH.SectionDisagreement, "!= instrument"),
+    (_LegDropsOne, CH.SectionDisagreement, "!= instrument"),
+    (_LegOverruns, CH.SectionDisagreement, "'not_searched'"),
+    (_InstrumentTruncated, AssertionError, "of 46 points"),
+])
+def test_a_section_the_instrument_cannot_vouch_for_is_a_fault(
+        index, fixtures, tmp_path, monkeypatch, broken, raised, needle):
+    """Each broken index subclasses the shared fake and overrides one method (the
+    tree-wide protocol sweep forbids any other broken double). An order swap or a lost
+    match in the shipped section disagrees; an overrun section compares nothing; an
+    instrument read missing a point is never a measurement."""
+    probe = _item_probe(index, tmp_path, monkeypatch, broken(present=True))
+    needle = needle.replace("46", str(len(probe.items.points)))
+    with pytest.raises(raised) as err:
+        CH.read_query_form(probe, _fixture(fixtures, "rejection-own-postgres"))
+    assert needle in str(err.value) and "rejection-own-postgres" in str(err.value)

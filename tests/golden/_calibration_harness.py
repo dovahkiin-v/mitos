@@ -19,14 +19,26 @@ an instrument that resolved through the code it measures could not catch that co
 wrong. Labels stay slugs, so the sealed fixtures and every earlier run stay comparable;
 fixtures still name nodes by slug, which is why the slug-uniqueness assertion stays.
 
-A rejection-target fixture is also read against two more throwaway collections, the two
-rejection-index shapes ruling 2 compares: one point per rejected item part
-(``rejections.rejection_points``) and one point per decision holding its whole
-``rejected_paths`` field. No shipped reader searches them before 5a, so `search_points`
-reads them raw with ``exact`` search, which makes "every point valued" a declaration —
-``VectorStore.query`` has no exact knob, and production has no reason to gain one. Both
-shape reads join hits to the graph by point id, never by payload. 5a's switch to the
-shipped rejection search retires `search_points`.
+A rejection-target fixture is also read for its items. The per-item shape (one point per
+rejected item part, ``rejections.rejection_points``) is the index that ships (ruling 2),
+so it is written and searched through the shipped client, ``QdrantRejectionIndex``
+(5b): on Harbor a throwaway collection in production's shape, on the measurement copy
+the copy's own ``rejection_collection``. `read_rejection_items` takes the whole
+collection in one search and checks that every point came back, so "every point valued"
+is a checked fact rather than an assumption about the index. The per-decision shape
+(one point per decision holding its whole field) has no shipped reader; it is kept on
+Harbor only as ruling 2's recorded evidence and read raw by `search_points` with
+``exact`` set. Every item hit is labelled by this module's own map from
+``rejections.rejection_points`` over the graph, never through ``resolve_point_ids`` or
+``fill_rejections``, for the reason above.
+
+With a per-item client bound (`CalibrationIndex.items`), `read_query_form` also binds
+``mcp_server._ranked_rejection_index`` to it, so the envelope carries the shipped
+rejection section, and checks that section against the instrument's own ranking
+(`check_section_agreement`): the shipped leg end to end, measured by a reader that does
+not share its code. Without one (a run over a workspace with no rejection index) the
+section is recorded as read and nothing is compared. The draft form's gather passes no
+rejection leg, so it needs no binding.
 
 This module imports ``_semantic_harness`` and never ``_conflict_harness``, which pulls
 ``anthropic`` in; Layer C makes no judge call.
@@ -36,7 +48,6 @@ import importlib
 import json
 import os
 import sys
-import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from unittest.mock import patch
@@ -44,11 +55,11 @@ from unittest.mock import patch
 import requests
 
 import mitos
-from mitos import conflict, sync
+from mitos import conflict, recall, sync
 from mitos.identity import canonical_core_string_norm, embedding_text
 from mitos.mcp_server import surface_decisions
 from mitos.rejections import enumerate_rejected_paths, rejection_points
-from mitos.vector_store import hash_to_uuid
+from mitos.vector_store import RejectionPoint, hash_to_uuid
 
 sys.path.insert(0, os.path.dirname(__file__))
 import _calibration_record as R  # noqa: E402
@@ -60,8 +71,19 @@ RECORD_LIMIT = 10
 # Retagged by 2c: the query form now reads through the shared identity walk (one call at
 # the over-fetch bound, ids only), so runs before and after can be told apart. Retagged
 # by 2d: the draft form's gather reads through the same walk (one call at the gather raw
-# bound, ids only).
-READER = "mcp.surface_decisions(retrieval_walk)+conflict.gather_candidates(retrieval_walk)"
+# bound, ids only). Retagged by 5b: the query form's envelope carries the shipped
+# rejection leg's section, and items are read through the shipped rejection client.
+READER = ("mcp.surface_decisions(retrieval_walk+rejection_leg)"
+          "+conflict.gather_candidates(retrieval_walk)")
+# The per-item reader (5b): one shipped-client search over the whole collection,
+# labelled by this module's own map.
+ITEM_READER = "QdrantRejectionIndex.search(limit=all)+rejections.rejection_points"
+# The instrument's search waits this long: it reads the whole collection, not the
+# ranked read's fetch, and an overrun here would be a missing measurement, not a
+# section state. The shipped leg keeps its own budget.
+ITEM_SEARCH_BUDGET_SECONDS = 5.0
+# How far an envelope match's score may sit from the instrument's for the same item.
+AGREEMENT_TOLERANCE = 1e-6
 # The reader's own live predicate (``surface_decisions`` and ``gather_candidates`` both).
 LIVE_STATES = ("active", "drifted")
 MITOS_DIR = os.path.dirname(os.path.abspath(mitos.__file__))
@@ -97,15 +119,31 @@ class RecordingVectorStore:
 
 
 @dataclass
-class ShapeCollections:
-    """The two rejection-index shapes, populated, and the maps a read labels hits with.
+class ItemIndex:
+    """The per-item rejection index a read searches, and the map it labels hits with.
 
-    ``item_points`` maps a per-item point id to ``(owner slug, ordinal, part index)``;
-    ``field_points`` maps a per-decision point id to its owner slug. Both ids are the
-    lowercase dashed UUIDs Qdrant returns.
+    ``client`` is a ``QdrantRejectionIndex`` (or a test double honouring its
+    ``search``); ``points`` maps every point id the collection should hold to ``(owner
+    slug, ordinal, part index)``, built by `item_points_of` from the graph, never from
+    the collection. Ids are the lowercase dashed UUIDs Qdrant returns.
     """
 
-    items_vstore: Any
+    client: Any
+    points: Dict[str, Tuple[str, int, int]]
+
+
+@dataclass
+class ShapeCollections:
+    """Harbor's two rejection-index shapes, populated, and the maps a read labels hits with.
+
+    ``items_index`` is a ``QdrantRejectionIndex`` on the per-item collection, written in
+    production's shape; ``fields_vstore`` a ``QdrantVectorStore`` on the per-decision
+    one. ``item_points`` maps a per-item point id to ``(owner slug, ordinal, part
+    index)``; ``field_points`` maps a per-decision point id to its owner slug. Both ids
+    are the lowercase dashed UUIDs Qdrant returns.
+    """
+
+    items_index: Any
     fields_vstore: Any
     item_points: Dict[str, Tuple[str, int, int]]
     field_points: Dict[str, str]
@@ -114,13 +152,21 @@ class ShapeCollections:
     def counts(self) -> Dict[str, int]:
         return {"per_item": len(self.item_points), "per_decision": len(self.field_points)}
 
+    @property
+    def items(self) -> ItemIndex:
+        """The per-item shape as the reader binds it (`CalibrationIndex.items`)."""
+        return ItemIndex(self.items_index, self.item_points)
+
 
 @dataclass
 class CalibrationIndex:
     """The built Harbor graph, its Layer C collection and what a read needs to label hits.
 
-    ``shapes`` is set by the live module's shape fixture; an item-measured read without
-    it raises rather than recording a result with no items.
+    ``items`` is the per-item rejection index a read searches (Harbor: the live module's
+    shape fixture binds ``shapes.items``; the copy: the dense worker binds the copy's
+    own ``rejection_collection``). ``shapes`` is Harbor's two throwaway shape
+    collections, which add the per-decision shape. An item-measured read without
+    ``items`` raises rather than recording a result with no items.
     """
 
     store: Any
@@ -132,6 +178,7 @@ class CalibrationIndex:
     nodes_by_point_id: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     live_by_slug: Dict[str, bool] = field(default_factory=dict)
     shapes: Optional[ShapeCollections] = None
+    items: Optional[ItemIndex] = None
 
     @property
     def decision_count(self) -> int:
@@ -147,6 +194,15 @@ class FormRead:
     envelope: Optional[Dict[str, Any]] = None
     candidates: Optional[Any] = None   # the draft form's ``conflict.Gathering``
     shape_searches: Optional[Dict[str, int]] = None
+    item_ranking: Optional[List[Dict[str, Any]]] = None  # the instrument's collapsed items
+
+
+class SectionDisagreement(Exception):
+    """The envelope's rejection section is not the instrument's ranking cut at the floor.
+
+    Also raised when the section was not searched or not whole, since then nothing can
+    be compared. A fault for the fixture: the run it belongs to is unrecordable.
+    """
 
 
 class DraftReadUnavailable(Exception):
@@ -238,42 +294,53 @@ def _decisions(index: CalibrationIndex) -> List[Dict[str, Any]]:
     return [n for n in index.nodes if n["kind"] == "decision"]
 
 
-def populate_shape_collections(index: CalibrationIndex, items_vstore: Any, fields_vstore: Any) -> ShapeCollections:
+def item_points_of(index: CalibrationIndex) -> Dict[str, Tuple[str, int, int]]:
+    """Maps every rejection point of every decision to ``(owner slug, ordinal, part)``.
+
+    Built from ``rejections.rejection_points`` over the graph, retired owners included
+    (§4.6: their items stay), so it is the instrument's own answer to "which item is
+    this point", independent of the collection being read.
+    """
+    points: Dict[str, Tuple[str, int, int]] = {}
+    for node in _decisions(index):
+        for pid, ref in rejection_points(node["id"], node.get("rejected_paths") or "").items():
+            points[pid] = (node["slug"], ref.ordinal, ref.part_index)
+    return points
+
+
+def populate_shape_collections(index: CalibrationIndex, items_index: Any, fields_vstore: Any) -> ShapeCollections:
     """Embeds both rejection-index shapes over every decision, each text as a document.
 
-    Per item: one point per ``rejections.rejection_points(node id, field)`` entry, its
-    part text embedded. Per decision: one point at ``hash_to_uuid(node id)``, holding
-    ``canonical_core_string_norm(field)`` embedded. An empty field contributes no point
-    in either shape. The payload names the owner's node id and nothing a read takes from
-    the graph (ADR ``rejection-point-payload-names-its-owner-and-nothing-a-read-takes-from-the-graph``).
-
-    ``upsert`` maps its id through ``hash_to_uuid``, which slices hex, so an item point is
-    written under ``uuid.UUID(pid).hex`` and round-trips to ``pid``; the population row
-    checks that against ``list_point_ids()``.
+    Per item, in production's shape (5b): one point per ``rejections.rejection_points``
+    entry, its part text embedded, written through ``QdrantRejectionIndex.upsert_points``
+    under its own id with the payload ``{owner_id, model}``. Per decision: one point at
+    ``hash_to_uuid(node id)``, holding ``canonical_core_string_norm(field)`` embedded,
+    payload ``{"owner": node id}``; nothing reads it but `search_points`. An empty field
+    contributes no point in either shape.
 
     Args:
         index: A populated `CalibrationIndex` (its provider embeds).
-        items_vstore: A ``QdrantVectorStore`` bound to the per-item collection.
+        items_index: A ``QdrantRejectionIndex`` bound to the per-item collection.
         fields_vstore: A ``QdrantVectorStore`` bound to the per-decision collection.
 
     Returns:
         The `ShapeCollections`.
     """
-    item_points: Dict[str, Tuple[str, int, int]] = {}
+    item_points = item_points_of(index)
     field_points: Dict[str, str] = {}
+    points: List[RejectionPoint] = []
     for node in _decisions(index):
         field_text = node.get("rejected_paths") or ""
-        payload = {"owner": node["id"]}
         for pid, ref in rejection_points(node["id"], field_text).items():
             vector = index.provider.get_embedding(ref.text, is_query=False)
-            items_vstore.upsert(uuid.UUID(pid).hex, vector, payload, may_create=True)
-            item_points[pid] = (node["slug"], ref.ordinal, ref.part_index)
+            points.append(RejectionPoint(point_id=pid, owner_id=node["id"], vector=vector))
         whole = canonical_core_string_norm(field_text)
         if whole:
             vector = index.provider.get_embedding(whole, is_query=False)
-            fields_vstore.upsert(node["id"], vector, payload, may_create=True)
+            fields_vstore.upsert(node["id"], vector, {"owner": node["id"]}, may_create=True)
             field_points[hash_to_uuid(node["id"])] = node["slug"]
-    return ShapeCollections(items_vstore, fields_vstore, item_points, field_points)
+    items_index.upsert_points(points, model=index.provider.model_id, may_create=True)
+    return ShapeCollections(items_index, fields_vstore, item_points, field_points)
 
 
 def resolve_item_refs(index: CalibrationIndex, fixture: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
@@ -291,6 +358,7 @@ def resolve_item_refs(index: CalibrationIndex, fixture: Dict[str, Any]) -> Dict[
     Returns:
         ``{"targets": [...], "negatives": [...]}``, each ref as ``{owner, option, ordinal,
         part_ids, field_id}``: the item's part point ids and its owner's whole-field id.
+        A negative also carries its ``kind`` (generic or vocabulary).
 
     Raises:
         ValueError: Naming the fixture, on an owner that is not a decision of the graph,
@@ -315,8 +383,11 @@ def resolve_item_refs(index: CalibrationIndex, fixture: Dict[str, Any]) -> Dict[
             item = matches[0]
             part_ids = [pid for pid, p in rejection_points(node["id"], field_text).items()
                         if p.ordinal == item.ordinal]
-            out[role].append({"owner": ref["owner"], "option": ref["option"], "ordinal": item.ordinal,
-                              "part_ids": part_ids, "field_id": hash_to_uuid(node["id"])})
+            resolved = {"owner": ref["owner"], "option": ref["option"], "ordinal": item.ordinal,
+                        "part_ids": part_ids, "field_id": hash_to_uuid(node["id"])}
+            if "kind" in ref:
+                resolved["kind"] = ref["kind"]
+            out[role].append(resolved)
     return out
 
 
@@ -355,12 +426,12 @@ def _one_call(proxy: RecordingVectorStore, fixture: Dict[str, Any]) -> List[Dict
 
 
 def search_points(base_url: str, collection: str, vector: List[float], limit: int) -> List[Dict[str, Any]]:
-    """One raw ``POST …/points/search`` with ``exact`` set, for the two shape collections.
+    """One raw ``POST …/points/search`` with ``exact`` set, for Harbor's per-decision shape.
 
-    ``exact`` makes "every point valued" a declaration rather than a consequence of the
-    collection sitting below HNSW's indexing threshold. ``VectorStore.query`` returns
-    point ids too since 2a, but it has no exact knob, so this read stays until 5a's
-    switch to the shipped rejection search retires it.
+    The per-decision shape has no shipped reader, so it keeps this raw read as ruling 2's
+    recorded evidence; ``exact`` makes "every point valued" a declaration rather than a
+    consequence of the collection sitting below HNSW's indexing threshold. The per-item
+    shape is read through the shipped client instead (`read_rejection_items`).
 
     Returns:
         ``[{"id", "score", "payload"}]``, best first.
@@ -381,48 +452,118 @@ def search_points(base_url: str, collection: str, vector: List[float], limit: in
     return [{"id": h["id"], "score": h["score"], "payload": h.get("payload")} for h in result]
 
 
-def read_rejection_shapes(
-    index: CalibrationIndex, fixture: Dict[str, Any], vector: List[float]
-) -> Tuple[Dict[str, Any], Dict[str, int]]:
-    """Searches both shape collections with the fixture's query vector and derives ``items``.
+def search_items(index: CalibrationIndex, vector: List[float], fixture_id: str) -> List[Dict[str, Any]]:
+    """The instrument's uncensored per-item ranking: one shipped-client search, every point.
 
-    Each search takes the whole collection (``limit`` = its point count) and must return
-    every point, so ``absent`` on a ref can only mean an unresolved ref, never a censored
-    low score. Hits are labelled from the population maps by point id.
+    ``limit`` is the map's point count and the search must return exactly that many hits,
+    each a point of the map, so a value is never missing for an approximate index or a
+    stray point. Hits are labelled from ``index.items.points``.
+
+    Returns:
+        ``[{point_id, owner, ordinal, part, value, owner_live}]``, best first.
+
+    Raises:
+        ValueError: If no per-item index is bound, naming the fixture.
+        AssertionError: If the search overran or did not return every point, or a hit is
+            not a point the map holds.
+    """
+    items = index.items
+    if items is None:
+        raise ValueError(
+            f"fixture {fixture_id!r}: measure `item` needs a per-item rejection index "
+            f"(CalibrationIndex.items is unset)"
+        )
+    search = items.client.search(vector, len(items.points), budget_seconds=ITEM_SEARCH_BUDGET_SECONDS)
+    assert search.searched, f"fixture {fixture_id!r}: the per-item search overran its budget"
+    assert len(search.hits) == len(items.points), (
+        f"fixture {fixture_id!r}: per_item search returned {len(search.hits)} of {len(items.points)} points"
+    )
+    hits = []
+    for h in search.hits:
+        assert h.point_id in items.points, f"per_item hit {h.point_id!r} is not a point of the graph's map"
+        owner, ordinal, part = items.points[h.point_id]
+        hits.append({"point_id": h.point_id, "owner": owner, "ordinal": ordinal, "part": part,
+                     "value": h.score, "owner_live": index.live_by_slug[owner]})
+    return hits
+
+
+def read_rejection_items(
+    index: CalibrationIndex, fixture: Dict[str, Any], vector: List[float],
+    item_hits: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[Dict[str, Any], Dict[str, int]]:
+    """Reads a rejection-target fixture's items and derives ``items``; the one item reader.
+
+    ``per_item`` always, through the shipped client (`search_items`; pass ``item_hits``
+    to reuse a search already made with this vector). ``per_decision`` only when Harbor's
+    throwaway ``shapes`` are bound, through `search_points`, which must return every
+    point too. Either way ``absent`` on a ref can only mean an unresolved ref, never a
+    censored low score.
 
     Returns:
         The pure ``items`` value and the number of searches made per shape.
-
-    Raises:
-        ValueError: If ``index.shapes`` is unset, naming the fixture.
     """
-    shapes = index.shapes
-    if shapes is None:
-        raise ValueError(
-            f"fixture {fixture['id']!r}: measure `item` needs the shape collections "
-            f"(CalibrationIndex.shapes is unset)"
-        )
     refs = resolve_item_refs(index, fixture)
-    searches = {}
-    by_shape: Dict[str, List[Dict[str, Any]]] = {}
-    for shape, vstore, points in (("per_item", shapes.items_vstore, shapes.item_points),
-                                  ("per_decision", shapes.fields_vstore, shapes.field_points)):
-        raw = search_points(vstore.base_url, vstore.collection, vector, len(points))
-        searches[shape] = 1
+    hits_by_shape = {"per_item": item_hits if item_hits is not None
+                     else search_items(index, vector, fixture["id"])}
+    searches = {"per_item": 1}
+    shapes = index.shapes
+    if shapes is not None:
+        points = shapes.field_points
+        raw = search_points(shapes.fields_vstore.base_url, shapes.fields_vstore.collection, vector, len(points))
+        searches["per_decision"] = 1
         assert len(raw) == len(points), (
-            f"fixture {fixture['id']!r}: {shape} search returned {len(raw)} of {len(points)} points"
+            f"fixture {fixture['id']!r}: per_decision search returned {len(raw)} of {len(points)} points"
         )
         hits = []
         for h in raw:
-            assert h["id"] in points, f"{shape} hit {h['id']!r} is not a point this population wrote"
-            if shape == "per_item":
-                owner, ordinal, part = points[h["id"]]
-            else:
-                owner, ordinal, part = points[h["id"]], None, None
-            hits.append({"point_id": h["id"], "owner": owner, "ordinal": ordinal, "part": part,
+            assert h["id"] in points, f"per_decision hit {h['id']!r} is not a point this population wrote"
+            owner = points[h["id"]]
+            hits.append({"point_id": h["id"], "owner": owner, "ordinal": None, "part": None,
                          "value": h["score"], "owner_live": index.live_by_slug[owner]})
-        by_shape[shape] = hits
-    return R.derive_item_result(fixture, by_shape, refs), searches
+        hits_by_shape["per_decision"] = hits
+    return R.derive_item_result(fixture, hits_by_shape, refs), searches
+
+
+def section_of(envelope: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The envelope's rejection matches, reduced to slug, ordinal, score and letter."""
+    return [{"slug": m["slug"], "ordinal": m["ordinal"], "score": m["score"], "letter": m["letter"]}
+            for m in envelope.get("rejection_matches") or []]
+
+
+def expected_section(item_hits: List[Dict[str, Any]], floor: float, bound: int) -> List[Dict[str, Any]]:
+    """The section the instrument predicts: its collapsed items at or above ``floor``, first ``bound``.
+
+    Collapsed with Layer C's own ``_collapse`` (an item's parts at its best part's
+    value), never through ``fill_rejections``.
+    """
+    units = R._collapse(item_hits, per_item=True)
+    return [{"slug": u["key"][0], "ordinal": u["key"][1], "score": u["value"]}
+            for u in units if u["value"] >= floor][:bound]
+
+
+def check_section_agreement(fixture_id: str, envelope: Dict[str, Any],
+                            item_hits: List[Dict[str, Any]], floor: float, bound: int) -> None:
+    """Checks the shipped section against the instrument's ranking at the floor in force.
+
+    The envelope's ``(slug, ordinal)`` list must equal `expected_section`'s, in order,
+    each score within ``AGREEMENT_TOLERANCE``. A section that was not searched or is not
+    whole compares nothing and is a disagreement too.
+
+    Raises:
+        SectionDisagreement: Naming the fixture and both lists.
+    """
+    state = envelope.get("rejection_section")
+    if state is not None:
+        raise SectionDisagreement(f"fixture {fixture_id!r}: the section is {state!r}; nothing to compare")
+    shown = section_of(envelope)
+    predicted = expected_section(item_hits, floor, bound)
+    same = [(m["slug"], m["ordinal"]) for m in shown] == [(p["slug"], p["ordinal"]) for p in predicted]
+    if not same or any(abs(m["score"] - p["score"]) > AGREEMENT_TOLERANCE for m, p in zip(shown, predicted)):
+        raise SectionDisagreement(
+            f"fixture {fixture_id!r}: shipped section {[(m['slug'], m['ordinal'], m['score']) for m in shown]} "
+            f"!= instrument {[(p['slug'], p['ordinal'], p['score']) for p in predicted]} "
+            f"(floor {floor}, bound {bound})"
+        )
 
 
 def read_query_form(index: CalibrationIndex, fixture: Dict[str, Any]) -> FormRead:
@@ -431,25 +572,48 @@ def read_query_form(index: CalibrationIndex, fixture: Dict[str, Any]) -> FormRea
     The text is embedded once here first, through the same provider: the reader
     swallows an embedding fault into a degraded envelope, so this is where a quota
     fault can propagate. The reader's own embed is then a cache hit with the same vector.
-    An item-measured fixture also reads both rejection shapes with that vector.
+
+    With a per-item index bound, the read binds ``mcp_server._ranked_rejection_index``
+    to its client, searches the items with the same vector, and checks the envelope's
+    section against that ranking (`check_section_agreement`) for every query-form
+    fixture, not only rejection targets. ``section`` and ``section_state`` are recorded
+    on every query-form result either way. An item-measured fixture derives ``items``.
+
+    Raises:
+        SectionDisagreement: With a per-item index bound, when the section disagrees.
     """
     vector = index.provider.get_embedding(fixture["text"], is_query=True)
     proxy = RecordingVectorStore(index.vstore)
     with patch("mitos.mcp_server.get_workspace_components") as components:
         components.return_value = (index.store, index.provider, proxy)
-        envelope = json.loads(
-            surface_decisions(fixture["text"], project=index.workspace, limit=RECORD_LIMIT, brief=True)
-        )
+        if index.items is not None:
+            with patch("mitos.mcp_server._ranked_rejection_index", return_value=index.items.client):
+                envelope = json.loads(
+                    surface_decisions(fixture["text"], project=index.workspace, limit=RECORD_LIMIT, brief=True)
+                )
+        else:
+            envelope = json.loads(
+                surface_decisions(fixture["text"], project=index.workspace, limit=RECORD_LIMIT, brief=True)
+            )
     # The raw ranking the shipped path received, up to `RECORD_LIMIT`: since 2c the
     # walk fetches at the over-fetch bound (every Harbor point), so the slice keeps the
     # recorded window the size it always was.
     raw = _one_call(proxy, fixture)[:RECORD_LIMIT]
     hits = label_hits(index, raw, fixture.get("exclude", []))
     result = R.derive_result(fixture, hits, envelope.get("confidence"), None)
+    result["section"] = section_of(envelope)
+    result["section_state"] = envelope.get("rejection_section")
+    item_hits = ranking = None
+    if index.items is not None:
+        item_hits = search_items(index, vector, fixture["id"])
+        ranking = expected_section(item_hits, -1.0, len(item_hits))
+        check_section_agreement(fixture["id"], envelope, item_hits,
+                                recall.REJECTION_MATCH_FLOOR, recall.REJECTION_SECTION_BOUND)
     searches = None
     if fixture["measure"] == "item":
-        result["items"], searches = read_rejection_shapes(index, fixture, vector)
-    return FormRead(result=result, calls=proxy.calls, envelope=envelope, shape_searches=searches)
+        result["items"], searches = read_rejection_items(index, fixture, vector, item_hits)
+    return FormRead(result=result, calls=proxy.calls, envelope=envelope, shape_searches=searches,
+                    item_ranking=ranking)
 
 
 def read_draft_form(index: CalibrationIndex, fixture: Dict[str, Any]) -> FormRead:
@@ -499,13 +663,16 @@ def constants_in_force() -> Dict[str, Any]:
     return out
 
 
-def run_provenance(provider: Any, shapes: Optional[ShapeCollections] = None) -> Dict[str, Any]:
+def run_provenance(provider: Any, index: Optional[CalibrationIndex] = None) -> Dict[str, Any]:
     """Extends ``_semantic_harness.provenance()`` for a Layer C run.
 
     The model is the provider's own, so one value flows to the cache path, the provider
-    and the record. The three judge keys are dropped: Layer C makes no judge call. With
-    the shape collections, ``record_limit.items`` is ``"all"`` (each shape read takes the
-    whole collection) and ``shape_points`` gives the two point counts.
+    and the record. The three judge keys are dropped: Layer C makes no judge call. With a
+    per-item index bound, ``item_reader`` names it and ``record_limit.items`` is
+    ``"all"`` (the item read takes the whole collection); with Harbor's shapes,
+    ``shape_points`` gives both shapes' point counts, else ``item_points`` the per-item
+    count. ``constants_in_force`` carries the rejection floor; the section bound rides
+    beside it.
     """
     prov = H.provenance()
     for key in ("judgment_model", "judgment_model_id", "prompt_version"):
@@ -513,10 +680,15 @@ def run_provenance(provider: Any, shapes: Optional[ShapeCollections] = None) -> 
     prov["embedding_model"] = provider.model_id
     prov["reader"] = READER
     prov["record_limit"] = {"query": RECORD_LIMIT, "draft": conflict.CONFLICT_OVERFETCH_LIMIT}
-    if shapes is not None:
+    if index is not None and index.items is not None:
+        prov["item_reader"] = ITEM_READER
         prov["record_limit"]["items"] = "all"
-        prov["shape_points"] = shapes.counts
+        if index.shapes is not None:
+            prov["shape_points"] = index.shapes.counts
+        else:
+            prov["item_points"] = len(index.items.points)
     prov["constants_in_force"] = constants_in_force()
+    prov["rejection_section_bound"] = recall.REJECTION_SECTION_BOUND
     return prov
 
 
@@ -530,7 +702,7 @@ def build_run(index: CalibrationIndex, results: List[Dict[str, Any]], corpus: st
         "corpus": corpus,
         "decision_count": index.decision_count,
         "node_count": len(index.nodes),
-        "provenance": run_provenance(index.provider, index.shapes),
+        "provenance": run_provenance(index.provider, index),
         "fixtures": results,
         "classes": R.summarize_classes(results),
     }

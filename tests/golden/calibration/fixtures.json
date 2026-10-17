@@ -11,7 +11,7 @@
       "measure": "target (each target's value), top_live (the top live hit's value, the band's input) or item (each target item's value in the per-item rejection shape; rejection-target only, and that class only with it)",
       "exclude": "optional: slugs flagged as the draft's own node and left out of every margin",
       "target_items": "rejection-target only, non-empty: [{owner, option}], owner a Harbor slug, option a case-sensitive prefix of exactly one of the owner's items (its text without the (N) marker)",
-      "negative_items": "rejection-target only, non-empty: the same refs, for generic items (do nothing, defer, status quo)",
+      "negative_items": "rejection-target only, non-empty: [{owner, option, kind}], the hard negatives the rejection-match floor must keep out of a section. kind is generic (do nothing, defer, status quo) or vocabulary (another decision's non-generic item, rejected for another question, naming a different mechanism from the one the query proposes while sharing its subject words). Never a target's own item, and never an elsewhere-does-not-carry case, which stays a target under its form",
       "rejection_form": "rejection-target only: own-question, elsewhere-carries or elsewhere-does-not-carry (the owner's reason carries over, or not; never a hard negative either way)",
       "notes": "one line: why this label holds"
     }
@@ -589,11 +589,18 @@
       "negative_items": [
         {
           "owner": "harbor-storage-is-sqlite",
-          "option": "Keeping the status quo"
+          "option": "Keeping the status quo",
+          "kind": "generic"
         },
         {
           "owner": "harbor-backup-nightly",
-          "option": "Do nothing"
+          "option": "Do nothing",
+          "kind": "generic"
+        },
+        {
+          "owner": "harbor-blobs-on-s3",
+          "option": "Blobs in SQLite",
+          "kind": "vocabulary"
         }
       ],
       "rejection_form": "own-question"
@@ -618,11 +625,18 @@
       "negative_items": [
         {
           "owner": "harbor-api-rate-limit",
-          "option": "Defer"
+          "option": "Defer",
+          "kind": "generic"
         },
         {
           "owner": "harbor-webhook-delivery",
-          "option": "Do nothing"
+          "option": "Do nothing",
+          "kind": "generic"
+        },
+        {
+          "owner": "harbor-premium-exempt-rate-limit",
+          "option": "A higher fixed ceiling",
+          "kind": "vocabulary"
         }
       ],
       "rejection_form": "own-question"
@@ -647,11 +661,18 @@
       "negative_items": [
         {
           "owner": "harbor-backup-nightly",
-          "option": "Defer"
+          "option": "Defer",
+          "kind": "generic"
         },
         {
           "owner": "harbor-blob-encryption-at-rest",
-          "option": "Keeping the status quo"
+          "option": "Keeping the status quo",
+          "kind": "generic"
+        },
+        {
+          "owner": "harbor-blobs-on-s3",
+          "option": "Blobs in SQLite",
+          "kind": "vocabulary"
         }
       ],
       "rejection_form": "own-question"
@@ -676,11 +697,13 @@
       "negative_items": [
         {
           "owner": "harbor-webhook-delivery",
-          "option": "Do nothing"
+          "option": "Do nothing",
+          "kind": "generic"
         },
         {
           "owner": "harbor-observability-otel",
-          "option": "Defer"
+          "option": "Defer",
+          "kind": "generic"
         }
       ],
       "rejection_form": "own-question"
@@ -706,7 +729,13 @@
       "negative_items": [
         {
           "owner": "harbor-storage-is-sqlite",
-          "option": "Keeping the status quo"
+          "option": "Keeping the status quo",
+          "kind": "generic"
+        },
+        {
+          "owner": "harbor-sync-last-write-wins",
+          "option": "CRDT merge",
+          "kind": "vocabulary"
         }
       ],
       "rejection_form": "own-question"
@@ -732,7 +761,13 @@
       "negative_items": [
         {
           "owner": "harbor-backup-nightly",
-          "option": "Defer"
+          "option": "Defer",
+          "kind": "generic"
+        },
+        {
+          "owner": "harbor-delete-is-immediate-hard",
+          "option": "A grace period",
+          "kind": "vocabulary"
         }
       ],
       "rejection_form": "own-question"
@@ -757,7 +792,13 @@
       "negative_items": [
         {
           "owner": "harbor-api-rate-limit",
-          "option": "Defer"
+          "option": "Defer",
+          "kind": "generic"
+        },
+        {
+          "owner": "harbor-webhook-delivery",
+          "option": "Tenant polling",
+          "kind": "vocabulary"
         }
       ],
       "rejection_form": "elsewhere-carries"
@@ -782,7 +823,13 @@
       "negative_items": [
         {
           "owner": "harbor-observability-otel",
-          "option": "Defer"
+          "option": "Defer",
+          "kind": "generic"
+        },
+        {
+          "owner": "harbor-structured-logging",
+          "option": "Free-text logs",
+          "kind": "vocabulary"
         }
       ],
       "rejection_form": "elsewhere-carries"
@@ -807,7 +854,13 @@
       "negative_items": [
         {
           "owner": "harbor-blob-encryption-at-rest",
-          "option": "Keeping the status quo"
+          "option": "Keeping the status quo",
+          "kind": "generic"
+        },
+        {
+          "owner": "harbor-auth-sessions-v3",
+          "option": "Sticking with stateless JWTs",
+          "kind": "vocabulary"
         }
       ],
       "rejection_form": "elsewhere-carries"
@@ -832,7 +885,13 @@
       "negative_items": [
         {
           "owner": "harbor-webhook-delivery",
-          "option": "Do nothing"
+          "option": "Do nothing",
+          "kind": "generic"
+        },
+        {
+          "owner": "harbor-premium-exempt-rate-limit",
+          "option": "A higher fixed ceiling",
+          "kind": "vocabulary"
         }
       ],
       "rejection_form": "elsewhere-carries"
@@ -857,7 +916,8 @@
       "negative_items": [
         {
           "owner": "harbor-backup-nightly",
-          "option": "Do nothing"
+          "option": "Do nothing",
+          "kind": "generic"
         }
       ],
       "rejection_form": "elsewhere-does-not-carry"
@@ -882,7 +942,8 @@
       "negative_items": [
         {
           "owner": "harbor-api-rate-limit",
-          "option": "Defer"
+          "option": "Defer",
+          "kind": "generic"
         }
       ],
       "rejection_form": "elsewhere-does-not-carry"
@@ -907,7 +968,75 @@
       "negative_items": [
         {
           "owner": "harbor-storage-is-sqlite",
-          "option": "Keeping the status quo"
+          "option": "Keeping the status quo",
+          "kind": "generic"
+        },
+        {
+          "owner": "harbor-config-yaml",
+          "option": "Environment variables only",
+          "kind": "vocabulary"
+        }
+      ],
+      "rejection_form": "elsewhere-does-not-carry"
+    },
+    {
+      "id": "rejection-not-carry-batch-ip-throttle",
+      "class": "rejection-target",
+      "form": "query",
+      "text": "Our nightly export job runs alone on one machine with a fixed address. Should its API throttle key on that IP?",
+      "targets": [
+        "harbor-api-rate-limit"
+      ],
+      "negatives": [],
+      "measure": "item",
+      "notes": "per-IP was rejected because tenants behind one NAT would share a budget; a single internal job has no tenants to share one, so the reason does not carry",
+      "target_items": [
+        {
+          "owner": "harbor-api-rate-limit",
+          "option": "Per-IP"
+        }
+      ],
+      "negative_items": [
+        {
+          "owner": "harbor-backup-nightly",
+          "option": "Defer",
+          "kind": "generic"
+        },
+        {
+          "owner": "harbor-premium-exempt-rate-limit",
+          "option": "A higher fixed ceiling",
+          "kind": "vocabulary"
+        }
+      ],
+      "rejection_form": "elsewhere-does-not-carry"
+    },
+    {
+      "id": "rejection-not-carry-load-test-purge",
+      "class": "rejection-target",
+      "form": "query",
+      "text": "In the throwaway load-test environment, should deleted test files be purged at once instead of kept around?",
+      "targets": [
+        "harbor-delete-is-soft-30d"
+      ],
+      "negatives": [],
+      "measure": "item",
+      "notes": "immediate hard delete was rejected because one mistaken call loses a customer's data; synthetic load-test files belong to no customer, so the reason does not carry",
+      "target_items": [
+        {
+          "owner": "harbor-delete-is-soft-30d",
+          "option": "Immediate hard delete"
+        }
+      ],
+      "negative_items": [
+        {
+          "owner": "harbor-webhook-delivery",
+          "option": "Do nothing",
+          "kind": "generic"
+        },
+        {
+          "owner": "harbor-delete-is-immediate-hard",
+          "option": "A grace period",
+          "kind": "vocabulary"
         }
       ],
       "rejection_form": "elsewhere-does-not-carry"

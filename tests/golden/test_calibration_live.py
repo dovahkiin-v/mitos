@@ -13,7 +13,10 @@ into a named skip. No Anthropic call is made here.
 
 Rejection-target fixtures are also read against two more throwaway collections, the two
 rejection-index shapes (one point per rejected item part, one per decision's whole field),
-built by the module-scoped ``shape_collections`` fixture.
+built by the module-scoped ``shape_collections`` fixture. Since 5b the per-item one is
+written and searched through the shipped ``QdrantRejectionIndex`` in production's shape,
+and bound as the reads' per-item index: every query-form read then carries the shipped
+rejection section and checks it against the instrument's own ranking.
 
 Hard asserts are structural only: the collections hold every point they should, each read
 makes one proxied call (and one search per shape), every target has a value, and the
@@ -37,7 +40,7 @@ from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.errors import EmbeddingError
 from mitos.models import get_embedding_model_id
 from mitos.rejections import rejection_points
-from mitos.vector_store import QdrantVectorStore, hash_to_uuid
+from mitos.vector_store import QdrantRejectionIndex, QdrantVectorStore, hash_to_uuid
 
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))  # tests/ for live_helpers
@@ -121,17 +124,21 @@ def calibration_index(tmp_path_factory):
 
 @pytest.fixture(scope="module")
 def shape_collections(calibration_index):
-    """Builds both rejection-index shapes over every Harbor decision; deletes both after."""
+    """Builds both rejection-index shapes over every Harbor decision and binds the per-item
+    one as the reads' item index; deletes both after."""
     index = calibration_index
     suffix = uuid.uuid4().hex[:8]
     names = (f"mitos-tmp-golden-layerc-items-{suffix}", f"mitos-tmp-golden-layerc-fields-{suffix}")
-    items_vstore, fields_vstore = (QdrantVectorStore(QDRANT_URL, name) for name in names)
+    items_index = QdrantRejectionIndex(QDRANT_URL, names[0])
+    fields_vstore = QdrantVectorStore(QDRANT_URL, names[1])
     try:
         with skip_on_embed_quota():
-            index.shapes = CH.populate_shape_collections(index, items_vstore, fields_vstore)
+            index.shapes = CH.populate_shape_collections(index, items_index, fields_vstore)
+        index.items = index.shapes.items
         yield index.shapes
     finally:
         index.shapes = None
+        index.items = None
         for name in names:
             try:
                 requests.delete(f"{QDRANT_URL.rstrip('/')}/collections/{name}", timeout=5)
@@ -189,14 +196,15 @@ def test_collection_holds_every_harbor_node(calibration_index):
 
 
 def test_shape_collections_hold_every_rejection_point(calibration_index, shape_collections):
-    """Per item: every rejection point of every decision, retired owners included.
-    Per decision: one point per decision with a non-empty field."""
+    """Per item: every rejection point of every decision, retired owners included, listed
+    through the shipped client. Per decision: one point per decision with a non-empty field."""
     index = calibration_index
     decisions = [n for n in index.nodes if n["kind"] == "decision"]
     expected_items = set()
     for n in decisions:
         expected_items |= set(rejection_points(n["id"], n["rejected_paths"] or ""))
-    assert shape_collections.items_vstore.list_point_ids() == expected_items == set(shape_collections.item_points)
+    assert shape_collections.items_index.list_point_ids() == expected_items == set(shape_collections.item_points)
+    assert set(index.items.points) == expected_items
     expected_fields = {hash_to_uuid(n["id"]) for n in decisions if (n["rejected_paths"] or "").strip()}
     assert shape_collections.fields_vstore.list_point_ids() == expected_fields == set(shape_collections.field_points)
     by_slug = {n["slug"]: n for n in decisions}
@@ -299,6 +307,22 @@ def _class_lines(run) -> str:
     return "\n".join(lines)
 
 
+def _floor_lines(run) -> str:
+    """The rejection floor's reading of this run (5b D3), and the section's appearance
+    rate on the query fixtures that re-propose nothing (the generic attractor's evidence)."""
+    from mitos.recall import REJECTION_MATCH_FLOOR
+
+    results = run["fixtures"]
+    boundary = R.rejection_floor_boundary(results)
+    lines = [f"  rejection floor: boundary {boundary} (in force {REJECTION_MATCH_FLOOR}); carrying-target "
+             f"retention at boundary {R.rejection_floor_retention(results, boundary) if boundary else None}"]
+    others = [r for r in results if r["space"] == "query" and r["class"] != "rejection-target"]
+    shown = sum(1 for r in others if r.get("section"))
+    lines.append(f"  sections on non-rejection query fixtures: {shown}/{len(others)} "
+                 f"(matches {sum(len(r.get('section') or []) for r in others)})")
+    return "\n".join(lines)
+
+
 def test_calibration_classes(calibration_index, shape_collections):
     """Reads the labelled fixtures, reports the class distributions, soft-diffs the record."""
     index = calibration_index
@@ -311,6 +335,11 @@ def test_calibration_classes(calibration_index, shape_collections):
             assert "confidence" in read.envelope, f"{fx['id']}: degraded envelope {read.envelope}"
             for d in read.envelope["active_decisions"]:
                 assert d["score"] == raw_score.get(d["slug"]), f"{fx['id']}: envelope score for {d['slug']}"
+        if fx["form"] == "query":
+            # The read checked the shipped section against the instrument (it raises on a
+            # disagreement); the section was searched and whole.
+            assert read.result["section_state"] is None, fx["id"]
+            assert len(read.item_ranking) == len(index.items.points), fx["id"]
         if fx["measure"] == "item":
             assert read.shape_searches == {"per_item": 1, "per_decision": 1}, fx["id"]
             assert set(read.result["items"]) == set(R.SHAPES), fx["id"]
@@ -324,7 +353,8 @@ def test_calibration_classes(calibration_index, shape_collections):
     assert {(c, s) for c, spaces in run["classes"].items() for s in spaces} == expected
     assert set(run["shapes"]) == set(R.SHAPES)
     path = H.write_report(run, "calibration-latest")
-    print(f"\n[layer-c] classes (min median max):\n{_class_lines(run)}\n{_stats_line(index)}\n[report] {path}")
+    print(f"\n[layer-c] classes (min median max):\n{_class_lines(run)}\n{_floor_lines(run)}\n"
+          f"{_stats_line(index)}\n[report] {path}")
     record = R.load_record()
     baseline_id = R.latest_run_id(record, "harbor")
     if baseline_id is None:
