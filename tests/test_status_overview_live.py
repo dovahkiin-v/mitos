@@ -42,7 +42,7 @@ import pytest
 import requests
 
 from mitos import overview, registry
-from mitos.config import default_collection_name
+from mitos.config import default_collection_name, rejection_collection_name
 from mitos.models import EMBEDDING_DIM
 
 from live_helpers import live_tests_disabled
@@ -302,13 +302,22 @@ def test_an_absent_collection_is_flagged_and_its_present_twin_is_not(
     is wrong for a clone whose graph was never built; it now hands the reader to
     ``mitos status <name>``, the surface that reads the graph and can tell the two
     heals apart.
+
+    Since recall-confidence 4d a reconciled workspace holds **both** collections —
+    the decision collection and its rejection sibling — so the present twin creates
+    both; a third workspace holding the decision collection alone (an upgraded one,
+    not yet reconciled) gets the rejection pointer, proven here against the real
+    listing.
     """
     from mitos import cli
 
     swept = _workspace(tmp_path / "tmp-swept", populated=True)
     reconciled = _workspace(tmp_path / "tmp-reconciled", populated=True)
+    upgraded = _workspace(tmp_path / "tmp-upgraded", populated=True)
     created_collection(default_collection_name(reconciled))
-    _register(swept=swept, reconciled=reconciled)
+    created_collection(rejection_collection_name(default_collection_name(reconciled)))
+    created_collection(default_collection_name(upgraded))
+    _register(swept=swept, reconciled=reconciled, upgraded=upgraded)
 
     payload = overview.build_overview()
     projects = _by_name(payload)
@@ -326,6 +335,10 @@ def test_an_absent_collection_is_flagged_and_its_present_twin_is_not(
     assert "reconcile" not in notes
     assert default_collection_name(swept) in notes
     assert cli._overview_notes(projects["reconciled"], payload) == []
+    assert projects["upgraded"]["rejection_collection_present"] is False
+    assert cli._overview_notes(projects["upgraded"], payload) == [
+        f"   rejection index {rejection_collection_name(default_collection_name(upgraded))} "
+        f"absent — `mitos status 'upgraded'` for the heal"]
 
 
 def test_a_fresh_projects_absent_collection_is_not_a_finding(tmp_path):
