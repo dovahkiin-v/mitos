@@ -77,8 +77,10 @@ RANKED_EDGE_MARGIN: float = 0.0156
 REJECTION_MATCH_FLOOR: float = 0.8147
 
 # The rejection section's bound, in items (not points): how many verified matches a
-# ranked answer carries at most. A budget constant (vision §6.3's default); 5b may
-# lower it from the token read at the calibrated floor.
+# ranked answer carries at most. A budget constant (vision §6.3's default), kept at 3 by
+# 5b at the calibrated floor: on the copy's replay (run 20261017-0759-3c17335-dogfood-copy)
+# rank 1 showed 6 matches and rank 2 one, every one earned, and rank 3 none — under the 10
+# a lower bound needs; the section cost 0 tokens p50 and p90 per read (132-869 when shown).
 REJECTION_SECTION_BOUND: int = 3
 
 # How many live scope tags the bounded unused-scope vector lists (busiest first) before
