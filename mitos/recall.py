@@ -1151,6 +1151,13 @@ def rejection_section_clause(state: str, *, dropped: Optional[int], surface: str
         )
     if state == "short":
         n = dropped or 0
+        if n == 0:
+            # Short with nothing dropped: the full fetch's hits collapsed into fewer
+            # items than the bound (parts of one item), so verification is not why.
+            return (
+                "The rejection search's fetch filled before the rejection section "
+                "did, so the section may hold fewer than it could."
+            )
         noun = "match" if n == 1 else "matches"
         return (
             f"Verification dropped {n} rejection {noun} whose decision no longer "

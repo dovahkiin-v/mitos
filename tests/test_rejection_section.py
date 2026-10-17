@@ -966,6 +966,23 @@ def test_the_state_vocabulary_maps_one_to_one() -> None:
         rejection_section_state(W("bogus"), gap=gap)
 
 
+def test_a_short_section_with_nothing_dropped_does_not_blame_verification(ws) -> None:
+    """A full fetch whose hits are all parts of fewer items than the bound is short
+    with zero drops: the clause names the full fetch, never "dropped 0" (5a
+    fresh-eyes). With drops it still counts them."""
+    world = _Pure()
+    a = _a_owner(world, n=1)
+    world.hit("a1", a["id"], .95).hit("a1", a["id"], .9).hit("a1", a["id"], .8)
+    walk = world.fill(fetch=3)
+    assert walk.short is True and sum(walk.dropped.values()) == 0
+    for surface in ("cli", "mcp"):
+        clause = rejection_section_clause("short", dropped=0, surface=surface, config=ws)
+        assert "dropped" not in clause and "fetch filled" in clause, clause
+        assert "may hold fewer than it could" in clause
+        clause = rejection_section_clause("short", dropped=2, surface=surface, config=ws)
+        assert clause.startswith("Verification dropped 2 rejection matches"), clause
+
+
 def test_the_leg_states_agree_with_recall() -> None:
     import mitos.recall as recall
     assert (recall._LEG_ABSENT, recall._LEG_OVER_BUDGET, recall._LEG_ERROR,

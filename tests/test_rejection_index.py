@@ -438,6 +438,55 @@ def test_c6b_an_overrun_against_a_silent_socket_is_not_searched() -> None:
     assert elapsed < 1.0, elapsed
 
 
+def test_c6c_an_overrun_while_reading_the_body_is_not_searched() -> None:
+    """A server that sends its headers in time and then stalls the body. `requests`
+    raises that read's timeout as a ``ConnectionError`` wrapping urllib3's
+    ``ReadTimeoutError`` (``Response.iter_content``), not as a ``Timeout``, so a
+    search that only caught ``Timeout`` named an overrun an outage (5a fresh-eyes)."""
+    import threading
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)
+    release = threading.Event()
+
+    def serve() -> None:
+        conn, _ = listener.accept()
+        try:
+            conn.recv(65536)
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                         b"Content-Length: 64\r\n\r\n{\"result\": ")
+            release.wait(2.0)
+        finally:
+            conn.close()
+
+    server = threading.Thread(target=serve, daemon=True)
+    server.start()
+    try:
+        port = listener.getsockname()[1]
+        index = QdrantRejectionIndex(f"http://127.0.0.1:{port}", _COLLECTION)
+        start = time.monotonic()
+        answer = index.search(axis_vector(0), 3, budget_seconds=0.05)
+        elapsed = time.monotonic() - start
+    finally:
+        release.set()
+        server.join(3.0)
+        listener.close()
+    assert answer.searched is False and answer.hits == []
+    assert elapsed < 1.0, elapsed
+
+
+@patch("mitos.vector_store.requests.post")
+def test_c6c_a_reset_while_reading_the_body_is_still_an_outage(post) -> None:
+    """Only a wrapped read timeout counts as an overrun; any other connection fault
+    met while reading stays unreachable."""
+    from urllib3.exceptions import ProtocolError
+
+    post.side_effect = requests.ConnectionError(ProtocolError("connection reset"))
+    with pytest.raises(VectorStoreUnreachableError):
+        _index().search([0.1], 3, budget_seconds=1.0)
+
+
 @patch("mitos.vector_store.requests.post")
 def test_c7_retrieve_asks_by_ids_and_answers_the_present_subset(post) -> None:
     ids = ["00000000-0000-0000-0000-000000000001", "00000000-0000-0000-0000-000000000002"]

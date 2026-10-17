@@ -18,6 +18,10 @@ single write must not be able to spend it.
 
 import requests
 import json
+# requests' own transport layer (a hard dependency of requests, not a new one of
+# ours): the one class that tells a body read's timeout from an outage, which
+# requests re-raises as a bare ``ConnectionError`` (see ``QdrantRejectionIndex.search``).
+from urllib3.exceptions import ReadTimeoutError
 from typing import (
     AbstractSet, Any, Dict, FrozenSet, List, NamedTuple, Optional, Sequence, Set,
 )
@@ -894,6 +898,14 @@ class QdrantRejectionIndex:
         except requests.Timeout:
             return RejectionSearch(searched=False, hits=[])
         except requests.RequestException as e:
+            # A read that times out on the body, after the headers arrived, is
+            # raised by requests as a ``ConnectionError`` wrapping urllib3's
+            # ``ReadTimeoutError`` (``Response.iter_content``), never as a
+            # ``Timeout``: still an overrun, so it costs the matches, not an outage.
+            if isinstance(e, requests.ConnectionError) and any(
+                isinstance(arg, ReadTimeoutError) for arg in e.args
+            ):
+                return RejectionSearch(searched=False, hits=[])
             raise VectorStoreUnreachableError(
                 f"Qdrant rejection search connection error: {str(e)}"
             ) from e
