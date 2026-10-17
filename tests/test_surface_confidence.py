@@ -203,10 +203,19 @@ def test_policy_degraded_with_results_is_not_a_ranking():
     assert "mitos list" in note and "list_decisions" not in note
 
 
-def test_policy_degraded_empty_scope_unused():
-    conf, note = assess_surface_recall(semantic_ran=False, degraded_reason=_DEGRADED, top_score=None, result_count=0,
-                                       scope="ghost", scope_counts={}, surface="cli")
-    assert conf is None and "unavailable" in note and "unused scope tag" in note
+def test_a_degraded_answer_with_no_results_raises():
+    """Was `test_policy_degraded_empty_scope_unused` (inverted at checkpoint-6): an
+    empty degraded answer is the lexical exit's on both surfaces, so the no-results
+    forks were reached by none, and the unused-scope one said "Safe to decide". It now
+    raises on both, scope unused or not; the missing-reason guard is still asked first."""
+    for scope, counts in (("ghost", {}), (None, None)):
+        with pytest.raises(ValueError, match="no results is the lexical exit's"):
+            assess_surface_recall(semantic_ran=False, degraded_reason=_DEGRADED,
+                                  top_score=None, result_count=0, scope=scope,
+                                  scope_counts=counts, surface="cli")
+    with pytest.raises(ValueError, match="degraded_reason"):
+        assess_surface_recall(semantic_ran=False, degraded_reason=None, top_score=None,
+                              result_count=0, scope="ghost", surface="cli")
 
 
 # --------------------------------------------------------------------------- #
@@ -277,7 +286,8 @@ def test_surface_leak_gate_cli_never_emits_mcp_callforms():
     counts = _counts(("auth", 3), ("store", 2))
     cases = [
         dict(semantic_ran=True, top_score=None, result_count=0, scope="ghost"),    # unused, no match
-        dict(semantic_ran=False, top_score=None, result_count=0, scope="ghost"),   # degraded, unused
+        # checkpoint-6 dropped "degraded, unused": that arm now raises
+        # (test_a_degraded_answer_with_no_results_raises).
         dict(semantic_ran=False, top_score=None, result_count=4, scope="auth",
              scope_total=4),                                                       # degraded, populated (the dump; 5d)
         dict(semantic_ran=True, top_score=0.9, result_count=2, scope="auth"),      # completeness, scoped
@@ -2638,7 +2648,8 @@ def _band_forks():
             forks.append((verb, label, top, n, scope_unused, rides))
     # 5d dropped the "degraded-partial" fork (results, no scope_total): that arm now
     # raises on every edge shape (test_a_degraded_answer_with_results_and_no_scope_total_raises).
-    for label, n, total in (("degraded-dump", 3, 8), ("degraded-empty", 0, None)):
+    # Checkpoint-6 dropped "degraded-empty" likewise (test_a_degraded_answer_with_no_results_raises).
+    for label, n, total in (("degraded-dump", 3, 8),):
         forks.append(("surface-degraded", label, None, n, total, False))
     return forks
 

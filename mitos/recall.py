@@ -934,7 +934,8 @@ def assess_surface_recall(
         ValueError: ``semantic_ran`` is False and ``degraded_reason`` is None — a
             call-site defect, loud on purpose rather than a note with no cause —
             or ``semantic_ran`` is False with results and no ``scope_total``: a
-            degraded answer with results is the scope dump's.
+            degraded answer with results is the scope dump's; or ``semantic_ran``
+            is False with no results, which is the lexical exit's.
 
     Returns:
         A ``(confidence, legend)`` pair. ``confidence`` is ``"strong"`` / ``"weak"`` /
@@ -978,33 +979,31 @@ def assess_surface_recall(
                 "assess_surface_recall: a degraded answer with results is the scope "
                 "dump's; pass scope_total"
             )
-        # The no-results branches carry no omission clause — no surface reaches
-        # them, since both route an empty degraded answer to the lexical exit, which
-        # states its own.
-        if result_count:
-            # The dump's own branch: it names how many of the scope's decisions it
-            # shows. ``result_count`` is what the envelope returns; the dump is one
-            # read, so it is either whole (up to ``limit``) or not shown at all.
-            if result_count < scope_total:
-                shown_part = (
-                    f"{result_count} of the {scope_total} active decisions in {scope_phrase}"
-                )
-            elif scope_total == 1:
-                shown_part = f"the one active decision in {scope_phrase}"
-            else:
-                shown_part = f"all {scope_total} active decisions in {scope_phrase}"
-            return None, (
-                f"Semantic recall unavailable ({degraded_reason}) — showing "
-                f"{shown_part} as a fallback, NOT a relevance ranking. For the "
-                f"authoritative set use {complete_hint} (pure graph read)."
+        # A degraded answer with no results is the lexical exit's: both surfaces route
+        # an empty degraded answer there (``scope_dump`` returns None for an empty
+        # scope), and that exit states its own note. The two no-results forks this
+        # replaced were reached by no surface, and one said "Safe to decide", a
+        # verdict the band never licenses (checkpoint-6; the 5d precedent above).
+        if not result_count:
+            raise ValueError(
+                "assess_surface_recall: a degraded answer with no results is the "
+                "lexical exit's; it composes its own note"
             )
-        if scope_unused:
-            return None, (
-                f"{scope_prefix}Semantic recall unavailable — no precedent here. Safe to decide, then record it."
+        # The dump's own branch: it names how many of the scope's decisions it
+        # shows. ``result_count`` is what the envelope returns; the dump is one
+        # read, so it is either whole (up to ``limit``) or not shown at all.
+        if result_count < scope_total:
+            shown_part = (
+                f"{result_count} of the {scope_total} active decisions in {scope_phrase}"
             )
+        elif scope_total == 1:
+            shown_part = f"the one active decision in {scope_phrase}"
+        else:
+            shown_part = f"all {scope_total} active decisions in {scope_phrase}"
         return None, (
-            f"Semantic recall unavailable and nothing to fall back on — cannot confirm "
-            f"precedent. Use {complete_hint} (pure graph read) to check."
+            f"Semantic recall unavailable ({degraded_reason}) — showing "
+            f"{shown_part} as a fallback, NOT a relevance ranking. For the "
+            f"authoritative set use {complete_hint} (pure graph read)."
         )
 
     band = _classify_recall(top_score=top_score, result_count=result_count)
