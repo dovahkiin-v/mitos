@@ -28,7 +28,7 @@ from mitos.conflict import ConflictUnavailableReason, Unavailable
 from mitos.errors import DatabaseError, EmbeddingError, VectorStoreError
 from mitos.parser import ParsedEntry
 from mitos.store import GraphStore
-from mitos.sync import (DRAFT_DIGEST_FIELDS, MitosSyncManager, PAUSE_HELD_CLAUSE,
+from mitos.sync import (DRAFT_DIGEST_FIELDS, MitosSyncManager, PAUSE_HELD_CLAUSE, _floor_text,
                         _NEIGHBOR_REVIEW_THRESHOLD, _PAUSE_DIGEST_CLAUSE,
                         _PAUSE_RESOLVING_RELATIONS, _draft_digest)
 
@@ -1778,7 +1778,7 @@ def test_cli_pause_header_states_the_floor_and_the_count(ws, capsys):
     config, _ = ws
     err = _cli_pause(config, [_neighbour("one"), _neighbour("two")], capsys)
     header = next(line for line in err.splitlines() if line.startswith("⚠ Paused"))
-    assert (f"is ≥{_NEIGHBOR_REVIEW_THRESHOLD:.2f} similar to 2 existing "
+    assert (f"is ≥{_floor_text(_NEIGHBOR_REVIEW_THRESHOLD)} similar to 2 existing "
             "decision(s) you did not reference") in header
     assert header.endswith("Nothing written.")
 
@@ -2607,7 +2607,7 @@ def test_f10_the_text_receipt_prints_one_line_per_form(ws, capsys):
     """Row 13 — the three forms through `cmd_record`, and none without the flag."""
     config, m = ws
     _seed(m, "txt-seed", "Use SQLite for the store.")
-    floor = f"{_NEIGHBOR_REVIEW_THRESHOLD:.2f}"
+    floor = _floor_text(_NEIGHBOR_REVIEW_THRESHOLD)
 
     def record(slug, matches, **kw):
         capsys.readouterr()
@@ -2777,7 +2777,7 @@ def test_a_cut_review_rides_the_pause_and_its_twin_does_not(ws, small_bound, las
     if last_above:
         cut = res["neighbor_review_cut"]
         assert "21 points" in cut and "1 live decision" in cut
-        assert f"{_NEIGHBOR_REVIEW_THRESHOLD:.2f} floor" in cut
+        assert f"{_floor_text(_NEIGHBOR_REVIEW_THRESHOLD)} floor" in cut
         assert "mitos" not in cut     # a receipt dict string names no command
     else:
         assert "neighbor_review_cut" not in res

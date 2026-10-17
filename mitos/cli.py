@@ -98,8 +98,8 @@ from mitos.conflict import (CONFLICT_OVERFETCH_LIMIT, run_conflict_check,
                             ConflictUnavailableReason,
                             SEMANTIC_SUBSTRATE_REASONS)
 from mitos.migrations import is_pre_v1a_schema
-from mitos.store import (GraphStore, MODIFIER_EDGE_KEYS, REJECTION_BACKLOG_FAILURE_TOLERANCE,
-                         open_connection)
+from mitos.store import (GraphStore, LIVE_STATES, MODIFIER_EDGE_KEYS,
+                         REJECTION_BACKLOG_FAILURE_TOLERANCE, open_connection)
 from mitos.rejections import (diff_rejection_index, expected_rejection_points, point_items,
                               render_rejected_item, render_rejected_paths)
 from mitos.cutover import default_aside_db_path, perform_swap, rebuild_and_gate
@@ -123,7 +123,7 @@ from mitos.retrieval_walk import (REJECTIONS_OVER_BUDGET, RejectionLeg,
                                   walk_rejection_lookup)
 from mitos.sync import (MitosSyncManager, run_ambient_capture, _SLUG_MAX_LEN,
                         _ENTRIES_MARKER, _NEIGHBOR_REVIEW_THRESHOLD, _TOMBSTONE_FLOOR,
-                        _floor_text,
+                        _floor_text, _live_successors,
                         _PAUSE_RESOLVING_RELATIONS, _declared_echo_lines, _split_relation_slugs,
                         EXISTS_NO_OP_FACT, PAUSE_HELD_CLAUSE,
                         ROTATION_FAILED, ROTATION_REASON_DUPLICATED, ROTATION_ROTATED,
@@ -574,6 +574,7 @@ def _skill_md_text(format_spec_content: str) -> str:
         "- `amend_commentary`  (CLI: `mitos amend-commentary -p . <slug> …`) — fix a committed entry's commentary in place: `rejected_paths`, `invalidates_if`, `context`, `scope`, or its slug (`new_slug`). On the tool, `clear=[…]` empties `invalidates_if`, `context` or `scope`. It refuses a change to the axiom or mechanisms: that is a new decision, recorded with `corrects` / `supersedes` / `amends`. It reaches only entries still in `decisions.md`; an entry already rotated into an archive answers `archived`.\n"
         "- `list_projects`     (CLI: `mitos projects`) — the project names registered on this machine. It takes no selector. A registration whose workspace no longer exists is hidden and counted in `hidden_missing`.\n"
         "- `unregister_project` (CLI: `mitos unregister <name>`) — remove one registration that should not be there (a throwaway or test workspace). Routing only: the workspace itself is untouched. It takes `name`, not `project`.\n\n"
+        "A `record_decision` receipt may also carry `rotation`: older settled entries the call moved to an archive, with its own `outcome`; a failed rotation leaves the write standing. A debounced `scope_overflow` is a health nudge about the corpus, not about the decision just recorded.\n\n"
         "## When to record — the capture trigger (YOUR judgement; Mitos stores, it does not decide what is worth storing)\n"
         "Recall is easy to ask for; knowing WHAT is worth recording is the real call, and it falls to you. Record a decision when it:\n"
         "- sets a pattern future work must follow, or\n"
@@ -584,6 +585,8 @@ def _skill_md_text(format_spec_content: str) -> str:
         "Skip the local, easily-reversible, or already-settled choice. A quick self-test at any fork: *would the next agent waste time re-deriving or re-litigating this?* If yes, record it. When unsure, `surface_decisions` first — if no hit answers it and it clears the bar, record it.\n\n"
         "## Linking decisions\n"
         "When a decision relates to an existing one, pass that one's EXACT slug to the matching relation arg so the graph stays connected instead of accumulating silent tension: `supersedes` (replaces it), `amends`, `narrows`, `depends_on`, `resolves`, `contradicts`, `cites`. On `record_decision` these are args; on the CLI they are flags (`--supersedes`, `--depends-on`, …). Look the target up first to get its exact slug.\n"
+        "A record that sits close to a decision it does not reference pauses (`needs_review`; nothing is written), in two partitions. `neighbors` are live decisions: relate to the ones this decision bears on, and pass `acknowledge_neighbors` as true for the ones it stands apart from. `tombstones` are retired decisions, each with its axiom and where its current word lives (`superseded_by` / `corrected_by`, or `live_end` when the chain runs through another retired decision). A retired decision is never a relation target, so for a tombstone the draft does not re-tread, relate to its live successor (a deliberate reversal is a `supersedes` of the successor) or acknowledge it. A tombstone marked `successor_ambiguous` clears only by acknowledgement: its successor's slug names two decisions, and `record_decision` refuses a relation target that two decisions carry. The usual case is a same-slug supersession, where the slug reads the live decision and the id reads the retired one.\n"
+        "An acknowledged write's receipt names what the acknowledgement went past: `acknowledged_neighbors` (the live slugs) and `acknowledged_tombstones` (the retired handles, each with its id and successors). A re-record whose axiom and mechanisms are a retired decision's answers `exists` with that decision's successors: relate a new decision to those, never to its slug, and repair its commentary with `amend_commentary` by its id.\n"
     )
 
 
@@ -2565,7 +2568,7 @@ def _acknowledged_line(value: Optional[List[str]]) -> str:
     Returns:
         The receipt line, without a trailing newline.
     """
-    floor = f"{_NEIGHBOR_REVIEW_THRESHOLD:.2f}"
+    floor = _floor_text(_NEIGHBOR_REVIEW_THRESHOLD)
     if value is None:
         return ("  Acknowledged: unknown — the neighbours this record went past "
                 "could not be gathered")
@@ -2573,6 +2576,43 @@ def _acknowledged_line(value: Optional[List[str]]) -> str:
         return f"  Acknowledged: no unlinked decision at or above {floor} similarity"
     return (f"  Acknowledged: {', '.join(value)} — the unlinked decisions at or above "
             f"{floor} similarity this record went past")
+
+
+def _acknowledged_tombstones_lines(value: Optional[List[Dict[str, Any]]],
+                                   config: MitosConfig) -> List[str]:
+    """Renders the `created` receipt's ``acknowledged_tombstones`` (7b).
+
+    The sibling of :func:`_acknowledged_line`, keyed on the same flag. Each handle is
+    one line in the pause's tombstone shape (``† slug (state, score) id``) plus where
+    its current word lives, and the floor prints exactly (:func:`_floor_text`), never
+    rounded up. ``None`` means the retired decisions could not be read and must not
+    read as an empty list.
+
+    Args:
+        value: The key's value: handles, ``[]``, or ``None``.
+        config: The workspace config; its ``project`` selects the read recipe.
+
+    Returns:
+        The receipt lines, without trailing newlines.
+    """
+    floor = _floor_text(_TOMBSTONE_FLOOR)
+    if value is None:
+        return ["  Acknowledged tombstones: unknown — the retired decisions this record "
+                "went past could not be read"]
+    if not value:
+        return [f"  Acknowledged tombstones: no retired decision at or above {floor} "
+                "similarity"]
+    lines = [f"  Acknowledged tombstones — the retired decisions at or above {floor} "
+             "similarity this record went past, closest first:"]
+    for t in value:
+        lines.append(f"    † {t['slug']}  ({t['state']}, score {t['score']:.3f})  "
+                     f"id {t['id']}")
+        successors = _live_successors(t)
+        lines.append(f"      current word: {', '.join(successors)}" if successors
+                     else "      current word: no live decision reached")
+    lines.append(f"    read one whole with `mitos show {shell_flag('-p', config.project)} "
+                 "-- <id>`")
+    return lines
 
 
 def cmd_record(
@@ -2810,7 +2850,13 @@ def cmd_record(
     if no_op:
         for line in _exists_recovery_lines(result, config):
             print(line)
-    print(f"  Handle:    '{result['slug']}' — pass this to --supersedes/--amends/--depends-on/… to link future decisions.")
+    if result.get("state") in LIVE_STATES or "state" not in result:
+        print(f"  Handle:    '{result['slug']}' — pass this to --supersedes/--amends/--depends-on/… to link future decisions.")
+    else:
+        # A retired node is no relation target (the commit refuses one), and a slug a
+        # live decision also carries names that one: the handle is its id (7b).
+        print(f"  Handle:    {result['id']} — this decision is retired: its id reads it, "
+              "and new decisions relate to its live successor, never to it.")
     # Read back from the committed node (NOT an echo of the flags): the edges the
     # commit actually wired, each naming what it hit, scope as stored, and
     # mechanisms as authored in decisions.md, followed by the fold line when the
@@ -2836,6 +2882,10 @@ def cmd_record(
     # Keyed on presence: [] and None are both answers, only the flag's absence isn't.
     if "acknowledged_neighbors" in result:
         print(_acknowledged_line(result["acknowledged_neighbors"]))
+    if "acknowledged_tombstones" in result:
+        for line in _acknowledged_tombstones_lines(result["acknowledged_tombstones"],
+                                                   config):
+            print(line)
     # Debounced size-ceiling nudge — AFTER the receipt, on stderr (an ancillary health
     # hint, never the receipt itself), so a healthy growing corpus can't bury "Recorded ✓".
     # Flush stdout first so the receipt lands before the nudge even when stdout is piped
@@ -2898,6 +2948,11 @@ def _exists_recovery_lines(result: Dict[str, Any], config: MitosConfig) -> List[
     states the verb cannot reach are conditionals: the receipt does not know which,
     if either, holds.
 
+    A retired node (7b) leads with where its current word lives, binds the amend
+    recipe to its id, and closes on its live successor rather than on its own slug,
+    which no relation may name; when its successor's slug names two decisions the
+    close names no relation flag, only the two ``show`` reads that tell them apart.
+
     Args:
         result: The ``exists`` receipt dict.
         config: The workspace config; its ``project`` selects every recipe.
@@ -2907,10 +2962,16 @@ def _exists_recovery_lines(result: Dict[str, Any], config: MitosConfig) -> List[
     """
     project = config.project
     slug = result["slug"]
+    retired = result.get("state") not in LIVE_STATES
     # The handle leads the flags the reader appends (`--scope` eats every word after
-    # it), and no `--` guards it, so a dash-led slug falls back to the id.
-    handle = result["id"] if slug.startswith("-") else slug
-    return [
+    # it), and no `--` guards it, so a dash-led slug falls back to the id. A retired
+    # node is named by its id too: amend-commentary resolves a handle as `show` does,
+    # and a slug a live decision also carries names the live one (7b).
+    handle = result["id"] if retired or slug.startswith("-") else slug
+    lines: List[str] = []
+    if retired:
+        lines.append(_exists_retired_line(result, config))
+    lines += [
         f"  → To change its commentary: `mitos amend-commentary {shell_flag('-p', project)} {shell_arg(handle)}` "
         "with a flag per field (--rejected, --scope, --invalidates-if, --context, "
         "--new-slug); it edits in place and keeps the id.",
@@ -2921,9 +2982,55 @@ def _exists_recovery_lines(result: Dict[str, Any], config: MitosConfig) -> List[
         f"{shell_flag('--slug', slug)}` re-materializes one first; if the entry has "
         "rotated into decisions/archive/, edit it there, then run "
         f"`mitos rebuild {shell_flag('-p', project)}`.",
-        "  → To record a changed decision, write a new one with --supersedes or --amends "
-        "naming this slug.",
     ]
+    if not retired:
+        lines.append("  → To record a changed decision, write a new one with --supersedes "
+                     "or --amends naming this slug.")
+        return lines
+    faulted = result.get("superseded_by", []) is None
+    successors = [] if faulted else _live_successors(result)
+    if not successors:
+        return lines
+    named = ", ".join(successors)
+    if result.get("successor_ambiguous"):
+        if slug.casefold() in {s.casefold() for s in successors}:
+            lines.append("  → Its slug also names the live decision: --reconcile-entry "
+                         "and restore-source --slug above reach an entry by that slug, "
+                         "so check which block they name before running them.")
+        lines.append(
+            f"  → A relation to {named} is refused: two decisions carry that slug. "
+            f"`mitos show {shell_flag('-p', project)} -- {shell_arg(successors[0])}` "
+            "reads the live one; "
+            f"`mitos show {shell_flag('-p', project)} -- {shell_arg(result['id'])}` "
+            "reads this one.")
+    else:
+        reversal = (f"--supersedes {shell_arg(successors[0])}" if len(successors) == 1
+                    else "--supersedes at one of them")
+        lines.append(
+            f"  → To record a changed decision, write a new one relating to {named} "
+            f"({reversal} for a deliberate reversal), never to this decision's slug: a "
+            "relation can name only a live decision.")
+    return lines
+
+
+def _exists_retired_line(result: Dict[str, Any], config: MitosConfig) -> str:
+    """The first recovery line of a retired node's ``exists``: where its word lives (7b).
+
+    Composed from the receipt's handle keys, like the dict's note, with this
+    boundary's own recipe: ``None`` keys (a faulted handle read) name the id-bound
+    ``mitos show`` that reads the successors.
+    """
+    state = result.get("state")
+    if result.get("superseded_by", []) is None:
+        return (f"  → This decision is {state}; its successors could not be read: "
+                f"`mitos show {shell_flag('-p', config.project)} -- "
+                f"{shell_arg(result['id'])}` reads them.")
+    successors = _live_successors(result)
+    if successors:
+        return (f"  → This decision is {state}; its current word lives in "
+                f"{', '.join(successors)}.")
+    return (f"  → This decision is {state}; its chain of successors reaches no live "
+            "decision.")
 
 
 def _rotation_receipt_lines(report: Dict[str, Any]) -> List[str]:

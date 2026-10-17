@@ -93,6 +93,7 @@ from mitos.store import (
     RejectionBacklogRow,
     edge_kind_is_legal,
     live_ends_from_chains,
+    LIVE_STATES,
 )
 from mitos.display import retired_handle
 from mitos.retrieval_walk import EDGE_FOUND, EDGE_UNMEASURED
@@ -683,18 +684,32 @@ EXISTS_NO_OP_FACT = (
     "A committed decision's axiom and mechanisms are immutable (M1): re-recording "
     "them is a no-op."
 )
-_EXISTS_NO_OP_NOTE = (
-    EXISTS_NO_OP_FACT + " "
-    "To change its commentary (rejected_paths, scope, invalidates_if, context, or its "
-    "slug with new_slug), call the `amend_commentary` tool on this same project with "
-    "this slug; it edits the entry in place and keeps the id. Relations are not "
+# The note's state-blind middle, shared by the live note and the retired one (7b):
+# relations are not commentary, and the two states the tool cannot reach.
+_EXISTS_RELATIONS_AND_ARCHIVED = (
+    "Relations are not "
     "commentary and that tool refuses them: relation lines are edited in decisions.md "
     "and applied by a sync reconcile, which no tool here performs — a person with a "
     "shell in that project runs it. The tool reaches an entry only while its `### ` "
     "block is in decisions.md. A node with no source block and an entry already "
     "rotated into decisions/archive/ both answer `archived` from it, and the tool cannot "
-    "tell the two apart; either one is repaired by a person. To record a changed "
+    "tell the two apart; either one is repaired by a person."
+)
+_EXISTS_COMMENTARY_FIELDS = (
+    "(rejected_paths, scope, invalidates_if, context, or its slug with new_slug)"
+)
+_EXISTS_NO_OP_NOTE = (
+    EXISTS_NO_OP_FACT + " "
+    f"To change its commentary {_EXISTS_COMMENTARY_FIELDS}, call the `amend_commentary` "
+    "tool on this same project with "
+    "this slug; it edits the entry in place and keeps the id. "
+    + _EXISTS_RELATIONS_AND_ARCHIVED + " To record a changed "
     "decision, record a new one with supersedes or amends naming this slug."
+)
+# The handle keys a retired node's `exists` receipt adds (7b, vision §4.9), and the
+# four that go `null` together when the handle read faults.
+_EXISTS_HANDLE_KEYS: Tuple[str, ...] = (
+    "superseded_by", "corrected_by", "live_end", "successor_ambiguous",
 )
 
 # The standing coherence debt, stated without a number: the `created` receipt's
@@ -1143,6 +1158,109 @@ def _ambiguous_target(ids: Sequence[str]) -> bool:
     return len(ids) > 1
 
 
+def _live_successors(handle: Mapping[str, Any]) -> List[str]:
+    """Where a retired handle's current word lives: the one successor rule (7a, 7b).
+
+    ``live_end`` when the handle holds one (an immediate successor is itself retired;
+    ``[]`` when the chain reaches no live decision), else ``superseded_by`` ∪
+    ``corrected_by`` in order, deduplicated — the live-end rule guarantees those are
+    live then. The pause's tombstone loop, the retired ``exists`` receipt and the CLI's
+    retired lines all read it. A ``null`` key (a faulted ``exists`` handle read)
+    contributes nothing, so a caller that must tell a fault from "no live successor"
+    tests the keys itself.
+
+    ``recall._successor_slugs`` is a deliberate twin on the read path: it answers
+    ``None`` for "no successor key read" (lock 3 there) and does not deduplicate, and
+    ``recall.py`` sits behind the check family's fence, so the two are not merged.
+
+    Args:
+        handle: A :func:`~mitos.display.retired_handle` dict, or a receipt carrying its
+            successor keys.
+
+    Returns:
+        The live successor slugs, possibly empty.
+    """
+    if handle.get("live_end") is not None:
+        return list(handle["live_end"])
+    return list(dict.fromkeys(list(handle.get("superseded_by") or [])
+                              + list(handle.get("corrected_by") or [])))
+
+
+def _quoted_slugs(slugs: Sequence[str]) -> str:
+    """Backticks each slug and joins them, for a receipt sentence."""
+    return ", ".join(f"`{s}`" for s in slugs)
+
+
+def _retired_exists_note(slug: str, node_id: str, state: str,
+                         keys: Mapping[str, Any]) -> str:
+    """The ``no_op_reason`` of an ``exists`` receipt whose node is retired (7b, §4.9).
+
+    MCP-worded, like :data:`_EXISTS_NO_OP_NOTE` (the dict reaches MCP and ``record
+    --json`` verbatim): it names tools and argument names, never a shell command. It
+    opens with :data:`EXISTS_NO_OP_FACT`, then says the decision is retired and where
+    its current word lives, then how its commentary is still repaired — by this node's
+    **id**, because ``amend_commentary`` resolves a handle as ``show_node`` does and a
+    slug a live decision also carries names that live decision — then keeps the live
+    note's state-blind relations and archived sentences, and closes with exactly one
+    of three forms, from the keys alone:
+
+    * **relatable** (a live successor, none ambiguous): record a new decision relating
+      to the live successor, a deliberate reversal being a ``supersedes`` of it; never
+      this node's slug, a relation the commit refuses because a relation resolves only
+      to a live target (P3);
+    * **ambiguous** (``successor_ambiguous``): the successor's slug names two
+      decisions, so ``record_decision`` refuses a relation to it; no relation is named.
+      When the successor's slug is this node's own (a same-slug supersession), the note
+      says the slug reads the live decision and the id reads this one;
+    * **no live end, or a fault**: no relation is named.
+
+    Args:
+        slug: The retired node's stored slug.
+        node_id: Its id.
+        state: Its computed state (``superseded`` / ``corrected``).
+        keys: The receipt's handle keys (:data:`_EXISTS_HANDLE_KEYS`; all ``None`` on
+            a faulted read).
+
+    Returns:
+        The note.
+    """
+    faulted = keys.get("superseded_by", []) is None
+    successors = [] if faulted else _live_successors(keys)
+    if faulted:
+        where = ("its successors could not be read; `show_node` with this decision's id "
+                 "reads them.")
+    elif successors:
+        where = f"its current word lives in {_quoted_slugs(successors)}."
+    else:
+        where = "its chain of successors reaches no live decision."
+    parts = [
+        EXISTS_NO_OP_FACT,
+        f"This decision is {state}: {where}",
+        f"To change its commentary {_EXISTS_COMMENTARY_FIELDS}, call the "
+        "`amend_commentary` tool on this same project and pass this decision's id, "
+        f"{node_id}, as `slug`: the tool reads a handle the way `show_node` does, and a "
+        "slug that a live decision also carries names the live one. It edits the entry "
+        "in place and keeps the id.",
+        _EXISTS_RELATIONS_AND_ARCHIVED,
+    ]
+    if not faulted and successors:
+        if keys.get("successor_ambiguous"):
+            parts.append(
+                f"`record_decision` refuses a relation to {_quoted_slugs(successors)}: "
+                "two decisions carry that slug.")
+            if slug.casefold() in {s.casefold() for s in successors}:
+                parts.append(
+                    f"The slug `{slug}` reads the live decision through `show_node`; "
+                    "this decision's id reads this one.")
+        else:
+            parts.append(
+                "To record a changed decision, record a new one with a relation to "
+                f"{_quoted_slugs(successors)}, where a deliberate reversal is a "
+                "supersedes of it, and never to this decision's slug: a relation can "
+                "name only a live decision.")
+    return " ".join(parts)
+
+
 class DeclaredReview(NamedTuple):
     """What a draft's declarations exempt on the pause, by slug and by node id (7a).
 
@@ -1177,6 +1295,22 @@ class TombstoneReview(NamedTuple):
     shown: List[Dict[str, Any]]
     omitted: int
     cleared_by: Set[str]
+
+
+class AcknowledgedReview(NamedTuple):
+    """What an acknowledged write went past (:meth:`MitosSyncManager._acknowledged_fields`).
+
+    Each field is its own lock-3 statement about a write that has landed (7b, D4): a
+    list when read, ``[]`` when read and empty, ``None`` when it could not be read.
+
+    Attributes:
+        neighbors: The ``acknowledged_neighbors`` slugs, most similar first.
+        tombstones: The ``acknowledged_tombstones`` retired handles, closest first,
+            uncut.
+    """
+
+    neighbors: Optional[List[str]]
+    tombstones: Optional[List[Dict[str, Any]]]
 
 
 class PauseReview(NamedTuple):
@@ -1484,7 +1618,7 @@ def _declared_echo_lines(payload: Dict[str, Any]) -> List[str]:
             rendered.append(
                 item["slug"] if score is None
                 else f"{item['slug']} ({_floored_score_text(score)}, below the "
-                     f"{_NEIGHBOR_REVIEW_THRESHOLD:.2f} floor)"
+                     f"{_floor_text(_NEIGHBOR_REVIEW_THRESHOLD)} floor)"
             )
         line = "Declared, not a near neighbour here: " + ", ".join(rendered)
         total = payload.get("declared_no_near_match_total")
@@ -2371,7 +2505,7 @@ class MitosSyncManager:
         # a multi-entry sync prints ONE deferral line and skips N−1 wasted Qdrant round
         # trips (and N−1 embedding calls). Per manager instance — one per command — and
         # read by the decision leg (``_embed_decision_inline``) and the post-commit
-        # acknowledged-neighbour gather (``_acknowledged_neighbors_field``), which would
+        # acknowledged-neighbour gather (``_acknowledged_fields``), which would
         # meet the same absence. Neither reads the rejection latches below, and the
         # rejection leg never reads this one. A covering drain later in the same
         # ``perform_sync`` must not consult it, or a rebuild-then-sync would refuse to
@@ -4910,6 +5044,7 @@ class MitosSyncManager:
     def _validate_relation_target(
         self, relation: str, target: str, *,
         canonical_slugs: Optional[Dict[str, str]] = None,
+        canonical_ids: Optional[Dict[str, str]] = None,
     ) -> Optional[Dict[str, str]]:
         """Validates a typed relation's target is a unique, EXACT-match decision.
 
@@ -4926,6 +5061,9 @@ class MitosSyncManager:
                 node is already fetched here and its slug discarded — and the pause echo
                 prints stored spellings, never caller ones. Absent on the callers that
                 do not compose an echo.
+            canonical_ids: Optional casefolded-target -> node-id map, filled from the
+                same node: the id Phase A proved unique before the commit, which the
+                acknowledged path's post-commit review exempts by (7b, D3).
 
         Returns:
             None if valid, else a structured ``{error, code}`` dict.
@@ -4940,6 +5078,8 @@ class MitosSyncManager:
             return _record_error("relation_target_not_found", relation=relation, target=target)
         if canonical_slugs is not None:
             canonical_slugs[target.casefold()] = node["slug"]
+        if canonical_ids is not None:
+            canonical_ids[target.casefold()] = node["id"]
         return None
 
     def _review_neighbors(self, entry: ParsedEntry, declared_targets: set, *,
@@ -4982,7 +5122,7 @@ class MitosSyncManager:
                 string stay green.
             top_k: How many screened survivors to keep. The pause uses the default,
                 ``CONFLICT_TOP_K``, which is what it displays. The acknowledged path
-                (:meth:`_acknowledged_neighbors_field`) passes
+                (:meth:`_acknowledged_fields`) passes
                 ``CONFLICT_OVERFETCH_LIMIT``, the gather's 20 live candidates,
                 because an acknowledgement covers every neighbour the gate would have
                 held the write for, not only the ones a pause would show.
@@ -5048,7 +5188,8 @@ class MitosSyncManager:
             raise DatabaseError(f"Failed to resolve slug '{slug}': {exc}")
 
     def _lineage_ancestors(
-        self, mutation_target_slugs: List[Optional[str]]
+        self, mutation_target_slugs: List[Optional[str]], *,
+        target_ids: Optional[Mapping[str, str]] = None,
     ) -> Dict[str, List[Dict[str, str]]]:
         """The transitive mutation ancestors of declared targets, per target (3b, 7a).
 
@@ -5106,6 +5247,10 @@ class MitosSyncManager:
         Args:
             mutation_target_slugs: The declared ``supersedes``/``amends``/``narrows``
                 target slugs; any element may be ``None`` or empty (skipped).
+            target_ids: Optional casefolded target → node id that Phase A validated
+                (7b). A target found here seeds its walk from that id, unresolved; the
+                rest resolve as before. The acknowledged path passes it, because after
+                the commit a slug may name more nodes than it did before.
 
         Returns:
             Casefolded target slug → its ancestors (``get_lineage``'s ``{node_id, slug,
@@ -5119,7 +5264,8 @@ class MitosSyncManager:
         for slug in mutation_target_slugs:
             if not slug or not slug.strip():
                 continue
-            ids = self._resolve_slug_typed(slug)
+            pinned = (target_ids or {}).get(slug.casefold())
+            ids = [pinned] if pinned is not None else self._resolve_slug_typed(slug)
             # Each declared target was pre-validated unique-and-existing before the gate
             # runs (supersedes at the supersedes fast-fail, amends/narrows via
             # _validate_relation_target), so resolve_slug returns exactly one id on the
@@ -5135,7 +5281,9 @@ class MitosSyncManager:
         return ancestors
 
     def _review_declared(self, supersedes: Optional[str], corrects: Optional[str],
-                         extra_relations: Dict[str, str]) -> DeclaredReview:
+                         extra_relations: Dict[str, str], *,
+                         target_ids: Optional[Mapping[str, str]] = None,
+                         ) -> DeclaredReview:
         """What a draft's declarations exempt on the pause, by slug and by id (7a).
 
         One lineage walk (:meth:`_lineage_ancestors`) feeds all three fields of the
@@ -5154,10 +5302,20 @@ class MitosSyncManager:
         then exempts that decision itself. A target resolving otherwise (a replay shell
         skips Phase A) contributes its slug and no id.
 
+        ``target_ids`` pins targets to the ids Phase A validated (7b, D3). The pause
+        passes none: before the commit each target resolves to exactly the id Phase A
+        saw. The acknowledged path runs after the commit, where a slug may name more
+        nodes than before (a reconcile that landed a same-slug node between this
+        write's commit and its read; ``record_decision`` itself never mints a slug a
+        node already carries), so it passes Phase A's ids and its exemptions cannot
+        move with the commit.
+
         Args:
             supersedes: The raw ``supersedes`` argument.
             corrects: The raw ``corrects`` argument.
             extra_relations: The seven non-kill relations, stripped, non-empty only.
+            target_ids: Optional casefolded target → validated node id; a target found
+                here takes that id unresolved, and seeds its lineage walk from it.
 
         Returns:
             The :class:`DeclaredReview`.
@@ -5170,13 +5328,15 @@ class MitosSyncManager:
         slugs = {t.casefold() for t in direct}
         ids_by_target: Dict[str, Set[str]] = {}
         for target in direct:
-            ids = self._resolve_slug_typed(target)
+            pinned = (target_ids or {}).get(target.casefold())
+            ids = [pinned] if pinned is not None else self._resolve_slug_typed(target)
             if len(ids) == 1:
                 ids_by_target.setdefault(target.casefold(), set()).add(ids[0])
         lineage = self._lineage_ancestors(
             _split_relation_slugs(supersedes)
             + _split_relation_slugs(extra_relations.get("amends"))
-            + _split_relation_slugs(extra_relations.get("narrows"))
+            + _split_relation_slugs(extra_relations.get("narrows")),
+            target_ids=target_ids,
         )
         for folded, ancestors in lineage.items():
             for ancestor in ancestors:
@@ -5193,9 +5353,12 @@ class MitosSyncManager:
                                  extra_relations: Dict[str, str]) -> set[str]:
         """Builds the neighbour review's suppression set from the raw relation args.
 
-        The one source for both callers: the pre-commit pause and the acknowledged
-        path's post-commit gather (:meth:`_acknowledged_neighbors_field`). Two copies
-        would drift, and the first drift would name a neighbour the caller had linked.
+        The pause's no-provider branch reads it, and so does the replay worker's legacy
+        build. The acknowledged path's post-commit gather (:meth:`_acknowledged_fields`)
+        reads :meth:`_review_declared` directly since 7b, seeded with Phase A's target
+        ids, and its own early ``None`` answers the provider gate below. Every copy is
+        the one walk: two would drift, and the first drift would name a neighbour the
+        caller had linked.
         The set is every declared relation target, casefolded, plus the transitive
         mutation lineage of the ``supersedes``/``amends``/``narrows`` targets (3b).
         The lineage walk is skipped without providers: the gate is then a no-op
@@ -5228,7 +5391,8 @@ class MitosSyncManager:
     def _review_tombstones(self, gathering: Gathering, declared: DeclaredReview, *,
                            shown_neighbors: Sequence[Mapping[str, Any]],
                            bound: Optional[int] = CONFLICT_TOP_K,
-                           floor: Optional[float] = None) -> TombstoneReview:
+                           floor: Optional[float] = None,
+                           bare: bool = False) -> TombstoneReview:
         """The pause's tombstone partition from one healthy gathering (7a, vision §4.9).
 
         A pure consumer of the gather's retired partition plus at most three reads, all
@@ -5250,14 +5414,18 @@ class MitosSyncManager:
           and the live ends of the walk already read, through
           :func:`~mitos.store.live_ends_from_chains`), plus the hit node's whole
           ``axiom`` (the agent must recognise what it re-treads), plus two facts over
-          its live successors (its ``live_end`` when present, else its
-          ``superseded_by`` ∪ ``corrected_by``, which the live-end rule guarantees are
-          live then): ``successor_on_pause``, the successors among
+          its live successors (:func:`_live_successors`: its ``live_end`` when present,
+          else its ``superseded_by`` ∪ ``corrected_by``, which the live-end rule
+          guarantees are live then): ``successor_on_pause``, the successors among
           ``shown_neighbors`` by casefolded slug (both sides live, and a live slug
           names its one live bearer), present only when non-empty; and
           ``successor_ambiguous: True`` when some successor's slug names several
           nodes, by the validator's own predicate (:func:`_ambiguous_target`), so only
           acknowledgement clears the tombstone. Present only when true.
+        * **Bare** (7b, D2). ``bare=True`` makes each entry the handle alone — no axiom,
+          no successor facts — and skips the per-successor slug reads with them. The
+          acknowledged receipt names what a landed write went past; it does not
+          re-open it. Membership, exemption and order do not read the flag.
 
         Faults are not caught: a ``DatabaseError`` from any read propagates to the
         pause's fail-open arm, which discards the live neighbours too (D3). A partly
@@ -5273,6 +5441,7 @@ class MitosSyncManager:
             bound: How many tombstones to show; ``None`` for all.
             floor: The tombstone floor; ``None`` reads ``_TOMBSTONE_FLOOR`` at call
                 time. The candidate sweep passes a lower floor to price a lowered one.
+            bare: Entries are the handle alone, and no slug is read.
 
         Returns:
             The :class:`TombstoneReview`.
@@ -5309,12 +5478,11 @@ class MitosSyncManager:
         for hit in shown_hits:
             entry = retired_handle(hit.node, score=hit.score, stamps=stamps,
                                    live_ends=live_ends)
+            if bare:
+                shown.append(entry)
+                continue
             entry["axiom"] = hit.node["core_axiom"]
-            if "live_end" in entry:
-                successors = list(entry["live_end"])
-            else:
-                successors = list(dict.fromkeys(entry.get("superseded_by", [])
-                                                + entry.get("corrected_by", [])))
+            successors = _live_successors(entry)
             beside = [s for s in successors if s.casefold() in on_pause]
             if beside:
                 entry["successor_on_pause"] = beside
@@ -5477,66 +5645,93 @@ class MitosSyncManager:
         }
         return PauseReview(pause=pause, unavailable=None, cut=None)
 
-    def _acknowledged_neighbors_field(self, entry: ParsedEntry,
-                                      supersedes: Optional[str],
-                                      corrects: Optional[str],
-                                      extra_relations: Dict[str, str],
-                                      *,
-                                      gathering_sink: Optional[List[Gathering]] = None,
-                                      ) -> Optional[List[str]]:
-        """Names the neighbours an acknowledged write went past, never raising (F10).
+    def _acknowledged_fields(self, entry: ParsedEntry,
+                             supersedes: Optional[str],
+                             corrects: Optional[str],
+                             extra_relations: Dict[str, str],
+                             *,
+                             target_ids: Optional[Mapping[str, str]] = None,
+                             gathering_sink: Optional[List[Gathering]] = None,
+                             ) -> AcknowledgedReview:
+        """Names what an acknowledged write went past, never raising (F10; 7b).
 
         ``acknowledge_neighbors=True`` skips the pause, and mitos holds nothing between
         calls, so a pause cleared on a re-send and a flag passed blind on the first
-        call look the same. This lists the neighbours for both. It re-runs the pause's
-        own gather after the commit and the embed, so the axiom's vector is already in
-        the embedding cache and the gather adds one vector query, no embedding call.
-        The list is not cut to the pause's ``CONFLICT_TOP_K``: an acknowledgement
-        covers every neighbour the gate would have held the write for, bounded only by
-        the gather's 20 live candidates (``CONFLICT_OVERFETCH_LIMIT``). The new node's
+        call look the same. This lists what the gate would have held the write for, for
+        both: the live neighbours (``acknowledged_neighbors``) and the tombstones
+        (``acknowledged_tombstones``). It re-runs the pause's own gather after the
+        commit and the embed, so the axiom's vector is already in the embedding cache
+        and the gather adds one vector query, no embedding call. Neither list is cut to
+        the pause's ``CONFLICT_TOP_K``: an acknowledgement disarms the gate for the
+        whole draft, so it covers everything the gather read — 20 live candidates
+        (``CONFLICT_OVERFETCH_LIMIT``) and the retired hits beside them. The new node's
         own vector is in that fetch and holds one of the 20, and the own-slug screen
         drops it.
 
+        Both lists read one :meth:`_review_declared` (one lineage walk), seeded with
+        the target ids Phase A validated (``target_ids``), so neither list's
+        exemptions move with the commit: the decision this write superseded or
+        corrected, now retired and the closest hit by construction, and its lineage stay
+        exempt as they were on the pause (D3). The tombstones are 7a's own
+        :meth:`_review_tombstones` over the gathering's retired partition, bare and
+        uncut (D1, D2).
+
         Called after the commit and outside the lock, like :meth:`_audit_debt_fields`.
-        ``None`` means nothing is claimed: no embedding provider or vector store (where
+        Two fault domains, one per key (D4). Both are ``None`` when the gather could not
+        be trusted: no embedding provider or vector store (where
         :meth:`_review_neighbors` would answer a healthy ``[]`` for a gather that never
-        ran), a typed :class:`Unavailable`, or any exception, which also writes one
-        stderr warning. The write has landed, so nothing here may escape (§7).
+        ran), the collection-absent latch, a typed :class:`Unavailable`, or any
+        exception from the declared review or the gather. A fault in the tombstone
+        reads alone, after a healthy gather, makes only ``tombstones`` ``None``. Each
+        fault writes one stderr warning. The write has landed, so nothing here may
+        escape (§7).
 
         Args:
             entry: The committed entry.
             supersedes: The raw ``supersedes`` argument.
             corrects: The raw ``corrects`` argument.
             extra_relations: The seven non-kill relations, as the pause reads them.
-            gathering_sink: Forwarded to :meth:`_review_neighbors`, so the caller can
-                word a cut of this re-run gather.
+            target_ids: Casefolded declared target → the node id Phase A validated.
+            gathering_sink: Receives the re-run gathering, so the caller can word its
+                cut; a local list is used when ``None``.
 
         Returns:
-            The neighbours' stored slugs, most similar first; ``[]`` when the gather
-            ran and found none; ``None`` when it could not run.
+            The :class:`AcknowledgedReview`.
         """
         if not self.embed_provider or not self.vector_store:
-            return None
+            return AcknowledgedReview(neighbors=None, tombstones=None)
         # Step 8 met a missing collection it could not create: the gather would meet
         # it too, and with the new node live `missing_index_is_a_gap` says True, so it
         # would answer Unavailable. Same None, one round trip fewer. A first write
         # (may_create) never sets the latch, so a fresh workspace still gathers.
         if self._collection_absent:
-            return None
+            return AcknowledgedReview(neighbors=None, tombstones=None)
+        sink: List[Gathering] = gathering_sink if gathering_sink is not None else []
         try:
-            declared = self._review_declared_targets(supersedes, corrects,
-                                                     extra_relations)
-            reviewed = self._review_neighbors(entry, declared,
+            declared = self._review_declared(supersedes, corrects, extra_relations,
+                                             target_ids=target_ids)
+            reviewed = self._review_neighbors(entry, declared.slugs,
                                               top_k=CONFLICT_OVERFETCH_LIMIT,
-                                              gathering_sink=gathering_sink)
+                                              gathering_sink=sink)
         except Exception as e:
             # stderr: the MCP write tool shares this path and uses stdout for JSON-RPC.
             print(f"[Warning] Acknowledged-neighbour read failed for '{entry.slug}': "
                   f"{str(e)}", file=sys.stderr)
-            return None
+            return AcknowledgedReview(neighbors=None, tombstones=None)
         if isinstance(reviewed, Unavailable):
-            return None
-        return [n["slug"] for n in reviewed]
+            return AcknowledgedReview(neighbors=None, tombstones=None)
+        neighbors = [n["slug"] for n in reviewed]
+        if not sink:
+            # A healthy answer with no gathering: nothing was gathered to read.
+            return AcknowledgedReview(neighbors=neighbors, tombstones=None)
+        try:
+            tombs = self._review_tombstones(sink[0], declared, shown_neighbors=[],
+                                            bound=None, bare=True)
+        except Exception as e:
+            print(f"[Warning] Acknowledged-tombstone read failed for '{entry.slug}': "
+                  f"{str(e)}", file=sys.stderr)
+            return AcknowledgedReview(neighbors=neighbors, tombstones=None)
+        return AcknowledgedReview(neighbors=neighbors, tombstones=tombs.shown)
 
     def _node_state(self, node_id: str) -> str:
         """Returns the computed state of a node ('active'/'superseded'/'corrected'/'drifted')."""
@@ -5666,6 +5861,92 @@ class MitosSyncManager:
                 entry["target_topic"] = None
             degraded.append(entry)
         return degraded
+
+    def _exists_receipt(self, entry: ParsedEntry, existing: Dict[str, Any],
+                        node_id: str, *, slug: str, state: str) -> Dict[str, Any]:
+        """Composes the ``exists`` receipt, for gate 3 and its TOCTOU twin alike (7b).
+
+        One composer, so the two returns cannot drift. ``state`` is read once by the
+        caller and passed in; nothing here reads it again, so the top-level ``state``
+        and the note come from one snapshot. A live node's receipt (``active`` /
+        ``drifted``) is the receipt as it always was: the same keys and
+        :data:`_EXISTS_NO_OP_NOTE`. A retired node's adds its handle keys after
+        ``state`` (:meth:`_exists_handle_keys`) and carries a note composed from them
+        (:func:`_retired_exists_note`), which names where the current word lives and
+        never a relation the commit would refuse (vision §4.9, P3).
+
+        Args:
+            entry: The parsed entry this call built.
+            existing: The committed node (``get_node``).
+            node_id: The node's id.
+            slug: The receipt's ``slug`` (gate 3 echoes the stored slug, the twin the
+                entry's; a pre-existing difference, left as it was).
+            state: The node's computed state, read once by the caller.
+
+        Returns:
+            The receipt dict.
+        """
+        receipt: Dict[str, Any] = {"slug": slug, "id": node_id, "state": state}
+        note = _EXISTS_NO_OP_NOTE
+        if state not in LIVE_STATES:
+            keys = self._exists_handle_keys(existing, node_id, state)
+            receipt.update(keys)
+            note = _retired_exists_note(existing["slug"], node_id, state, keys)
+        receipt.update({
+            "embedding": self._embedding_status(node_id),
+            "status": "exists",
+            # `path` stays: it points at where the existing entry LIVES, which is
+            # the useful answer to "already recorded — so where is it?" (#5b).
+            # What was wrong is that the renderer labelled it `Written:` under a
+            # `Recorded ✓` headline, so a re-record aimed at correcting commentary
+            # — or at restoring a source block on a graph-only node — read as a
+            # successful write while nothing had changed. The claim moves to
+            # no_op_reason; the pointer stays.
+            "path": self.config.decisions_file,
+            "no_op_reason": note,
+            **self._exists_receipt_extras(entry, existing, node_id),
+        })
+        return receipt
+
+    def _exists_handle_keys(self, existing: Dict[str, Any], node_id: str,
+                            state: str) -> Dict[str, Any]:
+        """A retired node's handle keys for its ``exists`` receipt, never raising (7b).
+
+        The §4.4 handle (:func:`~mitos.display.retired_handle`, with no score: an
+        ``exists`` is not a ranked hit) from one kill-chain walk and one stamp read, then
+        ``successor_ambiguous`` over its live successors (:func:`_live_successors`) by
+        the validator's own predicate. Flat on the receipt, because they are the stamps
+        every decision-read surface carries. One fault domain: any exception from those
+        reads makes all four keys ``None``, ``superseded_by`` included — a handle that
+        kept its stamps but lost its live end could name a dead hop as the place to go.
+
+        Args:
+            existing: The committed node.
+            node_id: Its id.
+            state: Its computed state.
+
+        Returns:
+            ``superseded_by`` / ``corrected_by`` when held, ``live_end`` when an
+            immediate successor is retired, ``successor_ambiguous: True`` when some live
+            successor's slug names several nodes; or all four ``None`` on a fault.
+        """
+        try:
+            chains, chain_slugs = self.store.get_kill_chains([node_id])
+            live_ends = live_ends_from_chains(chains, chain_slugs)
+            stamps = self.store.get_modifiers_map([node_id])
+            handle = retired_handle({**existing, "computed_state": state}, score=None,
+                                    stamps=stamps, live_ends=live_ends)
+            keys = {k: handle[k] for k in ("superseded_by", "corrected_by", "live_end")
+                    if k in handle}
+            if any(_ambiguous_target(self._resolve_slug_typed(s))
+                   for s in _live_successors(handle)):
+                keys["successor_ambiguous"] = True
+            return keys
+        except Exception as e:
+            # stderr: the MCP write tool shares this path and uses stdout for JSON-RPC.
+            print(f"[Warning] Retired-handle read failed for '{existing.get('slug')}': "
+                  f"{str(e)}", file=sys.stderr)
+            return dict.fromkeys(_EXISTS_HANDLE_KEYS)
 
     def _exists_receipt_extras(
         self, entry: ParsedEntry, existing: Dict[str, Any], node_id: str
@@ -6380,7 +6661,14 @@ class MitosSyncManager:
 
         Returns:
             A success dict ``{slug, id, state, embedding, status}`` (status
-            "created"|"exists"); on the "created" path it also carries
+            "created"|"exists"); an "exists" receipt whose node is retired also carries
+            that node's handle keys after ``state`` (:meth:`_exists_receipt`, 7b):
+            ``superseded_by`` / ``corrected_by`` when held, ``live_end`` when an
+            immediate successor is retired, ``successor_ambiguous: true`` when a live
+            successor's slug names two decisions — all four ``None`` when the handle
+            could not be read — and a ``no_op_reason`` naming where its current word
+            lives and never a relation the commit would refuse (a live node's receipt
+            is unchanged); on the "created" path it also carries
             ``edges_created`` (the edges the commit actually wired, read back
             from the store and not echoed from the input args, each ``{kind,
             target, target_state, target_stamps}`` plus the target's whole
@@ -6413,10 +6701,15 @@ class MitosSyncManager:
             check's outcome, :func:`~mitos.check_notice.compose_check_notice`),
             present only while a judge key is set and that outcome is not
             ``no_new_findings``; plus, only when ``acknowledge_neighbors`` was
-            passed, ``acknowledged_neighbors`` (:meth:`_acknowledged_neighbors_field`):
+            passed, ``acknowledged_neighbors`` (:meth:`_acknowledged_fields`):
             the stored slugs of every unlinked live decision at or above the floor
             that the write went past, most similar first, ``[]`` when there were
-            none, or ``None`` when the gather could not run; OR, when a highly-similar
+            none, or ``None`` when the gather could not run; and beside it
+            ``acknowledged_tombstones``: the bare retired handles (``slug`` / ``id`` /
+            ``state`` / ``score`` / successor stamps / ``live_end``; no axiom) of every
+            non-exempt retired decision at or above ``_TOMBSTONE_FLOOR`` the write went
+            past, closest first and uncut, ``[]`` when there were none, or ``None`` when
+            the gather or the tombstone reads could not run; OR, when a highly-similar
             unreferenced live decision or retired decision exists and
             ``acknowledge_neighbors`` is False, a ``{status: "needs_review", code:
             "similar_decision_exists", slug, neighbors, message, draft_digest}`` pause
@@ -6591,6 +6884,11 @@ class MitosSyncManager:
         # whose stored spelling is computed nowhere else — and it costs a dict write on
         # a node already fetched.
         canonical_slugs: Dict[str, str] = {}
+        # Beside it, the resolved node's id under the same key: what this validation
+        # proved unique before the commit, which the acknowledged path's post-commit
+        # review exempts by, so a slug that names more nodes after the commit cannot
+        # move its exemptions (7b, D3).
+        canonical_ids: Dict[str, str] = {}
         supersedes_slugs = _split_relation_slugs(supersedes)
         for _sup in supersedes_slugs:
             ids = self.store.resolve_slug(_sup)
@@ -6602,6 +6900,7 @@ class MitosSyncManager:
             if not target or target.get("slug", "").casefold() != _sup.casefold():
                 return _record_error("supersedes_not_found", supersedes=_sup)
             canonical_slugs[_sup.casefold()] = target["slug"]
+            canonical_ids[_sup.casefold()] = target["id"]
         if supersedes_slugs:
             entry.supersedes = supersedes_slugs  # List[str] shape (V1b multi-valued)
 
@@ -6619,6 +6918,7 @@ class MitosSyncManager:
             if not target or target.get("slug", "").casefold() != _cor.casefold():
                 return _record_error("corrects_not_found", corrects=_cor)
             canonical_slugs[_cor.casefold()] = target["slug"]
+            canonical_ids[_cor.casefold()] = target["id"]
         if corrects_slugs:
             entry.corrects = corrects_slugs  # List[str] shape (V1b multi-valued)
 
@@ -6630,7 +6930,8 @@ class MitosSyncManager:
             _targets = _split_relation_slugs(_raw)
             for _t in _targets:
                 err = self._validate_relation_target(
-                    _name, _t, canonical_slugs=canonical_slugs)
+                    _name, _t, canonical_slugs=canonical_slugs,
+                    canonical_ids=canonical_ids)
                 if err:
                     return err
             if _targets:
@@ -6659,23 +6960,9 @@ class MitosSyncManager:
             self.store.note_source_reencounter(
                 node_id, existing["source"], entry.source or "user"
             )
-            return {
-                "slug": existing["slug"],
-                "id": node_id,
-                "state": self._node_state(node_id),
-                "embedding": self._embedding_status(node_id),
-                "status": "exists",
-                # `path` stays: it points at where the existing entry LIVES, which is
-                # the useful answer to "already recorded — so where is it?" (#5b).
-                # What was wrong is that the renderer labelled it `Written:` under a
-                # `Recorded ✓` headline, so a re-record aimed at correcting commentary
-                # — or at restoring a source block on a graph-only node — read as a
-                # successful write while nothing had changed. The claim moves to
-                # no_op_reason; the pointer stays.
-                "path": self.config.decisions_file,
-                "no_op_reason": _EXISTS_NO_OP_NOTE,
-                **self._exists_receipt_extras(entry, existing, node_id),
-            }
+            state = self._node_state(node_id)
+            return self._exists_receipt(entry, existing, node_id,
+                                        slug=existing["slug"], state=state)
 
         # Slug-collision fast-fail (exact match only).
         coll_id, _coll_node = self._exact_slug_node(entry.slug)
@@ -6720,17 +7007,10 @@ class MitosSyncManager:
                     self.store.note_source_reencounter(
                         node_id, existing["source"], entry.source or "user"
                     )
-                    return {
-                        "slug": entry.slug,
-                        "id": node_id,
-                        "state": self._node_state(node_id),
-                        "embedding": self._embedding_status(node_id),
-                        "status": "exists",
-                        # See the gate-3 twin above: the path points, it does not claim.
-                        "path": self.config.decisions_file,
-                        "no_op_reason": _EXISTS_NO_OP_NOTE,
-                        **self._exists_receipt_extras(entry, existing, node_id),
-                    }
+                    # One composer with gate 3, and one state read per return.
+                    state = self._node_state(node_id)
+                    return self._exists_receipt(entry, existing, node_id,
+                                                slug=entry.slug, state=state)
                 coll_id, _coll_node = self._exact_slug_node(entry.slug)
                 if coll_id and coll_id != node_id:
                     return _record_error("slug_collision", slug=entry.slug)
@@ -6845,18 +7125,20 @@ class MitosSyncManager:
         #     as 9b; None on a keyless workspace or a healthy record.
         check_notice = self._check_notice_field()
 
-        # 9d. Under acknowledge_neighbors, the neighbours this write went past (F10):
-        #     the pause's gather re-run after the embed, so it hits the embedding
-        #     cache. Same never-raising shape as 9b/9c; None when it could not run.
-        acknowledged: Optional[List[str]] = None
+        # 9d. Under acknowledge_neighbors, the neighbours and the tombstones this write
+        #     went past (F10; 7b): the pause's gather re-run after the embed, so it hits
+        #     the embedding cache, exempting by the target ids Phase A validated. Same
+        #     never-raising shape as 9b/9c; each list None when it could not be read.
+        acknowledged = AcknowledgedReview(neighbors=None, tombstones=None)
         if acknowledge_neighbors:
             acknowledged_gatherings: List[Gathering] = []
-            acknowledged = self._acknowledged_neighbors_field(
+            acknowledged = self._acknowledged_fields(
                 entry, supersedes, corrects, extra_relations,
-                gathering_sink=acknowledged_gatherings)
-            # The re-run gather's cut, only when the list it fills was produced: a
-            # `None` list already says the read could not be trusted.
-            if acknowledged is not None and acknowledged_gatherings:
+                target_ids=canonical_ids, gathering_sink=acknowledged_gatherings)
+            # The re-run gather's cut, only when the live list it fills was produced: a
+            # `None` list already says the read could not be trusted. A tombstone-only
+            # fault keeps it, because the gather that was cut did run.
+            if acknowledged.neighbors is not None and acknowledged_gatherings:
                 review_cut = _review_cut_notice(acknowledged_gatherings[0],
                                                 _NEIGHBOR_REVIEW_THRESHOLD,
                                                 tombstone_floor=_TOMBSTONE_FLOOR)
@@ -6932,5 +7214,6 @@ class MitosSyncManager:
         # Keyed on the flag, not the value: None ("could not look") and [] ("looked,
         # none") are both answers, and the key's absence means the flag was not passed.
         if acknowledge_neighbors:
-            result["acknowledged_neighbors"] = acknowledged
+            result["acknowledged_neighbors"] = acknowledged.neighbors
+            result["acknowledged_tombstones"] = acknowledged.tombstones
         return result

@@ -1808,10 +1808,11 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
         is a failure. status="created": newly recorded, with `edges_created` write
         facts (read back from the committed graph — empty means no edge landed)
         and the committed scope, plus mechanisms as authored. status="exists": a
-        SUCCESS no-op, not an error — the same axiom and mechanisms are already recorded, whatever the
+        SUCCESS no-op — the same axiom and mechanisms are already recorded, whatever the
         slug; changed commentary/relations are NOT saved and are listed under
         `differs`; record a NEW decision (a distinct
-        axiom) for new reasoning. status="needs_review" (code
+        axiom) for new reasoning. On a retired decision it names its successors;
+        relate to those, not its slug. status="needs_review" (code
         "similar_decision_exists"): a PAUSE, not a failure — nothing was written;
         the response lists ≥0.80-similar unlinked `neighbors`, each with its axiom,
         rejected_paths, scope, score and modifier stamps (if you go on to
@@ -1820,14 +1821,15 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
         Judge each, then re-record with that judgment: a relation arg
         (amends/narrows/supersedes/corrects/contradicts/cites) pointing at any
         neighbour this decision genuinely relates to, acknowledge_neighbors=True
-        for neighbours that stand independently — or both at once for a mixed set. A "created"
+        for neighbours that stand independently — or both at once for a mixed set.
+        A pause may list `tombstones`: retired decisions near the draft, each
+        naming its live successor; a relation to that (a reversal supersedes it)
+        or acknowledgement clears one, only the latter if successor_ambiguous.
+        A "created"
         result MAY carry `neighbor_review_unavailable` (the near-dup review could
-        not run; absent neighbours are not checked-clean) or a debounced
-        `scope_overflow` health nudge (not about this decision). It MAY carry
-        `rotation`: older settled entries this call moved to an archive, with its
-        own `outcome`; a failed rotation leaves the write standing. A pause or a
+        not run; absent neighbours are not checked-clean). A pause or a
         created result MAY carry `neighbor_review_cut`: the review read its whole
-        bound, so a live neighbour may lie past it.
+        bound, so a neighbour or tombstone may lie past it.
     """
     config = _target_config(project, "record_decision")
     # Build our own writable manager — do NOT reuse get_workspace_components()

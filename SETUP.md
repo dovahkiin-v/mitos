@@ -329,13 +329,26 @@ If yes, record it — and `surface_decisions` first when unsure.
 that one's exact slug to the matching relation argument so the graph stays
 connected instead of accumulating silent tension: `supersedes` (replaces it),
 `amends`, `narrows`, `depends_on`, `resolves`, `contradicts`, `cites`. A record
-that is strongly similar (≥0.80) to an existing decision it does not reference
-pauses instead of committing (`needs_review` — nothing is written) and surfaces
-each neighbour's axiom, `rejected_paths`, `scope`, and modifier stamps. Judge
-each neighbour from that payload: if the new decision
-amends/supersedes/contradicts/cites one, re-record with that relation pointing
-at its slug; if it is genuinely independent, re-record with
-`acknowledge_neighbors=True`. If you go on to supersede or amend a neighbour, an
+that sits close to a decision it does not reference pauses instead of committing
+(`needs_review` — nothing is written), in two partitions. `neighbors` are live
+decisions strongly similar (≥0.80) to the draft, each with its axiom,
+`rejected_paths`, `scope`, and modifier stamps. `tombstones` are retired
+decisions at ≥0.8265, each with its axiom and where its current word lives
+(`superseded_by` / `corrected_by`, or `live_end` when the chain runs through
+another retired decision). Judge each neighbour from that payload: if the new
+decision amends/supersedes/contradicts/cites one, re-record with that relation
+pointing at its slug; if it is genuinely independent, re-record with
+`acknowledge_neighbors=True`. A retired decision is never a relation target, so
+for a tombstone the draft does not re-tread, relate to its live successor
+instead (a deliberate reversal is a `supersedes` of the successor), or
+acknowledge it. A tombstone marked `successor_ambiguous` clears only by
+acknowledgement: its successor's slug names two decisions, and
+`record_decision` refuses a relation target that two decisions carry. That is
+the same-slug case, a decision superseded by a new one under its own slug: the
+slug reads the live decision and the id reads the retired one. An acknowledged
+write's receipt names what it went past, `acknowledged_neighbors` and
+`acknowledged_tombstones`, and a re-record identical to a retired decision
+answers `exists` naming its successors. If you go on to supersede or amend a neighbour, an
 `amended_by`/`narrowed_by` stamp on it means it has moved on — dereference that
 slug before linking.
 

@@ -153,7 +153,7 @@ def oneline_payload(node: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
-def retired_handle(node: Mapping[str, Any], *, score: float,
+def retired_handle(node: Mapping[str, Any], *, score: Optional[float],
                    stamps: Mapping[str, Mapping[str, List[str]]],
                    live_ends: Mapping[str, List[str]]) -> Dict[str, Any]:
     """Shapes a retired decision's handle — the one constructor, shared CLI⇄MCP.
@@ -173,9 +173,13 @@ def retired_handle(node: Mapping[str, Any], *, score: float,
     read faulted both maps are empty and every successor key is omitted; the
     envelope's ``stamps_unread`` says so. Store-free: the maps are passed in.
 
+    ``score`` is required with no default, so a ranked caller that forgot its score is
+    a ``TypeError``. A handle that is not a ranked hit (a retired node's ``exists``
+    receipt, 7b) passes ``None`` deliberately, and the ``score`` key is then omitted.
+
     Args:
         node: The resolved node; reads ``id``, ``slug`` and ``computed_state``.
-        score: The hit's similarity score.
+        score: The hit's similarity score, or ``None`` for a handle that is no hit.
         stamps: Node id → modifier stamps, as the walk returned them.
         live_ends: Node id → live-end slugs, as the walk returned them.
 
@@ -186,8 +190,9 @@ def retired_handle(node: Mapping[str, Any], *, score: float,
         "slug": node["slug"],
         "id": node["id"],
         "state": node["computed_state"],
-        "score": score,
     }
+    if score is not None:
+        handle["score"] = score
     node_stamps = stamps.get(node["id"], {})
     for key in ("superseded_by", "corrected_by"):
         successors = node_stamps.get(key)

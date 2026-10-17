@@ -560,11 +560,11 @@ def test_container_shape_is_stated_in_the_first_sentence(tool, arg):
         )
 
 
-# --- 7a: the pause's tombstone partition ships before its prose -------------------------
+# --- 7a → 7b: the pause's tombstone partition, and its prose ----------------------------
 #
-# 7a wires the partition into the pause and its runtime message; `record_decision`'s
-# description and SETUP.md's pause passage are 7b's to rewrite. Until then they must not
-# half-describe it. Each row was seen red against a planted mention first.
+# 7a shipped the partition and pinned this prose silent; 7b ships the receipts and the
+# prose together, so both rows are inverted here, deliberately (constraint 12). Floors
+# are imported from the constants, never copied, so a recalibration reds the prose.
 
 def _setup_md():
     import os
@@ -573,19 +573,52 @@ def _setup_md():
         return fh.read()
 
 
-def test_record_decision_description_does_not_yet_mention_tombstones():
-    desc = _descriptions()["record_decision"].lower()
-    assert "tombstone" not in desc and "retired" not in desc, (
-        "7b rewrites record_decision's pause paragraph for the tombstone partition; "
-        "invert this row in that phase, not before"
-    )
-
-
-def test_setup_md_pause_passage_still_quotes_the_live_floor_alone():
+def _setup_pause_passage():
     text = _flat(_setup_md())
-    assert "strongly similar (≥0.80) to an existing decision it does not reference" in text, (
-        "SETUP.md's pause passage is 7b's to rewrite; invert this row in that phase"
-    )
-    assert "tombstone" not in text.lower(), (
-        "SETUP.md's pause passage is 7b's to rewrite; invert this row in that phase"
-    )
+    start = text.index("**Link related decisions.**")
+    return text[start:text.index("---", start)]
+
+
+def test_record_decision_description_teaches_the_tombstone_partition():
+    """Inverted from 7a's ``…does_not_yet_mention_tombstones``."""
+    desc = _flat(_descriptions()["record_decision"])
+    assert "`tombstones`: retired decisions near the draft" in desc
+    assert "naming its live successor" in desc
+    assert "a relation to that (a reversal supersedes it) or acknowledgement clears one" in desc
+    assert "only the latter if successor_ambiguous" in desc
+    assert "On a retired decision it names its successors; relate to those, not its slug" in desc
+    assert "a neighbour or tombstone may lie past it" in desc
+    # The runtime message carries the tombstone floor; the description quotes none.
+    from mitos.sync import _TOMBSTONE_FLOOR, _floor_text
+    assert _floor_text(_TOMBSTONE_FLOOR) not in desc
+
+
+def test_record_decision_description_quotes_the_live_floor_from_its_constant():
+    from mitos.sync import _NEIGHBOR_REVIEW_THRESHOLD, _floor_text
+    desc = _flat(_descriptions()["record_decision"])
+    assert f"≥{_floor_text(_NEIGHBOR_REVIEW_THRESHOLD)}-similar unlinked `neighbors`" in desc
+
+
+def test_setup_md_pause_passage_names_both_floors_and_the_successor_rule():
+    """Inverted from 7a's ``…still_quotes_the_live_floor_alone``."""
+    from mitos.sync import _NEIGHBOR_REVIEW_THRESHOLD, _TOMBSTONE_FLOOR, _floor_text
+    passage = _setup_pause_passage()
+    assert f"strongly similar (≥{_floor_text(_NEIGHBOR_REVIEW_THRESHOLD)}) to the draft" in passage
+    assert f"`tombstones` are retired decisions at ≥{_floor_text(_TOMBSTONE_FLOOR)}" in passage
+    assert "relate to its live successor" in passage
+    assert "A retired decision is never a relation target" in passage
+    assert "clears only by acknowledgement" in passage and "same-slug" in passage
+    assert "`acknowledged_tombstones`" in passage
+
+
+def test_skill_text_teaches_the_tombstones_and_both_acknowledged_lists():
+    from mitos import cli
+    text = cli._skill_md_text("<<SENTINEL>>")
+    tail = text.split("<<SENTINEL>>", 1)[1]
+    linking = tail[tail.index("## Linking decisions"):]
+    assert "`acknowledged_tombstones`" in linking and "`acknowledged_neighbors`" in linking
+    assert "`successor_ambiguous` clears only by acknowledgement" in linking
+    assert "same-slug supersession, where the slug reads the live decision" in linking
+    assert "never to its slug" in linking and "`amend_commentary` by its id" in linking
+    # The clauses the description no longer carries live here.
+    assert "`rotation`" in tail and "`scope_overflow`" in tail
