@@ -47,6 +47,7 @@ from mitos.display import (
     oneline_payload,
     order_scope_counts,
     projects_payload,
+    rejection_matches_payload,
     retired_handle,
     scope_report,
     truncate_words,
@@ -99,7 +100,7 @@ from mitos.conflict import (CONFLICT_OVERFETCH_LIMIT, run_conflict_check,
 from mitos.migrations import is_pre_v1a_schema
 from mitos.store import (GraphStore, MODIFIER_EDGE_KEYS, REJECTION_BACKLOG_FAILURE_TOLERANCE,
                          open_connection)
-from mitos.rejections import diff_rejection_index, expected_rejection_points
+from mitos.rejections import diff_rejection_index, expected_rejection_points, point_items
 from mitos.cutover import default_aside_db_path, perform_swap, rebuild_and_gate
 from mitos.degraded import lexical_envelope, scope_dump
 from mitos.lexical import degraded_reason_from_error
@@ -108,10 +109,12 @@ from mitos.recall import (DEGRADED_NOT_COMPUTED, RANKED_EDGE_MARGIN, RetiredPart
                           corpus_provenance, missing_graph_is_a_gap,
                           missing_graph_note, missing_index_is_a_gap,
                           missing_rejection_index_is_a_gap,
-                          provenance_line, retired_partition, scope_filter_recovery,
+                          provenance_line, REJECTION_MATCH_FLOOR,
+                          REJECTION_SECTION_BOUND, rejection_section,
+                          retired_partition, scope_filter_recovery,
                           count_withheld, short_window, stamps_unread_clause,
                           window_edge, withheld_clause)
-from mitos.retrieval_walk import WalkContractError, walk_ranked
+from mitos.retrieval_walk import RejectionLeg, WalkContractError, walk_ranked
 from mitos.sync import (MitosSyncManager, run_ambient_capture, _SLUG_MAX_LEN,
                         _ENTRIES_MARKER, _NEIGHBOR_REVIEW_THRESHOLD,
                         _PAUSE_RESOLVING_RELATIONS, _declared_echo_lines, _split_relation_slugs,
@@ -1207,6 +1210,31 @@ def _rank_thinned(rank: int, full_top: Optional[int]) -> bool:
     return full_top is not None and rank > full_top
 
 
+def _ranked_rejection_index(config: MitosConfig) -> Optional[QdrantRejectionIndex]:
+    """The ranked reads' rejection index; constructs, never connects.
+
+    Built here rather than reused from ``manager.rejection_index``: the offline
+    conftest refuses that seam for the write path, and binds this one (D5).
+
+    Returns:
+        The index, or None on a construction fault (the section then says
+        ``unavailable``).
+    """
+    try:
+        return QdrantRejectionIndex(config.qdrant_url, config.rejection_collection)
+    except Exception:
+        return None
+
+
+def _rejection_leg(config: MitosConfig) -> Optional[RejectionLeg]:
+    """Builds the ranked reads' rejection leg, or None when the seam built no index."""
+    index = _ranked_rejection_index(config)
+    if index is None:
+        return None
+    return RejectionLeg(index=index, items_of=point_items, floor=REJECTION_MATCH_FLOOR,
+                        bound=REJECTION_SECTION_BOUND)
+
+
 def _emit_lexical_degraded(config: MitosConfig, query: str, *, reason: str,
                            store: Optional[GraphStore], as_json: bool,
                            full_top: Optional[int], limit: Optional[int],
@@ -1348,7 +1376,7 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         # every hit resolved by its point id (never its payload slug), the window
         # filled with live decisions, the stamps read in one batch.
         walk = walk_ranked(q_vector, vector_store=manager.vector_store, graph=store,
-                           limit=top_k)
+                           limit=top_k, rejections=_rejection_leg(config), light=True)
     except WalkContractError:
         # A wrong store or vector double: loud, never "recall degraded".
         raise
@@ -1386,6 +1414,9 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
     handles: List[Dict[str, Any]] = []
     short = None
     lead = None
+    # The rejection section; composed only when the walk ran (the healthy-empty
+    # CollectionMissingError arm reaches here with none).
+    section = None
     if walk is not None:
         # The rank just past the live window: retired and open-question points
         # take no slots, so it is the next live decision the walk found.
@@ -1411,12 +1442,29 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
                    for h in part.shown]
         short = short_window(walk)
         lead = handles[0] if part.leads else None
+        # The rejection section, composed once (recall) — the same call
+        # mcp_server.query_decisions makes.
+        section = rejection_section(
+            walk, full_top=full_top,
+            gap=lambda: missing_rejection_index_is_a_gap(store),
+            shape=rejection_matches_payload, surface="cli", config=config,
+        )
+    # The ranked count is over decisions, section owners included; with no walk
+    # (the healthy-empty arm) there is nothing to count.
+    withheld = section.withheld if section is not None else count_withheld(matches)
     # The stamps went unread: the ranking stands and every exit that renders hits
     # or handles says so, last on its note (after every override). None when read.
     unread_clause = (stamps_unread_clause(surface="cli", config=config)
                      if walk is not None and walk.stamps_unread else None)
 
     def _closing(text: str) -> str:
+        """The note's tail, composed once for every exit, after its override: the
+        rejection section's state clause, the withheld clause, the stamps-unread
+        clause — the one order all four ranked surfaces use."""
+        if section is not None and section.clause:
+            text = f"{text} {section.clause}"
+        if withheld:
+            text = f"{text} {withheld_clause(withheld, surface='cli', config=config)}"
         return f"{text} {unread_clause}" if unread_clause else text
 
     # Blackout: the walk found zero live decisions in its whole fetch but passed
@@ -1449,12 +1497,9 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         lead=lead,
         short=short,
     )
-    # A thinned answer says so, on both encodings: the clause joins the local note
-    # the text render prints and the envelope carries. The blackout and unbuilt
-    # overrides below need zero matches, so neither can co-occur with a count.
-    withheld = count_withheld(matches)
-    if withheld:
-        note = f"{note} {withheld_clause(withheld, surface='cli', config=config)}"
+    # A thinned answer says so, on both encodings, through `_closing`: composed after
+    # the blackout and unbuilt overrides, because a zero-match answer under `brief`
+    # can still withhold its `here` rejection owners.
 
     # Build the per-match list once, then branch the two renderings over it.
     if as_json:
@@ -1470,6 +1515,8 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
             envelope["retired_partition"] = handles
             if part.omitted:
                 envelope["retired_partition_omitted"] = part.omitted
+        if section is not None:
+            envelope.update(section.envelope_keys())
         if blackout:
             envelope["all_superseded"] = handles
             # Closes the text/JSON divergence: the text branch below has printed
@@ -1478,10 +1525,10 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
                                              config=config)
         if unbuilt:
             envelope["note"] = missing_graph_note("cli", config)
+        envelope["note"] = _closing(envelope["note"])
         if withheld:
             envelope["rejected_paths_withheld"] = withheld
         if unread_clause:
-            envelope["note"] = _closing(envelope["note"])
             envelope["stamps_unread"] = True
         _emit_json(envelope)
         return
@@ -1494,6 +1541,7 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         # was the one text exit of the read verbs that named none.
         _echo_corpus(config)
         _print_retired_partition(handles, part.omitted)
+        _print_rejection_section(section)
         print(_closing(blackout_note(handles, short=short, surface="cli",
                                      config=config)))
         return
@@ -1504,6 +1552,9 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
     if not matches:
         print(provenance_line(config))
         print("No matching decisions found.")
+        # The case the rejection section exists for is often this one: the query
+        # names a rejected option, so no live decision ranks and the item does.
+        _print_rejection_section(section)
         # This branch APPENDS where the envelope above assigns, so the override is
         # written rather than inherited: left to the copy, a miss over an unbuilt
         # graph would print the band note *and* the pointer, and the band note's
@@ -1535,6 +1586,7 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
             print(f"   Scope:    {', '.join(d['scope'])}")
         print()
     _print_retired_partition(handles, part.omitted)
+    _print_rejection_section(section)
     print(f"→ {_closing(note)}")
 
 
@@ -1564,6 +1616,50 @@ def _print_retired_partition(handles: List[Dict[str, Any]], omitted: int) -> Non
         print(line)
     if omitted:
         print(f"  (+{omitted} more retired not listed)")
+    print()
+
+
+def _print_rejection_section(section: Optional[Any]) -> None:
+    """Prints a ranked answer's rejection matches on the CLI text surface.
+
+    The text twin of ``rejection_matches``, shared by ``mitos surface`` and ``mitos
+    query`` and called on every ranked text exit (blackout, miss, empty and
+    populated), after the retired partition and before the ``→`` note line, which
+    carries the section's state clause. One line per match — owner slug, state,
+    score, ordinal and the item text verbatim — then, by ``letter``: the owner's
+    Letter under a ``here`` match, ``see rank N above`` for a ``window`` owner, and
+    the successors and live end for a ``retired`` one. Prints nothing when there
+    are no matches.
+
+    Args:
+        section: The answer's ``recall.RejectionSection``, or None when the walk
+            did not run.
+    """
+    if section is None or not section.matches:
+        return
+    print("Rejected options matching this query (closest first):")
+    for m in section.matches:
+        print(f"  {m['slug']}  ({m['state']}, score {m['score']:.3f})  "
+              f"item {m['ordinal']}: {m['item']}")
+        if m["letter"] == "here":
+            print(f"    Decided:  {m['axiom']}")
+            if "rejected_paths" in m:
+                print(f"    Rejected: {m['rejected_paths']}")
+            if m["scope"]:
+                print(f"    Scope:    {', '.join(m['scope'])}")
+        elif m["letter"] == "window":
+            print(f"    see rank {m['rank']} above")
+        elif m["letter"] == "retired":
+            line = "   "
+            for key in ("superseded_by", "corrected_by", "live_end"):
+                if key in m:
+                    line += f" {key}: {', '.join(m[key]) if m[key] else '(none)'}"
+            if line.strip():
+                print(line)
+        if m["letter"] != "retired":
+            marker = _modifier_marker(m)
+            if marker:
+                print(f"    {marker}")
     print()
 
 
@@ -2841,6 +2937,8 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     short = None
     lead = None
     dump_total: Optional[int] = None
+    # The rejection section; composed only when the walk ran.
+    section = None
 
     walk = None
     if manager.embed_provider and manager.vector_store:
@@ -2848,7 +2946,8 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
             q_vector = manager.embed_provider.get_embedding(query, is_query=True)
             # The shared identity walk — see cmd_query.
             walk = walk_ranked(q_vector, vector_store=manager.vector_store,
-                               graph=store, limit=top_k)
+                               graph=store, limit=top_k,
+                               rejections=_rejection_leg(config), light=True)
             semantic_ran = True
         except WalkContractError:
             # A wrong store or vector double: loud, never "recall degraded".
@@ -2887,6 +2986,12 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
                    for h in part.shown]
         short = short_window(walk)
         lead = handles[0] if part.leads else None
+        # The rejection section — see cmd_query.
+        section = rejection_section(
+            walk, full_top=full_top,
+            gap=lambda: missing_rejection_index_is_a_gap(store),
+            shape=rejection_matches_payload, surface="cli", config=config,
+        )
 
     # Scope listing fallback ONLY in degraded mode (mirrors the MCP tool, P5): a
     # semantic run that found nothing must not masquerade as an unranked scope dump.
@@ -2966,6 +3071,10 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         results["retired_partition"] = handles
         if part.omitted:
             results["retired_partition_omitted"] = part.omitted
+    # The rejection section's keys, after the retired partition (see
+    # mcp_server.surface_decisions).
+    if section is not None:
+        results.update(section.envelope_keys())
 
     # Blackout: semantic ranking ran and retrieved precedents, but every one is
     # retired (no live match). Override the note with its zero-live form and attach
@@ -2990,9 +3099,17 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         results["note"] = missing_graph_note("cli", config)
         note = results["note"]
 
-    # A thinned answer says so by a count and a clause, after every note override
-    # (they need zero hits) and before the notice; the printed note follows.
-    withheld = count_withheld(results["active_decisions"])
+    # The note's tail, after every override, in the one order (see
+    # mcp_server.surface_decisions): the section's state clause, the withheld
+    # clause, the stamps-unread clause; the printed note follows.
+    if section is not None and section.clause:
+        results["note"] = f"{note} {section.clause}"
+        note = results["note"]
+    # A thinned answer says so by a count and a clause, before the notice. Over
+    # decisions on the ranked path, section owners included; the scope dump counts
+    # its hits.
+    withheld = (section.withheld if section is not None
+                else count_withheld(results["active_decisions"]))
     if withheld:
         results["note"] = f"{note} {withheld_clause(withheld, surface='cli', config=config)}"
         note = results["note"]
@@ -3026,6 +3143,7 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
             print(provenance_line(config))
             print(f"No active precedents found for: '{query}'{scope_note}")
         _print_retired_partition(handles, part.omitted)
+        _print_rejection_section(section)
         print(f"→ {note}")
         _print_check_notice(config, notice)
         return
@@ -3050,6 +3168,7 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
     # After the hit list, before the open questions and the note: on a blackout
     # with parked open questions this is the branch that renders the handles.
     _print_retired_partition(handles, part.omitted)
+    _print_rejection_section(section)
     for oq in oqs:
         print(f"[open question in scope] {oq['topic']}")
         marker = _modifier_marker(oq)
@@ -4021,7 +4140,9 @@ def _rejection_index_rungs(rejection: Dict[str, Any], config: MitosConfig) -> Li
     stale items as a neutral line (a healthy amend leaves them until the next drain),
     orphaned items, items not judged over a graph holding no node, and backlog rows
     past the tolerance. None feeds ``ready``, the verdict or the exit code. Each states
-    an index fact and its heal; none says what a read finds.
+    an index fact and its heal. Only the stale line says what a read finds — that no
+    read serves a stale item, because every ranked read checks each match against its
+    decision's current field (since 5a); no other line makes a read claim.
     """
     sel = shell_flag("-p", config.project)
     lines: List[str] = []
@@ -4044,7 +4165,8 @@ def _rejection_index_rungs(rejection: Dict[str, Any], config: MitosConfig) -> Li
     if stale:
         lines.append(
             f"  • {stale} rejected item(s) await removal — their decision's field no "
-            f"longer states them; `mitos reconcile {sel}` removes them."
+            f"longer states them, so no read serves them; `mitos reconcile {sel}` "
+            f"removes them."
         )
     orphaned = rejection["orphan_items"]
     if orphaned:

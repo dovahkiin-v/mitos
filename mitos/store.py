@@ -1269,6 +1269,33 @@ class GraphStore:
         Raises:
             DatabaseError: If the read fails.
         """
+        return self._resolve_points(point_ids, light=False)
+
+    def resolve_point_states(self, point_ids: Iterable[str]) -> PointResolution:
+        """Maps point ids to their nodes' identity, kind and state only — the light resolver.
+
+        :meth:`resolve_point_ids`' partition, prefix rule, chunking and state
+        derivation, with each node reduced to ``{"id", "kind", "computed_state"}``
+        and nothing hydrated (no columns beyond those, no scopes). The ranked reads
+        walk every hit of their over-fetched call on it and then hydrate only what
+        the answer shows with :meth:`resolve_point_ids` (ADR
+        ``ranked-walk-resolves-every-hit-whole-light-resolver-unbuilt-until-core-p95-passes-40ms``,
+        whose trigger 5a's rejection leg fired).
+
+        Args:
+            point_ids: Point ids exactly as ``VectorStore.query`` returned them.
+
+        Returns:
+            The :class:`PointResolution` partition, with light nodes. Empty input runs
+            no statement.
+
+        Raises:
+            DatabaseError: If the read fails.
+        """
+        return self._resolve_points(point_ids, light=True)
+
+    def _resolve_points(self, point_ids: Iterable[str], *, light: bool) -> PointResolution:
+        """The one body of both resolvers; ``light`` selects the light node shape."""
         raw = list(dict.fromkeys(point_ids))
         prefix_of = {pid: _point_id_prefix(pid) for pid in raw}
         prefixes = list(dict.fromkeys(p for p in prefix_of.values() if p is not None))
@@ -1279,14 +1306,16 @@ class GraphStore:
                 for start in range(0, len(prefixes), _POINT_ID_CHUNK):
                     chunk = prefixes[start:start + _POINT_ID_CHUNK]
                     values = ",".join("(?)" for _ in chunk)
+                    columns = "nodes.id, nodes.kind" if light else "nodes.*"
                     rows = conn.execute(
                         f"WITH p(lo) AS (VALUES {values}) "
-                        f"SELECT nodes.*, {_IS_DRIFTED_SQL}, {_KILLER_TYPE_SQL} "
+                        f"SELECT {columns}, {_IS_DRIFTED_SQL}, {_KILLER_TYPE_SQL} "
                         "FROM p JOIN nodes "
                         "ON nodes.id >= p.lo AND nodes.id < p.lo || 'g'",
                         chunk,
                     ).fetchall()
-                    scopes_map = self._scopes_for(conn, [row["id"] for row in rows])
+                    scopes_map = ({} if light else
+                                  self._scopes_for(conn, [row["id"] for row in rows]))
                     for row in rows:
                         # Read the state before hydrating: _hydrate_node pops
                         # killer_type and recasts is_drifted.
@@ -1294,7 +1323,10 @@ class GraphStore:
                             state = "drifted"
                         else:
                             state = _computed_decision_state(row["killer_type"])
-                        node = self._hydrate_node(row, scopes_map.get(row["id"], []))
+                        if light:
+                            node = {"id": row["id"], "kind": row["kind"]}
+                        else:
+                            node = self._hydrate_node(row, scopes_map.get(row["id"], []))
                         node["computed_state"] = state
                         matched.setdefault(row["id"][:32], []).append(node)
             except sqlite3.Error as e:

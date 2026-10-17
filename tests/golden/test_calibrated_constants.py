@@ -31,7 +31,7 @@ import _calibration_record as R  # noqa: E402
 MITOS_DIR = os.path.dirname(os.path.abspath(mitos.__file__))
 RECORD_POINTER = "tests/golden/calibration/record.json"
 
-# Dotted names whose value the record pins. 5a, 6a and 7a add theirs.
+# Dotted names whose value the record pins. 5b, 6a and 7a add theirs.
 CALIBRATED_CONSTANTS: FrozenSet[str] = frozenset({
     "mitos.recall.RANKED_EDGE_MARGIN",
 })
@@ -40,6 +40,8 @@ CALIBRATED_CONSTANTS: FrozenSet[str] = frozenset({
 PENDING: Dict[str, str] = {
     "mitos.recall.SURFACE_STRONG_THRESHOLD": "6a",
     "mitos.recall.SURFACE_WEAK_THRESHOLD": "6a",
+    # 5a ships the floor provisional (0.65, a placeholder); 5b calibrates it.
+    "mitos.recall.REJECTION_MATCH_FLOOR": "5b",
     "mitos.sync._NEIGHBOR_REVIEW_THRESHOLD": "7a",
 }
 

@@ -243,6 +243,19 @@ def test_surface_decisions_states_the_band_axis():
     )
 
 
+@pytest.mark.parametrize("tool", ["surface_decisions", "query_decisions"])
+def test_the_ranked_descriptions_do_not_yet_name_the_rejection_section(tool):
+    """5a ships the section's mechanics with a PROVISIONAL floor; the descriptions
+    teach an agent to rely on the section, so they ship with the calibrated floor
+    (5b, constraint 12). This pins the current truth so 5b inverts it deliberately.
+    The selector must match the tool: an empty description would pass vacuously."""
+    desc = _flat(_descriptions()[tool]).lower()
+    assert "returns:" in desc and tool.split("_")[0] in desc
+    for phrase in ("rejection_matches", "rejection_section", "rejection section",
+                   "rejection match"):
+        assert phrase not in desc, (tool, phrase)
+
+
 _REQUIRED_PAIRS = _required_pairs()
 
 

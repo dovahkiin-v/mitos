@@ -912,8 +912,12 @@ def test_s_text_absent_with_a_gap_prices_the_heal_on_the_row(absent, capsys) -> 
             f"embedding cache)") in out
 
 
-def test_s_text_each_rung_names_the_selectored_reconcile_and_no_read_claim(
+def test_s_text_each_rung_names_the_selectored_reconcile_and_one_read_claim(
         d, capsys) -> None:
+    """4d planted the word-absence loop for 5a to invert, on the stale line only: the
+    ranked reads now verify every match against its decision's current field, so the
+    stale line says no read serves those items. Every other rejection line still
+    makes no read claim."""
     owner = _seat(d, "one", F_ABC)
     _hold(d, owner, F_ONE)  # stale
     _plant(d, "11111111-1111-1111-1111-111111111111", C)  # orphan; ABC missing
@@ -928,8 +932,10 @@ def test_s_text_each_rung_names_the_selectored_reconcile_and_no_read_claim(
             f"cached. Informational, not a readiness blocker.") in out
     assert "the rejection backlog was seeded by `reconcile`" in out
     assert f"the next `mitos sync {_sel(d)}` builds it" in out
-    assert (f"  • 1 rejected item(s) await removal — their decision's field no longer "
-            f"states them; `mitos reconcile {_sel(d)}` removes them.") in out
+    stale_line = (f"  • 1 rejected item(s) await removal — their decision's field no "
+                  f"longer states them, so no read serves them; `mitos reconcile "
+                  f"{_sel(d)}` removes them.")
+    assert stale_line in lines
     assert (f"  ⚠ 1 rejected item(s) belong to no decision in the graph — "
             f"`mitos reconcile {_sel(d)}` deletes them.") in out
     assert f"  ✓ rejection index '{d.config.rejection_collection}'" in out
@@ -937,6 +943,8 @@ def test_s_text_each_rung_names_the_selectored_reconcile_and_no_read_claim(
     for line in lines:
         assert "None" not in line
         for word in ("find", "match", "serve", "search"):
+            if line == stale_line and word == "serve":
+                continue
             assert word not in line.lower(), (word, line)
 
 

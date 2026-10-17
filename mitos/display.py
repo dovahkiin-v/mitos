@@ -199,6 +199,82 @@ def retired_handle(node: Mapping[str, Any], *, score: float,
     return handle
 
 
+def rejection_matches_payload(rejections: Any, *, window_ids: Sequence[str],
+                              owners_whole: bool,
+                              stamps: Mapping[str, Mapping[str, List[str]]],
+                              live_ends: Mapping[str, List[str]]) -> List[Dict[str, Any]]:
+    """Shapes a ranked answer's rejection matches — the one constructor, shared CLI⇄MCP.
+
+    Every match carries ``slug``, ``id`` and ``state`` (its owner's), ``score``,
+    ``ordinal`` and ``item`` (the whole matched item, at every depth: it is what the
+    search found), then ``letter``, which says where the owner's reasoning sits:
+
+    * ``"here"`` — a live owner outside the window, on its best (first) match: the
+      owner's Letter follows (``axiom``, ``scope``, then ``rejected_paths`` unless
+      ``owners_whole`` is False), through :func:`letter_payload`, so the key set is
+      the Letter's own;
+    * ``"section"`` — that owner's later matches, which add nothing: the ``here``
+      match above carries the Letter;
+    * ``"window"`` — a live owner already in the window, which adds ``rank`` (its
+      1-based window rank) and no Letter;
+    * ``"retired"`` — a retired owner, which adds :func:`retired_handle`'s successor
+      keys (``superseded_by`` / ``corrected_by``, ``live_end``) and never a Letter.
+
+    So no decision's Letter appears twice in one envelope. A live owner's modifier
+    stamps follow (a match hands a reader a decision's state). Store-free: the walk's
+    maps are passed in.
+
+    Args:
+        rejections: The walk's ``RejectionWalk`` (duck-typed); reads ``matches``.
+        window_ids: The window's node ids, in rank order.
+        owners_whole: Whether a ``here`` owner keeps its ``rejected_paths`` (the
+            depth the caller set for the window's last rank;
+            ``recall.rejection_owners_whole``).
+        stamps: Node id → modifier stamps, as the walk returned them.
+        live_ends: Node id → live-end slugs, as the walk returned them.
+
+    Returns:
+        One dict per match, in the section's (score) order.
+    """
+    rank_of = {node_id: rank for rank, node_id in enumerate(window_ids, start=1)}
+    lettered = set()
+    out: List[Dict[str, Any]] = []
+    for match in rejections.matches:
+        owner = match.owner
+        payload: Dict[str, Any] = {
+            "slug": owner["slug"],
+            "id": owner["id"],
+            "state": owner["computed_state"],
+            "score": match.score,
+            "ordinal": match.ordinal,
+            "item": match.item,
+        }
+        if not match.live:
+            payload["letter"] = "retired"
+            handle = retired_handle(owner, score=match.score, stamps=stamps,
+                                    live_ends=live_ends)
+            for key, value in handle.items():
+                if key not in payload:
+                    payload[key] = value
+            out.append(payload)
+            continue
+        if owner["id"] in rank_of:
+            payload["letter"] = "window"
+            payload["rank"] = rank_of[owner["id"]]
+        elif owner["id"] in lettered:
+            payload["letter"] = "section"
+        else:
+            lettered.add(owner["id"])
+            payload["letter"] = "here"
+            for key, value in letter_payload(owner, brief=not owners_whole).items():
+                if key not in payload:
+                    payload[key] = value
+        for key, slugs in stamps.get(owner["id"], {}).items():
+            payload[key] = list(slugs)
+        out.append(payload)
+    return out
+
+
 def node_handles(
     ids: Sequence[str],
     get_node: Callable[[str], Optional[Mapping[str, Any]]],

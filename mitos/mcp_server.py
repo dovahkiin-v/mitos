@@ -14,12 +14,12 @@ from mcp.server.fastmcp.utilities.func_metadata import FuncMetadata, func_metada
 from pydantic import ValidationError
 
 from mitos import amend, registry, routing
-from mitos.display import RANKED_LIMIT_CEILING, clamp_limit, dumps_display, letter_payload, oneline_payload, order_scope_counts, projects_payload, retired_handle, scope_report, show_payload
+from mitos.display import RANKED_LIMIT_CEILING, clamp_limit, dumps_display, letter_payload, oneline_payload, order_scope_counts, projects_payload, rejection_matches_payload, retired_handle, scope_report, show_payload
 from mitos.config import MitosConfig
 from mitos.store import GraphStore, MODIFIER_EDGE_KEYS
 from mitos.embeddings import GeminiEmbeddingProvider
 from mitos.models import get_embedding_model_id
-from mitos.vector_store import QdrantVectorStore
+from mitos.vector_store import QdrantRejectionIndex, QdrantVectorStore
 from mitos.errors import (
     CollectionMissingError,
     ProjectTargetingError,
@@ -42,10 +42,13 @@ from mitos.recall import (DEGRADED_NOT_COMPUTED, RANKED_EDGE_MARGIN, RetiredPart
                           assess_query_recall, assess_surface_recall, blackout_note,
                           corpus_provenance, missing_graph_is_a_gap,
                           missing_graph_note, missing_index_is_a_gap,
+                          missing_rejection_index_is_a_gap, REJECTION_MATCH_FLOOR,
+                          REJECTION_SECTION_BOUND, rejection_section,
                           retired_partition, scope_filter_recovery, count_withheld,
                           short_window, stamps_unread_clause, window_edge,
                           withheld_clause)
-from mitos.retrieval_walk import WalkContractError, walk_ranked
+from mitos.rejections import point_items
+from mitos.retrieval_walk import RejectionLeg, WalkContractError, walk_ranked
 
 # No cross-call "seen" dedup state — deliberately. An earlier design cached
 # already-surfaced slugs in a process-global set and trimmed `rejected_paths` (the
@@ -746,6 +749,31 @@ def get_workspace_components(config: MitosConfig) -> Tuple[GraphStore, Optional[
     return store, embed_provider, vector_store
 
 
+def _ranked_rejection_index(config: MitosConfig) -> Optional[QdrantRejectionIndex]:
+    """The ranked reads' rejection index; constructs, never connects.
+
+    The read seam the offline conftest binds (D5). ``get_workspace_components``
+    keeps its three-tuple, so the index is built here, beside it.
+
+    Returns:
+        The index, or None on a construction fault (the section then says
+        ``unavailable``).
+    """
+    try:
+        return QdrantRejectionIndex(config.qdrant_url, config.rejection_collection)
+    except Exception:
+        return None
+
+
+def _rejection_leg(config: MitosConfig) -> Optional[RejectionLeg]:
+    """Builds the ranked reads' rejection leg, or None when the seam built no index."""
+    index = _ranked_rejection_index(config)
+    if index is None:
+        return None
+    return RejectionLeg(index=index, items_of=point_items, floor=REJECTION_MATCH_FLOOR,
+                        bound=REJECTION_SECTION_BOUND)
+
+
 def _lexical_degraded_response(query: str, *, config: MitosConfig, reason: str,
                                store: Optional[GraphStore],
                                full_top: Optional[int], limit: int,
@@ -961,6 +989,8 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
     short = None
     lead = None
     dump_total: Optional[int] = None
+    # The rejection section; composed only when the walk ran.
+    section = None
 
     # 1. Semantic search if embeddings and vector store are active
     walk = None
@@ -973,7 +1003,8 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
             # decisions, the stamps read in one batch (a stamp fault costs the
             # stamps alone and is flagged, never degraded).
             walk = walk_ranked(q_vector, vector_store=vector_store, graph=store,
-                               limit=top_k)
+                               limit=top_k, rejections=_rejection_leg(config),
+                               light=True)
             semantic_ran = True
         except WalkContractError:
             # A wrong store or vector double: loud, never "recall degraded".
@@ -1018,6 +1049,14 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
                    for h in part.shown]
         short = short_window(walk)
         lead = handles[0] if part.leads else None
+        # The rejection section, composed once (recall): matches, state, clause, and
+        # the withheld count over decisions. The gap's graph read happens only when
+        # the collection was absent, and outside the ranked `try`.
+        section = rejection_section(
+            walk, full_top=full_top,
+            gap=lambda: missing_rejection_index_is_a_gap(store),
+            shape=rejection_matches_payload, surface="mcp", config=config,
+        )
 
     # 2. Scope pre-filtering fallback — ONLY when semantic recall is down (degraded).
     #    When semantic ran and simply found nothing, do NOT dump an unranked scope
@@ -1099,6 +1138,10 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         results["retired_partition"] = handles
         if part.omitted:
             results["retired_partition_omitted"] = part.omitted
+    # The rejection section's keys, after the retired partition; none when it was
+    # computed and empty.
+    if section is not None:
+        results.update(section.envelope_keys())
 
     # Blackout: semantic ranking ran and retrieved precedents, but every one is
     # retired. Override the note with its zero-live form, naming each handle's live
@@ -1123,10 +1166,18 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
     ):
         results["note"] = missing_graph_note("mcp", config)
 
-    # A thinned answer says so by a count and a clause, after every note override
-    # (they need zero hits, so none can co-occur with a count) and before the notice.
-    # Absent at zero, so a default answer is byte-identical.
-    withheld = count_withheld(results["active_decisions"])
+    # The note's tail, after every override, in one order on all four surfaces:
+    # the rejection section's state clause, the withheld clause, the stamps-unread
+    # clause. An override can co-occur with a withheld count: a blackout or a miss
+    # under `brief` still withholds its `here` rejection owners.
+    if section is not None and section.clause:
+        results["note"] = f"{results['note']} {section.clause}"
+    # A thinned answer says so by a count and a clause, before the notice. The
+    # ranked count is over decisions, section owners included; the scope dump has
+    # no section and counts its hits. Absent at zero, so a default answer is
+    # byte-identical.
+    withheld = (section.withheld if section is not None
+                else count_withheld(results["active_decisions"]))
     if withheld:
         results["note"] = (
             f"{results['note']} {withheld_clause(withheld, surface='mcp', config=config)}"
@@ -1527,7 +1578,8 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             q_vector = embed_provider.get_embedding(query, is_query=True)
             # The shared identity walk (see surface_decisions).
             walk = walk_ranked(q_vector, vector_store=vector_store, graph=store,
-                               limit=top_k)
+                               limit=top_k, rejections=_rejection_leg(config),
+                               light=True)
         except WalkContractError:
             # A wrong store or vector double: loud, never "recall degraded".
             raise
@@ -1601,6 +1653,12 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
                    for h in part.shown]
         short = short_window(walk)
         lead = handles[0] if part.leads else None
+        # The rejection section — see surface_decisions.
+        section = rejection_section(
+            walk, full_top=full_top,
+            gap=lambda: missing_rejection_index_is_a_gap(store),
+            shape=rejection_matches_payload, surface="mcp", config=config,
+        )
 
         envelope: Dict[str, Any] = {"query": query, "depth_mode": "letter", "matches": output_list}
         envelope.update(corpus_provenance(config))
@@ -1623,6 +1681,7 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             envelope["retired_partition"] = handles
             if part.omitted:
                 envelope["retired_partition_omitted"] = part.omitted
+        envelope.update(section.envelope_keys())
         # Blackout: retrieved precedents but every one retired. The same handle
         # list rides `all_superseded`, so the agent gets a pointer, not a false miss
         # (CLI⇄MCP-identical shape, T5 parity).
@@ -1644,8 +1703,10 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
             store, config, corpus_scan=corpus_holds_entries
         ):
             envelope["note"] = missing_graph_note("mcp", config)
-        # See surface_decisions.
-        withheld = count_withheld(output_list)
+        # The note's tail — see surface_decisions.
+        if section.clause:
+            envelope["note"] = f"{envelope['note']} {section.clause}"
+        withheld = section.withheld
         if withheld:
             envelope["note"] = (
                 f"{envelope['note']} "

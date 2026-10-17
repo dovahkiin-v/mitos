@@ -233,7 +233,8 @@ def _refuse_rejection_index(*args, **kwargs):
     raise OfflineRejectionIndexRefused(
         "offline tests never construct a real QdrantRejectionIndex; bind a "
         "FakeRejectionIndex factory at mitos.sync.QdrantRejectionIndex (and at "
-        "mitos.cli.QdrantRejectionIndex for status) instead"
+        "mitos.cli.QdrantRejectionIndex for status) instead — the ranked reads' "
+        "seam is _ranked_rejection_index, bound by offline_rejection_read_seam"
     )
 
 
@@ -257,10 +258,44 @@ def offline_rejection_index(request, monkeypatch):
     ``_check_qdrant`` to reachable would scroll the live :7333. Its construction sits
     inside status's best-effort ``try``, so the refusal reads as "could not list".
     A row that needs a listing binds the factory at both seams.
+
+    The ranked reads (5a) build their index through a seam of their own,
+    ``_ranked_rejection_index`` in ``mitos.cli`` and ``mitos.mcp_server``, which
+    :func:`offline_rejection_read_seam` binds; this refusal never reaches them,
+    because the seam function is replaced whole rather than the class it names.
     """
     if request.node.path.name not in LIVE_MODULES:
         monkeypatch.setattr("mitos.sync.QdrantRejectionIndex", _refuse_rejection_index)
         monkeypatch.setattr("mitos.cli.QdrantRejectionIndex", _refuse_rejection_index)
+
+
+@pytest.fixture(autouse=True)
+def offline_rejection_read_seam(request, monkeypatch):
+    """Binds an empty, present ``FakeRejectionIndex`` at both ranked-read seams.
+
+    Every ranked read (``surface_decisions``, ``query_decisions``, ``mitos surface``,
+    ``mitos query``) searches the rejection index through
+    ``_ranked_rejection_index(config)``. Offline, that would send a real search to
+    whatever ``QDRANT_URL`` names — the live :7333 on this box, nothing on keyless
+    CI — and a ``None`` seam would put an ``unavailable`` clause on every offline
+    ranked note (a state production cannot reach: the constructor does no I/O). So
+    each non-live test gets one fresh fake, present and empty, at both seams: every
+    existing ranked-read row composes a searched-empty section (no key, no clause)
+    and stays byte-identical. A row about the section binds its own index at the
+    seam(s) it drives; a write-then-read row binds the SAME instance at the write
+    seam (``mitos.sync.QdrantRejectionIndex``) too. ``LIVE_MODULES`` are exempt.
+
+    The seam *functions* are replaced, not ``QdrantRejectionIndex``: a status row
+    that binds a fake factory at ``mitos.cli.QdrantRejectionIndex`` must not feed
+    the read seam, nor the reverse.
+    """
+    if request.node.path.name in LIVE_MODULES:
+        return
+    from _rejection_index_double import FakeRejectionIndex
+
+    index = FakeRejectionIndex(present=True)
+    monkeypatch.setattr("mitos.cli._ranked_rejection_index", lambda config: index)
+    monkeypatch.setattr("mitos.mcp_server._ranked_rejection_index", lambda config: index)
 
 
 # Record every GraphStore construction, so a canned vector double with no explicit
@@ -367,6 +402,7 @@ LIVE_MODULES: tuple[str, ...] = (
     "test_rejection_inline_live.py",
     "test_rejection_drain_live.py",
     "test_rejection_covering_live.py",
+    "test_rejection_section_live.py",
 )
 
 

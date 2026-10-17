@@ -2829,7 +2829,7 @@ def test_the_dump_sentence_names_how_much_of_the_scope_it_shows():
     tail = (" as a fallback, NOT a relevance ranking. For the authoritative set use "
             "list_decisions(scope='y') (pure graph read). "
             "Not computed without similarity scores: the retired partition, the "
-            "window's edge and the confidence band.")
+            "window's edge, the confidence band and the rejection matches.")
     assert (_dump_note("mcp", 7, 8, reason=reason)
             == f"{head}7 of the 8 active decisions in scope 'y'{tail}")
     assert (_dump_note("mcp", 8, 8, reason=reason)
@@ -2843,13 +2843,14 @@ def test_the_partial_list_sentence_is_byte_identical_to_4b():
     """Row 14's other half / K5: without a scope_total (the G9a partial ranked list)
     the shared sentence is frozen from `4b23e68` except its head, which 7a changed on
     purpose to name the injected cause, and its tail, where 2g appended the omission
-    clause (a degraded answer has no partition, edge or band); an edge on that
-    degraded arm is ignored."""
+    clause (a degraded answer has no partition, edge or band — and, since 5a, no
+    rejection matches, which the clause names fourth); an edge on that degraded arm
+    is ignored."""
     frozen = (f"Semantic recall unavailable ({_DEGRADED}) — showing the "
               "active decisions in scope 'x' as a fallback, NOT a relevance ranking. "
               "For the authoritative set use list_decisions(scope='x') (pure graph read). "
               "Not computed without similarity scores: the retired partition, the "
-              "window's edge and the confidence band.")
+              "window's edge, the confidence band and the rejection matches.")
     for edge in _EDGE_SHAPES:
         assert assess_surface_recall(lead=None, short=None, edge=edge, semantic_ran=False, degraded_reason=_DEGRADED, top_score=None,
                                      result_count=2, scope="x", scope_total=None,

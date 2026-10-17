@@ -62,6 +62,9 @@ class FakeRejectionIndex:
         refuse_list: a listing (``list_owner_point_ids``, ``list_point_ids``,
             ``list_point_owners``) reaching an existing collection raises
             ``VectorStoreError``.
+        refuse_search: a search reaching an existing collection raises
+            ``VectorStoreError``, as the real client does on a non-200 or a 200 of
+            the wrong shape.
         on_call: called as ``on_call(method, details)`` right after a call is
             recorded and before it answers, so a row can raise mid-walk or inject a
             commit between two of a drain's calls.
@@ -81,6 +84,7 @@ class FakeRejectionIndex:
         self.refuse_delete = False
         self.create_then_missing = False
         self.refuse_list = False
+        self.refuse_search = False
         self.on_call: Optional[Callable[[str, Dict[str, Any]], None]] = None
         self.points: Dict[str, Dict[str, Any]] = {}
         self.calls: List[Tuple[str, Dict[str, Any]]] = []
@@ -116,6 +120,8 @@ class FakeRejectionIndex:
         if self.over_budget:
             return RejectionSearch(searched=False, hits=[])
         self._reach("search")
+        if self.refuse_search:
+            raise VectorStoreError("fake: search refused")
         ranked = sorted(
             self.points.items(),
             key=lambda item: _cosine(vector, item[1]["vector"]),

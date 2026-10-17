@@ -498,3 +498,43 @@ def test_the_parsed_flag_is_false_for_prose_and_empty_only() -> None:
 def test_ucd_pin_guard() -> None:
     """The out-of-band ids NFC a decomposed field, so they share identity's UCD pin."""
     assert unicodedata.unidata_version == "15.1.0"
+
+
+# --------------------------------------------------------------------------- #
+# point_items: the ranked reads' verification key (5a)
+# --------------------------------------------------------------------------- #
+
+_AGREEMENT_FIELDS = [row.values[0] for row in TRACE] + [
+    "(1) A — x\n(2) A — x",                               # T13's duplicate items
+    "(1) A — x\n(2) B — y\n(3) A — x",
+    "x" * 9000 + ".",                                     # one item, two parts
+    "",
+]
+
+
+@pytest.mark.parametrize("field", _AGREEMENT_FIELDS)
+def test_point_items_agrees_with_rejection_points_id_for_id(field: str) -> None:
+    """If the two ever disagree, a read drops an item the drain wrote."""
+    items = rejections.point_items(OWNER, field)
+    points = rejection_points(OWNER, field)
+    assert list(items) == list(points)
+    for pid, ref in points.items():
+        assert items[pid].ordinal == ref.ordinal
+        assert ref.text in [p.text for p in items[pid].parts]
+
+
+def test_point_items_maps_every_part_to_its_whole_item_first_occurrence_kept() -> None:
+    field = "(1) A — x\n(2) A — x\n(3) " + "y" * 9000 + "."
+    items = rejections.point_items(OWNER, field)
+    enum = enumerate_rejected_paths(field)
+    assert {item.ordinal for item in items.values()} == {1, 3}
+    long_item = enum.items[2]
+    assert len(long_item.parts) > 1
+    for part in long_item.parts:
+        assert items[item_point_id(OWNER, part.text)] == long_item
+
+
+def test_point_items_refuses_a_non_node_owner_as_rejection_points_does() -> None:
+    for bad in ("A" * 64, "a" * 63, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"):
+        with pytest.raises(ValueError):
+            rejections.point_items(bad, "(1) A — x")

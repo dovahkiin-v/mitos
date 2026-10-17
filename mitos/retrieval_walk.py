@@ -37,6 +37,34 @@ surface re-raises ahead of its degraded arm, so a double that absorbs every call
 (a ``MagicMock``) fails loud instead of passing an absence-asserting row over an
 empty window.
 
+The rejection leg
+-----------------
+A ranked surface may hand the walk a :class:`RejectionLeg`. The walk then makes
+**one** more call and no more graph reads: one ``RejectionIndex.search`` with the
+same query vector, at the leg's own fetch bound and under its own time budget
+(ADR ``rejection-search-on-ranked-reads-runs-under-its-own-time-budget``). The
+owners of the hits at or above the leg's floor join the one resolve batch (an
+owner's point-id form is its decision point's id, so a window hit's owner resolves
+once), the one stamp read and the one live-end read. :func:`fill_rejections` then
+checks every hit against its owner's **current** enumeration, injected as
+``items_of`` (``rejections.point_items``), so an item the field no longer states is
+never served (ADR
+``rejection-index-keeps-its-own-backlog-and-reads-serve-no-item-its-owner-no-longer-states``).
+The leg's own failures never escape the walk: an absent collection, an overrun
+budget and an index error each become a state on ``RankedWalk.rejections``, and the
+decision answer is the one a read without the leg returns. The conflict gather
+never passes a leg.
+
+The light resolver
+------------------
+The ranked reads pass ``light=True``: the resolve over every hit reads only each
+node's id, kind and state (``resolve_point_states``), and one more batched read
+(``resolve_point_ids``) hydrates only what the answer shows — the window, the edge,
+the partition's shown members and the leg's owners. 5a's rejection leg took the
+ranked read's core p95 past the 40 ms trigger at the horizon, which builds it (ADR
+``ranked-walk-resolves-every-hit-whole-light-resolver-unbuilt-until-core-p95-passes-40ms``).
+The gather keeps the one whole resolve: it consumes every retired node it passed.
+
 Why a module of its own
 -----------------------
 The walk cannot live in ``store.py``: the conflict gather (``conflict.gather_candidates``)
@@ -52,19 +80,23 @@ is this class).
 
 Its admission to the check family's fence
 -----------------------------------------
-Stdlib (``dataclasses``, ``typing``) plus ``mitos.errors``, which is already a
-fence member and imports only ``typing``: the leaf's runtime closure is exactly
-``{retrieval_walk.py, errors.py}``. It reads three methods off a store it is handed
-and writes nothing, so admitting it costs the fence no write path and no
-``store``/``vector_store``/``telemetry`` reach. ``conflict.py``'s import of it grew
-the exact-set pin by this module alone. Keep it that way: never import ``store``,
-``protocols``, ``vector_store``, ``display``, ``recall`` or ``config`` here.
+Stdlib (``dataclasses``, ``re``, ``typing``, ``uuid``) plus ``mitos.errors``, which
+is already a fence member and imports only ``typing``: the leaf's runtime closure is
+exactly ``{retrieval_walk.py, errors.py}``. It reads three methods off a store it is
+handed, and one off a rejection index, and writes nothing, so admitting it costs the
+fence no write path and no ``store``/``vector_store``/``telemetry`` reach.
+``conflict.py``'s import of it grew the exact-set pin by this module alone. Keep it
+that way: never import ``store``, ``protocols``, ``vector_store``, ``display``,
+``recall``, ``rejections`` or ``config`` here. The leg's enumeration, floor and
+bound arrive as arguments.
 """
 
+import re
+import uuid
 from dataclasses import dataclass, field, replace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
-from mitos.errors import DatabaseError
+from mitos.errors import CollectionMissingError, DatabaseError, VectorStoreError
 
 # The ranked over-fetch bound: how many points one ranked read fetches before it
 # walks them to `limit + 1` live decisions. A budget constant, not a calibrated
@@ -92,6 +124,27 @@ from mitos.errors import DatabaseError
 # (pinned by a row, not an import: this leaf imports no `display`).
 RANKED_OVERFETCH_BOUND: int = 350
 
+# The rejection leg's fetch bound: how many items one rejection search asks for
+# before `fill_rejections` walks them to the floor or the section bound. A budget
+# constant, not a calibrated threshold (vision §6.3), so it stays outside Layer C's
+# pin population.
+#
+# MEASUREMENT PENDING (§7.1 of phase 5a sets it and cites its runs here).
+#
+# Must stay above `display.RANKED_LIMIT_CEILING`: the field-scoped lookup (5c) walks
+# to a caller's `limit` with this one bound (pinned by a row, not an import).
+REJECTION_OVERFETCH_BOUND: int = 100
+
+# The rejection search's time budget, in seconds: the search's socket timeout
+# (`RejectionIndex.search`'s contract), so the wall it bounds is about twice this
+# (connect, then read). A budget constant, not a calibrated threshold. An overrun
+# costs the section alone, stated as `not_searched`; the decision answer is whole
+# (ADRs `rejection-search-on-ranked-reads-runs-under-its-own-time-budget` and
+# `rejection-search-time-budget-sits-inside-the-50ms-letter-retrieval-budget`).
+#
+# MEASUREMENT PENDING (§7.1 of phase 5a sets it and cites its runs here).
+REJECTION_SEARCH_BUDGET_SECONDS: float = 0.008
+
 # The computed states a ranked read serves as live. Agreement-pinned to
 # `store.LIVE_STATES` by a row; spelled here because this leaf cannot import the
 # store.
@@ -105,6 +158,23 @@ EXHAUSTED = "exhausted"
 
 # The skip reasons, always all four keys in `RankedWalk.skipped`.
 SKIP_KEYS: Tuple[str, ...] = ("orphan", "ambiguous", "non_decision", "duplicate")
+
+# The rejection leg's states (`RejectionWalk.state`).
+REJECTIONS_SEARCHED = "searched"
+REJECTIONS_ABSENT = "absent"
+REJECTIONS_OVER_BUDGET = "over_budget"
+REJECTIONS_ERROR = "error"
+
+# The rejection hits verification drops, always all five keys in
+# `RejectionWalk.dropped`.
+REJECTION_DROP_KEYS: Tuple[str, ...] = (
+    "stale", "ownerless", "orphan", "non_decision", "ambiguous",
+)
+
+# A node id: 64 lowercase hex characters. The same predicate as
+# `rejections._OWNER_ID_RE` (agreement-pinned by a row); spelled here because this
+# leaf cannot import `rejections`. An owner id outside it is never UUID-formatted.
+_OWNER_ID_RE = re.compile(r"[0-9a-f]{64}")
 
 
 @dataclass(frozen=True)
@@ -161,6 +231,82 @@ class WalkHit:
 
 
 @dataclass(frozen=True)
+class RejectionLeg:
+    """What a ranked surface hands the walk to search the rejection index too.
+
+    Attributes:
+        index: The duck-typed rejection index; must provide
+            ``search(vector, limit, *, budget_seconds)``.
+        items_of: ``rejections.point_items``, injected: ``(owner_id, field)`` →
+            ``{point_id: item}``, each item carrying ``ordinal`` and ``text``.
+        floor: The rejection-match floor (``recall.REJECTION_MATCH_FLOOR``); a hit
+            below it ends the walk.
+        bound: The section bound in items (``recall.REJECTION_SECTION_BOUND``).
+            No default: the value lives in ``recall``, which this leaf cannot
+            import, so every caller passes it.
+        fetch: How many items the search asks for.
+        budget_seconds: The search's time budget.
+    """
+
+    index: Any
+    items_of: Callable[[str, str], Mapping[str, Any]]
+    floor: float
+    bound: int
+    fetch: int = REJECTION_OVERFETCH_BOUND
+    budget_seconds: float = REJECTION_SEARCH_BUDGET_SECONDS
+
+
+@dataclass(frozen=True)
+class RejectionMatch:
+    """One verified rejection match. Runtime only.
+
+    Attributes:
+        owner: The resolved owner node (reader-facing shape plus
+            ``computed_state``).
+        point_id: The best-scoring part's point id.
+        score: The best-scoring part's score.
+        ordinal: The item's ordinal in the owner's **current** enumeration.
+        item: The whole item's text, ``item.text.rstrip()`` (never a part).
+        live: Whether the owner's computed state is live (:data:`LIVE_STATES`).
+    """
+
+    owner: Dict[str, Any]
+    point_id: str
+    score: float
+    ordinal: int
+    item: str
+    live: bool
+
+
+@dataclass(frozen=True)
+class RejectionWalk:
+    """What the rejection leg found. Runtime only, ``RankedWalk.rejections``.
+
+    Attributes:
+        state: ``searched``, ``absent`` (the collection does not exist),
+            ``over_budget`` (the search ran past its time budget) or ``error``
+            (the index could not be read).
+        matches: Verified matches in score order, at most ``bound`` distinct items.
+        short: The bound did not fill, the fetch came back full and its last hit
+            was still at or above the floor: an unfetched hit could have qualified.
+        dropped: Hits at or above the floor that verification dropped, by reason —
+            always all of :data:`REJECTION_DROP_KEYS`.
+        item_counts: Owner id → how many distinct items its current field can
+            serve (the distinct ordinals of ``items_of``), for every matched owner.
+        returned: How many hits the search returned.
+        fetch: The ``limit`` the search asked for.
+    """
+
+    state: str
+    matches: List[RejectionMatch]
+    short: bool
+    dropped: Dict[str, int]
+    item_counts: Dict[str, int]
+    returned: int
+    fetch: int
+
+
+@dataclass(frozen=True)
 class RankedWalk:
     """What one ranked read found. Runtime only, never persisted.
 
@@ -192,9 +338,13 @@ class RankedWalk:
             retired hit in the fetch (a short walk never stops early). Always a
             prefix of ``retired``, so ``passed[:limit]`` is already stamped.
         live_ends: Node id → the live-end slugs of its kill chain, for
-            ``passed[:limit]`` only, and only for the ids whose immediate successor
-            is itself retired (``GraphStore.get_live_ends``' result rule). ``{}``
-            when not read or when the read faulted.
+            ``passed[:limit]`` and the rejection section's retired owners, and only
+            for the ids whose immediate successor is itself retired
+            (``GraphStore.get_live_ends``' result rule). ``{}`` when not read or
+            when the read faulted.
+        rejections: What the rejection leg found, or None when no leg ran. Never
+            set by :func:`fill`. When set, ``stamps`` covers the section's owners
+            too.
     """
 
     window: List[WalkHit]
@@ -210,6 +360,7 @@ class RankedWalk:
     last_score: Optional[float] = None
     passed: List[WalkHit] = field(default_factory=list)
     live_ends: Dict[str, List[str]] = field(default_factory=dict)
+    rejections: Optional[RejectionWalk] = None
 
 
 def _point_id_of(hit: Any) -> str:
@@ -327,6 +478,153 @@ def fill(hits: List[Dict[str, Any]], resolution: PointResolution, *,
                       last_score=last_score, passed=passed)
 
 
+def _owner_point_id(owner_id: Optional[str]) -> Optional[str]:
+    """Returns an owner's point-id form, or None for an id that is not a node id.
+
+    ``vector_store.hash_to_uuid``'s output, spelled with ``uuid`` because this leaf
+    cannot import the vector store: the first 128 bits of the id as a lowercase
+    8-4-4-4-12 UUID, byte-identical to the owner's decision point id, so the
+    resolver dedupes it against a window hit by raw string.
+    """
+    if not isinstance(owner_id, str) or _OWNER_ID_RE.fullmatch(owner_id) is None:
+        return None
+    return str(uuid.UUID(hex=owner_id[:32]))
+
+
+def _rejection_hits_of(answer: Any) -> List[Tuple[str, Optional[str], float]]:
+    """Returns a searched answer's hits as ``(point_id, owner_id, score)``.
+
+    Attribute access, because a rejection hit is a ``RejectionHit`` named tuple, not
+    a decision hit's dict.
+
+    Raises:
+        WalkContractError: If the answer carries no ``hits`` list, or a hit carries
+            no string ``point_id``, no numeric ``score`` or an ``owner_id`` that is
+            neither a string nor None.
+    """
+    hits = getattr(answer, "hits", None)
+    if not isinstance(hits, list):
+        raise WalkContractError(
+            f"a rejection search answer must carry a hits list; got {answer!r}"
+        )
+    out = []
+    for hit in hits:
+        pid = getattr(hit, "point_id", None)
+        score = getattr(hit, "score", None)
+        owner = getattr(hit, "owner_id", None)
+        if not isinstance(pid, str):
+            raise WalkContractError(
+                f"a rejection hit must carry a string point_id; got {hit!r}"
+            )
+        if not isinstance(score, (int, float)) or isinstance(score, bool):
+            raise WalkContractError(
+                f"a rejection hit must carry a numeric score; got {hit!r}"
+            )
+        if owner is not None and not isinstance(owner, str):
+            raise WalkContractError(
+                f"a rejection hit's owner_id must be a string or None; got {hit!r}"
+            )
+        out.append((pid, owner, score))
+    return out
+
+
+def _unsearched(state: str, fetch: int) -> RejectionWalk:
+    """The leg's result when no hit came back to walk."""
+    return RejectionWalk(state=state, matches=[], short=False,
+                         dropped={key: 0 for key in REJECTION_DROP_KEYS},
+                         item_counts={}, returned=0, fetch=fetch)
+
+
+def fill_rejections(search: Any, resolution: PointResolution, *,
+                    items_of: Callable[[str, str], Mapping[str, Any]],
+                    floor: float, bound: int, fetch: int) -> RejectionWalk:
+    """Walks a rejection search's hits to verified matches. Pure; no I/O.
+
+    The hits arrive in score order. The walk stops at the first hit below
+    ``floor`` (nothing past it can qualify) or once ``bound`` distinct items are
+    held. Each hit above the floor is checked in this order: no payload owner is
+    ``ownerless``; an owner that is not a node id, or whose point-id form resolved
+    to no node or to a node with a different id, is an ``orphan``; a prefix two
+    nodes share is ``ambiguous``; an owner that is not a decision is
+    ``non_decision``; a point id the owner's current field no longer produces
+    (``items_of(owner_id, owner["rejected_paths"])``) is ``stale``. A hit whose
+    ``(owner, ordinal)`` is already held is a lower-scoring part of a shown item and
+    collapses into it, counted as nothing.
+
+    Args:
+        search: The ``RejectionSearch`` the index answered. ``searched=False``
+            gives the ``over_budget`` state.
+        resolution: The walk's one resolution, which holds the owners' point-id
+            forms.
+        items_of: ``(owner_id, field)`` → ``{point_id: item}``.
+        floor: The rejection-match floor.
+        bound: The section bound in items.
+        fetch: The ``limit`` the search asked for.
+
+    Returns:
+        A :class:`RejectionWalk`. ``short`` is True only when the bound did not
+        fill, the fetch came back full and its last hit was still at or above the
+        floor; a fetch that ran out or crossed the floor is complete, however many
+        hits were dropped.
+
+    Raises:
+        WalkContractError: On an answer or a hit that breaks the search contract.
+    """
+    searched = getattr(search, "searched", None)
+    if not isinstance(searched, bool):
+        raise WalkContractError(
+            f"a rejection search answer must carry a bool searched; got {search!r}"
+        )
+    hits = _rejection_hits_of(search)
+    if not searched:
+        return _unsearched(REJECTIONS_OVER_BUDGET, fetch)
+    dropped = {key: 0 for key in REJECTION_DROP_KEYS}
+    matches: List[RejectionMatch] = []
+    item_counts: Dict[str, int] = {}
+    held: set = set()
+    enumerations: Dict[str, Mapping[str, Any]] = {}
+    for pid, owner_id, score in hits:
+        if score < floor or len(matches) >= bound:
+            break
+        if owner_id is None:
+            dropped["ownerless"] += 1
+            continue
+        owner_pid = _owner_point_id(owner_id)
+        if owner_pid is not None and owner_pid in resolution.ambiguous:
+            dropped["ambiguous"] += 1
+            continue
+        node = resolution.nodes.get(owner_pid) if owner_pid is not None else None
+        # The resolver matches a 128-bit prefix; only the payload's whole id is the
+        # owner, never a node that merely shares its prefix.
+        if node is None or node["id"] != owner_id:
+            dropped["orphan"] += 1
+            continue
+        if node["kind"] != "decision":
+            dropped["non_decision"] += 1
+            continue
+        items = enumerations.get(owner_id)
+        if items is None:
+            items = items_of(owner_id, node["rejected_paths"])
+            enumerations[owner_id] = items
+        item = items.get(pid)
+        if item is None:
+            dropped["stale"] += 1
+            continue
+        if (owner_id, item.ordinal) in held:
+            continue
+        held.add((owner_id, item.ordinal))
+        item_counts[owner_id] = len({i.ordinal for i in items.values()})
+        matches.append(RejectionMatch(
+            owner=node, point_id=pid, score=score, ordinal=item.ordinal,
+            item=item.text.rstrip(), live=node["computed_state"] in LIVE_STATES,
+        ))
+    short = (len(matches) < bound and len(hits) >= fetch
+             and bool(hits) and hits[-1][2] >= floor)
+    return RejectionWalk(state=REJECTIONS_SEARCHED, matches=matches, short=short,
+                         dropped=dropped, item_counts=item_counts,
+                         returned=len(hits), fetch=fetch)
+
+
 def _require_callable(obj: Any, name: str, role: str) -> None:
     if not callable(getattr(obj, name, None)):
         raise WalkContractError(f"the walk's {role} must provide {name}(); "
@@ -335,7 +633,9 @@ def _require_callable(obj: Any, name: str, role: str) -> None:
 
 def walk_ranked(vector: List[float], *, vector_store: Any, graph: Any, limit: int,
                 bound: int = RANKED_OVERFETCH_BOUND,
-                read_stamps: bool = True) -> RankedWalk:
+                read_stamps: bool = True,
+                rejections: Optional[RejectionLeg] = None,
+                light: bool = False) -> RankedWalk:
     """Runs one ranked read: query, resolve, fill, stamp, live ends — four reads, no more.
 
     Every contract check runs at entry, before the query, so a double missing a
@@ -350,6 +650,14 @@ def walk_ranked(vector: List[float], *, vector_store: Any, graph: Any, limit: in
     domain: a ``DatabaseError`` from either costs the stamps and the live ends
     together, flagged ``stamps_unread``.
 
+    With a rejection leg, one ``search`` follows the query (same vector, the leg's
+    fetch and budget). The owners of its hits at or above the floor join the one
+    resolve batch, the section's owners join the one stamp read, and its retired
+    owners join the one live-end read: one more network call, no more graph reads.
+    The leg's failures become its state, never a raise: ``CollectionMissingError`` →
+    ``absent``, an overrun budget → ``over_budget``, any other ``VectorStoreError``
+    (an unreachable index included) → ``error``.
+
     Args:
         vector: The query embedding.
         vector_store: Duck-typed; must provide ``query``.
@@ -361,34 +669,84 @@ def walk_ranked(vector: List[float], *, vector_store: Any, graph: Any, limit: in
             gather, which reads its live window's stamps itself and must never stamp
             the retired hits it passed. It makes neither the stamp read nor the
             live-end read.
+        rejections: The rejection leg, or None (the gather, and every read that
+            composes no section). Without it the walk is the four reads above.
+        light: Walk every hit on ``graph.resolve_point_states`` (id, kind and
+            state), then hydrate only what the answer shows — the window, the edge,
+            ``passed[:limit]`` and the leg's owners — in one ``resolve_point_ids``
+            (the ranked reads; ADR
+            ``ranked-walk-resolves-every-hit-whole-light-resolver-unbuilt-until-core-p95-passes-40ms``).
+            False keeps the one whole resolve: the gather, which consumes every
+            retired node it passed. On a light walk ``retired`` beyond
+            ``passed[:limit]`` holds light nodes.
 
     Returns:
-        A :class:`RankedWalk`.
+        A :class:`RankedWalk`; ``rejections`` is set exactly when a leg was passed.
 
     Raises:
-        WalkContractError: On a contract fault (see the class).
+        WalkContractError: On a contract fault (see the class), the rejection
+            index's and its answer's included.
         DatabaseError: From the resolver; the caller degrades it as a store fault.
         Exception: Whatever ``vector_store.query`` raises (``CollectionMissingError``
             included), propagated unchanged.
     """
     _require_callable(vector_store, "query", "vector store")
     _require_callable(graph, "resolve_point_ids", "graph store")
+    if light:
+        _require_callable(graph, "resolve_point_states", "graph store")
     if read_stamps:
         _require_callable(graph, "get_modifiers_map", "graph store")
         _require_callable(graph, "get_live_ends", "graph store")
+    if rejections is not None:
+        _require_callable(rejections.index, "search", "rejection index")
+        if not callable(rejections.items_of):
+            raise WalkContractError("the rejection leg's items_of must be callable")
     if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit < bound:
         raise WalkContractError(f"limit must satisfy 1 <= limit < bound ({bound}); "
                                 f"got {limit!r}")
 
     hits = vector_store.query(vector, limit=bound, with_payload=False)
     point_ids = [_point_id_of(hit) for hit in hits]
-    resolution = graph.resolve_point_ids(point_ids)
-    if not isinstance(resolution, PointResolution):
-        raise WalkContractError(
-            "resolve_point_ids must return a PointResolution; got "
-            f"{type(resolution).__name__}"
-        )
+    search = None
+    leg_state: Optional[str] = None
+    batch = point_ids
+    owners: List[str] = []
+    if rejections is not None:
+        # Caught by class: a WalkContractError is a TypeError, never swallowed here.
+        try:
+            search = rejections.index.search(vector, rejections.fetch,
+                                             budget_seconds=rejections.budget_seconds)
+        except CollectionMissingError:
+            leg_state = REJECTIONS_ABSENT
+        except VectorStoreError:
+            leg_state = REJECTIONS_ERROR
+        if leg_state is None and not isinstance(getattr(search, "searched", None), bool):
+            raise WalkContractError(
+                f"a rejection search answer must carry a bool searched; got {search!r}"
+            )
+        if leg_state is None and search.searched:
+            # Only the owners `fill_rejections` can reach: those of hits at or above
+            # the floor, each once, after the decision hits (raw-string dedupe).
+            seen = set(point_ids)
+            for _pid, owner_id, score in _rejection_hits_of(search):
+                if score < rejections.floor:
+                    break
+                owner_pid = _owner_point_id(owner_id)
+                if owner_pid is not None and owner_pid not in owners:
+                    owners.append(owner_pid)
+            batch = point_ids + [pid for pid in owners if pid not in seen]
+    resolver = "resolve_point_states" if light else "resolve_point_ids"
+    resolution = _resolution(getattr(graph, resolver)(batch), resolver)
     walk = fill(hits, resolution, limit=limit, bound=bound)
+    if light:
+        walk, resolution = _hydrate_shown(walk, owners, graph)
+    if rejections is not None:
+        # Attached before every return below, so no exit drops the section.
+        section = (_unsearched(leg_state, rejections.fetch) if leg_state is not None
+                   else fill_rejections(search, resolution, items_of=rejections.items_of,
+                                        floor=rejections.floor, bound=rejections.bound,
+                                        fetch=rejections.fetch))
+        walk = replace(walk, rejections=section)
     if not read_stamps:
         return walk
     stamp_ids = stamp_ids_of(walk)
@@ -403,6 +761,10 @@ def walk_ranked(vector: List[float], *, vector_store: Any, graph: Any, limit: in
             f"get_modifiers_map must return a dict; got {type(stamps).__name__}"
         )
     shown_ids = [h.node["id"] for h in walk.passed[:walk.limit]]
+    if walk.rejections is not None:
+        for match in walk.rejections.matches:
+            if not match.live and match.owner["id"] not in shown_ids:
+                shown_ids.append(match.owner["id"])
     if not shown_ids:
         return replace(walk, stamps=stamps)
     try:
@@ -418,7 +780,57 @@ def walk_ranked(vector: List[float], *, vector_store: Any, graph: Any, limit: in
     return replace(walk, stamps=stamps, live_ends=live_ends)
 
 
+def _resolution(result: Any, resolver: str) -> PointResolution:
+    if not isinstance(result, PointResolution):
+        raise WalkContractError(
+            f"{resolver} must return a PointResolution; got {type(result).__name__}"
+        )
+    return result
+
+
+def _hydrate_shown(walk: RankedWalk, owners: List[str],
+                   graph: Any) -> Tuple[RankedWalk, PointResolution]:
+    """Swaps a light walk's shown hits for whole nodes, in one ``resolve_point_ids``.
+
+    Shown means what a ranked answer composes from: the window, the edge,
+    ``passed[:limit]`` (the partition's handles) and the leg's owners. A shown hit
+    whose node the second read no longer holds (a graph rebuilt between the two
+    reads) raises ``DatabaseError``, which every surface degrades as a store fault.
+
+    Returns:
+        The walk with whole nodes on its shown hits, and the hydrating resolution
+        (the leg's owners are verified against it).
+    """
+    shown = ([h.point_id for h in walk.window]
+             + ([walk.edge.point_id] if walk.edge is not None else [])
+             + [h.point_id for h in walk.passed[:walk.limit]])
+    hydrated = _resolution(graph.resolve_point_ids(list(dict.fromkeys(shown + owners))),
+                           "resolve_point_ids")
+
+    def whole(hit: WalkHit) -> WalkHit:
+        node = hydrated.nodes.get(hit.point_id)
+        if node is None:
+            raise DatabaseError(f"point {hit.point_id} left the graph between two reads")
+        return replace(hit, node=node)
+
+    shown_passed = [whole(h) for h in walk.passed[:walk.limit]]
+    by_point = {h.point_id: h for h in shown_passed}
+    return replace(
+        walk,
+        window=[whole(h) for h in walk.window],
+        edge=whole(walk.edge) if walk.edge is not None else None,
+        retired=[by_point.get(h.point_id, h) for h in walk.retired],
+        passed=shown_passed + walk.passed[walk.limit:],
+    ), hydrated
+
+
 def stamp_ids_of(walk: RankedWalk) -> List[str]:
-    """The node ids :func:`walk_ranked` stamps: the window, then ``retired[:limit]``."""
-    return ([h.node["id"] for h in walk.window]
-            + [h.node["id"] for h in walk.retired[:walk.limit]])
+    """The node ids :func:`walk_ranked` stamps: the window, then ``retired[:limit]``,
+    then the rejection section's owners not already among them (when a leg ran)."""
+    ids = ([h.node["id"] for h in walk.window]
+           + [h.node["id"] for h in walk.retired[:walk.limit]])
+    if walk.rejections is not None:
+        for match in walk.rejections.matches:
+            if match.owner["id"] not in ids:
+                ids.append(match.owner["id"])
+    return ids

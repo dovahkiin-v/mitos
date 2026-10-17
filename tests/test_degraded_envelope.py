@@ -300,7 +300,8 @@ def test_the_lexical_count_is_the_clamped_limit_on_every_route(dws, driver, caus
 # --------------------------------------------------------------------------- #
 
 _BAND_KEYS = ("confidence", "retired_partition", "retired_partition_omitted",
-              "all_superseded")
+              "all_superseded", "rejection_matches", "rejection_section",
+              "rejection_dropped")
 _EDGE_STEMS = ("This ranking ended", "This ranking's edge")
 
 
@@ -311,7 +312,7 @@ def _assert_degraded_statement(driver: str, resp: Any) -> None:
         assert "⚠ confidence:" not in resp
         return
     assert resp["not_computed"] == list(DEGRADED_NOT_COMPUTED) == [
-        "retired_partition", "edge", "band"]
+        "retired_partition", "edge", "band", "rejection_matches"]
     assert _OMISSION in resp["note"]
     for key in _BAND_KEYS:
         assert key not in resp, key

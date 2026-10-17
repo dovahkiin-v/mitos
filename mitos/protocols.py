@@ -280,6 +280,24 @@ class GraphStoreProtocol(Protocol):
         """
         ...
 
+    def resolve_point_states(self, point_ids: Iterable[str]) -> PointResolution:
+        """The light twin of :meth:`resolve_point_ids`: same partition, each node only
+        ``{"id", "kind", "computed_state"}``.
+
+        The ranked reads walk every hit on it and hydrate only what the answer shows
+        with :meth:`resolve_point_ids`.
+
+        Args:
+            point_ids: Point ids as the vector index returned them.
+
+        Returns:
+            The partition of the input, with light nodes. Empty input runs no statement.
+
+        Raises:
+            DatabaseError: If the read fails.
+        """
+        ...
+
     def get_node(self, node_id: str) -> Optional[Dict[str, Any]]:
         """Retrieves a single node by its ID.
 

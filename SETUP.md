@@ -530,10 +530,12 @@ order:
    the same pass, and it reports the items it embedded and those it found
    already present (`--json` adds the embedding calls). `mitos status <project>`
    beforehand shows what it will embed; the rejection index's missing count is
-   its embedding count, because rejected items bypass the embedding cache. Why
-   the order: an older build reads the decision collection unfiltered, so once
-   the retired vectors are back they take slots from live hits in its reads and
-   in its conflict sensing.
+   its embedding count, because rejected items bypass the embedding cache. Until
+   it has built the rejection index, every ranked read states that the index is
+   missing and names this heal; the decision answer is unchanged. Why the order:
+   an older build reads the decision collection unfiltered, so once the retired
+   vectors are back they take slots from live hits in its reads and in its
+   conflict sensing.
 3. **Then refresh each workspace's skill text.** If `mitos status <project>`
    reports that `.mitos/skill.md` differs, run the command it prints.
 4. **What leaves the machine.** Each decision's `rejected_paths` is now sent to
@@ -542,6 +544,9 @@ order:
    in Qdrant, unread. Records and amends the previous build makes leave their
    decisions' rejected items stale or missing; after you upgrade again, `mitos
    status <project>` names them and `mitos reconcile -p <project>` heals them.
+   Meanwhile each ranked read checks every rejected item it would show against
+   its decision's current field, so an item the previous build left stale is
+   never shown.
 
 ---
 

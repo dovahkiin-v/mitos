@@ -21,6 +21,12 @@ because the scope tag is absent from the live vocabulary, the caller surfaces th
 bounded vector instead of a silent empty (the false-negative an agent reads as a
 real absence rather than its own typo).
 
+The **rejection section** of the four ranked reads is composed here too
+(:func:`rejection_section`): its floor and bound, the state token naming a section
+that was not computed whole (gap, not searched, unavailable, short) with its note
+clause and the gap's per-surface heal, and the withheld rule counted over decisions.
+The walk that found the matches and the shaper that words them are handed in.
+
 The policy is **surface-agnostic**: it emits the recall *signal* (which confidence
 branch, whether the scope tag is unused) and words each pointer from a per-surface
 table (CLI verbs vs MCP tool call-forms), so no CLI/MCP presentation knowledge
@@ -61,6 +67,20 @@ SURFACE_WEAK_THRESHOLD: float = 0.60
 # a labelled target (bullseye and handle-words, query space), read on the dense run
 # beside Harbor's. Method: tests/golden/_calibration_record.py ``edge_margin_boundary``.
 RANKED_EDGE_MARGIN: float = 0.0156
+
+# The rejection-match floor: a rejection hit scoring below it is not a match, and the
+# leg's walk stops at it. PROVISIONAL, not calibrated: listed in
+# tests/golden/test_calibrated_constants.py's PENDING as phase 5b's, which sets it
+# under the calibration rule. 0.65 is a placeholder chosen only to sit under the
+# median of Layer C's per-item rejection targets (0.720) and at the max of its generic
+# negatives (0.651), run `harbor-20261015-a79a820`; it ships no prose that leans on
+# its meaning.
+REJECTION_MATCH_FLOOR: float = 0.65
+
+# The rejection section's bound, in items (not points): how many verified matches a
+# ranked answer carries at most. A budget constant (vision §6.3's default); 5b may
+# lower it from the token read at the calibrated floor.
+REJECTION_SECTION_BOUND: int = 3
 
 # How many live scope tags the bounded unused-scope vector lists (busiest first) before
 # it stops and points at the dedicated discovery surface. Mirrors clamp_limit's working
@@ -163,6 +183,27 @@ MISSING_GRAPH_POINTERS: Dict[str, Dict[str, str]] = {
         "build": (
             "only a full rebuild from the corpus builds it, which no tool on this "
             "surface performs — a person with a shell in that project runs it"
+        ),
+    },
+}
+
+
+# Per-surface wording for the rejection index's gap, on ``MISSING_GRAPH_POINTERS``'
+# idiom: the shared sentence states the fact, each surface supplies its heal. The heal
+# is ``mitos reconcile``, which builds an absent rejection collection from the graph
+# (the gate, ``missing_rejection_index_is_a_gap``, keys on the same expected set it
+# fills). The CLI names the command with its selector (``shell_flag`` at composition).
+# The MCP clause names no command and no tool: it states the fact and a person as the
+# next actor, because an agent handed a shell command runs it and there is no tool
+# that builds a collection (ADR ``collection-heal-stays-operator-invoked-never-implicit``).
+REJECTION_GAP_POINTERS: Dict[str, Dict[str, str]] = {
+    "cli": {
+        "build": "`mitos reconcile {selector}` builds it",
+    },
+    "mcp": {
+        "build": (
+            "no tool on this surface builds it — a person with a shell in that "
+            "project runs the collection heal"
         ),
     },
 }
@@ -974,13 +1015,248 @@ def count_withheld(hits: List[Dict[str, Any]]) -> int:
     return sum(1 for hit in hits if "rejected_paths" not in hit)
 
 
+def count_withheld_decisions(*, thinned_ids: List[str],
+                             shown_ordinals: Mapping[str, Any],
+                             item_counts: Mapping[str, int]) -> int:
+    """Counts the decisions a ranked answer withheld reasoning from.
+
+    The ranked reads' withheld rule, over **decisions** (ADR
+    ``withheld-count-names-only-reasoning-the-answer-left-out``). The population is
+    every thinned window hit plus every ``letter: "here"`` rejection owner whose
+    ``rejected_paths`` the depth withheld, each once. A decision is exempt when the
+    rejection section's matches already show every item its field can serve
+    (``len(shown_ordinals[id]) == item_counts[id]``) — a one-item field's match is
+    the common case — because then nothing of its reasoning was left out.
+    :func:`count_withheld` keeps serving the paths that carry no section (lexical,
+    ``list``); on an answer with no matches the two give the same number.
+
+    Args:
+        thinned_ids: The population's node ids, repeats allowed.
+        shown_ordinals: Node id → the ordinals its rejection matches show.
+        item_counts: Node id → how many distinct items its field can serve
+            (``RejectionWalk.item_counts``).
+
+    Returns:
+        How many distinct decisions in the population are not covered.
+    """
+    counted = set()
+    for node_id in thinned_ids:
+        if node_id in counted:
+            continue
+        shown = shown_ordinals.get(node_id)
+        if shown and len(shown) == item_counts.get(node_id):
+            continue
+        counted.add(node_id)
+    return len(counted)
+
+
+def rejection_owners_whole(full_top: Optional[int], window_len: int) -> bool:
+    """Says whether a ``here`` rejection owner keeps its ``rejected_paths``.
+
+    The depth the caller set for the window's **last** rank (ADR
+    ``rejection-section-owners-follow-the-depth-of-the-windows-last-rank``): an owner
+    outside the window ranks below all of it, so it gets that rank's depth. With an
+    empty window (a blackout or a miss) only ``brief`` (``full_top == 0``) withholds.
+
+    Args:
+        full_top: The effective depth (None ⇒ every rank whole, 0 ⇒ brief).
+        window_len: How many decisions the window holds.
+
+    Returns:
+        True when the owner's Letter is whole.
+    """
+    return not (full_top is not None and (full_top == 0 or full_top < window_len))
+
+
+# The rejection leg's states, as `retrieval_walk.RejectionWalk.state` spells them.
+# Agreement-pinned to `retrieval_walk.REJECTIONS_*` by a row; spelled here because
+# this leaf imports no `mitos` module but `shell_quote`.
+_LEG_ABSENT = "absent"
+_LEG_OVER_BUDGET = "over_budget"
+_LEG_ERROR = "error"
+_LEG_SEARCHED = "searched"
+
+
+def rejection_section_state(rejections: Optional["object"], *,
+                            gap: Callable[[], bool]) -> Optional[str]:
+    """Maps the walk's rejection result to the envelope's state token.
+
+    Called only when the ranked walk ran (``walk is not None``); the healthy-empty
+    ``CollectionMissingError`` arm composes no section. The token is ``None`` when
+    the section was computed whole, which leaves ``rejection_section`` absent
+    (constraint 5: absent means computed).
+
+    Args:
+        rejections: ``RankedWalk.rejections`` (duck-typed), or None when the read
+            seam built no leg while ranking ran.
+        gap: Asked only on ``absent``: ``missing_rejection_index_is_a_gap(store)``
+            bound by the caller, so a healthy read makes no graph read for it.
+
+    Returns:
+        ``"gap"`` (absent over a non-empty expected set), ``"not_searched"`` (over
+        budget), ``"unavailable"`` (the index errored, or no leg ran), ``"short"``
+        (verification left the section short), or None.
+
+    Raises:
+        ValueError: On a state outside the walk's vocabulary.
+    """
+    if rejections is None:
+        return "unavailable"
+    state = rejections.state
+    if state == _LEG_ABSENT:
+        # An empty expected set: the absent collection IS the empty index.
+        return "gap" if gap() else None
+    if state == _LEG_OVER_BUDGET:
+        return "not_searched"
+    if state == _LEG_ERROR:
+        return "unavailable"
+    if state == _LEG_SEARCHED:
+        return "short" if rejections.short else None
+    raise ValueError(f"unknown rejection leg state {state!r}")
+
+
+def rejection_section_clause(state: str, *, dropped: Optional[int], surface: str,
+                             config: "object") -> str:
+    """Words the note clause for a rejection section that was not computed whole.
+
+    Each says what was not computed and why, and that the decision answer stands.
+    The gap names its heal through :data:`REJECTION_GAP_POINTERS` (the MCP form names
+    no command and no tool). Pure string formatting; it never raises for a token
+    :func:`rejection_section_state` returns.
+
+    Args:
+        state: The state token (``gap``, ``not_searched``, ``unavailable``,
+            ``short``).
+        dropped: How many fetched hits verification dropped (``short`` only).
+        surface: ``"cli"`` or ``"mcp"`` — selects the gap's heal wording.
+        config: The active ``MitosConfig`` (duck-typed). Read only for
+            ``project``, which the CLI recipe names as its selector.
+
+    Returns:
+        One sentence.
+    """
+    if state == "gap":
+        heal = REJECTION_GAP_POINTERS[surface]["build"].format(
+            selector=shell_flag("-p", getattr(config, "project", ""))
+        )
+        return (
+            "The rejection index is missing while decisions here state rejected "
+            "options, so no rejected option was searched for this answer; "
+            f"{heal}."
+        )
+    if state == "not_searched":
+        return (
+            "The rejection search ran past its time budget, so rejected options were "
+            "not searched for this answer; the decision answer is whole."
+        )
+    if state == "short":
+        n = dropped or 0
+        noun = "match" if n == 1 else "matches"
+        return (
+            f"Verification dropped {n} rejection {noun} whose decision no longer "
+            "states the option or is gone, so the rejection section may hold fewer "
+            "than it could."
+        )
+    return (
+        "The rejection index could not be read, so rejected options were not "
+        "searched for this answer; the decision answer is whole."
+    )
+
+
+class RejectionSection(NamedTuple):
+    """One ranked answer's rejection section, composed once for every surface.
+
+    Attributes:
+        matches: The shaped matches (``display.rejection_matches_payload``), ``[]``
+            when none.
+        state: The state token, or None when the section was computed whole.
+        dropped: How many fetched hits verification dropped, beside ``short`` only.
+        withheld: :func:`count_withheld_decisions` over the window and the section.
+        clause: The state's note clause, or None.
+    """
+
+    matches: List[Dict[str, Any]]
+    state: Optional[str]
+    dropped: Optional[int]
+    withheld: int
+    clause: Optional[str]
+
+    def envelope_keys(self) -> Dict[str, Any]:
+        """The section's envelope keys, in order; empty when computed and empty.
+
+        ``rejection_matches`` when at least one match, ``rejection_section`` when
+        not computed whole, ``rejection_dropped`` only beside ``"short"``. Never a
+        ``[]`` and never a ``null``: absent means computed and empty.
+        """
+        keys: Dict[str, Any] = {}
+        if self.matches:
+            keys["rejection_matches"] = self.matches
+        if self.state is not None:
+            keys["rejection_section"] = self.state
+        if self.state == "short":
+            keys["rejection_dropped"] = self.dropped
+        return keys
+
+
+def rejection_section(walk: "object", *, full_top: Optional[int],
+                      gap: Callable[[], bool], shape: Callable[..., List[Dict[str, Any]]],
+                      surface: str, config: "object") -> RejectionSection:
+    """Composes a ranked answer's rejection section: matches, state, clause, withheld.
+
+    The one composition the four ranked surfaces call, after the walk and outside
+    their ranked ``try``, only when the walk ran. The shaper is injected
+    (``display.rejection_matches_payload``) because this leaf imports no display.
+
+    Args:
+        walk: The ``RankedWalk`` (duck-typed): ``window``, ``rejections``,
+            ``stamps``, ``live_ends``.
+        full_top: The effective depth (None ⇒ whole, 0 ⇒ brief); the window's
+            thinning rule is the surfaces' (rank > ``full_top``).
+        gap: See :func:`rejection_section_state`.
+        shape: ``display.rejection_matches_payload``.
+        surface: ``"cli"`` or ``"mcp"``.
+        config: The active ``MitosConfig`` (duck-typed).
+
+    Returns:
+        A :class:`RejectionSection`.
+    """
+    window_ids = [hit.node["id"] for hit in walk.window]
+    owners_whole = rejection_owners_whole(full_top, len(window_ids))
+    rejections = walk.rejections
+    matches: List[Dict[str, Any]] = []
+    if rejections is not None and rejections.matches:
+        matches = shape(rejections, window_ids=window_ids, owners_whole=owners_whole,
+                        stamps=walk.stamps, live_ends=walk.live_ends)
+    state = rejection_section_state(rejections, gap=gap)
+    dropped = sum(rejections.dropped.values()) if state == "short" else None
+    shown: Dict[str, set] = {}
+    for match in matches:
+        shown.setdefault(match["id"], set()).add(match["ordinal"])
+    thinned = [node_id for rank, node_id in enumerate(window_ids, start=1)
+               if full_top is not None and rank > full_top]
+    if not owners_whole:
+        thinned += [match["id"] for match in matches if match["letter"] == "here"]
+    withheld = count_withheld_decisions(
+        thinned_ids=thinned, shown_ordinals=shown,
+        item_counts=rejections.item_counts if rejections is not None else {},
+    )
+    clause = (rejection_section_clause(state, dropped=dropped, surface=surface,
+                                       config=config)
+              if state is not None else None)
+    return RejectionSection(matches=matches, state=state, dropped=dropped,
+                            withheld=withheld, clause=clause)
+
+
 # What a degraded answer could not compute, as concept tokens: ``retired_partition``
 # names the ranked envelopes' key, ``edge`` the window-edge clause, ``band`` the
-# ``confidence`` band. Each needs similarity scores, which a degraded read has none
-# of. Carried on every degraded envelope as ``not_computed`` (serialized as a list)
-# and never on a ranked one, so on a ranked envelope an absent ``retired_partition``
-# still means computed and empty. A tuple here only so no caller can mutate it.
-DEGRADED_NOT_COMPUTED: Tuple[str, ...] = ("retired_partition", "edge", "band")
+# ``confidence`` band, ``rejection_matches`` the rejection section. Each needs
+# similarity scores, which a degraded read has none of. Carried on every degraded
+# envelope as ``not_computed`` (serialized as a list) and never on a ranked one, so
+# on a ranked envelope an absent ``retired_partition`` still means computed and
+# empty. A tuple here only so no caller can mutate it.
+DEGRADED_NOT_COMPUTED: Tuple[str, ...] = (
+    "retired_partition", "edge", "band", "rejection_matches",
+)
 
 
 def degraded_omission_clause() -> str:
@@ -991,11 +1267,11 @@ def degraded_omission_clause() -> str:
     write, so it is the same sentence on both surfaces. Pure string formatting.
 
     Returns:
-        One sentence naming the three omissions.
+        One sentence naming the four omissions.
     """
     return (
         "Not computed without similarity scores: the retired partition, the "
-        "window's edge and the confidence band."
+        "window's edge, the confidence band and the rejection matches."
     )
 
 

@@ -11,9 +11,11 @@ gets out of the way:
 2. rebinds ``GeminiEmbeddingProvider`` and ``QdrantVectorStore`` at the two
    construct sites the MCP path reaches — ``mitos.mcp_server``
    (``get_workspace_components``) and ``mitos.sync`` (``MitosSyncManager``) — and
-   the third constructor, ``QdrantRejectionIndex``, at ``mitos.sync`` alone (the
-   only MCP-reachable site that builds one: the record and amend tools' inline
-   rejection leg). Both modules did ``from … import`` at their own scope, so
+   the third constructor, ``QdrantRejectionIndex``, at the two MCP-reachable sites
+   that build one: ``mitos.sync`` (the record and amend tools' inline rejection
+   leg) and ``mitos.mcp_server`` (the ranked reads' ``_ranked_rejection_index``,
+   since 5a). Both share one process-lifetime fake per collection, so a read
+   searches what a record wrote. Both modules did ``from … import`` at their own scope, so
    rebinding the defining modules would change nothing. The other two construct
    sites are left alone on purpose: ``mitos.importer`` (the import verb) and
    ``mitos.cli``'s ``_build_check_substrate`` (the check verb) are not reachable
@@ -289,6 +291,7 @@ def bind() -> None:
         module.GeminiEmbeddingProvider = FakeEmbeddingProvider
         module.QdrantVectorStore = FakeVectorStore
     mitos.sync.QdrantRejectionIndex = fake_rejection_index
+    mitos.mcp_server.QdrantRejectionIndex = fake_rejection_index
     print(BOUND_MARKER, file=sys.stderr, flush=True)
 
 

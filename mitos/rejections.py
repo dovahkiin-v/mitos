@@ -533,6 +533,36 @@ def rejection_points(owner_id: str, field: str) -> Dict[str, PointRef]:
     return points
 
 
+def point_items(owner_id: str, field: str) -> Dict[str, RejectedItem]:
+    """Maps each distinct point id of a field to the item that produced it.
+
+    The ranked reads' verification key and match source in one call: a rejection
+    hit whose id is absent here is one its owner's current field no longer states,
+    and a present one yields the item's ordinal and whole text. Keyed exactly as
+    :func:`rejection_points` (same ids, same first-occurrence rule), so a read never
+    drops an item the drain wrote; a row pins the agreement.
+
+    Args:
+        owner_id: The owner node's ``nodes.id`` (see :func:`item_point_id`).
+        field: The raw ``rejected_paths`` text.
+
+    Returns:
+        ``{point_id: RejectedItem}``, every part's id, first occurrence kept; empty
+        for an empty field.
+
+    Raises:
+        ValueError: If ``owner_id`` is not 64 lowercase hex characters.
+    """
+    _check_owner(owner_id)
+    items: Dict[str, RejectedItem] = {}
+    for item in enumerate_rejected_paths(field).items:
+        for part in item.parts:
+            pid = item_point_id(owner_id, part.text)
+            if pid not in items:
+                items[pid] = item
+    return items
+
+
 def expected_rejection_points(
     owner_fields: Mapping[str, str],
     memo: Optional[Dict[Tuple[str, str], Tuple[str, ...]]] = None,

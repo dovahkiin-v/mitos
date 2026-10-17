@@ -715,7 +715,8 @@ def test_the_reconcile_help_names_every_decision() -> None:
 
 
 def test_the_upgrade_note_orders_the_server_first_and_states_the_egress() -> None:
-    """The upgrade note as 4d ships it: server first, one reconcile, egress stated."""
+    """The upgrade note: server first, one reconcile, egress stated (4d), and the two
+    read-side sentences 5a's behaviour makes true."""
     setup = _collapsed((REPO / "SETUP.md").read_text(encoding="utf-8"))
     head = "## Upgrading a workspace written by an earlier Mitos"
     assert head in setup and setup.index(head) < setup.index("## Cutover")
@@ -728,8 +729,15 @@ def test_the_upgrade_note_orders_the_server_first_and_states_the_egress() -> Non
             "rejection index in the same pass") in note
     assert ("Each decision's `rejected_paths` is now sent to the embedding provider "
             "beside its axiom.") in note
-    # True at 4d: nothing here may claim a read finds or hides rejected items (5a).
-    for word in ("surface", "query", "match", "hide"):
+    # 4d pinned the absence of any read claim for 5a to invert: the ranked reads now
+    # state the missing index and verify every item against its decision's field.
+    assert ("Until it has built the rejection index, every ranked read states that the "
+            "index is missing and names this heal; the decision answer is unchanged.") in note
+    assert ("Meanwhile each ranked read checks every rejected item it would show "
+            "against its decision's current field, so an item the previous build left "
+            "stale is never shown.") in note
+    # Still no verb named and nothing said to be hidden: those are 5b's and 5c's.
+    for word in ("surface", "query", "hide"):
         assert word not in note.lower(), word
 
 
