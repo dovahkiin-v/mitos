@@ -348,6 +348,13 @@ def test_calibration_classes(calibration_index, shape_collections):
                 assert all(not r["absent"] for r in refs), f"{fx['id']}: an item ref with no value in {shape}"
         else:
             assert read.shape_searches is None and "items" not in read.result, fx["id"]
+        if fx["form"] == "draft" and fx["class"] == "retired-precedent":
+            # 7a §6.6: the read asked the shipped tombstone review (it raises on a
+            # disagreement), and every target at or above the floor came back shown.
+            assert read.tombstones is not None, f"{fx['id']}: the tombstone agreement did not run"
+            for t in read.result["targets"]:
+                if t["value"] is not None and t["value"] >= sync._TOMBSTONE_FLOOR:
+                    assert t["slug"] in read.tombstones, fx["id"]
     run = CH.build_run(index, [read.result for read in reads])
     expected = {(f["class"], R.SPACE_OF_FORM[f["form"]]) for f in fixtures}
     assert {(c, s) for c, spaces in run["classes"].items() for s in spaces} == expected

@@ -200,6 +200,9 @@ class FormRead:
     candidates: Optional[Any] = None   # the draft form's ``conflict.Gathering``
     shape_searches: Optional[Dict[str, int]] = None
     item_ranking: Optional[List[Dict[str, Any]]] = None  # the instrument's collapsed items
+    # 7a: the shipped tombstone review's shown slugs on a retired-precedent draft read
+    # (the agreement ran); None on any other read or a build without the review.
+    tombstones: Optional[List[str]] = None
 
 
 class SectionDisagreement(Exception):
@@ -668,9 +671,9 @@ def read_draft_form(index: CalibrationIndex, fixture: Dict[str, Any]) -> FormRea
     hits = label_hits(index, raw, fixture.get("exclude", []))
     result = R.derive_result(fixture, hits, None, _pause_floor_of(fixture))
     result["hits"] = result["hits"][:conflict.CONFLICT_OVERFETCH_LIMIT]
-    if fixture["class"] == "retired-precedent":
-        check_tombstone_agreement(index, fixture, result, gathering)
-    return FormRead(result=result, calls=proxy.calls, candidates=gathering)
+    tombstones = (check_tombstone_agreement(index, fixture, result, gathering)
+                  if fixture["class"] == "retired-precedent" else None)
+    return FormRead(result=result, calls=proxy.calls, candidates=gathering, tombstones=tombstones)
 
 
 def _pause_floor_of(fixture: Dict[str, Any]) -> float:

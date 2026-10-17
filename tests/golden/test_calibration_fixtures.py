@@ -405,6 +405,7 @@ def test_a_retired_precedent_read_asks_the_shipped_tombstone_review(index, monke
     read = CH.read_draft_form(probe, fixture)
     assert read.result["pause_floor"] == sync._TOMBSTONE_FLOOR
     assert read.result["targets"][0]["clears_pause_floor"] is True
+    assert read.tombstones == [retired]
 
     def silent(self, gathering, declared, **kw):
         return sync.TombstoneReview(shown=[], omitted=0, cleared_by=set())
