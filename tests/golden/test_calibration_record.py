@@ -1157,11 +1157,13 @@ def test_nothing_shown_is_a_ratio_of_zero(record_dir):
     assert _escalation_record(record_dir, cry_wolf=block) == []
 
 
+# 7a generalised the side: a raised floor sits above its unraised value, which for the
+# rejection floor's `higher` rule is max(boundaries), as these cases always read it.
 @pytest.mark.parametrize("value, raised, clean, needle", [
     (0.88, 0.80, True, None),                       # raised above its boundary, inside the range
-    (0.80, 0.80, False, "needs value > max(boundaries)"),
-    (0.88, None, False, "needs `cry_wolf.raised_from` == max(boundaries)"),
-    (0.88, 0.79, False, "needs `cry_wolf.raised_from` == max(boundaries)"),
+    (0.80, 0.80, False, "needs value > its unraised value ('higher' rule) = 0.8"),
+    (0.88, None, False, "needs `cry_wolf.raised_from` == its unraised value ('higher' rule) = 0.8"),
+    (0.88, 0.79, False, "needs `cry_wolf.raised_from` == its unraised value ('higher' rule) = 0.8"),
     (0.97, 0.80, False, "raised value 0.97 lies outside run"),  # above every target: D3's escalation
 ])
 def test_the_ceiling_side(record_dir, value, raised, clean, needle):
@@ -1178,7 +1180,7 @@ def test_a_raised_floor_whose_value_is_not_a_number_is_reported_not_raised(recor
     raised value's range check compared it unguarded, so a malformed value raised TypeError."""
     problems = _escalation_record(record_dir, value=value, side="ceiling",
                                   cry_wolf=_cry_wolf(raised_from=0.80))
-    assert _has(problems, "needs value > max(boundaries)")
+    assert _has(problems, "needs value > its unraised value")
 
 
 def test_the_ceiling_side_and_a_cry_wolf_block_belong_to_escalation_floors_only(record_dir):
@@ -1553,3 +1555,65 @@ def test_the_two_lines_read_absent_targets_as_nothing_and_an_empty_class_as_none
 def test_a_line_already_on_a_four_place_step_is_its_own_line():
     results = [_draft("bullseye", [_hit("b1", 0.8175)], ["b1"], "a")]
     assert R.pause_floor_boundary(results) == 0.8175
+
+
+# ---------------------------------------------------------------------------
+# 7a D2: the tombstone floor's recall rule under side `ceiling`
+# ---------------------------------------------------------------------------
+
+TOMBSTONE = "mitos.sync._TOMBSTONE_FLOOR"
+
+
+def _tombstone_record(record_dir, value, boundaries, side="ceiling", raised="unset"):
+    """A recall-first escalation floor over document-space retired-precedent and
+    family-neighbour blocks (targets 0.82–0.93, noise top-live 0.70–0.88)."""
+    runs = []
+    for i, b in enumerate(boundaries):
+        runs.append(R.append_run(_run(corpus="dense" if i else "harbor", decision_count=500 if i else 32,
+                                      classes={"retired-precedent": {"document": _class_block([0.82, 0.93])},
+                                               "family-neighbour": {"document": _class_block(
+                                                   [0.70, 0.88], "top_live", negatives=[0.69, 0.85])}}),
+                                 record_dir))
+    record = R.load_record(record_dir)
+    block = _cry_wolf(appearances=0, earned=0, earned_label=0, earned_proxy=0, ratio=0.0,
+                      raised_from=R.RECALL_FLOOR_START if raised == "unset" else raised)
+    record["constants"][TOMBSTONE] = {
+        "value": value, "kind": "threshold", "space": "document",
+        "separates": ["retired-precedent", "family-neighbour"],
+        "boundaries": dict(zip(runs, boundaries)), "side": side, "method": "synthetic",
+        "cry_wolf": block}
+    return _problems(record, R.load_cited_runs(record, record_dir), {TOMBSTONE: value})
+
+
+def test_the_tombstone_floor_is_an_escalation_floor_with_the_recall_rule():
+    assert TOMBSTONE in R.ESCALATION_FLOORS
+    assert R.UNRAISED_RULE == {FLOOR: "higher", TOMBSTONE: "recall"}
+    assert R.unraised_value(TOMBSTONE, {"a": 0.8235, "b": 0.81}) == 0.80
+    assert R.unraised_value(TOMBSTONE, {"a": 0.8235, "b": 0.7712}) == 0.7712
+    assert R.unraised_value(FLOOR, {"a": 0.8147, "b": 0.7367}) == 0.8147
+
+
+@pytest.mark.parametrize("value, boundaries, raised, clean, needle", [
+    # raised from 0.80 to 0.8265, above the one recall line: clean
+    (0.8265, (0.8235,), "unset", True, None),
+    # a raise that stops below a recall line loses no labelled target and is lawful: the
+    # `higher` rule's `value > max(boundaries)` would refuse it
+    (0.8100, (0.8235,), "unset", True, None),
+    # from a lowered floor: raised_from is the lower recall line
+    (0.8000, (0.8235, 0.7712), 0.7712, True, None),
+    (0.8000, (0.8235, 0.7712), "unset", False, "needs `cry_wolf.raised_from` == its unraised value ('recall' rule) = 0.7712"),
+    (0.8000, (0.8235,), "unset", False, "needs value > its unraised value ('recall' rule) = 0.8"),
+    (0.8265, (0.8235,), 0.8235, False, "needs `cry_wolf.raised_from` == its unraised value ('recall' rule) = 0.8"),
+])
+def test_the_tombstone_floors_ceiling_side_reads_its_recall_rule(record_dir, value, boundaries, raised,
+                                                                 clean, needle):
+    problems = _tombstone_record(record_dir, value, boundaries, raised=raised)
+    assert (problems == []) is clean, problems
+    if needle:
+        assert _has(problems, needle)
+
+
+def test_an_unmoved_tombstone_floor_carries_its_block_unraised(record_dir):
+    assert _tombstone_record(record_dir, 0.80, (0.8235,), side="unmoved", raised=None) == []
+    assert _has(_tombstone_record(record_dir, 0.80, (0.8235,), side="unmoved"),
+                "a raised floor takes side `ceiling`")

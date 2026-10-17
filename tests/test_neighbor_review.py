@@ -178,9 +178,16 @@ def test_strong_match_band_declared_target_still_commits(ws):
     assert res["status"] == "created", res
 
 
-def test_threshold_value_matches_adr():
-    """The floor is 0.80 — pinned so a drive-by retune goes through the ADR."""
-    assert _NEIGHBOR_REVIEW_THRESHOLD == 0.80
+def test_threshold_is_pinned_by_the_calibration_record():
+    """7a retired the literal `== 0.80` pin that stood here: the floor is a calibrated
+    constant now, and the calibration record's pin row (`test_calibrated_constants.py`)
+    holds its value, so a drive-by retune reds there, against its measured placement."""
+    import os
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "golden"))
+    import test_calibrated_constants as pins
+    assert "mitos.sync._NEIGHBOR_REVIEW_THRESHOLD" in pins.CALIBRATED_CONSTANTS
+    assert pins._runtime_value("mitos.sync._NEIGHBOR_REVIEW_THRESHOLD") == _NEIGHBOR_REVIEW_THRESHOLD
 
 
 def test_threshold_is_inclusive(ws):

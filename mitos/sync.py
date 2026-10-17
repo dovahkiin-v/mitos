@@ -1000,26 +1000,31 @@ def _rotation_report(outcome: "rotation.RotationOutcome") -> Optional[Dict[str, 
         return {"outcome": ROTATION_SKIPPED, "archives": [], "skipped": skipped}
     return None
 
-# A new decision at/above this document-document similarity to an existing one the
-# author did NOT reference is paused for review (AX P4): the neighbour must surface
-# BEFORE commit, while the author can still point an amends/supersedes/contradicts
-# at it (you can't relink after commit — re-record is a no-op; the retired
-# post-commit `related` echo was exactly one step too late).
-# 0.80 is the floor of the strong-match band (see recall.py's calibration):
-# an unlinked strong match must force an explicit confirm-or-link, because prose-only
-# obsoletion is invisible to state-filtered retrieval — only edges retire a node (ADR
-# `record-pause-floor-lowered-to-strong-match-band`; the routine-case pause tax stays
-# low via --acknowledge-neighbors, the declared-target exemption, and transitive
-# lineage suppression). Tune here.
+# A new decision at/above this similarity to an existing live one the author did NOT
+# reference is paused for review (AX P4): the neighbour must surface BEFORE commit, while
+# the author can still point an amends/supersedes/contradicts at it (you can't relink
+# after commit — re-record is a no-op; the retired post-commit `related` echo was exactly
+# one step too late). An unlinked near-duplicate must force an explicit confirm-or-link,
+# because prose-only obsoletion is invisible to state-filtered retrieval — only edges
+# retire a node (ADR `record-pause-floor-lowered-to-strong-match-band`; the routine-case
+# pause tax stays low via --acknowledge-neighbors, the declared-target exemption, and
+# transitive lineage suppression).
+# It is a document-space floor: the gather embeds the draft as a document and compares it
+# with documents. The confidence band rates a query against documents and shares no scale
+# with it, so this is not the band's strong line. Recall first: it stays where it is while
+# every measured duplicate sits at or above it, and never rises. The measured placement,
+# its rule and its runs: tests/golden/calibration/record.json.
 _NEIGHBOR_REVIEW_THRESHOLD = 0.80
 
-# A retired decision the draft sits at or above this document-document similarity to
-# is a tombstone on the pause (7a): the draft may re-tread ground the corpus already
-# tried and abandoned. Its own constant, never an alias of the live floor above: the
-# two share a space and a population of vectors but not a class boundary (vision
-# §6.3). Provisional at 0.80, PENDING its measurement in phase 7a's constants commit;
-# no surface reads it until the partition is wired.
-_TOMBSTONE_FLOOR = 0.80
+# A retired decision the draft sits at or above this document-space similarity to is a
+# tombstone on the pause: the draft may re-tread ground the corpus already tried and
+# abandoned (vision §4.9). It separates a re-tread of a retired decision from proximity to
+# a retired family. Its own constant, never an alias of the live floor above: the two share
+# a space and a population of vectors but not a class boundary, so either may move without
+# the other (§6.3). Recall first: at or below every measured re-tread, never above the live
+# floor's start, and raised only by its cry-wolf ceiling (a ratio of 2.0 on the copy's
+# replay), which it is. Rule, runs and ceiling: tests/golden/calibration/record.json.
+_TOMBSTONE_FLOOR = 0.8265
 
 # The relations the pause offers for resolving a flagged neighbour — a fourth
 # edge-field set beside store.py's kill/deferred/mutation trio, derivable from none

@@ -31,20 +31,19 @@ import _calibration_record as R  # noqa: E402
 MITOS_DIR = os.path.dirname(os.path.abspath(mitos.__file__))
 RECORD_POINTER = "tests/golden/calibration/record.json"
 
-# Dotted names whose value the record pins. 7a adds its own.
+# Dotted names whose value the record pins. 7a added the pause's two floors, the last.
 CALIBRATED_CONSTANTS: FrozenSet[str] = frozenset({
     "mitos.recall.RANKED_EDGE_MARGIN",
     "mitos.recall.REJECTION_MATCH_FLOOR",
     "mitos.recall.SURFACE_STRONG_THRESHOLD",
     "mitos.recall.SURFACE_WEAK_THRESHOLD",
     "mitos.recall.RANKED_TOP_CLUSTER_MARGIN",
+    "mitos.sync._NEIGHBOR_REVIEW_THRESHOLD",
+    "mitos.sync._TOMBSTONE_FLOOR",
 })
 
-# Shipped thresholds that owe calibration, with the phase that sets each.
-PENDING: Dict[str, str] = {
-    "mitos.sync._NEIGHBOR_REVIEW_THRESHOLD": "7a",
-    "mitos.sync._TOMBSTONE_FLOOR": "7a",
-}
+# Shipped thresholds that owe calibration, with the phase that sets each. Empty since 7a.
+PENDING: Dict[str, str] = {}
 
 # Suffix matches that are not calibrated against this record, each with its reason.
 EXEMPT: Dict[str, str] = {
@@ -139,22 +138,22 @@ def test_every_shipped_threshold_is_calibrated_pending_or_exempt():
     )
 
 
-def test_the_calibrated_set_is_the_two_margins_the_rejection_floor_and_the_band():
+def test_the_calibrated_set_is_complete_and_nothing_is_pending():
     """Inverted from `test_no_constant_is_calibrated_yet` (landed empty in 1b): 2e's
-    commit added the first record entry (`test_the_edge_margin_is_the_first_calibrated_constant`),
-    5b's added the rejection-match floor, which 5a shipped PENDING at a placeholder. 6a
-    inverts `test_the_calibrated_set_is_the_edge_margin_and_the_rejection_floor`: the band's
-    two thresholds leave `PENDING` and join with the new top-cluster margin. One pair
-    serves both rankings (6a D4), so no `REJECTION_*` threshold joins. The record holds
-    exactly the pinned set."""
+    commit added the first record entry, 5b's the rejection-match floor, 6a's the band's
+    two thresholds and the top-cluster margin. 7a inverts
+    `test_the_calibrated_set_is_the_two_margins_the_rejection_floor_and_the_band`: the
+    pause's two floors leave `PENDING` and join, and `PENDING` is empty — 7a was the last
+    phase that sets a calibrated constant. The record holds exactly the pinned set."""
     assert set(R.load_record()["constants"]) == set(CALIBRATED_CONSTANTS)
     assert CALIBRATED_CONSTANTS == frozenset({"mitos.recall.RANKED_EDGE_MARGIN",
                                               "mitos.recall.REJECTION_MATCH_FLOOR",
                                               "mitos.recall.SURFACE_STRONG_THRESHOLD",
                                               "mitos.recall.SURFACE_WEAK_THRESHOLD",
-                                              "mitos.recall.RANKED_TOP_CLUSTER_MARGIN"})
-    assert PENDING == {"mitos.sync._NEIGHBOR_REVIEW_THRESHOLD": "7a",
-                       "mitos.sync._TOMBSTONE_FLOOR": "7a"}
+                                              "mitos.recall.RANKED_TOP_CLUSTER_MARGIN",
+                                              "mitos.sync._NEIGHBOR_REVIEW_THRESHOLD",
+                                              "mitos.sync._TOMBSTONE_FLOOR"})
+    assert PENDING == {}
 
 
 def test_the_edge_margins_harbor_boundary_recomputes_from_the_committed_run():
@@ -310,3 +309,62 @@ def test_the_envelopes_top_cluster_equals_the_size_recomputed_from_the_run():
     assert checked >= 40, (run_id, checked)
     assert not wrong, wrong
     assert not unconfirmed, f"{run_id}: the recorded slice cannot confirm {unconfirmed}"
+
+
+# -- 7a: the pause's two floors ------------------------------------------------------------
+
+def _sync_entry(name: str):
+    return R.load_record()["constants"][f"mitos.sync.{name}"]
+
+
+def test_the_tombstone_lines_harbor_boundary_recomputes_from_the_committed_run():
+    """7a D1: the method is code. Harbor's recall line is what `tombstone_floor_boundary`
+    derives from the committed run's fixtures."""
+    entry = _sync_entry("_TOMBSTONE_FLOOR")
+    run_id, fixtures = _harbor_fixtures(entry)
+    assert R.tombstone_floor_boundary(fixtures) == entry["boundaries"][run_id]
+
+
+def test_the_live_pause_lines_harbor_boundary_recomputes_from_the_committed_run():
+    entry = _sync_entry("_NEIGHBOR_REVIEW_THRESHOLD")
+    run_id, fixtures = _harbor_fixtures(entry)
+    assert R.pause_floor_boundary(fixtures) == entry["boundaries"][run_id]
+
+
+def test_the_live_pause_floor_is_recorded_unmoved_in_document_space():
+    """7a D1: recall first, never rising; no cry-wolf block (it arms no new escalation)."""
+    from mitos import sync
+    entry = _sync_entry("_NEIGHBOR_REVIEW_THRESHOLD")
+    assert entry["space"] == "document" and entry["separates"] == ["bullseye", "family-neighbour"]
+    assert entry["side"] == "unmoved" and entry["value"] == sync._NEIGHBOR_REVIEW_THRESHOLD
+    assert entry["value"] <= min(entry["boundaries"].values())
+    assert "cry_wolf" not in entry
+    assert "mitos.sync._NEIGHBOR_REVIEW_THRESHOLD" not in R.ESCALATION_FLOORS
+
+
+def test_the_tombstone_floor_carries_its_cry_wolf_ceiling():
+    """7a D2: the second escalation floor states its ceiling and the ratio measured on the
+    copy's replay at its value, and says where it rose from by its recall rule."""
+    entry = _sync_entry("_TOMBSTONE_FLOOR")
+    name = "mitos.sync._TOMBSTONE_FLOOR"
+    assert name in R.ESCALATION_FLOORS and R.UNRAISED_RULE[name] == "recall"
+    block = entry["cry_wolf"]
+    assert set(block) == set(R.CRY_WOLF_KEYS)
+    assert block["ceiling"] == 2.0 and block["ratio"] <= block["ceiling"]
+    unraised = R.unraised_value(name, entry["boundaries"])
+    if entry["side"] == "ceiling":
+        assert block["raised_from"] == unraised and entry["value"] > unraised
+    else:
+        assert block["raised_from"] is None and entry["value"] == unraised
+    assert R._check_cry_wolf(name, entry, unraised) == []
+
+
+def test_the_tombstone_floor_is_its_own_constant_not_an_alias():
+    """§6.3: two floors, two literals, two entries, even where the values agree."""
+    from mitos import sync
+    source = open(os.path.join(MITOS_DIR, "sync.py"), encoding="utf-8").read()
+    assert re.search(r"^_TOMBSTONE_FLOOR = \d", source, re.M)
+    assert "_TOMBSTONE_FLOOR = _NEIGHBOR_REVIEW_THRESHOLD" not in source
+    assert type(sync._TOMBSTONE_FLOOR) is float
+    assert _sync_entry("_TOMBSTONE_FLOOR")["separates"] != \
+        _sync_entry("_NEIGHBOR_REVIEW_THRESHOLD")["separates"]

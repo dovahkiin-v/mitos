@@ -1470,8 +1470,34 @@ def _summary_of_file(run: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # Floors that arm an escalation, so read on traffic: each record entry carries a
-# ``cry_wolf`` block (5b D5). 7a adds the tombstone floor.
-ESCALATION_FLOORS: Tuple[str, ...] = ("mitos.recall.REJECTION_MATCH_FLOOR",)
+# ``cry_wolf`` block (5b D5). 7a added the tombstone floor.
+ESCALATION_FLOORS: Tuple[str, ...] = ("mitos.recall.REJECTION_MATCH_FLOOR", "mitos.sync._TOMBSTONE_FLOOR")
+# Where each escalation floor sits before its cry-wolf ceiling raises it (7a D2): its
+# unraised rule. ``higher`` (5b's rejection floor) sits at ``max(boundaries)``, just above
+# every hard negative; ``recall`` (7a's tombstone floor) sits at or below every corpus's
+# recall line and never above its start, ``min(RECALL_FLOOR_START, min(boundaries))``. A
+# side-``ceiling`` entry's ``raised_from`` is that value and its value lies above it; a
+# recall floor's raise may stop below a recall line, so ``max(boundaries)`` cannot stand in.
+UNRAISED_RULE: Dict[str, str] = {
+    "mitos.recall.REJECTION_MATCH_FLOOR": "higher",
+    "mitos.sync._TOMBSTONE_FLOOR": "recall",
+}
+# The recall-first floors' start (7a D1): a floor stays here unless a recall line is lower.
+RECALL_FLOOR_START = 0.80
+
+
+def unraised_value(name: str, boundaries: Dict[str, float]) -> Optional[float]:
+    """The escalation floor's value before any raise, by its `UNRAISED_RULE`; None when the
+    rule is unknown or a boundary is not a number."""
+    values = list(boundaries.values())
+    if not values or not all(_is_number(b) for b in values):
+        return None
+    rule = UNRAISED_RULE.get(name)
+    if rule == "higher":
+        return max(values)
+    if rule == "recall":
+        return min(RECALL_FLOOR_START, min(values))
+    return None
 # The block's keys, exactly: the ceiling and the ratio measured against it, its
 # population, and the ids that let anyone re-read it. ``earned`` is the union of the two
 # signals ``earned_label`` and ``earned_proxy`` count apart. Numbers and ids only.
@@ -1491,7 +1517,9 @@ def _check_cry_wolf(name: str, entry: Dict[str, Any], top: Optional[float]) -> L
 
     The ratio is sections shown over sections earned, rounded to 4 places, and must sit
     at or under the ceiling; nothing shown is a ratio of 0. ``raised_from`` is ``null``
-    for side ``higher`` and equals ``max(boundaries)`` (``top``) for side ``ceiling``.
+    unless the side is ``ceiling``, where it equals the floor's unraised value (``top``,
+    from `unraised_value`: ``max(boundaries)`` for a ``higher`` floor, the recall rule's
+    value for a ``recall`` floor).
     """
     block = entry.get("cry_wolf")
     if not isinstance(block, dict):
@@ -1533,7 +1561,8 @@ def _check_cry_wolf(name: str, entry: Dict[str, Any], top: Optional[float]) -> L
     side, raised = entry.get("side"), block["raised_from"]
     if side == "ceiling":
         if raised is None or raised != top:
-            problems.append(f"{name}: side `ceiling` needs `cry_wolf.raised_from` == max(boundaries) = {top!r}")
+            problems.append(f"{name}: side `ceiling` needs `cry_wolf.raised_from` == its unraised value "
+                            f"({UNRAISED_RULE.get(name)!r} rule) = {top!r}")
     elif raised is not None:
         problems.append(f"{name}: `cry_wolf.raised_from` is set but the side is {side!r}; "
                         f"a raised floor takes side `ceiling`")
@@ -1720,13 +1749,14 @@ def _check_constant(
         elif value != boundaries[dense_cited[0]]:
             problems.append(f"{name}: side `dense` needs value == boundaries[{dense_cited[0]!r}]")
     elif side == "ceiling":
+        unraised = unraised_value(name, boundaries)
         if name not in ESCALATION_FLOORS:
             problems.append(f"{name}: side `ceiling` belongs to an escalation floor ({list(ESCALATION_FLOORS)})")
-        elif not (_is_number(value) and value > max(boundaries.values())):
-            problems.append(f"{name}: side `ceiling` needs value > max(boundaries) = {max(boundaries.values())!r}")
+        elif not (_is_number(value) and unraised is not None and value > unraised):
+            problems.append(f"{name}: side `ceiling` needs value > its unraised value "
+                            f"({UNRAISED_RULE.get(name)!r} rule) = {unraised!r}")
     if name in ESCALATION_FLOORS:
-        top = max(boundaries.values()) if all(_is_number(b) for b in boundaries.values()) else None
-        problems.extend(_check_cry_wolf(name, entry, top))
+        problems.extend(_check_cry_wolf(name, entry, unraised_value(name, boundaries)))
     elif "cry_wolf" in entry:
         problems.append(f"{name}: carries a `cry_wolf` block but arms no escalation "
                         f"(ESCALATION_FLOORS is {list(ESCALATION_FLOORS)})")

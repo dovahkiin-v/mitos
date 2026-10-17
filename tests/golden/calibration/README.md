@@ -106,17 +106,27 @@ A threshold named any other way escapes that row, so name new ones with those su
    for `strong` and the rejection floor, the lower for the weak/none line, the dense
    run's for a margin. Record that choice as the entry's `side`.
 3. **A floor that arms an escalation** (`_calibration_record.ESCALATION_FLOORS`: the
-   rejection-match floor; 7a adds the tombstone floor) also carries a `cry_wolf` block:
+   rejection-match floor and, since 7a, the tombstone floor) also carries a `cry_wolf` block:
    its `ceiling`, the `ratio` of sections shown to sections earned measured on the copy's
    replay at the floor (`appearances / earned`, 4 places), `earned` with its two signals
    `earned_label` and `earned_proxy`, the `reads` measured, and the ids that let anyone
    re-read it (`replay_run`, `copy_state`, `labels_sha256`). A ratio over its ceiling is
    refused: the floor rises to the smallest value at which it is not, recorded as side
-   `ceiling` with `raised_from` naming `max(boundaries)`; an unraised floor keeps side
-   `higher` and `raised_from: null`. A raised value must still lie inside every cited run's
-   range. The rejection floor's boundary is code:
-   `_calibration_record.rejection_floor_boundary`, just above every hard negative of the
-   corpus, recomputed from the committed Harbor run by an offline row.
+   `ceiling` with `raised_from` naming the floor's unraised value by its rule
+   (`UNRAISED_RULE`): `max(boundaries)` for the rejection floor (`higher`, just above every
+   hard negative), `min(RECALL_FLOOR_START, min(boundaries))` for the tombstone floor
+   (`recall`, at or below every re-tread and never above 0.80); a raised value lies above
+   that and inside every cited run's range, and may stop below a recall line. An unraised
+   floor keeps its side (`higher`, or `unmoved`/`lower` for a recall floor) and
+   `raised_from: null`. The boundaries are code: `rejection_floor_boundary` (just above
+   every hard negative of the corpus), `tombstone_floor_boundary` (at or below every
+   retired-precedent draft target, document space), each recomputed from the committed
+   Harbor run by an offline row; the dense sides are re-derived out of repo through the same
+   functions (`dense.py floor`, and the dense report's pause-floor lines).
+   **The live pause floor** (`sync._NEIGHBOR_REVIEW_THRESHOLD`) follows the recall rule
+   without a ceiling: `pause_floor_boundary`, at or below every bullseye draft target in
+   document space; side `unmoved` while it sits at or below every line (the checker holds
+   `value <= min(boundaries)`), `lower` if a line drops beneath it, never higher.
    **A threshold that states its precision** (`_calibration_record.PRECISION_STATED`: the
    band's `strong` line) carries a `precision` block with one key per cited run, each
    `{fires, right, precision, interval, base}` from `band_precision` at the entry's value

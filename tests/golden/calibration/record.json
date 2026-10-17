@@ -124,6 +124,48 @@
       "side": "lower",
       "space": "query",
       "value": 0.6375
+    },
+    "mitos.sync._NEIGHBOR_REVIEW_THRESHOLD": {
+      "boundaries": {
+        "dense-20261017-a78bb97": 0.8029,
+        "harbor-20261017-bb2645e": 0.8175
+      },
+      "kind": "threshold",
+      "method": "pause_floor_boundary: at or below every bullseye draft target, document space (a draft against documents, the gather's space); stays at 0.80 while every corpus's line sits at or above it and never rises. Harbor n 4; dense n 9, harvested re-records that linked the neighbour their pause named",
+      "separates": [
+        "bullseye",
+        "family-neighbour"
+      ],
+      "side": "unmoved",
+      "space": "document",
+      "value": 0.8
+    },
+    "mitos.sync._TOMBSTONE_FLOOR": {
+      "boundaries": {
+        "harbor-20261017-bb2645e": 0.8235
+      },
+      "cry_wolf": {
+        "appearances": 0,
+        "ceiling": 2.0,
+        "copy_state": "s3-rejection-9c6fd89",
+        "earned": 0,
+        "earned_label": 0,
+        "earned_proxy": 0,
+        "labels_sha256": "da87e4a62d453883a139b3a14b834ab86711c9b5d4c00468e4baf4b76d5a070a",
+        "raised_from": 0.8,
+        "ratio": 0.0,
+        "reads": 60,
+        "replay_run": "20261017-1924-bb2645e-dogfood-copy"
+      },
+      "kind": "threshold",
+      "method": "tombstone_floor_boundary: at or below every retired-precedent draft target, document space; the floor is min(0.80, every line) and rises only by its cry-wolf ceiling. Harbor alone (n 5): the dense draft set holds no harvested re-tread (62 sealed pairs, all noise) and authored re-treads may be at most half the class, so none. At 0.80 the copy's replay showed 2 tombstone-alone pauses, none earned, so the floor rose until nothing appears",
+      "separates": [
+        "retired-precedent",
+        "family-neighbour"
+      ],
+      "side": "ceiling",
+      "space": "document",
+      "value": 0.8265
     }
   },
   "embedding_model": "gemini-embedding-2",
