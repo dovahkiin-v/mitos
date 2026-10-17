@@ -1160,7 +1160,9 @@ def _check_constant(
             )
         # A raised floor is decoupled from its boundaries, so its value is held to every
         # cited run's range itself: one above every target separates nothing (D3's case).
-        if side == "ceiling" and lows and highs and not (min(lows) <= value <= max(highs)):
+        # A non-number value is reported once, by the side check below, never raised here.
+        if side == "ceiling" and _is_number(value) and lows and highs \
+                and not (min(lows) <= value <= max(highs)):
             problems.append(
                 f"{name}: raised value {value!r} lies outside run {run_id!r}'s observed range "
                 f"[{min(lows)!r}, {max(highs)!r}]"

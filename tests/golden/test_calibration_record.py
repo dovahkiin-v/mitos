@@ -1109,6 +1109,15 @@ def test_the_ceiling_side(record_dir, value, raised, clean, needle):
         assert _has(problems, needle)
 
 
+@pytest.mark.parametrize("value", [None, "0.88"])
+def test_a_raised_floor_whose_value_is_not_a_number_is_reported_not_raised(record_dir, value):
+    """The checker's contract: a record problem is a returned string. 5b fresh-eyes: the
+    raised value's range check compared it unguarded, so a malformed value raised TypeError."""
+    problems = _escalation_record(record_dir, value=value, side="ceiling",
+                                  cry_wolf=_cry_wolf(raised_from=0.80))
+    assert _has(problems, "needs value > max(boundaries)")
+
+
 def test_the_ceiling_side_and_a_cry_wolf_block_belong_to_escalation_floors_only(record_dir):
     record, runs, _, harbor, dense = _clean(record_dir)
     record["constants"][STRONG].update(side="ceiling", value=0.76)
