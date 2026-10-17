@@ -114,6 +114,27 @@ def test_a_degraded_answer_with_no_section_match_prints_no_section(dws, driver):
     assert out.endswith("size limits.\n\n") and not out.endswith("\n\n\n")
 
 
+@pytest.mark.parametrize("driver", list(DRIVERS))
+def test_no_decision_match_beside_a_matched_option_reads_true(dws, driver):
+    """6b (D7, 5d's debt): with no decision matched by its words but a rejected option
+    matched, the leaf's "No lexical matches either" line would contradict the section
+    beneath it; the legend says what did match and keeps the leaf's grep pointer."""
+    from mitos.degraded import _NO_DECISION_MATCH_LINE
+    from mitos.lexical import _NO_MATCH_LINE
+    _two_owners(dws)
+    resp = drive(driver, dws, "cookies", cause="no-providers")
+    assert _decisions(driver, resp) == []
+    note = resp if _is_text(driver) else resp["note"]
+    assert _NO_DECISION_MATCH_LINE in note and _NO_MATCH_LINE not in note
+    if not _is_text(driver):
+        (match,) = _section(driver, resp)
+        assert match["slug"] == "session-store" and match["ordinal"] == 2
+        assert note.index(_NO_DECISION_MATCH_LINE) < note.index(_OMISSION)
+    nothing = drive(driver, dws, "zeppelin", cause="no-providers")
+    note = nothing if _is_text(driver) else nothing["note"]
+    assert _NO_MATCH_LINE in note and _NO_DECISION_MATCH_LINE not in note
+
+
 # --------------------------------------------------------------------------- #
 # Row 2 — the section on the dump
 # --------------------------------------------------------------------------- #

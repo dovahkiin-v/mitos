@@ -3071,6 +3071,14 @@ def test_a_top_cluster_is_counted_on_the_envelope_and_said_in_the_note(ws, drive
     assert list(resp).index("band_evidence") == list(resp).index("confidence") + 1
 
 
+@pytest.mark.parametrize("verb", ["surface", "query"])
+def test_the_cli_text_says_the_top_cluster_too(ws, verb):
+    _seed_4c(ws)
+    run = _cli_surface_text if verb == "surface" else _cli_query
+    out = run(_cluster_points("weak"), ws)
+    assert top_cluster_clause(3, register=verb, margin=RANKED_TOP_CLUSTER_MARGIN) in out
+
+
 @pytest.mark.parametrize("band", ["weak", "none"])
 def test_the_evidence_agrees_across_all_four_exits(ws, band):
     """Parity: one object, the same values on MCP and `--json`, `surface` and `query`."""
