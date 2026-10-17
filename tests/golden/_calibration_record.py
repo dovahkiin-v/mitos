@@ -755,6 +755,8 @@ def _strictly_above(top: float) -> float:
     boundary = round((math.floor(top * 10_000) + 1) / 10_000, 4)
     if boundary <= top:  # float noise: an exact 4-place maximum floored one step low
         boundary = round(boundary + 0.0001, 4)
+    elif round(boundary - 0.0001, 4) > top:  # float noise: a value just under a step floored onto it
+        boundary = round(boundary - 0.0001, 4)
     return boundary
 
 
@@ -768,6 +770,8 @@ def _at_or_below(low: float) -> float:
     step = round(boundary + 0.0001, 4)
     if step <= low:  # float noise: an exact 4-place minimum floored one step low
         boundary = step
+    elif boundary > low:  # float noise: a value just under a 4-place step floored onto it
+        boundary = round(boundary - 0.0001, 4)
     return boundary
 
 

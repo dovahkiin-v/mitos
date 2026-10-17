@@ -8,6 +8,7 @@ and the soft diff.
 """
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -1150,10 +1151,22 @@ def _band(cls, hits, targets=(), fid=None, space="query"):
     (0.6375222, 0.6376, 0.6375),       # Harbor's family-neighbour minimum floors to 0.6375
     (0.6375, 0.6376, 0.6375),
     (0.69999, 0.7, 0.6999),
+    (math.nextafter(0.9998, 0), 0.9998, 0.9997),  # one ulp under a step: `x * 10_000` rounds onto it
 ])
 def test_the_two_rounding_helpers_are_one_rule_each(value, above, below):
     assert R._strictly_above(value) == above and R._strictly_above(value) > value
     assert R._at_or_below(value) == below and R._at_or_below(value) <= value
+
+
+def test_the_rounding_helpers_are_the_nearest_step_on_their_side_one_ulp_around_every_step():
+    """Fresh eyes (6a): one ulp under a 4-place step, `x * 10_000` rounds onto the step, so
+    `_at_or_below` once returned the step (above its input) and `_strictly_above` the step
+    after it (not the smallest)."""
+    for k in range(1, 10_000):
+        for x in (k / 10_000, math.nextafter(k / 10_000, 0), math.nextafter(k / 10_000, 1)):
+            below, above = R._at_or_below(x), R._strictly_above(x)
+            assert below <= x < round(below + 0.0001, 4), x
+            assert round(above - 0.0001, 4) <= x < above, x
 
 
 def test_the_strong_boundary_sits_strictly_above_every_non_answering_top():

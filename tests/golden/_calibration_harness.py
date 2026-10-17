@@ -73,7 +73,9 @@ RECORD_LIMIT = 10
 # by 2d: the draft form's gather reads through the same walk (one call at the gather raw
 # bound, ids only). Retagged by 5b: the query form's envelope carries the shipped
 # rejection leg's section, and items are read through the shipped rejection client.
-# Retagged by 6a: every query-form hit carries its lexical overlap with the query.
+# Not retagged by 6a: every query-form hit now carries its lexical overlap with the
+# query, but it is derived from the node already in hand, not read through a new path,
+# and the runs that first carry it (`harbor-20261017-15ccebb` on) record this string.
 READER = ("mcp.surface_decisions(retrieval_walk+rejection_leg)"
           "+conflict.gather_candidates(retrieval_walk)")
 # The per-item reader (5b): one shipped-client search over the whole collection,
