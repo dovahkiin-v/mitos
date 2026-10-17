@@ -258,7 +258,7 @@ def test_the_table_enters_every_lawful_cell_and_each_note_is_its_slots_in_order(
         assert (evidence is not None) == (band != "none-empty" and lead != "unbuilt"), cell
         assert override == {"blackout": "blackout", "unbuilt": "unbuilt"}.get(lead), cell
         count += 1
-    assert count >= 250, count
+    assert count >= 450, count
 
 
 def test_note_slots_is_d1s_order():
