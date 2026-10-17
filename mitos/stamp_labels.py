@@ -55,14 +55,19 @@ Tier 1: stdlib and ``mitos.errors`` only. ``recall.py`` never imports this modul
 (the check family's fence and its zero-import pin); it takes the labels injected.
 """
 
-from typing import Any, Dict, FrozenSet, Iterable, List, Mapping, NamedTuple, Sequence, Tuple
+from typing import (Any, Dict, FrozenSet, Iterable, List, Mapping, NamedTuple, Optional,
+                    Sequence, Tuple)
 
 from mitos.errors import DatabaseError
 
 # The label's budget in UTF-8 bytes, its ``…`` mark included. A byte bound holds
 # roughly one token count across scripts (a code-point bound would let a CJK label
-# cost about three times a Latin one). Set by 8a's M2 from the copy's replay — see
-# measure/labels/ — as REJECTION_SECTION_BOUND is set from its tokens.
+# cost about three times a Latin one). A budget constant, set by 8a from the copy's
+# replay (run 20261017-2309-01c107a-dogfood-copy, the vision folder's measure/labels/):
+# the largest bound on the 60–200 grid whose map costs at most 10 % of the brief
+# envelope's p90 (2,431 tokens) at p90 over the 94 of 111 reads that carry one —
+# 241 tokens at 120, 265 at 160. Labels per carrying read: median 3, p90 5. The read
+# itself: p95 under 3.4 ms at 150 slugs on the 50,000-decision horizon graph.
 LABEL_CUT_BYTES: int = 120
 
 # The ellipsis every truncation seam already uses: a label ends with it exactly when
@@ -78,8 +83,8 @@ _SPACED_BOUNDARIES: FrozenSet[str] = frozenset({
     "।", "॥",                     # Devanagari danda, double danda
     "։",                          # Armenian full stop
     "።", "፤",                     # Ethiopic full stop, semicolon
-    ";", "·",           # Greek question mark, ano teleia (as typed)
-    "·",                     # middle dot: NFC's form of the ano teleia
+    "\u037e", "\u0387",           # Greek question mark, ano teleia (as typed)
+    "\u00b7",                     # middle dot: NFC's form of the ano teleia
 })
 
 # Clause marks that cut with or without whitespace after them: scripts that write
@@ -104,13 +109,19 @@ _RETIRED_LETTER = "retired"
 
 
 def _fits(text: str, budget: int) -> bool:
+    """Whether ``text`` takes at most ``budget`` UTF-8 bytes."""
     return len(text.encode("utf-8")) <= budget
 
 
-def _first_cut(text: str) -> int:
-    """The index of the first qualifying clause boundary that cuts, or -1."""
+def _first_cut(text: str, limit: Optional[int] = None) -> int:
+    """The index of the first qualifying clause boundary that cuts, or -1.
+
+    ``limit`` stops the scan there: a boundary at index ``i`` keeps ``i`` characters,
+    at least ``i`` bytes, so one past the byte room can never cut.
+    """
     last = len(text) - 1
-    for index in range(1, last):
+    stop = last if limit is None else min(last, limit + 1)
+    for index in range(1, stop):
         char = text[index]
         if char in _CLOSED_BOUNDARIES:
             return index
@@ -144,18 +155,15 @@ def cut_label(axiom: str) -> str:
     if not text:
         return ""
     room = LABEL_CUT_BYTES - len(CUT_MARK.encode("utf-8"))
-    boundary = _first_cut(text)
+    boundary = _first_cut(text, room)
     if boundary > 0:
         clause = text[:boundary].rstrip()
         if _fits(clause, room):
             return clause + CUT_MARK
     if _fits(text, LABEL_CUT_BYTES):
         return text
-    kept = ""
-    for char in text:
-        if not _fits(kept + char, room):
-            break
-        kept += char
+    # The bound's bytes, a partial trailing sequence dropped: the last whole code point.
+    kept = text.encode("utf-8")[:room].decode("utf-8", errors="ignore")
     # A word cut inside the bound, unless the bound already fell on a space.
     space = kept.rfind(" ")
     if space > 0 and not text[len(kept)].isspace():
@@ -219,12 +227,12 @@ def label_targets(*, named: Iterable[Mapping[str, Any]],
         stamp finds its key; the read folds them into one).
     """
     carried_folds = {slug.casefold() for slug in carried}
-    targets: List[str] = []
+    targets: Dict[str, None] = {}
     for entry in named:
         for slug in _named_slugs(entry):
-            if slug.casefold() not in carried_folds and slug not in targets:
-                targets.append(slug)
-    return targets
+            if slug.casefold() not in carried_folds:
+                targets.setdefault(slug)
+    return list(targets)
 
 
 def read_stamp_labels(store: "object", *, named: Iterable[Mapping[str, Any]],

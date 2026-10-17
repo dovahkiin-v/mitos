@@ -87,9 +87,9 @@ TRACE = [
     ("T7", "نستخدم ذاكرة التخزين؛ تنتهي كل ساعة", f"نستخدم ذاكرة التخزين{CUT_MARK}"),
     ("T8", "हम कैश रखते हैं। यह हर घंटे समाप्त होता है", f"हम कैश रखते हैं{CUT_MARK}"),
     # Greek ano teleia, as NFC normalises it (U+00B7), and as typed (U+0387).
-    ("T8g", "Κρατάμε την κρυφή μνήμη· λήγει κάθε ώρα",
+    ("T8g", "Κρατάμε την κρυφή μνήμη\u00b7 λήγει κάθε ώρα",
      f"Κρατάμε την κρυφή μνήμη{CUT_MARK}"),
-    ("T8h", "Κρατάμε την κρυφή μνήμη· λήγει κάθε ώρα",
+    ("T8h", "Κρατάμε την κρυφή μνήμη\u0387 λήγει κάθε ώρα",
      f"Κρατάμε την κρυφή μνήμη{CUT_MARK}"),
     # T10 a full stop inside a token does not cut.
     ("T10", "Ship v0.19.1 with recall.py intact", "Ship v0.19.1 with recall.py intact"),
@@ -151,7 +151,7 @@ def test_a_whole_axiom_that_fits_is_not_marked_and_one_that_does_not_is():
 
 
 def test_the_boundary_set_names_every_script_the_plan_requires():
-    floor = set(".;:!?—。；：！？．؛؟۔।॥։።፤;·")
+    floor = set(".;:!?—。；：！？．؛؟۔।॥։።፤\u037e\u0387")
     assert floor <= CLAUSE_BOUNDARIES
     assert "," not in CLAUSE_BOUNDARIES
 
@@ -1193,6 +1193,18 @@ def test_17_the_unbuilt_note_stands_for_the_label_map_too():
             unbuilt=lambda: True, top_cluster_margin=0.01, edge_margin=0.01, ceiling=50,
             full_top=None, scan_faults=(), labels=labels)
         assert list(composed.envelope_keys()) == ["confidence", "note"]
+
+
+def test_17_the_envelope_places_the_map_below_the_unbuilt_return():
+    """L14's row: ``compose_ranked`` also empties the map on its unbuilt return, so the
+    placement inside ``envelope_keys`` is pinned on the note itself."""
+    note = recall.RankedNote(confidence="none", note="n", evidence=None,
+                             override=recall.OVERRIDE_UNBUILT, handles=[], omitted=0,
+                             section=None, withheld=0, stamps_unread=False,
+                             labels={"x": "A label."}, labels_unread=True)
+    assert list(note.envelope_keys()) == ["confidence", "note"]
+    healthy = note._replace(override=None)
+    assert list(healthy.envelope_keys())[-2:] == ["stamp_labels", "stamp_labels_unread"]
 
 
 def test_17_the_lookup_under_the_unbuilt_graph_never_reads_labels():
