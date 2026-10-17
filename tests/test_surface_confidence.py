@@ -3225,19 +3225,111 @@ def test_the_cli_text_names_a_faulted_scan_too(ws, monkeypatch):
     assert "[open question in scope]" not in out
 
 
-# ---- constraint 12: the descriptions keep their pre-6c band sentences ------ #
+# ---- 6c: the shipped prose says what the notes say a band means ----------- #
 
-def test_the_ranked_descriptions_still_carry_their_pre_6c_band_sentences():
-    """6c rewrites both descriptions to agree with the composed notes (`WEAK_MEANING`);
-    until it does, the shipped sentences are pinned here, so 6c inverts this row
-    deliberately rather than drifting past it."""
-    from mitos import mcp_server
-    from test_description_budget import _flat
+# The absence clause's shared phrase, anchored on the composer's own output in each
+# row (never a test-side copy standing alone).
+_ABSENCE = "A ranking cannot show that nothing covers this claim"
+_LOOKUP_ABSENCE = "cannot show that no rejected option covers this claim"
+_SKILL_SENTINEL = "<<FORMAT SPEC SENTINEL>>"
 
-    surface = _flat(mcp_server.surface_decisions.__doc__)
-    query = _flat(mcp_server.query_decisions.__doc__)
-    assert ("`weak` or `none` means no settled precedent on this claim — treat it as "
-            "no-precedent and decide, or call list_decisions(scope=...) for a certain "
-            "check") in surface
-    assert "its `confidence` says whether precedent exists" in query
-    assert WEAK_MEANING not in surface and WEAK_MEANING not in query
+
+def test_the_ranked_descriptions_say_what_the_notes_say_a_band_means():
+    """Inverted by 6c from `test_the_ranked_descriptions_still_carry_their_pre_6c_band_sentences`.
+
+    6b rewrote the notes (`WEAK_MEANING`, the absence clause) and pinned the two
+    descriptions' old band sentences, so that 6c had to invert that row on purpose
+    rather than drift past it (constraint 12). 6c rewrote them: each description now
+    carries the constant's text and the absence clause's phrase, and none of the old
+    verdict sentences survives. The constant is imported, so re-wording it reds here."""
+    from test_description_budget import _descriptions, _flat
+
+    for register in ("surface", "query"):
+        assert _ABSENCE in absence_clause(register=register, surface="mcp",
+                                          config=None, scope=None), register
+    descriptions = _descriptions()
+    for tool in ("surface_decisions", "query_decisions"):
+        desc = _flat(descriptions[tool])
+        assert WEAK_MEANING in desc, tool
+        assert _ABSENCE in desc, tool
+        for old in ("`weak` or `none` means no settled precedent",
+                    "treat it as no-precedent",
+                    "is the verdict on whether precedent exists",
+                    "says whether precedent exists"):
+            assert old not in desc, (tool, old)
+
+
+def _skill_line(prefix):
+    """The one skill line starting with `prefix`, checked to sit after the spec."""
+    from mitos import cli
+    body = cli._skill_md_text(_SKILL_SENTINEL)
+    line = next(l for l in body.splitlines() if l.startswith(prefix))
+    assert body.index(_SKILL_SENTINEL) < body.index(line), prefix
+    return line
+
+
+def test_the_skill_surface_bullet_teaches_the_band_the_absence_read_and_the_phrasing():
+    from test_description_budget import _TEACHING
+
+    line = _skill_line("- `surface_decisions`")
+    for phrase in (_TEACHING, WEAK_MEANING, _ABSENCE, "`top_cluster` above 1",
+                   "`list_decisions(scope=…)`",
+                   "`list_decisions(scope=…, oneline=True)` for one line per decision"):
+        assert phrase in line, phrase
+
+
+def test_the_skill_query_bullet_and_capture_trigger_read_no_absence_from_a_ranking():
+    line = _skill_line("- `query_decisions`")
+    assert "`surface_decisions` answers that one" not in line
+    assert "rates this ranking" in line
+    assert "keeps each decision's `rejected_paths`" in line
+    assert _LOOKUP_ABSENCE in line
+    assert _LOOKUP_ABSENCE in absence_clause(register="lookup", surface="mcp",
+                                             config=None, scope=None)
+    capture = _skill_line("Skip the local")
+    assert "if nothing is there" not in capture
+    assert "if no hit answers it" in capture
+
+
+def _verb_help(verb):
+    """(the `mitos --help` one-liner, the flat description + epilog) of one verb."""
+    from mitos import cli
+    from test_cli_selector import _subparsers
+    parser = cli._build_parser()
+    one_line = next(a.help for a in parser._subparsers._group_actions[0]._choices_actions
+                    if a.dest == verb)
+    sub = _subparsers(parser)[verb]
+    return one_line, " ".join(((sub.description or "") + " " + (sub.epilog or "")).split())
+
+
+def test_the_surface_help_line_reads_the_band_as_the_ranking():
+    """The one-liner names its sibling verb in the `list --scope` form `--scope`'s own
+    help uses: a full `mitos list` here would teach a selectorless command."""
+    line, _ = _verb_help("surface")
+    assert "rates whether precedent exists" not in line
+    assert "rates this ranking" in line and "`list --scope`" in line
+    assert "mitos list" not in line
+
+
+@pytest.mark.parametrize("verb", ["surface", "query"])
+def test_the_ranked_verbs_help_carries_the_band_the_note_and_the_teaching(verb):
+    from test_description_budget import _TEACHING
+
+    assert _ABSENCE in absence_clause(register=verb, surface="cli", config=None, scope=None)
+    _, text = _verb_help(verb)
+    for phrase in (_TEACHING, "band_evidence", WEAK_MEANING, _ABSENCE,
+                   "with --oneline for one line per decision"):
+        assert phrase in text, (verb, phrase)
+    assert text.count("mitos list") >= 1
+    assert text.count("mitos list") == text.count("mitos list -p <project> --scope <scope>"), verb
+
+
+def test_the_query_epilog_names_both_absence_reads():
+    """`mitos query` serves two registers: a decision lookup reads the scope with
+    `--oneline`; after `--field rejected_paths` the read keeps the field, so it is
+    the whole-depth one (both cheaper tiers drop `rejected_paths`)."""
+    _, text = _verb_help("query")
+    assert "with --oneline for one line per decision" in text
+    assert _LOOKUP_ABSENCE in text
+    assert "without --oneline or --brief" in text
+    assert "keeps each decision's rejected_paths" in text

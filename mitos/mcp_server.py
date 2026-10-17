@@ -886,17 +886,18 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
     """Surface active precedents for a CLAIM before you decide — the recall loop, use first.
 
     The broad "is there a settled decision near this?" scan: a ranked, capped (top
-    few) semantic match — and its `confidence` is the verdict on whether precedent
-    exists. Reach for this when deciding something; reach for query_decisions to
-    look up a SPECIFIC slug or claim (its band rates that ranking, not the corpus),
-    and list_decisions for the EXHAUSTIVE set in a scope. Every hit carries its full
+    few) semantic match. Reach for this when deciding something; reach for
+    query_decisions to look up a SPECIFIC slug or claim, and list_decisions for the
+    EXHAUSTIVE set in a scope. Every hit carries its full
     `rejected_paths` — why alternatives were ruled out, the field that actually
     stops relitigation — unless you pass `brief=True` or `full_top`. Closing the loop: after you
     decide, `record_decision` the outcome so the next agent inherits it instead of
     relitigating.
 
     Args:
-        query: The semantic claim or topic string (e.g. 'cache strategy').
+        query: The semantic claim or topic string (e.g. 'cache strategy'). Phrase it
+            by the mechanism and subject, not by the conclusion you are about to
+            reach: phrasing moves the score.
         project: Which project this call is about — REQUIRED on every call: a
             registered project name (e.g. 'mitos') or the absolute path of a
             workspace. Call `list_projects()` if you do not know the names.
@@ -929,11 +930,14 @@ def surface_decisions(query: str, scope: Optional[str] = None, brief: bool = Fal
         apply, even on a brief scan; `stamps_unread` marks an answer whose stamps
         could not be read) — chase those before treating its axiom as
         the current mechanism. Also includes `confidence` (`strong`/`weak`/`none` when
-        semantic ranking ran) and a `note`: `weak` or `none` means no settled precedent
-        on this claim — treat it as no-precedent and decide, or call
-        list_decisions(scope=...) for a certain check (don't read weak neighbours as a
-        settled decision). Retired decisions the ranking passed come as
-        `retired_partition` handles (slug, id, state, score, the successor stamps, and
+        semantic ranking ran), which rates this ranking on both verbs: under `weak`, a
+        score in this band does not tell the answer from a neighbour, so read the
+        hits; `none` is the lowest band. `band_evidence` (`top_score`, `top_cluster`,
+        `edge`, `next_score`) is what the band read; a `top_cluster` above 1 means the
+        order inside it does not say which hit answers. A ranking cannot show that
+        nothing covers this claim; list_decisions(scope=...) can. Retired decisions the
+        ranking passed come as `retired_partition` handles (slug, id, state, score,
+        the successor stamps, and
         `live_end` where the successor is itself retired), at most `limit`, closest
         first, `retired_partition_omitted` counting the rest; read one whole by its id
         with show_node. When every precedent the ranking retrieved is retired (a
@@ -1408,9 +1412,9 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
     you're carrying). A slug in hand is a dereference: call show_node with it
     first — it answers for superseded nodes too, where this verb's slug branch
     sees the active view only. For the broad "is there precedent near this?" scan before
-    deciding, use surface_decisions — its `confidence` says whether precedent
-    exists, where this verb's rates only the ranking; for the EXHAUSTIVE set in a
-    scope, list_decisions. If query matches a unique slug exactly, returns that one
+    deciding, use surface_decisions. On both verbs `confidence` rates this ranking,
+    never whether precedent exists; for the EXHAUSTIVE set in a scope,
+    list_decisions. If query matches a unique slug exactly, returns that one
     decision in full (active view only — to dereference an EXACT handle including
     a superseded node, use show_node); otherwise a ranked semantic search for the
     claim. Once you decide, `record_decision` the outcome so the next agent
@@ -1418,6 +1422,11 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
 
     Args:
         query: Unique decision slug identifier OR a semantic claim search query.
+            Phrase it by the mechanism and subject, not by the conclusion you are
+            about to reach: phrasing moves the score.
+        project: Which project this call is about — REQUIRED on every call: a
+            registered project name (e.g. 'mitos') or the absolute path of a
+            workspace. Call `list_projects()` if you do not know the names.
         depth: The retrieval depth (e.g. 'letter'). v0.1 enforces Letter mode.
         brief: An existence screen over the ranked matches, to dereference from
             by slug: if True, they omit `rejected_paths` (an exact-slug hit is
@@ -1428,9 +1437,6 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
         full_top: Keep `rejected_paths` on ranked matches 1..N only; lower ranks
             are axiom-only. Default: all whole. `full_top=0` is `brief=True`;
             passing both is refused. An exact-slug hit is always whole.
-        project: Which project this call is about — REQUIRED on every call: a
-            registered project name (e.g. 'mitos') or the absolute path of a
-            workspace. Call `list_projects()` if you do not know the names.
         field: Set to "rejected_paths" (its one value) to ask "was this rejected,
             and by what?": the rejection index is searched alone. `limit` then
             counts rejected options, `full_top` counts their decisions, and a slug
@@ -1447,8 +1453,10 @@ def query_decisions(query: str, depth: str = "letter", brief: bool = False, limi
         `retired_partition_omitted` counting the rest; show_node reads one by its
         id. When every retrieved precedent is retired (a blackout), `matches` stays
         empty and `all_superseded` carries the same handles — settled before, not a
-        true miss. An
-        exact-slug hit's `mechanisms` is the folded identity form the graph
+        true miss. `band_evidence` is surface_decisions' object; under `weak`, a
+        score in this band does not tell the answer from a neighbour. A ranking
+        cannot show that nothing covers this claim; list_decisions(scope=...) can.
+        An exact-slug hit's `mechanisms` is the folded identity form the graph
         stores; no by-handle read returns transcripts (they stay in
         `decisions.md`), graph-primary provenance (`source`, `created_at`,
         `confirmed_by`/`confirmed_at`) or outgoing edges. A ranked or degraded answer

@@ -107,7 +107,7 @@ from mitos.degraded import (DumpSection, dump_section, lexical_envelope,
                              lexical_rejection_envelope, scope_dump)
 from mitos.lexical import degraded_reason_from_error
 from mitos.recall import (OVERRIDE_BLACKOUT, OVERRIDE_UNBUILT, RANKED_EDGE_MARGIN,
-                          RANKED_TOP_CLUSTER_MARGIN, RetiredPartition,
+                          RANKED_TOP_CLUSTER_MARGIN, RetiredPartition, WEAK_MEANING,
                           compose_ranked, corpus_provenance, missing_graph_is_a_gap,
                           missing_index_is_a_gap,
                           missing_rejection_index_is_a_gap,
@@ -565,8 +565,8 @@ def _skill_md_text(format_spec_content: str) -> str:
         "## Recording & recall — MCP tools (preferred) or CLI fallback\n"
         "If the Mitos MCP server is wired into your agent, call these tools directly — best experience: structured args, no shell-quoting. If it is NOT wired, each maps to a CLI verb (and the CLI also accepts five of the long names as aliases, e.g. `mitos record_decision -p .`):\n"
         "- `record_decision`  (CLI: `mitos record -p .`) — the moment you commit to a foundational choice (a schema, a library, a pattern, a path you're abandoning), persist it WITH the alternatives you rejected and why, so future sessions inherit it instead of relitigating. Write `rejected_paths` one rejected option per line, as `(N) <option>: REJECTED — <reason>`, so each option is found and shown on its own; the comma prose of the format spec's sample above still parses, as one option. Recording rich prose via the CLI? Use `--axiom-file -` / `--rejected-file -` / `--context-file -` to read from stdin and avoid shell-quoting.\n"
-        "- `surface_decisions` (CLI: `mitos surface -p .`) — surface active precedents for a claim/scope BEFORE you decide, so you don't relitigate a settled call. This is the recall loop — use it first. Every hit carries its full `rejected_paths` by default. `brief=True` (CLI `--brief`) is an existence screen: scan the axioms, then read the hits that matter whole with `show_node`. `full_top=N` (CLI `--full-top N`) keeps the reasoning on the top N ranks only. If an answer carries `rejection_matches`, read them before you propose: each is an option a decision already rejected for its own question, with that decision's reason — weigh whether the reason carries over.\n"
-        "- `query_decisions`   (CLI: `mitos query -p .`) — the TARGETED lookup of a pointed claim. On the tool an exact slug returns that decision whole; on the CLI, read a slug with `mitos show -p . -- <slug>`. Its confidence band rates how well the ranking matched what you named, not whether precedent exists — `surface_decisions` answers that one. Before you propose an option, ask whether it was already rejected: `field=\"rejected_paths\"` (CLI `--field rejected_paths`) ranks the rejected options alone, each with its decision's reason.\n"
+        f"- `surface_decisions` (CLI: `mitos surface -p .`) — surface active precedents for a claim/scope BEFORE you decide, so you don't relitigate a settled call. This is the recall loop — use it first. Every hit carries its full `rejected_paths` by default. `brief=True` (CLI `--brief`) is an existence screen: scan the axioms, then read the hits that matter whole with `show_node`. `full_top=N` (CLI `--full-top N`) keeps the reasoning on the top N ranks only. If an answer carries `rejection_matches`, read them before you propose: each is an option a decision already rejected for its own question, with that decision's reason — weigh whether the reason carries over. Phrase the query by the mechanism and subject, not by the conclusion you are about to reach: phrasing moves the score. Its `confidence` rates this ranking: under `weak`, {WEAK_MEANING}, so read the hits; a `top_cluster` above 1 in `band_evidence` means the order inside it does not say which one answers. A ranking cannot show that nothing covers this claim: read the scope whole with `list_decisions(scope=…)`, or `list_decisions(scope=…, oneline=True)` for one line per decision.\n"
+        "- `query_decisions`   (CLI: `mitos query -p .`) — the TARGETED lookup of a pointed claim. On the tool an exact slug returns that decision whole; on the CLI, read a slug with `mitos show -p . -- <slug>`. Its confidence band rates this ranking, as `surface_decisions`' does; for the precedent question, ask `surface_decisions` with the claim you are about to commit to. Before you propose an option, ask whether it was already rejected: `field=\"rejected_paths\"` (CLI `--field rejected_paths`) ranks the rejected options alone, each with its decision's reason. That ranking cannot show that no rejected option covers this claim; `list_decisions(scope=…)` keeps each decision's `rejected_paths`.\n"
         "- `list_decisions`    (CLI: `mitos list -p .`) — the EXHAUSTIVE recall path. surface/query are semantic and capped at the top few matches; this returns EVERY decision in a scope, deterministically, so a completeness pass or audit doesn't miss anything below the relevance cliff. Needs no key or Qdrant.\n"
         "- `list_scopes`       (CLI: `mitos scopes -p .`) — the scope vocabulary with a count per tag. Read it before a scope-filtered read, or before tagging a new decision, so you reuse a tag that exists instead of minting a near-duplicate.\n"
         "- `show_node`         (CLI: `mitos show -p . -- <slug>`) — dereference one exact handle (slug or id) to its stored fields, including a node that has been superseded; transcripts, provenance and outgoing edges are left out.\n"
@@ -580,7 +580,7 @@ def _skill_md_text(format_spec_content: str) -> str:
         "- is structural or costly to reverse, or\n"
         "- reverses or supersedes a prior decision, or\n"
         "- has cross-cutting blast radius (touches many areas).\n"
-        "Skip the local, easily-reversible, or already-settled choice. A quick self-test at any fork: *would the next agent waste time re-deriving or re-litigating this?* If yes, record it. When unsure, `surface_decisions` first — if nothing is there and it clears the bar, record it.\n\n"
+        "Skip the local, easily-reversible, or already-settled choice. A quick self-test at any fork: *would the next agent waste time re-deriving or re-litigating this?* If yes, record it. When unsure, `surface_decisions` first — if no hit answers it and it clears the bar, record it.\n\n"
         "## Linking decisions\n"
         "When a decision relates to an existing one, pass that one's EXACT slug to the matching relation arg so the graph stays connected instead of accumulating silent tension: `supersedes` (replaces it), `amends`, `narrows`, `depends_on`, `resolves`, `contradicts`, `cites`. On `record_decision` these are args; on the CLI they are flags (`--supersedes`, `--depends-on`, …). Look the target up first to get its exact slug.\n"
     )
@@ -8805,6 +8805,15 @@ _BRIEF_HELP = ("An existence screen: axiom-only hits (no rejected_paths) to scan
                "read the ones that matter whole with `show`.")
 _FULL_TOP_HELP = ("Keep rejected_paths on the top N ranks only; lower ranks are axiom-only "
                   "(default: all).")
+# The ranked verbs' --help says no more about a band than its notes do (6c); the
+# weak sentence is the composer's own constant, interpolated at each epilog.
+_RANKED_HELP_DESCRIPTION = (
+    "Phrase the query by the mechanism and subject, not by the conclusion you are about "
+    "to reach: phrasing moves the score. --json carries `confidence`, which rates this "
+    "ranking, `band_evidence` (top_score, top_cluster, edge, next_score) and a note "
+    "describing the ranking's shape.")
+_RANKED_HELP_ABSENCE = ("A ranking cannot show that nothing covers this claim; the exhaustive "
+                        "read can: mitos list -p <project> --scope <scope>")
 
 
 def _non_negative_int(value: str) -> int:
@@ -9048,7 +9057,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # query (alias: query_decisions — MCP tool name)
     q_p = subparsers.add_parser("query", aliases=["query_decisions"],
-                                help="Targeted lookup of a pointed claim; `--field rejected_paths` ranks rejected options alone (its confidence rates the ranking, not the corpus).")
+                                help="Targeted lookup of a pointed claim; `--field rejected_paths` ranks rejected options alone (its confidence rates the ranking, not the corpus).",
+                                description=_RANKED_HELP_DESCRIPTION,
+                                epilog=(f"Under weak, {WEAK_MEANING}. {_RANKED_HELP_ABSENCE}, "
+                                        "with --oneline for one line per decision. After "
+                                        "--field rejected_paths, that ranking cannot show that "
+                                        "no rejected option covers this claim; read the same "
+                                        "scope without --oneline or --brief, which keeps each "
+                                        "decision's rejected_paths."))
     q_p.add_argument("claim", help="Assertion or subsystem query.")
     q_p.add_argument("--depth", default="letter", help="Depth (default: letter).")
     q_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON.")
@@ -9064,7 +9080,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # surface (alias: surface_decisions — MCP tool name) — the precedent-recall loop
     surf_p = subparsers.add_parser("surface", aliases=["surface_decisions"],
-                                   help="Surface active decisions relevant to a query (precedent check before deciding — its confidence rates whether precedent exists).")
+                                   help="Surface active decisions relevant to a claim (the precedent check before deciding; its confidence rates this ranking, and `list --scope` is what shows an absence).",
+                                   description=_RANKED_HELP_DESCRIPTION,
+                                   epilog=(f"Under weak, {WEAK_MEANING}: read the hits. "
+                                           f"{_RANKED_HELP_ABSENCE}, or the same with "
+                                           "--oneline for one line per decision."))
     surf_p.add_argument("query", help="The claim or topic to find precedents for.")
     surf_p.add_argument("--scope", default=None, help="Optional scope hint (does NOT filter semantic recall — scopes open-questions + note only). Use `list --scope` to hard-filter by scope.")
     surf_p.add_argument("--json", action="store_true", dest="as_json", help="Emit machine-readable JSON.")

@@ -206,7 +206,8 @@ def test_query_decisions_verb_choice_guidance_is_front_loaded():
 
 
 def test_query_decisions_states_the_band_axis_inside_the_head_window():
-    """The verb-choice redirect now carries WHICH QUESTION each band answers.
+    """The verb-choice redirect carries the question the band answers, which is
+    the same on both verbs: how this ranking did.
 
     A byte-count gate cannot see a trim that silently deletes the clause, so the
     content gets its own row. Asserted inside the 600-char window rather than
@@ -214,33 +215,67 @@ def test_query_decisions_states_the_band_axis_inside_the_head_window():
     later edit that moved it behind the window would leave the budget row green
     while the teaching left every truncating client.
 
-    The axis is the QUESTION each answer is a verdict on, never what the two verbs
-    retrieve — that is measured identical, and "surface returns the active set" is
-    measured false.
+    Until 6c the axis was which question each band is a verdict on, with
+    `surface_decisions`' band said to say whether precedent exists. 6b's notes
+    claim that for neither verb, so the head now says the band is verb-neutral and
+    names the exhaustive read as what shows an absence. The verbs still differ by
+    the question posed, never by what they retrieve (measured identical). The old
+    pin asserted the bare words "whether precedent exists", which the negated
+    sentence also contains, so this row asserts the negated form and the absence
+    of the old clause.
     """
     head = _flat(_descriptions()["query_decisions"][:600])
-    assert "confidence" in head and "whether precedent exists" in head, (
-        "query_decisions' description no longer says which question each recall "
-        "verb's band is a verdict on — an agent holding five matches at 0.61 is "
-        "back to guessing which verb it should have called."
+    assert "surface_decisions" in head and "list_decisions" in head
+    assert "On both verbs `confidence` rates this ranking, never whether precedent exists" in head, (
+        "query_decisions' head no longer says what the band rates — an agent "
+        "holding five matches at 0.61 is back to guessing what the band settles."
     )
+    assert "says whether precedent exists" not in head
 
 
 def test_surface_decisions_states_the_band_axis():
     """The sibling half. Its phrases are gated by the ceiling alone: the window
     this tool is under is the required-arguments one, which measures where
-    `query` and `project` end, not where this contrast sits.
+    `query` and `project` end, not where this sentence sits.
 
-    The two descriptions must not converge: neither gains a `Returns:`-block gloss
-    for the other's fields, and this one keeps the corpus-level reading of the band
-    while `query_decisions` keeps the ranking-level one.
+    Until 6c the two descriptions kept opposite readings of the band (corpus here,
+    ranking there). They now converge on the band, which rates the ranking on both
+    verbs, and stay distinct on the question posed and the register.
     """
     desc = _flat(_descriptions()["surface_decisions"])
-    assert "whether precedent exists" in desc and "confidence" in desc
-    assert "rates that ranking, not the corpus" in desc, (
-        "surface_decisions no longer contrasts its own band with query_decisions' "
-        "— the differentiator sentence was trimmed rather than extended"
+    assert ("`confidence` (`strong`/`weak`/`none` when semantic ranking ran), which "
+            "rates this ranking on both verbs") in desc
+    assert "verdict on whether precedent exists" not in desc
+    assert "rates that ranking, not the corpus" not in desc, (
+        "surface_decisions still contrasts its band with query_decisions' — the "
+        "two bands are the same arithmetic over the same kind of ranking"
     )
+
+
+# The query-phrasing teaching (vision §4.7): phrasing moves the score, so a query
+# names the mechanism and subject. Test-side, because no note carries it.
+_TEACHING = "by the mechanism and subject, not by the conclusion"
+
+
+@pytest.mark.parametrize("tool", ["surface_decisions", "query_decisions"])
+def test_both_ranked_descriptions_teach_the_query_phrasing(tool):
+    """Inside the `query:` Args entry, where a caller is when it writes the
+    string — not merely somewhere in the description."""
+    desc = _descriptions()[tool]
+    start, end = _arg_entry_span(desc, "query")
+    assert _TEACHING in _flat(desc[start:end]), tool
+
+
+@pytest.mark.parametrize("tool", ["surface_decisions", "query_decisions"])
+def test_the_ranked_descriptions_name_band_evidence(tool):
+    """`band_evidence` is named inside `Returns` on both; `surface_decisions`, the
+    one description that spells out the bands, also names its four keys."""
+    desc = _flat(_descriptions()[tool])
+    returns = desc.index("Returns:")
+    assert desc.find("band_evidence", returns) > returns, tool
+    if tool == "surface_decisions":
+        keys = "(`top_score`, `top_cluster`, `edge`, `next_score`)"
+        assert desc.find("`band_evidence` " + keys, returns) > returns
 
 
 @pytest.mark.parametrize("tool", ["surface_decisions", "query_decisions"])
