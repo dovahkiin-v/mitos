@@ -105,7 +105,7 @@ from mitos.shell_quote import shell_flag
 from mitos.tool_markup import field_values, find_tool_call_markup
 from mitos.recall import missing_graph_is_a_gap
 from mitos.rejections import (diff_rejection_index, expected_rejection_points,
-                              rejection_points)
+                              rejection_points, render_rejected_paths)
 from mitos.vector_store import (QdrantRejectionIndex, QdrantVectorStore, RejectionPoint,
                                 hash_to_uuid, partition_points)
 from mitos.renderer import MitosRenderer, OVERFLOW_HINT_WINDOW_SECONDS, summarize_overflows
@@ -2624,7 +2624,7 @@ class MitosSyncManager:
                 # is strict-deterministic; ADR sync-strict-deterministic-no-llm-enrichment).
                 print(f"\nProposed Decision: {entry.slug}")
                 print(f"  Core Axiom:  {entry.axiom}")
-                print(f"  Rejected:    {entry.rejected_paths}")
+                print(render_rejected_paths(entry.rejected_paths, "  Rejected:    "))
                 print(f"  Mechanisms:  {', '.join(entry.mechanisms)}")
                 print(f"  Scope:       {', '.join(entry.scope)}")
 
@@ -3396,7 +3396,7 @@ class MitosSyncManager:
             # only when non-empty (blind indexing KeyErrors on the common unmodified
             # candidate), so guard every optional key (mirrors 2b's own copy guard).
             if "rejected_paths" in payload:
-                print(f"       Rejected: {payload['rejected_paths']}")
+                print(render_rejected_paths(payload["rejected_paths"], "       Rejected: "))
             scope = payload.get("scope") or []
             scope_text = ", ".join(scope) if scope else "(global — no scope declared)"
             print(f"       Scope:    {scope_text}")

@@ -23,7 +23,6 @@ partial-list arm raises) in ``test_surface_confidence``.
 """
 
 import json
-import re
 from typing import Any, Dict, List
 from unittest.mock import patch
 
@@ -56,13 +55,10 @@ def _is_text(driver: str) -> bool:
 
 
 def _decisions(driver: str, resp: Any) -> List[str]:
-    """The decision slugs an answer lists. On text, the ``N. slug`` lines whose slug is
-    a decision's: a multi-line ``rejected_paths`` printed whole leaves its own
-    ``2. …`` lines at column 0 (the whole-field print 5e replaces), which
-    ``text_slugs`` would also count."""
-    if not _is_text(driver):
-        return listed(driver, resp)
-    return re.findall(r"^\d+\. ([a-z][a-z0-9-]*)(?:  \(score|$)", resp, flags=re.MULTILINE)
+    """The decision slugs an answer lists, on any encoding. On text this is 2g's
+    ``text_slugs``: since 5e a multi-line ``rejected_paths`` hangs under its label
+    (``rejections.render_rejected_paths``), so no ``2. …`` item line reaches column 0."""
+    return listed(driver, resp)
 
 
 # --------------------------------------------------------------------------- #

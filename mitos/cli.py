@@ -100,7 +100,8 @@ from mitos.conflict import (CONFLICT_OVERFETCH_LIMIT, run_conflict_check,
 from mitos.migrations import is_pre_v1a_schema
 from mitos.store import (GraphStore, MODIFIER_EDGE_KEYS, REJECTION_BACKLOG_FAILURE_TOLERANCE,
                          open_connection)
-from mitos.rejections import diff_rejection_index, expected_rejection_points, point_items
+from mitos.rejections import (diff_rejection_index, expected_rejection_points, point_items,
+                              render_rejected_item, render_rejected_paths)
 from mitos.cutover import default_aside_db_path, perform_swap, rebuild_and_gate
 from mitos.degraded import (DumpSection, dump_section, lexical_envelope,
                              lexical_rejection_envelope, scope_dump)
@@ -564,7 +565,7 @@ def _skill_md_text(format_spec_content: str) -> str:
         "Every answer echoes the corpus it acted on: `project · collection · workspace`. Read that line. Now that a call *can* reach another project, the echo is what makes a mis-aimed one visible instead of silently plausible.\n\n"
         "## Recording & recall — MCP tools (preferred) or CLI fallback\n"
         "If the Mitos MCP server is wired into your agent, call these tools directly — best experience: structured args, no shell-quoting. If it is NOT wired, each maps to a CLI verb (and the CLI also accepts five of the long names as aliases, e.g. `mitos record_decision -p .`):\n"
-        "- `record_decision`  (CLI: `mitos record -p .`) — the moment you commit to a foundational choice (a schema, a library, a pattern, a path you're abandoning), persist it WITH the alternatives you rejected and why, so future sessions inherit it instead of relitigating. Recording rich prose via the CLI? Use `--axiom-file -` / `--rejected-file -` / `--context-file -` to read from stdin and avoid shell-quoting.\n"
+        "- `record_decision`  (CLI: `mitos record -p .`) — the moment you commit to a foundational choice (a schema, a library, a pattern, a path you're abandoning), persist it WITH the alternatives you rejected and why, so future sessions inherit it instead of relitigating. Write `rejected_paths` one rejected option per line, as `(N) <option>: REJECTED — <reason>`, so each option is found and shown on its own; the comma prose of the format spec's sample above still parses, as one option. Recording rich prose via the CLI? Use `--axiom-file -` / `--rejected-file -` / `--context-file -` to read from stdin and avoid shell-quoting.\n"
         "- `surface_decisions` (CLI: `mitos surface -p .`) — surface active precedents for a claim/scope BEFORE you decide, so you don't relitigate a settled call. This is the recall loop — use it first. Every hit carries its full `rejected_paths` by default. `brief=True` (CLI `--brief`) is an existence screen: scan the axioms, then read the hits that matter whole with `show_node`. `full_top=N` (CLI `--full-top N`) keeps the reasoning on the top N ranks only. If an answer carries `rejection_matches`, read them before you propose: each is an option a decision already rejected for its own question, with that decision's reason — weigh whether the reason carries over.\n"
         "- `query_decisions`   (CLI: `mitos query -p .`) — the TARGETED lookup of a pointed claim. On the tool an exact slug returns that decision whole; on the CLI, read a slug with `mitos show -p . -- <slug>`. Its confidence band rates how well the ranking matched what you named, not whether precedent exists — `surface_decisions` answers that one. Before you propose an option, ask whether it was already rejected: `field=\"rejected_paths\"` (CLI `--field rejected_paths`) ranks the rejected options alone, each with its decision's reason.\n"
         "- `list_decisions`    (CLI: `mitos list -p .`) — the EXHAUSTIVE recall path. surface/query are semantic and capped at the top few matches; this returns EVERY decision in a scope, deterministically, so a completeness pass or audit doesn't miss anything below the relevance cliff. Needs no key or Qdrant.\n"
@@ -1293,7 +1294,7 @@ def _emit_lexical_degraded(config: MitosConfig, query: str, *, reason: str,
         if marker:
             print(f"   {marker}")
         if "rejected_paths" in d:
-            print(f"   Rejected: {d['rejected_paths']}")
+            print(render_rejected_paths(d["rejected_paths"], "   Rejected: "))
         if d["scope"]:
             print(f"   Scope:    {', '.join(d['scope'])}")
         print()
@@ -1605,7 +1606,7 @@ def cmd_query(config: MitosConfig, query_text: str, depth: str = "letter",
         if marker:
             print(f"   {marker}")
         if "rejected_paths" in d:
-            print(f"   Rejected: {d['rejected_paths']}")
+            print(render_rejected_paths(d["rejected_paths"], "   Rejected: "))
         if d["scope"]:
             print(f"   Scope:    {', '.join(d['scope'])}")
         print()
@@ -1736,20 +1737,21 @@ def _print_lexical_matches(matches: List[Dict[str, Any]]) -> None:
     """Prints rejection matches found by words, one line per matched item.
 
     Shared by the lookup's lexical answer and every degraded section: owner slug,
-    state when known, ordinal and the item verbatim, its matched terms, then, by
+    state when known, ordinal and the item verbatim (a multi-line item hangs under
+    the hit line, ``rejections.render_rejected_item``), its matched terms, then, by
     ``letter``: the owner's Letter under a ``here`` match, ``see rank N above`` for
     a ``window`` owner; then the owner's stamps marker. No score: none was computed.
     Every line is indented, so none reads as a numbered decision line.
     """
     for m in matches:
         state = f"  ({m['state']})" if "state" in m else ""
-        print(f"  {m['slug']}{state}  item {m['ordinal']}: {m['item']}")
+        print(render_rejected_item(m["item"], f"  {m['slug']}{state}  item {m['ordinal']}: "))
         if m["matched_terms"]:
             print(f"    matched: {', '.join(m['matched_terms'])}")
         if m["letter"] == "here":
             print(f"    Decided:  {m['axiom']}")
             if "rejected_paths" in m:
-                print(f"    Rejected: {m['rejected_paths']}")
+                print(render_rejected_paths(m["rejected_paths"], "    Rejected: "))
             if m["scope"]:
                 print(f"    Scope:    {', '.join(m['scope'])}")
         elif m["letter"] == "window":
@@ -1815,11 +1817,11 @@ def _print_rejection_section(section: Optional[Any]) -> None:
     The text twin of ``rejection_matches``, shared by ``mitos surface`` and ``mitos
     query`` and called on every ranked text exit (blackout, miss, empty and
     populated), after the retired partition and before the ``→`` note line, which
-    carries the section's state clause. One line per match — owner slug, state,
-    score, ordinal and the item text verbatim — then, by ``letter``: the owner's
-    Letter under a ``here`` match, ``see rank N above`` for a ``window`` owner, and
-    the successors and live end for a ``retired`` one. Prints nothing when there
-    are no matches.
+    carries the section's state clause. One hit line per match — owner slug, state,
+    score, ordinal and the item text verbatim, a multi-line item hung under it —
+    then, by ``letter``: the owner's Letter under a ``here`` match, ``see rank N
+    above`` for a ``window`` owner, and the successors and live end for a
+    ``retired`` one. Prints nothing when there are no matches.
 
     Args:
         section: The answer's ``recall.RejectionSection``, or None when the walk
@@ -1829,12 +1831,12 @@ def _print_rejection_section(section: Optional[Any]) -> None:
         return
     print("Rejected options matching this query (closest first):")
     for m in section.matches:
-        print(f"  {m['slug']}  ({m['state']}, score {m['score']:.3f})  "
-              f"item {m['ordinal']}: {m['item']}")
+        print(render_rejected_item(m["item"], f"  {m['slug']}  ({m['state']}, score "
+                                              f"{m['score']:.3f})  item {m['ordinal']}: "))
         if m["letter"] == "here":
             print(f"    Decided:  {m['axiom']}")
             if "rejected_paths" in m:
-                print(f"    Rejected: {m['rejected_paths']}")
+                print(render_rejected_paths(m["rejected_paths"], "    Rejected: "))
             if m["scope"]:
                 print(f"    Scope:    {', '.join(m['scope'])}")
         elif m["letter"] == "window":
@@ -2109,7 +2111,7 @@ def cmd_show(config: MitosConfig, ident: str, as_json: bool = False) -> None:
         
     if node["kind"] == "decision":
         print(f"Decided:      {node['core_axiom']}")
-        print(f"Rejected:     {node['rejected_paths']}")
+        print(render_rejected_paths(node["rejected_paths"], "Rejected:     "))
         print(f"Mechanisms:   {', '.join(node['mechanisms'])}")
         print(f"Scope:        {', '.join(node['scope'])}")
         if node.get("invalidates_if"):
@@ -2566,7 +2568,10 @@ def cmd_render(config: MitosConfig, scope: Optional[str] = None, render_format: 
 # The text pause's terminal preview of a neighbour's rejected_paths, in characters.
 # The axiom prints whole (it is what the author judges by); a longer rejected_paths
 # is cut here and the cut is named, with a recipe for the whole field. The --json
-# and MCP payloads carry both fields whole.
+# and MCP payloads carry both fields whole. This name is load-bearing: the source sweep
+# in tests/test_rejection_render.py finds the pause's preview (both branches, the
+# one whole-field print exempt from rejections.render_rejected_paths) by the if/elif
+# chain whose test names it, so a rename reds that row on purpose.
 _PAUSE_REJECTED_PREVIEW = 80
 
 
@@ -3354,7 +3359,7 @@ def cmd_surface(config: MitosConfig, query: str, scope: Optional[str] = None,
         if marker:
             print(f"   {marker}")
         if "rejected_paths" in d:
-            print(f"   Rejected: {d['rejected_paths']}")
+            print(render_rejected_paths(d["rejected_paths"], "   Rejected: "))
         if d["scope"]:
             print(f"   Scope:    {', '.join(d['scope'])}")
         print()
@@ -6921,7 +6926,7 @@ def _print_check_finding_side(node: Dict[str, Any]) -> None:
     print(f"      Scope:    {scope_text}")
     rejected = node.get("rejected_paths")
     if rejected:
-        print(f"      Rejected: {rejected}")
+        print(render_rejected_paths(rejected, "      Rejected: "))
     for key in _CHECK_MODIFIER_STAMP_KEYS:
         if key in node:
             print(f"      ({key.replace('_', ' ')}: {', '.join(node[key])})")
@@ -8018,7 +8023,7 @@ def _print_staged_finding(entry: ParsedEntry, finding: "Any") -> None:
     scope_text = ", ".join(entry.scope) if entry.scope else "(global — no scope declared)"
     print(f"      Scope:    {scope_text}")
     if entry.rejected_paths:
-        print(f"      Rejected: {entry.rejected_paths}")
+        print(render_rejected_paths(entry.rejected_paths, "      Rejected: "))
     payload = finding.payload
     print(f"  conflicts with active decision '{payload['slug']}'   "
           f"(similarity {payload['score']:.2f}):")
@@ -8027,7 +8032,7 @@ def _print_staged_finding(entry: ParsedEntry, finding: "Any") -> None:
     p_scope_text = ", ".join(p_scope) if p_scope else "(global — no scope declared)"
     print(f"      Scope:    {p_scope_text}")
     if "rejected_paths" in payload:
-        print(f"      Rejected: {payload['rejected_paths']}")
+        print(render_rejected_paths(payload["rejected_paths"], "      Rejected: "))
     for key in _CHECK_MODIFIER_STAMP_KEYS:
         if key in payload:
             print(f"      ({key.replace('_', ' ')}: {', '.join(payload[key])})")

@@ -32,8 +32,10 @@ The contracts consumers rely on:
   so ``"".join(i.text for i in items) == field``. Text before the first marker
   belongs to item 1; whitespace between items belongs to the earlier item. So
   ``item.text`` carries the inter-item separator (item 1 of ``(1) A⏎(2) B`` ends with
-  ``"\\n"``), and a renderer prints ``item.text.rstrip()``. ``item.text`` is the
-  verbatim slice and never changes; the markdown stays as authored (M7/P6).
+  ``"\\n"``), and a match carries ``item.text.rstrip()``. ``item.text`` is the
+  verbatim slice and never changes; the markdown stays as authored (M7/P6). The
+  CLI's text prints lay a whole field out through :func:`render_rejected_paths`,
+  one item per line, which strips only whitespace at line ends and blank edge lines.
 * **Parts.** Every part is non-empty, fits in :data:`ITEM_PART_BOUND_BYTES` UTF-8
   bytes, and is a fixpoint of ``identity.canonical_core_string_norm``. Joined, the
   parts' non-whitespace characters equal the identity text's.
@@ -470,6 +472,78 @@ def enumerate_rejected_paths(field: str) -> Enumeration:
                 items.append(_make_item(k + 1, field, start, end, body))
             return Enumeration(shape=shape, items=items)
     return Enumeration(shape="prose", items=[_make_item(1, field, 0, len(field), field)])
+
+
+def _item_lines(text: str) -> List[str]:
+    """Splits one item's verbatim text into its printed lines.
+
+    Splits on ``"\\n"`` only, never ``str.splitlines()``, so ``\\v``, ``\\f``,
+    ``\\x85`` and U+2028/U+2029 stay inside a line, as the grammar reads them. Each
+    line is rstripped (which drops a CRLF's ``"\\r"``), and blank lines at the item's
+    edges are dropped. Blank lines inside it and each kept line's own leading
+    whitespace stay, because that indentation is the author's, not a separator.
+    """
+    lines = [line.rstrip() for line in text.split("\n")]
+    start, end = 0, len(lines)
+    while start < end and not lines[start]:
+        start += 1
+    while end > start and not lines[end - 1]:
+        end -= 1
+    return lines[start:end]
+
+
+def _hang(prefix: str, lines: List[str]) -> str:
+    """Joins lines under a prefix, every later non-empty line indented to its width."""
+    if not lines:
+        return prefix
+    indent = " " * len(prefix)
+    return "\n".join([prefix + lines[0]] + [indent + line if line else "" for line in lines[1:]])
+
+
+def render_rejected_paths(field: str, prefix: str) -> str:
+    """Lays out a stored ``rejected_paths`` for a terminal, one item per line.
+
+    The one layout rule for every CLI text print of a decision's whole field (a
+    source sweep in ``tests/test_rejection_render.py`` holds every such print site
+    to it). Every item of :func:`enumerate_rejected_paths` starts a new line, so a
+    parsed field prints one option per line and a prose field, which is one item,
+    prints verbatim. Nothing is re-split, reflowed or rewritten: each item keeps its
+    own marker and its own line breaks, and only whitespace at line ends and blank
+    edge lines move. Every line after the first is indented to ``len(prefix)``
+    (code points; every label today is ASCII), so no continuation line lands at
+    column 0, where it would read as a numbered decision row. JSON, MCP and the
+    rendered files never pass through this: they keep the stored string.
+
+    Args:
+        field: The raw ``rejected_paths`` text, exactly as stored.
+        prefix: The call site's label, e.g. ``"   Rejected: "``.
+
+    Returns:
+        The block, with no trailing newline: ``prefix`` alone for a field with no
+        non-whitespace character, and ``prefix + field`` for a one-line, one-item
+        field with no trailing whitespace.
+    """
+    lines: List[str] = []
+    for item in enumerate_rejected_paths(field).items:
+        lines.extend(_item_lines(item.text))
+    return _hang(prefix, lines)
+
+
+def render_rejected_item(item: str, prefix: str) -> str:
+    """Lays out one matched item's text under a prefix, by the same rule.
+
+    A rejection match prints its item on the hit line; a multi-line item (a
+    preamble, a paragraph break) hangs under the prefix exactly as
+    :func:`render_rejected_paths` hangs a whole field's lines.
+
+    Args:
+        item: One item's text, e.g. a match's ``item`` (``RejectedItem.text.rstrip()``).
+        prefix: The hit line up to the item.
+
+    Returns:
+        The block, with no trailing newline.
+    """
+    return _hang(prefix, _item_lines(item))
 
 
 def _check_owner(owner_id: str) -> None:
