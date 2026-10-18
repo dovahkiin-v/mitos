@@ -150,6 +150,7 @@ def test_the_retired_partition_printer_keeps_an_empty_live_end():
     with redirect_stdout(out):
         cli._print_retired_partition([h for _, h, _ in TABLE], 0)
     lines = [ln for ln in out.getvalue().splitlines() if ln.startswith("  t")]
+    assert len(lines) == len(TABLE), lines                       # zip would hide a drop
     for (case, handle, _), line in zip(TABLE, lines):
         for key in _KEYS:
             if key in handle:
