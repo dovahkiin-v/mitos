@@ -56,13 +56,13 @@ The same steps by hand — full detail in **[SETUP.md](SETUP.md)**:
 
 ## How it runs
 
-Mitos is **per-project** — each project gets its own decision graph and its own Qdrant collection. Day to day, three verbs carry the loop (as MCP tools for agents, with identical CLI twins):
+Mitos is **per-project** — each project gets its own decision graph and its own Qdrant collection. Day to day, three verbs carry the loop (as MCP tools for agents, with CLI twins):
 
 | Verb | When |
 |---|---|
 | `surface_decisions` (`mitos surface`) | *Before* deciding — is there precedent? Every hit carries the alternatives that were already rejected and why. |
 | `record_decision` (`mitos record`) | The moment something is settled — the decision, the rejected paths, and how it relates to prior decisions (supersedes, amends, …). |
-| `query_decisions` (`mitos query`) | Looking something up — by meaning or by exact handle. |
+| `query_decisions` (`mitos query`) | Looking something up by meaning (the MCP tool also by exact handle), or searching only the rejected options. |
 
 A few properties worth knowing:
 
