@@ -1039,9 +1039,10 @@ _NEIGHBOR_REVIEW_THRESHOLD = 0.80
 # abandoned (vision §4.9). It separates a re-tread of a retired decision from proximity to
 # a retired family. Its own constant, never an alias of the live floor above: the two share
 # a space and a population of vectors but not a class boundary, so either may move without
-# the other (§6.3). Recall first: at or below every measured re-tread, never above the live
-# floor's start, and raised only by its cry-wolf ceiling (a ratio of 2.0 on the copy's
-# replay), which it is. Rule, runs and ceiling: tests/golden/calibration/record.json.
+# the other (§6.3). Its recall rule would place it at or below every measured re-tread and
+# never above the live floor's start; its cry-wolf ceiling then raised it, past the lowest
+# labelled re-tread, which therefore no longer pauses (the stated trade, filed on the
+# ROADMAP with its re-read triggers). Rule, runs and ceiling: tests/golden/calibration/record.json.
 _TOMBSTONE_FLOOR = 0.8265
 
 # The relations the pause offers for resolving a flagged neighbour — a fourth

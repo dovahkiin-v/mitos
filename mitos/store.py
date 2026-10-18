@@ -1360,7 +1360,8 @@ class GraphStore:
         walk every hit of their over-fetched call on it and then hydrate only what
         the answer shows with :meth:`resolve_point_ids` (ADR
         ``ranked-walk-resolves-every-hit-whole-light-resolver-unbuilt-until-core-p95-passes-40ms``,
-        whose trigger 5a's rejection leg fired).
+        whose trigger 5a's rejection leg fired; superseded by
+        ``ranked-reads-resolve-light-since-the-rejection-leg-fired-the-40ms-trigger-the-gather-stays-whole``).
 
         Args:
             point_ids: Point ids exactly as ``VectorStore.query`` returned them.

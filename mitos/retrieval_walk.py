@@ -123,7 +123,8 @@ from mitos.errors import CollectionMissingError, DatabaseError, VectorStoreError
 # `over-fetch-bound-covers-measured-burial-horizon-and-a-real-corpus-cut-builds-the-active-hint`).
 #
 # The light resolver (ADR
-# `ranked-walk-resolves-every-hit-whole-light-resolver-unbuilt-until-core-p95-passes-40ms`)
+# `ranked-walk-resolves-every-hit-whole-light-resolver-unbuilt-until-core-p95-passes-40ms`,
+# superseded by `ranked-reads-resolve-light-since-the-rejection-leg-fired-the-40ms-trigger-the-gather-stays-whole`)
 # is built since 5a: the rejection leg took the ranked read's core p95 past the 40 ms
 # trigger at the horizon (with the leg, whole resolve: 42.8 / 41.7 ms on timing, run
 # `20261017-0552-2523a7a-timing-rejection-search`, dirty tree). The ranked reads pass
@@ -761,7 +762,7 @@ def walk_ranked(vector: List[float], *, vector_store: Any, graph: Any, limit: in
             state), then hydrate only what the answer shows — the window, the edge,
             ``passed[:limit]`` and the leg's owners — in one ``resolve_point_ids``
             (the ranked reads; ADR
-            ``ranked-walk-resolves-every-hit-whole-light-resolver-unbuilt-until-core-p95-passes-40ms``).
+            ``ranked-reads-resolve-light-since-the-rejection-leg-fired-the-40ms-trigger-the-gather-stays-whole``).
             False keeps the one whole resolve: the gather, which consumes every
             retired node it passed. On a light walk ``retired`` beyond
             ``passed[:limit]`` holds light nodes.
