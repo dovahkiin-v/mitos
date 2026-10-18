@@ -1841,13 +1841,13 @@ def record_decision(axiom: str, rejected_paths: str, scope: List[str], slug: str
         rejected_paths, scope, score and modifier stamps (if you go on to
         supersede or amend a neighbour, an amended_by/narrowed_by stamp on it
         means it has moved on — dereference that slug before linking).
-        Judge each, then re-record with that judgment: a relation arg
+        Judge each, then re-record: a relation arg
         (amends/narrows/supersedes/corrects/contradicts/cites) pointing at any
         neighbour this decision genuinely relates to, acknowledge_neighbors=True
         for neighbours that stand independently — or both at once for a mixed set.
         A pause may list `tombstones`: retired decisions near the draft, each
         naming its live successor; a relation to that (a reversal supersedes it)
-        or acknowledgement clears one, only the latter if successor_ambiguous.
+        or acknowledgement clears one; successor_ambiguous: a successor's slug is refused.
         A "created"
         result MAY carry `neighbor_review_unavailable` (the near-dup review could
         not run; absent neighbours are not checked-clean). A pause or a

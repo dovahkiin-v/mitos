@@ -643,7 +643,10 @@ def test_a_retired_lineage_ancestor_of_an_amends_target_is_never_a_tombstone(ws)
 
 # -- Row 4: the same-slug successor ------------------------------------------------------
 
-def test_a_same_slug_successor_says_acknowledgement_only(ws):
+def test_a_same_slug_successor_says_acknowledgement_clears_it(ws):
+    """9b (D5), inverted from ``…says_acknowledgement_only``: the message names the
+    refused target and acknowledgement, and no longer says "only" (see the row below:
+    a relation to a decision descended from the successor clears it too)."""
     config, m = ws
     from test_point_identity import same_slug_lineage
     retired, _successor = same_slug_lineage(m.store)
@@ -652,7 +655,53 @@ def test_a_same_slug_successor_says_acknowledgement_only(ws):
     assert res["status"] == "needs_review"
     (t,) = res["tombstones"]
     assert t["id"] == retired and t["successor_ambiguous"] is True
-    assert "successor_ambiguous clears only with acknowledge_neighbors=True" in res["message"]
+    assert "clears only" not in res["message"]
+    assert ("successor_ambiguous has a successor whose slug two decisions carry, a "
+            "relation target record_decision refuses; acknowledge_neighbors=True clears "
+            "it") in res["message"]
+
+
+@pytest.mark.parametrize("how", ["supersedes", "corrects"])
+def test_9b_an_ambiguous_tombstone_clears_through_a_decision_descended_from_its_successor(
+        ws, how):
+    """9b (D5): the prose's "only by acknowledgement" was false for one successor. T and
+    its successor S share a slug (S kills T by ``how``), and W amends S. A draft that
+    ``amends`` W declares W's lineage, which holds S, and S sits on T's kill chain, so T
+    is exempt and the draft lands without acknowledgement. W is committed through the
+    store, as ``mitos sync`` commits a markdown ``**Amends:** database`` (the edge
+    resolves to the live bearer); ``record_decision`` itself refuses that slug."""
+    config, m = ws
+    retired = _commit(m.store, "database", "We use PostgreSQL.")
+    _commit(m.store, "database", "We use SQLite for local WAL reads.", **{how: ["database"]})
+    _commit(m.store, "wal-tuning", "We tune the WAL for local reads.", amends=["database"])
+    _arm(m, [point_hit(retired, _HIGH)])
+    paused = _draft(m)
+    assert paused["status"] == "needs_review", paused
+    (t,) = paused["tombstones"]
+    assert t["id"] == retired and t["successor_ambiguous"] is True
+    landed = _draft(m, amends="wal-tuning")
+    assert landed["status"] == "created", landed
+
+
+def test_9b_a_fan_out_ambiguous_tombstone_clears_through_its_other_successor(ws):
+    """9b (D5): T has two successors (out of band): ``cache-layer``, uniquely slugged,
+    and a same-slug ``database``. The tombstone is ambiguous, yet a relation of any kind
+    to ``cache-layer`` reaches it through T's kill chain and clears it. The second kill
+    edge is inserted raw: the write path refuses a kill edge to a retired target."""
+    from test_neighbor_review import _inject_raw_edge
+    config, m = ws
+    retired = _commit(m.store, "database", "We use PostgreSQL.")
+    _commit(m.store, "database", "We use SQLite for local WAL reads.", supersedes=["database"])
+    cache = _commit(m.store, "cache-layer", "We keep a cache layer in front.")
+    _inject_raw_edge(m.store, cache, retired, "supersedes")
+    _arm(m, [point_hit(retired, _HIGH)])
+    paused = _draft(m)
+    assert paused["status"] == "needs_review", paused
+    (t,) = paused["tombstones"]
+    assert t["id"] == retired and t["successor_ambiguous"] is True
+    assert sorted(sync._live_successors(t)) == ["cache-layer", "database"]
+    landed = _draft(m, cites="cache-layer")
+    assert landed["status"] == "created", landed
 
 
 def test_an_ambiguous_fan_out_tombstone_claims_no_refusal_for_every_successor(ws):
@@ -690,9 +739,21 @@ def test_an_ambiguous_fan_out_tombstone_claims_no_refusal_for_every_successor(ws
     assert "at least one of its successors is one; --acknowledge-neighbors clears it" in text
 
     single = {**pause, "tombstones": [{**tomb, "corrected_by": []}]}
-    assert "successor_ambiguous clears only with acknowledge_neighbors=True" in \
+    # 9b (D5): the one-successor wording lost its "only" too (old: "successor_ambiguous
+    # clears only with acknowledge_neighbors=True").
+    assert "successor_ambiguous has a successor whose slug two decisions carry" in \
         sync._pause_message(single)
     assert "several successors" not in sync._pause_message(single)
+    single["message"] = sync._pause_message(single)
+    pause.update(single)  # the canned manager returns `pause`
+    err = io.StringIO()
+    with patch("mitos.cli.MitosSyncManager", _Canned), redirect_stderr(err), \
+            redirect_stdout(io.StringIO()), pytest.raises(SystemExit):
+        cmd_record(config, axiom=_DRAFT, rejected="rej", scope=["s"], slug="draft")
+    text = err.getvalue()
+    assert "only --acknowledge-neighbors" not in text
+    assert ("its successor's slug names two decisions, so a relation to it is refused; "
+            "--acknowledge-neighbors clears it") in text
 
 
 def test_a_distinct_slug_successor_carries_no_ambiguity(ws):

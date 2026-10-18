@@ -404,6 +404,7 @@ LIVE_MODULES: tuple[str, ...] = (
     "test_rejection_covering_live.py",
     "test_rejection_section_live.py",
     "test_rejection_lookup_live.py",
+    "test_mcp_recall_walk_live.py",
 )
 
 

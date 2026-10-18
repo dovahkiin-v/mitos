@@ -41,6 +41,19 @@ SDK does: an
 the matching typed fields. The fault fires in the call, never the constructor: a
 constructor raise is swallowed at the construct site, and the read would then
 report no provider at all instead of the classified cause.
+
+``MITOS_FAKE_PROVIDERS=embed`` selects the **embed-only** mode (recall-confidence 9b,
+ADR ``a-walk-across-a-covering-verb-rebinds-only-the-embedder-and-keeps-real-qdrant``):
+only ``GeminiEmbeddingProvider`` is rebound — at ``mitos.mcp_server``, ``mitos.sync``
+and ``mitos.cli`` (the check verb's site; harmless) — and both Qdrant collections stay
+real, because a covering verb (``reconcile``) runs in its own process and process-lifetime
+fakes cannot carry its state to the server. Vectors are ``mitos.models.EMBEDDING_DIM``
+wide, the width a real collection is created at. Any arguments after the script name
+pass through to ``cli.main()`` (``init``, ``record``, ``reconcile``, ``status``; none
+means ``serve``), and one identity line names the mode, ``mitos.__file__`` and
+``sys.executable``, so a row can prove the child ran this checkout through this
+interpreter. With the name absent, nothing above changes: the default bind, its
+marker and its 1024-wide vectors are today's.
 """
 
 from __future__ import annotations
@@ -58,6 +71,19 @@ FAULT_ENV = "MITOS_FAKE_EMBED_FAULT"
 
 #: Written to stderr once both sites are bound; a row reads it back.
 BOUND_MARKER = "[fake-providers] bound at mitos.mcp_server and mitos.sync"
+
+#: The environment name that selects the launcher's mode; absent means the default.
+MODE_ENV = "MITOS_FAKE_PROVIDERS"
+
+#: The one non-default mode: the embedder alone is fake, Qdrant is real.
+EMBED_MODE = "embed"
+
+#: Written to stderr once the embed-only mode has bound its sites.
+EMBED_BOUND_MARKER = ("[fake-providers] embed-only: GeminiEmbeddingProvider bound at "
+                      "mitos.mcp_server, mitos.sync and mitos.cli; Qdrant is real")
+
+#: Prefixes the embed mode's identity line: ``<marker> mode=… mitos=… python=…``.
+IDENTITY_MARKER = "[fake-providers] identity"
 
 #: Prefixes the line a fake writes when production calls something it lacks.
 UNIMPLEMENTED_MARKER = "[fake-providers] UNIMPLEMENTED"
@@ -80,24 +106,26 @@ DIMENSION = 1024
 _TOKEN = re.compile(r"[a-z0-9]+")
 
 
-def fake_vector(text: str) -> List[float]:
+def fake_vector(text: str, width: int = DIMENSION) -> List[float]:
     """Embeds text as a normalised, hashed bag of lower-cased tokens.
 
     Deterministic across processes (sha256, never ``hash()``), so the test that
     chooses fixture texts and the child that embeds them agree on every score.
     Axioms that share most of their words score high; unrelated ones score low.
+    Two processes agree only at the same ``width``: the token's bucket is its hash
+    modulo the width.
 
     Args:
         text: The text to embed.
+        width: The vector's width; the embed-only mode passes ``EMBEDDING_DIM``.
 
     Returns:
-        A unit vector of :data:`DIMENSION` floats (all zeros for a text with no
-        tokens).
+        A unit vector of ``width`` floats (all zeros for a text with no tokens).
     """
-    vector = [0.0] * DIMENSION
+    vector = [0.0] * width
     for token, count in Counter(_TOKEN.findall(text.lower())).items():
         index = int.from_bytes(hashlib.sha256(token.encode()).digest()[:4], "big")
-        vector[index % DIMENSION] += count
+        vector[index % width] += count
     norm = math.sqrt(sum(value * value for value in vector))
     return [value / norm for value in vector] if norm else vector
 
@@ -134,6 +162,7 @@ class FakeEmbeddingProvider:
                  model_id: Optional[str] = None) -> None:
         self.cache_path = cache_path
         self.model_id = model_id
+        self._width = _mode_width()
         self._fault = os.environ.get(FAULT_ENV) or None
         if self._fault is not None and self._fault not in FAULT_FIELDS:
             raise SystemExit(f"{FAULT_ENV}={self._fault!r} is not one of {sorted(FAULT_FIELDS)}")
@@ -149,7 +178,7 @@ class FakeEmbeddingProvider:
         """Returns the fake vector for ``text``, or raises the planted fault."""
         if self._fault is not None:
             self._raise_fault()
-        return fake_vector(text)
+        return fake_vector(text, self._width)
 
     def embed_documents(self, texts: Sequence[str]) -> List[List[float]]:
         """Returns one fake vector per text (uncached), or raises the planted fault."""
@@ -157,7 +186,7 @@ class FakeEmbeddingProvider:
             return []
         if self._fault is not None:
             self._raise_fault()
-        return [fake_vector(text) for text in texts]
+        return [fake_vector(text, self._width) for text in texts]
 
     def __getattr__(self, name: str) -> Any:
         if name.startswith("__"):
@@ -282,6 +311,37 @@ def fake_rejection_index(qdrant_url: str, collection_name: str) -> Any:
     return index
 
 
+def _mode() -> Optional[str]:
+    """The launcher's mode from this process's environment; refuses an unknown one."""
+    mode = os.environ.get(MODE_ENV) or None
+    if mode is not None and mode != EMBED_MODE:
+        raise SystemExit(f"{MODE_ENV}={mode!r} is not {EMBED_MODE!r} (or unset)")
+    return mode
+
+
+def _mode_width() -> int:
+    """The fake vector width the mode selects: a real collection's in embed mode."""
+    if _mode() == EMBED_MODE:
+        from mitos.models import EMBEDDING_DIM
+
+        return EMBEDDING_DIM
+    return DIMENSION
+
+
+def bind_embed_only() -> None:
+    """Rebinds ``GeminiEmbeddingProvider`` alone; the Qdrant clients stay real."""
+    import mitos
+    import mitos.cli
+    import mitos.mcp_server
+    import mitos.sync
+
+    for module in (mitos.mcp_server, mitos.sync, mitos.cli):
+        module.GeminiEmbeddingProvider = FakeEmbeddingProvider
+    print(EMBED_BOUND_MARKER, file=sys.stderr, flush=True)
+    print(f"{IDENTITY_MARKER} mode={EMBED_MODE} mitos={mitos.__file__} "
+          f"python={sys.executable}", file=sys.stderr, flush=True)
+
+
 def bind() -> None:
     """Rebinds the three constructors at their MCP-reachable construct sites."""
     import mitos.mcp_server
@@ -296,11 +356,18 @@ def bind() -> None:
 
 
 def main() -> None:
-    """Binds the fakes, then enters the ``mitos serve`` path ``-m mitos.cli`` takes."""
-    bind()
+    """Binds the fakes, then enters ``cli.main()`` as ``-m mitos.cli`` does.
+
+    With no arguments the verb is ``serve``; any arguments pass through, and the
+    exit status is ``cli.main()``'s.
+    """
+    if _mode() == EMBED_MODE:
+        bind_embed_only()
+    else:
+        bind()
     from mitos.cli import main as cli_main
 
-    sys.argv = ["mitos", "serve"]
+    sys.argv = ["mitos", *(sys.argv[1:] or ["serve"])]
     cli_main()
 
 

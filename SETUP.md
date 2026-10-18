@@ -341,11 +341,14 @@ pointing at its slug; if it is genuinely independent, re-record with
 `acknowledge_neighbors=True`. A retired decision is never a relation target, so
 for a tombstone the draft does not re-tread, relate to its live successor
 instead (a deliberate reversal is a `supersedes` of the successor), or
-acknowledge it. A tombstone marked `successor_ambiguous` clears only by
-acknowledgement: its successor's slug names two decisions, and
-`record_decision` refuses a relation target that two decisions carry. That is
-the same-slug case, a decision superseded by a new one under its own slug: the
-slug reads the live decision and the id reads the retired one. An acknowledged
+acknowledge it. A tombstone marked `successor_ambiguous` has a successor whose
+slug two decisions carry, and `record_decision` refuses that slug as a relation
+target, so acknowledge it. The usual case is the same-slug one, a decision
+superseded by a new one under its own slug: the slug reads the live decision
+and the id reads the retired one. A relation still clears it when the draft's
+declarations reach the tombstone another way: for example `amends`, `narrows` or
+`supersedes` naming a decision descended from its successor, or, for a tombstone
+with several successors, any relation to one whose slug names a single decision. An acknowledged
 write's receipt names what it went past, `acknowledged_neighbors` and
 `acknowledged_tombstones`, and a re-record identical to a retired decision
 answers `exists` naming its successors. If you go on to supersede or amend a neighbour, an

@@ -585,7 +585,11 @@ def test_record_decision_description_teaches_the_tombstone_partition():
     assert "`tombstones`: retired decisions near the draft" in desc
     assert "naming its live successor" in desc
     assert "a relation to that (a reversal supersedes it) or acknowledgement clears one" in desc
-    assert "only the latter if successor_ambiguous" in desc
+    # 9b (D5), inverted from "only the latter if successor_ambiguous": a relation to a
+    # decision descended from the successor clears an ambiguous tombstone too, so the
+    # description says only what is refused.
+    assert "only the latter" not in desc
+    assert "successor_ambiguous: a successor's slug is refused" in desc
     assert "On a retired decision it names its successors; relate to those, not its slug" in desc
     assert "a neighbour or tombstone may lie past it" in desc
     # The runtime message carries the tombstone floor; the description quotes none.
@@ -607,7 +611,13 @@ def test_setup_md_pause_passage_names_both_floors_and_the_successor_rule():
     assert f"`tombstones` are retired decisions at ≥{_floor_text(_TOMBSTONE_FLOOR)}" in passage
     assert "relate to its live successor" in passage
     assert "A retired decision is never a relation target" in passage
-    assert "clears only by acknowledgement" in passage and "same-slug" in passage
+    # 9b (D5), inverted from "clears only by acknowledgement" / "That is the same-slug
+    # case": acknowledgement is one way out, the same-slug case the usual one.
+    assert "clears only by acknowledgement" not in passage
+    assert "refuses that slug as a relation target, so acknowledge it" in passage
+    assert "The usual case is the same-slug one" in passage
+    assert "naming a decision descended from its successor" in passage
+    assert "any relation to one whose slug names a single decision" in passage
     assert "`acknowledged_tombstones`" in passage
 
 
@@ -617,7 +627,11 @@ def test_skill_text_teaches_the_tombstones_and_both_acknowledged_lists():
     tail = text.split("<<SENTINEL>>", 1)[1]
     linking = tail[tail.index("## Linking decisions"):]
     assert "`acknowledged_tombstones`" in linking and "`acknowledged_neighbors`" in linking
-    assert "`successor_ambiguous` clears only by acknowledgement" in linking
+    # 9b (D5), inverted from "`successor_ambiguous` clears only by acknowledgement".
+    assert "clears only by acknowledgement" not in linking
+    assert "refuses that slug as a relation target, so acknowledge it" in linking
+    assert "naming a decision descended from its successor" in linking
+    assert "any relation to one whose slug names a single decision" in linking
     assert "same-slug supersession, where the slug reads the live decision" in linking
     assert "never to its slug" in linking and "`amend_commentary` by its id" in linking
     # The clauses the description no longer carries live here.

@@ -1705,10 +1705,11 @@ def _pause_message(payload: Dict[str, Any]) -> str:
                          "the neighbours above, so one relation to it clears both.")
         ambiguous = [t for t in tombstones if t.get("successor_ambiguous")]
         if any(len(_live_successors(t)) == 1 for t in ambiguous):
-            parts.append("A tombstone marked successor_ambiguous clears only with "
-                         "acknowledge_neighbors=True: its successor's slug names two "
-                         "decisions, and record_decision refuses a relation target that two "
-                         "decisions carry.")
+            # No "only": a mutation relation to a decision whose lineage holds the
+            # tombstone (an amendment of its successor) clears it too (9b, D5).
+            parts.append("A tombstone marked successor_ambiguous has a successor whose "
+                         "slug two decisions carry, a relation target record_decision "
+                         "refuses; acknowledge_neighbors=True clears it.")
         if any(len(_live_successors(t)) > 1 for t in ambiguous):
             # A fan-out (out-of-band only) may hold one ambiguous successor among
             # several, and the key does not say which: claim no more than that (7b's
@@ -5454,8 +5455,8 @@ class MitosSyncManager:
           ``shown_neighbors`` by casefolded slug (both sides live, and a live slug
           names its one live bearer), present only when non-empty; and
           ``successor_ambiguous: True`` when some successor's slug names several
-          nodes, by the validator's own predicate (:func:`_ambiguous_target`), so only
-          acknowledgement clears the tombstone. Present only when true.
+          nodes, by the validator's own predicate (:func:`_ambiguous_target`), so no
+          relation to that successor clears the tombstone. Present only when true.
         * **Bare** (7b, D2). ``bare=True`` makes each entry the handle alone — no axiom,
           no successor facts — and skips the per-successor slug reads with them. The
           acknowledged receipt names what a landed write went past; it does not
