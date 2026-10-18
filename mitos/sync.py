@@ -1705,8 +1705,8 @@ def _pause_message(payload: Dict[str, Any]) -> str:
                          "the neighbours above, so one relation to it clears both.")
         ambiguous = [t for t in tombstones if t.get("successor_ambiguous")]
         if any(len(_live_successors(t)) == 1 for t in ambiguous):
-            # No "only": a mutation relation to a decision whose lineage holds the
-            # tombstone (an amendment of its successor) clears it too (9b, D5).
+            # No "only": a supersedes/amends/narrows of a decision descended from the
+            # successor reaches the tombstone and clears it too (9b, D5).
             parts.append("A tombstone marked successor_ambiguous has a successor whose "
                          "slug two decisions carry, a relation target record_decision "
                          "refuses; acknowledge_neighbors=True clears it.")

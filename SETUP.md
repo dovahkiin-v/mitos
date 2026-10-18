@@ -348,8 +348,8 @@ superseded by a new one under its own slug: the slug reads the live decision
 and the id reads the retired one. A relation still clears it when the draft's
 declarations reach the tombstone another way: for example `amends`, `narrows` or
 `supersedes` naming a decision descended from its successor, or, for a tombstone
-with several successors, any relation to one whose slug names a single decision. An acknowledged
-write's receipt names what it went past, `acknowledged_neighbors` and
+with several successors, any relation to one whose slug names a single decision.
+An acknowledged write's receipt names what it went past, `acknowledged_neighbors` and
 `acknowledged_tombstones`, and a re-record identical to a retired decision
 answers `exists` naming its successors. If you go on to supersede or amend a neighbour, an
 `amended_by`/`narrowed_by` stamp on it means it has moved on — dereference that
