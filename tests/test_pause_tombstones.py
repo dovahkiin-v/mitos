@@ -192,6 +192,19 @@ def test_a_corrects_chain_clears_through_the_kill_chain_walk(store):
     assert review.shown == [] and review.cleared_by == {"x"}
 
 
+def test_9a_a_corrects_chain_clears_with_the_corrected_node_outside_the_declared_ids(store):
+    """The row above's premise, by x's own id: `.pop()` over a two-id set picks by
+    hash order, so a lineage that took in `corrects` reddened that row only in some
+    processes. With p outside x's declared ids, only the kill-chain walk can clear it."""
+    p = _commit(store, "p")
+    x = _commit(store, "x", corrects=["p"])
+    declared = _declared(store, amends="x")
+    assert _shell(store).store.get_lineage(x) == []
+    assert declared.ids_by_target["x"] == {x} and p not in declared.ids
+    review = _review(store, [(p, _ABOVE)], declared)
+    assert review.shown == [] and review.cleared_by == {"x"}
+
+
 def test_a_lineage_that_holds_the_corrector_clears(store):
     """The draft amends Y; Y amends C; C corrected P. P's chain reaches C, which is in
     Y's lineage."""
