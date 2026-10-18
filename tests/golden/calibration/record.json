@@ -247,6 +247,12 @@
       "decision_count": 29,
       "embedding_model": "gemini-embedding-2",
       "run_id": "harbor-20261018-6e6baa2"
+    },
+    {
+      "corpus": "dense",
+      "decision_count": 595,
+      "embedding_model": "gemini-embedding-2",
+      "run_id": "dense-20261018-cd6d95c"
     }
   ],
   "schema": 2
