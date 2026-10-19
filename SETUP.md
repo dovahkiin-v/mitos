@@ -1,7 +1,7 @@
 # Adding Mitos to a project
 
 Mitos is **per-project**: each project gets its own decision graph and its own
-Qdrant collection, sharing one Qdrant instance. Setting it up for a new project
+Qdrant collections, sharing one Qdrant instance. Setting it up for a new project
 takes a couple of minutes.
 
 Two commands are worth knowing before you start, because they answer different

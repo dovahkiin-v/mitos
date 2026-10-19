@@ -56,7 +56,7 @@ The same steps by hand — full detail in **[SETUP.md](SETUP.md)**:
 
 ## How it runs
 
-Mitos is **per-project** — each project gets its own decision graph and its own Qdrant collection. Day to day, three verbs carry the loop (as MCP tools for agents, with CLI twins):
+Mitos is **per-project** — each project gets its own decision graph and its own Qdrant collections. Day to day, three verbs carry the loop (as MCP tools for agents, with CLI twins):
 
 | Verb | When |
 |---|---|
